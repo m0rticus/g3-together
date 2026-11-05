@@ -449,10 +449,9 @@ def stage1(copies, report, negative=False):
 
 def remotes(bot):
     """Parse the bot's REMOTE lines: {id: {'pos': (x, y, z), 'puppet': bool, 'puppet_pos': (x, y, z), ...}}."""
-    start = bot.send('remotes', 20)
-    bot.line('REMOTES end', 10, 'remotes', start)
+    text = command_text(bot, 'remotes', 'REMOTES end', timeout=20, wait=10, what='remotes')
     found = {}
-    for line in bot.log()[start:].splitlines():
+    for line in text.splitlines():
         m = re.match(r'REMOTE id=(\d+) name=(\S+) world=\w+ same_world=(\d) age_ms=(\d+) pos=([-\d.,]+) puppet=(\d) puppet_pos=([-\d.,]+)', line)
         if m:
             found[int(m[1])] = {'name': m[2], 'same_world': m[3] == '1', 'age_ms': int(m[4]),
@@ -703,9 +702,8 @@ def join_both_plain(copies, host_before=None):
 
 
 def anim_lines(bot, prefix):
-    start = bot.send('remotes', 20)
-    bot.line('REMOTES end', 10, 'remotes', start)
-    return [l for l in bot.log()[start:].splitlines() if l.startswith(prefix)]
+    text = command_text(bot, 'remotes', 'REMOTES end', timeout=20, wait=10, what='remotes')
+    return [l for l in text.splitlines() if l.startswith(prefix)]
 
 
 def animdiag(copies, report, negative=False):
@@ -725,10 +723,9 @@ def animdiag(copies, report, negative=False):
 
 def npcs(bot):
     """Parse the bot's NPC lines: {guid: {'name', 'pos', 'hp', 'dead', 'mirrored', 'task'}}."""
-    start = bot.send('npcs', 20)
-    bot.line('NPCS end', 10, 'npcs', start)
+    text = command_text(bot, 'npcs', 'NPCS end', timeout=20, wait=10, what='npcs')
     found = {}
-    for line in bot.log()[start:].splitlines():
+    for line in text.splitlines():
         m = re.match(r'NPC guid=(\S+) name=(\S+) pos=([-\d.,]+) hp=(-?\d+) dead=(\d) mirrored=(\d) task=(\S*) repacified=(\d+) last_foreign=(\S+)(?: owner=(\d+))?', line)
         if m:
             found[m[1]] = {'name': m[2], 'pos': tuple(map(float, m[3].split(','))), 'hp': int(m[4]),
@@ -1126,9 +1123,8 @@ def swimdiag(copies, report, negative=False):
 
 def equipped_stacks(bot, guid):
     """An NPC's equipped stacks (slot not 0) as name@slot (QA stacks)."""
-    start = bot.send('stacks ' + guid, 20)
-    bot.line('STACKS end', 10, 'stacks', start)
-    return sorted(f'{m[1]}@{m[2]}' for m in re.finditer(r'^STACK \d+ name=(\S+) amount=\d+ slot=(\d+)', bot.log()[start:], re.M) if m[2] != '0')
+    text = command_text(bot, 'stacks ' + guid, 'STACKS end', timeout=20, wait=10, what='stacks')
+    return sorted(f'{m[1]}@{m[2]}' for m in re.finditer(r'^STACK \d+ name=(\S+) amount=\d+ slot=(\d+)', text, re.M) if m[2] != '0')
 
 
 def stageEnterRange(copies, report, negative=False):
@@ -1401,17 +1397,15 @@ def storyepilogdiag(copies, report, negative=False):
 
 
 def town_status(bot, town):
-    start = bot.send('enclaves', 20)
-    bot.line('ENCLAVES end', 15, 'enclaves', start)
-    m = re.search(r'ENCLAVE members=\d+ first=\S+ status=(\d+) enclave=' + re.escape(town) + ' ', bot.log()[start:])
+    text = command_text(bot, 'enclaves', 'ENCLAVES end', timeout=20, wait=15, what='enclaves')
+    m = re.search(r'ENCLAVE members=\d+ first=\S+ status=(\d+) enclave=' + re.escape(town) + ' ', text)
     return int(m[1]) if m else None
 
 
 def town_members(bot, town):
     """QA murdercand: the town's members, [{'member', 'alive', 'counts', 'guid', ...}]."""
-    start = bot.send('murdercand ' + town, 20)
-    bot.line('MURDERCAND end', 15, 'murdercand', start)
-    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in bot.log()[start:].splitlines() if l.startswith('MURDERCAND enclave=')]
+    text = command_text(bot, 'murdercand ' + town, 'MURDERCAND end', timeout=20, wait=15, what='murdercand')
+    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('MURDERCAND enclave=')]
 
 
 def client_frees_town(host, client, town, report, fits=lambda name: name.startswith('Orc_'), each_round=None):
@@ -1573,9 +1567,8 @@ def stageDefeatQuest(copies, report, negative=False):
 
 
 def find_ents(bot, prefix):
-    start = bot.send('findents ' + prefix, 20)
-    bot.line('FINDENTS end', 10, 'findents', start)
-    return [tuple(float(v) for v in m[1].split('_')) for m in re.finditer(r'FINDENT name=\S+ pos=(\S+)', bot.log()[start:])]
+    text = command_text(bot, 'findents ' + prefix, 'FINDENTS end', timeout=20, wait=10, what='findents')
+    return [tuple(float(v) for v in m[1].split('_')) for m in re.finditer(r'FINDENT name=\S+ pos=(\S+)', text)]
 
 
 def stageHailCopy(copies, report, negative=False):
@@ -2041,10 +2034,9 @@ def soultraveldiag(copies, report, negative=False):
 
 
 def inventory_of(bot):
-    start = bot.send('inventory', 20)
-    bot.line('INV end', 10, 'inventory', start)
+    text = command_text(bot, 'inventory', 'INV end', timeout=20, wait=10, what='inventory')
     found = {}
-    for m in re.finditer(r'INV name=(\S+) amount=(-?\d+)', bot.log()[start:]):
+    for m in re.finditer(r'INV name=(\S+) amount=(-?\d+)', text):
         found[m[1]] = found.get(m[1], 0) + int(m[2])
     return found
 
@@ -2249,9 +2241,8 @@ def stageSharedUse(copies, report, negative=False):
 
 
 def pick_cands(bot):
-    start = bot.send('pickcands', 20)
-    bot.line('PICKCANDS end', 10, 'pickcands', start)
-    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in bot.log()[start:].splitlines() if l.startswith('PICKCAND guid=')]
+    text = command_text(bot, 'pickcands', 'PICKCANDS end', timeout=20, wait=10, what='pickcands')
+    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('PICKCAND guid=')]
 
 
 def stagePickPocket(copies, report, negative=False):
@@ -2299,16 +2290,14 @@ KO_TASKS = ('ZS_Unconscious', 'ZS_LieKnockDown', 'ZS_PiercedKO')
 def murder_town(host, report, default=None):
     """A town with routine status (G3_TOWN, else `default`, else the first with members) and two members whose murder the
     game counts there (QA murdercand: counts=1), unique names, not Zuben (a special case in NotifyEnclave, C 12:28)."""
-    start = host.bot.send('enclaves', 20)
-    host.bot.line('ENCLAVES end', 15, 'enclaves', start)
-    towns = [m.groupdict() for m in re.finditer(r'ENCLAVE members=(?P<members>\d+) first=\S+ status=(?P<status>\d+) enclave=(?P<name>\S+)', host.bot.log()[start:])]
+    text = command_text(host.bot, 'enclaves', 'ENCLAVES end', timeout=20, wait=15, what='enclaves')
+    towns = [m.groupdict() for m in re.finditer(r'ENCLAVE members=(?P<members>\d+) first=\S+ status=(?P<status>\d+) enclave=(?P<name>\S+)', text)]
     wanted = os.environ.get('G3_TOWN', default)
     town = next((t['name'] for t in towns if (t['name'] == wanted if wanted else t['status'] == '0' and int(t['members']) >= 4)), None)
     assert town, f'no town with routine status and members: {towns}'
     report['town'] = town
-    start = host.bot.send('murdercand ' + town, 20)
-    host.bot.line('MURDERCAND end', 15, 'murdercand', start)
-    cands = [dict(re.findall(r'(\w+)=(\S+)', l)) for l in host.bot.log()[start:].splitlines() if l.startswith('MURDERCAND enclave=')]
+    text = command_text(host.bot, 'murdercand ' + town, 'MURDERCAND end', timeout=20, wait=15, what='murdercand')
+    cands = [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('MURDERCAND enclave=')]
     from collections import Counter
     names = Counter(c['member'] for c in cands)
     good = [c['member'] for c in cands if c['alive'] == '1' and c['counts'] == '1' and names[c['member']] == 1 and c['member'] != 'Zuben']
@@ -4444,10 +4433,9 @@ def homescandiag(copies, report, negative=False):
 
 def probe_rows(bot):
     """QA p7probe as {name: {calls, as_puppet, puppet_results, hero_results, ...}} (counts since the last p7probeon)."""
-    start = bot.send('p7probe', 20)
-    bot.line('P7PROBE end', 15, 'p7probe', start)
+    text = command_text(bot, 'p7probe', 'P7PROBE end', timeout=20, wait=15, what='p7probe')
     rows = {}
-    for l in bot.log()[start:].splitlines():
+    for l in text.splitlines():
         if l.startswith('P7PROBE name='):
             r = dict(re.findall(r'(\w+)=(\S+)', l))
             rows[r['name']] = r
@@ -5142,9 +5130,8 @@ def combatdiag(copies, report, negative=False):
 
 
 def hitstacks(bot):
-    start = bot.send('hitstacks', 20)
-    bot.line('HITSTACKS end', 10, 'hitstacks', start)
-    return [l for l in bot.log()[start:].splitlines() if l.startswith('HITSTACK')]
+    text = command_text(bot, 'hitstacks', 'HITSTACKS end', timeout=20, wait=10, what='hitstacks')
+    return [l for l in text.splitlines() if l.startswith('HITSTACK')]
 
 
 def stackdiag(copies, report, negative=False):
@@ -5186,10 +5173,9 @@ def converge(bot, quest_id, expected, seconds=15):
 
 def story(bot):
     """{kind: {counter: value}} from the mod's STORY lines."""
-    start = bot.send('story', 20)
-    bot.line('STORY end', 10, 'story', start)
+    text = command_text(bot, 'story', 'STORY end', timeout=20, wait=10, what='story')
     found = {}
-    for line in bot.log()[start:].splitlines():
+    for line in text.splitlines():
         match = re.match(r'STORY kind=(\w+) (.*)', line)
         if match:
             found[match[1]] = {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', match[2])}
@@ -5256,9 +5242,8 @@ def info(bot, action, name):
 
 
 def info_candidates(bot):
-    start = bot.send('infolist', 20)
-    bot.line('INFOS end', 10, 'infolist', start)
-    return [m[1] for m in re.finditer(r'INFOS name=(\S+) owner=(\S+)', bot.log()[start:])]
+    text = command_text(bot, 'infolist', 'INFOS end', timeout=20, wait=10, what='infolist')
+    return [m[1] for m in re.finditer(r'INFOS name=(\S+) owner=(\S+)', text)]
 
 
 def stage4b(copies, report, negative=False):
@@ -5476,9 +5461,7 @@ def stage4c(copies, report, negative=False):
 
 
 def world_items(bot):
-    start = bot.send('items', 20)
-    bot.line('ITEMS end', 10, 'items', start)
-    text = bot.log()[start:]
+    text = command_text(bot, 'items', 'ITEMS end', timeout=20, wait=10, what='items')
     found = {m[1]: {'name': m[2], 'distance': float(m[3])} for m in re.finditer(r'ITEM guid=(\S+) name=(\S+) distance_cm=([\d.]+)', text)}
     summary = re.search(r'ITEMS entities=(\d+) world_items_near=(\d+)', text)
     return found, summary[0] if summary else ''
@@ -5587,10 +5570,9 @@ def stage5(copies, report, negative=False):
 
 
 def containers(bot):
-    start = bot.send('containers', 20)
-    bot.line('CONTAINERS end', 10, 'containers', start)
+    text = command_text(bot, 'containers', 'CONTAINERS end', timeout=20, wait=10, what='containers')
     found = {}
-    for m in re.finditer(r'CONTAINER guid=(\S+) name=(\S+) kind=(\S+) items=(\S+)', bot.log()[start:]):
+    for m in re.finditer(r'CONTAINER guid=(\S+) name=(\S+) kind=(\S+) items=(\S+)', text):
         found[m[1]] = {'name': m[2], 'kind': m[3], 'items': m[4]}
     return found
 
@@ -5995,9 +5977,8 @@ def invstate(bot, guid):
 
 
 def chests(bot):
-    start = bot.send('chests', 20)
-    bot.line('CHESTS end', 10, 'chests', start)
-    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in bot.log()[start:].splitlines() if l.startswith('CHEST ')]
+    text = command_text(bot, 'chests', 'CHESTS end', timeout=20, wait=10, what='chests')
+    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('CHEST ')]
 
 
 def chestdiag(copies, report, negative=False):
@@ -6421,9 +6402,8 @@ def stageAreaSpells(copies, report, negative=False):
 
 
 def held_lines(bot):
-    start = bot.send('remotes', 20)
-    bot.line('REMOTES end', 10, 'remotes', start)
-    return [l for l in bot.log()[start:].splitlines() if l.startswith('HELD ')]
+    text = command_text(bot, 'remotes', 'REMOTES end', timeout=20, wait=10, what='remotes')
+    return [l for l in text.splitlines() if l.startswith('HELD ')]
 
 
 def flamesworddiag(copies, report, negative=False):
@@ -6880,9 +6860,8 @@ def spellfuncdiag(copies, report, negative=False):
     report['spells'] = []
     names = names.split(',')
     for name in names:  # one per command: QA arguments allow no commas
-        start = host.bot.send('spellfunc '+name, 20)
-        host.bot.line('SPELLFUNC end', 20, 'spellfunc', start)
-        report['spells'] += [l for l in host.bot.log()[start:].splitlines() if l.startswith('SPELLFUNC item=')]
+        text = command_text(host.bot, 'spellfunc '+name, 'SPELLFUNC end', timeout=20, wait=20, what='spellfunc')
+        report['spells'] += [l for l in text.splitlines() if l.startswith('SPELLFUNC item=')]
     report['status_note'] = 'diagnostic only'
 
 
@@ -7746,9 +7725,7 @@ def listendiag(copies, report, negative=False):
 
 
 def npc_summary(bot):
-    start = bot.send('npcsummary', 20)
-    bot.line('NPCSUMMARY end', 20, 'npcsummary', start)
-    text = bot.log()[start:]
+    text = command_text(bot, 'npcsummary', 'NPCSUMMARY end', timeout=20, wait=20, what='npcsummary')
     head = re.search(r'NPCSUMMARY npcs=\d+ entities=\d+ farthest_m=\d+', text)[0]
     rows = [{'name': m[1], 'distance': float(m[2]), 'pos': m[3], 'dead': m[4] == '1'}
             for m in re.finditer(r'NPCAT name=(\S+) distance_m=(\d+) pos=(\S+) dead=(\d)', text)]
@@ -7756,9 +7733,7 @@ def npc_summary(bot):
 
 
 def near(bot, pos):
-    start = bot.send('near '+pos, 20)
-    bot.line('NEAR end', 20, 'near', start)
-    text = bot.log()[start:]
+    text = command_text(bot, 'near '+pos, 'NEAR end', timeout=20, wait=20, what='near')
     found = {}
     for m in re.finditer(r'NEAR name=(\S+) pos=(\S+) task=(\S*) hp=(-?\d+) dead=(\d) mirrored=(\d)', text):
         found.setdefault(m[1], []).append({'pos': tuple(map(float, m[2].split('_'))), 'task': m[3], 'dead': m[5] == '1',
@@ -7868,9 +7843,8 @@ def save_files_of(copy):
 
 
 def scriptinfo(bot, name):
-    start = bot.send('scriptinfo '+name, 20)
-    bot.line('SCRIPTINFO ', 10, 'scriptinfo', start)
-    return [l for l in bot.log()[start:].splitlines() if l.startswith('SCRIPTINFO address')]
+    text = command_text(bot, 'scriptinfo '+name, 'SCRIPTINFO ', timeout=20, wait=10, what='scriptinfo')
+    return [l for l in text.splitlines() if l.startswith('SCRIPTINFO address')]
 
 
 def wait_running(copy, seconds, what):
@@ -8200,6 +8174,13 @@ def stageA(copies, report, negative=False):
     assert remotes(host.bot).get(2, {}).get('puppet') and remotes(client.bot).get(1, {}).get('puppet'), 'session broke'
 
 
+def command_text(bot, command, end_prefix=None, timeout=20, wait=10, what=None):
+    start = bot.send(command, timeout)
+    if end_prefix is not None:
+        bot.line(end_prefix, wait, what or command, start)
+    return bot.log()[start:]
+
+
 def report_line(bot, command, prefix):
     start = bot.send(command, 20)
     return bot.line(prefix, 10, command, start)
@@ -8346,10 +8327,9 @@ def stageB(copies, report, negative=False):
 
 
 def far_rows(bot):
-    start = bot.send('farnpcs', 60)
-    bot.line('FARNPC end', 60, 'farnpcs', start)
+    text = command_text(bot, 'farnpcs', 'FARNPC end', timeout=60, wait=60, what='farnpcs')
     return [{'name': m[1], 'distance': float(m[2]), 'pos': tuple(float(v) for v in m[3].split('_'))}
-            for m in re.finditer(r'FARNPC name=(\S+) distance_m=(\d+) pos=(\S+)', bot.log()[start:])]
+            for m in re.finditer(r'FARNPC name=(\S+) distance_m=(\d+) pos=(\S+)', text)]
 
 
 def teleport_to(bot, name):
@@ -9851,11 +9831,10 @@ def stageE5(copies, report, negative=False):
 
 
 def near_rows(bot):
-    start = bot.send('nearnpcs', 20)
-    bot.line('NEARX end', 10, 'nearnpcs', start)
+    text = command_text(bot, 'nearnpcs', 'NEARX end', timeout=20, wait=10, what='nearnpcs')
     rows = {}
     for m in re.finditer(r'NEARX guid=(\S+) name=(\S+) dead=(\d) mirrored=(\d) owner=(\d+) target=(\S+) target_hero=(\d) '
-                         r'target_puppet=(\d+) task=(\S*) ani=(-?\d+) hand=(\S+) motion=(\S+)', bot.log()[start:]):
+                         r'target_puppet=(\d+) task=(\S*) ani=(-?\d+) hand=(\S+) motion=(\S+)', text):
         rows[m[1]] = {'name': m[2], 'dead': m[3] == '1', 'mirrored': m[4] == '1', 'owner': int(m[5]), 'target': m[6],
                       'target_hero': m[7] == '1', 'target_puppet': int(m[8]), 'task': m[9], 'ani': int(m[10]), 'hand': m[11], 'motion': m[12]}
     return rows
@@ -9901,11 +9880,10 @@ def viewdiag(copies, report, negative=False):
 
 def pose_rows(bot):
     """NEARX rows with the slot-0 state: {guid: {'name', 'dead', 'mirrored', 'motion', 'run0', 'weight0'}}."""
-    start = bot.send('nearnpcs', 20)
-    bot.line('NEARX end', 10, 'nearnpcs', start)
+    text = command_text(bot, 'nearnpcs', 'NEARX end', timeout=20, wait=10, what='nearnpcs')
     rows = {}
     for m in re.finditer(r'NEARX guid=(\S+) name=(\S+) dead=(\d) mirrored=(\d) .*? motion=(\S+) state=(\S*) run0=(-?\d+) weight0=(-?\d+)(?: yaw=(-?\d+))?',
-                         bot.log()[start:]):
+                         text):
         rows[m[1]] = {'name': m[2], 'dead': m[3] == '1', 'mirrored': m[4] == '1', 'motion': m[5], 'run0': int(m[7]), 'weight0': int(m[8]),
                       'yaw': int(m[9]) if m[9] else None}
     return rows
@@ -10064,27 +10042,26 @@ def syncdiag(copies, report, negative=False):
 
 
 def glide_counts(bot):
-    start = bot.send('glide', 20)
-    bot.line('GLIDE kind=puppet ', 10, 'glide', start)
+    text = command_text(bot, 'glide', 'GLIDE kind=puppet ', timeout=20, wait=10, what='glide')
     found = {}
-    for m in re.finditer(r'GLIDE kind=(\w+) moving_ms=(\d+) glide_ms=(\d+) steer_ms=(\d+) place_ms=(\d+) snaps=(\d+) stance_stops=(\d+)', bot.log()[start:]):
+    for m in re.finditer(r'GLIDE kind=(\w+) moving_ms=(\d+) glide_ms=(\d+) steer_ms=(\d+) place_ms=(\d+) snaps=(\d+) stance_stops=(\d+)', text):
         found[m[1]] = dict(zip(('moving_ms', 'glide_ms', 'steer_ms', 'place_ms', 'snaps', 'stance_stops'), map(int, m.groups()[1:])))
-    for m in re.finditer(r'GLIDEMOTION kind=(\w+) ms=(\d+) motion=(\S*)', bot.log()[start:]):
+    for m in re.finditer(r'GLIDEMOTION kind=(\w+) ms=(\d+) motion=(\S*)', text):
         found.setdefault(m[1], {}).setdefault('motions', []).append((int(m[2]), m[3]))
     # Stufe 3.1/3.2: smoothness (why still: steered/snapped/placed/held; sample between/ahead/held/older) and the display error
     for m in re.finditer(r'SMOOTH kind=(\w+) frames=(\d+) jumps30=(\d+) max_step_cm=(\d+) still=(\d+) lag_cm=(\d+) interp=(\d)'
                          r'(?: still_by=(\S+) still_case=(\S+) offset_window=(\d))?(?: goal_ahead=\d glide_by=(\S+) lead_factor=(\S+))?',
-                         bot.log()[start:]):
+                         text):
         s = found.setdefault(m[1], {})
         s['smooth'] = {'frames': int(m[2]), 'jumps30': int(m[3]), 'max_step_cm': int(m[4]), 'still': int(m[5]), 'lag_cm': int(m[6]),
                        'interp': int(m[7]), 'still_by': m[8], 'still_case': m[9], 'offset_window': m[10], 'glide_by': m[11],
                        'lead_factor': m[12]}
         s['still_share'] = round(int(m[5]) / int(m[2]), 3) if int(m[2]) else None
-    for m in re.finditer(r'STILLMOTION kind=(\w+) frames=(\d+) motion=(\S*)', bot.log()[start:]):
+    for m in re.finditer(r'STILLMOTION kind=(\w+) frames=(\d+) motion=(\S*)', text):
         found.setdefault(m[1], {}).setdefault('still_motions', []).append((int(m[2]), m[3][:70]))
-    for m in re.finditer(r'SNAPS kind=(\w+) hard=(\d+) action=(\d+)', bot.log()[start:]):
+    for m in re.finditer(r'SNAPS kind=(\w+) hard=(\d+) action=(\d+)', text):
         found.setdefault(m[1], {})['hard_snaps'], found[m[1]]['action_snaps'] = int(m[2]), int(m[3])
-    for m in re.finditer(r'LEAD kind=(\w+) samples=(\d+) err_median_cm=(\d+) err_p95_cm=(\d+) sampled=(\S+)', bot.log()[start:]):
+    for m in re.finditer(r'LEAD kind=(\w+) samples=(\d+) err_median_cm=(\d+) err_p95_cm=(\d+) sampled=(\S+)', text):
         found.setdefault(m[1], {})['lead'] = {'samples': int(m[2]), 'err_median_cm': int(m[3]), 'err_p95_cm': int(m[4]), 'sampled': m[5]}
     return found
 
@@ -10190,10 +10167,9 @@ def stageGlide(copies, report, negative=False):
 
 
 def wear_line(bot, player_id):
-    start = bot.send('remotes', 20)
-    bot.line('REMOTES end', 10, 'remotes', start)
+    text = command_text(bot, 'remotes', 'REMOTES end', timeout=20, wait=10, what='remotes')
     m = re.search(rf'WEAR id={player_id} remote_armor=(\S+) remote_helmet=(\S+) puppet_armor=(\S+) puppet_helmet=(\S+) look=(\S+) template=(\S+)',
-                  bot.log()[start:])
+                  text)
     return dict(zip(('remote_armor', 'remote_helmet', 'puppet_armor', 'puppet_helmet', 'look', 'template'), m.groups())) if m else {}
 
 
@@ -11681,10 +11657,9 @@ def stageTradeGoods(copies, report, negative=False):
 
 
 def puppet_pose(bot, player_id):
-    start = bot.send('remotes', 20)
-    bot.line('NET ', 10, 'remotes', start)
+    text = command_text(bot, 'remotes', 'NET ', timeout=20, wait=10, what='remotes')
     time.sleep(0.05)
-    m = re.search(rf'PUPPETPOSE id={player_id} remote=(\S+) shows=(\S+) run0=(-?\d+)(?: shape=(\S+) body=(\S+))?', bot.log()[start:])
+    m = re.search(rf'PUPPETPOSE id={player_id} remote=(\S+) shows=(\S+) run0=(-?\d+)(?: shape=(\S+) body=(\S+))?', text)
     return {'remote': m[1], 'shows': m[2], 'run0': int(m[3]), 'shape': m[4], 'body': m[5]} if m else None
 
 
@@ -11930,10 +11905,9 @@ POTION_CANDIDATES = ['It_Potion_Health'] + [f'It_Potion_Health_{i:02d}' for i in
 
 def owned_items(bot, radius=6000):
     """QA owned: world items near the hero whose AI zone has an owner or a security level (theft counts there)."""
-    start = bot.send(f'owned {radius}', 20)
-    bot.line('OWNED end', 15, 'owned', start)
+    text = command_text(bot, f'owned {radius}', 'OWNED end', timeout=20, wait=15, what='owned')
     rows = []
-    for l in bot.log()[start:].splitlines():
+    for l in text.splitlines():
         if l.startswith('OWNED guid='):
             rows.append(dict(re.findall(r'(\w+)=(\S+)', l)))
     return rows
@@ -11979,9 +11953,8 @@ def crime_of(bot, name):
 
 def enclave_counts(bot, name):
     """Crime counters of one enclave (QA enclaves) as a list of ints, crime index 3 = theft, 4 = murder."""
-    start = bot.send('enclaves', 20)
-    bot.line('ENCLAVES end', 15, 'enclaves', start)
-    for l in bot.log()[start:].splitlines():
+    text = command_text(bot, 'enclaves', 'ENCLAVES end', timeout=20, wait=15, what='enclaves')
+    for l in text.splitlines():
         if l.startswith('ENCLAVE ') and f' enclave={name} ' in l:
             return [int(v) for v in re.search(r' crimes=(\S+)', l)[1].split(',')]
     return None
@@ -12742,16 +12715,14 @@ def xpinfodiag(copies, report, negative=False):
     host = copies['host'].launch()
     enter_world(host)
     clear_raid(host, report)
-    start = host.bot.send('xpinfos', 60)
-    host.bot.line('XPINFOS end', 60, 'xpinfos', start)
-    rows = [l for l in host.bot.log()[start:].splitlines() if l.startswith('XPINFO name=')]
+    text = command_text(host.bot, 'xpinfos', 'XPINFOS end', timeout=60, wait=60, what='xpinfos')
+    rows = [l for l in text.splitlines() if l.startswith('XPINFO name=')]
     report['xpinfos_near'] = sorted(rows, key=lambda l: float(re.search(r'distance_m=(-?[\d.]+)', l)[1]) % 1e9)[:40]
     report['xpinfos_count'] = len(rows)
     report['desc'] = {}
     for name in ('BPANKRATZ31293', 'BPANKRATZ31290', 'BPANKRATZ31289'):
-        start = host.bot.send('infodesc ' + name, 20)
-        host.bot.line('INFODESC end', 10, 'infodesc', start)
-        report['desc'][name] = [l for l in host.bot.log()[start:].splitlines() if l.startswith('INFO')]
+        text = command_text(host.bot, 'infodesc ' + name, 'INFODESC end', timeout=20, wait=10, what='infodesc')
+        report['desc'][name] = [l for l in text.splitlines() if l.startswith('INFO')]
     report['offers'] = {}
     for npc in os.environ.get('G3_TALKERS', 'Diego,Gorn,Milten,Lester,Hamlar,Brenton').split(','):
         teleport_to(host.bot, npc)
@@ -13454,15 +13425,12 @@ def skilldiag(copies, report, negative=False):
     """Diagnostic for stage W9 (23.10.): what a skill stack of the hero is (SKILLDIAG), and which way puts a removed skill
     back (SKILLTRY: TeachSkill with the item's skill, else CreateItems with the stack's template). Client only."""
     host, client = join_both(copies)
-    start = client.bot.send('skilldiag', 20)
-    client.bot.line('SKILLDIAG end', 10, 'skilldiag', start)
-    report['skilldiag'] = [l for l in client.bot.log()[start:].splitlines() if l.startswith('SKILLDIAG stack=')]
-    start = client.bot.send('skilltry', 20)
-    client.bot.line('SKILLTRY case=unlearned', 10, 'skilltry', start)
-    report['skilltry'] = [l for l in client.bot.log()[start:].splitlines() if l.startswith('SKILLTRY ')]
-    start = client.bot.send('skilldiag', 20)
-    client.bot.line('SKILLDIAG end', 10, 'skilldiag', start)
-    report['skilldiag_after'] = [l for l in client.bot.log()[start:].splitlines() if l.startswith('SKILLDIAG stack=')]
+    text = command_text(client.bot, 'skilldiag', 'SKILLDIAG end', timeout=20, wait=10, what='skilldiag')
+    report['skilldiag'] = [l for l in text.splitlines() if l.startswith('SKILLDIAG stack=')]
+    text = command_text(client.bot, 'skilltry', 'SKILLTRY case=unlearned', timeout=20, wait=10, what='skilltry')
+    report['skilltry'] = [l for l in text.splitlines() if l.startswith('SKILLTRY ')]
+    text = command_text(client.bot, 'skilldiag', 'SKILLDIAG end', timeout=20, wait=10, what='skilldiag')
+    report['skilldiag_after'] = [l for l in text.splitlines() if l.startswith('SKILLDIAG stack=')]
 
 
 def stageW10(copies, report, negative=False):
@@ -13775,9 +13743,8 @@ def potiondiag(copies, report, negative=False):
     report['before'] = report_line(host.bot, 'potions', 'POTIONS end')
     report['give'] = [report_line(host.bot, 'givepotion '+name, 'GIVEPOTION ') for name in
                       os.environ.get('G3_POTIONS', ','.join(POTION_CANDIDATES)).split(',')]
-    start = host.bot.send('potions', 20)
-    host.bot.line('POTIONS end', 10, 'potions', start)
-    report['carried'] = [l for l in host.bot.log()[start:].splitlines() if l.startswith('POTION')]
+    text = command_text(host.bot, 'potions', 'POTIONS end', timeout=20, wait=10, what='potions')
+    report['carried'] = [l for l in text.splitlines() if l.startswith('POTION')]
     report['status_note'] = 'diagnostic only'
 
 
@@ -14000,9 +13967,8 @@ def clear_spot(shooter, host, target, report, tag, gap=600):
 
 
 def summons(bot):
-    start = bot.send('summons', 20)
-    bot.line('SUMMONS end', 10, 'summons', start)
-    return [l[7:] for l in bot.log()[start:].splitlines() if l.startswith('SUMMON ')]
+    text = command_text(bot, 'summons', 'SUMMONS end', timeout=20, wait=10, what='summons')
+    return [l[7:] for l in text.splitlines() if l.startswith('SUMMON ')]
 
 
 def ranged_bot_phase(shooter, watcher, shooter_id, host, report, tag, spell='It_Spell_Meteor'):
@@ -14062,9 +14028,7 @@ def ranged_bot_phase(shooter, watcher, shooter_id, host, report, tag, spell='It_
 
 
 def summon_state(bot):
-    start = bot.send('summonstate', 20)
-    bot.line('SUMMONSTATE end', 10, 'summonstate', start)
-    lines = bot.log()[start:].splitlines()
+    lines = command_text(bot, 'summonstate', 'SUMMONSTATE end', timeout=20, wait=10, what='summonstate').splitlines()
     head = next(l for l in lines if l.startswith('SUMMONSTATE ') and not l.startswith('SUMMONSTATE end'))
     return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', head)}, [l[7:] for l in lines if l.startswith('SMNHIT ')]
 
@@ -14138,9 +14102,7 @@ def stageP1(copies, report, negative=False):
 
 
 def shot_state(bot):
-    start = bot.send('shotstate', 20)
-    bot.line('SHOTSTATE end', 10, 'shotstate', start)
-    lines = bot.log()[start:].splitlines()
+    lines = command_text(bot, 'shotstate', 'SHOTSTATE end', timeout=20, wait=10, what='shotstate').splitlines()
     head = next(l for l in lines if l.startswith('SHOTSTATE ') and not l.startswith('SHOTSTATE end'))
     return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', head)}, [l[9:] for l in lines if l.startswith('SHOTCOPY ')]
 
@@ -14298,9 +14260,8 @@ def arrow_phase(shooter, watcher, shooter_id, host, report, tag, shots=3):
 
 
 def touch_lines(bot):
-    start = bot.send('touchlog', 20)
-    bot.line('TOUCHLOG end', 10, 'touchlog', start)
-    return [l[6:] for l in bot.log()[start:].splitlines() if l.startswith('TOUCH ')]
+    text = command_text(bot, 'touchlog', 'TOUCHLOG end', timeout=20, wait=10, what='touchlog')
+    return [l[6:] for l in text.splitlines() if l.startswith('TOUCH ')]
 
 
 def arrowtouchdiag(copies, report, negative=False):
@@ -15025,10 +14986,9 @@ def stagePoison(copies, report, negative=False):
 
 
 def creatures(bot):
-    start = bot.send('creatures', 20)
-    bot.line('CREATURES end', 10, 'creatures', start)
+    text = command_text(bot, 'creatures', 'CREATURES end', timeout=20, wait=10, what='creatures')
     out = []
-    for l in bot.log()[start:].splitlines():
+    for l in text.splitlines():
         m = re.match(r'CREATURE own name=(\S+) guid=(\S+) at=(-?\d+)_(-?\d+)_(-?\d+) dead=(\d)', l)
         if m:
             out.append({'name': m[1], 'guid': m[2], 'pos': (float(m[3]), float(m[4]), float(m[5])), 'dead': m[6] == '1'})
@@ -15171,10 +15131,9 @@ def stageCreatureLife(copies, report, negative=False):
 
 
 def party_members(bot):
-    start = bot.send('party', 20)
-    bot.line('PARTY end', 10, 'party', start)
+    text = command_text(bot, 'party', 'PARTY end', timeout=20, wait=10, what='party')
     out = []
-    for l in bot.log()[start:].splitlines():
+    for l in text.splitlines():
         m = re.match(r'MEMBER name=(\S+) guid=(\S+) type=(\d+) task=(\S*) at=(-?\d+)_(-?\d+)_(-?\d+)', l)
         if m:
             out.append({'name': m[1], 'guid': m[2], 'type': int(m[3]), 'task': m[4], 'pos': (float(m[5]), float(m[6]), float(m[7]))})
@@ -15666,9 +15625,8 @@ def scriptfinddiag(copies, report, negative=False):
     host = copies['host'].launch()
     enter_world(host)
     for rva in [r for r in os.environ.get('G3_RVAS', 'a5ea0,a9440').split(',') if r]:
-        start = host.bot.send('scriptfind '+rva, 20)
-        host.bot.line('SCRIPTFIND end', 10, 'scriptfind', start)
-        report[rva] = [l for l in host.bot.log()[start:].splitlines() if l.startswith('SCRIPTFIND')]
+        text = command_text(host.bot, 'scriptfind '+rva, 'SCRIPTFIND end', timeout=20, wait=10, what='scriptfind')
+        report[rva] = [l for l in text.splitlines() if l.startswith('SCRIPTFIND')]
     report['status_note'] = 'diagnostic only'
 
 
@@ -15759,10 +15717,9 @@ USABLE_LINE = re.compile(r'USABLE name=(\S+) pos=(\S+) usefunc=(\S*) usetype=(\d
 
 
 def usables(bot, radius=3000):
-    start = bot.send(f'usables {radius}', 20)
-    bot.line('USABLE end', 10, 'usables', start)
+    text = command_text(bot, f'usables {radius}', 'USABLE end', timeout=20, wait=10, what='usables')
     return [dict(zip(('name', 'pos', 'usefunc', 'usetype', 'item', 'door', 'open', 'lock', 'locked', 'user', 'distance'), m.groups()))
-            for m in USABLE_LINE.finditer(bot.log()[start:])]
+            for m in USABLE_LINE.finditer(text)]
 
 
 def use_info(bot, name):
@@ -16060,10 +16017,9 @@ def stageArenaQuest(copies, report, negative=False):
 
 def find_all(bot, name):
     """QA findall: [(pos, dead)] of every entity of that name in the world, processed or not."""
-    start = bot.send('findall ' + name, 20)
-    bot.line('FINDALL end', 10, 'findall', start)
+    text = command_text(bot, 'findall ' + name, 'FINDALL end', timeout=20, wait=10, what='findall')
     return [(tuple(float(v) for v in m[1].split('_')), m[2] == '1')
-            for m in re.finditer(r'FINDALL name=\S+ pos=(\S+) dead=(\d)', bot.log()[start:])]
+            for m in re.finditer(r'FINDALL name=\S+ pos=(\S+) dead=(\d)', text)]
 
 
 def stageKillQuest(copies, report, negative=False):
@@ -16584,9 +16540,8 @@ def arenastartdiag(copies, report, negative=False):
 
 
 def movers(bot):
-    start = bot.send('movers', 20)
-    bot.line('MOVER end', 10, 'movers', start)
-    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in bot.log()[start:].splitlines() if l.startswith('MOVER name=')]
+    text = command_text(bot, 'movers', 'MOVER end', timeout=20, wait=10, what='movers')
+    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('MOVER name=')]
 
 
 def moverscan(copies, report, negative=False):
@@ -16625,10 +16580,9 @@ def spellnamediag(copies, report, negative=False):
 
 
 def near_view(bot, names):
-    start = bot.send('nearnpcs', 20)
-    bot.line('NEARX end', 10, 'nearnpcs', start)
+    text = command_text(bot, 'nearnpcs', 'NEARX end', timeout=20, wait=10, what='nearnpcs')
     out = {}
-    for l in bot.log()[start:].splitlines():
+    for l in text.splitlines():
         m = re.match(r'NEARX guid=\S+ name=(\S+) .*?task=(\S*) .*?motion=(\S+) state=(\S*)', l)
         if m and m[1] in names:
             out[m[1]] = (m[2], m[4], m[3][:60])
@@ -16878,9 +16832,8 @@ def stageUseStation(copies, report, negative=False):
 
 
 def enclave_lines(bot):
-    start = bot.send('enclaves', 20)
-    bot.line('ENCLAVES end', 15, 'enclaves', start)
-    return [l for l in bot.log()[start:].splitlines() if l.startswith('ENCLAVE members=')]
+    text = command_text(bot, 'enclaves', 'ENCLAVES end', timeout=20, wait=15, what='enclaves')
+    return [l for l in text.splitlines() if l.startswith('ENCLAVE members=')]
 
 
 def stageDialogCommands(copies, report, negative=False):
@@ -16955,9 +16908,8 @@ def stageDialogCommands(copies, report, negative=False):
 
 def scan_type(copy, kind, limit=12):
     """QA infoscan type_<kind>: the dialog infos of that condition type, nearest first (dicts of the INFOSCAN fields)."""
-    start = copy.bot.send('infoscan type_' + str(kind), 30)
-    copy.bot.line('INFOSCAN end', 30, 'infoscan', start)
-    rows = [dict(re.findall(r'(\w+)=(\S*)', l)) for l in copy.bot.log()[start:].splitlines() if l.startswith('INFOSCAN info=')]
+    text = command_text(copy.bot, 'infoscan type_' + str(kind), 'INFOSCAN end', timeout=30, wait=30, what='infoscan')
+    rows = [dict(re.findall(r'(\w+)=(\S*)', l)) for l in text.splitlines() if l.startswith('INFOSCAN info=')]
     return sorted(rows, key=lambda r: float(r.get('distance_m', '1e9')))[:limit]
 
 
@@ -16979,9 +16931,8 @@ def dialogcondiag(copies, report, negative=False):
 
 def ai_counts(bot):
     """QA aicount: {name: calls} of the AI scripts counted since the last 'aicount PREFIX' (hero and others together)."""
-    start = bot.send('aicount', 20)
-    bot.line('AICOUNT end', 10, 'aicount', start)
-    return {m[1]: int(m[2]) + int(m[3]) for m in re.finditer(r'AICOUNT name=(\S+) hero=(\d+) others=(\d+)', bot.log()[start:])}
+    text = command_text(bot, 'aicount', 'AICOUNT end', timeout=20, wait=10, what='aicount')
+    return {m[1]: int(m[2]) + int(m[3]) for m in re.finditer(r'AICOUNT name=(\S+) hero=(\d+) others=(\d+)', text)}
 
 
 def end_dialog(copy):
@@ -17349,9 +17300,8 @@ def infodescdiag(copies, report, negative=False):
     host = copies['host'].launch()
     enter_world(host)
     for name in [t for t in os.environ.get('G3_INFOS', 'NEWM1055').split(',') if t]:
-        start = host.bot.send('infodesc '+name, 20)
-        host.bot.line('INFODESC end', 10, 'infodesc', start)
-        report[name] = [l for l in host.bot.log()[start:].splitlines() if l.startswith(('INFODESC', 'INFOLINE'))]
+        text = command_text(host.bot, 'infodesc '+name, 'INFODESC end', timeout=20, wait=10, what='infodesc')
+        report[name] = [l for l in text.splitlines() if l.startswith(('INFODESC', 'INFOLINE'))]
     report['status_note'] = 'diagnostic only'
 
 

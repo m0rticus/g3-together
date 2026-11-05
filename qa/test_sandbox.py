@@ -277,6 +277,58 @@ class SandboxRoutingTests(unittest.TestCase):
             self.assertEqual(wait.call_args.args[1], 9)
             self.assertTrue(wait.call_args.args[0]('COMMAND sequence=2 action=state thread=1'))
 
+    def test_command_text_preserves_send_line_and_log_semantics(self):
+        calls = []
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 123,
+            line=lambda prefix, wait, what, start: calls.append(('line', prefix, wait, what, start)) or 'ignored',
+            log=lambda: 'x' * 123 + 'first\nsecond',
+        )
+        self.assertEqual(self.runner.command_text(bot, 'reader', 'READER end', timeout=37, wait=14, what='reader diagnostic'),
+                         'first\nsecond')
+        self.assertEqual(calls, [('send', 'reader', 37),
+                                 ('line', 'READER end', 14, 'reader diagnostic', 123)])
+
+    def test_command_text_can_skip_the_end_line_wait(self):
+        calls = []
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 7,
+            line=lambda *args: calls.append(('line',) + args),
+            log=lambda: 'x' * 7 + 'after',
+        )
+        self.assertEqual(self.runner.command_text(bot, 'raw', timeout=41), 'after')
+        self.assertEqual(calls, [('send', 'raw', 41)])
+
+    def test_command_text_preserves_tuple_prefix_and_default_timeout(self):
+        calls = []
+        prefix = ('WEARHERO ', 'REFUSED wear')
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 3,
+            line=lambda prefix, wait, what, start: calls.append(('line', prefix, wait, what, start)) or 'wear reply',
+            log=lambda: 'xxxwear reply',
+        )
+        self.assertEqual(self.runner.command_text(bot, 'wear item', prefix, what='wear item'), 'wear reply')
+        self.assertEqual(calls, [('send', 'wear item', 20),
+                                 ('line', prefix, 10, 'wear item', 3)])
+
+    def test_uniform_readers_keep_their_existing_parser_patterns(self):
+        checks = {
+            'remotes': ("for line in text.splitlines()", "REmote id=(\\d+)".replace('REmote', 'REMOTE')),
+            'npcs': ("for line in text.splitlines()", "NPC guid=(\\S+)"),
+            'inventory_of': ("for m in re.finditer(r'INV name=", "found[m[1]]"),
+            'town_status': ("re.search(r'ENCLAVE", "return int(m[1]) if m else None"),
+            'town_members': ("l.startswith('MURDERCAND enclave=')", "dict(re.findall"),
+            'pick_cands': ("l.startswith('PICKCAND guid=')", "dict(re.findall"),
+            'near_rows': ("for m in re.finditer(r'NEARX guid=", "target_puppet"),
+            'glide_counts': ("re.finditer(r'GLIDE kind=", "re.finditer(r'GLIDEMOTION"),
+            'ai_counts': ("re.finditer(r'AICOUNT name=", "int(m[2]) + int(m[3])"),
+        }
+        for name, fragments in checks.items():
+            with self.subTest(reader=name):
+                source = inspect.getsource(getattr(self.runner, name))
+                for fragment in fragments:
+                    self.assertIn(fragment, source)
+
     def test_both_closes_are_queued_before_waiting_for_either_renderer(self):
         events = []
         copies = {}
