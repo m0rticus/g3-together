@@ -10042,26 +10042,27 @@ def syncdiag(copies, report, negative=False):
 
 
 def glide_counts(bot):
-    text = command_text(bot, 'glide', 'GLIDE kind=puppet ', timeout=20, wait=10, what='glide')
+    start = bot.send('glide', 20)
+    bot.line('GLIDE kind=puppet ', 10, 'glide', start)
     found = {}
-    for m in re.finditer(r'GLIDE kind=(\w+) moving_ms=(\d+) glide_ms=(\d+) steer_ms=(\d+) place_ms=(\d+) snaps=(\d+) stance_stops=(\d+)', text):
+    for m in re.finditer(r'GLIDE kind=(\w+) moving_ms=(\d+) glide_ms=(\d+) steer_ms=(\d+) place_ms=(\d+) snaps=(\d+) stance_stops=(\d+)', bot.log()[start:]):
         found[m[1]] = dict(zip(('moving_ms', 'glide_ms', 'steer_ms', 'place_ms', 'snaps', 'stance_stops'), map(int, m.groups()[1:])))
-    for m in re.finditer(r'GLIDEMOTION kind=(\w+) ms=(\d+) motion=(\S*)', text):
+    for m in re.finditer(r'GLIDEMOTION kind=(\w+) ms=(\d+) motion=(\S*)', bot.log()[start:]):
         found.setdefault(m[1], {}).setdefault('motions', []).append((int(m[2]), m[3]))
     # Stufe 3.1/3.2: smoothness (why still: steered/snapped/placed/held; sample between/ahead/held/older) and the display error
     for m in re.finditer(r'SMOOTH kind=(\w+) frames=(\d+) jumps30=(\d+) max_step_cm=(\d+) still=(\d+) lag_cm=(\d+) interp=(\d)'
                          r'(?: still_by=(\S+) still_case=(\S+) offset_window=(\d))?(?: goal_ahead=\d glide_by=(\S+) lead_factor=(\S+))?',
-                         text):
+                         bot.log()[start:]):
         s = found.setdefault(m[1], {})
         s['smooth'] = {'frames': int(m[2]), 'jumps30': int(m[3]), 'max_step_cm': int(m[4]), 'still': int(m[5]), 'lag_cm': int(m[6]),
                        'interp': int(m[7]), 'still_by': m[8], 'still_case': m[9], 'offset_window': m[10], 'glide_by': m[11],
                        'lead_factor': m[12]}
         s['still_share'] = round(int(m[5]) / int(m[2]), 3) if int(m[2]) else None
-    for m in re.finditer(r'STILLMOTION kind=(\w+) frames=(\d+) motion=(\S*)', text):
+    for m in re.finditer(r'STILLMOTION kind=(\w+) frames=(\d+) motion=(\S*)', bot.log()[start:]):
         found.setdefault(m[1], {}).setdefault('still_motions', []).append((int(m[2]), m[3][:70]))
-    for m in re.finditer(r'SNAPS kind=(\w+) hard=(\d+) action=(\d+)', text):
+    for m in re.finditer(r'SNAPS kind=(\w+) hard=(\d+) action=(\d+)', bot.log()[start:]):
         found.setdefault(m[1], {})['hard_snaps'], found[m[1]]['action_snaps'] = int(m[2]), int(m[3])
-    for m in re.finditer(r'LEAD kind=(\w+) samples=(\d+) err_median_cm=(\d+) err_p95_cm=(\d+) sampled=(\S+)', text):
+    for m in re.finditer(r'LEAD kind=(\w+) samples=(\d+) err_median_cm=(\d+) err_p95_cm=(\d+) sampled=(\S+)', bot.log()[start:]):
         found.setdefault(m[1], {})['lead'] = {'samples': int(m[2]), 'err_median_cm': int(m[3]), 'err_p95_cm': int(m[4]), 'sampled': m[5]}
     return found
 
@@ -11657,8 +11658,10 @@ def stageTradeGoods(copies, report, negative=False):
 
 
 def puppet_pose(bot, player_id):
-    text = command_text(bot, 'remotes', 'NET ', timeout=20, wait=10, what='remotes')
+    start = bot.send('remotes', 20)
+    bot.line('NET ', 10, 'remotes', start)
     time.sleep(0.05)
+    text = bot.log()[start:]
     m = re.search(rf'PUPPETPOSE id={player_id} remote=(\S+) shows=(\S+) run0=(-?\d+)(?: shape=(\S+) body=(\S+))?', text)
     return {'remote': m[1], 'shows': m[2], 'run0': int(m[3]), 'shape': m[4], 'body': m[5]} if m else None
 

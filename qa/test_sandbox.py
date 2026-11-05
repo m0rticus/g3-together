@@ -311,6 +311,52 @@ class SandboxRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [('send', 'wear item', 20),
                                  ('line', prefix, 10, 'wear item', 3)])
 
+    def test_puppet_pose_reads_after_the_post_command_sleep(self):
+        state = {'log': ''}
+        calls = []
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 123,
+            line=lambda prefix, wait, what, start: calls.append(('line', prefix, wait, what, start)),
+            log=lambda: 'x' * 123 + state['log'],
+        )
+
+        def append_pose(seconds):
+            calls.append(('sleep', seconds))
+            state['log'] += 'PUPPETPOSE id=2 remote=host shows=body run0=17 shape=Human body=Torso\n'
+
+        with patch.object(self.runner.time, 'sleep', side_effect=append_pose):
+            pose = self.runner.puppet_pose(bot, 2)
+
+        self.assertEqual(pose, {'remote': 'host', 'shows': 'body', 'run0': 17, 'shape': 'Human', 'body': 'Torso'})
+        self.assertEqual(calls, [('send', 'remotes', 20),
+                                 ('line', 'NET ', 10, 'remotes', 123),
+                                 ('sleep', 0.05)])
+
+    def test_glide_counts_reads_each_result_kind_from_separate_log_snapshots(self):
+        snapshots = iter([
+            'x' * 123 + 'GLIDE kind=puppet moving_ms=10 glide_ms=20 steer_ms=30 place_ms=40 snaps=50 stance_stops=60\n',
+            'x' * 123 + 'GLIDE kind=puppet moving_ms=10 glide_ms=20 steer_ms=30 place_ms=40 snaps=50 stance_stops=60\n'
+            'GLIDEMOTION kind=puppet ms=70 motion=Walk\n',
+            'x' * 123 + 'GLIDE kind=puppet moving_ms=10 glide_ms=20 steer_ms=30 place_ms=40 snaps=50 stance_stops=60\n'
+            'SMOOTH kind=puppet frames=100 jumps30=1 max_step_cm=2 still=3 lag_cm=4 interp=5 still_by=host still_case=held offset_window=8\n',
+            'x' * 123 + 'STILLMOTION kind=puppet frames=9 motion=Stand\n',
+            'x' * 123 + 'SNAPS kind=puppet hard=2 action=3\n',
+            'x' * 123 + 'LEAD kind=puppet samples=5 err_median_cm=6 err_p95_cm=7 sampled=8/9\n',
+        ])
+        bot = SimpleNamespace(
+            send=lambda command, timeout: 123,
+            line=lambda *args: None,
+            log=lambda: next(snapshots),
+        )
+
+        found = self.runner.glide_counts(bot)
+        self.assertEqual(found['puppet']['moving_ms'], 10)
+        self.assertEqual(found['puppet']['motions'], [(70, 'Walk')])
+        self.assertEqual(found['puppet']['smooth']['frames'], 100)
+        self.assertEqual(found['puppet']['still_motions'], [(9, 'Stand')])
+        self.assertEqual(found['puppet']['hard_snaps'], 2)
+        self.assertEqual(found['puppet']['lead']['samples'], 5)
+
     def test_uniform_readers_keep_their_existing_parser_patterns(self):
         checks = {
             'remotes': ("for line in text.splitlines()", "REmote id=(\\d+)".replace('REmote', 'REMOTE')),
