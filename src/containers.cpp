@@ -2,6 +2,7 @@
 #include "containers.h"
 
 #include "body.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "remote.h"
@@ -40,33 +41,6 @@ DWORD lastLocalPoll = 0;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
-void GuidOf(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
-Entity Resolve(uint8_t const guid[16])
-{
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    return Entity(bCPropertyID(bCGuid(raw)));
-}
-
-Entity Resolve(std::string const& key) { return Resolve(reinterpret_cast<uint8_t const*>(key.data())); }
-
-bool ParseGuid(char const* text, uint8_t out[16])
-{
-    unsigned d1, d2, d3, b[8];
-    if (sscanf_s(text, "%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6],
-                 &b[7]) != 11)
-        return false;
-    _GUID raw{d1, static_cast<unsigned short>(d2), static_cast<unsigned short>(d3), {}};
-    for (int i = 0; i < 8; ++i) raw.Data4[i] = static_cast<unsigned char>(b[i]);
-    std::memcpy(out, &raw, 16);
-    return true;
-}
-
 bool HasInventory(eCEntity* entity) { return entity && entity->GetPropertySet(eEPropertySetType_Inventory); }
 
 // Chests and corpses: an inventory, not an item, not a living NPC.
@@ -97,7 +71,7 @@ Template TemplateOf(std::string const& key)
 {
     _GUID raw;
     std::memcpy(&raw, key.data(), 16);
-    return Template(bCPropertyID(bCGuid(raw)));
+    return Template(guid::Property(raw));
 }
 
 char const* NameOf(std::string const& key)
@@ -199,7 +173,7 @@ void CreateGoods(Entity& entity, std::string const& key, int amount)
         _GUID raw;
         std::memcpy(&raw, key.data(), 16);
         eCTemplateEntityProxy item;
-        item.SetEntity(bCPropertyID(bCGuid(raw)));
+        item.SetEntity(guid::Property(raw));
         if (eCTemplateEntity* templ = item.GetEntity(); inventory && templ) {
             inventory->CreateItems(templ, 0, static_cast<GEU32>(amount), gEStackType_Merchandise);
             return;
@@ -309,12 +283,12 @@ void Broadcast(std::string const& key, Content const& content)
     if (!net::SendContents(reinterpret_cast<uint8_t const*>(key.data()), entries.data(), static_cast<int>(entries.size()))) {
         // Not marked as sent, so it goes out again once it fits (Codex review R4: marked anyway, it never went again).
         if (!lastSent.count(key) || lastSent[key] != content)
-            Logf("containers: contents of %s not sent (%zu entries, at most %d)", NameOf(Resolve(key)).c_str(), entries.size(), net::MaxContentEntries);
+            Logf("containers: contents of %s not sent (%zu entries, at most %d)", NameOf(guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()))).c_str(), entries.size(), net::MaxContentEntries);
         return;
     }
     auto before = lastSent.find(key);
     if (watched.count(key) || (before != lastSent.end() && before->second != content)) {  // first sends near a player are many
-        Entity entity = Resolve(key);
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
         Note("containers: contents of %s sent: %s%s", NameOf(entity).c_str(), Describe(content).c_str(), watched.count(key) ? " (trader watched)" : "");
     }
     lastSent[key] = content;
@@ -405,7 +379,7 @@ void HostTick()
         for (auto const& at : players) nearPlayer = nearPlayer || DistanceTo(instance, at.data()) <= InterestRadius;
         if (!nearPlayer) continue;
         uint8_t guid[16];
-        GuidOf(instance, guid);
+        guid::CopyEntity(instance, guid);
         const std::string key = Key(guid);
         // A chest a client comes close to is rolled here before the client can open it: its loot screen then
         // shows the host's contents from the start (the watch on opening stays as a fallback).
@@ -445,7 +419,7 @@ void HostTick()
 void OnTx(uint8_t from, uint8_t const guid[16], uint32_t seq, net::ContentEntry const* entries, int count)
 {
     if (disabled) return;
-    Entity container = Resolve(guid);
+    Entity container = guid::Resolve(guid);
     bool ok = container.GetInstance() && Shared(container);
     Content have = ok ? Read(container) : Content{};
     constexpr int32_t MaxAmount = 1000000;  // more than any stack in the game; keeps -amount from overflowing
@@ -484,7 +458,7 @@ void OnTx(uint8_t from, uint8_t const guid[16], uint32_t seq, net::ContentEntry 
 void OnWatch(uint8_t from, uint8_t const guid[16])
 {
     if (disabled) return;
-    Entity chest = Resolve(guid);
+    Entity chest = guid::Resolve(guid);
     if (chest.GetInstance() && !Shared(chest)) return;
     watched[Key(guid)] = GetTickCount() + 120000;
     Note("containers: player %u opened %s (%s); here %s", from, NameOf(chest).c_str(), IsChest(chest) ? "chest" : "trade",
@@ -514,7 +488,7 @@ DWORD activeSince = 0;
 // line whenever the container this client's player has open changes, with why.
 void NoteActive(char const* what, std::string const& key, char const* why)
 {
-    Entity container = Resolve(key);
+    Entity container = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
     Logf("containers: open container %s %s (%s)", key.empty() ? "-" : NameOf(container).c_str(), what, why);
 }
 struct Pending {
@@ -590,7 +564,7 @@ void OnContents(uint8_t const guid[16], net::ContentEntry const* entries, int co
     if (disabled) return;
     ++contentsReceived;
     const std::string key = Key(guid);
-    Entity container = Resolve(guid);
+    Entity container = guid::Resolve(guid);
     if (container.GetInstance() && !Shared(container)) return;
     if (tradeKeep) {
         // The open container: the host's contents plus what is sent and not answered, plus the player's change not reported
@@ -664,7 +638,7 @@ void OnTxResult(uint8_t const guid[16], uint32_t seq, bool ok)
     ++txDenied;
     // Undo what this hero gained or gave in that transaction, and in anything done since that was not
     // reported yet; the container then follows the host's contents.
-    Entity container = Resolve(guid);
+    Entity container = guid::Resolve(guid);
     // What the hero changed here since sending counts against the container as it was then, not against host contents that
     // arrived meanwhile (Codex review R2: with those, a refused take could leave the hero its item); with tradeKeep its base.
     Content undo = done.deltas;
@@ -734,7 +708,7 @@ void DialogTradeFrame(DWORD now)
     Entity trader(partner);
     if (!partner || remote::PuppetOwner(partner) || !IsTrader(trader)) return;
     uint8_t guid[16];
-    GuidOf(partner, guid);
+    guid::CopyEntity(partner, guid);
     if (Key(guid) == active) return;
     active = Key(guid);
     activeSince = now;
@@ -765,7 +739,7 @@ void ClientTick()
         Entity chest = self.Focus.GetFocusEntity();
         if (IsChest(chest) && chest.Interaction.GetUser().GetInstance() == hero) {
             uint8_t guid[16];
-            GuidOf(chest.GetInstance(), guid);
+            guid::CopyEntity(chest.GetInstance(), guid);
             if (Key(guid) != active) {
                 active = Key(guid);
                 activeSince = now;
@@ -787,7 +761,7 @@ void ClientTick()
         Entity trader(partner);
         if (partner && !remote::PuppetOwner(partner) && IsTrader(trader)) {
             uint8_t guid[16];
-            GuidOf(partner, guid);
+            guid::CopyEntity(partner, guid);
             if (tradeKeep && Key(guid) == active) {
                 trading = true;
                 activeSince = now;  // open as long as the screen is
@@ -807,7 +781,7 @@ void ClientTick()
         }
     }
     if (!active.empty()) {
-        Entity container = Resolve(active);
+        Entity container = guid::Resolve(reinterpret_cast<uint8_t const*>(active.data()));
         auto host = known.find(active);
         bool hold = false;
         if (reportDelay && container.GetInstance() && host != known.end()) {
@@ -845,7 +819,7 @@ void ClientTick()
     // Anything else that drifted from the host's contents (a corpse rolling its own plunder) is put back.
     for (auto const& [key, host] : known) {
         if (key == active) continue;
-        Entity container = Resolve(key);
+        Entity container = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
         // Far ones are skipped, not forgotten: the host sends a container again only when it changes.
         if (!container.GetInstance() || DistanceTo(container.GetInstance(), at) > InterestRadius) continue;
         const Content here = Read(container);
@@ -1057,7 +1031,7 @@ void Tick()
 void Contents(char const* guid, LogFn log)
 {
     uint8_t raw[16];
-    Entity container = ParseGuid(guid, raw) ? Resolve(raw) : Entity();
+    Entity container = guid::Parse(guid, raw) ? guid::Resolve(raw) : Entity();
     if (!container.GetInstance() || !HasInventory(container.GetInstance())) { log("REFUSED contents: no container"); return; }
     const std::string line = "CONTENTS guid=" + std::string(guid) + " items=" + Describe(Read(container));
     log(line.c_str());
@@ -1068,7 +1042,7 @@ void Open(char const* guid, LogFn log)
     uint8_t raw[16];
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     // "puppet<id>": another player's puppet (stage Ransack: nobody plunders a knocked-out partner)
-    Entity container = !std::strncmp(guid, "puppet", 6) ? Entity(remote::PuppetOf(std::atoi(guid + 6))) : ParseGuid(guid, raw) ? Resolve(raw) : Entity();
+    Entity container = !std::strncmp(guid, "puppet", 6) ? Entity(remote::PuppetOf(std::atoi(guid + 6))) : guid::Parse(guid, raw) ? guid::Resolve(raw) : Entity();
     if (!hero || !container.GetInstance()) { log("REFUSED lootopen: no hero or container"); return; }
     // Stand next to it first, as a player does.
     const bCVector& c = container.GetInstance()->GetWorldPosition();
@@ -1090,7 +1064,7 @@ void Take(char const* argument, LogFn log)
     strncpy_s(guid, argument, 36);
     char const* wanted = std::strlen(argument) > 37 && argument[36] == '_' ? argument + 37 : nullptr;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    Entity container = ParseGuid(guid, raw) ? Resolve(raw) : Entity();
+    Entity container = guid::Parse(guid, raw) ? guid::Resolve(raw) : Entity();
     if (!hero || !container.GetInstance()) { log("REFUSED loottake: no hero or container"); return; }
     for (int i = 0; i < container.Inventory.GetStackCount(); ++i) {
         if (!Counted(container, i)) continue;
@@ -1152,7 +1126,7 @@ void Silent(char const* argument, LogFn log)
     char guid[40] = {};
     strncpy_s(guid, argument, 36);
     char const* wanted = std::strlen(argument) > 37 && argument[36] == '_' ? argument + 37 : nullptr;
-    Entity container = ParseGuid(guid, raw) ? Resolve(raw) : Entity();
+    Entity container = guid::Parse(guid, raw) ? guid::Resolve(raw) : Entity();
     if (!net::IsHost() || !container.GetInstance()) { log("REFUSED lootsilent: not the host or no container"); return; }
     for (int i = 0; i < container.Inventory.GetStackCount(); ++i) {
         if (!Counted(container, i)) continue;
@@ -1184,7 +1158,7 @@ Entity Target(char const* argument, char const** wanted)
     char guid[40] = {};
     strncpy_s(guid, argument, 36);
     *wanted = std::strlen(argument) > 37 && argument[36] == '_' ? argument + 37 : nullptr;
-    return ParseGuid(guid, raw) ? Resolve(raw) : Entity();
+    return guid::Parse(guid, raw) ? guid::Resolve(raw) : Entity();
 }
 
 int StackOf(Entity& entity, char const* wanted, bool skipGold, int quality = -1)

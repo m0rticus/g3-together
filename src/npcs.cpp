@@ -5,6 +5,7 @@
 #include "combat.h"
 #include "config.h"
 #include "guide.h"
+#include "guid.h"
 #include "arena.h"
 #include "ai.h"
 #include "log.h"
@@ -238,32 +239,9 @@ std::unordered_map<uint32_t, std::string> motionNames;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
-bool ParseGuid(char const* text, uint8_t bytes[16])
-{
-    unsigned d1, d2, d3, b[8];
-    if (std::strlen(text) != 36 ||
-        sscanf_s(text, "%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X", &d1, &d2, &d3,
-                 &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11) return false;
-    _GUID raw{};
-    raw.Data1 = d1; raw.Data2 = static_cast<unsigned short>(d2); raw.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) raw.Data4[i] = static_cast<unsigned char>(b[i]);
-    std::memcpy(bytes, &raw, 16);
-    return true;
-}
+void Guid(eCEntity* entity, uint8_t out[16]) { guid::CopyEntity(entity, out); }
 
-void Guid(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
-void FormatGuid(uint8_t const guid[16], char* out, size_t size)
-{
-    bCPropertyID::bSCore core;
-    std::memcpy(&core, guid, 16);
-    Format(out, size, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", core.Data1, core.Data2, core.Data3, core.Data4[0],
-              core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4], core.Data4[5], core.Data4[6], core.Data4[7]);
-}
+Entity Resolve(uint8_t const guid[16]) { return guid::Resolve(guid); }
 
 // Which item an NPC holds in a hand, as the hash of the item's name (the same template name on every machine).
 uint32_t HeldHash(Entity& npc, gESlot slot)
@@ -289,13 +267,6 @@ void EnsureItem(Entity& npc, uint32_t hash)
     auto name = motionNames.find(hash);  // the name table carries item names too
     if (name == motionNames.end()) return;
     npc.Inventory.CreateItems(Template(name->second.c_str()), 0, 1);
-}
-
-Entity Resolve(uint8_t const guid[16])
-{
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    return Entity(bCPropertyID(bCGuid(raw)));
 }
 
 bool IsNpc(eCEntity* instance)
@@ -582,7 +553,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         if (!instance || instance == hero || remote::IsPuppet(instance)) continue;
         if (instance == controlled) continue;  // a transformed player's creature travels as its player state
         uint8_t guid[16];
-        Guid(instance, guid);
+        guid::CopyEntity(instance, guid);
         SendNote& note = sendNotes[Key(guid)];
         note.at = net::Now();
         if (journal::Pending(instance)) { note.reason = "pending"; continue; }  // a recorded death not applied yet: never show it alive
@@ -2964,7 +2935,7 @@ void Report(LogFn log)
         uint8_t guid[16];
         Guid(instance, guid);
         char text[48];
-        FormatGuid(guid, text, sizeof(text));
+        guid::Format(guid, text, sizeof(text));
         auto mirror = mirrors.find(Key(guid));
         Format(line, "NPC guid=%s name=%s pos=%.1f,%.1f,%.1f hp=%d dead=%d mirrored=%d task=%s repacified=%u last_foreign=%s owner=%u", text,
                   npc.GetName().GetText(), at[0], at[1], at[2], static_cast<int>(npc.DamageReceiver.HitPoints), npc.IsDead(),
@@ -2998,7 +2969,7 @@ void EdgeReport(LogFn log)
         uint8_t guid[16];
         Guid(instance, guid);
         char text[48];
-        FormatGuid(guid, text, sizeof(text));
+        guid::Format(guid, text, sizeof(text));
         const auto note = sendNotes.find(Key(guid));
         Format(line, "EDGENPC guid=%s name=%s nearest_m=%.1f reason=%s age_ms=%d mirror=%d", text, npc.GetName().GetText(), nearest / 100.0f,
                   note != sendNotes.end() ? note->second.reason : "never", note != sendNotes.end() ? static_cast<int>(net::Now() - note->second.at) : -1,
@@ -3013,7 +2984,7 @@ void SendInfo(char const* name, LogFn log)
     // A GUID too (stage EdgeClaim: scavengers share one name).
     Entity npc;
     uint8_t bytes[16];
-    if (ParseGuid(name, bytes)) npc = Resolve(bytes);
+    if (guid::ParseExact(name, bytes)) npc = guid::Resolve(bytes);
     else npc = Entity::GetEntity(bCString(name));
     char line[300];
     if (!npc.GetInstance()) { log("REFUSED npcsend: no such NPC"); return; }
@@ -3023,7 +2994,7 @@ void SendInfo(char const* name, LogFn log)
     const auto note = sendNotes.find(key);
     const auto back = givenBack.find(key);
     char text[48];
-    FormatGuid(guid, text, sizeof(text));
+    guid::Format(guid, text, sizeof(text));
     Format(line, "NPCSEND name=%s guid=%s reason=%s age_ms=%d myclaim=%d mirror=%d givenback_ms=%d", name, text,
               note != sendNotes.end() ? note->second.reason : "never",
               note != sendNotes.end() ? static_cast<int>(net::Now() - note->second.at) : -1, myClaims.count(key) ? 1 : 0,
@@ -3034,7 +3005,7 @@ void SendInfo(char const* name, LogFn log)
 void LifeReport(char const* text, LogFn log)
 {
     uint8_t guid[16];
-    if (!ParseGuid(text, guid)) { log("REFUSED npclife: expected an NPC GUID"); return; }
+    if (!guid::ParseExact(text, guid)) { log("REFUSED npclife: expected an NPC GUID"); return; }
     const std::string key = Key(guid);
     net::NpcRecord const* record = nullptr;
     Mirror const* mirror = nullptr;
@@ -3102,7 +3073,7 @@ void LifeReport(char const* text, LogFn log)
 void CorpseSleep(char const* text, LogFn log)
 {
     uint8_t guid[16];
-    if (net::IsHost() || !ParseGuid(text, guid)) { log("REFUSED corpsesleep: expected a client corpse GUID"); return; }
+    if (net::IsHost() || !guid::ParseExact(text, guid)) { log("REFUSED corpsesleep: expected a client corpse GUID"); return; }
     const auto found = mirrors.find(Key(guid));
     if (found == mirrors.end() || !found->second.ragdollInitialized || found->second.corpsePose.empty()) {
         log("REFUSED corpsesleep: corpse has not initialized and cached its pose");

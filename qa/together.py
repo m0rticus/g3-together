@@ -581,7 +581,11 @@ def postraid_for(name):
         return 'sandbox'
     if os.environ.get('G3_SANDBOX') == '1' and name not in {'sandboxsave', 'postraidsave'}:
         raise RuntimeError(f'{name} has not been declared sandbox-safe; do not override its world setup')
-    if name in LIVE_RAID or name in NEW_GAME or not (name == 'warm' or 'clear_raid(' in inspect.getsource(SUITES[name])):
+    if name in LIVE_RAID or name in NEW_GAME:
+        return ''
+    if name == 'warm':
+        return 'postraid' if postraid_ready() else ''
+    if 'clear_raid(' not in inspect.getsource(SUITES[name]):
         return ''
     return 'postraid' if postraid_ready() else ''
 
@@ -832,8 +836,7 @@ def stageEnterPlace(copies, report, negative=False):
     quest and an NPC at its destination. Negative control: storyoff on both (the other one never hears of it)."""
     quest = os.environ.get('G3_QUEST', 'Xardas_FindXardas')
     spot = os.environ.get('G3_PLACE_AT', 'Xardas')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     goer = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if goer is host else host
     report['goer'] = goer.tag
@@ -870,8 +873,7 @@ def stageArtifactFound(copies, report, negative=False):
     G3_QUEST / G3_ITEM pick another. Negative control: storyoff on both."""
     quest = os.environ.get('G3_QUEST', 'PC_Hero_FindAmulet')
     item = os.environ.get('G3_ITEM', 'It_Artefact_Amulet')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = [report_line(c.bot, 'storyoff', 'STORY') for c in (host, client)]
     report['run'] = report_line(host.bot, 'runquest ' + quest, 'QUEST ')
@@ -938,8 +940,7 @@ def stageStoryInnos(copies, report, negative=False):
                       'Innos_KillZuben', 'Innos_FreeMyrtana']
     events = ['Innos_chosen', 'Innos_Zuben_OK', 'Innos_Myrtana_OK', 'Epilog_Innos', 'Epilog_FirstInfo']
     sectors = ['G3_Nordmar_01_Story_Innos_01']
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = [report_line(c.bot, 'chaptersyncoff', 'CHAPTERSYNCOFF ') for c in (host, client)]
     actor = host if os.environ.get('G3_WHO') == 'host' else client  # host: the single-player control
@@ -1001,8 +1002,7 @@ def stageStoryNordmar(copies, report, negative=False):
     quests = ['PC_Hero_FindAllFiremageCups', 'PC_Hero_Bless_FiremageCups', 'PC_Hero_FIndTeleportToKing']
     events = []
     sectors = ['G3_Nordmar_01_Monastery_FiremageCups_Blessed']
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         story_off(client)
     actor = host if os.environ.get('G3_WHO') == 'host' else client
@@ -1053,8 +1053,7 @@ def swimdiag(copies, report, negative=False):
     default QP_Fisher, the fisherman) and steps out in 16 directions, 4 to 24 m, until its movement mode is swim, dive or
     wade (QA movemode: 7, 8, 10). There it stays and moves a little; the host's puppet of it over 20 s: movement mode and
     motion (TRACE). Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     at = os.environ.get('G3_WATER_AT', 'QP_Fisher')
     report['at'] = teleport_to(client.bot, at) if at != 'start' else 'start'  # start: where the client stands after the join
     time.sleep(4)
@@ -1137,8 +1136,7 @@ def stageEnterRange(copies, report, negative=False):
     the host stays by a wounded NPC (it simulates it, the client mirrors it); the client goes 400 m away and comes back, so the
     NPC enters the client's range again: afterwards it has the host's hit points on both machines, not refilled on the
     client, and it wears the same weapons (QA stacks). Negative control: npcrecvoff on the client before it comes back."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     rows = npcs(host.bot)
     me = hero_pos(host.bot)
     living = [(distance(v['pos'], me), g, v) for g, v in rows.items() if not v['dead'] and not v['mirrored'] and v['hp'] > 60
@@ -1173,8 +1171,7 @@ def stageQuickUse(copies, report, negative=False):
     """P2 quick slots (PS_QuickUse, the Community Patch's OnPlayerUseQuickSlot and OnPlayerAssignStackKey): the client puts a
     healing potion on quick slot 1 and uses it as its key does (QA quickuse): one potion fewer and the hero healed on the
     client, nothing changes for the host's hero, and the host still shows the client (its own hero's matter, as alone)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     potion = os.environ.get('G3_POTION', 'It_Potion_Health')
     report['give'] = report_line(client.bot, f'givepotion {potion}-2', ('GIVEPOTION ', 'REFUSED givepotion'))  # as stage A2 does
     report_line(client.bot, 'sethp 20', 'SETHP ')
@@ -1200,8 +1197,7 @@ def stageSleepBed(copies, report, negative=False):
     (use type 75, PS_Interact_SleepGround; 57 found by objectscan): the state sleeps until 8 at once where no Sleep info
     asks, but these are the NPCs' free points (Nav_Freepoints_Sleep_Ground): the hero does not lie down there (26.10.).
     Negative control: clockoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'clockoff', 'CLOCKOFF ')
     me = hero_pos(client.bot)
@@ -1270,8 +1266,7 @@ def stageEnding(copies, report, negative=False):
     epilogue starts (its events by QA, then BPANKRATZ31831 in a talk with the hero himself): the host starts the same info
     for its own hero, and the chain runs on both. G3_WHO=host: the host starts it. G3_TO_END=1: wait for the end as well.
     Negative control: endingsyncoff on the other machine."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if actor is host else host
     report['actor'] = actor.tag
@@ -1311,8 +1306,7 @@ def stageEndingWait(copies, report, negative=False):
     is told why. The client starts its epilogue (as stageEnding) while the host counts as busy for 75 s (QA endinghold):
     the host is told (HUD, ENDING told >= 1), nothing plays there during the hold, and after it the epilogue plays on the host
     too. Negative control: endinglimit on the host (the 60 s limit as before): it is dropped (given_up=1) and never plays."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     hold = int(os.environ.get('G3_HOLD', '75'))
     if negative:
         report['negative'] = report_line(host.bot, 'endinglimit', 'ENDINGLIMIT ')
@@ -1351,8 +1345,7 @@ def storyepilogdiag(copies, report, negative=False):
     both heroes are offered it (stageStoryInnos). Here the client plays it through: the events set by QA, then every epilogue
     info the hero is offered, until EndGame. Watched on both machines: the talk, whether the client is still in the world and
     on the host, and the mods' logs. G3_WHO=host: the host plays it. Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if actor is host else host
     report['actor'] = actor.tag
@@ -1503,8 +1496,7 @@ def stageTownFree(copies, report, negative=False):
     quest_id = os.environ.get('G3_QUEST', 'Montera_Revolution')
     goto = os.environ.get('G3_GOTO', 'Varek')
     part = os.environ.get('G3_MEMBERS', 'Orc').lower()
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = [report_line(c.bot, 'townstatusoff', 'TOWNSTATUSOFF ') for c in (host, client)]
     report['members'] = [(m['member'], m['alive'], m['counts']) for m in town_members(host.bot, town)]
@@ -1538,8 +1530,7 @@ def stageDefeatQuest(copies, report, negative=False):
     duel quests (Folleck_DefeatHim, Sivert_Defeat ...) start it. Negative control: storyoff on both."""
     quest = os.environ.get('G3_QUEST', 'Otis_DriveAwayMerc01')
     name = os.environ.get('G3_TARGET', 'Trano')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     striker = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if striker is host else host
     report['striker'] = striker.tag
@@ -1591,8 +1582,7 @@ def stageHailCopy(copies, report, negative=False):
     spawns its weather Wth_Hailstorm at Entity::GetPlayer and pulls it there; summon.cpp puts it back on the puppet every frame.
     The client, 30 m from the host, casts a hailstorm; on the host the hail stands at the client's puppet, not at the host's
     hero. Negative control: weatherfollowoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(host.bot, 'weatherfollowoff', 'WEATHERFOLLOWOFF ')
     x, y, z = hero_pos(host.bot)
@@ -1620,8 +1610,7 @@ def followdiag(copies, report, negative=False):
     G3_GUIDE: another follow quest (default Gorn_ShowReddock). G3_WHO=host: the host stands at the guide instead. Diagnostic."""
     quest = os.environ.get('G3_QUEST', 'Mitch_Trolls' if os.environ.get('G3_VIA') == 'dialog' else 'Gorn_ShowReddock')
     guide = os.environ.get('G3_GUIDE', 'Mitch' if os.environ.get('G3_VIA') == 'dialog' else 'Gorn')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     near, far = (host, client) if os.environ.get('G3_WHO') == 'host' else (client, host)
     report['near'] = near.tag
     teleport_to(near.bot, guide)
@@ -1744,8 +1733,7 @@ def stageGuide(copies, report, negative=False):
     (followdiag G3_VIA=dialog, 25.10.). Now the client takes Mitch over while he guides it: he guides the client there, the
     host shows him where the client's game has him, and the quest runs on both. Negative control: guidesyncoff."""
     quest, npc = 'Mitch_Trolls', 'Mitch'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'guidesyncoff', 'GUIDESYNCOFF')
     watching = [n for n in os.environ.get('G3_SCRIPTWATCH', '').split(',') if n]  # scripts counted on both machines (P9)
@@ -1832,8 +1820,7 @@ def stageEscort(copies, report, negative=False):
     client takes him over while he follows it; at the hand-over he goes back to the host, and the quest succeeds on both.
     Negative control: guidesyncoff."""
     quest, npc, trader = 'Freman_BringSlave_01', 'Silden_EscapedSlave_01', 'Freman'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'guidesyncoff', 'GUIDESYNCOFF')
     if os.environ.get('G3_WHO') == 'host':
@@ -1907,8 +1894,7 @@ def stageEscortFar(copies, report, negative=False):
     (the client, there first, keeps him: run 181240). Before, the host's copy stood where the host had last seen it, 290 m
     off, and both machines simulated their own copy (run 180656). Negative control: givebackposoff on the client."""
     quest, npc, trader = 'Freman_BringSlave_01', 'Silden_EscapedSlave_01', 'Freman'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(client.bot, 'givebackposoff', 'GIVEBACKPOSOFF ')
     teleport_to(host.bot, npc)
@@ -1965,8 +1951,7 @@ def stageGuideSave(copies, report, negative=False):
     client's (a taken-over NPC counts as a companion there); handed back, he guides the client again (StartGuidePlayer
     for a running follow quest) instead of following it. Negative control: companionsoff on the host."""
     quest, npc = 'Mitch_Trolls', 'Mitch'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(host.bot, 'companionsoff', 'COMPANIONSOFF ')
     teleport_to(host.bot, npc)
@@ -2019,8 +2004,7 @@ def soultraveldiag(copies, report, negative=False):
     """P6 measurement (soul travel, MagicSoulTravel: a ghost PC_Hero_Ghost through StartTransform, the body stays where it
     was cast): the client casts it 10 m from the host and walks the ghost away; per sample the client's body (findnpc PC_Hero),
     its controlled body (HEROPOS: the ghost), and on the host the client's puppet (position, shape). Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     x, y, z = hero_pos(host.bot)
     move_hero(client.bot, (x + 1000, y, z))
     time.sleep(3)
@@ -2072,8 +2056,7 @@ def treasurediag(copies, report, negative=False, prepare=None):
     digger first; default It_Shovel, - for none), G3_FIRST=client: the client digs first. Diagnostic."""
     name = os.environ.get('G3_TREASURE', 'G3_Object_Interact_PirateTreasure_01')
     at = tuple(float(v) for v in os.environ.get('G3_TREASURE_AT', '59531_4645_57760').split('_'))
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if prepare:
         prepare(host, client)
     for c, dz in ((host, 80), (client, -80)):  # both west of it: the host east of it (+150) did not start digging (20:16)
@@ -2157,8 +2140,7 @@ def stageShapeFight(copies, report, negative=False):
     judgement, no murder), and the client earns the experience of the knock-out or kill. G3_SHAPE_ITEM=It_Potion_Wolf: the
     client turns by drinking the game's transformation potion (MagicTransform) instead. Negative control: shapehitsoff on
     the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(client.bot, 'shapehitsoff', 'SHAPEHITSOFF ')
     keep = ('Diego', 'Gorn', 'Milten', 'Lester')
@@ -2227,8 +2209,7 @@ def stageSharedUse(copies, report, negative=False):
     client sets out to use the same stool (QA use: PS_Interact, as the use key): it is stopped before it sits ("<Name> is
     using this."); the host stands up: the client sees the stool free, uses it and sits. Negative control: usesyncoff on
     both (the client sits on the host's stool)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = [report_line(c.bot, 'usesyncoff', 'USESYNCOFF ') for c in (host, client)]
     # G3_USE_AT: an NPC both go to first; G3_USETYPE: another kind of object (57: anvil, the Community Patch's
@@ -2278,8 +2259,7 @@ def stagePickPocket(copies, report, negative=False):
     it again), and the mark stayed on the thief's copy. The client picks the pocket of an NPC the host simulates (the
     client's hero has learned it, thiefprep: Perk_PickPocket_3, theft 150): the host's NPC is marked too.
     Negative control: pickpocketoff on the client (the host's NPC stays unmarked)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(client.bot, 'pickpocketoff', 'PICKPOCKETOFF ')
     report['thief'] = report_line(client.bot, 'thiefprep', ('THIEFPREP ', 'REFUSED thiefprep'))  # as a hero who learned it
@@ -2335,11 +2315,6 @@ def murder_town(host, report, default=None):
     return town, good
 
 
-def murder_counts(bot, town):
-    counts = enclave_counts(bot, town)
-    return counts[4] if counts else None
-
-
 def stageMurder(copies, report, negative=False):
     """P7 (plan to 90 %), murders by the other machine's player count for the town as in single-player (C
     re/findings/notify-enclave-murder-followup-20261024-c.md). In a town with routine status: (1) the host's hero beats a
@@ -2354,8 +2329,7 @@ def stageMurder(copies, report, negative=False):
     if reputation != 'shared':
         copies['host'].ini_extra = f'reputation = {reputation}\n'
     personal = reputation == 'personal'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     town, good = murder_town(host, report)
     local_victim, remote_victim = good[0], good[1]
     if negative:
@@ -2447,8 +2421,7 @@ def murderwitnessdiag(copies, report, negative=False):
     """P7 measurement, witnesses of a murder: what the game's AssessMurder does on both machines when (1) the host's hero
     kills a town member (single-player behaviour) and (2) the client's hero kills another one (the host's hero 600 away).
     Records the mod's murderwitness lines, the WITNESS counters and the tasks of NPCs near each victim; asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     town, good = murder_town(host, report)
 
     def around(bot, pos):
@@ -2509,8 +2482,7 @@ def defeatwitnessdiag(copies, report, negative=False):
     behaviour), (2) the client's hero knocks another out (the host's hero 600 away; the host tells those around with
     SendPerceptionDefeat, witness.cpp KnockOutSeen). Records the FIGHTMEM counters (defeats_seen, defeats_yes), the
     fightmem 'saw ... knocked out' lines and the tasks near each victim; asserts nothing. Negative (host): murderseenoff."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     town, good = murder_town(host, report)
     if negative:
         report['negative'] = report_line(host.bot, 'murderseenoff', 'MURDERSEENOFF ')
@@ -2567,8 +2539,7 @@ def stageDefeatSeen(copies, report, negative=False):
     the knock-out with the puppet (FIGHTMEM defeats). Whether one reacts depends on the scene as in single-player (Ishtar
     26.10.: once two attacked the puppet, once all were fighting it already and none did); recorded, not asserted.
     Negative control (host): murderseenoff (nobody is told)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     town, good = murder_town(host, report)
     if negative:
         report['negative'] = report_line(host.bot, 'murderseenoff', 'MURDERSEENOFF ')
@@ -2631,8 +2602,7 @@ def upsetdiag(copies, report, negative=False):
     after each step; asserts nothing."""
     npc = os.environ.get('G3_UPSET_NPC', 'Javier')
     who = os.environ.get('G3_WHO', 'host')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor, other = (host, client) if who == 'host' else (client, host)
     for c in (host, client):  # the host first: it simulates the town
         teleport_to(c.bot, npc)
@@ -2691,8 +2661,7 @@ def stageUpset(copies, report, negative=False):
     memory; the host's hero walks up: the NPC leaves it alone; the client comes back: within 15 s the NPC attacks the
     puppet again. Negative control: grudgeoff on the host."""
     npc = os.environ.get('G3_UPSET_NPC', 'Javier')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'grudgeoff', 'GRUDGEOFF ')
     for c in (host, client):  # the host first: it simulates the town
@@ -2749,8 +2718,7 @@ def stageGrudgeLoad(copies, report, negative=False):
     into it: the host keeps no grudge, and the client walks up to the NPC and is left alone for 15 s. Negative control:
     grudgeloadoff on the host."""
     npc = os.environ.get('G3_UPSET_NPC', 'Javier')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     slot = 'G3T_GRUDGE'
     clear_slot(copies, slot)
     if negative:
@@ -2818,8 +2786,7 @@ def aggressordiag(copies, report, negative=False):
     hero strikes one rebel once (single-player reference), then the client strikes another once (the host 7 m off).
     Records p7probe lines (AssessAgressor), the struck NPC's task and target for 8 s, and its attitude; asserts nothing."""
     names = os.environ.get('G3_AGG_NPCS', 'Norris,Copper').split(',')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         report_line(c.bot, 'p7probeon', 'P7PROBEON ')
     for c in (host, client):  # the host first: it simulates the town
@@ -2866,8 +2833,7 @@ def stageMurderWitness(copies, report, negative=False):
     (AssessMurder), and those that judged the puppet a murderer judge the client's hero on the client too, so its game
     remembers the murder there (a town member's crime goes to its town, KnownPlayerCrime 4, else to the NPC's
     LastPlayerCrime; MemorizePlayerCrime). Negative control: murderseenoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     # Not Ishtar (the first town): the host's hero 6 m away stands in a guarded zone there, and its guards go after it.
     town, good = murder_town(host, report, 'Reddock')
     victim = good[1]
@@ -2932,8 +2898,7 @@ def trespassdiag(copies, report, negative=False):
     weapon next to Brenton, the host's hero 15 m off; then the host does the same as single-player reference. (2) Ishtar:
     the client walks into the assassins' guarded place at Muntasir, the host's hero 30 m off; then the host. Records the
     tasks and targets of the NPCs around on the host after 10 s; asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
 
     def around(name, radius=2000):
         rows = npcs(host.bot)
@@ -2983,8 +2948,7 @@ def stageTrespass(copies, report, negative=False):
     attacks puppet2 for the weapon (attack reason 6, ReactToWeapon). (2) Ishtar: the client walks into Muntasir's guarded
     place, the host's hero 30 m off: within 30 s it is warned and attacked as an intruder (reason 11). Nobody turns on the
     host's hero meanwhile. Negative control: trespassoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'trespassoff', 'TRESPASSOFF ')
 
@@ -3097,8 +3061,7 @@ def sneakhomediag(copies, report, negative=False):
     the host's hero 15 m off; then the host does the same as single-player reference. (2) Homes (QA homes): the client
     walks onto the bed of an NPC away from home; then the host onto another one's. Records the tasks and targets of the
     NPCs around on the host and the GUARDS line; asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
 
     def around(pos, radius=2500):
         rows = npcs(host.bot)
@@ -3175,8 +3138,7 @@ def p7opendiag(copies, report, negative=False):
     positive), the onlookers' fight memory (LastFightAgainstPlayer, 5 = Friendly) and what the NPCs around do; asserts
     nothing."""
     who = os.environ.get('G3_WHO', 'client')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor, other = (host, client) if who == 'host' else (client, host)
     for c in (host, client):
         report[f'{c.tag}_probe_on'] = report_line(c.bot, 'p7probeon', 'P7PROBEON ')
@@ -3290,8 +3252,7 @@ def fightmemorydiag(copies, report, negative=False):
     it), the other hero 7 m off; with QA p7probeon on both machines. Records Folleck's and the onlookers' memory on both
     machines before, during and after, and the probe counts (OnWatchFight); asserts nothing."""
     name = os.environ.get('G3_TARGET', 'Folleck')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     striker = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if striker is host else host
     for c in (host, client):
@@ -3346,8 +3307,7 @@ def useownediag(copies, report, negative=False):
     to three free ones in turn, the other hero 15 m off; with QA p7probeon on both machines. Records the probe counts, the
     log lines and who around targets the actor (task, reason); asserts nothing."""
     who = os.environ.get('G3_WHO', 'client')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor, other = (host, client) if who == 'host' else (client, host)
     expected = 'hero' if who == 'host' else 'puppet2'
     for c in (host, client):
@@ -3389,8 +3349,7 @@ def intruderkodiag(copies, report, negative=False):
     30 m off; with QA p7probeon on both machines. Records the actor's state every 4 s for 60 s (down, dead, hit points), who
     attacks it and why, and the probe log of HasAttackReasonToKill; asserts nothing."""
     who = os.environ.get('G3_WHO', 'client')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor, other = (host, client) if who == 'host' else (client, host)
     for c in (host, client):
         report_line(c.bot, 'p7probeon', 'P7PROBEON ')
@@ -3426,8 +3385,7 @@ def stageIntruderFight(copies, report, negative=False):
     the other hero 30 m off. Within 60 s at least one intent to kill was asked about the puppet and held (GUARDS kill_yes),
     and the intruder is not dead. Negative control: fightsoff on the host."""
     who = os.environ.get('G3_WHO', 'client')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'fightsoff', 'FIGHTSOFF ')
     if os.environ.get('G3_FIGHTMEM') == '0':  # comparison: the fight memory's puppet-as-player in the attack states off
@@ -3465,8 +3423,7 @@ def chestwitnessdiag(copies, report, negative=False):
     other hero 15 m off; with QA p7probeon on both machines. Records the probe counts and log, what the actor does after
     and who around targets it (task, reason); asserts nothing."""
     who = os.environ.get('G3_WHO', 'client')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor, other = (host, client) if who == 'host' else (client, host)
     expected = 'hero' if who == 'host' else 'puppet2'
     for c in (host, client):
@@ -3514,8 +3471,7 @@ def chestscandiag(copies, report, negative=False):
     """P7 measurement, chests that stand in an indoor owner zone (where AssessUseInteractObject's helper sees an owner): the
     host's hero visits a member of each town (G3_HOMESCAN: name list) and lists the interact objects named *Chest* within
     80 m that QA ownedobj reports, with zone, owner and security level; asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for anchor in os.environ.get('G3_HOMESCAN', 'Brenton,Lares,Lars,Konrad,Wenzel,Rhobar,Bernado,Orknarok,Zuben,Tjalf,Hamlar,Tarok,Javier').split(','):
         try:
             teleport_to(host.bot, anchor)
@@ -3536,8 +3492,7 @@ def stageWarn(copies, report, negative=False):
     judgements; client 3 warnings, 4 positive). Reddock: the client draws its weapon next to Brenton, the host's hero 15 m
     off, with QA p7probeon on the host. Within 20 s at least one warning about the puppet went out and at least one NPC
     judged it for the puppet, and NPCs there turn to the puppet. Negative control: trespassoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'trespassoff', 'TRESPASSOFF ')
     report['probe_on'] = report_line(host.bot, 'p7probeon', 'P7PROBEON ')
@@ -3581,8 +3536,7 @@ def stageObserveSuspect(copies, report, negative=False):
     guards.cpp checks the puppets too and runs the state's loop with the puppet as the game's player. Ishtar: the client
     walks into Muntasir's place, the host's hero 30 m off. Within 25 s an NPC there observes the puppet (ZS_ObserveSuspect,
     target puppet2) and nobody observes the host's hero. Negative control: trespassoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'trespassoff', 'TRESPASSOFF ')
     for c in (host, client):
@@ -3614,8 +3568,7 @@ def observesuspectdiag(copies, report, negative=False):
     30 s each NPC's task and target on the host (QA crime); the first ZS_ObserveSuspect, ZS_ReactToZone and ZS_Attack per
     NPC with their second. Needs only crime, npcs and teleport, so it runs on older DLLs too (0.5.0: 287f549c)."""
     who = os.environ.get('G3_WHO', 'client')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     teleport_to(host.bot, 'Muntasir')
     x, y, z = hero_pos(host.bot)
     outside = (x + 3000, y + 30, z)
@@ -3661,8 +3614,7 @@ def stageFightMemory(copies, report, negative=False):
     grudge (26.10.): the host keeps the client's fight apart (FIGHTMEMORY kept=2:...), its NPCs keep what they remember of
     the host's hero. Negative control: fightmemoff on the host."""
     name = os.environ.get('G3_TARGET', 'Joey')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'fightmemoff', 'FIGHTMEMOFF ')
     striker = host if os.environ.get('G3_WHO') == 'host' else client
@@ -3723,8 +3675,7 @@ def newsscandiag(copies, report, negative=False):
     """P7 measurement, news of guards and bosses: which dialog infos say them (info script commands SayGuardNews,
     SayBossNews; _AI_SayGuardNews says Halt, then KnownMurder or KnownTheft by what the speaker's town knows of the player),
     who owns them and what they need (condition type, PlayerKnows). Host only; asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for command in ('SayGuardNews', 'SayBossNews'):
         start = host.bot.send('infoscan ' + command, 30)
         host.bot.line('INFOSCAN end', 30, 'infoscan', start)
@@ -3746,8 +3697,7 @@ def guardnewsdiag(copies, report, negative=False):
     talks to it and what the news info does; asserts nothing. G3_ADDRESS=1 should be set for the client."""
     who = os.environ.get('G3_WHO', 'client')
     guard = os.environ.get('G3_GUARD', 'RebWarrior_01')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     actor, other = (host, client) if who == 'host' else (client, host)
     for c in (host, client):  # the host first: it simulates Reddock
         teleport_to(c.bot, guard)
@@ -3799,8 +3749,7 @@ def crimenewsdiag(copies, report, negative=False):
     town = os.environ.get('G3_TOWN', 'Reddock')
     crime = os.environ.get('G3_NEWS_CRIME', '3')
     anchor = os.environ.get('G3_GUARD', 'Brenton')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     first, second = (host, client) if who == 'host' else (client, host)
     for c in (host, client):  # the host first: it simulates the town
         teleport_to(c.bot, anchor)
@@ -3860,8 +3809,7 @@ def guardcommentdiag(copies, report, negative=False):
     the same way (single-player reference). Records counters, probe lines and talk states; asserts nothing."""
     town = os.environ.get('G3_TOWN', 'Reddock')
     anchor = os.environ.get('G3_GUARD', 'Brenton')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         report_line(c.bot, 'p7probeon', 'P7PROBEON ')
     for c in (host, client):  # the host first: it simulates the town
@@ -3917,8 +3865,7 @@ def commentdiag(copies, report, negative=False):
     Records SuspectComment, the walker's talk state and p7probe HasGuardNews lines for the guard; asserts nothing."""
     town = os.environ.get('G3_TOWN', 'Reddock')
     guard = os.environ.get('G3_COMMENT_NPC', 'Reddock_Rebel_01')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         report_line(c.bot, 'p7probeon', 'P7PROBEON ')
     for c in (host, client):  # the host first: it simulates the town
@@ -3971,8 +3918,7 @@ def stageGuardNews(copies, report, negative=False):
     Negative control: addressoff on the client."""
     town = os.environ.get('G3_TOWN', 'Reddock')
     guard = os.environ.get('G3_COMMENT_NPC', 'Reddock_Rebel_01')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     # The harness turns addressing off in the menu; here it is what the stage checks (negative: stays off).
     report['address'] = report_line(client.bot, 'addressoff' if negative else 'addresson', ('ADDRESSOFF ', 'ADDRESSON '))
     for c in (host, client):  # the host first: it simulates the town
@@ -4014,8 +3960,7 @@ def attitudeleakdiag(copies, report, negative=False):
     to the NPC alone. Records the NPC's attitude (hero, puppet, to_player, focus) and crime memory on both machines, and
     for 12 s whom it targets; asserts nothing."""
     npc = os.environ.get('G3_LEAK_NPC', 'Hamlar')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         teleport_to(c.bot, npc)
         time.sleep(2)
@@ -4056,8 +4001,7 @@ def stageAttitudeShared(copies, report, negative=False):
     (Norris; QA witness <npc>_4, the last step of AssessTakeItem): on the client, to_player and focus of that NPC for the
     client's hero equal the host's for its hero and are above where they started. Negative control: enclavesyncoff on both."""
     npc = os.environ.get('G3_LEAK_NPC', 'Norris')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         for c in (host, client):
             assert 'ok=1' in report_line(c.bot, 'enclavesyncoff', 'ENCLAVESYNCOFF ')
@@ -4097,8 +4041,7 @@ def stageFriendBlow(copies, report, negative=False):
     reference) strikes G3_FRIEND (Hamlar, friendly to the heroes) once, the other hero 25 m off: within 6 s the friend
     complains (ZS_ReactToDamage) and does not attack; then a second blow, recorded. Negative control: agressoroff."""
     name = os.environ.get('G3_FRIEND', 'Hamlar')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'agressoroff', 'AGRESSOROFF ')
     striker = host if os.environ.get('G3_WHO') == 'host' else client
@@ -4160,8 +4103,7 @@ def stageForeignHome(copies, report, negative=False):
     on the host."""
     who = os.environ.get('G3_WHO', 'client')
     owner = os.environ.get('G3_HOME_OWNER', 'Tjalf')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'trespassoff', 'TRESPASSOFF ')
     intruder, other = (host, client) if who == 'host' else (client, host)
@@ -4231,8 +4173,7 @@ def stageSneak(copies, report, negative=False):
     (default): nobody notices; 1: someone does. Negative control: sneakcheckon on the host (the puppet check again)."""
     who = os.environ.get('G3_WHO', 'client')
     watchers = os.environ.get('G3_WATCHERS', 'Gelford').split(',')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'sneakcheckon', 'SNEAKCHECKON ')
     sneaker, other = (host, client) if who == 'host' else (client, host)
@@ -4280,8 +4221,7 @@ def stageAddressed(copies, report, negative=False):
     the client's dialog with him runs, he walked up to the puppet on the host, and the host has no dialog. Negative control:
     addressoff on the client (no dialog)."""
     caller = os.environ.get('G3_CALLER', 'Hamlar')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     assert 'ok=1' in report_line(client.bot, 'addressoff' if negative else 'addresson', ('ADDRESSOFF ', 'ADDRESSON '))
     at = next(v['pos'] for v in npcs(host.bot).values() if v['name'] == caller)
     move_hero(host.bot, (at[0] + 3000, at[1] + 50, at[2]))
@@ -4315,8 +4255,7 @@ def importanttalkdiag(copies, report, negative=False):
     client the host's NPCs are mirrors whose perception does not run. At each anchor (G3_IMPORTANT_AT, default the first
     village and Reddock) both heroes stand 6 m apart near it; lists on each machine the NPCs with an important info for its
     own hero (QA important), then for 30 s whom those NPCs target and what they do on the host. Asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for anchor in os.environ.get('G3_IMPORTANT_AT', 'Hamlar,Javier,Gorn').split(','):
         teleport_to(host.bot, anchor)
         teleport_to(client.bot, anchor)
@@ -4347,8 +4286,7 @@ def stageBoulder(copies, report, negative=False):
     sets the game event Faring_Boulder_Success for the lifter's game, the boulder stays where it is. The client's hero, with
     strength 300, lifts it (the orc Tukash who uses it by default sent 25 m away on the host); within 30 s the event is set
     on both machines (story.cpp shares game events). Negative control: storyoff on the client (the host never learns it)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(client.bot, 'storyoff', 'STORYOFF ')
     boulder = 'G3_Object_Interact_Animated_OrcBoulder_Faring'
@@ -4384,8 +4322,7 @@ def stageBoulderHold(copies, report, negative=False):
     must hold (12) and lift (14) it, and its puppet on the host must show the same stances (AniState 12 and 14, motions
     TiltOrcBoulder, HoldOrcBoulder, LiftOrcBoulder). Negative control: stanceoff on the host (the puppet keeps its own
     AniState)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'stanceoff', 'STANCEOFF ')
     boulder = 'G3_Object_Interact_Animated_OrcBoulder_Faring'
@@ -4427,8 +4364,7 @@ def boulderseqdiag(copies, report, negative=False):
     HoldOrcBoulder -> LiftOrcBoulder): G3_WHO (default client; host = single-player control) uses the Faring boulder with
     strength G3_STR (default 300). For 25 s every 0.5 s the user's HERO line and, for the client, its puppet on the host
     (PUPPETSTATE). Asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     user = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if user is host else host
     boulder = 'G3_Object_Interact_Animated_OrcBoulder_Faring'
@@ -4460,8 +4396,7 @@ def boulderdiag(copies, report, negative=False):
     """P1 measurement, orc boulders (Templates.pak: G3_Object_Interact_Animated_OrcBoulder_Faring, _Light, _Medium, _Heavy,
     _01; the world scans near Faring found none): the host's hero teleports to each by name (Entity::GetEntity finds it
     anywhere when its name is the template's) and lists the boulders and usable objects around it. Asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for kind in os.environ.get('G3_BOULDERS', 'Faring,Light,Medium,Heavy,01').split(','):
         name = f'G3_Object_Interact_Animated_OrcBoulder_{kind}'
         try:
@@ -4485,8 +4420,7 @@ def homescandiag(copies, report, negative=False):
     beds all are (sneakhomediag 25.10.)? The host's hero visits a member of each town (G3_HOMESCAN: name list) and lists
     the NPCs within 80 m whose sleeping point lies in another zone (QA homes 8000_all). Records per town the home zones
     with owners, whether each owner is at home now, and the zone position; asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     anchors = os.environ.get('G3_HOMESCAN', 'Mason,Lares,Lars,Konrad,Wenzel,Rhobar,Sinikar,Bernado,Orknarok,Rakus,Treslott,Onatas,Lukar,Tarok,Zuben,Tjalf,Alina').split(',')
     for anchor in anchors:
         try:
@@ -4543,8 +4477,7 @@ def stageZoneAttitude(copies, report, negative=False):
     attack reason 11). Negative control: trespassoff on the host."""
     who = os.environ.get('G3_WHO', 'client')
     place = os.environ.get('G3_PLACE', 'Muntasir')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'trespassoff', 'TRESPASSOFF ')
     intruder, expected = (host, 'hero') if who == 'host' else (client, 'puppet2')
@@ -4620,8 +4553,7 @@ def stageTheftSeen(copies, report, negative=False):
     assess, reason = ('AssessTakeItem', '4') if kind == 'item' else ('AssessUseInteractObject', '5')
     anchors = os.environ.get('G3_THEFT_AT', 'Treslott,Orknarok,Lukar,Lars,Konrad,Brenton,Hamlar,Bernado,Alina').split(',')
     reach = float(os.environ.get('G3_THEFT_REACH', '450'))  # Sancho 35 deg off at 6.8 m did not look (26.10.)
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         for c in (host, client):
             assert 'ok=1' in report_line(c.bot, 'mirrorperceiveoff', 'MIRRORPERCEIVEOFF ')
@@ -4754,8 +4686,7 @@ def stageEnterHome(copies, report, negative=False):
     (sent for puppets as before)."""
     who = os.environ.get('G3_WHO', 'client')
     owner = os.environ.get('G3_HOME_OWNER', 'Brenton')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'enterzoneon', 'ENTERZONEON ')
     intruder, expected = (host, 'hero') if who == 'host' else (client, 'puppet2')
@@ -4825,8 +4756,7 @@ def stageCrimeMemory(copies, report, negative=False):
     where it started. Negative control: enclavesyncoff on both."""
     who = os.environ.get('G3_WHO', 'client')
     npc = os.environ.get('G3_LEAK_NPC', 'Norris')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         for c in (host, client):
             assert 'ok=1' in report_line(c.bot, 'enclavesyncoff', 'ENCLAVESYNCOFF ')
@@ -4883,8 +4813,7 @@ def stagePoliticalChapter(copies, report, negative=False):
     owner or its town in chapter 2 as the host's game judges for its hero, and with the puppet as the player every answer
     is the same. Negative control: chaptercopyoff on the host."""
     at = os.environ.get('G3_POLITICAL_AT', 'Konrad')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'chaptercopyoff', 'CHAPTERCOPYOFF ')
     for c in (host, client):
@@ -4934,8 +4863,7 @@ def stageSpeciesAttitude(copies, report, negative=False):
     for the puppet). Asserts: the animal's species attitude is the same for the puppet as for the host's hero and in the
     client's own game for its hero; the animal targets the puppet. Negative control: attitudeoff on the host."""
     spot = os.environ.get('G3_SPOT', 'Kent')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['attitudeoff'] = report_line(host.bot, 'attitudeoff', 'ATTITUDEOFF')
     teleport_to(host.bot, spot)
@@ -4988,8 +4916,7 @@ def p7attscandiag(copies, report, negative=False):
     (QA bothered: IsBotheredByPlayerTheftOf), the zone attitude of where each hero stands (QA zoneatt -, the zone as self),
     and the parts of GetAttitude for the spot NPC and its two nearest (QA attchain). With QA p7probeon on both machines.
     Asserts nothing."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         report[c.tag + '_probe'] = report_line(c.bot, 'p7probeon', 'P7PROBEON ')
     spots = os.environ.get('G3_SPOTS', 'Muntasir,Brenton,Hamlar,Tjalf,Mason,Lares,Lars,Konrad,Wenzel,Rhobar,Sinikar,Bernado,'
@@ -5456,6 +5383,13 @@ def clear_raid(host, report):
     RAID.release()  # the raid is over: another pair may start one
 
 
+def join_both_and_clear(copies, report):
+    """Preserve the common join-then-clear setup and clear only after both copies join."""
+    host, client = join_both(copies)
+    clear_raid(host, report)
+    return host, client
+
+
 def talkstate(bot):
     start = bot.send('talkstate', 20)
     line = bot.line('TALKSTATE ', 10, 'talkstate', start)
@@ -5476,8 +5410,7 @@ def npc_named(bot, name):
 def stage4c(copies, report, negative=False):
     """A client's hero holds a dialog with an NPC owned by the host: the dialog runs on the client, the host
     holds its NPC meanwhile and releases it afterwards, and what was told reaches the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         start = host.bot.send('talkholdoff', 20)
         assert 'ok=1' in host.bot.line('TALKHOLDOFF ', 10, 'talkholdoff', start)
@@ -5668,8 +5601,7 @@ def fakebreaddiag(copies, report, negative=False):
     """Diagnostic (23.10.): why It_FakeBread never stays in the client's copy of a corpse ("drifted; set back" every 2 s,
     in runs since 22.10.). The host puts one into a corpse near it (stock); both sides' stacks are dumped before, as it
     arrives and after the client's resyncs. Then the client makes one in its own copy, to see where the game puts it."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     found = containers(host.bot)
     corpses = [g for g, c in found.items() if c['kind'] == 'corpse']
@@ -5702,8 +5634,7 @@ def fakebreadlivediag(copies, report, negative=False):
     raid holding its bread; the client's copy of the corpse drifted every 2 s). A live slave near the host gets
     It_FakeBread into its right hand (holditem, as a slave eats); once the client's copy holds it too, the host kills
     the slave (farkill). The client's copy of the corpse is dumped as it dies and after the container sync."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     here = hero_pos(host.bot)
     alive = {g: v for g, v in npcs(host.bot).items() if not v['dead'] and v['hp'] > 0}
@@ -5761,8 +5692,7 @@ def stageCorpseProp(copies, report, negative=False):
     holditem), is killed by a lethal claim from the client, as a raid kill is (OnCheatKill on the host). Within 6 s the
     client's copy holds what the host's corpse holds, then 8 s more without a rewrite, and no hand holds a prop.
     Negative control: containersyncoff hands on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     if negative:
         assert 'hands=0' in report_line(client.bot, 'containersyncoff hands', 'CONTAINERSYNCOFF ')
@@ -5892,8 +5822,7 @@ def stageHostUnreachable(copies, report, negative=False):
 
 def lootdiag(copies, report, negative=False):
     """Diagnostic: chests and corpses near the start, after the raid, on both sides: same contents?"""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     h, c = containers(host.bot), containers(client.bot)
     report['host_count'], report['client_count'] = len(h), len(c)
@@ -6249,8 +6178,7 @@ def quicklootdiag(copies, report, negative=False):
     """Diagnostic for 1.2: does a posted right click quick-loot the faced corpse or chest (QuickLoot=true in ge3.ini),
     and does the take reach the host?"""
     from bot import post_rclick
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(8)
     h = containers(host.bot)
     corpses = [g for g, c in h.items() if c['kind'] == 'corpse' and c['items'] != '-']
@@ -6353,8 +6281,7 @@ def areaspelldiag(copies, report, negative=False):
     (default mist, light, time bubble, fire rain) the host casts it at a villager it simulates (as in single-player), then
     the client at another one: for 12 s both machines' Smn_ objects (owner, task, position), the tasks of the host's NPCs
     within 12 m of the target (and of the client's mirrors of them), and the target's hit points. Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -6416,8 +6343,7 @@ def stageAreaSpells(copies, report, negative=False):
     mist ends; the client's light has a copy on the host owned by its puppet that stays with the light; the client's
     time bubble has a copy at its place on the host with the time zone (property set 112) that slows what is inside.
     Negative control: summonmirroroff on both (no copies: nothing happens on the host)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -6512,8 +6438,7 @@ def flamesworddiag(copies, report, negative=False):
     """P6 (PS_Magic_FlameSword): the client conjures the flame sword the player's way (ready the spell, then the game's
     state PS_Magic_FlameSword through QA act), then, after a pause, by castat; after each, for 6 s: what the client says
     it holds and what its puppet holds on the host (QA remotes, HELD). Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     move_hero(client.bot, hero_pos(host.bot))
     time.sleep(2)
@@ -6543,8 +6468,7 @@ def stageFlameSword(copies, report, negative=False):
     PS_Magic_FlameSword through QA act); the sword (It_1H_MagicFlameSword_01) is in its hand, and its puppet on the host holds
     the same sword within 6 s (flamesworddiag 26.10.). Negative control: puppetholdoff on the host (the puppet's hands are not
     set from what the player holds)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     if negative:
         report['negative'] = report_line(host.bot, 'puppetholdoff', 'PUPPETHOLDOFF')
@@ -6722,8 +6646,7 @@ def stageCounterHit(copies, report, negative=False):
     stumbles at most once per blow (TRACE motions; counterhitdiag 26.10.: 8 blows, 8 stumbles, 200 -> 96). Negative
     control: combatoff on the host (its blows stay on the puppet)."""
     kind = os.environ.get('G3_COUNTER_ANIMAL', 'Scavenger')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -6800,8 +6723,7 @@ def counterhitdiag(copies, report, negative=False):
     the client's hit counters (dropped: the mirror's own blows, rule 1; player_hits_taken: the host's), the host's
     player_hits_sent, the client hero's hit points, and how often the client's hero showed a stumble or hit motion (TRACE).
     Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -6851,8 +6773,7 @@ def animalsleepdiag(copies, report, negative=False):
     scavengers, rippers); the host sets the clock to G3_HOUR (default 23); every 5 s for 40 s the animals near the host with
     their tasks. Then the client walks up to the nearest sleeping one the host simulates while the host stands 25 m off; the
     animal's task on the host over 20 s. Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     spot = os.environ.get('G3_SPOT', 'Kent')
     for c in (host, client):
         report[c.tag + '_jump'] = teleport_to(c.bot, spot)[:100]
@@ -6898,8 +6819,7 @@ def sectorrefreshdiag(copies, report, negative=False):
     to the monastery: re/out/basis-rest-20261026-b.c). From the post-raid save (Ardea freed): where Diego, Gorn, Milten and
     Lester are on both machines (QA findnpc: position, task, mirrored); then G3_WHO (default client) goes 400 m off and comes
     back after 15 s, then the other one does; the friends on both after each. Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     friends = ('Diego', 'Gorn', 'Milten', 'Lester')
     look = lambda c: {n: re.sub(r'FIND name=\S+ ', '', find_npc(c.bot, n))[:150] for n in friends}
     report['start'] = {c.tag: look(c) for c in (host, client)}
@@ -6922,8 +6842,7 @@ def zoneattitudediag(copies, report, negative=False):
     count as where the host's hero stands. At G3_PLACE (default Muntasir, Ishtar): (A) the client in the place, the host 30 m
     off; (B) the other way round. Each time the host's QA attitude (to its hero and to puppet 2) for G3_JUDGES (default
     Muntasir and the NPCs within 15 m of him), three samples. Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     place = os.environ.get('G3_PLACE', 'Muntasir')
     for phase, inside, outside in (('client_in', client, host), ('host_in', host, client)):
         for c in (host, client):
@@ -6951,8 +6870,7 @@ def zonescandiag(copies, report, negative=False):
     other way round; each time QA zoneatt for the spot NPC and the two nearest others on the host (zone and security of
     hero and puppet, GetZoneAttitudeToPlayer and GetAttitudeToPlayer for the hero, for the puppet plainly and as the
     game's player, GetAttitude to the puppet). Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     spots = os.environ.get('G3_SPOTS', 'Muntasir,Topork,Varek,Brenton,Hamlar').split(',')
     for spot in spots:
         for phase, inside, outside in (('host_in', host, client), ('client_in', client, host)):
@@ -6989,8 +6907,7 @@ def tradediag(copies, report, negative=False):
     """1.4 (playtest 21.10.: whoever talks to a trader first sees its goods, the other does not): one player talks to
     Hamlar in a real dialog (ZS_Talk fills the trade inventory), then the other; the trade state on both machines after
     each. G3_ORDER=client (default) or host picks who talks first."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     first = os.environ.get('G3_ORDER', 'client')
     guid = next((g for g, n in npcs(host.bot).items() if n['name'] == 'Hamlar' and not n['dead']), None)
@@ -7434,8 +7351,7 @@ def stageJoinOnce(copies, report, negative=False):
     after the load). Joins under the netsim (run it with G3_NETSIM, e.g. 800,20,0), waits G3_JOIN_WAIT s (default 240) and counts
     the client's loads of the host's campaign (persist autoload) and the host's sends. Passes with one load. Negative control:
     run with G3_INI_EXTRA="qa_resendguard = off" (both INIs: the host sends again; more than one load)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # also makes join_both start from the post-raid save: the client joins and loads the host's copy
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # also makes join_both start from the post-raid save: the client joins and loads the host's copy
     time.sleep(int(os.environ.get('G3_JOIN_WAIT', '240')))
     loads = [l[-120:] for l in client.mod_log().splitlines() if 'persist: autoload of' in l and 'posted' in l]
     sends = [l[-110:] for l in host.mod_log().splitlines() if 'persist: campaign' in l and 'sent to player' in l]
@@ -7509,8 +7425,7 @@ def stageRoiHold(copies, report, negative=False):
     processing range at host_roi (8000) nearly all are the host's and few change hands. Negative control: G3_INI_EXTRA=
     "host_roi = 4000" (the game's own range) or G3_SWITCHES=hysteresisoff; the stage reports, its limits are G3_ROI_SHARE
     (default 0.8) and G3_ROI_FLIPS (default 3)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     report['world_processing'] = {}
     for copy in (host, client):
@@ -7595,8 +7510,7 @@ def stageAnimalCorpse(copies, report, negative=False):
     Negative controls: G3_SWITCHES=deadstaysoff or corpseplunderoff (on both)."""
     kind = os.environ.get('G3_COUNTER_ANIMAL', 'Scavenger')
     part = os.environ.get('G3_PART', 'both')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -7669,8 +7583,7 @@ def stageHostFill(copies, report, negative=False):
     steps 25 m off (it keeps the trader); the host walks up and talks to it: the host fills it and sees goods. Negative
     control: G3_SWITCHES=hostfilloff."""
     name = os.environ.get('G3_TRADER', 'Deckard')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     start = host.bot.send('findall ' + name, 20)
     host.bot.line('FINDALL end', 10, 'findall', start)
@@ -7708,8 +7621,7 @@ def stageDialogAudio(copies, report, negative=False):
     each line the host's hero or Hamlar starts is played on the client at the speaker, while the client is in no dialog
     of its own. Then the other way round. Then the client 30 m away: nothing is played there. Negative control:
     dialogaudiooff on the listener."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     assert next((g for g, n in npcs(host.bot).items() if n['name'] == 'Hamlar' and not n['dead']), None), 'Hamlar is not near the start'
 
@@ -7784,8 +7696,7 @@ def stageSubtitles(copies, report, negative=False):
     the client next to it. Each line the client plays shows as the game shows its own dialog's text (GUI2::StartSay), in the
     client's language: the line's text id travels with it and is looked up there (the client has the game's subtitles on).
     Screenshots of the client while lines play. Negative control: subtitlesoff on the client (lines play without text)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     assert next((g for g, n in npcs(host.bot).items() if n['name'] == 'Hamlar' and not n['dead']), None), 'Hamlar is not near the start'
     if negative:
@@ -7821,8 +7732,7 @@ def listendiag(copies, report, negative=False):
     """Listening test with the owner (dialog audio, 22.10.): the speaking game is muted, so what is heard comes from the
     listening game alone, through the mod. Part 1: the host talks to Hamlar, the client (listening) stands by, after
     about 40 s it walks 35 m away. Part 2: the other way round. HUD messages say which part runs."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     for part, (speaker, listener) in enumerate(((host, client), (client, host)), 1):
         report_line(speaker.bot, 'mutegame 1', 'MUTEGAME ')
@@ -8420,8 +8330,7 @@ def stageB(copies, report, negative=False):
     for both (stage E), so a client 60 m from the host is not told anything, and neither is the host; back next to the
     host there is no all-clear either. Only a partner in another world is told. Negative control: the same stage on the
     old build (DLL before the change) fails at 'distance notice shown'."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     far_texts = ('Far from host', 'Weit weg vom Host', 'Daleko od hosta', 'is far away', 'weit entfernt', 'jest daleko')
     near_texts = ('Back near the host', 'Wieder beim Host', 'is nearby again', 'wieder in der N', 'pobliżu')
     start_pos = remotes(host.bot)[2]['pos']
@@ -8621,8 +8530,7 @@ def stageQuickLoad(copies, report, negative=False):
     healing potion on quick slot 1 and a sword on slot 2, the host saves, the client loads (a copy of) that save and gets its
     own hero back from its record, quick slots included (<record>.quick.txt). Negative control: quickrestoreoff on the client
     (the quick bar stays empty, as before 27.10.)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'quickrestoreoff', 'QUICKRESTOREOFF ')
     potion = os.environ.get('G3_POTION', 'It_Potion_Health')
@@ -8669,8 +8577,7 @@ def stageSpellLoad(copies, report, negative=False):
     byte with it starts at 0, so the client's learned spells were gone after a load. The client learns a spell the host's
     hero does not know, puts it on quick slot 3, the host saves, the client loads (a copy of) that save and still knows the
     spell, on its slot (<record>.quick.txt, spell lines). Negative control: spellrestoreoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'spellrestoreoff', 'SPELLRESTOREOFF ')
     spell = os.environ.get('G3_SPELL', 'It_Spell_Healing')
@@ -8752,8 +8659,7 @@ def clock_of(bot):
 def stageG(copies, report, negative=False):
     """Stage G, one time of day: the host sets its clock six hours on; within one update the client has the
     same hour and minute (two game minutes of tolerance)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report_line(client.bot, 'clockoff', 'CLOCKOFF ')
     report['host_before'], before = clock_of(host.bot)
@@ -8771,8 +8677,7 @@ def stageG(copies, report, negative=False):
 def stageG2(copies, report, negative=False):
     """Stage G2, a sleep moves time on for everyone: the client's clock jumps six hours (as a sleep does); the
     host follows within seconds instead of setting the client back."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report_line(client.bot, 'clockoff', 'CLOCKOFF ')
     time.sleep(6)  # first updates settle
@@ -8838,8 +8743,7 @@ def event_known(bot, name):
 def stageH1(copies, report, negative=False):
     """Stage H1, shared story events: what a dialog makes one hero know (SetGameEvent) every hero knows, a
     cleared event is cleared everywhere, both ways (story sync, third domain)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         story_off(client)
     name = 'G3T_StageH1'
@@ -8861,8 +8765,7 @@ def stageH2(copies, report, negative=False):
     """Stage H2, the world state after a dialog command reaches everyone: a dialog command on one machine changes
     an NPC (trade flag, guard status, as SetTradeEnabled / SetGuardStatus do); its resulting state goes to the host
     and on, and every copy of that NPC takes it, both ways."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report_line(client.bot, 'infocmdoff', 'INFOCMDOFF ')
     name = None
@@ -8991,8 +8894,7 @@ def navdiag(copies, report, negative=False):
     ran an AI goto and the client's puppet walked after the client had jumped 60 m away and back. G3_NAVMODE picks
     what repeats: 'part' (client jumps away and back), 'walk' (host AI goto), 'both'."""
     mode = os.environ.get('G3_NAVMODE', 'both')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     cycles = []
     for i in range(20):
         if mode in ('part', 'both'):
@@ -9031,8 +8933,7 @@ def walkdiag(copies, report, negative=False):
     """Soak crash repro with both players: host and client both run AI gotos to random circle points (as the
     soak's walk actions do), so the host's hero paths while the client's puppet walks nearby."""
     import random
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     rng = random.Random(1018)
     legs = []
     for i in range(40):
@@ -9166,8 +9067,7 @@ def stageE1(copies, report, negative=False):
     """Stage E1, regional ownership: a client far from the host simulates its surroundings and sends those NPCs to
     the host; when the host arrives there it shows the client's NPCs (mirrors, own AI off, same places) instead of
     simulating them a second time; when the client leaves, the host simulates them again."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report_line(client.bot, 'ownoff', 'OWNOFF ')
     target = next(r for r in far_rows(host.bot) if 600 < r['distance'] < 1500)
@@ -9201,8 +9101,7 @@ def stageE2(copies, report, negative=False):
     """Stage E2, fights across owners: in the client's region (its NPCs mirrored on the host) the host's hits on
     such an NPC go to the client, which applies them; a kill pays the host. A client-owned NPC attacking the host
     hits the host's real hero (judged there)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     target = next(r for r in far_rows(host.bot) if 600 < r['distance'] < 1500)
     report['region'] = target['name']
     teleport_to(client.bot, target['name'])
@@ -9491,8 +9390,7 @@ def p9smalldiag(copies, report, negative=False):
     it has with a sleeping point (QA sleepers) at Ardea, Kent and the scavenger meadow north of Ardea at 23 o'clock, and
     the routine destinations of the NPCs near it at Ardea (QA waitfree NAME_show); EndGoto, SelectRoutineDestination,
     CanHealSelf counted at their code on both machines over 20 s (QA nativewatch). Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     names = ('CanHealSelf', 'SelectRoutineDestination', 'EndGoto')
     for c in (host, client):
         report[c.tag + '_watch'] = native_watch(c.bot, names)
@@ -9606,8 +9504,7 @@ def followtimediag(copies, report, negative=False):
     player (G3_WHO=host: the host alone; default the client) goes up to the nearest wolf on the meadow north of Ardea (the
     host 25 m off simulates it), lets it attack, then runs 25 m off twice (QA runto: running, not sprinting); both counted
     at their code on both machines (QA nativewatch). Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     player = host if os.environ.get('G3_WHO') == 'host' else client
     other = client if player is host else host
     names = ('GetFollowTime', 'GetDiffToPlayerLevel')
@@ -9790,8 +9687,7 @@ def stageE4(copies, report, negative=False):
     """Stage E4, NPC against NPC where two regions meet: in the client's region (its NPCs mirrored on the host) one of
     the host's NPCs (Lester, moved there) attacks a client-owned NPC. Lester's hits go to the client, which applies
     them to its NPC; that NPC's hits on Lester come back to the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     target = next(r for r in far_rows(host.bot) if 600 < r['distance'] < 1500)
     victim = report['victim'] = target['name']
     teleport_to(client.bot, victim)
@@ -9870,8 +9766,7 @@ def stageQ(copies, report, negative=False):
     troll in its own region (the death script Kill runs there, so only the client's quest manager saw it); the host's
     own quest counter for that target goes 0 -> 1 when the client reports the death, and stays 1 when the host gets
     there itself (the death is applied as a state, no second count)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report_line(host.bot, 'questcountoff', 'QUESTCOUNTOFF ')
     quest_id, target = 'Zakosh_KillTrolls', 'Faring_Troll_01'
@@ -10217,8 +10112,7 @@ def stageWalk(copies, report, negative=False):
     did), glide (travel without a movement motion), jumps over 30 cm, hard corrections (SNAPS), the display error against the
     sender (LEAD). Meant to run with and without G3_NETSIM. Passes when every segment's still share is at most G3_WALK_STILL
     (default 0.05) and none has a hard correction (G3_WALK_SNAPS, default 0). Negative control: none (red before the fix)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((host, client), (client, host)):
         if ' down=1 ' in herostate(copy.bot):
@@ -10389,8 +10283,7 @@ def puppettalkdiag(copies, report, negative=False):
     built; whether the client can address the host's puppet the player's way (AssessTalk); whether a copy of a trader's
     option, owned by the puppet under a name of its own (QA puppetinfo), is offered and opens the trade screen."""
     copies['client'].ini_extra = 'look = Diego\n'  # the host then addresses an NPC-template puppet (Diego), not PC_Hero
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((host, client), (client, host)):
         if ' down=1 ' in herostate(copy.bot):
@@ -10438,8 +10331,7 @@ def postraidsave(copies, report, negative=False):
     client writes its hero record. The host's save and record and the client's copy and record go to
     runtime/fixtures/postraid-p<pair>, from which join_both starts the stages that do not need the raid. Run it again after
     a change to what a save holds (the mod's sidecars)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((host, client), (client, host)):
         if ' down=1 ' in herostate(copy.bot):
@@ -10608,8 +10500,7 @@ def stageCorpseRest(copies, report, negative=False):
 def stageClientLocomotion(copies, report, negative=False):
     """Score client-added sliding only while the host supplies locomotion; never invent a walk over a host idle."""
     assert not negative, 'This stage requires a valid native-navigation source'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for copy in (host, client):
         report_line(copy.bot, 'tutorialoff', 'TUTORIALOFF ')
         report_line(copy.bot, 'unarm', 'UNARM ')
@@ -10873,8 +10764,7 @@ def stagePlayerTrade(copies, report, negative=False):
     arrives there, the client gets the bow. A second window (a fireball scroll; the host sold its bow) is declined: the
     client's gold comes back and nothing changes on the host. Negative control: tradeholdoff on the client (it keeps the
     item before the answer)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'tradeholdoff', 'TRADEHOLDOFF ')
     report['client_gold'] = report_line(client.bot, 'givepotion It_Gold-500', 'GIVEPOTION ')  # the bow costs 200, a hero starts with 123
@@ -10923,8 +10813,7 @@ def stageTradeHaggle(copies, report, negative=False):
     accepts: it gets value + 50, the client the bow. A second window (a fireball scroll, the price 30 gold lower) is declined:
     all of the client's gold comes back. A third press far beyond the client's gold is clamped to the gold it has.
     Negative control: tradeadjustoff on the client (the offer carries the screen's gold, as before 27.10.)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'tradeadjustoff', 'TRADEADJUSTOFF ')
     report['client_gold'] = report_line(client.bot, 'givepotion It_Gold-500', 'GIVEPOTION ')
@@ -11003,8 +10892,7 @@ def stageWitness(copies, report, negative=False):
     client's hero a thief (AssessTarget with the attack reason Theft, the last step of AssessTakeItem); the host's real NPC
     then goes after the client's puppet (its target puppet2, its attack reason Theft). Negative control: witnessoff on the
     client (nothing is passed on)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     name = os.environ.get('G3_WITNESS', 'Hamlar')
     if negative:
         assert 'ok=1' in report_line(client.bot, 'witnessoff', 'WITNESSOFF ')
@@ -11035,8 +10923,7 @@ def stageTogether(copies, report, negative=False):
     copy of one holds it (LastPlayerCrime Theft = 3, it refuses to talk to the client); the host's own NPC then holds it
     against the host's player too. Negative control: reputation = shared, the default (the host's NPC holds nothing)."""
     copies['host'].ini_extra = '' if negative else 'reputation = together\n'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     report['mode'] = {c.tag: report_line(c.bot, 'enclavesync', 'ENCLAVESYNC ') for c in (host, client)}
     companions = {'Diego', 'Gorn', 'Milten', 'Lester'}
     here = hero_pos(client.bot)
@@ -11101,8 +10988,7 @@ def stageShieldBlock(copies, report, negative=False):
     (whether the host's own hero faced him varies). G3_SHIELD (default It_Shield_Wood_01), G3_SHIELDPERKS (default
     Perk_Shield_1,Perk_Shield_2; empty: none). Negative control: puppetparadeoff on the host (the host judges the parrying
     puppet's block itself, as before 25.10.: the blows never reach the client, its block costs nothing)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     striker = os.environ.get('G3_STRIKER', 'Hamlar')
     shield = os.environ.get('G3_SHIELD', 'It_Shield_Wood_01')
     perks = [p for p in os.environ.get('G3_SHIELDPERKS', 'Perk_Shield_1,Perk_Shield_2').split(',') if p]
@@ -11177,8 +11063,7 @@ def stageShieldBlock(copies, report, negative=False):
 
 def stageNpcBlock(copies, report, negative=False):
     """Native host blocks remain native; a client's landed hit still counts against a genuinely parrying host NPC."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     blocker = os.environ.get('G3_BLOCKER', 'Hamlar')
     blows = int(os.environ.get('G3_BLOWS', '6'))
     for c in (host, client):
@@ -11248,8 +11133,7 @@ def stageLagBlock(copies, report, negative=False):
     delay (G3_NETSIM, e.g. 400,20,0: the bots' commands take some 100-300 ms themselves). Off by default (28.10.): the stage
     switches it on (lagblockon on the host). Negative control: off as by default (judged against the parade now: blocked).
     Each blow also reports the host's "judged as seen" line (how old the state was and whether he parried then)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     blocker = os.environ.get('G3_BLOCKER', 'Hamlar')
     blows = int(os.environ.get('G3_BLOWS', '6'))
     for c in (host, client):
@@ -11311,8 +11195,7 @@ def stageFightMusic(copies, report, negative=False):
     fight music natively. The stage switches it on (fightmusicon on the client, on by default since 28.10.); negative control:
     fightmusicoff (fight_music stays 0). PARADE also reports music_ticks (the wrapped tick runs) and fight_sent/fight_seen (the
     fighting bit sent by the host, seen on the client at all, for our hero, within 30 m)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     fighter = os.environ.get('G3_FIGHTER', 'Hamlar')
     assert 'ok=1' in report_line(client.bot, 'fightmusicoff' if negative else 'fightmusicon', 'SWITCH ')
     teleport_to(host.bot, fighter)
@@ -11409,8 +11292,7 @@ def stageDamageScale(copies, report, negative=False):
     (3) friendly_fire: the host's hero strikes the client's puppet 3 times (QA hitpuppet 2). (2) and (3) are reported, to be
     compared between a run with the factors and one without (the game's own damage is not known here). Negative control:
     none, run without G3_INI_EXTRA for the comparison."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         report_line(c.bot, 'arm It_1H_Sword_Rust_01', 'ARM ')
     line = report_line(host.bot, 'parade', 'PARADE ')
@@ -11470,8 +11352,7 @@ def stageDamageHits(copies, report, negative=False):
     The hero's hit points are filled before each blow. Both INIs take G3_INI_EXTRA (e.g. "npc_damage = 2;friendly_fire = 50").
     With friendly_fire = 0 (default), the attack must be blocked before judgement with exactly zero damage.
     Explicit friendly_fire = 100 and npc_damage = 1 apply the game's damage unchanged."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for c in (host, client):
         report_line(c.bot, 'arm It_1H_Sword_Rust_01', 'ARM ')
     m = re.search(r' friendly_fire=(\d+) npc_damage=([\d.]+)', report_line(client.bot, 'parade', 'PARADE '))
@@ -11562,8 +11443,7 @@ def stageRansack(copies, report, negative=False):
     hero: of G3_ROBGOLD (default 11) gold half rounded down, at least one piece (11 -> 6); he gains as much on the host. The
     client stands up by itself. With G3_ROB_BASELINE=1 he first knocks out and robs the host's own hero (the game alone).
     Negative control: ransackoff on the host (he takes the puppet's gold, the client pays nothing)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     robber = os.environ.get('G3_ROBBER', 'Hamlar')
     reason = int(os.environ.get('G3_ROBREASON', '7'))
     gold = int(os.environ.get('G3_ROBGOLD', '11'))
@@ -11642,8 +11522,7 @@ def stageMapMarks(copies, report, negative=False):
     from the host: the host's compass shows it in its direction as seen from the camera. The host opens its world map: the
     client is drawn at its place; the client goes to Reddock and its mark follows (u and v change as x and z do).
     Screenshots of the compass and both map views. Negative control: mapmarksoff on the host (nothing drawn)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(host.bot, 'mapmarksoff', 'MAPMARKSOFF ')
     line, counts, view, player = map_marks(host.bot)
@@ -11712,8 +11591,7 @@ def stageTradeQuality(copies, report, negative=False):
     host has the forged sword, the client not. Negative control: tradequalityoff on the client (what it gets and gives
     arrives at quality 0, as before)."""
     bow, sword, sharp, forged = 'It_Bow_Hunting', WEAPON, 32, 128
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'tradequalityoff', 'TRADEQUALITYOFF ')
     for copy in (host, client):  # the bow costs 200 and the puppet pays for the sword with the host's gold
@@ -11760,8 +11638,7 @@ def stageTradePrice(copies, report, negative=False):
     and when selling one to it; with the trader Hamlar selling still brings less than the value (traders unchanged).
     Negative control: tradepricesoff on the client (the puppet prices like a trader)."""
     item = 'It_Bow_Hunting'  # every test hero carries one, unequipped, worth more than 1 gold
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'tradepricesoff', 'TRADEPRICESOFF ')
     wait_for(lambda: (l := player_goods(client.bot, '1_'+item)) and f'item={item}:0 ' not in l and 'unknown' not in l and [l], 30,
@@ -11794,8 +11671,7 @@ def stageTradeGoods(copies, report, negative=False):
     heroes carry every spell already); the puppet's gold is the host's.
     Negative control: tradefilloff on the client (the puppet keeps what its template carries)."""
     item = 'It_Spell_TimeBubble'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(client.bot, 'tradefilloff', 'TRADEFILLOFF ')
     report['give'] = report_line(host.bot, f'givepotion {item}-1', 'GIVEPOTION ')
@@ -12002,8 +11878,7 @@ def stageV2(copies, report, negative=False):
 def stageV3(copies, report, negative=False):
     """Stage V3 (human look: the host saw the client's character unarmed): the client draws a weapon; its puppet on
     the host holds the same weapon."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report_line(host.bot, 'puppetholdoff', 'PUPPETHOLDOFF')
     report['arm'] = report_line(client.bot, 'arm '+WEAPON, 'ARM ')
@@ -12266,8 +12141,7 @@ def stageS1(copies, report, negative=False):
     client kept its own world. Checked on the client: an item the host took after saving is back, the hero stands
     where the save put it (not where the client had walked to), both show each other again. Negative control:
     worldsyncoff on the host (a load is not passed on)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'worldsyncoff', 'WORLDSYNCOFF ')
     clear_slot(copies, 'G3T_S1')
@@ -12346,8 +12220,7 @@ def stageU1(copies, report, negative=False):
     client hero's inventory, not in the corpse on either machine, not with the host. Negative control: containersyncoff
     on the client before the take (the corpse keeps its copy on the host: two of them)."""
     item, slot = 'It_Spell_TimeBubble', 'G3T_U1'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     clear_slot(copies, slot)
     found = containers(host.bot)
@@ -12438,8 +12311,7 @@ def stageReloadLoot(copies, report, negative=False):
     must not report the reloaded difference as a deposit. Negative control: containersyncoff forget on the client
     (its container state survives the load, as before)."""
     slot = 'G3T_R5'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     clear_slot(copies, slot)
     found = containers(host.bot)
@@ -12481,8 +12353,7 @@ def stageS3(copies, report, negative=False):
     client loads a save of its own. The client is then not let into the host's world (no puppet on either side for 15 s,
     the client's messages stop at the gate) until the host saves; then it gets the host's save, loads it and is back.
     Negative control: worldsyncoff on the host (the client counts as in the host's world whatever it loaded)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # alone in its own save, the client would be beaten down by the raid there
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # alone in its own save, the client would be beaten down by the raid there
     if negative:
         assert 'ok=1' in report_line(host.bot, 'worldsyncoff', 'WORLDSYNCOFF ')
     clear_slot(copies, 'G3T_S3own')
@@ -12739,8 +12610,7 @@ def stageQ2(copies, report, negative=False):
     four boars in its own region (the quest succeeds on both machines), then hands in (BPANKRATZ31293: Give It_Gold 30,
     GiveXP 50). The host's hero then gains the same experience as the client's, and no gold. Negative control: dialogxpoff
     on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(client.bot, 'dialogxpoff', 'DIALOGXPOFF ')
     npc, info_name, quest_id = 'Brenton', 'BPANKRATZ31293', 'Brenton_KillBoars'
@@ -12799,8 +12669,7 @@ def stageA3(copies, report, negative=False):
     (G3_DUELIST, default Diego; attack reason Duel, which the game ends with Defeat, a knock-out). The hero is not held:
     the log has no "waiting for a partner", the client is not told to help, and the hero stands up by itself within 45 s.
     Negative control: lethalonlyoff on the host (every knock-out waits for help, as before)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'lethalonlyoff', 'LETHALONLYOFF ')
     fighter = os.environ.get('G3_DUELIST', 'Hamlar')  # Diego, a companion, never struck the host's hero in 120 s
@@ -12849,8 +12718,7 @@ def stageA4(copies, report, negative=False):
     host logs them as not counted). Part 2: he duels the client instead (started on the host, as a dialog's duel is); the
     client hits him down; the host ends the bout with a knock-out, he is not dead and nobody's murder count rises.
     Negative control: arenaruleoff on the host (the client's hits count again; its last hit kills)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'arenaruleoff', 'ARENARULEOFF ')
     fighter = os.environ.get('G3_DUELIST', 'Diego')
@@ -13091,8 +12959,7 @@ def stageW1(copies, report, negative=False):
     bookkeeping saw the slot empty, and a new connection in the same slot was never told the world; it waited outside.
     The host's bookkeeping pauses for 5 s (persistpause) while the client reconnects, so that leaving and joining fall
     into one of its frames. Negative control: generationoff on the host (a slot starts over only once it is empty)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'generationoff', 'GENERATIONOFF ')
     since_client, since_host = len(client.mod_log()), len(host.mod_log())
@@ -13116,8 +12983,7 @@ def stageW2(copies, report, negative=False):
     write that breaks off (recordwritefault) leaves the record before it; records cut in the middle of their stacks and
     after their first line are refused and the hero stays as it was; the complete record loads, and the hero is the same.
     Negative control: recordcheckoff on the client (records are applied as read)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     folder = client.root/'isolated-profile/Documents/gothic3'
     record = folder/'g3t-hero-G3TW2.txt'
     record.unlink(missing_ok=True)
@@ -13164,8 +13030,7 @@ def stageW3(copies, report, negative=False):
     writes its hero record for that save) and loads the save: the client is loaded into it and its record is applied
     before it is in the host's world. Then the client loads that save itself while in the host's world: the gate closes as
     the load begins. Negative control: worldgatelate on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     slot = 'G3T_W3'
     clear_slot(copies, slot)
     if negative:
@@ -13219,8 +13084,7 @@ def stageW4(copies, report, negative=False):
     the older save it was loaded into. The client leaves; the host sets an event, saves and clears the event; the client
     joins again and is loaded into that save; after the full state the event is cleared on the client too. Negative
     control: storyzerosoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     slot, event = 'G3T_W4', 'G3T_W4_Event'
     clear_slot(copies, slot)
     if negative:
@@ -13255,8 +13119,7 @@ def stageStoryReload(copies, report, negative=False):
     loads the save (cleared again) and sets the event once more while the client is still loading: after the client is
     back, the event is still set on the host and on the client, and the client claimed nothing. Negative control:
     storyreloadoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     slot, event = 'G3T_STORYRL', 'G3T_StoryReload_Event'
     clear_slot(copies, slot)
     if negative:
@@ -13301,8 +13164,7 @@ def stageW5(copies, report, negative=False):
     burst killed and rewarded again, and the client's GiveXP had no check of its own. The client sends five lethal hit
     claims on a living host NPC near it in one frame (hitnpcburst): the host kills it once, the client is rewarded once.
     Negative control: killonceoff on both."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         for copy in (host, client):
             assert 'ok=1' in report_line(copy.bot, 'killonceoff', 'KILLONCEOFF ')
@@ -13340,8 +13202,7 @@ def stageW6(copies, report, negative=False):
     first invalidated by an isolated local WelcomeSerial change; a real reconnect must then increment the serial through
     the wire Welcome path and create a fresh order, which alone may run after release. Negative control: loadticksoff on
     both."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     slot = 'G3T_W6'
     clear_slot(copies, slot)
     held = False
@@ -13457,8 +13318,7 @@ def stageW7(copies, report, negative=False):
     the host sends a campaign the client must not store (badtransfer), and a hello with another protocol version is refused
     by the host: a message for each on the client. Negative control: recordwaitoff on the client (a refused record opened
     the gate, as before 23.10.). The host learns that the client waits for its hero (WorldWaiting) and shows it."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     slot = 'G3T_W7'
     clear_slot(copies, slot)
     record = client.root/'isolated-profile/Documents/gothic3'/f'g3t-hero-G3T_host_{slot}.txt'
@@ -13536,8 +13396,7 @@ def stageW8(copies, report, negative=False):
     no NPC there (badrecord, as in X1): the host's mirror entry is missing, then gone once stale. Negative control:
     mirrorretryoff on both."""
     spell = os.environ.get('G3_SPELL', 'It_Spell_SummonSkeleton')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -13582,8 +13441,7 @@ def stageW9(copies, report, negative=False):
     (skilldiag 23.10.). On the client: the record is written (its skill lines carry the learned state); in the file one
     learned skill is set to unlearned and one unlearned skill to learned; loading it unlearns the first and teaches the
     second; the whole record, loaded again, puts both back. Negative control: skillreplaceoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     record = client.root/'isolated-profile/Documents/gothic3'/'g3t-hero-G3TW9.txt'
     record.unlink(missing_ok=True)
     if negative:
@@ -13655,8 +13513,7 @@ def stageW10(copies, report, negative=False):
     possible" and changes nothing, not even the part the host has. The other way round, the host buys from the client.
     Negative control: offerpartial on the host (no check before, no undo on a failure): the offer it cannot fill
     takes the potion all the same."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         assert 'ok=1' in report_line(host.bot, 'offerpartial', 'OFFERPARTIAL ')
     report['host_add'] = report_line(host.bot, 'heroadd It_Potion_Health_3', 'HEROADD ')
@@ -13755,8 +13612,7 @@ def stageX1(copies, report, negative=False):
     folder. Client to host: an NPC record with the hero's GUID and a NaN position (1.6) and player states with a NaN
     position (1.2): the host's hero keeps its own task and place, is not mirrored, and the client's puppet keeps a finite
     position; both games keep running. No negative control: without the checks a run may crash a game."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     frames = lambda copy: int(re.findall(r'frame=(\d+)', copy.mod_log())[-1])
     before = {c.tag: frames(c) for c in (host, client)}
     since_client, since_host = len(client.mod_log()), len(host.mod_log())
@@ -13823,8 +13679,7 @@ def stageEdgeClaim(copies, report, negative=False):
     must refuse it, keep simulating the NPC and send it itself (within 60 m of a player). NPCs the host does not process
     (a client's region far from the host, stage E) are not touched. Moving an NPC there with farmove did not do: the host's
     game stopped processing a teleported NPC for seconds. Negative control: contestoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     if negative:
         assert 'ok=1' in report_line(host.bot, 'contestoff', 'CONTESTOFF ')
@@ -13887,8 +13742,7 @@ def stageM1(copies, report, negative=False):
     snapshots win again and the client shows them as mirrors. Before, both kept simulating them for good (Slave_04
     following the host in stageControl, Lester in stageP3a). The stale moment is made with npcrecvoff/npcrecvon on the
     client. Negative control: hostwinsoff on the client (it keeps its own simulation)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
 
     def view():
@@ -13922,8 +13776,7 @@ def stageR2(copies, report, negative=False):
     window made wide), the host counts a murder meanwhile and sends its counters. Afterwards both machines show
     Ardea with both murders and the theft. Negative control: keeplocaloff on the client (the host's counters
     overwrite its unreported deeds)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     time.sleep(5)
     before = enclave_counts(host.bot, 'Ardea')
     report['before'] = {'host': before, 'client': enclave_counts(client.bot, 'Ardea')}
@@ -14312,8 +14165,7 @@ def stageP1(copies, report, negative=False):
     meteor acts: the target dies on its owner's machine once, the caster earns the experience). Client casts, then
     host. Negative control: summoncopyhero (the copy belongs to the watcher's own hero, as a naive copy would, and
     its hits count there too)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -14500,8 +14352,7 @@ def arrowtouchdiag(copies, report, negative=False):
     at a villager's chest (shootat mode 5) with the other player 6 m behind; after each shot, the gCProjectile_PS::OnTouch
     calls on both machines. A shot whose first touch is not the target (a chest, a house) is shot again from a spot 2 m
     aside or back, up to 6 times, until 3 arrows reached the target."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for c in (host, client):
         report[c.tag+'_touchlog'] = report_line(c.bot, 'touchlog', 'TOUCHLOG ')
@@ -14669,8 +14520,7 @@ def stageP2fire(copies, report, negative=False):
     announced like an arrow with the item cast from; the copy on the other machine belongs to the caster's puppet and
     carries the spell. Each fireball that reaches a sturdy NPC is applied once on the host. Host casts, then client.
     Negative control: shotcopyhero. G3_SPELL picks the spell (default It_Spell_Fireball)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -14700,8 +14550,7 @@ def stageP2fire(copies, report, negative=False):
 def raiddiag(copies, report, negative=False):
     """The Entity::AttachTo crash (Script.dll+0x13ea3) seen while killraiders ended the raid (17.10., 18.10., 20.10.):
     join, end the raid, nothing else; with QA crashlog any access violation is in g3together.log (CRASH lines)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     report['crash_lines'] = {c.tag: [l for l in c.mod_log().splitlines() if ' CRASH ' in l][:6] for c in (host, client)}
     report['status_note'] = 'diagnostic only'
@@ -14751,8 +14600,7 @@ def stageNetOutage(copies, report, negative=False):
             CHAOS.disconnect(seconds * 1000)
         else:
             CHAOS.partition(direction, True, seconds * 1000)
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     spot = [90078.0, 5080.0, -12374.0]  # open ground in the start village (stageP2)
 
     def recovered(tag, seconds):
@@ -14785,8 +14633,7 @@ def selfspelldiag(copies, report, negative=False):
     """Spells on oneself (agent B, inventory 21.10.: MagicHeal/MagicCure, MagicRefresh, MagicTeleport were open): each
     player casts Healing at 40 hit points, Refresh after spending mana, and the teleport stone to Lago. What does the
     caster get, and what does the other machine show (its own hero untouched; the puppet at the new place)?"""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -14823,8 +14670,7 @@ def animalscandiag(copies, report, negative=False):
     host spawns does not exist on the client (callanimalsdiag), so animals may come from spawn points on each machine.
     Both players go to a few places away from the village (next to people farnpcs lists); at each, every NPC within
     reach on both machines is listed. Compared: names, GUIDs, who owns or mirrors them. G3_SPOTS: how many places."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     rows = far_rows(host.bot)
     spots = []
     for r in sorted(rows, key=lambda r: r['distance']):
@@ -14857,8 +14703,7 @@ def callanimals2diag(copies, report, negative=False):
     """Call Animals on world animals (animalscandiag 21.10.: Goose and Lizard at Montera, Pig at Gamal have the same GUID
     on both machines). Both players go to G3_SPOT (Montera_Slave_01); each casts in turn at G3_TARGET (Merc_03). After
     each cast, every animal's attack reason (16 = called) and task is read on both machines, with who owns it."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     spot = os.environ.get('G3_SPOT', 'Montera_Slave_01')
     for c in (host, client):
         report[c.tag+'_jump'] = teleport_to(c.bot, spot)[:120]
@@ -14877,7 +14722,8 @@ def callanimals2diag(copies, report, negative=False):
             for c in (host, client):
                 memory = report_line(c.bot, 'npcmemory '+g, 'NPCMEMORY ')
                 n = npcs(c.bot).get(g, {})
-                row[c.tag] = f"reason={re.search(r'attack_reason=(-?\d+)', memory)[1] if 'attack_reason=' in memory else '?'} " \
+                reason = re.search(r'attack_reason=(-?\d+)', memory)
+                row[c.tag] = f"reason={reason[1] if reason else '?'} " \
                              f"task={n.get('task')} mirrored={n.get('mirrored')}"
             rows[name+'_'+g[:8]] = row
         return rows
@@ -14898,8 +14744,7 @@ def stageCallAnimals(copies, report, negative=False):
     client's puppet. At Kent (G3_SPOT; scavenger, deer, rippers the host simulates), the client casts at Kent: on the host
     an animal must get attack reason 16 (called) within 6 s. Negative control: spellmirroroff (the cast stays on the
     client)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     spot = os.environ.get('G3_SPOT', 'Kent')
     for c in (host, client):
         report[c.tag+'_jump'] = teleport_to(c.bot, spot)[:120]
@@ -14941,8 +14786,7 @@ def callanimalsdiag(copies, report, negative=False):
     caster stands by and casts at a villager the host simulates; the host's view of the animal (attack reason, task) is
     sampled. Host casts first (the game's own path), then the client with a fresh animal: does the client's cast reach
     the host's animal? G3_ANIMALS: templates to try (first valid)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -14974,7 +14818,8 @@ def callanimalsdiag(copies, report, negative=False):
             memory = report_line(host.bot, 'npcmemory '+animal, 'NPCMEMORY ')
             on_host = npcs(host.bot).get(animal, {})
             on_client = npcs(client.bot).get(animal, {})
-            samples.append(f"reason={re.search(r'attack_reason=(-?\d+)', memory)[1] if 'attack_reason=' in memory else '?'} "
+            reason = re.search(r'attack_reason=(-?\d+)', memory)
+            samples.append(f"reason={reason[1] if reason else '?'} "
                            f"host_task={on_host.get('task')} client_task={on_client.get('task')} client_mirrored={on_client.get('mirrored')}")
         report[tag+'_samples'] = samples
         report[tag+'_called'] = any(s.startswith('reason=16 ') for s in samples)
@@ -14986,8 +14831,7 @@ def stageOpenLocks(copies, report, negative=False):
     re/findings/npc-spells-c.md) on the prison door in Lago, cast by G3_WHO (client by default). doors.cpp watches every
     lock (doors and chests) and sends a change, so the other machine must see it unlocked too. Negative control:
     doorsyncoff on both (the lock stays shut over there)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15030,8 +14874,7 @@ def stageSelfSpell(copies, report, negative=False):
     at 40, alone; the teleport stone to Lago moves the caster there and the other machine shows its puppet in Lago
     within 15 s. Refresh (MagicRefresh) cannot be tested: It_Spell_Refresh, It_Scroll_Refresh and It_Spell_Heal are in
     Templates.pak but the game loads no such template (READY valid=0). No negative control: nothing of the mod to switch off."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15077,8 +14920,7 @@ def stageHealOther(copies, report, negative=False):
     MagicHealOther sets only the puppet's hit points (re/findings/spells-b.md). spells.cpp sends the cast to the puppet's
     player, whose machine replays the script on its own hero: that hero is fully healed. Client heals the host, then the
     host heals the client. Negative control: spellmirroroff (the cast is not sent, the hero stays hurt)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15118,8 +14960,7 @@ def stageNpcSpell(copies, report, negative=False):
     expected = {'It_Spell_Sleep': 'ZS_MagicSleep', 'It_Spell_Fear': 'ZS_Flee', 'It_Spell_Charm': 'memory', 'It_Spell_Bloodlust': 'ZS_Attack'}
     spell = os.environ.get('G3_SPELL', 'It_Spell_Sleep')
     task = expected.get(spell, os.environ.get('G3_TASK', ''))
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15188,8 +15029,7 @@ def stagePoison(copies, report, negative=False):
     control: spellmirroroff and tickguardoff (the client's cast stays on its mirror, mirrors tick again)."""
     spell = os.environ.get('G3_SPELL', 'It_Spell_Poison')
     bit = 8 if 'Disease' in spell else 4
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15267,8 +15107,7 @@ def stageCreature(copies, report, negative=False):
     then the caster walks off 8 m, the creature follows, and its mirror is still near it. Host casts, then client. G3_SPELL picks the spell (default
     It_Spell_SummonSkeleton). Negative control: summonmirroroff (nothing announced, no copy)."""
     spell = os.environ.get('G3_SPELL', 'It_Spell_SummonSkeleton')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15346,8 +15185,7 @@ def stageCreatureLife(copies, report, negative=False):
     old one (it dies on the caster's machine, and its copy dies or goes on the other); the Army of Darkness brings
     several creatures, all mirrored; when the caster walks off 50 m its creatures end there, and no copy lives on as a
     free creature. Host casts, then client. Negative control: summonmirroroff (no copies at all)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15427,8 +15265,7 @@ def stageControl(copies, report, negative=False):
     must say yes for the caster's own hero on the caster's machine and never on the other one. Negative control: spellmirroroff (the
     client does not take it over; the host keeps simulating it, and it does not follow there)."""
     spell = os.environ.get('G3_SPELL', 'It_Spell_WordOfControl')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15536,8 +15373,7 @@ def stageP2hit(copies, report, negative=False):
     """P2, arrows act once (agent B): pin an existing host-owned NPC in an open firing lane before each shot, then
     require every arrow that touches it to have exactly one correlated application on the host. Host shoots, then
     client. Negative control: shotcopyhero (the copies belong to the watcher's own hero and hit a second time)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15618,8 +15454,7 @@ def stageP2(copies, report, negative=False):
     shot announced and copied, the copy owned by the puppet and flying like the arrow (distance, direction), none of its
     hits applied on the watcher. Client shoots, then host. Negative control: shotmirroroff (shots are not announced, the
     watcher sees nothing)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15638,8 +15473,7 @@ def stageP2(copies, report, negative=False):
 def rangedbot(copies, report, negative=False):
     """Step 2 of bows and spells (agent B): the bot shoots and casts by the NPC path; does it hit, on whose machine does
     the target take damage, what does the watcher see. G3_SPELL picks the spell (default It_Spell_Meteor)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15656,8 +15490,7 @@ def rangeddiag(copies, report, negative=False):
     """Owner (19.10.): bows and spells, the meteor in particular. After the raid, the client shoots and casts at a
     villager the host simulates while the host watches, then the other way round: what flies on each machine, what
     the watcher's puppet plays, whether the target is hurt on the machine that owns it, and who earns experience."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     for copy, helper in ((client, host), (host, client)):
         if ' down=1 ' in herostate(copy.bot):
@@ -15732,8 +15565,7 @@ def stageL(copies, report, negative=False):
     """Stage L, the soft leash (owner 2026-10-19): instead of a hard distance limit a key (INI partner_key, default Page
     Down) puts the local hero next to the other player. The host walks 60 m away; the client jumps (QA: partnerjump,
     the same function as the key) and stands within 3 m of the host on both machines. Negative control: no jump."""
-    host, client = join_both(copies)
-    clear_raid(host, report)  # no raid needed: starts from the post-raid save (25.10.)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # no raid needed: starts from the post-raid save (25.10.)
     start_pos = remotes(client.bot)[1]['pos']
     move_hero(host.bot, (start_pos[0] + 6000, start_pos[1], start_pos[2]))
     time.sleep(4)
@@ -16146,8 +15978,7 @@ def stageBringItems(copies, report, negative=False):
     infos 31237 to 31239, It_WeaponPack, hand-in BPANKRATZ31243 with 300 gold): the host takes it and leaves, the client brings.
     G3_QUEST, G3_NPC, G3_START (infos, comma separated, or runquest), G3_ITEM, G3_COUNT, G3_HANDIN, G3_TAKER=client.
     Negative control: storyoff on the client (quest states not shared)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     quest_id = os.environ.get('G3_QUEST', 'Norris_BringWeapons')
     npc = os.environ.get('G3_NPC', 'Norris')
     chain = os.environ.get('G3_START', 'runquest').split(',')
@@ -16195,8 +16026,7 @@ def stageReportQuest(copies, report, negative=False):
     the hero to Javier in Reddock; the game starts it outside a dialog, so the host runs it through the quest manager;
     Delivery info FILLER938 at Javier): the client reports. G3_QUEST, G3_NPC (giver), G3_START, G3_TO (addressee),
     G3_DELIVERY, G3_TAKER=client. Negative control: storyoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     quest_id = os.environ.get('G3_QUEST', 'Hamlar_gotoReddock')
     giver, to = os.environ.get('G3_NPC', 'Hamlar'), os.environ.get('G3_TO', 'Javier')
     chain = os.environ.get('G3_START', 'runquest').split(',')
@@ -16231,8 +16061,7 @@ def stageArenaQuest(copies, report, negative=False):
     name = os.environ.get('G3_TARGET', 'Joey')
     chain = os.environ.get('G3_START', 'BPANKRATZ31249,BPANKRATZ31250').split(',')
     payer = os.environ.get('G3_PAY', 'BPANKRATZ31253')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         story_off(client)
     for copy in (host, client):
@@ -16336,8 +16165,7 @@ def stageKillQuest(copies, report, negative=False):
     quest_id = os.environ.get('G3_QUEST', 'Zakosh_KillTrolls')
     target = os.environ.get('G3_TARGET', 'Faring_Troll_01')
     near = os.environ.get('G3_HOST_NEAR') == '1'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report_line(host.bot, 'questcountoff', 'QUESTCOUNTOFF ')
     for copy in (host, client):
@@ -16418,8 +16246,7 @@ def stageArenaStart(copies, report, negative=False):
     quest_id, name = os.environ.get('G3_QUEST', 'Copper_Arena'), os.environ.get('G3_TARGET', 'Copper')
     chain = os.environ.get('G3_CHAIN', 'BPANKRATZ31259,BPANKRATZ31260|BPANKRATZ31261')
     arena = os.environ.get('G3_ARENA', 'Reddock_Arena')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(client.bot, 'arenasyncoff', 'ARENASYNCOFF ')
     for copy in (host, client):
@@ -16511,8 +16338,7 @@ def stageRevolution(copies, report, negative=False):
     road, the host alone neither: ZS_RevolutionSuccess only reported). Negative control: townstatusoff
     on both and infocmdoff on the client (the host never hears of the uprising)."""
     town, goto = os.environ.get('G3_TOWN', 'KapDun'), os.environ.get('G3_GOTO', 'Phil')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     starter = host if os.environ.get('G3_WHO') == 'host' else client
     report['starter'] = starter.tag
     if negative:
@@ -16590,8 +16416,7 @@ def stageSectorRefresh(copies, report, negative=False):
     both machines, and the two agree (< 10 m); before 26.10. (coop-evening) the client kept its copies at Ardea, 1748 m from
     the host's (the script moves them with SetRoutine and MoveTo on the machine whose player left; infocmd.cpp now passes
     the host's moves on). Negative control: storymoveoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(host.bot, 'storymoveoff', 'STORYMOVEOFF ')
     friends = ('Diego', 'Gorn', 'Milten', 'Lester')
@@ -16646,8 +16471,7 @@ def stageStoryCompanion(copies, report, negative=False):
     The host keeps its copy with the client too (its script moved it; infocmd.cpp puts it back and does not pass the move on;
     the first run 26.10. had the host's copy in Braga, 1796 m from the client's). Negative control: storycompanionoff on both
     (the move is taken as before)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     npc = os.environ.get('G3_PARTY', 'Diego')
     if negative:
         report['negative'] = [report_line(c.bot, 'storycompanionoff', 'STORYCOMPANIONOFF ') for c in (host, client)]
@@ -16703,8 +16527,7 @@ def stageSwim(copies, report, negative=False):
     Hero_Swim_..._Ambient_Loop in movement mode 1 while the client made strokes (steering it with movement mode 7 left it
     in mode 1); body.cpp now plays the player's stroke on the swimming puppet. Negative control: G3_NEGATIVE (default
     swimstrokeoff on the host)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     xyz = lambda v: tuple(float(c) for c in v.split('_'))
     spot = xyz(os.environ.get('G3_WATER_SPOT', '102767_-608_-4075'))
     shore = xyz(os.environ.get('G3_WATER_SHORE', '103985_-200_-10198'))
@@ -16757,8 +16580,7 @@ def stageArenaLeave(copies, report, negative=False):
     quest_id, name = os.environ.get('G3_QUEST', 'Copper_Arena'), os.environ.get('G3_TARGET', 'Copper')
     chain = os.environ.get('G3_CHAIN', 'BPANKRATZ31259,BPANKRATZ31260|BPANKRATZ31261')
     arena = os.environ.get('G3_ARENA', 'Reddock_Arena')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = report_line(host.bot, 'storyoff', 'STORY')
     for copy in (host, client):
@@ -16804,8 +16626,7 @@ def arenastartdiag(copies, report, negative=False):
     quest_id, name = os.environ.get('G3_QUEST', 'Joey_Arena'), os.environ.get('G3_TARGET', 'Joey')
     activator = os.environ.get('G3_ACTIVATOR', 'BPANKRATZ31256')
     arena = os.environ.get('G3_ARENA', 'Reddock_Arena')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     for copy in (host, client):
         report_line(copy.bot, 'unarm', 'UNARM')
     taker = host if os.environ.get('G3_WHO') == 'host' else client
@@ -16905,8 +16726,7 @@ def dialogviewdiag(copies, report, negative=False):
     1. The client talks to Hamlar and picks an option: the host samples Hamlar and the client's puppet (task, state,
     motion), its dialog channel and its own dialog state; a screenshot of each. 2. While the client is in the dialog, the
     host addresses Hamlar too. 3. The other way round: the host talks, the client watches. Diagnostic."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     name = os.environ.get('G3_TARGET', 'Hamlar')
     for copy in (host, client):
@@ -16946,8 +16766,7 @@ def stageBusyNpc(copies, report, negative=False):
     """One dialog per NPC: use Lester by default so Ardea's automatic Hamlar greeting cannot occupy the fixture.
     While the client talks, the host is refused; once the client's dialog ends, the host can start one.
     Before 25.10. both talked to him at once (dialogviewdiag). Negative control: talkholdoff on the host."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     name = os.environ.get('G3_TARGET', 'Lester')
     if negative:
@@ -16987,8 +16806,7 @@ def stageDialogOptions(copies, report, negative=False):
     The menu box can be turned off (listener_textbox = off, the owner's wish 28.10.: a listener sees subtitles, no box; on by
     default until tested): the stage switches it on (optionsboxon). With G3_LISTENER_DEFAULT=1 and G3_INI_EXTRA=
     "listener_textbox = off" it checks that setting instead: no menu box at the listener, the lines as subtitles all the same."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     name = os.environ.get('G3_TARGET', 'Hamlar')
     plain = os.environ.get('G3_LISTENER_DEFAULT') == '1'
@@ -17041,8 +16859,7 @@ def stageNpcGestures(copies, report, negative=False):
     """Phase 5 (owner 25.10. "NPC-Gesten"): while the client talks to the host's Hamlar, the host's Hamlar gestures as the
     client's copy does (talk and listen motions, facing the client) instead of standing still (dialogviewdiag: only
     Move_Stand on the host). Negative control: gesturesoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(5)
     name = os.environ.get('G3_TARGET', 'Hamlar')
     if negative:
@@ -17086,8 +16903,7 @@ def stageUseStation(copies, report, negative=False):
     station's own state); the host shows the client's puppet as the station's user; what the station gives lands in the
     client's inventory only (the host's stays as it was); after the client lets go its hero is back in PS_Normal and the host
     sees the station free. Negative control: usesyncoff on both (the host does not see the user)."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     kind = os.environ.get('G3_USETYPE', '88')
     place = os.environ.get('G3_USE_AT', 'Hamlar')
     if negative:
@@ -17159,8 +16975,7 @@ def stageDialogCommands(copies, report, negative=False):
     not checked) at its owner, with the host next to it; afterwards both machines must agree on what it changed: the NPC
     (trade, teach, guard, routine: SetTeachEnabled, SetRoutine ...), the clock (Sleep) or the towns (ModReputEnc,
     ResetCrime). Negative control: infocmdoff and storyoff on the client."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     if negative:
         report['negative'] = [report_line(client.bot, 'infocmdoff', 'INFOCMDOFF '), story_off(client)]
     for c in (host, client):
@@ -17292,8 +17107,7 @@ def stageEnclaveFriend(copies, report, negative=False):
     the info (ProcessInfo). G3_TARGET owner (default Orc_KapDun_Guard_01), G3_INFO the info (BPANKRATZ31797), G3_TOWN the
     town (default: the owner's). G3_WHO=host: the host talks (single player control). Negative control: enclavesyncoff on
     both."""
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     owner = os.environ.get('G3_TARGET', 'Orc_KapDun_Guard_01')
     info = os.environ.get('G3_INFO', 'BPANKRATZ31797')
     town = os.environ.get('G3_TOWN', owner)
@@ -17342,8 +17156,7 @@ def stageBossNews(copies, report, negative=False):
     report['reputation'] = reputation
     if reputation != 'shared':
         copies['host'].ini_extra = f'reputation = {reputation}\n'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     town = os.environ.get('G3_TOWN', 'Montera')
     targets = os.environ.get('G3_TARGETS', 'Kan,Gnar').split(',')
     info = os.environ.get('G3_INFO', 'FILLERX2144')
@@ -17413,8 +17226,7 @@ def stageMobJoin(copies, report, negative=False):
     client; the NPC follows the client on both PCs. G3_WHO=host: the host (single player control). Negative control:
     guidesyncoff on the client (it does not take its new follower over)."""
     os.environ.setdefault('G3_NATIVEWATCH', 'JoinPlayerMob')
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     info = os.environ.get('G3_INFO', 'KALVERAMX228')
     owner = os.environ.get('G3_TARGET', '')
     if not owner:
@@ -17709,8 +17521,7 @@ def stageBalanceRefused(copies, report, negative=False):
 def stagePersonalEconomy(copies, report, negative=False):
     """Each player keeps its own corpse/chest loot and merchant stock; no host inventory rewrite or take rollback."""
     assert not negative, 'This stage has no runtime negative-control switch'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     time.sleep(3)
     h, c = containers(host.bot), containers(client.bot)
     corpse = next((g for g in h.keys() & c.keys() if h[g]['kind'] == c[g]['kind'] == 'corpse'), None)
@@ -17788,8 +17599,7 @@ def stageLanguage(copies, report, negative=False):
         CLEANUPS.append(lambda path=path, original=original: path.write_bytes(original))
         path.write_bytes(original.replace(german, polish))
     client_copy.ini_extra = 'language = en\n' if negative else 'language = auto\n'
-    host, client = join_both(copies)
-    clear_raid(host, report)  # keeps the post-raid save start (postraid_for); a new game's Polish menu has no New Game focus
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for  # keeps the post-raid save start (postraid_for); a new game's Polish menu has no New Game focus
     living = {g: v for g, v in npcs(client.bot).items() if not v.get('dead')}
     assert living, 'no living NPC near the client'
     killer = next((g for g, v in living.items() if 'Orc' in v.get('name', '')), next(iter(living)))
@@ -17812,8 +17622,7 @@ def stageFreePlayerExchange(copies, report, negative=False):
     """Free native-selection exchanges, while the page remains open. This exercises the production exchange handler,
     not mouse input; the Trade button and gold selection still need the manual playtest."""
     assert not negative, 'The retired offer negative controls do not apply to automatic exchanges'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     item, quality = 'It_Bow_Hunting', 32
     report_line(host.bot, f'givequality {item}_{quality}', ('GIVEQUALITY', 'REFUSED'))
     wait_for(lambda: f'item={item}:0 ' not in player_goods(client.bot, f'1_{item}-q{quality}') and
@@ -17855,8 +17664,7 @@ def stageFreePlayerExchange(copies, report, negative=False):
 def stageFreePlayerPrice(copies, report, negative=False):
     """Player item prices are zero; NPC merchant pricing still uses the original script."""
     assert not negative, 'Custom-price negative controls have been retired'
-    host, client = join_both(copies)
-    clear_raid(host, report)
+    host, client = join_both_and_clear(copies, report)  # clear_raid( source sentinel for postraid_for
     report_line(host.bot, 'givepotion It_Bow_Hunting-1', 'GIVEPOTION ')
     wait_for(lambda: 'unknown' not in player_goods(client.bot, '1'), 30, 'host stock known')
     report_line(client.bot, 'tradeopen puppet1', ('TRADEOPEN', 'REFUSED'))

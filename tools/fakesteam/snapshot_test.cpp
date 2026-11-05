@@ -5,10 +5,12 @@
 #include "replication.h"
 #include "processing.h"
 #include "contact.h"
+#include "guid_text.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 class eCEntity {};
@@ -355,6 +357,38 @@ void VisibleContactGeometry()
     Check(SegmentDistanceSquared(away, away, low, high) > 900000, "a distant visible swing cannot create a contact");
     Check(SegmentDistanceSquared(low, low, low, low) == 0, "degenerate contact segments remain finite");
 }
+
+void GuidCodec()
+{
+    char const* canonical = "12345678-9ABC-DEF0-1234-56789ABCDEF0";
+    char text[48] = {};
+    uint8_t bytes[16] = {};
+    uint8_t expected[16] = {0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde,
+                            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0};
+    Check(g3t::guid::ParseBytes(canonical, bytes), "permissive canonical GUID is accepted");
+    Check(std::memcmp(bytes, expected, 16) == 0, "canonical GUID text produces exact 16-byte fields");
+    g3t::guid::FormatBytes(bytes, text, sizeof(text));
+    Check(std::strcmp(text, canonical) == 0, "16-byte GUID fields format exactly in canonical text");
+
+    Check(g3t::guid::ParseBytes("12345678-9abc-def0-1234-56789abcdef0-suffix", bytes),
+          "permissive GUID parsing retains suffix handling");
+    Check(g3t::guid::ParseBytes("12345678-9ABC-DEF0-1234-56789ABCDEF", bytes),
+          "permissive GUID parsing retains 35-character one-hex-tail acceptance");
+    Check(!g3t::guid::ParseBytes("12345678/9ABC-DEF0-1234-56789ABCDEF0", bytes),
+          "malformed GUID separators are rejected");
+    Check(!g3t::guid::ParseBytes(nullptr, bytes), "null GUID text is rejected");
+
+    Check(g3t::guid::ParseBytesExact(canonical, bytes), "exact GUID text accepts a canonical 36 characters");
+    Check(!g3t::guid::ParseBytesExact("12345678-9ABC-DEF0-1234-56789ABCDEF0-extra", bytes),
+          "exact GUID text rejects suffix text");
+    Check(!g3t::guid::ParseBytesExact("12345678-9ABC-DEF0-1234-56789ABCDEF", bytes),
+          "exact GUID text rejects a 35-character input");
+    Check(!g3t::guid::ParseBytesExact(nullptr, bytes), "exact GUID text rejects null input");
+
+    Check(g3t::guid::ParseBytes("00000000-0000-0000-0000-000000000000", bytes), "zero GUID remains accepted");
+    g3t::guid::FormatBytes(bytes, text, sizeof(text));
+    Check(std::strcmp(text, "00000000-0000-0000-0000-000000000000") == 0, "zero GUID formats exactly");
+}
 }
 
 int main()
@@ -372,6 +406,7 @@ int main()
     TerminalCorpseLife();
     HostCadence();
     VisibleContactGeometry();
+    GuidCodec();
     std::printf("RESULT: %s (%d failures; no game or Steam loaded)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

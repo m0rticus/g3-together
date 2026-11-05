@@ -1,5 +1,6 @@
 """Check sandbox routing without installed game copies."""
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -82,6 +83,71 @@ class SandboxRoutingTests(unittest.TestCase):
         for name in ('sandboxsave', 'postraidsave'):
             with self.subTest(stage=name):
                 self.assertFalse(self.session.shareable(name))
+
+    def test_join_and_clear_setup_preserves_order_and_return_values(self):
+        host = SimpleNamespace(tag='host')
+        client = SimpleNamespace(tag='client')
+        copies = {'host': host, 'client': client}
+        report = {}
+        events = []
+        with patch.object(self.runner, 'join_both',
+                          side_effect=lambda value: events.append(('join', value)) or (host, client)), \
+                patch.object(self.runner, 'clear_raid',
+                             side_effect=lambda value, result: events.append(('clear', value, result))):
+            result = self.runner.join_both_and_clear(copies, report)
+        self.assertEqual(result, (host, client))
+        self.assertEqual(events, [('join', copies), ('clear', host, report)])
+
+    def test_join_and_clear_propagates_join_and_clear_failures(self):
+        copies = {'host': object(), 'client': object()}
+        report = {}
+        with patch.object(self.runner, 'join_both', side_effect=RuntimeError('join failed')), \
+                patch.object(self.runner, 'clear_raid') as clear:
+            with self.assertRaisesRegex(RuntimeError, 'join failed'):
+                self.runner.join_both_and_clear(copies, report)
+        clear.assert_not_called()
+
+        host = SimpleNamespace(tag='host')
+        with patch.object(self.runner, 'join_both', return_value=(host, SimpleNamespace(tag='client'))), \
+                patch.object(self.runner, 'clear_raid', side_effect=RuntimeError('clear failed')):
+            with self.assertRaisesRegex(RuntimeError, 'clear failed'):
+                self.runner.join_both_and_clear(copies, report)
+
+    def test_consolidated_legacy_suite_keeps_postraid_source_policy(self):
+        with patch.object(self.runner, 'postraid_ready', return_value=True):
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
+        source = inspect.getsource(self.runner.SUITES['stageEnterPlace'])
+        self.assertIn('join_both_and_clear(', source)
+        self.assertIn('clear_raid(', source)
+
+    def test_all_live_raid_and_new_game_names_stay_out_of_saved_routes(self):
+        with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')):
+            for name in sorted(self.runner.LIVE_RAID | self.runner.NEW_GAME):
+                with self.subTest(stage=name):
+                    self.assertEqual(self.runner.postraid_for(name), '')
+        self.ready.assert_not_called()
+
+    def test_warm_routes_before_source_inspection(self):
+        with patch.dict(os.environ, {'G3_SANDBOX': '0'}):
+            with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')), \
+                    patch.object(self.runner, 'postraid_ready', return_value=True):
+                self.assertEqual(self.runner.postraid_for('warm'), 'postraid')
+            with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')), \
+                    patch.object(self.runner, 'postraid_ready', return_value=False):
+                self.assertEqual(self.runner.postraid_for('warm'), '')
+
+    def test_normal_source_inspection_detects_literal_clear_raid_call(self):
+        original = inspect.getsource
+        with patch.object(self.runner, 'postraid_ready', return_value=True), \
+                patch.object(inspect, 'getsource', wraps=original) as getsource:
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
+        getsource.assert_called_once_with(self.runner.SUITES['stageEnterPlace'])
+
+    def test_murder_counts_returns_fourth_count_or_none(self):
+        with patch.object(self.runner, 'enclave_counts', return_value=[1, 2, 3, 4, 9]):
+            self.assertEqual(self.runner.murder_counts(object(), 'Ardea'), 9)
+        with patch.object(self.runner, 'enclave_counts', return_value=[]):
+            self.assertIsNone(self.runner.murder_counts(object(), 'Ardea'))
 
     def test_native_shared_spawn_is_verified_before_client_is_offset(self):
         copies = {tag: SimpleNamespace(bot=tag) for tag in ('host', 'client')}

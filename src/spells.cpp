@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "combat.h"
+#include "guid.h"
 #include "infocmd.h"
 #include "log.h"
 #include "net.h"
@@ -105,31 +106,11 @@ int IndexOf(char const* name)
     return -1;
 }
 
-void Guid(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
-bool ParseGuidText(char const* text, _GUID& out)
-{
-    unsigned d1 = 0, d2 = 0, d3 = 0, b[8] = {};
-    if (std::sscanf(text, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
-        return false;
-    out.Data1 = d1;
-    out.Data2 = static_cast<unsigned short>(d2);
-    out.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) out.Data4[i] = static_cast<unsigned char>(b[i]);
-    return true;
-}
-
 Entity ByGuid(uint8_t const guid[16])
 {
     static const uint8_t none[16] = {};
     if (!std::memcmp(guid, none, 16)) return Entity();
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    return Entity(bCPropertyID(bCGuid(raw)));
+    return guid::Resolve(guid);
 }
 
 // One wrapper per script: the index picks the original, the name to send and what it acts on.
@@ -144,21 +125,21 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
     if (own && (Specs[I].kind == OnNpc || Specs[I].kind == OnPlayer) &&
         target && npcs::IsMirrored(target) && npcs::OwnerOf(target)) {
         uint8_t guid[16];
-        Guid(target, guid);
+        guid::CopyEntity(target, guid);
         net::SendNpcSpell(npcs::OwnerOf(target), Specs[I].name, guid, args);
         ++npcSent;
         Logf("spells: %s on %s, simulated by player %u: sent", Specs[I].name, Entity(target).GetName().GetText(), npcs::OwnerOf(target));
         return 1;
     }
     if (own && Specs[I].kind == TakeOver && target && npcs::IsMirrored(target)) {
-        uint8_t guid[16]; Guid(target, guid);
+        uint8_t guid[16]; guid::CopyEntity(target, guid);
         net::SendNpcSpell(1, Specs[I].name, guid, args);
         ++npcSent;
         return GETrue;
     }
     if (own && (Specs[I].kind == AroundCaster || Specs[I].kind == AroundCasterAt) && !net::IsHost()) {
         uint8_t guid[16] = {};
-        if (Specs[I].kind == AroundCasterAt && target) Guid(target, guid);
+        if (Specs[I].kind == AroundCasterAt && target) guid::CopyEntity(target, guid);
         net::SendNpcSpell(1, Specs[I].name, guid, args);
         ++npcSent;
         Logf("spells: %s around us: sent to the host", Specs[I].name);
@@ -431,7 +412,7 @@ void StatusOf(char const* guid, LogFn log)
     char line[420];
     _GUID raw;
     uint8_t bytes[16];
-    if (!ParseGuidText(guid, raw)) { log("STATUSOF refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("STATUSOF refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("STATUSOF refused no such NPC"); return; }
@@ -455,7 +436,7 @@ void NpcHp(char const* argument, LogFn log)
     char const* sep = std::strrchr(argument, '_');
     if (!sep || sep - argument >= static_cast<ptrdiff_t>(sizeof(guid)) || (hp = std::atoi(sep + 1)) < 1) { log("NPCHP refused GUID_HP"); return; }
     std::memcpy(guid, argument, sep - argument);
-    if (!ParseGuidText(guid, raw)) { log("NPCHP refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("NPCHP refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) || npc.IsDead()) { log("NPCHP refused no living NPC"); return; }
@@ -499,7 +480,7 @@ void NpcMemory(char const* guid, LogFn log)
     char line[220];
     _GUID raw;
     uint8_t bytes[16];
-    if (!ParseGuidText(guid, raw)) { log("NPCMEMORY refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("NPCMEMORY refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("NPCMEMORY refused no such NPC"); return; }
@@ -516,7 +497,7 @@ void NpcGrudge(char const* guid, LogFn log)
 {
     _GUID raw;
     uint8_t bytes[16];
-    if (!ParseGuidText(guid, raw)) { log("NPCGRUDGE refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("NPCGRUDGE refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("NPCGRUDGE refused no such NPC"); return; }

@@ -9,6 +9,7 @@
 #include "hud.h"
 #include "guards.h"
 #include "downed.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -375,8 +376,7 @@ bool KnocksOut(Entity& npc)
 
 void Guid(eCEntity* entity, uint8_t out[16])
 {
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
+    guid::CopyEntity(entity, out);
 }
 
 void ScheduleReactionProbe(eCEntity* entity, bool owner)
@@ -1070,7 +1070,7 @@ void OnKilled(uint8_t const guid[16], uint32_t incarnation)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     _GUID raw;
     std::memcpy(&raw, guid, 16);
-    Entity victim = Entity(bCPropertyID(bCGuid(raw)));
+    Entity victim = guid::Resolve(raw);
     if (!hero || !victim.GetInstance()) return;
     std::string identity(reinterpret_cast<char const*>(guid), 16);
     identity.append(reinterpret_cast<char const*>(&incarnation), sizeof(incarnation));
@@ -1298,26 +1298,13 @@ eCEntity* DamageSource(eCDynamicEntity* hero, char const** name)
     return weapon.GetInstance() ? weapon.GetInstance() : hero;
 }
 
-bool ParseGuid(char const* text, _GUID& out)
-{
-    unsigned d1, d2, d3, b[8];
-    if (sscanf_s(text, "%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6],
-                 &b[7]) != 11)
-        return false;
-    out.Data1 = d1;
-    out.Data2 = static_cast<unsigned short>(d2);
-    out.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) out.Data4[i] = static_cast<unsigned char>(b[i]);
-    return true;
-}
-
 void HitNpc(char const* guid, LogFn log)
 {
     char line[300];
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     _GUID raw;
-    if (!ParseGuid(guid, raw)) { log("REFUSED hitnpc: bad GUID"); return; }
-    Entity target = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw)) { log("REFUSED hitnpc: bad GUID"); return; }
+    Entity target = guid::Resolve(raw);
     if (!hero || !target.GetInstance()) { log("REFUSED hitnpc: no hero or no such NPC"); return; }
     char const* kind = "";
     eCEntity* body = remote::ControlledBody();
@@ -1349,7 +1336,7 @@ void HitNpcBurst(char const* argument, LogFn log)
     const int count = cut ? std::atoi(cut + 1) : 0;
     if (cut && cut - argument < static_cast<ptrdiff_t>(sizeof(guid))) std::memcpy(guid, argument, cut - argument);
     _GUID raw;
-    if (net::IsHost() || count < 1 || count > 10 || !ParseGuid(guid, raw)) {
+    if (net::IsHost() || count < 1 || count > 10 || !guid::Parse(guid, raw)) {
         log("REFUSED hitnpcburst: client only, \"<guid>_<1-10>\"");
         return;
     }
@@ -1570,8 +1557,8 @@ void GiveXp(char const* guid, LogFn log)
         log(line);
         return;
     }
-    if (!ParseGuid(guid, raw) || !hero) { log("REFUSED givexp: bad GUID or no hero"); return; }
-    Entity victim = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !hero) { log("REFUSED givexp: bad GUID or no hero"); return; }
+    Entity victim = guid::Resolve(raw);
     if (!victim.GetInstance()) { log("REFUSED givexp: no such NPC"); return; }
     Entity self(hero);
     const int before = static_cast<int>(self.PlayerMemory.XP);
@@ -1605,8 +1592,8 @@ void HurtHero(char const* guid, LogFn log)
     char line[300];
     _GUID raw;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!ParseGuid(guid, raw) || !hero) { log("REFUSED hurthero: bad GUID or no hero"); return; }
-    Entity attacker = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !hero) { log("REFUSED hurthero: bad GUID or no hero"); return; }
+    Entity attacker = guid::Resolve(raw);
     if (!attacker.GetInstance()) { log("REFUSED hurthero: no such NPC"); return; }
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker.GetInstance()), &kind);
@@ -1633,8 +1620,8 @@ void KillHero(char const* guid, LogFn log)
     char line[300];
     _GUID raw;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!ParseGuid(guid, raw) || !hero) { log("REFUSED killhero: bad GUID or no hero"); return; }
-    Entity killer = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !hero) { log("REFUSED killhero: bad GUID or no hero"); return; }
+    Entity killer = guid::Resolve(raw);
     if (!killer.GetInstance()) { log("REFUSED killhero: no such NPC"); return; }
     const GEInt result = CallScript("OnCheatKill", killer.GetInstance(), hero, 0);
     Entity self(hero);
@@ -1660,8 +1647,8 @@ void Swing(char const* state, LogFn log)
         Entity target = self.Focus.GetFocusEntity();
         if (state[6] == '_') {
             _GUID guid{};
-            if (!ParseGuid(state + 7, guid)) { log("REFUSED swing: invalid target GUID"); return; }
-            target = Entity(bCPropertyID(bCGuid(guid)));
+            if (!guid::Parse(state + 7, guid)) { log("REFUSED swing: invalid target GUID"); return; }
+            target = guid::Resolve(guid);
         }
         if (!target.GetInstance()) { log("REFUSED swing: no native target"); return; }
         routine->AIStopCombatMove();
@@ -1761,8 +1748,8 @@ void NpcGuard(char const* argument, LogFn log)
     char const* cut = std::strrchr(argument, '_');
     if (cut && cut - argument < static_cast<ptrdiff_t>(sizeof(guid))) std::memcpy(guid, argument, cut - argument);
     _GUID raw;
-    if (!cut || !ParseGuid(guid, raw)) { log("REFUSED npcguard: \"<guid>_<hero|puppetN>\""); return; }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!cut || !guid::Parse(guid, raw)) { log("REFUSED npcguard: \"<guid>_<hero|puppetN>\""); return; }
+    Entity npc = guid::Resolve(raw);
     eCEntity* who = !std::strcmp(cut + 1, "hero") ? gCSession::GetInstance().GetHero()
                     : !std::strncmp(cut + 1, "puppet", 6) ? remote::PuppetOf(static_cast<uint8_t>(std::atoi(cut + 7))) : nullptr;
     if (!npc.GetInstance() || !who || !HasDamageReceiver(npc.GetInstance())) { log("REFUSED npcguard: no such NPC or no one to face"); return; }
@@ -1786,8 +1773,8 @@ void NpcStill(char const* guid, LogFn log)
 {
     char line[200];
     _GUID raw;
-    if (!ParseGuid(guid, raw)) { log("REFUSED npcstill: bad GUID"); return; }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw)) { log("REFUSED npcstill: bad GUID"); return; }
+    Entity npc = guid::Resolve(raw);
     if (!npc.GetInstance() || npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) { log("REFUSED npcstill: no such NPC simulated here"); return; }
     if (walkProbe.until && !std::memcmp(&raw, walkProbe.guid, 16)) EndWalkProbe(npc);
     npc.Routine.FullStop();
@@ -1807,7 +1794,7 @@ void NpcPin(char const* guid, LogFn log)
 {
     if (!std::strcmp(guid, "off")) { pinnedNpc = PinnedNpc{}; log("NPCPIN active=0"); return; }
     _GUID raw{};
-    if (!net::IsHost() || !ParseGuid(guid, raw)) { log("REFUSED npcpin: expected a host NPC GUID or off"); return; }
+    if (!net::IsHost() || !guid::Parse(guid, raw)) { log("REFUSED npcpin: expected a host NPC GUID or off"); return; }
     uint8_t id[16];
     std::memcpy(id, &raw, sizeof(id));
     eCEntity* entity = npcs::NpcByGuid(id);
@@ -1831,11 +1818,11 @@ void NpcWalk(char const* argument, LogFn log)
     float position[3] = {};
     _GUID raw{};
     if (!argument || sscanf_s(argument, "%36[^_]_%f_%f_%f", guid, static_cast<unsigned>(sizeof(guid)),
-                             &position[0], &position[1], &position[2]) != 4 || !ParseGuid(guid, raw)) {
+                             &position[0], &position[1], &position[2]) != 4 || !guid::Parse(guid, raw)) {
         log("REFUSED npcwalk: need GUID_X_Y_Z");
         return;
     }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    Entity npc = guid::Resolve(raw);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ||
         npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) {
         log("REFUSED npcwalk: no living NPC simulated here");
@@ -1871,8 +1858,8 @@ void NpcWalk(char const* argument, LogFn log)
 void NpcAttack(char const* guid, LogFn log)
 {
     _GUID raw{};
-    if (!ParseGuid(guid, raw)) { log("REFUSED npcattack: bad GUID"); return; }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw)) { log("REFUSED npcattack: bad GUID"); return; }
+    Entity npc = guid::Resolve(raw);
     eCEntity* target = remote::PuppetOf(net::IsHost() ? 2 : 1);
     if (!npc.GetInstance() || !target || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ||
         npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) {
@@ -1898,8 +1885,8 @@ void PuppetParade(char const* guid, LogFn log)
     char line[200];
     _GUID raw;
     eCEntity* puppet = remote::PuppetOf(2);
-    if (!ParseGuid(guid, raw) || !puppet) { log("REFUSED puppetparade: bad GUID or no puppet"); return; }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !puppet) { log("REFUSED puppetparade: bad GUID or no puppet"); return; }
+    Entity npc = guid::Resolve(raw);
     if (!npc.GetInstance()) { log("REFUSED puppetparade: no such NPC"); return; }
     Entity victim(puppet);
     Format(line, "PUPPETPARADE parade=%d fov=%d ani_state=%d", CallScript("IsInParadeMode", puppet, nullptr, 0),
@@ -1927,8 +1914,8 @@ void NpcParade(char const* guid, LogFn log)
 {
     char line[300];
     _GUID raw;
-    if (!ParseGuid(guid, raw)) { log("REFUSED npcparade: bad GUID"); return; }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw)) { log("REFUSED npcparade: bad GUID"); return; }
+    Entity npc = guid::Resolve(raw);
     if (!npc.GetInstance() || !HasDamageReceiver(npc.GetInstance())) { log("REFUSED npcparade: no such NPC"); return; }
     Format(line, "NPCPARADE name=%s task=%s ani_state=%d parade_mode=%d sp=%d hp=%d", npc.GetName().GetText(),
               npc.Routine.GetCurrentTask().GetText(), static_cast<int>(npc.Routine.AniState),
@@ -1944,8 +1931,8 @@ void HitProbe(char const* guid, LogFn log)
     char line[400];
     _GUID raw;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!ParseGuid(guid, raw) || !hero) { log("REFUSED hitprobe: bad GUID or no hero"); return; }
-    Entity attacker = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !hero) { log("REFUSED hitprobe: bad GUID or no hero"); return; }
+    Entity attacker = guid::Resolve(raw);
     if (!attacker.GetInstance()) { log("REFUSED hitprobe: no such NPC"); return; }
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker.GetInstance()), &kind);
@@ -1976,8 +1963,8 @@ void HitPuppetBy(char const* argument, LogFn log)
     std::memcpy(guid, argument, cut && cut - argument < 63 ? cut - argument : std::min<size_t>(std::strlen(argument), 63));
     _GUID raw;
     eCEntity* puppet = remote::PuppetOf(2);
-    if (!ParseGuid(guid, raw) || !puppet) { log("REFUSED hitpuppetby: bad GUID or no puppet"); return; }
-    Entity attacker = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !puppet) { log("REFUSED hitpuppetby: bad GUID or no puppet"); return; }
+    Entity attacker = guid::Resolve(raw);
     if (!attacker.GetInstance()) { log("REFUSED hitpuppetby: no such NPC"); return; }
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker.GetInstance()), &kind);
@@ -2005,8 +1992,8 @@ void FleeFrom(char const* guid, LogFn log)
     char line[300];
     _GUID raw;
     eCEntity* puppet = remote::PuppetOf(2);
-    if (!ParseGuid(guid, raw) || !puppet) { log("REFUSED flee: bad GUID or no puppet"); return; }
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw) || !puppet) { log("REFUSED flee: bad GUID or no puppet"); return; }
+    Entity npc = guid::Resolve(raw);
     if (!npc.GetInstance() || npc.IsDead()) { log("REFUSED flee: no such NPC"); return; }
     npc.Routine.FullStop();
     npc.NPC.SetCurrentTarget(Entity(puppet));
