@@ -547,6 +547,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     const bTObjArray<Entity> all = Entity::GetNPCs();
     net::NpcRecord batch[net::MaxNpcsPerMessage];
     int n = 0;
+    std::vector<pose::Bone> bones;
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity const& npc = all.GetAt(i);
         eCEntity* instance = npc.GetInstance();
@@ -661,7 +662,6 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         const bool motionReady = npcplayback::Capture(instance, r, [](uint32_t hash, char const* name) {
             if (namesSent.insert(hash).second) net::SendMotionName(hash, name);
         });
-        std::vector<pose::Bone> bones;
         uint8_t poseFlags = 0;
         const bool posed = !(r.flags & 128) && npcplayback::CapturePose(instance, bones, poseFlags,
             [](uint32_t hash, char const* name) {
