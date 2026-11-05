@@ -205,6 +205,8 @@ class SteamOnlyTests(unittest.TestCase):
             process.wait(timeout=25)
             self.assertEqual(process.returncode, 0, path.read_text(encoding='utf-8'))
         self.assertIn('refused NPC leaked 0', observer_log.read_text(encoding='utf-8'))
+        self.assertIn('world route targeted 1', observer_log.read_text(encoding='utf-8'))
+        self.assertIn('world route targeted leaked 0', client_log.read_text(encoding='utf-8'))
         self.assertIn('host death 1, refused death leaked 0', observer_log.read_text(encoding='utf-8'))
         self.assertIn('host removal 1', observer_log.read_text(encoding='utf-8'))
         self.assertIn('native defaults 1', observer_log.read_text(encoding='utf-8'))

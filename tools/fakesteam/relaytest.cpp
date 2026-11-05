@@ -136,6 +136,7 @@ bool routeWitnessArrived = false, routeDialogArrived = false, routeSummonArrived
 bool routeTargetedItemArrived = false, routeUnknownItemRejected = false;
 bool routeNpcSpellProbeArrived = false, routePlayerSpellProbeArrived = false, routeRansackProbeArrived = false;
 bool routeWorldExcludedArrived = false, routeWorldBroadcastArrived = false;
+bool routeWorldTargetedArrived = false, routeWorldTargetedLeaked = false;
 void OnPose(net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool reliable)
 {
     if (record.guid[0] != 0xc1 || count != (poseFlood ? 95 : pose::MaxBones) || flags || reliable) return;
@@ -228,6 +229,8 @@ void OnRouteWorld(uint8_t from, net::WorldState const& state)
     if (from != 1) return;
     routeWorldExcludedArrived = routeWorldExcludedArrived || state.kind == 11;
     routeWorldBroadcastArrived = routeWorldBroadcastArrived || state.kind == 12;
+    routeWorldTargetedArrived = routeWorldTargetedArrived || (observer && state.kind == 18);
+    routeWorldTargetedLeaked = routeWorldTargetedLeaked || (!observer && !net::IsHost() && state.kind == 18);
 }
 
 void PrintMenuStatus()
@@ -608,7 +611,7 @@ int main(int argc, char** argv)
                 acceptedDeathArrived && posedNpcArrived && routeEnclaveArrived &&
                 !routeTargetedItemArrived && !routeUnknownItemRejected &&
                 !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived && !routeRansackProbeArrived &&
-                !routeWorldExcludedArrived && routeWorldBroadcastArrived) {
+                !routeWorldExcludedArrived && routeWorldBroadcastArrived && routeWorldTargetedArrived) {
                 if (!hitSentAt) hitSentAt = GetTickCount();
                 if (GetTickCount() - hitSentAt > 500) break;
             }
@@ -618,7 +621,7 @@ int main(int argc, char** argv)
                 routeDialogArrived && routeSummonArrived && routeShotArrived && routeTargetedItemArrived &&
                 !routeUnknownItemRejected &&
                 !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived && !routeRansackProbeArrived &&
-                !routeWorldExcludedArrived && routeWorldBroadcastArrived &&
+                !routeWorldExcludedArrived && routeWorldBroadcastArrived && !routeWorldTargetedLeaked &&
                 GetTickCount() - hitSentAt > (poseFlood ? 5000u : authorityMode ? 3000u : 500u)) {
                 leftAfter = GetTickCount() - joinedAt;
                 break;
@@ -644,10 +647,10 @@ int main(int argc, char** argv)
                acceptedAbsenceArrived && acceptedDeathArrived && !rejectedDeathArrived && acceptedNativeDefaults && posedNpcArrived &&
                routeEnclaveArrived && !routeTargetedItemArrived && !routeUnknownItemRejected &&
                !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived && !routeRansackProbeArrived &&
-               !routeWorldExcludedArrived && routeWorldBroadcastArrived;
-        Logf("RESULT: %s (host-approved NPC %d, ordered release %d, refused NPC leaked %d, host death %d, refused death leaked %d, host removal %d, native defaults %d)",
+               !routeWorldExcludedArrived && routeWorldBroadcastArrived && routeWorldTargetedArrived;
+        Logf("RESULT: %s (host-approved NPC %d, ordered release %d, refused NPC leaked %d, host death %d, refused death leaked %d, host removal %d, native defaults %d, world route targeted %d)",
              pass ? "PASS" : "FAIL", acceptedNpcArrived, acceptedReleaseArrived, rejectedNpcArrived,
-             acceptedDeathArrived, rejectedDeathArrived, acceptedAbsenceArrived, acceptedNativeDefaults);
+             acceptedDeathArrived, rejectedDeathArrived, acceptedAbsenceArrived, acceptedNativeDefaults, routeWorldTargetedArrived);
     } else {
         const uint32_t got = Crc(received.data(), received.size());
         const bool whole = fileDone && receivedBytes == SaveSize && got == saveCrc && doneCrc == saveCrc;
@@ -656,10 +659,10 @@ int main(int argc, char** argv)
                routeClockArrived && routeItemArrived && routeEnclaveArrived && routeWitnessArrived &&
                routeDialogArrived && routeSummonArrived && routeShotArrived && routeTargetedItemArrived &&
                !routeUnknownItemRejected && !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived &&
-               !routeRansackProbeArrived && !routeWorldExcludedArrived && routeWorldBroadcastArrived;
-        Logf("RESULT: %s (welcomed %d, host state %d, save %u of %u bytes, crc %s, host %s, %u ms after the welcome)",
+               !routeRansackProbeArrived && !routeWorldExcludedArrived && routeWorldBroadcastArrived && !routeWorldTargetedLeaked;
+        Logf("RESULT: %s (welcomed %d, host state %d, save %u of %u bytes, crc %s, host %s, %u ms after the welcome, world route targeted leaked %d)",
              pass ? "PASS" : "FAIL", joined, sawState, receivedBytes, SaveSize, got == saveCrc ? "ok" : "WRONG",
-             *steam::HostName() ? steam::HostName() : "-", leftAfter);
+             *steam::HostName() ? steam::HostName() : "-", leftAfter, routeWorldTargetedLeaked);
         if (poseFlood) {
             unsigned minimum = poseCounts[0], maximum = poseCounts[0];
             for (auto count : poseCounts) { minimum = count < minimum ? count : minimum; maximum = count > maximum ? count : maximum; }
