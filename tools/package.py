@@ -107,10 +107,8 @@ def main():
         z.write(dll, 'scripts/Script_G3Together.dll')
         z.writestr('g3together.ini.host-example', HOST_INI)
         z.writestr('g3together.ini.client-example', CLIENT_INI)
-        # Explicit public guides only. Keep their relative language links valid in the ZIP.
-        for guide in ('PLAYING.md', 'JOINING.md', 'PLAYTEST.md',
-                      'SPIELEN.md', 'MITSPIELER.md', 'TESTPLAN.md',
-                      'GRANIE.md', 'DOLACZANIE.md'):
+        # Explicit English public guides only.
+        for guide in ('PLAYING.md', 'JOINING.md', 'PLAYTEST.md'):
             z.write(ROOT / 'docs' / guide, guide)
         z.write(ROOT / 'tools/collect_logs.py', 'tools/collect_logs.py')
         z.write(ROOT / 'tools/setup.ps1', 'tools/setup.ps1')

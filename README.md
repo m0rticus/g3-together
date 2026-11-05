@@ -118,11 +118,7 @@ Read the [full limitations](docs/PLAYING.md#known-limitations), including saving
 
 ## Player guides
 
-| Language | Install and play | Join a host | Help test |
-| --- | --- | --- | --- |
-| English | [Player guide](docs/PLAYING.md) | [Joining guide](docs/JOINING.md) | [Playtest checklist](docs/PLAYTEST.md) |
-| Deutsch | [Installieren und spielen](docs/SPIELEN.md) | [Beim Host beitreten](docs/MITSPIELER.md) | [Spieltest-Checkliste](docs/TESTPLAN.md) |
-| Polski | [Instalacja i gra](docs/GRANIE.md) | [Dołączanie do hosta](docs/DOLACZANIE.md) | — |
+[Player guide](docs/PLAYING.md) · [Joining guide](docs/JOINING.md) · [Playtest checklist](docs/PLAYTEST.md)
 
 ### Found a bug?
 

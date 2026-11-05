@@ -13,8 +13,8 @@ Quick start
 
 The ZIP file is created in the current folder. Paths under C:\\Users\\...,
 IPv4/IPv6 addresses and the configuration line "address" are redacted.
-127.0.0.1 is preserved. German instructions are in docs/TESTPLAN.md in the
-source repository, or TESTPLAN.md in the player package.
+127.0.0.1 is preserved. Instructions are in docs/PLAYTEST.md in the
+source repository, or PLAYTEST.md in the player package.
 """
 
 from __future__ import annotations

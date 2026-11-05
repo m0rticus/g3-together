@@ -1,7 +1,5 @@
 # Playing G3 Together
 
-**English** · [Deutsch](SPIELEN.md) · [Polski](GRANIE.md)
-
 G3 Together adds co-op to Gothic 3 for two players. More players are planned but have not been tested.
 One player is the **host**: their world is the shared campaign, and their save is everyone's campaign save.
 The other player joins them.

@@ -1,7 +1,5 @@
 # G3 Together: joining a host
 
-**English** · [Deutsch](MITSPIELER.md) · [Polski](DOLACZANIE.md)
-
 ## Before you start
 
 - Both PCs should use the tested baseline: Gothic 3 from Steam, **Community Patch 1.75.14** and
