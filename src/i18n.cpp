@@ -103,6 +103,7 @@ constexpr Translation Messages[] = {
      L"G3 Together: nie udało się hostować przez Steam (%s). Sprawdź Steam i steam_api.dll, potem uruchom grę ponownie. Nie otwarto połączenia."},
     {L"G3 Together: starting Steam co-op...", L"G3 Together: Steam-Koop startet...",
      L"G3 Together: uruchamianie kooperacji przez Steam..."},
+    {L" | Session ID: %s", L" | Sitzungs-ID: %s", L" | ID sesji: %s"},
     {L"G3 Together: creating a Steam lobby as %s...", L"G3 Together: Steam-Lobby für %s wird erstellt...",
      L"G3 Together: tworzenie lobby Steam dla gracza %s..."},
     {L"G3 Together: hosting as %s | lobby %llu\nClients: %u | ready: %u | Steam peers: %u | ping (max): %s",

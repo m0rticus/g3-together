@@ -1,7 +1,5 @@
 # G3 Together: joining a host
 
-**English** · [Deutsch](MITSPIELER.md) · [Polski](DOLACZANIE.md)
-
 ## Before you start
 
 - Both PCs should use the tested baseline: Gothic 3 from Steam, **Community Patch 1.75.14** and
@@ -33,11 +31,18 @@ folders, not yet by players; the steps below do the same by hand.
    ```ini
    role = client
    transport = steam
+   session_id = pair-red
    language = auto
    ```
 
 Your PC must use `role = client`. Your player name comes from Steam; keep that Steam display name unchanged: the host uses it to
 restore your companions after loading a save.
+
+Set `session_id` to exactly the host's ID (setup asks for it too). IDs are case-sensitive and contain 1-63 ASCII
+letters, digits, underscores or hyphens. Use a different ID for each independent host/client pair; leave it out
+only to use the shared `default` group. The main menu and log show your ID. A Steam invite, `+connect_lobby`,
+`steam_lobby` or `steam_host` does not bypass this match. An invalid ID stops networking instead of falling back.
+IDs are public labels, not authentication secrets. Both players need the updated build; older relay builds cannot join.
 
 `language = auto` shows the mod's messages in the language of your Gothic 3 texts (German, Polish, otherwise
 English). To fix one, set `language = en`, `de` or `pl`; without the line the messages are English. Each player can

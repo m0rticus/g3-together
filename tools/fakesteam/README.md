@@ -12,6 +12,14 @@ Build with the mod, then run from the repository root:
 python tools\fakesteam\test_transport.py build\artifacts\fakesteam\Release
 ```
 
+Without the private Gothic 3 SDK, build only the engine-free tests with MSVC Win32:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 18 2026" -A Win32 -DG3T_TRANSPORT_TESTS_ONLY=ON
+cmake --build build --config Release
+python tools\fakesteam\test_transport.py build\artifacts\fakesteam\Release
+```
+
 Use Python 3.12+ to also run the regression covering the QA runner's fake-Steam network impairment path.
 
 The tests launch and clean up their own host/client processes and temporary lobby folders. They check:
@@ -24,15 +32,25 @@ The tests launch and clean up their own host/client processes and temporary lobb
 - Gothic 3 AppID selection and explicit rejection of unexpected Steam identities.
 - Reliable NPC terminal-state and ordered ownership-release delivery.
 - A third observer receives only host NPC publications; client NPC snapshots/releases are refused.
+- Six concurrent processes with distinct fake Steam identities share **one discovery directory**, forming three
+  independent host/client pairs selected only by `session_id`. Each pair exchanges player states tagged with its ID,
+  a session-specific 2 MB save (checked by CRC), NPC poses and hit claims; each host admits only its intended client.
+- Mismatched/case-different IDs cannot join through search, `steam_lobby`, `+connect_lobby` or accepted invites.
+- Matching lobby metadata does not admit relay messages with the wrong session ID or stale Steam lobby number.
+- Real INI parsing accepts the legacy default and valid IDs and rejects empty, overlong or invalid IDs without fallback.
 
 `g3t_snapshot_test.exe` checks the production engine-free timeline with jitter/loss, stops, discontinuities, clock changes,
 timer wrap, pose-aligned animation/combat metadata, publication ordering and nested damage-perception isolation.
 It also checks fixed 60 Hz deadlines, interpolation-only NPC state and visible-contact segment geometry.
-It loads neither Gothic 3 nor Steam. The sampler and ten transport tests pass locally, including host-only NPC
+It loads neither Gothic 3 nor Steam. The sampler and transport tests pass locally, including host-only NPC
 authority and identified hit acknowledgements. Native gameplay is not covered by these standalone tests.
 
 The standalone executable uses `g3t_relaytest host <seconds> [steam_host]` or `client <seconds> [steam_host]`.
 Its `direct <loopback-port> <seconds>` mode is a negative test probe, not a player connection path.
+`G3T_RELAY_SESSION_ID` selects its test session, and `G3T_RELAY_STEAM_LOBBY` selects an explicit test lobby.
+The stand-in's `G3T_FAKESTEAM_TAMPER_SESSION` and `G3T_FAKESTEAM_TAMPER_LOBBY` are envelope-rejection negative controls;
+`G3T_FAKESTEAM_TAMPER_DATA_SESSION` and `G3T_FAKESTEAM_TAMPER_DATA_LOBBY` leave control handshakes intact but corrupt data.
+These tests do not establish six-real-game or real-Steam acceptance. Real Steam still requires distinct account identities.
 
 ## Game bot suites
 
@@ -47,6 +65,8 @@ python qa\together.py --suite stage2
 Each isolated game copy gets its own Steam ID and each pair a private lobby folder.
 `G3_NETSIM=delay_ms,jitter_ms,loss_percent` impairs the fake Steam message transport through a local relay.
 It does not open a direct-IP game connection. Fake Steam adds a 9-byte framing header to ENet datagrams.
+The session relay adds a further 72-byte header (native Steam lobby number plus the configured session ID), on both
+data and control channels; an MTU-sized ENet datagram therefore uses at most 1281 bytes including fake Steam framing.
 The old direct-UDP `G3_CHAOS` runner is rejected explicitly rather than reporting results from an unused relay.
 
 Real Steam is not touched. The `steamstatus` QA command reports lobby, linked peers, relay counters and round-trip time.

@@ -14,6 +14,7 @@ struct State
     unsigned clients = 0, readyClients = 0, linkedPeers = 0;
     int ping = -1;
     char name[64] = {};
+    char sessionId[64] = "default";
     char reason[256] = {};
 };
 

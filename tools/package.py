@@ -17,11 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 STEAM_DLL_SHA256 = 'fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da'
 
 HOST_INI = """# G3 Together: this player hosts the campaign.
-# This package speaks protocol 67: both players need this same package (older ones are refused).
+# This package speaks protocol 71 with session-scoped Steam relays: both players need this same package.
 role = host
 # Player name is taken from Steam automatically.
 # Steam friends find this game. Steam and G3Together/steam_api.dll are required; there is no direct-IP fallback.
 transport = steam
+# Match this case-sensitive ID on both players; use a different ID for each independent group.
+# 1-63 ASCII letters, digits, underscores or hyphens. This is not a password or a Steam lobby number.
+session_id = default
 # Mod messages only: auto (the language of your Gothic 3 texts), en, de or pl; without this line: en.
 # Each player can choose independently.
 language = auto
@@ -58,10 +61,12 @@ friendly_fire = 0
 # npc_hp = 1.0
 """
 CLIENT_INI = """# G3 Together: this player joins the host.
-# This package speaks protocol 67: both players need this same package (older ones are refused).
+# This package speaks protocol 71 with session-scoped Steam relays: both players need this same package.
 role = client
 # Finds the host among your Steam friends; Steam is required. With several friends hosting: steam_host = <their Steam name>.
 transport = steam
+# Must match the host; different IDs never connect, even through invites or steam_lobby.
+session_id = default
 # Player name is taken from Steam automatically.
 # Mod messages only: auto (the language of your Gothic 3 texts), en, de or pl; without this line: en.
 # Each player can choose independently.
@@ -102,10 +107,8 @@ def main():
         z.write(dll, 'scripts/Script_G3Together.dll')
         z.writestr('g3together.ini.host-example', HOST_INI)
         z.writestr('g3together.ini.client-example', CLIENT_INI)
-        # Explicit public guides only. Keep their relative language links valid in the ZIP.
-        for guide in ('PLAYING.md', 'JOINING.md', 'PLAYTEST.md',
-                      'SPIELEN.md', 'MITSPIELER.md', 'TESTPLAN.md',
-                      'GRANIE.md', 'DOLACZANIE.md'):
+        # Explicit English public guides only.
+        for guide in ('PLAYING.md', 'JOINING.md', 'PLAYTEST.md'):
             z.write(ROOT / 'docs' / guide, guide)
         z.write(ROOT / 'tools/collect_logs.py', 'tools/collect_logs.py')
         z.write(ROOT / 'tools/setup.ps1', 'tools/setup.ps1')

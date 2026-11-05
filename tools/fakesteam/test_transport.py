@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,16 +47,165 @@ class SteamOnlyTests(unittest.TestCase):
         env.update(extra)
         return env
 
-    def start(self, role, env, seconds=25):
+    def start(self, role, env, seconds=25, steam_host='SteamOnlyHost', extra_args=()):
         path = self.root / f'{role}-{len(self.processes)}.log'
         log = path.open('w', encoding='utf-8')
         self.logs.append(log)
         process = subprocess.Popen(
-            [str(ARTIFACTS / 'g3t_relaytest.exe'), role, str(seconds), 'SteamOnlyHost'],
+            [str(ARTIFACTS / 'g3t_relaytest.exe'), role, str(seconds), steam_host, *extra_args],
             env=env, stdout=log, stderr=subprocess.STDOUT,
         )
         self.processes.append(process)
         return process, path
+
+    def wait_for_lobby(self, process, path):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and process.poll() is None:
+            match = re.search(r'steam: lobby (\d+) open;', path.read_text(encoding='utf-8'))
+            if match:
+                return match[1]
+            time.sleep(0.05)
+        self.fail(path.read_text(encoding='utf-8'))
+
+    def test_three_pairs_share_discovery_but_not_gameplay(self):
+        pairs = []
+        for index, session in enumerate(('pair-red', 'pair-green', 'pair-blue')):
+            host_name = f'Host-{session}'
+            host, host_log = self.start('host', self.environment(
+                True, G3T_FAKESTEAM_ID=str(self.base + index * 2),
+                G3T_FAKESTEAM_NAME=host_name, G3T_RELAY_SESSION_ID=session,
+            ))
+            lobby_id = self.wait_for_lobby(host, host_log)
+            pairs.append((session, host_name, lobby_id, host, host_log))
+        clients = []
+        # Reverse start order and no steam_host filter: only session_id can select the right lobby.
+        for index in reversed(range(3)):
+            session, host_name, lobby_id, _, _ = pairs[index]
+            client_name = f'Client-{session}'
+            client, client_log = self.start('client', self.environment(
+                False, G3T_FAKESTEAM_ID=str(self.base + index * 2 + 1),
+                G3T_FAKESTEAM_NAME=client_name, G3T_RELAY_SESSION_ID=session,
+            ), steam_host='')
+            clients.append((index, client_name, client, client_log))
+        for index, client_name, client, client_log in clients:
+            session, host_name, lobby_id, host, host_log = pairs[index]
+            for process, path in ((client, client_log), (host, host_log)):
+                process.wait(timeout=35)
+                text = path.read_text(encoding='utf-8')
+                self.assertEqual(process.returncode, 0, text)
+                self.assertIn('RESULT: PASS', text)
+                self.assertIn(f'Session ID: {session}', text)
+                self.assertNotIn('cross-session', text)
+            client_text = client_log.read_text(encoding='utf-8')
+            host_text = host_log.read_text(encoding='utf-8')
+            self.assertIn(f'host Steam wire name={host_name}', client_text)
+            self.assertEqual(re.findall(r'steam: joining lobby (\d+)', client_text), [lobby_id])
+            self.assertIn(f'net: {client_name} joined as player 2', host_text)
+            self.assertEqual(len(re.findall(r'joined as player', host_text)), 1, host_text)
+            self.assertIn('save 2097152 of 2097152 bytes, crc ok', client_text)
+
+    def test_mismatch_blocks_search_explicit_lobby_command_line_and_invite(self):
+        host, host_log = self.start('lobbyprobe', self.environment(True, G3T_RELAY_SESSION_ID='Pair-A'), seconds=10)
+        lobby_id = self.wait_for_lobby(host, host_log)
+        clients = []
+        for index, route in enumerate(('search', 'explicit', 'command_line', 'invite')):
+            extra = dict(G3T_RELAY_SESSION_ID='pair-a', G3T_FAKESTEAM_ID=str(self.base + index + 1))
+            args = ()
+            if route == 'explicit':
+                extra['G3T_RELAY_STEAM_LOBBY'] = lobby_id
+            elif route == 'command_line':
+                args = ('+connect_lobby', lobby_id)
+            elif route == 'invite':
+                extra['G3T_FAKESTEAM_INVITE'] = lobby_id
+            clients.append(self.start('client', self.environment(False, **extra), seconds=4,
+                                      steam_host='', extra_args=args))
+        for client, path in clients:
+            client.wait(timeout=12)
+            text = path.read_text(encoding='utf-8')
+            self.assertNotEqual(client.returncode, 0, text)
+            self.assertIn('different session_id or incompatible transport', text)
+            self.assertNotIn('steam: joining lobby', text)
+            self.assertIn('welcomed 0, host state 0, save 0 of', text)
+        self.assertNotIn('linked to this game', host_log.read_text(encoding='utf-8'))
+        self.assertFalse(list(self.root.glob(f'member_{lobby_id}_*')))
+
+    def test_relay_envelopes_reject_wrong_session_and_stale_lobby(self):
+        host, host_log = self.start('lobbyprobe', self.environment(True), seconds=10)
+        self.wait_for_lobby(host, host_log)
+        clients = []
+        for index, tamper in enumerate(('SESSION', 'LOBBY', 'DATA_SESSION', 'DATA_LOBBY')):
+            clients.append((tamper, *self.start('client', self.environment(
+                False, G3T_FAKESTEAM_ID=str(self.base + index + 1),
+                **{f'G3T_FAKESTEAM_TAMPER_{tamper}': '1'},
+            ), seconds=4)))
+        for tamper, client, path in clients:
+            client.wait(timeout=12)
+            text = path.read_text(encoding='utf-8')
+            self.assertNotEqual(client.returncode, 0, text)
+            self.assertIn('welcomed 0, host state 0, save 0 of', text)
+            if tamper.startswith('DATA_'):
+                self.assertIn('welcomed by the host', text)
+            else:
+                self.assertNotIn('welcomed by the host', text)
+        host.wait(timeout=15)
+        text = host_log.read_text(encoding='utf-8')
+        self.assertEqual(host.returncode, 0, text)
+        self.assertRegex(text, r'isolated_drops=[1-9]\d*')
+        self.assertNotIn('joined as player', text)
+
+    def test_longest_session_id_connects(self):
+        session = 'X' * 63
+        host, host_log = self.start('host', self.environment(True, G3T_RELAY_SESSION_ID=session))
+        self.wait_for_lobby(host, host_log)
+        client, client_log = self.start('client', self.environment(False, G3T_RELAY_SESSION_ID=session))
+        for process, path in ((client, client_log), (host, host_log)):
+            process.wait(timeout=30)
+            self.assertEqual(process.returncode, 0, path.read_text(encoding='utf-8'))
+
+    def test_legacy_relay_lobby_is_not_joined(self):
+        lobby_id = str(self.base)
+        (self.root / f'lobby_{lobby_id}.txt').write_text(
+            'g3together=1\npersona=SteamOnlyHost\nsession_id=default\napp_id=39500\n',
+            encoding='utf-8',
+        )
+        client, path = self.start('client', self.environment(False), seconds=4)
+        client.wait(timeout=12)
+        text = path.read_text(encoding='utf-8')
+        self.assertNotEqual(client.returncode, 0, text)
+        self.assertIn('incompatible transport', text)
+        self.assertNotIn('steam: joining lobby', text)
+        self.assertIn('welcomed 0, host state 0, save 0 of', text)
+
+    def test_invalid_session_id_fails_without_default_lobby(self):
+        for session in ('', 'with space', 'x' * 64, 'non-ascii-\u00e4', 'path/name'):
+            for role in ('host', 'client'):
+                with self.subTest(session=session, role=role):
+                    process, path = self.start(role, self.environment(
+                        role == 'host', G3T_RELAY_SESSION_ID=session,
+                    ), seconds=1)
+                    process.wait(timeout=10)
+                    text = path.read_text(encoding='utf-8')
+                    self.assertNotEqual(process.returncode, 0, text)
+                    self.assertIn('invalid session_id', text)
+                    self.assertNotIn('steam: loaded', text)
+
+    def test_ini_session_id_validation_and_legacy_default(self):
+        scripts = self.root / 'scripts'
+        scripts.mkdir()
+        executable = scripts / 'g3t_config_test.exe'
+        shutil.copy2(ARTIFACTS / executable.name, executable)
+        ini = self.root / 'g3together.ini'
+        for value, expected in (
+            (None, 'default'), ('pair-A_123', 'pair-A_123'), ('"pair-A"', 'pair-A'),
+            ('x' * 63, 'x' * 63), ('', '!invalid'), ('x' * 64, '!invalid'),
+            ('with space', '!invalid'), ('bad/name', '!invalid'), ('\u00e4', '!invalid'),
+            ('x' * 300, '!invalid'),
+        ):
+            with self.subTest(value=value):
+                ini.write_text('role = client\n' + ('' if value is None else f'session_id = {value}\n'),
+                               encoding='utf-8')
+                result = subprocess.run([str(executable), expected], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_steam_round_trip_loopback_and_direct_rejection(self):
         host, host_log = self.start('host', self.environment(True))
@@ -293,7 +443,7 @@ class SteamOnlyTests(unittest.TestCase):
             self.assertEqual(host.returncode, 0, host_log.read_text(encoding='utf-8'))
             self.assertGreater(relay.stats['up']['packets'], 0)
             self.assertGreater(relay.stats['down']['packets'], 0)
-            self.assertLessEqual(max(row['max_bytes'] for row in relay.stats.values()), 1209)
+            self.assertLessEqual(max(row['max_bytes'] for row in relay.stats.values()), 1281)
         finally:
             relay.stop()
 
@@ -303,7 +453,7 @@ if __name__ == '__main__':
     parser.add_argument('artifacts', type=Path, help='Folder containing g3t_relaytest.exe and fake_steam_api.dll')
     args = parser.parse_args()
     ARTIFACTS = args.artifacts.resolve()
-    for name in ('g3t_relaytest.exe', 'fake_steam_api.dll'):
+    for name in ('g3t_relaytest.exe', 'fake_steam_api.dll', 'g3t_config_test.exe'):
         if not (ARTIFACTS / name).is_file():
             parser.error(f'Missing transport test artifact: {name}')
     unittest.main(argv=[__file__])

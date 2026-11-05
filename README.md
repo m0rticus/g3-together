@@ -7,7 +7,7 @@
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
 
-The current source speaks **protocol 69**. Its host-authoritative NPC overhaul is experimental and native gameplay
+The current source speaks **protocol 71**. Its host-authoritative NPC overhaul is experimental and native gameplay
 acceptance is still in progress; it is not a verified release. Both players need the same build.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
 Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
@@ -62,7 +62,17 @@ Both players must own Gothic 3 on Steam, have Steam running and be Steam friends
 no host address, VPN or router port forwarding is needed. Steam failures are reported without opening another connection.
 ENet's internal UDP sockets bind only to localhost. See [over Steam](docs/PLAYING.md#over-steam-experimental).
 
+Choose the same **Session ID** in setup on both players, or set `session_id = pair-red` in both
+`g3together.ini` files and restart. For six concurrent instances in three independent pairs, use `pair-red` on
+the first host/client, `pair-green` on the second, and `pair-blue` on the third. Only hosts with a matching ID
+are eligible for joining; different IDs never exchange gameplay traffic, even through Steam invites or explicit lobby numbers.
+IDs are case-sensitive, 1-63 ASCII letters, digits, `_` or `-`; they are visible labels, **not passwords**.
+Omitting the setting keeps the shared `default` group. Each live instance needs a distinct Steam identity;
+this does not add multiple independent instances under one Steam account. Use isolated game/profile/save folders
+when running multiple copies on one PC.
+
 The main menu shows the lobby state, joined/ready client counts and measured Steam ping (or `pending` before a sample).
+It also shows the configured Session ID. Both players need this updated build: older Steam relay builds are incompatible.
 Steam activity uses **Gothic 3 (AppID 39500)**, not Spacewar.
 
 | Host starts first… | Joining player… |
@@ -108,11 +118,7 @@ Read the [full limitations](docs/PLAYING.md#known-limitations), including saving
 
 ## Player guides
 
-| Language | Install and play | Join a host | Help test |
-| --- | --- | --- | --- |
-| English | [Player guide](docs/PLAYING.md) | [Joining guide](docs/JOINING.md) | [Playtest checklist](docs/PLAYTEST.md) |
-| Deutsch | [Installieren und spielen](docs/SPIELEN.md) | [Beim Host beitreten](docs/MITSPIELER.md) | [Spieltest-Checkliste](docs/TESTPLAN.md) |
-| Polski | [Instalacja i gra](docs/GRANIE.md) | [Dołączanie do hosta](docs/DOLACZANIE.md) | — |
+[Player guide](docs/PLAYING.md) · [Joining guide](docs/JOINING.md) · [Playtest checklist](docs/PLAYTEST.md)
 
 ### Found a bug?
 
