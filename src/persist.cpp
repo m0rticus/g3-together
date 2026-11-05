@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "persist.h"
 
+#include "ai.h"
 #include "config.h"
 #include "containers.h"
 #include "dialogaudio.h"
@@ -65,26 +66,6 @@ unsigned char* Resolve(Internal const& fn)
         if (code[i] != value) return nullptr;
     }
     return code;
-}
-
-// Jump from `target` to `detour`; the returned trampoline runs the stolen bytes and continues in the original.
-void* Hook(unsigned char* target, void* detour)
-{
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, Stolen);
-    trampoline[Stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + Stolen) - reinterpret_cast<intptr_t>(trampoline + Stolen + 5));
-    std::memcpy(trampoline + Stolen + 1, &back, 4);
-    DWORD old = 0;
-    if (!VirtualProtect(target, Stolen, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
-    target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
-    std::memcpy(target + 1, &to, 4);
-    for (size_t i = 5; i < Stolen; ++i) target[i] = 0x90;
-    VirtualProtect(target, Stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, Stolen);
-    return trampoline;
 }
 
 std::string SidecarPath(bCString const* name)
@@ -999,8 +980,8 @@ void Install()
     unsigned char* save = Resolve(SaveGameFn);
     unsigned char* load = Resolve(LoadGameFn);
     if (!save || !load) { Log("persist: Game.dll does not match this build; saves are not hooked"); installed = true; return; }
-    originalSave = reinterpret_cast<FileFn>(Hook(save, reinterpret_cast<void*>(&SaveDetour)));
-    originalLoad = reinterpret_cast<FileFn>(Hook(load, reinterpret_cast<void*>(&LoadDetour)));
+    originalSave = reinterpret_cast<FileFn>(ai::JumpTo(save, reinterpret_cast<void*>(&SaveDetour), Stolen));
+    originalLoad = reinterpret_cast<FileFn>(ai::JumpTo(load, reinterpret_cast<void*>(&LoadDetour), Stolen));
     if (originalSave) saveTarget = save;
     if (originalLoad) loadTarget = load;
     installed = true;

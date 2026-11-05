@@ -160,27 +160,6 @@ const gFScript wrappers[] = {&Wrap<0>, &Wrap<1>, &Wrap<2>, &Wrap<3>, &Wrap<4>, &
 // One wrapper per spec: a missing one put a null function into the script table (a client crashed casting bloodlust, 24.10.).
 static_assert(sizeof(wrappers) / sizeof(wrappers[0]) == Count, "one Wrap<I> per entry of Specs");
 
-// Jump from `target` to `detour`; the returned trampoline runs the 6 stolen bytes and continues in the original.
-void* JumpTo(unsigned char* target, void* detour)
-{
-    constexpr size_t Stolen = 6;
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, Stolen);
-    trampoline[Stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + Stolen) - reinterpret_cast<intptr_t>(trampoline + Stolen + 5));
-    std::memcpy(trampoline + Stolen + 1, &back, 4);
-    DWORD old = 0;
-    if (!VirtualProtect(target, Stolen, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
-    target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
-    std::memcpy(target + 1, &to, 4);
-    target[5] = 0x90;
-    VirtualProtect(target, Stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, Stolen);
-    return trampoline;
-}
-
 gFScript HookCast(gSScript& script, gFScript wrapper, char const* name)
 {
     gFScript original = script.m_funcScript;
@@ -224,7 +203,7 @@ void InstallTick()
     auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleA("Script_Game.dll"));
     static const unsigned char expected[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x1c, 0x04, 0x00, 0x00, 0x53, 0x56, 0x8b, 0x35};
     if (base && std::memcmp(base + OnTickRva, expected, sizeof(expected)) == 0)
-        originalTick = reinterpret_cast<gFScript>(JumpTo(base + OnTickRva, reinterpret_cast<void*>(&HookTick)));
+        originalTick = reinterpret_cast<gFScript>(ai::JumpTo(base + OnTickRva, reinterpret_cast<void*>(&HookTick)));
     Log(originalTick ? "spells: OnTick hooked (mirrors and puppets do not tick poison)" : "spells: OnTick not hooked (prologue differs)");
     InstallGiveXp(base);
 }
@@ -254,7 +233,7 @@ void InstallGiveXp(unsigned char* base)
 {
     static const unsigned char expected[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x7c, 0x03, 0x00, 0x00};
     if (base && std::memcmp(base + GiveXpRva, expected, sizeof(expected)) == 0)
-        originalGiveXp = reinterpret_cast<gFScript>(JumpTo(base + GiveXpRva, reinterpret_cast<void*>(&HookGiveXp)));
+        originalGiveXp = reinterpret_cast<gFScript>(ai::JumpTo(base + GiveXpRva, reinterpret_cast<void*>(&HookGiveXp)));
     Log(originalGiveXp ? "spells: GiveXP hooked (rewards logged)" : "spells: GiveXP not hooked (prologue differs)");
 }
 
