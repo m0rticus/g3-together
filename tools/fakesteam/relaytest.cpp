@@ -362,8 +362,15 @@ int main(int argc, char** argv)
     const uint32_t seconds = static_cast<uint32_t>(std::atoi(argv[2]));
     config.host = host;
     if (argc > 3) strncpy_s(config.steamHost, argv[3], _TRUNCATE);
+    if (char const* session = std::getenv("G3T_RELAY_SESSION_ID")) {
+        config.sessionIdValid = ValidSessionId(session);
+        if (config.sessionIdValid) strcpy_s(config.sessionId, session);
+    }
+    if (char const* target = std::getenv("G3T_RELAY_STEAM_LOBBY")) strncpy_s(config.steamLobby, target, _TRUNCATE);
     std::vector<uint8_t> save(SaveSize);
-    for (uint32_t i = 0; i < SaveSize; ++i) save[i] = static_cast<uint8_t>((i * 2654435761u) >> 13);
+    uint32_t sessionSeed = 0;
+    for (char c : config.sessionId) sessionSeed = sessionSeed * 33u + static_cast<unsigned char>(c);
+    for (uint32_t i = 0; i < SaveSize; ++i) save[i] = static_cast<uint8_t>(((i * 2654435761u) >> 13) ^ sessionSeed);
     const uint32_t saveCrc = Crc(save.data(), save.size());
     net::SetFileHandlers(OnChunk, OnDone);
     net::SetHitHandlers(OnHitNpc, OnHitPlayer);
@@ -387,6 +394,7 @@ int main(int argc, char** argv)
     uint32_t lastMenu = 0;
     while (GetTickCount() - start < seconds * 1000) {
         net::PlayerState local{};
+        strcpy_s(local.animation, config.sessionId);
         local.flags = 1;
         local.rotation[3] = 1.0f;
         local.position[0] = x += 1.0f;
@@ -506,6 +514,14 @@ int main(int argc, char** argv)
                 GetTickCount() - hitSentAt > (poseFlood ? 5000u : authorityMode ? 3000u : 500u)) {
                 leftAfter = GetTickCount() - joinedAt;
                 break;
+            }
+        }
+        for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
+            if (id == net::LocalId() || !net::Remotes()[id].latestTicks) continue;
+            if (std::strcmp(net::Remotes()[id].latest.animation, config.sessionId)) {
+                Logf("RESULT: FAIL (cross-session player state from %u: %s)", id, net::Remotes()[id].latest.animation);
+                net::Stop();
+                return 1;
             }
         }
         Sleep(16);

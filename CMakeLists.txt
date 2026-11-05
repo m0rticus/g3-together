@@ -4,6 +4,8 @@ project(G3Together LANGUAGES C CXX)
 if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   message(FATAL_ERROR "Use MSVC with -A Win32 for Gothic 3.")
 endif()
+option(G3T_TRANSPORT_TESTS_ONLY "Build engine-free regression tests without the Gothic 3 SDK" OFF)
+if(NOT G3T_TRANSPORT_TESTS_ONLY)
 # The unofficial Gothic 3 SDK (georgeto/gothic3sdk) is not part of this repository.
 set(G3SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/workspace/tools/gothic3sdk" CACHE PATH "Gothic 3 SDK checkout")
 if(NOT EXISTS "${G3SDK_DIR}/cmake/Setup.cmake")
@@ -12,6 +14,7 @@ endif()
 set(G3SDK_BINDING_ONLY ON CACHE BOOL "Use only the SDK bindings" FORCE)
 add_subdirectory("${G3SDK_DIR}" sdk)
 include("${G3SDK_DIR}/cmake/Setup.cmake")
+endif()
 
 file(GLOB ENET_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/enet/*.c")
 add_library(enet STATIC ${ENET_SOURCES})
@@ -24,6 +27,7 @@ target_compile_options(enet PRIVATE /Gz)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/enet/compress.c" PROPERTIES COMPILE_OPTIONS /Gd)
 target_link_libraries(enet PUBLIC ws2_32 winmm)
 
+if(NOT G3T_TRANSPORT_TESTS_ONLY)
 add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/qa.cpp src/config.cpp src/net.cpp src/steam.cpp src/lobby.cpp src/snapshot.cpp src/npcplayback.cpp
             src/remote.cpp src/body.cpp src/npcs.cpp src/ai.cpp src/combat.cpp src/hitprobe.cpp src/story.cpp src/talk.cpp src/items.cpp src/containers.cpp src/explore.cpp src/parity.cpp src/downed.cpp src/hud.cpp src/range.cpp src/journal.cpp src/persist.cpp src/hero.cpp src/clock.cpp src/infocmd.cpp src/transform.cpp src/ranged.cpp src/partner.cpp src/summon.cpp src/shot.cpp src/spells.cpp src/crashlog.cpp src/trace.cpp src/world.cpp src/social.cpp src/enclaves.cpp src/doors.cpp src/dialogaudio.cpp src/offer.cpp src/trade.cpp src/mapmarks.cpp src/ransack.cpp src/witness.cpp src/guards.cpp src/pickpocket.cpp src/respawn.cpp src/occupancy.cpp src/address.cpp src/p7probe.cpp src/fightmem.cpp src/guide.cpp src/arena.cpp src/ending.cpp src/xpshare.cpp src/i18n.cpp src/exports.def)
 target_gothic_script_options(Script_G3Together)
@@ -33,6 +37,7 @@ target_compile_options(Script_G3Together PRIVATE /utf-8)
 target_link_options(Script_G3Together PRIVATE /MAP)
 target_link_libraries(Script_G3Together PRIVATE g3sdk::SDK enet)
 set_target_properties(Script_G3Together PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts")
+endif()
 
 # Steam transport tests (tools/fakesteam/README.md): a stand-in for steam_api.dll over 127.0.0.1 and the transport alone,
 # without the game. Neither goes into the player package.
@@ -54,3 +59,9 @@ target_include_directories(g3t_snapshot_test PRIVATE src)
 target_compile_features(g3t_snapshot_test PRIVATE cxx_std_17)
 target_compile_options(g3t_snapshot_test PRIVATE /EHsc /utf-8)
 set_target_properties(g3t_snapshot_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/fakesteam")
+
+add_executable(g3t_config_test tools/fakesteam/config_test.cpp src/config.cpp)
+target_include_directories(g3t_config_test PRIVATE src)
+target_compile_features(g3t_config_test PRIVATE cxx_std_17)
+target_compile_options(g3t_config_test PRIVATE /EHsc /utf-8)
+set_target_properties(g3t_config_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/fakesteam")

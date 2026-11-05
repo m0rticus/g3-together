@@ -1,7 +1,5 @@
 # Checklist: first human co-op playtest
 
-**English** · [Deutsch](TESTPLAN.md)
-
 ## Purpose
 
 A first session for two players, one host and one joining player: joining, combat, companions,

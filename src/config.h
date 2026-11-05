@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "session.h"
+
 namespace g3t {
 struct Config
 {
     bool host = true;               // role = host | client
+    char sessionId[SessionIdSize] = "default";  // shared, case-sensitive session_id; not the native Steam lobby number
+    bool sessionIdValid = true;
     // Steam is the only transport. ENet's sockets are private loopback bridges, not direct-IP endpoints.
     char steamLobby[24] = "";             // client, steam: join this lobby (its number from the host's log) instead of searching
     char steamHost[64] = "";              // client, steam: only this friend's game (its Steam name), when several friends host

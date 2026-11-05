@@ -31,14 +31,15 @@ class SteamOnlySetupTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def setup(self, role, bundled=True):
+    def setup(self, role, bundled=True, session_id=None):
         if bundled:
-            (self.package / 'G3Together').mkdir()
+            (self.package / 'G3Together').mkdir(exist_ok=True)
             shutil.copy2(STEAM_DLL, self.package / 'G3Together' / 'steam_api.dll')
+        session_arg = f' -SessionId "{session_id}"' if session_id is not None else ''
         command = (
             'function global:Invoke-WebRequest { throw "offline setup fixture" }; '
             f'& "{self.package / "tools" / "setup.ps1"}" -GamePath "{self.game}" '
-            f'-Role {role} -Yes'
+            f'-Role {role}{session_arg} -Yes'
         )
         return subprocess.run(
             ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
@@ -83,6 +84,36 @@ class SteamOnlySetupTests(unittest.TestCase):
         self.assertIn('Steam is required', result.stdout)
         self.assertFalse((self.game / 'scripts' / 'Script_G3Together.dll').exists())
         self.assertEqual((self.game / 'g3together.ini').read_text(), original)
+
+    def test_default_session_id_is_written_once(self):
+        result = self.setup('host')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ini = (self.game / 'g3together.ini').read_text()
+        self.assertEqual(len(__import__('re').findall(r'(?m)^session_id\s*=', ini)), 1)
+        self.assertIn('session_id = default', ini)
+
+    def test_custom_session_id_is_written_once(self):
+        result = self.setup('client', session_id='pair_A-7')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ini = (self.game / 'g3together.ini').read_text()
+        self.assertIn('session_id = pair_A-7', ini)
+        self.assertEqual(len(__import__('re').findall(r'(?m)^session_id\s*=', ini)), 1)
+
+    def test_invalid_session_id_stops_setup(self):
+        for session_id in ('bad id', 'bad.id', 'A' * 64, 'pair_A-7\n'):
+            with self.subTest(session_id=session_id):
+                result = self.setup('host', session_id=session_id)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('Invalid session ID', result.stdout)
+                self.assertFalse((self.game / 'scripts' / 'Script_G3Together.dll').exists())
+
+    def test_existing_valid_session_id_is_preserved(self):
+        (self.game / 'g3together.ini').write_text('role = host\nsession_id = preserved_pair-2\n')
+        result = self.setup('host')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ini = (self.game / 'g3together.ini').read_text()
+        self.assertIn('session_id = preserved_pair-2', ini)
+        self.assertEqual(len(__import__('re').findall(r'(?m)^session_id\s*=', ini)), 1)
 
     def test_packaged_examples_are_steam_only(self):
         output = self.root / 'packages'
