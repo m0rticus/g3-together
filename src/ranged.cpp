@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "body.h"
 #include "log.h"
+#include "guid.h"
 #include "remote.h"
 #include "summon.h"
 #include "world.h"
@@ -23,19 +24,6 @@ bool homing = true;
 int reloadFallbacks = 0;
 
 namespace {
-bool ParseGuid(char const* text, _GUID& out)
-{
-    unsigned long d1 = 0;
-    unsigned d2 = 0, d3 = 0, b[8] = {};
-    if (sscanf_s(text, "%8lx-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
-        return false;
-    out.Data1 = d1;
-    out.Data2 = static_cast<unsigned short>(d2);
-    out.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) out.Data4[i] = static_cast<unsigned char>(b[i]);
-    return true;
-}
-
 Entity Player()
 {
     eCEntity* body = gCSession::GetInstance().GetHero() ? remote::ControlledBody() : nullptr;
@@ -61,7 +49,7 @@ char const* HeldName(Entity& self, gESlot slot, char* out, size_t size)
 Entity EntityAt(char const* guid)
 {
     _GUID raw;
-    if (ParseGuid(guid, raw)) return Entity(bCPropertyID(bCGuid(raw)));
+    if (guid::Parse(guid, raw)) return guid::Resolve(raw);
     // Not a GUID: the nearest processed entity of that name (doors and chests have no GUID in the QA output, and chests
     // share names; MagicOpenLocks).
     eCEntity* hero = gCSession::GetInstance().GetHero();

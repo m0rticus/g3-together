@@ -1,5 +1,6 @@
 """Check sandbox routing without installed game copies."""
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -83,6 +84,153 @@ class SandboxRoutingTests(unittest.TestCase):
             with self.subTest(stage=name):
                 self.assertFalse(self.session.shareable(name))
 
+    def test_join_and_clear_setup_preserves_order_and_return_values(self):
+        host = SimpleNamespace(tag='host')
+        client = SimpleNamespace(tag='client')
+        copies = {'host': host, 'client': client}
+        report = {}
+        events = []
+        with patch.object(self.runner, 'join_both',
+                          side_effect=lambda value: events.append(('join', value)) or (host, client)), \
+                patch.object(self.runner, 'clear_raid',
+                             side_effect=lambda value, result: events.append(('clear', value, result))):
+            result = self.runner.join_both_and_clear(copies, report)
+        self.assertEqual(result, (host, client))
+        self.assertEqual(events, [('join', copies), ('clear', host, report)])
+
+    def test_join_and_clear_propagates_join_and_clear_failures(self):
+        copies = {'host': object(), 'client': object()}
+        report = {}
+        with patch.object(self.runner, 'join_both', side_effect=RuntimeError('join failed')), \
+                patch.object(self.runner, 'clear_raid') as clear:
+            with self.assertRaisesRegex(RuntimeError, 'join failed'):
+                self.runner.join_both_and_clear(copies, report)
+        clear.assert_not_called()
+
+        host = SimpleNamespace(tag='host')
+        with patch.object(self.runner, 'join_both', return_value=(host, SimpleNamespace(tag='client'))), \
+                patch.object(self.runner, 'clear_raid', side_effect=RuntimeError('clear failed')):
+            with self.assertRaisesRegex(RuntimeError, 'clear failed'):
+                self.runner.join_both_and_clear(copies, report)
+
+    def test_raid_help_up_preserves_client_first_order_and_mutates_report(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=1 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=1 '))
+        report = {}
+        events = []
+
+        def recover(helper, downed, result, tag):
+            events.append(('help', helper.tag, downed.tag, tag))
+            downed.bot.state = ' down=0 '
+            result[tag+'_helper_moved'] = 'recovered'
+
+        def wait(predicate, seconds, diagnostic):
+            events.append(('wait', seconds, diagnostic, predicate()))
+            return predicate()
+
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up', side_effect=recover), \
+                patch.object(self.runner, 'wait_for', side_effect=wait):
+            self.runner.help_up_raid((client, host), report)
+
+        self.assertEqual(events, [
+            ('help', 'host', 'client', 'client_raid'),
+            ('wait', 30, 'client helped up after the raid', ['up']),
+            ('help', 'client', 'host', 'host_raid'),
+            ('wait', 30, 'host helped up after the raid', ['up']),
+        ])
+        self.assertEqual(report, {
+            'client_raid_helper_moved': 'recovered',
+            'host_raid_helper_moved': 'recovered',
+        })
+
+    def test_raid_help_up_preserves_host_first_order(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=1 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=1 '))
+        events = []
+
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up',
+                             side_effect=lambda helper, downed, report, tag:
+                             events.append((helper.tag, downed.tag, tag))), \
+                patch.object(self.runner, 'wait_for',
+                             side_effect=lambda predicate, seconds, diagnostic:
+                             ['up'] if predicate() else None):
+            self.runner.help_up_raid((host, client), {})
+
+        self.assertEqual(events, [
+            ('client', 'host', 'host_raid'),
+            ('host', 'client', 'client_raid'),
+        ])
+
+    def test_raid_help_up_skips_already_standing_players(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=0 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=0 '))
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up') as help_up, \
+                patch.object(self.runner, 'wait_for') as wait:
+            self.runner.help_up_raid((client, host), {})
+        help_up.assert_not_called()
+        wait.assert_not_called()
+
+    def test_raid_help_up_propagates_help_and_wait_failures(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=1 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=1 '))
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up', side_effect=RuntimeError('help failed')), \
+                patch.object(self.runner, 'wait_for') as wait:
+            with self.assertRaisesRegex(RuntimeError, 'help failed'):
+                self.runner.help_up_raid((client, host), {})
+        wait.assert_not_called()
+
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up'), \
+                patch.object(self.runner, 'wait_for', side_effect=RuntimeError('wait failed')):
+            with self.assertRaisesRegex(RuntimeError, 'wait failed'):
+                self.runner.help_up_raid((client, host), {})
+
+    def test_consolidated_legacy_suite_keeps_postraid_source_policy(self):
+        with patch.object(self.runner, 'postraid_ready', return_value=True):
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
+        source = inspect.getsource(self.runner.SUITES['stageEnterPlace'])
+        self.assertIn('join_both_and_clear(', source)
+        self.assertNotIn('# clear_raid(', source)
+
+    def test_all_live_raid_and_new_game_names_stay_out_of_saved_routes(self):
+        with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')):
+            for name in sorted(self.runner.LIVE_RAID | self.runner.NEW_GAME):
+                with self.subTest(stage=name):
+                    self.assertEqual(self.runner.postraid_for(name), '')
+        self.ready.assert_not_called()
+
+    def test_warm_routes_before_source_inspection(self):
+        with patch.dict(os.environ, {'G3_SANDBOX': '0'}):
+            with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')), \
+                    patch.object(self.runner, 'postraid_ready', return_value=True):
+                self.assertEqual(self.runner.postraid_for('warm'), 'postraid')
+            with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')), \
+                    patch.object(self.runner, 'postraid_ready', return_value=False):
+                self.assertEqual(self.runner.postraid_for('warm'), '')
+
+    def test_normal_source_inspection_detects_join_or_clear_helper_calls(self):
+        with patch.object(self.runner, 'postraid_ready', return_value=True), \
+                patch.object(inspect, 'getsource', return_value='host, client = join_both_and_clear(copies, report)') as getsource:
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
+        getsource.assert_called_once_with(self.runner.SUITES['stageEnterPlace'])
+
+        with patch.object(self.runner, 'postraid_ready', return_value=True), \
+                patch.object(inspect, 'getsource', return_value='host, client = clear_raid(copies, report)'):
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
+
+        with patch.object(inspect, 'getsource', return_value='host, client = join_both(copies)'):
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), '')
+
+    def test_murder_counts_returns_fourth_count_or_none(self):
+        with patch.object(self.runner, 'enclave_counts', return_value=[1, 2, 3, 4, 9]):
+            self.assertEqual(self.runner.murder_counts(object(), 'Ardea'), 9)
+        with patch.object(self.runner, 'enclave_counts', return_value=[]):
+            self.assertIsNone(self.runner.murder_counts(object(), 'Ardea'))
+
     def test_native_shared_spawn_is_verified_before_client_is_offset(self):
         copies = {tag: SimpleNamespace(bot=tag) for tag in ('host', 'client')}
         baseline = {'host': {'pos': (77000, -280, -61000)}, 'client': {'pos': (77800, -280, -61000)}}
@@ -128,6 +276,104 @@ class SandboxRoutingTests(unittest.TestCase):
                 self.assertEqual(bot.send('state', 9), 0)
             self.assertEqual(wait.call_args.args[1], 9)
             self.assertTrue(wait.call_args.args[0]('COMMAND sequence=2 action=state thread=1'))
+
+    def test_command_text_preserves_send_line_and_log_semantics(self):
+        calls = []
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 123,
+            line=lambda prefix, wait, what, start: calls.append(('line', prefix, wait, what, start)) or 'ignored',
+            log=lambda: 'x' * 123 + 'first\nsecond',
+        )
+        self.assertEqual(self.runner.command_text(bot, 'reader', 'READER end', timeout=37, wait=14, what='reader diagnostic'),
+                         'first\nsecond')
+        self.assertEqual(calls, [('send', 'reader', 37),
+                                 ('line', 'READER end', 14, 'reader diagnostic', 123)])
+
+    def test_command_text_can_skip_the_end_line_wait(self):
+        calls = []
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 7,
+            line=lambda *args: calls.append(('line',) + args),
+            log=lambda: 'x' * 7 + 'after',
+        )
+        self.assertEqual(self.runner.command_text(bot, 'raw', timeout=41), 'after')
+        self.assertEqual(calls, [('send', 'raw', 41)])
+
+    def test_command_text_preserves_tuple_prefix_and_default_timeout(self):
+        calls = []
+        prefix = ('WEARHERO ', 'REFUSED wear')
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 3,
+            line=lambda prefix, wait, what, start: calls.append(('line', prefix, wait, what, start)) or 'wear reply',
+            log=lambda: 'xxxwear reply',
+        )
+        self.assertEqual(self.runner.command_text(bot, 'wear item', prefix, what='wear item'), 'wear reply')
+        self.assertEqual(calls, [('send', 'wear item', 20),
+                                 ('line', prefix, 10, 'wear item', 3)])
+
+    def test_puppet_pose_reads_after_the_post_command_sleep(self):
+        state = {'log': ''}
+        calls = []
+        bot = SimpleNamespace(
+            send=lambda command, timeout: calls.append(('send', command, timeout)) or 123,
+            line=lambda prefix, wait, what, start: calls.append(('line', prefix, wait, what, start)),
+            log=lambda: 'x' * 123 + state['log'],
+        )
+
+        def append_pose(seconds):
+            calls.append(('sleep', seconds))
+            state['log'] += 'PUPPETPOSE id=2 remote=host shows=body run0=17 shape=Human body=Torso\n'
+
+        with patch.object(self.runner.time, 'sleep', side_effect=append_pose):
+            pose = self.runner.puppet_pose(bot, 2)
+
+        self.assertEqual(pose, {'remote': 'host', 'shows': 'body', 'run0': 17, 'shape': 'Human', 'body': 'Torso'})
+        self.assertEqual(calls, [('send', 'remotes', 20),
+                                 ('line', 'NET ', 10, 'remotes', 123),
+                                 ('sleep', 0.05)])
+
+    def test_glide_counts_reads_each_result_kind_from_separate_log_snapshots(self):
+        snapshots = iter([
+            'x' * 123 + 'GLIDE kind=puppet moving_ms=10 glide_ms=20 steer_ms=30 place_ms=40 snaps=50 stance_stops=60\n',
+            'x' * 123 + 'GLIDE kind=puppet moving_ms=10 glide_ms=20 steer_ms=30 place_ms=40 snaps=50 stance_stops=60\n'
+            'GLIDEMOTION kind=puppet ms=70 motion=Walk\n',
+            'x' * 123 + 'GLIDE kind=puppet moving_ms=10 glide_ms=20 steer_ms=30 place_ms=40 snaps=50 stance_stops=60\n'
+            'SMOOTH kind=puppet frames=100 jumps30=1 max_step_cm=2 still=3 lag_cm=4 interp=5 still_by=host still_case=held offset_window=8\n',
+            'x' * 123 + 'STILLMOTION kind=puppet frames=9 motion=Stand\n',
+            'x' * 123 + 'SNAPS kind=puppet hard=2 action=3\n',
+            'x' * 123 + 'LEAD kind=puppet samples=5 err_median_cm=6 err_p95_cm=7 sampled=8/9\n',
+        ])
+        bot = SimpleNamespace(
+            send=lambda command, timeout: 123,
+            line=lambda *args: None,
+            log=lambda: next(snapshots),
+        )
+
+        found = self.runner.glide_counts(bot)
+        self.assertEqual(found['puppet']['moving_ms'], 10)
+        self.assertEqual(found['puppet']['motions'], [(70, 'Walk')])
+        self.assertEqual(found['puppet']['smooth']['frames'], 100)
+        self.assertEqual(found['puppet']['still_motions'], [(9, 'Stand')])
+        self.assertEqual(found['puppet']['hard_snaps'], 2)
+        self.assertEqual(found['puppet']['lead']['samples'], 5)
+
+    def test_uniform_readers_keep_their_existing_parser_patterns(self):
+        checks = {
+            'remotes': ("for line in text.splitlines()", "REmote id=(\\d+)".replace('REmote', 'REMOTE')),
+            'npcs': ("for line in text.splitlines()", "NPC guid=(\\S+)"),
+            'inventory_of': ("for m in re.finditer(r'INV name=", "found[m[1]]"),
+            'town_status': ("re.search(r'ENCLAVE", "return int(m[1]) if m else None"),
+            'town_members': ("l.startswith('MURDERCAND enclave=')", "dict(re.findall"),
+            'pick_cands': ("l.startswith('PICKCAND guid=')", "dict(re.findall"),
+            'near_rows': ("for m in re.finditer(r'NEARX guid=", "target_puppet"),
+            'glide_counts': ("re.finditer(r'GLIDE kind=", "re.finditer(r'GLIDEMOTION"),
+            'ai_counts': ("re.finditer(r'AICOUNT name=", "int(m[2]) + int(m[3])"),
+        }
+        for name, fragments in checks.items():
+            with self.subTest(reader=name):
+                source = inspect.getsource(getattr(self.runner, name))
+                for fragment in fragments:
+                    self.assertIn(fragment, source)
 
     def test_both_closes_are_queued_before_waiting_for_either_renderer(self):
         events = []

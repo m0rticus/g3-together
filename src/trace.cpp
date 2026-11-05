@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "trace.h"
 
+#include "ai.h"
 #include "log.h"
 #include "npcs.h"
 #include "remote.h"
@@ -38,25 +39,6 @@ unsigned char* Locate(Site const& site)
     if (!module) return nullptr;
     auto* code = reinterpret_cast<unsigned char*>(module) + site.rva;
     return std::memcmp(code, site.expected, site.stolen) == 0 ? code : nullptr;
-}
-
-void* JumpTo(unsigned char* target, size_t stolen, void* detour)
-{
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, stolen);
-    trampoline[stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + stolen) - reinterpret_cast<intptr_t>(trampoline + stolen + 5));
-    std::memcpy(trampoline + stolen + 1, &back, 4);
-    DWORD old = 0;
-    if (!VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
-    target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
-    std::memcpy(target + 1, &to, 4);
-    for (size_t i = 5; i < stolen; ++i) target[i] = 0x90;
-    VirtualProtect(target, stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, stolen);
-    return trampoline;
 }
 
 bool Wanted(eCEntity* entity)
@@ -153,9 +135,9 @@ void Install()
 {
     if (installed) return;
     installed = true;
-    if (unsigned char* code = Locate(PlayMotionSite)) playMotion = reinterpret_cast<PlayMotionFn>(JumpTo(code, PlayMotionSite.stolen, reinterpret_cast<void*>(&PlayMotionDetour)));
-    if (unsigned char* code = Locate(SetCurrentTaskSite)) setCurrentTask = reinterpret_cast<SetTaskFn>(JumpTo(code, SetCurrentTaskSite.stolen, reinterpret_cast<void*>(&SetCurrentTaskDetour)));
-    if (unsigned char* code = Locate(AISetTaskSite)) aiSetTask = reinterpret_cast<SetTaskFn>(JumpTo(code, AISetTaskSite.stolen, reinterpret_cast<void*>(&AISetTaskDetour)));
+    if (unsigned char* code = Locate(PlayMotionSite)) playMotion = reinterpret_cast<PlayMotionFn>(ai::JumpTo(code, reinterpret_cast<void*>(&PlayMotionDetour), PlayMotionSite.stolen));
+    if (unsigned char* code = Locate(SetCurrentTaskSite)) setCurrentTask = reinterpret_cast<SetTaskFn>(ai::JumpTo(code, reinterpret_cast<void*>(&SetCurrentTaskDetour), SetCurrentTaskSite.stolen));
+    if (unsigned char* code = Locate(AISetTaskSite)) aiSetTask = reinterpret_cast<SetTaskFn>(ai::JumpTo(code, reinterpret_cast<void*>(&AISetTaskDetour), AISetTaskSite.stolen));
     Logf("trace: hooks play_motion=%d set_current_task=%d ai_set_task=%d", playMotion != nullptr, setCurrentTask != nullptr, aiSetTask != nullptr);
 }
 }

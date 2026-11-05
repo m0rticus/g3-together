@@ -28,7 +28,7 @@ set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/enet/compres
 target_link_libraries(enet PUBLIC ws2_32 winmm)
 
 if(NOT G3T_TRANSPORT_TESTS_ONLY)
-add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/qa.cpp src/config.cpp src/net.cpp src/steam.cpp src/lobby.cpp src/snapshot.cpp src/npcplayback.cpp
+add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/guid_text.cpp src/guid.cpp src/qa.cpp src/config.cpp src/net.cpp src/steam.cpp src/lobby.cpp src/snapshot.cpp src/npcplayback.cpp
             src/remote.cpp src/body.cpp src/npcs.cpp src/ai.cpp src/combat.cpp src/hitprobe.cpp src/story.cpp src/talk.cpp src/items.cpp src/containers.cpp src/explore.cpp src/parity.cpp src/downed.cpp src/hud.cpp src/range.cpp src/journal.cpp src/persist.cpp src/hero.cpp src/clock.cpp src/infocmd.cpp src/transform.cpp src/ranged.cpp src/partner.cpp src/summon.cpp src/shot.cpp src/spells.cpp src/crashlog.cpp src/trace.cpp src/world.cpp src/social.cpp src/enclaves.cpp src/doors.cpp src/dialogaudio.cpp src/offer.cpp src/trade.cpp src/mapmarks.cpp src/ransack.cpp src/witness.cpp src/guards.cpp src/pickpocket.cpp src/respawn.cpp src/occupancy.cpp src/address.cpp src/p7probe.cpp src/fightmem.cpp src/guide.cpp src/arena.cpp src/ending.cpp src/xpshare.cpp src/i18n.cpp src/exports.def)
 target_gothic_script_options(Script_G3Together)
 # Sources are UTF-8: without /utf-8 MSVC reads them as Windows-1252 and HUD texts show "lÃ¤uft" (plan 3.5).
@@ -54,7 +54,7 @@ target_compile_definitions(g3t_relaytest PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(g3t_relaytest PRIVATE enet)
 set_target_properties(fake_steam_api g3t_relaytest PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/fakesteam")
 
-add_executable(g3t_snapshot_test tools/fakesteam/snapshot_test.cpp src/snapshot.cpp)
+add_executable(g3t_snapshot_test tools/fakesteam/snapshot_test.cpp src/snapshot.cpp src/guid_text.cpp src/log.cpp)
 target_include_directories(g3t_snapshot_test PRIVATE src)
 target_compile_features(g3t_snapshot_test PRIVATE cxx_std_17)
 target_compile_options(g3t_snapshot_test PRIVATE /EHsc /utf-8)

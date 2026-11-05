@@ -213,6 +213,31 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
     return true;
 }
 
+void SendToServer(void const* data, size_t size, uint8_t channel, bool reliable)
+{
+    if (!isHost && server && connected) Send(server, data, size, channel, reliable);
+}
+
+void SendToPeer(void const* data, size_t size, uint8_t channel, bool reliable, uint8_t to)
+{
+    if (!isHost) { SendToServer(data, size, channel, reliable); return; }
+    if (to < MaxPlayers && peers[to]) Send(peers[to], data, size, channel, reliable);
+}
+
+void SendBroadcast(void const* data, size_t size, uint8_t channel, bool reliable)
+{
+    if (!isHost) { SendToServer(data, size, channel, reliable); return; }
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i]) Send(peers[i], data, size, channel, reliable);
+}
+
+void SendBroadcastExcept(void const* data, size_t size, uint8_t channel, bool reliable, uint8_t except)
+{
+    if (!isHost) { SendToServer(data, size, channel, reliable); return; }
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i] && i != except) Send(peers[i], data, size, channel, reliable);
+}
+
 // A player's state from the network (Fable's review 22.10. 1.2, 1.6): its strings may lack their terminator and its floats
 // may be anything; the puppet code feeds them to %s, strstr, Template(...) and MoveTo.
 bool Sane(PlayerState& state)
@@ -392,8 +417,6 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                     if (bones[k].name == bones[i].name) { ++npcRejected; return; }
             }
         } else if (packet->dataLength != recordsSize) { ++npcRejected; return; }
-        NpcRecord records[MaxNpcsPerMessage];
-        std::memcpy(records, packet->data + sizeof(header), header.count * sizeof(NpcRecord));
         if (isHost) {
             header.owner = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
             if (header.owner < 2 || header.owner >= MaxPlayers) return;
@@ -402,34 +425,48 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             ++npcRejected;
             return;
         }
-        int count = 0;
-        for (int i = 0; i < header.count; ++i) {
-            NpcRecord const& record = records[i];
-            if (!Sane(record)) { ++npcRejected; continue; }
-            const std::string key = NpcKey(record.guid);
-            const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
-                                     : npcPublications[key].Snapshot(header.owner, header.publication);
-            if (!newer) { ++npcStale; continue; }
-            if (bones && npcPoseHandler)
-                npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
-            records[count++] = record;
-        }
-        if (!count) return;
-        const int accepted = npcHandler ? npcHandler(records, count, enet_time_get(), header.sent, header.owner, header.generation) : 0;
-        if (accepted < 0 || accepted > count) { Log("net: invalid accepted NPC count; publication refused"); return; }
-        npcRejected += count - accepted;
-        npcAccepted += accepted;
-        if (isHost && accepted) {
-            // Adjudicate first: an update refused by the host must never become truth on a third client.
-            header.count = static_cast<uint8_t>(accepted);
-            header.publication = ++npcPublication;
-            uint8_t buffer[sizeof(header) + MaxNpcsPerMessage * sizeof(NpcRecord)];
-            std::memcpy(buffer, &header, sizeof(header));
-            std::memcpy(buffer + sizeof(header), records, accepted * sizeof(NpcRecord));
-            for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != header.owner)
-                    Send(peers[i], buffer, sizeof(header) + accepted * sizeof(NpcRecord), ChannelNpcs,
-                         (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+        auto processRecords = [&](NpcRecord* records, int recordCount) {
+            int count = 0;
+            for (int i = 0; i < recordCount; ++i) {
+                NpcRecord const& record = records[i];
+                if (!Sane(record)) { ++npcRejected; continue; }
+                const std::string key = NpcKey(record.guid);
+                const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
+                                         : npcPublications[key].Snapshot(header.owner, header.publication);
+                if (!newer) { ++npcStale; continue; }
+                if (bones && npcPoseHandler)
+                    npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+                records[count++] = record;
+            }
+            return count;
+        };
+        auto finishRecords = [&](NpcRecord* records, int count) {
+            if (!count) return;
+            const int accepted = npcHandler ? npcHandler(records, count, enet_time_get(), header.sent, header.owner, header.generation) : 0;
+            if (accepted < 0 || accepted > count) { Log("net: invalid accepted NPC count; publication refused"); return; }
+            npcRejected += count - accepted;
+            npcAccepted += accepted;
+            if (isHost && accepted) {
+                // Adjudicate first: an update refused by the host must never become truth on a third client.
+                header.count = static_cast<uint8_t>(accepted);
+                header.publication = ++npcPublication;
+                uint8_t buffer[sizeof(header) + MaxNpcsPerMessage * sizeof(NpcRecord)];
+                std::memcpy(buffer, &header, sizeof(header));
+                std::memcpy(buffer + sizeof(header), records, accepted * sizeof(NpcRecord));
+                for (uint8_t i = 2; i < MaxPlayers; ++i)
+                    if (peers[i] && i != header.owner)
+                        Send(peers[i], buffer, sizeof(header) + accepted * sizeof(NpcRecord), ChannelNpcs,
+                             (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+            }
+        };
+        if (type == MsgPosedNpc) {
+            NpcRecord record;
+            std::memcpy(&record, packet->data + sizeof(header), sizeof(record));
+            finishRecords(&record, processRecords(&record, 1));
+        } else {
+            NpcRecord batchRecords[MaxNpcsPerMessage];
+            std::memcpy(batchRecords, packet->data + sizeof(header), header.count * sizeof(NpcRecord));
+            finishRecords(batchRecords, processRecords(batchRecords, header.count));
         }
     } else if (type == MsgNpcRelease && packet->dataLength >= sizeof(NpcReleaseHeader)) {
         if (isHost) { ++npcRejected; return; }
@@ -843,10 +880,10 @@ void SendWorld(WorldNote const& note, uint8_t to)
     }
     const WorldMsg message{MsgWorld, note};
     if (isHost) {
-        if (to > 1 && to < MaxPlayers && peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
-    } else if (server && connected) {
-        Send(server, &message, sizeof(message), ChannelReliable, true);
-    }
+        if (to > 1 && to < MaxPlayers && peers[to])
+            SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
+    } else if (server && connected)
+        SendToServer(&message, sizeof(message), ChannelReliable, true);
 }
 
 uint32_t HashName(char const* name) { return HashWorld(name); }
@@ -899,12 +936,7 @@ void SendNpcs(NpcRecord const* records, int count, bool reliable)
         if (!record.sent) record.sent = header.sent;
         std::memcpy(buffer + sizeof(header) + i * sizeof(record), &record, sizeof(record));
     }
-    if (!isHost) {
-        if (server && connected) Send(server, buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, reliable);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, reliable);
+    SendBroadcast(buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, reliable);
 }
 
 void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags)
@@ -935,12 +967,7 @@ void SendNpcRelease(uint8_t const* guids, int count)
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), guids, count * 16u);
     const size_t size = sizeof(header) + count * 16u;
-    if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i)
-            if (peers[i]) Send(peers[i], buffer, size, ChannelNpcs, true);
-    } else if (server && connected) {
-        Send(server, buffer, size, ChannelNpcs, true);
-    }
+    SendBroadcast(buffer, size, ChannelNpcs, true);
 }
 
 void SetNpcReleaseHandler(NpcReleaseHandler handler) { npcReleaseHandler = handler; }
@@ -975,15 +1002,14 @@ void SendHitResult(uint8_t to, HitResult const& result)
     HitResultMsg message{MsgHitResult, result};
     message.result.epoch = worldEpoch;
     message.result.processedAt = enet_time_get();
-    Send(peers[to], &message, sizeof(message), ChannelCombat, true);
+    SendToPeer(&message, sizeof(message), ChannelCombat, true, to);
 }
 void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill)
 {
     if (!host || playerId == localId || playerId >= MaxPlayers) return;
     HitPlayerMsg message{MsgHitPlayer, delta, {}, attackerPlayer, playerId, static_cast<uint8_t>(meansToKill ? 1 : 0)};
     std::memcpy(message.attacker, attacker, 16);
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true); return; }
-    if (peers[playerId]) Send(peers[playerId], &message, sizeof(message), ChannelCombat, true);
+    SendToPeer(&message, sizeof(message), ChannelCombat, true, playerId);
 }
 
 void SetStateHandler(StateHandler handler) { stateHandler = handler; }
@@ -1006,24 +1032,14 @@ void SendWorldState(WorldState const& state, uint8_t except)
 {
     if (!host) return;
     const WorldStateMsg message{MsgWorldState, state};
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i] && i != except) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
 }
 
 void SendClock(ClockState const& state)
 {
     if (!host) return;
     const ClockMsg message{MsgClock, state};
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcast(&message, sizeof(message), ChannelReliable, true);
 }
 
 void SetFileHandlers(FileChunkHandler chunk, FileDoneHandler done)
@@ -1040,7 +1056,7 @@ bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, vo
     const FileChunkHeader header{MsgFileChunk, file, total, offset, length};
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), data, length);
-    Send(peers[to], buffer, sizeof(header) + length, ChannelReliable, true);
+    SendToPeer(buffer, sizeof(header) + length, ChannelReliable, true, to);
     return true;
 }
 
@@ -1051,7 +1067,7 @@ bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], 
     strncpy_s(message.name, name, _TRUNCATE);
     std::memcpy(message.size, size, sizeof(message.size));
     std::memcpy(message.crc, crc, sizeof(message.crc));
-    Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
     return true;
 }
 
@@ -1060,8 +1076,7 @@ void SendCampaign(uint8_t kind, char const* name)
     if (!host || !isHost) return;
     CampaignMsg message{MsgCampaign, kind, {}};
     strncpy_s(message.name, name, _TRUNCATE);
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcast(&message, sizeof(message), ChannelReliable, true);
 }
 
 void SendDeath(uint8_t const guid[16], uint8_t by, uint8_t except)
@@ -1069,8 +1084,7 @@ void SendDeath(uint8_t const guid[16], uint8_t by, uint8_t except)
     if (!host || !isHost) return;
     DeathMsg message{MsgDeath, {}, by};
     std::memcpy(message.guid, guid, 16);
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i] && i != except) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
 }
 
 void SendKilled(uint8_t to, uint8_t const guid[16], uint32_t incarnation)
@@ -1078,7 +1092,7 @@ void SendKilled(uint8_t to, uint8_t const guid[16], uint32_t incarnation)
     if (!host || !isHost || to <= 1 || to >= MaxPlayers || !incarnation) return;
     KilledMsg message{MsgKilled, {}, to, worldEpoch, incarnation};
     std::memcpy(message.guid, guid, 16);
-    if (peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 bool SendGoods(uint64_t epoch, uint32_t serial, int32_t gold, GoodsEntry const* entries, int count)
@@ -1089,13 +1103,8 @@ bool SendGoods(uint64_t epoch, uint32_t serial, int32_t gold, GoodsEntry const* 
     std::memcpy(buffer, &header, sizeof(header));
     if (count) std::memcpy(buffer + sizeof(header), entries, count * sizeof(GoodsEntry));
     const size_t size = sizeof(header) + count * sizeof(GoodsEntry);
-    if (!isHost) {
-        if (!server || !connected) return false;
-        Send(server, buffer, size, ChannelReliable, true);
-        return true;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], buffer, size, ChannelReliable, true);
+    if (!isHost && (!server || !connected)) return false;
+    SendBroadcast(buffer, size, ChannelReliable, true);
     return true;
 }
 
@@ -1117,8 +1126,7 @@ bool SendContents(uint8_t const guid[16], ContentEntry const* entries, int count
     std::memcpy(header.guid, guid, 16);
     std::memcpy(buffer, &header, sizeof(header));
     if (count) std::memcpy(buffer + sizeof(header), entries, count * sizeof(ContentEntry));
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], buffer, sizeof(header) + count * sizeof(ContentEntry), ChannelReliable, true);
+    SendBroadcast(buffer, sizeof(header) + count * sizeof(ContentEntry), ChannelReliable, true);
     return true;
 }
 
@@ -1130,7 +1138,7 @@ bool SendContainerTx(uint8_t const guid[16], uint32_t seq, ContentEntry const* e
     std::memcpy(header.guid, guid, 16);
     std::memcpy(buffer, &header, sizeof(header));
     if (count) std::memcpy(buffer + sizeof(header), entries, count * sizeof(ContentEntry));
-    Send(server, buffer, sizeof(header) + count * sizeof(ContentEntry), ChannelReliable, true);
+    SendToServer(buffer, sizeof(header) + count * sizeof(ContentEntry), ChannelReliable, true);
     return true;
 }
 
@@ -1139,7 +1147,7 @@ void SendContainerTxResult(uint8_t to, uint8_t const guid[16], uint32_t seq, boo
     if (!host || !isHost || to >= MaxPlayers || !peers[to]) return;
     TxResultMsg message{MsgTxResult, {}, seq, static_cast<uint8_t>(ok ? 1 : 0)};
     std::memcpy(message.guid, guid, 16);
-    Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SendWatch(uint8_t const guid[16])
@@ -1147,19 +1155,16 @@ void SendWatch(uint8_t const guid[16])
     if (!host || isHost || !server || !connected) return;
     WatchMsg message{MsgWatch, {}};
     std::memcpy(message.guid, guid, 16);
-    Send(server, &message, sizeof(message), ChannelReliable, true);
+    SendToServer(&message, sizeof(message), ChannelReliable, true);
 }
 
 void SendItem(ItemNote const& note, uint8_t to)
 {
     if (!host) return;
     ItemMsg message{MsgItem, note};
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i] && (to == 0 || to == i)) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
+    else if (to == 0) SendBroadcast(&message, sizeof(message), ChannelReliable, true);
+    else if (to > 1 && to < MaxPlayers) SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SetSummonHandler(SummonHandler handler) { summonHandler = handler; }
@@ -1182,8 +1187,7 @@ void SendNpcSpell(uint8_t to, char const* script, uint8_t const target[16], int3
     NpcSpellMsg message{MsgNpcSpell, localId, to, {}, {}, args};
     strncpy_s(message.script, script, _TRUNCATE);
     std::memcpy(message.target, target, 16);
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
-    if (peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SetEnclaveHandler(EnclaveHandler handler) { enclaveHandler = handler; }
@@ -1192,12 +1196,9 @@ void SendEnclave(EnclaveNote const& note, uint8_t to)
 {
     if (!host) return;
     const EnclaveMsg message{MsgEnclave, note};
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i] && (to == 0 || to == i)) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
+    else if (to == 0) SendBroadcast(&message, sizeof(message), ChannelReliable, true);
+    else if (to > 1 && to < MaxPlayers) SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SendPlayerSpell(uint8_t to, char const* script)
@@ -1205,25 +1206,23 @@ void SendPlayerSpell(uint8_t to, char const* script)
     if (!host || to == localId || to >= MaxPlayers) return;
     PlayerSpellMsg message{MsgPlayerSpell, localId, to, {}};
     strncpy_s(message.script, script, _TRUNCATE);
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
-    if (peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SendRansack(uint8_t to, RansackNote const& note)
 {
     if (!host || to == localId || to >= MaxPlayers) return;
     const RansackMsg message{MsgRansack, localId, to, note};
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
-    if (peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SendWitness(uint8_t to, WitnessNote const& note)
 {
     if (!host || to == localId || to >= MaxPlayers) return;
     const WitnessMsg message{MsgWitness, localId, to, note};
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i] && (to == 0 || to == i)) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
+    else if (to == 0) SendBroadcast(&message, sizeof(message), ChannelReliable, true);
+    else if (to > 1 && to < MaxPlayers) SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
 }
 
 void SendShot(ShotNote const& note)
@@ -1232,12 +1231,7 @@ void SendShot(ShotNote const& note)
     ShotMsg message{MsgShot, localId, note};
     message.note.epoch = worldEpoch;
     if (!message.note.sent) message.note.sent = enet_time_get();
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelCombat, true);
+    SendBroadcast(&message, sizeof(message), ChannelCombat, true);
 }
 
 void SendRagdoll(RagdollNote const& note)
@@ -1245,24 +1239,14 @@ void SendRagdoll(RagdollNote const& note)
     if (!host || !isHost) return;
     RagdollMsg message{MsgRagdoll, localId, note};
     message.note.epoch = worldEpoch;
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelCombat, true);
+    SendBroadcast(&message, sizeof(message), ChannelCombat, true);
 }
 
 void SendDialogLine(DialogLineNote const& note)
 {
     if (!host) return;
     const DialogLineMsg message{MsgDialogLine, localId, note};
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcast(&message, sizeof(message), ChannelReliable, true);
 }
 
 bool SendOffer(OfferNote const& note)
@@ -1274,11 +1258,11 @@ bool SendOffer(OfferNote const& note)
     const size_t size = OfferHeaderSize + note.count * sizeof(OfferEntry);
     if (!isHost) {
         if (!server || !connected) return false;
-        Send(server, &message, size, ChannelReliable, true);
+        SendToServer(&message, size, ChannelReliable, true);
         return true;
     }
     if (!peers[note.seller] || !InWorld(note.seller)) return false;
-    Send(peers[note.seller], &message, size, ChannelReliable, true);
+    SendToPeer(&message, size, ChannelReliable, true, note.seller);
     return true;
 }
 
@@ -1287,11 +1271,9 @@ void SendOfferResult(OfferResultNote const& note)
     if (!host) return;
     OfferResultMsg message{MsgOfferResult, note};
     message.note.seller = localId;
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    if (note.buyer > 1 && note.buyer < MaxPlayers && peers[note.buyer]) Send(peers[note.buyer], &message, sizeof(message), ChannelReliable, true);
+    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
+    else if (note.buyer > 1 && note.buyer < MaxPlayers && peers[note.buyer])
+        SendToPeer(&message, sizeof(message), ChannelReliable, true, note.buyer);
 }
 
 void SendSummon(SummonNote const& note)
@@ -1299,12 +1281,7 @@ void SendSummon(SummonNote const& note)
     if (!host) return;
     SummonMsg message{MsgSummon, localId, note};
     message.note.epoch = worldEpoch;
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcast(&message, sizeof(message), ChannelReliable, true);
 }
 
 void SendTalk(bool begin, uint8_t const guid[16])
@@ -1312,7 +1289,7 @@ void SendTalk(bool begin, uint8_t const guid[16])
     if (!host || isHost || !server || !connected) return;
     TalkMsg message{MsgTalk, static_cast<uint8_t>(begin ? 1 : 0), {}};
     std::memcpy(message.guid, guid, 16);
-    Send(server, &message, sizeof(message), ChannelReliable, true);
+    SendToServer(&message, sizeof(message), ChannelReliable, true);
 }
 
 void SendStates(uint8_t kind, StateEntry const* entries, int count)
@@ -1323,12 +1300,7 @@ void SendStates(uint8_t kind, StateEntry const* entries, int count)
     std::memcpy(buffer, &header, sizeof(header));
     if (count) std::memcpy(buffer + sizeof(header), entries, count * sizeof(StateEntry));
     const size_t size = sizeof(header) + count * sizeof(StateEntry);
-    if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i)
-            if (peers[i]) Send(peers[i], buffer, size, ChannelReliable, true);
-    } else if (server && connected) {
-        Send(server, buffer, size, ChannelReliable, true);
-    }
+    SendBroadcast(buffer, size, ChannelReliable, true);
 }
 
 void SendMotionName(uint32_t hash, char const* name)
@@ -1336,8 +1308,7 @@ void SendMotionName(uint32_t hash, char const* name)
     if (!host || !isHost) return;
     MotionNameMsg message{MsgMotionName, hash, {}};
     strncpy_s(message.name, name, _TRUNCATE);
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+    SendBroadcast(&message, sizeof(message), ChannelReliable, true);
 }
 bool Connected() { return isHost ? connected : connected && inWorld; }
 Remote const* Remotes() { return remotes; }

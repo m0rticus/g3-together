@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "combat.h"
+#include "guid.h"
 #include "infocmd.h"
 #include "log.h"
 #include "net.h"
@@ -105,31 +106,11 @@ int IndexOf(char const* name)
     return -1;
 }
 
-void Guid(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
-bool ParseGuidText(char const* text, _GUID& out)
-{
-    unsigned d1 = 0, d2 = 0, d3 = 0, b[8] = {};
-    if (std::sscanf(text, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
-        return false;
-    out.Data1 = d1;
-    out.Data2 = static_cast<unsigned short>(d2);
-    out.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) out.Data4[i] = static_cast<unsigned char>(b[i]);
-    return true;
-}
-
 Entity ByGuid(uint8_t const guid[16])
 {
     static const uint8_t none[16] = {};
     if (!std::memcmp(guid, none, 16)) return Entity();
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    return Entity(bCPropertyID(bCGuid(raw)));
+    return guid::Resolve(guid);
 }
 
 // One wrapper per script: the index picks the original, the name to send and what it acts on.
@@ -144,21 +125,21 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
     if (own && (Specs[I].kind == OnNpc || Specs[I].kind == OnPlayer) &&
         target && npcs::IsMirrored(target) && npcs::OwnerOf(target)) {
         uint8_t guid[16];
-        Guid(target, guid);
+        guid::CopyEntity(target, guid);
         net::SendNpcSpell(npcs::OwnerOf(target), Specs[I].name, guid, args);
         ++npcSent;
         Logf("spells: %s on %s, simulated by player %u: sent", Specs[I].name, Entity(target).GetName().GetText(), npcs::OwnerOf(target));
         return 1;
     }
     if (own && Specs[I].kind == TakeOver && target && npcs::IsMirrored(target)) {
-        uint8_t guid[16]; Guid(target, guid);
+        uint8_t guid[16]; guid::CopyEntity(target, guid);
         net::SendNpcSpell(1, Specs[I].name, guid, args);
         ++npcSent;
         return GETrue;
     }
     if (own && (Specs[I].kind == AroundCaster || Specs[I].kind == AroundCasterAt) && !net::IsHost()) {
         uint8_t guid[16] = {};
-        if (Specs[I].kind == AroundCasterAt && target) Guid(target, guid);
+        if (Specs[I].kind == AroundCasterAt && target) guid::CopyEntity(target, guid);
         net::SendNpcSpell(1, Specs[I].name, guid, args);
         ++npcSent;
         Logf("spells: %s around us: sent to the host", Specs[I].name);
@@ -178,27 +159,6 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
 const gFScript wrappers[] = {&Wrap<0>, &Wrap<1>, &Wrap<2>, &Wrap<3>, &Wrap<4>, &Wrap<5>, &Wrap<6>, &Wrap<7>, &Wrap<8>, &Wrap<9>, &Wrap<10>, &Wrap<11>};
 // One wrapper per spec: a missing one put a null function into the script table (a client crashed casting bloodlust, 24.10.).
 static_assert(sizeof(wrappers) / sizeof(wrappers[0]) == Count, "one Wrap<I> per entry of Specs");
-
-// Jump from `target` to `detour`; the returned trampoline runs the 6 stolen bytes and continues in the original.
-void* JumpTo(unsigned char* target, void* detour)
-{
-    constexpr size_t Stolen = 6;
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, Stolen);
-    trampoline[Stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + Stolen) - reinterpret_cast<intptr_t>(trampoline + Stolen + 5));
-    std::memcpy(trampoline + Stolen + 1, &back, 4);
-    DWORD old = 0;
-    if (!VirtualProtect(target, Stolen, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
-    target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
-    std::memcpy(target + 1, &to, 4);
-    target[5] = 0x90;
-    VirtualProtect(target, Stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, Stolen);
-    return trampoline;
-}
 
 gFScript HookCast(gSScript& script, gFScript wrapper, char const* name)
 {
@@ -243,7 +203,7 @@ void InstallTick()
     auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleA("Script_Game.dll"));
     static const unsigned char expected[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x1c, 0x04, 0x00, 0x00, 0x53, 0x56, 0x8b, 0x35};
     if (base && std::memcmp(base + OnTickRva, expected, sizeof(expected)) == 0)
-        originalTick = reinterpret_cast<gFScript>(JumpTo(base + OnTickRva, reinterpret_cast<void*>(&HookTick)));
+        originalTick = reinterpret_cast<gFScript>(ai::JumpTo(base + OnTickRva, reinterpret_cast<void*>(&HookTick)));
     Log(originalTick ? "spells: OnTick hooked (mirrors and puppets do not tick poison)" : "spells: OnTick not hooked (prologue differs)");
     InstallGiveXp(base);
 }
@@ -273,7 +233,7 @@ void InstallGiveXp(unsigned char* base)
 {
     static const unsigned char expected[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x7c, 0x03, 0x00, 0x00};
     if (base && std::memcmp(base + GiveXpRva, expected, sizeof(expected)) == 0)
-        originalGiveXp = reinterpret_cast<gFScript>(JumpTo(base + GiveXpRva, reinterpret_cast<void*>(&HookGiveXp)));
+        originalGiveXp = reinterpret_cast<gFScript>(ai::JumpTo(base + GiveXpRva, reinterpret_cast<void*>(&HookGiveXp)));
     Log(originalGiveXp ? "spells: GiveXP hooked (rewards logged)" : "spells: GiveXP not hooked (prologue differs)");
 }
 
@@ -431,7 +391,7 @@ void StatusOf(char const* guid, LogFn log)
     char line[420];
     _GUID raw;
     uint8_t bytes[16];
-    if (!ParseGuidText(guid, raw)) { log("STATUSOF refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("STATUSOF refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("STATUSOF refused no such NPC"); return; }
@@ -455,7 +415,7 @@ void NpcHp(char const* argument, LogFn log)
     char const* sep = std::strrchr(argument, '_');
     if (!sep || sep - argument >= static_cast<ptrdiff_t>(sizeof(guid)) || (hp = std::atoi(sep + 1)) < 1) { log("NPCHP refused GUID_HP"); return; }
     std::memcpy(guid, argument, sep - argument);
-    if (!ParseGuidText(guid, raw)) { log("NPCHP refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("NPCHP refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) || npc.IsDead()) { log("NPCHP refused no living NPC"); return; }
@@ -499,7 +459,7 @@ void NpcMemory(char const* guid, LogFn log)
     char line[220];
     _GUID raw;
     uint8_t bytes[16];
-    if (!ParseGuidText(guid, raw)) { log("NPCMEMORY refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("NPCMEMORY refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("NPCMEMORY refused no such NPC"); return; }
@@ -516,7 +476,7 @@ void NpcGrudge(char const* guid, LogFn log)
 {
     _GUID raw;
     uint8_t bytes[16];
-    if (!ParseGuidText(guid, raw)) { log("NPCGRUDGE refused bad GUID"); return; }
+    if (!guid::Parse(guid, raw)) { log("NPCGRUDGE refused bad GUID"); return; }
     std::memcpy(bytes, &raw, 16);
     Entity npc = ByGuid(bytes);
     if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("NPCGRUDGE refused no such NPC"); return; }

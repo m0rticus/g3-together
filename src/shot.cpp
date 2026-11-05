@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "shot.h"
 
+#include "ai.h"
 #include "body.h"
 #include "combat.h"
 #include "log.h"
@@ -157,27 +158,6 @@ unsigned char* NativeShoot(gFScript registered)
     return code && std::memcmp(code, expected, sizeof(expected)) == 0 ? code : nullptr;
 }
 
-// Jump from `target` to `detour`; the returned trampoline runs the 6 stolen bytes and continues in the original.
-void* JumpTo(unsigned char* target, void* detour)
-{
-    constexpr size_t Stolen = 6;
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, Stolen);
-    trampoline[Stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + Stolen) - reinterpret_cast<intptr_t>(trampoline + Stolen + 5));
-    std::memcpy(trampoline + Stolen + 1, &back, 4);
-    DWORD old = 0;
-    if (!VirtualProtect(target, Stolen, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
-    target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
-    std::memcpy(target + 1, &to, 4);
-    target[5] = 0x90;
-    VirtualProtect(target, Stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, Stolen);
-    return trampoline;
-}
-
 GEInt GE_STDCALL HookShoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     eCEntity* shooter = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
@@ -249,7 +229,7 @@ void Install()
         Log("shot: Shoot does not start as expected, shots are not mirrored");
         return;
     }
-    originalShoot = reinterpret_cast<gFScript>(JumpTo(code, reinterpret_cast<void*>(&HookShoot)));
+    originalShoot = reinterpret_cast<gFScript>(ai::JumpTo(code, reinterpret_cast<void*>(&HookShoot)));
     installed = true;
     Log(originalShoot ? "shot: Shoot hooked" : "shot: could not hook Shoot");
 }
@@ -495,7 +475,7 @@ void InstallTouch()
                                 GetProcAddress(game, "?OnTouch@gCProjectile_PS@@MAEXPAVeCEntity@@AAVeCContactIterator@@@Z"))
                           : nullptr;
         if (code && std::memcmp(code, expected, sizeof(expected)) == 0)
-            originalTouch = reinterpret_cast<TouchFn>(JumpTo(code, reinterpret_cast<void*>(&HookTouch)));
+            originalTouch = reinterpret_cast<TouchFn>(ai::JumpTo(code, reinterpret_cast<void*>(&HookTouch)));
         contactsReady = originalTouch != nullptr;
         Log(originalTouch ? "shot: projectile contacts hooked" : "shot: projectile contacts NOT hooked");
     }

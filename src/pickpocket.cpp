@@ -2,6 +2,7 @@
 #include "pickpocket.h"
 
 #include "ai.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -40,29 +41,10 @@ bool HasDialog(eCEntity* entity) { return entity && entity->GetPropertySet(eEPro
 
 bool Picked(eCEntity* entity) { return HasDialog(entity) && Entity(entity).Dialog.PickedPocket; }
 
-void GuidOf(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
-bool ParseGuid(char const* text, _GUID& out)
-{
-    unsigned d1, d2, d3, b[8];
-    if (sscanf_s(text, "%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6],
-                 &b[7]) != 11)
-        return false;
-    out.Data1 = d1;
-    out.Data2 = static_cast<unsigned short>(d2);
-    out.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) out.Data4[i] = static_cast<unsigned char>(b[i]);
-    return true;
-}
-
 Entity ByGuid(char const* text)
 {
     _GUID raw;
-    return ParseGuid(text, raw) ? Entity(bCPropertyID(bCGuid(raw))) : Entity();
+    return guid::Parse(text, raw) ? guid::Resolve(raw) : Entity();
 }
 
 int ItemCount(Entity& who)
@@ -83,7 +65,7 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (!enabled || !net::Connected()) return result;
     net::WorldState s{};
     s.kind = KindPicked;
-    GuidOf(victim, s.guid);
+    guid::CopyEntity(victim, s.guid);
     s.guard = net::LocalId();
     net::SendWorldState(s, 0);
     ++sent;
@@ -112,7 +94,7 @@ void OnState(uint8_t from, net::WorldState const& s)
 {
     _GUID raw;
     std::memcpy(&raw, s.guid, 16);
-    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    Entity npc = guid::Resolve(raw);
     eCEntity* instance = npc.GetInstance();
     if (!HasDialog(instance)) return;
     if (npc.Dialog.PickedPocket) { ++already; return; }  // the game never takes the mark back
@@ -151,13 +133,11 @@ void Candidates(LogFn log)
         const float dx = p.GetX() - h.GetX(), dy = p.GetY() - h.GetY(), dz = p.GetZ() - h.GetZ();
         const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
         if (dist > 3000.0f) continue;
-        const eCEntityProxy proxy(instance);
-        bCPropertyID::bSCore core;
-        std::memcpy(&core, &proxy.GetEntityID().GetCore(), 16);
-        Format(line, "PICKCAND guid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X name=%s level=%u picked=%d dist=%.0f mirrored=%d down=%d",
-                  core.Data1, core.Data2, core.Data3, core.Data4[0], core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4],
-                  core.Data4[5], core.Data4[6], core.Data4[7], npc.GetName().GetText(), static_cast<unsigned>(npc.NPC.LevelMax),
-                  npc.Dialog.PickedPocket ? 1 : 0, dist, npcs::IsMirrored(instance) ? 1 : 0, npc.IsDown() ? 1 : 0);
+        char guid[48];
+        guid::FormatEntity(instance, guid, sizeof(guid));
+        Format(line, "PICKCAND guid=%s name=%s level=%u picked=%d dist=%.0f mirrored=%d down=%d",
+                  guid, npc.GetName().GetText(), static_cast<unsigned>(npc.NPC.LevelMax), npc.Dialog.PickedPocket ? 1 : 0,
+                  dist, npcs::IsMirrored(instance) ? 1 : 0, npc.IsDown() ? 1 : 0);
         log(line);
         ++count;
     }

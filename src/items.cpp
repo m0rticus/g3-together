@@ -2,6 +2,7 @@
 #include "items.h"
 
 #include "body.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 
@@ -15,28 +16,6 @@
 
 namespace g3t::items {
 namespace {
-bool ParseGuid(char const* text, _GUID& out)
-{
-    unsigned d1, d2, d3, b[8];
-    if (sscanf_s(text, "%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6],
-                 &b[7]) != 11)
-        return false;
-    out.Data1 = d1;
-    out.Data2 = static_cast<unsigned short>(d2);
-    out.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) out.Data4[i] = static_cast<unsigned char>(b[i]);
-    return true;
-}
-
-void FormatGuid(eCEntity* entity, char* out, size_t size)
-{
-    const eCEntityProxy proxy(entity);
-    bCPropertyID::bSCore core;
-    std::memcpy(&core, &proxy.GetEntityID().GetCore(), 16);
-    Format(out, size, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", core.Data1, core.Data2, core.Data3, core.Data4[0],
-              core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4], core.Data4[5], core.Data4[6], core.Data4[7]);
-}
-
 float DistanceToHero(eCEntity* entity)
 {
     eCEntity* hero = gCSession::GetInstance().GetHero();
@@ -68,7 +47,7 @@ void List(LogFn log)
         if (!entity.GetInstance() || !entity.IsItem() || entity.GetOwner().GetInstance()) continue;
         const float distance = DistanceToHero(entity.GetInstance());
         if (distance > 3000.0f) continue;
-        FormatGuid(entity.GetInstance(), guid, sizeof(guid));
+        guid::FormatEntity(entity.GetInstance(), guid, sizeof(guid));
         Format(line, "ITEM guid=%s name=%s distance_cm=%.0f", guid, entity.GetName().GetText(), distance);
         log(line);
         ++items;
@@ -82,33 +61,33 @@ void Take(char const* guid, LogFn log)
 {
     _GUID raw;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || !ParseGuid(guid, raw)) { log("REFUSED itemtake: no hero or bad GUID"); return; }
-    Entity item = Entity(bCPropertyID(bCGuid(raw)));
+    if (!hero || !guid::Parse(guid, raw)) { log("REFUSED itemtake: no hero or bad GUID"); return; }
+    Entity item = guid::Resolve(raw);
     if (!item.GetInstance()) { log("REFUSED itemtake: no such entity"); return; }
     const GEInt stack = Entity(hero).Inventory.InsertStack(item);
     char line[120];
     Format(line, "ITEMTAKE guid=%s stack=%d", guid, stack);
     log(line);
-    Entity again = Entity(bCPropertyID(bCGuid(raw)));
+    Entity again = guid::Resolve(raw);
     Line("ITEMAFTER", guid, again, log);
 }
 
 void Decay(char const* guid, LogFn log)
 {
     _GUID raw;
-    if (!ParseGuid(guid, raw)) { log("REFUSED itemdecay: bad GUID"); return; }
-    Entity item = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw)) { log("REFUSED itemdecay: bad GUID"); return; }
+    Entity item = guid::Resolve(raw);
     if (!item.GetInstance()) { log("REFUSED itemdecay: no such entity"); return; }
     item.Decay();
-    Entity again = Entity(bCPropertyID(bCGuid(raw)));
+    Entity again = guid::Resolve(raw);
     Line("ITEMDECAY", guid, again, log);
 }
 
 void Describe(char const* guid, LogFn log)
 {
     _GUID raw;
-    if (!ParseGuid(guid, raw)) { log("REFUSED iteminfo: bad GUID"); return; }
-    Entity item = Entity(bCPropertyID(bCGuid(raw)));
+    if (!guid::Parse(guid, raw)) { log("REFUSED iteminfo: bad GUID"); return; }
+    Entity item = guid::Resolve(raw);
     Line("ITEMINFO", guid, item, log);
 }
 }
@@ -156,7 +135,7 @@ void AfterTake(gCScriptProcessingUnit*)
     if (!taking) return;
     _GUID raw;
     std::memcpy(&raw, takingGuid, 16);
-    if (Entity(bCPropertyID(bCGuid(raw))).GetInstance()) return;  // not taken yet (the animation runs over frames)
+    if (guid::Resolve(raw).GetInstance()) return;  // not taken yet (the animation runs over frames)
     taking = false;
     ++tookCount;
     // What actually arrived can differ from the world item (a gold stack turns into coins): compare.
@@ -169,10 +148,7 @@ void AfterTake(gCScriptProcessingUnit*)
         break;
     }
     char guid[48];
-    bCPropertyID::bSCore core;
-    std::memcpy(&core, takingGuid, 16);
-    Format(guid, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", core.Data1, core.Data2, core.Data3, core.Data4[0],
-              core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4], core.Data4[5], core.Data4[6], core.Data4[7]);
+    guid::Format(takingGuid, guid, sizeof(guid));
     Format(lastTook, "guid=%s name=%s amount=%u", guid, takingName, takingAmount);
     Logf("items: hero took %s (personal world pickup; other players' copies unchanged)", lastTook);
 }
@@ -200,8 +176,8 @@ void Pick(char const* guid, LogFn log)
 {
     _GUID raw;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || !ParseGuid(guid, raw)) { log("REFUSED itempick: no hero or bad GUID"); return; }
-    Entity item = Entity(bCPropertyID(bCGuid(raw)));
+    if (!hero || !guid::Parse(guid, raw)) { log("REFUSED itempick: no hero or bad GUID"); return; }
+    Entity item = guid::Resolve(raw);
     if (!item.GetInstance()) { log("REFUSED itempick: no such entity"); return; }
     Entity self(hero);
     self.NPC.SetCurrentTarget(item);
@@ -258,7 +234,7 @@ void Containers(LogFn log)
         const bool npc = instance->GetPropertySet(eEPropertySetType_NPC) != nullptr;
         if (npc && !entity.IsDead()) continue;
         if (DistanceToHero(instance) > 4000.0f) continue;
-        FormatGuid(instance, guid, sizeof(guid));
+        guid::FormatEntity(instance, guid, sizeof(guid));
         line = std::string("CONTAINER guid=") + guid + " name=" + entity.GetName().GetText() + (npc ? " kind=corpse" : " kind=other") +
                " items=";
         std::map<std::string, int> contents;

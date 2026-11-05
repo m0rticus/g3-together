@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "dialogaudio.h"
 
+#include "ai.h"
 #include "config.h"
 #include "log.h"
 #include "net.h"
@@ -275,21 +276,12 @@ void Hook()
         Log("dialogaudio: StartOutput not as expected; dialog lines are not shared");
         return;
     }
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) { hookFailed = true; return; }
-    std::memcpy(trampoline, target, stolen);
-    trampoline[stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>((target + stolen) - (trampoline + stolen + 5));
-    std::memcpy(trampoline + stolen + 1, &back, 4);
-    DWORD old = 0;
-    if (!VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old)) { hookFailed = true; return; }
-    target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<unsigned char*>(&StartOutput) - (target + 5));
-    std::memcpy(target + 1, &to, 4);
-    target[5] = 0x90;
-    VirtualProtect(target, stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, stolen);
-    original = reinterpret_cast<StartOutputFn>(trampoline);
+    original = reinterpret_cast<StartOutputFn>(
+        ai::JumpTo(target, reinterpret_cast<void*>(&StartOutput), stolen));
+    if (!original) {
+        hookFailed = true;
+        return;
+    }
     hooked = true;
     Log("dialogaudio: StartOutput hooked");
 }

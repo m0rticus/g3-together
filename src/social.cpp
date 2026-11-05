@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "social.h"
+#include "guid.h"
 #include "log.h"
 
 #include "body.h"
@@ -24,15 +25,6 @@ float DistanceToHero(eCEntity* entity)
     const bCVector& b = hero->GetWorldPosition();
     const float p[3] = {a.GetX(), a.GetY(), a.GetZ()}, q[3] = {b.GetX(), b.GetY(), b.GetZ()};
     return body::Distance(p, q);
-}
-
-void FormatGuid(eCEntity* entity, char* out, size_t size)
-{
-    const eCEntityProxy proxy(entity);
-    bCPropertyID::bSCore core;
-    std::memcpy(&core, &proxy.GetEntityID().GetCore(), 16);
-    Format(out, size, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", core.Data1, core.Data2, core.Data3, core.Data4[0],
-              core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4], core.Data4[5], core.Data4[6], core.Data4[7]);
 }
 
 // Who an NPC's target is, as the tests need it: this machine's hero, the puppet of player N, or the entity's name.
@@ -85,7 +77,7 @@ void Owned(char const* radius, LogFn log)
         if (!zone.GetInstance()) continue;
         Entity zoneOwner = zone.GetAIZoneOwner();
         const int security = static_cast<int>(zone.GetAIZoneSecurityLevel());
-        FormatGuid(entity.GetInstance(), guid, sizeof(guid));
+        guid::FormatEntity(entity.GetInstance(), guid, sizeof(guid));
         const bCVector& at = entity.GetInstance()->GetWorldPosition();
         Format(line, "OWNED guid=%s name=%s distance_cm=%.0f pos=%.0f_%.0f_%.0f zone=%s zone_owner=%s security=%d", guid,
                   entity.GetName().GetText(), distance, at.GetX(), at.GetY(), at.GetZ(), zone.GetName().GetText(),
@@ -134,7 +126,7 @@ void Bothered(char const* radius, LogFn log)
         }
         if (who.empty()) continue;
         Entity zoneOwner = zone.GetAIZoneOwner();
-        FormatGuid(entity.GetInstance(), guid, sizeof(guid));
+        guid::FormatEntity(entity.GetInstance(), guid, sizeof(guid));
         Format(line, "BOTHERED guid=%s name=%s distance_cm=%.0f pos=%.0f_%.0f_%.0f zone=%s zone_owner=%s security=%d kind=%s usetype=%d npcs=%s", guid,
                   entity.GetName().GetText(), distance, at.GetX(), at.GetY(), at.GetZ(), zone.GetName().GetText(),
                   zoneOwner.GetInstance() ? zoneOwner.GetName().GetText() : "-", static_cast<int>(zone.GetAIZoneSecurityLevel()),
@@ -163,7 +155,7 @@ void OwnedObjects(char const* radius, LogFn log)
         Entity zone = entity.GetIndoorOwnerZone(100.0f);
         if (!zone.GetInstance()) continue;
         Entity zoneOwner = zone.GetAIZoneOwner();
-        FormatGuid(instance, guid, sizeof(guid));
+        guid::FormatEntity(instance, guid, sizeof(guid));
         const bCVector& at = instance->GetWorldPosition();
         Format(line, "OWNEDOBJ guid=%s name=%s distance_cm=%.0f pos=%.0f_%.0f_%.0f usetype=%d usefunc=%s user=%s zone=%s zone_owner=%s security=%d", guid,
                   entity.GetName().GetText(), distance, at.GetX(), at.GetY(), at.GetZ(), static_cast<int>(entity.Interaction.UseType),
