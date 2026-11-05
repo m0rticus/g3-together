@@ -27,11 +27,16 @@ an Testordnern geprüft, noch nicht von Spielern; die Schritte unten machen dass
 ```ini
 role = client
 transport = steam
+session_id = pair-red
 language = auto
 ```
 
 Der Name kommt automatisch von Steam. Auf deinem Rechner muss unbedingt `role = client` stehen. Behalte deinen Steam-Anzeigenamen bei:
 Gefolgsleute findet der Host nach dem Laden eines Spielstands über diesen Namen wieder.
+
+`session_id` muss exakt zum Host passen (Groß-/Kleinschreibung zählt). Pro unabhängigem Paar eine andere ID:
+1-63 ASCII-Buchstaben, Ziffern, `_` oder `-`. Ohne Eintrag gilt `default`; ungültige Werte stoppen den Netzwerkstart.
+Einladungen, `steam_host` und `steam_lobby` umgehen den Abgleich nicht. Beide brauchen die neue Mod-Version.
 
 `language = auto` zeigt die Mod-Meldungen in der Textsprache deines Gothic 3 (Deutsch, Polnisch, sonst Englisch).
 Fest einstellen: `language = de`, `en` oder `pl`; ohne die Zeile sind sie englisch.

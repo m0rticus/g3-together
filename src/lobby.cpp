@@ -16,6 +16,7 @@ State Snapshot()
 {
     State state;
     state.host = GetConfig().host;
+    strcpy_s(state.sessionId, GetConfig().sessionId);
     state.id = steam::LobbyId();
     state.linkedPeers = static_cast<unsigned>(steam::LinkedCount());
     state.ping = steam::Ping();
@@ -86,5 +87,9 @@ void Format(State const& state, wchar_t* out, size_t size)
         _snwprintf_s(out, size, _TRUNCATE, i18n::Text(i18n::RefusedOther), reason);
         break;
     }
+    wchar_t session[64] = {};
+    MultiByteToWideChar(CP_UTF8, 0, state.sessionId, -1, session, 64);
+    const size_t used = std::wcslen(out);
+    if (used < size) _snwprintf_s(out + used, size - used, _TRUNCATE, i18n::Text(i18n::LobbySession), session);
 }
 }

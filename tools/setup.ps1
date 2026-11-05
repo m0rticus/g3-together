@@ -5,13 +5,14 @@
 # The INI gets language = auto: the mod's messages follow the game's text language, whichever language the setup spoke.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup.ps1 [-Language de|pl] [-GamePath <folder>] [-Role host|client]
-#              [-Yes]
+#              [-SessionId <id>] [-Yes]
 # Steam is required. The mod needs Valve's 32-bit steam_api.dll in <game>\G3Together: from the package's
 # G3Together folder if it has one, else downloaded from the Steamworks.NET release after asking, checked by its SHA-256.
 param(
     [ValidateSet('en', 'de', 'pl')][string]$Language = 'en',
     [string]$GamePath = '',
     [ValidateSet('', 'host', 'client')][string]$Role = '',
+    [string]$SessionId = '',
     [switch]$Yes
 )
 $ErrorActionPreference = 'Stop'
@@ -47,6 +48,8 @@ $texts = @{
         DllDone      = 'G3 Together copied to {0}.'
         DllBackup    = 'The previous version is kept in {0}.'
         AskRole      = 'Do you host the campaign (1) or join a host (2)?'
+        AskSessionId = 'Shared session ID (the lobby ID; 1-63 letters, digits, _ or -)'
+        SessionIdBad = 'Invalid session ID. Use 1-63 ASCII letters, digits, underscore or hyphen.'
         SteamDllOk   = 'steam_api.dll for the Steam connection: in place ({0}).'
         SteamDllDone = 'steam_api.dll copied to {0}.'
         SteamDllAsk  = 'The Steam connection needs Valve''s steam_api.dll (32-bit, from the Steamworks.NET release 2025.164.1 on GitHub, checked by its SHA-256). Download it now?'
@@ -87,6 +90,8 @@ $texts = @{
         DllDone      = 'G3 Together kopiert nach {0}.'
         DllBackup    = 'Die vorige Version liegt in {0}.'
         AskRole      = 'Bist du Host der Kampagne (1) oder trittst du einem Host bei (2)?'
+        AskSessionId = 'Gemeinsame Sitzungs-ID (Lobby-ID; 1-63 Buchstaben, Ziffern, _ oder -)'
+        SessionIdBad = 'Ungültige Sitzungs-ID. Verwende 1-63 ASCII-Buchstaben, Ziffern, Unterstrich oder Bindestrich.'
         SteamDllOk   = 'steam_api.dll für die Steam-Verbindung: vorhanden ({0}).'
         SteamDllDone = 'steam_api.dll kopiert nach {0}.'
         SteamDllAsk  = 'Die Steam-Verbindung braucht Valves steam_api.dll (32 Bit, aus dem Steamworks.NET-Release 2025.164.1 auf GitHub, geprüft per SHA-256). Jetzt herunterladen?'
@@ -127,6 +132,8 @@ $texts = @{
         DllDone      = 'Skopiowano G3 Together do {0}.'
         DllBackup    = 'Poprzednia wersja jest w {0}.'
         AskRole      = 'Prowadzisz kampanię jako host (1) czy dołączasz do hosta (2)?'
+        AskSessionId = 'Wspólne ID sesji (ID lobby; 1-63 litery, cyfry, _ lub -)'
+        SessionIdBad = 'Nieprawidłowe ID sesji. Użyj 1-63 znaków: liter ASCII, cyfr, podkreślenia lub łącznika.'
         SteamDllOk   = 'steam_api.dll do połączenia przez Steam: jest ({0}).'
         SteamDllDone = 'Skopiowano steam_api.dll do {0}.'
         SteamDllAsk  = 'Połączenie przez Steam wymaga pliku steam_api.dll od Valve (32-bitowy, z wydania Steamworks.NET 2025.164.1 na GitHubie, sprawdzany sumą SHA-256). Pobrać go teraz?'
@@ -160,6 +167,10 @@ function AskYes([string]$question, [bool]$default) {
     $answer = Read-Host "$question $($t.YesNo)"
     if ([string]::IsNullOrWhiteSpace($answer)) { return $default }
     return $answer.Trim().ToLower().StartsWith($t.Yes) -or $answer.Trim().ToLower().StartsWith('y')
+}
+
+function ValidSessionId([string]$value) {
+    return $value -cmatch '^[A-Za-z0-9_-]{1,63}\z'
 }
 
 # "1, 75, 20108, 14" -> "1.75.20108.14"
@@ -279,6 +290,19 @@ $game = (Resolve-Path -LiteralPath $game).Path.TrimEnd('\')
 Say ($t.Using -f $game) 'Green'
 Say $t.CopyHint
 
+# Session IDs isolate Steam lobby groups. Preserve a valid existing ID and never accept a changed value with invalid characters.
+$iniPath = Join-Path $game 'g3together.ini'
+$old = ReadIni $iniPath
+$oldSessionId = if (ValidSessionId $old['session_id']) { $old['session_id'] } else { 'default' }
+if ([string]::IsNullOrWhiteSpace($SessionId)) {
+    $SessionId = if ($Yes) { $oldSessionId } else { Ask $t.AskSessionId $oldSessionId }
+}
+while (-not (ValidSessionId $SessionId)) {
+    if ($Yes) { Say $t.SessionIdBad 'Red'; exit 1 }
+    Say $t.SessionIdBad 'Red'
+    $SessionId = Ask $t.AskSessionId $oldSessionId
+}
+
 # 2. The tested baseline: Community Patch 1.75.14 and Parallel Universe Patch 1.1.1; no other co-op mod in scripts.
 $problems = 0
 $exeVersion = VersionOf (Join-Path $game 'Gothic3.exe')
@@ -321,8 +345,6 @@ if ((Test-Path -LiteralPath $target) -and ((Get-FileHash -LiteralPath $target).H
 }
 
 # 4. g3together.ini: Steam-only role, name and language; unrelated earlier settings are kept.
-$iniPath = Join-Path $game 'g3together.ini'
-$old = ReadIni $iniPath
 $oldRole = if ($old['role'] -eq 'client') { 'client' } elseif ($old['role']) { 'host' } else { '' }
 if (-not $Role) {
     $answer = Ask $t.AskRole $(if ($oldRole -eq 'client') { '2' } else { '1' })
@@ -334,10 +356,11 @@ if ($Role -eq 'host') { $lines.Add('# G3 Together: this player hosts the campaig
 else { $lines.Add('# G3 Together: this player joins the host (written by the setup).') }
 $lines.Add("role = $Role")
 $lines.Add('transport = steam')
+$lines.Add("session_id = $SessionId")
 $lines.Add('# Player names are taken from Steam automatically.')
 $lines.Add('# Mod messages only: auto (the language of your Gothic 3 texts), en, de or pl. Each player can choose independently.')
 $lines.Add('language = auto')
-$known = @('role', 'transport', 'address', 'port', 'name', 'language', 'offer_accept_key', 'offer_decline_key', 'price_up_key', 'price_down_key', 'qa_keycheck')
+$known = @('role', 'transport', 'session_id', 'address', 'port', 'name', 'language', 'offer_accept_key', 'offer_decline_key', 'price_up_key', 'price_down_key', 'qa_keycheck')
 $kept = @($old.Keys | Where-Object { $known -notcontains $_ })
 if ($kept.Count -gt 0) {
     $lines.Add('# Kept from the previous g3together.ini:')

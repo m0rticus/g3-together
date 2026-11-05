@@ -474,8 +474,20 @@ EXPORT const char *__cdecl SteamAPI_ISteamMatchmaking_GetLobbyData(void *s, u64 
 {
     (void)s;
     if (remote_id && l == remote_id)
-        return strcmp(k, "g3together") == 0 ? "1" : "";
+        return strcmp(k, "g3together") == 0 ? "2" : strcmp(k, "session_id") == 0 ? "default" : "";
     return file_value(l, k);
+}
+
+EXPORT unsigned char __cdecl SteamAPI_ISteamMatchmaking_RequestLobbyData(void *s, u64 l)
+{
+    (void)s;
+    char p[MAX_PATH], result[24] = {0};
+    lobby_path(p, l);
+    memcpy(result, &l, 8);
+    memcpy(result + 8, &l, 8);
+    result[16] = (remote_id && l == remote_id) || GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+    cb_push(505, result, sizeof result);
+    return 1;
 }
 
 EXPORT u64 __cdecl SteamAPI_ISteamMatchmaking_GetLobbyOwner(void *s, u64 l) { (void)s; return l; }
@@ -591,6 +603,14 @@ EXPORT int __cdecl SteamAPI_ISteamNetworkingMessages_SendMessageToUser(void *s, 
     buf[0] = (char)channel;
     memcpy(buf + 1, &me, 8);
     memcpy(buf + 9, data, len);
+    /* Negative controls: metadata still matches, but the relay envelope belongs to another session/lobby. */
+    char tamper[8];
+    if (len > 72 && (GetEnvironmentVariableA("G3T_FAKESTEAM_TAMPER_SESSION", tamper, sizeof tamper) ||
+                    (channel == 0 && GetEnvironmentVariableA("G3T_FAKESTEAM_TAMPER_DATA_SESSION", tamper, sizeof tamper))))
+        buf[9 + 8] ^= 1;
+    if (len > 72 && (GetEnvironmentVariableA("G3T_FAKESTEAM_TAMPER_LOBBY", tamper, sizeof tamper) ||
+                    (channel == 0 && GetEnvironmentVariableA("G3T_FAKESTEAM_TAMPER_DATA_LOBBY", tamper, sizeof tamper))))
+        buf[9] ^= 1;
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons((u_short)port_of(to));

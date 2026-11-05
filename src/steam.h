@@ -3,6 +3,7 @@
 // datagrams travel between the players over Steam (ISteamNetworkingMessages, relayed by Valve where no direct path
 // exists). Uses Gothic 3's AppID 39500; both players must own the Steam game. Kept free of SDK and winsock headers,
 // like net.h.
+// session_id filters lobby metadata before joining; every relay message also carries that ID and the Steam lobby number.
 #pragma once
 
 #include <cstdint>

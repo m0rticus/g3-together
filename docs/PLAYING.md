@@ -82,8 +82,22 @@ goes through Steam, relayed by Valve where needed.
   downloaded from the Steamworks.NET release 2025.164.1 after asking, checked by its SHA-256).
 - The mod initializes as Gothic 3 (AppID 39500), so Steam activity uses Gothic 3 instead of Spacewar.
   Local real-Steam initialization and lobby creation were checked; two-account gameplay remains a separate check.
-- With several friends hosting at once, the joining player sets `steam_host = <the host's Steam name>`. The host's
-  `g3together.log` also names its lobby number; `steam_lobby = <number>` joins exactly that one.
+- Set the same `session_id` in both players' `g3together.ini`, or choose it in setup. It is a case-sensitive label
+  of 1-63 ASCII letters, digits, underscores or hyphens, shown in the menu and log. Missing settings use `default`;
+  empty or invalid values stop networking. Different IDs are rejected before joining a Steam lobby, and every
+  relay message also checks the ID and native Steam lobby number before forwarding any gameplay/save data.
+- For three independent pairs, set `session_id = pair-red`, `pair-green` or `pair-blue` on each pair's host and client.
+  These IDs do not change the existing per-lobby player limit or impose a two-player cap. Use one host per ID;
+  if multiple hosts deliberately share an ID, automatic search still selects the first matching friend.
+- `steam_host = <the host's Steam name>` additionally restricts friend search. The host's `g3together.log` names
+  its Steam lobby number; `steam_lobby = <number>` restricts joining to that lobby. These selectors, command-line
+  `+connect_lobby`, and Steam invites **never override session_id**.
+- Session IDs are visible grouping labels, not passwords or access controls. Steam friendship/lobby membership
+  still applies. The session-scoped relay format is incompatible with older builds, even in the default group;
+  update every player. The gameplay protocol itself is unchanged.
+- Each concurrently running real-Steam instance needs a distinct Steam identity. Running six processes under
+  one Steam account is not supported by this identity-addressed transport. Multiple copies on one PC also need
+  isolated installations, profiles and saves; a Session ID isolates network traffic, not filesystem writes.
 - Without Steam or the required `steam_api.dll`, co-op startup fails with a message in the menu and game.
   There is no fallback. ENet's UDP sockets bind only to localhost and accept linked Steam relays, not direct-IP players.
 - The Steam overlay's invite may not open in Gothic 3. It is not needed: the joining player's game finds the host by

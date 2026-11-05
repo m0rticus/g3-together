@@ -78,6 +78,13 @@ Verkehr läuft über Steam, wo nötig über Valves Relay.
 - Die Mod braucht Valves 32-Bit-`steam_api.dll` in `<Gothic 3>\G3Together\`. Das Setup legt sie dort ab (aus dem Paket oder
   nach Rückfrage aus dem Steamworks.NET-Release 2025.164.1 heruntergeladen, per SHA-256 geprüft).
 - Die Mod verwendet Gothic 3 (AppID 39500); Steam zeigt Gothic 3 statt Spacewar.
+- Beide Spieler wählen im Setup dieselbe `session_id` (auch in `g3together.ini` einstellbar). Für drei getrennte
+  Paare: `pair-red`, `pair-green`, `pair-blue`, jeweils einmal beim Host und beim Mitspieler. Die ID besteht aus
+  1-63 ASCII-Buchstaben, Ziffern, `_` oder `-`; Groß-/Kleinschreibung zählt. Ohne Eintrag gilt `default`.
+  Hauptmenü und Log zeigen die ID. Einladungen und Lobby-Nummern umgehen den Abgleich nicht.
+  Ungültige IDs verhindern den Netzwerkstart. IDs sind öffentliche Gruppenbezeichnungen, keine Passwörter.
+  Alle Spieler brauchen diese neue Version; ältere Steam-Relays sind inkompatibel. Jede gleichzeitig laufende
+  Instanz braucht eine eigene Steam-Identität sowie getrennte Spiel-, Profil- und Speicherordner.
 - Hosten mehrere Freunde gleichzeitig, trägt der Mitspieler `steam_host = <Steam-Name des Hosts>` ein. Die
   `g3together.log` des Hosts nennt auch die Lobby-Nummer; `steam_lobby = <Nummer>` tritt genau dieser bei.
 - Ohne Steam oder die erforderliche `steam_api.dll` startet Koop nicht; Hauptmenü und Spiel zeigen den Fehler.

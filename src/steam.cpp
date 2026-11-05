@@ -92,6 +92,7 @@ struct Api
     void(__cdecl* LeaveLobby)(void*, u64 lobby);
     sbool(__cdecl* SetLobbyData)(void*, u64 lobby, char const* key, char const* value);
     char const*(__cdecl* GetLobbyData)(void*, u64 lobby, char const* key);
+    sbool(__cdecl* RequestLobbyData)(void*, u64 lobby);
     u64(__cdecl* GetLobbyOwner)(void*, u64 lobby);
     int(__cdecl* MemberCount)(void*, u64 lobby);
     u64(__cdecl* MemberByIndex)(void*, u64 lobby, int index);
@@ -134,6 +135,7 @@ Export const Exports[] = {
     {reinterpret_cast<void**>(&api.LeaveLobby), "SteamAPI_ISteamMatchmaking_LeaveLobby"},
     {reinterpret_cast<void**>(&api.SetLobbyData), "SteamAPI_ISteamMatchmaking_SetLobbyData"},
     {reinterpret_cast<void**>(&api.GetLobbyData), "SteamAPI_ISteamMatchmaking_GetLobbyData"},
+    {reinterpret_cast<void**>(&api.RequestLobbyData), "SteamAPI_ISteamMatchmaking_RequestLobbyData"},
     {reinterpret_cast<void**>(&api.GetLobbyOwner), "SteamAPI_ISteamMatchmaking_GetLobbyOwner"},
     {reinterpret_cast<void**>(&api.MemberCount), "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers"},
     {reinterpret_cast<void**>(&api.MemberByIndex), "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex"},
@@ -161,6 +163,7 @@ enum : int {
     CbLobbyJoinRequested = 333,  // GameLobbyJoinRequested_t { u64 lobby; u64 friend; }: an invite accepted in the game
     CbRichJoinRequested = 337,   // GameRichPresenceJoinRequested_t { u64 friend; char connect[256]; }: "Join game"
     CbLobbyEnter = 504,          // LobbyEnter_t { u64 lobby; u32 perms; bool locked; u32 response at 16; } 1 = success
+    CbLobbyDataUpdate = 505,     // LobbyDataUpdate_t { u64 lobby; u64 member; bool success; }
     CbLobbyChatUpdate = 506,     // LobbyChatUpdate_t { u64 lobby; u64 changed; u64 by; u32 state at 24; }
     CbLobbyCreated = 513,        // LobbyCreated_t { int result; u64 lobby at 8; }
     CbCallCompleted = 703,       // SteamAPICallCompleted_t { u64 call; int callback; u32 size; }
@@ -174,6 +177,9 @@ constexpr int LobbyFriendsOnly = 1;
 constexpr int FriendFlagImmediate = 4;
 constexpr uint32_t GothicAppId = 39500;
 char const LobbyTag[] = "g3together";
+char const LobbyVersion[] = "2";  // session-scoped relay framing; version 1 cannot isolate sessions
+struct RelayHeader { u64 lobby; char session[SessionIdSize]; };
+static_assert(sizeof(RelayHeader) == 72, "session relay wire header");
 // No silence timeout below ENet's own: a world load stops the game loop (and so Pump) for many seconds, and net.cpp gives
 // ENet peers up to 180 s for it. A friend who quits leaves the lobby, which ends the link at once.
 constexpr uint32_t SilenceMs = 180000;
@@ -185,6 +191,7 @@ struct Remote
 {
     u64 id = 0;
     bool linked = false;   // host: said hello while in the lobby; client: the host welcomed us
+    bool leaving = false;
     uint32_t heard = 0, lastPing = 0;
     int rtt = -1;
     SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
@@ -202,6 +209,7 @@ u64 me = 0;
 char persona[64] = "";
 char playerName[24] = "";
 unsigned sendFailures = 0;
+unsigned isolatedDrops = 0;
 uint32_t lastSendFailure = 0, lastDiagnostics = 0;
 
 bool isHost = false;
@@ -219,6 +227,9 @@ bool haveEnetAddress = false;
 u64 wantedLobby = 0;             // from steam_lobby in the INI or +connect_lobby on the command line
 bool wantedWaitLogged = false;
 u64 pendingLobby = 0;            // an invite or "Join game" accepted through Steam
+u64 candidateLobby = 0;          // metadata must match before calling JoinLobby, including invites and explicit numbers
+uint32_t candidateAt = 0;
+char candidateReason[64] = "";
 uint32_t joinedAt = 0, lastScan = 0, lastHello = 0;
 char hostName[64] = "";
 Skipped skipped[16] = {};
@@ -246,9 +257,18 @@ void Identity(char (&buffer)[160], u64 id)
 
 int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
 {
+    char packet[sizeof(RelayHeader) + 4096];
+    if (!lobby || size > 4096) {
+        Logf("steam: cannot send relay message (lobby=%llu bytes=%u)", lobby, size);
+        return 2;
+    }
+    RelayHeader header{lobby, {}};
+    strcpy_s(header.session, GetConfig().sessionId);
+    std::memcpy(packet, &header, sizeof(header));
+    std::memcpy(packet + sizeof(header), data, size);
     char identity[160];
     Identity(identity, to);
-    const int result = api.SendToUser(messages, identity, data, size, flags | SendNoNagle | SendAutoRestart, channel);
+    const int result = api.SendToUser(messages, identity, packet, size + sizeof(header), flags | SendNoNagle | SendAutoRestart, channel);
     if (result != ResultOk) {
         ++sendFailures;
         const uint32_t now = Now();
@@ -378,6 +398,25 @@ void Join(u64 id, char const* why)
     Logf("steam: joining lobby %llu (%s)", id, why);
 }
 
+void InspectLobby(u64 id, char const* why)
+{
+    candidateLobby = id;
+    candidateAt = Now();
+    strncpy_s(candidateReason, why, _TRUNCATE);
+    if (!api.RequestLobbyData(matchmaking, id)) {
+        Logf("steam: could not request lobby %llu metadata", id);
+        candidateLobby = 0;
+        Skip(id, 30000);
+        strcpy_s(error, "Steam could not read the lobby's session ID");
+    }
+}
+
+bool MatchesSession(u64 id)
+{
+    if (std::strcmp(Text(api.GetLobbyData(matchmaking, id, LobbyTag)), LobbyVersion)) return false;
+    return !std::strcmp(Text(api.GetLobbyData(matchmaking, id, "session_id")), GetConfig().sessionId);
+}
+
 void LeaveLobby()
 {
     if (!lobby) return;
@@ -418,8 +457,9 @@ void OnLobbyCreated(char const* p)
     owner = me;
     char connect[64];
     Format(connect, "+connect_lobby %llu", id);
-    if (!api.SetLobbyData(matchmaking, id, LobbyTag, "1")) {
-        strcpy_s(error, "Steam did not publish the co-op lobby tag");
+    if (!api.SetLobbyData(matchmaking, id, "session_id", GetConfig().sessionId) ||
+        !api.SetLobbyData(matchmaking, id, LobbyTag, LobbyVersion)) {
+        strcpy_s(error, "Steam did not publish the co-op session ID and lobby tag");
         Logf("steam: %s", error);
         LeaveLobby();
         return;
@@ -428,6 +468,7 @@ void OnLobbyCreated(char const* p)
     if (!api.SetRichPresence(friends, "status", "G3 Together")) Log("steam: could not publish rich-presence status");
     if (!api.SetRichPresence(friends, "connect", connect)) Log("steam: could not publish Join game rich presence");
     Logf("steam: lobby %llu open; friends join over Steam (friends list: Join game, or steam_lobby = %llu)", id, id);
+    Logf("steam: session_id=%s (case-sensitive; only matching sessions can connect)", GetConfig().sessionId);
 }
 
 void OnLobbyEnter(char const* p)
@@ -437,14 +478,12 @@ void OnLobbyEnter(char const* p)
     std::memcpy(&id, p, 8);
     std::memcpy(&response, p + 16, 4);
     if (isHost || id != lobby || owner) return;
-    char const* tag = api.GetLobbyData(matchmaking, id, LobbyTag);
-    if (response != 1 || !tag || std::strcmp(tag, "1")) {
-        Logf("steam: lobby %llu refused (response %u, %s)", id, response, tag && *tag ? "G3 Together" : "not a G3 Together lobby");
-        Format(error, response != 1 ? "the Steam lobby is full or closed" : "that Steam lobby is not a G3 Together game");
-        const bool ours = tag && !std::strcmp(tag, "1");
+    if (response != 1 || !MatchesSession(id)) {
+        Logf("steam: lobby %llu refused (response %u, incompatible session ID or transport)", id, response);
+        Format(error, response != 1 ? "the Steam lobby is full or closed" : "different session_id or incompatible G3 Together transport");
         api.LeaveLobby(matchmaking, id);
         lobby = 0;
-        Skip(id, ours ? 30000 : 0);
+        Skip(id, 30000);
         return;
     }
     error[0] = '\0';
@@ -472,11 +511,30 @@ void OnCallback(int callback, char const* p, int size)
     case CbLobbyEnter:
         OnLobbyEnter(p);
         break;
+    case CbLobbyDataUpdate:
+        if (size < 17 || isHost) break;
+        std::memcpy(&a, p, 8);
+        std::memcpy(&b, p + 8, 8);
+        if (a != candidateLobby || a != b) break;
+        candidateLobby = 0;
+        if (p[16] && MatchesSession(a)) {
+            error[0] = '\0';
+            Join(a, candidateReason);
+        } else {
+            Logf("steam: skipping lobby %llu: different session_id or incompatible transport (wanted %s)", a, GetConfig().sessionId);
+            Skip(a, 30000);
+            if (wantedLobby == a || !std::strcmp(candidateReason, "accepted through Steam"))
+                strcpy_s(error, "different session_id or incompatible G3 Together transport");
+            lastScan = Now() - ScanMs;
+        }
+        break;
     case CbLobbyChatUpdate:
         std::memcpy(&a, p, 8);
         std::memcpy(&b, p + 8, 8);
         std::memcpy(&state, p + 24, 4);
-        if (a == lobby && (state & 0x1e)) Drop(Find(b), "left the lobby");  // left, disconnected, kicked, banned
+        if (a == lobby && (state & 0x1e)) {
+            if (Remote* r = Find(b)) r->leaving = true;
+        }
         break;
     case CbLobbyJoinRequested:
         std::memcpy(&pendingLobby, p, 8);
@@ -595,6 +653,17 @@ void Receive(int channel)
             std::memcpy(&data, m, sizeof(data));  // SteamNetworkingMessage_t (32-bit): data at 0, size at 4
             std::memcpy(&size, m + 4, sizeof(size));
             const u64 from = Sender(m);
+            RelayHeader header{};
+            if (data && size > static_cast<int>(sizeof(header))) std::memcpy(&header, data, sizeof(header));
+            char session[SessionIdSize] = {};
+            strcpy_s(session, GetConfig().sessionId);
+            if (!lobby || header.lobby != lobby || std::memcmp(header.session, session, sizeof(session))) {
+                ++isolatedDrops;
+                api.MessageRelease(batch[i]);
+                continue;
+            }
+            data += sizeof(header);
+            size -= sizeof(header);
             // Host: a slot only for a member of its lobby (checked before Get reserves one), or one it has already.
             Remote* r = !from || (!isHost && from != owner) ? nullptr : isHost && !Find(from) && !(lobby && InLobby(from)) ? nullptr : Get(from);
             if (r && size > 0) {
@@ -655,10 +724,19 @@ void Search()
         }
         return;
     }
+    if (candidateLobby) {
+        if (Now() - candidateAt > JoinWaitMs) {
+            Logf("steam: lobby %llu did not answer the metadata request", candidateLobby);
+            Skip(candidateLobby, 30000);
+            candidateLobby = 0;
+            strcpy_s(error, "Steam did not answer the lobby session ID request");
+        }
+        return;
+    }
     if (pendingLobby) {
         const u64 id = pendingLobby;
         pendingLobby = 0;
-        Join(id, "accepted through Steam");
+        InspectLobby(id, "accepted through Steam");
         return;
     }
     if (Now() - lastScan < ScanMs) return;
@@ -666,7 +744,7 @@ void Search()
     // steam_lobby set: that lobby only. Refused or silent, it is tried again after its pause; the friends' games are not
     // searched instead (code review 28.10. P2: that could join another friend's host).
     if (wantedLobby) {
-        if (!IsSkipped(wantedLobby)) Join(wantedLobby, "steam_lobby");
+        if (!IsSkipped(wantedLobby)) InspectLobby(wantedLobby, "steam_lobby");
         else if (!wantedWaitLogged) {
             wantedWaitLogged = true;
             Logf("steam: steam_lobby %llu refused or did not answer; waiting for it (no other host)", wantedLobby);
@@ -683,7 +761,7 @@ void Search()
         if (IsSkipped(info.lobby)) continue;
         char const* name = Text(api.FriendPersonaName(friends, id));
         if (*wantedHost && _stricmp(name, wantedHost)) continue;
-        Join(info.lobby, *name ? name : "a friend");
+        InspectLobby(info.lobby, *name ? name : "a friend");
         return;
     }
     if (!searchLogged) {
@@ -745,6 +823,8 @@ bool Start(bool host, unsigned short port)
     tried = true;
     isHost = host;
     enetPort = port;
+    if (!GetConfig().sessionIdValid || !ValidSessionId(GetConfig().sessionId))
+        return Fail("invalid session_id: use 1-63 ASCII letters, digits, '_' or '-'");
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return Fail("winsock not started");
     winsockStarted = true;
@@ -828,6 +908,9 @@ void Pump()
     // Data before control: a friend who quits sends ENet's goodbye and then 'B'; the other order closed its socket first.
     Receive(ChannelData);
     Receive(ChannelControl);
+    // Lobby departure callbacks can precede a queued ENet goodbye. Drain it before closing that peer's relay.
+    for (auto& r : remotes)
+        if (r.leaving) Drop(&r, "left the lobby");
     Forward();
     const uint32_t now = Now();
     if (!isHost && owner) {
@@ -908,6 +991,7 @@ void Status(void (*log)(char const*))
     int n = Format(line, "STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d send_failures=%u offset=%d error=%s",
                    GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, LinkedCount(), Ping(), sendFailures,
                    senderOffset, *error ? error : "-");
+    n += Format(line + n, sizeof(line) - n, " session_id=%s isolated_drops=%u", GetConfig().sessionId, isolatedDrops);
     for (auto const& r : remotes)
         if (r.id) n += Format(line + n, sizeof(line) - n, " peer=%llu:%d:%u:%u:%d", r.id, r.linked ? 1 : 0, r.toEnet, r.toSteam, r.rtt);
     log(line);

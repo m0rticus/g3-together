@@ -33,11 +33,16 @@ sprawdzono na folderach testowych, jeszcze nie u graczy; poniższe kroki robią 
    ```ini
    role = client
    transport = steam
+   session_id = pair-red
    language = auto
    ```
 
 Nazwa gracza pochodzi automatycznie ze Steam. Twój komputer musi mieć
 `role = client`. Nie zmieniaj swojej nazwy na Steam: host po niej przywraca twoich towarzyszy po wczytaniu zapisu.
+
+`session_id` musi dokładnie odpowiadać ID hosta (wielkość liter ma znaczenie). Każda osobna para używa innego ID:
+1-63 litery ASCII, cyfry, `_` lub `-`. Brak wpisu oznacza `default`; nieprawidłowe wartości blokują sieć.
+Zaproszenia, `steam_host` i `steam_lobby` nie omijają sprawdzania ID. Obaj gracze potrzebują nowej wersji moda.
 
 `language = auto` pokazuje komunikaty moda w języku tekstów twojego Gothic 3 (polska gra: po polsku). Na stałe możesz
 ustawić `language = pl`, `de` albo `en`; bez tego wiersza komunikaty są po angielsku. Każdy gracz wybiera niezależnie;

@@ -46,6 +46,7 @@ enum Message
     SteamUnavailableClient,
     SteamUnavailableHost,
     LobbyStarting,
+    LobbySession,
     LobbyCreating,
     LobbyHosting,
     LobbySearching,

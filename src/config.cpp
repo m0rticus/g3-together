@@ -60,6 +60,14 @@ Config const& LoadConfig()
         Trim(key);
         Trim(value);
         if (!_stricmp(key, "role")) config.host = _stricmp(value, "client") != 0;
+        else if (!_stricmp(key, "session_id")) {
+            config.sessionIdValid = ValidSessionId(value);
+            if (config.sessionIdValid) strcpy_s(config.sessionId, value);
+            else {
+                config.sessionId[0] = '\0';
+                Log("config: invalid session_id; use 1-63 ASCII letters, digits, '_' or '-'; networking will not start");
+            }
+        }
         else if (!_stricmp(key, "address") || !_stricmp(key, "port"))
             Logf("config: %s is no longer used; connections require Steam", key);
         else if (!_stricmp(key, "name")) Log("config: name is taken from Steam; the INI name is ignored");
@@ -136,7 +144,7 @@ Config const& LoadConfig()
          config.puppetLead ? "auto" : "off", config.motionSeek ? "on" : "off", config.listenerTextbox ? "on" : "off", config.friendlyFire, config.npcDamage, config.npcHp);
     Logf("config: movement_smoothing=%s (100 ms replica display buffer; local controls remain native)",
          config.movementSmoothing ? "on" : "off");
-    Logf("config: transport=steam steam_lobby=%s steam_host=%s", *config.steamLobby ? config.steamLobby : "-",
+    Logf("config: transport=steam session_id=%s steam_lobby=%s steam_host=%s", config.sessionIdValid ? config.sessionId : "(invalid)", *config.steamLobby ? config.steamLobby : "-",
          *config.steamHost ? config.steamHost : "-");
     Logf("config: send_rate=%d Hz (player states and every NPC that changed; unchanged NPCs every 100 ms)", config.sendRate);
     return config;
