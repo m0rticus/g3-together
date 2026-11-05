@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Engine-free checks of the production snapshot sampler and scoped mirror-perception policy.
 #include "snapshot.h"
+#include "qa_dispatch.h"
 #include "ai.h"
 #include "replication.h"
 #include "processing.h"
@@ -21,6 +22,61 @@ void Check(bool condition, char const* description)
 {
     if (!condition) { ++failures; std::printf("FAIL: %s\n", description); }
 }
+
+int noArgumentCalls = 0;
+int withArgumentCalls = 0;
+int firstDuplicateCalls = 0;
+int secondDuplicateCalls = 0;
+char receivedArgument[32] = {};
+
+void NoArgument(g3t::qa::QaLogFn)
+{
+    ++noArgumentCalls;
+}
+
+void WithArgument(char const* argument, g3t::qa::QaLogFn)
+{
+    ++withArgumentCalls;
+    std::snprintf(receivedArgument, sizeof(receivedArgument), "%s", argument);
+}
+
+void FirstDuplicate(g3t::qa::QaLogFn)
+{
+    ++firstDuplicateCalls;
+}
+
+void SecondDuplicate(g3t::qa::QaLogFn)
+{
+    ++secondDuplicateCalls;
+}
+
+void IgnoreLog(char const*) {}
+
+void QaDispatchRouting()
+{
+    using g3t::qa::QaTypedRoute;
+    const QaTypedRoute routes[] = {
+        {"noarg", NoArgument, nullptr},
+        {"witharg", nullptr, WithArgument},
+        {"duplicate", FirstDuplicate, nullptr},
+        {"duplicate", SecondDuplicate, nullptr},
+    };
+
+    Check(g3t::qa::DispatchTypedRoute("noarg", "", IgnoreLog, routes),
+          "typed dispatch matches a no-argument route");
+    Check(noArgumentCalls == 1, "typed no-argument dispatch invokes the first matching handler");
+    Check(g3t::qa::DispatchTypedRoute("witharg", "matched", IgnoreLog, routes),
+          "typed dispatch matches an argument route");
+    Check(withArgumentCalls == 1 && std::strcmp(receivedArgument, "matched") == 0,
+          "typed argument dispatch forwards the original argument");
+    Check(g3t::qa::DispatchTypedRoute("duplicate", "", IgnoreLog, routes),
+          "typed dispatch accepts a duplicate route");
+    Check(firstDuplicateCalls == 1 && secondDuplicateCalls == 0,
+          "typed dispatch preserves first-match precedence");
+    Check(!g3t::qa::DispatchTypedRoute("unknown", "", IgnoreLog, routes),
+          "typed dispatch rejects unknown actions");
+}
+
 void Feed(g3t::body::Track& track, uint32_t sent, uint32_t arrived, float x, int mode = 4)
 {
     const float position[3] = {x, 0.0f, 0.0f}, rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -393,6 +449,7 @@ void GuidCodec()
 
 int main()
 {
+    QaDispatchRouting();
     LossAndJitter();
     StopsAndTeleports();
     ClockAndWrap();

@@ -131,6 +131,11 @@ bool posedNpcArrived = false, canonicalBonesArrived = false;
 bool poseFlood = false;
 unsigned poseCounts[73] = {};
 unsigned offeredPoseFrames = 0;
+bool routeClockArrived = false, routeItemArrived = false, routeEnclaveArrived = false;
+bool routeWitnessArrived = false, routeDialogArrived = false, routeSummonArrived = false, routeShotArrived = false;
+bool routeTargetedItemArrived = false, routeUnknownItemRejected = false;
+bool routeNpcSpellProbeArrived = false, routePlayerSpellProbeArrived = false, routeRansackProbeArrived = false;
+bool routeWorldExcludedArrived = false, routeWorldBroadcastArrived = false;
 void OnPose(net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool reliable)
 {
     if (record.guid[0] != 0xc1 || count != (poseFlood ? 95 : pose::MaxBones) || flags || reliable) return;
@@ -193,6 +198,37 @@ void OnHitResult(net::HitResult const& result)
     Logf("client: acknowledged hit sequence=%u incarnation=%u accepted=%u", result.sequence, result.incarnation, result.accepted);
 }
 void OnHitPlayer(int32_t, uint8_t const*, uint8_t, bool) {}
+void OnRouteItem(uint8_t from, net::ItemNote const& note)
+{
+    if (from != 1) return;
+    routeItemArrived = routeItemArrived || note.op == net::ItemGone;
+    routeTargetedItemArrived = routeTargetedItemArrived || note.amount == 2;
+    routeUnknownItemRejected = routeUnknownItemRejected || note.amount == 9;
+}
+void OnRouteEnclave(uint8_t from, net::EnclaveNote const& note) { routeEnclaveArrived = from == 1 && note.op == net::EnclaveState; }
+void OnRouteWitness(uint8_t from, net::WitnessNote const& note) { routeWitnessArrived = from == 1 && note.op == net::WitnessHolds; }
+void OnRouteDialog(uint8_t from, net::DialogLineNote const& note) { routeDialogArrived = from == 1 && note.kind == net::DialogLineStart; }
+void OnRouteSummon(uint8_t from, net::SummonNote const& note) { routeSummonArrived = from == 1 && note.op == net::SummonSpawned; }
+void OnRouteShot(uint8_t from, net::ShotNote const& note) { routeShotArrived = from == 1 && note.netId == 0x55aa; }
+void OnRouteClock(net::ClockState const& state) { routeClockArrived = state.timestamp == 0x12345678u; }
+void OnRouteNpcSpell(uint8_t from, char const* script, uint8_t const*, int32_t)
+{
+    routeNpcSpellProbeArrived = routeNpcSpellProbeArrived || (from == 1 && std::strcmp(script, "RouteProbe") == 0);
+}
+void OnRoutePlayerSpell(uint8_t from, char const* script)
+{
+    routePlayerSpellProbeArrived = routePlayerSpellProbeArrived || (from == 1 && std::strcmp(script, "RouteProbe") == 0);
+}
+void OnRouteRansack(uint8_t from, net::RansackNote const& note)
+{
+    routeRansackProbeArrived = routeRansackProbeArrived || (from == 1 && note.seq == 1);
+}
+void OnRouteWorld(uint8_t from, net::WorldState const& state)
+{
+    if (from != 1) return;
+    routeWorldExcludedArrived = routeWorldExcludedArrived || state.kind == 11;
+    routeWorldBroadcastArrived = routeWorldBroadcastArrived || state.kind == 12;
+}
 
 void PrintMenuStatus()
 {
@@ -372,6 +408,17 @@ int main(int argc, char** argv)
     net::SetNpcPoseHandler(OnPose);
     net::SetNpcReleaseHandler(OnNpcRelease);
     net::SetDeathHandler(OnDeath);
+    net::SetClockHandler(OnRouteClock);
+    net::SetItemHandler(OnRouteItem);
+    net::SetEnclaveHandler(OnRouteEnclave);
+    net::SetWitnessHandler(OnRouteWitness);
+    net::SetDialogLineHandler(OnRouteDialog);
+    net::SetSummonHandler(OnRouteSummon);
+    net::SetShotHandler(OnRouteShot);
+    net::SetNpcSpellHandler(OnRouteNpcSpell);
+    net::SetPlayerSpellHandler(OnRoutePlayerSpell);
+    net::SetRansackHandler(OnRouteRansack);
+    net::SetWorldStateHandler(OnRouteWorld);
 
     if (!net::Start(host)) {
         Logf("RESULT: FAIL (required Steam startup: %s; connected=%d joined=%d)",
@@ -380,7 +427,7 @@ int main(int argc, char** argv)
     }
     fpPreserved = (_control87(0, 0) & (_MCW_RC | _MCW_PC)) == fpBefore && (_mm_getcsr() & ~0x3fu) == sseBefore;
     PrintMenuStatus();
-    bool sawPeer = false, sentSave = false, sawState = false, peerLeft = false, joined = false, sentHit = false, sentNpcs = false;
+    bool sawPeer = false, sentSave = false, sawState = false, peerLeft = false, joined = false, sentHit = false, sentNpcs = false, sentRoutes = false;
     uint32_t joinedAt = 0, leftAfter = 0, hitSentAt = 0, poseSentAt = 0, poseFrame = 0;
     const uint32_t start = GetTickCount();
     float x = 0;
@@ -428,6 +475,19 @@ int main(int argc, char** argv)
                 net::SendNpcs(&canonical, 1, true);
                 net::SendNpcRelease(canonical.guid, 1);
                 net::SendDeath(canonical.guid, 1, 0);
+                net::ItemNote target{};
+                target.op = net::ItemDenied;
+                target.amount = 2;
+                net::SendItem(target, 2);
+                net::EnclaveNote broadcast{};
+                broadcast.op = net::EnclaveState;
+                net::SendEnclave(broadcast, 0);
+                net::WorldState state{};
+                state.kind = 18;
+                net::SendWorldState(state, 2);
+                state.kind = 12;
+                net::SendWorldState(state, 0);
+                net::SendDeath(canonical.guid, 1, 2);
                 sentNpcs = true;
             }
             for (uint8_t id = 3; id < net::MaxPlayers; ++id)
@@ -438,6 +498,49 @@ int main(int argc, char** argv)
                 net::SetInWorld(2, true);
                 PrintMenuStatus();
                 Log("host: client 2 joined, sending the save");
+            }
+            if (sawPeer && net::InWorld(2) && !sentRoutes) {
+                net::ClockState clock{};
+                clock.timestamp = 0x12345678u;
+                net::SendClock(clock);
+                net::DialogLineNote line{};
+                line.kind = net::DialogLineStart;
+                net::SendDialogLine(line);
+                net::SummonNote summon{};
+                summon.op = net::SummonSpawned;
+                summon.netId = 0x55aa;
+                net::SendSummon(summon);
+                net::ShotNote shot{};
+                shot.netId = 0x55aa;
+                net::SendShot(shot);
+                net::ItemNote item{};
+                item.op = net::ItemGone;
+                item.amount = 1;
+                net::SendItem(item, 0);
+                item.amount = 2;
+                net::SendItem(item, 2);
+                item.amount = 9;
+                net::SendItem(item, 9);
+                net::EnclaveNote enclave{};
+                enclave.op = net::EnclaveState;
+                net::SendEnclave(enclave, 0);
+                net::WitnessNote witness{};
+                witness.op = net::WitnessHolds;
+                net::SendWitness(0, witness);
+                uint8_t target[16] = {};
+                net::SendNpcSpell(0, "RouteProbe", target, 7);
+                net::SendNpcSpell(net::LocalId(), "RouteGuard", target, 7);
+                net::SendNpcSpell(9, "RouteUnknown", target, 7);
+                net::SendPlayerSpell(0, "RouteProbe");
+                net::SendPlayerSpell(net::LocalId(), "RouteGuard");
+                net::SendRansack(0, net::RansackNote{net::RansackHold, 1, 3, {}});
+                net::SendRansack(net::LocalId(), net::RansackNote{net::RansackHold, 2, 3, {}});
+                net::WorldState state{};
+                state.kind = 11;
+                net::SendWorldState(state, 2);
+                state.kind = 12;
+                net::SendWorldState(state, 0);
+                sentRoutes = true;
             }
             if (sawPeer && !sentSave) {
                 bool ok = true;
@@ -463,6 +566,10 @@ int main(int argc, char** argv)
             if (sawState && !net::PeerJoined(2) && !peerLeft) {
                 peerLeft = true;
                 Log("host: client 2 is gone");
+                net::ItemNote disconnected{};
+                disconnected.op = net::ItemDenied;
+                disconnected.amount = 7;
+                net::SendItem(disconnected, 2);
                 break;
             }
         } else {
@@ -497,12 +604,21 @@ int main(int argc, char** argv)
                 net::SendDeath(records[0].guid, net::LocalId(), 0);
                 sentNpcs = true;
             }
-            if (observer && acceptedNpcArrived && acceptedAbsenceArrived && acceptedReleaseArrived && acceptedDeathArrived && posedNpcArrived) {
+            if (observer && acceptedNpcArrived && acceptedAbsenceArrived && acceptedReleaseArrived &&
+                acceptedDeathArrived && posedNpcArrived && routeEnclaveArrived &&
+                !routeTargetedItemArrived && !routeUnknownItemRejected &&
+                !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived && !routeRansackProbeArrived &&
+                !routeWorldExcludedArrived && routeWorldBroadcastArrived) {
                 if (!hitSentAt) hitSentAt = GetTickCount();
                 if (GetTickCount() - hitSentAt > 500) break;
             }
             if (!observer && fileDone && sawState && sentHit && terminalNpcArrived && releaseArrived && posedNpcArrived &&
                 (!authorityMode || sentNpcs) && (!redirectHit || redirectedHitArrived) &&
+                routeClockArrived && routeItemArrived && routeEnclaveArrived && routeWitnessArrived &&
+                routeDialogArrived && routeSummonArrived && routeShotArrived && routeTargetedItemArrived &&
+                !routeUnknownItemRejected &&
+                !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived && !routeRansackProbeArrived &&
+                !routeWorldExcludedArrived && routeWorldBroadcastArrived &&
                 GetTickCount() - hitSentAt > (poseFlood ? 5000u : authorityMode ? 3000u : 500u)) {
                 leftAfter = GetTickCount() - joinedAt;
                 break;
@@ -518,13 +634,17 @@ int main(int argc, char** argv)
             pass = steam::Ready() && steam::LobbyId() && lobby::Snapshot().phase == lobby::Phase::Hosting;
             Logf("RESULT: %s (Steam startup, real lobby and hosting menu state; no peer gameplay tested)", pass ? "PASS" : "FAIL");
         } else {
-            pass = sawPeer && sentSave && sawState && peerLeft && hitArrived && !rejectedDeathArrived && (!authorityMode || sentNpcs);
+            pass = sawPeer && sentSave && sawState && peerLeft && hitArrived && !rejectedDeathArrived &&
+                   (!authorityMode || sentNpcs);
             Logf("RESULT: %s (peer %d, save sent %d, client state %d, hit claim %d, client left %d, death claims %d)",
                  pass ? "PASS" : "FAIL", sawPeer, sentSave, sawState, hitArrived, peerLeft, rejectedDeathArrived);
         }
     } else if (observer) {
         pass = joined && sawState && acceptedNpcArrived && acceptedReleaseArrived && !rejectedNpcArrived &&
-               acceptedAbsenceArrived && acceptedDeathArrived && !rejectedDeathArrived && acceptedNativeDefaults && posedNpcArrived;
+               acceptedAbsenceArrived && acceptedDeathArrived && !rejectedDeathArrived && acceptedNativeDefaults && posedNpcArrived &&
+               routeEnclaveArrived && !routeTargetedItemArrived && !routeUnknownItemRejected &&
+               !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived && !routeRansackProbeArrived &&
+               !routeWorldExcludedArrived && routeWorldBroadcastArrived;
         Logf("RESULT: %s (host-approved NPC %d, ordered release %d, refused NPC leaked %d, host death %d, refused death leaked %d, host removal %d, native defaults %d)",
              pass ? "PASS" : "FAIL", acceptedNpcArrived, acceptedReleaseArrived, rejectedNpcArrived,
              acceptedDeathArrived, rejectedDeathArrived, acceptedAbsenceArrived, acceptedNativeDefaults);
@@ -532,7 +652,11 @@ int main(int argc, char** argv)
         const uint32_t got = Crc(received.data(), received.size());
         const bool whole = fileDone && receivedBytes == SaveSize && got == saveCrc && doneCrc == saveCrc;
         pass = joined && sawState && whole && *steam::HostName() && terminalNpcArrived && releaseArrived && posedNpcArrived &&
-               (!redirectHit || redirectedHitArrived) && (!authorityMode || acceptedDeathArrived) && !rejectedDeathArrived;
+               (!redirectHit || redirectedHitArrived) && (!authorityMode || acceptedDeathArrived) && !rejectedDeathArrived &&
+               routeClockArrived && routeItemArrived && routeEnclaveArrived && routeWitnessArrived &&
+               routeDialogArrived && routeSummonArrived && routeShotArrived && routeTargetedItemArrived &&
+               !routeUnknownItemRejected && !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived &&
+               !routeRansackProbeArrived && !routeWorldExcludedArrived && routeWorldBroadcastArrived;
         Logf("RESULT: %s (welcomed %d, host state %d, save %u of %u bytes, crc %s, host %s, %u ms after the welcome)",
              pass ? "PASS" : "FAIL", joined, sawState, receivedBytes, SaveSize, got == saveCrc ? "ok" : "WRONG",
              *steam::HostName() ? steam::HostName() : "-", leftAfter);

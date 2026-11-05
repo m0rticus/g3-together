@@ -4,6 +4,7 @@
 // game handles each key in its normal message pump. No OS input, no address patterns.
 #include "qa.h"
 #include "log.h"
+#include "qa_dispatch.h"
 
 #include "ai.h"
 #include "body.h"
@@ -274,188 +275,110 @@ void ReceiveItem()
 // Codex review 22.10. (R1, R8, R9): a third chain, the other two are at MSVC's limit of nested blocks (C1061).
 bool RunReviewAction(const char* action)
 {
-    if (!std::strcmp(action, "chapter")) {  // here: RunAction's chain is at the compiler's nesting limit (C1061)
-        g3t::explore::Chapter(&Log);
-    } else if (!std::strcmp(action, "politicaloff")) {
-        g3t::enclaves::PoliticalOff(&Log);
-    } else if (!std::strcmp(action, "swimstrokeoff")) {
+    if (!std::strcmp(action, "swimstrokeoff")) {
         g3t::body::swimStrokes = false;
         Log("SWIMSTROKEOFF ok=1 (a swimming puppet only glides)");
-    } else if (!std::strcmp(action, "swimstrokes")) {
+        return true;
+    }
+    if (!std::strcmp(action, "swimstrokes")) {
         char line[80];
         Format(line, "SWIMSTROKES on=%d played=%u", g3t::body::swimStrokes ? 1 : 0, g3t::body::swimStrokesPlayed);
         Log(line);
-    } else if (!std::strcmp(action, "agressoroff")) {
-        g3t::combat::AgressorOff(&Log);
-    } else if (!std::strcmp(action, "cancelattack")) {
-        g3t::explore::CancelAttack(argument, &Log);
-    } else if (!std::strcmp(action, "sector")) {
-        g3t::explore::Sector(argument, &Log);
-    } else if (!std::strcmp(action, "quickuse")) {
-        g3t::explore::QuickUse(argument, &Log);
-    } else if (!std::strcmp(action, "zoneatt")) {
-        g3t::explore::ZoneAttitude(argument, &Log);
-    } else if (!std::strcmp(action, "attchain")) {  // P7 attitudes (26.10. pair 1)
-        g3t::explore::AttitudeChain(argument, &Log);
-    } else if (!std::strcmp(action, "setchapter")) {
-        g3t::explore::SetChapter(argument, &Log);
-    } else if (!std::strcmp(action, "polmem")) {  // P4 dialog conditions (26.10. pair 2)
-        g3t::explore::PolMem(argument, &Log);
-    } else if (!std::strcmp(action, "enclavefame")) {
-        g3t::explore::EnclaveFame(argument, &Log);
-    } else if (!std::strcmp(action, "enclavestatus")) {
-        g3t::explore::EnclaveStatus(argument, &Log);
-    } else if (!std::strcmp(action, "chaptercopyoff")) {
-        g3t::guards::ChapterCopyOff(&Log);
-    } else if (!std::strcmp(action, "mirrorperceiveoff")) {
-        g3t::witness::MirrorPerceiveOff(&Log);
-    } else if (!std::strcmp(action, "scriptwatch")) {
-        g3t::explore::ScriptWatch(argument, &Log);
-    } else if (!std::strcmp(action, "nativewatch")) {
-        g3t::explore::NativeWatch(argument, &Log);
-    } else if (!std::strcmp(action, "sleepers")) {
-        g3t::explore::Sleepers(argument, &Log);
-    } else if (!std::strcmp(action, "waitfree")) {
-        g3t::explore::WaitFree(argument, &Log);
-    } else if (!std::strcmp(action, "animalsleep")) {
-        g3t::explore::AnimalSleep(argument, &Log);
-    } else if (!std::strcmp(action, "swimgoal")) {
-        g3t::explore::SwimGoal(argument, &Log);
-    } else if (!std::strcmp(action, "worldprocess")) {
-        g3t::world::ProcessingReport(&Log);
-    } else if (!std::strcmp(action, "streamprobe")) {
-        g3t::world::StreamProbe(argument, &Log);
-    } else if (!std::strcmp(action, "passiveprobe")) {
-        g3t::npcplayback::Probe(argument, &Log);
-    } else if (!std::strcmp(action, "passivestats")) {
-        g3t::npcplayback::Stats(&Log);
-    } else if (!std::strcmp(action, "movemode")) {
-        g3t::explore::MoveMode(&Log);
-    } else if (!std::strcmp(action, "chaptersyncoff")) {
-        g3t::story::ChapterOff(&Log);
-    } else if (!std::strcmp(action, "ending")) {
-        g3t::ending::Report(&Log);
-    } else if (!std::strcmp(action, "endingsyncoff")) {
-        g3t::ending::Off(&Log);
-    } else if (!std::strcmp(action, "endinghold")) {
-        g3t::ending::Hold(argument, &Log);
-    } else if (!std::strcmp(action, "endinglimit")) {
-        g3t::ending::Limit(&Log);
-    } else if (!std::strcmp(action, "herocut")) {
-        g3t::hero::CutCommand(argument, &Log);
-    } else if (!std::strcmp(action, "recordcheckoff")) {
-        g3t::hero::CheckOff(&Log);
-    } else if (!std::strcmp(action, "recordwritefault")) {
-        g3t::hero::WriteFault(&Log);
-    } else if (!std::strcmp(action, "storyzerosoff")) {
-        g3t::story::ZerosOff(&Log);
-    } else if (!std::strcmp(action, "storyreloadoff")) {
-        g3t::story::ReloadOff(&Log);
-    } else if (!std::strcmp(action, "hitnpcburst")) {
-        g3t::combat::HitNpcBurst(argument, &Log);
-    } else if (!std::strcmp(action, "killonceoff")) {
-        g3t::combat::KillOnceOff(&Log);
-    } else if (!std::strcmp(action, "killconfirmoff")) {
-        g3t::combat::KillConfirmOff(&Log);
-    } else if (!std::strcmp(action, "killreport")) {
-        g3t::combat::KillReport(&Log);
-    } else if (!std::strcmp(action, "recordwaitoff")) {
-        g3t::persist::RecordWaitOff(&Log);
-    } else if (!std::strcmp(action, "recordwait")) {
-        g3t::persist::Waiting(&Log);
-    } else if (!std::strcmp(action, "helloversion")) {  // stage W7: the next hello claims this protocol version
+        return true;
+    }
+    if (!std::strcmp(action, "helloversion")) {  // stage W7: the next hello claims this protocol version
         g3t::net::ClaimVersionForTest(static_cast<uint16_t>(std::atoi(argument)));
         Log("HELLOVERSION ok=1");
-    } else if (!std::strcmp(action, "mirrorretryoff")) {
-        g3t::npcs::MirrorRetryOff(&Log);
-    } else if (!std::strcmp(action, "mirrorstats")) {
-        g3t::npcs::MirrorStats(&Log);
-    } else if (!std::strcmp(action, "summonlatecopy")) {
-        g3t::summon::LateCopyCommand(argument, &Log);
-    } else if (!std::strcmp(action, "skillreplaceoff")) {
-        g3t::hero::SkillReplaceOff(&Log);
-    } else if (!std::strcmp(action, "hasskill")) {
-        g3t::hero::HasSkill(argument, &Log);
-    } else if (!std::strcmp(action, "skilldiag")) {
-        g3t::hero::SkillDiag(&Log);
-    } else if (!std::strcmp(action, "skilltry")) {
-        g3t::hero::SkillTry(&Log);
-    } else if (!std::strcmp(action, "exchangestate")) {
-        g3t::offer::Report(&Log);
-    } else if (!std::strcmp(action, "heroadd")) {
-        g3t::offer::AddCommand(argument, &Log);
-    } else if (!std::strcmp(action, "herocount")) {
-        g3t::offer::CountCommand(argument, &Log);
-    } else if (!std::strcmp(action, "menutext")) {
-        g3t::hud::Probe(argument, &Log);
-    } else if (!std::strcmp(action, "menuline")) {
-        g3t::hud::MenuLineReport(&Log);
-    } else if (!std::strcmp(action, "stacks")) {
-        g3t::containers::Stacks(argument, &Log);
-    } else if (!std::strcmp(action, "holditem")) {
-        g3t::containers::HoldItem(argument, &Log);
-    } else if (!std::strcmp(action, "guide")) {  // P9 (25.10.)
-        g3t::guide::Report(argument, &Log);
-    } else if (!std::strcmp(action, "guidesyncoff")) {
-        g3t::guide::Off(&Log);
-    } else if (!std::strcmp(action, "farheal")) {
-        g3t::explore::FarHeal(argument, &Log);
-    } else if (!std::strcmp(action, "farxpoff")) {
-        g3t::npcs::FarXpOff(&Log);
-    } else if (!std::strcmp(action, "important")) {  // P7 rest (25.10.)
-        g3t::story::Important(argument, &Log);
-    } else if (!std::strcmp(action, "runto")) {
-        g3t::explore::RunTo(argument, &Log);
-    } else if (!std::strcmp(action, "setattr")) {
-        g3t::explore::SetAttribute(argument, &Log);
-    } else if (!std::strcmp(action, "p7probeon")) {  // open P7 points (25.10. evening)
-        g3t::p7probe::On(&Log);
-    } else if (!std::strcmp(action, "p7probe")) {
-        g3t::p7probe::Report(&Log);
-    } else if (!std::strcmp(action, "bothered")) {  // P7 attitudes (26.10. pair 1)
-        g3t::social::Bothered(argument, &Log);
-    } else if (!std::strcmp(action, "ownedobj")) {
-        g3t::social::OwnedObjects(argument, &Log);
-    } else if (!std::strcmp(action, "fightmemory")) {
-        g3t::p7probe::FightMemory(argument, &Log);
-    } else if (!std::strcmp(action, "crimeknown")) {
-        g3t::enclaves::SetKnown(argument, &Log);
-    } else if (!std::strcmp(action, "crimesuspect")) {
-        g3t::enclaves::SetSuspect(argument, &Log);
-    } else if (!std::strcmp(action, "fightmem")) {  // fight memory (26.10.)
-        g3t::fightmem::Report(&Log);
-    } else if (!std::strcmp(action, "grudgeoff")) {
-        g3t::fightmem::ApartOff(&Log);
-    } else if (!std::strcmp(action, "grudgeloadoff")) {
-        g3t::fightmem::KeepOff(&Log);
-    } else if (!std::strcmp(action, "formatprobe")) {  // lines cut to their buffer (review 26.10.)
-        g3t::FormatProbe(argument, &Log);
-    } else if (!std::strcmp(action, "formatstrict")) {
-        g3t::FormatStrict(&Log);
-    } else if (!std::strcmp(action, "fightmemoff")) {
-        g3t::fightmem::Off(&Log);
-    } else if (!std::strcmp(action, "zonefixoff")) {
-        g3t::guards::ZoneFixOff(&Log);
-    } else if (!std::strcmp(action, "fightsoff")) {
-        g3t::guards::FightsOff(&Log);
-    } else if (!std::strcmp(action, "sneakcheckon")) {
-        g3t::guards::SneakCheckOn(&Log);
-    } else if (!std::strcmp(action, "enterzoneon")) {
-        g3t::guards::EnterZoneOn(&Log);
-    } else if (!std::strcmp(action, "animalwakeoff")) {
-        g3t::guards::AnimalWakeOff(&Log);
-    } else if (!std::strcmp(action, "freedestoff")) {
-        g3t::guards::FreeDestOff(&Log);
-    } else if (!std::strcmp(action, "address")) {
-        g3t::address::Report(&Log);
-    } else if (!std::strcmp(action, "addressoff")) {
-        g3t::address::Off(&Log);
-    } else if (!std::strcmp(action, "addresson")) {
-        g3t::address::On(&Log);
-    } else {
-        return false;
+        return true;
     }
-    return true;
+
+    static constexpr QaTypedRoute routes[] = {
+        {"chapter", g3t::explore::Chapter, nullptr},
+        {"politicaloff", g3t::enclaves::PoliticalOff, nullptr},
+        {"agressoroff", g3t::combat::AgressorOff, nullptr},
+        {"cancelattack", nullptr, g3t::explore::CancelAttack},
+        {"sector", nullptr, g3t::explore::Sector},
+        {"quickuse", nullptr, g3t::explore::QuickUse},
+        {"zoneatt", nullptr, g3t::explore::ZoneAttitude},
+        {"attchain", nullptr, g3t::explore::AttitudeChain},
+        {"setchapter", nullptr, g3t::explore::SetChapter},
+        {"polmem", nullptr, g3t::explore::PolMem},
+        {"enclavefame", nullptr, g3t::explore::EnclaveFame},
+        {"enclavestatus", nullptr, g3t::explore::EnclaveStatus},
+        {"chaptercopyoff", g3t::guards::ChapterCopyOff, nullptr},
+        {"mirrorperceiveoff", g3t::witness::MirrorPerceiveOff, nullptr},
+        {"scriptwatch", nullptr, g3t::explore::ScriptWatch},
+        {"nativewatch", nullptr, g3t::explore::NativeWatch},
+        {"sleepers", nullptr, g3t::explore::Sleepers},
+        {"waitfree", nullptr, g3t::explore::WaitFree},
+        {"animalsleep", nullptr, g3t::explore::AnimalSleep},
+        {"swimgoal", nullptr, g3t::explore::SwimGoal},
+        {"worldprocess", g3t::world::ProcessingReport, nullptr},
+        {"streamprobe", nullptr, g3t::world::StreamProbe},
+        {"passiveprobe", nullptr, g3t::npcplayback::Probe},
+        {"passivestats", g3t::npcplayback::Stats, nullptr},
+        {"movemode", g3t::explore::MoveMode, nullptr},
+        {"chaptersyncoff", g3t::story::ChapterOff, nullptr},
+        {"ending", g3t::ending::Report, nullptr},
+        {"endingsyncoff", g3t::ending::Off, nullptr},
+        {"endinghold", nullptr, g3t::ending::Hold},
+        {"endinglimit", g3t::ending::Limit, nullptr},
+        {"herocut", nullptr, g3t::hero::CutCommand},
+        {"recordcheckoff", g3t::hero::CheckOff, nullptr},
+        {"recordwritefault", g3t::hero::WriteFault, nullptr},
+        {"storyzerosoff", g3t::story::ZerosOff, nullptr},
+        {"storyreloadoff", g3t::story::ReloadOff, nullptr},
+        {"hitnpcburst", nullptr, g3t::combat::HitNpcBurst},
+        {"killonceoff", g3t::combat::KillOnceOff, nullptr},
+        {"killconfirmoff", g3t::combat::KillConfirmOff, nullptr},
+        {"killreport", g3t::combat::KillReport, nullptr},
+        {"recordwaitoff", g3t::persist::RecordWaitOff, nullptr},
+        {"recordwait", g3t::persist::Waiting, nullptr},
+        {"mirrorretryoff", g3t::npcs::MirrorRetryOff, nullptr},
+        {"mirrorstats", g3t::npcs::MirrorStats, nullptr},
+        {"summonlatecopy", nullptr, g3t::summon::LateCopyCommand},
+        {"skillreplaceoff", g3t::hero::SkillReplaceOff, nullptr},
+        {"hasskill", nullptr, g3t::hero::HasSkill},
+        {"skilldiag", g3t::hero::SkillDiag, nullptr},
+        {"skilltry", g3t::hero::SkillTry, nullptr},
+        {"exchangestate", g3t::offer::Report, nullptr},
+        {"heroadd", nullptr, g3t::offer::AddCommand},
+        {"herocount", nullptr, g3t::offer::CountCommand},
+        {"menutext", nullptr, g3t::hud::Probe},
+        {"menuline", g3t::hud::MenuLineReport, nullptr},
+        {"stacks", nullptr, g3t::containers::Stacks},
+        {"holditem", nullptr, g3t::containers::HoldItem},
+        {"guide", nullptr, g3t::guide::Report},
+        {"guidesyncoff", g3t::guide::Off, nullptr},
+        {"farheal", nullptr, g3t::explore::FarHeal},
+        {"farxpoff", g3t::npcs::FarXpOff, nullptr},
+        {"important", nullptr, g3t::story::Important},
+        {"runto", nullptr, g3t::explore::RunTo},
+        {"setattr", nullptr, g3t::explore::SetAttribute},
+        {"p7probeon", g3t::p7probe::On, nullptr},
+        {"p7probe", g3t::p7probe::Report, nullptr},
+        {"bothered", nullptr, g3t::social::Bothered},
+        {"ownedobj", nullptr, g3t::social::OwnedObjects},
+        {"fightmemory", nullptr, g3t::p7probe::FightMemory},
+        {"crimeknown", nullptr, g3t::enclaves::SetKnown},
+        {"crimesuspect", nullptr, g3t::enclaves::SetSuspect},
+        {"fightmem", g3t::fightmem::Report, nullptr},
+        {"grudgeoff", g3t::fightmem::ApartOff, nullptr},
+        {"grudgeloadoff", g3t::fightmem::KeepOff, nullptr},
+        {"formatprobe", nullptr, g3t::FormatProbe},
+        {"formatstrict", g3t::FormatStrict, nullptr},
+        {"fightmemoff", g3t::fightmem::Off, nullptr},
+        {"zonefixoff", g3t::guards::ZoneFixOff, nullptr},
+        {"fightsoff", g3t::guards::FightsOff, nullptr},
+        {"sneakcheckon", g3t::guards::SneakCheckOn, nullptr},
+        {"enterzoneon", g3t::guards::EnterZoneOn, nullptr},
+        {"animalwakeoff", g3t::guards::AnimalWakeOff, nullptr},
+        {"freedestoff", g3t::guards::FreeDestOff, nullptr},
+        {"address", g3t::address::Report, nullptr},
+        {"addressoff", g3t::address::Off, nullptr},
+        {"addresson", g3t::address::On, nullptr},
+    };
+    return DispatchTypedRoute(action, argument, &Log, routes);
 }
 
 // Commands added after the chain below reached MSVC's limit of nested blocks (C1061).
@@ -463,451 +386,274 @@ bool RunReviewAction(const char* action)
 // in RunAction, which reached the compiler's nesting limit.
 bool RunPlayerAction(const char* action)
 {
-    if (!std::strcmp(action, "puppettradeon")) {
-        g3t::remote::PuppetTradeOn(argument, &Log);
-    } else if (!std::strcmp(action, "puppetinfo")) {
-        g3t::remote::PuppetInfo(argument, &Log);
-    } else if (!std::strcmp(action, "lookoff")) {
-        g3t::remote::LookOff(&Log);
-    } else if (!std::strcmp(action, "wear")) {
-        g3t::remote::WearHero(argument, &Log);
-    } else if (!std::strcmp(action, "wornscan")) {
-        g3t::remote::WornScan(&Log);
-    } else if (!std::strcmp(action, "wearoff")) {
-        g3t::remote::WearOff(&Log);
-    } else if (!std::strcmp(action, "glidestopoff")) {
-        g3t::body::GlideStopOff(&Log);
-    } else if (!std::strcmp(action, "glideold")) {
-        g3t::body::GlideOld(&Log);
-    } else if (!std::strcmp(action, "glidereset")) {
-        g3t::body::GlideReset(&Log);
-    } else if (!std::strcmp(action, "glide")) {
-        g3t::body::GlideReport(&Log);
-    } else if (!std::strcmp(action, "tradesync")) {
-        g3t::trade::Report(&Log);
-    } else if (!std::strcmp(action, "autohelpon")) {
-        g3t::downed::AutoHelpOn(&Log);
-    } else if (!std::strcmp(action, "helpoptionoff")) {
-        g3t::downed::HelpOptionOff(&Log);
-    } else if (!std::strcmp(action, "tradeclose")) {
-        g3t::trade::CloseCommand(&Log);
-    } else if (!std::strcmp(action, "murdercand")) {
-        g3t::enclaves::MurderCandidates(argument, &Log);
-    } else if (!std::strcmp(action, "creditqueueoff")) {
-        g3t::enclaves::CreditQueueOff(&Log);
-    } else if (!std::strcmp(action, "credithold")) {
-        g3t::enclaves::CreditHold(argument, &Log);
-    } else if (!std::strcmp(action, "townstatusoff")) {
-        g3t::enclaves::TownStatusOff(&Log);
-    } else if (!std::strcmp(action, "townfarkill")) {
-        g3t::enclaves::TownFarKill(argument, &Log);
-    } else if (!std::strcmp(action, "cheatkill")) {
-        g3t::enclaves::CheatKill(argument, &Log);
-    } else if (!std::strcmp(action, "occupancy")) {
-        g3t::occupancy::Report(&Log);
-    } else if (!std::strcmp(action, "usesyncoff")) {
-        g3t::occupancy::Off(&Log);
-    } else if (!std::strcmp(action, "unuse")) {
-        g3t::occupancy::StandUp(&Log);
-    } else if (!std::strcmp(action, "npcroutine")) {
-        g3t::explore::NpcRoutine(argument, &Log);
-    } else if (!std::strcmp(action, "findents")) {
-        g3t::world::FindEntities(argument, &Log);
-    } else if (!std::strcmp(action, "arenasync")) {
-        g3t::arena::Report(&Log);
-    } else if (!std::strcmp(action, "arenasyncoff")) {
-        g3t::arena::Off(&Log);
-    } else if (!std::strcmp(action, "findall")) {
-        g3t::world::FindAll(argument, &Log);
-    } else if (!std::strcmp(action, "weatherfollowoff")) {
-        g3t::summon::WeatherFollowOff(&Log);
-    } else if (!std::strcmp(action, "weather")) {
-        g3t::summon::WeatherReport(&Log);
-    } else if (!std::strcmp(action, "receiveitem")) {
+    if (!std::strcmp(action, "receiveitem")) {
         ReceiveItem();
-    } else if (!std::strcmp(action, "pickcands")) {
-        g3t::pickpocket::Candidates(&Log);
-    } else if (!std::strcmp(action, "pickinfo")) {
-        g3t::pickpocket::Info(argument, &Log);
-    } else if (!std::strcmp(action, "pickpocket")) {
-        g3t::pickpocket::Pick(argument, &Log);
-    } else if (!std::strcmp(action, "thiefprep")) {
-        g3t::pickpocket::ThiefPrep(&Log);
-    } else if (!std::strcmp(action, "pickpocketoff")) {
-        g3t::pickpocket::Off(&Log);
-    } else if (!std::strcmp(action, "picksync")) {
-        g3t::pickpocket::Report(&Log);
-    } else if (!std::strcmp(action, "remotemurdersoff")) {
-        g3t::enclaves::RemoteMurdersOff(&Log);
-    } else if (!std::strcmp(action, "shapehitsoff")) {
-        g3t::combat::ShapeHitsOff(&Log);
-    } else if (!std::strcmp(action, "remotekooff")) {
-        g3t::combat::RemoteKnockOutsOff(&Log);
-    } else if (!std::strcmp(action, "questdump")) {
+        return true;
+    }
+    if (!std::strcmp(action, "questdump")) {
         char path[MAX_PATH] = {};
         if (Path(path, "quests.tsv")) g3t::explore::QuestDump(path, &Log);
-    } else if (!std::strcmp(action, "ransack")) {
-        g3t::ransack::Report(&Log);
-    } else if (!std::strcmp(action, "ransackoff")) {
-        g3t::ransack::Off(&Log);
-    } else if (!std::strcmp(action, "npcgold")) {
-        g3t::ransack::NpcGold(argument, &Log);
-    } else if (!std::strcmp(action, "subtitlesoff")) {
-        g3t::dialogaudio::SubtitlesOff(&Log);
-    } else if (!std::strcmp(action, "witness")) {
-        g3t::witness::Saw(argument, &Log);
-    } else if (!std::strcmp(action, "witnesses")) {
-        g3t::witness::Report(&Log);
-    } else if (!std::strcmp(action, "witnessoff")) {
-        g3t::witness::Off(&Log);
-    } else if (!std::strcmp(action, "murderseenoff")) {
-        g3t::witness::SeenOff(&Log);
-    } else if (!std::strcmp(action, "guards")) {
-        g3t::guards::Report(&Log);
-    } else if (!std::strcmp(action, "trespassoff")) {
-        g3t::guards::Off(&Log);
-    } else if (!std::strcmp(action, "sneak")) {
-        g3t::guards::Sneak(argument, &Log);
-    } else if (!std::strcmp(action, "homes")) {
-        g3t::guards::Homes(argument, &Log);
-    } else if (!std::strcmp(action, "assesshero")) {
-        g3t::explore::AssessHero(argument, &Log);
-    } else if (!std::strcmp(action, "mapmarks")) {
-        g3t::mapmarks::Report(&Log);
-    } else if (!std::strcmp(action, "mapmarksoff")) {
-        g3t::mapmarks::Off(&Log);
-    } else if (!std::strcmp(action, "mapopen")) {
-        g3t::mapmarks::OpenMap(&Log);
-    } else if (!std::strcmp(action, "mapclose")) {
-        g3t::mapmarks::CloseMap(&Log);
-    } else if (!std::strcmp(action, "givequality")) {
-        g3t::trade::GiveQuality(argument, &Log);
-    } else if (!std::strcmp(action, "qualitycount")) {
-        g3t::trade::QualityCount(argument, &Log);
-    } else if (!std::strcmp(action, "tradesell")) {
-        g3t::containers::TradeSell(argument, &Log);
-    } else if (!std::strcmp(action, "tradegift")) {
-        g3t::trade::GiftCommand(argument, &Log);
-    } else if (!std::strcmp(action, "tradeprice")) {
-        g3t::trade::Price(argument, &Log);
-    } else if (!std::strcmp(action, "tradefilloff")) {
-        g3t::trade::FillOff(&Log);
-    } else if (!std::strcmp(action, "playergoods")) {
-        g3t::trade::GoodsReport(argument, &Log);
-    } else {
-        return false;
+        return true;
     }
-    return true;
+
+    static constexpr QaTypedRoute routes[] = {
+        {"puppettradeon", nullptr, g3t::remote::PuppetTradeOn},
+        {"puppetinfo", nullptr, g3t::remote::PuppetInfo},
+        {"lookoff", g3t::remote::LookOff, nullptr},
+        {"wear", nullptr, g3t::remote::WearHero},
+        {"wornscan", g3t::remote::WornScan, nullptr},
+        {"wearoff", g3t::remote::WearOff, nullptr},
+        {"glidestopoff", g3t::body::GlideStopOff, nullptr},
+        {"glideold", g3t::body::GlideOld, nullptr},
+        {"glidereset", g3t::body::GlideReset, nullptr},
+        {"glide", g3t::body::GlideReport, nullptr},
+        {"tradesync", g3t::trade::Report, nullptr},
+        {"autohelpon", g3t::downed::AutoHelpOn, nullptr},
+        {"helpoptionoff", g3t::downed::HelpOptionOff, nullptr},
+        {"tradeclose", g3t::trade::CloseCommand, nullptr},
+        {"murdercand", nullptr, g3t::enclaves::MurderCandidates},
+        {"creditqueueoff", g3t::enclaves::CreditQueueOff, nullptr},
+        {"credithold", nullptr, g3t::enclaves::CreditHold},
+        {"townstatusoff", g3t::enclaves::TownStatusOff, nullptr},
+        {"townfarkill", nullptr, g3t::enclaves::TownFarKill},
+        {"cheatkill", nullptr, g3t::enclaves::CheatKill},
+        {"occupancy", g3t::occupancy::Report, nullptr},
+        {"usesyncoff", g3t::occupancy::Off, nullptr},
+        {"unuse", g3t::occupancy::StandUp, nullptr},
+        {"npcroutine", nullptr, g3t::explore::NpcRoutine},
+        {"findents", nullptr, g3t::world::FindEntities},
+        {"arenasync", g3t::arena::Report, nullptr},
+        {"arenasyncoff", g3t::arena::Off, nullptr},
+        {"findall", nullptr, g3t::world::FindAll},
+        {"weatherfollowoff", g3t::summon::WeatherFollowOff, nullptr},
+        {"weather", g3t::summon::WeatherReport, nullptr},
+        {"pickcands", g3t::pickpocket::Candidates, nullptr},
+        {"pickinfo", nullptr, g3t::pickpocket::Info},
+        {"pickpocket", nullptr, g3t::pickpocket::Pick},
+        {"thiefprep", g3t::pickpocket::ThiefPrep, nullptr},
+        {"pickpocketoff", g3t::pickpocket::Off, nullptr},
+        {"picksync", g3t::pickpocket::Report, nullptr},
+        {"remotemurdersoff", g3t::enclaves::RemoteMurdersOff, nullptr},
+        {"shapehitsoff", g3t::combat::ShapeHitsOff, nullptr},
+        {"remotekooff", g3t::combat::RemoteKnockOutsOff, nullptr},
+        {"ransack", g3t::ransack::Report, nullptr},
+        {"ransackoff", g3t::ransack::Off, nullptr},
+        {"npcgold", nullptr, g3t::ransack::NpcGold},
+        {"subtitlesoff", g3t::dialogaudio::SubtitlesOff, nullptr},
+        {"witness", nullptr, g3t::witness::Saw},
+        {"witnesses", g3t::witness::Report, nullptr},
+        {"witnessoff", g3t::witness::Off, nullptr},
+        {"murderseenoff", g3t::witness::SeenOff, nullptr},
+        {"guards", g3t::guards::Report, nullptr},
+        {"trespassoff", g3t::guards::Off, nullptr},
+        {"sneak", nullptr, g3t::guards::Sneak},
+        {"homes", nullptr, g3t::guards::Homes},
+        {"assesshero", nullptr, g3t::explore::AssessHero},
+        {"mapmarks", g3t::mapmarks::Report, nullptr},
+        {"mapmarksoff", g3t::mapmarks::Off, nullptr},
+        {"mapopen", g3t::mapmarks::OpenMap, nullptr},
+        {"mapclose", g3t::mapmarks::CloseMap, nullptr},
+        {"givequality", nullptr, g3t::trade::GiveQuality},
+        {"qualitycount", nullptr, g3t::trade::QualityCount},
+        {"tradesell", nullptr, g3t::containers::TradeSell},
+        {"tradegift", nullptr, g3t::trade::GiftCommand},
+        {"tradeprice", nullptr, g3t::trade::Price},
+        {"tradefilloff", g3t::trade::FillOff, nullptr},
+        {"playergoods", nullptr, g3t::trade::GoodsReport},
+    };
+    return DispatchTypedRoute(action, argument, &Log, routes);
 }
 
 // P4 hit judgement (25.10.): a fourth chain, RunLaterAction reached C1061 too.
 bool RunHitAction(const char* action)
 {
-    if (!std::strcmp(action, "hitprobe")) {
-        g3t::combat::HitProbe(argument, &Log);
-    } else if (!std::strcmp(action, "puppetparadeoff")) {
-        g3t::combat::PuppetParadeOff(&Log);
-    } else if (!std::strcmp(action, "npcblockoff")) {
-        g3t::combat::NpcBlockOff(&Log);
-    } else if (!std::strcmp(action, "parade")) {
-        g3t::combat::ParadeReport(&Log);
-    } else if (!std::strcmp(action, "npcguard")) {
-        g3t::combat::NpcGuard(argument, &Log);
-    } else if (!std::strcmp(action, "npcstill")) {
-        g3t::combat::NpcStill(argument, &Log);
-    } else if (!std::strcmp(action, "puppetparade")) {
-        g3t::combat::PuppetParade(argument, &Log);
-    } else if (!std::strcmp(action, "stanceoff")) {
+    if (!std::strcmp(action, "stanceoff")) {
         g3t::body::stanceSync = false;
         Log("STANCEOFF ok=1 (bodies keep their own AniState)");
-    } else if (!std::strcmp(action, "aicount")) {
-        g3t::ai::Count(argument, &Log);
-    } else if (!std::strcmp(action, "partyenable")) {
-        g3t::infocmd::PartyEnableQa(argument, &Log);
-    } else if (!std::strcmp(action, "puppetstate")) {
-        g3t::combat::PuppetState(&Log);
-    } else if (!std::strcmp(action, "npcparade")) {
-        g3t::combat::NpcParade(argument, &Log);
-    } else if (!std::strcmp(action, "guard")) {
-        g3t::combat::Guard(argument, &Log);
-    } else if (!std::strcmp(action, "storycompanionoff")) {  // here: RunLaterAction is at C1061 again (review 26.10.)
-        g3t::infocmd::StoryCompanionOff(&Log);
-    } else if (!std::strcmp(action, "steamstatus")) {  // here as well: RunLaterAction is at C1061 (MSVC, 27.10.)
-        g3t::steam::Status(&Log);
-    } else if (!std::strcmp(action, "quickrestoreoff")) {  // here: RunAction is at C1061 (stageQuickLoad 27.10.)
-        g3t::hero::QuickRestoreOff(&Log);
-    } else if (!std::strcmp(action, "quickassign")) {
-        g3t::hero::QuickAssign(argument, &Log);
-    } else if (!std::strcmp(action, "quickdiag")) {
-        g3t::hero::QuickDiag(&Log);
-    } else if (!std::strcmp(action, "spellrestoreoff")) {
-        g3t::hero::SpellRestoreOff(&Log);
-    } else if (!std::strcmp(action, "spellknow")) {
-        g3t::hero::SpellKnow(argument, &Log);
-    } else {
-        return false;
+        return true;
     }
-    return true;
+
+    static constexpr QaTypedRoute routes[] = {
+        {"hitprobe", nullptr, g3t::combat::HitProbe},
+        {"puppetparadeoff", g3t::combat::PuppetParadeOff, nullptr},
+        {"npcblockoff", g3t::combat::NpcBlockOff, nullptr},
+        {"parade", g3t::combat::ParadeReport, nullptr},
+        {"npcguard", nullptr, g3t::combat::NpcGuard},
+        {"npcstill", nullptr, g3t::combat::NpcStill},
+        {"puppetparade", nullptr, g3t::combat::PuppetParade},
+        {"aicount", nullptr, g3t::ai::Count},
+        {"partyenable", nullptr, g3t::infocmd::PartyEnableQa},
+        {"puppetstate", g3t::combat::PuppetState, nullptr},
+        {"npcparade", nullptr, g3t::combat::NpcParade},
+        {"guard", nullptr, g3t::combat::Guard},
+        {"storycompanionoff", g3t::infocmd::StoryCompanionOff, nullptr},
+        {"steamstatus", g3t::steam::Status, nullptr},
+        {"quickrestoreoff", g3t::hero::QuickRestoreOff, nullptr},
+        {"quickassign", nullptr, g3t::hero::QuickAssign},
+        {"quickdiag", g3t::hero::QuickDiag, nullptr},
+        {"spellrestoreoff", g3t::hero::SpellRestoreOff, nullptr},
+        {"spellknow", nullptr, g3t::hero::SpellKnow},
+    };
+    return DispatchTypedRoute(action, argument, &Log, routes);
 }
 
 bool RunLaterAction(const char* action)
 {
-    if (!std::strcmp(action, "world")) {
-        g3t::persist::WorldReport(&Log);
-    } else if (!std::strcmp(action, "worldsyncoff")) {
-        g3t::persist::WorldSyncOff(&Log);
-    } else if (!std::strcmp(action, "npchp")) {
+    if (!std::strcmp(action, "npchp")) {
         // GUID_HP (P3) or Name_HP (stageA4, stageArenaQuest): the GUID form shadowed the name form since P3, Diego kept his
         // 1000 hit points and won the duel (stageA4 red, 25.10.).
         char const* cut = std::strrchr(argument, '_');
         if (cut && cut - argument == 36) g3t::spells::NpcHp(argument, &Log);
         else g3t::combat::NpcHp(argument, &Log);
-    } else if (!std::strcmp(action, "respawnsync")) {
-        g3t::respawn::Report(&Log);
-    } else if (!std::strcmp(action, "respawnoff")) {
-        g3t::respawn::Off(&Log);
-    } else if (!std::strcmp(action, "movers")) {
-        g3t::doors::Movers(&Log);
-    } else if (!std::strcmp(action, "revolution")) {
-        g3t::social::Revolution(argument, &Log);
-    } else if (!std::strcmp(action, "storymoveoff")) {
-        g3t::infocmd::StoryMoveOff(&Log);
-    } else if (!std::strcmp(action, "storymoves")) {
-        g3t::infocmd::StoryMoves(&Log);
-    } else if (!std::strcmp(action, "startrevolution")) {
-        g3t::social::StartRevolution(argument, &Log);
-    } else if (!std::strcmp(action, "learnperk")) {
-        g3t::pickpocket::LearnPerk(argument, &Log);
-    } else if (!std::strcmp(action, "gesturesoff")) {
-        g3t::talk::GesturesOff(&Log);
-    } else if (!std::strcmp(action, "optionsoff")) {
-        g3t::dialogaudio::OptionsOff(&Log);
-    } else if (!std::strcmp(action, "clockdays")) {
-        g3t::clock::AddDays(argument, &Log);
-    } else if (!std::strcmp(action, "waitoff")) {
-        g3t::clock::WaitOff(&Log);
-    } else if (!std::strcmp(action, "reconnect")) {
-        g3t::net::Reconnect(&Log);
-    } else if (!std::strcmp(action, "generationoff")) {
-        g3t::persist::GenerationOff(&Log);
-    } else if (!std::strcmp(action, "persistpause")) {
-        g3t::persist::Pause(argument, &Log);
-    } else if (!std::strcmp(action, "worldgatelate")) {
-        g3t::persist::WorldGateLate(&Log);
-    } else if (!std::strcmp(action, "loadticksoff")) {
-        g3t::persist::LoadTicksOff(argument, &Log);
-    } else if (!std::strcmp(action, "dialogxpoff")) {
-        g3t::infocmd::DialogXpOff(&Log);
-    } else if (!std::strcmp(action, "givebackposoff")) {
-        g3t::infocmd::GivebackPlaceOff(&Log);
-    } else if (!std::strcmp(action, "duelhero")) {
-        g3t::explore::DuelHero(argument, &Log);
-    } else if (!std::strcmp(action, "lethalonlyoff")) {
-        g3t::downed::LethalOnlyOff(&Log);
-    } else if (!std::strcmp(action, "arenaruleoff")) {
-        g3t::combat::ArenaRuleOff(&Log);
-    } else if (!std::strcmp(action, "arena")) {
-        g3t::combat::ArenaReport(argument, &Log);
-    } else if (!std::strcmp(action, "npchp")) {
-        g3t::combat::NpcHp(argument, &Log);
-    } else if (!std::strcmp(action, "xpinfos")) {
-        g3t::explore::XpInfos(&Log);
-    } else if (!std::strcmp(action, "forgetnpclist")) {
-        g3t::remote::ForgetNpcListOn(&Log);
-    } else if (!std::strcmp(action, "contactsoff")) {
-        g3t::remote::ContactsOff(&Log);
-    } else if (!std::strcmp(action, "badtransfer")) {
-        g3t::persist::BadTransfer(&Log);
-    } else if (!std::strcmp(action, "badrecord")) {
-        g3t::npcs::BadRecord(&Log);
-    } else if (!std::strcmp(action, "badstates")) {
-        g3t::remote::BadStates(argument, &Log);
-    } else if (!std::strcmp(action, "reacthitsoff")) {
-        g3t::combat::ReactHitsOff(&Log);
-    } else if (!std::strcmp(action, "keeplocaloff")) {
-        g3t::enclaves::KeepLocalOff(&Log);
-    } else if (!std::strcmp(action, "enclavescanpause")) {
-        g3t::enclaves::PauseScan(argument, &Log);
-    } else if (!std::strcmp(action, "crimeadd")) {
-        g3t::enclaves::AddCrime(argument, &Log);
-    } else if (!std::strcmp(action, "npcsend")) {
-        g3t::npcs::SendInfo(argument, &Log);
-    } else if (!std::strcmp(action, "joingraceoff")) {
-        g3t::npcs::JoinGraceOff(&Log);
-    } else if (!std::strcmp(action, "contestoff")) {
-        g3t::npcs::ContestOff(&Log);
-    } else if (!std::strcmp(action, "claimrecord")) {
-        g3t::npcs::ClaimRecord(argument, &Log);
-    } else if (!std::strcmp(action, "edgenpcs")) {
-        g3t::npcs::EdgeReport(&Log);
-    } else if (!std::strcmp(action, "hostwinsoff")) {
-        g3t::npcs::HostWinsOff(&Log);
-    } else if (!std::strcmp(action, "doors")) {
-        g3t::doors::Report(&Log);
-    } else if (!std::strcmp(action, "doorsyncoff")) {
-        g3t::doors::SyncOff(&Log);
-    } else if (!std::strcmp(action, "owned")) {
-        g3t::social::Owned(argument, &Log);
-    } else if (!std::strcmp(action, "enclavesync")) {
-        g3t::enclaves::Report(&Log);
-    } else if (!std::strcmp(action, "enclavesyncoff")) {
-        g3t::enclaves::SyncOff(&Log);
-    } else if (!std::strcmp(action, "unarm")) {
-        g3t::social::Unarm(&Log);
-    } else if (!std::strcmp(action, "enclaves")) {
-        g3t::social::Enclaves(&Log);
-    } else if (!std::strcmp(action, "crime")) {
-        g3t::social::Crime(argument, &Log);
-    } else if (!std::strcmp(action, "usables")) {
-        g3t::world::Usables(argument, &Log);
-    } else if (!std::strcmp(action, "face")) {
-        g3t::world::Face(argument, &Log);
-    } else if (!std::strcmp(action, "use")) {
-        g3t::world::Use(argument, &Log);
-    } else if (!std::strcmp(action, "unlock")) {
-        g3t::world::Unlock(argument, &Log);
-    } else if (!std::strcmp(action, "useinfo")) {
-        g3t::world::UseInfo(argument, &Log);
-    } else if (!std::strcmp(action, "attitude")) {
-        g3t::explore::Attitude(argument, &Log);
-    } else if (!std::strcmp(action, "continueroutine")) {
-        g3t::ai::ContinueRoutineReport(&Log);
-    } else if (!std::strcmp(action, "continueroutineon")) {
-        g3t::ai::ContinueRoutineOn(&Log);
-    } else if (!std::strcmp(action, "movelength")) {
-        g3t::ai::MoveLengthReport(&Log);
-    } else if (!std::strcmp(action, "movelengthoff")) {
-        g3t::ai::MoveLengthOff(&Log);
-    } else if (!std::strcmp(action, "scriptfind")) {
-        g3t::ai::FindByRva(argument, &Log);
-    } else if (!std::strcmp(action, "heropos")) {
-        g3t::explore::HeroPos(&Log);
-    } else if (!std::strcmp(action, "hitpuppet")) {
-        g3t::combat::HitPuppet(argument, &Log);
-    } else if (!std::strcmp(action, "lookat")) {
-        g3t::explore::LookAt(argument, &Log);
-    } else if (!std::strcmp(action, "deadposeoff")) {
-        g3t::npcs::DeadPoseOff(&Log);
-    } else if (!std::strcmp(action, "deadpose")) {
-        g3t::npcs::DeadPoseReport(&Log);
-    } else if (!std::strcmp(action, "trace")) {
-        g3t::trace::Command(argument, &Log);
-    } else if (!std::strcmp(action, "partnerjump")) {
-        g3t::partner::JumpQa(&Log);
-    } else if (!std::strcmp(action, "partyxpoff")) {
-        g3t::combat::PartyXpOff(&Log);
-    } else if (!std::strcmp(action, "npcrecvon")) {
-        g3t::npcs::RecvOn(&Log);
-    } else if (!std::strcmp(action, "npcrecvoff")) {
-        g3t::npcs::RecvOff(&Log);
-    } else if (!std::strcmp(action, "fleekeepoff")) {
-        g3t::ai::FleeKeepOff(&Log);
-    } else if (!std::strcmp(action, "flee")) {
-        g3t::combat::FleeFrom(argument, &Log);
-    } else if (!std::strcmp(action, "scriptanioff")) {
+        return true;
+    }
+    if (!std::strcmp(action, "scriptanioff")) {
         g3t::body::scriptAniReplay = false;
         Log("SCRIPTANIOFF gestures and knock-downs are replayed with StartPlayAni");
-    } else if (!std::strcmp(action, "looprestartoff")) {
+        return true;
+    }
+    if (!std::strcmp(action, "looprestartoff")) {
         g3t::body::loopRestart = false;
         Log("LOOPRESTARTOFF replayed loops play once");
-    } else if (!std::strcmp(action, "potionoff")) {
-        g3t::downed::PotionOff(&Log);
-    } else if (!std::strcmp(action, "givepotion")) {
-        g3t::downed::GivePotion(argument, &Log);
-    } else if (!std::strcmp(action, "potions")) {
-        g3t::downed::Potions(&Log);
-    } else if (!std::strcmp(action, "transform")) {
-        g3t::transform::Start(argument, &Log);
-    } else if (!std::strcmp(action, "transformback")) {
-        g3t::transform::Back(&Log);
-    } else if (!std::strcmp(action, "transformstate")) {
-        g3t::transform::Report(&Log);
-    } else if (!std::strcmp(action, "inventory")) {
-        g3t::ranged::Inventory(&Log);
-    } else if (!std::strcmp(action, "ready")) {
-        g3t::ranged::Ready(argument, &Log);
-    } else if (!std::strcmp(action, "aimat")) {
-        g3t::ranged::Target(argument, &Log);
-    } else if (!std::strcmp(action, "act")) {
-        g3t::ranged::Act(argument, &Log);
-    } else if (!std::strcmp(action, "finishat")) {
-        g3t::ranged::FinishAt(argument, &Log);
-    } else if (!std::strcmp(action, "shootat")) {
-        g3t::ranged::ShootAt(argument, &Log);
-    } else if (!std::strcmp(action, "summonstate")) {
-        g3t::summon::Report(&Log);
-    } else if (!std::strcmp(action, "summoncopyhero")) {
-        g3t::summon::CopyHeroOff(&Log);
-    } else if (!std::strcmp(action, "creatures")) {
-        g3t::summon::Creatures(&Log);
-    } else if (!std::strcmp(action, "areatickon")) {
-        g3t::summon::AreaTickOn(&Log);
-    } else if (!std::strcmp(action, "summonmirroroff")) {
-        g3t::summon::MirrorOff(&Log);
-    } else if (!std::strcmp(action, "shotstate")) {
-        g3t::shot::Report(&Log);
-    } else if (!std::strcmp(action, "shotcopyhero")) {
-        g3t::shot::CopyHeroOff(&Log);
-    } else if (!std::strcmp(action, "spellstate")) {
-        g3t::spells::Report(&Log);
-    } else if (!std::strcmp(action, "spellmirroroff")) {
-        g3t::spells::MirrorOff(&Log);
-    } else if (!std::strcmp(action, "statusof")) {
-        g3t::spells::StatusOf(argument, &Log);
-    } else if (!std::strcmp(action, "tickguardoff")) {
-        g3t::spells::TickGuardOff(&Log);
-    } else if (!std::strcmp(action, "spawnnpc")) {
+        return true;
+    }
+    if (!std::strcmp(action, "spawnnpc")) {
         // "spawnnpc shared <template> <GUID>": the same creature on both machines (this chain is at the compiler's nesting limit)
         if (!std::strncmp(argument, "shared_", 7)) g3t::summon::SpawnShared(argument + 7, &Log);
         else g3t::spells::SpawnNpc(argument, &Log);
-    } else if (!std::strcmp(action, "party")) {
-        g3t::spells::Party(&Log);
-    } else if (!std::strcmp(action, "npcmemory")) {
-        g3t::spells::NpcMemory(argument, &Log);
-    } else if (!std::strcmp(action, "npcgrudge")) {
-        g3t::spells::NpcGrudge(argument, &Log);
-    } else if (!std::strcmp(action, "puppetguid")) {
-        g3t::spells::PuppetGuid(argument, &Log);
-    } else if (!std::strcmp(action, "locks")) {
-        g3t::spells::Locks(&Log);
-    } else if (!std::strcmp(action, "sethp")) {
-        g3t::spells::SetHp(argument, &Log);
-    } else if (!std::strcmp(action, "touchlog")) {
-        g3t::shot::TouchLog(&Log);
-    } else if (!std::strcmp(action, "shotmirroroff")) {
-        g3t::shot::MirrorOff(&Log);
-    } else if (!std::strcmp(action, "summons")) {
-        g3t::ranged::Summons(&Log);
-    } else if (!std::strcmp(action, "lastarrow")) {
-        g3t::ranged::LastArrow(&Log);
-    } else if (!std::strcmp(action, "homingoff")) {
+        return true;
+    }
+    if (!std::strcmp(action, "homingoff")) {
         g3t::ranged::homing = false;
         Log("HOMINGOFF shootat keeps the camera's aim");
-    } else if (!std::strcmp(action, "castat")) {
-        g3t::ranged::CastAt(argument, &Log);
-    } else if (!std::strcmp(action, "mana")) {
-        g3t::ranged::Mana(&Log);
-    } else if (!std::strcmp(action, "flying")) {
-        g3t::ranged::Flying(&Log);
-    } else if (!std::strcmp(action, "shapeoff")) {
-        g3t::remote::ShapeOff(&Log);
-    } else if (!std::strcmp(action, "walkby")) {
+        return true;
+    }
+    if (!std::strcmp(action, "walkby")) {
         g3t::transform::Walk(std::atoi(argument), &Log);
-    } else if (!std::strcmp(action, "dialogaudio")) {
-        g3t::dialogaudio::Report(&Log);
-    } else if (!std::strcmp(action, "mutegame")) {
-        g3t::dialogaudio::MuteGame(argument, &Log);
-    } else if (!std::strcmp(action, "dialogaudiooff")) {
-        g3t::dialogaudio::Disable(&Log);
-    } else if (!std::strcmp(action, "spellfunc")) {
-        g3t::spells::SpellFunc(argument, &Log);
-    } else if (!std::strcmp(action, "quickloot")) {  // "quickloot" queues the action, "quickloot count" only counts
+        return true;
+    }
+    if (!std::strcmp(action, "quickloot")) {  // "quickloot" queues the action, "quickloot count" only counts
         if (!std::strcmp(argument, "count")) g3t::containers::QuickLootActions(&Log);
         else g3t::containers::QuickLoot(&Log);
-    } else {
-        return false;
+        return true;
     }
-    return true;
+
+    static constexpr QaTypedRoute routes[] = {
+        {"world", g3t::persist::WorldReport, nullptr},
+        {"worldsyncoff", g3t::persist::WorldSyncOff, nullptr},
+        {"respawnsync", g3t::respawn::Report, nullptr},
+        {"respawnoff", g3t::respawn::Off, nullptr},
+        {"movers", g3t::doors::Movers, nullptr},
+        {"revolution", nullptr, g3t::social::Revolution},
+        {"storymoveoff", g3t::infocmd::StoryMoveOff, nullptr},
+        {"storymoves", g3t::infocmd::StoryMoves, nullptr},
+        {"startrevolution", nullptr, g3t::social::StartRevolution},
+        {"learnperk", nullptr, g3t::pickpocket::LearnPerk},
+        {"gesturesoff", g3t::talk::GesturesOff, nullptr},
+        {"optionsoff", g3t::dialogaudio::OptionsOff, nullptr},
+        {"clockdays", nullptr, g3t::clock::AddDays},
+        {"waitoff", g3t::clock::WaitOff, nullptr},
+        {"reconnect", g3t::net::Reconnect, nullptr},
+        {"generationoff", g3t::persist::GenerationOff, nullptr},
+        {"persistpause", nullptr, g3t::persist::Pause},
+        {"worldgatelate", g3t::persist::WorldGateLate, nullptr},
+        {"loadticksoff", nullptr, g3t::persist::LoadTicksOff},
+        {"dialogxpoff", g3t::infocmd::DialogXpOff, nullptr},
+        {"givebackposoff", g3t::infocmd::GivebackPlaceOff, nullptr},
+        {"duelhero", nullptr, g3t::explore::DuelHero},
+        {"lethalonlyoff", g3t::downed::LethalOnlyOff, nullptr},
+        {"arenaruleoff", g3t::combat::ArenaRuleOff, nullptr},
+        {"arena", nullptr, g3t::combat::ArenaReport},
+        {"xpinfos", g3t::explore::XpInfos, nullptr},
+        {"forgetnpclist", g3t::remote::ForgetNpcListOn, nullptr},
+        {"contactsoff", g3t::remote::ContactsOff, nullptr},
+        {"badtransfer", g3t::persist::BadTransfer, nullptr},
+        {"badrecord", g3t::npcs::BadRecord, nullptr},
+        {"badstates", nullptr, g3t::remote::BadStates},
+        {"reacthitsoff", g3t::combat::ReactHitsOff, nullptr},
+        {"keeplocaloff", g3t::enclaves::KeepLocalOff, nullptr},
+        {"enclavescanpause", nullptr, g3t::enclaves::PauseScan},
+        {"crimeadd", nullptr, g3t::enclaves::AddCrime},
+        {"npcsend", nullptr, g3t::npcs::SendInfo},
+        {"joingraceoff", g3t::npcs::JoinGraceOff, nullptr},
+        {"contestoff", g3t::npcs::ContestOff, nullptr},
+        {"claimrecord", nullptr, g3t::npcs::ClaimRecord},
+        {"edgenpcs", g3t::npcs::EdgeReport, nullptr},
+        {"hostwinsoff", g3t::npcs::HostWinsOff, nullptr},
+        {"doors", g3t::doors::Report, nullptr},
+        {"doorsyncoff", g3t::doors::SyncOff, nullptr},
+        {"owned", nullptr, g3t::social::Owned},
+        {"enclavesync", g3t::enclaves::Report, nullptr},
+        {"enclavesyncoff", g3t::enclaves::SyncOff, nullptr},
+        {"unarm", g3t::social::Unarm, nullptr},
+        {"enclaves", g3t::social::Enclaves, nullptr},
+        {"crime", nullptr, g3t::social::Crime},
+        {"usables", nullptr, g3t::world::Usables},
+        {"face", nullptr, g3t::world::Face},
+        {"use", nullptr, g3t::world::Use},
+        {"unlock", nullptr, g3t::world::Unlock},
+        {"useinfo", nullptr, g3t::world::UseInfo},
+        {"attitude", nullptr, g3t::explore::Attitude},
+        {"continueroutine", g3t::ai::ContinueRoutineReport, nullptr},
+        {"continueroutineon", g3t::ai::ContinueRoutineOn, nullptr},
+        {"movelength", g3t::ai::MoveLengthReport, nullptr},
+        {"movelengthoff", g3t::ai::MoveLengthOff, nullptr},
+        {"scriptfind", nullptr, g3t::ai::FindByRva},
+        {"heropos", g3t::explore::HeroPos, nullptr},
+        {"hitpuppet", nullptr, g3t::combat::HitPuppet},
+        {"lookat", nullptr, g3t::explore::LookAt},
+        {"deadposeoff", g3t::npcs::DeadPoseOff, nullptr},
+        {"deadpose", g3t::npcs::DeadPoseReport, nullptr},
+        {"trace", nullptr, g3t::trace::Command},
+        {"partnerjump", g3t::partner::JumpQa, nullptr},
+        {"partyxpoff", g3t::combat::PartyXpOff, nullptr},
+        {"npcrecvon", g3t::npcs::RecvOn, nullptr},
+        {"npcrecvoff", g3t::npcs::RecvOff, nullptr},
+        {"fleekeepoff", g3t::ai::FleeKeepOff, nullptr},
+        {"flee", nullptr, g3t::combat::FleeFrom},
+        {"potionoff", g3t::downed::PotionOff, nullptr},
+        {"givepotion", nullptr, g3t::downed::GivePotion},
+        {"potions", g3t::downed::Potions, nullptr},
+        {"transform", nullptr, g3t::transform::Start},
+        {"transformback", g3t::transform::Back, nullptr},
+        {"transformstate", g3t::transform::Report, nullptr},
+        {"inventory", g3t::ranged::Inventory, nullptr},
+        {"ready", nullptr, g3t::ranged::Ready},
+        {"aimat", nullptr, g3t::ranged::Target},
+        {"act", nullptr, g3t::ranged::Act},
+        {"finishat", nullptr, g3t::ranged::FinishAt},
+        {"shootat", nullptr, g3t::ranged::ShootAt},
+        {"summonstate", g3t::summon::Report, nullptr},
+        {"summoncopyhero", g3t::summon::CopyHeroOff, nullptr},
+        {"creatures", g3t::summon::Creatures, nullptr},
+        {"areatickon", g3t::summon::AreaTickOn, nullptr},
+        {"summonmirroroff", g3t::summon::MirrorOff, nullptr},
+        {"shotstate", g3t::shot::Report, nullptr},
+        {"shotcopyhero", g3t::shot::CopyHeroOff, nullptr},
+        {"spellstate", g3t::spells::Report, nullptr},
+        {"spellmirroroff", g3t::spells::MirrorOff, nullptr},
+        {"statusof", nullptr, g3t::spells::StatusOf},
+        {"tickguardoff", g3t::spells::TickGuardOff, nullptr},
+        {"party", g3t::spells::Party, nullptr},
+        {"npcmemory", nullptr, g3t::spells::NpcMemory},
+        {"npcgrudge", nullptr, g3t::spells::NpcGrudge},
+        {"puppetguid", nullptr, g3t::spells::PuppetGuid},
+        {"locks", g3t::spells::Locks, nullptr},
+        {"sethp", nullptr, g3t::spells::SetHp},
+        {"touchlog", g3t::shot::TouchLog, nullptr},
+        {"shotmirroroff", g3t::shot::MirrorOff, nullptr},
+        {"summons", g3t::ranged::Summons, nullptr},
+        {"lastarrow", g3t::ranged::LastArrow, nullptr},
+        {"castat", nullptr, g3t::ranged::CastAt},
+        {"mana", g3t::ranged::Mana, nullptr},
+        {"flying", g3t::ranged::Flying, nullptr},
+        {"shapeoff", g3t::remote::ShapeOff, nullptr},
+        {"dialogaudio", g3t::dialogaudio::Report, nullptr},
+        {"mutegame", nullptr, g3t::dialogaudio::MuteGame},
+        {"dialogaudiooff", g3t::dialogaudio::Disable, nullptr},
+        {"spellfunc", nullptr, g3t::spells::SpellFunc},
+    };
+    return DispatchTypedRoute(action, argument, &Log, routes);
 }
 
 void RunConsole(const char* command)
