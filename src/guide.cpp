@@ -81,7 +81,7 @@ void Take(eCEntity* npc, Kind kind)
     }
     held[key] = {kind, e.GetName().GetText()};
     if (kind == Guide) {
-        StartGuiding(e);
+        if (net::IsHost()) StartGuiding(e);
         ++guidesTaken;
     } else {
         ++followersTaken;
@@ -165,6 +165,14 @@ void Tick()
 bool Readopt(eCEntity* npc)
 {
     if (!on || !GuidesInQuest(npc)) return false;
+    if (!net::IsHost()) {
+        Entity hero(gCSession::GetInstance().GetHero());
+        if (!hero.GetInstance() || !hero.GetInstance()->GetPropertySet(eEPropertySetType_Party)) return false;
+        hero.Party.SetPartyLeader(Entity(npc));
+        held[Key(npc)] = {Guide, Entity(npc).GetName().GetText()};
+        ++readopted;
+        return infocmd::TakeOver(npc, true, false);
+    }
     // StartGuidePlayer as the quest's start runs it: the local hero's leader becomes the guide.
     GetScriptAdminExt().CallScript(bCString("StartGuidePlayer"), npc, nullptr, 0);
     Entity e(npc);
@@ -174,6 +182,8 @@ bool Readopt(eCEntity* npc)
     Logf("guide: %s guides this player again (from the host's save), task %s", e.GetName().GetText(), e.Routine.GetCurrentTask().GetText());
     return true;
 }
+
+bool IsQuestGuide(eCEntity* npc) { return GuidesInQuest(npc); }
 
 void OnWorldChange()
 {

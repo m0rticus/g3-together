@@ -28,6 +28,11 @@ private:
 
 // The puppet that stands for the game's player right now, none for the local hero (QA, p7probe.cpp).
 eCEntity* CurrentActor();
+// This machine's own player body (its hero, or the creature it controls). Acting() makes the game's IsPlayer false for it, so a
+// script that runs with this body as self under an Acting scope treats the player as an NPC (it watched a fight, applauded and
+// walked around, 2 Nov. play session): no hook opens an Acting scope for a script whose self is this body.
+bool IsLocalPlayer(eCEntity const* entity);
+bool PlayerContextReady();  // both native GetPlayer/IsPlayer imports were redirected
 
 // ai.cpp, before an AI state of `self` runs: the puppet it reacts to when that state follows the player, else none.
 eCEntity* StateActor(eCEntity* self, char const* state);

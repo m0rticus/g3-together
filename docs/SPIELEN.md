@@ -7,6 +7,8 @@ ist die gemeinsame Kampagne, sein Spielstand ist der Spielstand aller. Die ander
 
 Stand: Testversion. Was geht und was nicht, steht unten unter „Bekannte Grenzen“.
 
+Dieser Fork unterstützt **nur Steam**. Beitritt über IP, LAN/VPN und ein automatischer IP-Ausweichweg entfallen.
+
 ## Voraussetzungen (alle Spieler gleich)
 
 - Gothic 3 von Steam mit dem **Community Patch 1.75.14** (dieselbe Version bei allen).
@@ -18,6 +20,7 @@ Stand: Testversion. Was geht und was nicht, steht unten unter „Bekannte Grenze
   (Zeile mit `REFUSED by host`). Lose Dateien in den Data-Unterordnern prüft sie nicht.
 - Keine anderen Koop-Mods im Ordner `scripts` (zum Beispiel `Script_G3Coop.dll` von Myrtana Accord).
 - Am besten eine **Kopie** der Gothic-3-Installation nur für Koop verwenden.
+- Steam muss auf beiden PCs laufen und angemeldet sein; beide Spieler müssen Steam-Freunde sein.
 
 ## Installieren
 
@@ -25,29 +28,28 @@ Stand: Testversion. Was geht und was nicht, steht unten unter „Bekannte Grenze
 doppelklicken (`Setup.cmd` auf Englisch, `Instalacja.cmd` auf Polnisch). Es erledigt das Kopieren und die INI: Es findet Gothic 3 (Steam, GOG oder der
 Ordner, den du angibst), prüft Community Patch 1.75.14 und Parallel Universe Patch 1.1.1, nimmt eine andere Koop-Mod aus
 `scripts`, kopiert die Mod nach `scripts` und schreibt `g3together.ini` nach deinen Antworten (Host oder Mitspieler, dein
-Name, die Adresse des Hosts). Ersetzte Dateien liegen danach in `G3Together-backup` im Spielordner. Das Einrichten wurde
+Rolle). Der Spielername kommt automatisch von Steam. Steam und die geprüfte `steam_api.dll` sind erforderlich; ohne diese DLL bricht das Setup ab.
+Ersetzte Dateien liegen danach in `G3Together-backup` im Spielordner. Das Einrichten wurde
 an Testordnern geprüft, noch nicht von Spielern; die Schritte unten machen dasselbe von Hand.
 
 1. Gothic 3 von Steam installieren, danach den **Community Patch 1.75.14**.
 2. Den [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm) in dieselbe Spielinstallation installieren. Beide Spieler verwenden denselben Patchstand.
-3. Aus demselben G3-Together-Paket `Script_G3Together.dll` in den Ordner `<Gothic 3>\scripts\` kopieren.
+3. Aus demselben Paket `Script_G3Together.dll` nach `<Gothic 3>\scripts\` und die geprüfte 32-Bit-`steam_api.dll`
+   nach `<Gothic 3>\G3Together\` kopieren; alternativ erledigt das Setup dies.
 4. Die passende Datei `g3together.ini.host-example` oder `g3together.ini.client-example` aus dem Paket als `g3together.ini` in den Ordner `<Gothic 3>\` kopieren und anpassen:
 
    Host:
 
    ```ini
    role = host
-   port = 34567
-   name = DeinName
+   transport = steam
    ```
 
    Mitspieler:
 
    ```ini
    role = client
-   address = <IP-Adresse des Hosts>
-   port = 34567
-   name = DeinName
+   transport = steam
    ```
 
    Wichtig: Bei jedem Mitspieler muss `role = client` stehen. Fehlt die Datei oder steht dort etwas anderes,
@@ -64,50 +66,28 @@ Meldungen in dieser Anleitung beziehen sich auf ein deutsches Spiel oder `langua
 
 ## Verbinden über das Internet
 
-Die Mod verbindet sich direkt per UDP (Port 34567). Ohne Router-Einstellungen geht das am einfachsten über ein
-virtuelles privates Netz, das alle Spieler installieren, zum Beispiel **Tailscale** oder **ZeroTier**.
-Als `address` trägt man dann die Tailscale- bzw. ZeroTier-Adresse des Hosts ein.
-Alternativ leitet der Host UDP-Port 34567 in seinem Router auf seinen PC weiter.
+Steam ist der einzige Verbindungsweg. Eine Host-Adresse, ein VPN oder eine Portfreigabe im Router sind nicht nötig.
 
 ### Über Steam (experimentell)
 
 Mit `transport = steam` in beiden INIs findet das Spiel des Mitspielers den Host unter seinen Steam-Freunden, und der ganze
-Verkehr läuft über Steam, wo nötig über Valves Relay: keine Adresse, keine Portfreigabe, kein Hamachi.
+Verkehr läuft über Steam, wo nötig über Valves Relay.
 
-- Beide brauchen ein laufendes, angemeldetes Steam und müssen Steam-Freunde sein. Ein Gothic 3 von GOG geht auch; nötig
-  ist nur ein Steam-Konto.
+- Beide müssen Gothic 3 auf Steam besitzen, angemeldet sein und Steam-Freunde sein.
+  Spielernamen kommen automatisch von Steam; ein INI-Name wird ignoriert.
 - Die Mod braucht Valves 32-Bit-`steam_api.dll` in `<Gothic 3>\G3Together\`. Das Setup legt sie dort ab (aus dem Paket oder
   nach Rückfrage aus dem Steamworks.NET-Release 2025.164.1 heruntergeladen, per SHA-256 geprüft).
-- Die Mod läuft als Valves kostenlose Beispiel-App „Spacewar“ (AppID 480); Steam zeigt beide als „spielt Spacewar“.
-  Kaufen muss man nichts.
+- Die Mod verwendet Gothic 3 (AppID 39500); Steam zeigt Gothic 3 statt Spacewar.
 - Hosten mehrere Freunde gleichzeitig, trägt der Mitspieler `steam_host = <Steam-Name des Hosts>` ein. Die
   `g3together.log` des Hosts nennt auch die Lobby-Nummer; `steam_lobby = <Nummer>` tritt genau dieser bei.
-- Ohne Steam (läuft nicht, keine `steam_api.dll`) verbindet das Spiel des Mitspielers stattdessen mit `address` und sagt
-  das im Spiel. Der UDP-Port des Hosts bleibt auch über Steam offen, ein Spieler mit Adresse kann also demselben Spiel
-  beitreten.
+- Ohne Steam oder die erforderliche `steam_api.dll` startet Koop nicht; Hauptmenü und Spiel zeigen den Fehler.
+  Es gibt keinen Ausweichweg. ENet bindet seine UDP-Sockets nur an localhost und akzeptiert nur verbundene Steam-Relays.
 - Die Einladung über das Steam-Overlay geht in Gothic 3 vielleicht nicht auf. Sie ist nicht nötig: Das Spiel des
   Mitspielers findet den Host von selbst, und „Spiel beitreten“ in der Steam-Freundesliste geht auch, solange sein Spiel
   läuft.
 
 Getestet ist diese Verbindung mit einem Steam-Ersatz auf einem PC; zwischen zwei echten Steam-Konten ist sie noch nicht
 geprüft.
-
-### Über Hamachi
-
-1. Beide Spieler installieren Hamachi und treten **demselben** Hamachi-Netz bei.
-2. Den angezeigten Verbindungsstatus zum Partner prüfen. Eine direkte Verbindung ist vorzuziehen; eine Verbindung
-   über einen Relay-Server erhöht die Verzögerung und kann ruckeln. Verbindungsfehler vor dem Spielstart beheben.
-3. Der Host sieht seine Hamachi-Adresse oben im Hamachi-Fenster (`25.x.x.x`). Der Mitspieler trägt sie in seiner INI ein:
-   `address = 25.x.x.x`, `port = 34567`.
-4. **Firewall beim Host:** Windows behandelt das Hamachi-Netz oft als „Öffentliches Netzwerk“. Erscheint beim ersten Start von
-   Gothic 3 die Firewall-Frage, das von Hamachi verwendete Netzwerkprofil erlauben, gegebenenfalls auch **„Öffentliche Netzwerke“**.
-5. Probe: Der Mitspieler tippt in der Eingabeaufforderung `ping 25.x.x.x` (Adresse des Hosts). Damit lassen sich Verbindung
-   und Verzögerung prüfen. Eine geringe Verzögerung ist besser; eine Ping-Antwort allein bestätigt noch keine erlaubte UDP-Spielverbindung.
-6. Erreicht das Spiel des Mitspielers den Host nicht, sagt das nach etwa 15 Sekunden die oberste Zeile seines Hauptmenüs, mit der
-   eingetragenen Adresse und dem Port (im Spiel: alle 30 Sekunden eine Meldung).
-
-Die Mod nimmt auf dem Host Verbindungen über jeden Netzwerkadapter an, also auch über Hamachi. Die in diesen Anleitungen
-beschriebenen Tests liefen auf einem PC mit zwei Spielkopien; Spielen über das echte Internet bleibt ungeprüft.
 
 ## Spielen
 
@@ -130,14 +110,14 @@ beschriebenen Tests liefen auf einem PC mit zwei Spielkopien; Spielen über das 
 ## Was gemeinsam ist
 
 - Spieler sehen sich und ihre Bewegungen, Kampf-Animationen, Stürze.
-- Alle sehen dieselben NPCs, Kämpfe und Tode. Jede Gegend läuft bei einem Spieler: in der Nähe des Hosts beim
-  Host, weit weg von ihm bei dem Mitspieler, der zuerst dort war. Kommt der andere dazu, sieht er dieselbe Gegend.
-- Schaden: Einen Treffer auf ein NPC entscheidet der Rechner, bei dem dieses NPC läuft. Erfahrung bekommt, wer
+- Protokoll 69 ist noch experimentell: Der Host simuliert NPCs bei allen Spielern, auch in entfernten Gebieten.
+  Mitspieler geben gepufferte Positionen und Animationen wieder, ohne eigene NPC-KI oder Aufgaben.
+- Schaden: Der eigene Spieler beurteilt sichtbare Treffer; der Host wendet NPC-Treffer an. Erfahrung bekommt, wer
   tötet. Tötet ein Begleiter oder eine Beschwörung eines Spielers ein NPC, bekommt dieser Spieler die Erfahrung;
   tötet ein anderes NPC es, bekommt niemand Erfahrung. Einen Menschen oder Ork schlägt dein letzter Treffer wie im
   Einzelspiel nieder (Erfahrung, kein Mord); erst ein Schlag auf den am Boden Liegenden tötet ihn.
-- Gefolgsleute folgen dem Spieler, der sie angeworben hat, auch weit weg vom Host. Entlässt er sie, gehören sie
-  wieder dem Host.
+- Gefolgsleute folgen dem Spieler, der sie angeworben hat, auch weit weg vom Host. Ihre Simulation bleibt immer
+  beim Host; Anwerben und Entlassen ändern nur die Gruppenzugehörigkeit.
 - Wer dich führt oder wen du begleitest (Folgen- und Hinbringen-Quests), geht mit dem Spieler, der die Quest angenommen
   hat, auch mit dem Mitspieler; lädt der Host einen Spielstand, führt wieder dieser Spieler. Endet das Hinbringen weit weg
   vom Host, steht das NPC danach bei beiden am selben Ort.
@@ -170,6 +150,10 @@ beschriebenen Tests liefen auf einem PC mit zwei Spielkopien; Spielen über das 
   merken sich, wie ein Kampf ausging, und ein NPC, das einem Spieler noch böse ist, hält es nur diesem vor.
 - Blocken wie im Einzelspiel für beide Spieler: Ein Block kostet Ausdauer, und das Schild-Talent zählt. Ein NPC, das
   pariert, blockt die Schläge beider Spieler gleich.
+- Freundbeschuss ist standardmäßig aus (`friendly_fire = 0`): Spieler und ihre Begleiter verletzen, vergiften,
+  vereisen oder betäuben einander nicht und schlagen einander nicht nieder. Heilung und Aufhelfen bleiben möglich;
+  Gegner und Umgebungsschaden bleiben unverändert. Auf beiden PCs denselben Wert einstellen und das Spiel neu starten.
+  Ein ausdrücklich gesetzter Wert von 1 bis 100 behält die bisherige Schadensskalierung; Setup übernimmt vorhandene Werte.
 - Mithören: Wer höchstens etwa 20 m entfernt steht, hört den Dialog des Mitspielers. Sind die Untertitel des Spiels an,
   erscheint auch der Text, in der eigenen Spielsprache, solange man nicht selbst in einem Dialog ist. Man sieht auch die
   Antworten, die der Mitspieler wählen kann, und dann die gewählte; wer spricht, wählt.
@@ -228,34 +212,31 @@ beschriebenen Tests liefen auf einem PC mit zwei Spielkopien; Spielen über das 
 - **Zum Mitspieler springen:** Die Taste **Bild ab** (Page Down) setzt dich 1,5 m hinter deinen Mitspieler, in derselben
   Welt, auch wenn er bewusstlos ist (dann kannst du ihm aufhelfen). Danach 5 Sekunden Pause. So könnt ihr euch trennen und
   jederzeit wieder treffen; am besten bleibt ihr meist zusammen. Andere Taste: `partner_key = F9` in der INI
-  (F1–F24, PAGEUP, HOME, END, INSERT, DELETE oder ein Buchstabe; Einfg und Entf sind die Handelstasten, siehe unten).
+  (F1–F24, PAGEUP, HOME, END, INSERT, DELETE oder ein Buchstabe).
 - **Karte und Kompass:** Dein Mitspieler ist auf deiner Karte mit seinem Namen eingezeichnet und auf dem Kompass in seiner
   Richtung, von deinem Blick aus gesehen.
 - **Dein Aussehen:** Dein Mitspieler sieht die Rüstung und den Helm, die du trägst. Willst du für ihn wie eine andere Figur
   aussehen, trag in deiner eigenen INI `look = Diego` ein (eine Figurvorlage des Spiels); ohne den Eintrag entscheidet sein
   `puppet_template` (Standard: der Held).
 - **Handeln mit deinem Mitspieler:** Sprich seine Figur an und wähle „Zeig mir deine Ware!“. Es öffnet sich der normale
-  Handelsbildschirm mit allem, was dein Mitspieler handeln kann (nicht, was er trägt, keine Questgegenstände), und seinem
-  Gold; die Preise sind in beide Richtungen gleich, eine geschärfte, gesegnete oder geschmiedete Waffe bleibt es. Beim
-  allerersten Handel kommt zuerst ein Tipp: auf „Ok“ klicken.
-  Tausche so oft du willst und schließe dann das Fenster: Dein Mitspieler bekommt ein Angebot und nimmt es innerhalb von
-  30 Sekunden mit Einfg an oder lehnt mit Entf ab. **Eigener Preis:** Solange das Fenster offen ist, stellst du mit
-  Num+ und Num− ein, wie viel Gold fließt (10 pro Druck, mit Shift 100); der Preis startet beim Wert der Ware und steht
-  oben auf dem Bildschirm. Dein Mitspieler sieht ihn im Angebot und entscheidet. Mehr Gold, als einer von euch hat, geht
-  nicht, und unter null geht der Preis nicht (dann ist es ein Geschenk). Bis dahin hast du weder, was du bekommst, noch, was du hergegeben hast;
-  danach ist alles beim Richtigen. Andere Tasten: `offer_accept_key = F7`, `offer_decline_key = F8`, `price_up_key` und
-  `price_down_key` (Standard `NUMPLUS`, `NUMMINUS`) in der INI (dieselben Namen wie bei `partner_key`). Sind zwei dieser Tasten gleich, löst ein Druck beides aus: Die Mod sagt
-  das beim Start auf dem Bildschirm und in `g3together.log`.
+  Handelsbildschirm mit seinen nicht angelegten Gegenständen und seinem Gold. Wähle, was du nehmen oder geben
+  möchtest, und drücke **Tauschen**. Gegenstände sind kostenlos; ein passender Gegenwert ist nicht nötig. Gold
+  verschenkst du ausdrücklich als ausgewählte Menge, auch ohne Gegenstände. Jeder Austausch wird im offenen Fenster
+  automatisch synchronisiert, ohne Bestätigung durch den Mitspieler. Angelegte/getragene Ausrüstung,
+  Questgegenstände und Fähigkeiten bleiben geschützt; die Qualität bleibt erhalten.
+  Beim ersten Handel den Tipp mit Ok schließen. Angebots- und Preistasten entfallen; NPC-Preise bleiben unverändert.
+  Während der Synchronisierung erst nach Wiederverbindung speichern oder laden. Der neue Ablauf ist für manuelle
+  Tests gebaut; Mausbedienung und reine Goldgeschenke sind im Spiel noch zu prüfen.
 - Dialog-Auswirkungen: Was ein Dialog bei einem NPC ändert (Händler, Lehrer, Wache, Tagesablauf ...), Duelle und
   Angriffe aus Dialogen und das Anwerben von Gefolgsleuten gelten für alle. Gegenstände aus Dialogen bekommt, wer
   den Dialog führt.
 - Gefolgsleute über Speichern und Laden: Der Host merkt sich, wem sie gehören. Nach dem Laden bekommt der Mitspieler sie
-  beim Wiederbeitritt zurück, erkannt an seinem Namen in der INI; den Namen also nicht ändern. Nach einem
+  beim Wiederbeitritt zurück, erkannt an seinem Steam-Anzeigenamen; den Namen also nicht ändern. Nach einem
   Verbindungsabbruch ohne Laden gehören sie zunächst dem Host.
 - Lädt der Host während des Spiels einen Spielstand, laden die Mitspieler ihn automatisch mit. Bis sie fertig sind,
   seht ihr euch nicht.
-- Handel und Plündern sind mit Bots über die Handelsfunktionen des Spiels getestet; die Maussteuerung des
-  Handelsfensters (Ziehen, Knöpfe) hat noch kein Mensch ausprobiert.
+- Frühere Handelsprüfungen nutzten Inventarhilfen, nicht den nativen Tauschknopf. Sie bestätigen den neuen
+  Spielerhandel nicht; siehe die manuellen Prüfungen in [TESTPLAN.md](TESTPLAN.md).
 - Schlafen: Wer schläft, stellt die Uhr für alle vor (die Heilung durch den Schlaf gilt nur für den Schläfer).
 - Verwandlungen (z. B. in einen Wolf oder eine Blutfliege): Der andere Spieler sieht das Tier, wie es läuft und sich
   bewegt, und nach der Rückverwandlung wieder den Helden. Getestet mit Wolf und Blutfliege, ausgelöst wie der

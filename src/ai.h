@@ -4,9 +4,33 @@
 // had touched their targets). Both are wrapped through the script admin's own tables.
 #pragma once
 
+#include <cstddef>
+
 class eCEntity;
 
 namespace g3t::ai {
+namespace detail {
+inline thread_local eCEntity* damageReceiver = nullptr;
+}
+
+class DamagePerception {
+public:
+    explicit DamagePerception(eCEntity* receiver) : before(detail::damageReceiver)
+    {
+        if (receiver) detail::damageReceiver = receiver;
+    }
+    ~DamagePerception() { detail::damageReceiver = before; }
+    DamagePerception(DamagePerception const&) = delete;
+    DamagePerception& operator=(DamagePerception const&) = delete;
+private:
+    eCEntity* before;
+};
+
+inline bool PerceptionBlocked(eCEntity* receiver, bool driven)
+{
+    return driven && (!receiver || receiver != detail::damageReceiver);
+}
+
 void Tick();             // installs the filter once the game's scripts have registered it
 bool PerceptionFiltered();
 unsigned BlockedCount(); // perceptions refused for driven bodies so far
@@ -23,9 +47,8 @@ void ContinueRoutineReport(void (*log)(char const*));  // QA: CONTINUEROUTINE li
 void ContinueRoutineOn(void (*log)(char const*));      // QA negative control: ContinueRoutine runs for puppets again
 void MoveLengthReport(void (*log)(char const*));       // QA: MOVELENGTH line (GetCombatMoveLength without the fight target)
 void MoveLengthOff(void (*log)(char const*));          // QA negative control: the original binds the target again
-// Jump from a native function whose first 6 bytes are complete, position-independent instructions (push ebp; mov ebp,esp;
-// and esp,-8) to `detour`; returns the trampoline that runs the original, or null.
-void* JumpTo(unsigned char* target, void* detour);
+// The caller must verify `stolen` complete, position-independent instruction bytes before patching.
+void* JumpTo(unsigned char* target, void* detour, size_t stolen = 6);
 // Points one import of `module` (by DLL and function name) at `replacement`; returns what it pointed at.
 void* PatchImport(void* module, char const* dll, char const* function, void* replacement);
 // GetAttitude wrapper: an NPC judging a puppet judges the local hero instead.

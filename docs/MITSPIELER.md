@@ -7,6 +7,7 @@
 - Die getestete Grundlage ist Gothic 3 aus Steam mit **Community Patch 1.75.14** und **Parallel Universe Patch 1.1.1** auf beiden Rechnern. Dazu dieselbe G3-Together-DLL und dieselben Spieldateien verwenden. Die Kompatibilität ohne PUP ist nicht belegt.
 - Schwierigkeit, alternatives Balancing, alternative KI, XP-Faktor, minimale Trefferdauer, Quick Loot und der Abschnitt `[Game]` in `Ini\ge3.ini` müssen mit dem Host übereinstimmen.
 - Im Ordner `scripts` darf keine andere Koop-Mod liegen.
+- Steam muss auf beiden PCs laufen und angemeldet sein; beide Spieler müssen Steam-Freunde sein.
 
 ## Installieren
 
@@ -14,22 +15,22 @@
 doppelklicken (`Setup.cmd` auf Englisch, `Instalacja.cmd` auf Polnisch). Es erledigt das Kopieren und die INI: Es findet Gothic 3 (Steam, GOG oder der
 Ordner, den du angibst), prüft Community Patch 1.75.14 und Parallel Universe Patch 1.1.1, nimmt eine andere Koop-Mod aus
 `scripts`, kopiert die Mod nach `scripts` und schreibt `g3together.ini` nach deinen Antworten (Host oder Mitspieler, dein
-Name, die Adresse des Hosts). Ersetzte Dateien liegen danach in `G3Together-backup` im Spielordner. Das Einrichten wurde
+Rolle). Der Spielername kommt automatisch von Steam. Steam und die geprüfte `steam_api.dll` sind erforderlich; ohne diese DLL bricht das Setup ab.
+Ersetzte Dateien liegen danach in `G3Together-backup` im Spielordner. Das Einrichten wurde
 an Testordnern geprüft, noch nicht von Spielern; die Schritte unten machen dasselbe von Hand.
 
 1. Installiere Gothic 3 von Steam, danach **Community Patch 1.75.14**, danach den [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm) in dieselbe Spielinstallation.
-2. Kopiere `Script_G3Together.dll` aus demselben Paket wie beim Host nach `<Gothic-3-Ordner>\scripts\`.
+2. Kopiere `Script_G3Together.dll` aus demselben Paket wie beim Host nach `<Gothic-3-Ordner>\scripts\`
+   und die geprüfte 32-Bit-`steam_api.dll` nach `<Gothic-3-Ordner>\G3Together\`, oder verwende das Setup.
 3. Kopiere `g3together.ini.client-example` aus dem Paket als `g3together.ini` nach `<Gothic-3-Ordner>\` und trage deine Daten ein:
 
 ```ini
 role = client
-address = <Adresse des Hosts>
-port = 34567
-name = <Dein Name>
+transport = steam
 language = auto
 ```
 
-Ersetze die beiden Platzhalter. **Über Hamachi** ist die Adresse des Hosts seine Hamachi-Adresse (`25.x.x.x`, steht bei ihm oben im Hamachi-Fenster); beide müssen im selben Hamachi-Netz sein, vorzugsweise mit direkter Verbindung. Auf deinem Rechner muss unbedingt `role = client` stehen. Behalte deinen Namen bei:
+Der Name kommt automatisch von Steam. Auf deinem Rechner muss unbedingt `role = client` stehen. Behalte deinen Steam-Anzeigenamen bei:
 Gefolgsleute findet der Host nach dem Laden eines Spielstands über diesen Namen wieder.
 
 `language = auto` zeigt die Mod-Meldungen in der Textsprache deines Gothic 3 (Deutsch, Polnisch, sonst Englisch).
@@ -43,14 +44,12 @@ Der Host startet Gothic 3 und beginnt eine neue Kampagne oder lädt seine Koop-K
 Wird der Beitritt abgelehnt, öffne im Gothic-3-Ordner `g3together.log` und suche die Zeile `REFUSED by host`. Prüfe Versionen und Spieloptionen.
 Der Grund steht auch in der obersten Zeile des Hauptmenüs.
 
-Erreicht dein Spiel den Host gar nicht, sagt das nach etwa 15 Sekunden die oberste Zeile des Hauptmenüs, mit Adresse und Port aus
-deiner INI (im Spiel: alle 30 Sekunden eine Meldung). Prüfe, ob das Spiel des Hosts läuft, Adresse und Port und die Firewall beim
-Host. Die Mod versucht es weiter; sobald sie den Host erreicht, ist die Zeile wieder wie vorher.
-
-**Über Steam** (`transport = steam`, experimentell, siehe [SPIELEN.md](SPIELEN.md#über-steam-experimentell)): Du brauchst
-keine Adresse. Dein Spiel sucht den Host unter deinen Steam-Freunden; solange es keinen findet, sagt das nach etwa 15
+**Steam ist der einzige Verbindungsweg** (siehe [SPIELEN.md](SPIELEN.md#über-steam-experimentell)).
+Dein Spiel sucht den Host unter deinen Steam-Freunden; solange es keinen findet, sagt das nach etwa 15
 Sekunden die oberste Zeile des Hauptmenüs. Der Host muss in deiner Steam-Freundesliste sein und Steam und sein Spiel laufen
 haben.
+Kann Steam nicht starten, erscheint ein Fehler. Prüfe Steam und die erforderliche DLL und starte das Spiel neu.
+Es gibt keinen IP-Ausweichweg.
 
 ## Im Spiel
 
@@ -60,13 +59,12 @@ haben.
 - Kämpft dein Partner ein Duell oder in der Arena, halte dich heraus: Deine Treffer auf seinen Gegner zählen nicht.
 - Die Gegend jedes Spielers läuft bei ihm und bleibt für beide gleich, darum gibt es keine Abstandsmeldung. Ist dein Partner in einer anderen Welt, erscheint **„<Name> ist in einer anderen Welt.“**
 - **Bild ab** (Page Down) bringt dich direkt hinter deinen Mitspieler, auch zu ihm, wenn er am Boden liegt. Danach 5 Sekunden
-  Pause. Andere Taste: in der INI `partner_key = F9` (F1–F24, PAGEUP, HOME, END, INSERT, DELETE oder ein Buchstabe;
-  Einfg und Entf sind die Handelstasten, solange du die nicht änderst).
+  Pause. Andere Taste: in der INI `partner_key = F9` (F1–F24, PAGEUP, HOME, END, INSERT, DELETE oder ein Buchstabe).
 - Dein Partner ist auf deiner Karte und deinem Kompass eingezeichnet.
 - Dein Partner sieht die Rüstung und den Helm, die du trägst. Mit `look = Diego` in deiner INI siehst du für ihn wie eine andere Figur aus.
-- Handeln mit deinem Partner: seine Figur ansprechen, „Zeig mir deine Ware!“; er bestätigt mit Einfg (Entf lehnt ab).
-  Eigenen Preis im offenen Handelsfenster mit Num+ / Num− einstellen (mit Shift in 100er-Schritten).
-  Andere Tasten: `offer_accept_key` und `offer_decline_key` in der INI; sind zwei deiner Tasten gleich, warnt die Mod beim Start.
+- Handeln mit deinem Partner: „Zeig mir deine Ware!“, Gegenstände oder Gold auswählen und **Tauschen** drücken.
+  Gegenstände sind kostenlos, ausgewähltes Gold ist ein Geschenk. Keine Partnerbestätigung und kein Schließen nötig.
+  Angelegte Ausrüstung, Questgegenstände und Fähigkeiten bleiben geschützt. Manuelle Spieltests stehen noch aus.
 - Gespeichert wird beim Host.
 - Was noch schiefgehen kann und was ihr dann tut: Abschnitt **„Bekannte Probleme“** in der [Spielanleitung](SPIELEN.md).
 
@@ -80,4 +78,3 @@ python "tools\collect_logs.py" "<Gothic-3-Ordner>"
 
 Schicke die erzeugte Datei `g3together-logs-<Zeitstempel>.zip` an den Host. Sie liegt im Paketordner. Ohne Python: `g3together.log` aus dem Gothic-3-Ordner und die `.log`-Dateien aus
 `Dokumente\gothic3` (mit Unterordner `paru`) von Hand schicken.
-

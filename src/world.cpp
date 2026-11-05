@@ -1,24 +1,443 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "world.h"
 #include "log.h"
+#include "hud.h"
+#include "i18n.h"
 
 #include "body.h"
 #include "ai.h"
 #include "config.h"
 #include "net.h"
+#include "npcs.h"
+#include "processing.h"
+#include "qa.h"
 #include "remote.h"
 
 #include <Engine.h>
 #include <Game.h>
 #include <Script.h>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <array>
+#include <algorithm>
+#include <vector>
 #include <Windows.h>
 
 namespace g3t::world {
 namespace {
+struct StreamProbeState {
+    std::unique_ptr<eCCameraBase> camera;
+    std::unique_ptr<eCPVSPrefetcher3> prefetcher;
+    float position[3] = {};
+    float radius = 0.0f;
+    uint32_t frames = 0;
+    bool failed = false;
+    uint32_t retryAt = 0;
+};
+StreamProbeState streamProbe;
+std::vector<StreamProbeState> hostRegions;
+std::vector<std::array<float, 3>> simulationAnchors;
+uint32_t anchorsCheckedAt = 0;
+unsigned remoteRegionFailures = 0;
+uint32_t regionErrorShownAt = 0;
+
+void RegionError()
+{
+    if (!regionErrorShownAt || net::Now() - regionErrorShownAt >= 30000) {
+        hud::Message(hud::Warning, i18n::Text(i18n::NpcRegionUnavailable));
+        regionErrorShownAt = net::Now() ? net::Now() : 1;
+    }
+}
+
+eCRenderSystemAdmin* RenderAdmin()
+{
+    return static_cast<eCRenderSystemAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCRenderSystemAdmin")));
+}
+
+using CacheOutFn = GEBool(__fastcall*)(eCPVSPrefetcher3*, void*, eCEntity*);
+CacheOutFn originalCacheOut = nullptr;
+using DestroyEntityFn = void(__fastcall*)(eCEntity*, void*);
+DestroyEntityFn originalDestroyEntity = nullptr;
+unsigned remoteEntityEvictions = 0;
+using ContextCacheOutFn = GEBool(__stdcall*)(eCGeometrySpatialContext*);
+using ContextCallbackGetter = ContextCacheOutFn(__thiscall*)(eCPVSPrefetcher3 const*);
+ContextCallbackGetter getContextCallback = nullptr;
+ContextCacheOutFn previousContextCallback = nullptr;
+eCPVSPrefetcher3* contextCacheOwner = nullptr;
+unsigned contextsRetained = 0;
+bool contextRefreshPending = false;
+
+bool RemoteJobsPending()
+{
+    if (streamProbe.prefetcher && streamProbe.prefetcher->IsJobRunning()) return true;
+    for (auto& region : hostRegions)
+        if (region.prefetcher && region.prefetcher->IsJobRunning()) return true;
+    return false;
+}
+
+void RefreshContexts()
+{
+    if (!contextRefreshPending || RemoteJobsPending()) return;
+    eCApplication::GetInstance().GetCurrentCamera().GetFrustumDatabase().ForcePrefetch();
+    contextRefreshPending = false;
+}
+
+bool NeedsContext(StreamProbeState& region, bCBox const& context)
+{
+    if (!region.camera || !region.prefetcher || region.failed) return false;
+    bTSmallArray<eCPVSCellItem*> cells;
+    region.prefetcher->GetValidCells(region.camera->GetFrustumDatabase(), cells);
+    for (GEU16 i = 0; i < cells.GetCount(); ++i) {
+        auto const& cell = cells.GetAt(i)->GetCellBox();
+        // Execute expands context bounds by one grid cell before testing the active rectangle.
+        if (context.GetMax().GetX() >= cell.GetMin().GetX() - cell.GetWidth() &&
+            context.GetMin().GetX() <= cell.GetMax().GetX() + cell.GetWidth() &&
+            context.GetMax().GetZ() >= cell.GetMin().GetZ() - cell.GetDepth() &&
+            context.GetMin().GetZ() <= cell.GetMax().GetZ() + cell.GetDepth()) return true;
+    }
+    return false;
+}
+
+GEBool __stdcall MayReleaseContext(eCGeometrySpatialContext* context)
+{
+    if (RemoteJobsPending()) {
+        contextRefreshPending = true;
+        ++contextsRetained;
+        return GEFalse;
+    }
+    if (NeedsContext(streamProbe, context->GetContextBox())) { ++contextsRetained; return GEFalse; }
+    for (auto& region : hostRegions)
+        if (NeedsContext(region, context->GetContextBox())) { ++contextsRetained; return GEFalse; }
+    return previousContextCallback ? previousContextCallback(context) : GETrue;
+}
+
+GEBool __stdcall KeepSharedContext(eCGeometrySpatialContext*)
+{
+    // Spatial contexts are global, even when the requesting prefetcher has a private cell map.
+    // Only the main prefetcher may retire them, after checking every live remote region.
+    return GEFalse;
+}
+
+bool InstallContextOwnership(eCPVSPrefetcher3& prefetcher)
+{
+    if (contextCacheOwner == &prefetcher) return true;
+    if (contextCacheOwner) { Log("FAIL world: spatial-context cache owner changed without retirement"); return false; }
+    HMODULE engine = GetModuleHandleA("Engine.dll");
+    auto* entry = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?GetContextCacheOutCallback@eCPVSPrefetcher3@@QBEP6G_NPAVeCGeometrySpatialContext@@@ZXZ")) : nullptr;
+    const unsigned char expected[] = {0x8b, 0x41, 0x4c, 0xc3};
+    if (!entry || std::memcmp(entry, expected, sizeof(expected))) {
+        Log("FAIL world: unsupported spatial-context callback ABI; remote streaming refused");
+        return false;
+    }
+    // The SDK getter has the wrong signature; the checked export takes no argument and returns this callback.
+    getContextCallback = reinterpret_cast<ContextCallbackGetter>(entry);
+    previousContextCallback = getContextCallback(&prefetcher);
+    contextCacheOwner = &prefetcher;
+    prefetcher.SetContextCacheOutCallback(&MayReleaseContext);
+    return true;
+}
+
+void RestoreContextOwnership()
+{
+    if (!contextCacheOwner) return;
+    if (getContextCallback(contextCacheOwner) == &MayReleaseContext)
+        contextCacheOwner->SetContextCacheOutCallback(previousContextCallback);
+    else Log("WARN world: spatial-context callback changed externally; not overwriting it");
+    contextCacheOwner = nullptr;
+    previousContextCallback = nullptr;
+    contextRefreshPending = false;
+}
+
+void EvictRemoteEntity(StreamProbeState& region, eCEntity* entity)
+{
+    if (!region.camera || !region.prefetcher || !entity) return;
+    const uint32_t index = region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex();
+    if (index == 0xffffffffu) return;
+    region.prefetcher->RemoveNewAddedEntity(entity);
+    bTSmallArray<eCPVSCellItem*> cells;
+    region.prefetcher->GetAllValidCells(cells);
+    auto* permanent = region.prefetcher->GetNonDeactivationCell();
+    for (GEU16 i = 0; i < cells.GetCount(); ++i) {
+        auto* cell = cells.GetAt(i);
+        if (cell && cell != permanent && cell->ExistsEntity(entity)) {
+            cell->CacheOutEntity(entity, index);
+            ++remoteEntityEvictions;
+        }
+    }
+    if (permanent && permanent->ExistsEntity(entity)) {
+        permanent->CacheOutEntity(entity, index);
+        ++remoteEntityEvictions;
+    }
+}
+
+GEBool __fastcall CacheOut(eCPVSPrefetcher3* self, void* edx, eCEntity* entity)
+{
+    auto* renderer = RenderAdmin();
+    if (renderer && self == &renderer->GetPVSPrefetcher3()) {
+        EvictRemoteEntity(streamProbe, entity);
+        for (auto& region : hostRegions) EvictRemoteEntity(region, entity);
+    } else {
+        if (self == streamProbe.prefetcher.get()) { EvictRemoteEntity(streamProbe, entity); return GETrue; }
+        for (auto& region : hostRegions)
+            if (self == region.prefetcher.get()) { EvictRemoteEntity(region, entity); return GETrue; }
+    }
+    return originalCacheOut(self, edx, entity);
+}
+
+void __fastcall DestroyEntityDiagnostic(eCEntity* entity, void* edx)
+{
+    uint32_t flags = 0, databases = 0;
+    std::memcpy(&flags, reinterpret_cast<unsigned char const*>(entity) + 0x3c, sizeof(flags));
+    std::memcpy(&databases, reinterpret_cast<unsigned char const*>(entity) + 0x16c, sizeof(databases));
+    if ((flags & 0x100) || databases) {
+        unsigned cells = 0, permanent = 0;
+        if (auto* renderer = RenderAdmin()) {
+            bTSmallArray<eCPVSCellItem*> all;
+            auto& pvs = renderer->GetPVSPrefetcher3();
+            pvs.GetAllValidCells(all);
+            for (GEU16 i = 0; i < all.GetCount(); ++i) cells += all.GetAt(i)->ExistsEntity(entity) ? 1 : 0;
+            auto* cell = pvs.GetNonDeactivationCell();
+            permanent = cell && cell->ExistsEntity(entity);
+        }
+        Logf("world: cached destruction entity=%p name=%s flags=%08x databases=%08x global_cells=%u permanent=%u",
+             entity, entity->GetName().GetText(), flags, databases, cells, permanent);
+    }
+    originalDestroyEntity(entity, edx);
+}
+
+bool InstallRemoteCacheOut()
+{
+    if (originalCacheOut) return true;
+    HMODULE engine = GetModuleHandleA("Engine.dll");
+    auto* code = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?CacheOut@eCPVSPrefetcher3@@QAE_NPAVeCEntity@@@Z")) : nullptr;
+    const unsigned char expected[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
+    if (!code || std::memcmp(code, expected, sizeof(expected))) {
+        Log("FAIL world: native entity cache-out interception is unavailable; remote streaming refused");
+        return false;
+    }
+    originalCacheOut = reinterpret_cast<CacheOutFn>(ai::JumpTo(code, reinterpret_cast<void*>(&CacheOut), sizeof(expected)));
+    if (!originalCacheOut) Log("FAIL world: native remote cache-out hook could not be installed");
+    if (originalCacheOut && qa::Enabled() && !originalDestroyEntity) {
+        auto* destroy = reinterpret_cast<unsigned char*>(GetProcAddress(engine, "?Destroy@eCEntity@@UAEXXZ"));
+        const unsigned char prefix[] = {0x51, 0x56, 0x57, 0x8b, 0xf1};
+        if (destroy && !std::memcmp(destroy, prefix, sizeof(prefix))) {
+            originalDestroyEntity = reinterpret_cast<DestroyEntityFn>(
+                ai::JumpTo(destroy, reinterpret_cast<void*>(&DestroyEntityDiagnostic), sizeof(prefix)));
+        }
+        if (!originalDestroyEntity) Log("QA world: cached-destruction diagnostics could not be installed");
+    }
+    return originalCacheOut != nullptr;
+}
+
+void ReleaseRegion(StreamProbeState& region);
+
+void CompletePrefetcher(eCPVSPrefetcher3& prefetcher)
+{
+    eCPVSPrefetcherJob* job = nullptr;
+    std::memcpy(&job, reinterpret_cast<unsigned char const*>(&prefetcher) + 0xc, sizeof(job));
+    if (!job) return;
+    // WaitForEmptyThreadQueue cancels and discards a job; partially cached entities must be committed to cells first.
+    job->DisableTimeSlice();
+    while (!job->IsFinished()) {
+        job->Process();
+        if (!job->IsFinished()) SwitchToThread();
+    }
+    prefetcher.WaitForEmptyThreadQueue();
+}
+
+void ResetStreamProbe()
+{
+    ReleaseRegion(streamProbe);
+}
+
+void TickStreamProbe()
+{
+    if (!streamProbe.camera || !streamProbe.prefetcher || streamProbe.failed) return;
+    auto* renderer = RenderAdmin();
+    if (!renderer) {
+        Log("world: stream probe stopped: render system administration is unavailable");
+        streamProbe.failed = true;
+        return;
+    }
+    eCFrustumDatabase& database = streamProbe.camera->GetFrustumDatabase();
+    if (!streamProbe.prefetcher->Process(database)) {
+        Log("world: stream probe stopped: the prefetcher refused its database");
+        streamProbe.failed = true;
+        return;
+    }
+    ++streamProbe.frames;
+}
+
+void ReleaseRegion(StreamProbeState& region)
+{
+    if (!region.camera) { region = StreamProbeState{}; return; }
+    if (auto* renderer = RenderAdmin()) {
+        if (region.prefetcher) CompletePrefetcher(*region.prefetcher);
+        CompletePrefetcher(renderer->GetPVSPrefetcher3());
+        if (!renderer->FlushThreadQueues()) Log("world: remote region render queues did not flush before release");
+        auto& database = region.camera->GetFrustumDatabase();
+        const uint32_t index = database.GetFrustumDatabaseIndex();
+        if (index != 0xffffffffu) {
+            // Retirement queues cell cache-out work; drain it while both native owners are still alive.
+            database.RefreshFrustumData();
+            if (region.prefetcher) {
+                region.prefetcher->ClearCells(database);
+                region.prefetcher->WaitForEmptyThreadQueue();
+            }
+            if (!renderer->UnregisterDatabase(database))
+                Logf("FAIL world: remote camera database %u could not be unregistered", index);
+            renderer->GetPVSPrefetcher3().WaitForEmptyThreadQueue();
+            if (!renderer->FlushThreadQueues()) Log("FAIL world: remote cell cache-out queues did not flush");
+            Logf("world: retired remote camera database %u before destroying its camera", index);
+        }
+        region.camera.reset();
+        region.prefetcher.reset();
+        if (!renderer->FlushThreadQueues()) Log("FAIL world: remote camera destruction queues did not flush");
+    } else {
+        Log("FAIL world: remote camera retirement has no render system administration");
+    }
+    region = StreamProbeState{};
+    contextRefreshPending = true;
+}
+
+bool PlaceRegion(StreamProbeState& region, float const at[3], float radius)
+{
+    if (region.failed) {
+        if (static_cast<int32_t>(net::Now() - region.retryAt) < 0) return false;
+        ReleaseRegion(region);
+    }
+    if (!region.camera) {
+        auto* renderer = RenderAdmin();
+        if (!renderer || !InstallRemoteCacheOut() || !InstallContextOwnership(renderer->GetPVSPrefetcher3())) {
+            region.failed = true;
+            region.retryAt = net::Now() + 5000;
+            ++remoteRegionFailures;
+            RegionError();
+            return false;
+        }
+        // The game's grid-removal path assumes one database per prefetcher outside the editor.
+        auto prefetcher = std::make_unique<eCPVSPrefetcher3>();
+        if (prefetcher->Create() != bEResult_Ok) {
+            region.failed = true;
+            region.retryAt = net::Now() + 5000;
+            ++remoteRegionFailures;
+            Log("FAIL world: cannot create an isolated remote prefetcher");
+            RegionError();
+            return false;
+        }
+        prefetcher->SetContextCacheOutCallback(&KeepSharedContext);
+        auto camera = std::make_unique<eCCameraBase>();
+        if (camera->Create(GEFalse, GETrue) != bEResult_Ok ||
+            camera->Init(bCRect(0, 0, 32, 32), 60.0f, 1.0f, radius) != bEResult_Ok ||
+            camera->GetFrustumDatabase().GetFrustumDatabaseIndex() == 0xffffffffu) {
+            region.failed = true;
+            region.retryAt = net::Now() + 5000;
+            ++remoteRegionFailures;
+            Log("FAIL world: cannot register a remote simulation camera; no client-simulation fallback");
+            RegionError();
+            return false;
+        }
+        region.camera = std::move(camera);
+        region.prefetcher = std::move(prefetcher);
+        region.radius = 0.0f;
+    }
+    const bool moved = body::Distance(at, region.position) >= 500.0f || region.radius != radius;
+    if (moved) {
+        contextRefreshPending = true;
+        region.camera->SetClipDepth(bCVector2(1.0f, radius));
+        region.camera->SetPosition(bCVector(at[0], at[1], at[2]));
+        auto& database = region.camera->GetFrustumDatabase();
+        database.Update();
+        database.ForcePrefetch();
+        std::memcpy(region.position, at, sizeof(region.position));
+        region.radius = radius;
+    }
+    auto* renderer = RenderAdmin();
+    if (!renderer || !region.prefetcher || !region.prefetcher->Process(region.camera->GetFrustumDatabase())) {
+        region.failed = true;
+        region.retryAt = net::Now() + 5000;
+        ++remoteRegionFailures;
+        Log("FAIL world: remote simulation prefetch refused; no client-simulation fallback");
+        RegionError();
+        return false;
+    }
+    ++region.frames;
+    return true;
+}
+
+void TickHostRegions()
+{
+    auto* renderer = RenderAdmin();
+    if (!renderer) return;
+    auto const& camera = eCApplication::GetInstance().GetCurrentCamera();
+    const bCVector& p = camera.GetPosition();
+    const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
+    if (!anchorsCheckedAt || net::Now() - anchorsCheckedAt >= 250) {
+        anchorsCheckedAt = net::Now();
+        simulationAnchors.clear();
+        auto add = [](bCVector const& position) {
+            simulationAnchors.push_back({position.GetX(), position.GetY(), position.GetZ()});
+        };
+        auto const* remotes = net::Remotes();
+        for (int id = 2; id < net::MaxPlayers; ++id) {
+            auto const& peer = remotes[id];
+            if (peer.connected && (peer.latest.flags & 1) && peer.latest.world == remote::CurrentWorld())
+                simulationAnchors.push_back({peer.latest.position[0], peer.latest.position[1], peer.latest.position[2]});
+        }
+        std::vector<eCEntity*> guides;
+        for (int id = 1; id < net::MaxPlayers; ++id) {
+            eCEntity* player = id == 1 ? remote::ControlledBody() : remote::PuppetOf(static_cast<uint8_t>(id));
+            if (!player || !player->GetPropertySet(eEPropertySetType_Party)) continue;
+            if (auto* guide = Entity(player).Party.GetPartyLeader().GetInstance()) guides.push_back(guide);
+        }
+        const auto all = Entity::GetNPCs();
+        for (int i = 0; i < all.GetCount(); ++i) {
+            Entity npc = all.GetAt(i);
+            eCEntity* entity = npc.GetInstance();
+            if (!entity || entity->GetPropertySet(eEPropertySetType_PlayerMemory) || remote::IsPuppet(entity)) continue;
+            if (std::find(guides.begin(), guides.end(), entity) != guides.end()) { add(entity->GetWorldPosition()); continue; }
+            if (!entity->GetPropertySet(eEPropertySetType_Party) || npc.Party.Waiting) continue;
+            if (entity->GetPropertySet(eEPropertySetType_DamageReceiver) && npc.DamageReceiver.HitPoints <= 0) continue;
+            const uint8_t owner = npcs::CompanionOwner(entity);
+            if (owner == 1 || (owner > 1 && remotes[owner].connected && net::InWorld(owner))) add(entity->GetWorldPosition());
+        }
+    }
+    struct Group { std::array<float, 3> low, high; };
+    std::vector<Group> groups;
+    for (auto const& anchor : simulationAnchors) {
+        if (body::Distance(here, anchor.data()) + GetConfig().hostRoi + 1000.0f < camera.GetClipDepth().GetY()) continue;
+        size_t group = groups.size();
+        for (size_t previous = 0; previous < groups.size(); ++previous) {
+            float centre[3];
+            for (int k = 0; k < 3; ++k) centre[k] = (groups[previous].low[k] + groups[previous].high[k]) * 0.5f;
+            if (body::Distance(centre, anchor.data()) <= GetConfig().hostRoi * 0.5f) { group = previous; break; }
+        }
+        if (group == groups.size()) {
+            groups.push_back({anchor, anchor});
+        } else {
+            for (int k = 0; k < 3; ++k) {
+                groups[group].low[k] = std::min(groups[group].low[k], anchor[k]);
+                groups[group].high[k] = std::max(groups[group].high[k], anchor[k]);
+            }
+        }
+    }
+    for (size_t i = groups.size(); i < hostRegions.size(); ++i) ReleaseRegion(hostRegions[i]);
+    hostRegions.resize(groups.size());
+    for (size_t id = 0; id < groups.size(); ++id) {
+        auto& region = hostRegions[id];
+        float centre[3];
+        for (int k = 0; k < 3; ++k) centre[k] = (groups[id].low[k] + groups[id].high[k]) * 0.5f;
+        const float radius = GetConfig().hostRoi + body::Distance(groups[id].low.data(), groups[id].high.data()) * 0.5f + 1500.0f;
+        PlaceRegion(region, centre, radius);
+    }
+}
+
 void PositionOf(eCEntity* entity, float out[3])
 {
     const bCVector& at = entity->GetWorldPosition();
@@ -39,23 +458,21 @@ bTSmallArray<eCEntity*> const* Processed()
 
 bTSmallArray<eCEntity*> const* ProcessedEntities() { return Processed(); }
 
-// Host: its processing range as host_roi says (owner 27.10., "80 m"). The engine keeps the radius in the entity admin
-// (EntityAdmin+0x10, SetROISphere; the centre follows the camera every frame) and read it at start from Entity.ROI in the
-// engine setup, a float there although the SDK declares an int (re/findings/range-guid-clock.md). Both are set, then a full
-// rebuild of the processing list; checked every 2 s, since a load may put the setup's value back.
-uint32_t lastRoiCheck = 0;
-float roiLogged = 0.0f;
+void RequestProcessingUpdate()
+{
+    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
+    if (scene) scene->GetAccessToEntityAdmin().FourceFullROIUpdate();
+    else Log("world: cannot refresh NPC processing range; scene administration is unavailable");
+}
 
-// Stufe 2, host_sim = elastic: the host's processing sphere takes in every player (re/findings/stufe2-elastic-roi-c.md).
-// eCEntityAdmin::Process (Engine.dll 0x230a70) takes the current camera's position (camera +0x8c) as the sphere's centre in
-// every frame and builds its lists anew once that moved 2.5 m; SetROISphere's centre does not last. Process is wrapped: for
-// its run the camera stands in the middle of the players and the radius (+0x10) reaches all of them plus a margin, then the
-// camera goes back before anything renders. Only what the prefetcher loaded around the camera (its view distance, camera
-// +0xbc) can be processed: a player farther away keeps the machines' own split (the client simulates its surroundings).
+// Extra ranges are only for NPC collection. Moving the camera, resizing the engine ROI, or globally replacing its
+// culling functions also changes static-world processing and can leave low-detail geometry over detailed buildings.
 constexpr float ElasticMargin = 4000.0f;   // cm beyond the farthest player
 constexpr float ElasticMax = 15000.0f;     // cm, largest radius
 using ProcessFn = void(__thiscall*)(eCEntityAdmin*);
 ProcessFn originalProcess = nullptr;
+using StopSessionFn = void(__fastcall*)(gCSession*, void*);
+StopSessionFn originalStopSession = nullptr;
 bool elasticTried = false, elasticActive = false;
 unsigned elasticFrames = 0, elasticTooFar = 0;
 float elasticRadius = 0.0f, elasticCentre[3] = {};
@@ -95,143 +512,141 @@ bool ElasticSphere(eCEntity* camera, float centre[3], float& radius)
     return true;
 }
 
-// Stufe 2 in full, host_sim = spheres (re/findings/stufe2-spheres-plan.md): one sphere around each other player besides the
-// camera's own. The engine asks only three functions whether a box lies in its processing range: CullProcessingRangeRegion
-// (Engine.dll 0x2317d0: the box against the range's box at EntityAdmin+0x64..+0x78, then its sphere at +0x20: 0 outside, 1
-// inside, 2 partly), CullOldProcessingRangeRegion (0x231840, the same against the range before the last rebuild, +0x7c..+0x90
-// and +0x30) and IntersectsProcessingRangeRegion (0x2318c0, the box only). Their first instructions are longer than JumpTo
-// takes (7 and 10 bytes), so they are rebuilt here whole and the spheres added: in one of them counts as in range. The
-// spheres change only when the engine rebuilds its lists (the camera moved 2.5 m, +0x40) or a player moved that far (then
-// +0xfd asks for the rebuild); the spheres before are the old range then, for whatever left it. Only what the prefetcher loaded
-// around the camera can be processed: a player farther away keeps the machines' own split, as with elastic.
-struct Sphere
-{
-    float at[3];
-    float radius;
-};
-Sphere spheres[net::MaxPlayers], oldSpheres[net::MaxPlayers];
-int sphereCount = 0, oldSphereCount = 0;
+using processing::Sphere;
+std::vector<Sphere> spheres;
+int sphereCount = 0;
 bool spheresHooked = false, spheresActive = false;
 unsigned sphereRebuilds = 0, sphereTooFar = 0;
+unsigned npcRangeChecks = 0, npcRangeExpanded = 0, npcUpdateChecks = 0, npcUpdateExpanded = 0;
 eCEntityAdmin* lastAdmin = nullptr;
 
 float const* Field(eCEntityAdmin const* admin, int offset) { return reinterpret_cast<float const*>(reinterpret_cast<char const*>(admin) + offset); }
 
-// As the engine compares: the box (min x y z, max x y z) meets the range's box lo..hi.
-bool BoxMeets(float const* box, float const* lo, float const* hi)
+bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, unsigned& expanded)
 {
-    return box[0] <= hi[0] && lo[0] <= box[3] && box[1] <= hi[1] && lo[1] <= box[4] && box[2] <= hi[2] && lo[2] <= box[5];
+    const bool native = admin->IntersectsProcessingRangeRegion(box);
+    if (native) return true;
+    // Reached only from the validated LEA/PUSH/CALL sites of the engine's two dynamic-entity range paths.
+    static_assert(offsetof(eCEntity, m_WorldNodeBoundary) == 0xe8, "native dynamic-collection box offset");
+    auto const* entity = reinterpret_cast<eCEntity const*>(reinterpret_cast<char const*>(&box) - 0xe8);
+    const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    ++checks;
+    const bool included = processing::IncludesNpc(native, npc, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount);
+    if (included) ++expanded;
+    return included;
 }
 
-int CullSpheres(bCBox const& box, Sphere const* list, int count, int result)
+bool __fastcall NpcIntersects(eCEntityAdmin* admin, void*, bCBox const& box)
 {
-    float const* b = reinterpret_cast<float const*>(&box);
-    for (int i = 0; i < count && result != 1; ++i) {
-        Sphere const& s = list[i];
-        const float lo[3] = {s.at[0] - s.radius, s.at[1] - s.radius, s.at[2] - s.radius};
-        const float hi[3] = {s.at[0] + s.radius, s.at[1] + s.radius, s.at[2] + s.radius};
-        if (!BoxMeets(b, lo, hi)) continue;
-        result = bCSphere(bCVector(s.at[0], s.at[1], s.at[2]), s.radius).Contains(box) ? 1 : 2;
-    }
-    return result;
+    return NpcIntersectsAt(admin, box, npcRangeChecks, npcRangeExpanded);
 }
 
-int Cull(eCEntityAdmin const* admin, bCBox const& box, int range, int sphere)
+bool __fastcall NpcIntersectsUpdate(eCEntityAdmin* admin, void*, bCBox const& box)
 {
-    if (!BoxMeets(reinterpret_cast<float const*>(&box), Field(admin, range), Field(admin, range + 0xc))) return 0;
-    return reinterpret_cast<bCSphere const*>(Field(admin, sphere))->Contains(box) ? 1 : 2;
-}
-
-int __fastcall SpheresCull(eCEntityAdmin* admin, void*, bCBox const& box)
-{
-    return CullSpheres(box, spheres, sphereCount, Cull(admin, box, 0x64, 0x20));
-}
-
-int __fastcall SpheresCullOld(eCEntityAdmin* admin, void*, bCBox const& box)
-{
-    return CullSpheres(box, oldSpheres, oldSphereCount, Cull(admin, box, 0x7c, 0x30));
-}
-
-bool __fastcall SpheresIntersect(eCEntityAdmin* admin, void*, bCBox const& box)
-{
-    float const* b = reinterpret_cast<float const*>(&box);
-    if (BoxMeets(b, Field(admin, 0x64), Field(admin, 0x70))) return true;
-    for (int i = 0; i < sphereCount; ++i) {
-        Sphere const& s = spheres[i];
-        const float lo[3] = {s.at[0] - s.radius, s.at[1] - s.radius, s.at[2] - s.radius};
-        const float hi[3] = {s.at[0] + s.radius, s.at[1] + s.radius, s.at[2] + s.radius};
-        if (BoxMeets(b, lo, hi)) return true;
-    }
-    return false;
+    return NpcIntersectsAt(admin, box, npcUpdateChecks, npcUpdateExpanded);
 }
 
 void HookSpheres()
 {
     HMODULE engine = GetModuleHandleA("Engine.dll");
-    struct Hook
-    {
-        char const* name;
-        unsigned char start[10];
-        size_t length;
-        void* detour;
-    } const hooks[] = {
-        {"?CullProcessingRangeRegion@eCEntityAdmin@@QAE?AW4eEProcessingRangeCull@1@ABVbCBox@@@Z", {0x8b, 0x54, 0x24, 0x04, 0xd9, 0x41, 0x70}, 7,
-         reinterpret_cast<void*>(&SpheresCull)},
-        {"?CullOldProcessingRangeRegion@eCEntityAdmin@@QAE?AW4eEProcessingRangeCull@1@ABVbCBox@@@Z",
-         {0x8b, 0x54, 0x24, 0x04, 0xd9, 0x81, 0x88, 0x00, 0x00, 0x00}, 10, reinterpret_cast<void*>(&SpheresCullOld)},
-        {"?IntersectsProcessingRangeRegion@eCEntityAdmin@@QAE_NABVbCBox@@@Z", {0x8b, 0x54, 0x24, 0x04, 0xd9, 0x41, 0x70}, 7,
-         reinterpret_cast<void*>(&SpheresIntersect)},
+    auto* collect = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?CollectDynamicProcessingRangeEntity@eCEntityAdmin@@IAEXPAVeCEntity@@AAV?$bTSmallArray@PAVeCEntity@@@@1@Z")) : nullptr;
+    auto* update = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?UpdateProcessingRangeEntity@eCEntityAdmin@@QAEXPAVeCEntity@@AAV?$bTSmallArray@PAVeCEntity@@@@1@Z")) : nullptr;
+    auto* intersects = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?IntersectsProcessingRangeRegion@eCEntityAdmin@@QAE_NABVbCBox@@@Z")) : nullptr;
+    // Engine 1.75 (Engine.dll SHA-256 ac0fb505...): the CALL of IntersectsProcessingRangeRegion in both dynamic-entity paths.
+    //   Collect+0x8d: 8d 87 e8 00 00 00 (lea eax,[edi+e8]) 50 (push eax) 8b cd (mov ecx,ebp) e8 <rel32>
+    //   Update+0x68:  8d 97 e8 00 00 00 (lea edx,[edi+e8]) 52 (push edx) 8b cd (mov ecx,ebp) e8 <rel32>
+    // Both are patched, or neither. With only the collection path patched, a moving NPC outside the native range was dropped
+    // by the engine's per-entity update and re-added by the next collection, and every re-entry refilled its hit points and
+    // reset its routine (stuns and hits were lost). These are the only callers besides the static-entity collection.
+    static const unsigned char collectBefore[] = {0x8d, 0x87, 0xe8, 0x00, 0x00, 0x00, 0x50, 0x8b, 0xcd};
+    static const unsigned char updateBefore[] = {0x8d, 0x97, 0xe8, 0x00, 0x00, 0x00, 0x52, 0x8b, 0xcd};
+    struct Site { unsigned char* call; unsigned char const* before; size_t length; void* detour; char const* name; };
+    Site sites[] = {
+        {collect ? collect + 0x8d : nullptr, collectBefore, sizeof(collectBefore), reinterpret_cast<void*>(&NpcIntersects), "collection"},
+        {update ? update + 0x68 : nullptr, updateBefore, sizeof(updateBefore), reinterpret_cast<void*>(&NpcIntersectsUpdate), "update"},
     };
-    unsigned char* code[3] = {};
-    for (int i = 0; i < 3; ++i) {
-        code[i] = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine, hooks[i].name)) : nullptr;
-        if (!code[i] || std::memcmp(code[i], hooks[i].start, hooks[i].length)) {
-            Logf("world: %s %s; host_sim spheres stays off", hooks[i].name, code[i] ? "has other code" : "not found");
+    for (Site const& s : sites) {
+        int32_t displacement = 0;
+        if (s.call) std::memcpy(&displacement, s.call + 1, sizeof(displacement));
+        if (!s.call || !intersects || std::memcmp(s.call - s.length, s.before, s.length) || s.call[0] != 0xe8 ||
+            s.call + 5 + displacement != intersects) {
+            Logf("world: NPC range %s call site did not match; native world culling retained, NPC extension off", s.name);
             return;
         }
     }
-    for (int i = 0; i < 3; ++i)
-        if (!ai::JumpTo(code[i], hooks[i].detour)) {  // no way back needed: the detours are the whole function
-            Logf("world: %s could not be redirected; host_sim spheres stays off", hooks[i].name);
-            return;  // the ones before answer as the engine would, without spheres
+    DWORD old[2] = {};
+    // QA negative control (only with the QA bot): patch the collection path alone, as the first fix did.
+    const int patched = qa::Enabled() && std::getenv("G3T_QA_COLLECTION_HOOK_ONLY") ? 1 : 2;
+    if (patched == 1) Log("world: QA control: only the collection call site is patched");
+    for (int i = 0; i < patched; ++i) {
+        if (!VirtualProtect(sites[i].call, 5, PAGE_EXECUTE_READWRITE, &old[i])) {
+            Logf("world: cannot patch NPC range call (Windows error %lu); native culling retained", GetLastError());
+            for (int k = 0; k < i; ++k) {
+                const int32_t original = static_cast<int32_t>(reinterpret_cast<intptr_t>(intersects) - reinterpret_cast<intptr_t>(sites[k].call + 5));
+                std::memcpy(sites[k].call + 1, &original, sizeof(original));
+                DWORD unused = 0;
+                VirtualProtect(sites[k].call, 5, old[k], &unused);
+                FlushInstructionCache(GetCurrentProcess(), sites[k].call, 5);
+            }
+            return;
         }
+        const int32_t displacement = static_cast<int32_t>(reinterpret_cast<intptr_t>(sites[i].detour) - reinterpret_cast<intptr_t>(sites[i].call + 5));
+        std::memcpy(sites[i].call + 1, &displacement, sizeof(displacement));
+    }
+    for (int i = 0; i < patched; ++i) {
+        DWORD unused = 0;
+        if (!VirtualProtect(sites[i].call, 5, old[i], &unused))
+            Logf("world: cannot restore NPC range call protection (Windows error %lu)", GetLastError());
+        FlushInstructionCache(GetCurrentProcess(), sites[i].call, 5);
+    }
     spheresHooked = true;
-    Logf("world: processing range functions redirected (host_sim spheres)");
+    Log("world: NPC-only range calls hooked (collection and per-entity update); static culling, native ROI and camera unchanged");
 }
 
-// Before Process: the spheres for this frame (only at a rebuild, see above).
+// Rebuild the NPC collection when a covered player moves by the engine's own ROI threshold.
 void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
 {
     lastAdmin = admin;
-    Sphere wanted[net::MaxPlayers];
+    std::vector<Sphere> wanted(simulationAnchors.size() + 3);
     int n = 0;
     float const* at = camera ? reinterpret_cast<float const*>(reinterpret_cast<char const*>(camera) + 0x8c) : nullptr;
     const float step = *Field(admin, 0x40);
-    if (spheresHooked && at && net::IsHost()) {
-        const float loaded = *reinterpret_cast<float const*>(reinterpret_cast<char const*>(camera) + 0xbc);
-        net::Remote const* remotes = net::Remotes();
-        for (int id = 2; id < net::MaxPlayers; ++id) {
-            net::Remote const& r = remotes[id];
-            if (!r.connected || !(r.latest.flags & 1) || r.latest.world != remote::CurrentWorld()) continue;
-            if (loaded > 0.0f && body::Distance(at, r.latest.position) > loaded - 1000.0f) { ++sphereTooFar; continue; }
-            std::memcpy(wanted[n].at, r.latest.position, sizeof(wanted[n].at));
+    elasticActive = false;
+    if (spheresHooked && at && net::IsHost() && gCSession::GetInstance().IsGameRunning()) {
+        if (GetConfig().hostRoi > *Field(admin, 0x10)) {
+            std::memcpy(wanted[n].at, at, sizeof(wanted[n].at));
             wanted[n++].radius = GetConfig().hostRoi + step;
+        }
+        float centre[3], radius = 0.0f;
+        if (GetConfig().hostSimElastic && ElasticSphere(camera, centre, radius)) {
+            std::memcpy(wanted[n].at, centre, sizeof(wanted[n].at));
+            wanted[n++].radius = radius + step;
+            std::memcpy(elasticCentre, centre, sizeof(elasticCentre));
+            elasticRadius = radius;
+            elasticActive = true;
+            ++elasticFrames;
+        }
+        for (auto const& anchor : simulationAnchors) {
+            std::memcpy(wanted[n].at, anchor.data(), sizeof(wanted[n].at));
+            wanted[n++].radius = GetConfig().hostRoi + step;
+        }
+        if (streamProbe.camera && !streamProbe.failed) {
+            std::memcpy(wanted[n].at, streamProbe.position, sizeof(wanted[n].at));
+            wanted[n++].radius = streamProbe.radius + step;
         }
     }
     bool changed = n != sphereCount;
     for (int i = 0; i < n && !changed; ++i)
         changed = body::Distance(wanted[i].at, spheres[i].at) > step || wanted[i].radius != spheres[i].radius;
     auto* bytes = reinterpret_cast<unsigned char*>(admin);
-    const bool rebuild = bytes[0xfd] == 1 || (at && body::Distance(Field(admin, 0x24), at) > step);
-    if (changed || rebuild) {
-        std::memcpy(oldSpheres, spheres, sizeof(spheres));
-        oldSphereCount = sphereCount;
-        std::memcpy(spheres, wanted, sizeof(wanted));
+    if (changed) {
+        spheres.assign(wanted.begin(), wanted.begin() + n);
         sphereCount = n;
-        if (changed) {
-            bytes[0xfd] = 1;
-            ++sphereRebuilds;
-        }
+        bytes[0xfd] = 1;
+        ++sphereRebuilds;
     }
     spheresActive = sphereCount > 0;
 }
@@ -240,31 +655,29 @@ void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
 {
     eCEntity* camera = nullptr;
     camera = reinterpret_cast<eCEntity*>(&eCApplication::GetInstance().GetCurrentCamera());  // Process reads the same one
-    if (GetConfig().hostSimSpheres) {
-        PlaceSpheres(admin, camera);
-        originalProcess(admin);
-        return;
-    }
-    float centre[3], radius = 0.0f, saved[3];
-    float* at = camera ? reinterpret_cast<float*>(reinterpret_cast<char*>(camera) + 0x8c) : nullptr;
-    elasticActive = GetConfig().hostSimElastic && net::IsHost() && at && ElasticSphere(camera, centre, radius);
-    if (elasticActive) {
-        std::memcpy(saved, at, sizeof(saved));
-        std::memcpy(at, centre, sizeof(saved));
-        *reinterpret_cast<float*>(reinterpret_cast<char*>(admin) + 0x10) = radius;
-        std::memcpy(elasticCentre, centre, sizeof(centre));
-        elasticRadius = radius;
-        ++elasticFrames;
-    }
+    PlaceSpheres(admin, camera);
     originalProcess(admin);
-    if (elasticActive) std::memcpy(at, saved, sizeof(saved));
+}
+
+void __fastcall StopSession(gCSession* session, void* edx)
+{
+    OnWorldDeactivate();
+    originalStopSession(session, edx);
 }
 
 void HookElastic()
 {
-    if (elasticTried || !(GetConfig().hostSimElastic || GetConfig().hostSimSpheres)) return;
+    if (elasticTried) return;
     elasticTried = true;
-    if (GetConfig().hostSimSpheres) HookSpheres();
+    auto* stop = reinterpret_cast<unsigned char*>(GetProcAddress(GetModuleHandleA("Game.dll"), "?Stop@gCSession@@QAEXXZ"));
+    const unsigned char stopPrefix[] = {0x51, 0x53, 0x55, 0x8b, 0x2d};
+    if (!stop || std::memcmp(stop, stopPrefix, sizeof(stopPrefix)) ||
+        stop[9] != 0x56 || stop[10] != 0x33 || stop[11] != 0xdb) {
+        Log("FAIL world: unsupported session teardown; remote simulation cameras cannot be retained safely");
+        return;
+    }
+    originalStopSession = reinterpret_cast<StopSessionFn>(ai::JumpTo(stop, reinterpret_cast<void*>(&StopSession), 9));
+    if (!originalStopSession) { Log("FAIL world: cannot guard remote camera lifetime"); return; }
     auto* code = reinterpret_cast<unsigned char*>(GetProcAddress(GetModuleHandleA("Engine.dll"), "?Process@eCEntityAdmin@@QAEXXZ"));
     static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
     if (!code || std::memcmp(code, prologue, sizeof(prologue))) {
@@ -272,14 +685,14 @@ void HookElastic()
         return;
     }
     originalProcess = reinterpret_cast<ProcessFn>(ai::JumpTo(code, reinterpret_cast<void*>(&ElasticProcess)));
-    Logf("world: eCEntityAdmin::Process %s", originalProcess ? "wrapped (host_sim)" : "could not be wrapped");
+    if (originalProcess) HookSpheres();
+    Logf("world: eCEntityAdmin::Process %s", originalProcess ? "wrapped (NPC-only ranges)" : "could not be wrapped");
 }
 
 bool Extended() { return elasticActive || spheresActive; }
 
 bool HostProcesses(float const at[3], float margin)
 {
-    if (elasticActive) return body::Distance(at, elasticCentre) <= elasticRadius - margin;
     if (!spheresActive || !lastAdmin) return false;
     if (body::Distance(at, Field(lastAdmin, 0x24)) <= *Field(lastAdmin, 0x10) - margin) return true;  // the camera's own
     const float step = *Field(lastAdmin, 0x40);
@@ -292,6 +705,11 @@ void Tick()
 {
     if (!net::IsHost()) return;
     HookElastic();
+    if (spheresHooked && originalStopSession && gCSession::GetInstance().IsGameRunning()) {
+        TickHostRegions();
+        TickStreamProbe();
+        RefreshContexts();
+    }
     if (GetConfig().hostSimSpheres && net::Now() - elasticLogged >= 5000) {
         elasticLogged = net::Now();
         if (spheresActive)
@@ -308,28 +726,117 @@ void Tick()
         else if (originalProcess)
             Logf("world: elastic range off now (%s; %u times too far apart)", elasticWhy, elasticTooFar);
     }
-    if (elasticActive) return;  // the radius is set every frame then; host_roi below only when it is not
-    const uint32_t now = net::Now();
-    if (now - lastRoiCheck < 2000) return;
-    lastRoiCheck = now;
-    if (!gCSession::GetInstance().IsGameRunning()) return;
-    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
-    if (!scene) return;
-    eCEntityAdmin& admin = scene->GetAccessToEntityAdmin();
-    const float wanted = GetConfig().hostRoi;
-    bCSphere sphere = admin.GetROISphere();
-    const float before = sphere.GetRadius();
-    if (std::fabs(before - wanted) < 1.0f) return;
-    auto& setup = const_cast<eSSetupEngine&>(eCApplication::GetInstance().GetEngineSetup());
-    std::memcpy(&setup.Entity_ROI, &wanted, sizeof(float));
-    sphere.SetRadius(wanted);
-    admin.SetROISphere(sphere);
-    admin.FourceFullROIUpdate();
-    const float after = admin.GetROISphere().GetRadius();
-    if (after != roiLogged) {
-        roiLogged = after;
-        Logf("world: processing range %.0f -> %.0f cm (host_roi %.0f)", before, after, wanted);
+}
+
+void OnWorldDeactivate()
+{
+    for (auto& region : hostRegions) ReleaseRegion(region);
+    hostRegions.clear();
+    simulationAnchors.clear();
+    anchorsCheckedAt = 0;
+    spheres.clear();
+    sphereCount = 0;
+    lastAdmin = nullptr;
+    ResetStreamProbe();
+    RestoreContextOwnership();
+}
+
+void StreamProbe(char const* argument, LogFn log)
+{
+    if (!qa::Enabled() || !net::IsHost() || !gCSession::GetInstance().IsGameRunning()) {
+        log("REFUSED streamprobe needs=qa_running_host");
+        return;
     }
+    if (argument && !std::strcmp(argument, "off")) {
+        ResetStreamProbe();
+        RequestProcessingUpdate();
+        log("STREAMPROBE active=0");
+        return;
+    }
+    if (argument && *argument && std::strcmp(argument, "report")) {
+        float at[3] = {}, radius = 0.0f;
+        char tail = '\0';
+        if (std::sscanf(argument, "%f_%f_%f_%f%c", &at[0], &at[1], &at[2], &radius, &tail) != 4 ||
+            !std::isfinite(at[0]) || !std::isfinite(at[1]) || !std::isfinite(at[2]) ||
+            !std::isfinite(radius) || radius < 1000.0f || radius > 15000.0f) {
+            log("REFUSED streamprobe expected=X_Y_Z_radius radius_cm=1000..15000");
+            return;
+        }
+        ResetStreamProbe();
+        if (!PlaceRegion(streamProbe, at, radius)) {
+            log("REFUSED streamprobe reason=remote_region_setup_failed");
+            return;
+        }
+        RequestProcessingUpdate();
+    }
+    if (!streamProbe.camera) { log("STREAMPROBE active=0"); return; }
+    auto* renderer = RenderAdmin();
+    if (!renderer) { log("REFUSED streamprobe reason=no_render_admin"); return; }
+    auto& database = streamProbe.camera->GetFrustumDatabase();
+    bTSmallArray<eCPVSCellItem*> cells;
+    if (!streamProbe.prefetcher) { log("REFUSED streamprobe reason=no_private_prefetcher"); return; }
+    streamProbe.prefetcher->GetValidCells(database, cells);
+    unsigned nearbyNpcs = 0, processed = 0, navigation = 0, floors = 0;
+    if (auto* entities = Processed())
+        for (GEU16 i = 0; i < entities->GetCount(); ++i) {
+            eCEntity* entity = entities->GetAt(i);
+            if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) continue;
+            ++processed;
+            float at[3];
+            PositionOf(entity, at);
+            if (body::Distance(at, streamProbe.position) > streamProbe.radius) continue;
+            ++nearbyNpcs;
+            if (entity->GetPropertySet(eEPropertySetType_Navigation) && Entity(entity).Navigation.GetCurrentZone().GetInstance())
+                ++navigation;
+            if (auto* movement = static_cast<gCCharacterMovement_PS*>(entity->GetPropertySet(eEPropertySetType_CharacterMovement))) {
+                const float ground = movement->GetDistToGround(entity->GetWorldPosition(), GETrue);
+                if (std::isfinite(ground) && std::fabs(ground) < 2000.0f) ++floors;
+            }
+        }
+    char line[320];
+    Format(line, "STREAMPROBE active=1 failed=%d database=%u cells=%d frames=%u job=%d processed_npcs=%u near_npcs=%u nav_npcs=%u floor_npcs=%u "
+                 "position=%.1f,%.1f,%.1f radius=%.0f",
+           streamProbe.failed ? 1 : 0, database.GetFrustumDatabaseIndex(), cells.GetCount(), streamProbe.frames,
+           streamProbe.prefetcher->IsJobRunning() ? 1 : 0, processed, nearbyNpcs, navigation, floors, streamProbe.position[0],
+           streamProbe.position[1], streamProbe.position[2], streamProbe.radius);
+    log(line);
+}
+
+void ProcessingReport(LogFn log)
+{
+    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
+    HMODULE engine = GetModuleHandleA("Engine.dll");
+    auto* cull = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?CullProcessingRangeRegion@eCEntityAdmin@@QAE?AW4eEProcessingRangeCull@1@ABVbCBox@@@Z")) : nullptr;
+    auto* old = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?CullOldProcessingRangeRegion@eCEntityAdmin@@QAE?AW4eEProcessingRangeCull@1@ABVbCBox@@@Z")) : nullptr;
+    auto* intersects = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?IntersectsProcessingRangeRegion@eCEntityAdmin@@QAE_NABVbCBox@@@Z")) : nullptr;
+    unsigned regions = 0;
+    for (auto const& region : hostRegions) regions += region.camera && !region.failed;
+    char line[480];
+    auto& camera = eCApplication::GetInstance().GetCurrentCamera();
+    bCVector const& cameraPosition = camera.GetPosition();
+    Format(line, "WORLDPROCESS npc_only=%d native_roi_cm=%.0f npc_roi_cm=%.0f spheres=%d checks=%u expanded=%u "
+                 "update_checks=%u update_expanded=%u static_cull_original=%d old_cull_original=%d intersects_original=%d "
+                 "camera=%.2f,%.2f,%.2f camera_far=%.0f remote_regions=%u remote_failures=%u",
+           spheresHooked, scene ? scene->GetAccessToEntityAdmin().GetROISphere().GetRadius() : -1.0f,
+           GetConfig().hostRoi, sphereCount, npcRangeChecks, npcRangeExpanded, npcUpdateChecks, npcUpdateExpanded,
+           cull && cull[0] == 0x8b, old && old[0] == 0x8b, intersects && intersects[0] == 0x8b,
+           cameraPosition.GetX(), cameraPosition.GetY(), cameraPosition.GetZ(), camera.GetClipDepth().GetY(), regions, remoteRegionFailures);
+    log(line);
+    bTSmallArray<eCPVSCellItem*> cells;
+    if (auto* renderer = RenderAdmin()) renderer->GetPVSPrefetcher3().GetValidCells(camera.GetFrustumDatabase(), cells);
+    unsigned statics = 0, dynamics = 0;
+    for (GEU16 i = 0; i < cells.GetCount(); ++i) {
+        statics += cells.GetAt(i)->GetStaticEntities().GetCount();
+        dynamics += cells.GetAt(i)->GetDynamicEntities().GetCount();
+    }
+    Format(line, "WORLDRENDER main_database=%u cells=%d statics=%u dynamics=%u solids=%d alpha=%d remote_regions=%u evictions=%u contexts_retained=%u",
+           camera.GetFrustumDatabase().GetFrustumDatabaseIndex(), cells.GetCount(), statics, dynamics,
+           camera.GetFrustumDatabase().GetSolidElementCount(), camera.GetFrustumDatabase().GetAlphaElementCount(),
+           regions, remoteEntityEvictions, contextsRetained);
+    log(line);
 }
 
 namespace {

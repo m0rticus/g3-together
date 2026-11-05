@@ -11,6 +11,8 @@
 #include "fightmem.h"
 #include "infocmd.h"
 #include "ransack.h"
+#include "npcplayback.h"
+#include "net.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -56,6 +58,20 @@ std::unordered_map<std::string, gFScriptAIState> originalStates;
 std::unordered_map<std::string, gFScriptAIFunction> originalFunctions;
 char const* const IdleTaskName = "ZS_HangAround_DoNothing";
 
+// NPC reactions that only a villager has: watching a fight (and walking to a spot to watch it), applauding, observing a
+// suspect, reacting to a weapon or a zone, small talk. A player body that runs one of them is a bug (2 Nov. play session:
+// the host's hero stood in OnWatchFight, spectated a fight and applauded a death); it is put back on its routine.
+bool SpectatorState(char const* name)
+{
+    static char const* const prefixes[] = {"ZS_WatchFight", "OnWatchFight", "ZS_Applaud", "ZS_OrcParty_Spectator", "ZS_Observe",
+                                           "ZS_ReactTo", "ZS_Smalltalk", "ZS_Goblin_Smalltalk"};
+    for (char const* prefix : prefixes)
+        if (!std::strncmp(name, prefix, std::strlen(prefix))) return true;
+    return false;
+}
+unsigned playerSpectatorRefused = 0, heroPerceptionBlocked = 0;
+std::unordered_map<std::string, unsigned> playerStatesSeen;  // the first run of each state by the player body, for the log
+
 // The SDK's gCScriptAdminExt::GetScript* call bTValMap::GetAt(key), which dereferences null for a missing
 // name (it crashed the first lookup of an unregistered name). Look up safely instead.
 template <typename T>
@@ -67,7 +83,7 @@ T* Find(bTValMap<bCString, T*>& map, char const* name)
 
 bool Driven(eCEntity* entity)
 {
-    return entity && (remote::IsPuppet(entity) || npcs::IsMirrored(entity) || talk::IsHeld(entity));
+    return entity && (remote::IsPuppet(entity) || npcs::IsMirrored(entity) || (!net::IsHost() && talk::IsHeld(entity)));
 }
 
 eCEntity* Self(gCScriptProcessingUnit* spu, GELPVoid self)
@@ -76,9 +92,33 @@ eCEntity* Self(gCScriptProcessingUnit* spu, GELPVoid self)
     return spu ? spu->GetSelfEntity() : nullptr;
 }
 
+template <typename Function>
+Function WrapPerceptionEntry(Function function, void* replacement)
+{
+    HMODULE owner = nullptr;
+    auto* code = reinterpret_cast<unsigned char*>(function);
+    static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
+    if (function &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(function), &owner) &&
+        owner == GetModuleHandleA("Script_Game.dll") && !std::memcmp(code, prologue, sizeof(prologue))) {
+        if (void* trampoline = JumpTo(code, replacement)) {
+            Log("ai: damage-aware perception wrapped at native entry");
+            return reinterpret_cast<Function>(trampoline);
+        }
+    }
+    Log("ai: perception wrapped by registered entry only; native prologue did not match");
+    return function;
+}
+
 GEInt GE_STDCALL FilterScript(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
-    if (Driven(Self(spu, self))) { ++blocked; return 0; }
+    eCEntity* receiver = Self(spu, self);
+    if (PerceptionBlocked(receiver, Driven(receiver))) { ++blocked; return 0; }
+    // While another player's puppet stands for the game's player (an Acting scope), this machine's own hero is no player to the
+    // scripts and would take part in the fight it hears as a villager does (ZS_WatchFight, ZS_Applaud; 2 Nov.): it perceives nothing then.
+    if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return 0; }
+    if (receiver && receiver == detail::damageReceiver) return GETrue;
     return originalScript(spu, self, other, args);
 }
 
@@ -90,22 +130,42 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
 {
     char const* name = stack.GetCount() ? stack.Peek().m_strScriptName.GetText() : "";
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
+    if (npcplayback::IsPassive(self)) { ++skipped; return GEFalse; }
     // A mirrored NPC runs its death state only once the host reported it dead (npcs.cpp sets it then);
     // the client's own hit judgement must not decide that.
     const bool dying = (strncmp(name, "ZS_Dead", 7) == 0 || strncmp(name, "ZS_RagDollDead", 14) == 0) && npcs::DiedOnHost(self);
+    // Our own blow's stagger on a mirror runs as the game's state (the client's hit feels as it does in single-player).
+    const bool reacting = Driven(self) && npcs::LocalReaction(self, name);
     // A mirrored NPC in a dialog with this client's hero runs its talk states (facing, gestures).
     const bool talking = (strcmp(name, "ZS_Talk") == 0 || strcmp(name, "ZS_Talk_Loop") == 0) && talk::TalkingWithHero(self);
     // The idle task of a mirror plays its standing motions every frame and replaced every attack the owner sent
     // (first human test: the client saw 11 attack motions where the host played 147); it waits while one plays.
-    const bool acting = strcmp(name, IdleTaskName) == 0 && (npcs::InAction(self) || talk::InGesture(self));
+    const bool acting = strcmp(name, IdleTaskName) == 0 &&
+                        (npcs::DiedOnHost(self) || npcs::InAction(self) || talk::InGesture(self));
     // Tried on Fable's advice (2026-10-18), no effect on attack motions: returning true here (E3) and running no idle
     // task at all for mirrors (E2). The stance's ambient loop is re-selected outside the AI states.
-    if ((Driven(self) && strcmp(name, IdleTaskName) != 0 && !dying && !talking) || acting) {
+    if ((Driven(self) && strcmp(name, IdleTaskName) != 0 && !dying && !talking && !reacting) || acting) {
         ++skipped;
         return GEFalse;  // nothing ran; our driver puts the idle task back
     }
     auto it = originals.find(name);
     if (it == originals.end()) { ++unknown; return GEFalse; }
+    if (self && guards::IsLocalPlayer(self)) {
+        if (!strncmp(name, "ZS_", 3) && playerStatesSeen.size() < 200 && playerStatesSeen[name]++ == 0)
+            Logf("ai: the player body %s runs %s", Entity(self).GetName().GetText(), name);
+        if (SpectatorState(name)) {
+            ++playerSpectatorRefused;
+            if (playerSpectatorRefused <= 20) {
+                eCEntity* actingFor = guards::CurrentActor();
+                Logf("ai: the player body %s was put into %s (acting for %s); back to its routine", Entity(self).GetName().GetText(), name,
+                     actingFor ? Entity(actingFor).GetName().GetText() : "-");
+            }
+            Entity body(self);
+            body.Routine.FullStop();
+            body.Routine.ContinueRoutine();
+            return GEFalse;
+        }
+    }
     if (!countPrefix.empty() && !std::strncmp(name, countPrefix.c_str(), countPrefix.size())) {
         auto& c = counted[name];
         ++(self && self == gCSession::GetInstance().GetHero() ? c.first : c.second);
@@ -215,23 +275,26 @@ void* PatchImport(void* module, char const* dll, char const* function, void* rep
 }
 
 // Jump from `target` to `detour`; the returned trampoline runs the 6 stolen bytes and continues in the original.
-void* JumpTo(unsigned char* target, void* detour)
+void* JumpTo(unsigned char* target, void* detour, size_t stolen)
 {
-    constexpr size_t Stolen = 6;
+    if (!target || !detour || stolen < 5 || stolen > 27) return nullptr;
     auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, Stolen);
-    trampoline[Stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + Stolen) - reinterpret_cast<intptr_t>(trampoline + Stolen + 5));
-    std::memcpy(trampoline + Stolen + 1, &back, 4);
+    std::memcpy(trampoline, target, stolen);
+    trampoline[stolen] = 0xE9;
+    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + stolen) - reinterpret_cast<intptr_t>(trampoline + stolen + 5));
+    std::memcpy(trampoline + stolen + 1, &back, 4);
     DWORD old = 0;
-    if (!VirtualProtect(target, Stolen, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
+    if (!VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return nullptr;
+    }
     target[0] = 0xE9;
     const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
     std::memcpy(target + 1, &to, 4);
-    target[5] = 0x90;
-    VirtualProtect(target, Stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, Stolen);
+    for (size_t i = 5; i < stolen; ++i) target[i] = 0x90;
+    VirtualProtect(target, stolen, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, stolen);
     return trampoline;
 }
 
@@ -244,6 +307,8 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
         ++attitudeAsked;
         eCEntity* judge = Self(spu, self);
         remote::NoteContact(judge, target);
+        // A scoped remote player must remain the same player for GetPlayer, IsPlayer and attitude checks.
+        if (guards::CurrentActor() == target) return originalAttitude(spu, self, other, args);
         eCEntity* hero = gCSession::GetInstance().GetHero();
         if (attitudeOn && !plainAsk && hero && judge && judge != hero && !Driven(judge)) {
             // GetAttitude answers Panic when self flees and its current target is other. With the hero in place of
@@ -286,7 +351,10 @@ GEInt GE_STDCALL SafeMoveLength(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 
 GEBool GE_STDCALL FilterCallback(gCScriptProcessingUnit* spu)
 {
-    if (Driven(spu ? spu->GetSelfEntity() : nullptr)) { ++blocked; return GEFalse; }
+    eCEntity* receiver = spu ? spu->GetSelfEntity() : nullptr;
+    if (PerceptionBlocked(receiver, Driven(receiver))) { ++blocked; return GEFalse; }
+    if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return GEFalse; }
+    if (receiver && receiver == detail::damageReceiver) return GETrue;
     return originalCallback(spu);
 }
 }
@@ -321,9 +389,9 @@ unsigned WrappedCount() { return wrapped; }
 unsigned UnknownCount() { return unknown; }
 void ContinueRoutineReport(void (*log)(char const*))
 {
-    char line[160];
-    Format(line, "CONTINUEROUTINE wrapped=%d block=%d blocked=%u run=%u", originalContinue != nullptr, continueBlock ? 1 : 0,
-              continueBlocked, continueRun);
+    char line[200];
+    Format(line, "CONTINUEROUTINE wrapped=%d block=%d blocked=%u run=%u player_spectator_refused=%u hero_perception_blocked=%u", originalContinue != nullptr, continueBlock ? 1 : 0,
+              continueBlocked, continueRun, playerSpectatorRefused, heroPerceptionBlocked);
     log(line);
 }
 void ContinueRoutineOn(void (*log)(char const*))
@@ -463,13 +531,13 @@ void Tick()
         Log(originalMoveLength ? "ai: GetCombatMoveLength wrapped (fight target not bound)" : "ai: GetCombatMoveLength NOT found, not wrapped");
     }
     if (installed || searched) return;
-    if (auto* script = Find(admin.GetScripts(), Name)) {
-        originalScript = script->m_funcScript;
+    if (auto* script = Find(admin.GetScripts(), Name); script && script->m_funcScript) {
+        originalScript = WrapPerceptionEntry(script->m_funcScript, reinterpret_cast<void*>(&FilterScript));
         script->m_funcScript = &FilterScript;
         installed = true;
         Log("ai: perception filter installed (script)");
-    } else if (auto* callback = Find(admin.GetScriptAICallbacks(), Name)) {
-        originalCallback = callback->m_funcScriptAICallback;
+    } else if (auto* callback = Find(admin.GetScriptAICallbacks(), Name); callback && callback->m_funcScriptAICallback) {
+        originalCallback = WrapPerceptionEntry(callback->m_funcScriptAICallback, reinterpret_cast<void*>(&FilterCallback));
         callback->m_funcScriptAICallback = &FilterCallback;
         installed = true;
         Log("ai: perception filter installed (AI callback)");

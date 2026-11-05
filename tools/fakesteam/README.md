@@ -1,56 +1,86 @@
-# Testing the Steam transport without two Steam accounts
+# Testing the Steam-only transport locally
 
-`transport = steam` (src/steam.cpp) needs two Steam accounts on two PCs for a real test. Everything else runs on one PC
-with `fake_steam_api.c`, a stand-in for `steam_api.dll` that passes the same flat API calls over 127.0.0.1 (lobbies are
-files in a folder, every other copy's lobby counts as a friend's). It keeps the real 32-bit layouts (the sender identity
-at offset 12, GetSteamID64 answering 0 for a wrong offset), so a reader at the wrong offset fails here as with Steam.
+`src\steam.cpp` normally requires two real Steam accounts. `fake_steam_api.c` is a test-only stand-in whose lobbies,
+friends, session requests and messages use files and loopback sockets. It keeps the real 32-bit API layouts.
+Neither the fake DLL nor `g3t_relaytest.exe` goes into the player package.
 
-Both are built with the mod (`fake_steam_api.dll` and `g3t_relaytest.exe` in `artifacts/fakesteam`); neither goes into
-the player package.
+## Focused transport tests
 
-## The transport alone: g3t_relaytest
+Build with the mod, then run from the repository root:
 
-`net.cpp`, `steam.cpp` and ENet without the game. The host waits for a client, sends it a 2 MB "save" as file chunks and
-exchanges player states; the client must find the host among its friends, be welcomed, get the states and the whole save
-(CRC), then quit; the host must see it gone at once.
-
-```bat
-set G3T_STEAM_DLL=%CD%\artifacts\fakesteam\fake_steam_api.dll
-set G3T_FAKESTEAM_DIR=%TEMP%\g3t-relaytest
-rmdir /s /q %G3T_FAKESTEAM_DIR%
-start "host" cmd /c "set G3T_FAKESTEAM_ID=1&& set G3T_FAKESTEAM_NAME=Host&& artifacts\fakesteam\g3t_relaytest host 34600 60"
-set G3T_FAKESTEAM_ID=2&& artifacts\fakesteam\g3t_relaytest client 34600 60
+```powershell
+python tools\fakesteam\test_transport.py build\artifacts\fakesteam\Release
 ```
 
-Each prints `RESULT: PASS` or `RESULT: FAIL (...)`. Checked on 27.10. (mingw build under Wine, the same sources):
+Use Python 3.12+ to also run the regression covering the QA runner's fake-Steam network impairment path.
 
-| Run | Client | Expected | Result |
-|---|---|---|---|
-| plain | finds the host | PASS | PASS both, save whole, host saw the client leave within 1 ms |
-| `steam_host` | 4th argument `host` (any case) | PASS | PASS |
-| invite | `G3T_FAKESTEAM_INVITE=1` | PASS | PASS (joins through the accepted invite) |
-| negative: no Steam | `G3T_FAKESTEAM_INIT=2` | FAIL, falls back to the address | FAIL, "Steam not available (Steam is not running); connecting to the address instead" |
-| negative: wrong friend | 4th argument `Nobody` | FAIL | FAIL, keeps looking |
-| negative: foreign lobby | a friend in a Spacewar lobby without the G3 Together tag, `steam_host` = that friend | FAIL | FAIL, "not a G3 Together lobby", skipped for good |
+The tests launch and clean up their own host/client processes and temporary lobby folders. They check:
 
-## The game: qa/together.py
+- Steam discovery, player-state exchange, a complete 2 MB save transfer, a damage claim and disconnect detection.
+- All test-process UDP endpoints bind to localhost.
+- A compatible direct ENet hello from outside the linked Steam relays is rejected.
+- Missing Steam and a missing Steam DLL fail startup on both host and client, without fallback.
+- Menu-state formatting, joined/ready client counts, automatic Steam names and UTF-8-safe name truncation.
+- Gothic 3 AppID selection and explicit rejection of unexpected Steam identities.
+- Reliable NPC terminal-state and ordered ownership-release delivery.
+- A third observer receives only host NPC publications; client NPC snapshots/releases are refused.
 
-Any stage over the stand-in:
+`g3t_snapshot_test.exe` checks the production engine-free timeline with jitter/loss, stops, discontinuities, clock changes,
+timer wrap, pose-aligned animation/combat metadata, publication ordering and nested damage-perception isolation.
+It also checks fixed 60 Hz deadlines, interpolation-only NPC state and visible-contact segment geometry.
+It loads neither Gothic 3 nor Steam. The sampler and ten transport tests pass locally, including host-only NPC
+authority and identified hit acknowledgements. Native gameplay is not covered by these standalone tests.
 
-```bat
-set G3_FAKESTEAM=%CD%\artifacts\fakesteam\fake_steam_api.dll
-set G3_INI_EXTRA=transport = steam
-python qa\together.py stage2
+The standalone executable uses `g3t_relaytest host <seconds> [steam_host]` or `client <seconds> [steam_host]`.
+Its `direct <loopback-port> <seconds>` mode is a negative test probe, not a player connection path.
+
+## Game bot suites
+
+These still require the configured private QA workspace and Python 3.12 or newer.
+The Steam-only runner requires the stand-in:
+
+```powershell
+$env:G3_FAKESTEAM = "$PWD\build\artifacts\fakesteam\Release\fake_steam_api.dll"
+python qa\together.py --suite stage2
 ```
 
-Each copy gets its own Steam id (pair × 10 + 1 for the host, + 2 for the client) and each pair its own lobby folder
-(`%TEMP%\g3t-fakesteam-<pair>`), so pairs never see each other. The host's lobby folder is emptied at its launch. Real
-Steam is never touched. The QA command `steamstatus` logs `STEAMSTATUS ready=… role=… lobby=… linked=… peer=<id>:<linked>:<to ENet>:<to Steam>:<rtt>`.
-Negative control: the same stage with `G3_INI_EXTRA=transport = steam;steam_host = Nobody` must fail to join.
+Each isolated game copy gets its own Steam ID and each pair a private lobby folder.
+`G3_NETSIM=delay_ms,jitter_ms,loss_percent` impairs the fake Steam message transport through a local relay.
+It does not open a direct-IP game connection. Fake Steam adds a 9-byte framing header to ENet datagrams.
+The old direct-UDP `G3_CHAOS` runner is rejected explicitly rather than reporting results from an unused relay.
 
-## Two PCs, one Steam account each, or none
+Real Steam is not touched. The `steamstatus` QA command reports lobby, linked peers, relay counters and round-trip time.
+Actual play between two real Steam accounts remains a separate human test; see `docs\PLAYTEST.md`.
 
-The stand-in also works between two PCs without Steam: on each, `G3T_FAKESTEAM_REMOTE=<other PC's IP>:<its port>:<its id>`
-and `G3T_FAKESTEAM_PORT`, plus `G3T_FAKESTEAM_LISTREMOTE=1` on the client. For the real thing, both PCs use
-`<game>\G3Together\steam_api.dll` (the setup puts it there) and two Steam accounts that are friends; the rows to check are
-in docs/PLAYTEST.md ("over Steam").
+For an explicitly requested real-Steam startup check, `g3t_relaytest lobbyprobe <seconds>` uses the DLL selected by
+`G3T_STEAM_DLL`, creates a friends-only lobby and leaves it on completion. It checks startup/lobby state, not peer gameplay.
+
+## NPC authority feasibility probes
+
+`qa\stream_probe.py` runs native engine probes in disposable QA copies. Set `G3_WORKSPACE` to a separately
+provisioned isolated workspace and `G3_FAKESTEAM` as above; do not overwrite a deployment reserved for manual testing.
+
+```powershell
+python qa\stream_probe.py --suite streamProbe --seconds 240
+python qa\stream_probe.py --suite passiveProbe --seconds 240
+```
+
+`streamProbe` loads a distant region through a non-rendered prefetch camera and checks processed NPCs, navigation,
+collision floors, and the unchanged real camera. `passiveProbe` copies native animation state between two
+NPCs while blocking the recipient's routine, script, movement, and unsolicited animation entry points. It captures
+the native playback options rather than constructing the SDK's opaque descriptors, and checks clip retention,
+phase, and root-position drift across engine frames.
+
+These remain opt-in QA commands (`streamprobe`, `passiveprobe`). Protocol 71 separately wires host-only authority and
+passive replay into the live NPC path. Primitive probe results are not network/gameplay acceptance: real client swings,
+counterattacks, dialog audio, companion/guide/arena/summon lifecycles, loading and clean shutdown need separate coverage.
+`stageClientFriendlyHits` additionally checks immediate local flinches and suppression of the host's echoed reaction.
+`SYNCNPC` reports actual capture ticks, missed 60 Hz deadlines and elapsed capture time.
+
+The final-pose path additionally copies the host's completed affine bone matrices, including hidden blend-out layers
+and facial bones. The primitive selects this by default; `G3_EXACT_POSE=0` is the old clip-only diagnostic, not skeletal acceptance.
+The portable transport suite now includes a sustained 73-actor burst case and verifies that large pose packets use
+unreliable fragmentation, not an implicit reliable transfer. The wrap test moves the pose stream to its alternate channel
+before the 16-bit sequence is exhausted. Its steady-state phase starts after the save transfer.
+The stand-in keeps tail pointers for its receive queues and bounds each socket pump so a continuous pose stream
+cannot starve the game's main thread. The live transport's owned loopback sockets also reserve burst-sized buffers.

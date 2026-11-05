@@ -1,5 +1,51 @@
 # Development stages
 
+> This table records upstream development history, including the former direct-UDP path. This fork supports Steam only.
+> Bot suites require the fake Steam DLL; `G3_NETSIM` now impairs that loopback test transport. Historical pass claims below
+> are not new validation claims for this fork.
+
+> Protocol 71 replaces distributed NPC authority with passive client replay, final skeletal poses and host-side regional streaming.
+> Its native acceptance is still in progress. Historical ownership, companion and dialog pass claims below do not
+> validate this new model. A protocol-67 control also reproduces the intermittent AMD/D3D9 shutdown hang.
+
+Earlier protocol-68 evidence: the engine-free timeline/cadence/contact checks and ten fake-Steam transport tests pass,
+including host-only NPC/death/removal publication to a third player. An isolated `stage3a` run passes with 25 common NPCs,
+no client authority, and clean shutdown. The fixed-root native-input melee fixture passes with 9/10 target-specific
+host hits, immediate local flinches and suppressed echoes; its claim-routing negative control passes with zero hits.
+These are individual acceptance runs, not completion of the full matrix below. Native respawn/removal, the newer
+NPC-admin event guard, incoming contacts, interaction lifecycles and multi-region resource cost still need coverage.
+
+Rendered geometry and bones are separate acceptance gates. A new host-rendering probe reproduced remote travel unloading
+the host's town despite an unchanged main camera. Shared geometry contexts now have a single cache-out owner, with
+remote-region retention and deferred refresh after streaming jobs finish. The corrected isolated run kept all 3,622
+main-camera static entries before travel, during remote replay and after camera retirement; screenshots retain the
+terrain/buildings and both games closed normally. This is not yet a multi-region performance or lifecycle sign-off.
+
+The actual-bone probe invalidated relying on matching clip names/times alone: native blend-out instances survive
+outside the eight motion slots. Protocol 71 therefore sends the host's completed affine bone matrices and facial-rig
+state. The production-equivalent decoded probe passed 58,710 comparisons at 0.214 cm maximum error (5 cm limit),
+with normal shutdown. Portable codec/timeline tests and thirteen transport tests pass, including sustained 73-actor
+bursts, explicit unreliable fragmentation, discarded-fragment budget release, rejected-peer slot reuse and the 16-bit
+pose-sequence rotation. A 60+ second lossy run (`G3_NETSIM=25,10,3`) crossed several pose-channel switches with no
+stall (`readinessProbe`: ready, zero invariant violations). The fake Steam receive queue is bounded and uses constant-time appends.
+
+The current native walking case passed with 5,788 ms of actual walking, zero added sliding, 60 clean NPC invariants
+and both normal shutdowns. Camera retirement now finishes native prefetch jobs before clearing cells: the misleadingly
+named WaitForEmptyThreadQueue cancels unfinished work and can leave an entity cached under a retired database.
+The isolated defender-local case also passes: visible Scavenger damage, no host-only or stale damage, and NPC fireball
+reconstruction. Actual sword-input acceptance reached 10/10 host hits, 19 local flinches and 25 suppressed echoes.
+The native parry control blocked two host hits while all six client hits still counted, including five genuine host
+parries. Those last two runs passed their functional checks but failed their overall teardown checks (GPU hang and,
+before completion-first retirement, the now-addressed cached-entity assertion respectively).
+These results do not complete the entire interaction, lifecycle, multi-player and resource-cost matrix.
+Further current-build cases passed: remote host-only lifecycle at 1,115 m (one revival to incarnation 2, one removal,
+second-life death, zero client rolls) and the claim-routing negative control (0/10 host hits, no local/echo reactions);
+both cases closed both games normally and preserved protected saves. Lester dialogue entry, busy refusal, release,
+and subsequent host dialogue also passed their functional checks, but that run failed the known client GPU shutdown.
+
+> Loose ground pickups are now personal in the fork's source. The old host-authority ground-pickup stages and their
+> negative controls below describe upstream behavior, not the new policy.
+
 What the mod does, stage by stage, and how each stage is tested. For players, the [README](../README.md) has the short version.
 
 Follows the build order of the [coop-anything](https://github.com/cranebeaker/coop-anything) playbook.
@@ -44,20 +90,20 @@ with a negative control that fails.
 | P2 | Arrows and bolts: a player's arrow is announced as it leaves the bow and flown as a copy on the other machine that belongs to that player's puppet; an arrow that hits is applied once | passing for the arrow's flight and the hit counted once; the test bot often does not get an arrow through the village to its target |
 | P2f | Spell projectiles, the fireball first: announced like arrows, the copy carries the spell; each fireball that hits is applied once | passing |
 | TradeGoods | Player trade, goods: what a player can trade (unequipped, no quest items, no skills; gold apart) reaches the other machine, and a dialog with its puppet fills the puppet with exactly those goods as merchandise | passing (shown after the first trade's tip box Ok) |
-| TradePrice | Player trade, prices: with a puppet the game's price script gives an item's value both ways; traders unchanged | passing |
-| TradeQuality | Player trade keeps item quality: a sharp bow bought from the partner and a forged sword sold to them arrive sharp and forged (goods and offers carry the quality, protocol 46) | passing (swaps through QA, as PlayerTrade) |
+| TradePrice | Player prices are zero in either direction; ordinary NPC merchant prices are unchanged | updated helper coverage; protocol-67 gameplay verification pending |
+| TradeQuality | Automatic player exchanges preserve template and quality, without partner approval | updated helper coverage; protocol-67 gameplay verification pending |
 | MapMarks | The other player on the map (mark and name at its place, following it) and on the compass (in its direction from the camera); drawn after the game's own paint, nothing added to the map's saved markers; the other player is an arrow with its name | passing (checked on screenshots) |
 | Ransack | A guard of the host robs a knocked-out partner as in single-player: while the partner lies knocked out by the game's own rules its puppet lies down for the AI and carries the partner's gold; the game's own ZS_RansackBody takes half (one piece of one), the partner pays it from its real hero, and stays down while the robber is at work (protocol 47) | passing (3x + negative control) |
 | Witness | An NPC the other machine runs reacts to a player's crime: the game judges it on the thief's machine (AssessTarget with a crime's reason, caught in the native function), the NPC's machine lets the real NPC go after the thief's puppet | passing (3x + negative control) |
 | Together | `reputation = together`: what an NPC holds against one player (LastPlayerCrime), its copies hold against everybody's | passing (3x + negative control) |
 | Subtitles | Overheard dialog lines show their text in the listener's language (the line's text id travels with it; GUI2::StartSay as the game's own dialog, never over the listener's own dialog) | passing (3x + negative control) |
-| PlayerTrade | Player trade end to end: a trade window's swaps go to the other player as one offer, held back until the answer; accepted, both inventories change; declined, nothing does | passing (swaps through QA; on the first trade the tip box must be closed with Ok, then the window shows the partner's goods) |
-| TradeHaggle | Player trade, free prices (owner 27.10.): in the open window the buyer sets its own price with price_up_key / price_down_key (default Num+ / Num-, 10 gold a press, 100 with Shift; QA: tradeadjust); the offer carries that gold, the buyer pays it until the answer; accepted, the seller gets it; declined, all of it comes back; a price beyond the buyer's or the seller's gold, or below nothing, is clamped. Negative control: tradeadjustoff | not run yet (the keys themselves only by hand: the bot's presses do not reach GetAsyncKeyState) |
+| PlayerTrade | Native-window free take/give and direct gold gifts, with automatic owner validation and acknowledged delivery while the window remains open | Release build only; manual mouse/button testing requested, not run by the agent |
+| TradeHaggle | Retired: items are free and gold gifts are explicit; custom-price keys no longer exist | removed from runnable suites |
 | Glide | Puppets walk instead of gliding: under a Hamachi-like network (`G3_NETSIM=40,20,1`) each player runs eight legs; the other machine's puppet may show no movement motion for at most 5 % of its travel (QA `glide`). Speed comes from send times, and a replayed stance motion ends as the body sets off | passing (23.10.: 1.0-2.4 %; before 13-16 %) |
 | Wear | Look, armor and helmet: a player's INI `look` is how the others show it; the body armor (`Body_*`, slot 17) and helmet (slot 18) it wears show on its puppet within 5 s, and come off again | passing |
 | HO | Heal other between players: a heal cast on the other player's puppet is replayed on that player's own hero (fully healed, as in the single-player game) | passing |
-| W10 | Trade between players, the seller's side (offer.cpp; the trade window: PlayerTrade): what the buyer took and gave at the seller's puppet arrives as one offer through the host; the seller sees what it gives and gets and accepts (INI offer_accept_key, default Insert) or declines (offer_decline_key, Delete) within 30 s; accepted, it is checked against the seller's hero (still there, not equipped, no quest item, no skill) and applied whole or not at all; one offer at a time (another one is answered busy); the buyer counts no answer within 40 s as declined | passing (23.10., offers sent by the bot; with the trade window in PlayerTrade; the keys themselves not, the bot cannot press them) |
-| TradeKeys | The keys a player chooses do not get in each other's way: partner_key, offer_accept_key and offer_decline_key are read as the mod reads them, and a key set for two or three of them is named in the log at the start and on the screen once the game runs (one press would do all of them); other trade keys (F9, f10) are used as set, with no warning | passing (24.10.) |
+| W10 | Retired manual-offer protocol; real-owner inventory validation is now part of automatic exchanges | replaced by PlayerTrade |
+| TradeKeys | Retired: there are no offer-approval or price-adjustment keys | removed from runnable suites |
 | SharedUse | One user per place as in single-player: the game sets a place's user (Interaction.User) only where its user acts, so two heroes sat on one stool; each PC now reports when its hero uses a place and lets go (world state kind 13), the others set that player's puppet as its user (their NPCs keep off), and a hero that sets out to use it is stopped before it gets there ("<Name> is using this."). The host sits on a stool, the joining player is refused, then sits once the host stands up | passing (24.10.) |
 | Guide | A follow quest the joining player takes: Mitch_Trolls in Faring (SKALVERAM3409 opens the quest's Activator SKALVERAM3395). The game guides only the local hero (StartGuidePlayer sets its party leader; SelectRoutineTask picks ZS_GuidePlayer by it); the host simulated Mitch, so he never guided the client. The client now takes him over while he guides it (guide.cpp, as a recruited companion): he guides at once, leads the client 20+ m, the host shows him within 4 m, the quest runs on both. G3_WHO=host: the host takes the quest from Mitch while the client simulates him; the host takes him back (npcs::HostTake) and he guides the host. Negative control: guidesyncoff on the client | passing (25.10.) |
 | Escort | An escort quest the joining player takes: Freman_BringSlave_01 in Silden, the escaped slave joins (KALVERAMX233, the player's word CmdSlaveJoin, no JoinPlayer line), the client takes him over and he follows it 20 m, the host shows him within 4 m; then client and slave are put at Freman (the way there has wolves that killed him), the hand-over (BPANKRATZ3112) succeeds on both and he goes back to the host. A join started following only ~50 s later on the host and never on a client; now at once. G3_WHO=host: the host takes him along. Negative control: guidesyncoff on the client | passing (25.10.) |

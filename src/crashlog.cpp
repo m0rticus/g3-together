@@ -242,6 +242,13 @@ bool Where(uintptr_t address, char* out, size_t size)
 LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
 {
     if (!info || info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t fault = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+    bool gameFault = false;
+    for (Module const& module : modules)
+        if (module.base && fault >= module.base && fault - module.base < module.size) { gameFault = true; break; }
+    // Drivers can handle their own first-chance exceptions. Dumping those may block graphics teardown.
+    // Unhandled exceptions from any module still reach LastChance.
+    if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
     if (!probing && GetCurrentThreadId() != dumpThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps) Dump(info);  // before anything
     // that could fault again
     if (InterlockedIncrement(&logged) > 12) return EXCEPTION_CONTINUE_SEARCH;

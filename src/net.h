@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Transport: ENet over UDP. One player hosts (id 1), others connect. Kept free of SDK headers so that
+// Transport: ENet through private loopback Steam bridges. One player hosts (id 1), others connect. Kept free of SDK headers so that
 // winsock2 and the game's headers never meet in one translation unit.
 #pragma once
 
 #include <cstdint>
+#include "pose.h"
 
 namespace g3t::net {
+constexpr int NpcMotionSlots = 8;
+#pragma pack(push, 1)
+struct NpcMotion {
+    uint32_t name = 0, instance = 0;
+    float phase = 0.0f, speed = 1.0f, weight = 0.0f;  // weight is the current rendered blend, not its target
+    float intro = 0.0f, extro = 0.0f;
+    int32_t blend = 0;
+    uint32_t options[7] = {};
+    uint8_t active = 0;  // bit 0: active; bit 1: the host passed a null native descriptor
+};
+#pragma pack(pop)
 #pragma pack(push, 1)
 struct PlayerState
 {
@@ -49,15 +61,30 @@ struct NpcRecord
     float rotation[4] = {};
     uint8_t movementMode = 0;
     // bit 0: dead, bit 1: down (knocked out), bit 2: fighting (AI mode combat, Stufe 4.2), bits 3-5: the player it fights (its
-    // hero, puppet or party member; 0 none). Older receivers look at bits 0 and 1 only.
+    // hero, puppet or party member; 0 none; also sent outside combat), bit 6: the owner's actual IsInParadeMode result, bit 7: it died by ragdoll
+    // (the game's ZS_RagDollDead; the mirrors then fall by physics too).
     uint8_t flags = 0;
     int32_t hitPoints = 0;
+    int32_t hitPointsMax = 1;
     uint32_t motion = 0;     // hash of the visible motion's name; names travel once via SendMotionName
     uint8_t aniState = 0;    // gEAniState (2 standing, 4 fighting stance ...); 0 = unknown
     uint32_t heldRight = 0;  // HashName of the item in the right hand (a drawn weapon), 0 = empty
     uint32_t heldLeft = 0;   // the same for the left hand (shield, bow)
-    uint8_t actionSeq = 0;   // protocol 58: as PlayerState.actionSeq
-    uint16_t motionFrac = 65535;  // protocol 59: as PlayerState.motionFrac
+    uint32_t sent = 0;  // protocol 61: capture time in the owner's clock, shared by pose, motion and parry history
+    uint8_t partyPlayer = 0;  // protocol 66: co-op party leader, independent of which machine simulates this NPC
+    uint8_t partyType = 0, waiting = 0, guidePlayer = 0;
+    uint8_t aiMode = 0;
+    uint8_t action = 0, attackReason = 0, damageType = 0;
+    int32_t damageAmount = 0;
+    float damageMultiplier = 0.0f;
+    uint32_t incarnation = 1;
+    uint8_t hitPlayer = 0;
+    uint32_t hitSequence = 0;
+    uint8_t presentationReady = 0;
+    uint8_t absent = 0;      // reliable host removal for this incarnation; a later life must use a newer incarnation
+    uint8_t contact = 0;
+    uint8_t attitude = 0;    // protocol 71: gCNPC_PS.AttitudeToPlayer2; the game colours an NPC's name tag from it
+    NpcMotion motions[NpcMotionSlots];
 };
 #pragma pack(pop)
 
@@ -70,8 +97,8 @@ struct Remote
     bool connected = false;
 };
 
-// steam: transport = steam (steam.cpp); a client without Steam connects to address instead.
-bool Start(bool host, char const* address, unsigned short port, char const* name, bool steam);
+bool Start(bool host);
+char const* StartupError();  // a startup failure; no direct-IP fallback is opened
 void Stop();  // at shutdown: disconnect now so the others notice at once
 void Stats(void (*log)(char const*));      // QA: NETSTATS (rtt and packet loss per connection)
 void RttLogOff(void (*log)(char const*));  // QA negative control: no "net: rtt=" lines
@@ -80,6 +107,7 @@ uint32_t RoundTrip(uint8_t player);
 void Reconnect(void (*log)(char const*));  // QA, client (stage W1): leave the host and connect again at once
 // Service the socket and, at most every 50 ms, send the local state. Call once per frame.
 void Tick(PlayerState const& local, bool haveLocal);
+void SetSendRate(int hz);  // 20..60 Hz for player states; NPC captures have their own fixed 60 Hz deadline
 uint8_t LocalId();
 // Host: always. Client: welcomed by the host and in the host's world (SetInWorld); gameplay pauses otherwise.
 bool Connected();
@@ -100,6 +128,7 @@ bool Joined();                   // client: welcomed by the host, in its world o
 uint32_t ConnectingFor();        // client: ms since it began to connect, while it never reached the host; else 0
 char const* RefusalReason();     // client: why the host refused this machine (empty if it did not), as the host wrote it
 void ClaimVersionForTest(uint16_t version);  // QA stage W7 only: the next hello claims this protocol version (0: ours)
+void PrimePoseWrapForTest();  // QA stage W7 only: the next hello claims this protocol version (0: ours)
 uint32_t WelcomeSerial();        // client: counts the welcomes this machine got, local only (persist binds an autoload to one)
 void AdvanceWelcomeSerialForTest();  // QA stage W6 only: simulate a new local welcome without a wire/server change
 bool PeerJoined(uint8_t id);     // host: a client with this id is connected, in the host's world or not
@@ -129,19 +158,31 @@ void SendWorld(WorldNote const& note, uint8_t to);  // host: to client `to`; cli
 using WorldHandler = void (*)(uint8_t from, WorldNote const& note);
 void SetWorldHandler(WorldHandler handler);
 
-// NPC snapshots (unreliable) and motion names (reliable): host -> every client; client -> host (its own region,
-// passed on by the host).
+// NPC snapshots (normally unreliable; life transitions reliable) and motion names (reliable).
+// Only the host publishes NPC state. Motion slots and pose share one capture time.
 constexpr int MaxNpcsPerMessage = 48;  // receiving limit
-constexpr int NpcsPerSend = 18;         // sent per message: 11 + 18 x 66 bytes (protocol 59) fit one 1200-byte datagram (hamachi-net-c.md)
-static_assert(11 + NpcsPerSend * sizeof(NpcRecord) <= 1200, "a batch of NPC records must fit one datagram");
-void SendNpcs(NpcRecord const* records, int count);
+constexpr int NpcsPerSend = 2;
+static_assert(23 + NpcsPerSend * sizeof(NpcRecord) <= 1200, "a batch of NPC records must fit one datagram");
+void SendNpcs(NpcRecord const* records, int count, bool reliable = false);
+void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags = 0);
+using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool reliable);
+void SetNpcPoseHandler(NpcPoseHandler handler);
+void SendNpcRelease(uint8_t const* guids, int count);  // host retires interest; this never restores client NPC AI
+using NpcReleaseHandler = int (*)(uint8_t owner, uint32_t generation, uint8_t* guids, int count);
+void SetNpcReleaseHandler(NpcReleaseHandler handler);
+void ResetNpcReplication();  // forget ordering/history fences on a world change, not the host publication clock
+void NpcReplicationCounts(unsigned& accepted, unsigned& rejected, unsigned& stale);
+void NpcPoseCounts(unsigned& sent, unsigned& received, unsigned& failed);
 void SendMotionName(uint32_t hash, char const* name);
 // Client side: received NPC snapshots and motion names are handed to these callbacks.
-// owner: the player whose machine simulates these NPCs (1 = host; a client sends its own region's NPCs).
+// owner: always 1; client NPC publications are refused.
 // sent: the sender's net::Now() when the snapshot went out.
-using NpcHandler = void (*)(NpcRecord const* records, int count, uint32_t now, uint32_t sent, uint8_t owner);
+// Compact accepted records in place and return their count.
+using NpcHandler = int (*)(NpcRecord* records, int count, uint32_t now, uint32_t sent, uint8_t owner, uint32_t generation);
 using MotionNameHandler = void (*)(uint32_t hash, char const* name);
 void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names);
+using PlayerStateHandler = void (*)(PlayerState const& state, uint32_t arrived, bool reset);
+void SetPlayerStateHandler(PlayerStateHandler handler);  // each accepted network state, before the next render frame
 
 // Damage, reliable. Client -> host: this client hit an NPC (by GUID) for delta (negative) hit points.
 // Host -> one client: an NPC hit that player's puppet for delta.
@@ -150,17 +191,29 @@ void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names);
 // for this hit of the sender's hero on the sender's machine (its hit judgement runs before AddHitPoints), see HitOutcome.
 // seen: the owner's send time of the NPC's state the sender showed when its hero struck (Stufe 3.3), 0 unknown.
 enum HitOutcome : uint8_t { HitUnjudged = 0, HitKnockOut = 1, HitDeath = 2 };
-void SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16] = nullptr,
-                uint8_t outcome = HitUnjudged, uint32_t seen = 0);
-// attacker: the hitting NPC (GUID), or zeros with attackerPlayer = the player whose hero hit.
-void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer);
+enum HitReaction : uint8_t { HitNoReaction = 0, HitQuickStumble = 1, HitStumble = 2, HitPierceStumble = 3, HitSitKnockDown = 4 };
+uint32_t SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16] = nullptr,
+                   uint8_t outcome = HitUnjudged, uint32_t seen = 0, uint8_t reaction = HitNoReaction, uint32_t incarnation = 1);
+// attacker: the hitting NPC (GUID), or zeros with attackerPlayer = the player whose hero hit. meansToKill: its owner says the NPC
+// means to kill (the game's HasAttackReasonToKill; the victim's machine has only a mirror of it, which has no target or reason).
+void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill = false);
 using HitNpcHandler = void (*)(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16],
-                               uint8_t outcome, uint32_t seen);
-using HitPlayerHandler = void (*)(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer);
+                               uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation);
+using HitPlayerHandler = void (*)(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill);
 void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player);
+#pragma pack(push, 1)
+struct HitResult {
+    uint8_t guid[16] = {};
+    uint32_t epoch = 0, sequence = 0, incarnation = 0, processedAt = 0;
+    uint8_t accepted = 0;
+};
+#pragma pack(pop)
+void SendHitResult(uint8_t to, HitResult const& result);
+using HitResultHandler = void (*)(HitResult const&);
+void SetHitResultHandler(HitResultHandler handler);
 // Host -> one client: your hit killed the NPC with this GUID (the killer earns the experience).
-void SendKilled(uint8_t to, uint8_t const guid[16]);
-using KilledHandler = void (*)(uint8_t const guid[16]);
+void SendKilled(uint8_t to, uint8_t const guid[16], uint32_t incarnation);
+using KilledHandler = void (*)(uint8_t const guid[16], uint32_t incarnation);
 void SetKilledHandler(KilledHandler handler);
 // An NPC died where nobody mirrored it (journal.cpp). Client: to the host. Host: to every client except
 // `except`, with `by` = the player in whose region it died.
@@ -269,8 +322,8 @@ struct GoodsEntry {
     int32_t amount;
 };
 constexpr int MaxGoodsEntries = MaxContentEntries;
-bool SendGoods(uint32_t serial, int32_t gold, GoodsEntry const* entries, int count);  // false: not sent
-using GoodsHandler = void (*)(uint8_t player, uint32_t serial, int32_t gold, GoodsEntry const* entries, int count);
+bool SendGoods(uint64_t epoch, uint32_t serial, int32_t gold, GoodsEntry const* entries, int count);
+using GoodsHandler = void (*)(uint8_t player, uint64_t epoch, uint32_t serial, int32_t gold, GoodsEntry const* entries, int count);
 void SetGoodsHandler(GoodsHandler goods);
 using ContentsHandler = void (*)(uint8_t const guid[16], ContentEntry const* entries, int count);
 using ContainerTxHandler = void (*)(uint8_t from, uint8_t const guid[16], uint32_t seq, ContentEntry const* entries, int count);
@@ -280,7 +333,7 @@ void SetContainerHandlers(ContentsHandler contents, ContainerTxHandler tx, TxRes
 // Summoned things (summon.cpp, P1), reliable. A player's own summon got a net ID (caster id in the top byte); the
 // others replay it on that player's puppet. op 1: spawned; op 2: gone. Client -> host; host -> every other client
 // (relayed, `from` = the caster).
-enum : uint8_t { SummonSpawned = 1, SummonGone = 2, SummonCreature = 3 };  // 3: a summoned creature (an NPC), see guid
+enum : uint8_t { SummonSpawned = 1, SummonGone = 2, SummonCreature = 3, SummonCreatureRequest = 4 };
 #pragma pack(push, 1)
 struct SummonNote {
     uint8_t op = 0;
@@ -291,6 +344,9 @@ struct SummonNote {
     char spellItem[40] = {};  // the item cast from (It_Spell_Meteor, a scroll ...)
     char spawn[40] = {};      // the summoned entity's template (Smn_Meteor ...)
     uint8_t guid[16] = {};    // SummonCreature: the creature's GUID, which its copy takes over (SetID)
+    uint8_t ownerPlayer = 0;
+    int32_t args = 0;
+    uint32_t epoch = 0;
 };
 #pragma pack(pop)
 void SendSummon(SummonNote const& note);
@@ -310,8 +366,8 @@ struct DeedContext {
 };
 #pragma pack(pop)
 uint32_t NextDeedId();  // counts up from 1 per session on this machine
-// Shots (shot.cpp, P2), reliable: a player's own arrow or spell projectile as it set off; the others fly a copy that belongs to that
-// player's puppet. Client -> host; host -> every other client (relayed, `from` = the shooter).
+// Shots: player and locally simulated NPC projectiles. Reliable on the combat channel, independent of bulk state.
+// `from` identifies the publishing machine; caster identifies an NPC when it is not that machine's player.
 #pragma pack(push, 1)
 struct ShotNote {
     uint32_t netId = 0;
@@ -326,11 +382,30 @@ struct ShotNote {
     float multiplier = 0.0f;  // PSDamage.DamageHitMultiplier
     char arrow[40] = {};      // the arrow's template (or a spell's projectile: Mis_Fireball ...)
     char spellItem[40] = {};  // a spell's projectile: the item cast from (empty for arrows)
+    uint8_t caster[16] = {};  // zero: player `from`; otherwise the NPC that actually cast/fired
+    uint8_t targetPlayer = 0;
+    char spell[64] = {};      // NPCs can cast directly without a spell item in their hand
+    uint32_t epoch = 0;
+    uint32_t sent = 0;
 };
 #pragma pack(pop)
 void SendShot(ShotNote const& note);
 using ShotHandler = void (*)(uint8_t from, ShotNote const& note);
 void SetShotHandler(ShotHandler handler);
+// Host ragdoll impulses. Clients wait for the matching incarnation, presentation time and active physics.
+// Reliable on the combat channel; clients cannot publish NPC forces.
+#pragma pack(push, 1)
+struct RagdollNote {
+    uint8_t guid[16] = {};
+    float at[3] = {};     // where the force acts, relative to the NPC's own position
+    float force[3] = {};
+    uint32_t epoch = 0;
+    uint32_t sequence = 0, incarnation = 1, sent = 0;
+};
+#pragma pack(pop)
+void SendRagdoll(RagdollNote const& note);
+using RagdollHandler = void (*)(RagdollNote const& note);
+void SetRagdollHandler(RagdollHandler handler);
 // A spell a player cast on another player's puppet (spells.cpp): the target player replays the script on its own hero.
 // Any machine -> player `to` (through the host). script: the script's name (only a fixed list is replayed).
 void SendPlayerSpell(uint8_t to, char const* script);
@@ -417,32 +492,35 @@ struct DialogLineNote {
 void SendDialogLine(DialogLineNote const& note);
 using DialogLineHandler = void (*)(uint8_t from, DialogLineNote const& note);
 void SetDialogLineHandler(DialogLineHandler handler);
-// A trade between two players (offer.cpp, owner 23.10., point 2): the buyer, who traded at the seller's puppet, sends what
-// it took and gave; the seller accepts or declines it within 30 s and answers. Through the host, reliable; the host stamps
-// who sent it.
-constexpr int MaxOfferEntries = 24;
-enum : uint8_t { OfferAccepted = 1, OfferDeclined = 2, OfferExpired = 3, OfferUnavailable = 4, OfferBusy = 5 };
+// Automatic exchanges: owner-side validation, cached outcomes and acknowledgment before saving. Reliable packets may
+// be fragmented by ENet; a native basket has the same capacity as the advertised goods.
+constexpr int MaxOfferEntries = MaxGoodsEntries * 2;
+enum : uint8_t { OfferAccepted = 1, OfferUnavailable = 4, OfferFinalized = 6 };
 #pragma pack(push, 1)
 struct OfferEntry {
     uint8_t item[16] = {};      // template ID
     int32_t amount = 0;         // + goes to the buyer, - from the buyer
-    uint16_t quality = 0;       // gEItemQuality flags of what goes (protocol 46; the name gave 2 bytes, the message stays 1164)
+    uint16_t quality = 0;       // gEItemQuality flags of what goes
     char name[26] = {};         // the buyer's name of it (its focus name, UTF-8), for the seller's screen
 };
 struct OfferNote {
     uint8_t buyer = 0, seller = 0;
-    uint8_t count = 0;
+    uint8_t acknowledge = 0;
+    uint16_t count = 0;
+    uint64_t buyerEpoch = 0, sellerEpoch = 0;
     uint32_t serial = 0;        // the buyer's
     int32_t gold = 0;           // + goes to the buyer, - from the buyer
     OfferEntry entries[MaxOfferEntries];
 };
 struct OfferResultNote {
     uint8_t buyer = 0, seller = 0;
-    uint8_t result = 0;         // OfferAccepted .. OfferBusy
+    uint8_t result = 0;
+    uint64_t buyerEpoch = 0, sellerEpoch = 0;
     uint32_t serial = 0;
+    uint32_t goodsSerial = 0;
 };
 #pragma pack(pop)
-void SendOffer(OfferNote const& note);              // to note.seller (through the host)
+bool SendOffer(OfferNote const& note);              // false: no route to note.seller
 void SendOfferResult(OfferResultNote const& note);  // to note.buyer (through the host)
 using OfferHandler = void (*)(OfferNote const& note);
 using OfferResultHandler = void (*)(OfferResultNote const& note);

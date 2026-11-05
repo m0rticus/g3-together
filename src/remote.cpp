@@ -4,12 +4,14 @@
 
 #include "ai.h"
 #include "body.h"
+#include "combat.h"
 #include "config.h"
 #include "downed.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
 #include "parity.h"
+#include "trade.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -19,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -34,16 +37,47 @@ struct Puppet
     uint32_t dropChecked = 0;
     uint32_t wearChecked = 0;
     uint32_t world = 0;
+    uint32_t truthSent = 0;
     body::State body;
     std::string shape;        // the shape it stands for (the player's hero template, or its creature)
+    std::unordered_map<uint32_t, std::string> presentationNames;
 };
 Puppet puppets[net::MaxPlayers];
 bool started = false;
 bool trace = false;  // test copies only: 5 Hz trace of hero and puppet motion
 uint32_t lastTrace = 0;
+uint32_t lastSyncReport = 0;
 bool templateWarned = false;
 bool haveAnchor = false;
 bCVector anchor;
+
+void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
+{
+    if (!state.id || state.id >= net::MaxPlayers) return;
+    Puppet& puppet = puppets[state.id];
+    if (reset) {
+        puppet.body.track = body::Track{};
+        puppet.body.presentationSerial = 0;
+        puppet.body.actionSeq = -1;
+        puppet.presentationNames.clear();
+    }
+    auto remember = [&](char const* name) {
+        if (!*name) return uint32_t(0);
+        const uint32_t hash = net::HashName(name);
+        if (puppet.presentationNames.size() < 50000 || puppet.presentationNames.count(hash))
+            puppet.presentationNames[hash] = name;
+        return hash;
+    };
+    body::MotionState motion;
+    motion.motion = remember(state.animation);
+    motion.heldRight = remember(state.heldRight);
+    motion.heldLeft = remember(state.heldLeft);
+    motion.aniState = state.aniState;
+    motion.actionSeq = state.actionSeq;
+    motion.motionFrac = state.motionFrac;
+    motion.flags = state.flags;
+    body::Feed(puppet.body.track, state.position, state.rotation, state.sent, arrived, state.movementMode, motion);
+}
 
 void LogMotions(char const* who, Entity& entity, LogFn log)
 {
@@ -382,15 +416,16 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     if (std::strcmp(puppet.entity.GetInstance()->GetName().GetText(), own) != 0) puppet.entity.GetInstance()->SetName(bCString(own));
     // Trading between players (owner 23.10.): addressed, a puppet offers the game's own trade option ("Zeig mir deine
     // Ware!"), which opens the trade window with it (trade.cpp, offer.cpp). Checked like the name.
-    if (!puppet.entity.Dialog.TradeEnabled) puppet.entity.Dialog.TradeEnabled = GETrue;
+    puppet.entity.Dialog.TradeEnabled = trade::Available() ? GETrue : GEFalse;
     const float speed = body::Speed(remote.previous.position, remote.latest.position, remote.previous.sent, remote.latest.sent,
                                     remote.previousTicks, remote.latestTicks);
-    const uint32_t newestBefore = puppet.body.track.count ? puppet.body.track.snaps[puppet.body.track.count - 1].sent : 0;
-    body::Feed(puppet.body.track, remote.latest.position, remote.latest.rotation, remote.latest.sent, remote.latestTicks);
+    // A changed shape can replace the puppet after its packets were serviced; seed that new presentation once.
+    if (!puppet.body.track.count) FeedPlayer(remote.latest, remote.latestTicks, false);
     const uint32_t roundTrip = net::RoundTrip(static_cast<uint8_t>(id));
     // QA (Stufe 3.2): how far the puppet stood from where its player was (half the round trip before the state arrived)
-    if (puppet.body.track.count && puppet.body.track.snaps[puppet.body.track.count - 1].sent != newestBefore && speed > 100.0f)
+    if (remote.latest.sent != puppet.truthSent && speed > 100.0f)
         body::NoteTruth(puppet.body, remote.latest.position, remote.latestTicks - roundTrip / 2);
+    puppet.truthSent = remote.latest.sent;
     // Stufe 3.2, puppet lead: the sample half a round trip ahead of the newest state (at most 150 ms), so the puppet stands about
     // where its player is now; the host's NPCs then strike at that place, not where the player was. The movement controller
     // walks to that point too (not to the older newest state, which it would reach and stop at).
@@ -407,12 +442,11 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     float shownAt[3], shownTurn[4];
     bool buffered = false;
-    if (lead && factor > 0.0f && body::Sample(puppet.body.track, now, shownAt, shownTurn, shift)) {
+    const bool timeline = GetConfig().movementSmoothing && body::interpolate;
+    if (!timeline && lead && factor > 0.0f && body::Sample(puppet.body.track, now, shownAt, shownTurn, shift)) {
         for (int k = 0; k < 3; ++k) shownAt[k] = remote.latest.position[k] + factor * (shownAt[k] - remote.latest.position[k]);
         std::memcpy(shownTurn, remote.latest.rotation, sizeof(shownTurn));
         buffered = true;
-    } else if (!lead && body::interpolate) {
-        buffered = body::Sample(puppet.body.track, now, shownAt, shownTurn, shift);
     }
     float ahead[3];
     body::Target target{buffered ? shownAt : remote.latest.position, buffered ? shownTurn : remote.latest.rotation,
@@ -422,8 +456,36 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     target.actionSeq = remote.latest.actionSeq;
     target.motionFrac = remote.latest.motionFrac;  // protocol 59: where its player's motion was, and how long ago
     target.motionAgeMs = now - remote.latestTicks + roundTrip / 2;
+    float smoothGoal[3], goalTurn[4];
+    body::Presentation presentation;
+    bool presented = false;
+    const int32_t presentationDelay = body::PlaybackDelay(puppet.body.track);
+    auto nameOf = [&](uint32_t hash) -> char const* {
+        const auto it = puppet.presentationNames.find(hash);
+        return it == puppet.presentationNames.end() ? "" : it->second.c_str();
+    };
+    if (timeline) {
+        if (body::Sample(puppet.body.track, now, shownAt, shownTurn, -presentationDelay, true, &presentation)) {
+            presented = true;
+            target.position = shownAt;
+            target.rotation = shownTurn;
+            if (presentation.movementMode >= 0 && presentation.movementMode <= 255)
+                target.movementMode = static_cast<uint8_t>(presentation.movementMode);
+            target.speed = presentation.speed;
+            target.motion = nameOf(presentation.motion.motion);
+            target.aniState = presentation.motion.aniState;
+            target.actionSeq = presentation.motion.actionSeq;
+            target.motionFrac = presentation.motion.motionFrac;
+            target.motionAgeMs = presentation.sent - presentation.stateSent;
+            target.goal = body::Sample(puppet.body.track, now, smoothGoal, goalTurn, body::GoalAhead - presentationDelay, false)
+                          ? smoothGoal : shownAt;
+            target.smooth = true;
+            target.timeline = true;
+            target.presentationSerial = puppet.body.track.serial;
+        }
+    }
     float lineAt[3], lineTurn[4], lineBefore[3], lineBeforeTurn[4], lineGoal[3], lineGoalTurn[4];
-    if (walkLine && body::Sample(puppet.body.track, now, lineAt, lineTurn, -WalkDelay, false) &&
+    if (!timeline && walkLine && body::Sample(puppet.body.track, now, lineAt, lineTurn, -WalkDelay, false) &&
         body::Sample(puppet.body.track, now - 100, lineBefore, lineBeforeTurn, -WalkDelay, false) &&
         body::Sample(puppet.body.track, now, lineGoal, lineGoalTurn, -WalkDelay + WalkAhead, false)) {
         const bool stopped = speed < 40.0f;  // its newest two states: the player stands
@@ -437,7 +499,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     if (!*remote.latest.shape) {  // a creature holds and wears nothing
         NoDrop(puppet, now);
-        Hold(puppet, remote.latest.heldRight, remote.latest.heldLeft, now);
+        Hold(puppet, presented ? nameOf(presentation.motion.heldRight) : remote.latest.heldRight,
+                     presented ? nameOf(presentation.motion.heldLeft) : remote.latest.heldLeft, now);
         Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
     }
     // The player's swings replay as the game's combat moves too (owner's look: players' attacks hardly visible);
@@ -459,7 +522,7 @@ eCEntity* ControlledBody()
 {
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* player = Entity::GetPlayer().GetInstance();
-    return followShape && hero && player && player != hero ? player : hero;
+    return followShape && hero && player && player != hero && !IsPuppet(player) ? player : hero;
 }
 
 void ShapeOff(LogFn log)
@@ -502,7 +565,9 @@ void Start()
     }
     Config const& config = GetConfig();
     parity::Compute();
-    started = net::Start(config.host, config.address, config.port, config.name, config.steam);
+    net::SetPlayerStateHandler(&FeedPlayer);
+    net::SetSendRate(config.sendRate);
+    started = net::Start(config.host);
 }
 
 void OnWorldDeactivate()
@@ -551,6 +616,12 @@ void Tick()
         else if (puppets[id].spawned) Despawn(id, "local game not running");
     }
     const uint32_t now = GetTickCount();
+    if (haveLocal && (!lastSyncReport || now - lastSyncReport >= 5000)) {
+        lastSyncReport = now ? now : 1;
+        body::SyncReport(&Log);
+        npcs::SyncReport(&Log);
+        combat::SyncReport(&Log);
+    }
     if (!trace || now - lastTrace < 200) return;
     lastTrace = now;
     if (haveLocal) {

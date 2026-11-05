@@ -8,37 +8,18 @@
 #include <Script.h>
 #include <cstdint>
 #include <vector>
+#include "snapshot.h"
 
 namespace g3t::body {
-float Distance(float const a[3], float const b[3]);
 // Motion slot `type` of a body; slot 0 is what it visibly plays right now. Guarded against bad slots.
 bool MotionName(eCVisualAnimation_PS* animation, int type, char* out, size_t size);
 bool CurrentMotion(eCEntity* entity, char* out, size_t size);
+bool LocallyAttacking(eCEntity* entity);  // a running, locally presented melee contact phase
+float SwingProgress(eCEntity* entity);    // 0..1 through that phase, -1 when none runs
 bool MotionRunning(eCEntity* entity);  // slot 0 plays a motion (it is not stopped at its end)
 float BoundaryHeight(eCEntity* entity); // highest bone of the posed body above its position in cm, < 0 unknown
 bCMatrix Pose(eCEntity const& base, float const position[3], float const rotation[4]);
 
-// A display buffer of a body's last snapshots (Stufe 1, owner 27.10.): the body is driven toward where the sender was
-// Delay ms ago, interpolated between two snapshots by the sender's send times, and at most MaxAhead ms beyond the newest
-// when snapshots are late. Before, the goal jumped to each new snapshot (every 50 to 100 ms, uneven over Hamachi).
-struct Track
-{
-    struct Snap { uint32_t sent = 0; float position[3] = {}; float rotation[4] = {}; };
-    Snap snaps[8];
-    int count = 0;       // valid snapshots, oldest first
-    int32_t offset = 0;  // arrival minus send time, the lowest seen (latency plus the clocks' difference)
-    bool haveOffset = false;
-    // Stufe 3.1: offset as the lowest of this and the last 2-s window (a slow path no longer pulls it up 1 ms a snapshot)
-    int32_t windowMin = 0, lastWindowMin = 0;
-    uint32_t windowAt = 0;
-    uint8_t lastCase = 0;  // QA: how the last Sample answered (0 not sampled, 1 between, 2 ahead, 3 held, 4 older than all)
-};
-constexpr int32_t BufferDelay = 100;  // ms behind the sender's newest possible snapshot (the display buffer)
-void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived);
-// Where to drive the body now: the sender's state at (its newest possible send time + shift ms), between two snapshots or on
-// along the newest's velocity (at most MaxAhead beyond it). shift < 0: a display buffer behind the sender; shift > 0: a
-// prediction ahead of the newest snapshot (puppet lead, Stufe 3.2). False when there is nothing yet.
-bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], int32_t shift = -BufferDelay, bool counted = true);
 // Stufe 3.1 (stageGlide 28.10.: a steered body stood still in 20 % of its moving frames, with the display buffer or without):
 // its movement controller reached the newest snapshot before the next came and stopped. With goalAhead it walks to where the
 // sender will be GoalAhead ms later along its last velocity; placing and correcting keep the shown position.
@@ -77,9 +58,15 @@ struct State
     bool combatOwned = false; // slot 0 carries the combat owner we set; released once the action stopped running
     bool combatMoves = false; // replay attacks as the game's combat moves (mirrored NPCs; a player's hero fights without its SPU)
     bool combatFaulted = false; // a combat move faulted on this body: motion names only from then on
+    eCEntity* contactTarget = nullptr;  // the local hero only; remote damage is judged at the locally displayed contact
+    uint32_t walkExpectedMs = 0, walkTravelMs = 0, walkSlideMs = 0, walkStillMs = 0;
     uint32_t localHitAt = 0;    // our own blow showed on it at once (npcs::LocalHit): its stagger's effect played here already
+    uint32_t localHitUntil = 0;
+    bool localNative = false;   // that blow's reaction runs as the game's own stagger state here (ai.cpp lets it run on this mirror)
     uint32_t staggerEffectAt = 0;
     uint32_t combatMoveAt = 0;  // when the last combat move started (its own recover follows the hit by itself)
+    uint32_t blowAt = 0;        // when this body's visible swing last hurt our hero (npcs.cpp TryLocalBlow)
+    bool swingJudged = false;   // the swing now running was judged already
     bool puppet = false;        // QA (glide): a remote player's puppet, else a mirrored NPC
     float lastPos[3] = {};      // QA (glide): where the body stood at the last Drive, and when
     uint32_t lastAt = 0;
@@ -94,6 +81,8 @@ struct State
     uint32_t shownAt[16] = {};
     int shownNext = 0;
     uint32_t seekAt = 0;        // motion_seek: not again before then
+    bool paced = false, paceNow = false;  // slot 0's play speed is off 1.0 to catch up with (or wait for) the sender's motion
+    uint32_t presentationSerial = 0;
 };
 // QA (Stufe 3.2): the sender stood at `truth` at this machine's time `at`; how far was the body from it then (Glide::
 // displayErrors)? Nothing when no Drive was near that time.
@@ -126,6 +115,7 @@ struct Glide
 };
 extern Glide glide[2];  // 0: mirrored NPCs, 1: puppets
 void GlideReport(void (*log)(char const*));
+void SyncReport(void (*log)(char const*));  // compact aggregate diagnostics; no per-entity scan or vector sorting
 // Speed in cm/s between two states, from the sender's clock: over Hamachi two states often arrived in one frame, their
 // arrival times gave 0 and the body was placed instead of walking (owner's look 21.10.: characters glide). QA negative
 // control `glideold`: from the arrival times, and a replayed stance motion is left running when the body sets off, as
@@ -156,6 +146,8 @@ struct Target
     int actionSeq = -1;  // the sender's action number (protocol 58), -1 none
     int motionFrac = -1;      // protocol 59: how far the sender's slot 0 had played (0..65535 of its length), -1 none
     uint32_t motionAgeMs = 0; // how old that is now: since the state arrived plus half the round trip
+    bool timeline = false;   // authoritative interpolated pose; keep the animation/controller instead of MoveTo resets
+    uint32_t presentationSerial = 0;
 };
 // Display step 3 (review 28.10.): numbers each start of an action motion (not _Move_, not _Ambient_) on slot 0, a restart of the
 // same motion too (its play time went back); the receiver then replays an action of the same name again (actionSeq, QA
@@ -176,9 +168,12 @@ extern bool actionSeq;
 // QA seekon / seekoff (-1: the INI).
 uint16_t MotionFraction(eCEntity* entity);  // 65535: nothing runs
 extern int motionSeek;
-constexpr float SeekOver = 60.0f;      // ms
+constexpr float SeekOver = 200.0f;     // ms: only a mirrored motion this far off jumps (SetPlayTime); a smaller lag is paced out (below)
+constexpr float PaceDeadZone = 12.0f;  // ms of lag that is left alone
+constexpr float PaceOver = 250.0f;     // ms: the play speed rises by lag / PaceOver (60 ms behind: 24 % faster), 0.7..1.4 at most
 constexpr uint32_t SeekEvery = 200;    // ms, at most one seek per body in that time
 extern unsigned seeks[2];              // 0 mirrors, 1 puppets
+extern unsigned paceSteps[2];          // frames a followed motion was played faster or slower than 1.0
 void MotionLagReport(void (*log)(char const*));  // MOTIONLAG per kind; reset with glidereset
 void MotionTime(eCEntity* entity, void (*log)(char const*));  // QA motiontime: MOTIONTIME name, play and max time of slot 0
 extern bool fallMove;  // a sender's short fall drives the body as travel (QA fallmoveon; no gain, off)

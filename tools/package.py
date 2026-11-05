@@ -4,8 +4,8 @@ the player guides, the test plan, the log collector and the licences.
     python tools/package.py <built Script_G3Together.dll> <output folder> [<steam_api.dll>]
 
 Writes <output folder>/G3Together-<git hash>.zip. Contains no game files. With a steam_api.dll (Valve's 32-bit one from the
-Steamworks.NET Standalone release 2025.164.1, checked by its SHA-256) it goes in as G3Together/steam_api.dll for
-transport = steam; without it the setup offers to download that file.
+Steamworks.NET Standalone release 2025.164.1, checked by its SHA-256) it goes in as G3Together/steam_api.dll.
+Steam is the only supported transport; without that DLL the setup must download it before installing the mod.
 """
 import hashlib
 import subprocess
@@ -17,24 +17,17 @@ ROOT = Path(__file__).resolve().parents[1]
 STEAM_DLL_SHA256 = 'fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da'
 
 HOST_INI = """# G3 Together: this player hosts the campaign.
-# This package speaks protocol 59: both players need this same package (older ones are refused).
+# This package speaks protocol 67: both players need this same package (older ones are refused).
 role = host
-port = 34567
-name = Host
-# Connection: udp (by address: IP, Hamachi, ZeroTier, Tailscale) or steam (Steam friends find this game over Steam; needs
-# G3Together/steam_api.dll, see PLAYING.md). Over Steam the UDP port stays open for players with an address.
-transport = udp
+# Player name is taken from Steam automatically.
+# Steam friends find this game. Steam and G3Together/steam_api.dll are required; there is no direct-IP fallback.
+transport = steam
 # Mod messages only: auto (the language of your Gothic 3 texts), en, de or pl; without this line: en.
 # Each player can choose independently.
 language = auto
 # Key that jumps to the other player (default PAGEDOWN): F1-F24, PAGEUP, HOME, END, INSERT, DELETE or a letter
 partner_key = PAGEDOWN
-# Keys that accept / decline the other player's trade offer (same names; the mod warns if two of these keys are the same)
-offer_accept_key = INSERT
-offer_decline_key = DELETE
-# Keys that raise / lower your own price in a trade window with the other player (Shift: 100 gold a press)
-price_up_key = NUMPLUS
-price_down_key = NUMMINUS
+# Player exchanges use the normal trade window: free items and explicit gold gifts, with no approval keys.
 # Your own look for the other players (a character template such as Diego; default: their puppet_template)
 # look = Diego
 # For a bug report about NPCs: remove the # below, restart, reproduce (writes g3trace.log, see PLAYING.md)
@@ -57,30 +50,24 @@ price_down_key = NUMMINUS
 # While you listen to the other player's dialog you see the spoken lines as subtitles; on also shows their answers in a box.
 # listener_textbox = on
 # Balance (both players need the same values, the join compares them): friendly_fire = percent of the damage players and
-# their companions deal to each other (0-100, default 20); npc_damage and npc_hp = factors on the damage NPCs deal and on
+# their companions deal to each other (0-100, default 0). Zero also prevents allied hit reactions and harmful effects.
+# npc_damage and npc_hp = factors on the damage NPCs deal and on
 # how much NPCs endure (0.1-10, default 1.0; companions excepted).
-# friendly_fire = 20
+friendly_fire = 0
 # npc_damage = 1.0
 # npc_hp = 1.0
 """
 CLIENT_INI = """# G3 Together: this player joins the host.
-# This package speaks protocol 59: both players need this same package (older ones are refused).
+# This package speaks protocol 67: both players need this same package (older ones are refused).
 role = client
-# Connection: udp (by address) or steam (finds the host among your Steam friends; then the address is only the fallback
-# for a PC without Steam). With several friends hosting: steam_host = <their Steam name>.
-transport = udp
-address = 127.0.0.1
-port = 34567
-name = Player
+# Finds the host among your Steam friends; Steam is required. With several friends hosting: steam_host = <their Steam name>.
+transport = steam
+# Player name is taken from Steam automatically.
 # Mod messages only: auto (the language of your Gothic 3 texts), en, de or pl; without this line: en.
 # Each player can choose independently.
 language = auto
 partner_key = PAGEDOWN
-offer_accept_key = INSERT
-offer_decline_key = DELETE
-# Keys that raise / lower your own price in a trade window with the other player (Shift: 100 gold a press)
-price_up_key = NUMPLUS
-price_down_key = NUMMINUS
+# Player exchanges are free and automatically confirmed.
 # Your own look for the other players (a character template such as Diego; default: their puppet_template)
 # look = Diego
 # For a bug report about NPCs: remove the # below, restart, reproduce (writes g3trace.log, see PLAYING.md)
@@ -94,9 +81,10 @@ price_down_key = NUMMINUS
 # While you listen to the other player's dialog you see the spoken lines as subtitles; on also shows their answers in a box.
 # listener_textbox = on
 # Balance (both players need the same values, the join compares them): friendly_fire = percent of the damage players and
-# their companions deal to each other (0-100, default 20); npc_damage and npc_hp = factors on the damage NPCs deal and on
+# their companions deal to each other (0-100, default 0). Zero also prevents allied hit reactions and harmful effects.
+# npc_damage and npc_hp = factors on the damage NPCs deal and on
 # how much NPCs endure (0.1-10, default 1.0; companions excepted).
-# friendly_fire = 20
+friendly_fire = 0
 # npc_damage = 1.0
 # npc_hp = 1.0
 """

@@ -41,8 +41,8 @@ bool sneakCheck = false;
 // QA enterzoneon: sent again (negative control).
 bool enterZone = false;
 DWORD lastTry = 0;
-eCEntity* actor = nullptr;  // the puppet that stands for the game's player now
-int depth = 0;
+thread_local eCEntity* actor = nullptr;  // the puppet that stands for the game's player now
+thread_local int depth = 0;
 unsigned checks = 0, reactions = 0, stateRuns = 0;
 std::unordered_map<eCEntity*, DWORD> lastCheck;  // per NPC: its look around runs every frame in some states
 // Entering a place: the game tells the NPCs when its player walks into a zone (SendPerceptionEnterZone, 0x33170, called
@@ -55,13 +55,26 @@ unsigned zonesEntered = 0;
 // Script_Game.dll's import of Entity::GetPlayer (static, __stdcall, the result returned through a hidden pointer).
 Entity* GE_STDCALL ActingGetPlayer(Entity* result)
 {
-    if (!actor) return originalGetPlayer(result);
+    if (!actor) {
+        Entity* selected = originalGetPlayer(result);
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        if (selected && selected == result && hero && remote::IsPuppet(selected->GetInstance())) {
+            selected->~Entity();
+            return new (result) Entity(hero);
+        }
+        return selected;
+    }
     return new (result) Entity(actor);
 }
 
 GEBool __fastcall ActingIsPlayer(Entity const* self, void* edx)
 {
-    if (!actor) return originalIsPlayer(self, edx);
+    if (!actor) {
+        eCEntity* controlled = remote::ControlledBody();
+        if (controlled && self && self->GetInstance() == controlled) return GETrue;
+        if (self && remote::IsPuppet(self->GetInstance())) return GEFalse;
+        return originalIsPlayer(self, edx);
+    }
     return self && self->GetInstance() == actor;
 }
 
@@ -89,7 +102,7 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
     const GEInt result = originalPerceive(spu, self, other, args);
     if (result || !enabled || depth || !net::Connected()) return result;
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
-    if (!npc || !npc->GetPropertySet(eEPropertySetType_NPC) || remote::IsPuppet(npc) || npcs::IsMirrored(npc)) return result;
+    if (!npc || !npc->GetPropertySet(eEPropertySetType_NPC) || remote::IsPuppet(npc) || npcs::IsMirrored(npc) || IsLocalPlayer(npc)) return result;
     Entity guard(npc);
     if (guard.IsDead() || guard.IsDown()) return result;
     // At most twice a second per NPC, not for 8 s after it reacted (an observing NPC let go of the puppet within a second
@@ -178,7 +191,8 @@ void KeepZone(eCEntity* puppet)
 GEInt GE_STDCALL KillIntent(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     eCEntity* asked = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
-    eCEntity* puppet = fightsOn && enabled && remote::IsPuppet(asked) ? asked : nullptr;
+    eCEntity* judging = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+    eCEntity* puppet = fightsOn && enabled && remote::IsPuppet(asked) && !IsLocalPlayer(judging) ? asked : nullptr;
     KeepZone(puppet);
     Acting acting(puppet);
     const GEInt result = originalKill(spu, self, other, args);
@@ -205,7 +219,7 @@ gFScriptAICallback originalOnZone = nullptr, originalOnWeapon = nullptr;
 eCEntity* TargetPuppet(gCScriptProcessingUnit* spu)
 {
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
-    if (!enabled || !self || !self->GetPropertySet(eEPropertySetType_NPC)) return nullptr;
+    if (!enabled || !self || !self->GetPropertySet(eEPropertySetType_NPC) || IsLocalPlayer(self)) return nullptr;
     eCEntity* target = Entity(self).NPC.GetCurrentTarget().GetInstance();
     return remote::IsPuppet(target) ? target : nullptr;
 }
@@ -272,7 +286,7 @@ unsigned waitActs = 0;
 
 eCEntity* WaitActor(eCEntity* self)
 {
-    if (!freeDest || !net::Connected() || remote::IsPuppet(self) || npcs::IsMirrored(self)) return nullptr;
+    if (!freeDest || !net::Connected() || remote::IsPuppet(self) || npcs::IsMirrored(self) || IsLocalPlayer(self)) return nullptr;
     Entity dest = Entity(self).Navigation.GetCurrentDestinationPoint();
     eCEntity* point = dest.GetInstance();
     eCEntity* hero = gCSession::GetInstance().GetHero();
@@ -330,12 +344,20 @@ Acting::Acting(eCEntity* puppet) : before(actor)
 Acting::~Acting() { actor = before; }
 
 eCEntity* CurrentActor() { return actor; }
+bool PlayerContextReady() { return originalGetPlayer && originalIsPlayer; }
+
+bool IsLocalPlayer(eCEntity const* entity)
+{
+    return entity && (entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody());
+}
 
 eCEntity* StateActor(eCEntity* self, char const* state)
 {
-    if (!installed || !self || !state || !self->GetPropertySet(eEPropertySetType_NPC)) return nullptr;
+    if (!installed || !self || !state || !self->GetPropertySet(eEPropertySetType_NPC) || IsLocalPlayer(self)) return nullptr;
+    if (const uint8_t player = npcs::ContextPlayer(self); player > 1)
+        if (eCEntity* leader = remote::PuppetOf(player)) return leader;
     if (!std::strcmp(state, "ZS_WaitForFreeDestination_Loop")) return WaitActor(self);  // its own switch: freedestoff
-    if (!enabled || !FollowsPlayer(state)) return nullptr;
+    if (!enabled || (!FollowsPlayer(state) && std::strncmp(state, "ZS_Talk", 7))) return nullptr;
     eCEntity* target = Entity(self).NPC.GetCurrentTarget().GetInstance();
     if (!target || !remote::IsPuppet(target)) return nullptr;
     ++stateRuns;

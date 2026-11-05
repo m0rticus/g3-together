@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "occupancy.h"
 
+#include "containers.h"
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
@@ -40,6 +41,7 @@ void GuidOf(eCEntity* entity, uint8_t out[16])
 bool UsedBy(eCEntity* object, eCEntity* user)
 {
     return object && user && object->GetPropertySet(eEPropertySetType_Interaction) && !object->GetPropertySet(eEPropertySetType_NPC) &&
+           !containers::IsPersonalInventory(object) &&
            Entity(object).Interaction.GetUser().GetInstance() == user;
 }
 
@@ -57,6 +59,7 @@ void Send(uint8_t const guid[16], bool use)
 uint8_t TakenBy(eCEntity* object)
 {
     if (!object || !object->GetPropertySet(eEPropertySetType_Interaction) || object->GetPropertySet(eEPropertySetType_NPC)) return 0;
+    if (containers::IsPersonalInventory(object)) return 0;
     uint8_t guid[16];
     GuidOf(object, guid);
     const auto it = marked.find(Key(guid));
@@ -133,6 +136,7 @@ void OnState(uint8_t from, net::WorldState const& s)
     Entity object = Entity(bCPropertyID(bCGuid(raw)));
     eCEntity* instance = object.GetInstance();
     if (!instance || !instance->GetPropertySet(eEPropertySetType_Interaction) || instance->GetPropertySet(eEPropertySetType_NPC)) return;
+    if (containers::IsPersonalInventory(instance)) return;
     eCEntity* puppet = remote::PuppetOf(player);
     eCEntity* user = object.Interaction.GetUser().GetInstance();
     if (s.npc) {

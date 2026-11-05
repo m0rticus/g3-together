@@ -2,19 +2,21 @@
 #include "doors.h"
 #include "pickpocket.h"
 #include "occupancy.h"
-#include "respawn.h"
 #include "address.h"
 #include "fightmem.h"
 #include "infocmd.h"
+#include "xpshare.h"
 
 #include "ai.h"
 #include "body.h"
 #include "downed.h"
 #include "guide.h"
+#include "arena.h"
 #include "ending.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "guards.h"
 #include "remote.h"
 #include "talk.h"
 
@@ -32,15 +34,10 @@ unsigned observed = 0, distinct = 0, snapshotsSent = 0, snapshotsApplied = 0, se
 std::string lastKey;
 std::string lastText = "-";
 bool sharing = true;  // QA negative control
-// Owner's decision 21.10. (play evening): experience a dialog gives (handing in a quest) goes to every player, gold
-// only to the one who hands in. The dialog runs on the speaker's machine only (GiveXP takes Entity::GetPlayer(),
-// re/findings/info-commands.md); every other machine runs the same reward for its own hero (world state kind 11).
-bool sharingXp = true;  // QA negative control `dialogxpoff`
+// Experience is shared by xpshare.cpp (every GiveXP of a hero, whatever its source), not by the dialogs.
 bool givebackPlace = true;  // QA negative control `givebackposoff`
 bool keepCompanions = true;  // QA negative control `storycompanionoff`: a story move takes this machine's companion too
 unsigned companionsKept = 0;
-unsigned xpSent = 0, xpApplied = 0;
-constexpr uint8_t DialogXp = 11;
 
 // Commands whose result is a state of their first entity (static analysis of IS_Running_ProcessInfo: dialog
 // flags, guard status, class, political alignment, immortality, routine, position, enclave raid/revolution).
@@ -154,14 +151,6 @@ void Apply(net::WorldState const& s, uint8_t from)
         occupancy::OnState(from, s);
         return;
     }
-    if (s.kind == 15) {  // a client's dialog partner gestures there (talk.cpp)
-        talk::OnGesture(from, s.guid, static_cast<uint32_t>(std::strtoul(s.routine, nullptr, 16)), s.rotation);
-        return;
-    }
-    if (s.kind == 14) {  // another machine rolled for a dead NPC's return (respawn.cpp)
-        respawn::OnState(from, s);
-        return;
-    }
     if (s.kind == 17) {  // another player's epilogue started (ending.cpp)
         ending::OnState(from, s);
         return;
@@ -174,21 +163,40 @@ void Apply(net::WorldState const& s, uint8_t from)
         address::OnState(from, s);
         return;
     }
-    if (s.kind == DialogXp) {  // another player's dialog gave experience: the same reward for this player's hero
-        eCEntity* hero = gCSession::GetInstance().GetHero();
-        const int amount = std::atoi(s.routine);
-        // The game's dialogs give 10 to 2000 (Infos.pak); far more is no dialog of this game (Fable's review 22.10. 1.9).
-        if (!hero || amount <= 0 || amount > 5000 || !gCSession::GetInstance().IsGameRunning()) return;
-        Entity self(hero);
-        const int before = static_cast<int>(self.PlayerMemory.XP);
-        // As the dialog command does: no victim, the hero earns it; the game turns the amount into experience.
-        GetScriptAdminExt().CallScript(bCString("GiveXP"), nullptr, hero, amount);
-        ++xpApplied;
-        Logf("infocmd: dialog experience %d from player %u: xp %d -> %d", amount, from, before, static_cast<int>(self.PlayerMemory.XP));
+    if (s.kind == 19) {  // another player's experience (xpshare.cpp)
+        xpshare::OnState(s);
+        return;
+    }
+    if (s.kind == 20) { arena::OnState(from, s); return; }
+    if (s.kind == 22) {
+        if (!net::IsHost()) return;
+        Entity npc(npcs::NpcByGuid(s.guid));
+        if (npc.GetInstance() && npcs::CompanionOwner(npc.GetInstance()) == from)
+            npcs::Follow(s.guid, from, static_cast<uint8_t>(static_cast<gEPartyMemberType>(npc.Party.PartyMemberType)), s.immortal != 0);
+        else Log("infocmd: companion waiting request refused: not that player's follower");
         return;
     }
     if (s.kind == 4 || s.kind == 5) {  // a client took over (4) or gave back (5) a companion
-        if (net::IsHost() && npcs::OnClaim(s.guid, from, s.kind == 4) && s.kind == 5 && s.moved) npcs::PlaceGivenBack(s.guid, s.position, s.rotation);
+        if (!net::IsHost()) return;
+        Entity npc(npcs::NpcByGuid(s.guid));
+        eCEntity* actor = remote::PuppetOf(from);
+        if (!npc.GetInstance() || !actor) { Log("infocmd: NPC relation request refused: missing actor"); return; }
+        if (s.kind == 5) {
+            npcs::SetContext(npc.GetInstance(), 0);
+            if (npcs::OnClaim(s.guid, from, false) && npc.GetInstance()->GetPropertySet(eEPropertySetType_Party))
+                npc.Party.SetPartyLeader(Entity());
+            if (actor->GetPropertySet(eEPropertySetType_Party)) {
+                Entity player(actor);
+                if (player.Party.GetPartyLeader().GetInstance() == npc.GetInstance()) player.Party.SetPartyLeader(Entity());
+            }
+            npc.Routine.FullStop();
+            npc.Routine.ContinueRoutine();
+        } else if (s.npcClass == 2) {
+            if (!npcs::OnClaim(s.guid, from, true)) return;
+            npcs::Guide(s.guid, from);
+        } else if (npcs::OnClaim(s.guid, from, true)) {
+            npcs::Follow(s.guid, from, static_cast<uint8_t>(gEPartyMemberType_Slave));
+        }
         return;
     }
     if (s.kind == 7) {  // host: this NPC from its save is the companion of player `guard`
@@ -260,7 +268,8 @@ void Apply(net::WorldState const& s, uint8_t from)
     // places (soak test; the host crashed in its navigation code 25 s later, cause not proven).
     if (auto* nav = static_cast<gCNavigation_PS*>(instance->GetPropertySet(eEPropertySetType_Navigation))) {
         if (*s.routine && std::strcmp(nav->AccessRoutine().GetText(), s.routine) != 0) {
-            e.Navigation.SetRoutine(bCString(s.routine));
+            if (mirrored) nav->AccessRoutine() = bCString(s.routine);
+            else e.Navigation.SetRoutine(bCString(s.routine));
             if (!mirrored) { e.Routine.FullStop(); e.Routine.ContinueRoutine(); }
         }
     }
@@ -275,6 +284,21 @@ void Apply(net::WorldState const& s, uint8_t from)
 
 void OnWorldState(uint8_t from, net::WorldState const& s)
 {
+    if (s.kind == 14 || s.kind == 15) {
+        Logf("infocmd: obsolete NPC lifecycle/gesture result from player %u refused; host snapshots own NPC state", from);
+        return;
+    }
+    if (net::IsHost() && s.kind == 1) {
+        Entity npc(npcs::NpcByGuid(s.guid));
+        if (npc.GetInstance()) {
+            Apply(s, from);
+            net::WorldState canonical{};
+            Snapshot(npc, canonical);
+            canonical.moved = s.moved;
+            net::SendWorldState(canonical, 0);
+            return;
+        }
+    }
     if (net::IsHost() && s.kind != 3 && s.kind != 16) net::SendWorldState(s, from);  // pass it on to everyone else
     Apply(s, from);
 }
@@ -294,13 +318,9 @@ bool Join(eCEntity* target, bool join, bool follow = true)
         net::WorldState s{};
         s.kind = 4;
         GuidOf(target, s.guid);
+        const bool guide = !follow && Entity(gCSession::GetInstance().GetHero()).Party.GetPartyLeader().GetInstance() == target;
+        s.npcClass = guide ? 2 : 1;
         Send(s);
-        if (follow) {
-            Pending p{{}, {}, net::Now() + ReadAfter};
-            GuidOf(target, p.guid);
-            p.follow = true;
-            pending.push_back(p);
-        }
         return true;
     }
     if (!join && npcs::Claimed(target)) {
@@ -337,6 +357,7 @@ unsigned refreshCalls = 0, refreshSent = 0;
 
 GEInt GE_STDCALL SectorRefresh(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (!net::IsHost()) return 0;
     struct Before { eCEntity* entity; std::string routine; bCVector position; bCQuaternion rotation; uint8_t companionOf; };
     std::vector<Before> before;
     const bool passOn = refreshSync && sharing && net::IsHost() && net::Connected();
@@ -432,16 +453,7 @@ void Observe(gCScriptProcessingUnit* spu)
         pending.push_back({{}, command.GetID1().GetText(), net::Now() + ReadAfter});
         return;
     }
-    if (!std::strcmp(name, "GiveXP")) {
-        if (!sharingXp || std::atoi(command.GetID1().GetText()) <= 0) return;
-        net::WorldState s{};
-        s.kind = DialogXp;
-        strncpy_s(s.routine, command.GetID1().GetText(), _TRUNCATE);
-        Send(s);
-        ++xpSent;
-        Logf("infocmd: dialog experience %s passed on to the other players", s.routine);
-        return;
-    }
+    if (!std::strcmp(name, "GiveXP")) return;  // shared by xpshare.cpp, which sees the game's GiveXP itself
     eCEntity* target = e1.GetInstance();
     if (!std::strcmp(name, "Attack") && !net::IsHost() && target && npcs::IsMirrored(target) &&
         e2.GetInstance() == gCSession::GetInstance().GetHero()) {
@@ -546,14 +558,14 @@ void GivebackPlaceOff(LogFn log)
 
 void DialogXpOff(LogFn log)
 {
-    sharingXp = false;
+    xpshare::Off(log);
     log("DIALOGXPOFF ok=1");
 }
 
 void Report(LogFn log)
 {
     char line[600];
-    Format(line, "INFOCMD xp_sent=%u xp_applied=%u observed=%u distinct=%u sent=%u applied=%u sectors_sent=%u sectors_applied=%u fights_sent=%u fights_started=%u last=%s", xpSent, xpApplied, observed, distinct,
+    Format(line, "INFOCMD observed=%u distinct=%u sent=%u applied=%u sectors_sent=%u sectors_applied=%u fights_sent=%u fights_started=%u last=%s", observed, distinct,
               snapshotsSent, snapshotsApplied, sectorsSent, sectorsApplied, fightsSent, fightsStarted, lastText.c_str());
     log(line);
 }

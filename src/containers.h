@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Containers with host authority: chests, corpses and the trader a client deals with. Their contents differ
-// between machines (plunder is rolled per machine when an NPC dies), so the host's contents count:
-// - the host sends the contents of containers near any player whenever they change; a client overwrites
-//   its copy with them (equipped stacks of a living trader are left alone);
-// - a client that opened a container (the game's PlayerOpenLoot / PlayerOpenTrade) sends what its player
-//   changed there as one transaction; the host applies all of it or none, and on a refusal the client undoes
-//   the change to its hero's inventory.
+// Personal chest/corpse loot and NPC merchant inventories. Native local generation/transfers are retained;
+// remote inventory messages never overwrite loot or roll back the hero. Direct player trades remain in trade.cpp.
 #pragma once
 
+class eCEntity;
+
 namespace g3t::containers {
+bool IsPersonalInventory(eCEntity* entity);  // world inventory, not the hero, an item or another player's puppet
 void Start();
 void Tick();
 void OnWorldChange();  // forget every container state of the world before (load, world change)

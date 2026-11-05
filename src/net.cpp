@@ -5,20 +5,25 @@
 
 #include "log.h"
 #include "parity.h"
+#include "replication.h"
 #include "steam.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <unordered_map>
+#include <cstddef>
 
 namespace g3t::net {
 namespace {
-constexpr uint16_t ProtocolVersion = 59;  // 59: motion progress (PlayerState.motionFrac, NpcRecord.motionFrac); 58: action numbers (PlayerState.actionSeq/actionMs, NpcRecord.actionSeq); 57: HitNpcMsg.seen (lag-compensated block, Stufe 3.3); 56: EnclavePolitical (a freed town's political crime for the other heroes, enclaves.cpp); 55: world state kind 18 (an NPC remembers a fight with the other player, fightmem.cpp); 54: world state kind 17 (the epilogue for everyone, ending.cpp), the hero's chapter as a story event; 53: world state kind 16 (an NPC with an important info walks up to a client, address.cpp); 52: world state kind 15 (a dialog partner's gestures); 51: dialog options for the listener (DialogLineNote kinds 3, 4); 50: WitnessJudge (witness op 3, P7); 49: world state kind 14 (respawn rolls); 48: HitNpcMsg.outcome (knock-outs by another machine's player), EnclaveCredit; 47: robbery (MsgRansack 34, gold and flag bit 4 in PlayerState), witnesses (MsgWitness 35), subtitles (DialogLineNote.text); 46: item quality in goods and offers; 45: send times in PlayerState and NpcsHeader (glide), armor/helmet/look, MsgGoods (31) and A's offers (32, 33); 36: MsgSummon; 37: MsgShot; 38: spell projectiles, MsgPlayerSpell; 39: MsgNpcSpell; 40: creatures; 41: town reputation (MsgEnclave); 42: world gate (MsgWorld); 43: MsgDialogLine; 44: up to 250 container entries
+constexpr uint16_t ProtocolVersion = 71;  // host-only NPC state with complete rendered bone poses on two alternating pose channels, NPC attitude to the players
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
 // UDP payload per datagram (ENet default 1392 = up to 1420-byte IP packets): VPNs such as Hamachi carry about 1400, so
 // stay well below (C, re/findings/hamachi-net-c.md, 21.10.). ENet splits larger messages into fragments of this size.
 constexpr enet_uint32 Mtu = 1200;
-enum : uint8_t { ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCount = 3 };
+enum : uint8_t { ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3, ChannelPoses = 4, ChannelPosesAlt = 5, ChannelCount = 6 };
+enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
 
 #pragma pack(push, 1)
 struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };
@@ -31,27 +36,41 @@ struct FileDoneMsg { uint8_t type; char name[64]; uint32_t size[FileCount]; uint
 struct Welcome { uint8_t type; uint8_t id; };
 struct State { uint8_t type; PlayerState state; };
 struct Leave { uint8_t type; uint8_t id; };
-struct NpcsHeader { uint8_t type; uint32_t sequence; uint32_t sent; uint8_t count; uint8_t owner; };
+struct NpcsHeader {
+    uint8_t type;
+    uint32_t sequence, sent, epoch, generation, publication;
+    uint8_t count, owner;
+};
+struct NpcReleaseHeader {
+    uint8_t type;
+    uint32_t sequence, epoch, generation, publication;
+    uint8_t count, owner;
+};
 struct MotionNameMsg { uint8_t type; uint32_t hash; char name[96]; };
 // to: the player who applies it (the NPC's owner, the hit player); from: who sent it (set by the host).
-struct HitNpcMsg { uint8_t type; uint8_t guid[16]; int32_t delta; uint8_t weapon[16]; uint8_t to; uint8_t from; uint8_t npc[16]; uint8_t outcome; uint32_t seen; };
-struct HitPlayerMsg { uint8_t type; int32_t delta; uint8_t attacker[16]; uint8_t attackerPlayer; uint8_t to; };
+struct HitNpcMsg { uint8_t type; uint8_t guid[16]; int32_t delta; uint8_t weapon[16]; uint8_t to; uint8_t from; uint8_t npc[16]; uint8_t outcome; uint32_t seen; uint8_t reaction; uint32_t epoch, sequence, incarnation; };
+enum : uint8_t { MsgHitResult = 38 };
+struct HitResultMsg { uint8_t type; HitResult result; };
+struct HitPlayerMsg { uint8_t type; int32_t delta; uint8_t attacker[16]; uint8_t attackerPlayer; uint8_t to; uint8_t meansToKill; };
 struct StatesHeader { uint8_t type; uint8_t kind; uint8_t count; };
 struct TalkMsg { uint8_t type; uint8_t begin; uint8_t guid[16]; };
 struct ItemMsg { uint8_t type; ItemNote note; };
 struct ContentsHeader { uint8_t type; uint8_t guid[16]; uint8_t count; };
 // What a player can trade (trade.cpp): its goods and its gold. player: set by the host to the sender.
-struct GoodsHeader { uint8_t type; uint8_t player; uint32_t serial; int32_t gold; uint8_t count; };
+struct GoodsHeader { uint8_t type; uint8_t player; uint64_t epoch; uint32_t serial; int32_t gold; uint8_t count; };
 struct TxHeader { uint8_t type; uint8_t guid[16]; uint32_t seq; uint8_t count; };
 struct TxResultMsg { uint8_t type; uint8_t guid[16]; uint32_t seq; uint8_t ok; };
 struct WatchMsg { uint8_t type; uint8_t guid[16]; };
-struct KilledMsg { uint8_t type; uint8_t guid[16]; uint8_t to; };
+struct KilledMsg { uint8_t type; uint8_t guid[16]; uint8_t to; uint32_t epoch, incarnation; };
 struct DeathMsg { uint8_t type; uint8_t guid[16]; uint8_t by; };
 struct SummonMsg { uint8_t type; uint8_t from; SummonNote note; };
 struct ShotMsg { uint8_t type; uint8_t from; ShotNote note; };
+enum : uint8_t { MsgRagdoll = 37 };
+struct RagdollMsg { uint8_t type; uint8_t from; RagdollNote note; };
 struct DialogLineMsg { uint8_t type; uint8_t from; DialogLineNote note; };
 enum : uint8_t { MsgOffer = 32, MsgOfferResult = 33 };  // offer.cpp (A); 31 is B's MsgGoods
-struct OfferMsg { uint8_t type; OfferNote note; };      // 1164 bytes: under the 1200-byte datagram
+struct OfferMsg { uint8_t type; OfferNote note; };  // reliable fragmentation, like goods snapshots
+constexpr size_t OfferHeaderSize = offsetof(OfferMsg, note) + offsetof(OfferNote, entries);
 struct OfferResultMsg { uint8_t type; OfferResultNote note; };
 struct PlayerSpellMsg { uint8_t type; uint8_t from; uint8_t to; char script[32]; };
 enum : uint8_t { MsgRansack = 34, MsgWitness = 35 };  // ransack.cpp, witness.cpp
@@ -61,6 +80,7 @@ struct NpcSpellMsg { uint8_t type; uint8_t from; uint8_t to; char script[32]; ui
 struct EnclaveMsg { uint8_t type; EnclaveNote note; };
 struct WorldMsg { uint8_t type; WorldNote note; };
 #pragma pack(pop)
+static_assert(sizeof(NpcsHeader) == 23, "NPC datagram budget must match its wire header");
 
 ENetHost* host = nullptr;
 ENetPeer* server = nullptr;  // client side: the connection to the host
@@ -69,7 +89,8 @@ uint32_t lastConnectAttempt = 0;
 uint32_t startedAt = 0;      // client: when it began to connect (enet_time_get)
 bool everConnected = false;  // client: an ENet connection to the host came up once (owner 24.10.: "host not reachable")
 bool isHost = false;
-bool overSteam = false;      // transport = steam and Steam started: datagrams also pass steam.cpp's relay
+bool enetInitialized = false;
+char startupError[256] = {};
 uint8_t localId = 0;
 bool connected = false;
 uint32_t welcomes = 0;  // client side: welcomes so far (WelcomeSerial), never sent
@@ -79,12 +100,24 @@ uint16_t helloVersion = 0;     // QA (stage W7): the next hello claims this prot
 char localName[24] = {};
 uint32_t sequence = 0;
 uint32_t lastSend = 0;
+int sendRate = 60;  // Hz of the player state; npcs.cpp uses the same setting (config send_rate)
 Remote remotes[MaxPlayers] = {};
 uint32_t joins = 0;
 uint32_t npcSequence = 0;
+uint32_t npcPublication = 0, worldEpoch = 0;
+std::unordered_map<std::string, replication::Sequence> npcOrigins[MaxPlayers];
+std::unordered_map<std::string, replication::ReplicaOrder> npcPublications;
+unsigned npcAccepted = 0, npcRejected = 0, npcStale = 0;
+unsigned poseSent = 0, poseReceived = 0, poseSendFailed = 0;
 NpcHandler npcHandler = nullptr;
+NpcPoseHandler npcPoseHandler = nullptr;
+PlayerStateHandler playerStateHandler = nullptr;
+NpcReleaseHandler npcReleaseHandler = nullptr;
 MotionNameHandler motionNameHandler = nullptr;
 HitNpcHandler hitNpcHandler = nullptr;
+HitResultHandler hitResultHandler = nullptr;
+uint32_t hitSequence = 0;
+replication::Sequence hitClaims[MaxPlayers];
 HitPlayerHandler hitPlayerHandler = nullptr;
 StateHandler stateHandler = nullptr;
 TalkHandler talkHandler = nullptr;
@@ -104,6 +137,7 @@ FileDoneHandler fileDoneHandler = nullptr;
 ENetPeer* peers[MaxPlayers] = {};  // host side: peer for each client id
 SummonHandler summonHandler = nullptr;
 ShotHandler shotHandler = nullptr;
+RagdollHandler ragdollHandler = nullptr;
 DialogLineHandler dialogLineHandler = nullptr;
 OfferHandler offerHandler = nullptr;
 OfferResultHandler offerResultHandler = nullptr;
@@ -137,12 +171,46 @@ bool Open(ENetPeer* peer)
     return id > 1 && id < MaxPlayers && clientInWorld[id];
 }
 
-void Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool reliable)
+constexpr enet_uint16 PoseEpochLimit = 0xff00;
+constexpr enet_uint32 PoseRestMs = 3000;
+struct PoseRoute {
+    bool alt = false;
+    enet_uint32 checkpointed[2] = {};
+};
+PoseRoute poseRoutes[MaxPlayers];
+
+bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool reliable)
 {
-    if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !Open(peer)) { ++gatedOut; return; }
-    ENetPacket* packet = enet_packet_create(data, size, reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
-    if (!packet) return;  // out of memory
-    if (enet_peer_send(peer, channel, packet) < 0) enet_packet_destroy(packet);
+    if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !Open(peer)) { ++gatedOut; return false; }
+    if (channel == ChannelPoses && !reliable) {
+        PoseRoute& route = poseRoutes[peer - host->peers];
+        uint8_t active = route.alt ? ChannelPosesAlt : ChannelPoses;
+        if (peer->channels[active].outgoingUnreliableSequenceNumber >= PoseEpochLimit) {
+            const uint8_t next = route.alt ? ChannelPoses : ChannelPosesAlt;
+            const enet_uint32 now = enet_time_get() | 1u;
+            if (route.checkpointed[next - ChannelPoses] && now - route.checkpointed[next - ChannelPoses] < PoseRestMs) return false;
+            // Only an empty reliable packet resets the 16-bit unreliable epoch, and the receiver holds every later packet
+            // of that channel until it arrives. Reset the exhausted channel while the stream already runs on the other.
+            ENetPacket* checkpoint = enet_packet_create(nullptr, 0, ENET_PACKET_FLAG_RELIABLE);
+            if (!checkpoint) { Log("net: pose sequence checkpoint allocation failed"); return false; }
+            if (enet_peer_send(peer, active, checkpoint) < 0) {
+                enet_packet_destroy(checkpoint);
+                Log("net: pose sequence checkpoint could not be queued");
+                return false;
+            }
+            route.checkpointed[active - ChannelPoses] = now;
+            route.alt = !route.alt;
+            active = next;
+            Logf("net: pose sequence checkpoint queued; the pose stream moved to channel %u", static_cast<unsigned>(active));
+        }
+        channel = active;
+    }
+    const enet_uint32 flags = reliable ? ENET_PACKET_FLAG_RELIABLE
+        : size > Mtu ? ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT : 0;
+    ENetPacket* packet = enet_packet_create(data, size, flags);
+    if (!packet) return false;
+    if (enet_peer_send(peer, channel, packet) < 0) { enet_packet_destroy(packet); return false; }
+    return true;
 }
 
 // A player's state from the network (Fable's review 22.10. 1.2, 1.6): its strings may lack their terminator and its floats
@@ -167,12 +235,15 @@ void Store(PlayerState const& state)
 {
     if (state.id == 0 || state.id >= MaxPlayers || state.id == localId) return;
     Remote& r = remotes[state.id];
-    if (r.latestTicks && state.sequence <= r.latest.sequence) return;  // late or duplicate
+    if (r.latestTicks && static_cast<int32_t>(state.sequence - r.latest.sequence) <= 0) return;
+    const bool reset = !r.latestTicks || r.latest.world != state.world || std::strcmp(r.latest.shape, state.shape) ||
+                       std::strcmp(r.latest.look, state.look);
     r.previous = r.latestTicks ? r.latest : state;
     r.previousTicks = r.latestTicks ? r.latestTicks : enet_time_get();
     r.latest = state;
     r.latestTicks = enet_time_get();
     r.connected = true;
+    if (playerStateHandler) playerStateHandler(state, r.latestTicks, reset);
 }
 
 void Drop(uint8_t id)
@@ -181,12 +252,44 @@ void Drop(uint8_t id)
     remotes[id] = Remote{};
     peers[id] = nullptr;
     clientInWorld[id] = false;
+    npcOrigins[id].clear();
+    hitClaims[id] = replication::Sequence{};
 }
+
+bool Sane(NpcRecord const& record)
+{
+    if (!record.incarnation || record.hitPlayer >= MaxPlayers || record.guidePlayer >= MaxPlayers ||
+        record.partyType > 8 || record.waiting > 1 || record.presentationReady > 1 || record.absent > 1 || record.contact > 1 || record.attitude > 8 ||
+        record.aiMode > 11 || record.attackReason > 21 || record.damageType > 7 ||
+        record.damageAmount < -1000000 || record.damageAmount > 1000000 ||
+        !std::isfinite(record.damageMultiplier) || std::fabs(record.damageMultiplier) > 1000.0f) return false;
+    for (auto const& motion : record.motions) {
+        if ((motion.active & ~3u) || (motion.active && !(motion.active & 1u)) ||
+            !std::isfinite(motion.phase) || motion.phase < 0.0f || motion.phase > 1.0f ||
+            !std::isfinite(motion.speed) || std::fabs(motion.speed) > 100.0f ||
+            !std::isfinite(motion.weight) || motion.weight < 0.0f || motion.weight > 10.0f ||
+            !std::isfinite(motion.intro) || motion.intro < 0.0f || motion.intro > 100000.0f ||
+            !std::isfinite(motion.extro) || motion.extro < 0.0f || motion.extro > 100000.0f ||
+            (motion.active && (!motion.name || !motion.instance))) return false;
+    }
+    for (float v : record.position) if (!std::isfinite(v) || std::fabs(v) > 1e7f) return false;
+    float length = 0.0f;
+    for (float v : record.rotation) {
+        if (!std::isfinite(v) || std::fabs(v) > 2.0f) return false;
+        length += v * v;
+    }
+    return length > 0.01f && record.hitPoints >= -1000000 && record.hitPoints <= 1000000 &&
+           record.hitPointsMax >= 1 && record.hitPointsMax <= 1000000 && record.partyPlayer < MaxPlayers;
+}
+
+std::string NpcKey(uint8_t const* guid) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
 void OnReceive(ENetPeer* peer, ENetPacket* packet)
 {
+    if (isHost && (peer->address.host != target.host || !steam::IsPeerRelay(peer->address.port))) return;
     if (packet->dataLength < 1) return;
     const uint8_t type = packet->data[0];
+    if (type == MsgPosedNpc) ++poseReceived;
     if (Gated(type) && !Open(peer)) { ++gatedIn; return; }  // from another world (a client still loading, or the host before a load)
     if (type == MsgHello && isHost && packet->dataLength >= 3) {
         if (peer->data) { Log("net: a second hello from a player who joined already; ignored"); return; }  // it took a new slot each time
@@ -244,6 +347,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         connected = true;
         inWorld = false;  // until the host's world is known to be this one (persist.cpp)
         ++welcomes;
+        ResetNpcReplication();  // a new host connection has a fresh publication stream, even in the same campaign
         Logf("net: welcomed as player %u (welcome %u)", localId, welcomes);
     } else if (type == MsgState && packet->dataLength == sizeof(State)) {
         State message;
@@ -254,58 +358,160 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             message.state.id = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
             Store(message.state);
             for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != message.state.id) Send(peers[i], &message, sizeof(message), ChannelState, false);
+                if (peers[i] && i != message.state.id)
+                    Send(peers[i], &message, sizeof(message), ChannelState, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
         } else {
             Store(message.state);
         }
-    } else if (type == MsgNpcs && packet->dataLength >= sizeof(NpcsHeader)) {
+    } else if ((type == MsgNpcs || type == MsgPosedNpc) && packet->dataLength >= sizeof(NpcsHeader)) {
+        if (isHost) { ++npcRejected; return; }
         NpcsHeader header;
         std::memcpy(&header, packet->data, sizeof(header));
-        if (packet->dataLength != sizeof(header) + header.count * sizeof(NpcRecord)) return;
-        static NpcRecord records[MaxNpcsPerMessage];
-        if (header.count > MaxNpcsPerMessage) return;
+        if (!header.count || header.count > MaxNpcsPerMessage || header.epoch != worldEpoch) {
+            ++npcRejected;
+            return;
+        }
+        uint16_t boneCount = 0;
+        uint8_t poseFlags = 0;
+        const pose::Bone* bones = nullptr;
+        const size_t recordsSize = sizeof(header) + header.count * sizeof(NpcRecord);
+        if (type == MsgPosedNpc) {
+            if (header.count != 1 || packet->dataLength < recordsSize + sizeof(boneCount) + sizeof(poseFlags)) { ++npcRejected; return; }
+            std::memcpy(&boneCount, packet->data + recordsSize, sizeof(boneCount));
+            std::memcpy(&poseFlags, packet->data + recordsSize + sizeof(boneCount), sizeof(poseFlags));
+            if (!boneCount || boneCount > pose::MaxBones ||
+                (poseFlags & ~pose::Facial) ||
+                packet->dataLength != recordsSize + sizeof(boneCount) + sizeof(poseFlags) + boneCount * sizeof(pose::Bone)) {
+                ++npcRejected;
+                return;
+            }
+            bones = reinterpret_cast<pose::Bone const*>(packet->data + recordsSize + sizeof(boneCount) + sizeof(poseFlags));
+            for (int i = 0; i < boneCount; ++i) {
+                if (!bones[i].name) { ++npcRejected; return; }
+                for (int k = 0; k < i; ++k)
+                    if (bones[k].name == bones[i].name) { ++npcRejected; return; }
+            }
+        } else if (packet->dataLength != recordsSize) { ++npcRejected; return; }
+        NpcRecord records[MaxNpcsPerMessage];
         std::memcpy(records, packet->data + sizeof(header), header.count * sizeof(NpcRecord));
         if (isHost) {
-            // A client's own NPCs (its region): the host decides who sent them and passes them on.
             header.owner = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-            if (!header.owner) return;
-            std::memcpy(packet->data, &header, sizeof(header));
-            for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != header.owner) Send(peers[i], packet->data, packet->dataLength, ChannelNpcs, false);
+            if (header.owner < 2 || header.owner >= MaxPlayers) return;
+            header.generation = generations[header.owner];
+        } else if (header.owner != 1) {
+            ++npcRejected;
+            return;
         }
-        if (npcHandler) npcHandler(records, header.count, enet_time_get(), header.sent, header.owner ? header.owner : 1);
+        int count = 0;
+        for (int i = 0; i < header.count; ++i) {
+            NpcRecord const& record = records[i];
+            if (!Sane(record)) { ++npcRejected; continue; }
+            const std::string key = NpcKey(record.guid);
+            const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
+                                     : npcPublications[key].Snapshot(header.owner, header.publication);
+            if (!newer) { ++npcStale; continue; }
+            if (bones && npcPoseHandler)
+                npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+            records[count++] = record;
+        }
+        if (!count) return;
+        const int accepted = npcHandler ? npcHandler(records, count, enet_time_get(), header.sent, header.owner, header.generation) : 0;
+        if (accepted < 0 || accepted > count) { Log("net: invalid accepted NPC count; publication refused"); return; }
+        npcRejected += count - accepted;
+        npcAccepted += accepted;
+        if (isHost && accepted) {
+            // Adjudicate first: an update refused by the host must never become truth on a third client.
+            header.count = static_cast<uint8_t>(accepted);
+            header.publication = ++npcPublication;
+            uint8_t buffer[sizeof(header) + MaxNpcsPerMessage * sizeof(NpcRecord)];
+            std::memcpy(buffer, &header, sizeof(header));
+            std::memcpy(buffer + sizeof(header), records, accepted * sizeof(NpcRecord));
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i] && i != header.owner)
+                    Send(peers[i], buffer, sizeof(header) + accepted * sizeof(NpcRecord), ChannelNpcs,
+                         (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+        }
+    } else if (type == MsgNpcRelease && packet->dataLength >= sizeof(NpcReleaseHeader)) {
+        if (isHost) { ++npcRejected; return; }
+        NpcReleaseHeader header;
+        std::memcpy(&header, packet->data, sizeof(header));
+        if (!header.count || header.count > MaxNpcsPerMessage ||
+            packet->dataLength != sizeof(header) + header.count * 16u || header.epoch != worldEpoch) {
+            ++npcRejected;
+            return;
+        }
+        if (isHost) {
+            header.owner = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+            if (header.owner < 2 || header.owner >= MaxPlayers) return;
+            header.generation = generations[header.owner];
+        } else if (header.owner != 1) {
+            return;
+        }
+        uint8_t guids[MaxNpcsPerMessage * 16];
+        int count = 0;
+        for (int i = 0; i < header.count; ++i) {
+            uint8_t const* guid = packet->data + sizeof(header) + i * 16;
+            const std::string key = NpcKey(guid);
+            const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
+                                     : npcPublications[key].Release(header.owner, header.publication);
+            if (!newer) { ++npcStale; continue; }
+            std::memcpy(guids + count++ * 16, guid, 16);
+        }
+        const int accepted = count && npcReleaseHandler ? npcReleaseHandler(header.owner, header.generation, guids, count) : 0;
+        if (accepted < 0 || accepted > count) { Log("net: invalid accepted release count; publication refused"); return; }
+        npcRejected += count - accepted;
+        if (isHost && accepted) {
+            header.count = static_cast<uint8_t>(accepted);
+            header.publication = ++npcPublication;
+            uint8_t buffer[sizeof(header) + MaxNpcsPerMessage * 16];
+            std::memcpy(buffer, &header, sizeof(header));
+            std::memcpy(buffer + sizeof(header), guids, accepted * 16u);
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i] && i != header.owner) Send(peers[i], buffer, sizeof(header) + accepted * 16u, ChannelNpcs, true);
+        }
     } else if (type == MsgMotionName && packet->dataLength == sizeof(MotionNameMsg)) {
+        if (isHost) { Log("net: client NPC motion dictionary publication refused"); return; }
         MotionNameMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         message.name[sizeof(message.name) - 1] = '\0';
-        if (isHost) {
-            const uint8_t from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-            for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != from) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
-        }
+        if (message.hash != HashName(message.name)) { Log("net: NPC motion dictionary hash mismatch"); return; }
         if (motionNameHandler) motionNameHandler(message.hash, message.name);
     } else if (type == MsgHitNpc && packet->dataLength == sizeof(HitNpcMsg)) {
+        if (!isHost) { Log("net: client NPC hit publication refused"); return; }
         HitNpcMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         if (isHost) {
             message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-            if (message.to > 1 && message.to < MaxPlayers && peers[message.to]) {  // another client owns the NPC
-                Send(peers[message.to], &message, sizeof(message), ChannelReliable, true);
-                return;
-            }
         }
+        static const uint8_t zero[16] = {};
+        if (message.from < 2 || message.from >= MaxPlayers || message.to != 1 || message.delta >= 0 || message.delta < -1000000 ||
+            message.epoch != worldEpoch || !message.sequence || !message.incarnation || message.reaction > HitSitKnockDown ||
+            message.outcome > HitDeath ||
+            std::memcmp(message.npc, zero, 16)) { Log("net: invalid or stale NPC hit rejected"); return; }
+        if (!hitClaims[message.from].Accept(message.sequence)) {
+            Log("net: repeated NPC hit ignored; its original reliable result remains authoritative");
+            return;
+        }
+        // The sender's destination is only a hint: gameplay resolves the current authority before applying or relaying.
         if (hitNpcHandler && message.from)
-            hitNpcHandler(message.from, message.guid, message.delta, message.weapon, message.npc, message.outcome, message.seen);
+            hitNpcHandler(message.from, message.guid, message.delta, message.weapon, message.npc, message.outcome, message.seen,
+                          message.reaction, message.sequence, message.incarnation);
+    } else if (type == MsgHitResult && packet->dataLength == sizeof(HitResultMsg)) {
+        if (isHost) return;
+        HitResultMsg message;
+        std::memcpy(&message, packet->data, sizeof(message));
+        if (message.result.epoch == worldEpoch && message.result.accepted <= 1 && hitResultHandler)
+            hitResultHandler(message.result);
     } else if (type == MsgHitPlayer && packet->dataLength == sizeof(HitPlayerMsg)) {
         HitPlayerMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         if (message.delta < -1000000 || message.delta > 0) return;  // damage only, no overflow
         if (isHost && message.attackerPlayer) message.attackerPlayer = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
         if (isHost && message.to > 1 && message.to < MaxPlayers) {  // for another client: never the host's hero, even if it just left
-            if (peers[message.to]) Send(peers[message.to], &message, sizeof(message), ChannelReliable, true);
+            if (peers[message.to]) Send(peers[message.to], &message, sizeof(message), ChannelCombat, true);
             return;
         }
-        if (hitPlayerHandler) hitPlayerHandler(message.delta, message.attacker, message.attackerPlayer);
+        if (hitPlayerHandler) hitPlayerHandler(message.delta, message.attacker, message.attackerPlayer, message.meansToKill != 0);
     } else if (type == MsgStates && packet->dataLength >= sizeof(StatesHeader)) {
         StatesHeader header;
         std::memcpy(&header, packet->data, sizeof(header));
@@ -327,9 +533,12 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         message.note.spellItem[sizeof(message.note.spellItem) - 1] = 0;
         message.note.spawn[sizeof(message.note.spawn) - 1] = 0;
+        if (message.note.epoch != worldEpoch || message.note.ownerPlayer >= MaxPlayers) return;
         if (isHost) {  // from a client: the caster is that client; pass it on to the others
             message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-            for (uint8_t i = 2; i < MaxPlayers; ++i)
+            if (message.note.op == SummonCreature) { Log("net: client NPC spawn publication refused"); return; }
+            if (message.note.op == SummonCreatureRequest) message.note.ownerPlayer = message.from;
+            else for (uint8_t i = 2; i < MaxPlayers; ++i)
                 if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
         }
         if (summonHandler && message.from) summonHandler(message.from, message.note);
@@ -391,14 +600,34 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     } else if (type == MsgShot && packet->dataLength == sizeof(ShotMsg)) {
         ShotMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
+        static const uint8_t none[16] = {};
+        if (isHost && std::memcmp(message.note.caster, none, 16)) { Log("net: client NPC projectile publication refused"); return; }
         message.note.arrow[sizeof(message.note.arrow) - 1] = 0;
         message.note.spellItem[sizeof(message.note.spellItem) - 1] = 0;
+        message.note.spell[sizeof(message.note.spell) - 1] = 0;
+        if (message.note.epoch != worldEpoch || message.note.targetPlayer >= MaxPlayers) {
+            Log("net: stale or invalid projectile refused");
+            return;
+        }
         if (isHost) {  // from a client: the shooter is that client; pass it on to the others
             message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
             for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+                if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), ChannelCombat, true);
         }
         if (shotHandler && message.from) shotHandler(message.from, message.note);
+    } else if (type == MsgRagdoll && packet->dataLength == sizeof(RagdollMsg)) {
+        if (isHost) { Log("net: client NPC force publication refused"); return; }
+        RagdollMsg message;
+        std::memcpy(&message, packet->data, sizeof(message));
+        if (message.note.epoch != worldEpoch || !message.note.sequence || !message.note.incarnation) return;
+        for (float v : message.note.at) if (!std::isfinite(v) || std::fabs(v) > 1e7f) return;
+        for (float v : message.note.force) if (!std::isfinite(v) || std::fabs(v) > 1e9f) return;
+        if (isHost) {  // from a client: pass it on to the others
+            message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), ChannelCombat, true);
+        }
+        if (ragdollHandler) ragdollHandler(message.note);
     } else if (type == MsgDialogLine && packet->dataLength == sizeof(DialogLineMsg)) {
         DialogLineMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
@@ -409,16 +638,18 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
         }
         if (dialogLineHandler && message.from) dialogLineHandler(message.from, message.note);
-    } else if (type == MsgOffer && packet->dataLength == sizeof(OfferMsg)) {
-        OfferMsg message;
-        std::memcpy(&message, packet->data, sizeof(message));
-        if (message.note.count > MaxOfferEntries) return;
+    } else if (type == MsgOffer && packet->dataLength >= OfferHeaderSize) {
+        OfferMsg message{};
+        std::memcpy(&message, packet->data, OfferHeaderSize);
+        if (message.note.count > MaxOfferEntries ||
+            packet->dataLength != OfferHeaderSize + message.note.count * sizeof(OfferEntry)) return;
+        std::memcpy(&message, packet->data, packet->dataLength);
         for (auto& entry : message.note.entries) entry.name[sizeof(entry.name) - 1] = 0;
         if (isHost) {
             message.note.buyer = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));  // who sent it
             if (message.note.seller != 1) {  // another client's goods: on to it
                 const uint8_t to = message.note.seller;
-                if (to > 1 && to < MaxPlayers && peers[to] && to != message.note.buyer) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+                if (to > 1 && to < MaxPlayers && peers[to] && to != message.note.buyer) Send(peers[to], &message, packet->dataLength, ChannelReliable, true);
                 return;
             }
         } else if (message.note.seller != localId) {
@@ -465,7 +696,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             entries[i].name[sizeof(entries[i].name) - 1] = 0;
             if (entries[i].amount <= 0 || entries[i].amount > 1000000 || entries[i].quality >= 1024) return;
         }
-        goodsHandler(header.player, header.serial, header.gold, entries, header.count);
+        goodsHandler(header.player, header.epoch, header.serial, header.gold, entries, header.count);
     } else if (type == MsgContents && !isHost && packet->dataLength >= sizeof(ContentsHeader)) {
         ContentsHeader header;
         std::memcpy(&header, packet->data, sizeof(header));
@@ -521,20 +752,16 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         message.name[sizeof(message.name) - 1] = 0;
         if (campaignHandler) campaignHandler(message.kind, message.name);
-    } else if (type == MsgDeath && packet->dataLength == sizeof(DeathMsg)) {
+    } else if (type == MsgDeath && !isHost && packet->dataLength == sizeof(DeathMsg)) {
         DeathMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
-        // The host decides who reported it; a client only hears it from the host (relayed or the host's own).
-        const uint8_t by = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : message.by;
-        if (deathHandler && by) deathHandler(by, message.guid);
+        if (deathHandler && message.by && message.by < MaxPlayers) deathHandler(message.by, message.guid);
     } else if (type == MsgKilled && packet->dataLength == sizeof(KilledMsg)) {
+        if (isHost) return;
         KilledMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
-        if (isHost && message.to > 1 && message.to < MaxPlayers) {  // another client's kill: its reward, not the host's
-            if (peers[message.to]) Send(peers[message.to], &message, sizeof(message), ChannelReliable, true);
-            return;
-        }
-        if (killedHandler) killedHandler(message.guid);
+        if (message.to != localId || message.epoch != worldEpoch || !message.incarnation) return;
+        if (killedHandler) killedHandler(message.guid, message.incarnation);
     } else if (type == MsgLeave && !isHost && packet->dataLength == sizeof(Leave)) {
         Leave leave;
         std::memcpy(&leave, packet->data, sizeof(leave));
@@ -545,6 +772,10 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         message.note.campaign[sizeof(message.note.campaign) - 1] = 0;
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if (!isHost && message.note.op == WorldHost && worldEpoch != message.note.epoch) {
+            ResetNpcReplication();
+            worldEpoch = message.note.epoch;
+        }
         if (worldHandler && from) worldHandler(from, message.note);
     }
 }
@@ -579,6 +810,7 @@ void SetInWorld(uint8_t id, bool in)
         Remote cleared{};
         strncpy_s(cleared.latest.name, remotes[id].latest.name, _TRUNCATE);
         remotes[id] = cleared;  // its puppet goes; it comes back with the first state from the host's world
+        npcOrigins[id].clear();
     }
     Logf("net: player %u (%s) is %s the host's world", id, remotes[id].latest.name, in ? "in" : "out of");
 }
@@ -588,6 +820,12 @@ bool Joined() { return connected; }
 char const* RefusalReason() { return refusalReason; }
 uint32_t ConnectingFor() { return isHost || everConnected || !host ? 0 : enet_time_get() - startedAt; }
 void ClaimVersionForTest(uint16_t version) { helloVersion = version; }
+void PrimePoseWrapForTest()
+{
+    if (!isHost) return;
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i]) peers[i]->channels[ChannelPoses].outgoingUnreliableSequenceNumber = 0xfffe;
+}
 uint32_t WelcomeSerial() { return welcomes; }
 void AdvanceWelcomeSerialForTest() { ++welcomes; }
 bool PeerJoined(uint8_t id) { return isHost && id > 1 && id < MaxPlayers && peers[id]; }
@@ -599,6 +837,10 @@ void SetWorldHandler(WorldHandler handler) { worldHandler = handler; }
 void SendWorld(WorldNote const& note, uint8_t to)
 {
     if (!host) return;
+    if (isHost && note.op == WorldHost && worldEpoch != note.epoch) {
+        ResetNpcReplication();
+        worldEpoch = note.epoch;
+    }
     const WorldMsg message{MsgWorld, note};
     if (isHost) {
         if (to > 1 && to < MaxPlayers && peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
@@ -621,20 +863,87 @@ void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names)
     motionNameHandler = names;
 }
 
-void SendNpcs(NpcRecord const* records, int count)
+void SetNpcPoseHandler(NpcPoseHandler handler) { npcPoseHandler = handler; }
+
+void SetPlayerStateHandler(PlayerStateHandler handler) { playerStateHandler = handler; }
+void SetSendRate(int hz) { sendRate = hz < 20 ? 20 : hz > 60 ? 60 : hz; }
+
+void ResetNpcReplication()
 {
-    if (!host || count <= 0 || count > MaxNpcsPerMessage) return;
+    for (auto& origins : npcOrigins) origins.clear();
+    npcPublications.clear();
+}
+
+void NpcReplicationCounts(unsigned& accepted, unsigned& rejected, unsigned& stale)
+{
+    accepted = npcAccepted;
+    rejected = npcRejected;
+    stale = npcStale;
+}
+
+void NpcPoseCounts(unsigned& sent, unsigned& received, unsigned& failed)
+{
+    sent = poseSent; received = poseReceived; failed = poseSendFailed;
+}
+
+void SendNpcs(NpcRecord const* records, int count, bool reliable)
+{
+    if (!host || !isHost || count <= 0 || count > MaxNpcsPerMessage) return;
     static uint8_t buffer[sizeof(NpcsHeader) + MaxNpcsPerMessage * sizeof(NpcRecord)];
-    const NpcsHeader header{MsgNpcs, ++npcSequence, enet_time_get(), static_cast<uint8_t>(count), isHost ? uint8_t(1) : localId};
+    const uint8_t owner = isHost ? uint8_t(1) : localId;
+    const NpcsHeader header{MsgNpcs, ++npcSequence, enet_time_get(), worldEpoch, isHost ? 1u : 0u,
+                            isHost ? ++npcPublication : 0u, static_cast<uint8_t>(count), owner};
     std::memcpy(buffer, &header, sizeof(header));
-    std::memcpy(buffer + sizeof(header), records, count * sizeof(NpcRecord));
+    for (int i = 0; i < count; ++i) {
+        NpcRecord record = records[i];
+        if (!record.sent) record.sent = header.sent;
+        std::memcpy(buffer + sizeof(header) + i * sizeof(record), &record, sizeof(record));
+    }
     if (!isHost) {
-        if (server && connected) Send(server, buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, false);
+        if (server && connected) Send(server, buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, reliable);
         return;
     }
     for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, false);
+        if (peers[i]) Send(peers[i], buffer, sizeof(header) + count * sizeof(NpcRecord), ChannelNpcs, reliable);
 }
+
+void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags)
+{
+    if (!host || !isHost || !bones || count <= 0 || count > pose::MaxBones || (poseFlags & ~pose::Facial)) return;
+    uint8_t buffer[sizeof(NpcsHeader) + sizeof(NpcRecord) + sizeof(uint16_t) + sizeof(poseFlags) + pose::MaxBones * sizeof(pose::Bone)];
+    const NpcsHeader header{MsgPosedNpc, ++npcSequence, enet_time_get(), worldEpoch, 1, ++npcPublication, 1, 1};
+    const uint16_t boneCount = static_cast<uint16_t>(count);
+    std::memcpy(buffer, &header, sizeof(header));
+    std::memcpy(buffer + sizeof(header), &record, sizeof(record));
+    std::memcpy(buffer + sizeof(header) + sizeof(record), &boneCount, sizeof(boneCount));
+    std::memcpy(buffer + sizeof(header) + sizeof(record) + sizeof(boneCount), &poseFlags, sizeof(poseFlags));
+    std::memcpy(buffer + sizeof(header) + sizeof(record) + sizeof(boneCount) + sizeof(poseFlags), bones, count * sizeof(*bones));
+    const size_t size = sizeof(header) + sizeof(record) + sizeof(boneCount) + sizeof(poseFlags) + count * sizeof(*bones);
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i]) {
+            if (Send(peers[i], buffer, size, ChannelPoses, false)) ++poseSent;
+            else ++poseSendFailed;
+        }
+}
+
+void SendNpcRelease(uint8_t const* guids, int count)
+{
+    if (!host || !isHost || !guids || count <= 0 || count > MaxNpcsPerMessage) return;
+    uint8_t buffer[sizeof(NpcReleaseHeader) + MaxNpcsPerMessage * 16];
+    const NpcReleaseHeader header{MsgNpcRelease, ++npcSequence, worldEpoch, isHost ? 1u : 0u,
+                                  isHost ? ++npcPublication : 0u, static_cast<uint8_t>(count), localId};
+    std::memcpy(buffer, &header, sizeof(header));
+    std::memcpy(buffer + sizeof(header), guids, count * 16u);
+    const size_t size = sizeof(header) + count * 16u;
+    if (isHost) {
+        for (uint8_t i = 2; i < MaxPlayers; ++i)
+            if (peers[i]) Send(peers[i], buffer, size, ChannelNpcs, true);
+    } else if (server && connected) {
+        Send(server, buffer, size, ChannelNpcs, true);
+    }
+}
+
+void SetNpcReleaseHandler(NpcReleaseHandler handler) { npcReleaseHandler = handler; }
 
 void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player)
 {
@@ -642,25 +951,39 @@ void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player)
     hitPlayerHandler = player;
 }
 
-void SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16], uint8_t outcome,
-                uint32_t seen)
+uint32_t SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16], uint8_t outcome,
+                    uint32_t seen, uint8_t reaction, uint32_t incarnation)
 {
-    if (!host || to == localId) return;
-    HitNpcMsg message{MsgHitNpc, {}, delta, {}, to, localId, {}, outcome, seen};
+    if (!host || isHost || !server || !connected || !inWorld || to != 1) {
+        Log("net: NPC hit not sent: no ready authoritative host");
+        return 0;
+    }
+    if (++hitSequence == 0) ++hitSequence;
+    HitNpcMsg message{MsgHitNpc, {}, delta, {}, to, localId, {}, outcome, seen, reaction, worldEpoch, hitSequence, incarnation};
     std::memcpy(message.guid, guid, 16);
     std::memcpy(message.weapon, weapon, 16);
     if (npc) std::memcpy(message.npc, npc, 16);
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
-    if (to < MaxPlayers && peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true);
+    return hitSequence;
 }
 
-void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer)
+void SetHitResultHandler(HitResultHandler handler) { hitResultHandler = handler; }
+
+void SendHitResult(uint8_t to, HitResult const& result)
+{
+    if (!isHost || !host || to < 2 || to >= MaxPlayers || !peers[to]) return;
+    HitResultMsg message{MsgHitResult, result};
+    message.result.epoch = worldEpoch;
+    message.result.processedAt = enet_time_get();
+    Send(peers[to], &message, sizeof(message), ChannelCombat, true);
+}
+void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill)
 {
     if (!host || playerId == localId || playerId >= MaxPlayers) return;
-    HitPlayerMsg message{MsgHitPlayer, delta, {}, attackerPlayer, playerId};
+    HitPlayerMsg message{MsgHitPlayer, delta, {}, attackerPlayer, playerId, static_cast<uint8_t>(meansToKill ? 1 : 0)};
     std::memcpy(message.attacker, attacker, 16);
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
-    if (peers[playerId]) Send(peers[playerId], &message, sizeof(message), ChannelReliable, true);
+    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true); return; }
+    if (peers[playerId]) Send(peers[playerId], &message, sizeof(message), ChannelCombat, true);
 }
 
 void SetStateHandler(StateHandler handler) { stateHandler = handler; }
@@ -743,31 +1066,26 @@ void SendCampaign(uint8_t kind, char const* name)
 
 void SendDeath(uint8_t const guid[16], uint8_t by, uint8_t except)
 {
-    if (!host) return;
+    if (!host || !isHost) return;
     DeathMsg message{MsgDeath, {}, by};
     std::memcpy(message.guid, guid, 16);
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
     for (uint8_t i = 2; i < MaxPlayers; ++i)
         if (peers[i] && i != except) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
 }
 
-void SendKilled(uint8_t to, uint8_t const guid[16])
+void SendKilled(uint8_t to, uint8_t const guid[16], uint32_t incarnation)
 {
-    if (!host || to == localId || to >= MaxPlayers) return;
-    KilledMsg message{MsgKilled, {}, to};
+    if (!host || !isHost || to <= 1 || to >= MaxPlayers || !incarnation) return;
+    KilledMsg message{MsgKilled, {}, to, worldEpoch, incarnation};
     std::memcpy(message.guid, guid, 16);
-    if (!isHost) { if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true); return; }
     if (peers[to]) Send(peers[to], &message, sizeof(message), ChannelReliable, true);
 }
 
-bool SendGoods(uint32_t serial, int32_t gold, GoodsEntry const* entries, int count)
+bool SendGoods(uint64_t epoch, uint32_t serial, int32_t gold, GoodsEntry const* entries, int count)
 {
     if (!host || count < 0 || count > MaxGoodsEntries || gold < 0) return false;
     uint8_t buffer[sizeof(GoodsHeader) + MaxGoodsEntries * sizeof(GoodsEntry)];
-    const GoodsHeader header{MsgGoods, localId, serial, gold, static_cast<uint8_t>(count)};
+    const GoodsHeader header{MsgGoods, localId, epoch, serial, gold, static_cast<uint8_t>(count)};
     std::memcpy(buffer, &header, sizeof(header));
     if (count) std::memcpy(buffer + sizeof(header), entries, count * sizeof(GoodsEntry));
     const size_t size = sizeof(header) + count * sizeof(GoodsEntry);
@@ -846,6 +1164,7 @@ void SendItem(ItemNote const& note, uint8_t to)
 
 void SetSummonHandler(SummonHandler handler) { summonHandler = handler; }
 void SetShotHandler(ShotHandler handler) { shotHandler = handler; }
+void SetRagdollHandler(RagdollHandler handler) { ragdollHandler = handler; }
 void SetDialogLineHandler(DialogLineHandler handler) { dialogLineHandler = handler; }
 void SetOfferHandlers(OfferHandler offer, OfferResultHandler result)
 {
@@ -910,13 +1229,28 @@ void SendWitness(uint8_t to, WitnessNote const& note)
 void SendShot(ShotNote const& note)
 {
     if (!host) return;
-    const ShotMsg message{MsgShot, localId, note};
+    ShotMsg message{MsgShot, localId, note};
+    message.note.epoch = worldEpoch;
+    if (!message.note.sent) message.note.sent = enet_time_get();
     if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
+        if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true);
         return;
     }
     for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
+        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelCombat, true);
+}
+
+void SendRagdoll(RagdollNote const& note)
+{
+    if (!host || !isHost) return;
+    RagdollMsg message{MsgRagdoll, localId, note};
+    message.note.epoch = worldEpoch;
+    if (!isHost) {
+        if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true);
+        return;
+    }
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelCombat, true);
 }
 
 void SendDialogLine(DialogLineNote const& note)
@@ -931,16 +1265,21 @@ void SendDialogLine(DialogLineNote const& note)
         if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
 }
 
-void SendOffer(OfferNote const& note)
+bool SendOffer(OfferNote const& note)
 {
-    if (!host) return;
+    if (!host || note.seller == 0 || note.seller >= MaxPlayers || note.seller == localId) return false;
     OfferMsg message{MsgOffer, note};
     message.note.buyer = localId;
+    if (note.count > MaxOfferEntries) return false;
+    const size_t size = OfferHeaderSize + note.count * sizeof(OfferEntry);
     if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
+        if (!server || !connected) return false;
+        Send(server, &message, size, ChannelReliable, true);
+        return true;
     }
-    if (note.seller > 1 && note.seller < MaxPlayers && peers[note.seller]) Send(peers[note.seller], &message, sizeof(message), ChannelReliable, true);
+    if (!peers[note.seller] || !InWorld(note.seller)) return false;
+    Send(peers[note.seller], &message, size, ChannelReliable, true);
+    return true;
 }
 
 void SendOfferResult(OfferResultNote const& note)
@@ -958,7 +1297,8 @@ void SendOfferResult(OfferResultNote const& note)
 void SendSummon(SummonNote const& note)
 {
     if (!host) return;
-    const SummonMsg message{MsgSummon, localId, note};
+    SummonMsg message{MsgSummon, localId, note};
+    message.note.epoch = worldEpoch;
     if (!isHost) {
         if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
         return;
@@ -993,13 +1333,9 @@ void SendStates(uint8_t kind, StateEntry const* entries, int count)
 
 void SendMotionName(uint32_t hash, char const* name)
 {
-    if (!host) return;
+    if (!host || !isHost) return;
     MotionNameMsg message{MsgMotionName, hash, {}};
     strncpy_s(message.name, name, _TRUNCATE);
-    if (!isHost) {
-        if (server && connected) Send(server, &message, sizeof(message), ChannelReliable, true);
-        return;
-    }
     for (uint8_t i = 2; i < MaxPlayers; ++i)
         if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelReliable, true);
 }
@@ -1009,55 +1345,75 @@ Remote const* Remotes() { return remotes; }
 void Stop()
 {
     // Tell the others right away; otherwise a closed game only shows up after the long peer timeout.
-    if (!host) return;
-    if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i)
-            if (peers[i]) enet_peer_disconnect_now(peers[i], 0);
-    } else if (server) {
-        enet_peer_disconnect_now(server, 0);
+    if (host) {
+        if (isHost) {
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i]) enet_peer_disconnect_now(peers[i], 0);
+        } else if (server) {
+            enet_peer_disconnect_now(server, 0);
+        }
+        enet_host_flush(host);
     }
-    enet_host_flush(host);
-    if (overSteam) steam::Stop();  // passes the goodbyes on first
+    steam::Stop();  // passes the goodbyes on before closing ENet
+    if (host) enet_host_destroy(host);
+    host = nullptr;
+    server = nullptr;
+    connected = inWorld = false;
+    localId = 0;
+    ResetNpcReplication();
+    for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
+    if (enetInitialized) {
+        enet_deinitialize();
+        enetInitialized = false;
+    }
 }
 
-bool Start(bool asHost, char const* address, unsigned short port, char const* name, bool steamTransport)
+char const* StartupError() { return startupError; }
+
+namespace {
+bool StartFailed(char const* reason)
 {
-    if (enet_initialize() != 0) { Log("net: enet_initialize failed"); return false; }
+    strncpy_s(startupError, reason, _TRUNCATE);
+    Logf("net: Steam-only connection failed: %s", startupError);
+    Stop();
+    return false;
+}
+}
+
+bool Start(bool asHost)
+{
     isHost = asHost;
-    strncpy_s(localName, name, _TRUNCATE);
+    ResetNpcReplication();
+    worldEpoch = npcPublication = npcSequence = 0;
+    startupError[0] = '\0';
+    if (enet_initialize() != 0) return StartFailed("ENet initialization failed");
+    enetInitialized = true;
+    target = ENetAddress{};
+    if (enet_address_set_host_ip(&target, "127.0.0.1") != 0) return StartFailed("loopback address unavailable");
+    host = enet_host_create(&target, isHost ? MaxPlayers - 1 : 1, ChannelCount, 0, 0);
+    if (!host) return StartFailed("loopback ENet socket could not be created");
+    host->mtu = Mtu;
+    constexpr int PoseBurstBuffer = 4 * 1024 * 1024;
+    if (enet_socket_set_option(host->socket, ENET_SOCKOPT_RCVBUF, PoseBurstBuffer) < 0 ||
+        enet_socket_set_option(host->socket, ENET_SOCKOPT_SNDBUF, PoseBurstBuffer) < 0)
+        return StartFailed("cannot configure the owned ENet socket for canonical pose bursts");
+    if (!steam::Start(isHost, isHost ? host->address.port : 0)) return StartFailed(steam::Error());
+    strcpy_s(localName, steam::PlayerName());
+    Logf("net: player name from Steam: %s", localName);
     if (isHost) {
-        ENetAddress bind{};
-        bind.host = ENET_HOST_ANY;
-        bind.port = port;
-        host = enet_host_create(&bind, MaxPlayers - 1, ChannelCount, 0, 0);
-        if (host) host->mtu = Mtu;
         localId = 1;
         connected = true;
-        Logf("net: hosting on UDP %u: %s", port, host ? "ok" : "FAILED");
-        // Friends over Steam reach the same ENet port through steam.cpp's relay; the UDP port stays open for addresses.
-        overSteam = host && steamTransport && steam::Start(true, port);
-        if (steamTransport) Logf("net: Steam %s", overSteam ? "on: friends can join over Steam" : steam::Error());
+        Logf("net: Steam-only host relay on 127.0.0.1:%u", host->address.port);
     } else {
-        host = enet_host_create(nullptr, 1, ChannelCount, 0, 0);
-        if (host) host->mtu = Mtu;  // before connecting: the connect proposes it, both sides keep the smaller
-        // Over Steam ENet connects to the relay on 127.0.0.1, which passes everything to the host found among the Steam
-        // friends. Without Steam (not running, no steam_api.dll) the address from the INI is the fallback.
-        overSteam = host && steamTransport && steam::Start(false, 0);
-        if (overSteam) {
-            enet_address_set_host(&target, "127.0.0.1");
-            target.port = steam::RelayPort();
-        } else {
-            if (steamTransport) Logf("net: Steam not available (%s); connecting to the address instead", steam::Error());
-            enet_address_set_host(&target, address);
-            target.port = port;
-        }
-        server = host ? enet_host_connect(host, &target, ChannelCount, 0) : nullptr;
+        target.port = steam::RelayPort();
+        if (!target.port) return StartFailed("Steam relay socket is unavailable");
+        server = enet_host_connect(host, &target, ChannelCount, 0);
+        if (!server) return StartFailed("connection to the Steam relay could not be created");
         lastConnectAttempt = enet_time_get();
         startedAt = enet_time_get();
-        if (overSteam) Logf("net: connecting over Steam (relay 127.0.0.1:%u): %s", target.port, server ? "pending" : "FAILED");
-        else Logf("net: connecting to %s:%u: %s", address, port, server ? "pending" : "FAILED");
+        Logf("net: connecting over Steam (relay 127.0.0.1:%u): pending", target.port);
     }
-    return host != nullptr;
+    return true;
 }
 
 namespace {
@@ -1068,12 +1424,21 @@ void Service(PlayerState const& local, bool haveLocal)
     for (int events = 0; events < 512 && enet_host_service(host, &event, 0) > 0; ++events) {
         switch (event.type) {
         case ENET_EVENT_TYPE_CONNECT:
+            if (isHost && (event.peer->address.host != target.host || !steam::IsPeerRelay(event.peer->address.port))) {
+                Log("net: rejected an ENet connection outside the linked Steam relays");
+                enet_peer_reset(event.peer);
+                break;
+            }
             // World loads and the intro video stop the engine loop (and so this service call) for
             // many seconds; the default ENet timeouts dropped a loading player after about 9 s.
             enet_peer_timeout(event.peer, 0, 60000, 180000);
+            // The pose stream is fixed-rate and already tolerates loss; ENet's RTT-jitter throttle only drops more
+            // frames and shrinks the reliable window, so keep it at full rate (deceleration 0).
+            enet_peer_throttle_configure(event.peer, 5000, 0, 0);
             // A new connection has not said hello yet. ENet hands out the peer of a player who left before, and its old
             // player id made the hello guard refuse every rejoin (stageU1, 22.10.).
             event.peer->data = nullptr;
+            poseRoutes[event.peer - host->peers] = PoseRoute{};
             if (!isHost) {
                 everConnected = true;
                 Hello hello{MsgHello, helloVersion ? helloVersion : ProtocolVersion, {}, {}};
@@ -1113,17 +1478,20 @@ void Service(PlayerState const& local, bool haveLocal)
         server = enet_host_connect(host, &target, ChannelCount, 0);
         Log(server ? "net: reconnecting" : "net: reconnect failed");
     }
-    if (!connected || !haveLocal || now - lastSend < 50) return;
+    if (!connected || !haveLocal || now - lastSend < std::max<uint32_t>(8, 1000u / static_cast<uint32_t>(sendRate) - 1)) return;
     lastSend = now;
     State message{MsgState, local};
     message.state.id = localId;
     message.state.sequence = ++sequence;
     message.state.sent = now;
+    static uint8_t previousFlags = 0;
+    const bool reliable = message.state.flags != previousFlags;
+    previousFlags = message.state.flags;
     strncpy_s(message.state.name, localName, _TRUNCATE);
     if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelState, false);
+        for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelState, reliable);
     } else if (server) {
-        Send(server, &message, sizeof(message), ChannelState, false);
+        Send(server, &message, sizeof(message), ChannelState, reliable);
     }
     enet_host_flush(host);
 }
@@ -1136,8 +1504,18 @@ bool rttLog = true;  // QA negative control: rttlogoff
 enet_uint32 lastRttLog = 0;
 void RttLine(ENetPeer* peer, char const* who, char* out, size_t size)
 {
-    Format(out, size, "net: rtt=%u ms (+-%u) loss=%.1f%% sent=%u lost=%u to %s", peer->roundTripTime, peer->roundTripTimeVariance,
-           peer->packetLoss * 100.0 / ENET_PEER_PACKET_LOSS_SCALE, peer->packetsSent, peer->packetsLost, who);
+    auto const& poses = peer->channels[ChannelPoses];
+    auto const& alt = peer->channels[ChannelPosesAlt];
+    Format(out, size, "net: rtt=%u ms (+-%u) loss=%.1f%% sent=%u lost=%u throttle=%u/%u to %s "
+                     "pose_send=%u/%u,%u/%u pose_recv=%u/%u,%u/%u waiting_bytes=%u",
+           peer->roundTripTime, peer->roundTripTimeVariance,
+           peer->packetLoss * 100.0 / ENET_PEER_PACKET_LOSS_SCALE, peer->packetsSent, peer->packetsLost,
+           peer->packetThrottle, ENET_PEER_PACKET_THROTTLE_SCALE, who,
+           poses.outgoingReliableSequenceNumber, poses.outgoingUnreliableSequenceNumber,
+           alt.outgoingReliableSequenceNumber, alt.outgoingUnreliableSequenceNumber,
+           poses.incomingReliableSequenceNumber, poses.incomingUnreliableSequenceNumber,
+           alt.incomingReliableSequenceNumber, alt.incomingUnreliableSequenceNumber,
+           static_cast<unsigned>(peer->totalWaitingData));
 }
 void RttLog()
 {
@@ -1145,7 +1523,7 @@ void RttLog()
     const enet_uint32 now = enet_time_get();
     if (now - lastRttLog < 5000) return;
     lastRttLog = now;
-    char line[200];
+    char line[384];
     if (isHost) {
         for (uint8_t i = 2; i < MaxPlayers; ++i)
             if (peers[i] && peers[i]->state == ENET_PEER_STATE_CONNECTED) { RttLine(peers[i], PeerName(i), line, sizeof(line)); Log(line); }
@@ -1159,15 +1537,15 @@ void Tick(PlayerState const& local, bool haveLocal)
 {
     if (!host) return;
     RttLog();
-    if (overSteam) steam::Pump();  // Steam -> ENet before the service
+    steam::Pump();  // Steam -> ENet before the service
     Service(local, haveLocal);
-    if (overSteam) steam::Pump();  // what ENet sent in this frame goes out now, not a frame later
+    steam::Pump();  // what ENet sent in this frame goes out now, not a frame later
 }
 
 // QA: NETSTATS lines, one per connection, now; rttlogoff stops the 5-s lines.
 void Stats(void (*log)(char const*))
 {
-    char line[200];
+    char line[384];
     int n = 0;
     if (isHost) {
         for (uint8_t i = 2; i < MaxPlayers; ++i)

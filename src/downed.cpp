@@ -27,6 +27,7 @@ bool potionNeeded = true; // QA negative control: potionoff (helping up is free 
 // the winner may rob the hero, the hero stands up by itself. Before, every knock-out was held (spieltest 21.10.
 // 21:35: guards knocked a player out, a partner paid a potion, nobody robbed him).
 bool lethalOnly = true;   // QA negative control: lethalonlyoff (every knock-out waits for help again)
+bool lethalBlows = true;  // QA negative control: lethalblowsoff (a knock-out of the game's own is never a death, as before 3 Nov.)
 unsigned redirects = 0, revives = 0, releases = 0, deaths = 0, potionsPaid = 0, refusedNoPotion = 0;
 // Helping up through a dialog (owner 23.10.): a partner waiting for help gets an option on its puppet, the player's line
 // "Ich werde dir helfen." (INFO_SKALVERAM320060309153144, C trade-screen-c.md 6.); chosen, the hero pays a healing potion and
@@ -56,6 +57,9 @@ bool held = false;              // the local hero lies knocked out and waits for
 bool lethal = false;            // the knock-out it lies in replaced its death (RedirectDeath)
 bool lethalSeenDown = false;    // ... and the hero has lain down since (until then a frame without IsDown is no standing up)
 uint32_t lethalAt = 0;          // when RedirectDeath set it
+int lastHp = -1;                // the hero's hit points a frame ago
+uint32_t lethalBlowAt = 0;      // when a blow by someone who means to kill took hit points off the hero
+unsigned nativeLethal = 0;      // knock-outs of the game's own that were a lethal blow (promoted to the partner's help)
 bool nativeNoted = false;       // logged once per knock-out of the game's own
 bool dying = false;             // nobody could help: the hero dies like in the single-player game
 uint32_t diedAt = 0;            // when the death task was (last) set
@@ -243,6 +247,32 @@ void OfferHelp(Entity& hero, net::Remote const* remotes, uint32_t now)
     }
 }
 
+// The game knocks a human out where it would kill an animal (its hit judgement: a hero hit by an orc, a goblin with a club or
+// a man with a weapon lies down at 0 hit points, then stands up by itself), so the hero never died in a fight with them and
+// the help-up rule above never applied: 13 knock-outs and no death in the 2 Nov. play session (owner: "we can't die now").
+// Each blow that takes hit points off the hero is noted when its attacker means to kill (the game's HasAttackReasonToKill:
+// raiders, monsters, an intruder; not a duel, the arena or a fight with another player), and a knock-out at 0 hit points that
+// follows such a blow is held for a partner like a death that the mod turned into a knock-out.
+void WatchBlows(Entity& hero, uint32_t now)
+{
+    const int hp = hero.PlayerMemory.GetHitPoints();
+    const int before = lastHp;
+    lastHp = hp;
+    if (before < 0 || hp >= before || !net::Connected()) return;
+    eCEntity* attacker = hero.NPC.GetCurrentAttacker().GetInstance();
+    if (!attacker || remote::IsPuppet(attacker) || !attacker->GetPropertySet(eEPropertySetType_NPC)) return;
+    if (GetScriptAdminExt().CallScript(bCString("HasAttackReasonToKill"), attacker, hero.GetInstance(), 0)) lethalBlowAt = now ? now : 1;
+}
+
+// A partner is in the game (any world): only then does a lethal knock-out wait for help, else the game's own rule stands as in
+// single-player (alone, the hero would die after five seconds).
+bool PartnerPresent(net::Remote const* remotes, uint32_t now)
+{
+    for (int i = 1; i < net::MaxPlayers; ++i)
+        if (i != net::LocalId() && Present(remotes[i], now)) return true;
+    return false;
+}
+
 // Nobody can help: the hero dies the way the game lets it die (the death task, whose script shows the game over).
 void Die(Entity& hero)
 {
@@ -288,7 +318,7 @@ void Tick()
 {
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
-    if (!instance || !session.IsGameRunning()) { held = false; lethal = false; dying = false; aloneSince = 0; revivedBy = 0; return; }
+    if (!instance || !session.IsGameRunning()) { held = false; lethal = false; dying = false; aloneSince = 0; revivedBy = 0; lastHp = -1; lethalBlowAt = 0; return; }
     Entity hero(instance);
     const uint32_t now = net::Now();
     net::Remote const* remotes = net::Remotes();
@@ -316,6 +346,7 @@ void Tick()
     }
 
     if (hero.IsDead()) { held = false; lethal = false; return; }
+    WatchBlows(hero, now);
     const bool down = hero.IsDown();
     if (!down) {
         for (int i = 0; i < 2; ++i) {
@@ -358,6 +389,16 @@ void Tick()
     }
     if (!held) {
         if (!holdEnabled) return;  // QA negative control: the game's own timer stands the hero up
+        // A knock-out of the game's own at 0 hit points after a blow that meant to kill: a death the game turned into a
+        // knock-out; the partner helps it up, else it is one.
+        if (lethalOnly && !lethal && !nativeNoted && lethalBlows && hero.PlayerMemory.GetHitPoints() <= 0 && lethalBlowAt &&
+            now - lethalBlowAt < 3000 && PartnerPresent(remotes, now)) {
+            lethal = true;
+            lethalSeenDown = true;
+            lethalAt = now;
+            ++nativeLethal;
+            Logf("downed: lethal blow by someone who means to kill; knocked out like a death (hp=%d)", hero.PlayerMemory.GetHitPoints());
+        }
         if (lethalOnly && !lethal) {
             if (!nativeNoted) {
                 nativeNoted = true;
@@ -415,6 +456,11 @@ void HelperHasNoPotion(int byPlayer)
 }
 
 bool Held() { return held; }
+
+void NoteBlow()
+{
+    lethalBlowAt = net::Now() ? net::Now() : 1;
+}
 
 // Not a death the mod turned into a knock-out (that one waits for help, and nobody robs it): RedirectDeath sets lethal
 // before the hero lies down.
@@ -499,9 +545,9 @@ void Potions(LogFn log)
 void Report(LogFn log)
 {
     char line[240];
-    Format(line, "DOWNED lethal=%d lethal_only=%d enabled=%d hold=%d held=%d redirects=%u revives=%u releases=%u deaths=%u potions_paid=%u no_potion=%u potion_needed=%d"
+    Format(line, "DOWNED lethal=%d lethal_only=%d lethal_blows=%d native_lethal=%u enabled=%d hold=%d held=%d redirects=%u revives=%u releases=%u deaths=%u potions_paid=%u no_potion=%u potion_needed=%d"
                     " auto_help=%d help_option=%d offered=%u chosen=%u",
-              lethal ? 1 : 0, lethalOnly ? 1 : 0, enabled ? 1 : 0, holdEnabled ? 1 : 0, held ? 1 : 0, redirects, revives, releases, deaths, potionsPaid, refusedNoPotion,
+              lethal ? 1 : 0, lethalOnly ? 1 : 0, lethalBlows ? 1 : 0, nativeLethal, enabled ? 1 : 0, holdEnabled ? 1 : 0, held ? 1 : 0, redirects, revives, releases, deaths, potionsPaid, refusedNoPotion,
               potionNeeded ? 1 : 0, autoHelp ? 1 : 0, helpOption ? 1 : 0, optionsOffered, optionsChosen);
     log(line);
 }
@@ -524,6 +570,7 @@ bool Switch(char const* action, LogFn log)
 {
     if (!std::strcmp(action, "helplineoff")) { helpLineOnly = false; log("SWITCH helplineoff ok=1"); return true; }
     if (!std::strcmp(action, "autohelpoff")) { autoHelp = false; log("SWITCH autohelpoff ok=1"); return true; }
+    if (!std::strcmp(action, "lethalblowsoff")) { lethalBlows = false; log("SWITCH lethalblowsoff ok=1"); return true; }
     return false;
 }
 }

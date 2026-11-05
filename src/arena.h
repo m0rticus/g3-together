@@ -4,6 +4,7 @@
 // opponent over from the other machine while the fight lasts.
 #pragma once
 
+#include "net.h"
 class eCEntity;
 
 namespace g3t::arena {
@@ -15,4 +16,5 @@ void OnWorldChange();  // the world (or save) was left: nothing is held any more
 using LogFn = void (*)(char const*);
 void Report(LogFn log);  // QA: ARENASYNC line
 void Off(LogFn log);     // QA negative control: arenasyncoff, the opponent stays where it is simulated
+void OnState(uint8_t from, net::WorldState const& state);
 }

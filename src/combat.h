@@ -2,8 +2,8 @@
 // Damage with host authority, enforced where every hit in the game ends: the AddHitPoints script.
 // - a client hitting an NPC mirrored from the host: the client does not apply it, but sends it to the host,
 //   which applies it (and kills at zero); the result comes back through NPC mirroring;
-// - something on the host hitting a remote player's puppet: not applied to the puppet, but sent to that
-//   player, whose real hero takes it.
+// - NPC hits on a player's hero are judged by that player's locally presented contacts, not remote
+//   contacts with a puppet. Player-versus-player hit messages retain their separate path.
 #pragma once
 
 class eCEntity;
@@ -11,6 +11,9 @@ class eCEntity;
 namespace g3t::combat {
 void Start();
 void Tick();  // installs the filter once the game's scripts are registered
+// A harmful contact, including status effects. source may be a weapon/projectile; player is a known network attacker.
+// Counts a blocked contact for diagnostics. Self-damage and sources outside the co-op party remain native.
+bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player = 0);
 using LogFn = void (*)(char const*);
 void HitPuppet(char const* id, LogFn log);  // QA: hit player <id>'s puppet the same way (its stumble, stumblediag)
 void HitNpc(char const* guid, LogFn log);  // QA: hit the NPC (GUID as the npcs report prints it) the way gCEntity::DoDamage does
@@ -28,8 +31,11 @@ void KillHero(char const* guid, LogFn log); // QA stage A: OnCheatKill on the he
 void HitPuppetBy(char const* guid, LogFn log);  // QA stage A: an NPC hits player 2's puppet on the host
 void FleeFrom(char const* guid, LogFn log);     // QA stage V5: an NPC flees from player 2's puppet; FLEE line with its attitude
 void Report(LogFn log);                    // QA: HP of the local hero and counters
+void SyncReport(LogFn log);                // compact hit-routing and inventory-protection diagnostics
 // The game's IsInParadeMode (SG+d870: AniState parade and the parade held), for the parades sent (npcs.cpp, Stufe 3.3).
 bool InParadeMode(eCEntity* entity);
+bool LocalBlow(eCEntity* attacker);  // a visible swing of a mirrored NPC reached our hero: judge one blow here (npcs.cpp)
+bool PlayerBlow(eCEntity* victim);  // our displayed weapon sweep reached a passive NPC
 // QA (Stufe 4.1): foreignjudgeskipon / foreignjudgeskipoff; true if it was one of them.
 bool Switch(char const* action, LogFn log);
 void Uninstall(LogFn log);                  // QA negative control: let every hit through
@@ -53,6 +59,10 @@ void NpcParade(char const* guid, LogFn log);       // QA P4: NPCPARADE line (tha
 void PuppetState(LogFn log);                      // QA P1: PUPPETSTATE line (player 2's puppet here)
 void PuppetParade(char const* guid, LogFn log);   // QA P4: PUPPETPARADE line (player 2's puppet against that NPC)
 void NpcStill(char const* guid, LogFn log);       // QA P4: the NPC stops (its fight too) and stands idle
+void NpcPin(char const* guid, LogFn log);         // QA: pin a host NPC's root for five minutes, or off; its AI/animation still run
+void NpcWalk(char const* argument, LogFn log);   // QA: GUID_X_Y_Z, a locally simulated NPC walks to a test goal
+void NpcAttack(char const* guid, LogFn log);     // QA: this exact locally simulated NPC attacks the other player's puppet
 void HitProbe(char const* guid, LogFn log);  // QA P4: parade, strength and protection as the game judges them here  // QA P4: shield in the left hand, parrying, full stamina
 void Swing(char const* state, LogFn log);  // QA: the local hero swings as a key press would
+void PlayerKey(char const* argument, LogFn log);  // QA: key_pressed_pressedBefore_duration, native player input script
 }

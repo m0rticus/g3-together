@@ -9,7 +9,9 @@
  *   G3T_FAKESTEAM_ID=<n>       this copy's Steam id (default: the process id)
  *   G3T_FAKESTEAM_DIR=<dir>    lobby files (default %TEMP%\g3t-fakesteam); one folder per test pair keeps pairs apart
  *   G3T_FAKESTEAM_NAME=<name>  this copy's Steam name (default Fake<id>)
- *   G3T_FAKESTEAM_INIT=<n>     SteamAPI_InitFlat answers n (2: Steam is not running) for the fallback's negative control
+ *   G3T_FAKESTEAM_INIT=<n>     SteamAPI_InitFlat answers n (2: Steam is not running) for the required-Steam negative control
+ *   G3T_FAKESTEAM_FPU=1       perturb x87 precision/rounding at startup and callbacks (FP-state regression)
+ *   G3T_FAKESTEAM_FPU=2       mimic real Steam startup changing x87 precision to 53 bits
  *   G3T_FAKESTEAM_INVITE=<id>  after the start, as if the player accepted an invite to lobby <id> (callback 333)
  * Each id listens on UDP port 41000 + id % 1000. A lobby is a file lobby_<owner>.txt in the folder with its data
  * ("key=value" lines, persona=<owner's name>); joiners add member_<lobby>_<id>. Every copy sees every lobby file but its own
@@ -20,9 +22,9 @@
  * GetSteamID64 answers 0 for any other type, and a message's sender identity sits at offset 12 (Jericho's two-account
  * test, 2026-10-21): a reader at the wrong offset fails here too.
  *
- * Two PCs (one game on each):
+ * Loopback-only network impairment tests:
  *   G3T_FAKESTEAM_PORT=<n>                 this copy's UDP port (default 41000 + id % 1000)
- *   G3T_FAKESTEAM_REMOTE=<ip>:<port>:<id>  the other PC's copy: its packets go there, its lobby (id = its id) is joinable,
+ *   G3T_FAKESTEAM_REMOTE=<ip>:<port>:<id>  a local test relay: packets go there, its lobby (id = its id) is joinable,
  *                                          it counts as a member of this one's lobby once it has sent anything
  *   G3T_FAKESTEAM_LISTREMOTE=1             list the remote copy as a friend with a lobby
  */
@@ -31,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <float.h>
 
 #define EXPORT __declspec(dllexport)
 typedef unsigned long long u64;
@@ -55,10 +58,12 @@ typedef struct Msg {
 } Msg;
 
 static SOCKET sock = INVALID_SOCKET;
+static int perturb_fpu;
 static u64 me;
 static char my_name[64];
+static unsigned app_id;
 static Cb *cb_head, *cb_tail, *cb_current;
-static Msg *held, *ready_q[2];
+static Msg *held, *held_tail, *ready_q[2], *ready_tail[2];
 static u64 accepted[16];
 static u64 my_lobby, joined_lobby;
 static char dir[MAX_PATH];
@@ -66,6 +71,14 @@ static u64 next_call = 100;
 static int dummy;
 static u64 known_members[16];
 static DWORD last_member_check;
+
+static void msg_push(Msg **head, Msg **tail, Msg *message)
+{
+    message->next = NULL;
+    if (*tail) (*tail)->next = message;
+    else *head = message;
+    *tail = message;
+}
 
 static void cb_push(int id, const void *param, int size)
 {
@@ -189,14 +202,21 @@ static void file_set(u64 owner, const char *key, const char *val)
 EXPORT int __cdecl SteamAPI_InitFlat(char *err)
 {
     char v[MAX_PATH];
+    perturb_fpu = GetEnvironmentVariableA("G3T_FAKESTEAM_FPU", v, sizeof v) > 0 ? atoi(v) : 0;
     WSADATA w;
     if (GetEnvironmentVariableA("G3T_FAKESTEAM_INIT", v, sizeof v) > 0 && atoi(v) != 0) {
         strcpy(err, "fake steam: told to fail");
         return atoi(v);
     }
     WSAStartup(MAKEWORD(2, 2), &w);
+    app_id = GetEnvironmentVariableA("SteamAppId", v, sizeof v) ? (unsigned)strtoul(v, NULL, 10) : 0;
+    if (GetEnvironmentVariableA("G3T_FAKESTEAM_APPID", v, sizeof v))
+        app_id = (unsigned)strtoul(v, NULL, 10);
     me = GetEnvironmentVariableA("G3T_FAKESTEAM_ID", v, sizeof v) ? _strtoui64(v, NULL, 10) : GetCurrentProcessId();
-    if (GetEnvironmentVariableA("G3T_FAKESTEAM_NAME", my_name, sizeof my_name) == 0)
+    wchar_t wide_name[128];
+    if (GetEnvironmentVariableW(L"G3T_FAKESTEAM_NAME", wide_name, 128))
+        WideCharToMultiByte(CP_UTF8, 0, wide_name, -1, my_name, sizeof my_name, NULL, NULL);
+    else
         snprintf(my_name, sizeof my_name, "Fake%llu", me);
     if (GetEnvironmentVariableA("G3T_FAKESTEAM_DIR", dir, sizeof dir) == 0) {
         GetTempPathA(MAX_PATH, dir);
@@ -212,7 +232,7 @@ EXPORT int __cdecl SteamAPI_InitFlat(char *err)
     read_remote();
     int own = GetEnvironmentVariableA("G3T_FAKESTEAM_PORT", v, sizeof v) > 0 ? atoi(v) : port_of(me);
     a.sin_port = htons((u_short)own);
-    a.sin_addr.s_addr = remote_id ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(sock, (struct sockaddr *)&a, sizeof a) != 0) {
         strcpy(err, "fake steam: port in use");
         return 1;
@@ -228,7 +248,16 @@ EXPORT int __cdecl SteamAPI_InitFlat(char *err)
         memcpy(r + 8, &lobby, 8);   /* the friend: the lobby's owner */
         cb_push(333, r, 16);
     }
+    if (perturb_fpu == 1) _controlfp(_RC_DOWN | _PC_64, _MCW_RC | _MCW_PC);
+    else if (perturb_fpu == 2) _control87(_PC_53, _MCW_PC);
     return 0;
+}
+
+EXPORT void __cdecl SteamAPI_Shutdown(void)
+{
+    if (sock != INVALID_SOCKET) closesocket(sock);
+    sock = INVALID_SOCKET;
+    WSACleanup();
 }
 
 EXPORT int __cdecl SteamAPI_GetHSteamPipe(void) { return 1; }
@@ -237,7 +266,8 @@ EXPORT void __cdecl SteamAPI_ManualDispatch_Init(void) {}
 static void pump(void)
 {
     static char buf[70000];
-    for (;;) {
+    /* A continuous pose stream must not trap a game frame inside the stand-in's receive pump. */
+    for (int batch = 0; batch < 4096; ++batch) {
         int n = recv(sock, buf, sizeof buf, 0);
         if (n < 0 && WSAGetLastError() == WSAECONNRESET)
             continue;
@@ -248,6 +278,10 @@ static void pump(void)
         if (remote_id && from == remote_id)
             remote_seen = 1;
         Msg *m = calloc(1, sizeof *m + n - 9);
+        if (!m) {
+            fprintf(stderr, "fake steam: cannot allocate a received message\n");
+            return;
+        }
         m->channel = buf[0];
         m->size = n - 9;
         m->data = m->buf;
@@ -256,7 +290,6 @@ static void pump(void)
         int ok = 0;
         for (int i = 0; i < 16; i++)
             ok |= accepted[i] == from;
-        Msg **q = ok ? &ready_q[m->channel & 1] : &held;
         if (!ok) {
             int asked = 0;
             for (Msg *h = held; h; h = h->next)
@@ -267,9 +300,8 @@ static void pump(void)
                 cb_push(1251, id, 136);
             }
         }
-        while (*q)
-            q = &(*q)->next;
-        *q = m;
+        if (ok) msg_push(&ready_q[m->channel & 1], &ready_tail[m->channel & 1], m);
+        else msg_push(&held, &held_tail, m);
     }
 }
 
@@ -315,6 +347,7 @@ static void check_members(void)
 EXPORT void __cdecl SteamAPI_ManualDispatch_RunFrame(int pipe)
 {
     (void)pipe;
+    if (perturb_fpu == 1) _controlfp(_RC_UP, _MCW_RC);
     pump();
     check_members();
 }
@@ -362,6 +395,8 @@ EXPORT unsigned char __cdecl SteamAPI_ManualDispatch_GetAPICallResult(int pipe, 
 }
 
 EXPORT void *__cdecl SteamAPI_SteamUser_v023(void) { return &dummy; }
+EXPORT void *__cdecl SteamAPI_SteamUtils_v010(void) { return &dummy; }
+EXPORT unsigned __cdecl SteamAPI_ISteamUtils_GetAppID(void *s) { (void)s; return app_id; }
 EXPORT u64 __cdecl SteamAPI_ISteamUser_GetSteamID(void *s) { (void)s; return me; }
 EXPORT void *__cdecl SteamAPI_SteamMatchmaking_v009(void) { return &dummy; }
 EXPORT void *__cdecl SteamAPI_SteamFriends_v018(void) { return &dummy; }
@@ -374,6 +409,9 @@ EXPORT u64 __cdecl SteamAPI_ISteamMatchmaking_CreateLobby(void *s, int type, int
     (void)s; (void)type; (void)max;
     my_lobby = me;   /* the lobby id is the owner's id */
     file_set(me, "persona", my_name);
+    char app[16];
+    snprintf(app, sizeof app, "%u", app_id);
+    file_set(me, "app_id", app);
     char r[16] = {0}, e[24] = {0};
     int ok = 1;
     unsigned response = 1;
@@ -509,7 +547,8 @@ EXPORT unsigned char __cdecl SteamAPI_ISteamFriends_GetFriendGamePlayed(void *s,
 {
     (void)s;
     char *p = info;
-    u64 game = 480;
+    const char *saved_app = file_value(f, "app_id");
+    u64 game = *saved_app ? _strtoui64(saved_app, NULL, 10) : app_id;
     memset(p, 0, 24);
     memcpy(p, &game, 8);
     memcpy(p + 16, &f, 8);   /* the friend's lobby id is the friend's id */
@@ -530,7 +569,10 @@ EXPORT const char *__cdecl SteamAPI_ISteamFriends_GetFriendPersonaName(void *s, 
 
 EXPORT unsigned char __cdecl SteamAPI_ISteamFriends_SetRichPresence(void *s, const char *k, const char *v)
 {
-    (void)s; (void)k; (void)v;
+    (void)s;
+    char key[96];
+    snprintf(key, sizeof key, "rich_%s", k);
+    file_set(me, key, v);
     return 1;
 }
 
@@ -570,6 +612,7 @@ EXPORT int __cdecl SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel(vo
     while (*q && n < max) {
         Msg *m = *q;
         *q = m->next;
+        if (!*q) ready_tail[channel & 1] = NULL;
         out[n++] = m;
     }
     return n;
@@ -585,16 +628,15 @@ EXPORT unsigned char __cdecl SteamAPI_ISteamNetworkingMessages_AcceptSessionWith
             break;
         }
     /* release what was held for this sender, in order */
+    Msg *previous = NULL;
     for (Msg **p = &held; *p;) {
         Msg *m = *p;
         if (get_identity(m->identity) == who) {
             *p = m->next;
-            m->next = NULL;
-            Msg **q = &ready_q[m->channel & 1];
-            while (*q)
-                q = &(*q)->next;
-            *q = m;
+            if (held_tail == m) held_tail = previous;
+            msg_push(&ready_q[m->channel & 1], &ready_tail[m->channel & 1], m);
         } else {
+            previous = m;
             p = &m->next;
         }
     }

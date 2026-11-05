@@ -12,9 +12,12 @@
 #include "npcs.h"
 #include "qa.h"
 #include "log.h"
+#include "lobby.h"
 #include "remote.h"
 #include "explore.h"
 #include "steam.h"
+#include "trade.h"
+#include "world.h"
 
 #include <Game.h>
 #include <Windows.h>
@@ -48,6 +51,7 @@ unsigned saves = 0, loads = 0, sidecarsWritten = 0, sidecarsRead = 0;
 std::string lastSave, lastLoad;
 unsigned recordsWritten = 0, recordsApplied = 0;
 std::string pendingRecord;   // client: hero record to apply once the loaded world runs
+std::vector<std::string> deferredTradeRecords;
 uint32_t pendingSince = 0;
 
 unsigned char* Resolve(Internal const& fn)
@@ -92,9 +96,15 @@ std::string SidecarPath(bCString const* name)
 
 // --- The campaign travels to players in another world ------------------------------------------------------
 // The host's current campaign is the save it last loaded or saved. A client that does not play the host's world
-// gets its three files (.g3savcpx, .g3savcpxdat, .g3t), stores them under G3T_host_<name> (never over one of its
+// gets its three files (native header/data and .g3t), stores them under G3T_host_<name> (never over one of its
 // own saves) and loads that save; its own hero record for that name, if any, then goes on top (D3a).
-char const* const Extensions[net::FileCount] = {".g3savcpx", ".g3savcpxdat", ".g3t"};
+char const* SaveExtension(int file)
+{
+    // Match gCWorld::ExistsSaveGame: AlternativeBalancing selects CPX; parity requires both peers to agree.
+    static char const* const normal[net::FileCount] = {".g3savcp", ".g3savcpdat", ".g3t"};
+    static char const* const alternative[net::FileCount] = {".g3savcpx", ".g3savcpxdat", ".g3t"};
+    return eCApplication::GetInstance().GetEngineSetup().AlternativeBalancing ? alternative[file] : normal[file];
+}
 std::string campaign;                    // host: current campaign save name
 bool transferring = true;                // host: QA negative control `campaignoff`
 bool autoLoad = true;
@@ -224,7 +234,7 @@ bool CampaignComplete()
     uint64_t now[2] = {};
     for (int f = 0; f < 2; ++f) {
         WIN32_FILE_ATTRIBUTE_DATA info{};
-        if (GetFileAttributesExA((Folder() + campaign + Extensions[f]).c_str(), GetFileExInfoStandard, &info))
+        if (GetFileAttributesExA((Folder() + campaign + SaveExtension(f)).c_str(), GetFileExInfoStandard, &info))
             now[f] = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
     }
     if (name != campaign || now[0] != seen[0] || now[1] != seen[1]) {
@@ -234,7 +244,7 @@ bool CampaignComplete()
         return false;
     }
     if (!now[0] || !now[1]) {
-        Logf("persist: campaign %s is not complete on disk (%s); not sent yet", campaign.c_str(), now[0] ? Extensions[1] : Extensions[0]);
+        Logf("persist: campaign %s is not complete on disk (%s); not sent yet", campaign.c_str(), SaveExtension(now[0] ? 1 : 0));
         return false;
     }
     return GetTickCount() - since >= 1000;
@@ -246,7 +256,7 @@ bool SendCampaign(uint8_t to)
     if (!CampaignComplete()) return false;
     for (int f = 0; f < net::FileCount; ++f) {
         std::vector<uint8_t> data;
-        if (!ReadAll(Folder() + campaign + Extensions[f], data)) continue;
+        if (!ReadAll(Folder() + campaign + SaveExtension(f), data)) continue;
         sizes[f] = static_cast<uint32_t>(data.size());
         crcs[f] = Crc32(data.data(), data.size());
         for (size_t at = 0; at < data.size(); at += net::MaxChunk) {
@@ -386,7 +396,7 @@ void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t 
     }
     const std::string local = std::string("G3T_host_") + name;
     if (!size[0] || !size[1]) {  // a save without its world data must never be loaded (the game hangs)
-        Logf("persist: campaign %s arrived without %s; not loaded", name, size[0] ? Extensions[1] : Extensions[0]);
+        Logf("persist: campaign %s arrived without %s; not loaded", name, SaveExtension(size[0] ? 1 : 0));
         hud::Message(hud::Warning, i18n::Text(i18n::SaveDamaged));
         for (auto& v : incoming) v.clear();
         return;
@@ -403,7 +413,7 @@ void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t 
     for (int f = 0; f < net::FileCount; ++f) {
         if (!size[f]) continue;
         FILE* out = nullptr;
-        const std::string path = Folder() + local + Extensions[f];
+        const std::string path = Folder() + local + SaveExtension(f);
         if (fopen_s(&out, path.c_str(), "wb") || !out) { Logf("persist: could not write %s", path.c_str()); return; }
         fwrite(incoming[f].data(), 1, incoming[f].size(), out);
         fclose(out);
@@ -441,6 +451,11 @@ void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t 
 
 bool __stdcall SaveDetour(void* self, bCString const* name)
 {
+    if (!trade::ReadyForSave() || !deferredTradeRecords.empty()) {
+        Log("persist: save postponed until player exchanges settle");
+        hud::Message(hud::Warning, i18n::Text(i18n::TradeSettling));
+        return false;
+    }
     remote::DespawnAll("save");  // they come back with the next network update
     const bool ok = originalSave(self, name);
     ++saves;
@@ -679,6 +694,11 @@ void HostTick()
 
 bool __stdcall LoadDetour(void* self, bCString const* name)
 {
+    if (!trade::ReadyForSave() || !deferredTradeRecords.empty()) {
+        Log("persist: load refused while a player exchange is unsettled");
+        hud::Message(hud::Warning, i18n::Text(i18n::TradeSettling));
+        return false;
+    }
     ++loads;
     DropAutoload("a load began");  // before the game gets it: no order of the world before runs after this load (C 23.10.)
     pendingRecord.clear();  // a new load: the restore order of the one before is void (C 22.10.)
@@ -712,6 +732,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     Logf("persist: loading %s, %s (%u journal entries)", lastLoad.c_str(), found ? "sidecar read" : "no sidecar", entries);
     dialogaudio::OnWorldChange();  // nothing of the old world plays on into the load (B, with R6); idempotent
     containers::OnWorldChange();   // and no container state of it is compared with the reloaded containers (R5)
+    world::OnWorldDeactivate();    // retire registered prefetch cameras before the loader destroys their scene
     const unsigned framesBefore = loadFrames, ranBefore = loadFramesRan;
     ++nativeLoadDepth;
     const bool ok = originalLoad(self, name);
@@ -780,7 +801,26 @@ void StatusHints()
     static std::string shown;
     static std::wstring refusal;
     static uint32_t menuAt = 0, hintedAt = 0;
-    const bool joined = net::Joined();
+    static bool startupShown = false;
+    Config const& config = GetConfig();
+    const bool hintsOff = qa::Enabled() && !_stricmp(config.qaHostHint, "off");
+    const bool refusalOff = hintsOff || (qa::Enabled() && !_stricmp(config.qaHostHint, "norefusal"));
+    const uint32_t now = GetTickCount();
+    if (*net::StartupError()) {
+        if (hintsOff || now - menuAt < 1000) return;
+        menuAt = now;
+        wchar_t text[500], reason[256] = {};
+        MultiByteToWideChar(CP_UTF8, 0, net::StartupError(), -1, reason, 255);
+        _snwprintf_s(text, _TRUNCATE, i18n::Text(config.host ? i18n::SteamUnavailableHost : i18n::SteamUnavailableClient), reason);
+        if (!gCSession::GetInstance().IsGameRunning()) {
+            if (hud::MenuLine(text)) menuSet = true;
+        } else if (!startupShown) {
+            startupShown = true;
+            hud::Message(hud::Bad, text);
+        }
+        return;
+    }
+    const bool joined = !config.host && net::Joined();
     if (wasJoined && !joined) hud::Message(hud::Warning, i18n::Text(i18n::ConnectionLost));
     else if (!wasJoined && joined && everJoined) hud::Message(hud::Good, i18n::Text(i18n::Reconnected));
     everJoined = everJoined || joined;
@@ -801,39 +841,30 @@ void StatusHints()
         hud::Message(hud::Bad, text);
         refusal = text;
     }
-    const uint32_t now = GetTickCount();
     if (now - menuAt < 1000) return;  // the menu line is looked up by its position: once a second is enough
     menuAt = now;
     const bool running = gCSession::GetInstance().IsGameRunning();
     const uint32_t trying = net::ConnectingFor();
-    Config const& config = GetConfig();
-    const bool hintsOff = qa::Enabled() && !_stricmp(config.qaHostHint, "off");
-    const bool refusalOff = hintsOff || (qa::Enabled() && !_stricmp(config.qaHostHint, "norefusal"));
-    // transport = steam without Steam (not running, no steam_api.dll): said once in the game; the log has the details.
-    static bool steamToldOff = false;
-    if (config.steam && !steam::Ready() && *steam::Error() && running && !steamToldOff) {
-        steamToldOff = true;
-        wchar_t text[400], reason[200] = {};
-        MultiByteToWideChar(CP_UTF8, 0, steam::Error(), -1, reason, 199);
-        _snwprintf_s(text, _TRUNCATE, i18n::Text(config.host ? i18n::SteamUnavailableHost : i18n::SteamUnavailableClient), reason);
-        hud::Message(hud::Warning, text);
+    if (!running) {
+        if (!refusal.empty() && !refusalOff) {
+            if (hud::MenuLine(refusal.c_str())) menuSet = true;
+        } else if (!hintsOff) {
+            wchar_t text[700] = {};
+            lobby::Format(lobby::Snapshot(), text, 700);
+            if (hud::MenuLine(text)) menuSet = true;
+        } else if (menuSet && hud::MenuLine(nullptr)) {
+            menuSet = false;
+        }
     }
     if (!hintsOff && trying >= 15000 && refusal.empty()) {
-        wchar_t text[400], address[80] = {};
-        if (steam::Ready()) {  // over Steam there is no address to check: say whom it looks for or waits on
-            MultiByteToWideChar(CP_UTF8, 0, steam::HostName(), -1, address, 79);
-            if (*address) _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SteamConnecting), address, trying / 1000);
-            else _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SteamSearching), trying / 1000);
-        } else {
-            MultiByteToWideChar(CP_UTF8, 0, config.address, -1, address, 79);
-            _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::HostUnreachable), address, config.port, trying / 1000, config.port);
-        }
-        if (!unreachableHinted && steam::Ready())
+        wchar_t text[400], hostName[80] = {};
+        MultiByteToWideChar(CP_UTF8, 0, steam::HostName(), -1, hostName, 79);
+        if (*hostName) _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SteamConnecting), hostName, trying / 1000);
+        else _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SteamSearching), trying / 1000);
+        if (!unreachableHinted)
             Logf("net: no host over Steam for %u s (%s); still trying (said in the menu and the game)", trying / 1000,
                  *steam::HostName() ? steam::HostName() : "no friend hosting");
-        else if (!unreachableHinted) Logf("net: host %s:%u not reachable for %u s; still trying (said in the menu and the game)", config.address, config.port, trying / 1000);
         unreachableHinted = true;
-        if (!running && hud::MenuLine(text)) menuSet = true;
         if (running && (!hintedAt || now - hintedAt >= 30000)) {
             hintedAt = now ? now : 1;
             hud::Message(hud::Warning, text);
@@ -845,11 +876,6 @@ void StatusHints()
         Log("net: host reached after the not-reachable hint");
         if (running) hud::Message(hud::Good, i18n::Text(i18n::HostReached));
     }
-    if (!refusal.empty() && !running && !refusalOff) {
-        if (hud::MenuLine(refusal.c_str())) menuSet = true;
-    } else if (menuSet && !running && hud::MenuLine(nullptr)) {
-        menuSet = false;
-    }
 }
 
 // Client: the host saved the campaign; this player's own hero is kept for that save.
@@ -857,6 +883,12 @@ void OnCampaign(uint8_t kind, char const* name)
 {
     if (kind != 1 || !SafeName(name)) return;
     const std::string record = hero::RecordPath((std::string("G3T_host_") + name).c_str());
+    if (!trade::ReadyForSave()) {
+        if (std::find(deferredTradeRecords.begin(), deferredTradeRecords.end(), record) == deferredTradeRecords.end())
+            deferredTradeRecords.push_back(record);
+        Logf("persist: hero record for %s waits for the current player exchange", name);
+        return;
+    }
     const bool ok = hero::SaveRecord(record.c_str());
     recordsWritten += ok ? 1 : 0;
     Logf("persist: the host saved %s; own hero record %s", name, ok ? "written" : "NOT written");
@@ -901,6 +933,15 @@ void Tick()
     // Inside the game's load (one of its own frames): a hero may run already, but the load has not returned. Settling
     // here opened the gate and began the restore within it; an autoload here would start a load inside the load.
     if (earlyGate && nativeLoadDepth) return;
+    if (trade::ReadyForSave() && !deferredTradeRecords.empty()) {
+        for (auto const& record : deferredTradeRecords) {
+            const bool ok = hero::SaveRecord(record.c_str());
+            recordsWritten += ok ? 1 : 0;
+            Logf("persist: deferred exchange-settled hero record %s %s", record.c_str(), ok ? "written" : "NOT written");
+        }
+        deferredTradeRecords.clear();
+    }
+    StatusHints();
     gCSession& game = gCSession::GetInstance();
     if (game.GetHero() && game.IsGameRunning()) {
         if (!loading.empty()) {
@@ -927,7 +968,6 @@ void Tick()
         explore::NativeLoad(name.c_str(), &Log);
     }
     if (!net::IsHost()) {
-        StatusHints();
         if (!refusedRecord.empty()) WaitForRecord();
     }
     if (pendingRecord.empty()) return;

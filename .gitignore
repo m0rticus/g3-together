@@ -6,6 +6,8 @@ __pycache__/
 /g3together-logs-*.zip
 /.vs/
 /out/
+# Private workspace: SDK, game copies, receipts, run logs (see qa/workspace.py).
+/workspace/
 *.py[cod]
 # Personal play-session notes belong in the private workspace.
 /docs/SPIELABEND.md

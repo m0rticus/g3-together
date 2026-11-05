@@ -5,23 +5,18 @@
 # The INI gets language = auto: the mod's messages follow the game's text language, whichever language the setup spoke.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup.ps1 [-Language de|pl] [-GamePath <folder>] [-Role host|client]
-#              [-Name <name>] [-Transport udp|steam] [-Address <host address>] [-Port 34567] [-Yes]
-# Over Steam (transport = steam, 27.10.) the mod needs Valve's 32-bit steam_api.dll in <game>\G3Together: from the package's
+#              [-Yes]
+# Steam is required. The mod needs Valve's 32-bit steam_api.dll in <game>\G3Together: from the package's
 # G3Together folder if it has one, else downloaded from the Steamworks.NET release after asking, checked by its SHA-256.
 param(
     [ValidateSet('en', 'de', 'pl')][string]$Language = 'en',
     [string]$GamePath = '',
     [ValidateSet('', 'host', 'client')][string]$Role = '',
-    [string]$Name = '',
-    [ValidateSet('', 'udp', 'steam')][string]$Transport = '',
-    [string]$Address = '',
-    [int]$Port = 0,
     [switch]$Yes
 )
 $ErrorActionPreference = 'Stop'
 $package = Split-Path -Parent $PSScriptRoot
 $modDll = Join-Path $package 'scripts\Script_G3Together.dll'
-$defaultPort = 34567
 # Steamworks.NET Standalone 2025.164.1, Windows-x86/steam_api.dll: the copy coop-anything's playbook and Jericho Co-op tested.
 $steamZip = 'https://github.com/rlabrecque/Steamworks.NET/releases/download/2025.164.1/Steamworks.NET-Standalone_2025.164.1.zip'
 $steamDllHash = 'FDAFB7C65EC7D4182B42BF92CC8671C68E4DC547CC6E613899D2618A47EB65DA'
@@ -52,23 +47,16 @@ $texts = @{
         DllDone      = 'G3 Together copied to {0}.'
         DllBackup    = 'The previous version is kept in {0}.'
         AskRole      = 'Do you host the campaign (1) or join a host (2)?'
-        AskName      = 'Your player name (the others see it)'
-        AskAddress   = "The host's address (IP address, Hamachi/ZeroTier/Tailscale address or name)"
-        NeedAddress  = 'A joining player needs the host''s address.'
-        AskPort      = 'Port'
-        AskTransport = 'How do you connect? 1 = over Steam (Steam friends, no address, no port forwarding), 2 = by address (IP, Hamachi, ZeroTier, Tailscale)'
         SteamDllOk   = 'steam_api.dll for the Steam connection: in place ({0}).'
         SteamDllDone = 'steam_api.dll copied to {0}.'
         SteamDllAsk  = 'The Steam connection needs Valve''s steam_api.dll (32-bit, from the Steamworks.NET release 2025.164.1 on GitHub, checked by its SHA-256). Download it now?'
         SteamDllBad  = 'The downloaded steam_api.dll does not have the expected SHA-256; it is not used.'
         SteamDllFail = 'steam_api.dll could not be downloaded ({0}).'
-        SteamDllNone = 'Without steam_api.dll the mod connects by address.'
-        SteamHost    = 'Over Steam: your partner must be on your Steam friends list and have Steam running; their game finds yours by itself. Steam shows you both as playing "Spacewar".'
+        SteamDllNone = 'Steam is required. Setup cannot install the mod without the verified steam_api.dll.'
+        SteamHost    = 'Over Steam: both players must own Gothic 3 on Steam and be Steam friends. Steam must be running. Names come from Steam automatically; activity shows Gothic 3.'
         SteamClient  = 'Over Steam: the host must be on your Steam friends list and have Steam running; your game finds theirs by itself.'
         IniBackup    = 'Your previous g3together.ini is kept in {0}.'
         IniDone      = 'g3together.ini written: {0}'
-        HostTell     = 'Tell your partner one of these addresses of this PC (and the port {0}):'
-        HostFirewall = 'When Windows asks whether Gothic 3 may use the network, allow it (also for public networks if you use Hamachi).'
         DoneHost     = 'Done. Start Gothic 3 and begin a new game or load your co-op campaign; then your partner starts.'
         DoneClient   = 'Done. Start Gothic 3 once the host plays. If the host loaded a save, stay in the main menu: it is loaded for you.'
         Yes          = 'y'
@@ -99,23 +87,16 @@ $texts = @{
         DllDone      = 'G3 Together kopiert nach {0}.'
         DllBackup    = 'Die vorige Version liegt in {0}.'
         AskRole      = 'Bist du Host der Kampagne (1) oder trittst du einem Host bei (2)?'
-        AskName      = 'Dein Spielername (die anderen sehen ihn)'
-        AskAddress   = 'Adresse des Hosts (IP-Adresse, Hamachi-/ZeroTier-/Tailscale-Adresse oder Name)'
-        NeedAddress  = 'Wer beitritt, braucht die Adresse des Hosts.'
-        AskPort      = 'Port'
-        AskTransport = 'Wie verbindet ihr euch? 1 = über Steam (Steam-Freunde, keine Adresse, keine Portfreigabe), 2 = über eine Adresse (IP, Hamachi, ZeroTier, Tailscale)'
         SteamDllOk   = 'steam_api.dll für die Steam-Verbindung: vorhanden ({0}).'
         SteamDllDone = 'steam_api.dll kopiert nach {0}.'
         SteamDllAsk  = 'Die Steam-Verbindung braucht Valves steam_api.dll (32 Bit, aus dem Steamworks.NET-Release 2025.164.1 auf GitHub, geprüft per SHA-256). Jetzt herunterladen?'
         SteamDllBad  = 'Die heruntergeladene steam_api.dll hat nicht die erwartete SHA-256; sie wird nicht verwendet.'
         SteamDllFail = 'steam_api.dll konnte nicht heruntergeladen werden ({0}).'
-        SteamDllNone = 'Ohne steam_api.dll verbindet die Mod über die Adresse.'
-        SteamHost    = 'Über Steam: Dein Mitspieler muss in deiner Steam-Freundesliste sein und Steam laufen haben; sein Spiel findet deins von selbst. Steam zeigt euch beide als „Spacewar“ spielend.'
+        SteamDllNone = 'Steam ist erforderlich. Ohne die geprüfte steam_api.dll kann die Mod nicht installiert werden.'
+        SteamHost    = 'Beide müssen Gothic 3 auf Steam besitzen und Steam-Freunde sein. Steam muss laufen. Namen kommen automatisch von Steam; die Aktivität zeigt Gothic 3.'
         SteamClient  = 'Über Steam: Der Host muss in deiner Steam-Freundesliste sein und Steam laufen haben; dein Spiel findet seins von selbst.'
         IniBackup    = 'Deine vorige g3together.ini liegt in {0}.'
         IniDone      = 'g3together.ini geschrieben: {0}'
-        HostTell     = 'Sag deinem Mitspieler eine dieser Adressen dieses PCs (und den Port {0}):'
-        HostFirewall = 'Wenn Windows fragt, ob Gothic 3 das Netzwerk nutzen darf: erlauben (bei Hamachi auch für öffentliche Netzwerke).'
         DoneHost     = 'Fertig. Starte Gothic 3 und beginne ein neues Spiel oder lade deine Koop-Kampagne; danach startet dein Mitspieler.'
         DoneClient   = 'Fertig. Starte Gothic 3, sobald der Host spielt. Hat der Host einen Spielstand geladen, bleib im Hauptmenü: er wird für dich geladen.'
         Yes          = 'j'
@@ -146,23 +127,16 @@ $texts = @{
         DllDone      = 'Skopiowano G3 Together do {0}.'
         DllBackup    = 'Poprzednia wersja jest w {0}.'
         AskRole      = 'Prowadzisz kampanię jako host (1) czy dołączasz do hosta (2)?'
-        AskName      = 'Twoja nazwa gracza (widzą ją inni)'
-        AskAddress   = 'Adres hosta (adres IP, adres Hamachi/ZeroTier/Tailscale albo nazwa)'
-        NeedAddress  = 'Kto dołącza, potrzebuje adresu hosta.'
-        AskPort      = 'Port'
-        AskTransport = 'Jak się łączycie? 1 = przez Steam (znajomi na Steam, bez adresu i przekierowania portów), 2 = przez adres (IP, Hamachi, ZeroTier, Tailscale)'
         SteamDllOk   = 'steam_api.dll do połączenia przez Steam: jest ({0}).'
         SteamDllDone = 'Skopiowano steam_api.dll do {0}.'
         SteamDllAsk  = 'Połączenie przez Steam wymaga pliku steam_api.dll od Valve (32-bitowy, z wydania Steamworks.NET 2025.164.1 na GitHubie, sprawdzany sumą SHA-256). Pobrać go teraz?'
         SteamDllBad  = 'Pobrany steam_api.dll nie ma oczekiwanej sumy SHA-256; nie zostanie użyty.'
         SteamDllFail = 'Nie udało się pobrać steam_api.dll ({0}).'
-        SteamDllNone = 'Bez steam_api.dll mod łączy się przez adres.'
-        SteamHost    = 'Przez Steam: drugi gracz musi być na twojej liście znajomych na Steam i mieć uruchomiony Steam; jego gra sama znajdzie twoją. Steam pokaże was jako grających w „Spacewar”.'
+        SteamDllNone = 'Steam jest wymagany. Bez sprawdzonego steam_api.dll nie można zainstalować moda.'
+        SteamHost    = 'Obaj gracze muszą posiadać Gothic 3 na Steam i być znajomymi. Steam musi działać. Nazwy pochodzą automatycznie ze Steam; aktywność pokazuje Gothic 3.'
         SteamClient  = 'Przez Steam: host musi być na twojej liście znajomych na Steam i mieć uruchomiony Steam; twoja gra sama znajdzie jego grę.'
         IniBackup    = 'Twój poprzedni g3together.ini jest w {0}.'
         IniDone      = 'Zapisano g3together.ini: {0}'
-        HostTell     = 'Podaj drugiemu graczowi jeden z tych adresów tego komputera (i port {0}):'
-        HostFirewall = 'Gdy Windows zapyta, czy Gothic 3 może korzystać z sieci, zezwól (przy Hamachi także dla sieci publicznych).'
         DoneHost     = 'Gotowe. Uruchom Gothic 3 i rozpocznij nową grę albo wczytaj swoją kampanię kooperacji; potem startuje drugi gracz.'
         DoneClient   = 'Gotowe. Uruchom Gothic 3, gdy host już gra. Jeśli host wczytał zapis, zostań w menu głównym: zapis zostanie wczytany dla ciebie.'
         Yes          = 't'
@@ -242,7 +216,7 @@ function ReadIni([string]$path) {
     return $values
 }
 
-# <game>\G3Together\steam_api.dll for transport = steam: in place, from the package, or downloaded (asked) and checked.
+# Required <game>\G3Together\steam_api.dll: in place, from the package, or downloaded (asked) and checked.
 function InstallSteamDll([string]$game) {
     $folder = Join-Path $game 'G3Together'
     $target = Join-Path $folder 'steam_api.dll'
@@ -331,6 +305,7 @@ if (& $running) {
     if (-not $Yes) { Read-Host $t.Running | Out-Null }
     if (& $running) { Say $t.StillRunning 'Red'; exit 1 }
 }
+if (-not (InstallSteamDll $game)) { Say $t.SteamDllNone 'Red'; exit 1 }
 $target = Join-Path $game 'scripts\Script_G3Together.dll'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if ((Test-Path -LiteralPath $target) -and ((Get-FileHash -LiteralPath $target).Hash -eq (Get-FileHash -LiteralPath $modDll).Hash)) {
@@ -345,7 +320,7 @@ if ((Test-Path -LiteralPath $target) -and ((Get-FileHash -LiteralPath $target).H
     Say ($t.DllDone -f $target) 'Green'
 }
 
-# 4. g3together.ini: role, name, address, port and language; other settings of an earlier INI are kept.
+# 4. g3together.ini: Steam-only role, name and language; unrelated earlier settings are kept.
 $iniPath = Join-Path $game 'g3together.ini'
 $old = ReadIni $iniPath
 $oldRole = if ($old['role'] -eq 'client') { 'client' } elseif ($old['role']) { 'host' } else { '' }
@@ -353,50 +328,33 @@ if (-not $Role) {
     $answer = Ask $t.AskRole $(if ($oldRole -eq 'client') { '2' } else { '1' })
     $Role = if ($answer -eq '2' -or $answer -ieq 'client') { 'client' } else { 'host' }
 }
-if (-not $Name) { $Name = Ask $t.AskName $(if ($old['name']) { $old['name'] } elseif ($Role -eq 'host') { 'Host' } else { 'Player' }) }
-$Name = ($Name -replace '[#\r\n]', '').Trim()
-if ($Name.Length -gt 23) { $Name = $Name.Substring(0, 23) }
-if (-not $Transport) {
-    $answer = Ask $t.AskTransport $(if ($old['transport'] -eq 'steam') { '1' } else { '2' })
-    $Transport = if ($answer -eq '1' -or $answer -ieq 'steam') { 'steam' } else { 'udp' }
-}
-if ($Transport -eq 'steam' -and -not (InstallSteamDll $game)) { Say $t.SteamDllNone 'Yellow'; $Transport = 'udp' }
-# Over Steam a client needs no address; one from an earlier INI stays as the fallback for a PC without Steam.
-if ($Role -eq 'client' -and $Transport -eq 'udp' -and -not $Address) { $Address = Ask $t.AskAddress $(if ($old['address']) { $old['address'] } else { '' }) }
-if ($Role -eq 'client' -and $Transport -eq 'steam' -and -not $Address -and $old['address']) { $Address = $old['address'] }
-$Address = ($Address -replace '[#\s]', '')
-if ($Role -eq 'client' -and $Transport -eq 'udp' -and -not $Address) { Say $t.NeedAddress 'Red'; exit 1 }
-if ($Port -le 0) { $Port = [int](Ask $t.AskPort $(if ($old['port'] -match '^\d+$') { $old['port'] } else { "$defaultPort" })) }
 
 $lines = New-Object System.Collections.Generic.List[string]
 if ($Role -eq 'host') { $lines.Add('# G3 Together: this player hosts the campaign (written by the setup).') }
 else { $lines.Add('# G3 Together: this player joins the host (written by the setup).') }
 $lines.Add("role = $Role")
-$lines.Add("transport = $Transport")
-if ($Role -eq 'client' -and $Address) { $lines.Add("address = $Address") }
-$lines.Add("port = $Port")
-$lines.Add("name = $Name")
+$lines.Add('transport = steam')
+$lines.Add('# Player names are taken from Steam automatically.')
 $lines.Add('# Mod messages only: auto (the language of your Gothic 3 texts), en, de or pl. Each player can choose independently.')
 $lines.Add('language = auto')
-$known = @('role', 'transport', 'address', 'port', 'name', 'language')
+$known = @('role', 'transport', 'address', 'port', 'name', 'language', 'offer_accept_key', 'offer_decline_key', 'price_up_key', 'price_down_key', 'qa_keycheck')
 $kept = @($old.Keys | Where-Object { $known -notcontains $_ })
 if ($kept.Count -gt 0) {
     $lines.Add('# Kept from the previous g3together.ini:')
     foreach ($key in $kept) { $lines.Add("$key = $($old[$key])") }
 } else {
-    $lines.Add('# Keys: jump to the other player; accept / decline a trade offer (F1-F24, PAGEUP, HOME, END, INSERT, DELETE, NUMPLUS, NUMMINUS or a letter)')
+    $lines.Add('# Jump to the other player (F1-F24, PAGEUP, HOME, END, INSERT, DELETE or a letter)')
     $lines.Add('partner_key = PAGEDOWN')
-    $lines.Add('offer_accept_key = INSERT')
-    $lines.Add('offer_decline_key = DELETE')
-    $lines.Add('# Keys that raise / lower your own price in a trade window with the other player (Shift: 100 gold a press)')
-    $lines.Add('price_up_key = NUMPLUS')
-    $lines.Add('price_down_key = NUMMINUS')
     $lines.Add('# Your own look for the other players (a character template such as Diego)')
     $lines.Add('# look = Diego')
     if ($Role -eq 'host') {
         $lines.Add('# Town reputation: shared (one record per town for both; default), together (shared guilt), personal')
         $lines.Add('# reputation = shared')
     }
+}
+if (-not $old.Contains('friendly_fire')) {
+    $lines.Add('# Friendly fire is off, including allied hit reactions and harmful effects. Both players must match.')
+    $lines.Add('friendly_fire = 0')
 }
 if (Test-Path -LiteralPath $iniPath) {
     $saved = Join-Path (Backup $game) "g3together-$stamp.ini"
@@ -407,18 +365,8 @@ if (Test-Path -LiteralPath $iniPath) {
 [System.IO.File]::WriteAllText($iniPath, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding $false))
 Say ($t.IniDone -f $iniPath) 'Green'
 
-if ($Transport -eq 'steam') { Say $(if ($Role -eq 'host') { $t.SteamHost } else { $t.SteamClient }) 'Green' }
+Say $(if ($Role -eq 'host') { $t.SteamHost } else { $t.SteamClient }) 'Green'
 if ($Role -eq 'host') {
-    Say ($t.HostTell -f $Port)
-    $addresses = @()
-    try {
-        $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
-                       ForEach-Object { "  $($_.IPAddress)  ($($_.InterfaceAlias))" })
-    } catch {
-        $addresses = @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { "  $_" })
-    }
-    foreach ($a in $addresses) { Say $a }
-    Say $t.HostFirewall
     Say $t.DoneHost 'Cyan'
 } else {
     Say $t.DoneClient 'Cyan'

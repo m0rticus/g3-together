@@ -87,7 +87,8 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
 }
 
 // The death as a state, not as an event: the machine in whose region it happened already ran the game's death
-// script Kill there (quest OnNPCKilled, experience, plunder) and shared its results (story sync, containers).
+// script Kill there (quest OnNPCKilled, experience, plunder) and shared the story/death results.
+// Plunder is generated locally by containers.cpp, without rerunning the quest/XP bookkeeping.
 // Here the NPC only has to be dead: hit points 0 and AIMode 9 first, then ZS_Dead, which with AIMode already 9
 // only lays the body down (static analysis) and does not run Kill. With the kill cheat instead, Kill ran here
 // too: the client's quest manager completed the raid quest again and paid its reward (stage 3c regression).
@@ -179,6 +180,8 @@ void NewLife(eCEntity const* entity)
 
 void Tick()
 {
+    // Restore campaign deaths only on the authority. Clients get life/HP/poses from the NPC timeline.
+    if (!net::IsHost()) return;
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* hero = session.GetHero();
     if (!hero || !session.IsGameRunning()) return;

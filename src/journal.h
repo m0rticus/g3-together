@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// World journal for deaths: each machine reports the deaths of NPCs it simulates itself (not mirrored from the
-// host: its own surroundings, far from the host); the host records them and passes them on. A death is applied
-// on a machine only once that machine processes the NPC, because a kill written into an unprocessed NPC does
-// not hold (exploration 5: it was alive at full health again when processed).
+// Host campaign death journal. Only the host restores recorded deaths after processing-range entry;
+// clients replay the host's NPC life/HP/animation state without running death tasks.
 #pragma once
 
 class eCEntity;

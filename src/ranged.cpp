@@ -161,6 +161,14 @@ void Target(char const* guid, LogFn log)
     self.MoveTo(body::Pose(*body, position, rotation));
     self.SetAlignmentTarget(target);
     self.Focus.SetFocusEntity(target);
+    if (body->GetPropertySet(eEPropertySetType_NPC)) self.NPC.SetCurrentTarget(target);
+    if (auto* camera = gCSession::GetInstance().GetCamera_PS()) {
+        if (auto* entity = camera->GetEntity()) {
+            const auto& at = entity->GetWorldPosition();
+            const float cameraPosition[3] = {at.GetX(), at.GetY(), at.GetZ()};
+            entity->SetToWorldMatrix(body::Pose(*entity, cameraPosition, rotation));
+        }
+    }
     const float dx = to.GetX() - from.GetX(), dz = to.GetZ() - from.GetZ();
     Format(line, "TARGET name=%s distance_cm=%.0f focus=%s", target.GetName().GetText(), std::sqrt(dx * dx + dz * dz),
               self.Focus.GetFocusEntity().GetInstance() ? self.Focus.GetFocusEntity().GetName().GetText() : "-");

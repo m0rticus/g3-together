@@ -47,8 +47,8 @@ class Bot:
             time.sleep(0.5)
         raise RuntimeError('Timed out waiting for '+what)
 
-    def send(self, action, seconds=10):
-        """Queue one command and wait for its acknowledgement; return the log offset before it."""
+    def queue(self, action):
+        """Queue a command without waiting, for coordinated shutdown of both renderers."""
         self.sequence += 1
         start = len(self.log())
         # The mod reads this file every frame; a write can collide with that read (sharing violation).
@@ -60,6 +60,11 @@ class Bot:
                 if attempt == 19:
                     raise
                 time.sleep(0.05)
+        return start
+
+    def send(self, action, seconds=10):
+        """Queue one command and wait for its acknowledgement; return the log offset before it."""
+        start = self.queue(action)
         tag = f'COMMAND sequence={self.sequence} action={action} '
         self.wait(lambda text: tag in text, seconds, 'acknowledgement of '+action, start)
         return start

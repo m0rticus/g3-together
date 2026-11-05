@@ -11,6 +11,7 @@
 namespace g3t {
 namespace {
 char path[MAX_PATH] = {};
+bool reportedFileError = false;
 }
 
 void OpenLog(const char* name)
@@ -29,19 +30,29 @@ void OpenLog(const char* name)
         *separator = '\0';
     }
     if (strcat_s(path, "\\") || strcat_s(path, name)) *path = '\0';
+    if (*path) Logf("SESSION START pid=%lu build=%s %s", GetCurrentProcessId(), __DATE__, __TIME__);
 }
 
 void Log(const char* text)
 {
     if (!*path) return;
     HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
+    if (file == INVALID_HANDLE_VALUE) {
+        if (!reportedFileError) {
+            reportedFileError = true;
+            char warning[512];
+            Format(warning, "G3 Together: cannot append log %s (Windows error %lu)\n", path, GetLastError());
+            OutputDebugStringA(warning);
+        }
+        return;
+    }
     SYSTEMTIME now;
     GetLocalTime(&now);
     // A long text is cut off: sprintf_s and vsprintf_s end the game when the buffer is too small (stage E2 22.10.: a
     // trader's contents in one container line closed the client with 0xC0000409, no line written).
     char line[1024];
-    int length = Format(line, "%02u:%02u:%02u.%03u ", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    int length = Format(line, "%04u-%02u-%02u %02u:%02u:%02u.%03u ", now.wYear, now.wMonth, now.wDay,
+                        now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
     if (length > 0) {
         _snprintf_s(line + length, sizeof(line) - length - 2, _TRUNCATE, "%s", text);
         length = static_cast<int>(std::strlen(line));

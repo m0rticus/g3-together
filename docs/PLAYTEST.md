@@ -18,8 +18,8 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   build and protocol version. Compatibility without PUP has not been established. Remove other co-op mods
   from `scripts`; preferably use a separate installation copy for co-op. See [installation instructions](PLAYING.md).
 - [ ] Back up both players' Gothic 3 save folders. Use a clearly named test save during the session.
-- [ ] Choose a LAN or private VPN connection. Share the host's address and firewall details privately with the other
-  player. The host needs incoming UDP on port 34567. Human play over the real internet remains unverified.
+- [ ] Steam must run and be logged in on both PCs; both players must be Steam friends.
+  This fork has no direct-IP/VPN connection or fallback. Human Steam play over the real internet remains unverified.
 - [ ] Both players record their role and local time zone for later bug reports.
 - [ ] Optional: set up with `Setup.cmd` (German: `Einrichten.cmd`, Polish: `Instalacja.cmd`) from the package instead of copying by hand, and note
   anything it got wrong. It has only been tried on test folders.
@@ -32,8 +32,7 @@ Host:
 
 ```ini
 role = host
-port = 34567
-name = Host
+transport = steam
 language = en
 ```
 
@@ -41,15 +40,13 @@ Joining player:
 
 ```ini
 role = client
-address = <host LAN or VPN address>
-port = 34567
-name = Player2
+transport = steam
 language = en
 ```
 
 `puppet_template` is optional and defaults to `PC_Hero`. `look = <character template>` (for example
-`look = Diego`) is optional too: it is how you appear to the other player. `offer_accept_key` and
-`offer_decline_key` (default Insert and Delete) answer a trade offer. A missing INI starts the mod in host mode,
+`look = Diego`) is optional too: it is how you appear to the other player. Player exchanges use the native
+trade button and no approval keys. A missing INI starts the mod in host mode,
 so check that the joining PC has `role = client` before starting.
 
 The example INIs use `language = en`, matching the messages quoted below. `language = de` and `language = pl` give
@@ -61,6 +58,9 @@ choose independently; the setting changes only mod messages.
   section of `Ini\ge3.ini`. Loose files in Data subfolders and custom difficulty sliders are not covered.
 - [ ] Compare difficulty, alternative balancing, alternative AI, minimum hit duration, XP factor and Quick Loot.
   If joining is refused, read the reason in `g3together.log`.
+- [ ] With matching `friendly_fire = 0` (the default), allied melee, projectiles and harmful spells must not cost victim
+  HP or blocking stamina, stagger, knock down or apply statuses. Include followers and both attack directions.
+  Healing and enemy hits must still work. Knock-out/revive checks below require an enemy, not your partner.
 - [ ] If the host begins a new game, the other player does too. If the host has loaded or saved, the other player
   joins from the main menu and waits for the campaign transfer.
 
@@ -72,7 +72,7 @@ choose independently; the setting changes only mod messages.
 | 8–18 min | Shared combat | Fight a small encounter near the host. Both attack the same NPC. Check that hits and deaths appear on both PCs and the actual killer earns the experience. Record quest state and counters; one success does not verify every kill-quest case. |
 | 18–28 min | Recruit and dismiss a companion | The joining player recruits a suitable NPC. Check that it follows that player, appears on both PCs and is not simulated twice. The same player then dismisses it; both check that it no longer acts as their companion. |
 | 28–38 min | Knock-out and help | In a safe setting, let one player be knocked down in a controlled way. Their partner first stands next to them for a few seconds: nothing should happen. Then the partner talks to them and chooses "I will help you.". Check the recovery, notice and consumption of one healing potion. Without a potion, both should receive a notice and the player should remain down. Optionally at the end, before reloading: with both players down, both die and reach game over. |
-| 38–50 min | Dialog, quest, trade and loot | Speak to an NPC, trigger a known quest step, perform a clearly identifiable trade and take an item from a chest or corpse. Compare quest and dialog state, gold and item counts. Then trade with each other using the mouse: one player talks to the other's character and chooses "Show me your wares!" (on the very first trade, click Ok on the tip), takes one item, gives one and closes the window; the other accepts with Insert. Compare items and gold on both PCs. Trade once more and decline with Delete: nothing should change hands. Then set your own price: in the open window press Num+ a few times (Shift+Num+ for 100), the price shows on the screen; the other player sees it in the offer and accepts; compare the gold on both PCs. Bots could not test the trade window's mouse controls or the price keys. |
+| 38–50 min | Dialog, quest, trade and loot | Speak to an NPC, trigger a known quest step, trade and loot. Then open "Show me your wares!" on the partner; dismiss the first tutorial with Ok. Using the mouse and native Trade/Swap button, take an item for free, then give one back without closing. The other player takes no action. Check both inventories immediately after synchronization, unchanged gold and preserved quality. Select gold explicitly and give it in each direction without items; check exact balance changes. Repeat with zero gold, close just after a swap, reopen, and check protected gear/quest items. Verify an NPC still charges its normal prices. These native controls require manual verification; the agent has not launched the games. |
 | 50–70 min | Distance, separate regions and regrouping | Move apart. Beyond about 35 m, check that no distance message appears on either PC (no "Far from host", no "is far away"). While separated, each player fights a different NPC in their region; record whether results agree and whether anything appears to be simulated twice. Regroup and check that no message appears ("Back near the host." is gone) and that the world state matches. Accept a kill quest and kill a target in the joining player's region: the counter in the host's quest log should increase. |
 | 70–82 min | Save and load | The host saves with a distinct name. Check that the other player keeps their hero for this save. Use a separate test save or backup for loading. Let the world and players settle, then compare their state. If the joining player had a companion, it should follow them again after loading and rejoining. |
 | 82–90 min | Rejoin and bug report | If time remains, test a clean disconnect and rejoin, in the same process or after restarting. Record campaign, hero record, NPC ownership and companion state. If something failed, collect both players' logs as described below and give them privately to the host. |
@@ -84,7 +84,7 @@ and saving on the host. Test separate regions and rejoining in a follow-up sessi
 
 | Stage | Steps and observations |
 |---|---|
-| Host not reachable | Before the session, the joining player starts once with a wrong address in the INI: after about 15 seconds the top line of the main menu says the host is not reachable, with that address and port. |
+| Host not reachable | Before the session, start the joining player while the host is offline: the top menu line reports that it is searching Steam friends. No address or port is requested. |
 | Overheard dialog | One player talks to an NPC, the other stands within 20 m with the game's subtitles on: they hear the lines and read them at the top of the screen, in their own game language. |
 | Theft in front of a witness | The joining player takes an item that belongs to a town while a guard or citizen of the host's region watches: that NPC goes after the joining player, as it would after the host. |
 | Robbed when knocked out | Let a guard knock the joining player out (not kill): they stand up by themselves after a while, the guard takes half their gold, and they see "<Name> robbed you of N gold.". The host cannot loot them meanwhile. |
@@ -137,17 +137,17 @@ and saving on the host. Test separate regions and rejoining in a follow-up sessi
 | Freed town | The joining player frees a town with shared reputation: the rebels speak to the host about it as to the joining player. |
 | Sleeping animal | The joining player walks up to a sleeping animal: it wakes up as it would for the host. |
 
-### Optional: over Steam (experimental)
+### Required connection checks: over Steam (experimental)
 
-Both set `transport = steam` (or choose Steam in the setup) and are Steam friends; see [PLAYING.md](PLAYING.md#over-steam-experimental).
+Both use Steam and are Steam friends; see [PLAYING.md](PLAYING.md#over-steam-experimental).
 
 | Stage | Steps and observations |
 |---|---|
-| Finding the host | The host starts first, then the joining player without an address: within a few seconds it joins (note how long). Steam shows both as playing Spacewar. |
-| Different networks | Play from two different homes (no LAN, no VPN): joining, the save transfer and an hour of play work. Note stutters compared with Hamachi. |
+| Finding the host | The host starts first, then the joining player without an address: within a few seconds it joins (note how long). Steam shows Gothic 3 and player names match their Steam names. The menu shows lobby status and ping. |
+| Different networks | Play from two different homes without a VPN or port forwarding: check joining, save transfer and an hour of play. Record latency and stutters. |
 | Join game | The joining player's game runs first; then "Join game" on the host in the Steam friends list: it joins. |
 | Leaving | The joining player quits: the host sees it gone at once. It starts again and rejoins. |
-| Without Steam | The joining player closes Steam and starts the game: a message says Steam cannot be used, and with an address in the INI it connects by address. |
+| Without Steam | Close Steam and start the game: co-op startup must fail with a clear message and no alternative connection. Repeat on the host. |
 
 ## Recording a bug
 

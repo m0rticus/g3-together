@@ -7,6 +7,7 @@
 #pragma once
 
 namespace g3t::summon {
+void OnWorldChange();
 void Start();
 void Tick();  // once per frame: installs the wrappers, announces new summons, binds copies, notices summons ending
 using LogFn = void (*)(char const*);
@@ -15,7 +16,8 @@ void CopyHeroOff(LogFn log);  // QA negative control: copies belong to our own h
 void MirrorOff(LogFn log);    // QA negative control: summons are not announced
 void LateCopyCommand(char const* argument, LogFn log);  // QA (stage W8): "<ms>": copies of others' creatures come that late, no Rebind
 void AreaTickOn(LogFn log);
-void Creatures(LogFn log);    // QA: CREATURE lines, the local hero's summoned creatures   // QA negative control: copies of area spells pick targets and judge hits again
+void Creatures(LogFn log);    // QA: CREATURE lines, the local hero's summoned creatures
+void SpawnShared(char const* argument, LogFn log);  // QA: "<template> <GUID>" the same creature on both machines, hostable by the host
 void WatchHits();
 void WeatherFollowOff(LogFn log);  // QA negative control (P6): a copy's weather (hailstorm) stays at this PC's own hero
 void WeatherReport(LogFn log);     // QA: WEATHER line             // QA: log the hits of the next 4 s as SMNHIT lines too (after a shot)

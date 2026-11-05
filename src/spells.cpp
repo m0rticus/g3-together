@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "spells.h"
 
+#include "ai.h"
+#include "combat.h"
 #include "infocmd.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "guards.h"
 #include "remote.h"
+#include "shot.h"
 #include "world.h"
+#include "xpshare.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -60,6 +65,31 @@ constexpr uintptr_t GiveXpRva = 0x4e160;
 gFScript originalGiveXp = nullptr;
 bool tickTried = false, tickGuard = true;
 unsigned ticksRun = 0, ticksSkipped = 0, poisonedSkipped = 0;
+unsigned nativeCastsHooked = 0;
+using GetNpcsFn = bTObjArray<Entity>(GE_STDCALL*)();
+GetNpcsFn originalGetNpcs = nullptr;
+thread_local eCEntity* areaCaster = nullptr;
+
+struct AreaScope {
+    eCEntity* before;
+    explicit AreaScope(eCEntity* caster) : before(areaCaster) { areaCaster = caster; }
+    ~AreaScope() { areaCaster = before; }
+};
+
+bTObjArray<Entity> GE_STDCALL AreaTargets()
+{
+    bTObjArray<Entity> targets = originalGetNpcs();
+    if (areaCaster)
+        for (int i = targets.GetCount() - 1; i >= 0; --i)
+            if (combat::IgnoreFriendlyHit(targets.GetAt(i).GetInstance(), areaCaster)) targets.RemoveAt(i);
+    return targets;
+}
+
+bool HarmfulTarget(int index)
+{
+    return (Specs[index].kind == OnNpc && std::strcmp(Specs[index].name, "MagicCharm")) ||
+           Specs[index].kind == TakeOver || Specs[index].kind == AroundCasterAt;
+}
 
 template <typename T>
 T* Find(bTValMap<bCString, T*>& map, char const* name)
@@ -108,8 +138,11 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
 {
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (shot::InNpcReplicaContact() && target != remote::ControlledBody()) return 0;
+    if (HarmfulTarget(I) && combat::IgnoreFriendlyHit(target, caster)) return 0;
     const bool own = mirror && caster && caster == remote::ControlledBody();
-    if (own && Specs[I].kind == OnNpc && target && npcs::IsMirrored(target) && npcs::OwnerOf(target)) {
+    if (own && (Specs[I].kind == OnNpc || Specs[I].kind == OnPlayer) &&
+        target && npcs::IsMirrored(target) && npcs::OwnerOf(target)) {
         uint8_t guid[16];
         Guid(target, guid);
         net::SendNpcSpell(npcs::OwnerOf(target), Specs[I].name, guid, args);
@@ -117,19 +150,11 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
         Logf("spells: %s on %s, simulated by player %u: sent", Specs[I].name, Entity(target).GetName().GetText(), npcs::OwnerOf(target));
         return 1;
     }
-    if (own && Specs[I].kind == TakeOver && target && npcs::IsMirrored(target) && infocmd::TakeOver(target, true)) {
-        const GEInt result = originals[I](spu, self, other, args);
-        Entity npc(target);
-        const bool joined = npc.GetInstance()->GetPropertySet(eEPropertySetType_Party) && npc.Party.GetPartyLeader().GetInstance() == caster;
-        if (joined) {
-            ++takenOver;
-            Logf("spells: %s took %s over (now ours, in our party)", Specs[I].name, npc.GetName().GetText());
-        } else {
-            infocmd::TakeOver(target, false);
-            ++givenBack;
-            Logf("spells: %s did not take %s, given back", Specs[I].name, npc.GetName().GetText());
-        }
-        return result;
+    if (own && Specs[I].kind == TakeOver && target && npcs::IsMirrored(target)) {
+        uint8_t guid[16]; Guid(target, guid);
+        net::SendNpcSpell(1, Specs[I].name, guid, args);
+        ++npcSent;
+        return GETrue;
     }
     if (own && (Specs[I].kind == AroundCaster || Specs[I].kind == AroundCasterAt) && !net::IsHost()) {
         uint8_t guid[16] = {};
@@ -139,6 +164,7 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
         Logf("spells: %s around us: sent to the host", Specs[I].name);
         return 1;
     }
+    AreaScope area(Specs[I].kind == AroundCaster ? caster : nullptr);
     const GEInt result = originals[I](spu, self, other, args);
     const int player = target ? remote::PuppetOwner(target) : 0;
     if (own && Specs[I].kind == OnPlayer && player) {
@@ -172,6 +198,27 @@ void* JumpTo(unsigned char* target, void* detour)
     VirtualProtect(target, Stolen, old, &old);
     FlushInstructionCache(GetCurrentProcess(), target, Stolen);
     return trampoline;
+}
+
+gFScript HookCast(gSScript& script, gFScript wrapper, char const* name)
+{
+    gFScript original = script.m_funcScript;
+    HMODULE module = nullptr;
+    auto* code = reinterpret_cast<unsigned char*>(original);
+    static const unsigned char expected[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
+    if (original &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(original), &module) &&
+        module == GetModuleHandleA("Script_Game.dll") && !std::memcmp(code, expected, sizeof(expected))) {
+        if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(wrapper))) {
+            script.m_funcScript = wrapper;
+            ++nativeCastsHooked;
+            return reinterpret_cast<gFScript>(trampoline);
+        }
+    }
+    script.m_funcScript = wrapper;
+    Logf("spells: %s wrapped in script table only; native friendly-fire protection is incomplete", name);
+    return original;
 }
 
 GEInt GE_STDCALL HookTick(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -213,8 +260,11 @@ GEInt GE_STDCALL HookGiveXp(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
         Logf("xp: GiveXP self=%s other=- value=%d refused: not simulated here, the host pays its own hero", victimName, args);
         return 0;
     }
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    const int heroBefore = hero ? static_cast<int>(Entity(hero).PlayerMemory.XP) : 0;
     const GEInt result = originalGiveXp(spu, self, other, args);
     Logf("xp: GiveXP self=%s other=%s value=%d result=%d caller=SG+0x%x", victimName, earnerName, args, result, static_cast<unsigned>(caller));
+    if (hero) xpshare::NoteGiveXp(static_cast<int>(Entity(hero).PlayerMemory.XP) - heroBefore);
     return result;
 }
 
@@ -257,16 +307,17 @@ void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_
     const int index = IndexOf(script);
     eCEntity* puppet = remote::PuppetOf(from);
     Entity target = ByGuid(guid);
-    const bool known = index >= 0 && Specs[index].kind != OnPlayer && Specs[index].kind != TakeOver && originals[index];
-    const bool onNpc = known && Specs[index].kind == OnNpc;
+    const bool known = net::IsHost() && index >= 0 && originals[index];
+    const bool onNpc = known && (Specs[index].kind == OnNpc || Specs[index].kind == TakeOver || Specs[index].kind == OnPlayer);
     const bool at = known && Specs[index].kind == AroundCasterAt;
-    if (!known || !puppet || (onNpc && (!target.GetInstance() || npcs::IsMirrored(target.GetInstance()))) || (at && !target.GetInstance())) {
+    if (!known || !puppet || (onNpc && (!npcs::NpcByGuid(guid) || npcs::IsMirrored(target.GetInstance()))) || (at && !target.GetInstance())) {
         ++npcRefused;
         Logf("spells: %s from player %u refused (unknown, no puppet, or the NPC is not simulated here)", script, from);
         return;
     }
     Entity self(puppet);
     Entity other = onNpc || at ? target : Entity(puppet);
+    if (HarmfulTarget(index) && combat::IgnoreFriendlyHit(target.GetInstance(), puppet, from)) return;
     // Poison and disease judge the target by the caster's spell (re/findings/poison-plan-c.md): the puppet holds none, so
     // it gets the spell's item and that spell for the replay, as copies of spell projectiles do (shot.cpp).
     Entity held;
@@ -282,8 +333,13 @@ void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_
             lent = true;
         }
     }
+    AreaScope area(Specs[index].kind == AroundCaster ? puppet : nullptr);
+    guards::Acting context(puppet);
     originals[index](nullptr, &self, &other, args);
     if (lent) self.Interaction.SetSpell(held);
+    if (Specs[index].kind == TakeOver && target.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
+        target.Party.GetPartyLeader().GetInstance() == puppet)
+        npcs::OnClaim(guid, from, true);
     ++npcApplied;
     Logf("spells: %s from player %u applied%s%s", script, from, onNpc || at ? " on " : "", onNpc || at ? target.GetName().GetText() : "");
 }
@@ -301,12 +357,17 @@ void Tick()
     if (installed || !gCSession::GetInstance().IsGameRunning() || now - lastTry < 1000) return;
     lastTry = now;
     auto& scripts = GetScriptAdminExt().GetScripts();
+    if (!originalGetNpcs) {
+        originalGetNpcs = reinterpret_cast<GetNpcsFn>(ai::PatchImport(GetModuleHandleA("Script_Game.dll"), "Script.dll",
+            "?GetNPCs@Entity@@SG?AV?$bTObjArray@VEntity@@@@XZ", reinterpret_cast<void*>(&AreaTargets)));
+        Log(originalGetNpcs ? "spells: scoped area target filter installed"
+                            : "spells: area target filter NOT installed; friendly area crowd control is not protected");
+    }
     for (int i = 0; i < Count; ++i) {
         gSScript* script = Find(scripts, Specs[i].name);
-        if (!script) return;  // tried again later
+        if (!script || !script->m_funcScript) return;  // tried again later
         if (!originals[i]) {
-            originals[i] = script->m_funcScript;
-            script->m_funcScript = wrappers[i];
+            originals[i] = HookCast(*script, wrappers[i], Specs[i].name);
         }
     }
     installed = true;
@@ -320,9 +381,9 @@ void Report(LogFn log)
     char line[520];
     Format(line, "SPELLSTATE installed=%d mirror=%d sent=%u received=%u replayed=%u refused=%u no_hero=%u npc_sent=%u npc_received=%u "
                     "npc_applied=%u npc_refused=%u taken_over=%u given_back=%u tick_hooked=%d tick_guard=%d ticks_run=%u ticks_skipped=%u "
-                    "poisoned_skipped=%u",
+                    "poisoned_skipped=%u native_casts=%u area_targets=%d",
               installed, mirror, sent, received, replayed, refused, noHero, npcSent, npcReceived, npcApplied, npcRefused, takenOver, givenBack,
-              originalTick != nullptr, tickGuard, ticksRun, ticksSkipped, poisonedSkipped);
+              originalTick != nullptr, tickGuard, ticksRun, ticksSkipped, poisonedSkipped, nativeCastsHooked, originalGetNpcs != nullptr);
     log(line);
 }
 

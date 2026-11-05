@@ -18,7 +18,7 @@ void Changed(eCEntity* entity);  // QA: as if a dialog command had changed this 
 using LogFn = void (*)(char const*);
 void Report(LogFn log);   // QA: INFOCMD line
 void Off(LogFn log);      // QA negative control: pass nothing on
-void DialogXpOff(LogFn log);  // QA negative control: experience from dialogs stays with the speaker
+void DialogXpOff(LogFn log);  // QA negative control: experience is no longer shared (xpshare.cpp)
 void StoryMoveOff(LogFn log);  // QA negative control: the host does not pass on OnEnclaveSectorRefresh's moves
 void StoryMoves(LogFn log);    // QA: STORYMOVES line (hooked, calls, sent)
 void StoryCompanionOff(LogFn log);  // QA negative control: a story move takes this machine's own companion too (before 26.10.)

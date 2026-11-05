@@ -37,6 +37,7 @@
 #include "enclaves.h"
 #include "log.h"
 #include "npcs.h"
+#include "npcplayback.h"
 #include "offer.h"
 #include "qa.h"
 #include "remote.h"
@@ -45,6 +46,9 @@
 #include "spells.h"
 #include "summon.h"
 #include "world.h"
+#include "hud.h"
+#include "i18n.h"
+#include "xpshare.h"
 
 #include <Game.h>
 #include <Windows.h>
@@ -55,6 +59,7 @@ namespace {
 unsigned long long frames = 0;
 DWORD lastReport = 0;
 bool faulted = false;
+bool playbackErrorShown = false;
 
 // Yaw in degrees around the up axis (Y in Gothic 3).
 float Yaw(bCQuaternion const& q)
@@ -126,10 +131,15 @@ class Module : public eCEngineComponentBase
     // were deleted and the next frame crashed on them. So forget on both.
     static void ForgetWorld()
     {
+        g3t::npcplayback::OnWorldDeactivate();
+        g3t::world::OnWorldDeactivate();
         g3t::remote::OnWorldDeactivate();
         g3t::npcs::OnWorldDeactivate();
         g3t::combat::OnWorldChange();
+        g3t::shot::OnWorldChange();
+        g3t::summon::OnWorldChange();
         g3t::fightmem::OnWorldChange();
+        g3t::xpshare::OnWorldChange();
         g3t::talk::OnWorldChange();
         g3t::journal::OnWorldChange();
         g3t::story::OnWorldChange();
@@ -144,11 +154,12 @@ class Module : public eCEngineComponentBase
         g3t::dialogaudio::OnWorldChange();
         g3t::containers::OnWorldChange();
         g3t::ransack::OnWorldChange();
-        g3t::trade::OnWorldChange();  // before offer: its declines must not undo anything on the hero of the new world
+        g3t::trade::OnWorldChange();  // forget the old hero before retiring its automatic transactions
         g3t::offer::OnWorldChange();
     }
     bEResult WorldActivate() override
     {
+        playbackErrorShown = false;
         g3t::Log("world activated");
         ForgetWorld();
         g3t::persist::OnWorldActivate();
@@ -163,6 +174,8 @@ class Module : public eCEngineComponentBase
     }
     bEResult PreShutdown() override
     {
+        g3t::npcplayback::OnWorldDeactivate();
+        g3t::world::OnWorldDeactivate();
         g3t::dialogaudio::OnWorldChange();  // no channel of ours outlives the audio system, whichever way the game ends
         g3t::net::Stop();
         const GEBool removed = eCModuleAdmin::GetInstance().UnregisterModule(*this);
@@ -179,8 +192,17 @@ class Module : public eCEngineComponentBase
         FrameScope frame;
         if (!frame.run) return;
         Frame();
+        if (!g3t::npcplayback::Available()) {
+            g3t::hud::MenuLine(g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
+            if (!playbackErrorShown && gCSession::GetInstance().IsGameRunning()) {
+                g3t::hud::Message(g3t::hud::Bad, g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
+                playbackErrorShown = true;
+            }
+            return;
+        }
         g3t::crashlog::Tick();
         g3t::world::Tick();
+        g3t::npcplayback::Tick();
         g3t::remote::Tick();
         g3t::npcs::Tick();
         g3t::ai::Tick();
@@ -212,6 +234,7 @@ class Module : public eCEngineComponentBase
         g3t::occupancy::Tick();
         g3t::address::Tick();
         g3t::fightmem::Tick();
+        g3t::xpshare::Tick();
         g3t::dialogaudio::Tick();
         g3t::offer::Tick();
         g3t::qa::Tick();
@@ -237,8 +260,13 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
     g3t::OpenLog("g3together.log");
     g3t::qa::Init();
     g3t::LoadConfig();
+    const bool playbackReady = g3t::npcplayback::Start(!g3t::GetConfig().host);
     g3t::trace::Configure(g3t::GetConfig().trace);
     g3t::remote::Start();
+    if (!playbackReady) {
+        g3t::net::Stop();
+        g3t::Log("FAIL co-op disabled: this game build does not support authoritative NPC playback");
+    }
     g3t::npcs::Start();
     g3t::combat::Start();
     g3t::summon::Start();

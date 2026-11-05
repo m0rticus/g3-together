@@ -38,6 +38,12 @@ void Report(LogFn log)
     log(line);
 }
 
+bool InventoryOpen()
+{
+    gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
+    return manager && manager->IsAnyPageOpen() && manager->GetActivePage() == gEGamePage_Inventory;
+}
+
 namespace {
 // A main menu element by its id (QA's menu scan: the Community Patch's version line is 20812, top centre).
 CFFGFCWnd* MenuElement(GEU32 id)
@@ -78,7 +84,12 @@ bool MenuLine(wchar_t const* text)
         return true;
     }
     const std::wstring shown = lineText + L"\n" + text;
-    if (line->GetWindowTextA().GetText() != shown) line->SetWindowTextA(bCUnicodeString(shown.c_str()));
+    if (line->GetWindowTextA().GetText() != shown) {
+        line->SetWindowTextA(bCUnicodeString(shown.c_str()));
+        char utf8[900] = {};
+        WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+        Logf("menu: %s", utf8);
+    }
     // Room for the version and two lines of text: a refusal that lists differing files, or German, runs longer.
     if (!lineChanged) line->MoveWindow(bCRect(0, lineRect.GetTop(), 1024, lineRect.GetTop() + 3 * lineRect.GetHeight() + 4));
     lineChanged = true;

@@ -45,7 +45,7 @@ class Fresh(Exception):
 
 
 def shareable(name):
-    if name in ALONE:
+    if name in ALONE or name in T.SANDBOX_STAGES:
         return False
     source = inspect.getsource(T.SUITES[name])
     if 'join_both(' not in source or 'clear_raid(' not in source:
@@ -115,17 +115,16 @@ class Session:
     def close(self):
         """End both games; True if both shut down cleanly (the engine's own line, no exception)."""
         clean = True
+        closed = T.close_all(self.copies)
         for tag, copy in self.copies.items():
             if copy.process is None:
                 continue
-            closed = T.close(copy)
             if copy.process.poll() is None:
                 T.hang_stacks(copy, self.report)
                 copy.process.kill()
                 copy.process.wait(timeout=10)
             copy.collect()
-            engine = (copy.root/'isolated-profile/Documents/gothic3/paru/g3debug.log').read_text(errors='replace')
-            ok = closed and 'DestroyEngine - all engine modules destroyed' in engine and 'EXCEPTION_' not in engine
+            ok = T.clean_shutdown(copy, closed[tag])
             self.report[tag+'_clean_shutdown'] = ok
             clean = clean and ok
         for cleanup in T.CLEANUPS:
@@ -146,16 +145,7 @@ def prepare():
     pair, and a fingerprint of the owner's real saves. Returns (mutex handle, protected folder, its fingerprint, mod hash)."""
     import ctypes
     import hashlib
-    if T.PAIR == '1':
-        receipt = json.loads(T.RECEIPT.read_text())
-        assert any(e['file'] == T.OURS for e in receipt['files']), 'Run profile.py together first'
-        mod_sha = next(e['sha256'] for e in receipt['files'] if e['file'] == T.OURS)
-        checks = (('verify.py',), ('verify_client.py',))
-    else:
-        deployed = T.WORKSPACE/f'runtime/pair{T.PAIR}-deployment.json'
-        assert deployed.is_file(), 'Run runtime/install_pair2.py first'
-        mod_sha = json.loads(deployed.read_text())['sha256']
-        checks = (('verify_pair2.py', T.PAIR),)
+    mod_sha, protected = T.verify_workspace()
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
     kernel.CreateMutexW.restype = ctypes.c_void_p
@@ -163,9 +153,6 @@ def prepare():
     handle = kernel.CreateMutexW(None, True, lock)
     assert handle and ctypes.get_last_error() != 183, 'Another QA runner is active'
     (T.WORKSPACE/f'runtime/pair{T.PAIR}-runner.pid').write_text(str(os.getpid()))
-    for name, *check_args in checks:
-        subprocess.run([sys.executable, str(T.WORKSPACE/'isolation'/name), *check_args], cwd=T.WORKSPACE.parent, capture_output=True, check=True)
-    protected = Path(json.loads((T.WORKSPACE/'project.json').read_text(encoding='utf-8-sig'))['protected_save_dir'])
     return kernel, handle, protected, T.snapshot(protected), mod_sha
 
 
@@ -173,12 +160,18 @@ def run_alone(name):
     """The stage on its own, the way series.sh runs it; returns its summary."""
     args = [sys.executable, str(Path(T.__file__)), '--suite', name, '--seconds', '2400' if name == 'soak' else '1200']
     env = dict(os.environ, G3_VERIFY_QUICK='1')  # prepare() checked this pair at the start (isolation/hashcache.py)
-    out = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env).stdout.strip().splitlines()
+    result = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
+    out = result.stdout.strip().splitlines()
     try:
         report = json.loads(out[-2])
+        if report.get('protected_saves_unchanged') is not True:
+            return 'failed', 'protected saves check did not pass'
+        if result.returncode:
+            return 'failed', (report.get('error') or f'runner exited {result.returncode}')[:150]
         return report['status'], (report.get('error') or '')[:150]
     except (IndexError, ValueError, KeyError):
-        return 'failed', 'no report'
+        details = (result.stderr or result.stdout).strip().splitlines()
+        return 'failed', ('no report: '+details[-1])[:150] if details else 'no report'
 
 
 def main():
@@ -195,7 +188,7 @@ def main():
     while pending:
         session = Session(seconds=1200*len(pending))
         T.POSTRAID = T.postraid_for(pending[0])
-        session.report['start'] = 'post-raid save' if T.POSTRAID else 'new game'
+        session.report['start'] = (T.POSTRAID+' save') if T.POSTRAID else 'new game'
         T.join_both, T.clear_raid = session.join_both, session.clear_raid
         if not T.POSTRAID:
             T.RAID.take(session.report)  # T.clear_raid gives it back once the raid is over
@@ -244,9 +237,14 @@ def main():
     assert saves_unchanged, "the owner's real saves changed"
     kernel.ReleaseMutex(handle)
     kernel.CloseHandle(handle)  # together.py takes the pair's lock for each stage run on its own
+    failed_alone = []
     for name in alone + rerun:
         status, error = run_alone(name)
         print(f'--suite {name} => {status} (alone) | {error}', flush=True)
+        if status != 'passed':
+            failed_alone.append(name)
+    if failed_alone:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

@@ -13,7 +13,7 @@ Ein Ablauf für den ersten Abend zu zweit (ein Host, ein Mitspieler): Beitritt, 
 - [ ] Genau zwei Personen festlegen: ein Host und ein Mitspieler. Der Host startet oder lädt die gemeinsame Kampagne und speichert.
 - [ ] Beide verwenden die getestete Grundlage: Gothic 3 von Steam, danach Community Patch **1.75.14**, danach [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm), danach dieselbe G3-Together-Build/Protokollversion. Die Kompatibilität ohne PUP ist nicht belegt. Keine andere Koop-Mod im `scripts`-Ordner; wenn möglich eine eigene Installationskopie für den Koop-Abend verwenden. Die [Spielanleitung](SPIELEN.md) beschreibt die Installation.
 - [ ] Vorher den Gothic-3-Spielstandordner beider Personen sichern. Während des Abends einen klar benannten Test-Spielstand verwenden.
-- [ ] Verbindung wählen: gleiches LAN oder privates VPN. Host-IP/VPN-Adresse und Firewall-Regel nur dem Mitspieler geben. Der Host braucht eingehendes UDP auf Port 34567. Die Verbindung über echtes Internet gilt noch nicht als von Menschen getestet.
+- [ ] Steam läuft und ist auf beiden PCs angemeldet; beide Spieler sind Steam-Freunde. Dieser Fork hat keinen IP-/VPN-Verbindungsweg und keinen Ausweichweg. Steam über echtes Internet ist noch nicht von Menschen geprüft.
 - [ ] Beide notieren ihre Rolle und lokale Uhrzeit/Zeitzone für spätere Fehlerberichte.
 - [ ] Optional: statt von Hand mit `Einrichten.cmd` (Polnisch: `Instalacja.cmd`) aus dem Paket einrichten und notieren, was dabei schiefging. Es ist bisher
   nur an Testordnern ausprobiert.
@@ -26,8 +26,7 @@ Host:
 
 ```ini
 role = host
-port = 34567
-name = Host
+transport = steam
 language = de
 ```
 
@@ -35,13 +34,11 @@ Mitspieler:
 
 ```ini
 role = client
-address = <LAN- oder VPN-Adresse des Hosts>
-port = 34567
-name = Spieler2
+transport = steam
 language = de
 ```
 
-`puppet_template` ist optional; Standardwert ist `PC_Hero`. Ebenfalls optional ist `look = <Charaktervorlage>` (zum Beispiel `look = Diego`): So sieht der andere Spieler dich. `offer_accept_key` und `offer_decline_key` (Standard Einfg und Entf) beantworten ein Handelsangebot. Fehlt die INI, startet der Code im Host-Modus. Deshalb vor dem Start auf dem Mitspieler-PC `role = client` kontrollieren.
+`puppet_template` ist optional; Standardwert ist `PC_Hero`. Ebenfalls optional ist `look = <Charaktervorlage>` (zum Beispiel `look = Diego`): So sieht der andere Spieler dich. Spielerhandel benutzt den normalen Tauschknopf ohne Bestätigungstasten. Fehlt die INI, startet der Code im Host-Modus. Deshalb vor dem Start auf dem Mitspieler-PC `role = client` kontrollieren.
 
 Die Beispiel-INIs verwenden `language = de`, passend zu den unten zitierten Meldungen. Ohne die Zeile sind die
 Meldungen englisch; `language = pl` gibt polnische, `language = auto` (schreibt das Einrichten) folgt der Textsprache
@@ -51,6 +48,11 @@ des Spiels. Jeder Spieler kann die Sprache unabhängig wählen; sie ändert nur 
 - [ ] Schwierigkeit, alternatives Balancing, alternative KI, minimale Trefferdauer, XP-Faktor und Quick Loot abgleichen. Bei Join-Ablehnung den Grund in `g3together.log` ansehen.
 - [ ] Beginnt der Host ein neues Spiel, beginnt auch der Mitspieler ein neues Spiel. Hat der Host geladen oder gespeichert, tritt der Mitspieler vom Hauptmenü bei und wartet auf den Kampagnentransfer.
 
+- [ ] Mit `friendly_fire = 0` auf beiden PCs dürfen verbündete Nahkampf-, Fernkampf- und Zaubertreffer weder
+  Lebenspunkte noch Block-Ausdauer kosten, taumeln lassen, niederschlagen oder schädliche Zustände auslösen.
+  Begleiter und beide Angriffsrichtungen einbeziehen; Heilung und gegnerische Treffer müssen weiter wirken.
+  Für die Aufhelfen-Prüfung einen Gegner verwenden, nicht den Mitspieler.
+
 ## Ablauf für 90 Minuten
 
 | Zeit | Stufe | Schritte und Beobachtung |
@@ -59,7 +61,7 @@ des Spiels. Jeder Spieler kann die Sprache unabhängig wählen; sie ändert nur 
 | 8–18 min | Gemeinsamer Kampf | Einen kleinen Kampf nahe dem Host führen. Beide greifen dasselbe NPC an. Prüfen: Treffer und Tod erscheinen auf beiden Rechnern; Erfahrung erhält der tatsächliche Killer. Queststatus und Zähler notieren, ohne einen einzelnen Erfolg als Beleg für alle Kill-Quest-Fälle zu werten. |
 | 18–28 min | Gefolgsmann anwerben und entlassen | Der Mitspieler wirbt ein geeignetes NPC an. Prüfen: es folgt dem Mitspieler, beide sehen dasselbe NPC und keine Seite simuliert es doppelt. Danach entlässt derselbe Mitspieler es und beide prüfen, dass es nicht weiter als sein Gefolgsmann läuft. |
 | 28–38 min | Bewusstlosigkeit und Hilfe | In sicherer Umgebung einen Spieler kontrolliert niederschlagen lassen. Der Partner stellt sich zuerst ein paar Sekunden daneben: Es darf nichts passieren. Dann spricht er ihn an und wählt „Ich werde dir helfen.“. Prüfen: Aufhelfen und Meldung, ein Heiltrank des Helfers weniger. Ohne Heiltrank: Hinweis bei beiden, der Bewusstlose bleibt liegen. Optional zum Schluss (danach Spielstand laden): Liegen beide am Boden, sterben beide (Game Over). |
-| 38–50 min | Dialog, Quest, Handel und Plündern | Einen Dialog mit einem NPC beginnen, eine bekannte Queststufe auslösen, eine eindeutige Handelsaktion durchführen und einen Gegenstand aus einer Truhe oder Leiche nehmen. Beide vergleichen Quest-/Dialogstatus, Gold und Gegenstandsbestand. Danach miteinander handeln, mit der Maus: Ein Spieler spricht die Figur des anderen an und wählt „Zeig mir deine Ware!“ (beim allerersten Handel den Tipp mit Ok schließen), nimmt einen Gegenstand, gibt einen und schließt das Fenster; der andere nimmt mit Einfg an. Gegenstände und Gold auf beiden Rechnern vergleichen. Noch einmal handeln und mit Entf ablehnen: Es darf nichts den Besitzer wechseln. Die Maussteuerung des Handelsfensters konnten die Bots nicht prüfen. |
+| 38–50 min | Dialog, Quest, Handel und Plündern | NPC-Dialog, Quest, Handel und Beute prüfen. Danach „Zeig mir deine Ware!“ beim Mitspieler öffnen, den ersten Tipp mit Ok schließen. Mit Maus und Tauschknopf kostenlos Gegenstände nehmen und zurückgeben, ohne das Fenster zu schließen oder beim Partner zu bestätigen. Echte Bestände, unverändertes Gold und erhaltene Qualität vergleichen. Gold ausdrücklich auswählen und in beide Richtungen ohne Gegenstände verschenken. Ohne Gold, nach sofortigem Schließen, beim Wiederöffnen und mit geschützter Ausrüstung/Questgegenständen prüfen. NPC-Preise müssen unverändert bleiben. Die neue Maussteuerung wird manuell geprüft; der Agent hat die Spiele nicht gestartet. |
 | 50–70 min | Abstand, getrennte Regionen und Wiedersehen | Host und Mitspieler entfernen sich deutlich voneinander. Bei mehr als ungefähr 35 m prüfen, dass auf keinem PC eine Abstandsmeldung erscheint (kein „Weit weg vom Host“, kein „ist weit entfernt“). Während sie getrennt sind, kämpft jeder in seiner jeweiligen Gegend gegen ein eigenes NPC; notieren, ob beide dieselben Ergebnisse sehen und keine doppelte Simulation auffällt. Danach gehen sie wieder zusammen und prüfen, dass keine Meldung kommt („Wieder beim Host“ gibt es nicht mehr), sowie den gemeinsamen Zustand. Einen Kill-Quest-Auftrag annehmen und ein Ziel in der Gegend des Mitspielers töten lassen: Der Zähler im Quest-Log des Hosts muss steigen. |
 | 70–82 min | Speichern und Laden | Host speichert mit eindeutigem Namen. Prüfen, dass der Mitspieler seinen Helden für diesen Spielstand behält. Für das Laden einen separaten Teststand oder ein Backup verwenden. Nach dem Laden Welt und Spieler stabilisieren lassen und den allgemeinen Zustand vergleichen. Hatte der Mitspieler einen Gefolgsmann: Nach dem Laden und seinem Wiederbeitritt muss der Gefolgsmann ihm wieder folgen. |
 | 82–90 min | Wiederbeitritt und Fehlerpaket | Falls noch Zeit ist, einen sauberen Leave und Wiederbeitritt im selben Prozess oder nach Neustart prüfen. Kampagne, Heldenaufzeichnung, NPC-Besitz und Begleiterzustand notieren. Bei Fehlern beide Logpakete nach der folgenden Anleitung erstellen und privat an den Host geben. |
@@ -70,7 +72,7 @@ Wenn nur 60 Minuten verfügbar sind: zuerst Beitritt, Kampf, Aufhelfen, Gefolgsm
 
 | Abschnitt | Schritte und Beobachtungen |
 |---|---|
-| Host nicht erreichbar | Vor dem Abend startet der Mitspieler einmal mit falscher Adresse in der INI: Nach etwa 15 Sekunden steht in der obersten Zeile des Hauptmenüs, dass der Host nicht erreichbar ist, mit dieser Adresse und dem Port. |
+| Host nicht erreichbar | Vor dem Abend startet der Mitspieler, während der Host offline ist: Das Hauptmenü meldet die Suche unter Steam-Freunden. Adresse und Port werden nicht verlangt. |
 | Mitgehörter Dialog | Einer spricht mit einem NPC, der andere steht höchstens 20 m entfernt und hat die Untertitel des Spiels an: Er hört die Zeilen und liest sie oben im Bild, in seiner eigenen Spielsprache. |
 | Diebstahl vor Zeugen | Der Mitspieler nimmt einen Gegenstand, der einer Stadt gehört, während eine Wache oder ein Bürger aus dem Gebiet des Hosts zusieht: Dieser NPC geht auf den Mitspieler los, wie er es beim Host täte. |
 | Ausgeraubt nach Niederschlag | Eine Wache schlägt den Mitspieler bewusstlos (nicht tot): Er steht nach einer Weile von selbst auf, die Wache nimmt die Hälfte seines Goldes, und er sieht „<Name> hat dir N Gold abgenommen.“. Der Host kann ihn währenddessen nicht ausplündern. |
@@ -123,17 +125,17 @@ Wenn nur 60 Minuten verfügbar sind: zuerst Beitritt, Kampf, Aufhelfen, Gefolgsm
 | Befreite Stadt | Der Mitspieler befreit bei gemeinsamem Ruf eine Stadt: Die Rebellen sprechen den Host darauf an wie den Mitspieler. |
 | Schlafendes Tier | Der Mitspieler geht zu einem schlafenden Tier: Es wacht auf wie beim Host. |
 
-### Optional: über Steam (experimentell)
+### Erforderliche Verbindungsprüfungen: über Steam (experimentell)
 
-Beide stellen `transport = steam` ein (oder wählen im Setup Steam) und sind Steam-Freunde; siehe [SPIELEN.md](SPIELEN.md#über-steam-experimentell).
+Beide verwenden Steam und sind Steam-Freunde; siehe [SPIELEN.md](SPIELEN.md#über-steam-experimentell).
 
 | Abschnitt | Schritte und Beobachtungen |
 |---|---|
-| Host finden | Der Host startet zuerst, dann der Mitspieler ohne Adresse: Er tritt nach wenigen Sekunden bei (Dauer notieren). Steam zeigt beide als „spielt Spacewar“. |
-| Verschiedene Netze | Von zwei verschiedenen Wohnungen aus spielen (kein LAN, kein VPN): Beitritt, Übertragung des Spielstands und eine Stunde Spiel klappen. Ruckler im Vergleich zu Hamachi notieren. |
+| Host finden | Der Host startet zuerst, dann der Mitspieler ohne Adresse: Er tritt nach wenigen Sekunden bei (Dauer notieren). Steam zeigt Gothic 3; Spielernamen entsprechen den Steam-Namen. Das Menü zeigt Lobbyzustand und Ping. |
+| Verschiedene Netze | Von zwei verschiedenen Wohnungen ohne VPN oder Portfreigabe spielen: Beitritt, Übertragung des Spielstands und eine Stunde Spiel prüfen. Verzögerung und Ruckler notieren. |
 | Spiel beitreten | Das Spiel des Mitspielers läuft schon; dann in der Steam-Freundesliste beim Host „Spiel beitreten“: Er tritt bei. |
 | Verlassen | Der Mitspieler beendet sein Spiel: Der Host sieht ihn sofort weg. Er startet neu und tritt wieder bei. |
-| Ohne Steam | Der Mitspieler beendet Steam und startet das Spiel: Eine Meldung sagt, dass Steam nicht nutzbar ist; mit Adresse in der INI verbindet er sich über die Adresse. |
+| Ohne Steam | Steam beenden und das Spiel starten: Koop muss mit einer klaren Meldung und ohne Ausweichverbindung fehlschlagen. Auch beim Host prüfen. |
 
 ## Bei einem Fehler
 

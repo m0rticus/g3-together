@@ -60,12 +60,11 @@ Config const& LoadConfig()
         Trim(key);
         Trim(value);
         if (!_stricmp(key, "role")) config.host = _stricmp(value, "client") != 0;
-        else if (!_stricmp(key, "address")) strncpy_s(config.address, value, _TRUNCATE);
-        else if (!_stricmp(key, "port")) config.port = static_cast<unsigned short>(std::atoi(value));
-        else if (!_stricmp(key, "name")) strncpy_s(config.name, value, _TRUNCATE);
+        else if (!_stricmp(key, "address") || !_stricmp(key, "port"))
+            Logf("config: %s is no longer used; connections require Steam", key);
+        else if (!_stricmp(key, "name")) Log("config: name is taken from Steam; the INI name is ignored");
         else if (!_stricmp(key, "transport")) {
-            config.steam = !_stricmp(value, "steam");
-            if (!config.steam && _stricmp(value, "udp")) Logf("config: unknown transport '%s', using udp", value);
+            if (_stricmp(value, "steam")) Logf("config: transport '%s' is no longer supported; connections require Steam", value);
         }
         else if (!_stricmp(key, "steam_lobby")) strncpy_s(config.steamLobby, value, _TRUNCATE);
         else if (!_stricmp(key, "steam_host")) strncpy_s(config.steamHost, value, _TRUNCATE);
@@ -81,20 +80,15 @@ Config const& LoadConfig()
         else if (!_stricmp(key, "puppet_template")) strncpy_s(config.puppetTemplate, value, _TRUNCATE);
         else if (!_stricmp(key, "look")) strncpy_s(config.look, value, _TRUNCATE);
         else if (!_stricmp(key, "partner_key")) strncpy_s(config.partnerKey, value, _TRUNCATE);
-        else if (!_stricmp(key, "offer_accept_key")) strncpy_s(config.offerAcceptKey, value, _TRUNCATE);
-        else if (!_stricmp(key, "offer_decline_key")) strncpy_s(config.offerDeclineKey, value, _TRUNCATE);
-        else if (!_stricmp(key, "price_up_key")) strncpy_s(config.priceUpKey, value, _TRUNCATE);
-        else if (!_stricmp(key, "price_down_key")) strncpy_s(config.priceDownKey, value, _TRUNCATE);
-        else if (!_stricmp(key, "qa_keycheck")) config.qaKeyCheckOff = !_stricmp(value, "off");
         else if (!_stricmp(key, "qa_resendguard")) config.qaResendGuardOff = !_stricmp(value, "off");
         else if (!_stricmp(key, "qa_hosthint")) strncpy_s(config.qaHostHint, value, _TRUNCATE);
         else if (!_stricmp(key, "trace")) strncpy_s(config.trace, value, _TRUNCATE);
         else if (!_stricmp(key, "reputation")) strncpy_s(config.reputation, value, _TRUNCATE);
         else if (!_stricmp(key, "host_sim")) {
-            config.hostSimElastic = !_stricmp(value, "elastic");
-            config.hostSimSpheres = !_stricmp(value, "spheres");
-            if (!config.hostSimElastic && !config.hostSimSpheres && _stricmp(value, "off"))
-                Logf("config: unknown host_sim '%s', using off", value);
+            config.hostSimElastic = false;
+            config.hostSimSpheres = true;
+            if (_stricmp(value, "spheres"))
+                Logf("config: host_sim=%s ignored: host authority requires per-player simulation regions", value);
         }
         else if (!_stricmp(key, "puppet_lead")) {
             config.puppetLead = !_stricmp(value, "auto");
@@ -103,6 +97,15 @@ Config const& LoadConfig()
         else if (!_stricmp(key, "motion_seek")) {
             config.motionSeek = _stricmp(value, "off") != 0;
             if (config.motionSeek && _stricmp(value, "on")) Logf("config: unknown motion_seek '%s', using on", value);
+        }
+        else if (!_stricmp(key, "movement_smoothing")) {
+            config.movementSmoothing = _stricmp(value, "off") != 0;
+            if (config.movementSmoothing && _stricmp(value, "on")) Logf("config: unknown movement_smoothing '%s', using on", value);
+        }
+        else if (!_stricmp(key, "send_rate")) {
+            const int hz = std::atoi(value);
+            if (hz >= 20 && hz <= 60) config.sendRate = hz;
+            else Logf("config: send_rate %s out of 20-60; using %d", value, config.sendRate);
         }
         else if (!_stricmp(key, "listener_textbox")) {
             config.listenerTextbox = !_stricmp(value, "on");
@@ -126,14 +129,16 @@ Config const& LoadConfig()
         }
     }
     fclose(file);
-    Logf("config: role=%s address=%s port=%u name=%s puppet_template=%s look=%s language=%s", config.host ? "host" : "client",
-         config.address, config.port, config.name, config.puppetTemplate, *config.look ? config.look : "-", config.language);
+    Logf("config: role=%s name=Steam puppet_template=%s look=%s language=%s", config.host ? "host" : "client",
+         config.puppetTemplate, *config.look ? config.look : "-", config.language);
     if (config.host) Logf("config: host_roi=%.0f host_sim=%s", config.hostRoi, config.hostSimElastic ? "elastic" : config.hostSimSpheres ? "spheres" : "off");
     Logf("config: puppet_lead=%s motion_seek=%s listener_textbox=%s friendly_fire=%d npc_damage=%.2f npc_hp=%.2f",
          config.puppetLead ? "auto" : "off", config.motionSeek ? "on" : "off", config.listenerTextbox ? "on" : "off", config.friendlyFire, config.npcDamage, config.npcHp);
-    if (config.steam)
-        Logf("config: transport=steam steam_lobby=%s steam_host=%s", *config.steamLobby ? config.steamLobby : "-",
-             *config.steamHost ? config.steamHost : "-");
+    Logf("config: movement_smoothing=%s (100 ms replica display buffer; local controls remain native)",
+         config.movementSmoothing ? "on" : "off");
+    Logf("config: transport=steam steam_lobby=%s steam_host=%s", *config.steamLobby ? config.steamLobby : "-",
+         *config.steamHost ? config.steamHost : "-");
+    Logf("config: send_rate=%d Hz (player states and every NPC that changed; unchanged NPCs every 100 ms)", config.sendRate);
     return config;
 }
 }

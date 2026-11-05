@@ -12,19 +12,9 @@
 #include <cstring>
 #include <map>
 #include <string>
-#include <vector>
 
 namespace g3t::items {
 namespace {
-// Client: a knock-out drops the weapon in hand as a world item of this machine only (the host drops its puppet's own copy).
-// The host does not know it, refused the take as someone else's, and the weapon was gone (playtest 27.10.). A refusal for
-// such a weapon keeps it, once; the host's copy may then be a second one (better than none).
-struct OwnDrop { std::string name; uint32_t at; };
-std::vector<OwnDrop> ownDrops;
-constexpr uint32_t OwnDropKeep = 600000;  // ms
-unsigned keptOwn = 0;
-bool keepOwnDrop = true;  // false: a refusal deletes such a weapon too (as before 27.10.)
-
 bool ParseGuid(char const* text, _GUID& out)
 {
     unsigned d1, d2, d3, b[8];
@@ -142,9 +132,8 @@ std::map<std::string, int> Carried(eCDynamicEntity* hero)
     }
     return out;
 }
-bool disabled = false;  // QA negative control
 unsigned takesBegun = 0;
-unsigned tookCount = 0, sent = 0, received = 0, granted = 0, denials = 0, removed = 0, returned = 0;
+unsigned tookCount = 0, ignoredRemotePickups = 0;
 char lastTook[200] = "-";
 }
 
@@ -185,84 +174,26 @@ void AfterTake(gCScriptProcessingUnit*)
     Format(guid, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", core.Data1, core.Data2, core.Data3, core.Data4[0],
               core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4], core.Data4[5], core.Data4[6], core.Data4[7]);
     Format(lastTook, "guid=%s name=%s amount=%u", guid, takingName, takingAmount);
-    Logf("items: hero took %s", lastTook);
-    if (disabled) return;
-    net::ItemNote note{net::IsHost() ? net::ItemGone : net::ItemTook, {}, takingAmount, {}};
-    std::memcpy(note.guid, takingGuid, 16);
-    strncpy_s(note.name, takingName, _TRUNCATE);
-    net::SendItem(note, 0);  // host: gone for everyone; client: a claim to the host
-    ++sent;
+    Logf("items: hero took %s (personal world pickup; other players' copies unchanged)", lastTook);
 }
 
 namespace {
-// The world item with this GUID, if it still lies in the world on this machine.
-Entity WorldItem(uint8_t const guid[16])
-{
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    Entity item = Entity(bCPropertyID(bCGuid(raw)));
-    if (item.GetInstance() && item.IsItem() && !item.GetOwner().GetInstance()) return item;
-    return Entity();
-}
-
 void OnItem(uint8_t from, net::ItemNote const& note)
 {
-    if (disabled) return;
-    ++received;
-    if (net::IsHost() && note.op == net::ItemTook) {
-        Entity item = WorldItem(note.guid);
-        if (item.GetInstance()) {
-            // First to take it: gone from the host's world and from every other player's.
-            item.Decay();
-            net::ItemNote gone = note;
-            gone.op = net::ItemGone;
-            net::SendItem(gone, 0);
-            ++granted;
-            Logf("items: player %u took %s", from, note.name);
-        } else {
-            net::ItemNote denied = note;
-            denied.op = net::ItemDenied;
-            net::SendItem(denied, from);
-            ++denials;
-            Logf("items: player %u was too late for %s", from, note.name);
-        }
-        return;
-    }
-    if (net::IsHost()) return;
-    if (note.op == net::ItemGone) {
-        if (Entity item = WorldItem(note.guid); item.GetInstance()) {
-            item.Decay();
-            ++removed;
-        }
-    } else if (note.op == net::ItemDenied) {
-        const uint32_t now = GetTickCount();
-        for (auto it = ownDrops.begin(); keepOwnDrop && it != ownDrops.end(); ++it) {
-            if (now - it->at >= OwnDropKeep || it->name != note.name) continue;
-            ownDrops.erase(it);
-            ++keptOwn;
-            Logf("items: kept %s (this hero's own weapon, dropped when knocked out)", note.name);
-            return;
-        }
-        // Someone else had it first: give back what this hero took.
-        eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-        if (!hero) return;
-        Entity self(hero);
-        const GEInt stack = self.Inventory.FindStackIndex(Template(note.name));
-        if (stack >= 0) self.Inventory.DeleteItems(stack, note.amount ? static_cast<GEInt>(note.amount) : 1);
-        ++returned;
-        Logf("items: returned %s (someone else took it first)", note.name);
-    }
+    ++ignoredRemotePickups;
+    Logf("items: ignored shared-world pickup message from player %u (op=%u); loose pickups are personal", from, note.op);
 }
 }
 
-void Start() { net::SetItemHandler(&OnItem); }
+void Start()
+{
+    net::SetItemHandler(&OnItem);
+    Log("items: loose world pickups are personal; chest/corpse loot and NPC merchant stock are personal too");
+}
 
 void NoteOwnDrop(char const* name)
 {
-    const uint32_t now = GetTickCount();
-    for (auto it = ownDrops.begin(); it != ownDrops.end();) it = now - it->at >= OwnDropKeep ? ownDrops.erase(it) : std::next(it);
-    ownDrops.push_back({name, now});
-    Logf("items: this hero dropped %s when knocked out (kept if the host refuses it)", name);
+    Logf("items: this hero dropped %s when knocked out (personal world item)", name);
 }
 
 void Pick(char const* guid, LogFn log)
@@ -284,8 +215,8 @@ void Pick(char const* guid, LogFn log)
 void TookReport(LogFn log)
 {
     char line[320];
-    Format(line, "ITEMTOOK count=%u sent=%u received=%u granted=%u denials=%u removed=%u returned=%u last=%s", tookCount, sent,
-              received, granted, denials, removed, returned, lastTook);
+    Format(line, "ITEMTOOK count=%u sent=0 received=%u granted=0 denials=0 removed=0 returned=0 mode=personal last=%s",
+           tookCount, ignoredRemotePickups, lastTook);
     log(line);
 }
 }
@@ -302,11 +233,10 @@ void Count(char const* templateName, LogFn log)
 
 void Disable(LogFn log)
 {
-    disabled = true;
-    log("ITEMSYNCOFF ok=1");
+    log("ITEMSYNCOFF ok=1 (loose world pickups are already personal)");
 }
 
-unsigned Returned() { return returned; }
+unsigned Returned() { return 0; }
 unsigned TakesBegun() { return takesBegun; }
 unsigned TakesDone() { return tookCount; }
 }
@@ -350,7 +280,10 @@ void Containers(LogFn log)
 // QA negative controls of the play-evening fixes (27.10.): each switches its fix off (on: clientfameon).
 bool Switch(char const* action, LogFn log)
 {
-    if (!std::strcmp(action, "owndropoff")) { keepOwnDrop = false; log("SWITCH owndropoff ok=1"); return true; }
+    if (!std::strcmp(action, "owndropoff")) {
+        log("SWITCH owndropoff ok=1 (not applicable to personal world pickups)");
+        return true;
+    }
     return false;
 }
 }

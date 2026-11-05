@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Dialogs between a client's hero and an NPC owned by the host. The dialog itself runs on the client (the
-// game's own info manager; told options and quest changes reach the host through story.cpp). Meanwhile:
-// - the client stops moving that mirrored NPC and lets it run its talk states, so it faces and gestures;
-// - the host holds its NPC (no routine, no AI except idle) until the dialog ends or the player leaves, and plays the
-//   gestures and the facing the client's copy shows in the dialog (phase 5, owner 25.10.: "NPC-Gesten").
+// The client's info manager owns its dialog UI and choices. The host runs the NPC talk state against that player's
+// puppet and publishes its animation; the client partner remains a passive mirror.
 #pragma once
 
 #include <cstdint>

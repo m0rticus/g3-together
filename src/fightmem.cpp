@@ -54,6 +54,13 @@ eCEntity* PuppetAmong(std::initializer_list<eCEntity*> fighters)
     return nullptr;
 }
 
+// The scripts below run as the NPC `self` does; under Acting the game's player is the puppet and IsPlayer is false for this
+// machine's own hero, which then judged the fight as an onlooker (OnWatchFight: ZS_WatchFight, ZS_Applaud). Never for the hero.
+eCEntity* PuppetFor(eCEntity* self, std::initializer_list<eCEntity*> fighters)
+{
+    return guards::IsLocalPlayer(self) ? nullptr : PuppetAmong(fighters);
+}
+
 struct Memory {
     eCEntity* npc = nullptr;
     int value = 0;
@@ -132,7 +139,7 @@ void Pass(Memory const& before, eCEntity* puppet, char const* where, int reason 
 GEInt GE_STDCALL Sound(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     eCEntity* victim = Of(spu, other, false);
-    eCEntity* puppet = PuppetAmong({victim, AttackerOf(victim)});
+    eCEntity* puppet = PuppetFor(Of(spu, self, true), {victim, AttackerOf(victim)});
     const Memory before = Read(Of(spu, self, true));
     guards::Acting acting(puppet);
     const GEInt result = originalSound(spu, self, other, args);
@@ -148,7 +155,7 @@ GEInt GE_STDCALL Defeated(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
     eCEntity* seer = Of(spu, self, true);
     eCEntity* down = Of(spu, other, false);
     eCEntity* attacker = AttackerOf(down);
-    eCEntity* puppet = PuppetAmong({down, attacker});
+    eCEntity* puppet = PuppetFor(seer, {down, attacker});
     const Memory before = Read(seer);
     guards::Acting acting(puppet);
     const GEInt result = originalDefeated(spu, self, other, args);
@@ -169,7 +176,7 @@ GEInt GE_STDCALL Defeat(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 {
     eCEntity* a = Of(spu, self, true);
     eCEntity* b = Of(spu, other, false);
-    eCEntity* puppet = PuppetAmong({a, b});
+    eCEntity* puppet = PuppetFor(a, {a, b});
     const Memory first = Read(a), second = Read(b);
     guards::Acting acting(puppet);
     const GEInt result = originalDefeat(spu, self, other, args);
@@ -184,7 +191,7 @@ GEInt GE_STDCALL Defeat(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 GEInt GE_STDCALL Cancel(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     eCEntity* a = Of(spu, self, true);
-    eCEntity* puppet = PuppetAmong({Of(spu, other, false), TargetOf(a)});
+    eCEntity* puppet = PuppetFor(a, {Of(spu, other, false), TargetOf(a)});
     const Memory before = Read(a);
     const int reason = ReasonOf(a);
     guards::Acting acting(puppet);
@@ -199,7 +206,7 @@ GEInt GE_STDCALL Cancel(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 GEBool GE_STDCALL Watch(gCScriptProcessingUnit* spu)
 {
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
-    eCEntity* puppet = PuppetAmong({TargetOf(self), AlternativeOf(self)});
+    eCEntity* puppet = PuppetFor(self, {TargetOf(self), AlternativeOf(self)});
     const Memory before = Read(self);
     guards::Acting acting(puppet);
     const GEBool result = originalWatch(spu);
@@ -249,7 +256,7 @@ void Tick()
 
 eCEntity* StateActor(eCEntity* self, char const* state)
 {
-    if (!on || !state || std::strncmp(state, "ZS_Attack", 9) != 0) return nullptr;
+    if (!on || !state || std::strncmp(state, "ZS_Attack", 9) != 0 || guards::IsLocalPlayer(self)) return nullptr;
     eCEntity* puppet = PuppetAmong({TargetOf(self)});
     if (!puppet) return nullptr;
     ++stateRuns;

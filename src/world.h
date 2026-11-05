@@ -7,10 +7,14 @@
 #include <Engine.h>
 
 namespace g3t::world {
+void RequestProcessingUpdate();  // rebuild after relocating an authoritative NPC into an already-loaded region
 using LogFn = void (*)(char const*);
 // Every entity the engine processes here, static ones included (doors, ore veins); null before the scene exists.
 bTSmallArray<eCEntity*> const* ProcessedEntities();
-void Tick();  // host: its processing range as host_roi says (config.h)
+void Tick();  // host: NPC-only extra ranges; native camera, ROI and static culling stay unchanged
+void ProcessingReport(LogFn log);
+void StreamProbe(char const* argument, LogFn log);  // QA: X_Y_Z_radius, report, or off; never moves the player's camera
+void OnWorldDeactivate();
 // host_sim = elastic or spheres: whether the host's game processes around the other players too in this frame, and whether
 // it processes this place (margin cm inside the edge of its sphere or of one of its spheres).
 bool Extended();

@@ -1,38 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Trading between players (owner 23.10., ENTWURF-HANDEL-2026-10-23.md): the game's own trade screen, with the other
-// player's puppet as the partner.
-// - Every machine sends what its player can trade whenever it changes: its unequipped stacks without mission items and
-//   skills, and its gold apart (MsgGoods); the host passes it on.
-// - A dialog with a puppet fills it with that player's goods (the game's trade option on it opens the screen without
-//   PlayerOpenTrade); PlayerOpenTrade with a puppet does too.
-// - A swap in the screen shows as a difference between the puppet and the goods it was filled with: one offer to that
-//   player (offer.cpp, agent A), provisional until the answer; a refusal is undone on the hero and on the puppet.
-// - The buyer sets its own price in the window (owner 27.10.: free prices) with price_up_key / price_down_key; the offer
-//   carries that gold instead of the items' value.
+// Free player exchanges through Gothic 3's NPC trade screen. Native transaction selections, no approval keys.
 #pragma once
 
+#include <cstdint>
 class eCEntity;
 
 namespace g3t::trade {
 void Start();
 void Tick();
-void OnWorldChange();  // open offers and the open trade are forgotten (a decline must not undo on the new world's hero)
-// PlayerOpenTrade with a puppet as partner (containers.cpp): fill it with its player's goods. False: not a puppet.
+void OnWorldChange();
 bool OnOpen(eCEntity* partner);
-void RestoreGold(eCEntity* puppet, int player);  // ransack.cpp: the puppet's gold as trade last put it there
+bool Available();
+bool ReadyForSave();
+uint64_t Epoch();
+uint32_t Publish();
+void RestoreGold(eCEntity* puppet, int player);
 using LogFn = void (*)(char const*);
-void Report(LogFn log);                   // QA: TRADESYNC line
-// QA (playergoods): PLAYERGOODS line of player <id>'s goods as received here ("0": this machine's own; "puppet<id>": what
-// that puppet offers now)
+void Report(LogFn log);
 void GoodsReport(char const* argument, LogFn log);
-void FillOff(LogFn log);                            // QA negative control: a puppet is not filled with its player's goods
-void Price(char const* argument, LogFn log);        // QA (tradeprice): "<partner>_<Item>": buy and sell price of one piece
-void PricesOff(LogFn log);                          // QA negative control (tradepricesoff): a puppet's prices as a trader's
-void AdjustCommand(char const* argument, LogFn log);  // QA (tradeadjust): "<gold>" (n50 = -50) the price keys' change, in an open window
-void AdjustOff(LogFn log);                          // QA negative control (tradeadjustoff): the offer carries the screen's gold
-void HoldOff(LogFn log);                            // QA negative control (tradeholdoff): the buyer keeps what it got before the seller answered
-void QualityOff(LogFn log);                         // QA negative control (tradequalityoff): traded items arrive at quality 0 (as before 24.10.)
-void GiveQuality(char const* argument, LogFn log);  // QA (givequality): "<Item>_<quality>" one of the item at that quality
-void QualityCount(char const* name, LogFn log);     // QA (qualitycount): QUALITYCOUNT line, the hero's amount of the item per quality
-void CloseCommand(LogFn log);                       // QA (tradeclose): the hero out of the trade window's PS_HUD, as closing it does
+void FillOff(LogFn log);
+void Price(char const* argument, LogFn log);
+void GiveQuality(char const* argument, LogFn log);
+void QualityCount(char const* name, LogFn log);
+void CloseCommand(LogFn log);
+void GiftCommand(char const* argument, LogFn log);
+bool Exchange(eCEntity* partner, char const* item, int amount, bool take);
 }

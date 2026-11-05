@@ -14,7 +14,7 @@
 // The relay: a client's ENet connects to a 127.0.0.1 socket of this file, which passes each datagram to the host's
 // SteamID. On the host each linked friend gets its own 127.0.0.1 socket that talks to the host's ENet port, so ENet sees
 // every friend as a separate local peer (coop-anything's HXCoop pattern) and needs no change. The host's ENet still
-// listens on its UDP port too: friends over Steam and players over an IP address can join the same game.
+// listens only on loopback and admits sockets belonging to linked Steam peers.
 #include <winsock2.h>
 #include <windows.h>
 
@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <float.h>
+#include <xmmintrin.h>
 
 namespace g3t::steam {
 namespace {
@@ -34,10 +36,48 @@ using u64 = unsigned long long;
 using sbool = unsigned char;  // C++ bool, returned in AL
 using HSteamPipe = int;
 
+unsigned short FpuControl()
+{
+    unsigned short value;
+    __asm fnstcw value
+    return value;
+}
+
+// Real Steam startup changes x87 precision from the engine's single precision to double precision.
+class SteamFpScope
+{
+    unsigned short control = FpuControl();
+    unsigned mxcsr = _mm_getcsr();
+    char const* operation;
+  public:
+    explicit SteamFpScope(char const* name) : operation(name)
+    {
+        const unsigned short libraryControl = static_cast<unsigned short>((control & ~_MCW_PC) | _PC_53);
+        __asm fldcw libraryControl
+    }
+    ~SteamFpScope()
+    {
+        const unsigned short after = FpuControl();
+        const unsigned sseAfter = _mm_getcsr();
+        static unsigned changes = 0;
+        if ((after != control || ((sseAfter ^ mxcsr) & ~0x3fu)) && ++changes <= 8)
+            Logf("steam: restoring engine FP state after %s: x87=%04x->%04x mxcsr=%08x->%08x",
+                 operation, after, control, sseAfter, mxcsr);
+        const unsigned short saved = control;
+        __asm fldcw saved
+        _mm_setcsr(mxcsr);
+    }
+    SteamFpScope(SteamFpScope const&) = delete;
+    SteamFpScope& operator=(SteamFpScope const&) = delete;
+};
+
 // The flat API: plain __cdecl functions (the mod's own default is __stdcall, /Gz), the interface first.
 struct Api
 {
     int(__cdecl* InitFlat)(char* error);
+    void(__cdecl* Shutdown)();
+    void*(__cdecl* ClientUtils)();
+    uint32_t(__cdecl* AppId)(void*);
     HSteamPipe(__cdecl* GetHSteamPipe)();
     void(__cdecl* DispatchInit)();
     void(__cdecl* DispatchRunFrame)(HSteamPipe);
@@ -77,6 +117,9 @@ struct Api
 struct Export { void** slot; char const* name; };
 Export const Exports[] = {
     {reinterpret_cast<void**>(&api.InitFlat), "SteamAPI_InitFlat"},
+    {reinterpret_cast<void**>(&api.Shutdown), "SteamAPI_Shutdown"},
+    {reinterpret_cast<void**>(&api.ClientUtils), "SteamAPI_SteamUtils_v010"},
+    {reinterpret_cast<void**>(&api.AppId), "SteamAPI_ISteamUtils_GetAppID"},
     {reinterpret_cast<void**>(&api.GetHSteamPipe), "SteamAPI_GetHSteamPipe"},
     {reinterpret_cast<void**>(&api.DispatchInit), "SteamAPI_ManualDispatch_Init"},
     {reinterpret_cast<void**>(&api.DispatchRunFrame), "SteamAPI_ManualDispatch_RunFrame"},
@@ -129,8 +172,8 @@ enum : int { ResultOk = 1 };
 enum : int { ChannelData = 0, ChannelControl = 1 };
 constexpr int LobbyFriendsOnly = 1;
 constexpr int FriendFlagImmediate = 4;
-constexpr uint32_t SpacewarAppId = 480;
-char const LobbyTag[] = "g3together";  // lobby data that marks a G3 Together game (480 lobbies are everyone's)
+constexpr uint32_t GothicAppId = 39500;
+char const LobbyTag[] = "g3together";
 // No silence timeout below ENet's own: a world load stops the game loop (and so Pump) for many seconds, and net.cpp gives
 // ENet peers up to 180 s for it. A friend who quits leaves the lobby, which ends the link at once.
 constexpr uint32_t SilenceMs = 180000;
@@ -145,17 +188,21 @@ struct Remote
     uint32_t heard = 0, lastPing = 0;
     int rtt = -1;
     SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
+    unsigned short relayPort = 0;
     unsigned toEnet = 0, toSteam = 0;
 };
 
 struct Skipped { u64 lobby; uint32_t until; };  // until 0: for good (not a G3 Together lobby)
 
-bool ready = false, tried = false;
+bool ready = false, tried = false, winsockStarted = false, apiInitialized = false;
 char error[256] = "";
 HSteamPipe pipe = 0;
 void *user = nullptr, *matchmaking = nullptr, *friends = nullptr, *messages = nullptr;
 u64 me = 0;
 char persona[64] = "";
+char playerName[24] = "";
+unsigned sendFailures = 0;
+uint32_t lastSendFailure = 0, lastDiagnostics = 0;
 
 bool isHost = false;
 unsigned short enetPort = 0;
@@ -180,6 +227,17 @@ bool searchLogged = false;
 uint32_t Now() { return GetTickCount(); }
 char const* Text(char const* text) { return text ? text : ""; }  // Steam's strings, never null for the CRT
 
+void CopyName(char* out, size_t size, char const* source)
+{
+    size_t length = std::strlen(Text(source));
+    if (length >= size) {
+        length = size - 1;
+        while (length && (static_cast<unsigned char>(source[length]) & 0xc0) == 0x80) --length;
+    }
+    std::memcpy(out, Text(source), length);
+    out[length] = '\0';
+}
+
 void Identity(char (&buffer)[160], u64 id)
 {
     std::memset(buffer, 0, sizeof(buffer));  // a SteamNetworkingIdentity is 136 bytes; filled only through SetSteamID64
@@ -190,7 +248,16 @@ int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
 {
     char identity[160];
     Identity(identity, to);
-    return api.SendToUser(messages, identity, data, size, flags | SendNoNagle | SendAutoRestart, channel);
+    const int result = api.SendToUser(messages, identity, data, size, flags | SendNoNagle | SendAutoRestart, channel);
+    if (result != ResultOk) {
+        ++sendFailures;
+        const uint32_t now = Now();
+        if (!lastSendFailure || now - lastSendFailure >= 5000) {
+            lastSendFailure = now ? now : 1;
+            Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)", to, result, channel, size, sendFailures);
+        }
+    }
+    return result;
 }
 
 void Control(u64 to, char what, bool reliable)
@@ -210,11 +277,15 @@ SOCKET LoopbackSocket(unsigned short* port)
     local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int size = sizeof(local);
     u_long nonBlocking = 1;
+    constexpr int RelayBuffer = 4 * 1024 * 1024;
     // Windows reports an earlier datagram to a closed port as WSAECONNRESET on the next receive; turn that off.
     DWORD off = FALSE, bytes = 0;
     constexpr DWORD UdpConnReset = 0x9800000C;  // SIO_UDP_CONNRESET
     if (bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0 || ioctlsocket(s, FIONBIO, &nonBlocking) != 0 ||
-        getsockname(s, reinterpret_cast<sockaddr*>(&local), &size) != 0) {
+        getsockname(s, reinterpret_cast<sockaddr*>(&local), &size) != 0 ||
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char const*>(&RelayBuffer), sizeof(RelayBuffer)) != 0 ||
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char const*>(&RelayBuffer), sizeof(RelayBuffer)) != 0) {
+        Logf("steam: cannot configure the owned loopback relay socket (WSA %d)", WSAGetLastError());
         closesocket(s);
         return INVALID_SOCKET;
     }
@@ -288,7 +359,12 @@ bool IsSkipped(u64 id)
 void CreateLobby()
 {
     lastCreate = Now();
-    api.CreateLobby(matchmaking, LobbyFriendsOnly, net::MaxPlayers);
+    const u64 call = api.CreateLobby(matchmaking, LobbyFriendsOnly, net::MaxPlayers);
+    if (!call) {
+        strcpy_s(error, "Steam rejected the lobby creation request");
+        Logf("steam: %s", error);
+        return;
+    }
     Log("steam: creating a friends-only lobby");
 }
 
@@ -342,10 +418,15 @@ void OnLobbyCreated(char const* p)
     owner = me;
     char connect[64];
     Format(connect, "+connect_lobby %llu", id);
-    api.SetLobbyData(matchmaking, id, LobbyTag, "1");
-    api.SetLobbyData(matchmaking, id, "name", GetConfig().name);
-    api.SetRichPresence(friends, "status", "G3 Together");
-    api.SetRichPresence(friends, "connect", connect);
+    if (!api.SetLobbyData(matchmaking, id, LobbyTag, "1")) {
+        strcpy_s(error, "Steam did not publish the co-op lobby tag");
+        Logf("steam: %s", error);
+        LeaveLobby();
+        return;
+    }
+    if (!api.SetLobbyData(matchmaking, id, "name", persona)) Log("steam: could not publish the lobby's player name");
+    if (!api.SetRichPresence(friends, "status", "G3 Together")) Log("steam: could not publish rich-presence status");
+    if (!api.SetRichPresence(friends, "connect", connect)) Log("steam: could not publish Join game rich presence");
     Logf("steam: lobby %llu open; friends join over Steam (friends list: Join game, or steam_lobby = %llu)", id, id);
 }
 
@@ -368,7 +449,7 @@ void OnLobbyEnter(char const* p)
     }
     error[0] = '\0';
     owner = api.GetLobbyOwner(matchmaking, id);
-    strncpy_s(hostName, Text(api.FriendPersonaName(friends, owner)), _TRUNCATE);
+    CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
     if (Remote* r = Get(owner)) r->heard = Now();
     lastHello = 0;
     Logf("steam: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
@@ -416,6 +497,7 @@ void OnCallback(int callback, char const* p, int size)
         }
         break;
     case CbSessionFailed:
+        Logf("steam: session with %llu failed; dropping its relay", api.IdentityGetSteamId(p));
         Drop(Find(api.IdentityGetSteamId(p)), "session failed");
         break;
     default:
@@ -434,7 +516,7 @@ void OnControl(Remote& r, char const* data, int size)
                 Logf("steam: %llu refused, the game is full", r.id);
                 break;
             }
-            r.socket = LoopbackSocket(nullptr);
+            r.socket = LoopbackSocket(&r.relayPort);
             if (r.socket == INVALID_SOCKET) {
                 Logf("steam: no local socket for %llu (%d)", r.id, WSAGetLastError());
                 break;
@@ -597,7 +679,7 @@ void Search()
         const u64 id = api.FriendByIndex(friends, i, FriendFlagImmediate);
         // FriendGameInfo_t { CGameID game; u32 ip; u16 port, queryPort; CSteamID lobby at 16; }
         struct { u64 game; uint32_t ip; uint16_t port, queryPort; u64 lobby; } info{};
-        if (!api.FriendGamePlayed(friends, id, &info) || (info.game & 0xffffff) != SpacewarAppId || !info.lobby) continue;
+        if (!api.FriendGamePlayed(friends, id, &info) || (info.game & 0xffffff) != GothicAppId || !info.lobby) continue;
         if (IsSkipped(info.lobby)) continue;
         char const* name = Text(api.FriendPersonaName(friends, id));
         if (*wantedHost && _stricmp(name, wantedHost)) continue;
@@ -635,10 +717,8 @@ bool Load()
         }
         strcat_s(path, "\\G3Together\\steam_api.dll");
     }
-    // Spacewar: steam_api takes the app id from the environment before steam_appid.txt, also when Steam started the game
-    // as Gothic 3 (39500): the mod must not act as THQ Nordic's app.
-    SetEnvironmentVariableA("SteamAppId", "480");
-    SetEnvironmentVariableA("SteamGameId", "480");
+    if (!SetEnvironmentVariableA("SteamAppId", "39500") || !SetEnvironmentVariableA("SteamGameId", "39500"))
+        return Fail("Gothic 3 Steam identity could not be selected");
     HMODULE dll = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) {
         Logf("steam: %s not loaded (%lu)", path, GetLastError());
@@ -661,11 +741,13 @@ bool Load()
 bool Start(bool host, unsigned short port)
 {
     if (ready || tried) return ready;
+    SteamFpScope floatingPoint("startup");
     tried = true;
     isHost = host;
     enetPort = port;
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return Fail("winsock not started");
+    winsockStarted = true;
     if (!Load()) return false;
     char text[1024] = "";
     const int result = api.InitFlat(text);
@@ -673,6 +755,10 @@ bool Start(bool host, unsigned short port)
         Logf("steam: InitFlat %d: %s", result, text);
         return Fail(result == 2 ? "Steam is not running" : result == 3 ? "the Steam client is too old" : *text ? text : "Steam did not start");
     }
+    apiInitialized = true;
+    void* clientUtils = api.ClientUtils();
+    if (!clientUtils || api.AppId(clientUtils) != GothicAppId) return Fail("Steam initialized with an unexpected game AppID");
+    Logf("steam: initialized Gothic 3 AppID %u", GothicAppId);
     api.DispatchInit();
     pipe = api.GetHSteamPipe();
     user = api.User();
@@ -682,9 +768,13 @@ bool Start(bool host, unsigned short port)
     if (!user || !matchmaking || !friends || !messages) return Fail("Steam interfaces missing");
     if (void* utils = api.Utils()) api.InitRelayNetworkAccess(utils);  // the relay network is ready by the first message
     me = api.UserSteamId(user);
-    strncpy_s(persona, Text(api.PersonaName(friends)), _TRUNCATE);
+    char const* steamName = api.PersonaName(friends);
+    if (!steamName || !*steamName) return Fail("Steam did not provide a player name");
+    CopyName(persona, sizeof(persona), steamName);
+    CopyName(playerName, sizeof(playerName), steamName);
+    if (!*playerName) return Fail("Steam player name does not fit the network protocol");
     ready = true;
-    Logf("steam: ready as Spacewar (480), %s (%llu), %s", persona, me, isHost ? "host" : "client");
+    Logf("steam: ready as Gothic 3 (%u), %s (%llu), %s", GothicAppId, persona, me, isHost ? "host" : "client");
     if (isHost) {
         CreateLobby();
         return true;
@@ -702,9 +792,18 @@ bool Start(bool host, unsigned short port)
 
 unsigned short RelayPort() { return relayPort; }
 
+bool IsPeerRelay(unsigned short port)
+{
+    if (!ready || !isHost || !port) return false;
+    for (auto const& r : remotes)
+        if (r.linked && r.socket != INVALID_SOCKET && r.relayPort == port) return true;
+    return false;
+}
+
 void Pump()
 {
     if (!ready) return;
+    SteamFpScope floatingPoint("callbacks");
     api.DispatchRunFrame(pipe);
     struct { int user; int callback; char* param; int size; } message{};  // CallbackMsg_t
     while (api.DispatchNext(pipe, &message)) {
@@ -750,20 +849,43 @@ void Pump()
             r.lastPing = now;
         }
     }
+    if (!lastDiagnostics || now - lastDiagnostics >= 5000) {
+        lastDiagnostics = now ? now : 1;
+        Status(&Log);
+    }
 }
 
 void Stop()
 {
-    if (!ready) return;
-    Forward();  // ENet's goodbye to the others
-    LeaveLobby();
+    SteamFpScope floatingPoint("shutdown");
+    if (ready) {
+        Forward();  // ENet's goodbye to the others
+        LeaveLobby();
+        Log("steam: stopped");
+    }
     if (relay != INVALID_SOCKET) closesocket(relay);
     relay = INVALID_SOCKET;
     ready = false;
-    Log("steam: stopped");
+    if (apiInitialized) {
+        api.Shutdown();
+        apiInitialized = false;
+    }
+    if (winsockStarted) {
+        WSACleanup();
+        winsockStarted = false;
+    }
 }
 
 bool Ready() { return ready; }
+uint64_t LobbyId() { return lobby; }
+char const* PlayerName() { return playerName; }
+int Ping()
+{
+    int maximum = -1;
+    for (auto const& r : remotes)
+        if (r.linked && r.rtt > maximum) maximum = r.rtt;
+    return maximum;
+}
 char const* Error() { return error; }
 char const* HostName() { return hostName; }
 
@@ -783,8 +905,9 @@ int LinkedCount()
 void Status(void (*log)(char const*))
 {
     char line[512];
-    int n = Format(line, "STEAMSTATUS ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d offset=%d error=%s", ready ? 1 : 0,
-                   isHost ? "host" : "client", lobby, owner, hostName, LinkedCount(), senderOffset, *error ? error : "-");
+    int n = Format(line, "STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d send_failures=%u offset=%d error=%s",
+                   GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, LinkedCount(), Ping(), sendFailures,
+                   senderOffset, *error ? error : "-");
     for (auto const& r : remotes)
         if (r.id) n += Format(line + n, sizeof(line) - n, " peer=%llu:%d:%u:%u:%d", r.id, r.linked ? 1 : 0, r.toEnet, r.toSteam, r.rtt);
     log(line);

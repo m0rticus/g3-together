@@ -2,7 +2,22 @@
 
 **Return to Gothic 3 with a friend.** Share the campaign, fight side by side, and help each other back up when a battle goes wrong. One player hosts the world; the other joins over the network.
 
-[Download the beta](https://github.com/GGM1k3y23/g3-together/releases) · [Quickstart](#quickstart) · [Player guides](#player-guides) · [Build and test](#for-developers)
+[Release packages](https://github.com/m0rticus/g3-together/releases) · [Quickstart](#quickstart) · [Player guides](#player-guides) · [Build and test](#for-developers)
+
+> **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
+> direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
+
+The current source speaks **protocol 69**. Its host-authoritative NPC overhaul is experimental and native gameplay
+acceptance is still in progress; it is not a verified release. Both players need the same build.
+The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
+Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
+autonomous tasks or prediction. Final poses include native blend-out layers that motion slots alone do not describe.
+NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.
+A client's successful hit plays an immediate presentation-only flinch and counts despite a host-side parry.
+Hit identities suppress the corresponding echoed reaction. Hero damage is judged against locally presented contacts,
+and ragdoll impulses travel only from host to client.
+Player-puppet smoothing remains separate. Party identity, friendly-fire protection, automatic player exchanges,
+personal loot/merchant inventories, shared experience and lethal-blow rescue rules are retained.
 
 > **Beta — back up your saves.** Tested mainly with bots driving two real game clients on one PC, plus one evening of human play. Bots reached Innos' ending; no human co-op playthrough has been completed yet. Internet play remains unverified; only two players have been tested.
 
@@ -10,7 +25,10 @@
 
 - **Share the adventure.** Quest progress, dialogs and story milestones sync. Listen to nearby conversations and see your partner's dialog choices.
 - **Fight as a team.** Shared enemies, visible attacks and spells, individual kill XP. Quest XP is shared; dialog gold goes to the player handing in.
-- **Loot once, trade together.** Chests and corpses share loot; picked pockets stay picked. Player trades require your partner's confirmation.
+- **Personal loot and shops.** Ground pickups, corpse loot, chest contents and NPC merchant stock belong to each player's copy.
+  Taking or buying something does not deplete the other player's copy. Picked pockets still use shared NPC state.
+- **Trade together.** Use the game's trade screen to move real items freely or give gold. Exchanges synchronize automatically, without partner approval.
+  A later host-save load still replaces native world inventories; independent world-inventory save reconstruction is not implemented.
 - **Look out for each other.** Find your partner on the map and compass, jump to their side, and revive them with a healing potion.
 - **Keep your character and campaign.** Show your armor and helmet. The host saves; each player's hero record returns when loading the shared campaign.
 
@@ -32,22 +50,27 @@ Prefer a separate game copy for co-op. Keep other co-op mods out of `scripts`.
 
 ### 2. Run setup on both PCs
 
-Unpack the **whole mod package** from [Releases](https://github.com/GGM1k3y23/g3-together/releases) and run `Setup.cmd` (Deutsch: `Einrichten.cmd`; Polski: `Instalacja.cmd`). GitHub's source-code ZIP does not include the built mod.
+Unpack the **whole mod package built from this fork** and run `Setup.cmd` (Deutsch: `Einrichten.cmd`; Polski: `Instalacja.cmd`). GitHub's source-code ZIP does not include the built mod.
 
-Choose one **host** and one **joining player**, enter names and the host's address. Setup finds the game, checks patches and installs the mod with `g3together.ini`. Replaced files go into `G3Together-backup`. See also [manual installation](docs/PLAYING.md#installation).
+Choose one **host** and one **joining player**. Player names come from Steam automatically. Setup finds the game, checks patches and installs the required
+Steam DLL and mod with `g3together.ini`. If the verified Steam DLL cannot be installed, setup stops.
+Replaced files go into `G3Together-backup`. See also [manual installation](docs/PLAYING.md#installation).
 
 ### 3. Connect and play
 
-The default is **UDP port 34567**. Allow Gothic 3 through the host's firewall and use a reachable host address. See the [network guide](docs/PLAYING.md#connecting-over-the-internet) for VPN and port-forwarding options.
+Both players must own Gothic 3 on Steam, have Steam running and be Steam friends. The joining player's game finds the host through Steam:
+no host address, VPN or router port forwarding is needed. Steam failures are reported without opening another connection.
+ENet's internal UDP sockets bind only to localhost. See [over Steam](docs/PLAYING.md#over-steam-experimental).
 
-Experimental: choose **Steam** in the setup (`transport = steam`) and the joining player's game finds the host among its Steam friends, with no address or port forwarding. See [over Steam](docs/PLAYING.md#over-steam-experimental).
+The main menu shows the lobby state, joined/ready client counts and measured Steam ping (or `pending` before a sample).
+Steam activity uses **Gothic 3 (AppID 39500)**, not Spacewar.
 
 | Host starts first… | Joining player… |
 | --- | --- |
 | Load a saved campaign. | **Wait in the main menu**; the campaign transfers and loads automatically. |
 | Start a new, unsaved campaign. | **Start a new game too.** Once the host has saved, future joins can load from the main menu. |
 
-The **host saves**. Keep player names unchanged to restore companions. Read about [first-join heroes and saves](docs/PLAYING.md#starting-and-saving).
+The **host saves**. Keep Steam display names unchanged to restore companions. Read about [first-join heroes and saves](docs/PLAYING.md#starting-and-saving).
 
 ## A few things to try
 
@@ -55,7 +78,7 @@ The **host saves**. Keep player names unchanged to restore companions. Read abou
 | --- | --- |
 | Regroup | **Page Down** jumps behind your partner in the same world; five-second cooldown. |
 | Revive your partner | Talk to them: **“I will help you.”** Costs one healing potion. If nobody can help, normal death still applies. |
-| Trade | Talk to your partner: **“Show me your wares!”** Close the trade window; they accept with **Insert** or decline with **Delete**. |
+| Trade | Talk to your partner: **“Show me your wares!”** Select items or gold and use **Trade/Swap**. Items are free; no partner approval is needed. |
 
 Edit your `g3together.ini` and restart to customize messages, appearance and the regroup key:
 
@@ -68,6 +91,10 @@ partner_key = F9
 `auto` follows the game's text language: German, Polish, otherwise English. Override with `en`, `de` or `pl`; omitting the setting gives English. Each player chooses independently, without changing the game's language.
 
 The host chooses `reputation = shared` (default), `together` (shared guilt) or `personal`; see [reputation rules](docs/PLAYING.md#known-limitations).
+
+**Friendly fire is off by default.** Players and their followers cannot hurt, stagger, knock down or inflict harmful
+spell effects on one another; healing still works. Existing INIs with a nonzero `friendly_fire` keep that opt-in
+damage setting. Set `friendly_fire = 0` on both PCs and restart for full protection; both settings must match.
 
 ## Know the limits
 
@@ -95,7 +122,24 @@ Read the [full limitations](docs/PLAYING.md#known-limitations), including saving
 python "tools\collect_logs.py" "C:\Games\Gothic 3"
 ```
 
-Share both players' ZIPs privately with the host first. User paths and IP addresses are redacted; review before sharing further. Do not attach saves or unredacted INIs. [Without Python](docs/JOINING.md#if-something-goes-wrong), collect logs manually.
+`g3together.log` is enabled automatically and appends dated session markers, lobby/connection errors, player identities,
+relay counters and periodic Steam ping/status. While playing, compact `SYNCBODY` and `SYNCNPC` counters report hard
+corrections, action corrections, stale mirrors and ownership takeover deferrals without per-entity scans.
+`SYNCCOMBAT` distinguishes locally judged hits, forwarded/applied claims and damage ignored while browsing inventory.
+Share both players' ZIPs privately with the host first. User paths and IP addresses
+are redacted; Steam names/IDs can remain, so review before sharing further. Do not attach saves or unredacted INIs.
+[Without Python](docs/JOINING.md#if-something-goes-wrong), collect logs manually.
+
+NPC damage to a player browsing the inventory is blocked locally; the rest of the co-op world continues.
+Corpse presentation uses local ragdoll initialization or observed death-loop animations, with retries when resources are unavailable.
+Physics and bone poses are independent on each machine; death and quest/XP outcomes still synchronize.
+
+Player-puppet smoothing retains its own movement controller and prediction. NPCs instead interpolate received samples
+on an adaptive buffered timeline (at least 50 ms), hold on an underrun, and cannot authorize stale contacts.
+NPC HP and life state follow that same timeline. Local hero controls are not buffered.
+Combat/perception hooks also cover native direct calls when their instruction prologues match, and damage judgement can
+recognize a local player's hit on a mirrored NPC without enabling that NPC's independent AI.
+Native hostility, immortality, duel and damage rules remain in effect; this does not force friendly NPCs to become enemies.
 
 ## For developers
 
@@ -105,7 +149,7 @@ Built on the unofficial [Gothic 3 SDK](https://github.com/georgeto/gothic3sdk) f
 
 Use **MSVC, 32-bit**. This example needs Visual Studio 2026 C++ tools and [CMake 4.2+](https://cmake.org/cmake/help/latest/generator/Visual%20Studio%2018%202026.html) for its generator (project minimum: 3.24).
 
-The SDK is a separate checkout. Its default path is `../g3-workspace/tools/gothic3sdk`; add `-DG3SDK_DIR="C:/path/to/gothic3sdk"` to the first command to override it. From the repository root:
+The SDK is a separate checkout. Its default path is `workspace/tools/gothic3sdk` (inside this repository, gitignored); add `-DG3SDK_DIR="C:/path/to/gothic3sdk"` to the first command to override it. From the repository root:
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 18 2026" -A Win32
@@ -116,23 +160,70 @@ cmake --build build --config Release
 
 ```text
 dev/
-  g3-together/     Public source: src/, thirdparty/enet/, qa/, docs/, tools/
-  g3-workspace/   Private SDK, builds, isolated game copies, receipts, logs and research
-  coop-anything/  Development playbook; findings go back as pull requests
+  g3-together/            Public source: src/, thirdparty/enet/, qa/, docs/, tools/
+    workspace/            Private and gitignored: SDK, builds, isolated game copies, receipts, logs and research
+  coop-anything/          Development playbook; findings go back as pull requests
 ```
 
 Keep the workspace private and uncommitted. Its `build-mod.ps1` helper is not included here.
 
-Bot suites need a **configured private workspace** with `project.json`, deployment receipts and isolation checks; a fresh clone is insufficient. Default: `../g3-workspace`; override with `G3_WORKSPACE`.
+Bot suites need **Python 3.12+** and a **configured private workspace** with `project.json`, two disposable game copies
+and their isolated profiles; a fresh clone is insufficient. Default: `workspace/` in the repository; override with
+`G3_WORKSPACE`. `project.json` names the absolute `protected_save_dir`. Before launching, the checked-in isolation
+verifier requires the game modules' folder imports to point to the existing `g3qa32.dll` isolation shim, rejects redirected
+or shared writable paths, and checks matching mod DLLs. Existing private deployment receipts and verification scripts
+are still checked when configured.
 
 ```powershell
-python qa/together.py --suite stage2
-python qa/together.py --suite stage2 --negative-control
+$env:G3_FAKESTEAM = "$PWD\build\artifacts\fakesteam\Release\fake_steam_api.dll"
+python qa\together.py --suite stage2
+python qa\together.py --suite stage2 --negative-control
 ```
 
 These `stage2` runs drive two isolated game copies; the negative control is expected to report `RESULT: FAIL`. The runner checks isolation and hashes the owner's real saves before and after each run. Other suites include `stage1`, `stage3a` and `stage3b`; see [development stages](docs/STAGES.md).
 
 The compiled QA bot activates only with `qa-enable.txt`. Use it only in disposable test installations.
+
+### Saved-world QA baseline
+
+Create the baseline once, then verify it from fresh game processes:
+
+```powershell
+$env:G3_FAKESTEAM = "$PWD\build\artifacts\fakesteam\Release\fake_steam_api.dll"
+python qa\together.py --suite sandboxsave --seconds 900
+python qa\together.py --suite sandboxcheck --seconds 600
+```
+
+Use the workspace's bundled `workspace\tools\python-3.14.10\python.exe` instead of `python` if the system interpreter is
+older than 3.12. The save is `G3T_Sandbox`, stored privately under
+`workspace\runtime\fixtures\sandbox-p1` (or `sandbox-p<G3_PAIR>`). It contains the native world and host hero, mod sidecar,
+client hero and quickbar records, plus a versioned SHA-256 manifest, native game identity and hero/position baselines.
+
+`sandboxsave` clears the opening battle once, disables tutorial popups and moves the heroes to the flat island off Ardea
+(around native coordinates `77000, -280, -61000`), unarmed, at full health, at noon.
+No surrounding NPCs are killed to manufacture an empty area. Creation must pass a
+real host/client save/load and a walk on the ground before the fixture replaces any previous baseline.
+Campaign transfer and fixture validation support both native CP and alternative-balancing CPX save files; the transfer
+uses the same balancing option as the engine rather than assuming every installation writes CPX.
+Native loads put both players at the saved host position. The fixture loader verifies that position, then places the
+client at its fixed 8 m offset; the client's own inventory and attributes come from its saved hero record.
+
+`sandboxcheck` loads from the main menus without starting a new game, checks both heroes' positions, attributes,
+inventories, ground contact, empty 40 m surroundings and mutual visibility, walks, then spawns a controlled
+NPC on both machines. It changes gold, health and positions and reloads the baseline, requiring the original hero
+state to return and the spawned NPC to disappear. It idles afterward to check continued stability, and checks that
+the fixture itself and the real saves are unchanged.
+
+Location-independent stages (`stageW2`, `stageWear`, `stageHealOther`, `stagePlayerTrade`) and `warm` use this save
+by default. A missing, damaged or incompatible fixture is an error, never a silent new-game start. The shared-session
+runner runs these stages independently from the fixture so inventory, flags and spawned entities cannot leak between
+tests. Town/quest/startup/raid-specific stages keep their existing setup; forcing them all onto an empty map would
+invalidate their coverage. `G3_SANDBOX=0` explicitly opts compatible stages out; `sandboxcheck` cannot opt out.
+
+For new isolated scenarios, add the stage to `SANDBOX_STAGES`, call `join_both(copies)`, and use
+`spawn_sandbox_npc(copies, 'Scavenger')` to create the same GUID on both machines. Do not save scenario mutations over
+the fixture. Recreate it when native game files or the saved-state contract changes. Fast regression checks:
+`python -m unittest discover -s qa -p "test_*.py"`.
 
 ## License and credits
 

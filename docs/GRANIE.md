@@ -8,6 +8,8 @@ wszystkich. Drugi gracz do niego dołącza.
 
 To wersja testowa. Znane problemy i ograniczenia opisano niżej.
 
+Ten fork obsługuje **tylko Steam**. Dołączanie przez IP, LAN/VPN i automatyczne połączenie zastępcze przez IP nie są obsługiwane.
+
 ## Wymagania (takie same na obu komputerach)
 
 - Gothic 3 ze Steama z **Community Patch 1.75.14**.
@@ -20,6 +22,7 @@ To wersja testowa. Znane problemy i ograniczenia opisano niżej.
   w podfolderach Data nie są sprawdzane.
 - Żadnych innych modów kooperacji w `scripts`, np. `Script_G3Coop.dll` z Myrtana Accord.
 - Najlepiej używać do kooperacji osobnej **kopii** instalacji Gothic 3.
+- Steam musi działać i być zalogowany na obu komputerach; obaj gracze muszą być znajomymi na Steam.
 
 ## Instalacja
 
@@ -27,13 +30,15 @@ To wersja testowa. Znane problemy i ograniczenia opisano niżej.
 `Instalacja.cmd` (po angielsku `Setup.cmd`, po niemiecku `Einrichten.cmd`). Instalator zrobi resztę: znajdzie Gothic 3
 (Steam, GOG albo podany folder), sprawdzi Community Patch 1.75.14 i Parallel Universe Patch 1.1.1, przeniesie inny mod
 kooperacji ze `scripts`, skopiuje mod do `scripts` i zapisze `g3together.ini` na podstawie twoich odpowiedzi (host czy
-dołączający gracz, twoja nazwa, adres hosta). Zastąpione pliki trafiają do `G3Together-backup` w folderze gry. Instalator
+dołączający gracz). Nazwa gracza pochodzi automatycznie ze Steam. Steam i sprawdzony `steam_api.dll` są wymagane; instalator kończy pracę, jeśli DLL nie może być zainstalowany.
+Zastąpione pliki trafiają do `G3Together-backup` w folderze gry. Instalator
 sprawdzono na folderach testowych, jeszcze nie u graczy; poniższe kroki robią to samo ręcznie.
 
 1. Zainstaluj Gothic 3 ze Steama, potem **Community Patch 1.75.14**.
 2. Zainstaluj [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm) do tej samej
    instalacji gry. Obaj gracze muszą mieć te same wersje łatek.
-3. Używaj tego samego pakietu G3 Together na obu komputerach. Skopiuj `Script_G3Together.dll` do `<Gothic 3>\scripts\`.
+3. Używaj tego samego pakietu na obu komputerach. Skopiuj `Script_G3Together.dll` do `<Gothic 3>\scripts\`
+   i sprawdzony 32-bitowy `steam_api.dll` do `<Gothic 3>\G3Together\`, albo użyj instalatora.
 4. Skopiuj z pakietu odpowiedni plik `g3together.ini.host-example` albo `g3together.ini.client-example` do `<Gothic 3>\`,
    zmień jego nazwę na `g3together.ini` i edytuj go:
 
@@ -41,8 +46,7 @@ sprawdzono na folderach testowych, jeszcze nie u graczy; poniższe kroki robią 
 
    ```ini
    role = host
-   port = 34567
-   name = TwojaNazwa
+   transport = steam
    language = auto
    ```
 
@@ -50,9 +54,7 @@ sprawdzono na folderach testowych, jeszcze nie u graczy; poniższe kroki robią 
 
    ```ini
    role = client
-   address = <adres IP hosta>
-   port = 34567
-   name = TwojaNazwa
+   transport = steam
    language = auto
    ```
 
@@ -68,47 +70,27 @@ języka samego Gothic 3. Przykłady komunikatów w tym poradniku są po polsku.
 
 ## Połączenie przez internet
 
-Mod łączy się bezpośrednio przez UDP, port 34567. Prywatna sieć wirtualna, np. **Tailscale** albo **ZeroTier**, pozwala
-graczom połączyć się bez przekierowania portu na routerze. Zainstaluj wybraną usługę na obu komputerach i wpisz jako
-`address` adres hosta w sieci wirtualnej. Host może też przekierować na routerze port UDP 34567 na swój komputer.
+Steam jest jedyną drogą połączenia. Adres hosta, VPN i przekierowanie portów na routerze nie są potrzebne.
 
 ### Przez Steam (eksperymentalnie)
 
 Z `transport = steam` w obu plikach INI gra dołączającego gracza sama znajduje hosta wśród jego znajomych na Steam, a cały
-ruch idzie przez Steam, w razie potrzeby przez przekaźniki Valve: bez adresu, bez przekierowania portów, bez Hamachi.
+ruch idzie przez Steam, w razie potrzeby przez przekaźniki Valve.
 
-- Obaj gracze potrzebują uruchomionego i zalogowanego Steam i muszą być znajomymi na Steam. Gothic 3 z GOG też działa;
-  potrzebne jest tylko konto Steam.
+- Obaj gracze muszą posiadać Gothic 3 na Steam, mieć uruchomiony i zalogowany Steam oraz być znajomymi.
+  Nazwy graczy pochodzą automatycznie ze Steam; nazwa w INI jest ignorowana.
 - Mod potrzebuje 32-bitowego pliku `steam_api.dll` od Valve w `<Gothic 3>\G3Together\`. Instalator umieszcza go tam (z
   paczki albo, po pytaniu, pobrany z wydania Steamworks.NET 2025.164.1 i sprawdzony sumą SHA-256).
-- Mod działa jako darmowa przykładowa aplikacja Valve „Spacewar” (AppID 480), więc Steam pokazuje obu graczy jako grających
-  w Spacewar. Nic nie trzeba kupować.
+- Mod używa Gothic 3 (AppID 39500), więc aktywność Steam pokazuje Gothic 3 zamiast Spacewar.
 - Gdy hostuje kilku znajomych naraz, dołączający gracz wpisuje `steam_host = <nazwa hosta na Steam>`. Plik
   `g3together.log` hosta podaje też numer lobby; `steam_lobby = <numer>` dołącza dokładnie do niego.
-- Bez Steam (nie działa, brak `steam_api.dll`) gra dołączającego gracza łączy się zamiast tego z `address` i mówi o tym w
-  grze. Port UDP hosta pozostaje otwarty także przy Steam, więc gracz z adresem może dołączyć do tej samej gry.
+- Bez Steam albo wymaganego `steam_api.dll` kooperacja nie uruchamia się; menu główne i gra pokazują błąd.
+  Nie ma połączenia zastępczego. Gniazda UDP ENet są przypisane tylko do localhost i akceptują wyłącznie połączone przekaźniki Steam.
 - Zaproszenie przez nakładkę Steam może się w Gothic 3 nie otworzyć. Nie jest potrzebne: gra dołączającego gracza sama
   znajduje hosta, a „Dołącz do gry” na liście znajomych Steam też działa, gdy jego gra jest uruchomiona.
 
 To połączenie przetestowano z zastępnikiem Steam na jednym komputerze; gra między dwoma prawdziwymi kontami Steam nie została
 jeszcze sprawdzona.
-
-### Hamachi
-
-1. Obaj gracze instalują Hamachi i dołączają do **tej samej** sieci Hamachi.
-2. Sprawdź stan połączenia pokazany przy drugim graczu. Najlepsze jest połączenie bezpośrednie; połączenie przekazywane
-   (relay) dodaje opóźnienie i może powodować przycięcia. Usuń błędy połączenia przed startem.
-3. Adres Hamachi hosta jest widoczny na górze jego okna Hamachi (`25.x.x.x`). Dołączający gracz wpisuje ten adres w swoim
-   INI: `address = 25.x.x.x`, `port = 34567`.
-4. **Zapora u hosta:** Windows często traktuje Hamachi jako sieć publiczną. Gdy Windows zapyta, czy przepuścić Gothic 3
-   przez zaporę, zezwól dla profilu sieci używanego przez Hamachi, w razie potrzeby także dla **sieci publicznych**.
-5. Dołączający gracz może w wierszu poleceń wpisać `ping 25.x.x.x` z adresem hosta, aby sprawdzić połączenie i opóźnienie.
-   Im mniejsze opóźnienie, tym lepiej; sama odpowiedź na ping nie dowodzi, że połączenie UDP gry jest dozwolone.
-6. Jeśli gra dołączającego gracza nie może połączyć się z hostem, po około 15 sekundach mówi o tym górny wiersz menu
-   głównego, z wpisanym adresem i portem (w grze: komunikat co 30 sekund).
-
-Host przyjmuje połączenia przez każdą kartę sieciową, także Hamachi. Testy opisane w tych poradnikach używały dwóch kopii
-gry na jednym komputerze; gra przez prawdziwy internet nie została jeszcze sprawdzona.
 
 ## Start i zapisywanie
 
@@ -125,13 +107,14 @@ gry na jednym komputerze; gra przez prawdziwy internet nie została jeszcze spra
 ## Co jest wspólne
 
 - Gracze widzą się nawzajem, łącznie z ruchem, animacjami walki i upadkami.
-- Wszyscy widzą te same postacie, walki i śmierci. Każdy region symuluje jeden gracz: host w swojej okolicy albo pierwszy
-  gracz, który dotrze do odległego regionu. Inny gracz, który tam wejdzie, widzi tę samą symulację.
-- Komputer, który symuluje postać, decyduje o zadanych jej obrażeniach. Doświadczenie dostaje gracz, który ją zabije.
+- Protokół 69 jest nadal eksperymentalny: host symuluje NPC przy wszystkich graczach, również w odległych regionach.
+  Klienci odtwarzają buforowane pozycje i animacje bez własnej sztucznej inteligencji ani zadań NPC.
+- Każdy gracz ocenia widoczne trafienia, a host stosuje obrażenia NPC. Doświadczenie dostaje gracz, który ją zabije.
   Zabójstwa przez towarzyszy albo przywołane istoty gracza nagradzają tego gracza; zabójstwa przez inne postacie nie
   nagradzają nikogo. Jak w grze dla jednego gracza, ostatni cios w człowieka albo orka powala go (doświadczenie, bez
   morderstwa); dopiero cios w leżącego zabija.
-- Towarzysze idą za graczem, który ich zwerbował, także daleko od hosta. Odprawieni wracają pod opiekę hosta.
+- Towarzysze idą za graczem, który ich zwerbował, także daleko od hosta. Zawsze symuluje ich host;
+  werbowanie i odprawianie zmieniają przynależność do drużyny, nie władzę nad symulacją.
 - Postać, która cię prowadzi albo którą eskortujesz (zadania prowadzenia i eskorty), idzie z graczem, który przyjął
   zadanie, także z dołączającym graczem, a po wczytaniu zapisu przez hosta ten gracz znowu prowadzi. Gdy eskorta kończy się
   daleko od hosta, postać stoi w tym samym miejscu na obu komputerach.
@@ -168,6 +151,10 @@ gry na jednym komputerze; gra przez prawdziwy internet nie została jeszcze spra
   pamiętają, jak skończyła się walka, a postać, która wciąż jest zła na jednego gracza, ma pretensje tylko do niego.
 - Blokowanie działa dla obu graczy jak w grze dla jednego gracza: blok kosztuje wytrzymałość, a talent tarczy się liczy.
   Postać, która paruje, blokuje ciosy obu graczy tak samo.
+- Ogień przyjacielski jest domyślnie wyłączony (`friendly_fire = 0`): gracze i ich towarzysze nie mogą się wzajemnie
+  zranić, powalić, ogłuszyć, zatruć ani zamrozić. Leczenie i podnoszenie nadal działają; obrażenia od wrogów i otoczenia
+  pozostają bez zmian. Ustaw tę samą wartość na obu komputerach i uruchom grę ponownie. Wartość od 1 do 100 zachowuje
+  dotychczasowe skalowanie obrażeń między graczami; instalator zachowuje istniejące ustawienia.
 - Gracz w promieniu około 20 m słyszy dialog drugiego gracza. Przy włączonych napisach gry widać też tekst kwestii,
   w języku twojej gry, chyba że sam prowadzisz rozmowę. Widzisz również odpowiedzi, które drugi gracz może wybrać, a potem
   tę wybraną; wybiera ten, kto rozmawia.
@@ -221,27 +208,24 @@ gry na jednym komputerze; gra przez prawdziwy internet nie została jeszcze spra
 - **Twój wygląd:** drugi gracz widzi twoją zbroję i hełm. Aby wyglądać jak inna postać, ustaw we własnym INI
   `look = Diego` (szablon postaci z gry); bez tego decyduje `puppet_template` drugiego gracza (domyślnie: bohater).
 - **Handel z drugim graczem:** porozmawiaj z postacią drugiego gracza i wybierz „Pokaż mi swoje towary.”. Otworzy się okno
-  handlu gry z tym, czym drugi gracz może handlować (nie z tym, co ma na sobie, bez przedmiotów fabularnych), i jego
-  złotem; ceny są takie same w obie strony; naostrzona, poświęcona albo wykuta broń taka pozostaje. Przy pierwszym handlu
-  najpierw pojawi się okno ze wskazówką: kliknij Ok. Wymieniaj, ile chcesz, potem zamknij okno: drugi gracz dostaje jedną
-  ofertę i w ciągu 30 sekund przyjmuje ją klawiszem Insert albo odrzuca klawiszem Delete. **Własna cena:** dopóki okno
-  jest otwarte, klawiszami Num+ i Num− ustawiasz, ile złota przechodzi z rąk do rąk (10 na naciśnięcie, z Shift 100);
-  cena zaczyna się od wartości towaru i widać ją na ekranie. Drugi gracz widzi ją w ofercie i decyduje. Nie może
-  przekroczyć złota, które macie, ani spaść poniżej zera (wtedy to prezent). Do tego czasu nie masz ani tego,
-  co dostajesz, ani tego, co dałeś; potem wszystko jest tam, gdzie powinno. Inne klawisze: `offer_accept_key = F7`,
-  `offer_decline_key = F8`, `price_up_key` i `price_down_key` (domyślnie `NUMPLUS`, `NUMMINUS`) w INI (te same nazwy co
-  dla `partner_key`). Jeśli dwa z tych klawiszy są takie same,
-  jedno naciśnięcie wywołuje obie akcje: mod mówi o tym na ekranie przy starcie i w `g3together.log`.
+  handlu gry z jego niezałożonymi przedmiotami i złotem. Wybierz, co chcesz wziąć lub przekazać, i użyj zwykłego
+  przycisku wymiany. Przedmioty są darmowe: nie potrzeba zapłaty ani równej wartości towarów. Złoto przekazujesz
+  osobno, wybierając jego ilość, także bez przedmiotów. Każda wymiana synchronizuje się automatycznie przy otwartym
+  oknie, bez zatwierdzania przez partnera. Założony/trzymany sprzęt, przedmioty fabularne i umiejętności pozostają
+  chronione; jakość przedmiotów jest zachowana. Pierwszą wskazówkę gry zamknij przez Ok.
+  Dawne klawisze ofert i ceny już nie działają; handel z NPC pozostaje bez zmian. Przed zapisem lub wczytaniem
+  poczekaj na synchronizację, a po rozłączeniu połącz partnera ponownie.
+  Nowy przepływ zbudowano do testów ręcznych; obsługa myszą i przekazywanie samego złota wymagają sprawdzenia w grze.
 - Zmiany postaci przez dialogi, np. ustawienia handlarza, nauczyciela, strażnika i rozkładu dnia, obowiązują wszystkich,
   podobnie jak pojedynki, ataki i werbowanie towarzyszy wywołane dialogiem. Przedmioty z dialogów dostaje gracz, który
   rozmawia.
 - Zapis hosta pamięta, do którego gracza należy każdy towarzysz. Po wczytaniu towarzysz wraca do swojego gracza, gdy ten
-  dołączy ponownie; gracz jest rozpoznawany po nazwie z INI. Nie zmieniaj tej nazwy. Po rozłączeniu bez wczytywania
+  dołączy ponownie; gracz jest rozpoznawany po nazwie na Steam. Nie zmieniaj tej nazwy. Po rozłączeniu bez wczytywania
   towarzysze należą najpierw do hosta.
 - Jeśli host wczyta zapis podczas sesji, pozostali gracze zostają do niego wczytani automatycznie. Dopóki to trwa, nie
   widzicie się nawzajem.
-- Handel i przeszukiwanie boty sprawdziły przez własne funkcje handlu gry; obsługa okna handlu myszą (przeciąganie
-  przedmiotów, jego przyciski) nie była jeszcze próbowana przez człowieka.
+- Dawne testy handlu używały pomocników ekwipunku, nie przycisku wymiany. Nie potwierdzają nowego przepływu;
+  wymagane są ręczne testy okna handlu.
 - Sen przesuwa zegar dla wszystkich, ale leczy tylko śpiącego gracza.
 - Przemiany: drugi gracz widzi poruszające się zwierzę, a po końcu przemiany znowu bohatera. Wilka i krwiopijcę sprawdzono
   w takim samym układzie jak czar gry. W postaci zwierzęcia walczysz jako ty: twoje trafienia liczą się jako twoje

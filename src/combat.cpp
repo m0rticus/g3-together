@@ -6,10 +6,16 @@
 
 #include "enclaves.h"
 #include "config.h"
+#include "hud.h"
+#include "guards.h"
+#include "downed.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "npcplayback.h"
 #include "remote.h"
+#include "ranged.h"
+#include "shot.h"
 #include "witness.h"
 
 #include <Game.h>
@@ -23,6 +29,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace g3t::combat {
@@ -52,12 +59,114 @@ bool partyXp = true;  // QA negative control: PartyXpOff
 bool reactHits = true;  // QA negative control: ReactHitsOff
 bool agressor = true;   // QA negative control: agressoroff (the struck NPC judges its attacker with AssessTarget, as before 26.10.)
 unsigned reactionsStarted = 0;  // host: client hits that made the NPC judge its attacker (AssessTarget)
+unsigned hitsRedirected = 0, hitsWrongAuthority = 0, hitReactionsApplied = 0;
+struct PendingNpcHit {
+    uint8_t from, guid[16], weapon[16], npc[16], outcome, reaction;
+    int32_t delta;
+    uint32_t seen;
+    uint32_t sequence, incarnation, generation;
+};
+std::vector<PendingNpcHit> pendingNpcHits;
+struct ReactionProbe {
+    uint8_t guid[16];
+    DWORD due;
+    bool owner;
+};
+std::vector<ReactionProbe> reactionProbes;
+void ScheduleReactionProbe(eCEntity*, bool);
+void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16], bool party);
 bool npcHits = true;  // QA negative control: NpcHitsOff
 unsigned forwardedJudged = 0, forwardedBare = 0;  // client: forwarded hits judged here / applied as bare hit points
+unsigned inventoryHitsIgnored = 0, clientJudgements = 0, clientJudgementsWithoutDamage = 0;
+unsigned localNpcHits = 0, remoteNpcHitsIgnored = 0, invisibleContactsIgnored = 0;
+unsigned friendlyHitsIgnored = 0;
+DWORD lastInventoryHitLog = 0;
+struct WalkProbe {
+    uint8_t guid[16] = {};
+    float goal[3] = {};
+    uint32_t until = 0;
+    uint32_t nextGoto = 0;
+    char routine[64] = {};
+    int mode = 0;
+} walkProbe;
+struct PinnedNpc {
+    uint8_t guid[16] = {};
+    float position[3] = {}, rotation[4] = {};
+    uint32_t until = 0;
+} pinnedNpc;
+
+void TickPinnedNpc()
+{
+    if (!pinnedNpc.until) return;
+    if (!net::IsHost() || !gCSession::GetInstance().IsGameRunning() ||
+        static_cast<int32_t>(net::Now() - pinnedNpc.until) >= 0) { pinnedNpc = PinnedNpc{}; return; }
+    eCEntity* entity = npcs::NpcByGuid(pinnedNpc.guid);
+    if (!entity || Entity(entity).IsDead()) { pinnedNpc = PinnedNpc{}; return; }
+    const bCMatrix pose = body::Pose(*entity, pinnedNpc.position, pinnedNpc.rotation);
+    entity->SetToWorldMatrix(pose);
+    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+        rigid->SetPose(pose);
+}
+
+void EndWalkProbe(Entity& npc)
+{
+    if (auto* routine = static_cast<gCScriptRoutine_PS*>(npc.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine))) {
+        static_cast<bCString&>(routine->AccessRoutine()) = bCString(walkProbe.routine);
+        static_cast<gEAIMode&>(routine->AccessAIMode()) = static_cast<gEAIMode>(walkProbe.mode);
+    }
+    npc.CharacterMovement.StopMovement();
+    npc.Routine.ContinueRoutine();
+    walkProbe = WalkProbe{};
+}
+
+void TickWalkProbe()
+{
+    if (!walkProbe.until) return;
+    Entity npc(npcs::NpcByGuid(walkProbe.guid));
+    if (!npc.GetInstance() || npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) { walkProbe = WalkProbe{}; return; }
+    if (static_cast<int32_t>(net::Now() - walkProbe.until) >= 0) {
+        EndWalkProbe(npc);
+        return;
+    }
+    if (static_cast<int32_t>(net::Now() - walkProbe.nextGoto) >= 0) {
+        walkProbe.nextGoto = net::Now() + 1000;
+        const auto& at = npc.GetInstance()->GetWorldPosition();
+        const bCVector goal(walkProbe.goal[0], walkProbe.goal[1], walkProbe.goal[2]);
+        if ((goal - at).GetMagnitude() > 50.0f) npc.StartGoto(goal, gEWalkMode_Walk);
+    }
+}
+
+bool LocalNpcContact(gCScriptProcessingUnit* spu, GELPVoid other, eCEntity* attacker)
+{
+    // Melee never touches the hero natively through a mirror's weapon; it is judged by LocalBlow() at the visible swing.
+    // What does arrive natively is a replicated NPC projectile, which flies here and hits only this machine's hero.
+    if (shot::InNpcReplicaContact()) return true;
+    eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    return source && source->GetPropertySet(eEPropertySetType_Projectile) && !source->IsProcessingDisabled();
+}
+
+bool InventoryBlocksNpc(eCEntity* victim, eCEntity* attacker)
+{
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    return hero && victim && (victim == hero || victim == remote::ControlledBody()) && attacker &&
+           attacker != hero && attacker != remote::ControlledBody() && !remote::IsPuppet(attacker) &&
+           attacker->GetPropertySet(eEPropertySetType_NPC) && hud::InventoryOpen();
+}
+
+void NoteInventoryHit()
+{
+    ++inventoryHitsIgnored;
+    const DWORD now = GetTickCount();
+    if (!lastInventoryHitLog || now - lastInventoryHitLog >= 5000) {
+        lastInventoryHitLog = now ? now : 1;
+        Logf("combat: NPC damage ignored while inventory is open (%u so far)", inventoryHitsIgnored);
+    }
+}
 // A kill counts once per victim and world (Codex review 22.10. R9): IsDead() turns true only once the death task sets its
 // AI mode, so a second lethal hit in the same network tick passed and was rewarded again; the client's GiveXP had no check.
 std::unordered_set<std::string> killedHere;  // host: victims killed here for a client's hit or its companion's
 std::unordered_set<std::string> rewarded;    // client: victims this player was rewarded for
+std::unordered_map<std::string, uint32_t> playerSwings;
 bool killOnce = true;  // QA negative control: killonceoff
 unsigned killsRepeated = 0, rewardsRepeated = 0;
 // A kill here that did not take kept its victim in killedHere: no later hit of any client counted on it (stageLiberate
@@ -68,7 +177,13 @@ struct Unconfirmed { uint8_t guid[16]; DWORD due; };
 std::vector<Unconfirmed> unconfirmed;
 unsigned killsUndone = 0;
 bool confirmKills = true;  // QA negative control: killconfirmoff
-std::string KillKey(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
+std::string KillKey(uint8_t const guid[16])
+{
+    std::string key(reinterpret_cast<char const*>(guid), 16);
+    const uint32_t incarnation = npcs::Incarnation(guid);
+    key.append(reinterpret_cast<char const*>(&incarnation), sizeof(incarnation));
+    return key;
+}
 // Arena and duel (owner's decision 22.10., variant b; re/findings/defeat-arena-c.md): an NPC fighting a duel or an arena
 // bout (attack reason Duel or Arena) takes hits only from its opponent there; a second player's hits do not count. Its
 // opponent's last hit ends the bout as the game does, with a knock-out (Defeat), never with the kill cheat: a client's
@@ -87,8 +202,9 @@ bool shapeHits = true;  // QA negative control: shapehitsoff (an animal form's h
 // unused; alone the client pays 17 stamina a blocked blow). The parade belongs to the player's machine, which judges the blow
 // against its real hero (block, shield talent, stamina, stumble). So the judgement here sees the puppet standing, the blow
 // goes on to AddHitPoints and to the player (rule 4). The scripts that judge a blow, wrapped like AddHitPoints.
-char const* const Judgements[] = {"DoLogicalDamage", "OnDamage"};
-gFScript judge[2] = {};
+char const* const Judgements[] = {"DoLogicalDamage", "OnDamage", "AssessHit", "CanBePoisoned", "CanBeDiseased", "CanBurn", "CanFreeze"};
+constexpr int JudgementCount = sizeof(Judgements) / sizeof(Judgements[0]);
+gFScript judge[JudgementCount] = {};
 bool puppetParade = true;  // QA negative control: puppetparadeoff (the puppet's parade counts here, as before)
 unsigned paradesPassedOn = 0;  // blows on a parrying puppet judged as unblocked here, so that its player judges the block
 // The other way round (stageNpcBlock 25.10.): an NPC of the host parries a client's blow. The client judged it against its
@@ -99,6 +215,7 @@ unsigned paradesPassedOn = 0;  // blows on a parrying puppet judged as unblocked
 // block for an NPC (AssessHit SG+2c5a0..2c70b: half the damage from stamina, a quarter less with a shield in hand, what
 // stamina lacks from hit points; ZS_ParadeStumble).
 bool npcBlocks = true;  // QA negative control: npcblockoff (judged on the mirror, as before)
+bool trustClientBlows = true;  // a client's claimed blow always lands; QA trustclientblowsoff restores the owner's parry judgement
 unsigned mirrorParadesPassedOn = 0, npcBlocksApplied = 0;
 // Stufe 3.3: blows judged against the parade the attacker saw (npcs::AniStateAt), and how many of them came out other than
 // against the parade now.
@@ -149,11 +266,12 @@ GEInt CallScript(char const* name, eCEntity* self, eCEntity* other, GEInt args)
 // player: in its routine an NPC friendly to the attacker complains first (ZS_ReactToDamage) and fights back at the next
 // blow, any other fights back (AssessTarget, ReactToDamage); a fleeing one flees on; in a fight it picks its target.
 // AssessTarget alone made a friend fight back at the first blow (aggressordiag 26.10.: Hamlar, struck by the host's hero,
-// complained for 6 s; struck by the client, he attacked). Not with the puppet as the game's player: its friendliness is
-// the host hero's (ai.cpp answers GetAttitude about a puppet as about the hero, which then is no player and no friend).
+// complained for 6 s; struck by the client, he attacked). A scoped puppet uses the same identity in GetPlayer,
+// IsPlayer and GetAttitude; it must not be replaced by the host's hero partway through those checks.
 // Not again while it already fights the attacker.
 void React(Entity& target, eCEntity* attacker)
 {
+    guards::Acting player(remote::IsPuppet(attacker) && guards::PlayerContextReady() ? attacker : nullptr);
     if (target.NPC.GetCurrentTarget().GetInstance() == attacker && target.Routine.AIMode == gEAIMode_Combat) return;
     if (agressor) {
         const int mode = static_cast<int>(static_cast<gEAIMode>(target.Routine.AIMode));
@@ -172,12 +290,56 @@ void React(Entity& target, eCEntity* attacker)
 // What the game's hit judgement (AssessHit, before AddHitPoints) decided for the victim: the task it set.
 uint8_t Outcome(Entity& victim)
 {
-    const bCString task = victim.Routine.GetCurrentTask();
+    const bCString task = npcs::IsMirrored(victim.GetInstance()) ? bCString(npcplayback::HitTask(victim.GetInstance()))
+                                                              : victim.Routine.GetCurrentTask();
     for (char const* ko : {"ZS_Unconscious", "ZS_LieKnockDown", "ZS_PiercedKO"})
         if (task == bCString(ko)) return net::HitKnockOut;
     for (char const* dead : {"ZS_RagDollDead", "ZS_PiercedDead", "ZS_Dead"})
         if (task == bCString(dead)) return net::HitDeath;
     return net::HitUnjudged;
+}
+
+uint8_t Reaction(Entity& victim)
+{
+    const bCString task = npcs::IsMirrored(victim.GetInstance()) ? bCString(npcplayback::HitTask(victim.GetInstance()))
+                                                              : victim.Routine.GetCurrentTask();
+    if (task == bCString("ZS_QuickStumble")) return net::HitQuickStumble;
+    if (task == bCString("ZS_Stumble")) return net::HitStumble;
+    if (task == bCString("ZS_PierceStumble")) return net::HitPierceStumble;
+    if (task == bCString("ZS_SitKnockDown")) return net::HitSitKnockDown;
+    return net::HitNoReaction;
+}
+
+void ApplyReaction(Entity& victim, eCEntity* attacker, uint8_t reaction)
+{
+    char const* task = nullptr;
+    switch (reaction) {
+    case net::HitQuickStumble: task = "ZS_QuickStumble"; break;
+    case net::HitStumble: task = "ZS_Stumble"; break;
+    case net::HitPierceStumble: task = "ZS_PierceStumble"; break;
+    case net::HitSitKnockDown: task = "ZS_SitKnockDown"; break;
+    default: return;
+    }
+    if (!attacker || victim.IsDead() || victim.IsDown()) return;
+    victim.NPC.SetCurrentAttacker(Entity(attacker));
+    victim.Routine.FullStop();
+    victim.Routine.SetTask(bCString(task));
+    if (++hitReactionsApplied <= 20)
+        Logf("combat: native hit reaction on %s: %s", victim.GetName().GetText(), victim.Routine.GetCurrentTask().GetText());
+    ScheduleReactionProbe(victim.GetInstance(), true);
+}
+
+eCEntity* PlayerActor(uint8_t player)
+{
+    return player == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(player);
+}
+
+void OnKilled(uint8_t const guid[16], uint32_t incarnation);
+void RewardKill(uint8_t player, uint8_t const guid[16])
+{
+    const uint32_t incarnation = npcs::Incarnation(guid);
+    if (player == net::LocalId()) OnKilled(guid, incarnation);
+    else net::SendKilled(player, guid, incarnation);
 }
 
 void Expect(uint8_t const guid[16])
@@ -217,13 +379,108 @@ void Guid(eCEntity* entity, uint8_t out[16])
     std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
 }
 
+void ScheduleReactionProbe(eCEntity* entity, bool owner)
+{
+    static unsigned scheduled = 0;
+    if (!entity || scheduled >= 40) return;
+    ++scheduled;
+    // Several samples: the owner plays the reaction at once, the attacking client shows its own immediately and the owner's
+    // replay follows after the display buffer and the network delay.
+    static const DWORD ownerAt[] = {60, 250, 600};
+    static const DWORD localAt[] = {100, 250, 450, 700, 1000, 1500};
+    const DWORD now = GetTickCount();
+    for (DWORD offset : owner ? std::vector<DWORD>(std::begin(ownerAt), std::end(ownerAt))
+                              : std::vector<DWORD>(std::begin(localAt), std::end(localAt))) {
+        ReactionProbe probe{};
+        Guid(entity, probe.guid);
+        probe.due = now + offset;
+        probe.owner = owner;
+        reactionProbes.push_back(probe);
+    }
+}
+
+// Hit points of an NPC that took a client's blow must not rise again except through a real heal. They did in play: the NPC
+// was dropped from and re-added to the host's processing range and the engine's re-entry refilled it.
+struct HitWatch { uint8_t guid[16]; int hp; DWORD hitAt; };
+std::vector<HitWatch> hitWatches;
+unsigned hpResets = 0;
+
+void WatchHit(Entity& victim)
+{
+    if (!victim.GetInstance() || victim.IsDead()) return;
+    HitWatch watch{};
+    Guid(victim.GetInstance(), watch.guid);
+    watch.hp = HitPoints(victim);
+    watch.hitAt = GetTickCount();
+    for (auto& existing : hitWatches)
+        if (!std::memcmp(existing.guid, watch.guid, 16)) { existing = watch; return; }
+    if (hitWatches.size() < 32) hitWatches.push_back(watch);
+}
+
+void CheckHitWatches()
+{
+    const DWORD now = GetTickCount();
+    for (auto it = hitWatches.begin(); it != hitWatches.end();) {
+        if (now - it->hitAt > 8000) { it = hitWatches.erase(it); continue; }
+        Entity entity(npcs::NpcByGuid(it->guid));
+        if (!entity.GetInstance() || entity.IsDead()) { it = hitWatches.erase(it); continue; }
+        const int hp = HitPoints(entity);
+        if (hp > it->hp + 5) {
+            ++hpResets;
+            if (hpResets <= 20)
+                Logf("combat: hit points of %s rose %d -> %d %u ms after a client's blow (owner=%u task=%s); refilled by something other than a heal",
+                     entity.GetName().GetText(), it->hp, hp, static_cast<unsigned>(now - it->hitAt),
+                     npcs::OwnerOf(entity.GetInstance()), entity.Routine.GetCurrentTask().GetText());
+        }
+        it->hp = hp;
+        ++it;
+    }
+}
+
+void CheckReactionProbes()
+{
+    const DWORD now = GetTickCount();
+    for (auto it = reactionProbes.begin(); it != reactionProbes.end();) {
+        if (static_cast<int32_t>(now - it->due) < 0) { ++it; continue; }
+        Entity entity(npcs::NpcByGuid(it->guid));
+        if (!entity.GetInstance()) {
+            Log("combat: hit reaction presentation probe could not resolve the NPC");
+        } else {
+            auto* animation = static_cast<eCVisualAnimation_PS*>(entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
+            auto* actor = animation ? animation->GetActor() : nullptr;
+            char motions[4][128] = {};
+            for (int slot = 0; actor && slot < 4; ++slot)
+                if (actor->IsMotionRunning(static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot)))
+                    body::MotionName(animation, slot, motions[slot], sizeof(motions[slot]));
+            Logf("combat: hit reaction presentation npc=%s role=%s dead=%d task=%s slots=%s|%s|%s|%s",
+                 entity.GetName().GetText(), it->owner ? "owner" : "local", entity.IsDead(),
+                 entity.Routine.GetCurrentTask().GetText(), motions[0], motions[1], motions[2], motions[3]);
+        }
+        it = reactionProbes.erase(it);
+    }
+}
+
 // Who dealt the hit: a weapon's Interaction owner, else the damage source itself.
 eCEntity* Attacker(gCScriptProcessingUnit* spu, GELPVoid other)
 {
     Entity source = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
-    if (!source.GetInstance()) return nullptr;
-    Entity owner = source.Interaction.GetOwner();
-    return owner.GetInstance() ? owner.GetInstance() : source.GetInstance();
+    eCEntity* originalSource = source.GetInstance();
+    eCEntity* player = remote::ControlledBody();
+    for (unsigned depth = 0; source.GetInstance() && depth < 8; ++depth) {
+        eCEntity* entity = source.GetInstance();
+        if (entity == player || entity == gCSession::GetInstance().GetHero() ||
+            remote::IsPuppet(entity) || entity->GetPropertySet(eEPropertySetType_NPC)) return entity;
+        if (player && player->GetPropertySet(eEPropertySetType_Inventory)) {
+            Entity hero(player);
+            if (hero.Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance() == entity ||
+                hero.Inventory.GetItemFromSlot(gESlot_LeftHand).GetInstance() == entity) return player;
+        }
+        eCEntity* owner = entity->GetPropertySet(eEPropertySetType_Interaction) ? source.Interaction.GetOwner().GetInstance() : nullptr;
+        if (!owner || owner == entity) owner = entity->GetParent();
+        if (!owner || owner == entity) break;
+        source = Entity(owner);
+    }
+    return originalSource;
 }
 
 // Stufe 4.1: the game judges a blow (DoLogicalDamage: AssessHit's stumble, the hit sound and blood, the fight-sound perception)
@@ -263,25 +520,81 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     Entity victim = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* attacker = Attacker(spu, other);
+    if (!bypass && npcs::IsMirrored(victim.GetInstance()) &&
+        attacker != hero && attacker != remote::ControlledBody()) {
+        ++foreignSkipped;
+        return 0;
+    }
+    if (!bypass && npcs::IsMirrored(victim.GetInstance()) && !npcs::Ready(victim.GetInstance())) {
+        ++invisibleContactsIgnored;
+        return 0;
+    }
+    if (IgnoreFriendlyHit(victim.GetInstance(), attacker)) return 0;
+    uint32_t* consumed = nullptr;
+    uint32_t swing = 0;
+    eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (which < 2 && !bypass && npcs::IsMirrored(victim.GetInstance()) && attacker == remote::ControlledBody() &&
+        body::LocallyAttacking(attacker) && (source == attacker || source == Entity(attacker).Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance())) {
+        swing = npcplayback::MotionInstance(attacker);
+        if (swing) {
+            uint8_t guid[16]; Guid(victim.GetInstance(), guid);
+            consumed = &playerSwings[KillKey(guid)];
+            if (*consumed == swing) return 0;
+        }
+    }
+    struct ConsumeSwing {
+        uint32_t* consumed;
+        uint32_t swing;
+        ~ConsumeSwing() { if (consumed) *consumed = swing; }
+    } consume{consumed, swing};
+    if (which >= 2) return judge[which](spu, self, other, args);
+    if (!bypass && InventoryBlocksNpc(victim.GetInstance(), attacker)) {
+        NoteInventoryHit();
+        return 0;
+    }
+    const bool localVictim = victim.GetInstance() && (victim.GetInstance() == hero || victim.GetInstance() == remote::ControlledBody());
+    if (!bypass && shot::InNpcReplicaContact() && !localVictim) return 0;
+    if (!bypass && !forwarded && localVictim && npcs::IsMirrored(attacker) && !LocalNpcContact(spu, other, attacker)) {
+        ++invisibleContactsIgnored;
+        return 0;
+    }
+    const bool playerHitMirror = attacker && (attacker == hero || attacker == remote::ControlledBody()) &&
+                                 npcs::OwnerOf(victim.GetInstance()) && !victim.IsDead();
+    if (playerHitMirror && ai::detail::damageReceiver != victim.GetInstance())
+        npcplayback::BeginHit(victim.GetInstance());
+    ai::DamagePerception perception(playerHitMirror ? victim.GetInstance() : nullptr);
+    auto observed = [&](GEInt result) {
+        if (attacker && (attacker == hero || attacker == remote::ControlledBody()) && npcs::IsMirrored(victim.GetInstance())) {
+            ++clientJudgements;
+            if (Pending(victim) <= 0) {
+                ++clientJudgementsWithoutDamage;
+                if (clientJudgementsWithoutDamage <= 40)
+                    Logf("combat: local hit on mirror %s produced no pending damage (script=%s result=%#x immortal=%d defeated=%d)",
+                         victim.GetName().GetText(), Judgements[which], result, victim.NPC.Immortal ? 1 : 0,
+                         victim.NPC.DefeatedByPlayer ? 1 : 0);
+            }
+        }
+        return result;
+    };
     if (!bypass && !forwarded && attacker && attacker != hero && (remote::IsPuppet(attacker) || npcs::IsMirrored(attacker))) {
         eCEntity* hit = victim.GetInstance();
         const int kind = hit && (hit == hero || hit == remote::ControlledBody()) ? 0
                          : hit && (npcs::IsMirrored(hit) || remote::PuppetOwner(hit)) ? 2 : 1;
         ++foreignJudged[kind];
-        if (skipForeign) {
+        if (skipForeign && !localVictim) {
             ++foreignSkipped;
             return 0;
         }
     }
-    if (bypass || victim.Routine.AniState != gEAniState_Parade) return judge[which](spu, self, other, args);
+    if (bypass || victim.Routine.AniState != gEAniState_Parade) return observed(judge[which](spu, self, other, args));
     const bool puppet = puppetParade && remote::PuppetOwner(victim.GetInstance());
     const bool mirror = npcBlocks && npcs::IsMirrored(victim.GetInstance()) && attacker && (attacker == hero || attacker == remote::ControlledBody());
-    if (!puppet && !mirror) return judge[which](spu, self, other, args);
+    if (!puppet && !mirror) return observed(judge[which](spu, self, other, args));
     victim.Routine.AniState = gEAniState_Stand;
     const GEInt result = judge[which](spu, self, other, args);
     if (victim.Routine.AniState == gEAniState_Stand) victim.Routine.AniState = gEAniState_Parade;  // the snapshots set it anyway
     ++(puppet ? paradesPassedOn : mirrorParadesPassedOn);
-    return result;
+    return observed(result);
 }
 
 // Owner of the NPC: whether it blocks a player's blow, as AssessHit asks (IsBlocking SG+d480): parrying, able to parry that
@@ -293,7 +606,7 @@ bool Blocks(Entity& npc, eCEntity* attacker)
 }
 
 // Stufe 3.3: the same with the parade (IsInParadeMode) as the attacker saw it on its mirror when it struck, `seen` in this machine's
-// clock (the send time of that state). The player saw no parade: the blow lands, even if the NPC parries now; it saw one:
+// clock (the displayed snapshot timeline). The player saw no parade: the blow lands, even if the NPC parries now; it saw one:
 // blocked, if the NPC can parry that move and faces the attacker now. Without a known state: as Blocks.
 bool BlocksAsSeen(Entity& npc, eCEntity* attacker, uint32_t seen)
 {
@@ -312,24 +625,15 @@ bool BlocksAsSeen(Entity& npc, eCEntity* attacker, uint32_t seen)
 // Hit effects (28.10.): the game starts the blood or the clang of a blow and its sound in DoLogicalDamage (SG 0xb4f50, effect
 // name by AssessHit's result, SG 0xb46d0), before AddHitPoints. The striking player's machine plays it with its own hit; the
 // NPC's owner applies another player's claim through AddHitPoints alone, so whoever watched there saw the blow land without
-// blood or sound. The owner starts the game's effect at the victim: eff_col_wh_02_me_fl for a blow that hurt,
-// eff_col_wh_01_me_me for a block; at most one per victim in HitEffectGap (a burst of claims, or the game's own effect of a
-// touch). QA negative control: hiteffectsoff.
+// blood or sound. Each accepted hit identity plays its effect once; distinct rapid hits must not suppress each other.
 bool hitEffects = true;
 bool npcHitScale = true;  // QA negative control npchitscaleoff: NPC hits across machines unscaled (code review P2, as before)
 unsigned npcHitsScaled = 0;
 unsigned hitEffectsPlayed = 0, hitEffectsDeduped = 0;
-constexpr DWORD HitEffectGap = 300;  // ms
-std::unordered_map<eCEntity*, DWORD> lastHitEffect;
 
 void PlayHitEffect(eCEntity* victim, bool blocked)
 {
     if (!hitEffects || !victim) return;
-    const DWORD now = GetTickCount();
-    DWORD& last = lastHitEffect[victim];
-    if (last && now - last < HitEffectGap) { ++hitEffectsDeduped; return; }
-    last = now ? now : 1;
-    if (lastHitEffect.size() > 256) lastHitEffect.clear();  // dead victims' entries; a pointer may be reused
     const bCString name(blocked ? "eff_col_wh_01_me_me" : "eff_col_wh_02_me_fl");
     if (!EffectSystem::ExistsEffect(name)) return;
     EffectSystem::StartEffect(name, Entity(victim));
@@ -356,6 +660,8 @@ void Block(Entity& npc, eCEntity* attacker, int32_t delta)
 
 GEInt GE_STDCALL JudgeLogical(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args) { return Judge(0, spu, self, other, args); }
 GEInt GE_STDCALL JudgeOnDamage(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args) { return Judge(1, spu, self, other, args); }
+template <int I>
+GEInt GE_STDCALL JudgeStatus(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args) { return Judge(I, spu, self, other, args); }
 
 // Owner 28.10. (config.h): friendly_fire, npc_damage, npc_hp. Which player's side a body is on: its own hero (or the creature it
 // controls), a puppet's player, or the party leader's side of a companion; 0 for everyone else.
@@ -398,10 +704,29 @@ int32_t Scaled(eCEntity* victim, eCEntity* attacker, int32_t delta)
     return scaled < 0 ? scaled : -1;
 }
 
+// Whether `attacker` (an NPC this machine simulates) means to kill `victim` (a puppet that stands for a player here): the game's
+// own HasAttackReasonToKill, asked of the puppet as the player (guards.cpp). Sent with the hit: the victim's machine has only a
+// mirror of the attacker, which has neither target nor attack reason (downed.cpp: a lethal blow is no duel, arena or arrest).
+bool MeansToKill(eCEntity* attacker, eCEntity* victim)
+{
+    if (!attacker || !victim || attacker == gCSession::GetInstance().GetHero() || !attacker->GetPropertySet(eEPropertySetType_NPC)) return false;
+    return CallScript("HasAttackReasonToKill", attacker, victim, 0) != 0;
+}
+
 GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     ++filterCalls;
-    if (bypass || args >= 0) return original(spu, self, other, args);
+    if (!bypass && shot::InNpcReplicaContact()) {
+        Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
+        if (recipient.GetInstance() != remote::ControlledBody()) return GETrue;
+    }
+    if (bypass) return original(spu, self, other, args);
+    Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
+    if (args >= 0) {
+        if (npcs::IsMirrored(recipient.GetInstance())) return GETrue;
+        return original(spu, self, other, args);
+    }
+    if (IgnoreFriendlyHit(recipient.GetInstance(), Attacker(spu, other))) return GETrue;
     if (forwarded) {
         if (heroForward) {  // a hit on our hero judged here with the other machine's attacker
             Entity hit = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
@@ -413,6 +738,10 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     eCEntity* instance = victim.GetInstance();
     eCEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* attacker = Attacker(spu, other);
+    if (InventoryBlocksNpc(instance, attacker)) {
+        NoteInventoryHit();
+        return GETrue;
+    }
     // P6, an animal form: the player fights as the creature it controls (Entity::GetPlayer), the human body (GetHero) stays
     // hidden; the creature's hits are the player's, as the game counts them, not those of one of our NPCs (no experience,
     // no knock-out judgement, no murder for the player before).
@@ -421,13 +750,23 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     // others mirror it. Same rules on every machine:
     // 1. A hit by a body simulated elsewhere (another player's puppet, a mirrored NPC) is decided where that body
     //    really acts: the player's own hits arrive as claims, an NPC owner sends its NPC's hits on our hero.
-    if (attacker && attacker != hero && (remote::IsPuppet(attacker) || npcs::IsMirrored(attacker))) {
+    const bool localVictim = instance && (instance == hero || instance == remote::ControlledBody());
+    const bool mirroredNpc = attacker && npcs::OwnerOf(attacker);
+    if (localVictim && mirroredNpc) {
+        if (!LocalNpcContact(spu, other, attacker)) {
+            ++invisibleContactsIgnored;
+            return GETrue;
+        }
+        ++localNpcHits;
+        return original(spu, self, other, Scaled(instance, attacker, args));
+    }
+    if (attacker && attacker != hero && (remote::IsPuppet(attacker) || mirroredNpc)) {
         ++dropped;
         return GETrue;
     }
     // 2. A hit on an NPC simulated elsewhere goes to its owner, who applies it (and kills); the result comes back
     //    through mirroring. Our hero's hits, and our own NPCs' hits (fights where two players' regions meet).
-    if (const uint8_t owner = npcs::OwnerOf(instance); owner && npcs::IsMirrored(instance)) {
+    if (const uint8_t owner = npcs::OwnerOf(instance)) {
         if (attacker && attacker != hero && npcHits && attacker->GetPropertySet(eEPropertySetType_NPC)) {
             uint8_t guid[16], npc[16], flags[16] = {};
             Guid(instance, guid);
@@ -452,9 +791,13 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             std::memcpy(weapon, &id.GetCore(), 16);
         }
         lastOutcome = Outcome(victim);
-        net::SendHitNpc(owner, guid, args, weapon, nullptr, lastOutcome, npcs::SeenAt(instance));
-        ++claimsSent;
-        npcs::LocalHit(instance);  // shows at once; its owner's judgement follows through mirroring
+        uint8_t reaction = Reaction(victim);
+        if (reaction == net::HitNoReaction && body::LocallyAttacking(remote::ControlledBody())) reaction = net::HitQuickStumble;
+        const uint32_t hit = net::SendHitNpc(owner, guid, args, weapon, nullptr, lastOutcome, npcs::SeenAt(instance),
+                                             reaction, npcs::Incarnation(guid));
+        if (hit) { ++claimsSent; if (reaction != net::HitNoReaction) npcs::LocalHit(instance, hit); }
+        npcplayback::BeginHit(nullptr);
+        ScheduleReactionProbe(instance, false);
         return GETrue;
     }
     // 3. An NPC this machine simulates in a duel or arena bout with someone else: our hero's hit does not count.
@@ -466,13 +809,26 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     //    against its own hero (armour, stumble, knock-out), so the attacker goes along.
     if (const int owner = remote::PuppetOwner(instance)) {
         if (attacker && attacker != hero) remote::NoteContact(attacker, instance);
+        // A hit on a puppet is not evidence that the remote hero was hit in that player's game.
+        if (attacker && attacker != hero) return GETrue;
         uint8_t guid[16] = {};
         uint8_t attackerPlayer = 0;
         if (attacker && attacker == hero) attackerPlayer = net::LocalId();
         else if (attacker) Guid(attacker, guid);
-        net::SendHitPlayer(static_cast<uint8_t>(owner), args, guid, attackerPlayer);
+        net::SendHitPlayer(static_cast<uint8_t>(owner), args, guid, attackerPlayer, MeansToKill(attacker, instance));
         ++playerHitsSent;
         return GETrue;
+    }
+    if (net::IsHost() && instance && instance->GetPropertySet(eEPropertySetType_NPC))
+        npcs::HostHit(instance, 0, 0);
+    if (net::IsHost() && attacker && attacker->GetPropertySet(eEPropertySetType_NPC) &&
+        instance && instance->GetPropertySet(eEPropertySetType_NPC) && !remote::IsPuppet(instance)) {
+        const uint8_t party = npcs::CompanionOwner(attacker);
+        if (party > 1) {
+            uint8_t source[16]; Guid(attacker, source);
+            OnNpcHit(party, victim, args, source, true);
+            return GETrue;
+        }
     }
     return original(spu, self, other, Scaled(instance, attacker, args));
 }
@@ -507,7 +863,10 @@ GEInt GameHit(Entity& victim, eCEntity* source, int* pending)
 // earns experience: marked as defeated, the death script pays no one (static analysis of Kill).
 void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16], bool party)
 {
+    uint8_t victimGuid[16]; Guid(target.GetInstance(), victimGuid);
+    if (killOnce && killedHere.count(KillKey(victimGuid))) return;
     Entity attacker(npcs::NpcByGuid(npc));
+    if (IgnoreFriendlyHit(target.GetInstance(), attacker.GetInstance(), party ? from : 0)) return;
     // An attacker not found here (an entity spawned only on the sender's machine, such as a weapon without an owner)
     // still hurts: dropping those hits lost all 14 of one fight (stage E4). The victim stands in as the source then.
     if (!attacker.GetInstance()) ++npcHitsUnresolved;
@@ -517,7 +876,7 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     const int32_t unscaled = delta;
     // The sender's party mark counts first: its companion's copy here may have no party leader (stageNpcHitScale 28.10.: Lester's
     // hits unscaled).
-    if (npcHitScale && party) delta = Scaled(target.GetInstance(), remote::PuppetOf(from), delta);
+    if (npcHitScale && party) delta = Scaled(target.GetInstance(), PlayerActor(from), delta);
     else if (npcHitScale && attacker.GetInstance()) delta = Scaled(target.GetInstance(), attacker.GetInstance(), delta);
     if (delta != unscaled) ++npcHitsScaled;
     ++npcHitsApplied;
@@ -539,7 +898,7 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     Expect(guid);
     ++npcKills;
     if (party) {  // the sender's companion or summon killed it: the sender's hero earns the experience
-        net::SendKilled(from, guid);
+        RewardKill(from, guid);
         ++partyKills;
     }
     Logf("combat: %s of player %u killed %s", attacker.GetInstance() ? attacker.GetName().GetText() : "an NPC", from, target.GetName().GetText());
@@ -547,20 +906,34 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
 
 // Host: a client's hit on one of the host's NPCs.
 void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16], uint8_t outcome,
-              uint32_t seen)
+              uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation)
 {
+    struct Reply {
+        uint8_t to;
+        net::HitResult result;
+        ~Reply() { net::SendHitResult(to, result); }
+    } reply{from, {}};
+    std::memcpy(reply.result.guid, guid, 16);
+    reply.result.sequence = sequence;
+    reply.result.incarnation = incarnation;
+    if (!net::IsHost() || incarnation != npcs::Incarnation(guid)) {
+        Logf("combat: hit %u refused: stale NPC incarnation", sequence);
+        return;
+    }
+    if (delta >= 0 || delta < -1000000) return;
     Entity target(npcs::NpcByGuid(guid));  // an NPC only: no chest, door, hero or puppet (Fable 1.7)
-    if (!target.GetInstance() || target.IsDead() || delta >= 0 || delta < -1000000) return;
+    if (!target.GetInstance() || target.IsDead()) return;
     if (killOnce && killedHere.count(KillKey(guid))) {  // killed already, its death task not running yet (R9)
         ++killsRepeated;
         return;
     }
     static const uint8_t zeros[16] = {};
     if (std::memcmp(npc, zeros, 16)) {
-        OnNpcHit(from, target, delta, npc, weapon[0] == 1);
+        Logf("combat: player %u's NPC-origin hit refused; NPC damage is host-simulated", from);
         return;
     }
-    eCEntity* attacker = remote::PuppetOf(from);
+    eCEntity* attacker = PlayerActor(from);
+    if (IgnoreFriendlyHit(target.GetInstance(), attacker, from)) return;
     delta = Scaled(target.GetInstance(), attacker, delta);  // friendly_fire, npc_hp (the claim carries the game's damage)
     remote::NoteContact(target.GetInstance(), attacker);  // it may turn on the puppet now
     if (OutsideBout(target, attacker)) {
@@ -568,19 +941,14 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         Logf("combat: player %u hit %s, who fights a duel or arena bout with someone else; not counted", from, target.GetName().GetText());
         return;
     }
-    ++claimsApplied;
+    npcplayback::HitOrigin origin(target.GetInstance(), from, sequence);
     // Applied with the sender's puppet as attacker; the filter's rule for hits by puppets must not drop it.
     struct Pass { Pass() { forwarded = true; } ~Pass() { forwarded = false; } } pass;
     if (attacker && target.Routine.AniState == gEAniState_Parade)
         Logf("combat: a player's blow on %s parrying: parade_mode=%d can_parade=%d fov=%d", target.GetName().GetText(),
              CallScript("IsInParadeMode", target.GetInstance(), nullptr, 0), CallScript("CanParadeMoveOf", target.GetInstance(), attacker, 0),
              target.IsInFOV(Entity(attacker)) ? 1 : 0);
-    if (npcBlocks && attacker && !target.IsDown() && !target.IsDead() && BlocksAsSeen(target, attacker, seen)) {
-        Block(target, attacker, delta);
-        if (reactHits) React(target, attacker);
-        witness::HitSeen(target.GetInstance(), attacker);
-        return;
-    }
+    // The client's view wins (owner 3 Nov.): a blow it saw land is never turned into a block because the host's copy parried.
     // P7: a blow on one lying knocked out is the game's finishing blow, whatever its hit points (the host's hero: five blows
     // without effect while it fell, then dead). Judged here: the sender's copy is not down there, so its game judged every
     // such blow a new knock-out (stageMurder 24.10.). The fall is timed for our own knock-outs only (2 s).
@@ -596,13 +964,28 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             finishing = true;
         }
     }
+    ++claimsApplied;
+    reply.result.accepted = 1;
     if (!finishing && (HitPoints(target) + delta > 0 || !attacker)) {
-        CallScript("AddHitPoints", target.GetInstance(), attacker, delta);
+        guards::Acting player(attacker && guards::PlayerContextReady() ? attacker : nullptr);
+        const int before = HitPoints(target);
+        const GEInt result = CallScript("AddHitPoints", target.GetInstance(), attacker, delta);
+        static DWORD lastNoEffectLog = 0;
+        const DWORD now = GetTickCount();
+        if (claimsApplied <= 100 || (HitPoints(target) == before && now - lastNoEffectLog >= 5000)) {
+            lastNoEffectLog = now;
+            Logf("combat: remote hit from player %u on %s hp %d -> %d (delta=%d result=%#x immortal=%d owner=%u mirror=%d)",
+                 from, target.GetName().GetText(), before, HitPoints(target), delta, result, target.NPC.Immortal ? 1 : 0,
+                 npcs::OwnerOf(target.GetInstance()), npcs::IsMirrored(target.GetInstance()));
+        }
         PlayHitEffect(target.GetInstance(), false);
+        WatchHit(target);
         // The game's hit path (DoLogicalDamage) also decides how the NPC reacts; AddHitPoints alone left a friendly NPC
         // talking on while the client struck it (friendlydiag 20.10.). Let it judge the attacker as the game does when an
         // NPC takes damage: fight back, complain, flee or call for help (React).
         if (reactHits && attacker && !target.IsDead() && !target.IsDown()) React(target, attacker);
+        if (reaction != net::HitNoReaction) npcs::HostHit(target.GetInstance(), from, sequence);
+        ApplyReaction(target, attacker, reaction);
         witness::HitSeen(target.GetInstance(), attacker);  // and those around hear the fight (P7)
         return;
     }
@@ -633,7 +1016,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             knockedAt[KillKey(guid)] = GetTickCount();
             witness::KnockOutSeen(victim, attacker);
             ++knockedOut;
-            net::SendKilled(from, guid);
+            RewardKill(from, guid);
             Logf("combat: player %u knocked %s out (outcome %u)", from, target.GetName().GetText(), outcome);
             return;
         }
@@ -656,19 +1039,42 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     CallScript("OnCheatKill", victim, victim, 0);  // like the console: self = the one who kills, other = the target
     Expect(guid);
     ++kills;
-    net::SendKilled(from, guid);  // the killer earns the experience on its own machine
+    RewardKill(from, guid);  // the killer earns the experience on its own machine
     Logf("combat: player %u killed %s (OnCheatKill%s)", from, target.GetName().GetText(), finishing ? ", finishing blow" : "");  // ZS_RagDollDead takes effect next frame
 }
 
+void QueueHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16],
+                 uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation)
+{
+    if (pendingNpcHits.size() >= 1024) {
+        Log("combat: NPC hit queue full; hit refused");
+        net::HitResult result;
+        std::memcpy(result.guid, guid, 16);
+        result.sequence = sequence; result.incarnation = incarnation;
+        net::SendHitResult(from, result);
+        return;
+    }
+    PendingNpcHit hit{};
+    hit.from = from; hit.delta = delta; hit.outcome = outcome; hit.seen = seen; hit.reaction = reaction;
+    hit.sequence = sequence; hit.incarnation = incarnation;
+    hit.generation = net::PeerGeneration(from);
+    std::memcpy(hit.guid, guid, 16);
+    std::memcpy(hit.weapon, weapon, 16);
+    std::memcpy(hit.npc, npc, 16);
+    pendingNpcHits.push_back(hit);
+}
+
 // Client: this player's hit killed a host NPC: the game's own reward (GiveXP computes it from the NPC's level).
-void OnKilled(uint8_t const guid[16])
+void OnKilled(uint8_t const guid[16], uint32_t incarnation)
 {
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     _GUID raw;
     std::memcpy(&raw, guid, 16);
     Entity victim = Entity(bCPropertyID(bCGuid(raw)));
     if (!hero || !victim.GetInstance()) return;
-    if (killOnce && !rewarded.insert(KillKey(guid)).second) {  // R9: once per victim, whatever the host sends
+    std::string identity(reinterpret_cast<char const*>(guid), 16);
+    identity.append(reinterpret_cast<char const*>(&incarnation), sizeof(incarnation));
+    if (killOnce && !rewarded.insert(identity).second) {
         ++rewardsRepeated;
         Logf("combat: the kill of %s was rewarded already; not again", victim.GetName().GetText());
         return;
@@ -685,15 +1091,26 @@ void OnKilled(uint8_t const guid[16])
 // Client: something on the host hit this player's puppet; the real hero takes the damage.
 unsigned deadHitsDropped = 0;
 
-void OnHitPlayer(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer)
+void OnHitPlayer(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill)
 {
+    if (!attackerPlayer) {
+        if (++remoteNpcHitsIgnored <= 10)
+            Log("combat: remote NPC hit ignored; the local game decides contacts with its own hero");
+        return;
+    }
     // P6: in an animal form the creature the player controls takes it, not the hidden human body (GetHero).
     eCEntity* hero = gCSession::GetInstance().GetHero() ? (shapeHits ? remote::ControlledBody() : gCSession::GetInstance().GetHero()) : nullptr;
     if (!hero || delta >= 0) return;
+    if (IgnoreFriendlyHit(hero, remote::PuppetOf(attackerPlayer), attackerPlayer)) return;
     ++playerHitsTaken;
+    if (meansToKill) downed::NoteBlow();
     eCEntity* by = nullptr;
     static const uint8_t none[16] = {};
     const bool fromNpc = !attackerPlayer && std::memcmp(attacker, none, 16) != 0;
+    if (fromNpc && hud::InventoryOpen()) {
+        NoteInventoryHit();
+        return;
+    }
     if (attackerPlayer) by = remote::PuppetOf(attackerPlayer);
     else if (fromNpc) by = npcs::NpcByGuid(attacker);  // its weapon is read below: an NPC only
     // Invisible wolves (playtest 27.10.): a blow of an NPC that is dead here, or not here at all, comes from a machine that
@@ -743,14 +1160,94 @@ void OnHitPlayer(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlay
 }
 }
 
+bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player)
+{
+    if (bypass || GetConfig().friendlyFire != 0 || !victim) return false;
+    const uint8_t hit = SideOf(victim);
+    if (!hit) return false;
+    // Area effects and projectiles can own one another before reaching the caster.
+    for (unsigned depth = 0; source && depth < 8; ++depth) {
+        if (source == victim) return false;
+        if (SideOf(source)) {
+            ++friendlyHitsIgnored;
+            return true;
+        }
+        Entity owner = Entity(source).Interaction.GetOwner();
+        eCEntity* next = owner.GetInstance();
+        if (!next || next == source) break;
+        source = next;
+    }
+    if (player > 0 && player < net::MaxPlayers) {
+        ++friendlyHitsIgnored;
+        return true;
+    }
+    return false;
+}
+
 void Start()
 {
-    net::SetHitHandlers(&OnHitNpc, &OnHitPlayer);
+    net::SetHitHandlers(&QueueHitNpc, &OnHitPlayer);
     net::SetKilledHandler(&OnKilled);
+}
+
+namespace {
+gFScript WrapDamageScript(gSScript& script, gFScript replacement, char const* name)
+{
+    gFScript originalFunction = script.m_funcScript;
+    if (!originalFunction) {
+        Logf("combat: %s has no registered function; it was not wrapped", name);
+        return nullptr;
+    }
+    HMODULE owner = nullptr;
+    auto* code = reinterpret_cast<unsigned char*>(originalFunction);
+    static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
+    if (originalFunction &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(originalFunction), &owner) &&
+        owner == GetModuleHandleA("Script_Game.dll") && !std::memcmp(code, prologue, sizeof(prologue))) {
+        if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(replacement))) {
+            script.m_funcScript = replacement;
+            Logf("combat: %s wrapped at native entry and script table", name);
+            return reinterpret_cast<gFScript>(trampoline);
+        }
+    }
+    script.m_funcScript = replacement;
+    Logf("combat: %s wrapped in script table only; native entry did not match the checked prologue", name);
+    return originalFunction;
+}
+}
+
+void SyncReport(LogFn log)
+{
+    char line[600];
+    Format(line, "SYNCCOMBAT claims_sent=%u claims_applied=%u local_judgements=%u no_pending_damage=%u "
+                 "player_hits_sent=%u player_hits_received=%u inventory_open=%d inventory_hits_ignored=%u "
+                 "redirected=%u stale_authority=%u hit_reactions=%u hp_resets=%u local_npc_hits=%u "
+                 "remote_npc_hits_ignored=%u invisible_contacts_ignored=%u friendly_hits_ignored=%u",
+           claimsSent, claimsApplied, clientJudgements, clientJudgementsWithoutDamage, playerHitsSent, playerHitsTaken,
+           hud::InventoryOpen() ? 1 : 0, inventoryHitsIgnored, hitsRedirected, hitsWrongAuthority, hitReactionsApplied, hpResets,
+           localNpcHits, remoteNpcHitsIgnored, invisibleContactsIgnored, friendlyHitsIgnored);
+    log(line);
 }
 
 void Tick()
 {
+    TickPinnedNpc();
+    TickWalkProbe();
+    if (gCSession::GetInstance().IsGameRunning()) { CheckReactionProbes(); CheckHitWatches(); }
+    // NPC ownership/releases are advanced before combat::Tick, not while ENet is dispatching earlier in the frame.
+    if (installed && gCSession::GetInstance().IsGameRunning() && !pendingNpcHits.empty()) {
+        auto hits = std::move(pendingNpcHits);
+        pendingNpcHits.clear();
+        for (auto const& hit : hits) {
+            if (!net::PeerJoined(hit.from) || net::PeerGeneration(hit.from) != hit.generation) {
+                Logf("combat: queued hit %u refused after player %u's connection changed", hit.sequence, hit.from);
+                continue;
+            }
+            OnHitNpc(hit.from, hit.guid, hit.delta, hit.weapon, hit.npc, hit.outcome, hit.seen, hit.reaction,
+                     hit.sequence, hit.incarnation);
+        }
+    }
     if (!unconfirmed.empty()) ConfirmKills();
     for (auto it = npcParades.begin(); it != npcParades.end();) {  // QA npcguard
         if (static_cast<int32_t>(GetTickCount() - it->second) >= 0) { it = npcParades.erase(it); continue; }
@@ -767,17 +1264,17 @@ void Tick()
     if (now - lastTry < 1000) return;
     lastTry = now;
     gSScript* script = Find(GetScriptAdminExt().GetScripts(), "AddHitPoints");
-    if (!script) return;
-    original = script->m_funcScript;
-    script->m_funcScript = &Filter;
+    if (!script || !script->m_funcScript) return;
+    original = WrapDamageScript(*script, &Filter, "AddHitPoints");
     installed = true;
     Log("combat: AddHitPoints filter installed");
-    const gFScript wrappers[] = {&JudgeLogical, &JudgeOnDamage};
-    for (int i = 0; i < 2; ++i) {
+    const gFScript wrappers[] = {&JudgeLogical, &JudgeOnDamage, &JudgeStatus<2>, &JudgeStatus<3>, &JudgeStatus<4>,
+                                &JudgeStatus<5>, &JudgeStatus<6>};
+    static_assert(sizeof(wrappers) / sizeof(wrappers[0]) == JudgementCount, "one wrapper per damage/status gate");
+    for (int i = 0; i < JudgementCount; ++i) {
         gSScript* judgement = Find(GetScriptAdminExt().GetScripts(), Judgements[i]);
-        if (!judgement) { Logf("combat: no %s script; a parrying puppet is judged here", Judgements[i]); continue; }
-        judge[i] = judgement->m_funcScript;
-        judgement->m_funcScript = wrappers[i];
+        if (!judgement || !judgement->m_funcScript) { Logf("combat: no %s script; its native friendly-fire protection is unavailable", Judgements[i]); continue; }
+        judge[i] = WrapDamageScript(*judgement, wrappers[i], Judgements[i]);
     }
     // The OnTick callbacks run through the pointer stored at their registration (SG 0xe1ef0), not through the script table:
     // replacing the table's entry left the game's tick untouched (stageFightMusic 28.10.: music_ticks=0). Jump from the
@@ -889,11 +1386,17 @@ void KillReport(LogFn log)
 // A load brings the dead back as they were saved: they can die once more (R9).
 void OnWorldChange()
 {
+    walkProbe = WalkProbe{};
+    pendingNpcHits.clear();
+    reactionProbes.clear();
+    hitWatches.clear();
     killedHere.clear();
     unconfirmed.clear();
     rewarded.clear();
+    playerSwings.clear();
     knockedAt.clear();
     npcParades.clear();  // QA npcguard: its entities are gone with the world
+    pinnedNpc = PinnedNpc{};
 }
 
 // QA: the local hero hits another player's puppet through the game's hit path (judgement and stumble included).
@@ -1058,6 +1561,15 @@ void GiveXp(char const* guid, LogFn log)
     char line[200];
     _GUID raw;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (hero && guid[0] && guid[strspn(guid, "0123456789")] == '\0') {  // a plain amount: as a dialog gives it (in fives)
+        Entity self(hero);
+        const int before = static_cast<int>(self.PlayerMemory.XP);
+        const GEInt result = CallScript("GiveXP", nullptr, hero, std::atoi(guid));
+        Format(line, "GIVEXP amount=%s result=%d xp_before=%d xp_after=%d level=%u", guid, result, before, static_cast<int>(self.PlayerMemory.XP),
+                  static_cast<unsigned>(self.NPC.Level));
+        log(line);
+        return;
+    }
     if (!ParseGuid(guid, raw) || !hero) { log("REFUSED givexp: bad GUID or no hero"); return; }
     Entity victim = Entity(bCPropertyID(bCGuid(raw)));
     if (!victim.GetInstance()) { log("REFUSED givexp: no such NPC"); return; }
@@ -1142,6 +1654,35 @@ void Swing(char const* state, LogFn log)
     // A hero lying knocked out does not swing (29.10.: forced into PS_Melee, its knock-out task never ended: it stood with AI mode
     // 8 and 0 hit points, down for good; a player cannot attack while down)
     if (self.IsDown() || self.IsDead()) { log("REFUSED swing: hero down"); return; }
+    if (state && !std::strncmp(state, "native", 6) && (!state[6] || state[6] == '_')) {
+        auto* routine = static_cast<gCScriptRoutine_PS*>(hero->GetPropertySet(eEPropertySetType_ScriptRoutine));
+        if (!routine) { log("REFUSED swing: no player script unit"); return; }
+        Entity target = self.Focus.GetFocusEntity();
+        if (state[6] == '_') {
+            _GUID guid{};
+            if (!ParseGuid(state + 7, guid)) { log("REFUSED swing: invalid target GUID"); return; }
+            target = Entity(bCPropertyID(bCGuid(guid)));
+        }
+        if (!target.GetInstance()) { log("REFUSED swing: no native target"); return; }
+        routine->AIStopCombatMove();
+        self.Routine.FullStop();
+        if (state[6] == '_') ranged::Target(state + 7, log);
+        self.NPC.SetCurrentTarget(target);
+        self.SetAlignmentTarget(target);
+        auto* npc = static_cast<gCNPC_PS*>(hero->GetPropertySet(eEPropertySetType_NPC));
+        if (!npc) { log("REFUSED swing: no player pose"); return; }
+        npc->ForceNextPose(gEPose_P0);
+        gCScriptProcessingUnit::sAICombatMoveInstr_Args args(hero, target.GetInstance(), gEAction_Attack, bCString("Hit"), 1.0f);
+        auto& unit = routine->GetSPU();
+        const GEBool result = gCScriptProcessingUnit::sAICombatMoveInstr(&args, &unit, GEFalse);
+        // CP 1.75 stores the selected combat filename here, including a failed resource lookup.
+        auto const& requested = *reinterpret_cast<bCString const*>(reinterpret_cast<char const*>(&unit) + 0x150);
+        Format(line, "SWING native=1 instruction_result=%d target=%s pose=%d ani=%d requested=%.150s", result ? 1 : 0,
+               target.GetName().GetText(), static_cast<int>(npc->GetPrimaryPose()),
+               static_cast<int>(static_cast<gEAniState>(self.Routine.AniState)), requested.GetText());
+        log(line);
+        return;
+    }
     const bCString before = self.Routine.GetCurrentTask();
     if (std::strcmp(before.GetText(), "PS_Melee") != 0) self.Routine.SetTask(bCString("PS_Melee"));
     self.Routine.SetState(bCString(state && *state ? state : "PS_Melee_Attack"));
@@ -1149,6 +1690,36 @@ void Swing(char const* state, LogFn log)
     body::CurrentMotion(hero, motion, sizeof(motion));
     Format(line, "SWING task_before=%s task=%s state=%s motion=%s", before.GetText(), self.Routine.GetCurrentTask().GetText(),
               self.Routine.GetCurrentState().GetText(), motion);
+    log(line);
+}
+
+void PlayerKey(char const* argument, LogFn log)
+{
+    unsigned key = 0, pressed = 0, before = 0, duration = 0;
+    if (sscanf_s(argument, "%u_%u_%u_%u", &key, &pressed, &before, &duration) != 4 ||
+        (key != gESessionKey_Use1 && key != gESessionKey_Use2 && key != gESessionKey_WeaponMode) ||
+        pressed > 1 || before > 1 || duration > 10000) {
+        log("REFUSED playerkey: expected 15/16/38_pressed_before_duration");
+        return;
+    }
+    eCEntity* hero = remote::ControlledBody();
+    auto* control = hero ? static_cast<gCCharacterControl_PS*>(hero->GetPropertySet(eEPropertySetType_CharacterControl)) : nullptr;
+    if (!control) { log("REFUSED playerkey: no player input controller"); return; }
+    auto* script = Find(GetScriptAdminExt().GetScripts(), "OnPlayerGameKeyPressed");
+    if (!script || !script->m_funcScript) { log("REFUSED playerkey: native input script unavailable"); return; }
+    control->AccessPressedKey().AccessValue() = static_cast<gESessionKey>(key);
+    control->AccessIsPressed() = pressed != 0;
+    control->AccessIsPressedBefore() = before != 0;
+    control->AccessDurationPressedMSecs() = duration;
+    const GEInt result = CallScript("OnPlayerGameKeyPressed", hero, nullptr, 0);
+    Entity player(hero);
+    char line[384];
+    Format(line, "PLAYERKEY key=%u pressed=%u before=%u result=%d task=%s state=%s aimode=%d hp=%d "
+                 "readback=%d/%d/%d page=%d", key, pressed, before, result,
+           player.Routine.GetCurrentTask().GetText(), player.Routine.GetCurrentState().GetText(),
+           static_cast<int>(static_cast<gEAIMode>(player.Routine.AIMode)), HitPoints(player),
+           static_cast<int>(control->AccessPressedKey().GetValue()), control->AccessIsPressed() ? 1 : 0,
+           control->AccessIsPressedBefore() ? 1 : 0, static_cast<int>(gui2.GetActivePage()));
     log(line);
 }
 
@@ -1218,8 +1789,10 @@ void NpcStill(char const* guid, LogFn log)
     if (!ParseGuid(guid, raw)) { log("REFUSED npcstill: bad GUID"); return; }
     Entity npc = Entity(bCPropertyID(bCGuid(raw)));
     if (!npc.GetInstance() || npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) { log("REFUSED npcstill: no such NPC simulated here"); return; }
+    if (walkProbe.until && !std::memcmp(&raw, walkProbe.guid, 16)) EndWalkProbe(npc);
     npc.Routine.FullStop();
     npc.NPC.SetCurrentTarget(Entity());
+    npc.Routine.AIMode = gEAIMode_Routine;
     npc.Routine.SetTask(bCString(body::IdleTask()));
     // An npcguard parade is held for 15 s (npcParades): end it too, or the next blow met an NPC still parrying
     // (stageLagBlock 28.10.: every blow after the first).
@@ -1227,6 +1800,95 @@ void NpcStill(char const* guid, LogFn log)
     npc.Routine.AniState = gEAniState_Stand;
     Format(line, "NPCSTILL name=%s task=%s parade_mode=%d", npc.GetName().GetText(), npc.Routine.GetCurrentTask().GetText(),
               CallScript("IsInParadeMode", npc.GetInstance(), nullptr, 0));
+    log(line);
+}
+
+void NpcPin(char const* guid, LogFn log)
+{
+    if (!std::strcmp(guid, "off")) { pinnedNpc = PinnedNpc{}; log("NPCPIN active=0"); return; }
+    _GUID raw{};
+    if (!net::IsHost() || !ParseGuid(guid, raw)) { log("REFUSED npcpin: expected a host NPC GUID or off"); return; }
+    uint8_t id[16];
+    std::memcpy(id, &raw, sizeof(id));
+    eCEntity* entity = npcs::NpcByGuid(id);
+    if (!entity || Entity(entity).IsDead()) { log("REFUSED npcpin: no living host NPC"); return; }
+    std::memcpy(pinnedNpc.guid, id, sizeof(id));
+    const auto& at = entity->GetWorldPosition();
+    const auto turn = entity->GetWorldRotation();
+    pinnedNpc.position[0] = at.GetX(); pinnedNpc.position[1] = at.GetY(); pinnedNpc.position[2] = at.GetZ();
+    pinnedNpc.rotation[0] = turn.GetX(); pinnedNpc.rotation[1] = turn.GetY();
+    pinnedNpc.rotation[2] = turn.GetZ(); pinnedNpc.rotation[3] = turn.GetW();
+    pinnedNpc.until = net::Now() + 300000;
+    char line[200];
+    Format(line, "NPCPIN active=1 name=%s position=%.0f/%.0f/%.0f", entity->GetName().GetText(),
+           at.GetX(), at.GetY(), at.GetZ());
+    log(line);
+}
+
+void NpcWalk(char const* argument, LogFn log)
+{
+    char guid[37] = {}, line[240];
+    float position[3] = {};
+    _GUID raw{};
+    if (!argument || sscanf_s(argument, "%36[^_]_%f_%f_%f", guid, static_cast<unsigned>(sizeof(guid)),
+                             &position[0], &position[1], &position[2]) != 4 || !ParseGuid(guid, raw)) {
+        log("REFUSED npcwalk: need GUID_X_Y_Z");
+        return;
+    }
+    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ||
+        npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) {
+        log("REFUSED npcwalk: no living NPC simulated here");
+        return;
+    }
+    if (walkProbe.until) { log("REFUSED npcwalk: another walking probe is active"); return; }
+    auto* routine = static_cast<gCScriptRoutine_PS*>(npc.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    if (!routine) { log("REFUSED npcwalk: no script routine"); return; }
+    const bCVector goal(position[0], position[1], position[2]);
+    const GEBool canGoto = npc.CanGoto(goal);
+    if (!canGoto) {
+        Format(line, "NPCWALK name=%s started=0 can_goto=0 target=%.0f_%.0f_%.0f",
+               npc.GetName().GetText(), position[0], position[1], position[2]);
+        log(line);
+        return;
+    }
+    strncpy_s(walkProbe.routine, static_cast<bCString&>(routine->AccessRoutine()).GetText(), _TRUNCATE);
+    walkProbe.mode = body::AIModeOf(npc.GetInstance());
+    std::memcpy(walkProbe.guid, &raw, 16);
+    std::memcpy(walkProbe.goal, position, sizeof(position));
+    walkProbe.until = net::Now() + 15000;
+    walkProbe.nextGoto = net::Now() + 1000;
+    npc.Routine.FullStop();
+    const GEBool started = npc.StartGoto(goal, gEWalkMode_Walk);
+    if (!started) EndWalkProbe(npc);
+    Format(line, "NPCWALK name=%s started=%d target=%.0f_%.0f_%.0f processing=%d task=%s mode=%d can_goto=%d",
+           npc.GetName().GetText(), started ? 1 : 0, position[0], position[1], position[2],
+           !npc.GetInstance()->IsProcessingDisabled() ? 1 : 0, npc.Routine.GetCurrentTask().GetText(),
+           static_cast<int>(npc.CharacterMovement.GetMovementMode()), canGoto ? 1 : 0);
+    log(line);
+}
+
+void NpcAttack(char const* guid, LogFn log)
+{
+    _GUID raw{};
+    if (!ParseGuid(guid, raw)) { log("REFUSED npcattack: bad GUID"); return; }
+    Entity npc = Entity(bCPropertyID(bCGuid(raw)));
+    eCEntity* target = remote::PuppetOf(net::IsHost() ? 2 : 1);
+    if (!npc.GetInstance() || !target || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ||
+        npc.IsDead() || npcs::IsMirrored(npc.GetInstance())) {
+        log("REFUSED npcattack: no living NPC simulated here or no remote player");
+        return;
+    }
+    npc.EnableProcessing(GETrue);
+    npc.Routine.FullStop();
+    npc.NPC.SetCurrentTarget(Entity(target));
+    npc.NPC.AttackReason = gEAttackReason_ReactToDamage;
+    npc.Routine.AIMode = gEAIMode_Combat;
+    npc.Routine.SetTask(bCString("ZS_Attack"));
+    char line[240];
+    Format(line, "NPCATTACK name=%s task=%s processing=%d target_player=%d", npc.GetName().GetText(),
+           npc.Routine.GetCurrentTask().GetText(), !npc.GetInstance()->IsProcessingDisabled() ? 1 : 0,
+           remote::PuppetOwner(target));
     log(line);
 }
 
@@ -1416,6 +2078,46 @@ void ArenaReport(char const* name, LogFn log)
 namespace g3t::combat {
 bool InParadeMode(eCEntity* entity) { return entity && CallScript("IsInParadeMode", entity, nullptr, 0) != 0; }
 
+// One blow of a mirrored NPC on this machine's own hero, judged by this machine's game as a swing it showed (npcs.cpp calls this
+// at the hit part of a visible swing, in reach and facing the hero). The game's own judgement then decides parade, armour and
+// stumble; the hero's hit points are never set by the host.
+bool LocalBlow(eCEntity* attacker)
+{
+    eCEntity* body = remote::ControlledBody();
+    if (!installed || !body || !attacker || gCSession::GetInstance().GetCheats().GetCheatGodEnabled()) return false;
+    Entity self(body);
+    if (self.IsDead() || self.IsDown()) return false;
+    if (hud::InventoryOpen()) { NoteInventoryHit(); return false; }
+    char const* kind = "";
+    eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker), &kind);
+    int pending = 0;
+    if (MeansToKill(attacker, body)) downed::NoteBlow();
+    forwarded = true;
+    heroForward = true;
+    const GEInt result = GameHit(self, source, &pending);
+    heroForward = false;
+    forwarded = false;
+    ++localNpcHits;
+    if (localNpcHits <= 40)
+        Logf("combat: %s's visible blow judged here: result=%#x pending=%d", Entity(attacker).GetName().GetText(), result, pending);
+    return true;
+}
+
+bool PlayerBlow(eCEntity* victim)
+{
+    eCEntity* hero = remote::ControlledBody();
+    if (!installed || bypass || net::IsHost() || !hero || !victim || !npcplayback::IsPassive(victim) || !npcs::Ready(victim) ||
+        !body::LocallyAttacking(hero) || IgnoreFriendlyHit(victim, hero)) return false;
+    Entity player(hero), target(victim);
+    if (player.IsDown() || player.IsDead() || target.IsDead()) return false;
+    char const* kind = "";
+    eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(hero), &kind);
+    int pending = 0;
+    const GEInt result = GameHit(target, source, &pending);
+    if (result && pending > 0) PlayHitEffect(victim, false);
+    return result && pending > 0;
+}
+
 bool Switch(char const* action, LogFn log)
 {
     if (!std::strcmp(action, "foreignjudgeskipon")) { skipForeign = true; log("SWITCH foreignjudgeskipon ok=1"); return true; }
@@ -1424,6 +2126,7 @@ bool Switch(char const* action, LogFn log)
     if (!std::strcmp(action, "fightmusicon")) { fightMusic = true; log("SWITCH fightmusicon ok=1"); return true; }
     if (!std::strcmp(action, "hiteffectsoff")) { hitEffects = false; log("SWITCH hiteffectsoff ok=1"); return true; }
     if (!std::strcmp(action, "npchitscaleoff")) { npcHitScale = false; log("SWITCH npchitscaleoff ok=1"); return true; }
+    if (!std::strcmp(action, "trustclientblowsoff")) { trustClientBlows = false; log("SWITCH trustclientblowsoff ok=1"); return true; }
     return false;
 }
 }

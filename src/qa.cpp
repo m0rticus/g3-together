@@ -29,6 +29,7 @@
 #include "dialogaudio.h"
 #include "explore.h"
 #include "npcs.h"
+#include "npcplayback.h"
 #include "offer.h"
 #include "downed.h"
 #include "transform.h"
@@ -47,6 +48,7 @@
 #include "steam.h"
 #include "ending.h"
 #include "infocmd.h"
+#include "xpshare.h"
 #include "remote.h"
 #include "trace.h"
 #include "world.h"
@@ -198,7 +200,8 @@ void InspectMenu()
 
 // Focus a visible, enabled control with this id and caption. For the shared Yes button (20711) the
 // dialog question (20709) must contain prompt.
-bool Focus(unsigned id, const char* caption, const char* prompt = nullptr)
+bool Focus(unsigned id, const char* caption, const char* prompt = nullptr,
+           const char* alternateCaption = nullptr, const char* alternatePrompt = nullptr)
 {
     CFFGUIModule& gui = CFFGUIModule::GetInstance();
     char line[512] = {};
@@ -208,12 +211,17 @@ bool Focus(unsigned id, const char* caption, const char* prompt = nullptr)
             if (!button) continue;
             if (button->GetDlgCtrlID() != id) button = button->GetDlgItem(id);
             if (!button || !button->IsWindowVisible() || !button->IsWindowEnabled()) continue;
-            if (std::strcmp(button->GetWindowTextA().GetAnsiText().GetText(), caption)) continue;
+            const bCString text = button->GetWindowTextA().GetAnsiText();
+            if (std::strcmp(text.GetText(), caption) &&
+                (!alternateCaption || std::strcmp(text.GetText(), alternateCaption))) continue;
             CFFGFCWnd* parent = button->GetParentWindow();
             if (!parent) return false;
             if (prompt) {
                 CFFGFCWnd* question = parent->GetDlgItem(20709);
-                if (!question || !std::strstr(question->GetWindowTextA().GetAnsiText().GetText(), prompt)) continue;
+                if (!question) continue;
+                const bCString questionText = question->GetWindowTextA().GetAnsiText();
+                if (!std::strstr(questionText.GetText(), prompt) &&
+                    (!alternatePrompt || !std::strstr(questionText.GetText(), alternatePrompt))) continue;
             }
             button->SetFocus();
             Format(line, "MENU_FOCUS id=%u focused=%d text=%s", id, button->HasFocus(), caption);
@@ -313,6 +321,14 @@ bool RunReviewAction(const char* action)
         g3t::explore::AnimalSleep(argument, &Log);
     } else if (!std::strcmp(action, "swimgoal")) {
         g3t::explore::SwimGoal(argument, &Log);
+    } else if (!std::strcmp(action, "worldprocess")) {
+        g3t::world::ProcessingReport(&Log);
+    } else if (!std::strcmp(action, "streamprobe")) {
+        g3t::world::StreamProbe(argument, &Log);
+    } else if (!std::strcmp(action, "passiveprobe")) {
+        g3t::npcplayback::Probe(argument, &Log);
+    } else if (!std::strcmp(action, "passivestats")) {
+        g3t::npcplayback::Stats(&Log);
     } else if (!std::strcmp(action, "movemode")) {
         g3t::explore::MoveMode(&Log);
     } else if (!std::strcmp(action, "chaptersyncoff")) {
@@ -364,22 +380,12 @@ bool RunReviewAction(const char* action)
         g3t::hero::SkillDiag(&Log);
     } else if (!std::strcmp(action, "skilltry")) {
         g3t::hero::SkillTry(&Log);
-    } else if (!std::strcmp(action, "offersend")) {  // stage W10: player trade offers (offer.cpp)
-        g3t::offer::SendCommand(argument, &Log);
-    } else if (!std::strcmp(action, "offeraccept")) {
-        g3t::offer::Decide(true, &Log);
-    } else if (!std::strcmp(action, "offerreject")) {
-        g3t::offer::Decide(false, &Log);
-    } else if (!std::strcmp(action, "offerstate")) {
+    } else if (!std::strcmp(action, "exchangestate")) {
         g3t::offer::Report(&Log);
-    } else if (!std::strcmp(action, "offerpartial")) {
-        g3t::offer::PartialOn(&Log);
     } else if (!std::strcmp(action, "heroadd")) {
         g3t::offer::AddCommand(argument, &Log);
     } else if (!std::strcmp(action, "herocount")) {
         g3t::offer::CountCommand(argument, &Log);
-    } else if (!std::strcmp(action, "keycheck")) {
-        g3t::offer::KeyCheck(&Log);
     } else if (!std::strcmp(action, "menutext")) {
         g3t::hud::Probe(argument, &Log);
     } else if (!std::strcmp(action, "menuline")) {
@@ -485,8 +491,6 @@ bool RunPlayerAction(const char* action)
         g3t::downed::HelpOptionOff(&Log);
     } else if (!std::strcmp(action, "tradeclose")) {
         g3t::trade::CloseCommand(&Log);
-    } else if (!std::strcmp(action, "tradeholdoff")) {
-        g3t::trade::HoldOff(&Log);
     } else if (!std::strcmp(action, "murdercand")) {
         g3t::enclaves::MurderCandidates(argument, &Log);
     } else if (!std::strcmp(action, "creditqueueoff")) {
@@ -576,22 +580,16 @@ bool RunPlayerAction(const char* action)
         g3t::mapmarks::OpenMap(&Log);
     } else if (!std::strcmp(action, "mapclose")) {
         g3t::mapmarks::CloseMap(&Log);
-    } else if (!std::strcmp(action, "tradequalityoff")) {
-        g3t::trade::QualityOff(&Log);
     } else if (!std::strcmp(action, "givequality")) {
         g3t::trade::GiveQuality(argument, &Log);
     } else if (!std::strcmp(action, "qualitycount")) {
         g3t::trade::QualityCount(argument, &Log);
     } else if (!std::strcmp(action, "tradesell")) {
         g3t::containers::TradeSell(argument, &Log);
+    } else if (!std::strcmp(action, "tradegift")) {
+        g3t::trade::GiftCommand(argument, &Log);
     } else if (!std::strcmp(action, "tradeprice")) {
         g3t::trade::Price(argument, &Log);
-    } else if (!std::strcmp(action, "tradepricesoff")) {
-        g3t::trade::PricesOff(&Log);
-    } else if (!std::strcmp(action, "tradeadjust")) {
-        g3t::trade::AdjustCommand(argument, &Log);
-    } else if (!std::strcmp(action, "tradeadjustoff")) {
-        g3t::trade::AdjustOff(&Log);
     } else if (!std::strcmp(action, "tradefilloff")) {
         g3t::trade::FillOff(&Log);
     } else if (!std::strcmp(action, "playergoods")) {
@@ -859,7 +857,9 @@ bool RunLaterAction(const char* action)
     } else if (!std::strcmp(action, "tickguardoff")) {
         g3t::spells::TickGuardOff(&Log);
     } else if (!std::strcmp(action, "spawnnpc")) {
-        g3t::spells::SpawnNpc(argument, &Log);
+        // "spawnnpc shared <template> <GUID>": the same creature on both machines (this chain is at the compiler's nesting limit)
+        if (!std::strncmp(argument, "shared_", 7)) g3t::summon::SpawnShared(argument + 7, &Log);
+        else g3t::spells::SpawnNpc(argument, &Log);
     } else if (!std::strcmp(action, "party")) {
         g3t::spells::Party(&Log);
     } else if (!std::strcmp(action, "npcmemory")) {
@@ -910,11 +910,56 @@ bool RunLaterAction(const char* action)
     return true;
 }
 
+void RunConsole(const char* command)
+{
+    // The game's own console (gCSession::OnCheat: god, fullhealth, invisibility, idkfa, kill <name>, defeat <name>).
+    if (!*command) { Log("REFUSED console: no command"); return; }
+    if (!gCSession::GetInstance().IsGameRunning()) { Log("REFUSED console: no running game"); return; }
+    const bCString answer = eCConsole::AccessConsole().Execute(bCString(command));
+    char line[200] = {};
+    Format(line, "CONSOLE %s -> %s", command, answer.GetText());
+    Log(line);
+}
+
 void RunAction(const char* action)
 {
     gCSession& session = gCSession::GetInstance();
     char line[256] = {};
+    if (!std::strcmp(action, "console")) { RunConsole(argument); return; }
+    if (!std::strcmp(action, "tutorialoff") || !std::strcmp(action, "baselineinfo")) {
+        eCDynamicEntity* hero = session.GetHero();
+        auto* memory = hero ? static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory)) : nullptr;
+        gCGUIManager* manager = session.GetGUIManager();
+        if (!memory || !manager) { Log("REFUSED baseline: no hero or GUI"); return; }
+        const bool disable = !std::strcmp(action, "tutorialoff");
+        if (disable) {
+            memory->AccessHideTips() = GETrue;
+            memory->EnableTutorial(static_cast<gETutorialFlag>(-1), GEFalse);
+            if (manager->GetActivePage() == gEGamePage_Tutorial) manager->ClosePage();
+        }
+        Entity self(hero);
+        Format(line, "%s hidden=%d page_open=%d menu_open=%d standing=%d falling=%d swimming=%d floor_y=%.1f",
+               disable ? "TUTORIALOFF" : "BASELINEINFO", memory->GetHideTips() ? 1 : 0,
+               manager->IsAnyPageOpen() ? 1 : 0, manager->IsMenuOpen() ? 1 : 0,
+               self.CharacterMovement.IsStanding() ? 1 : 0, self.CharacterMovement.IsFalling() ? 1 : 0,
+               self.CharacterMovement.IsSwimming() ? 1 : 0, self.CharacterMovement.GetFloorY());
+        Log(line);
+        return;
+    }
+    if (!std::strcmp(action, "consoleopen") || !std::strcmp(action, "consoleclose")) {
+        eCConsole& console = eCConsole::AccessConsole();
+        if (action[7] == 'o') console.Open(); else console.Close();
+        Format(line, "CONSOLE open=%d", console.IsOpen() ? 1 : 0);
+        Log(line);
+        return;
+    }
     if (!std::strcmp(action, "netstats")) { g3t::net::Stats(&Log); return; }
+    if (!std::strcmp(action, "syncstats")) {
+        g3t::combat::SyncReport(&Log);
+        g3t::npcs::SyncReport(&Log);
+        g3t::body::SyncReport(&Log);
+        return;
+    }
     if (!std::strcmp(action, "tradebegin")) { g3t::containers::TradeBegin(argument, &Log); return; }  // C1061: not in the chains
     if (!std::strcmp(action, "rttlogoff")) { g3t::net::RttLogOff(&Log); return; }
     if (!std::strcmp(action, "crashprobe")) { g3t::crashlog::Probe(&Log); return; }  // stageCrashNames
@@ -926,6 +971,14 @@ void RunAction(const char* action)
     if (!std::strcmp(action, "interpoff")) { g3t::body::interpolate = false; Log("SWITCH interpoff ok=1"); return; }
     if (!std::strcmp(action, "interpon")) { g3t::body::interpolate = true; Log("SWITCH interpon ok=1"); return; }
     if (!std::strcmp(action, "walkrel")) { g3t::remote::WalkRel(argument, &Log); return; }  // stageWalk
+    if (!std::strcmp(action, "npcwalk")) { g3t::combat::NpcWalk(argument, &Log); return; }
+    if (!std::strcmp(action, "walking")) { g3t::npcs::WalkingReport(argument, &Log); return; }
+    if (!std::strcmp(action, "npclife")) { g3t::npcs::LifeReport(argument, &Log); return; }
+    if (!std::strcmp(action, "corpsesleep")) { g3t::npcs::CorpseSleep(argument, &Log); return; }
+    if (!std::strcmp(action, "npcattack")) { g3t::combat::NpcAttack(argument, &Log); return; }
+    if (!std::strcmp(action, "npcpin")) { g3t::combat::NpcPin(argument, &Log); return; }
+    if (!std::strcmp(action, "playerkey")) { g3t::combat::PlayerKey(argument, &Log); return; }
+    if (!std::strcmp(action, "npccast")) { g3t::shot::NpcCast(argument, &Log); return; }
     if (!std::strcmp(action, "actionseqon")) { g3t::body::actionSeq = true; Log("SWITCH actionseqon ok=1"); return; }
     if (!std::strcmp(action, "fallmoveon")) { g3t::body::fallMove = true; Log("SWITCH fallmoveon ok=1"); return; }
     if (!std::strcmp(action, "actionseqoff")) { g3t::body::actionSeq = false; Log("SWITCH actionseqoff ok=1"); return; }
@@ -943,16 +996,26 @@ void RunAction(const char* action)
         g3t::items::Switch(action, &Log))
         return;
     if (RunHitAction(action) || RunLaterAction(action) || RunReviewAction(action) || RunPlayerAction(action)) return;
+    if (!std::strcmp(action, "openinventory") || !std::strcmp(action, "closeinventory")) {
+        gCGUIManager* manager = session.GetGUIManager();
+        if (!session.IsGameRunning() || !manager) { Log("REFUSED inventory page: no game or GUI manager"); return; }
+        const bool opening = !std::strcmp(action, "openinventory");
+        const bool changed = opening ? manager->OpenInventory() : manager->ClosePage();
+        Format(line, "INVENTORYPAGE changed=%d open=%d active=%d", changed ? 1 : 0, hud::InventoryOpen() ? 1 : 0,
+               static_cast<int>(manager->GetActivePage()));
+        Log(line);
+        return;
+    }
     if (!std::strcmp(action, "state")) {
         State(session);
     } else if (!std::strcmp(action, "menu")) {
         InspectMenu();
     } else if (!std::strcmp(action, "focusnew")) {
         if (session.IsGameRunning()) { Log("REFUSED focusnew: already running"); return; }
-        newGamePending = Focus(20571, "Neues Spiel");
+        newGamePending = Focus(20571, "Neues Spiel", nullptr, "New Game");
     } else if (!std::strcmp(action, "focusyes")) {
         if (!newGamePending || session.IsGameRunning()) { Log("REFUSED focusyes: no pending new game"); return; }
-        Focus(20711, "Ja", "ein neues Spiel");
+        Focus(20711, "Ja", "ein neues Spiel", "Yes", "new game");
     } else if (!std::strcmp(action, "focussave")) {
         if (!session.IsGameRunning() || !session.IsSaveAllowed()) { Log("REFUSED focussave: game not save-ready"); return; }
         Focus(20574, "Spiel speichern");
@@ -1158,7 +1221,8 @@ void RunAction(const char* action)
     } else if (!std::strcmp(action, "hurthero")) {
         g3t::combat::HurtHero(argument, &Log);
     } else if (!std::strcmp(action, "givexp")) {
-        g3t::combat::GiveXp(argument, &Log);
+        if (!std::strcmp(argument, "report")) g3t::xpshare::Report(&Log);  // XPSHARE line (no further else-if: compiler nesting limit)
+        else g3t::combat::GiveXp(argument, &Log);
     } else if (!std::strcmp(action, "ownoff")) {
         g3t::npcs::OwnOff(&Log);
     } else if (!std::strcmp(action, "xpguardoff")) {

@@ -6,6 +6,8 @@ G3 Together adds co-op to Gothic 3 for two players. More players are planned but
 One player is the **host**: their world is the shared campaign, and their save is everyone's campaign save.
 The other player joins them.
 
+This fork supports **Steam only**. Direct IP, LAN/VPN joining and automatic IP fallback are not supported.
+
 This is a test version. See the known issues and limitations below.
 
 ## Requirements (the same on both PCs)
@@ -20,20 +22,23 @@ This is a test version. See the known issues and limitations below.
   containing `REFUSED by host`. Loose files in Data subfolders are not checked.
 - No other co-op mods in `scripts`, such as Myrtana Accord's `Script_G3Coop.dll`.
 - Prefer a separate **copy** of the Gothic 3 installation for co-op.
+- Steam running and logged in on both PCs, with both players on each other's friends list.
 
 ## Installation
 
 **Setup:** once Gothic 3 and both patches are installed, unpack the whole package anywhere and double-click
 `Setup.cmd` (`Einrichten.cmd` for German, `Instalacja.cmd` for Polish). It does the copying and the INI for you: it finds Gothic 3 (Steam, GOG or the
 folder you name), checks Community Patch 1.75.14 and Parallel Universe Patch 1.1.1, moves another co-op mod out of
-`scripts`, copies the mod into `scripts` and writes `g3together.ini` from your answers (host or joining player, your name,
-the host's address). Replaced files are kept in `G3Together-backup` in the game folder. The setup was checked on test
+`scripts`, copies the mod into `scripts` and writes `g3together.ini` from your role. Your display name comes from Steam automatically.
+Steam and the verified `steam_api.dll` are required; setup stops if that DLL cannot be installed.
+Replaced files are kept in `G3Together-backup` in the game folder. The setup was checked on test
 folders, not yet by players; the steps below do the same by hand.
 
 1. Install Gothic 3 from Steam, then **Community Patch 1.75.14**.
 2. Install [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm)
    into the same game installation. Both players must use the same patch versions.
-3. Use the same G3 Together package on both PCs. Copy `Script_G3Together.dll` into `<Gothic 3>\scripts\`.
+3. Use the same G3 Together package on both PCs. Copy `Script_G3Together.dll` into `<Gothic 3>\scripts\`
+   and the package's verified 32-bit `steam_api.dll` into `<Gothic 3>\G3Together\`, or let setup obtain it.
 4. Copy the appropriate `g3together.ini.host-example` or `g3together.ini.client-example` from the package
    into `<Gothic 3>\`, rename it to `g3together.ini`, and edit it:
 
@@ -41,17 +46,14 @@ folders, not yet by players; the steps below do the same by hand.
 
    ```ini
    role = host
-   port = 34567
-   name = YourName
+   transport = steam
    ```
 
    Joining player:
 
    ```ini
    role = client
-   address = <host IP address>
-   port = 34567
-   name = YourName
+   transport = steam
    ```
 
    The joining player must use `role = client`. If the INI is missing or the role has another value,
@@ -67,49 +69,75 @@ Gothic 3's own language. The message examples in this guide assume English.
 
 ## Connecting over the internet
 
-The mod connects directly over UDP port 34567. A private virtual network, such as **Tailscale** or
-**ZeroTier**, allows the players to connect without forwarding a router port. Install the chosen
-service on both PCs and use the host's virtual-network address as `address`.
-Alternatively, the host can forward UDP port 34567 on their router to their PC.
+Steam is the only connection path. No host address, VPN or router port forwarding is needed.
 
 ### Over Steam (experimental)
 
 With `transport = steam` in both INIs, the joining player's game finds the host among their Steam friends, and all traffic
-goes through Steam, relayed by Valve where needed: no address, no port forwarding, no Hamachi.
+goes through Steam, relayed by Valve where needed.
 
-- Both players need Steam running and logged in, and must be Steam friends. A GOG copy of Gothic 3 works too; only a
-  Steam account is needed.
+- Both players need to own Gothic 3 on Steam, with Steam running and logged in, and must be Steam friends.
+  The automatic player name is the current Steam display name; manual INI names are ignored.
 - The mod needs Valve's 32-bit `steam_api.dll` in `<Gothic 3>\G3Together\`. The setup puts it there (from the package, or
   downloaded from the Steamworks.NET release 2025.164.1 after asking, checked by its SHA-256).
-- The mod runs as Valve's free sample app "Spacewar" (AppID 480), so Steam shows both players as playing Spacewar.
-  Nothing has to be bought.
+- The mod initializes as Gothic 3 (AppID 39500), so Steam activity uses Gothic 3 instead of Spacewar.
+  Local real-Steam initialization and lobby creation were checked; two-account gameplay remains a separate check.
 - With several friends hosting at once, the joining player sets `steam_host = <the host's Steam name>`. The host's
   `g3together.log` also names its lobby number; `steam_lobby = <number>` joins exactly that one.
-- Without Steam (not running, no `steam_api.dll`) the joining player's game connects to `address` instead and says so in
-  the game. The host's UDP port stays open over Steam too, so a player with an address can join the same game.
+- Without Steam or the required `steam_api.dll`, co-op startup fails with a message in the menu and game.
+  There is no fallback. ENet's UDP sockets bind only to localhost and accept linked Steam relays, not direct-IP players.
 - The Steam overlay's invite may not open in Gothic 3. It is not needed: the joining player's game finds the host by
   itself, and "Join game" in the Steam friends list works as well while their game is running.
 
 This connection was tested with a stand-in for Steam on one PC; play between two real Steam accounts is still unverified.
 
-### Using Hamachi
+The main menu reports creating/hosting/searching/joined states, accepted and ready clients, linked Steam peers and
+measured Steam ping. `pending` means no ping sample exists yet; the host's displayed ping is the maximum linked-peer RTT.
+Errors and compatibility refusals take priority. `g3together.log` appends startup/session, lobby, peer, send-failure and
+periodic connection diagnostics automatically. Review names and Steam IDs before sharing logs.
 
-1. Both players install Hamachi and join the **same** Hamachi network.
-2. Check the connection status shown for the other player. Prefer a direct connection; a relayed
-   connection adds latency and may cause stuttering. Resolve connection errors before starting.
-3. The host's Hamachi address appears at the top of their Hamachi window (`25.x.x.x`). The joining player
-   puts that address in their INI: `address = 25.x.x.x`, `port = 34567`.
-4. **Host firewall:** Windows often treats Hamachi as a public network. When Windows asks whether to
-   allow Gothic 3 through the firewall, allow it on the network profile used by Hamachi, including
-   **Public networks** if applicable.
-5. The joining player can run `ping 25.x.x.x` in a command prompt, using the host's address, to check
-   connectivity and latency. Lower latency is preferable; a ping reply alone does not verify that
-   the game's UDP connection is allowed.
-6. If the joining player's game cannot reach the host, the top line of their main menu says so after about 15 seconds,
-   with the address and port they entered (in the game: a message every 30 seconds).
+The current source uses **protocol 71**. Its host-only NPC overhaul is experimental; native gameplay acceptance is still
+in progress, so this source must not be treated as a verified release. Both players need the same build. Personal loot,
+NPC merchant inventories and automatic player exchanges are retained.
 
-The host accepts connections through any network adapter, including Hamachi. Testing described by
-these guides used two game copies on one PC; play over the real internet remains unverified.
+The host simulates all NPCs, including remote companions, guides and summons. Separate non-rendered prefetch cameras
+load distant simulation regions; the real camera, static-world culling and building LOD remain unchanged.
+`host_roi` controls NPC coverage, not rendering distance. The old `host_sim = off/elastic` choices no longer transfer
+simulation to a client.
+
+NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
+A slow host cannot produce 60 distinct samples per second: `SYNCNPC` logs capture ticks, missed deadlines and elapsed
+capture time. Clients interpolate final bone poses, facial-rig state and eight motion slots on one buffered timeline, normally at least
+50 ms behind the host. They do not predict future NPC movement or resume NPC AI when packets stop. HP, stance and
+life transitions follow that same presentation timeline. Missing or stale presentation cannot authorize an incoming hit.
+Player-puppet smoothing remains separate.
+The host also sends each NPC's attitude to the player, so name-tag colours (green, white, orange, red) match on both PCs. While
+you talk to an NPC on the client, that one NPC's script routine runs locally so its voiced lines play; the host still holds
+and animates it. Both are built for manual testing and not yet verified live.
+
+Facial or skeleton changes retain the buffered old pose until the host's transition time. The nearby-NPC warning
+requires the same living NPC to lack usable presentation for two seconds; settled corpses are not pending live poses.
+Discarded pose fragments release their receive budget, so packet loss cannot gradually exhaust that budget and stop
+NPC updates. The 16-bit unreliable sequence of a pose channel is reset on a second, idle pose channel, so a lost reset
+packet can neither hold back nor starve the live pose stream. ENet's RTT-jitter throttle is off: it only drops more
+fixed-rate pose frames. Native clip bookkeeping or a pending clip name cannot invalidate a successfully rendered host skeleton.
+
+The host sends final skeletal matrices because native blend-out layers survive outside the eight motion slots.
+Poses retain matrix shear and use sub-centimetre translation quantization. They travel on a separate lossy ENet channel;
+essential life/party/hit changes remain reliable without making the pose stream wait for them. Owned loopback sockets
+have burst capacity for crowded scenes. `NPCPOSE` and `PASSIVE` diagnostics distinguish queued/received poses,
+presentation waits and completed skeletal updates. This full-pose stream costs more bandwidth than clip-only replay;
+internet throughput and multi-player resource limits still need acceptance.
+
+Your own successful hit shows its local flinch immediately and is claimed reliably from the host. A host-side parry
+does not cancel that landed hit. Hit identities, acknowledgements and NPC incarnations prevent duplicate claims and
+suppress the attacking client's echoed flinch; other players still see the host's reaction.
+Damage to your hero remains locally judged against the attack you are shown, not a host-issued HP subtraction.
+NPC projectiles follow their host presentation time. Ragdoll impulses originate only on the host; clients apply them
+after the matching corpse and physics are ready. Ragdoll bones still use local physics, not a transmitted bone stream.
+Each corpse initializes physics once per life. Settled bodies retain their resting pose when physics unloads;
+only a new host impulse can wake them. Revival requires a new host incarnation, not an older buffered alive frame.
+Friendly-fire protection applies before local hit feedback as well as before authoritative damage.
 
 ## Starting and saving
 
@@ -125,28 +153,36 @@ these guides used two game copies on one PC; play over the real internet remains
 
 ## What is shared
 
+Protocol 62 makes ground pickups, corpse loot, chest contents and NPC merchant inventories personal.
+Taking or buying an item changes only that player's copy; each player pays from their own gold.
+Chest locks and use reservations are local too; other shared doors and usable places are unchanged.
+Direct trades between players still transfer real items rather than copying them.
+This does not restore items already removed during an earlier session. A host-save transfer/load replaces the client's world
+with the host's saved world, including native loot, merchant stock and generated-inventory flags.
+Independent world-inventory persistence across saves/late joins is not implemented; this is not yet a persistent per-player world save.
+
 - Players see each other, including movement, combat animations and falls.
-- Everyone sees the same NPCs, fights and deaths. Each region is simulated by one player: the host
-  near the host, or the first player to arrive in a distant region. Another player entering that
-  region sees the same simulation.
-- The PC simulating an NPC decides damage to it. The player who kills it earns the experience.
+- The host simulates NPCs around every player; clients replay that state without NPC AI, navigation or autonomous tasks.
+- The host applies NPC damage claims; each player judges their own visible contacts. The player who kills an NPC earns the experience.
   Kills by a player's companions or summons reward that player; kills by other NPCs reward nobody. As in single-player,
   your last hit on a human or orc knocks them out (experience, no murder); only a blow on them lying there kills them.
-- Companions follow the player who recruited them, even far from the host. Dismissing them returns
-  their ownership to the host.
+- Companions belong to the player who recruited them, even far from the host, but their simulation always remains on
+  the host. Dismissal changes the party relationship, not simulation authority.
 - An NPC that guides you or that you escort (follow and escort quests) goes with the player who took the quest, also the
   joining player, and after the host loads a save that player leads again. When the escort ends far from the host, the
   NPC stands at the same place on both PCs.
 - Quest state and previously completed dialogs are shared. Quest rewards go to everyone. Kill
   quests also count enemies killed in the joining player's region.
+- Experience is one pool: whatever either hero earns (kills, quests, dialogs, anything that gives experience) is added for
+  the other too, so both always show the same total and level. A player joining with less is raised to the other's total.
 - The main story is shared to the end: when one player hands over the artefacts at a god's shrine, the chapter changes
   for both, and when one player starts the epilogue, the other sees the same pictures and the game's end at the same time.
   If the other player is in a dialog, a menu or a fight just then, their epilogue starts as soon as that is over (a message
   says so).
 - A stool, bench, campfire or other place has one user: while your partner uses it, you are kept off ("<Name> is
   using this."), and NPCs do not take it either.
-- Items, chests, corpses and trading are shared: what one player takes is gone for everyone. An NPC whose pocket one
-  player picked cannot be picked again by the other.
+- Loot and NPC merchant stock are personal; what one player takes or buys stays available in the other player's copy.
+  An NPC whose pocket one player picked still cannot be picked again by the other.
 - Everyone uses the same time of day. Sleeping advances time for all players, and so does waiting until morning: the one
   who waits jumps straight to 9 o'clock.
 - Animals that come back after some days (scavengers, deer, wolves and the like) come back on both PCs or on neither.
@@ -159,6 +195,10 @@ these guides used two game copies on one PC; play over the real internet remains
 - If nobody can help because everyone is down, or the partner is disconnected, in another world
   or out of the game for more than five seconds, the hero dies as in single-player. The host loads a
   save; the other player is loaded into it automatically.
+- The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
+  While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
+  monsters, an intruder; not a duel, the arena, a guard's arrest or another player) counts as a death: you stay down until
+  your partner helps you up, and you die if nobody can.
 - A knock-out of the game's own works as in single-player: when a guard or another person beats you in a fight (without
   killing you), you stand up by yourself after a while, nobody needs to help, and the winner may rob you of half your gold.
   When an NPC of the other player's game does it, you see "<Name> robbed you of N gold." Your partner cannot loot you.
@@ -170,6 +210,10 @@ these guides used two game copies on one PC; play over the real internet remains
   remember how a fight ended, and an NPC that is still angry at one player holds it against that player only.
 - Blocking works as in single-player for both players: a block costs stamina and the shield talent counts. An NPC that
   parries blocks either player's blows the same way.
+- Friendly fire is off by default (`friendly_fire = 0`): players and their followers cannot damage, stagger, knock down,
+  poison, freeze or otherwise harm one another. Healing and revival still work. Enemy attacks and environmental damage
+  are unchanged. Both players must use the same value and restart after changing it. An explicit value from 1 to 100
+  retains the previous cross-player damage scaling; setup preserves existing values.
 - A player within about 20 m hears the other player's dialog. With the game's subtitles on, the lines' text shows as
   well, in your own game language, unless you are in a dialog yourself. You also see the answers your partner can pick
   and then the one they picked; the one who talks chooses.
@@ -218,32 +262,31 @@ these guides used two game copies on one PC; play over the real internet remains
 - **Jump to your partner:** **Page Down** puts you 1.5 m behind the other player in the same world,
   including a downed partner you want to help. There is a five-second cooldown. Staying together
   is preferable, but you can separate and regroup. To change the key, use `partner_key = F9` in
-  the INI (F1–F24, PAGEUP, HOME, END, INSERT, DELETE or a letter; Insert and Delete are the trade keys below).
+  the INI (F1–F24, PAGEUP, HOME, END, INSERT, DELETE or a letter).
 - **Map and compass:** your partner is marked on your map, with their name, and on the compass in their direction from
   where you look.
 - **Your look:** the other player sees the armor and helmet you wear. To be seen as another character, set
   `look = Diego` (a character template of the game) in your own INI; without it, the other player's
   `puppet_template` decides (default: the hero).
 - **Trading with your partner:** talk to the other player's character and choose "Show me your wares!". The game's trade
-  window opens with what your partner can trade (not what they wear, no quest items) and their gold; prices are the
-  same both ways; a sharpened, blessed or forged weapon stays so. On your very first trade a tip box comes first: click Ok. Swap as often as you like, then close the
-  window: your partner gets one offer and accepts with Insert or declines with Delete within 30 seconds. **Your own
-  price:** while the window is open, Num+ and Num− set how much gold changes hands (10 a press, 100 with Shift); the
-  price starts at the goods' value and shows on the screen. Your partner sees it in the offer and decides. It cannot go
-  beyond the gold either of you has, nor below nothing (that makes it a gift). Until then
-  you have neither what you get nor what you gave; afterwards everything is where it belongs. Other keys:
-  `offer_accept_key = F7`, `offer_decline_key = F8`, `price_up_key` and `price_down_key` (default `NUMPLUS`,
-  `NUMMINUS`) in the INI (the same names as for `partner_key`). If two of these keys are the same, one press does both: the mod says so on the screen at the start and in `g3together.log`.
+  window opens with their unequipped goods and gold. Select what to take or give and use the normal **Trade/Swap**
+  button. Items are free: no payment or matching barter value is required. Select gold explicitly to give it, including
+  a gold-only gift. Each exchange synchronizes automatically while the window stays open; your partner does not approve
+  it, and closing the window is not a confirmation step. Equipped/held gear, quest items, skills and bare hands remain
+  protected; sharpened, blessed and forged qualities are preserved. On the first trade, close the game's tutorial with Ok.
+  The old offer and price-adjustment keys are no longer used. NPC merchant prices are unchanged.
+  Saving/loading waits for an exchange to finish synchronizing; if the connection drops, reconnect the partner first.
+  The new native free-exchange flow is built for manual testing; mouse controls and gold-only gifts need gameplay verification.
 - Dialog changes to NPCs, such as trader, teacher, guard and routine settings, apply to everyone,
   as do dialog-triggered duels, attacks and companion recruitment. Dialog items go to the player
   speaking.
 - The host's save records which player owns each companion. After loading, a companion returns to
-  its player when that player rejoins, identified by their INI name. Do not change that name.
+  its player when that player rejoins, identified by their Steam display name. Do not change that name.
   After a disconnect without loading, companions initially belong to the host.
 - If the host loads a save during a session, the other players are loaded into it automatically. Until they
   are done, you do not see each other.
-- Trading and looting have been tested with bots through the game's own trade functions; the trade window's mouse
-  controls (dragging items, its buttons) have not been tried by a person yet.
+- Older trading and looting checks used inventory helpers, not the native trade button. They do not verify the new
+  player-exchange flow; use the manual trading checks in [PLAYTEST.md](PLAYTEST.md).
 - Sleep advances the clock for everyone, but only heals the player who sleeps.
 - Transformations: the other player sees the creature moving, then sees the hero again after the
   transformation ends. Wolf and Bloodfly were tested using the same setup as the game's spell.

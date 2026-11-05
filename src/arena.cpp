@@ -6,6 +6,8 @@
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "guards.h"
+#include "remote.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -34,7 +36,7 @@ gFScript original = nullptr;
 bool installed = false, native = false;
 DWORD lastTry = 0;
 bool on = true;  // QA negative control: arenasyncoff
-struct Held { std::string name; std::string arena; bool started = false; unsigned tries = 0; };
+struct Held { std::string name; std::string arena; bool started = false; unsigned tries = 0; uint8_t player = 0; };
 constexpr unsigned MaxTries = 20;  // half seconds
 std::unordered_map<std::string, Held> held;  // GUID -> opponent taken over here
 uint32_t nextCheck = 0;
@@ -107,9 +109,40 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* arena = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     ++sent;
+    if (!net::IsHost() && npc && net::Connected()) {
+        net::WorldState request{};
+        request.kind = 20;
+        const eCEntityProxy proxy(npc);
+        std::memcpy(request.guid, &proxy.GetEntityID().GetCore(), 16);
+        if (arena) strncpy_s(request.routine, Entity(arena).GetName().GetText(), _TRUNCATE);
+        net::SendWorldState(request, 0);
+        ++taken;
+        return GETrue;
+    }
     if (on && npc && net::Connected()) Take(npc, arena);  // before the original: it stops the opponent and continues its routine here
     return original(spu, self, other, args);
 }
+}
+
+void OnState(uint8_t from, net::WorldState const& state)
+{
+    if (!net::IsHost() || from < 2 || from >= net::MaxPlayers) return;
+    Entity npc(npcs::NpcByGuid(state.guid));
+    Entity place = Entity::GetEntity(bCString(state.routine));
+    eCEntity* actor = remote::PuppetOf(from);
+    if (!npc.GetInstance() || !place.GetInstance() || !actor || !original) {
+        Log("arena: remote arena request refused: missing opponent, arena, player or native entry");
+        return;
+    }
+    const std::string key = Key(npc.GetInstance());
+    auto& hold = held[key];
+    hold.name = npc.GetName().GetText();
+    hold.arena = place.GetName().GetText();
+    hold.player = from;
+    npcs::SetContext(npc.GetInstance(), from);
+    guards::Acting context(actor);
+    original(nullptr, &npc, &place, 0);
+    ++taken;
 }
 
 void Tick()
@@ -137,8 +170,10 @@ void Tick()
         Entity e = Resolve(it->first);
         eCEntity* npc = e.GetInstance();
         if (!npc) { ++it; continue; }  // not loaded here now; kept until it is
-        const bool ours = net::IsHost() ? npcs::HostTaken(npc) : npcs::Claimed(npc);
         Held& h = it->second;
+        const bool ours = net::IsHost() ? (h.player > 1 || npcs::HostTaken(npc)) : npcs::Claimed(npc);
+        guards::Acting context(h.player > 1 ? remote::PuppetOf(h.player) : nullptr);
+        if (ours && !h.started && !Fights(npc) && h.tries < MaxTries) { ++h.tries; ++it; continue; }
         if (ours && !h.started && h.tries < MaxTries && Fights(npc) && !std::strstr(e.Routine.GetCurrentTask().GetText(), "ZS_Talk")) {
             Entity arena = Entity::GetEntity(bCString(h.arena.c_str()));
             if (!std::strstr(e.Routine.GetCurrentTask().GetText(), "ZS_Arena") && arena.GetInstance()) {
@@ -156,7 +191,7 @@ void Tick()
         }
         if (ours && (Fights(npc) || Busy(e))) { ++it; continue; }
         if (ours) {
-            if (net::IsHost()) npcs::HostRelease(npc);
+            if (net::IsHost()) { npcs::SetContext(npc, 0); npcs::HostRelease(npc); }
             else infocmd::TakeOver(npc, false);
             ++given;
             Logf("arena: %s's fight is over (task %s); %s", it->second.name.c_str(), e.Routine.GetCurrentTask().GetText(),

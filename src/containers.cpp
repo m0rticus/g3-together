@@ -35,6 +35,8 @@ bool handsOff = false;  // QA negative control: a corpse's hand keeps a held sta
 bool interactLoot = true;  // QA negative control (containersyncoff interact): only chests count as opened by use (before 24.10.)
 unsigned contentsSent = 0, contentsReceived = 0, rewrites = 0, txSent = 0, txApplied = 0, txRefused = 0, txMismatch = 0, txDenied = 0,
          reverted = 0, handsReleased = 0;
+unsigned ignoredSharedMessages = 0;
+DWORD lastLocalPoll = 0;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
@@ -122,9 +124,8 @@ bool IsTrader(Entity& entity)
     return false;
 }
 
-// What players share through the host: chests, corpses and NPCs they trade with (any NPC the game lets them trade
-// with, Diego too). Never the hero, a puppet or an item, whatever GUID arrives (Fable review 22.10.: a transaction
-// with the host hero's GUID could change the host's own inventory).
+// World inventories eligible for personal loot/stock. Never the hero, a puppet or a loose item.
+// The old shared-inventory routines below are not registered or ticked by the personal inventory runtime.
 bool Shared(Entity& entity)
 {
     eCEntity* instance = entity.GetInstance();
@@ -321,6 +322,46 @@ void Broadcast(std::string const& key, Content const& content)
 }
 
 bool hostFill = true;  // false: the host fills a trader only when a client comes close (as before 27.10.)
+
+void PrepareLocalLoot(Entity& entity)
+{
+    if (!IsContainer(entity) || remote::IsPuppet(entity.GetInstance()) || entity.Inventory.IsGeneratedPlunder()) return;
+    entity.Inventory.GeneratePlunderInvFromTreasureSets();
+    entity.Inventory.SetGeneratedPlunder(GETrue);
+    Note("containers: personal loot generated once for %s", NameOf(entity).c_str());
+}
+
+void PrepareLocalTrade(Entity& entity)
+{
+    if (!IsTrader(entity) || remote::IsPuppet(entity.GetInstance()) || entity.Inventory.IsGeneratedTrade()) return;
+    entity.Inventory.GenerateTradeInvFromTreasureSets();
+    if (static_cast<GEFloat>(entity.Dialog.EndDialogTimestamp) == 0.0f)
+        entity.Inventory.RefreshTradeInvFromTreasureSets();
+    Note("containers: personal merchant stock prepared for %s", NameOf(entity).c_str());
+}
+
+void LocalInventoryTick()
+{
+    const DWORD now = GetTickCount();
+    if (now - lastLocalPoll < 1000) return;
+    lastLocalPoll = now;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero) return;
+    gCInfoManager_PS* infos = gCInfoManager_PS::GetInstance();
+    if (infos && infos->AccessIsRunning()) {
+        Entity partner(infos->GetDialogPartnerNPC());
+        PrepareLocalTrade(partner);
+    }
+    // Mirrored NPCs skip native death bookkeeping, so prepare their local plunder before quick loot can inspect it.
+    const bCVector& p = hero->GetWorldPosition();
+    const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
+    const bTObjArray<Entity> all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i) {
+        Entity entity = all.GetAt(i);
+        eCEntity* instance = entity.GetInstance();
+        if (instance && DistanceTo(instance, here) <= PreRollRadius && Corpse(entity)) PrepareLocalLoot(entity);
+    }
+}
 
 void HostTick()
 {
@@ -826,17 +867,9 @@ void Opened(gCScriptProcessingUnit* spu, GELPVoid other, bool trade)
     Entity partner = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     // Trade with another player's puppet, on any machine: filled with that player's goods (trade.cpp), never a container.
     if (trade && partner.GetInstance() && trade::OnOpen(partner.GetInstance())) return;
-    if (net::IsHost() || disabled) return;
-    if (!partner.GetInstance()) return;
-    uint8_t guid[16];
-    GuidOf(partner.GetInstance(), guid);
-    active = Key(guid);
-    activeSince = GetTickCount();
-    NoteActive("set", active, trade ? "trade opened" : "loot opened");
-    auto host = known.find(active);
-    Note("containers: this player opened %s (%s); here %s; host %s", NameOf(partner).c_str(), trade ? "trade" : "loot",
-         Describe(Read(partner)).c_str(), host == known.end() ? "not known yet" : Describe(host->second).c_str());
-    if (trade) net::SendWatch(guid);  // a living trader is not sent unless someone deals with him
+    if (disabled || !partner.GetInstance()) return;
+    if (trade) PrepareLocalTrade(partner);
+    else PrepareLocalLoot(partner);
 }
 
 GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -854,16 +887,18 @@ GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
 
 GEInt GE_STDCALL OpenTrade(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    Entity partner = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
+    if (remote::PuppetOwner(partner.GetInstance()) && !trade::Available()) {
+        Log("trade: native player exchange unavailable; opening refused");
+        return 0;
+    }
     Opened(spu, other, true);
     return originalTrade(spu, self, other, args);
 }
 
-// Quick Loot (option quick_loot): PS_Normal_Loop takes the stacks of the focused chest or corpse with one key
-// press, calling PSInventory::TransferAmountTo directly (Script_Game.dll+0x81ced, through the import table; C
-// quick-loot-c.md), without PlayerOpenLoot. On a client that call site goes through QuickTake: the container
-// becomes this client's open container before anything leaves, so the next poll reports the take to the host
-// as one transaction; without the host's contents to compare against, nothing is taken. ZS_RansackBody uses the
-// same import from another call site and is not touched.
+// Quick loot uses this TransferAmountTo call site without PlayerOpenLoot. Keep the native local transfer and
+// the protection against looting another player's puppet; never wait for host inventory contents.
+// ZS_RansackBody uses the same import from another call site and is not touched.
 constexpr uintptr_t QuickLootCall = 0x81ced;
 bool quickHooked = false, quickHookFailed = false;
 unsigned quickTakes = 0, quickRefused = 0;
@@ -873,30 +908,7 @@ GEBool __fastcall QuickTake(PSInventory* self, void*, GEInt stack, GEInt amount,
     eCEntity* owner = nullptr;
     if (auto* set = reinterpret_cast<EntityPropertySet*>(self)->m_pEngineEntityPropertySet) owner = set->GetEntity();
     if (remote::PuppetOwner(owner)) { ++quickRefused; return GEFalse; }  // another player's puppet (ransack.cpp): never looted
-    if (!net::IsHost() && !disabled && net::Connected() && owner && to.GetInstance() == gCSession::GetInstance().GetHero()) {
-        uint8_t guid[16];
-        GuidOf(owner, guid);
-        const std::string key = Key(guid);
-        Entity container(owner);
-        if (!known.count(key)) {
-            ++quickRefused;
-            net::SendWatch(guid);
-            Note("containers: quick loot from %s refused: the host's contents are not here yet", NameOf(container).c_str());
-            return GEFalse;
-        }
-        if (key != active) {
-            // Whatever the player changed in the container open before still goes out first.
-            if (!active.empty() && !PendingFor(active) && known.count(active)) {
-                Entity before = Resolve(active);
-                if (before.GetInstance()) ReportChange(before, known[active]);
-            }
-            active = key;
-            activeSince = GetTickCount();
-            NoteActive("set", active, "quick loot");
-            Note("containers: quick loot from %s; host %s", NameOf(container).c_str(), Describe(known[key]).c_str());
-        }
-        ++quickTakes;
-    }
+    if (owner && to.GetInstance() == gCSession::GetInstance().GetHero()) ++quickTakes;
     return self->TransferAmountTo(stack, amount, to);
 }
 
@@ -981,7 +993,30 @@ void QuickLootActions(LogFn log)
 namespace {
 }
 
-void Start() { net::SetContainerHandlers(&OnContents, &OnTx, &OnTxResult, &OnWatch); }
+namespace {
+void IgnoreSharedInventory(char const* kind)
+{
+    ++ignoredSharedMessages;
+    if (ignoredSharedMessages <= 8)
+        Logf("containers: ignored remote %s; loot and NPC merchant inventories are personal", kind);
+}
+void IgnoreContents(uint8_t const*, net::ContentEntry const*, int) { IgnoreSharedInventory("contents"); }
+void IgnoreTransaction(uint8_t, uint8_t const*, uint32_t, net::ContentEntry const*, int) { IgnoreSharedInventory("transaction"); }
+void IgnoreResult(uint8_t const*, uint32_t, bool) { IgnoreSharedInventory("transaction result"); }
+void IgnoreWatch(uint8_t, uint8_t const*) { IgnoreSharedInventory("inventory watch"); }
+}
+
+void Start()
+{
+    net::SetContainerHandlers(&IgnoreContents, &IgnoreTransaction, &IgnoreResult, &IgnoreWatch);
+    Log("containers: chest/corpse loot and NPC merchant stock are personal; direct player trades remain transfers");
+}
+
+bool IsPersonalInventory(eCEntity* instance)
+{
+    Entity entity(instance);
+    return Shared(entity);
+}
 
 void OnWorldChange()
 {
@@ -996,6 +1031,7 @@ void OnWorldChange()
     active.clear();
     lastSent.clear();
     watched.clear();
+    lastLocalPoll = 0;
 }
 
 void Tick()
@@ -1015,8 +1051,7 @@ void Tick()
         }
     }
     if (!quickHooked && !quickHookFailed) HookQuickLoot();
-    if (net::IsHost()) HostTick();
-    else ClientTick();
+    LocalInventoryTick();
 }
 
 void Contents(char const* guid, LogFn log)
@@ -1075,9 +1110,9 @@ void Take(char const* argument, LogFn log)
 void Report(LogFn log)
 {
     char line[700];
-    Format(line, "CONTAINERSYNC hooked=%d quick_hooked=%d quick_takes=%u quick_refused=%u active=%d known=%zu pending=%zu contents_sent=%u contents_received=%u rewrites=%u tx_sent=%u tx_applied=%u tx_refused=%u tx_mismatch=%u tx_denied=%u reverted=%u hands_released=%u",
+    Format(line, "CONTAINERSYNC hooked=%d quick_hooked=%d quick_takes=%u quick_refused=%u active=%d known=%zu pending=%zu contents_sent=%u contents_received=%u rewrites=%u tx_sent=%u tx_applied=%u tx_refused=%u tx_mismatch=%u tx_denied=%u reverted=%u hands_released=%u personal=1 ignored_remote=%u",
               hooked, quickHooked, quickTakes, quickRefused, !active.empty(), known.size(), pending.size(), contentsSent, contentsReceived, rewrites, txSent, txApplied,
-              txRefused, txMismatch, txDenied, reverted, handsReleased);
+              txRefused, txMismatch, txDenied, reverted, handsReleased, ignoredSharedMessages);
     log(line);
 }
 
@@ -1218,6 +1253,11 @@ void TradeBuy(char const* argument, LogFn log)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     Entity trader = Target(argument, &wanted);
     if (!hero || !trader.GetInstance()) { log("REFUSED tradebuy: no hero or trader"); return; }
+    if (remote::PuppetOwner(trader.GetInstance())) {
+        const bool ok = wanted && trade::Exchange(trader.GetInstance(), wanted, 1, true);
+        log(ok ? "TRADEBUY price=0 native_exchange=1" : "REFUSED tradebuy: player exchange unavailable");
+        return;
+    }
     Entity self(hero);
     char only[64];
     const int quality = SplitQuality(wanted, only);
@@ -1244,6 +1284,11 @@ void TradeSell(char const* argument, LogFn log)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     Entity trader = Target(argument, &wanted);
     if (!hero || !trader.GetInstance() || !wanted) { log("REFUSED tradesell: no hero or trader, or no item"); return; }
+    if (remote::PuppetOwner(trader.GetInstance())) {
+        const bool ok = trade::Exchange(trader.GetInstance(), wanted, 1, false);
+        log(ok ? "TRADESELL price=0 native_exchange=1" : "REFUSED tradesell: player exchange unavailable");
+        return;
+    }
     Entity self(hero);
     char only[64];
     const int quality = SplitQuality(wanted, only);

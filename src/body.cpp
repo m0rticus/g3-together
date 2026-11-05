@@ -81,14 +81,25 @@ void GlideReport(void (*log)(char const*))
     }
 }
 
-bool arrivalSpeed = false;  // QA negative control: glideold
+void SyncReport(void (*log)(char const*))
+{
+    char line[280];
+    for (int kind = 0; kind < 2; ++kind) {
+        Glide const& g = glide[kind];
+        Format(line, "SYNCBODY kind=%s interpolation=%d moving_ms=%u glide_ms=%u frames=%u still=%u jumps30=%u "
+                     "hard_corrections=%u action_corrections=%u max_step_cm=%.0f",
+               kind ? "puppet" : "mirror", interpolate && GetConfig().movementSmoothing ? 1 : 0, g.movingMs, g.glideMs, g.frames, g.stillFrames, g.jumps,
+               g.hardSnaps, g.actionSnaps, g.maxStep);
+        log(line);
+    }
+}
+
 bool settleStance = true;   // QA negative control: glideold
 bool stopMotion = true;     // QA comparison: glidestopoff (only StopPlayAni on set-off)
 
-// Off by default (28.10.): under G3_NETSIM 80,40,3 mirrors stood still in some 25 % of their moving frames with the
-// buffer (2 % without), with the controller's goal on the newest snapshot as well; the puppet's jumps were not fewer in a
-// second run. QA interpon switches it on for the measurement.
-bool interpolate = false;
+// The timeline now owns replica transforms without resetting navigation, and steers ahead of that same timeline.
+// The old controller/buffer coupling made bodies stop between snapshots.
+bool interpolate = true;
 bool smoothWindow = true;
 bool fallMove = false;  // off: no gain (stageWalk 28.10.: fall still frames 37/19/0 with it, 10/5 without)
 bool actionSeq = true;  // on by default (stageActionSeq 28.10.: without it 68-83 starts of the same name lost, with it all replayed; stageV2 3/3 green)
@@ -116,6 +127,7 @@ uint8_t ActionSeq(eCEntity* entity, ActionClock& clock, char const* shown, uint1
 
 int motionSeek = -1;
 unsigned seeks[2] = {};
+unsigned paceSteps[2] = {};
 std::vector<float> motionLags[2];  // ms the receiver's combat motion was behind where the sender's was, per Drive (+ behind)
 bool lagMsUnit = false;            // the last length looked like milliseconds (see MotionUnitMs)
 // QA (stageSeek 29.10.: no mirror sample at all): Drives with a combat motion as target, and why FollowSender measured none:
@@ -166,9 +178,9 @@ void MotionLagReport(void (*log)(char const*))
         std::sort(off.begin(), off.end());
         auto at = [](std::vector<float> const& v, size_t percent) { return v.empty() ? 0.0f : v[std::min(v.size() - 1, v.size() * percent / 100)]; };
         unsigned const* why = followSkips[kind];
-        Format(line, "MOTIONLAG kind=%s n=%zu p50=%.0fms p95=%.0fms behind_p50=%.0fms seeks=%u seek=%d unit=%s combat_targets=%u "
+        Format(line, "MOTIONLAG kind=%s n=%zu p50=%.0fms p95=%.0fms behind_p50=%.0fms seeks=%u paced=%u seek=%d unit=%s combat_targets=%u "
                      "skipped=%u/%u/%u/%u/%u measured=%u", kind ? "puppet" : "mirror", off.size(), at(off, 50), at(off, 95), at(behind, 50),
-               seeks[kind], on ? 1 : 0, lagMsUnit ? "ms" : "s", combatTargets[kind], why[0], why[1], why[2], why[3], why[4], why[5]);
+               seeks[kind], paceSteps[kind], on ? 1 : 0, lagMsUnit ? "ms" : "s", combatTargets[kind], why[0], why[1], why[2], why[3], why[4], why[5]);
         log(line);
     }
 }
@@ -184,44 +196,6 @@ float TravelSpeed(Track const& track)
     }
     return 0.0f;
 }
-bool offsetWindow = true;
-unsigned sampledBetween = 0, sampledAhead = 0, sampledHeld = 0, sampledOldest = 0;
-constexpr int32_t MaxAhead = 250;  // ms beyond the newest snapshot at most
-constexpr uint32_t OffsetWindow = 2000;  // ms
-
-void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived)
-{
-    if (track.count && static_cast<int32_t>(sent - track.snaps[track.count - 1].sent) <= 0) return;  // known, or out of order
-    const int32_t offset = static_cast<int32_t>(arrived - sent);
-    if (!track.haveOffset) {
-        track.offset = track.windowMin = track.lastWindowMin = offset;
-        track.windowAt = arrived;
-        track.haveOffset = true;
-    } else if (offsetWindow) {
-        // The lowest arrival minus send time of this and the last window: follows a clock drift or a slower path within 4 s at
-        // most, and a single slow snapshot does not move it.
-        if (arrived - track.windowAt >= OffsetWindow) {
-            track.lastWindowMin = track.windowMin;
-            track.windowMin = offset;
-            track.windowAt = arrived;
-        } else if (offset < track.windowMin) {
-            track.windowMin = offset;
-        }
-        track.offset = std::min(track.windowMin, track.lastWindowMin);
-    } else if (offset < track.offset) {
-        track.offset = offset;
-    } else {
-        ++track.offset;  // a slower path than the fastest one seen: follow it slowly (1 ms a snapshot)
-    }
-    if (track.count == 8) {
-        for (int i = 1; i < 8; ++i) track.snaps[i - 1] = track.snaps[i];
-        --track.count;
-    }
-    Track::Snap& s = track.snaps[track.count++];
-    s.sent = sent;
-    std::memcpy(s.position, position, sizeof(s.position));
-    std::memcpy(s.rotation, rotation, sizeof(s.rotation));
-}
 
 bool goalAhead = false;
 bool leadOld = false;
@@ -229,6 +203,7 @@ constexpr float SteadyTurn = 30.0f;     // degrees (45 and 0.5-2x speed, stageGl
 constexpr uint32_t SteadyRise = 200;    // ms
 constexpr uint32_t OvershootFor = 500;  // ms after an unsteady moment, for the glide causes
 constexpr float DeadZone = 50.0f;       // cm
+constexpr float FarGoal = 400.0f;       // cm: how far ahead of the shown pose a buffered body's movement controller is aimed
 
 float Steadiness(Track const& track, State& state, uint32_t now)
 {
@@ -271,51 +246,6 @@ float const* SteerGoal(Track& track, uint32_t now, float ahead[3], float const* 
     return got ? ahead : fallback;
 }
 
-bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], int32_t shift, bool counted)
-{
-    if (counted) track.lastCase = 0;
-    if (!track.count) return false;
-    const uint32_t render = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);  // in the sender's clock
-    Track::Snap const& newest = track.snaps[track.count - 1];
-    if (static_cast<int32_t>(render - newest.sent) >= 0) {
-        // Later than the newest: on along its last velocity, at most MaxAhead, then held.
-        int32_t ahead = static_cast<int32_t>(render - newest.sent);
-        if (!counted) ahead = std::min(ahead, MaxAhead);
-        else if (ahead > MaxAhead) ahead = MaxAhead, ++sampledHeld, track.lastCase = 3;
-        else ++sampledAhead, track.lastCase = 2;
-        std::memcpy(position, newest.position, sizeof(newest.position));
-        std::memcpy(rotation, newest.rotation, sizeof(newest.rotation));
-        if (track.count >= 2) {
-            Track::Snap const& before = track.snaps[track.count - 2];
-            const int32_t span = static_cast<int32_t>(newest.sent - before.sent);
-            if (span > 0 && span < 1000)
-                for (int k = 0; k < 3; ++k) position[k] += (newest.position[k] - before.position[k]) * ahead / span;
-        }
-        return true;
-    }
-    for (int i = track.count - 1; i > 0; --i) {
-        Track::Snap const& a = track.snaps[i - 1];
-        Track::Snap const& b = track.snaps[i];
-        if (static_cast<int32_t>(render - a.sent) < 0) continue;
-        const int32_t span = static_cast<int32_t>(b.sent - a.sent);
-        const float t = span > 0 ? static_cast<float>(static_cast<int32_t>(render - a.sent)) / span : 1.0f;
-        for (int k = 0; k < 3; ++k) position[k] = a.position[k] + (b.position[k] - a.position[k]) * t;
-        // Rotation: the nearer of the two quaternions' sides, blended and normalised.
-        float dot = 0.0f;
-        for (int k = 0; k < 4; ++k) dot += a.rotation[k] * b.rotation[k];
-        const float sign = dot < 0.0f ? -1.0f : 1.0f;
-        float length = 0.0f;
-        for (int k = 0; k < 4; ++k) rotation[k] = a.rotation[k] * (1.0f - t) + sign * b.rotation[k] * t, length += rotation[k] * rotation[k];
-        length = std::sqrt(length);
-        if (length > 0.0f) for (int k = 0; k < 4; ++k) rotation[k] /= length;
-        if (counted) ++sampledBetween, track.lastCase = 1;
-        return true;
-    }
-    if (counted) ++sampledOldest, track.lastCase = 4;
-    std::memcpy(position, track.snaps[0].position, sizeof(track.snaps[0].position));  // older than all: the oldest
-    std::memcpy(rotation, track.snaps[0].rotation, sizeof(track.snaps[0].rotation));
-    return true;
-}
 
 void NoteTruth(State& state, float const truth[3], uint32_t at)
 {
@@ -331,11 +261,6 @@ void NoteTruth(State& state, float const truth[3], uint32_t at)
     if (errors.size() < 20000) errors.push_back(Distance(state.shownPos[best], truth));
 }
 
-float Speed(float const from[3], float const to[3], uint32_t sentFrom, uint32_t sentTo, uint32_t arrivedFrom, uint32_t arrivedTo)
-{
-    const uint32_t interval = arrivalSpeed ? arrivedTo - arrivedFrom : sentTo - sentFrom;
-    return interval ? Distance(from, to) * 1000.0f / interval : 0.0f;
-}
 
 void GlideStopOff(void (*log)(char const*))
 {
@@ -463,8 +388,8 @@ bool PlayScriptAni(eCEntity* instance, State& state, char const* name)
 }
 
 // Replay an attack, parade or stagger the way the game's own fight AI plays it: as a combat move on the body's
-// script processing unit, which keeps the motion (owner 5) and drives it to its end, then hands slot 0 back. No
-// target: nobody is hit (and a mirror's hits are dropped anyway, combat.cpp rule 1).
+// script processing unit, which keeps the motion (owner 5) and drives it to its end, then hands slot 0 back.
+// Only the local hero can be a contact target; each player's machine judges its own incoming hits (npcs.cpp TryLocalBlow).
 bool PlayCombatMove(eCEntity* instance, State& state, char const* name, uint32_t now)
 {
     int action = 0;
@@ -509,11 +434,22 @@ bool PlayCombatMove(eCEntity* instance, State& state, char const* name, uint32_t
 
 char const* IdleTask() { return Idle; }
 
-float Distance(float const a[3], float const b[3])
+bool LocallyAttacking(eCEntity* entity)
 {
-    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+    char name[128], phase[24];
+    int action = 0;
+    return entity && CurrentMotion(entity, name, sizeof(name)) && MotionRunning(entity) &&
+           ParseCombatMove(name, action, phase, sizeof(phase)) &&
+           ((action >= 1 && action <= 15) || action == 30) && !std::strcmp(phase, "Hit");
 }
+
+float SwingProgress(eCEntity* entity)
+{
+    if (!LocallyAttacking(entity)) return -1.0f;
+    const uint16_t part = MotionFraction(entity);
+    return part == 65535 ? -1.0f : static_cast<float>(part) / 65535.0f;
+}
+
 
 bool MotionName(eCVisualAnimation_PS* animation, int type, char* out, size_t size)
 {
@@ -654,7 +590,7 @@ void ReleaseFinished(eCEntity* instance, State& state)
 // Display step 4: a combat motion running here as at the sender is measured against where the sender's is now and, with
 // motion_seek, moved there. A combat move starts its motion a frame after it was asked for, so the start is caught in the first
 // frame slot 0 shows it.
-void FollowSender(eCEntity* instance, State& state, Target const& target, uint32_t now)
+void FollowSenderOnce(eCEntity* instance, State& state, Target const& target, uint32_t now)
 {
     const int kind = state.puppet ? 1 : 0;
     if (!target.motion || !*target.motion || strstr(target.motion, "_Move_") || strstr(target.motion, "_Ambient_") ||
@@ -685,14 +621,43 @@ void FollowSender(eCEntity* instance, State& state, Target const& target, uint32
         ++seeks[kind];
         lag = static_cast<float>((expected - actor->GetPlayTime(slot0)) * unitMs);  // what this frame shows: did it take?
     }
+    // A jump of the play time shows as a hitch in the middle of one swing. Smaller lags are caught up by playing a little faster
+    // (or waiting a little) until the swing is where the sender's was.
+    if (on && std::fabs(lag) > PaceDeadZone) {
+        actor->SetPlaySpeed(slot0, std::clamp(1.0f + lag / PaceOver, 0.7f, 1.4f));
+        state.paced = state.paceNow = true;
+        ++paceSteps[kind];
+    }
     std::vector<float>& lags = motionLags[kind];
     if (lags.size() < 50000) lags.push_back(lag);
+}
+
+// The pace belongs to one followed motion: anything else on slot 0 plays at its own speed.
+void FollowSender(eCEntity* instance, State& state, Target const& target, uint32_t now)
+{
+    state.paceNow = false;
+    FollowSenderOnce(instance, state, target, now);
+    if (!state.paced || state.paceNow) return;
+    state.paced = false;
+    auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
+    if (eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr)
+        actor->SetPlaySpeed(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0), 1.0f);
 }
 
 void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
 {
     eCEntity* instance = entity.GetInstance();
     if (!instance) return;
+    if (state.localHitUntil && static_cast<int32_t>(state.localHitUntil - now) > 0 &&
+        (!target.timeline || state.presentationSerial == target.presentationSerial)) {
+        entity.CharacterMovement.StopMovement();
+        state.walking = state.steered = false;
+        const bCVector& at = instance->GetWorldPosition();
+        state.lastPos[0] = at.GetX(); state.lastPos[1] = at.GetY(); state.lastPos[2] = at.GetZ();
+        state.lastAt = now;
+        return;  // do not pacify or replace a local hit reaction with a pre-hit buffered motion
+    }
+    state.localHitUntil = 0;
     if (target.motion && *target.motion && !strstr(target.motion, "_Move_") && ReplayKind(target.motion) == 0) ++combatTargets[state.puppet ? 1 : 0];
     ReleaseFinished(instance, state);
     const bCString task = entity.Routine.GetCurrentTask();
@@ -722,6 +687,7 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
     const float error = Distance(current, target.position);
     // QA (glide): how the body travelled since the last Drive. Faster than 15 m/s is a jump (snap), not travel.
     const uint32_t dt = now - state.lastAt;
+    const float traveled = Distance(current, state.lastPos);
     if (state.lastAt && dt > 0 && dt < 500) {
         const float moved = Distance(current, state.lastPos), speed = moved * 1000.0f / dt;
         Glide& g = glide[state.puppet ? 1 : 0];
@@ -789,13 +755,31 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
     // (Hero_Swim_..._Move_*) plays here like a loop instead, and the pose follows closely.
     const bool swimStroke = swimStrokes && mode == gECharMovementMode_Swim && target.motion && strstr(target.motion, "_Swim_") &&
                             strstr(target.motion, "_Move_");
-    if (error > target.snapAt) {
+    if (!action && mode >= gECharMovementMode_Sneak && mode <= gECharMovementMode_Sprint &&
+        target.speed > 40.0f && dt > 0 && dt < 500) {
+        state.walkExpectedMs += dt;
+        if (traveled > 0.5f) {
+            state.walkTravelMs += dt;
+            char shown[128] = {};
+            CurrentMotion(instance, shown, sizeof(shown));
+            if (!IsLocomotionMotion(shown) || !MotionRunning(instance)) state.walkSlideMs += dt;
+        } else {
+            state.walkStillMs += dt;
+        }
+    }
+    const bool discontinuity = target.timeline && state.presentationSerial != target.presentationSerial;
+    // The timeline owns the position of a buffered body every frame. Its movement controller only supplies the walk motion (it
+    // is given a goal far ahead, below), so it can never "arrive" and drop the clip while the body keeps travelling.
+    if (target.timeline && !discontinuity)
+        instance->SetToWorldMatrix(pose);
+    if (discontinuity || (!target.timeline && error > target.snapAt)) {
         ++glide[state.puppet ? 1 : 0].hardSnaps;
         entity.CharacterMovement.StopMovement();
         entity.MoveTo(pose);
         state.walking = false;
         state.steered = false;
         state.lastBranch = 1;
+        state.presentationSerial = target.presentationSerial;
     } else if (moving || catchUp || (!action && state.walking && error > 60.0f && !(target.smooth && error < DeadZone))) {
         // Up from a knock-down and off at once: a body left in its sitting state cannot walk and froze on its get-up
         // motion (19.10.: most of the raid's frozen mirrors). Take the stance here too, as below when standing.
@@ -825,6 +809,16 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
         }
         entity.CharacterMovement.SetMovementMode(moving ? (falling ? gECharMovementMode_Run : mode) : gECharMovementMode_Walk);
         float const* goal = target.goal ? target.goal : target.position;
+        float farGoal[3];
+        if (target.timeline && moving) {
+            float dx = goal[0] - target.position[0], dy = goal[1] - target.position[1], dz = goal[2] - target.position[2];
+            const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (length > 5.0f) {
+                const float scale = FarGoal / length;
+                farGoal[0] = target.position[0] + dx * scale, farGoal[1] = target.position[1] + dy * scale, farGoal[2] = target.position[2] + dz * scale;
+                goal = farGoal;
+            }
+        }
         entity.CharacterMovement.SetMovementGoal(bCVector(goal[0], goal[1], goal[2]));
         state.walking = true;
         state.steered = true;
@@ -839,7 +833,9 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
         // Setting the pose every frame restarted the body's motion and cut attacks short; while an action plays the
         // pose is only corrected when it drifted.
         const bool acting = static_cast<int32_t>(state.actionUntil - now) > 0;
-        if (target.smooth && !acting && error < DeadZone) {
+        if (target.timeline) {
+            state.lastBranch = 3;
+        } else if (target.smooth && !acting && error < DeadZone) {
             // Dead zone: turned as its player, but not pushed the last few centimetres (a push shows as gliding)
             const bCVector& here = instance->GetWorldPosition();
             const float stay[3] = {here.GetX(), here.GetY(), here.GetZ()};

@@ -5,6 +5,7 @@
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "guards.h"
 #include "remote.h"
 
 #include <Game.h>
@@ -40,11 +41,7 @@ unsigned announced = 0, unresolved = 0, goneSent = 0, received = 0, replayed = 0
 gFScript originalAreaTick = nullptr;
 bool areaInstalled = false, areaSkip = true;
 
-// Summoned creatures (re/findings/summons-b.md, summon-lifecycle-c.md): the scripts spawn NPCs into the caster's party
-// as Summoned (5). The caster announces each new one with its GUID; the other machine spawns a copy and gives it that
-// GUID with eCNode::SetID (it re-registers the entity under the new ID: entity-guids-c.md), so npcs.cpp mirrors it like
-// any NPC from the snapshots of the machine that simulates it. A client's creature is its own, as a companion it took
-// over (npcs::Claim); the host marks it so (npcs::OnClaim) and mirrors it from that client.
+// Only the host creates and expires creature NPCs. Clients bind passive copies to the host's GUID.
 char const* const CreatureScripts[] = {"MagicSummonSkeleton", "MagicSummonDemon", "MagicSummonGolem", "MagicSummonGoblin",
                                        "MagicSummonMonster", "MagicSummonArmyOfDarkness", "MagicSummonArmyOfCuteness",
                                        "MagicSummonCompanion"};
@@ -52,16 +49,13 @@ constexpr int CreatureCount = sizeof(CreatureScripts) / sizeof(CreatureScripts[0
 gFScript creatureOriginals[CreatureCount] = {};
 bool creaturesInstalled = false;
 unsigned creaturesAnnounced = 0, creatureCopies = 0, creatureCopyFailed = 0, creatureCopiesRemoved = 0;
-// A copy follows its original through the snapshots. When they stop (the original was replaced, dismissed, left the
-// area or vanished), npcs.cpp gives a stale mirror its own AI back: right for an NPC of the world, wrong for a copy,
-// which would live on as a free creature. So a copy goes once it is no longer mirrored (and one never mirrored goes
-// after a while). Its death comes as a snapshot: the copy dies as a corpse, then goes the same way.
 struct CreatureCopy {
     uint8_t guid[16];
-    DWORD created = 0;
-    DWORD mirroredSeen = 0;  // last time npcs.cpp drove it
+    uint32_t netId = 0;
 };
 std::vector<CreatureCopy> creatureCopyList;
+std::vector<net::SummonNote> hostCreatures;
+uint32_t creatureJoins = 0;
 DWORD lastCopyCheck = 0;
 // eCNode::SetID(bCPropertyID) is __thiscall with the 20-byte ID by value, ret 14h; __fastcall (node, edx, id) takes the
 // same registers and stack, and the callee destroys the argument in both.
@@ -225,18 +219,21 @@ std::vector<eCEntity*> SummonedOf(eCEntity* caster)
     return out;
 }
 
-void AnnounceCreature(eCEntity* creature)
+void AnnounceCreature(eCEntity* creature, uint8_t owner = 1)
 {
+    if (!net::IsHost()) return;
     net::SummonNote note;
     note.op = net::SummonCreature;
-    note.netId = (static_cast<uint32_t>(net::LocalId()) << 24) | (++counter & 0xFFFFFF);
     Guid(creature, note.guid);
+    for (auto const& existing : hostCreatures) if (!std::memcmp(existing.guid, note.guid, 16)) return;
+    note.netId = (static_cast<uint32_t>(net::LocalId()) << 24) | (++counter & 0xFFFFFF);
+    note.ownerPlayer = owner;
     const bCVector& at = creature->GetWorldPosition();
     const bCQuaternion q = creature->GetWorldRotation();
     note.position[0] = at.GetX(), note.position[1] = at.GetY(), note.position[2] = at.GetZ();
     note.rotation[0] = q.GetX(), note.rotation[1] = q.GetY(), note.rotation[2] = q.GetZ(), note.rotation[3] = q.GetW();
     strncpy_s(note.spawn, NameOf(Entity(Entity(creature).GetTemplate())), _TRUNCATE);
-    if (!net::IsHost()) npcs::Claim(creature);  // ours: we send it, the host's snapshots of it are ignored here
+    hostCreatures.push_back(note);
     net::SendSummon(note);
     ++creaturesAnnounced;
     Logf("summon: own creature %s is net %08X", note.spawn, note.netId);
@@ -247,11 +244,27 @@ GEInt GE_STDCALL WrapCreature(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
 {
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     const bool own = mirror && caster && caster == remote::ControlledBody();
-    const std::vector<eCEntity*> before = own ? SummonedOf(caster) : std::vector<eCEntity*>();
+    if (own && !net::IsHost()) {
+        net::SummonNote request;
+        request.op = net::SummonCreatureRequest;
+        request.netId = (static_cast<uint32_t>(net::LocalId()) << 24) | (++counter & 0xFFFFFF);
+        request.args = args;
+        request.ownerPlayer = net::LocalId();
+        strncpy_s(request.spawn, CreatureScripts[I], _TRUNCATE);
+        const Entity held = Entity(caster).Inventory.GetItemFromSlot(gESlot_RightHand);
+        if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Item) && held.Item.GetSpell().GetInstance())
+            strncpy_s(request.spellItem, held.GetName().GetText(), _TRUNCATE);
+        if (other && static_cast<Entity*>(other)->GetInstance()) Guid(static_cast<Entity*>(other)->GetInstance(), request.target);
+        net::SendSummon(request);
+        return GETrue;
+    }
+    const bool authoritative = mirror && net::IsHost() && caster;
+    const std::vector<eCEntity*> before = authoritative ? SummonedOf(caster) : std::vector<eCEntity*>();
     const GEInt result = creatureOriginals[I](spu, self, other, args);
-    if (own)
+    if (authoritative)
         for (eCEntity* creature : SummonedOf(caster))
-            if (std::find(before.begin(), before.end(), creature) == before.end()) AnnounceCreature(creature);
+            if (std::find(before.begin(), before.end(), creature) == before.end())
+                AnnounceCreature(creature, npcs::CompanionOwner(creature));
     return result;
 }
 
@@ -263,9 +276,19 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
 {
     _GUID raw;
     std::memcpy(&raw, note.guid, 16);
-    if (ByGuid(note.guid).GetInstance()) {  // that GUID is taken here: SetID would hide the other entity
-        ++creatureCopyFailed;
-        Logf("summon: creature net %08X from player %u: its GUID exists here already", note.netId, from);
+    for (auto const& existing : creatureCopyList)
+        if (!std::memcmp(existing.guid, note.guid, 16) && existing.netId == note.netId) { npcs::Rebind(note.guid); return; }
+    creatureCopyList.erase(std::remove_if(creatureCopyList.begin(), creatureCopyList.end(), [&](CreatureCopy const& previous) {
+        return !std::memcmp(previous.guid, note.guid, 16);
+    }), creatureCopyList.end());
+    Entity copy(npcs::NpcByGuid(note.guid));
+    if (copy.GetInstance()) {
+        CreatureCopy tracked;
+        std::memcpy(tracked.guid, note.guid, 16);
+        tracked.netId = note.netId;
+        creatureCopyList.push_back(tracked);
+        npcs::Foreign(note.guid);
+        npcs::Rebind(note.guid);
         return;
     }
     const Template creatureTemplate(note.spawn);
@@ -275,7 +298,7 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
         Logf("summon: creature net %08X from player %u: no copy (template %s, SetID %d)", note.netId, from, note.spawn, setId != nullptr);
         return;
     }
-    Entity copy = Entity::Spawn(creatureTemplate, body::Pose(*base, note.position, note.rotation));
+    copy = Entity::Spawn(creatureTemplate, body::Pose(*base, note.position, note.rotation));
     if (!copy.GetInstance()) {
         ++creatureCopyFailed;
         return;
@@ -287,12 +310,16 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
         copy.Kill();
         return;
     }
-    if (net::IsHost()) npcs::OnClaim(note.guid, from, true);  // the client simulates it and sends it
+    if (copy.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
+        eCEntity* owner = note.ownerPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(note.ownerPlayer);
+        copy.Party.SetPartyLeader(Entity(owner));
+        copy.Party.PartyMemberType = gEPartyMemberType_Summoned;
+    }
     npcs::Foreign(note.guid);  // before its first snapshot arrives it must not go out as one of ours
     if (!lateCopyMs) npcs::Rebind(note.guid);
     CreatureCopy c;
     std::memcpy(c.guid, note.guid, 16);
-    c.created = GetTickCount();
+    c.netId = note.netId;
     creatureCopyList.push_back(c);
     ++creatureCopies;
     Logf("summon: creature net %08X from player %u: %s copy under its GUID", note.netId, from, note.spawn);
@@ -454,6 +481,34 @@ void CheckKnown()
 void OnSummon(uint8_t from, net::SummonNote const& note)
 {
     ++received;
+    if (note.op == net::SummonCreatureRequest) {
+        if (!net::IsHost()) return;
+        int index = -1;
+        for (int i = 0; i < CreatureCount; ++i) if (!std::strcmp(note.spawn, CreatureScripts[i])) index = i;
+        eCEntity* actor = remote::PuppetOf(from);
+        if (index < 0 || !creatureOriginals[index] || !actor) {
+            Log("summon: creature cast request refused: unknown spell or missing player");
+            return;
+        }
+        const auto before = SummonedOf(actor);
+        Entity self(actor), target = ByGuid(note.target);
+        const Entity previousSpell = self.Interaction.GetSpell();
+        if (*note.spellItem) {
+            const Template item(note.spellItem);
+            if (!item.IsValid()) { Log("summon: creature cast refused: unknown spell item"); return; }
+            if (self.Inventory.GetItemAmount(item) < 1) self.Inventory.CreateItems(item, 0, 1);
+            const GEInt stack = self.Inventory.FindStackIndex(item);
+            const Entity spell = stack >= 0 ? self.Inventory.GetTemplateItem(stack).Item.GetSpell() : Entity();
+            if (!spell.GetInstance()) { Log("summon: creature cast refused: item has no spell"); return; }
+            self.Interaction.SetSpell(spell);
+        }
+        guards::Acting context(actor);
+        creatureOriginals[index](nullptr, &self, &target, note.args);
+        self.Interaction.SetSpell(previousSpell);
+        for (eCEntity* creature : SummonedOf(actor))
+            if (std::find(before.begin(), before.end(), creature) == before.end()) AnnounceCreature(creature, from);
+        return;
+    }
     // A position from the network becomes a spawn pose: no NaN or infinity (Fable review 22.10.).
     bool finite = true;
     for (float v : note.position) finite = finite && std::isfinite(v);
@@ -472,6 +527,18 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
         return;
     }
     if (note.op == net::SummonGone) {
+        if (!net::IsHost()) {
+            lateCopies.erase(std::remove_if(lateCopies.begin(), lateCopies.end(), [&](LateCopy const& late) {
+                return late.note.netId == note.netId && !std::memcmp(late.note.guid, note.guid, 16);
+            }), lateCopies.end());
+            for (auto it = creatureCopyList.begin(); it != creatureCopyList.end(); ++it) {
+                if (it->netId != note.netId || std::memcmp(it->guid, note.guid, 16)) continue;
+                Entity copy = ByGuid(it->guid);
+                if (copy.GetInstance()) copy.Kill();
+                creatureCopyList.erase(it);
+                break;
+            }
+        }
         for (size_t i = 0; i < known.size(); ++i) {
             // The copy began a little later than the caster's: let it play on for a moment (a meteor's fall).
             if (!known[i].own && known[i].netId == note.netId) known[i].removeAt = GetTickCount() + 1500;
@@ -519,32 +586,17 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
 
 void Start() { net::SetSummonHandler(&OnSummon); }
 
-void WatchHits() { watchUntil = GetTickCount() + 4000; }
-
-void CheckCreatureCopies()
+void OnWorldChange()
 {
-    const DWORD now = GetTickCount();
-    if (creatureCopyList.empty() || now - lastCopyCheck < 250) return;
-    lastCopyCheck = now;
-    for (size_t i = 0; i < creatureCopyList.size();) {
-        CreatureCopy& c = creatureCopyList[i];
-        Entity copy = ByGuid(c.guid);
-        if (!copy.GetInstance()) {
-            creatureCopyList.erase(creatureCopyList.begin() + i);
-            continue;
-        }
-        if (npcs::IsMirrored(copy.GetInstance())) c.mirroredSeen = now;
-        const bool lost = c.mirroredSeen ? now - c.mirroredSeen > 1000 : now - c.created > 8000;
-        if (lost) {
-            Logf("summon: creature copy %s removed (its original is no longer sent)", NameOf(copy));
-            copy.Kill();
-            ++creatureCopiesRemoved;
-            creatureCopyList.erase(creatureCopyList.begin() + i);
-            continue;
-        }
-        ++i;
-    }
+    pending.clear();
+    known.clear();
+    lateCopies.clear();
+    creatureCopyList.clear();
+    hostCreatures.clear();
+    creatureJoins = 0;
 }
+
+void WatchHits() { watchUntil = GetTickCount() + 4000; }
 
 // P6: a hailstorm's copy spawns its weather (Wth_Hailstorm, the copy's Interaction user) at Entity::GetPlayer and its states
 // pull it there every 400 ms: on the other PC the hail fell around that PC's own hero (re/findings/p6-magic-b.md). Each
@@ -570,6 +622,33 @@ void FollowWeather()
 void Tick()
 {
     Install();
+    if (net::IsHost()) {
+        const bool joined = creatureJoins != net::JoinCount();
+        creatureJoins = net::JoinCount();
+        const DWORD now = GetTickCount();
+        if (joined || now - lastCopyCheck >= 250) {
+            lastCopyCheck = now;
+            const auto entities = Entity::GetNPCs();
+            for (int i = 0; i < entities.GetCount(); ++i) {
+                Entity npc = entities.GetAt(i);
+                if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_Party) ||
+                    npc.Party.PartyMemberType != gEPartyMemberType_Summoned) continue;
+                const uint8_t owner = npcs::CompanionOwner(npc.GetInstance());
+                AnnounceCreature(npc.GetInstance(), owner);
+            }
+        }
+        for (auto it = hostCreatures.begin(); it != hostCreatures.end();) {
+            if (!ByGuid(it->guid).GetInstance()) {
+                net::SummonNote gone = *it;
+                gone.op = net::SummonGone;
+                net::SendSummon(gone);
+                it = hostCreatures.erase(it);
+            } else {
+                if (joined) net::SendSummon(*it);
+                ++it;
+            }
+        }
+    }
     if (weatherFollow && !known.empty()) FollowWeather();
     for (size_t i = 0; i < lateCopies.size();) {
         if (static_cast<int32_t>(GetTickCount() - lateCopies[i].due) < 0) { ++i; continue; }
@@ -579,7 +658,6 @@ void Tick()
     }
     if (!pending.empty()) Resolve();
     CheckKnown();
-    CheckCreatureCopies();
 }
 
 void WeatherFollowOff(LogFn log)
@@ -629,6 +707,48 @@ void LateCopyCommand(char const* argument, LogFn log)
     lateCopyMs = ms > 0 && ms <= 30000 ? static_cast<uint32_t>(ms) : 0;
     char line[100];
     Format(line, "SUMMONLATECOPY ms=%u (no Rebind)", lateCopyMs);
+    log(line);
+}
+
+// QA: the same creature on both machines under one GUID, so a player on either machine can fight it. A creature spawned
+// with spawnnpc exists only where it was made, and the other machine has nothing to hit. Run with the same "<template> <GUID>"
+// on both; the host keeps simulating it, the client mirrors it from the host's snapshots (as for any NPC of the world).
+void SpawnShared(char const* argument, LogFn log)
+{
+    char name[48] = {}, text[48] = {}, line[260];
+    unsigned long d1 = 0;
+    unsigned d2 = 0, d3 = 0, b[8] = {};
+    // "<template>_<GUID>": the test channel allows only letters, digits, _ and -; a GUID is always 36 characters.
+    const size_t length = argument ? std::strlen(argument) : 0;
+    if (length < 38 || length - 37 >= sizeof(name)) { log("SPAWNSHARED refused: usage <template>_<GUID>"); return; }
+    std::memcpy(name, argument, length - 37);
+    std::memcpy(text, argument + length - 36, 36);
+    if (argument[length - 37] != '_' ||
+        sscanf_s(text, "%8lx-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11) {
+        log("SPAWNSHARED refused: usage <template>_<GUID>");
+        return;
+    }
+    _GUID raw{};
+    raw.Data1 = d1;
+    raw.Data2 = static_cast<unsigned short>(d2);
+    raw.Data3 = static_cast<unsigned short>(d3);
+    for (int i = 0; i < 8; ++i) raw.Data4[i] = static_cast<unsigned char>(b[i]);
+    uint8_t guid[16];
+    std::memcpy(guid, &raw, 16);
+    eCEntity* hero = remote::ControlledBody();
+    const Template t(name);
+    if (!hero || !t.IsValid() || !setId) { Format(line, "SPAWNSHARED refused template=%s valid=%d setid=%d", name, t.IsValid() ? 1 : 0, setId != nullptr); log(line); return; }
+    if (ByGuid(guid).GetInstance()) { log("SPAWNSHARED refused: that GUID exists here already"); return; }
+    bCMatrix pose = hero->GetWorldMatrix();
+    pose.AccessTranslation() = hero->GetWorldPosition() + hero->GetWorldMatrix().GetZAxis() * 400.0f;
+    Entity npc = Entity::Spawn(t, pose);
+    if (!npc.GetInstance()) { log("SPAWNSHARED refused: spawn failed"); return; }
+    setId(npc.GetInstance(), nullptr, bCPropertyID(bCGuid(raw)));
+    if (ByGuid(guid).GetInstance() != npc.GetInstance()) { npc.Kill(); log("SPAWNSHARED refused: SetID did not take"); return; }
+    if (!net::IsHost()) npcs::Foreign(guid);  // until the host's snapshots arrive it must not go out as one of ours
+    npc.EnableProcessing(GETrue);
+    if (net::IsHost()) npc.Routine.ContinueRoutine();
+    Format(line, "SPAWNSHARED name=%s guid=%s host=%d", NameOf(npc), text, net::IsHost() ? 1 : 0);
     log(line);
 }
 

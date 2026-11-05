@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "doors.h"
 
+#include "containers.h"
 #include "log.h"
 #include "world.h"
 
@@ -100,6 +101,7 @@ void Tick()
         eCEntity* entity = every->GetAt(i);
         if (!entity || (!entity->GetPropertySet(eEPropertySetType_Door) && !entity->GetPropertySet(eEPropertySetType_Lock))) continue;
         if (entity->GetPropertySet(eEPropertySetType_NPC) || entity->GetPropertySet(eEPropertySetType_Item)) continue;
+        if (containers::IsPersonalInventory(entity)) continue;
         ++count;
         uint8_t guid[16];
         GuidOf(entity, guid);
@@ -142,6 +144,10 @@ void OnState(uint8_t /*from*/, net::WorldState const& s)
             }
         return;
     }
+    _GUID raw;
+    std::memcpy(&raw, s.guid, 16);
+    Entity object{bCPropertyID(bCGuid(raw))};
+    if (containers::IsPersonalInventory(object.GetInstance())) return;
     ++received;
     Seen want;
     want.open = s.guard ? 1 : 0;
