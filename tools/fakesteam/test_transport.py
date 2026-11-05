@@ -133,6 +133,22 @@ class SteamOnlyTests(unittest.TestCase):
                              '\nHOST:\n' + host_log.read_text(encoding='utf-8'))
         self.assertRegex(client_log.read_text(encoding='utf-8'), r'POSEFLOOD actors=73 minimum=\d+ maximum=\d+')
 
+    def test_unsorted_bone_names_accept_and_zero_or_duplicate_names_reject(self):
+        host, host_log = self.start('host', self.environment(True, G3T_RELAY_POSE_VALIDATION='1'))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and host.poll() is None:
+            if re.search(r'steam: lobby \d+ open;', host_log.read_text(encoding='utf-8')):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(host_log.read_text(encoding='utf-8'))
+        client, client_log = self.start('client', self.environment(False, G3T_RELAY_POSE_VALIDATION='1'))
+        for process, path in ((client, client_log), (host, host_log)):
+            process.wait(timeout=30)
+            self.assertEqual(process.returncode, 0, path.read_text(encoding='utf-8'))
+        text = client_log.read_text(encoding='utf-8')
+        self.assertRegex(text, r'POSEVALIDATION valid=3 invalid_callback=0 rejected=\d+ stale=\d+')
+
     def test_discarded_fragments_release_the_waiting_budget(self):
         process, path = self.start('queueprobe', self.environment(True), seconds=1)
         process.wait(timeout=10)

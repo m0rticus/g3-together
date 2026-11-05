@@ -129,6 +129,9 @@ bool acceptedNativeDefaults = false;
 bool redirectHit = false, redirectedHitArrived = false;
 bool posedNpcArrived = false, canonicalBonesArrived = false;
 bool poseFlood = false;
+bool poseValidation = false;
+unsigned poseValidationValid = 0;
+unsigned poseValidationInvalid = 0;
 unsigned poseCounts[73] = {};
 unsigned offeredPoseFrames = 0;
 bool routeClockArrived = false, routeItemArrived = false, routeEnclaveArrived = false;
@@ -139,6 +142,33 @@ bool routeWorldExcludedArrived = false, routeWorldBroadcastArrived = false;
 bool routeWorldTargetedArrived = false, routeWorldTargetedLeaked = false;
 void OnPose(net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool reliable)
 {
+    if (poseValidation) {
+        if (record.guid[0] != 0xc1 || flags || reliable) {
+            ++poseValidationInvalid;
+            return;
+        }
+        bool valid = false;
+        if (record.guid[1] == 0x10 && count == 1)
+            valid = bones[0].name == 17;
+        else if (record.guid[1] == 0x11 && count == 95)
+            valid = bones[0].name == 95 && bones[94].name == 1;
+        else if (record.guid[1] == 0x12 && count == pose::MaxBones)
+            valid = bones[0].name == pose::MaxBones && bones[255].name == 1;
+        if (!valid) {
+            ++poseValidationInvalid;
+            return;
+        }
+        if (record.guid[1] != 0x10) {
+            for (int i = 0; i < count; ++i)
+                if (bones[i].name != static_cast<uint32_t>(count - i)) {
+                    ++poseValidationInvalid;
+                    return;
+                }
+        }
+        ++poseValidationValid;
+        posedNpcArrived = true;
+        return;
+    }
     if (record.guid[0] != 0xc1 || count != (poseFlood ? 95 : pose::MaxBones) || flags || reliable) return;
     for (int i = 0; i < count; ++i) {
         if (bones[i].name != static_cast<uint32_t>(i + 1)) return;
@@ -397,6 +427,7 @@ int main(int argc, char** argv)
     authorityMode = observer || std::getenv("G3T_RELAY_AUTHORITY") != nullptr;
     redirectHit = std::getenv("G3T_RELAY_HIT_REDIRECT") != nullptr;
     poseFlood = std::getenv("G3T_RELAY_POSE_FLOOD") != nullptr;
+    poseValidation = std::getenv("G3T_RELAY_POSE_VALIDATION") != nullptr;
     role = host ? "host" : "client";
     const uint32_t seconds = static_cast<uint32_t>(std::atoi(argv[2]));
     config.host = host;
@@ -448,7 +479,43 @@ int main(int argc, char** argv)
             PrintMenuStatus();
         }
         if (host) {
-            if (sawState && (!poseFlood || hitArrived) && (!poseSentAt || GetTickCount() - poseSentAt >= (poseFlood ? 16u : 250u))) {
+            if (poseValidation && sawState && !poseFrame) {
+                net::NpcRecord posed{};
+                posed.guid[0] = 0xc1;
+                posed.rotation[3] = 1.0f;
+                posed.hitPoints = 1;
+                posed.sent = net::Now();
+                posed.presentationReady = 1;
+
+                pose::Bone bones[pose::MaxBones];
+                bones[0].name = 17;
+                posed.guid[1] = 0x10;
+                net::SendPosedNpc(posed, bones, 1);
+
+                for (int i = 0; i < 95; ++i) bones[i].name = static_cast<uint32_t>(95 - i);
+                posed.guid[1] = 0x11;
+                net::SendPosedNpc(posed, bones, 95);
+
+                for (int i = 0; i < pose::MaxBones; ++i)
+                    bones[i].name = static_cast<uint32_t>(pose::MaxBones - i);
+                posed.guid[1] = 0x12;
+                net::SendPosedNpc(posed, bones, pose::MaxBones);
+
+                for (int i = 0; i < 95; ++i) bones[i].name = static_cast<uint32_t>(i + 1);
+                bones[47].name = 0;
+                posed.guid[1] = 0xe1;
+                net::SendPosedNpc(posed, bones, 95);
+
+                for (int i = 0; i < 95; ++i) bones[i].name = static_cast<uint32_t>(i + 1);
+                bones[94].name = bones[47].name;
+                posed.guid[1] = 0xe2;
+                net::SendPosedNpc(posed, bones, 95);
+
+                poseFrame = 1;
+                Log("host: posed bone validation frames queued (1, 95, 256 valid unsorted; zero and duplicate invalid)");
+            }
+            if (!poseValidation && sawState && (!poseFlood || hitArrived) &&
+                (!poseSentAt || GetTickCount() - poseSentAt >= (poseFlood ? 16u : 250u))) {
                 if (!poseFrame && std::getenv("G3T_RELAY_POSE_WRAP")) net::PrimePoseWrapForTest();
                 net::NpcRecord posed;
                 posed.guid[0] = 0xc1;
@@ -631,16 +698,24 @@ int main(int argc, char** argv)
     }
     steam::Status(PrintStatus);
     PrintMenuStatus();
+    unsigned acceptedNpcs = 0, rejectedNpcs = 0, staleNpcs = 0;
+    net::NpcReplicationCounts(acceptedNpcs, rejectedNpcs, staleNpcs);
     bool pass = false;
     if (host) {
         if (lobbyProbe) {
             pass = steam::Ready() && steam::LobbyId() && lobby::Snapshot().phase == lobby::Phase::Hosting;
             Logf("RESULT: %s (Steam startup, real lobby and hosting menu state; no peer gameplay tested)", pass ? "PASS" : "FAIL");
         } else {
-            pass = sawPeer && sentSave && sawState && peerLeft && hitArrived && !rejectedDeathArrived &&
-                   (!authorityMode || sentNpcs);
-            Logf("RESULT: %s (peer %d, save sent %d, client state %d, hit claim %d, client left %d, death claims %d)",
-                 pass ? "PASS" : "FAIL", sawPeer, sentSave, sawState, hitArrived, peerLeft, rejectedDeathArrived);
+            if (poseValidation) {
+                pass = sawPeer && sentSave && sawState;
+                Logf("RESULT: %s (peer %d, save sent %d, client state %d, pose validation sent)",
+                     pass ? "PASS" : "FAIL", sawPeer, sentSave, sawState);
+            } else {
+                pass = sawPeer && sentSave && sawState && peerLeft && hitArrived && !rejectedDeathArrived &&
+                       (!authorityMode || sentNpcs);
+                Logf("RESULT: %s (peer %d, save sent %d, client state %d, hit claim %d, client left %d, death claims %d)",
+                     pass ? "PASS" : "FAIL", sawPeer, sentSave, sawState, hitArrived, peerLeft, rejectedDeathArrived);
+            }
         }
     } else if (observer) {
         pass = joined && sawState && acceptedNpcArrived && acceptedReleaseArrived && !rejectedNpcArrived &&
@@ -654,15 +729,22 @@ int main(int argc, char** argv)
     } else {
         const uint32_t got = Crc(received.data(), received.size());
         const bool whole = fileDone && receivedBytes == SaveSize && got == saveCrc && doneCrc == saveCrc;
-        pass = joined && sawState && whole && *steam::HostName() && terminalNpcArrived && releaseArrived && posedNpcArrived &&
-               (!redirectHit || redirectedHitArrived) && (!authorityMode || acceptedDeathArrived) && !rejectedDeathArrived &&
-               routeClockArrived && routeItemArrived && routeEnclaveArrived && routeWitnessArrived &&
-               routeDialogArrived && routeSummonArrived && routeShotArrived && routeTargetedItemArrived &&
-               !routeUnknownItemRejected && !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived &&
-               !routeRansackProbeArrived && !routeWorldExcludedArrived && routeWorldBroadcastArrived && !routeWorldTargetedLeaked;
-        Logf("RESULT: %s (welcomed %d, host state %d, save %u of %u bytes, crc %s, host %s, %u ms after the welcome, world route targeted leaked %d)",
-             pass ? "PASS" : "FAIL", joined, sawState, receivedBytes, SaveSize, got == saveCrc ? "ok" : "WRONG",
-             *steam::HostName() ? steam::HostName() : "-", leftAfter, routeWorldTargetedLeaked);
+        if (poseValidation) {
+            pass = joined && sawState && whole && poseValidationValid == 3 &&
+                   poseValidationInvalid == 0 && rejectedNpcs >= 2 && !routeWorldTargetedLeaked;
+            Logf("POSEVALIDATION valid=%u invalid_callback=%u rejected=%u stale=%u world route targeted leaked=%d",
+                 poseValidationValid, poseValidationInvalid, rejectedNpcs, staleNpcs, routeWorldTargetedLeaked);
+        } else {
+            pass = joined && sawState && whole && *steam::HostName() && terminalNpcArrived && releaseArrived && posedNpcArrived &&
+                   (!redirectHit || redirectedHitArrived) && (!authorityMode || acceptedDeathArrived) && !rejectedDeathArrived &&
+                   routeClockArrived && routeItemArrived && routeEnclaveArrived && routeWitnessArrived &&
+                   routeDialogArrived && routeSummonArrived && routeShotArrived && routeTargetedItemArrived &&
+                   !routeUnknownItemRejected && !routeNpcSpellProbeArrived && !routePlayerSpellProbeArrived &&
+                   !routeRansackProbeArrived && !routeWorldExcludedArrived && routeWorldBroadcastArrived && !routeWorldTargetedLeaked;
+            Logf("RESULT: %s (welcomed %d, host state %d, save %u of %u bytes, crc %s, host %s, %u ms after the welcome, world route targeted leaked %d)",
+                 pass ? "PASS" : "FAIL", joined, sawState, receivedBytes, SaveSize, got == saveCrc ? "ok" : "WRONG",
+                 *steam::HostName() ? steam::HostName() : "-", leftAfter, routeWorldTargetedLeaked);
+        }
         if (poseFlood) {
             unsigned minimum = poseCounts[0], maximum = poseCounts[0];
             for (auto count : poseCounts) { minimum = count < minimum ? count : minimum; maximum = count > maximum ? count : maximum; }

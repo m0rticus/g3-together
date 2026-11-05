@@ -417,8 +417,6 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                     if (bones[k].name == bones[i].name) { ++npcRejected; return; }
             }
         } else if (packet->dataLength != recordsSize) { ++npcRejected; return; }
-        NpcRecord records[MaxNpcsPerMessage];
-        std::memcpy(records, packet->data + sizeof(header), header.count * sizeof(NpcRecord));
         if (isHost) {
             header.owner = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
             if (header.owner < 2 || header.owner >= MaxPlayers) return;
@@ -427,34 +425,48 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             ++npcRejected;
             return;
         }
-        int count = 0;
-        for (int i = 0; i < header.count; ++i) {
-            NpcRecord const& record = records[i];
-            if (!Sane(record)) { ++npcRejected; continue; }
-            const std::string key = NpcKey(record.guid);
-            const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
-                                     : npcPublications[key].Snapshot(header.owner, header.publication);
-            if (!newer) { ++npcStale; continue; }
-            if (bones && npcPoseHandler)
-                npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
-            records[count++] = record;
-        }
-        if (!count) return;
-        const int accepted = npcHandler ? npcHandler(records, count, enet_time_get(), header.sent, header.owner, header.generation) : 0;
-        if (accepted < 0 || accepted > count) { Log("net: invalid accepted NPC count; publication refused"); return; }
-        npcRejected += count - accepted;
-        npcAccepted += accepted;
-        if (isHost && accepted) {
-            // Adjudicate first: an update refused by the host must never become truth on a third client.
-            header.count = static_cast<uint8_t>(accepted);
-            header.publication = ++npcPublication;
-            uint8_t buffer[sizeof(header) + MaxNpcsPerMessage * sizeof(NpcRecord)];
-            std::memcpy(buffer, &header, sizeof(header));
-            std::memcpy(buffer + sizeof(header), records, accepted * sizeof(NpcRecord));
-            for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != header.owner)
-                    Send(peers[i], buffer, sizeof(header) + accepted * sizeof(NpcRecord), ChannelNpcs,
-                         (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+        auto processRecords = [&](NpcRecord* records, int recordCount) {
+            int count = 0;
+            for (int i = 0; i < recordCount; ++i) {
+                NpcRecord const& record = records[i];
+                if (!Sane(record)) { ++npcRejected; continue; }
+                const std::string key = NpcKey(record.guid);
+                const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
+                                         : npcPublications[key].Snapshot(header.owner, header.publication);
+                if (!newer) { ++npcStale; continue; }
+                if (bones && npcPoseHandler)
+                    npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+                records[count++] = record;
+            }
+            return count;
+        };
+        auto finishRecords = [&](NpcRecord* records, int count) {
+            if (!count) return;
+            const int accepted = npcHandler ? npcHandler(records, count, enet_time_get(), header.sent, header.owner, header.generation) : 0;
+            if (accepted < 0 || accepted > count) { Log("net: invalid accepted NPC count; publication refused"); return; }
+            npcRejected += count - accepted;
+            npcAccepted += accepted;
+            if (isHost && accepted) {
+                // Adjudicate first: an update refused by the host must never become truth on a third client.
+                header.count = static_cast<uint8_t>(accepted);
+                header.publication = ++npcPublication;
+                uint8_t buffer[sizeof(header) + MaxNpcsPerMessage * sizeof(NpcRecord)];
+                std::memcpy(buffer, &header, sizeof(header));
+                std::memcpy(buffer + sizeof(header), records, accepted * sizeof(NpcRecord));
+                for (uint8_t i = 2; i < MaxPlayers; ++i)
+                    if (peers[i] && i != header.owner)
+                        Send(peers[i], buffer, sizeof(header) + accepted * sizeof(NpcRecord), ChannelNpcs,
+                             (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+            }
+        };
+        if (type == MsgPosedNpc) {
+            NpcRecord record;
+            std::memcpy(&record, packet->data + sizeof(header), sizeof(record));
+            finishRecords(&record, processRecords(&record, 1));
+        } else {
+            NpcRecord batchRecords[MaxNpcsPerMessage];
+            std::memcpy(batchRecords, packet->data + sizeof(header), header.count * sizeof(NpcRecord));
+            finishRecords(batchRecords, processRecords(batchRecords, header.count));
         }
     } else if (type == MsgNpcRelease && packet->dataLength >= sizeof(NpcReleaseHeader)) {
         if (isHost) { ++npcRejected; return; }
