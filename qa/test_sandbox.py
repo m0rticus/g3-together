@@ -118,7 +118,7 @@ class SandboxRoutingTests(unittest.TestCase):
             self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
         source = inspect.getsource(self.runner.SUITES['stageEnterPlace'])
         self.assertIn('join_both_and_clear(', source)
-        self.assertIn('clear_raid(', source)
+        self.assertNotIn('# clear_raid(', source)
 
     def test_all_live_raid_and_new_game_names_stay_out_of_saved_routes(self):
         with patch.object(inspect, 'getsource', side_effect=AssertionError('getsource must not run')):
@@ -136,12 +136,18 @@ class SandboxRoutingTests(unittest.TestCase):
                     patch.object(self.runner, 'postraid_ready', return_value=False):
                 self.assertEqual(self.runner.postraid_for('warm'), '')
 
-    def test_normal_source_inspection_detects_literal_clear_raid_call(self):
-        original = inspect.getsource
+    def test_normal_source_inspection_detects_join_or_clear_helper_calls(self):
         with patch.object(self.runner, 'postraid_ready', return_value=True), \
-                patch.object(inspect, 'getsource', wraps=original) as getsource:
+                patch.object(inspect, 'getsource', return_value='host, client = join_both_and_clear(copies, report)') as getsource:
             self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
         getsource.assert_called_once_with(self.runner.SUITES['stageEnterPlace'])
+
+        with patch.object(self.runner, 'postraid_ready', return_value=True), \
+                patch.object(inspect, 'getsource', return_value='host, client = clear_raid(copies, report)'):
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')
+
+        with patch.object(inspect, 'getsource', return_value='host, client = join_both(copies)'):
+            self.assertEqual(self.runner.postraid_for('stageEnterPlace'), '')
 
     def test_murder_counts_returns_fourth_count_or_none(self):
         with patch.object(self.runner, 'enclave_counts', return_value=[1, 2, 3, 4, 9]):
