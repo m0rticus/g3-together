@@ -113,6 +113,82 @@ class SandboxRoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'clear failed'):
                 self.runner.join_both_and_clear(copies, report)
 
+    def test_raid_help_up_preserves_client_first_order_and_mutates_report(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=1 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=1 '))
+        report = {}
+        events = []
+
+        def recover(helper, downed, result, tag):
+            events.append(('help', helper.tag, downed.tag, tag))
+            downed.bot.state = ' down=0 '
+            result[tag+'_helper_moved'] = 'recovered'
+
+        def wait(predicate, seconds, diagnostic):
+            events.append(('wait', seconds, diagnostic, predicate()))
+            return predicate()
+
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up', side_effect=recover), \
+                patch.object(self.runner, 'wait_for', side_effect=wait):
+            self.runner.help_up_raid((client, host), report)
+
+        self.assertEqual(events, [
+            ('help', 'host', 'client', 'client_raid'),
+            ('wait', 30, 'client helped up after the raid', ['up']),
+            ('help', 'client', 'host', 'host_raid'),
+            ('wait', 30, 'host helped up after the raid', ['up']),
+        ])
+        self.assertEqual(report, {
+            'client_raid_helper_moved': 'recovered',
+            'host_raid_helper_moved': 'recovered',
+        })
+
+    def test_raid_help_up_preserves_host_first_order(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=1 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=1 '))
+        events = []
+
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up',
+                             side_effect=lambda helper, downed, report, tag:
+                             events.append((helper.tag, downed.tag, tag))), \
+                patch.object(self.runner, 'wait_for',
+                             side_effect=lambda predicate, seconds, diagnostic:
+                             ['up'] if predicate() else None):
+            self.runner.help_up_raid((host, client), {})
+
+        self.assertEqual(events, [
+            ('client', 'host', 'host_raid'),
+            ('host', 'client', 'client_raid'),
+        ])
+
+    def test_raid_help_up_skips_already_standing_players(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=0 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=0 '))
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up') as help_up, \
+                patch.object(self.runner, 'wait_for') as wait:
+            self.runner.help_up_raid((client, host), {})
+        help_up.assert_not_called()
+        wait.assert_not_called()
+
+    def test_raid_help_up_propagates_help_and_wait_failures(self):
+        host = SimpleNamespace(tag='host', bot=SimpleNamespace(state=' down=1 '))
+        client = SimpleNamespace(tag='client', bot=SimpleNamespace(state=' down=1 '))
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up', side_effect=RuntimeError('help failed')), \
+                patch.object(self.runner, 'wait_for') as wait:
+            with self.assertRaisesRegex(RuntimeError, 'help failed'):
+                self.runner.help_up_raid((client, host), {})
+        wait.assert_not_called()
+
+        with patch.object(self.runner, 'herostate', side_effect=lambda bot: bot.state), \
+                patch.object(self.runner, 'help_up'), \
+                patch.object(self.runner, 'wait_for', side_effect=RuntimeError('wait failed')):
+            with self.assertRaisesRegex(RuntimeError, 'wait failed'):
+                self.runner.help_up_raid((client, host), {})
+
     def test_consolidated_legacy_suite_keeps_postraid_source_policy(self):
         with patch.object(self.runner, 'postraid_ready', return_value=True):
             self.assertEqual(self.runner.postraid_for('stageEnterPlace'), 'postraid')

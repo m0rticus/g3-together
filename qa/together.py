@@ -5540,10 +5540,7 @@ def stage5(copies, report, negative=False):
     # The opening raid first: raiders striking a hero break off its reach for an item (StumbleR_Hit during
     # Reach_Begin, red runs 20.10. 21:26/21:34), which is the game's way, not what this stage tests.
     clear_raid(host, report)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     host_items, _ = world_items(host.bot)
     client_items, _ = world_items(client.bot)
     common = sorted((g for g in set(host_items) & set(client_items)), key=lambda g: host_items[g]['distance'])
@@ -6284,10 +6281,7 @@ def areaspelldiag(copies, report, negative=False):
     within 12 m of the target (and of the client's mirrors of them), and the target's hit points. Diagnostic."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     keep = ('Diego', 'Gorn', 'Milten', 'Lester')
     spells = (os.environ.get('G3_SPELLS') or 'It_Spell_Mist,It_Spell_Light,It_Spell_TimeBubble,It_Spell_Firerain').split(',')
     order = ((client, host),) if os.environ.get('G3_CASTER') == 'client' else ((host, client), (client, host))
@@ -6346,10 +6340,7 @@ def stageAreaSpells(copies, report, negative=False):
     Negative control: summonmirroroff on both (no copies: nothing happens on the host)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = [report_line(c.bot, 'summonmirroroff', 'SUMMONMIRROROFF') for c in (host, client)]
     keep = ('Diego', 'Gorn', 'Milten', 'Lester')
@@ -6503,10 +6494,7 @@ def stageMeleeSwing(copies, report, negative=False):
     report['attack_path'] = 'native_instruction' if swing.endswith('native') else 'player_state'
     clear_raid(host, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = report_line(client.bot, 'combatoff', 'COMBATOFF')
     target = calm_target(host)
@@ -6649,10 +6637,7 @@ def stageCounterHit(copies, report, negative=False):
     kind = os.environ.get('G3_COUNTER_ANIMAL', 'Scavenger')
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = report_line(host.bot, 'combatoff', 'COMBATOFF')
     move_hero(host.bot, (90500.0, 5300.0, -6600.0))  # the host first: it simulates the animals
@@ -6726,10 +6711,7 @@ def counterhitdiag(copies, report, negative=False):
     Diagnostic."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     target = calm_target(host)
     report['target'] = npcs(host.bot)[target]['name']
     for n in ('OnHit', 'OnTouchDamage'):
@@ -7309,10 +7291,7 @@ def stageSeek(copies, report, negative=False):
     # (2) the client's blows on the host's puppet
     clear_raid(host, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     report_line(host.bot, 'glidereset', 'GLIDERESET')
     target = calm_target(host)
     hp0 = npcs(host.bot)[target]['hp']
@@ -7513,10 +7492,7 @@ def stageAnimalCorpse(copies, report, negative=False):
     part = os.environ.get('G3_PART', 'both')
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     move_hero(host.bot, (90500.0, 5300.0, -6600.0))
     herd = wait_for(lambda: [g for g, v in npcs(host.bot).items() if v['name'].startswith(kind) and not v['dead'] and not v['mirrored']],
                     20, f'a {kind} near the host')
@@ -8169,6 +8145,14 @@ def help_up(helper, downed, report, tag):
     lying = remotes(helper.bot)[downed_id]['pos']
     report[tag+'_helper_moved'] = move_hero(helper.bot, (lying[0] + 100, lying[1], lying[2]))
     help_dialog(helper, downed_id, report, tag)
+
+
+def help_up_raid(players, report):
+    for copy, helper in zip(players, reversed(players)):
+        if ' down=1 ' in herostate(copy.bot):
+            help_up(helper, copy, report, copy.tag+'_raid')
+            wait_for(lambda copy=copy: ' down=0 ' in herostate(copy.bot) and ['up'], 30,
+                     copy.tag+' helped up after the raid')
 
 
 def stageA(copies, report, negative=False):
@@ -10115,10 +10099,7 @@ def stageWalk(copies, report, negative=False):
     (default 0.05) and none has a hard correction (G3_WALK_SNAPS, default 0). Negative control: none (red before the fix)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((host, client), (client, host)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((host, client), report)
     move_hero(host.bot, OpenGround)
     move_hero(client.bot, (OpenGround[0] + 300, OpenGround[1], OpenGround[2]))
     time.sleep(3)
@@ -10181,10 +10162,7 @@ def stageGlide(copies, report, negative=False):
             report_line(copy.bot, 'glidestopoff', 'GLIDESTOPOFF ')
     clear_raid(host, report)
     time.sleep(3)
-    for copy, helper in ((host, client), (client, host)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((host, client), report)
     report['moved'] = {'host': move_hero(host.bot, OpenGround),
                        'client': move_hero(client.bot, (OpenGround[0] + 300, OpenGround[1], OpenGround[2]))}
     time.sleep(3)
@@ -10238,10 +10216,7 @@ def stageWear(copies, report, negative=False):
             report_line(copy.bot, 'lookoff', 'LOOKOFF ')
     clear_raid(host, report)
     time.sleep(3)
-    for copy, helper in ((host, client), (client, host)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((host, client), report)
     problems = []
     try:
         report['look_host_sees_client'] = wait_for(lambda: (w := wear_line(host.bot, 2)) and w['template'] == 'Diego' and [w], 15,
@@ -10286,10 +10261,7 @@ def puppettalkdiag(copies, report, negative=False):
     copies['client'].ini_extra = 'look = Diego\n'  # the host then addresses an NPC-template puppet (Diego), not PC_Hero
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((host, client), (client, host)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((host, client), report)
     start = client.bot.send('infoscan type_17', 20)
     client.bot.line('INFOSCAN end', 10, 'infoscan', start)
     rows = [l for l in client.bot.log()[start:].splitlines() if l.startswith('INFOSCAN ') and not l.startswith('INFOSCAN end')]
@@ -10334,10 +10306,7 @@ def postraidsave(copies, report, negative=False):
     a change to what a save holds (the mod's sidecars)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((host, client), (client, host)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((host, client), report)
     time.sleep(5)
     clear_slot(copies, POSTRAID_SLOT)
     since = len(client.mod_log())
@@ -10654,10 +10623,7 @@ def sandboxsave(copies, report, negative=False):
     time.sleep(3)
     for copy in (host, client):
         assert 'hidden=1 page_open=0 menu_open=0' in report_line(copy.bot, 'tutorialoff', 'TUTORIALOFF ')
-    for copy, helper in ((host, client), (client, host)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((host, client), report)
     for copy in (host, client):
         report_line(copy.bot, 'unarm', 'UNARM ')
         spot = SANDBOX_POSITION
@@ -12032,10 +11998,7 @@ def theftdiag(copies, report, negative=False, check=False):
             assert 'ok=1' in report_line(c.bot, 'enclavesyncoff', 'ENCLAVESYNCOFF ')
     clear_raid(host, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     time.sleep(2)
     report['ardea_before'] = {c.tag: enclave_counts(c.bot, 'Ardea') for c in (host, client)}
     items = [r for r in owned_items(host.bot, 4000) if r.get('zone_owner') == 'Ardea' and 'Chest' not in r['name']]
@@ -13399,10 +13362,7 @@ def stageW8(copies, report, negative=False):
     spell = os.environ.get('G3_SPELL', 'It_Spell_SummonSkeleton')
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         for c in (host, client):
             assert 'ok=1' in report_line(c.bot, 'mirrorretryoff', 'MIRRORRETRYOFF ')
@@ -13890,10 +13850,8 @@ def transformdiag(copies, report, negative=False):
             report_line(copy.bot, 'shapeoff', 'SHAPEOFF')
     clear_raid(host, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):  # the raid may have knocked someone out (first run: the client)
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    # the raid may have knocked someone out (first run: the client)
+    help_up_raid((client, host), report)
     for name in os.environ.get('G3_CREATURES', ','.join(CREATURES)).split(','):
         line = report_line(host.bot, 'transform '+name, 'TRANSFORM')
         if 'refused' not in line:
@@ -14168,10 +14126,7 @@ def stageP1(copies, report, negative=False):
     its hits count there too)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -14523,10 +14478,7 @@ def stageP2fire(copies, report, negative=False):
     Negative control: shotcopyhero. G3_SPELL picks the spell (default It_Spell_Fireball)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     for c in (host, client):
         report[c.tag+'_touchlog'] = report_line(c.bot, 'touchlog', 'TOUCHLOG ')
         if negative:
@@ -14636,10 +14588,7 @@ def selfspelldiag(copies, report, negative=False):
     caster get, and what does the other machine show (its own hero untouched; the puppet at the new place)?"""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     for caster, other, other_id, caster_id in ((client, host, 1, 2), (host, client, 2, 1)):
         tag = caster.tag
         guid = re.search(r'guid=(\S+)', report_line(caster.bot, f'puppetguid {other_id}', 'PUPPET '))[1]
@@ -14789,10 +14738,7 @@ def callanimalsdiag(copies, report, negative=False):
     the host's animal? G3_ANIMALS: templates to try (first valid)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     target = calm_target(host)
     report['target'] = npcs(host.bot)[target]['name']
     for caster in (host, client):
@@ -14877,10 +14823,7 @@ def stageSelfSpell(copies, report, negative=False):
     Templates.pak but the game loads no such template (READY valid=0). No negative control: nothing of the mod to switch off."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     problems = []
     for caster, other, other_id, caster_id in ((client, host, 1, 2), (host, client, 2, 1)):
         tag = caster.tag
@@ -14923,10 +14866,7 @@ def stageHealOther(copies, report, negative=False):
     host heals the client. Negative control: spellmirroroff (the cast is not sent, the hero stays hurt)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -14963,10 +14903,7 @@ def stageNpcSpell(copies, report, negative=False):
     task = expected.get(spell, os.environ.get('G3_TASK', ''))
     host, client = join_both_and_clear(copies, report)
     time.sleep(5)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15032,10 +14969,7 @@ def stagePoison(copies, report, negative=False):
     bit = 8 if 'Disease' in spell else 4
     host, client = join_both_and_clear(copies, report)
     time.sleep(5)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15110,10 +15044,7 @@ def stageCreature(copies, report, negative=False):
     spell = os.environ.get('G3_SPELL', 'It_Spell_SummonSkeleton')
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15188,10 +15119,7 @@ def stageCreatureLife(copies, report, negative=False):
     free creature. Host casts, then client. Negative control: summonmirroroff (no copies at all)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15268,10 +15196,7 @@ def stageControl(copies, report, negative=False):
     spell = os.environ.get('G3_SPELL', 'It_Spell_WordOfControl')
     host, client = join_both_and_clear(copies, report)
     time.sleep(5)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15376,10 +15301,7 @@ def stageP2hit(copies, report, negative=False):
     client. Negative control: shotcopyhero (the copies belong to the watcher's own hero and hit a second time)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     report['fixture_moved'] = {
         'host': move_hero(host.bot, OpenGround),
         'client': move_hero(client.bot, (OpenGround[0] + 100, OpenGround[1], OpenGround[2])),
@@ -15457,10 +15379,7 @@ def stageP2(copies, report, negative=False):
     watcher sees nothing)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     if negative:
         report['negative'] = True
         for c in (host, client):
@@ -15476,10 +15395,7 @@ def rangedbot(copies, report, negative=False):
     the target take damage, what does the watcher see. G3_SPELL picks the spell (default It_Spell_Meteor)."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     spell = os.environ.get('G3_SPELL', 'It_Spell_Meteor')
     ranged_bot_phase(client, host, 2, host, report, 'client', spell)
     ranged_bot_phase(host, client, 1, host, report, 'host', spell)
@@ -15493,10 +15409,7 @@ def rangeddiag(copies, report, negative=False):
     the watcher's puppet plays, whether the target is hurt on the machine that owns it, and who earns experience."""
     host, client = join_both_and_clear(copies, report)
     time.sleep(3)
-    for copy, helper in ((client, host), (host, client)):
-        if ' down=1 ' in herostate(copy.bot):
-            help_up(helper, copy, report, copy.tag+'_raid')
-            wait_for(lambda: ' down=0 ' in herostate(copy.bot) and ['up'], 30, copy.tag+' helped up after the raid')
+    help_up_raid((client, host), report)
     ranged_phase(client, host, 2, host, report, 'client')
     ranged_phase(host, client, 1, host, report, 'host')
     report['combat_end'] = [report_line(c.bot, 'hp', 'HP ') for c in (host, client)]
