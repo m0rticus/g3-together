@@ -13,6 +13,7 @@ bool RedirectDeath(eCEntity* self, char const* state);
 // chooses "Ich werde dir helfen." pays a healing potion and stands it up (owner 23.10.). Nobody able to help for 5 s: the hero dies. Other players are told
 // when someone goes down or dies.
 void Tick();
+void OnWorldChange();                 // a save/load or new world starts a new life
 void Revived(int byPlayer);           // network: that partner paid a potion for us
 void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us without one
 bool Held();             // the local hero lies knocked out, waiting for help

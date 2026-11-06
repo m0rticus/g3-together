@@ -145,6 +145,7 @@ class Module : public eCEngineComponentBase
         g3t::guide::OnWorldChange();
         g3t::arena::OnWorldChange();
         g3t::ending::OnWorldChange();
+        g3t::downed::OnWorldChange();
         g3t::doors::OnWorldChange();
         g3t::enclaves::OnWorldChange();
         g3t::occupancy::OnWorldChange();

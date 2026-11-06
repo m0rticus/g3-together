@@ -62,7 +62,7 @@ uint32_t lethalBlowAt = 0;      // when a blow by someone who means to kill took
 unsigned nativeLethal = 0;      // knock-outs of the game's own that were a lethal blow (promoted to the partner's help)
 bool nativeNoted = false;       // logged once per knock-out of the game's own
 bool dying = false;             // nobody could help: the hero dies like in the single-player game
-uint32_t diedAt = 0;            // when the death task was (last) set
+bool terminalKillSent = false;  // the native Kill/game-over script was called once for this life
 std::string inHand[2];         // the hero's right and left hand while standing (a knock-out drops them)
 bool wasDown = false;
 uint32_t aloneSince = 0;        // when the knocked-out hero last had nobody known able to help (0: someone can)
@@ -288,19 +288,23 @@ bool PartnerPresent(net::Remote const* remotes, uint32_t now)
     return false;
 }
 
-// Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths then die like single-player
-// (the death task, whose script shows the game over).
+// Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths end this life once.
+// The native Kill script shows game over immediately. Starting ZS_Dead as well would call Kill a second time.
 void Die(Entity& hero)
 {
+    if (dying || terminalKillSent) return;
     dying = true;
-    diedAt = net::Now();
     held = false;
+    lethal = false;
+    lethalSeenDown = false;
+    terminalKillSent = true;  // set before the script call: the terminal decision is re-entry safe
     ++deaths;
     Logf("downed: nobody can help; the hero dies (hp=%d)", hero.PlayerMemory.GetHitPoints());
     hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
     hero.PlayerMemory.SetHitPoints(0);
     hero.Routine.FullStop();
-    hero.Routine.SetTask(bCString(DeathTask));
+    const GEInt killed = GetScriptAdminExt().CallScript(bCString("Kill"), hero.GetInstance(), nullptr, 0);
+    Logf("downed: native Kill/game-over script called once (result=%d)", killed);
 }
 }
 
@@ -334,7 +338,24 @@ void Tick()
 {
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
-    if (!instance || !session.IsGameRunning()) { held = false; lethal = false; dying = false; aloneSince = 0; revivedBy = 0; lastHp = -1; lethalBlowAt = 0; return; }
+    if (!instance) {
+        held = false;
+        lethal = false;
+        dying = false;
+        terminalKillSent = false;
+        aloneSince = 0;
+        revivedBy = 0;
+        lastHp = -1;
+        lethalBlowAt = 0;
+        return;
+    }
+    if (!session.IsGameRunning()) {
+        held = false;
+        lethal = false;
+        aloneSince = 0;
+        revivedBy = 0;
+        return;
+    }
     Entity hero(instance);
     const uint32_t now = net::Now();
     net::Remote const* remotes = net::Remotes();
@@ -361,26 +382,19 @@ void Tick()
         toldDead[i] = dead;
     }
 
-    if (hero.IsDead()) { held = false; lethal = false; revivedBy = 0; return; }
     if (dying) {
-        // Terminal death: ending/dialog state may make the hero look stood up or let the death task be replaced.
-        // Keep the latch and reassert ZS_Dead until the hero is truly dead.
+        // Terminal death is one-shot.  The native Kill script, and not a repeating task latch, owns game over.
+        // Do not inspect or restart ZS_Dead/ZS_Dead_Loop/PS_Normal here: that lets PS_Normal be accepted without
+        // reviving or re-running the death script, while HP remains 0 and stale revive messages stay refused.
         held = false;
         lethal = false;
         lethalSeenDown = false;
         nativeNoted = false;
         revivedBy = 0;
         if (hero.PlayerMemory.GetHitPoints() > 0) hero.PlayerMemory.SetHitPoints(0);
-        const bCString task = hero.Routine.GetCurrentTask();
-        if (std::strcmp(task.GetText(), DeathTask) != 0 && now - diedAt >= 500) {
-            diedAt = now;
-            Logf("downed: the death task was replaced by %s; dying again", task.GetText());
-            hero.PlayerMemory.SetHitPoints(0);
-            hero.Routine.FullStop();
-            hero.Routine.SetTask(bCString(DeathTask));
-        }
         return;
     }
+    if (hero.IsDead()) { held = false; lethal = false; revivedBy = 0; return; }
     WatchBlows(hero, now);
     const bool down = hero.IsDown();
     if (!down) {
@@ -475,7 +489,7 @@ void Revived(int byPlayer)
     }
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
-    if (!held || dying || !instance || !session.IsGameRunning()) {
+    if (!held || dying || terminalKillSent || !instance || !session.IsGameRunning()) {
         revivedBy = 0;
         return;
     }
@@ -512,6 +526,30 @@ bool NativeDown()
     if (!instance || held || lethal || dying || !gCSession::GetInstance().IsGameRunning()) return false;
     Entity hero(instance);
     return hero.IsDown() && !hero.IsDead();
+}
+
+void OnWorldChange()
+{
+    held = false;
+    lethal = false;
+    lethalSeenDown = false;
+    lethalAt = 0;
+    lastHp = -1;
+    lethalBlowAt = 0;
+    nativeNoted = false;
+    dying = false;
+    terminalKillSent = false;
+    wasDown = false;
+    aloneSince = 0;
+    revivedBy = 0;
+    for (int i = 0; i < net::MaxPlayers; ++i) {
+        told[i] = false;
+        toldDead[i] = false;
+        helpingSince[i] = 0;
+        hinted[i] = false;
+        paidAt[i] = 0;
+    }
+    for (int i = 0; i < 2; ++i) inHand[i].clear();
 }
 
 void Off(LogFn log)

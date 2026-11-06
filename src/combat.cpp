@@ -495,6 +495,16 @@ eCEntity* Attacker(gCScriptProcessingUnit* spu, GELPVoid other)
     return originalSource;
 }
 
+bool IsPuppetMeleeJudgement(eCEntity* victim, eCEntity* attacker, eCEntity* source)
+{
+    return net::IsHost() && !bypass && !forwarded &&
+           victim && victim->GetPropertySet(eEPropertySetType_NPC) &&
+           !remote::IsPuppet(victim) && !npcs::IsMirrored(victim) &&
+           attacker && (remote::IsPuppet(attacker) || remote::PuppetOwner(attacker) != 0) &&
+           body::LocallyAttacking(attacker) &&
+           (!source || !source->GetPropertySet(eEPropertySetType_Projectile));
+}
+
 // Stufe 4.1: the game judges a blow (DoLogicalDamage: AssessHit's stumble, the hit sound and blood, the fight-sound perception)
 // before AddHitPoints, so a mirror's or puppet's weapon touching a body here plays all of it here, although rule 1 drops the
 // damage, and the owner's real hit follows (OnHitPlayer judges it again). Counted by victim (0 our hero, 1 our NPCs, 2 bodies
@@ -532,6 +542,11 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     Entity victim = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* attacker = Attacker(spu, other);
+    eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (IsPuppetMeleeJudgement(victim.GetInstance(), attacker, source)) {
+        ++foreignSkipped;
+        return 0;
+    }
     if (!bypass && npcs::IsMirrored(victim.GetInstance()) &&
         attacker != hero && attacker != remote::ControlledBody()) {
         ++foreignSkipped;
@@ -544,7 +559,6 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     if (IgnoreFriendlyHit(victim.GetInstance(), attacker)) return 0;
     uint32_t* consumed = nullptr;
     uint32_t swing = 0;
-    eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (which < 2 && !bypass && npcs::IsMirrored(victim.GetInstance()) && attacker == remote::ControlledBody() &&
         body::LocallyAttacking(attacker) && (source == attacker || source == Entity(attacker).Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance())) {
         swing = npcplayback::MotionInstance(attacker);

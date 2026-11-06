@@ -221,7 +221,51 @@ struct Mirror
     bool forcePending = false;
     float forceAt[3] = {}, force[3] = {};
     uint32_t forceWhen = 0;
+    eCEntity* deathReferencesCleared = nullptr;  // exact live instance whose local hero references were released
 };
+
+void ClearLocalReferencesToDeadMirror(eCEntity* dead)
+{
+    if (!dead) return;
+
+    eCEntity* bodies[2] = {
+        gCSession::GetInstance().GetHero(),
+        remote::ControlledBody()
+    };
+    for (int i = 0; i < 2; ++i) {
+        eCEntity* body = bodies[i];
+        if (!body) continue;
+        if (i > 0 && bodies[0] == body) continue;
+
+        Entity local(body);
+        if (body->GetPropertySet(eEPropertySetType_Focus) &&
+            local.Focus.GetFocusEntity().GetInstance() == dead) {
+            local.Focus.SetFocusEntity(Entity());
+        }
+        if (body->GetPropertySet(eEPropertySetType_NPC)) {
+            if (local.NPC.GetCurrentTarget().GetInstance() == dead) {
+                local.NPC.SetCurrentTarget(Entity());
+            }
+            if (local.NPC.GetAlternativeTarget().GetInstance() == dead) {
+                local.NPC.SetAlternativeTarget(Entity());
+            }
+            if (local.NPC.GetCurrentAttacker().GetInstance() == dead) {
+                local.NPC.SetCurrentAttacker(Entity());
+            }
+            if (local.NPC.GetLastAttacker().GetInstance() == dead) {
+                local.NPC.SetLastAttacker(Entity());
+            }
+            if (local.NPC.GetSpellTarget().GetInstance() == dead) {
+                local.NPC.SetSpellTarget(Entity());
+            }
+        }
+        if (body->GetPropertySet(eEPropertySetType_CharacterMovement) &&
+            local.GetAlignmentTarget().GetInstance() == dead) {
+            local.SetAlignmentTarget(Entity());
+        }
+    }
+}
+
 unsigned holdChanges = 0;
 bool style = true;  // QA negative control: StyleOff (no weapons in hand, no stance on mirrors)
 constexpr uint32_t RetryLookup = 1000;  // ms between lookups of a mirror whose NPC is not here (yet)
@@ -1978,11 +2022,14 @@ void PassiveMirrorTick()
     for (auto it = mirrors.begin(); it != mirrors.end();) {
         Mirror& m = it->second;
         if (m.released) { it = mirrors.erase(it); continue; }
+        eCEntity* previous = m.entity.GetInstance();
         Entity live = Resolve(m.latest.guid);
         if (live.GetInstance() != m.entity.GetInstance() || (m.resolved && !IsNpc(live.GetInstance()))) {
             if (m.resolved) Logf("npcs: mirror %s unloaded or changed property sets; waiting for its live instance",
                                 live.GetInstance() ? live.GetName().GetText() : "(unloaded)");
             m.entity = live;
+            if (live.GetInstance() != previous)
+                m.deathReferencesCleared = nullptr;
             m.resolved = false;
             m.replayReady = false;
             m.resolvedAt = 0;
@@ -2004,6 +2051,11 @@ void PassiveMirrorTick()
             m.defeatedBefore = m.entity.NPC.DefeatedByPlayer;
             m.entity.NPC.DefeatedByPlayer = GETrue;
             m.guarded = true;
+        }
+        if (m.killed && (m.latest.flags & 1) &&
+            m.deathReferencesCleared != m.entity.GetInstance()) {
+            ClearLocalReferencesToDeadMirror(m.entity.GetInstance());
+            m.deathReferencesCleared = m.entity.GetInstance();
         }
         m.replayReady = false;
         if (!net::Connected() || now - m.latestTicks > StaleAfter) { ++it; continue; }
@@ -2050,7 +2102,14 @@ void PassiveMirrorTick()
             m.ragdollStarted = m.laid = false;
             deadOnHost.erase(it->first);
         }
+        const bool firstDeath = !m.killed;
         m.killed = (shown.flags & 1) != 0;
+        if (m.killed && (firstDeath || m.deathReferencesCleared != m.entity.GetInstance())) {
+            ClearLocalReferencesToDeadMirror(m.entity.GetInstance());
+            m.deathReferencesCleared = m.entity.GetInstance();
+        } else if (!m.killed) {
+            m.deathReferencesCleared = nullptr;
+        }
         auto* routine = static_cast<gCScriptRoutine_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
         if (!routine) {
             Logf("npcs: %s lost its script property during presentation; rebinding next frame", m.entity.GetName().GetText());
@@ -2597,6 +2656,7 @@ void LayDownCorpse(eCEntity* entity)
     Guid(entity, guid);
     const std::string key = Key(guid);
     if (corpses.count(key)) return;
+    if (!net::IsHost()) ClearLocalReferencesToDeadMirror(entity);
     Mirror& c = corpses[key];
     std::memcpy(c.latest.guid, guid, 16);
     c.killed = true;
