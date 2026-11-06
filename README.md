@@ -72,7 +72,8 @@ Omitting the setting keeps the shared `default` group. Each live instance needs 
 this does not add multiple independent instances under one Steam account. Use isolated game/profile/save folders
 when running multiple copies on one PC.
 
-The main menu shows the lobby state, joined/ready client counts and measured Steam ping (or `pending` before a sample).
+The main menu shows the lobby state, joined/ready client counts and measured **transport RTT** (or `pending` before a
+sample or after five seconds without a reply). This is a high-resolution Steam control echo, not NPC playback delay.
 It also shows the configured Session ID. Both players need this updated build: older Steam relay builds are incompatible.
 Steam activity uses **Gothic 3 (AppID 39500)**, not Spacewar.
 
@@ -132,7 +133,9 @@ python "tools\collect_logs.py" "C:\Games\Gothic 3"
 ```
 
 `g3together.log` is enabled automatically and appends dated session markers, lobby/connection errors, player identities,
-relay counters and periodic Steam ping/status. While playing, compact `SYNCBODY` and `SYNCNPC` counters report hard
+relay counters and periodic Steam ping/status. Transport pumping is independent of the render loop; ENet/gameplay
+handlers remain on the engine thread. `STEAMSTATUS`, `net: rtt` and `SYNCLATENCY` separate transport, engine servicing,
+send-to-flush residence and buffered NPC presentation. While playing, compact `SYNCBODY` and `SYNCNPC` counters report hard
 corrections, action corrections, stale mirrors and ownership takeover deferrals without per-entity scans.
 `SYNCCOMBAT` distinguishes locally judged hits, forwarded/applied claims and damage ignored while browsing inventory.
 Share both players' ZIPs privately with the host first. User paths and IP addresses

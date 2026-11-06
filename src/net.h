@@ -107,8 +107,10 @@ void RttLogOff(void (*log)(char const*));  // QA negative control: no "net: rtt=
 // ENet's round trip to that player in ms (host: its connection; client: the one to the host, which relays the others), 0 unknown.
 uint32_t RoundTrip(uint8_t player);
 void Reconnect(void (*log)(char const*));  // QA, client (stage W1): leave the host and connect again at once
-// Service the socket and, at most every 50 ms, send the local state. Call once per frame.
+// Service ENet/gameplay on the engine thread and send local state at the configured rate.
 void Tick(PlayerState const& local, bool haveLocal);
+// Flush all gameplay queued after Tick in this frame and wake the independent Steam relay.
+void Flush();
 void SetSendRate(int hz);  // 20..60 Hz for player states; NPC captures have their own fixed 60 Hz deadline
 uint8_t LocalId();
 // Host: always. Client: welcomed by the host and in the host's world (SetInWorld); gameplay pauses otherwise.
@@ -165,6 +167,7 @@ void SetWorldHandler(WorldHandler handler);
 // Only the host publishes NPC state. Motion slots and pose share one capture time.
 constexpr int MaxNpcsPerMessage = 48;  // receiving limit
 constexpr int NpcsPerSend = 2;
+// These retained checks size the application envelope; ENet's own headers can require fragmentation.
 static_assert(NpcsPerSend == 2, "NPC datagrams must carry exactly two records");
 static_assert(NpcsPerSend >= 2, "NPC batches must retain two records per datagram");
 static_assert(23 + NpcsPerSend * sizeof(NpcRecord) <= 1200, "two NPC records must fit one 1200-byte datagram");

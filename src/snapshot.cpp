@@ -12,7 +12,6 @@ unsigned sampledBetween = 0, sampledAhead = 0, sampledHeld = 0, sampledOldest = 
 namespace {
 constexpr uint32_t OffsetWindow = 2000;
 constexpr uint32_t RestartAfter = 1500;
-constexpr int32_t MinDelay = 50;  // ms: three 60 Hz intervals; a lost packet at 60 Hz leaves a 33 ms hole
 constexpr float MaximumTravelSpeed = 3000.0f;  // cm/s; larger jumps are discontinuities, not interpolation paths
 
 uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
@@ -96,12 +95,14 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
                 track.jitterMs += (variation - track.jitterMs) / 16.0f;
             }
             const int32_t required = std::clamp(static_cast<int32_t>(2 * std::min(track.cadenceMin, track.previousCadenceMin)
-                                                                   + std::ceil(track.jitterMs * 2.0f)), MinDelay, 250);
+                                                                   + std::ceil(track.jitterMs * 2.0f)),
+                                                track.predictive ? PlayerBufferFloor : NpcBufferFloor, 250);
             if (required > track.delayMs) track.delayMs = required;
             else if ((!track.recoveryUntil || static_cast<int32_t>(arrived - track.recoveryUntil) >= 0) && track.delayMs > required)
                 --track.delayMs;
         }
     }
+    if (!track.count && !track.predictive) track.delayMs = NpcBufferFloor;
     track.lastArrived = arrived;
     const int32_t offset = static_cast<int32_t>(arrived - sent);
     if (!track.haveOffset) {
@@ -145,7 +146,19 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
             std::memcpy(position, newest.position, sizeof(newest.position));
             std::memcpy(rotation, newest.rotation, sizeof(newest.rotation));
             Describe(presentation, newest, 0.0f, newest.sent);
-            if (counted) ++sampledHeld, track.lastCase = 3;
+            if (counted) {
+                ++sampledHeld, track.lastCase = 3;
+                const int32_t late = static_cast<int32_t>(render - newest.sent);
+                const uint32_t interval = std::min(track.cadenceMin, track.previousCadenceMin);
+                // A whole missing interval, not a rounding-boundary hold, warrants more buffering.
+                if (track.count >= 2 && late > static_cast<int32_t>(interval) && !(newest.motion.flags & 1) &&
+                    (!track.underrunAt || now - track.underrunAt >= 100)) {
+                    track.underrunAt = now;
+                    track.recoveryUntil = now + OffsetWindow;
+                    track.delayMs = std::min(track.delayMs + static_cast<int32_t>(interval), 250);
+                    ++track.underruns;
+                }
+            }
             return true;
         }
         const int32_t wanted = static_cast<int32_t>(render - newest.sent);

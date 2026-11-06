@@ -2,16 +2,19 @@
 #include "log.h"
 
 #include <Windows.h>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 namespace g3t {
 namespace {
 char path[MAX_PATH] = {};
 bool reportedFileError = false;
+std::mutex logMutex;
 }
 
 void OpenLog(const char* name)
@@ -35,6 +38,7 @@ void OpenLog(const char* name)
 
 void Log(const char* text)
 {
+    std::lock_guard<std::mutex> lock(logMutex);
     if (!*path) return;
     HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
@@ -76,7 +80,7 @@ void Logf(const char* format, ...)
 }
 
 namespace {
-bool strict = false;  // QA negative control: formatstrict
+std::atomic<bool> strict{false};  // QA negative control: formatstrict
 }
 
 int FormatV(char* out, size_t size, const char* format, va_list args)

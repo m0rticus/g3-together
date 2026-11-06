@@ -21,6 +21,7 @@
 #include "steam.h"
 
 #include "config.h"
+#include "latency.h"
 #include "log.h"
 #include "net.h"
 
@@ -28,6 +29,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <float.h>
+#include <mutex>
+#include <process.h>
 #include <xmmintrin.h>
 
 namespace g3t::steam {
@@ -59,7 +62,7 @@ class SteamFpScope
     {
         const unsigned short after = FpuControl();
         const unsigned sseAfter = _mm_getcsr();
-        static unsigned changes = 0;
+        static thread_local unsigned changes = 0;
         if ((after != control || ((sseAfter ^ mxcsr) & ~0x3fu)) && ++changes <= 8)
             Logf("steam: restoring engine FP state after %s: x87=%04x->%04x mxcsr=%08x->%08x",
                  operation, after, control, sseAfter, mxcsr);
@@ -193,7 +196,7 @@ struct Remote
     bool linked = false;   // host: said hello while in the lobby; client: the host welcomed us
     bool leaving = false;
     uint32_t heard = 0, lastPing = 0;
-    int rtt = -1;
+    latency::Ping ping;
     SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
     unsigned short relayPort = 0;
     unsigned toEnet = 0, toSteam = 0;
@@ -235,7 +238,76 @@ char hostName[64] = "";
 Skipped skipped[16] = {};
 bool searchLogged = false;
 
-uint32_t Now() { return GetTickCount(); }
+// Only the transport worker owns the API, sockets and remotes after startup.
+// Engine-thread readers copy published state, never wait on a Steam call or inspect its mutable buffers.
+struct Published
+{
+    bool ready = false, hostLinked = false;
+    u64 lobby = 0;
+    int linked = 0, ping = -1;
+    uint32_t pingSampleAt = 0;
+    unsigned short ports[MaxRemotes] = {};
+    char hostName[64] = {}, error[256] = {}, status[900] = {};
+} published;
+std::mutex publishedMutex;
+HANDLE worker = nullptr, stopEvent = nullptr, wakeEvent = nullptr, pollTimer = nullptr;
+uint32_t lastPump = 0;
+latency::Samples pollGaps, pumpWork;
+unsigned receiveCaps = 0, forwardCaps = 0, socketFailures = 0, receiveFailures = 0, invalidPongs = 0;
+int socketError = 0;
+
+double PingSeconds()
+{
+    static const LONGLONG frequency = [] { LARGE_INTEGER value; QueryPerformanceFrequency(&value); return value.QuadPart; }();
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return static_cast<double>(value.QuadPart) / frequency;
+}
+// Keep relay intervals/ages on QPC too, independent of an occluded game's millisecond timer resolution.
+uint32_t Now() { return static_cast<uint32_t>(static_cast<uint64_t>(PingSeconds() * 1000.0)); }
+
+int CountLinked()
+{
+    int count = 0;
+    for (auto const& r : remotes) count += r.linked ? 1 : 0;
+    return count;
+}
+
+void Publish()
+{
+    Published next;
+    const uint32_t now = Now();
+    next.ready = ready;
+    next.lobby = lobby;
+    next.linked = CountLinked();
+    for (auto const& r : remotes)
+        if (r.linked && r.ping.Value(now) > next.ping) {
+            next.ping = r.ping.Value(now);
+            next.pingSampleAt = r.ping.sampledAt;
+        }
+    strcpy_s(next.hostName, hostName);
+    strcpy_s(next.error, error);
+    int n = Format(next.status, "STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d "
+                   "send_failures=%u offset=%d error=%s session_id=%s isolated_drops=%u "
+                   "poll_timer=%s poll_gap_avg_ms=%.2f poll_gap_max_ms=%u pump_work_max_ms=%u receive_caps=%u forward_caps=%u "
+                   "socket_failures=%u socket_error=%d receive_failures=%u invalid_pongs=%u",
+                   GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, next.linked, next.ping,
+                   sendFailures, senderOffset, *error ? error : "-", GetConfig().sessionId, isolatedDrops,
+                   pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum, receiveCaps, forwardCaps,
+                   socketFailures, socketError, receiveFailures, invalidPongs);
+    for (int i = 0; i < MaxRemotes; ++i) {
+        auto const& r = remotes[i];
+        if (!r.id) continue;
+        if (r.linked) next.ports[i] = r.relayPort;
+        if (!isHost && r.id == owner) next.hostLinked = r.linked;
+        n += Format(next.status + n, sizeof(next.status) - n, " peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
+                    r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
+                    r.ping.milliseconds < 0 ? 0u : now - r.ping.sampledAt);
+    }
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    published = next;
+}
+
 char const* Text(char const* text) { return text ? text : ""; }  // Steam's strings, never null for the CRT
 
 void CopyName(char* out, size_t size, char const* source)
@@ -283,9 +355,11 @@ int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
 void Control(u64 to, char what, bool reliable)
 {
     char buffer[9] = {what};
-    const double time = Now() / 1000.0;
+    const double time = PingSeconds();
     std::memcpy(buffer + 1, &time, sizeof(time));
-    RawSend(to, reliable ? SendReliable : SendUnreliable, ChannelControl, buffer, what == 'P' ? 9 : 1);
+    const int result = RawSend(to, reliable ? SendReliable : SendUnreliable, ChannelControl, buffer, what == 'P' ? 9 : 1);
+    if (what == 'P' && result == ResultOk)
+        for (auto& r : remotes) if (r.id == to) r.ping.Sent(time);
 }
 
 SOCKET LoopbackSocket(unsigned short* port)
@@ -570,7 +644,7 @@ void OnControl(Remote& r, char const* data, int size)
     switch (data[0]) {
     case 'H':
         if (isHost && lobby && !r.linked && InLobby(r.id)) {
-            if (LinkedCount() + 1 >= net::MaxPlayers) {
+            if (CountLinked() + 1 >= net::MaxPlayers) {
                 Logf("steam: %llu refused, the game is full", r.id);
                 break;
             }
@@ -602,7 +676,7 @@ void OnControl(Remote& r, char const* data, int size)
         if (size >= 9) {
             double sent = 0;
             std::memcpy(&sent, data + 1, 8);
-            r.rtt = static_cast<int>((Now() / 1000.0 - sent) * 1000.0 + 0.5);
+            if (!r.ping.Reply(sent, PingSeconds(), Now())) ++invalidPongs;
         }
         break;
     case 'B':
@@ -616,15 +690,17 @@ void OnControl(Remote& r, char const* data, int size)
 void OnData(Remote& r, char const* data, int size)
 {
     if (!r.linked || size <= 0) return;
+    int sent = 0;
     if (isHost) {
         sockaddr_in to{};
         to.sin_family = AF_INET;
         to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         to.sin_port = htons(enetPort);
-        sendto(r.socket, data, size, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
+        sent = sendto(r.socket, data, size, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
     } else if (haveEnetAddress) {
-        sendto(relay, data, size, 0, reinterpret_cast<sockaddr*>(&enetAddress), sizeof(enetAddress));
-    }
+        sent = sendto(relay, data, size, 0, reinterpret_cast<sockaddr*>(&enetAddress), sizeof(enetAddress));
+    } else return;
+    if (sent != size) { ++socketFailures; socketError = WSAGetLastError(); return; }
     ++r.toEnet;
 }
 
@@ -645,6 +721,7 @@ void Receive(int channel)
     void* batch[32];
     for (int rounds = 0; rounds < 16; ++rounds) {
         const int count = api.ReceiveOnChannel(messages, channel, batch, 32);
+        if (count < 0) ++receiveFailures;
         if (count <= 0) return;
         for (int i = 0; i < count; ++i) {
             char const* m = static_cast<char const*>(batch[i]);
@@ -674,6 +751,7 @@ void Receive(int channel)
             api.MessageRelease(batch[i]);
         }
     }
+    ++receiveCaps;
 }
 
 // ENet -> Steam: what ENet sent to the relay sockets since the last Pump.
@@ -689,10 +767,16 @@ void Forward()
                 fromSize = sizeof(from);
                 const int size = recvfrom(r.socket, datagram, sizeof(datagram), 0, reinterpret_cast<sockaddr*>(&from), &fromSize);
                 if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
-                if (size <= 0) break;
+                if (size <= 0) {
+                    if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+                        ++socketFailures; socketError = WSAGetLastError();
+                    }
+                    break;
+                }
                 if (ntohs(from.sin_port) != enetPort) continue;
                 RawSend(r.id, SendUnreliable, ChannelData, datagram, static_cast<unsigned>(size));
                 ++r.toSteam;
+                if (n == 255) ++forwardCaps;
             }
         }
         return;
@@ -703,12 +787,18 @@ void Forward()
         fromSize = sizeof(from);
         const int size = recvfrom(relay, datagram, sizeof(datagram), 0, reinterpret_cast<sockaddr*>(&from), &fromSize);
         if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
-        if (size <= 0) break;
+        if (size <= 0) {
+            if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+                ++socketFailures; socketError = WSAGetLastError();
+            }
+            break;
+        }
         enetAddress = from;
         haveEnetAddress = true;
         if (!host || !host->linked) continue;  // no host yet: ENet keeps trying to connect until there is one
         RawSend(owner, SendUnreliable, ChannelData, datagram, static_cast<unsigned>(size));
         ++host->toSteam;
+        if (n == 255) ++forwardCaps;
     }
 }
 
@@ -775,7 +865,41 @@ bool Fail(char const* text)
 {
     strncpy_s(error, text, _TRUNCATE);
     Logf("steam: not used: %s", error);
+    Publish();
     return false;
+}
+
+void PumpOnce();
+unsigned __stdcall TransportThread(void*)
+{
+    for (;;) {
+        const DWORD stop = WaitForSingleObject(stopEvent, 0);
+        if (stop == WAIT_OBJECT_0) break;
+        if (stop == WAIT_FAILED) {
+            ready = false;
+            Fail("transport stop event failed");
+            break;
+        }
+        PumpOnce();
+        HANDLE events[] = {stopEvent, wakeEvent, pollTimer};
+        if (pollTimer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -static_cast<LONGLONG>(latency::RelayPollMs) * 10000;  // relative 100 ns units
+            if (!SetWaitableTimer(pollTimer, &due, 0, nullptr, nullptr, FALSE)) {
+                ready = false;
+                Fail("transport timer could not be armed");
+                break;
+            }
+        }
+        const DWORD result = WaitForMultipleObjects(pollTimer ? 3 : 2, events, FALSE, pollTimer ? INFINITE : latency::RelayPollMs);
+        if (result == WAIT_OBJECT_0) break;
+        if (result == WAIT_FAILED) {
+            ready = false;
+            Fail("transport wait failed");
+            break;
+        }
+    }
+    return 0;
 }
 
 // <game>\G3Together\steam_api.dll (the mod's own copy, never one the game may have), or G3T_STEAM_DLL (QA: the
@@ -818,7 +942,7 @@ bool Load()
 
 bool Start(bool host, unsigned short port)
 {
-    if (ready || tried) return ready;
+    if (tried) return Ready();
     SteamFpScope floatingPoint("startup");
     tried = true;
     isHost = host;
@@ -857,16 +981,40 @@ bool Start(bool host, unsigned short port)
     Logf("steam: ready as Gothic 3 (%u), %s (%llu), %s", GothicAppId, persona, me, isHost ? "host" : "client");
     if (isHost) {
         CreateLobby();
-        return true;
+    } else {
+        relay = LoopbackSocket(&relayPort);
+        if (relay == INVALID_SOCKET) {
+            ready = false;
+            return Fail("no local relay socket");
+        }
+        wantedLobby = _strtoui64(GetConfig().steamLobby, nullptr, 10);
+        ParseConnect(GetCommandLineA());
+        Logf("steam: relay on 127.0.0.1:%u%s", relayPort, wantedLobby ? " (steam_lobby set)" : "");
     }
-    relay = LoopbackSocket(&relayPort);
-    if (relay == INVALID_SOCKET) {
+    stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    wakeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!stopEvent || !wakeEvent) {
         ready = false;
-        return Fail("no local relay socket");
+        return Fail("transport events could not be created");
     }
-    wantedLobby = _strtoui64(GetConfig().steamLobby, nullptr, 10);
-    ParseConnect(GetCommandLineA());
-    Logf("steam: relay on 127.0.0.1:%u%s", relayPort, wantedLobby ? " (steam_lobby set)" : "");
+    // Unlike a timed wait/timeBeginPeriod, this retains sub-frame scheduling for an occluded Windows 11 game.
+    pollTimer = CreateWaitableTimerExA(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
+    if (!pollTimer) {
+        const DWORD failure = GetLastError();
+        if (failure != ERROR_INVALID_PARAMETER) {
+            ready = false;
+            return Fail("transport timer could not be created");
+        }
+        Log("steam: high-resolution timers unavailable on this Windows version; using timed wait (see poll_gap diagnostics)");
+    }
+    Publish();
+    worker = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &TransportThread, nullptr, 0, nullptr));
+    if (!worker) {
+        ready = false;
+        return Fail("transport worker could not be started");
+    }
+    Logf("steam: independent transport worker poll_ms=%u timer=%s; ping=QPC control RTT",
+         latency::RelayPollMs, pollTimer ? "highres" : "legacy");
     return true;
 }
 
@@ -874,15 +1022,19 @@ unsigned short RelayPort() { return relayPort; }
 
 bool IsPeerRelay(unsigned short port)
 {
-    if (!ready || !isHost || !port) return false;
-    for (auto const& r : remotes)
-        if (r.linked && r.socket != INVALID_SOCKET && r.relayPort == port) return true;
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    if (!published.ready || !isHost || !port) return false;
+    for (auto const linkedPort : published.ports) if (linkedPort == port) return true;
     return false;
 }
 
-void Pump()
+namespace {
+void PumpOnce()
 {
     if (!ready) return;
+    const uint32_t began = Now();
+    if (lastPump) pollGaps.Add(began - lastPump);
+    lastPump = began;
     SteamFpScope floatingPoint("callbacks");
     api.DispatchRunFrame(pipe);
     struct { int user; int callback; char* param; int size; } message{};  // CallbackMsg_t
@@ -927,21 +1079,44 @@ void Pump()
             Drop(&r, r.linked ? "silent for 180 s" : "not linked after 60 s");
             continue;
         }
-        if (r.linked && now - r.lastPing > 1000) {
+        if (r.linked && now - r.lastPing > latency::PingIntervalMs && r.ping.CanSend(PingSeconds())) {
             Control(r.id, 'P', false);
             r.lastPing = now;
         }
     }
     if (!lastDiagnostics || now - lastDiagnostics >= 5000) {
         lastDiagnostics = now ? now : 1;
+        Publish();
         Status(&Log);
+        pollGaps = {};
+        pumpWork = {};
+    } else {
+        Publish();
     }
+    pumpWork.Add(Now() - began);
 }
+}
+
+void Pump() { if (wakeEvent) SetEvent(wakeEvent); }
 
 void Stop()
 {
+    if (worker) {
+        SetEvent(stopEvent);
+        // Never close the worker's sockets/API underneath it, including during engine shutdown.
+        if (WaitForSingleObject(worker, INFINITE) != WAIT_OBJECT_0) {
+            Logf("steam: transport worker join failed (Windows error %lu); resources retained", GetLastError());
+            return;
+        }
+        CloseHandle(worker);
+        worker = nullptr;
+    }
+    if (wakeEvent) CloseHandle(wakeEvent);
+    if (stopEvent) CloseHandle(stopEvent);
+    if (pollTimer) CloseHandle(pollTimer);
+    wakeEvent = stopEvent = pollTimer = nullptr;
     SteamFpScope floatingPoint("shutdown");
-    if (ready) {
+    if (apiInitialized) {
         Forward();  // ENet's goodbye to the others
         LeaveLobby();
         Log("steam: stopped");
@@ -957,44 +1132,52 @@ void Stop()
         WSACleanup();
         winsockStarted = false;
     }
+    Publish();
 }
 
-bool Ready() { return ready; }
-uint64_t LobbyId() { return lobby; }
+bool Ready() { std::lock_guard<std::mutex> lock(publishedMutex); return published.ready; }
+uint64_t LobbyId() { std::lock_guard<std::mutex> lock(publishedMutex); return published.lobby; }
 char const* PlayerName() { return playerName; }
 uint64_t PlayerId() { return me; }
 int Ping()
 {
-    int maximum = -1;
-    for (auto const& r : remotes)
-        if (r.linked && r.rtt > maximum) maximum = r.rtt;
-    return maximum;
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return published.ping >= 0 && Now() - published.pingSampleAt < latency::PingExpiryMs ? published.ping : -1;
 }
-char const* Error() { return error; }
-char const* HostName() { return hostName; }
+char const* Error()
+{
+    thread_local char copy[sizeof(error)];
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    strcpy_s(copy, published.error);
+    return copy;
+}
+char const* HostName()
+{
+    thread_local char copy[sizeof(hostName)];
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    strcpy_s(copy, published.hostName);
+    return copy;
+}
 
 bool HostLinked()
 {
-    Remote const* host = owner && !isHost ? Find(owner) : nullptr;
-    return host && host->linked;
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return published.hostLinked;
 }
 
 int LinkedCount()
 {
-    int count = 0;
-    for (auto const& r : remotes) count += r.linked ? 1 : 0;
-    return count;
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return published.linked;
 }
 
 void Status(void (*log)(char const*))
 {
-    char line[512];
-    int n = Format(line, "STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d send_failures=%u offset=%d error=%s",
-                   GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, LinkedCount(), Ping(), sendFailures,
-                   senderOffset, *error ? error : "-");
-    n += Format(line + n, sizeof(line) - n, " session_id=%s isolated_drops=%u", GetConfig().sessionId, isolatedDrops);
-    for (auto const& r : remotes)
-        if (r.id) n += Format(line + n, sizeof(line) - n, " peer=%llu:%d:%u:%u:%d", r.id, r.linked ? 1 : 0, r.toEnet, r.toSteam, r.rtt);
+    char line[sizeof(published.status)];
+    {
+        std::lock_guard<std::mutex> lock(publishedMutex);
+        strcpy_s(line, published.status);
+    }
     log(line);
 }
 }

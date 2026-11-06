@@ -100,7 +100,7 @@ void Frame()
 // One frame of the module for persist (BeginFrame/EndFrame), closed on every way out of Process.
 struct FrameScope {
     FrameScope() : run(g3t::persist::BeginFrame()) {}
-    ~FrameScope() { if (run) g3t::persist::EndFrame(); }
+    ~FrameScope() { if (run) { g3t::net::Flush(); g3t::persist::EndFrame(); } }
     FrameScope(FrameScope const&) = delete;
     FrameScope& operator=(FrameScope const&) = delete;
     const bool run;

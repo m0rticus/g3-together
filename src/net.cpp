@@ -3,6 +3,8 @@
 
 #include "net.h"
 
+#include "enet_policy.h"
+#include "latency.h"
 #include "log.h"
 #include "parity.h"
 #include "replication.h"
@@ -158,6 +160,10 @@ bool inWorld = false;                  // client side: this machine is in the ho
 bool clientInWorld[MaxPlayers] = {};   // host side: that client is in the host's world
 uint32_t generations[MaxPlayers] = {}; // host side: counts the connections a slot was given (PeerGeneration)
 unsigned gatedIn = 0, gatedOut = 0;
+bool haveQueued = false;
+uint32_t queuedAt = 0, lastServiceAt = 0;
+latency::Samples enqueueDelays, serviceGaps;
+unsigned serviceCaps = 0, serviceErrors = 0;
 
 // What passes the world gate: joining, campaign notifications, the save transfer and the world messages. Motion names wait for the world too
 // (Fable's review 22.10. 1.8: they were open to a peer that never said Hello); the host resends them all on entry.
@@ -221,11 +227,10 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
         }
         channel = active;
     }
-    const enet_uint32 flags = reliable ? ENET_PACKET_FLAG_RELIABLE
-        : size > Mtu ? ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT : 0;
-    ENetPacket* packet = enet_packet_create(data, size, flags);
+    ENetPacket* packet = enet_packet_create(data, size, PacketFlags(reliable));
     if (!packet) return false;
     if (enet_peer_send(peer, channel, packet) < 0) { enet_packet_destroy(packet); return false; }
+    if (!haveQueued) { haveQueued = true; queuedAt = enet_time_get(); }
     return true;
 }
 
@@ -1417,6 +1422,8 @@ void Stop()
     if (host) enet_host_destroy(host);
     host = nullptr;
     server = nullptr;
+    haveQueued = false;
+    lastServiceAt = 0;
     connected = inWorld = false;
     localId = 0;
     ResetNpcReplication();
@@ -1515,7 +1522,11 @@ void Service(PlayerState const& local, bool haveLocal)
 {
     ENetEvent event;
     // At most 512 events a frame: a flood must not stall the game (Fable's review 22.10. 1.9); the rest waits for the next.
-    for (int events = 0; events < 512 && enet_host_service(host, &event, 0) > 0; ++events) {
+    int events = 0;
+    int result = 0;
+    for (; events < 512; ++events) {
+        result = enet_host_service(host, &event, 0);
+        if (result <= 0) break;
         switch (event.type) {
         case ENET_EVENT_TYPE_CONNECT:
             if (isHost && (event.peer->address.host != target.host || !steam::IsPeerRelay(event.peer->address.port))) {
@@ -1566,6 +1577,8 @@ void Service(PlayerState const& local, bool haveLocal)
             break;
         }
     }
+    if (events == 512) ++serviceCaps;
+    if (result < 0 && ++serviceErrors == 1) Log("net: ENet service failed; subsequent failures counted in RTT diagnostics");
     const uint32_t now = enet_time_get();
     if (!isHost && !server && !refused && now - lastConnectAttempt > 3000) {
         lastConnectAttempt = now;
@@ -1587,8 +1600,18 @@ void Service(PlayerState const& local, bool haveLocal)
     } else if (server) {
         Send(server, &message, sizeof(message), ChannelState, reliable);
     }
-    enet_host_flush(host);
 }
+}
+
+void Flush()
+{
+    if (!host || g3t::ai::ShuttingDown()) return;
+    if (haveQueued) {
+        enqueueDelays.Add(enet_time_get() - queuedAt);
+        haveQueued = false;
+    }
+    enet_host_flush(host);
+    steam::Pump();
 }
 
 // Round trip and packet loss of every connection (Stufe 1, owner 27.10.: how much of the delay is the connection, Hamachi or
@@ -1601,7 +1624,10 @@ void RttLine(ENetPeer* peer, char const* who, char* out, size_t size)
     auto const& poses = peer->channels[ChannelPoses];
     auto const& alt = peer->channels[ChannelPosesAlt];
     Format(out, size, "net: rtt=%u ms (+-%u) loss=%.1f%% sent=%u lost=%u throttle=%u/%u to %s "
-                     "pose_send=%u/%u,%u/%u pose_recv=%u/%u,%u/%u waiting_bytes=%u",
+                     "pose_send=%u/%u,%u/%u pose_recv=%u/%u,%u/%u waiting_bytes=%u "
+                     "transport_max_rtt_ms=%d service_gap_avg_ms=%.2f service_gap_max_ms=%u "
+                     "enqueue_flush_avg_ms=%.2f enqueue_flush_max_ms=%u service_caps=%u service_errors=%u "
+                     "queued_commands=%u reliable_queued=%u reliable_inflight=%u reliable_bytes=%u",
            peer->roundTripTime, peer->roundTripTimeVariance,
            peer->packetLoss * 100.0 / ENET_PEER_PACKET_LOSS_SCALE, peer->packetsSent, peer->packetsLost,
            peer->packetThrottle, ENET_PEER_PACKET_THROTTLE_SCALE, who,
@@ -1609,7 +1635,11 @@ void RttLine(ENetPeer* peer, char const* who, char* out, size_t size)
            alt.outgoingReliableSequenceNumber, alt.outgoingUnreliableSequenceNumber,
            poses.incomingReliableSequenceNumber, poses.incomingUnreliableSequenceNumber,
            alt.incomingReliableSequenceNumber, alt.incomingUnreliableSequenceNumber,
-           static_cast<unsigned>(peer->totalWaitingData));
+           static_cast<unsigned>(peer->totalWaitingData), steam::Ping(),
+           serviceGaps.Average(), serviceGaps.maximum, enqueueDelays.Average(), enqueueDelays.maximum, serviceCaps, serviceErrors,
+           static_cast<unsigned>(enet_list_size(&peer->outgoingCommands)),
+           static_cast<unsigned>(enet_list_size(&peer->outgoingSendReliableCommands)),
+           static_cast<unsigned>(enet_list_size(&peer->sentReliableCommands)), peer->reliableDataInTransit);
 }
 void RttLog()
 {
@@ -1617,7 +1647,7 @@ void RttLog()
     const enet_uint32 now = enet_time_get();
     if (now - lastRttLog < 5000) return;
     lastRttLog = now;
-    char line[384];
+    char line[900];
     if (isHost) {
         for (uint8_t i = 2; i < MaxPlayers; ++i)
             if (peers[i] && peers[i]->state == ENET_PEER_STATE_CONNECTED) { RttLine(peers[i], PeerName(i), line, sizeof(line)); Log(line); }
@@ -1625,22 +1655,26 @@ void RttLog()
         RttLine(server, "host", line, sizeof(line));
         Log(line);
     }
+    serviceGaps = {};
+    enqueueDelays = {};
 }
 
 void Tick(PlayerState const& local, bool haveLocal)
 {
     if (g3t::ai::ShuttingDown()) return;
     if (!host) return;
-    RttLog();
-    steam::Pump();  // Steam -> ENet before the service
+    const uint32_t now = enet_time_get();
+    if (lastServiceAt) serviceGaps.Add(now - lastServiceAt);
+    lastServiceAt = now;
     Service(local, haveLocal);
-    steam::Pump();  // what ENet sent in this frame goes out now, not a frame later
+    Flush();  // ACKs and non-state sends must also leave on a rate-limited/menu frame.
+    RttLog();
 }
 
 // QA: NETSTATS lines, one per connection, now; rttlogoff stops the 5-s lines.
 void Stats(void (*log)(char const*))
 {
-    char line[384];
+    char line[900];
     int n = 0;
     if (isHost) {
         for (uint8_t i = 2; i < MaxPlayers; ++i)

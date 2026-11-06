@@ -101,9 +101,46 @@ goes through Steam, relayed by Valve where needed.
   itself, and "Join game" in the Steam friends list works as well while their game is running.
 
 The main menu reports creating/hosting/searching/joined states, accepted and ready clients, linked Steam peers and
-measured Steam ping. `pending` means no ping sample exists yet; the host's displayed ping is the maximum linked-peer RTT.
+measured **transport RTT**. It is the most recent high-resolution Steam control echo, rounded to integer milliseconds,
+not NPC buffering or input-to-photon latency; the host shows the maximum fresh linked-peer sample.
+`pending` means no valid sample exists yet or none arrived for five seconds. Control echoes are sent once per second,
+but a still-outstanding echo is not overwritten; genuinely slow replies up to five seconds remain measurable.
+The transport worker services callbacks and forwards datagrams independently of rendering, with a 1 ms high-resolution
+waitable timer and an immediate wake after ENet flushes. This avoids Windows 11's ordinary timer-resolution relaxation
+for an occluded game. Older Windows versions without high-resolution timers explicitly log the legacy timed-wait path.
+This is a scheduling target, not a hard OS deadline. ENet and gameplay handlers
+stay on the engine thread, so loading/render stalls can still raise **ENet RTT** without raising transport RTT.
 Errors and compatibility refusals take priority. `g3together.log` appends startup/session, lobby, peer, send-failure and
 periodic connection diagnostics automatically. Review names and Steam IDs before sharing logs.
+
+`STEAMSTATUS ping=` is the displayed transport RTT; `ping_age_ms` is the sample's age. `poll_timer` identifies the
+high-resolution or legacy wait path. `poll_gap_avg_ms`,
+`poll_gap_max_ms` and `pump_work_max_ms` describe the worker's scheduling and work over the last reporting interval,
+not measured wire or per-packet queue time; relay intervals/ages also use QPC, reduced to integer milliseconds.
+`receive_caps`/`forward_caps` count exhausted bounded relay batches;
+`socket_failures`, `socket_error`, `receive_failures`, `send_failures` and `invalid_pongs` expose failures instead of
+silently attributing them to lag. A clean local link should normally have low-single-digit transport RTT, but an
+overloaded OS or a real Steam route can legitimately take longer.
+
+The separate `net: rtt=` line measures smoothed ENet ACK RTT, including both engine service loops.
+`transport_max_rtt_ms` repeats the menu's maximum fresh transport echo, not a per-peer native Steam statistic.
+`service_gap_avg_ms`/`service_gap_max_ms` expose those frame intervals; `service_caps` counts exhausted 512-event budgets,
+and `service_errors` counts ENet service failures (the first is also logged immediately).
+`enqueue_flush_avg_ms`/`enqueue_flush_max_ms` bound time from the first queued send to an explicit flush; ENet may have
+sent some commands sooner during service. All mod sends now flush by the end of the current mod frame, including frames
+that skip player-state transmission. ENet's `loss` is a smoothed reliable-timeout statistic (loading can inflate it);
+`lost` is the current accounting interval, not a lifetime total. `waiting_bytes` is receive/reassembly storage, not an
+outgoing queue. `queued_commands` counts pending best-effort/control commands; `reliable_queued` counts unsent reliable
+commands, `reliable_inflight` counts reliable commands awaiting ACKs, and `reliable_bytes` is ENet's in-flight reliable
+payload bytes. These are instantaneous queue snapshots, not interval maxima. None of these counters proves physical
+packet loss or pure one-way wire latency.
+
+Best-effort sends explicitly allow unreliable fragmentation at ENet's actual negotiated MTU/header budget. At MTU 1200,
+the fragment payload budget is 1172 bytes (1168 with an ENet checksum), not 1200. The unchanged 1199-byte two-record NPC
+application batch therefore uses two unreliable fragments rather than silently becoming reliable; small packets remain
+ordinary sequenced unreliable. Explicit reliable events and ENet's reliable sequence rollover retain their semantics.
+This removes an unintended ACK/retransmission dependency, not the large full-pose stream's bandwidth cost; bandwidth
+and recipient/rate reductions remain separate work.
 
 The current source uses **protocol 72**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
 in progress, so this source must not be treated as a verified release. Both players need the same build. Personal loot,
@@ -116,10 +153,21 @@ simulation to a client.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 A slow host cannot produce 60 distinct samples per second: `SYNCNPC` logs capture ticks, missed deadlines and elapsed
-capture time. Clients interpolate final bone poses, facial-rig state and eight motion slots on one buffered timeline, normally at least
-50 ms behind the host. They do not predict future NPC movement or resume NPC AI when packets stop. HP, stance and
+capture time. Clients interpolate final bone poses, facial-rig state and eight motion slots on one buffered timeline.
+NPC buffering starts at a **34 ms floor** (two 60 Hz intervals rounded up), then follows two measured capture intervals
+plus twice measured arrival jitter, capped at the existing 250 ms maximum. A full-interval underrun raises it by one
+measured interval at most once per 100 ms and prevents decay for the existing two-second recovery window; single missing
+60 Hz samples are covered without predicting future NPC movement. Buffer changes slew the existing monotonic timeline,
+not a position/animation jump. The predictive player-puppet policy remains at its existing 50 ms minimum/100 ms startup.
+Clients do not predict future NPC movement or resume NPC AI when packets stop. HP, stance and
 life transitions follow that same presentation timeline. Missing or stale presentation cannot authorize an incoming hit.
 Player-puppet smoothing remains separate.
+`SYNCLATENCY` reports desired buffer and actual `shown_lag` separately: slew/holds can make them differ.
+`jitter_avg_ms`/`jitter_max_ms` expose the arrival/capture-interval variation driving adaptation.
+`shown_lag` and `transit_excess` use the track's minimum arrival-minus-send clock-offset estimate, **not synchronized
+one-way timing**; `arrival_age` is time since the newest local receive. `underruns` counts buffer recovery events in the
+currently tracked NPCs; age/lag maxima can include a deliberately held terminal pose. Do not add these estimates to an
+RTT as if all components were disjoint.
 The host also sends each NPC's attitude to the player, so name-tag colours (green, white, orange, red) match on both PCs. While
 you talk to an NPC on the client, that one NPC's script routine runs locally so its voiced lines play; the host still holds
 and animates it. Both are built for manual testing and not yet verified live.

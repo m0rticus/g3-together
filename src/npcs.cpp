@@ -3719,14 +3719,39 @@ void SyncReport(LogFn log)
            localContactWindows, localContactMissing, localContactTests, localContactOverlaps, localContactWalls, localBlowsJudged);
     log(line);
     unsigned tracked = 0, delaySum = 0, delayMax = 0;
+    unsigned arrivalAgeMax = 0, transitExcessMax = 0, shownLagMax = 0, shownTracks = 0, underruns = 0;
+    uint64_t shownLagSum = 0;
+    double jitterSum = 0.0, jitterMax = 0.0;
+    const uint32_t now = net::Now();
     for (auto const& entry : mirrors) {
-        if (!entry.second.body.track.count) continue;
-        const unsigned d = static_cast<unsigned>(body::PlaybackDelay(entry.second.body.track));
+        auto const& track = entry.second.body.track;
+        if (!track.count) continue;
+        const unsigned d = static_cast<unsigned>(body::PlaybackDelay(track));
         ++tracked, delaySum += d, delayMax = std::max(delayMax, d);
+        jitterSum += track.jitterMs;
+        jitterMax = std::max(jitterMax, static_cast<double>(track.jitterMs));
+        arrivalAgeMax = std::max(arrivalAgeMax, now - track.lastArrived);
+        const int32_t excess = static_cast<int32_t>(track.lastArrived - track.snaps[track.count - 1].sent -
+                                                  static_cast<uint32_t>(track.offset));
+        transitExcessMax = std::max(transitExcessMax, static_cast<unsigned>(std::max(excess, 0)));
+        if (entry.second.havePresentation) {
+            const int32_t lag = static_cast<int32_t>(now - static_cast<uint32_t>(track.offset) - entry.second.shownSent);
+            const unsigned shownLag = static_cast<unsigned>(std::max(lag, 0));
+            shownLagSum += shownLag;
+            shownLagMax = std::max(shownLagMax, shownLag);
+            ++shownTracks;
+        }
+        underruns += track.underruns;
     }
     Format(line, "SYNCFRAMES frames=%u avg_ms=%.1f over33=%u over66=%u max_ms=%u tracked=%u delay_avg=%u delay_max=%u local_blows=%u out_of_reach=%u",
            frameCount, frameCount ? static_cast<float>(frameSumMs) / frameCount : 0.0f, slowFrames, hitchFrames, maxFrameMs, tracked,
            tracked ? delaySum / tracked : 0u, delayMax, localBlowsJudged, localBlowsOutOfReach);
+    log(line);
+    Format(line, "SYNCLATENCY tracked=%u shown=%u buffer_avg_ms=%u buffer_max_ms=%u shown_lag_avg_ms=%u shown_lag_max_ms=%u "
+                 "arrival_age_max_ms=%u transit_excess_max_ms=%u jitter_avg_ms=%.1f jitter_max_ms=%.1f underruns=%u",
+           tracked, shownTracks, tracked ? delaySum / tracked : 0u, delayMax,
+           shownTracks ? static_cast<unsigned>(shownLagSum / shownTracks) : 0u, shownLagMax,
+           arrivalAgeMax, transitExcessMax, tracked ? jitterSum / tracked : 0.0, jitterMax, underruns);
     log(line);
     Format(line, "SYNCRAGDOLL hooked=%d forces_sent=%u forces_received=%u forces_applied=%u forces_late=%u ragdolls_started=%u not_ready=%u gravity_deaths=%u",
            originalAddForce ? 1 : 0, ragdollForcesSent, ragdollForcesReceived, ragdollForcesApplied, ragdollForcesLate,

@@ -8,6 +8,8 @@ namespace g3t::body {
 constexpr int SnapshotCount = 32;
 constexpr int32_t BufferDelay = 100;
 constexpr int32_t MaxAhead = 100;
+constexpr int32_t NpcBufferFloor = 34;  // two 60 Hz intervals rounded up; no NPC extrapolation
+constexpr int32_t PlayerBufferFloor = 50;  // preserve the existing predictive puppet policy
 
 struct MotionState
 {
@@ -47,6 +49,7 @@ struct Track
     int32_t windowMin = 0, lastWindowMin = 0;
     uint32_t windowAt = 0;
     uint8_t lastCase = 0;
+    unsigned underruns = 0;
     uint32_t serial = 1;
     uint32_t renderSent = 0, renderNow = 0;
     int32_t renderShift = -BufferDelay;
