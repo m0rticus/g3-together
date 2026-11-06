@@ -106,6 +106,7 @@ void Take(eCEntity* npc, eCEntity* arena)
 
 GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* arena = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     ++sent;

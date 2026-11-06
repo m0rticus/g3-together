@@ -17,14 +17,14 @@ struct MotionState
     uint8_t flags = 0;
     int32_t hitPoints = 0;
     int32_t hitPointsMax = 1;
-    uint32_t incarnation = 1, hitSequence = 0;
+    uint32_t incarnation = 1;
+    uint16_t hitSequence = 0;
     uint8_t hitPlayer = 0, partyPlayer = 0;
     uint8_t partyType = 0, waiting = 0, guidePlayer = 0;
     uint8_t aiMode = 0;
     uint8_t action = 0, attackReason = 0, damageType = 0;
     int32_t damageAmount = 0;
     float damageMultiplier = 0.0f;
-    uint8_t presentationReady = 0;
     uint8_t contact = 0;
     uint8_t attitude = 0;
     net::NpcMotion motions[net::NpcMotionSlots];

@@ -16,6 +16,7 @@
 #include "world.h"
 #include "npcplayback.h"
 #include "replication.h"
+#include "ragdoll_force.h"
 #include "contact.h"
 #include "guards.h"
 
@@ -174,6 +175,7 @@ struct Mirror
     body::State body;
     npcplayback::State replay;
     bool replayReady = false;
+    uint32_t shownCombatTarget = 0;
     uint32_t contactInstance = 0, contactAt = 0;
     bool contactConsumed = false;
     int contactBone = -1;
@@ -225,22 +227,91 @@ struct Mirror
     unsigned deathClearCount = 0, deathCombatStopCount = 0;
     bool deathLogged = false;
     char killerAttribution[32] = "host_or_npc_unknown";
-    char presentationSource[16] = "facing_fallback";
-    bool hostForceApplied = false, fallbackApplied = false;
+    char presentationSource[16] = "gravity";
+    ragdoll::DeathImpulse deathImpulse;
+    uint32_t ragdollTraceAt = 0, ragdollTraceSampleAt = 0;
+    unsigned ragdollTraceStage = 0;
+    float ragdollTracePosition[3] = {};
     bool localHitValid = false;
     uint32_t localHitAt = 0;
-    float localHitDir[3] = {};
     uint32_t fallbackGraceUntil = 0;
     uint32_t focusWatchUntil = 0;
     bool focusWatchLogged = false;
+    eCEntity* watchedFocus = nullptr;
+    unsigned focusWatchChanges = 0;
 };
 
-unsigned ClearLocalReferencesToDeadMirror(eCEntity* dead, unsigned* combatStops = nullptr)
+eCEntity* AutoAimTarget(eCVisualAnimation_PS* animation)
+{
+    if (!animation) return nullptr;
+    // The SDK exposes the switch, but not its separate target. Verify the exported setter before reading it.
+    static const bool supported = [] {
+        auto* engine = GetModuleHandleA("Engine.dll");
+        auto* code = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+            "?EnableAutoAiming@eCVisualAnimation_PS@@QAEX_NPAVeCEntity@@AAVbCString@@@Z")) : nullptr;
+        static unsigned char const expected[] = {
+            0x8b, 0x44, 0x24, 0x08, 0x8a, 0x54, 0x24, 0x04, 0x89, 0x81, 0x7c, 0x01, 0x00, 0x00,
+            0x8b, 0x44, 0x24, 0x0c, 0x88, 0x91, 0x7b, 0x01, 0x00, 0x00
+        };
+        if (code && !std::memcmp(code, expected, sizeof(expected))) return true;
+        Log("npcs: unsupported native auto-aim target layout; exact-target release unavailable");
+        return false;
+    }();
+    eCEntity* target = nullptr;
+    if (supported) std::memcpy(&target, reinterpret_cast<unsigned char const*>(animation) + 0x17c, sizeof(target));
+    return target;
+}
+
+void LogDeathFocus(eCEntity* dead, eCEntity* body, char const* phase, uint32_t elapsed, bool removed = false)
+{
+    if (!body) return;
+    Entity local(body);
+    auto* focus = static_cast<gCFocus_PS*>(body->GetPropertySet(eEPropertySetType_Focus));
+    auto* routine = static_cast<gCScriptRoutine_PS*>(body->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    auto* animation = static_cast<eCVisualAnimation_PS*>(body->GetPropertySet(eEPropertySetType_Animation));
+    const bool npc = body->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    Entity selected = focus ? local.Focus.GetFocusEntity() : Entity();
+    Entity target = npc ? local.NPC.GetCurrentTarget() : Entity();
+    Entity alignment = body->GetPropertySet(eEPropertySetType_CharacterMovement) ? local.GetAlignmentTarget() : Entity();
+    const bCString task = routine ? local.Routine.GetCurrentTask() : bCString("-");
+    const bCString state = routine ? local.Routine.GetCurrentState() : bCString("-");
+    const int priority = selected.GetInstance()
+        ? GetScriptAdminExt().CallScript(bCString("GetFocusEntityPriority"), selected.GetInstance(), nullptr, 0) : 0;
+    const bool focusDead = selected.GetInstance() &&
+        selected.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine) && selected.IsDead();
+    Logf("npcs: DEATHFOCUS dead=%.64s instance=%p phase=%s elapsed_ms=%u body=%p hero_dead=%d task=%.48s state=%.48s action=%d ani=%d combat_state=%lu mode=%d locked=%d focus=%.64s focus_ptr=%p focus_dead=%d script_priority=%d target=%.64s target_ptr=%p alignment=%.64s alignment_ptr=%p autoaim=%d autoaim_target=%p",
+         removed ? "(removed)" : dead->GetName().GetText(), dead, phase, elapsed, body,
+         routine && local.IsDead() ? 1 : 0, task.GetText(), state.GetText(),
+         routine ? static_cast<int>(local.Routine.Action) : -1,
+         routine ? static_cast<int>(local.Routine.AniState) : -1,
+         npc ? static_cast<unsigned long>(local.NPC.CombatState) : 0,
+         focus ? static_cast<int>(focus->GetCurrentMode().GetValue()) : -1, focus && focus->GetFocusLocked() ? 1 : 0,
+         selected.GetInstance() ? selected.GetName().GetText() : "-", selected.GetInstance(),
+         focusDead ? 1 : 0, priority,
+         target.GetInstance() ? target.GetName().GetText() : "-", target.GetInstance(),
+         alignment.GetInstance() ? alignment.GetName().GetText() : "-", alignment.GetInstance(),
+         animation && animation->IsAutoAimingEnabled() ? 1 : 0, AutoAimTarget(animation));
+}
+
+unsigned ClearLocalReferencesToDeadMirror(eCEntity* dead, unsigned* combatStops = nullptr,
+                                         bool first = true, bool removed = false)
 {
     if (!dead) return 0;
     if (net::IsHost()) return 0;
 
-    unsigned cleared = 0, stopped = 0;
+    unsigned cleared = 0;
+    if (combatStops) *combatStops = 0;
+    const bool wasDead = !removed && Entity(dead).IsDead();
+    if (!removed) {
+        // FindFocusEntity and GetFocusEntityPriority test AIMode, not HP. Publish death before asking either.
+        if (auto* routine = static_cast<gCScriptRoutine_PS*>(dead->GetPropertySet(eEPropertySetType_ScriptRoutine)))
+            routine->AccessAIMode().AccessValue() = gEAIMode_Dead;
+        auto* receiver = static_cast<gCDamageReceiver_PS*>(dead->GetPropertySet(eEPropertySetType_DamageReceiver));
+        if (receiver) receiver->AccessHitPoints() = 0;
+        if (first) Logf("npcs: CLIENTDEATHSTATE name=%.64s instance=%p native_dead_before=%d native_dead_after=%d hp=%ld",
+                        dead->GetName().GetText(), dead, wasDead ? 1 : 0, Entity(dead).IsDead() ? 1 : 0,
+                        receiver ? receiver->GetHitPoints() : -1L);
+    }
     eCEntity* bodies[2] = {
         gCSession::GetInstance().GetHero(),
         remote::ControlledBody()
@@ -250,62 +321,65 @@ unsigned ClearLocalReferencesToDeadMirror(eCEntity* dead, unsigned* combatStops 
         if (!body) continue;
         if (i > 0 && bodies[0] == body) continue;
 
-        unsigned bodyCleared = 0;
-        bool combatBound = false;
         Entity local(body);
-        if (body->GetPropertySet(eEPropertySetType_Focus) &&
-            local.Focus.GetFocusEntity().GetInstance() == dead) {
-            local.Focus.SetFocusEntity(Entity());
-            ++cleared;
-            ++bodyCleared;
-            combatBound = true;
-        }
-        if (body->GetPropertySet(eEPropertySetType_NPC)) {
-            if (local.NPC.GetCurrentTarget().GetInstance() == dead) {
+        auto* focus = static_cast<gCFocus_PS*>(body->GetPropertySet(eEPropertySetType_Focus));
+        auto* animation = static_cast<eCVisualAnimation_PS*>(body->GetPropertySet(eEPropertySetType_Animation));
+        const bool focused = focus && local.Focus.GetFocusEntity().GetInstance() == dead;
+        const bool npc = body->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+        const bool aligned = body->GetPropertySet(eEPropertySetType_CharacterMovement) &&
+                             local.GetAlignmentTarget().GetInstance() == dead;
+        const bool aimed = AutoAimTarget(animation) == dead;
+        if (!first && !focused && !aligned && !aimed &&
+            (!npc || (local.NPC.GetCurrentTarget().GetInstance() != dead &&
+                      local.NPC.GetAlternativeTarget().GetInstance() != dead &&
+                      local.NPC.GetCurrentAttacker().GetInstance() != dead &&
+                      local.NPC.GetLastAttacker().GetInstance() != dead &&
+                      local.NPC.GetSpellTarget().GetInstance() != dead))) continue;
+        const int priority = !removed
+            ? GetScriptAdminExt().CallScript(bCString("GetFocusEntityPriority"), dead, nullptr, 0) : -1;
+        // A corpse can legitimately be the loot/spell target. Only repair later rebindings when vanilla rejects it.
+        const bool release = removed || (first && !wasDead) || priority < 0;
+        if (first) LogDeathFocus(dead, body, "before", 0, removed);
+        if (npc) {
+            if (release && local.NPC.GetCurrentTarget().GetInstance() == dead) {
                 local.NPC.SetCurrentTarget(Entity());
                 ++cleared;
-                ++bodyCleared;
-                combatBound = true;
             }
-            if (local.NPC.GetAlternativeTarget().GetInstance() == dead) {
+            if (release && local.NPC.GetAlternativeTarget().GetInstance() == dead) {
                 local.NPC.SetAlternativeTarget(Entity());
                 ++cleared;
-                ++bodyCleared;
-                combatBound = true;
             }
             if (local.NPC.GetCurrentAttacker().GetInstance() == dead) {
                 local.NPC.SetCurrentAttacker(Entity());
                 ++cleared;
-                ++bodyCleared;
             }
             if (local.NPC.GetLastAttacker().GetInstance() == dead) {
                 local.NPC.SetLastAttacker(Entity());
                 ++cleared;
-                ++bodyCleared;
             }
-            if (local.NPC.GetSpellTarget().GetInstance() == dead) {
+            if (release && local.NPC.GetSpellTarget().GetInstance() == dead) {
                 local.NPC.SetSpellTarget(Entity());
                 ++cleared;
-                ++bodyCleared;
-                combatBound = true;
             }
         }
-        if (body->GetPropertySet(eEPropertySetType_CharacterMovement) &&
-            local.GetAlignmentTarget().GetInstance() == dead) {
+        if (release && aligned) {
             local.SetAlignmentTarget(Entity());
             ++cleared;
-            ++bodyCleared;
-            combatBound = true;
         }
-        if (bodyCleared && combatBound) {
-            auto* routine = static_cast<gCScriptRoutine_PS*>(body->GetPropertySet(eEPropertySetType_ScriptRoutine));
-            if (routine) {
-                routine->AIStopCombatMove();
-                ++stopped;
-            }
+        if (release && aimed) {
+            local.EnableAutoAiming(GEFalse, Entity(), bCString());
+            ++cleared;
         }
+        if (focused && (first || release || focus->GetFocusLocked())) {
+            focus->SetFocusLocked(GEFalse);
+            focus->SetFocusEntity(nullptr);
+            // Use the native cone/LOS/priority selector, including corpse looting. Do not assign a combat target.
+            focus->FindFocusEntity(GEFalse);
+            ++cleared;
+        }
+        // The hero's attack/recovery must finish normally; cancelling its instruction is not a target release.
+        if (first) LogDeathFocus(dead, body, "selected", 0, removed);
     }
-    if (combatStops) *combatStops = stopped;
     return cleared;
 }
 
@@ -431,15 +505,6 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         const auto absent = absences.find(key);
         if (absent != absences.end() &&
             static_cast<int32_t>(records[i].incarnation - absent->second.incarnation) <= 0) continue;
-        if (records[i].absent) {
-            absences[key] = records[i];
-            mirrors.erase(key);
-            corpses.erase(key);
-            pendingForces.erase(key);
-            absenceCheckAt = 0;
-            records[accepted++] = records[i];
-            continue;
-        }
         if (absent != absences.end()) {
             absences.erase(absent);
             world::RequestProcessingUpdate();
@@ -510,10 +575,11 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
                 m.deathReferencesCleared = nullptr;
                 m.deathClearCount = m.deathCombatStopCount = 0;
                 m.deathLogged = false;
-                m.hostForceApplied = m.fallbackApplied = m.localHitValid = false;
+                m.deathImpulse = {};
+                m.ragdollTraceAt = m.ragdollTraceSampleAt = m.ragdollTraceStage = 0;
+                m.localHitValid = false;
                 m.localHitAt = m.fallbackGraceUntil = 0;
-                m.localHitDir[0] = m.localHitDir[1] = m.localHitDir[2] = 0.0f;
-                std::strcpy(m.presentationSource, "facing_fallback");
+                std::strcpy(m.presentationSource, "gravity");
                 std::strcpy(m.killerAttribution, "host_or_npc_unknown");
                 m.focusWatchUntil = 0;
                 m.focusWatchLogged = false;
@@ -569,7 +635,6 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         motion.damageType = records[i].damageType;
         motion.damageAmount = records[i].damageAmount;
         motion.damageMultiplier = records[i].damageMultiplier;
-        motion.presentationReady = records[i].presentationReady;
         motion.contact = records[i].contact;
         motion.attitude = records[i].attitude;
         std::memcpy(motion.motions, records[i].motions, sizeof(motion.motions));
@@ -719,6 +784,16 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         r.hitPointsMax = self.DamageReceiver.HitPointsMax;
         r.aniState = static_cast<uint8_t>(static_cast<int>(self.Routine.AniState));
         r.attitude = static_cast<uint8_t>(static_cast<int>(static_cast<gEAttitude>(self.NPC.AttitudeToPlayer2)));
+        eCEntity* combatTarget = self.NPC.GetCurrentTarget().GetInstance();
+        if (combatTarget && !remote::IsPuppet(combatTarget) && combatTarget != remote::ControlledBody() &&
+            combatTarget != gCSession::GetInstance().GetHero())
+        {
+            uint8_t targetGuid[16];
+            guid::CopyEntity(combatTarget, targetGuid);
+            r.combatTarget = net::HashGuid(targetGuid);
+        } else {
+            r.combatTarget = 0;
+        }
         r.aiMode = static_cast<uint8_t>(body::AIModeOf(instance));
         r.action = static_cast<uint8_t>(static_cast<gEAction>(self.Routine.Action));
         r.attackReason = static_cast<uint8_t>(static_cast<gEAttackReason>(self.NPC.AttackReason));
@@ -735,7 +810,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         r.incarnation = incarnation;
         if (auto hit = hostHits.find(Key(guid)); hit != hostHits.end()) {
             r.hitPlayer = hit->second.player;
-            r.hitSequence = hit->second.sequence;
+            r.hitSequence = static_cast<uint16_t>(hit->second.sequence);
         }
         const bool parrying = r.aniState == gEAniState_Parade && combat::InParadeMode(instance);
         if (parrying) r.flags |= 64;
@@ -762,13 +837,13 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             [](uint32_t hash, char const* name) {
                 if (namesSent.insert(hash).second) net::SendMotionName(hash, name);
             });
-        r.presentationReady = (r.flags & 128) ? static_cast<uint8_t>(motionReady) : static_cast<uint8_t>(posed);
-        r.contact = motionReady && r.presentationReady && r.motions[0].weight > 0.0001f && body::LocallyAttacking(instance) ? 1 : 0;
+        r.contact = motionReady && (r.flags & 128 ? motionReady : posed) &&
+                    r.motions[0].weight > 0.0001f && body::LocallyAttacking(instance) ? 1 : 0;
         bool essential = false;
         {
             LastSent& last = lastSent[Key(guid)];
             const uint32_t t = net::Now();
-            if (!r.presentationReady && !(r.flags & 1) && (!last.at || last.record.presentationReady))
+            if (!(posed || motionReady) && !(r.flags & 1) && (!last.at))
                 Logf("npcs: %s is waiting for its native skeletal pose; contacts remain disabled", self.GetName().GetText());
             const bool terminalChanged = (r.flags & 3) &&
                                          (!last.at || (r.flags & 3) != (last.record.flags & 3));
@@ -907,8 +982,6 @@ void HostTick()
         knownJoins = net::JoinCount();
         namesSent.clear();
         for (auto const& entry : forceHistory) for (auto const& force : entry.second) net::SendRagdoll(force);
-        for (auto const& entry : lastSent)
-            if (entry.second.record.absent) net::SendNpcs(&entry.second.record, 1, true);
     }
     // Players in this world: the host's hero and every remote player here.
     float players[net::MaxPlayers][3];
@@ -1128,22 +1201,24 @@ void LateCheck(Mirror& m, uint32_t now, char const* kind)
          localPhysics ? "local ragdoll active" : lies ? "lies" : "STANDS", shows, slots);
 }
 
-// Ragdoll deaths. The game's death script for them (ZS_RagDollDead in Script_Game.dll) pushes the body with
-// PSAnimation::AddForceAtPos: from where its last inflictor stood, harder for a power attack. A mirror never ran that script (it must
-// not: it runs the death's bookkeeping), so it fell where it stood. The owner now tells the others what it applied (the script DLL's
-// import of that call is hooked) and each mirror applies the same to its own ragdoll.
-struct Vec3 { float x, y, z; };
-using AddForceFn = void(__fastcall*)(void* self, void* edx, Vec3 at, Vec3 force);
+// Script.dll+0x22b0 forwards AddForceAtPos(force, worldPosition), in that order, to Engine+0x31c40.
+// Mirrors replay the host's push without running its death script or kill/XP bookkeeping.
+using Vec3 = ragdoll::Vector;
+using AddForceFn = void(__fastcall*)(void* self, void* edx, Vec3 force, Vec3 at);
 AddForceFn originalAddForce = nullptr;
 unsigned ragdollForcesSent = 0, ragdollForcesReceived = 0, ragdollForcesApplied = 0, ragdollForcesLate = 0;
-unsigned ragdollFallbacksApplied = 0;
+unsigned ragdollGravityDeaths = 0;
 
-void __fastcall HookAddForce(void* self, void* edx, Vec3 at, Vec3 force)
+void __fastcall HookAddForce(void* self, void* edx, Vec3 force, Vec3 at)
 {
+    if (ai::ShuttingDown()) {
+        if (originalAddForce) originalAddForce(self, edx, at, force);
+        return;
+    }
     auto* set = self ? *static_cast<eCEntityPropertySet**>(self) : nullptr;  // PSAnimation starts with its engine property set
     eCEntity* entity = set ? set->GetEntity() : nullptr;
     if (npcplayback::IsPassive(entity)) return;
-    originalAddForce(self, edx, at, force);
+    originalAddForce(self, edx, force, at);
     if (!net::IsHost()) return;
     if (!entity || !net::Connected() || !entity->GetPropertySet(eEPropertySetType_NPC)) return;
     if (entity == gCSession::GetInstance().GetHero() || remote::IsPuppet(entity)) return;
@@ -1159,7 +1234,8 @@ void __fastcall HookAddForce(void* self, void* edx, Vec3 at, Vec3 force)
     note.incarnation = Incarnation(guid);
     note.sent = net::Now();
     const bCVector& position = entity->GetWorldPosition();
-    note.at[0] = at.x - position.GetX(), note.at[1] = at.y - position.GetY(), note.at[2] = at.z - position.GetZ();
+    const Vec3 relative = ragdoll::RelativePoint(at, {position.GetX(), position.GetY(), position.GetZ()});
+    note.at[0] = relative.x, note.at[1] = relative.y, note.at[2] = relative.z;
     note.force[0] = force.x, note.force[1] = force.y, note.force[2] = force.z;
     auto& history = forceHistory[Key(guid)];
     if (history.size() == 64) {
@@ -1209,7 +1285,18 @@ bool HostForceAvailable(Mirror const& m)
 bool TryApplyForce(Mirror& m, uint32_t now)
 {
     auto* animation = static_cast<eCVisualAnimation_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
-    if (!animation || !animation->GetRagDollEnabled()) return false;
+    if (!m.killed || !m.ragdollInitialized || !animation) return false;
+    const bool active = animation->GetRagDollEnabled() && animation->GetRagDollController();
+    char identity[40];
+    guid::Format(m.latest.guid, identity, sizeof(identity));
+    if (!active && m.deathImpulse.Pending()) {
+        m.deathImpulse.Choose(ragdoll::Source::Gravity);
+        ++ragdollGravityDeaths;
+        std::strcpy(m.presentationSource, "gravity");
+        Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u source=gravity applied=0 magnitude=0 reason=physics_stopped",
+             m.entity.GetName().GetText(), identity, m.latest.incarnation);
+    }
+    if (!active) return false;
 
     const bCVector& position = m.entity.GetInstance()->GetWorldPosition();
     bool applied = false;
@@ -1219,13 +1306,25 @@ bool TryApplyForce(Mirror& m, uint32_t now)
             if (it->incarnation < m.latest.incarnation) { it = pending->second.erase(it); ++ragdollForcesLate; continue; }
             if (it->incarnation != m.latest.incarnation) { ++it; continue; }
             if (static_cast<int32_t>(m.shownSent - it->sent) < 0) { ++it; continue; }
-            if (m.fallbackApplied) { it = pending->second.erase(it); ++ragdollForcesLate; continue; }
-            animation->AddForceAtPos(
-                bCVector(position.GetX() + it->at[0], position.GetY() + it->at[1], position.GetZ() + it->at[2]),
-                bCVector(it->force[0], it->force[1], it->force[2]));
+            if (!m.deathImpulse.Pending()) { it = pending->second.erase(it); ++ragdollForcesLate; continue; }
+            const Vec3 raw{it->force[0], it->force[1], it->force[2]};
+            const Vec3 offset{it->at[0], it->at[1], it->at[2]};
+            Vec3 force{};
+            const Vec3 at = ragdoll::WorldPoint(offset, {position.GetX(), position.GetY(), position.GetZ()});
+            if (!ragdoll::LimitForce(raw, force) || !ragdoll::Finite(offset) || !ragdoll::Finite(at)) {
+                Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=refuse_force incarnation=%u sequence=%u reason=nonfinite",
+                     m.entity.GetName().GetText(), identity, it->incarnation, it->sequence);
+                it = pending->second.erase(it);
+                ++ragdollForcesLate;
+                continue;
+            }
+            if (!m.deathImpulse.Choose(ragdoll::Source::Host)) { ++it; continue; }
+            animation->AddForceAtPos(bCVector(force.x, force.y, force.z), bCVector(at.x, at.y, at.z));
+            Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u sequence=%u source=host_force applied=%u raw_magnitude=%.1f magnitude=%.1f force=%.1f/%.1f/%.1f at_relative=%.1f/%.1f/%.1f",
+                 m.entity.GetName().GetText(), identity, it->incarnation, it->sequence, m.deathImpulse.applied,
+                 ragdoll::Magnitude(raw), ragdoll::Magnitude(force), force.x, force.y, force.z, offset.x, offset.y, offset.z);
             it = pending->second.erase(it);
             ++ragdollForcesApplied;
-            m.hostForceApplied = true;
             std::strcpy(m.presentationSource, "host_force");
             applied = true;
         }
@@ -1233,53 +1332,76 @@ bool TryApplyForce(Mirror& m, uint32_t now)
     }
     if (applied) return true;
 
-    if (m.fallbackApplied || !m.killed) return false;
+    if (!m.deathImpulse.Pending()) return false;
     if (!m.fallbackGraceUntil) m.fallbackGraceUntil = now ? now + 500 : 501;
-    if (HostForceAvailable(m) || static_cast<int32_t>(now - m.fallbackGraceUntil) < 0) return false;
+    if (HostForceQueued(m) || static_cast<int32_t>(now - m.fallbackGraceUntil) < 0) return false;
 
-    float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-    if (m.localHitValid && now - m.localHitAt <= 5000) {
-        dx = m.localHitDir[0];
-        dy = m.localHitDir[1];
-        dz = m.localHitDir[2];
-        std::strcpy(m.presentationSource, "local_blown");
-    } else {
-        const bCVector forward = m.entity.GetInstance()->GetAtVector();
-        dx = forward.GetX();
-        dy = 0.05f;
-        dz = forward.GetZ();
-        std::strcpy(m.presentationSource, "facing_fallback");
+    // ZS_RagDollDead skips AddForceAtPos when no inflictor/attacker exists. Gravity still drives the ragdoll.
+    // A predicted flinch supplies neither the native weapon force nor its application point.
+    if (m.deathImpulse.Choose(ragdoll::Source::Gravity)) {
+        ++ragdollGravityDeaths;
+        std::strcpy(m.presentationSource, "gravity");
+        Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u source=gravity applied=0 magnitude=0",
+             m.entity.GetName().GetText(), identity, m.latest.incarnation);
     }
-    float length = std::sqrt(dx * dx + dy * dy + dz * dz);
-    if (!(length > 0.001f) || !std::isfinite(length)) {
-        dx = 0.0f;
-        dy = 0.05f;
-        dz = 1.0f;
-        length = std::sqrt(dx * dx + dy * dy + dz * dz);
-    }
-    dx /= length;
-    dy /= length;
-    dz /= length;
-    constexpr float FallbackForce = 1200.0f;
-    float torso = body::BoundaryHeight(m.entity.GetInstance());
-    if (!std::isfinite(torso)) torso = 100.0f;
-    torso = std::max(60.0f, std::min(160.0f, torso));
-    animation->AddForceAtPos(
-        bCVector(position.GetX(), position.GetY() + torso, position.GetZ()),
-        bCVector(dx * FallbackForce, dy * FallbackForce, dz * FallbackForce));
-    m.fallbackApplied = true;
-    ++ragdollFallbacksApplied;
-    return true;
+    return false;
 }
 
 bool HasPendingCorpseForce(Mirror const& m)
 {
-    return HostForceAvailable(m);
+    return m.deathImpulse.Pending() && HostForceAvailable(m);
 }
 
-void CaptureCorpsePose(Mirror& m, uint32_t now)
+char const* RagdollSource(Mirror const& m)
 {
-    if (!m.corpsePose.empty() && now - m.corpsePoseAt < 100) return;
+    return m.deathImpulse.HostApplied() || (m.deathImpulse.Pending() && HostForceQueued(m)) ? "host_force" : "gravity";
+}
+
+void TraceCorpse(Mirror& m, uint32_t now)
+{
+    if (!m.ragdollInitialized || m.ragdollTraceStage >= 3) return;
+    if (m.ragdollTraceStage &&
+        now - m.ragdollTraceAt < (m.ragdollTraceStage == 1 ? 250u : 1000u)) return;
+    auto* entity = m.entity.GetInstance();
+    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+    char identity[40];
+    guid::Format(m.latest.guid, identity, sizeof(identity));
+    const bCVector& root = entity->GetWorldPosition();
+    const bCVector velocity = entity->GetLinearVelocity();
+    Vec3 center{};
+    unsigned bones = 0;
+    bCMatrix bone;
+    for (int i = 0; animation && i < 128 && animation->GetBoneMatrix(i, bone); ++i) {
+        const bCVector& at = bone.GetTranslation();
+        center.x += at.GetX();
+        center.y += at.GetY();
+        center.z += at.GetZ();
+        ++bones;
+    }
+    if (bones) { center.x /= bones; center.y /= bones; center.z /= bones; }
+    else center = {root.GetX(), root.GetY(), root.GetZ()};
+    const uint32_t dt = m.ragdollTraceStage ? now - m.ragdollTraceSampleAt : 0;
+    const float scale = dt ? 1000.0f / dt : 0.0f;
+    const Vec3 boneVelocity{(center.x - m.ragdollTracePosition[0]) * scale,
+                           (center.y - m.ragdollTracePosition[1]) * scale,
+                           (center.z - m.ragdollTracePosition[2]) * scale};
+    if (!m.ragdollTraceStage) m.ragdollTraceAt = now;
+    Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=sample incarnation=%u stage=%u elapsed_ms=%u source=%s applied=%u physics=%d root=%.1f/%.1f/%.1f velocity=%.1f/%.1f/%.1f bone_center=%.1f/%.1f/%.1f bone_velocity=%.1f/%.1f/%.1f sample_ms=%u",
+         m.entity.GetName().GetText(), identity, m.latest.incarnation, m.ragdollTraceStage, now - m.ragdollTraceAt,
+         m.deathImpulse.Pending() ? "pending" : RagdollSource(m), m.deathImpulse.applied,
+         animation && animation->GetRagDollController() ? 1 : 0, root.GetX(), root.GetY(), root.GetZ(),
+         velocity.GetX(), velocity.GetY(), velocity.GetZ(), center.x, center.y, center.z,
+         boneVelocity.x, boneVelocity.y, boneVelocity.z, dt);
+    m.ragdollTraceSampleAt = now;
+    m.ragdollTracePosition[0] = center.x;
+    m.ragdollTracePosition[1] = center.y;
+    m.ragdollTracePosition[2] = center.z;
+    ++m.ragdollTraceStage;
+}
+
+void CaptureCorpsePose(Mirror& m, uint32_t now, bool final = false)
+{
+    if (!final && !m.corpsePose.empty() && now - m.corpsePoseAt < 100) return;
     auto* entity = m.entity.GetInstance();
     auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
     auto* actor = animation ? animation->GetActor() : nullptr;
@@ -1321,22 +1443,23 @@ void UpdateCorpsePresentation(Mirror& m, uint32_t now)
             npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
         return;
     }
-    if (animation->GetRagDollEnabled()) {
+    if (animation->GetRagDollEnabled() && animation->GetRagDollController()) {
         npcplayback::UpdatePresentation(entity);
-        const bool active = animation->GetRagDollEnabled() != GEFalse;
-        if (active) CaptureCorpsePose(m, now);
+        const bool active = animation->GetRagDollEnabled() && animation->GetRagDollController();
+        CaptureCorpsePose(m, now, !active);
         m.corpseSimulating = active;
     } else if (m.ragdollInitialized) {
         m.corpseSimulating = false;
-        if (!m.corpsePose.empty() &&
-            npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags)) return;
-        if (!(m.lieNoted & 16)) {
+        const bool restored = !m.corpsePose.empty() &&
+            npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
+        if (!restored && !(m.lieNoted & 16)) {
             m.lieNoted |= 16;
             Logf("npcs: settled corpse %s awaits its cached render pose; death is not restarted", entity->GetName().GetText());
         }
     } else {
         npcplayback::UpdatePresentation(entity);
     }
+    TraceCorpse(m, now);
 }
 
 void OnRagdollNote(net::RagdollNote const& note)
@@ -1348,6 +1471,11 @@ void OnRagdollNote(net::RagdollNote const& note)
     }
     const auto current = mirrors.find(Key(note.guid));
     if (current != mirrors.end() && static_cast<int32_t>(note.incarnation - current->second.latest.incarnation) < 0) {
+        ++ragdollForcesLate;
+        return;
+    }
+    if (current != mirrors.end() && note.incarnation == current->second.latest.incarnation &&
+        !current->second.deathImpulse.Pending()) {
         ++ragdollForcesLate;
         return;
     }
@@ -1372,14 +1500,15 @@ void OnHitResult(net::HitResult const& result)
     const auto found = mirrors.find(Key(result.guid));
     if (found == mirrors.end()) return;
     Mirror& m = found->second;
-    if (result.incarnation != m.latest.incarnation || result.sequence != m.replay.pendingHit) return;
+    if (result.incarnation != m.latest.incarnation ||
+        static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
     if (!result.accepted) {
         m.replay.pendingHit = 0;
         m.replay.localMotion[0] = '\0';
         m.replay.initialized = false;
         Logf("npcs: host refused hit %u on %s; authoritative state retained", result.sequence, m.entity.GetName().GetText());
     } else {
-        m.replay.acknowledgedHit = result.sequence;
+        m.replay.acknowledgedHit = static_cast<uint16_t>(result.sequence);
         m.replay.acknowledgedAt = result.processedAt;
     }
 }
@@ -1394,23 +1523,8 @@ void LayDown(Mirror& m, uint32_t now)
         (m.latest.flags & 128) || m.latest.movementMode == gECharMovementMode_RagDollDead) {
         auto* animation = static_cast<eCVisualAnimation_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
         if (m.ragdollInitialized) {
-            if (animation && animation->GetRagDollEnabled()) TryApplyForce(m, now);
-            else if (animation && animation->GetActor() &&
-                     static_cast<int32_t>(now - m.ragdollTryAt) >= 0) {
-                if (!m.corpsePose.empty())
-                    npcplayback::ReplayFrozenPose(m.entity.GetInstance(), m.replay, m.corpsePose, m.corpsePoseFlags);
-                animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
-                m.ragdollTryAt = now + 1000;
-                if (animation->GetRagDollEnabled()) {
-                    ++m.ragdollWakes;
-                    std::strcpy(m.presentationSource, (m.hostForceApplied || HostForceAvailable(m)) ? "host_force" :
-                                (m.localHitValid && now - m.localHitAt <= 5000 ? "local_blown" : "facing_fallback"));
-                    Logf("npcs: CLIENTRAGDOLL name=%s action=wake source=%s host_force_queued=%d host_force_available=%d fallback=%s",
-                         m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m),
-                         (m.hostForceApplied || HostForceAvailable(m)) ? "none" : (m.localHitValid ? "local_blown" : "facing_fallback"));
-                    TryApplyForce(m, now);
-                }
-            }
+            // Native physics LOD stops settled ragdolls. Recreating them here wakes a corpse every five seconds.
+            TryApplyForce(m, now);
             m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
             return;
         }
@@ -1438,15 +1552,14 @@ void LayDown(Mirror& m, uint32_t now)
             m.lieCheckAt = now + 250;
             return;
         }
-        if (animation && animation->GetRagDollEnabled()) {
+        if (animation && animation->GetRagDollEnabled() && animation->GetRagDollController()) {
             if (!m.ragdollInitialized) {
                 ++m.ragdollStarts;
                 ++ragdollsStarted;
-                std::strcpy(m.presentationSource, (m.hostForceApplied || HostForceAvailable(m)) ? "host_force" :
-                            (m.localHitValid && now - m.localHitAt <= 5000 ? "local_blown" : "facing_fallback"));
+                std::strcpy(m.presentationSource, RagdollSource(m));
                 Logf("npcs: CLIENTRAGDOLL name=%s action=start source=%s host_force_queued=%d host_force_available=%d fallback=%s",
                      m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m),
-                     (m.hostForceApplied || HostForceAvailable(m)) ? "none" : (m.localHitValid ? "local_blown" : "facing_fallback"));
+                     "gravity");
             }
             m.ragdollInitialized = true;
             TryApplyForce(m, now);
@@ -1455,6 +1568,8 @@ void LayDown(Mirror& m, uint32_t now)
         }
         if (animation && animation->GetActor() && static_cast<int32_t>(now - m.ragdollTryAt) >= 0) {
             using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
+            // An out-of-range first attempt cannot enter mode 14. Retry its native collision/damping setup too.
+            m.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
             // CP 1.75's ragdoll setup (Game+0xdc810): stop animation blending, then enable immediately.
             // Setting the movement mode alone can be skipped for an already-dead/unprocessed mirror.
             for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
@@ -1463,17 +1578,17 @@ void LayDown(Mirror& m, uint32_t now)
                 animation->GetActor()->SetTargetWeight(type, 0.0f);
                 animation->SetMotionOwner(type, static_cast<Owner>(2));
             }
-            animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
-            const bool on = animation->GetRagDollEnabled() != GEFalse;
+            if (!animation->GetRagDollEnabled() || !animation->GetRagDollController())
+                animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
+            const bool on = animation->GetRagDollEnabled() && animation->GetRagDollController();
             if (on) {
                 m.ragdollInitialized = true;
                 ++m.ragdollStarts;
                 ++ragdollsStarted;
-                std::strcpy(m.presentationSource, (m.hostForceApplied || HostForceAvailable(m)) ? "host_force" :
-                            (m.localHitValid && now - m.localHitAt <= 5000 ? "local_blown" : "facing_fallback"));
+                std::strcpy(m.presentationSource, RagdollSource(m));
                 Logf("npcs: CLIENTRAGDOLL name=%s action=start source=%s host_force_queued=%d host_force_available=%d fallback=%s",
                      m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m),
-                     (m.hostForceApplied || HostForceAvailable(m)) ? "none" : (m.localHitValid ? "local_blown" : "facing_fallback"));
+                     "gravity");
                 TryApplyForce(m, now);
                 m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
                 return;
@@ -2016,12 +2131,7 @@ void MirrorTick()
                 m.fallbackGraceUntil = now ? now + 500 : 501;
                 m.focusWatchUntil = now ? now + 5000 : 5001;
                 m.focusWatchLogged = false;
-                if (m.hostForceApplied || HostForceAvailable(m))
-                    std::strcpy(m.presentationSource, "host_force");
-                else if (m.localHitValid && now - m.localHitAt <= 5000)
-                    std::strcpy(m.presentationSource, "local_blown");
-                else
-                    std::strcpy(m.presentationSource, "facing_fallback");
+                std::strcpy(m.presentationSource, RagdollSource(m));
                 if (m.deathReferencesCleared != m.entity.GetInstance()) {
                     m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);
                     m.deathReferencesCleared = m.entity.GetInstance();
@@ -2161,22 +2271,19 @@ void LogClientDeath(Mirror& m, net::NpcRecord const& shown, uint32_t now)
     else if (shown.hitPlayer)
         std::snprintf(m.killerAttribution, sizeof(m.killerAttribution), "reported_player_%u", shown.hitPlayer);
 
-    if (HostForceAvailable(m))
-        std::strcpy(m.presentationSource, "host_force");
-    else if (m.ragdollFails)
+    if (m.ragdollFails)
         std::strcpy(m.presentationSource, "not_ready");
-    else if (m.localHitValid && now - m.localHitAt <= 5000)
-        std::strcpy(m.presentationSource, "local_blown");
     else
-        std::strcpy(m.presentationSource, "facing_fallback");
+        std::strcpy(m.presentationSource, RagdollSource(m));
 
     eCEntity* hero = remote::ControlledBody();
     if (!hero) hero = gCSession::GetInstance().GetHero();
-    char const* task = "-", *focus = "-", *target = "-", *alignment = "-";
+    bCString task("-");
+    char const* focus = "-", *target = "-", *alignment = "-";
     if (hero) {
         Entity h(hero);
         if (hero->GetPropertySet(eEPropertySetType_ScriptRoutine))
-            task = h.Routine.GetCurrentTask().GetText();
+            task = h.Routine.GetCurrentTask();
         if (hero->GetPropertySet(eEPropertySetType_Focus)) {
             eCEntity* f = h.Focus.GetFocusEntity().GetInstance();
             if (f) focus = f->GetName().GetText();
@@ -2191,55 +2298,34 @@ void LogClientDeath(Mirror& m, net::NpcRecord const& shown, uint32_t now)
         }
     }
     Logf("npcs: CLIENTDEATH name=%s killer=%s dead=%d ragdoll_host=%d host_force_queued=%d host_force_available=%d source=%s refs_cleared=%u combat_stops=%u hero_task=%s focus=%s target=%s alignment=%s",
-         m.entity.GetName().GetText(), m.killerAttribution, 1,
+         m.entity.GetName().GetText(), m.killerAttribution, m.entity.IsDead() ? 1 : 0,
          (shown.flags & 128) != 0, HostForceQueued(m), HostForceAvailable(m), m.presentationSource,
-         m.deathClearCount, m.deathCombatStopCount, task, focus, target, alignment);
+         m.deathClearCount, m.deathCombatStopCount, task.GetText(), focus, target, alignment);
 }
 
 void TickDeathFocusWatch(Mirror& m, uint32_t now)
 {
-    if (!m.focusWatchUntil || m.focusWatchLogged || net::IsHost()) return;
+    if (!m.focusWatchUntil || net::IsHost()) return;
     eCEntity* hero = remote::ControlledBody();
     if (!hero) hero = gCSession::GetInstance().GetHero();
-    char const* focusName = "-", *targetName = "-";
-    eCEntity* focusEntity = nullptr, *targetEntity = nullptr;
-    if (hero) {
-        Entity h(hero);
-        if (hero->GetPropertySet(eEPropertySetType_Focus))
-            focusEntity = h.Focus.GetFocusEntity().GetInstance();
-        if (hero->GetPropertySet(eEPropertySetType_NPC))
-            targetEntity = h.NPC.GetCurrentTarget().GetInstance();
-        if (focusEntity) focusName = focusEntity->GetName().GetText();
-        if (targetEntity) targetName = targetEntity->GetName().GetText();
-    }
-    if (focusEntity && IsNpc(focusEntity) && !Entity(focusEntity).IsDead()) {
-        Logf("npcs: DEATHFOCUS dead=%s status=found candidate=%s focus=%s target=%s",
-             m.entity.GetName().GetText(), focusName, focusName, targetName);
+    if (!hero) return;
+    const uint32_t elapsed = now - (m.focusWatchUntil - 5000);
+    eCEntity* selected = hero->GetPropertySet(eEPropertySetType_Focus)
+        ? Entity(hero).Focus.GetFocusEntity().GetInstance() : nullptr;
+    if (static_cast<int32_t>(now - m.focusWatchUntil) >= 0) {
+        LogDeathFocus(m.entity.GetInstance(), hero, "settled", elapsed);
+        m.focusWatchUntil = 0;
+    } else if (!m.focusWatchLogged) {
+        // Observe the next native frame, not the cached selection in the death transaction.
+        if (!elapsed) return;
+        LogDeathFocus(m.entity.GetInstance(), hero, "next_frame", elapsed);
         m.focusWatchLogged = true;
-        return;
+        m.focusWatchChanges = 0;
+    } else if (selected != m.watchedFocus && m.focusWatchChanges < 4) {
+        LogDeathFocus(m.entity.GetInstance(), hero, "changed", elapsed);
+        ++m.focusWatchChanges;
     }
-    if (static_cast<int32_t>(now - m.focusWatchUntil) < 0) return;
-
-    eCEntity* candidate = nullptr;
-    float candidateDistance = 1e20f;
-    const bCVector& heroAt = hero ? hero->GetWorldPosition() : bCVector();
-    for (auto& entry : mirrors) {
-        Mirror& live = entry.second;
-        eCEntity* entity = live.entity.GetInstance();
-        if (!entity || live.killed || !IsNpc(entity) || Entity(entity).IsDead()) continue;
-        const bCVector& at = entity->GetWorldPosition();
-        const float dx = at.GetX() - heroAt.GetX(), dy = at.GetY() - heroAt.GetY(), dz = at.GetZ() - heroAt.GetZ();
-        const float distance = dx * dx + dy * dy + dz * dz;
-        if (distance < candidateDistance) {
-            candidateDistance = distance;
-            candidate = entity;
-        }
-    }
-    char const* candidateName = candidate ? candidate->GetName().GetText() : "-";
-    Logf("npcs: DEATHFOCUS dead=%s status=%s candidate=%s focus=%s target=%s",
-         m.entity.GetName().GetText(), candidate ? "no_focus" : "no_candidate",
-         candidateName, focusName, targetName);
-    m.focusWatchLogged = true;
+    m.watchedFocus = selected;
 }
 }
 
@@ -2258,6 +2344,7 @@ void PassiveMirrorTick()
             entity->SetToWorldMatrix(pose);
             if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
                 rigid->SetPose(pose);
+            ClearLocalReferencesToDeadMirror(entity, nullptr, false);
         }
     }
     SamplePlayerContact(now);
@@ -2276,8 +2363,11 @@ void PassiveMirrorTick()
         eCEntity* previous = m.entity.GetInstance();
         Entity live = Resolve(m.latest.guid);
         if (live.GetInstance() != m.entity.GetInstance() || (m.resolved && !IsNpc(live.GetInstance()))) {
+            const bool keepCorpse = m.killed && m.ragdollInitialized && !m.corpsePose.empty();
             if (m.resolved) Logf("npcs: mirror %s unloaded or changed property sets; waiting for its live instance",
                                 live.GetInstance() ? live.GetName().GetText() : "(unloaded)");
+            if (previous && live.GetInstance() != previous)
+                ClearLocalReferencesToDeadMirror(previous, nullptr, false, true);
             m.entity = live;
             if (live.GetInstance() != previous)
                 m.deathReferencesCleared = nullptr;
@@ -2285,21 +2375,20 @@ void PassiveMirrorTick()
             m.replayReady = false;
             m.resolvedAt = 0;
             m.replay = npcplayback::State{};
-            m.ragdollStarted = false;
-            m.ragdollInitialized = false;
+            m.ragdollStarted = keepCorpse;
+            m.ragdollInitialized = keepCorpse;
             m.corpsePlaced = false;
             m.corpseSimulating = false;
-            m.corpsePose.clear();
+            if (!keepCorpse) m.corpsePose.clear();
             m.corpseActor = nullptr;
             m.corpsePoseAt = m.ragdollTryAt = m.lieCheckAt = 0;
             m.ragdollStarts = m.ragdollWakes = 0;
             m.ragdollFails = m.lieTries = m.lieNoted = 0;
             m.laid = false;
-            m.hostForceApplied = m.fallbackApplied = false;
+            // Unloading an entity is not a new life: keep the impulse decision and the resting pose.
             m.localHitValid = false;
             m.localHitAt = m.fallbackGraceUntil = 0;
-            m.localHitDir[0] = m.localHitDir[1] = m.localHitDir[2] = 0.0f;
-            std::strcpy(m.presentationSource, "facing_fallback");
+            std::strcpy(m.presentationSource, RagdollSource(m));
             m.guarded = false;
         }
         if (!m.resolved || !m.entity.GetInstance()) {
@@ -2315,9 +2404,9 @@ void PassiveMirrorTick()
             m.entity.NPC.DefeatedByPlayer = GETrue;
             m.guarded = true;
         }
-        if (m.killed && (m.latest.flags & 1) &&
-            m.deathReferencesCleared != m.entity.GetInstance()) {
-            m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);
+        if (m.killed && (m.latest.flags & 1)) {
+            m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
+                m.deathReferencesCleared != m.entity.GetInstance());
             m.deathReferencesCleared = m.entity.GetInstance();
         }
         TickDeathFocusWatch(m, now);
@@ -2350,7 +2439,6 @@ void PassiveMirrorTick()
         shown.incarnation = presentation.motion.incarnation;
         shown.hitPlayer = presentation.motion.hitPlayer;
         shown.hitSequence = presentation.motion.hitSequence;
-        shown.presentationReady = presentation.motion.presentationReady;
         shown.contact = presentation.motion.contact;
         shown.attitude = presentation.motion.attitude;
         std::memcpy(shown.motions, presentation.motion.motions, sizeof(shown.motions));
@@ -2365,14 +2453,15 @@ void PassiveMirrorTick()
         if (m.killed && !(shown.flags & 1)) {
             m.ragdollStarted = m.laid = false;
             m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
-            m.hostForceApplied = m.fallbackApplied = m.localHitValid = false;
+            m.deathImpulse = {};
+            m.ragdollTraceAt = m.ragdollTraceSampleAt = m.ragdollTraceStage = 0;
+            m.localHitValid = false;
             m.localHitAt = m.fallbackGraceUntil = 0;
-            m.localHitDir[0] = m.localHitDir[1] = m.localHitDir[2] = 0.0f;
             m.deathClearCount = m.deathCombatStopCount = 0;
             m.deathLogged = false;
             m.focusWatchUntil = 0;
             m.focusWatchLogged = false;
-            std::strcpy(m.presentationSource, "facing_fallback");
+            std::strcpy(m.presentationSource, "gravity");
             std::strcpy(m.killerAttribution, "host_or_npc_unknown");
             deadOnHost.erase(it->first);
         }
@@ -2387,12 +2476,7 @@ void PassiveMirrorTick()
                 m.fallbackGraceUntil = now ? now + 500 : 501;
                 m.focusWatchUntil = now ? now + 5000 : 5001;
                 m.focusWatchLogged = false;
-                if (HostForceAvailable(m))
-                    std::strcpy(m.presentationSource, "host_force");
-                else if (m.localHitValid && now - m.localHitAt <= 5000)
-                    std::strcpy(m.presentationSource, "local_blown");
-                else
-                    std::strcpy(m.presentationSource, "facing_fallback");
+                std::strcpy(m.presentationSource, RagdollSource(m));
                 if (shown.hitPlayer)
                     std::snprintf(m.killerAttribution, sizeof(m.killerAttribution), "reported_player_%u", shown.hitPlayer);
                 LogClientDeath(m, shown, now);
@@ -2415,12 +2499,13 @@ void PassiveMirrorTick()
         npcProperties->AccessAttackReason().AccessValue() = static_cast<gEAttackReason>(shown.attackReason);
         // The game colours the name tag (green friendly, white neutral, orange angry, red hostile) from this property.
         npcProperties->AccessAttitudeToPlayer2().AccessValue() = static_cast<gEAttitude>(shown.attitude);
+        m.shownCombatTarget = shown.combatTarget;
         const uint8_t target = (shown.flags >> 3) & 7;
         npcProperties->AccessCurrentTargetEntity().SetEntity(target
             ? (target == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(target)) : nullptr);
         auto* receiver = static_cast<gCDamageReceiver_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver));
         receiver->AccessHitPointsMax() = shown.hitPointsMax;
-        receiver->AccessHitPoints() = shown.hitPoints;
+        receiver->AccessHitPoints() = m.killed ? 0 : shown.hitPoints;
         if (m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
             const bool waiting = m.entity.Party.Waiting != GEFalse;
             const uint8_t actualOwner = PlayerOf(m.entity.Party.GetPartyLeader().GetInstance());
@@ -2484,7 +2569,6 @@ void PassiveMirrorTick()
             ++it;
             continue;
         }
-        if (!shown.presentationReady) { ++it; continue; }
         if (shown.heldRight != HeldHash(m.entity, gESlot_RightHand) || shown.heldLeft != HeldHash(m.entity, gESlot_LeftHand)) {
             EnsureItem(m.entity, shown.heldRight);
             EnsureItem(m.entity, shown.heldLeft);
@@ -2755,34 +2839,11 @@ void LocalHit(eCEntity* entity, uint32_t sequence)
     for (auto& entry : mirrors) {
         Mirror& m = entry.second;
         if (m.entity.GetInstance() != entity) continue;
-        if (!m.killed) {
-            eCEntity* attacker = remote::ControlledBody();
-            if (!attacker) attacker = gCSession::GetInstance().GetHero();
-            if (attacker) {
-                const bCVector& victimAt = entity->GetWorldPosition();
-                const bCVector& attackerAt = attacker->GetWorldPosition();
-                float dx = victimAt.GetX() - attackerAt.GetX();
-                float dy = victimAt.GetY() - attackerAt.GetY();
-                float dz = victimAt.GetZ() - attackerAt.GetZ();
-                float horizontal = std::sqrt(dx * dx + dz * dz);
-                if (horizontal > 1.0f) {
-                    dx /= horizontal;
-                    dz /= horizontal;
-                    dy = std::max(-0.10f, std::min(0.20f, dy / 200.0f));
-                    float length = std::sqrt(dx * dx + dy * dy + dz * dz);
-                    if (length > 0.001f) {
-                        m.localHitDir[0] = dx / length;
-                        m.localHitDir[1] = dy / length;
-                        m.localHitDir[2] = dz / length;
-                        m.localHitValid = true;
-                        m.localHitAt = net::Now() ? net::Now() : 1;
-                        std::strcpy(m.presentationSource, "local_blown");
-                        std::strcpy(m.killerAttribution, "local_player");
-                    }
-                }
-            }
-        }
         if (m.killed) continue;
+        m.localHitValid = true;
+        const uint32_t hitAt = net::Now();
+        m.localHitAt = hitAt ? hitAt : 1;
+        std::strcpy(m.killerAttribution, "local_player");
         char shown[128] = {}, stance[16] = {};
         body::CurrentMotion(entity, shown, sizeof(shown));
         LearnSkeleton(m, shown);
@@ -2824,10 +2885,9 @@ void Despawn(eCEntity* entity)
     std::memcpy(record.guid, guid, sizeof(record.guid));
     record.incarnation = Incarnation(guid);
     record.sent = net::Now();
-    record.absent = 1;
     record.flags |= 1;
     record.hitPoints = 0;
-    record.presentationReady = record.contact = 0;
+    record.contact = 0;
     const auto& at = entity->GetWorldPosition();
     const auto turn = entity->GetWorldRotation();
     record.position[0] = at.GetX(); record.position[1] = at.GetY(); record.position[2] = at.GetZ();
@@ -2888,6 +2948,39 @@ bool Ready(eCEntity const* entity)
     return false;
 }
 
+bool CombatTarget(eCEntity* entity, eCEntity*& target)
+{
+    target = nullptr;
+    if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return false;
+    if (IsMirrored(entity)) {
+        for (auto const& entry : mirrors) {
+            auto const& mirror = entry.second;
+            if (mirror.entity.GetInstance() != entity) continue;
+            if (!Ready(entity)) return false;
+            if (mirror.shownCombatTarget) {
+                target = nullptr;
+                unsigned matches = 0;
+                const bTObjArray<Entity> all = Entity::GetNPCs();
+                for (int i = 0; i < all.GetCount(); ++i) {
+                    Entity candidate = all.GetAt(i);
+                    if (!candidate.GetInstance()) continue;
+                    uint8_t guidBytes[16];
+                    guid::CopyEntity(candidate.GetInstance(), guidBytes);
+                    if (net::HashGuid(guidBytes) != mirror.shownCombatTarget) continue;
+                    if (++matches == 1) target = candidate.GetInstance();
+                    else { target = nullptr; break; }
+                }
+                return target != nullptr;
+            }
+            target = Entity(entity).NPC.GetCurrentTarget().GetInstance();
+            return true;
+        }
+        return false;
+    }
+    target = Entity(entity).NPC.GetCurrentTarget().GetInstance();
+    return true;
+}
+
 bool PresentationPending(eCEntity const* entity)
 {
     if (!entity || !IsMirrored(entity)) return false;
@@ -2940,10 +3033,25 @@ void CorpseTick(uint32_t now)
 {
     for (auto it = corpses.begin(); it != corpses.end();) {
         Mirror& c = it->second;
+        eCEntity* previous = c.entity.GetInstance();
         c.entity = Resolve(c.latest.guid);
+        if (previous && c.entity.GetInstance() != previous)
+            ClearLocalReferencesToDeadMirror(previous, nullptr, false, true);
         if (!c.entity.GetInstance()) { ++it; continue; }  // not in this part of the world now; again when it is
-        if (deadStays && !net::IsHost() && deadOnHost.count(it->first) && !mirrors.count(it->first)) KeepDead(c.entity);
-        if (!c.entity.IsDead() || mirrors.count(it->first)) { it = corpses.erase(it); continue; }  // alive again, or mirrored now
+        if (mirrors.count(it->first)) { it = corpses.erase(it); continue; }
+        const bool heldDead = deadStays && !net::IsHost() && deadOnHost.count(it->first);
+        if (heldDead && !c.entity.IsDead()) c.entity.NPC.DefeatedByPlayer = GETrue;
+        if (!net::IsHost() && (heldDead || c.entity.IsDead())) {
+            const bool first = c.deathReferencesCleared != c.entity.GetInstance();
+            c.deathClearCount += ClearLocalReferencesToDeadMirror(c.entity.GetInstance(), &c.deathCombatStopCount, first);
+            c.deathReferencesCleared = c.entity.GetInstance();
+            if (first) {
+                c.focusWatchUntil = now ? now + 5000 : 5001;
+                c.focusWatchLogged = false;
+            }
+            TickDeathFocusWatch(c, now);
+        }
+        if (!c.entity.IsDead()) { it = corpses.erase(it); continue; }  // alive again
         LayDown(c, now);
         if (npcplayback::IsPassive(c.entity.GetInstance())) UpdateCorpsePresentation(c, now);
         LateCheck(c, now, c.wasMirror ? "mirror" : "journal");
@@ -2974,11 +3082,19 @@ void LayDownCorpse(eCEntity* entity)
     Guid(entity, guid);
     const std::string key = Key(guid);
     if (corpses.count(key)) return;
-    if (!net::IsHost()) ClearLocalReferencesToDeadMirror(entity);
     Mirror& c = corpses[key];
+    c.entity = Entity(entity);
     std::memcpy(c.latest.guid, guid, 16);
+    c.latest.flags = 1;
     c.killed = true;
     c.killedAt = net::Now() ? net::Now() : 1;
+    if (!net::IsHost()) {
+        c.deathClearCount = ClearLocalReferencesToDeadMirror(entity, &c.deathCombatStopCount);
+        c.deathReferencesCleared = entity;
+        c.focusWatchUntil = c.killedAt + 5000;
+        c.focusWatchLogged = false;
+        LogClientDeath(c, c.latest, c.killedAt);
+    }
 }
 
 void Claim(eCEntity* entity)
@@ -3395,7 +3511,7 @@ void LifeReport(char const* text, LogFn log)
             record = &found->second.record;
             shown = record->incarnation;
             displayed = record->sent;
-            ready = record->presentationReady != 0;
+            ready = false;
         }
     } else {
         const auto found = mirrors.find(key);
@@ -3413,8 +3529,9 @@ void LifeReport(char const* text, LogFn log)
     if (!record) { log("NPCLIFE known=0"); return; }
     char line[384], visible[96] = "-";
     if (eCEntity* entity = NpcByGuid(guid)) body::CurrentMotion(entity, visible, sizeof(visible));
+    const bool absent = net::IsHost() ? false : (!mirror && record != nullptr);
     Format(line, "NPCLIFE known=1 incarnation=%u shown=%u absent=%u ready=%d hp=%d hp_max=%d dead=%d captured=%u displayed=%u",
-           record->incarnation, shown, record->absent, ready ? 1 : 0, record->hitPoints,
+           record->incarnation, shown, absent ? 1 : 0, ready ? 1 : 0, record->hitPoints,
            record->hitPointsMax, (record->flags & 1) ? 1 : 0, record->sent, displayed);
     log(line);
     if (mirror) {
@@ -3611,9 +3728,9 @@ void SyncReport(LogFn log)
            frameCount, frameCount ? static_cast<float>(frameSumMs) / frameCount : 0.0f, slowFrames, hitchFrames, maxFrameMs, tracked,
            tracked ? delaySum / tracked : 0u, delayMax, localBlowsJudged, localBlowsOutOfReach);
     log(line);
-    Format(line, "SYNCRAGDOLL hooked=%d forces_sent=%u forces_received=%u forces_applied=%u forces_late=%u ragdolls_started=%u not_ready=%u fallbacks_applied=%u",
+    Format(line, "SYNCRAGDOLL hooked=%d forces_sent=%u forces_received=%u forces_applied=%u forces_late=%u ragdolls_started=%u not_ready=%u gravity_deaths=%u",
            originalAddForce ? 1 : 0, ragdollForcesSent, ragdollForcesReceived, ragdollForcesApplied, ragdollForcesLate,
-           ragdollsStarted, ragdollsNotReady, ragdollFallbacksApplied);
+           ragdollsStarted, ragdollsNotReady, ragdollGravityDeaths);
     log(line);
 }
 }

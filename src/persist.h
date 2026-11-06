@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The game's own save and load (gCHUDFileManager::SaveGame / LoadGame in Game.dll), hooked:
-// - before a save, puppets are removed (a save holding a puppet, which is a hero entity, aborts on load with
-//   "current world has more than one hero!"; true for saves from the game's menu as well);
-// - next to every save the mod writes a sidecar file <name>.g3t with its own campaign state (the world journal),
-//   and reads it back when that save is loaded.
+// Host-authoritative checkpoint bundles: one native world, a world/save manifest, and each account's own
+// mandatory character record. Native saves are deferred outside Process; client saves request the host's checkpoint.
 #pragma once
 
 namespace g3t::persist {
 void Install();          // once the game DLLs are loaded; refuses (and logs) on any other build
 void* SaveTarget();      // the game's SaveGame entry (checked before hooking), nullptr if not hooked
 void* LoadTarget();
+bool CheckpointBusy();   // no new player exchange may cross an in-flight character/world checkpoint
 // Once per frame: after a client loaded the host's save, its own hero record (written when the host saved)
-// is applied to the hero in that world. Also: which world this machine plays, and the host's world for clients
+// is applied before opening the world gate. A missing/refused character never permits the native host hero.
+// Also: which world this machine plays, and the host's world for clients
 // (the world gate, net.h SetInWorld).
 void Tick();
 // Around the engine module's Process. BeginFrame first: false, and nothing of the mod runs in this frame, while the
 // game's own load runs (its Session::Start runs frames of its own, C 22.10.); true otherwise, and EndFrame follows.
 bool BeginFrame();
 void EndFrame();
+bool NativeLoading();      // no native entity inspection until the synchronous loader returns
+bool HeroPending();        // client still has the host's fallback hero, not its own restored life
 void OnWorldActivate();    // from the engine module's callbacks
 void OnWorldDeactivate();
 using LogFn = void (*)(char const*);

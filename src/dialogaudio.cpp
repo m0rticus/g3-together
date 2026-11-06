@@ -260,6 +260,7 @@ void OnLocalLine(gCScriptProcessingUnit* spu, bCString const& sample)
 
 GEBool __fastcall StartOutput(gCScriptProcessingUnit* spu, void*, bCString const& sample)
 {
+    if (ai::ShuttingDown()) return original ? original(spu, sample) : GEFalse;
     const GEBool ok = original(spu, sample);
     if (ok) OnLocalLine(spu, sample);
     return ok;

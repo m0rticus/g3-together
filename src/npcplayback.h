@@ -14,7 +14,8 @@ struct State {
     uint32_t instances[net::NpcMotionSlots] = {};
     uint32_t suppressed[net::NpcMotionSlots] = {};
     uint32_t effects[net::NpcMotionSlots] = {};
-    uint32_t incarnation = 0, pendingHit = 0, acknowledgedHit = 0;
+    uint32_t incarnation = 0;
+    uint16_t pendingHit = 0, acknowledgedHit = 0;
     uint32_t localStart = 0;
     uint32_t acknowledgedAt = 0;
     float localDuration = 0.0f;

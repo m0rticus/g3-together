@@ -52,6 +52,7 @@ void EndDeathTask(Entity& npc)
 
 GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     eCEntity* instance = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     if (npcs::IsMirrored(instance)) { ++mirrorsSkipped; return 0; }
     if (!enabled || !instance) return original(spu, self, other, args);

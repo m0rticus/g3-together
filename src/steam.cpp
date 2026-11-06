@@ -962,6 +962,7 @@ void Stop()
 bool Ready() { return ready; }
 uint64_t LobbyId() { return lobby; }
 char const* PlayerName() { return playerName; }
+uint64_t PlayerId() { return me; }
 int Ping()
 {
     int maximum = -1;

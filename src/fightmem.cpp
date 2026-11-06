@@ -138,6 +138,7 @@ void Pass(Memory const& before, eCEntity* puppet, char const* where, int reason 
 // the one hit or knocked out, and its attacker) or self's and other's (Defeat, CancelAttack).
 GEInt GE_STDCALL Sound(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalSound ? originalSound(spu, self, other, args) : 0;
     eCEntity* victim = Of(spu, other, false);
     eCEntity* puppet = PuppetFor(Of(spu, self, true), {victim, AttackerOf(victim)});
     const Memory before = Read(Of(spu, self, true));
@@ -152,6 +153,7 @@ GEInt GE_STDCALL Sound(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
 
 GEInt GE_STDCALL Defeated(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalDefeated ? originalDefeated(spu, self, other, args) : 0;
     eCEntity* seer = Of(spu, self, true);
     eCEntity* down = Of(spu, other, false);
     eCEntity* attacker = AttackerOf(down);
@@ -174,6 +176,7 @@ GEInt GE_STDCALL Defeated(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
 
 GEInt GE_STDCALL Defeat(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalDefeat ? originalDefeat(spu, self, other, args) : 0;
     eCEntity* a = Of(spu, self, true);
     eCEntity* b = Of(spu, other, false);
     eCEntity* puppet = PuppetFor(a, {a, b});
@@ -190,6 +193,7 @@ GEInt GE_STDCALL Defeat(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 
 GEInt GE_STDCALL Cancel(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalCancel ? originalCancel(spu, self, other, args) : 0;
     eCEntity* a = Of(spu, self, true);
     eCEntity* puppet = PuppetFor(a, {Of(spu, other, false), TargetOf(a)});
     const Memory before = Read(a);
@@ -205,6 +209,7 @@ GEInt GE_STDCALL Cancel(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 
 GEBool GE_STDCALL Watch(gCScriptProcessingUnit* spu)
 {
+    if (ai::ShuttingDown()) return originalWatch ? originalWatch(spu) : GEFalse;
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
     eCEntity* puppet = PuppetFor(self, {TargetOf(self), AlternativeOf(self)});
     const Memory before = Read(self);

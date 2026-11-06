@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 class eCEntity;
 
@@ -51,10 +52,24 @@ void MoveLengthOff(void (*log)(char const*));          // QA negative control: t
 void* JumpTo(unsigned char* target, void* detour, size_t stolen = 6);
 // Points one import of `module` (by DLL and function name) at `replacement`; returns what it pointed at.
 void* PatchImport(void* module, char const* dll, char const* function, void* replacement);
+// Shutdown and reversible patch lifetime.
+void BeginShutdown();
+bool ShuttingDown();
+void TrackPatch(void* address, void const* original, void const* installed, size_t size, char const* name);
+void TrackPointer(void* slot, void* original, void* installed, char const* name);
+void* PatchPointer(void** slot, void* replacement, char const* name);
+struct PatchRestoreResult {
+    unsigned restored;
+    unsigned preserved;
+    unsigned failed;
+};
+PatchRestoreResult RestorePatches();
 // GetAttitude wrapper: an NPC judging a puppet judges the local hero instead.
 bool AttitudeInstalled();
 bool AttitudeNative();          // jump in the native function (all callers), not only the script table
 int PlainAttitude(eCEntity* self, eCEntity* other);  // QA: GetAttitude without the puppet -> hero redirect (as attitudeoff)
+// Native relation query for this exact player, without the wrapper's NoteContact or puppet -> hero redirect.
+bool TryPlayerAttitude(eCEntity* self, eCEntity* player, int& attitude);
 eCEntity* RedirectedFor();  // QA: the puppet a running GetAttitude answers for as the local hero (else null)
 unsigned AttitudeAsked();       // GetAttitude calls with a puppet as the judged entity
 unsigned AttitudeRedirected();  // of these, answered as for the local hero

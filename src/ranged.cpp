@@ -272,7 +272,7 @@ bCVector aimPoint;
 
 bCVector* __fastcall FakePick(void const* camera, void* edx, bCVector* out)
 {
-    if (!aimActive) return realPick(camera, edx, out);
+    if (ai::ShuttingDown() || !aimActive) return realPick ? realPick(camera, edx, out) : out;
     return new (out) bCVector(aimPoint);
 }
 

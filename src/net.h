@@ -49,6 +49,7 @@ struct PlayerState
     // Protocol 59 (29.10.): how far slot 0's motion has played, 0..65535 of its length (body::MotionFraction; 65535 also when
     // nothing runs), so the receiver can show a mirrored blow where it is at the sender (body.cpp, motion_seek)
     uint16_t motionFrac = 65535;
+    uint32_t downedSequence = 0; // the owning player's current downed life; paid revives must echo it
 };
 #pragma pack(pop)
 
@@ -79,14 +80,15 @@ struct NpcRecord
     float damageMultiplier = 0.0f;
     uint32_t incarnation = 1;
     uint8_t hitPlayer = 0;
-    uint32_t hitSequence = 0;
-    uint8_t presentationReady = 0;
-    uint8_t absent = 0;      // reliable host removal for this incarnation; a later life must use a newer incarnation
+    uint16_t hitSequence = 0;
     uint8_t contact = 0;
     uint8_t attitude = 0;    // protocol 71: gCNPC_PS.AttitudeToPlayer2; the game colours an NPC's name tag from it
+    uint32_t combatTarget = 0; // stable FNV-1a32 GUID reference to the actual NPC opponent
     NpcMotion motions[NpcMotionSlots];
 };
 #pragma pack(pop)
+static_assert(sizeof(NpcMotion) == 61, "NPC motion wire layout changed");
+static_assert(sizeof(NpcRecord) == 588, "NPC snapshot wire layout changed");
 
 struct Remote
 {
@@ -115,6 +117,7 @@ Remote const* Remotes();  // indexed by player id, size MaxPlayers; a client out
 constexpr int MaxPlayers = 8;
 uint32_t HashWorld(char const* name);
 uint32_t HashName(char const* name);
+uint32_t HashGuid(uint8_t const guid[16]);
 bool IsHost();
 // Increments whenever a client enters the host's world (after a join, or after loading the host's save again); the host
 // resends its motion-name table and container contents then.
@@ -162,7 +165,10 @@ void SetWorldHandler(WorldHandler handler);
 // Only the host publishes NPC state. Motion slots and pose share one capture time.
 constexpr int MaxNpcsPerMessage = 48;  // receiving limit
 constexpr int NpcsPerSend = 2;
-static_assert(23 + NpcsPerSend * sizeof(NpcRecord) <= 1200, "a batch of NPC records must fit one datagram");
+static_assert(NpcsPerSend == 2, "NPC datagrams must carry exactly two records");
+static_assert(NpcsPerSend >= 2, "NPC batches must retain two records per datagram");
+static_assert(23 + NpcsPerSend * sizeof(NpcRecord) <= 1200, "two NPC records must fit one 1200-byte datagram");
+static_assert(23 + NpcsPerSend * sizeof(NpcRecord) == 1199, "two NPC records must use the 1199-byte envelope");
 void SendNpcs(NpcRecord const* records, int count, bool reliable = false);
 void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags = 0);
 using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool reliable);
@@ -192,13 +198,23 @@ void SetPlayerStateHandler(PlayerStateHandler handler);  // each accepted networ
 // seen: the owner's send time of the NPC's state the sender showed when its hero struck (Stufe 3.3), 0 unknown.
 enum HitOutcome : uint8_t { HitUnjudged = 0, HitKnockOut = 1, HitDeath = 2 };
 enum HitReaction : uint8_t { HitNoReaction = 0, HitQuickStumble = 1, HitStumble = 2, HitPierceStumble = 3, HitSitKnockDown = 4 };
+#pragma pack(push, 1)
+struct MeleeContact {
+    uint8_t melee = 0, targetOnly = 0, item = 0;
+    uint8_t focus[16] = {}, target[16] = {};
+    uint32_t motion = 0;
+};
+#pragma pack(pop)
+static_assert(sizeof(MeleeContact) == 39, "melee contact wire layout changed");
 uint32_t SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16] = nullptr,
-                   uint8_t outcome = HitUnjudged, uint32_t seen = 0, uint8_t reaction = HitNoReaction, uint32_t incarnation = 1);
+                   uint8_t outcome = HitUnjudged, uint32_t seen = 0, uint8_t reaction = HitNoReaction, uint32_t incarnation = 1,
+                   MeleeContact const& contact = {});
 // attacker: the hitting NPC (GUID), or zeros with attackerPlayer = the player whose hero hit. meansToKill: its owner says the NPC
 // means to kill (the game's HasAttackReasonToKill; the victim's machine has only a mirror of it, which has no target or reason).
 void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill = false);
 using HitNpcHandler = void (*)(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16],
-                               uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation);
+                               uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation,
+                               MeleeContact const& contact);
 using HitPlayerHandler = void (*)(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill);
 void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player);
 #pragma pack(push, 1)
@@ -224,6 +240,19 @@ void SetDeathHandler(DeathHandler handler);
 void SendCampaign(uint8_t kind, char const* name);
 using CampaignHandler = void (*)(uint8_t kind, char const* name);
 void SetCampaignHandler(CampaignHandler handler);
+// Protocol 72: reliable, host-coordinated checkpoints. No client world files travel to the host.
+enum SaveOp : uint8_t { SaveRequest = 1, SavePrepare, SaveReady, SaveCommit, SaveStored, SaveCancel, SaveResult, SaveImport };
+#pragma pack(push, 1)
+struct SaveNote {
+    uint8_t op = 0, ok = 0;
+    uint32_t epoch = 0;
+    char world[33] = {}, save[33] = {}, name[49] = {};
+};
+#pragma pack(pop)
+static_assert(sizeof(SaveNote) == 121, "save note wire layout changed");
+bool SendSave(uint8_t to, SaveNote const& note); // client: to 1; host: to one welcomed client
+using SaveHandler = void (*)(uint8_t from, SaveNote const& note);
+void SetSaveHandler(SaveHandler handler);
 // Host -> one client: the campaign save files (.g3savcpx, .g3savcpxdat, .g3t) in chunks, then a summary
 // with sizes and CRC-32s (persist.cpp).
 constexpr int FileCount = 3;
@@ -243,7 +272,8 @@ void SetClockHandler(ClockHandler handler);
 // A world state after a dialog command (infocmd.cpp). kind 1: an entity's state by GUID; kind 2: a sector
 // (name in routine, status in enclave); kind 3: a dialog started a fight (guid = attacker, guard = the player
 // attacked, routine = the attack reason's name); kind 4/5: a client took over / gave back a companion (guid); kind 6: host to player `guard`: that claim is refused
-// or ended; kind 7: host to player `guard`: this NPC from the host's save is your companion; kind 8/9: downed.cpp;
+// or ended; kind 7: host to player `guard`: this NPC from the host's save is your companion;
+// kind 8/9: downed.cpp (guard=target, npcClass=helper, first four guid bytes=target's downedSequence);
 // kind 10: a door or lock (doors.cpp: guard = open, alignment = locked, npcClass bits 1 door, 2 lock); kind 16: client to host,
 // player `guard` asks for NPC guid that has an important info for its hero (address.cpp); kind 18: for player `guard`, NPC
 // guid now remembers its fight with that player as `npc` (LastFightAgainstPlayer, fightmem.cpp).
@@ -263,7 +293,11 @@ struct WorldState {
     float rotation[4] = {};
 };
 #pragma pack(pop)
+static_assert(sizeof(WorldState) == 102, "world state wire layout changed");
 void SendWorldState(WorldState const& state, uint8_t except);
+// XP sharing is the only kind sent by a client; deliver a baseline or ack to one
+// peer, or from a client directly to the host.
+bool SendWorldStateTo(uint8_t to, WorldState const& state);
 using WorldStateHandler = void (*)(uint8_t from, WorldState const& state);
 void SetWorldStateHandler(WorldStateHandler handler);
 

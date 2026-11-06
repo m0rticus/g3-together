@@ -80,6 +80,7 @@ struct AreaScope {
 bTObjArray<Entity> GE_STDCALL AreaTargets()
 {
     bTObjArray<Entity> targets = originalGetNpcs();
+    if (ai::ShuttingDown()) return targets;
     if (areaCaster)
         for (int i = targets.GetCount() - 1; i >= 0; --i)
             if (combat::IgnoreFriendlyHit(targets.GetAt(i).GetInstance(), areaCaster)) targets.RemoveAt(i);
@@ -117,6 +118,7 @@ Entity ByGuid(uint8_t const guid[16])
 template <int I>
 GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originals[I] ? originals[I](spu, self, other, args) : 0;
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (shot::InNpcReplicaContact() && target != remote::ControlledBody()) return 0;
@@ -172,17 +174,24 @@ gFScript HookCast(gSScript& script, gFScript wrapper, char const* name)
         module == GetModuleHandleA("Script_Game.dll") && !std::memcmp(code, expected, sizeof(expected))) {
         if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(wrapper))) {
             script.m_funcScript = wrapper;
+            ai::TrackPointer(reinterpret_cast<void*>(&script.m_funcScript),
+                             reinterpret_cast<void*>(original),
+                             reinterpret_cast<void*>(wrapper), "spells native cast script");
             ++nativeCastsHooked;
             return reinterpret_cast<gFScript>(trampoline);
         }
     }
     script.m_funcScript = wrapper;
+    ai::TrackPointer(reinterpret_cast<void*>(&script.m_funcScript),
+                     reinterpret_cast<void*>(original),
+                     reinterpret_cast<void*>(wrapper), "spells cast script");
     Logf("spells: %s wrapped in script table only; native friendly-fire protection is incomplete", name);
     return original;
 }
 
 GEInt GE_STDCALL HookTick(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalTick ? originalTick(spu, self, other, args) : 0;
     eCEntity* body = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     if (tickGuard && body && (remote::IsPuppet(body) || npcs::IsMirrored(body))) {
         ++ticksSkipped;
@@ -210,6 +219,7 @@ void InstallTick()
 
 GEInt GE_STDCALL HookGiveXp(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalGiveXp ? originalGiveXp(spu, self, other, args) : 0;
     const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - reinterpret_cast<uintptr_t>(GetModuleHandleA("Script_Game.dll"));
     eCEntity* victim = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* earner = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);

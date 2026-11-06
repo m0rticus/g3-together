@@ -6,8 +6,10 @@
 #include "log.h"
 #include "net.h"
 #include "offer.h"
+#include "persist.h"
 #include "remote.h"
 #include "tradeview.h"
+#include "ai.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <vector>
 #include <vector>
 
 namespace g3t::trade {
@@ -169,6 +172,7 @@ void OnGoods(uint8_t player, uint64_t epochIn, uint32_t serialIn, int32_t gold, 
 
 GEInt GE_STDCALL GoldCost(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalCost ? originalCost(spu, self, other, args) : 0;
     Entity counterpart, owner;
     if (self) counterpart = *static_cast<Entity*>(self);
     else if (spu) counterpart.AttachTo(spu->GetSelfEntity());
@@ -185,6 +189,9 @@ void HookCost()
     if (GetScriptAdminExt().GetScripts().GetAt(bCString("OnPlayerGetGoldCost"), cost) && cost && cost->m_funcScript) {
         originalCost = cost->m_funcScript;
         cost->m_funcScript = &GoldCost;
+        ai::TrackPointer(reinterpret_cast<void*>(&cost->m_funcScript),
+                         reinterpret_cast<void*>(originalCost),
+                         reinterpret_cast<void*>(&GoldCost), "trade OnPlayerGetGoldCost script");
         costHooked = true;
         Log("trade: player-only free price hook installed");
     }
@@ -192,7 +199,7 @@ void HookCost()
 
 bool BuildExchange(gCInventory_PS* heroInventory, gCInventory_PS* puppetInventory, int id, net::OfferNote& note)
 {
-    if (id <= 0 || id >= net::MaxPlayers || !Available() || !net::Connected() || !offer::Idle() ||
+    if (id <= 0 || id >= net::MaxPlayers || persist::CheckpointBusy() || !Available() || !net::Connected() || !offer::Idle() ||
         !net::Remotes()[id].connected || !received[id].known) return false;
     note = net::OfferNote{};
     note.buyer = net::LocalId();
@@ -259,6 +266,7 @@ bool BeginExchange(gCInventory_PS* heroInventory, gCInventory_PS* puppetInventor
 
 GEBool __fastcall NativeTransfer(gCInventory_PS* from, void*, gCInventory_PS* to, gEStackType type)
 {
+    if (ai::ShuttingDown()) return originalTransfer ? originalTransfer(from, to, type) : GETrue;
     const int fromPlayer = from ? remote::PuppetOwner(from->GetEntity()) : 0;
     const int toPlayer = to ? remote::PuppetOwner(to->GetEntity()) : 0;
     if (!fromPlayer && !toPlayer) return originalTransfer(from, to, type);
@@ -270,13 +278,14 @@ GEBool __fastcall NativeTransfer(gCInventory_PS* from, void*, gCInventory_PS* to
 
 bool __stdcall NativeCanExchange(void* controls, int playerValue, int partnerValue)
 {
+    if (ai::ShuttingDown()) return true;
     auto* bytes = static_cast<uint8_t*>(controls);
     gCInventory_PS *playerInventory = nullptr, *partnerInventory = nullptr;
     std::memcpy(&playerInventory, bytes + 0x24, sizeof(playerInventory));
     std::memcpy(&partnerInventory, bytes + 0x7c, sizeof(partnerInventory));
     const int id = partnerInventory ? remote::PuppetOwner(partnerInventory->GetEntity()) : 0;
     if (!id) return playerValue >= partnerValue && playerValue > 0 && partnerValue > 0;
-    return Available() && net::Connected() && offer::Idle() && net::Remotes()[id].connected && received[id].known &&
+    return !persist::CheckpointBusy() && Available() && net::Connected() && offer::Idle() && net::Remotes()[id].connected && received[id].known &&
            (HasSelection(playerInventory) || HasSelection(partnerInventory));
 }
 
@@ -314,17 +323,30 @@ void HookNative()
         return;
     }
     uint8_t* site = base + start;
+    uint8_t originalGate[sizeof(gate)];
+    std::memcpy(originalGate, site, sizeof(originalGate));
     std::memset(site, 0x90, sizeof(gate));
     site[0] = 0x57; site[1] = 0x53; site[2] = 0x56; site[3] = 0xe8;
     const int32_t can = static_cast<int32_t>(reinterpret_cast<intptr_t>(&NativeCanExchange) - reinterpret_cast<intptr_t>(site + 8));
     std::memcpy(site + 4, &can, 4);
-    for (const uintptr_t call : calls) {
+    uint8_t originalCalls[2][4];
+    uint8_t installedCalls[2][4];
+    for (int i = 0; i < 2; ++i) {
+        const uintptr_t call = calls[i];
+        std::memcpy(originalCalls[i], base + call + 1, sizeof(originalCalls[i]));
         const int32_t offset = static_cast<int32_t>(reinterpret_cast<intptr_t>(&NativeTransfer) - reinterpret_cast<intptr_t>(base + call + 5));
         std::memcpy(base + call + 1, &offset, 4);
+        std::memcpy(installedCalls[i], base + call + 1, sizeof(installedCalls[i]));
     }
     DWORD ignored = 0;
     if (!VirtualProtect(base + start, end - start, old, &ignored)) Logf("trade: cannot restore native code protection (error %lu)", GetLastError());
     FlushInstructionCache(GetCurrentProcess(), base + start, end - start);
+    uint8_t installedGate[sizeof(gate)];
+    std::memcpy(installedGate, site, sizeof(installedGate));
+    ai::TrackPatch(site, originalGate, installedGate, sizeof(gate), "trade native exchange gate");
+    for (int i = 0; i < 2; ++i)
+        ai::TrackPatch(base + calls[i] + 1, originalCalls[i], installedCalls[i], sizeof(originalCalls[i]),
+                       "trade native transfer call");
     nativeHooked = true;
     Log("trade: native free-exchange button and transaction hooks installed; NPC path preserved");
 }

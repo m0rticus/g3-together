@@ -508,6 +508,7 @@ void CountRemote(eCEntity* victim, RemoteKill const& kill)
 
 GEInt GE_STDCALL Notify(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalNotify ? originalNotify(spu, self, other, args) : 0;
     if (args != 0 || remoteKills.empty()) return originalNotify(spu, self, other, args);
     eCEntity* killer = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);

@@ -143,6 +143,7 @@ char const* NameOf(Entity const& e) { return e.GetInstance() ? e.GetName().GetTe
 
 GEInt GE_STDCALL WrapSummon(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalSummon ? originalSummon(spu, self, other, args) : 0;
     Entity caster = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     Entity target = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     Pending p;
@@ -168,6 +169,7 @@ GEInt GE_STDCALL WrapSummon(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
 // Sits behind the combat filter and only watches: was a hit applied here (hit points changed) or not.
 GEInt GE_STDCALL WatchHit(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalHit ? originalHit(spu, self, other, args) : 0;
     if (args >= 0 || static_cast<int32_t>(GetTickCount() - watchUntil) > 0) return originalHit(spu, self, other, args);
     Entity victim = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     Entity source = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
@@ -222,6 +224,7 @@ void AnnounceCreature(eCEntity* creature, uint8_t owner = 1)
 template <int I>
 GEInt GE_STDCALL WrapCreature(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return creatureOriginals[I] ? creatureOriginals[I](spu, self, other, args) : 0;
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     const bool own = mirror && caster && caster == remote::ControlledBody();
     if (own && !net::IsHost()) {
@@ -307,6 +310,7 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
 
 GEInt GE_STDCALL HookAreaTick(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalAreaTick ? originalAreaTick(spu, self, other, args) : 0;
     Entity cloud = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     const Entity owner = cloud.GetInstance() ? cloud.Interaction.GetOwner() : Entity();
     if (areaSkip && owner.GetInstance() && remote::PuppetOwner(owner.GetInstance())) {
@@ -327,6 +331,9 @@ void Install()
         if (gSScript* script = Find(scripts, "MagicSummon")) {
             originalSummon = script->m_funcScript;
             script->m_funcScript = &WrapSummon;
+            ai::TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                             reinterpret_cast<void*>(originalSummon),
+                             reinterpret_cast<void*>(&WrapSummon), "summon MagicSummon script");
             installed = true;
             Log("summon: MagicSummon wrapper installed");
         }
@@ -337,6 +344,9 @@ void Install()
         if (script && InOurModule(reinterpret_cast<void const*>(script->m_funcScript))) {
             originalHit = script->m_funcScript;
             script->m_funcScript = &WatchHit;
+            ai::TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                             reinterpret_cast<void*>(originalHit),
+                             reinterpret_cast<void*>(&WatchHit), "summon AddHitPoints watch script");
             probeInstalled = true;
             Log("summon: AddHitPoints watch installed behind the combat filter");
         }
@@ -347,6 +357,9 @@ void Install()
             if (script && !creatureOriginals[i]) {
                 creatureOriginals[i] = script->m_funcScript;
                 script->m_funcScript = creatureWrappers[i];
+                ai::TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                                 reinterpret_cast<void*>(creatureOriginals[i]),
+                                 reinterpret_cast<void*>(creatureWrappers[i]), "summon creature script");
             }
         }
         setId = reinterpret_cast<SetIdFn>(GetProcAddress(GetModuleHandleA("Engine.dll"), "?SetID@eCNode@@IAEXVbCPropertyID@@@Z"));

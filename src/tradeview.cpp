@@ -42,6 +42,7 @@ void Unsupported(char const* message)
 
 GEBool __fastcall Filter(void* control, void*, int stack)
 {
+    if (ai::ShuttingDown()) return originalVisible ? originalVisible(control, nullptr, stack) : GETrue;
     if (!originalVisible) return GEFalse;
     const GEBool visible = originalVisible(control, nullptr, stack);
     if (!visible) return GEFalse;
@@ -108,7 +109,7 @@ void Install()
             DWORD ignored = 0;
             VirtualProtect(target, Stolen, old, &ignored);
         }
-        VirtualFree(installedTrampoline, 0, MEM_RELEASE);
+        // ai::RestorePatches owns the executable allocation; this pointer is the original trampoline, not the allocation base.
         Unsupported("trade: unsupported native trade-grid visibility hook; predicate patch verification failed");
         return;
     }
@@ -123,31 +124,9 @@ void Install()
 
 void Uninstall()
 {
+    // Restoration is owned by ai::RestorePatches; never free the executable trampoline
+    // because a native caller may have entered it during teardown.
     if (!installed) return;
-    if (predicate) {
-        DWORD old = 0;
-        if (!VirtualProtect(predicate, Stolen, PAGE_EXECUTE_READWRITE, &old)) {
-            Log("trade: native trade-grid hook uninstall could not protect the predicate; hook left intact");
-            return;
-        }
-        uint8_t current[Stolen];
-        std::memcpy(current, predicate, Stolen);
-        if (std::memcmp(current, patchedBytes, Stolen) == 0) {
-            std::memcpy(predicate, originalBytes, Stolen);
-            FlushInstructionCache(GetCurrentProcess(), predicate, Stolen);
-        } else {
-            Log("trade: native trade-grid hook bytes changed by a replacement; preserving replacement bytes");
-            DWORD ignored = 0;
-            VirtualProtect(predicate, Stolen, old, &ignored);
-            return;
-        }
-        DWORD ignored = 0;
-        VirtualProtect(predicate, Stolen, old, &ignored);
-    }
-    if (trampoline) {
-        VirtualFree(trampoline, 0, MEM_RELEASE);
-        trampoline = nullptr;
-    }
     predicate = nullptr;
     originalVisible = nullptr;
     tradeListVTable = 0;

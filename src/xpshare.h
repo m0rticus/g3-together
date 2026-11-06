@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// One experience for everyone (owner 2 Nov.: host and client get exactly the same XP at any given time). Every
-// experience a hero earns by the game's own GiveXP (kills, quests, dialogs, whatever the source) counts for all the
-// players: each machine tells the others its running total of what its hero earned, and the others add what they have
-// not counted yet. The number is cumulative, so a lost or repeated message changes nothing. A machine hearing from a
-// player for the first time (a join, a restart) is lifted to that player's total, and the lift is no gain of its own.
+// Share future earned XP through admission-bound cumulative counters; never lift individually saved totals.
 #pragma once
 
 #include <cstdint>
@@ -11,10 +7,48 @@
 namespace g3t::net { struct WorldState; }
 
 namespace g3t::xpshare {
+namespace counter {
+constexpr uint8_t Live = 0;
+constexpr uint8_t Baseline = 1;
+constexpr uint8_t Ack = 2;
+constexpr uint8_t Request = 3;
+constexpr uint32_t BaselineEarned = 0;
+
+inline uint32_t Gain(uint32_t applied, uint32_t earned)
+{
+    return earned > applied ? earned - applied : 0;
+}
+
+struct Sender {
+    uint32_t nonce = 0, origin = 0;
+    void Begin(uint32_t id, uint32_t earned) { nonce = id; origin = earned; }
+    uint32_t Total(uint32_t earned) const { return earned - origin; }
+};
+
+struct Receiver {
+    bool known = false;
+    uint32_t nonce = 0, applied = 0;
+    bool Snapshot(uint32_t id, uint32_t baseline)
+    {
+        if (!id || baseline != BaselineEarned) return false;
+        if (!known || nonce != id) { known = true; nonce = id; applied = baseline; }
+        return true;
+    }
+    uint32_t Take(uint32_t id, uint32_t earned, uint32_t maximum)
+    {
+        if (!known || nonce != id) return 0;
+        const uint32_t gain = Gain(applied, earned);
+        if (gain > maximum) return 0;
+        if (earned > applied) applied = earned;
+        return gain;
+    }
+};
+}
+
 void Tick();                                  // sends this machine's total, applies what is waiting
 void NoteGiveXp(int gained);                  // spells.cpp: the game's GiveXP raised the local hero's experience by this much
 void OnState(net::WorldState const& s);       // kind 19: another player's total
-void OnWorldChange();                         // a load: the hero is another, lift it to the others again
+void OnWorldChange();                         // reset sharing counters, retaining the loaded hero's own XP/level
 using LogFn = void (*)(char const*);
 void Report(LogFn log);                       // QA: XPSHARE line
 void Off(LogFn log);                          // QA negative control (dialogxpoff): experience stays with whoever earned it

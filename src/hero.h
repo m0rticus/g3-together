@@ -4,12 +4,18 @@
 // is the host's and so is the hero in it; the record gives the player its own hero back.
 #pragma once
 
+#include "saving_policy.h"
+
 #include <string>
 
 namespace g3t::hero {
 using LogFn = void (*)(char const*);
 bool SaveRecord(char const* path);      // the local hero into a text file
 bool LoadRecord(char const* path);      // the local hero from a text file
+bool LoadLegacyRecordStrict(char const* path);  // mandatory migration, never a diagnostic no-op
+bool SaveRecord(char const* path, saving::Key const& key);
+bool LoadRecord(char const* path, saving::Key const& key);
+bool ReadRecordKey(char const* path, saving::Key& key);
 char const* LastRefusal();              // why the last LoadRecord refused its record (damaged, unreadable), nullptr if it did not
 void Dump(LogFn log);                   // QA: HERODUMP line, a canonical summary of the local hero
 void SaveCommand(char const* name, LogFn log);  // QA: <save folder>/g3t-hero-<name>.txt

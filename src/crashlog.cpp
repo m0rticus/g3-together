@@ -2,9 +2,11 @@
 #include "crashlog.h"
 
 #include "log.h"
+#include "ai.h"
 #include <Game.h>
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <TlHelp32.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,26 +18,57 @@ bool installed = false, dumpInstalled = false;
 volatile bool probing = false;
 LONG logged = 0;
 
-// Minidumps (28.10.: a client ended with 0xC0000005 without any CRASH line, game crash log or Windows dump). Written by a
-// thread of their own, started at install time, so that a crash with a broken stack still gets one: the crashing thread
-// hands over its exception and waits. File: <game dir>\g3together-crash-<hhmmss>-<n>.dmp, next to g3together.log; the QA
-// runner moves it into the run folder. For every player on the last chance (an exception nobody handled); with QA also on
-// the first chance of an access violation (at most MaxFirstChanceDumps: the game catches some itself).
 using DumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
                              PMINIDUMP_CALLBACK_INFORMATION);
 DumpFn writeDump = nullptr;
-HANDLE dumpRequest = nullptr, dumpDone = nullptr;
+HANDLE dumpRequest = nullptr, dumpDone = nullptr, dumpStop = nullptr, dumpThreadHandle = nullptr;
 EXCEPTION_POINTERS* dumpInfo = nullptr;
-DWORD dumpThreadId = 0;
+DWORD dumpThreadId = 0, dumpWorkerThreadId = 0;
 char dumpDir[MAX_PATH] = {};
 LONG dumps = 0;
 constexpr LONG MaxFirstChanceDumps = 2;
 LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
+PVOID vectoredHandler = nullptr;
+HANDLE watchdogCancel = nullptr, watchdogThreadHandle = nullptr;
+bool stageWorld = false, stageForget = false, stageSteam = false, stageHooks = false;
+bool stageThreads = false, stagePreShutdown = false, stageShutdownCalled = false;
+
+void DeriveDumpDir()
+{
+    if (*dumpDir) return;
+    HMODULE self = nullptr;
+    char path[MAX_PATH] = {};
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&DeriveDumpDir), &self) &&
+        GetModuleFileNameA(self, path, MAX_PATH)) {
+        for (int part = 0; part != 2; ++part) {
+            char* slash = std::strrchr(path, '\\');
+            if (!slash) { *path = '\0'; break; }
+            *slash = '\0';
+        }
+    }
+    if (!*path) {
+        if (!GetCurrentDirectoryA(MAX_PATH, dumpDir)) dumpDir[0] = '\0';
+    } else {
+        strcpy_s(dumpDir, path);
+    }
+    if (*dumpDir) {
+        size_t length = std::strlen(dumpDir);
+        if (length && dumpDir[length - 1] != '\\') strcat_s(dumpDir, "\\");
+    }
+}
 
 DWORD WINAPI DumpThread(LPVOID)
 {
     for (;;) {
-        if (WaitForSingleObject(dumpRequest, INFINITE) != WAIT_OBJECT_0) return 0;
+        HANDLE waits[2] = {dumpStop, dumpRequest};
+        const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (result == WAIT_OBJECT_0) return 0;
+        if (result != WAIT_OBJECT_0 + 1) return 0;
+        if (ai::ShuttingDown()) {
+            SetEvent(dumpDone);
+            return 0;
+        }
         SYSTEMTIME now;
         GetLocalTime(&now);
         char path[MAX_PATH + 64];
@@ -43,8 +76,12 @@ DWORD WINAPI DumpThread(LPVOID)
         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file != INVALID_HANDLE_VALUE) {
             MINIDUMP_EXCEPTION_INFORMATION exception{dumpThreadId, dumpInfo, FALSE};
-            const auto type = static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs | MiniDumpWithThreadInfo);
-            writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type, dumpInfo ? &exception : nullptr, nullptr, nullptr);
+            const auto type = static_cast<MINIDUMP_TYPE>(
+                MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+                MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
+            if (!writeDump || !writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type,
+                                         dumpInfo ? &exception : nullptr, nullptr, nullptr))
+                Log("crashlog: crash dump write failed");
             CloseHandle(file);
         }
         SetEvent(dumpDone);
@@ -53,15 +90,19 @@ DWORD WINAPI DumpThread(LPVOID)
 
 void Dump(EXCEPTION_POINTERS* info)
 {
-    if (!writeDump || !dumpRequest) return;
+    if (!writeDump || !dumpRequest || ai::ShuttingDown()) return;
+    if (InterlockedCompareExchange(&dumps, 0, 0) < 0) return;
     dumpInfo = info;
     dumpThreadId = GetCurrentThreadId();
     SetEvent(dumpRequest);
-    WaitForSingleObject(dumpDone, 30000);
+    const DWORD wait = ai::ShuttingDown() ? 1000 : 30000;
+    WaitForSingleObject(dumpDone, wait);
 }
 
 LONG WINAPI LastChance(EXCEPTION_POINTERS* info)
 {
+    if (ai::ShuttingDown() || GetCurrentThreadId() == dumpWorkerThreadId)
+        return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedIncrement(&dumps) <= 4) Dump(info);
     return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -70,23 +111,16 @@ void InstallDumps()
 {
     if (dumpInstalled) return;
     dumpInstalled = true;
-    HMODULE self = nullptr;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(&InstallDumps), &self) || !GetModuleFileNameA(self, dumpDir, MAX_PATH))
-        return;
-    for (int part = 0; part != 2; ++part) {  // <game dir>\scripts\Script_G3Together.dll -> <game dir>\  (as log.cpp)
-        char* separator = std::strrchr(dumpDir, '\\');
-        if (!separator) { *dumpDir = '\0'; return; }
-        *separator = '\0';
-    }
-    strcat_s(dumpDir, "\\");
+    DeriveDumpDir();
+    if (!*dumpDir) { Log("crashlog: no minidumps (game directory unavailable)"); return; }
     HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
     writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
     dumpRequest = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     dumpDone = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    HANDLE thread = writeDump && dumpRequest && dumpDone ? CreateThread(nullptr, 256 * 1024, &DumpThread, nullptr, 0, nullptr) : nullptr;
-    if (!thread) { writeDump = nullptr; Log("crashlog: no minidumps (dbghelp or thread missing)"); return; }
-    CloseHandle(thread);
+    dumpStop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    dumpThreadHandle = writeDump && dumpRequest && dumpDone && dumpStop
+        ? CreateThread(nullptr, 256 * 1024, &DumpThread, nullptr, 0, &dumpWorkerThreadId) : nullptr;
+    if (!dumpThreadHandle) { writeDump = nullptr; Log("crashlog: no minidumps (dbghelp or thread missing)"); return; }
     previousFilter = SetUnhandledExceptionFilter(&LastChance);
     Logf("crashlog: minidumps on a crash go to %sg3together-crash-*.dmp", dumpDir);
 }
@@ -239,6 +273,7 @@ bool Where(uintptr_t address, char* out, size_t size)
 
 LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
 {
+    if (ai::ShuttingDown()) return EXCEPTION_CONTINUE_SEARCH;
     if (!info || info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
     bool gameFault = false;
@@ -247,7 +282,8 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     // Drivers can handle their own first-chance exceptions. Dumping those may block graphics teardown.
     // Unhandled exceptions from any module still reach LastChance.
     if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
-    if (!probing && GetCurrentThreadId() != dumpThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps) Dump(info);  // before anything
+    if (!probing && GetCurrentThreadId() != dumpWorkerThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps)
+        Dump(info);  // before anything
     // that could fault again
     if (InterlockedIncrement(&logged) > 12) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT const& c = *info->ContextRecord;
@@ -305,6 +341,218 @@ int ProbeFault()
         return 1;
     }
 }
+
+struct WatchdogModule {
+    DWORD_PTR base;
+    DWORD_PTR size;
+    char path[MAX_PATH];
+};
+
+bool WriteText(HANDLE file, char const* text)
+{
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const size_t length = std::strlen(text);
+    return length == 0 || (WriteFile(file, text, static_cast<DWORD>(length), &written, nullptr) && written == length);
+}
+
+void WatchdogWhere(WatchdogModule const* watchModules, unsigned count, DWORD_PTR address, char* out, size_t size)
+{
+    for (unsigned i = 0; i < count; ++i)
+        if (address >= watchModules[i].base && address < watchModules[i].base + watchModules[i].size) {
+            Format(out, size, "%08IX +%08IX", watchModules[i].base, address - watchModules[i].base);
+            char const* slash = std::strrchr(watchModules[i].path, '\\');
+            char suffix[MAX_PATH];
+            Format(suffix, "%s", slash ? slash + 1 : watchModules[i].path);
+            strcat_s(out, size, " ");
+            strcat_s(out, size, suffix);
+            return;
+        }
+    Format(out, size, "unknown");
+}
+
+void WriteWatchdogText(char const* path)
+{
+    HANDLE text = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (text == INVALID_HANDLE_VALUE) {
+        Logf("shutdown watchdog: text create failed error=%lu", GetLastError());
+        return;
+    }
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    char line[1024];
+    Format(line, "G3 Together shutdown watchdog\nUTC/local %02u:%02u:%02u process=%lu watchdog_thread=%lu\n",
+           now.wHour, now.wMinute, now.wSecond, GetCurrentProcessId(), GetCurrentThreadId());
+    WriteText(text, line);
+
+    WatchdogModule watchModules[128] = {};
+    unsigned moduleCount = 0;
+    HANDLE moduleSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (moduleSnapshot != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32 module{};
+        module.dwSize = sizeof(module);
+        if (Module32First(moduleSnapshot, &module)) {
+            do {
+                if (moduleCount >= std::size(watchModules)) break;
+                watchModules[moduleCount].base = reinterpret_cast<DWORD_PTR>(module.modBaseAddr);
+                watchModules[moduleCount].size = module.modBaseSize;
+                strncpy_s(watchModules[moduleCount].path, module.szExePath, _TRUNCATE);
+                ++moduleCount;
+                Format(line, "MODULE base=%08IX size=%08IX path=%s\n",
+                       reinterpret_cast<DWORD_PTR>(module.modBaseAddr), static_cast<DWORD_PTR>(module.modBaseSize), module.szExePath);
+                WriteText(text, line);
+            } while (Module32Next(moduleSnapshot, &module));
+        }
+        CloseHandle(moduleSnapshot);
+    } else {
+        WriteText(text, "MODULE_INVENTORY failed=CreateToolhelp32Snapshot\n");
+    }
+
+    CONTEXT selfContext{};
+    selfContext.ContextFlags = CONTEXT_FULL;
+    RtlCaptureContext(&selfContext);
+    Format(line, "WATCHDOG_THREAD id=%lu EIP=%08lX ESP=%08lX EBP=%08lX (captured without suspension)\n",
+           GetCurrentThreadId(), selfContext.Eip, selfContext.Esp, selfContext.Ebp);
+    WriteText(text, line);
+    if (selfContext.Eip) {
+        char where[300];
+        WatchdogWhere(watchModules, moduleCount, selfContext.Eip, where, sizeof(where));
+        Format(line, "WATCHDOG_THREAD id=%lu frame=eip address=%08lX module+offset=%s\n",
+               GetCurrentThreadId(), selfContext.Eip, where);
+        WriteText(text, line);
+    }
+
+    HANDLE threadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (threadSnapshot == INVALID_HANDLE_VALUE) {
+        WriteText(text, "THREAD_INVENTORY failed=CreateToolhelp32Snapshot\n");
+        CloseHandle(text);
+        return;
+    }
+    THREADENTRY32 thread{};
+    thread.dwSize = sizeof(thread);
+    if (Thread32First(threadSnapshot, &thread)) {
+        do {
+            if (thread.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            const DWORD tid = thread.th32ThreadID;
+            if (tid == GetCurrentThreadId()) continue;
+            HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+            if (!handle) {
+                Format(line, "THREAD id=%lu CONTEXT failed=OpenThread error=%lu\n", tid, GetLastError());
+                WriteText(text, line);
+                continue;
+            }
+            DWORD suspended = SuspendThread(handle);
+            if (suspended == static_cast<DWORD>(-1)) {
+                Format(line, "THREAD id=%lu CONTEXT failed=SuspendThread error=%lu\n", tid, GetLastError());
+                WriteText(text, line);
+                CloseHandle(handle);
+                continue;
+            }
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_FULL;
+            if (!GetThreadContext(handle, &context)) {
+                Format(line, "THREAD id=%lu CONTEXT failed=GetThreadContext error=%lu\n", tid, GetLastError());
+                WriteText(text, line);
+            } else {
+                Format(line, "THREAD id=%lu EIP=%08lX ESP=%08lX EBP=%08lX\n",
+                       tid, context.Eip, context.Esp, context.Ebp);
+                WriteText(text, line);
+
+                char where[300];
+                WatchdogWhere(watchModules, moduleCount, context.Eip, where, sizeof(where));
+                Format(line, "THREAD id=%lu frame=eip address=%08lX module+offset=%s\n", tid, context.Eip, where);
+                WriteText(text, line);
+
+                unsigned char stackBytes[4096];
+                SIZE_T read = 0;
+                if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
+                                      stackBytes, sizeof(stackBytes), &read) && read >= sizeof(DWORD)) {
+                    unsigned frame = 0;
+                    for (SIZE_T i = 0; i + sizeof(DWORD) <= read && frame < 64; i += sizeof(DWORD)) {
+                        DWORD_PTR address;
+                        std::memcpy(&address, stackBytes + i, sizeof(DWORD));
+                        WatchdogWhere(watchModules, moduleCount, address, where, sizeof(where));
+                        if (!std::strcmp(where, "unknown")) continue;
+                        Format(line, "THREAD id=%lu frame=%u address=%08IX module+offset=%s\n",
+                               tid, frame++, address, where);
+                        WriteText(text, line);
+                    }
+                }
+
+                DWORD ebp = context.Ebp;
+                unsigned ebpFrame = 0;
+                for (unsigned i = 0; i < 32 && ebp; ++i) {
+                    DWORD pair[2] = {};
+                    SIZE_T got = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(ebp),
+                                            pair, sizeof(pair), &got) || got != sizeof(pair))
+                        break;
+                    if (!pair[1]) break;
+                    WatchdogWhere(watchModules, moduleCount, pair[1], where, sizeof(where));
+                    if (!std::strcmp(where, "unknown")) { ebp = pair[0]; continue; }
+                    Format(line, "THREAD id=%lu ebp-frame=%u address=%08lX module+offset=%s\n",
+                           tid, ebpFrame++, pair[1], where);
+                    WriteText(text, line);
+                    if (!pair[0] || pair[0] == ebp) break;
+                    ebp = pair[0];
+                }
+            }
+            const DWORD resumed = ResumeThread(handle);
+            if (resumed == static_cast<DWORD>(-1)) {
+                Format(line, "THREAD id=%lu RESUME failed=ResumeThread error=%lu\n", tid, GetLastError());
+                WriteText(text, line);
+            }
+            CloseHandle(handle);
+        } while (Thread32Next(threadSnapshot, &thread));
+    }
+    CloseHandle(threadSnapshot);
+    CloseHandle(text);
+}
+
+void WriteWatchdogDump(char const* path)
+{
+    if (!writeDump) {
+        HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+        writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    }
+    if (!writeDump) {
+        Log("shutdown watchdog: dmp write failed (MiniDumpWriteDump unavailable)");
+        return;
+    }
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        Logf("shutdown watchdog: dmp create failed error=%lu", GetLastError());
+        return;
+    }
+    const auto type = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+        MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
+    if (!writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type, nullptr, nullptr, nullptr))
+        Logf("shutdown watchdog: dmp write failed error=%lu", GetLastError());
+    CloseHandle(file);
+}
+
+DWORD WINAPI WatchdogThread(LPVOID)
+{
+    const DWORD result = WaitForSingleObject(watchdogCancel, 12000);
+    if (result != WAIT_TIMEOUT) return 0;
+    DeriveDumpDir();
+    if (!*dumpDir) {
+        Log("shutdown watchdog: write failed (game directory unavailable)");
+        return 0;
+    }
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    char base[MAX_PATH + 64];
+    Format(base, "%sg3together-hang-%02u%02u%02u", dumpDir, now.wHour, now.wMinute, now.wSecond);
+    char dmp[MAX_PATH + 64], txt[MAX_PATH + 64];
+    Format(dmp, "%s.dmp", base);
+    Format(txt, "%s.txt", base);
+    WriteWatchdogDump(dmp);
+    WriteWatchdogText(txt);
+    Logf("shutdown watchdog: files=%s ; %s", dmp, txt);
+    return 0;
+}
 }
 
 void Tick()
@@ -315,7 +563,7 @@ void Tick()
     FindModules();
     HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
     undecorate = dbghelp ? reinterpret_cast<UndecorateFn>(GetProcAddress(dbghelp, "UnDecorateSymbolName")) : nullptr;
-    AddVectoredExceptionHandler(1, &OnException);
+    if (!vectoredHandler) vectoredHandler = AddVectoredExceptionHandler(1, &OnException);
     Log("crashlog: access violations are logged");
 }
 
@@ -335,5 +583,108 @@ void Probe(LogFn log)
     Format(line, "CRASHPROBE fault=%d named=%u scripts=%d names=%d", fault, named - before, static_cast<int>(scriptCount),
            names ? 1 : 0);
     log(line);
+}
+
+void Stage(char const* name)
+{
+    if (!name) return;
+    if (!std::strcmp(name, "world deactivated") && stageWorld) return;
+    if (!std::strcmp(name, "forget done") && stageForget) return;
+    if (!std::strcmp(name, "steam stopped") && stageSteam) return;
+    if (!std::strcmp(name, "hooks removed") && stageHooks) return;
+    if (!std::strcmp(name, "threads joined") && stageThreads) return;
+    if (!std::strcmp(name, "pre-shutdown done") && stagePreShutdown) return;
+    if (!std::strcmp(name, "shutdown called") && stageShutdownCalled) return;
+    if (!std::strcmp(name, "world deactivated")) stageWorld = true;
+    if (!std::strcmp(name, "forget done")) stageForget = true;
+    if (!std::strcmp(name, "steam stopped")) stageSteam = true;
+    if (!std::strcmp(name, "hooks removed")) stageHooks = true;
+    if (!std::strcmp(name, "threads joined")) stageThreads = true;
+    if (!std::strcmp(name, "pre-shutdown done")) stagePreShutdown = true;
+    if (!std::strcmp(name, "shutdown called")) stageShutdownCalled = true;
+    char line[160];
+    Format(line, "shutdown-stage: %s", name);
+    Log(line);
+}
+
+void CancelWatchdog()
+{
+    if (watchdogCancel) SetEvent(watchdogCancel);
+    if (watchdogThreadHandle) {
+        const DWORD waited = WaitForSingleObject(watchdogThreadHandle, 2000);
+        if (waited == WAIT_TIMEOUT) {
+            Log("crashlog: watchdog cancel timed out; leaving worker and event live");
+            return;
+        }
+        CloseHandle(watchdogThreadHandle);
+        watchdogThreadHandle = nullptr;
+    }
+    if (watchdogCancel) {
+        CloseHandle(watchdogCancel);
+        watchdogCancel = nullptr;
+    }
+}
+
+void BeginShutdown()
+{
+    if (dumpStop) SetEvent(dumpStop);
+    if (dumpDone) SetEvent(dumpDone);
+    if (vectoredHandler) {
+        RemoveVectoredExceptionHandler(vectoredHandler);
+        vectoredHandler = nullptr;
+    }
+    if (previousFilter) {
+        LPTOP_LEVEL_EXCEPTION_FILTER current = SetUnhandledExceptionFilter(&LastChance);
+        if (current == &LastChance) {
+            SetUnhandledExceptionFilter(previousFilter);
+        } else {
+            SetUnhandledExceptionFilter(current);
+        }
+        previousFilter = nullptr;
+    }
+}
+
+bool Shutdown()
+{
+    CancelWatchdog();
+    BeginShutdown();
+    if (dumpStop) SetEvent(dumpStop);
+    bool joined = true;
+    if (dumpThreadHandle) {
+        const DWORD waited = WaitForSingleObject(dumpThreadHandle, 2000);
+        if (waited == WAIT_TIMEOUT) {
+            Log("crashlog: dump worker stop timed out; continuing teardown");
+            joined = false;
+        }
+        if (joined) {
+            CloseHandle(dumpThreadHandle);
+            dumpThreadHandle = nullptr;
+        }
+    }
+    if (!joined) {
+        return false;
+    }
+    if (dumpRequest) { CloseHandle(dumpRequest); dumpRequest = nullptr; }
+    if (dumpDone) { CloseHandle(dumpDone); dumpDone = nullptr; }
+    if (dumpStop) { CloseHandle(dumpStop); dumpStop = nullptr; }
+    return true;
+}
+
+void StartWatchdog()
+{
+    if (watchdogThreadHandle) return;
+    DeriveDumpDir();
+    watchdogCancel = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!watchdogCancel) {
+        Log("shutdown watchdog: start failed (cancel event unavailable)");
+        return;
+    }
+    watchdogThreadHandle = CreateThread(nullptr, 256 * 1024, &WatchdogThread, nullptr, 0, nullptr);
+    if (!watchdogThreadHandle) {
+        CloseHandle(watchdogCancel);
+        watchdogCancel = nullptr;
+        Log("shutdown watchdog: start failed (thread unavailable)");
+        return;
+    }
 }
 }

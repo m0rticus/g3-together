@@ -24,6 +24,7 @@ bool Ready();               // the Steam API is running
 uint64_t LobbyId();
 int Ping();                 // maximum measured Steam control RTT of linked peers, -1 before any sample
 char const* PlayerName();   // Steam persona truncated at a complete UTF-8 boundary for the protocol's 23-byte name
+uint64_t PlayerId();       // authenticated local account, stable across names and reconnects; 0 before Steam starts
 char const* Error();        // why Steam is not used, "" while it is (or before Start)
 // Client: the Steam name of the host whose lobby it is in ("" while it looks for one) and whether that host answered.
 char const* HostName();

@@ -38,6 +38,7 @@ int watchedCount = 0;
 template <int I>
 GEInt GE_STDCALL WatchWrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return watched[I].original ? watched[I].original(spu, self, other, args) : 0;
     Watched& w = watched[I];
     ++w.calls;
     Entity s = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
@@ -1002,6 +1003,9 @@ void ScriptWatch(char const* name, LogFn log)
     w.name = name;
     w.original = script->m_funcScript;
     script->m_funcScript = watchWrappers[watchedCount++];
+    ai::TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                     reinterpret_cast<void*>(w.original),
+                     reinterpret_cast<void*>(script->m_funcScript), "explore script watch");
     Format(line, "SCRIPTWATCH name=%s watched=1", name);
     log(line);
 }
@@ -1124,6 +1128,7 @@ int nativeCount = 0;
 template <int I>
 GEInt GE_STDCALL NativeWrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return natives[I].original ? natives[I].original(spu, self, other, args) : 0;
     NativeWatched& w = natives[I];
     eCEntity* s = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* o = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);

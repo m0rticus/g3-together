@@ -11,6 +11,7 @@
 #include "downed.h"
 #include "guid.h"
 #include "log.h"
+#include "melee_policy.h"
 #include "net.h"
 #include "npcs.h"
 #include "npcplayback.h"
@@ -36,6 +37,9 @@
 namespace g3t::combat {
 eCEntity* DamageSource(eCDynamicEntity* hero, char const** name);  // below
 namespace {
+static_assert(melee::Friendly == static_cast<int>(gEAttitude_Friendly) &&
+              melee::Neutral == static_cast<int>(gEAttitude_Neutral) &&
+              melee::Hostile == static_cast<int>(gEAttitude_Hostile));
 // Every hit in the game ends in the AddHitPoints script, called through the script admin (hit-path probe in
 // the opening raid, 2026-10-17): weapon touch damage (gCTouchDamage_PS::TriggerTarget), the AI combat loop
 // (after OnHit) and gCEntity::DoDamage. Each first judges the hit, which only records the damage in the
@@ -67,6 +71,7 @@ struct PendingNpcHit {
     int32_t delta;
     uint32_t seen;
     uint32_t sequence, incarnation, generation;
+    net::MeleeContact contact;
 };
 std::vector<PendingNpcHit> pendingNpcHits;
 struct ReactionProbe {
@@ -170,6 +175,8 @@ std::unordered_set<std::string> killedHere;  // host: victims killed here for a 
 std::unordered_set<std::string> rewarded;    // client: victims this player was rewarded for
 std::unordered_map<std::string, uint32_t> playerSwings;
 std::unordered_map<std::string, uint32_t> playerClaims;
+struct RefusedMelee { uint32_t motion = 0; std::string reason; };
+std::unordered_map<std::string, RefusedMelee> refusedMelee;
 bool killOnce = true;  // QA negative control: killonceoff
 unsigned killsRepeated = 0, rewardsRepeated = 0;
 // A kill here that did not take kept its victim in killedHere: no later hit of any client counted on it (stageLiberate
@@ -507,6 +514,156 @@ bool IsPuppetMeleeJudgement(eCEntity* victim, eCEntity* attacker, eCEntity* sour
            (!source || !source->GetPropertySet(eEPropertySetType_Projectile));
 }
 
+bool HasIdentity(uint8_t const identity[16])
+{
+    static const uint8_t zero[16] = {};
+    return std::memcmp(identity, zero, 16) != 0;
+}
+
+bool IsLocalMelee(eCEntity* attacker, eCEntity* source)
+{
+    return attacker && attacker == remote::ControlledBody() &&
+           (!source || (!source->GetPropertySet(eEPropertySetType_Projectile) &&
+            (!source->GetPropertySet(eEPropertySetType_Interaction) || !Entity(source).Interaction.GetSpell().GetInstance())));
+}
+
+net::MeleeContact CaptureMelee(eCEntity* attacker, eCEntity* source)
+{
+    Entity player(attacker);
+    net::MeleeContact contact;
+    contact.melee = 1;
+    contact.item = source && source->GetPropertySet(eEPropertySetType_Item);
+    const gEAction action = player.Routine.Action;
+    contact.targetOnly = action == gEAction_PierceAttack || action == gEAction_HackAttack;
+    contact.motion = npcplayback::MotionInstance(attacker);
+    guid::CopyEntity(player.Focus.GetFocusEntity().GetInstance(), contact.focus);
+    guid::CopyEntity(player.NPC.GetCurrentTarget().GetInstance(), contact.target);
+    return contact;
+}
+
+eCEntity* PartyLeader(eCEntity* entity)
+{
+    return entity && entity->GetPropertySet(eEPropertySetType_Party) ? Entity(entity).Party.GetPartyLeader().GetInstance() : nullptr;
+}
+
+int RawAttitude(eCEntity* entity)
+{
+    return entity && entity->GetPropertySet(eEPropertySetType_NPC)
+        ? static_cast<int>(static_cast<gEAttitude>(Entity(entity).NPC.AttitudeToPlayer2)) : melee::None;
+}
+
+struct MeleeVerdict {
+    melee::Victim victim;
+    eCEntity* focus = nullptr;
+    int relation = -1;
+    char const* decision = "missing-claimant";
+    bool allowed = false;
+};
+struct PlayerMeleeContact {
+    net::MeleeContact contact;
+    MeleeVerdict verdict;
+};
+std::unordered_map<std::string, PlayerMeleeContact> playerMeleeContacts;
+
+MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, net::MeleeContact const& contact)
+{
+    MeleeVerdict result;
+    if (!claimant || !claimant->GetPropertySet(eEPropertySetType_NPC)) return result;
+    result.focus = HasIdentity(contact.focus) ? guid::Resolve(contact.focus).GetInstance() : nullptr;
+    eCEntity* aimed = HasIdentity(contact.target) ? guid::Resolve(contact.target).GetInstance() : nullptr;
+    if ((HasIdentity(contact.focus) && !result.focus) || (HasIdentity(contact.target) && !aimed)) {
+        result.decision = "unresolved-intent";
+        return result;
+    }
+    eCEntity* opponent = nullptr;
+    if (!npcs::CombatTarget(victim, opponent)) {
+        result.decision = "unresolved-opponent";
+        return result;
+    }
+    if ((result.focus && !npcs::Ready(result.focus)) || (opponent && !npcs::Ready(opponent))) {
+        result.decision = "unready-relations";
+        return result;
+    }
+    auto& v = result.victim;
+    v.attitude = RawAttitude(victim);
+    v.focusAttitude = RawAttitude(result.focus);
+    v.targetAttitude = RawAttitude(opponent);
+    v.combat = body::AIModeOf(victim) == gEAIMode_Combat;
+    v.hasFocus = result.focus != nullptr;
+    v.focused = result.focus == victim;
+    v.targeted = aimed == victim;
+    v.hasTarget = opponent != nullptr;
+    v.targetsPlayer = opponent == claimant;
+    v.ledByPlayer = PartyLeader(victim) == claimant || npcs::CompanionOwner(victim) == player;
+    v.playerLedByVictim = PartyLeader(claimant) == victim;
+    v.targetsPlayerParty = opponent && (PartyLeader(opponent) == claimant || npcs::CompanionOwner(opponent) == player);
+    v.targetOnly = contact.targetOnly != 0;
+    v.item = contact.item != 0;
+    if (claimant->GetPropertySet(eEPropertySetType_Party)) {
+        const auto members = Entity(claimant).Party.GetMembers(GEFalse);
+        for (int i = 0; i < members.GetCount(); ++i)
+            if (members[i] == victim) v.partyMember = true;
+    }
+    // Recruiting can be represented in the host's companion registry before its native party is bound.
+    v.partyMember = v.partyMember || v.ledByPlayer;
+    if (!ai::TryPlayerAttitude(victim, claimant, result.relation)) {
+        result.decision = "attitude-unavailable";
+        return result;
+    }
+    v.relation = result.relation;
+    if (!v.combat && v.hasFocus && !v.focused && !v.targetsPlayer && !v.partyMember &&
+        !ai::TryPlayerAttitude(result.focus, claimant, v.focusRelation)) {
+        result.decision = "focus-attitude-unavailable";
+        return result;
+    }
+    Entity npc(victim);
+    if (arenaRule && InBout(npc) && !v.targetsPlayer) {
+        result.decision = "outside-bout";
+        return result;
+    }
+    const auto decision = melee::Judge(v);
+    result.allowed = decision == melee::Decision::Allow;
+    result.decision = melee::Name(decision);
+    return result;
+}
+
+void LogMelee(char const* entry, uint8_t player, uint32_t sequence, eCEntity* victim,
+              net::MeleeContact const& contact, MeleeVerdict const& verdict)
+{
+    char identity[40], focus[40], target[40];
+    guid::FormatEntity(victim, identity, sizeof(identity));
+    guid::Format(contact.focus, focus, sizeof(focus));
+    guid::Format(contact.target, target, sizeof(target));
+    const bCString name = Entity(victim).GetName();
+    Logf("combat: melee-victim entry=%s player=%u sequence=%u motion=%u victim=%s guid=%s attitude=%d raw=%d "
+         "focus=%s target=%s focused=%d targeted=%d combat=%d decision=%s",
+         entry, player, sequence, contact.motion, name.GetText(), identity, verdict.relation, verdict.victim.attitude,
+         focus, target, verdict.victim.focused ? 1 : 0, verdict.victim.targeted ? 1 : 0,
+         verdict.victim.combat ? 1 : 0, verdict.decision);
+}
+
+bool LocalMeleeAllowed(eCEntity* victim, eCEntity* attacker, net::MeleeContact const& contact)
+{
+    auto verdict = JudgeMelee(victim, attacker, net::LocalId(), contact);
+    if (verdict.allowed && contact.item && !Entity(attacker).IsInFOV(Entity(victim))) {
+        verdict.allowed = false;
+        verdict.decision = "outside-native-fov";
+    }
+    uint8_t identity[16]; Guid(victim, identity);
+    const auto key = KillKey(identity);
+    if (verdict.allowed) {
+        playerMeleeContacts[key] = {contact, verdict};
+        return true;
+    }
+    auto& refused = refusedMelee[key];
+    if (refused.motion != contact.motion || refused.reason != verdict.decision) {
+        refused.motion = contact.motion;
+        refused.reason = verdict.decision;
+        LogMelee("local-refused", net::LocalId(), 0, victim, contact, verdict);
+    }
+    return false;
+}
+
 // Stufe 4.1: the game judges a blow (DoLogicalDamage: AssessHit's stumble, the hit sound and blood, the fight-sound perception)
 // before AddHitPoints, so a mirror's or puppet's weapon touching a body here plays all of it here, although rule 1 drops the
 // damage, and the owner's real hit follows (OnHitPlayer judges it again). Counted by victim (0 our hero, 1 our NPCs, 2 bodies
@@ -527,6 +684,7 @@ constexpr DWORD FightMusicHold = 5000;  // ms
 
 GEInt GE_STDCALL MusicTick(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return musicTick ? musicTick(spu, self, other, args) : 0;
     const GEInt result = musicTick(spu, self, other, args);
     ++musicTicks;
     if (!fightMusic || bypass) return result;
@@ -541,10 +699,20 @@ GEInt GE_STDCALL MusicTick(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid 
 
 GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
-    Entity victim = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
+    // DoLogicalDamage takes (source, victim); OnDamage/AssessHit take (victim, source).
+    GELPVoid recipientArg = which == 0 ? other : self;
+    GELPVoid sourceArg = which == 0 ? self : other;
+    Entity victim = recipientArg ? *static_cast<Entity*>(recipientArg)
+        : Entity(spu ? (which == 0 ? spu->GetOtherEntity() : spu->GetSelfEntity()) : nullptr);
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    eCEntity* attacker = Attacker(spu, other);
-    eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    Entity damageSource = sourceArg ? *static_cast<Entity*>(sourceArg)
+        : Entity(spu ? (which == 0 ? spu->GetSelfEntity() : spu->GetOtherEntity()) : nullptr);
+    eCEntity* attacker = Attacker(nullptr, &damageSource);
+    eCEntity* source = damageSource.GetInstance();
+    if (!bypass && !forwarded && npcs::IsMirrored(victim.GetInstance()) && IsLocalMelee(attacker, source) &&
+        ai::detail::damageReceiver != victim.GetInstance() &&
+        !LocalMeleeAllowed(victim.GetInstance(), attacker, CaptureMelee(attacker, source))) return 0;
+    if (ai::ShuttingDown()) return judge[which] ? judge[which](spu, self, other, args) : 0;
     if (IsPuppetMeleeJudgement(victim.GetInstance(), attacker, source)) {
         ++foreignSkipped;
         return 0;
@@ -561,8 +729,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     if (IgnoreFriendlyHit(victim.GetInstance(), attacker)) return 0;
     uint32_t* consumed = nullptr;
     uint32_t swing = 0;
-    if (which < 2 && !bypass && npcs::IsMirrored(victim.GetInstance()) && attacker == remote::ControlledBody() &&
-        body::LocallyAttacking(attacker) && (!source || !source->GetPropertySet(eEPropertySetType_Projectile))) {
+    if (which < 2 && !bypass && npcs::IsMirrored(victim.GetInstance()) && IsLocalMelee(attacker, source)) {
         swing = npcplayback::MotionInstance(attacker);
         if (swing) {
             uint8_t guid[16]; Guid(victim.GetInstance(), guid);
@@ -587,7 +754,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     }
     const bool localVictim = victim.GetInstance() && (victim.GetInstance() == hero || victim.GetInstance() == remote::ControlledBody());
     if (!bypass && shot::InNpcReplicaContact() && !localVictim) return 0;
-    if (!bypass && !forwarded && localVictim && npcs::IsMirrored(attacker) && !LocalNpcContact(spu, other, attacker)) {
+    if (!bypass && !forwarded && localVictim && npcs::IsMirrored(attacker) && !LocalNpcContact(nullptr, &damageSource, attacker)) {
         ++invisibleContactsIgnored;
         return 0;
     }
@@ -817,6 +984,7 @@ GEInt CallOriginalAndLog(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid ot
 
 GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     ++filterCalls;
     if (!bypass && shot::InNpcReplicaContact()) {
         Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
@@ -842,7 +1010,6 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     eCEntity* attacker = Attacker(spu, other);
     eCEntity* localMeleeActor = remote::ControlledBody();
     eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
-    const bool projectileSource = source && source->GetPropertySet(eEPropertySetType_Projectile);
     if (InventoryBlocksNpc(instance, attacker)) {
         NoteInventoryHit();
         return GETrue;
@@ -900,7 +1067,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         if (reaction == net::HitNoReaction && body::LocallyAttacking(remote::ControlledBody())) reaction = net::HitQuickStumble;
         uint32_t swing = 0;
         std::string claimKey;
-        if (!projectileSource && localMeleeActor && body::LocallyAttacking(localMeleeActor) && attacker == hero) {
+        if (IsLocalMelee(localMeleeActor, source) && attacker == hero) {
             swing = npcplayback::MotionInstance(localMeleeActor);
             if (swing) {
                 claimKey = KillKey(guid);
@@ -918,11 +1085,24 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
                 }
             }
         }
+        net::MeleeContact contact;
+        if (IsLocalMelee(localMeleeActor, source)) {
+            const auto context = playerMeleeContacts.find(KillKey(guid));
+            if (context != playerMeleeContacts.end() && context->second.contact.motion == npcplayback::MotionInstance(localMeleeActor)) {
+                contact = context->second.contact;
+            } else {
+                contact = CaptureMelee(localMeleeActor, source);
+                if (!LocalMeleeAllowed(instance, localMeleeActor, contact)) return GETrue;
+            }
+        }
         const uint32_t hit = net::SendHitNpc(owner, guid, args, weapon, nullptr, lastOutcome, npcs::SeenAt(instance),
-                                             reaction, npcs::Incarnation(guid));
+                                             reaction, npcs::Incarnation(guid), contact);
         if (hit) {
             ++claimsSent;
             if (swing) playerClaims[claimKey] = swing;
+            if (contact.melee) {
+                LogMelee("claim-sent", net::LocalId(), hit, instance, contact, playerMeleeContacts.at(KillKey(guid)).verdict);
+            }
             if (reaction != net::HitNoReaction) npcs::LocalHit(instance, hit);
         }
         npcplayback::BeginHit(nullptr);
@@ -1036,7 +1216,7 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
 
 // Host: a client's hit on one of the host's NPCs.
 void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16], uint8_t outcome,
-              uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation)
+              uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation, net::MeleeContact const& contact)
 {
     struct Reply {
         uint8_t to;
@@ -1064,14 +1244,23 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         return;
     }
     eCEntity* attacker = PlayerActor(from);
+    if (!attacker) {
+        Logf("combat: hit %u refused victim=%s player=%u: missing claimant", sequence, target.GetName().GetText(), from);
+        return;
+    }
+    if (contact.melee) {
+        const auto verdict = JudgeMelee(target.GetInstance(), attacker, from, contact);
+        LogMelee("host-claim", from, sequence, target.GetInstance(), contact, verdict);
+        if (!verdict.allowed) return;
+    }
     if (IgnoreFriendlyHit(target.GetInstance(), attacker, from)) return;
-    delta = Scaled(target.GetInstance(), attacker, delta);  // friendly_fire, npc_hp (the claim carries the game's damage)
-    remote::NoteContact(target.GetInstance(), attacker);  // it may turn on the puppet now
     if (OutsideBout(target, attacker)) {
         ++duelHitsRefused;
         Logf("combat: player %u hit %s, who fights a duel or arena bout with someone else; not counted", from, target.GetName().GetText());
         return;
     }
+    delta = Scaled(target.GetInstance(), attacker, delta);  // friendly_fire, npc_hp (the claim carries the game's damage)
+    remote::NoteContact(target.GetInstance(), attacker);  // only an eligible hit may turn it on the puppet
     npcplayback::HitOrigin origin(target.GetInstance(), from, sequence);
     // Applied with the sender's puppet as attacker; the filter's rule for hits by puppets must not drop it.
     struct Pass { Pass() { forwarded = true; } ~Pass() { forwarded = false; } } pass;
@@ -1176,7 +1365,8 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
 }
 
 void QueueHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16],
-                 uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation)
+                 uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence, uint32_t incarnation,
+                 net::MeleeContact const& contact)
 {
     if (pendingNpcHits.size() >= 1024) {
         Log("combat: NPC hit queue full; hit refused");
@@ -1190,6 +1380,7 @@ void QueueHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t co
     hit.from = from; hit.delta = delta; hit.outcome = outcome; hit.seen = seen; hit.reaction = reaction;
     hit.sequence = sequence; hit.incarnation = incarnation;
     hit.generation = net::PeerGeneration(from);
+    hit.contact = contact;
     std::memcpy(hit.guid, guid, 16);
     std::memcpy(hit.weapon, weapon, 16);
     std::memcpy(hit.npc, npc, 16);
@@ -1339,11 +1530,17 @@ gFScript WrapDamageScript(gSScript& script, gFScript replacement, char const* na
         owner == GetModuleHandleA("Script_Game.dll") && !std::memcmp(code, prologue, sizeof(prologue))) {
         if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(replacement))) {
             script.m_funcScript = replacement;
+            ai::TrackPointer(reinterpret_cast<void*>(&script.m_funcScript),
+                             reinterpret_cast<void*>(originalFunction),
+                             reinterpret_cast<void*>(replacement), "combat native script table");
             Logf("combat: %s wrapped at native entry and script table", name);
             return reinterpret_cast<gFScript>(trampoline);
         }
     }
     script.m_funcScript = replacement;
+    ai::TrackPointer(reinterpret_cast<void*>(&script.m_funcScript),
+                     reinterpret_cast<void*>(originalFunction),
+                     reinterpret_cast<void*>(replacement), "combat script wrapper");
     Logf("combat: %s wrapped in script table only; native entry did not match the checked prologue", name);
     return originalFunction;
 }
@@ -1377,7 +1574,7 @@ void Tick()
                 continue;
             }
             OnHitNpc(hit.from, hit.guid, hit.delta, hit.weapon, hit.npc, hit.outcome, hit.seen, hit.reaction,
-                     hit.sequence, hit.incarnation);
+                     hit.sequence, hit.incarnation, hit.contact);
         }
     }
     if (!unconfirmed.empty()) ConfirmKills();
@@ -1514,6 +1711,8 @@ void OnWorldChange()
     rewarded.clear();
     playerSwings.clear();
     playerClaims.clear();
+    playerMeleeContacts.clear();
+    refusedMelee.clear();
     knockedAt.clear();
     npcParades.clear();  // QA npcguard: its entities are gone with the world
     pinnedNpc = PinnedNpc{};

@@ -15,9 +15,10 @@ namespace g3t::guards {
 void Tick();  // installs the hooks once the game's scripts are registered
 
 // While alive, the game's player is `puppet` for Script_Game.dll (none: no change).
+// Read-only queries pass keepChapter=false to avoid changing the puppet's PlayerMemory.
 class Acting {
 public:
-    explicit Acting(eCEntity* puppet);
+    explicit Acting(eCEntity* puppet, bool keepChapter = true);
     ~Acting();
     Acting(Acting const&) = delete;
     Acting& operator=(Acting const&) = delete;

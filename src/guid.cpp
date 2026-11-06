@@ -57,6 +57,16 @@ void FormatEntity(::eCEntity* entity, char* out, size_t size)
     Format(bytes, out, size);
 }
 
+uint32_t Hash(uint8_t const guid[16])
+{
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 16; ++i) {
+        hash ^= guid[i];
+        hash *= 16777619u;
+    }
+    return hash ? hash : 1u;
+}
+
 ::Entity Resolve(_GUID const& guid) { return ::Entity(Property(guid)); }
 
 ::Entity Resolve(uint8_t const guid[16])

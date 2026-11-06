@@ -10,7 +10,7 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ### Players and installations
 
-- [ ] Assign exactly two roles: host and joining player. The host starts or loads the shared campaign and saves it.
+- [ ] Assign exactly two roles: host and joining player. The host starts or loads the shared campaign; either player may request a paired save.
 - [ ] Both PCs use the tested baseline: Gothic 3 from Steam, then **Community Patch 1.75.14**, then
   [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm), then the same G3 Together
   build and protocol version. Compatibility without PUP has not been established. Remove other co-op mods
@@ -73,8 +73,9 @@ choose independently; the setting changes only mod messages.
 - [ ] With matching `friendly_fire = 0` (the default), allied melee, projectiles and harmful spells must not cost victim
   HP or blocking stamina, stagger, knock down or apply statuses. Include followers and both attack directions.
   Healing and enemy hits must still work. Knock-out/revive checks below require an enemy, not your partner.
-- [ ] If the host begins a new game, the other player does too. If the host has loaded or saved, the other player
-  joins from the main menu and waits for the campaign transfer.
+- [ ] If the host begins a new game, the other player does too. If the host has loaded or saved, a returning player
+  joins from the main menu and waits for the campaign transfer. A first-time player without an own character record
+  starts a new game or loads their own local hero first; they must never receive the host's character.
 
 ## A 90-minute session
 
@@ -86,11 +87,71 @@ choose independently; the setting changes only mod messages.
 | 28–38 min | Knock-out and help | In a safe setting, let one player be knocked down in a controlled way. Their partner first stands next to them for a few seconds: nothing should happen. Then the partner talks to them and chooses "I will help you.". Check the recovery, notice and consumption of one healing potion. Without a potion, both should receive a notice and the player should remain down. Optionally at the end, before reloading: with both players down, both die and reach game over. |
 | 38–50 min | Dialog, quest, trade and loot | Speak to an NPC, trigger a known quest step, trade and loot. Then open "Show me your wares!" on the partner; dismiss the first tutorial with Ok. Using the mouse and native Trade/Swap button, take an item for free, then give one back without closing. The other player takes no action. Check both inventories immediately after synchronization, unchanged gold and preserved quality. Select gold explicitly and give it in each direction without items; check exact balance changes. Repeat with zero gold, close just after a swap, reopen, and check protected gear/quest items. Verify an NPC still charges its normal prices. These native controls require manual verification. |
 | 50–70 min | Distance, separate regions and regrouping | Move apart. Beyond about 35 m, check that no distance message appears on either PC (no "Far from host", no "is far away"). While separated, each player fights a different NPC in their region; record whether results agree and whether anything appears to be simulated twice. Regroup and check that no message appears ("Back near the host." is gone) and that the world state matches. Accept a kill quest and kill a target in the joining player's region: the counter in the host's quest log should increase. |
-| 70–82 min | Save and load | The host saves with a distinct name. Check that the other player keeps their hero for this save. Use a separate test save or backup for loading. Let the world and players settle, then compare their state. If the joining player had a companion, it should follow them again after loading and rejoining. |
+| 70–82 min | Save and load | Make the heroes visibly different (attributes/LP, current HP/MP, gold, inventory/equipment, a learned spell and quick slot, and position). Change a quest/NPC/door, save on the host and wait for paired confirmation. Change both heroes/world again, then request a save on the client and wait for the same confirmation. Load the earlier host slot and let the client load/rejoin the matching checkpoint. Compare each earlier individual hero and the same earlier world, not the later character. Logs on both must show the same world/save IDs and native CRCs, different player IDs, and no host-character fallback. Repeat with a quick save. If the joining player had a companion, it should follow them after loading/rejoining. |
 | 82–90 min | Rejoin and bug report | If time remains, test a clean disconnect and rejoin, in the same process or after restarting. Record campaign, hero record, NPC ownership and companion state. If something failed, collect both players' logs as described below and give them privately to the host. |
 
 With only 60 minutes, prioritize joining, combat, helping up, recruiting and dismissing a companion,
-and saving on the host. Test separate regions and rejoining in a follow-up session.
+and paired saving initiated from both machines. Test separate regions and rejoining in a follow-up session.
+
+### Paired-save failure and migration checks (protocol 72)
+
+Use only backed-up isolated profiles; never the protected user save folder.
+
+1. Rejoin without restarting, then after restarting from the menu. The same account keeps its own character.
+2. Load an older G3T1/V3 test checkpoint. Its exact old character record migrates to V4; original files remain.
+   The one-time migration has no old pose to restore, so the native spawn position is retained.
+3. On a copied test profile only, remove an exact V4 record but retain its campaign/account latest record.
+   Require an explicit latest-character recovery notice. A damaged/wrong-account exact record must instead block
+   admission until repaired; deleting it must never admit a host clone.
+4. Join from the menu with a new account/no character record. Require a start/load-own-hero notice and a closed
+   world gate. Start a new game/load that account's local hero, then confirm normal import and own-character restore.
+   Reusing the same network slot/display name must not select the previous player's V4 record.
+5. Request a save while the partner is disconnected, loading, talking or an exchange is unsettled. Require a refusal,
+   cancellation or clearly incomplete result, never a paired-success message. An offline host can save alone.
+   Attempt a player exchange while coordination is pending; it must wait/refuse without losing goods.
+6. Interrupt a test checkpoint transfer or a native-pair replacement on a copied profile. Missing manifests or CRC/size
+   mismatches must be refused before native load. A valid host checkpoint can remain after a peer failure.
+7. Continue playing after the most recent checkpoint, then have the host reload that same checkpoint.
+   The client must restore its saved hero and world, not retain the later running state. Check quick-load aliases on both copies.
+8. Use equipment with attribute and maximum-health/mana bonuses. Compare base values, effective values and current HP/MP/SP
+   before and after reload; bonuses must not be inherited from the host or doubled. Temporary-effect expiry remains unverified.
+9. Award shared XP immediately after joining, then leave/rejoin and load a checkpoint. Only future shared gains should apply;
+   no first reward may be lost, historical rewards replayed, or saved XP/level lifted to the other hero's total.
+10. On a copied profile, remove one canonical native file but retain a complete manual-slot alias. Loading that alias must repair
+    the canonical bundle and allow the client to join. Clear a temporary publication/disk failure and require recovery without
+    touching the unchanged source character record.
+
+The bundle is the native pair **plus** `.g3t` and the account's character record. Loading a transferred native pair
+without this mod is not an individual-character restore. The protocol is coordinated, not a simultaneous distributed
+engine freeze; capture timing can differ by network latency. Do not claim runtime acceptance from policy tests/builds.
+
+### Targeting after deaths
+
+Use the same encounter/save on both copies and compare the joining player's targeting with the host's native
+targeting. Repeat at least ten kills, including several enemies together; keep another living enemy in view.
+
+- [ ] With melee weapons drawn, kill the focused enemy while continuing the next swing. Repeat with the host
+  and another NPC landing the killing blow, and with an enemy dying behind the joining player. The dead enemy
+  must stop owning combat focus/alignment; the next eligible enemy's name, health bar and swing aim must agree.
+  Selection still obeys the native view cone, range and line of sight, not simply the nearest NPC.
+- [ ] Repeat with focus lock enabled, then with bow/magic aim. A death must not leave the old lock or auto-aim
+  behind, interrupt an unrelated swing, force weapons away, or end a fight while living enemies still attack.
+- [ ] Sheathe weapons and look at an unlooted corpse. Its name and native loot focus must remain available.
+  A corpse can retain the native empty health bar; it must not show living HP. Loot it, look between corpses,
+  living NPCs and items, then draw weapons again. Do not treat legitimate corpse loot focus, an item focus,
+  the native HUD fade, or no eligible enemy in view as a targeting failure.
+- [ ] Leave an enemy out of view, have it die, then return. Also leave/re-enter the area and reload the test save
+  to exercise recreated NPC instances. No old-life combat/alignment binding should survive; a new living
+  incarnation must remain normally targetable. Check XP/kill credit still goes once to the proper killer,
+  with the host authoritative.
+
+The client log records `CLIENTDEATHSTATE` (native death publication), `CLIENTDEATH` and bounded `DEATHFOCUS`
+records: `before`, `selected`, `next_frame`, up to four `changed` selections, and `settled` after five seconds.
+Compare `instance`, `elapsed_ms`, `hero_dead`, task/state, focus pointer, lock, target, alignment and the separate
+auto-aim target pointer. `script_priority` is the game's script result for the actual focus, not a distance-based
+candidate guess; native category/range/LOS rules still apply. In melee a corpse must not remain the selected
+combat target. With weapons away a corpse may legitimately be selected for loot. Record exact kill times and
+whether the hero was knocked down/dead, looking away, or using an item/dialog when reporting a mismatch.
 
 ### Optional: 30 more minutes for the features of 0.3.0
 

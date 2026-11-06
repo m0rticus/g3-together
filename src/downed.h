@@ -3,20 +3,24 @@
 // and waits until a partner pays a healing potion to help it up. When nobody can help (alone, everybody down),
 // the hero dies as in the single-player game.
 #pragma once
+#include <cstdint>
 
 class eCEntity;
 
 namespace g3t::downed {
 // Called by the AI wrapper before an AI state runs for the local hero; true when it replaced a death state.
 bool RedirectDeath(eCEntity* self, char const* state);
+bool GuardState(eCEntity* self, char const* state); // before native AI runs: only the down task/loop may run while held
 // Once per frame: a knocked-out hero stays down while a partner could help; a partner who talks to its puppet and
 // chooses "Ich werde dir helfen." pays a healing potion and stands it up (owner 23.10.). Nobody able to help for 5 s: the hero dies. Other players are told
 // when someone goes down or dies.
 void Tick();
-void OnWorldChange();                 // a save/load or new world starts a new life
-void Revived(int byPlayer);           // network: that partner paid a potion for us
+void OnWorldChange();                 // reset terminal death, but carry an unfinished downed life through loading
+void Revived(int byPlayer, uint32_t sequence); // a paid revive for this particular downed life
 void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us without one
 bool Held();             // the local hero lies knocked out, waiting for help
+uint32_t Sequence();      // zero while not waiting; carried by player state and paid revive requests
+void Restore(bool waiting, char const* source); // saves may restore a downed life, never release an existing one
 void NoteBlow();         // combat.cpp: a blow on the local hero came from an NPC that means to kill (judged on its owner's machine)
 bool NativeDown();       // ... or knocked out by the game's own rules (a guard, a duel): it stands up by itself; a winner may rob it
 using LogFn = void (*)(char const*);

@@ -22,6 +22,8 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 namespace g3t::ai {
 namespace {
@@ -37,6 +39,7 @@ gFScriptAICallback originalCallback = nullptr;
 // every frame, and the puppet turned on the spot (stage2 red 2 of 20; trace with call chains and scriptfind, 20.10.).
 // A player's puppet has no routine: its life is the player's.
 gFScript originalContinue = nullptr;
+gFScript originalPlayerKeys = nullptr;
 bool continueBlock = true;  // QA negative control: ContinueRoutineOn
 unsigned continueBlocked = 0, continueRun = 0;
 // The script GetCombatMoveLength (Script_Game.dll 0xaa270), called by name from sAICombatMoveStart with other unset,
@@ -113,6 +116,7 @@ Function WrapPerceptionEntry(Function function, void* replacement)
 
 GEInt GE_STDCALL FilterScript(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ShuttingDown()) return originalScript ? originalScript(spu, self, other, args) : 0;
     eCEntity* receiver = Self(spu, self);
     if (PerceptionBlocked(receiver, Driven(receiver))) { ++blocked; return 0; }
     // While another player's puppet stands for the game's player (an Acting scope), this machine's own hero is no player to the
@@ -129,7 +133,13 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
            gCScriptProcessingUnit* spu)
 {
     char const* name = stack.GetCount() ? stack.Peek().m_strScriptName.GetText() : "";
+    if (ShuttingDown()) {
+        auto it = originals.find(name);
+        if (it != originals.end()) return it->second(stack, spu);
+        return GEFalse;
+    }
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
+    if (downed::GuardState(self, name)) return GEFalse;
     if (npcplayback::IsPassive(self)) { ++skipped; return GEFalse; }
     // A mirrored NPC runs its death state only once the host reported it dead (npcs.cpp sets it then);
     // the client's own hit judgement must not decide that.
@@ -208,6 +218,9 @@ void WrapStates(gCScriptAdminExt& admin)
         if (!state || state->m_funcScriptAIState == &FilterState || !state->m_funcScriptAIState) continue;
         originalStates[name.GetText()] = state->m_funcScriptAIState;
         state->m_funcScriptAIState = &FilterState;
+        TrackPointer(reinterpret_cast<void*>(&state->m_funcScriptAIState),
+                     reinterpret_cast<void*>(originalStates[name.GetText()]),
+                     reinterpret_cast<void*>(&FilterState), "ai script AI state");
         ++wrapped;
     }
     GE_MAP_FOR_EACH (name, function, admin.GetScriptAIFunctions())
@@ -215,6 +228,9 @@ void WrapStates(gCScriptAdminExt& admin)
         if (!function || function->m_funcScriptAIFunction == &FilterFunction || !function->m_funcScriptAIFunction) continue;
         originalFunctions[name.GetText()] = function->m_funcScriptAIFunction;
         function->m_funcScriptAIFunction = &FilterFunction;
+        TrackPointer(reinterpret_cast<void*>(&function->m_funcScriptAIFunction),
+                     reinterpret_cast<void*>(originalFunctions[name.GetText()]),
+                     reinterpret_cast<void*>(&FilterFunction), "ai script AI function");
         ++wrapped;
     }
     statesWrapped = true;
@@ -234,6 +250,7 @@ unsigned attitudeAsked = 0, attitudeRedirected = 0, attitudeFleeKept = 0;
 bool attitudeNative = false;
 eCEntity* redirectedFor = nullptr;  // the puppet whose GetAttitude runs as the local hero's right now
 bool plainAsk = false;              // QA attchain: one question answered without the redirect (as attitudeoff would)
+thread_local unsigned playerAttitudeQueries = 0;
 
 // Script_Game.dll of this build: GetAttitude at RVA 0xE3B0 starts with push ebp; mov ebp,esp; and esp,-8 (6 bytes
 // of complete, position-independent instructions), then sub esp,0x354.
@@ -246,6 +263,107 @@ unsigned char* NativeAttitude()
     return std::memcmp(code, expected, sizeof(expected)) == 0 ? code : nullptr;
 }
 
+}
+
+namespace {
+volatile LONG shutdownFlag = 0;
+
+struct PatchRecord {
+    void* address;
+    size_t size;
+    std::vector<unsigned char> original;
+    std::vector<unsigned char> installed;
+    char const* name;
+};
+
+std::vector<PatchRecord>& PatchRegistry()
+{
+    static std::vector<PatchRecord> registry;
+    return registry;
+}
+
+void RestoreOne(PatchRecord& patch, PatchRestoreResult& result)
+{
+    std::vector<unsigned char> current(patch.size);
+    std::memcpy(current.data(), patch.address, patch.size);
+    if (std::memcmp(current.data(), patch.installed.data(), patch.size) != 0) {
+        ++result.preserved;
+        Logf("ai: patch preserved; %s bytes changed after installation", patch.name ? patch.name : "unnamed");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(patch.address, patch.size, PAGE_EXECUTE_READWRITE, &old)) {
+        ++result.failed;
+        Logf("ai: patch restore failed (protect); %s error=%lu", patch.name ? patch.name : "unnamed", GetLastError());
+        return;
+    }
+    std::memcpy(patch.address, patch.original.data(), patch.size);
+    DWORD ignored = 0;
+    if (!VirtualProtect(patch.address, patch.size, old, &ignored)) {
+        ++result.failed;
+        Logf("ai: patch restore failed (restore protection); %s error=%lu", patch.name ? patch.name : "unnamed", GetLastError());
+        return;
+    }
+    FlushInstructionCache(GetCurrentProcess(), patch.address, patch.size);
+    ++result.restored;
+}
+}
+
+void BeginShutdown()
+{
+    InterlockedExchange(&shutdownFlag, 1);
+}
+
+bool ShuttingDown()
+{
+    return InterlockedCompareExchange(&shutdownFlag, 0, 0) != 0;
+}
+
+void TrackPatch(void* address, void const* original, void const* installed, size_t size, char const* name)
+{
+    if (!address || !original || !installed || !size) return;
+    PatchRecord patch;
+    patch.address = address;
+    patch.size = size;
+    patch.original.assign(static_cast<unsigned char const*>(original),
+                          static_cast<unsigned char const*>(original) + size);
+    patch.installed.assign(static_cast<unsigned char const*>(installed),
+                           static_cast<unsigned char const*>(installed) + size);
+    patch.name = name;
+    PatchRegistry().push_back(std::move(patch));
+}
+
+void TrackPointer(void* slot, void* original, void* installed, char const* name)
+{
+    if (!slot) return;
+    void* originalBytes[1] = {original};
+    void* installedBytes[1] = {installed};
+    TrackPatch(slot, originalBytes, installedBytes, sizeof(void*), name);
+}
+
+void* PatchPointer(void** slot, void* replacement, char const* name)
+{
+    if (!slot) return nullptr;
+    DWORD old = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
+    void* previous = *slot;
+    *slot = replacement;
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(void*), old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
+    TrackPointer(slot, previous, replacement, name);
+    return previous;
+}
+
+PatchRestoreResult RestorePatches()
+{
+    PatchRestoreResult result = {};
+    auto& registry = PatchRegistry();
+    for (size_t i = registry.size(); i != 0; --i)
+        RestoreOne(registry[i - 1], result);
+    registry.clear();
+    Logf("ai: patches removed restored=%u preserved=%u failed=%u", result.restored, result.preserved, result.failed);
+    return result;
 }
 
 // Points one import of `module` (by DLL and function name) at `replacement`; returns what it pointed at.
@@ -267,41 +385,81 @@ void* PatchImport(void* module, char const* dll, char const* function, void* rep
             if (!VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), PAGE_READWRITE, &old)) return nullptr;
             void* previous = reinterpret_cast<void*>(slots->u1.Function);
             slots->u1.Function = reinterpret_cast<DWORD>(replacement);
-            VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), old, &old);
+            DWORD ignored = 0;
+            VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), old, &ignored);
+            FlushInstructionCache(GetCurrentProcess(), &slots->u1.Function, sizeof(slots->u1.Function));
+            TrackPointer(reinterpret_cast<void*>(&slots->u1.Function), previous, replacement, "import patch");
             return previous;
         }
     }
     return nullptr;
 }
 
-// Jump from `target` to `detour`; the returned trampoline runs the 6 stolen bytes and continues in the original.
+// Jump from `target` to a small shutdown-aware guard and onward to `detour`.
+// The returned trampoline runs the stolen bytes and continues in the original function.
 void* JumpTo(unsigned char* target, void* detour, size_t stolen)
 {
     if (!target || !detour || stolen < 5 || stolen > 27) return nullptr;
-    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (ShuttingDown()) return nullptr;
+    auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!trampoline) return nullptr;
-    std::memcpy(trampoline, target, stolen);
-    trampoline[stolen] = 0xE9;
-    const int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(target + stolen) - reinterpret_cast<intptr_t>(trampoline + stolen + 5));
-    std::memcpy(trampoline + stolen + 1, &back, 4);
+    constexpr size_t originalOffset = 24;
+    std::memcpy(trampoline + originalOffset, target, stolen);
+    trampoline[originalOffset + stolen] = 0xE9;
+    const int32_t back = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(target + stolen) -
+        reinterpret_cast<intptr_t>(trampoline + originalOffset + stolen + 5));
+    std::memcpy(trampoline + originalOffset + stolen + 1, &back, 4);
+
+    // pushfd/cmp/conditional/popfd/jmp: no general register is changed, and EFLAGS is restored
+    // before either tail jump. 0x74 is taken only while the shutdown flag is clear.
+    trampoline[0] = 0x9C;
+    trampoline[1] = 0x83;
+    trampoline[2] = 0x3D;
+    const uintptr_t flag = reinterpret_cast<uintptr_t>(&shutdownFlag);
+    std::memcpy(trampoline + 3, &flag, sizeof(flag));
+    trampoline[7] = 0;
+    trampoline[8] = 0x74;
+    trampoline[9] = 6; // normal popfd/jmp at 16
+    trampoline[10] = 0x9D;
+    trampoline[11] = 0xE9;
+    const int32_t originalJump = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(trampoline + originalOffset) -
+        reinterpret_cast<intptr_t>(trampoline + 16));
+    std::memcpy(trampoline + 12, &originalJump, 4);
+    trampoline[16] = 0x9D;
+    trampoline[17] = 0xE9;
+    const int32_t detourJump = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(trampoline + 22));
+    std::memcpy(trampoline + 18, &detourJump, 4);
+
     DWORD old = 0;
     if (!VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return nullptr;
     }
+    unsigned char original[27];
+    unsigned char installed[27];
+    std::memcpy(original, target, stolen);
     target[0] = 0xE9;
-    const int32_t to = static_cast<int32_t>(reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(target + 5));
+    const int32_t to = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(trampoline) - reinterpret_cast<intptr_t>(target + 5));
     std::memcpy(target + 1, &to, 4);
     for (size_t i = 5; i < stolen; ++i) target[i] = 0x90;
+    std::memcpy(installed, target, stolen);
     VirtualProtect(target, stolen, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
     FlushInstructionCache(GetCurrentProcess(), target, stolen);
-    return trampoline;
+    TrackPatch(target, original, installed, stolen, "inline JumpTo");
+    return trampoline + originalOffset;
 }
 
 namespace {
 
 GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ShuttingDown()) return originalAttitude ? originalAttitude(spu, self, other, args) : 0;
+    if (playerAttitudeQueries) return originalAttitude(spu, self, other, args);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (target && remote::IsPuppet(target)) {
         ++attitudeAsked;
@@ -333,13 +491,23 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 
 GEInt GE_STDCALL FilterContinue(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ShuttingDown()) return originalContinue ? originalContinue(spu, self, other, args) : 0;
+    if (downed::GuardState(Self(spu, self), "ContinueRoutine")) return 0;
     if (continueBlock && remote::IsPuppet(Self(spu, self))) { ++continueBlocked; return 0; }
     ++continueRun;
     return originalContinue(spu, self, other, args);
 }
 
+GEInt GE_STDCALL FilterPlayerKeys(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    // This is the local keyboard dispatcher; its script self can be unset.
+    if (downed::Held()) return 0;
+    return originalPlayerKeys(spu, self, other, args);
+}
+
 GEInt GE_STDCALL SafeMoveLength(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ShuttingDown()) return originalMoveLength ? originalMoveLength(spu, self, other, args) : 0;
     ++moveLengthCalls;
     // Other feeds no branch of the original; a valid empty wrapper takes its copy branch instead of GetOtherEntity.
     Entity noOther;
@@ -351,6 +519,7 @@ GEInt GE_STDCALL SafeMoveLength(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 
 GEBool GE_STDCALL FilterCallback(gCScriptProcessingUnit* spu)
 {
+    if (ShuttingDown()) return originalCallback ? originalCallback(spu) : GEFalse;
     eCEntity* receiver = spu ? spu->GetSelfEntity() : nullptr;
     if (PerceptionBlocked(receiver, Driven(receiver))) { ++blocked; return GEFalse; }
     if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return GEFalse; }
@@ -369,6 +538,18 @@ int PlainAttitude(eCEntity* self, eCEntity* other)
     const GEInt result = GetScriptAdminExt().CallScript(bCString("GetAttitude"), self, other, 0);
     plainAsk = false;
     return static_cast<int>(result);
+}
+bool TryPlayerAttitude(eCEntity* self, eCEntity* player, int& attitude)
+{
+    if (!self || !player || !originalAttitude || !guards::PlayerContextReady()) return false;
+    guards::Acting acting(player, false);
+    struct Query {
+        Query() { ++playerAttitudeQueries; }
+        ~Query() { --playerAttitudeQueries; }
+    } query;
+    Entity npc(self), claimant(player);
+    attitude = static_cast<int>(originalAttitude(nullptr, &npc, &claimant, 0));
+    return true;
 }
 unsigned AttitudeAsked() { return attitudeAsked; }
 unsigned AttitudeRedirected() { return attitudeRedirected; }
@@ -502,22 +683,35 @@ void Tick()
             if (!attitudeNative) {
                 originalAttitude = script->m_funcScript;
                 script->m_funcScript = &FilterAttitude;
+                TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                             reinterpret_cast<void*>(originalAttitude),
+                             reinterpret_cast<void*>(&FilterAttitude), "ai GetAttitude script");
             }
             attitudeInstalled = true;
             Logf("ai: GetAttitude wrapped (%s; puppets count as the local hero)", attitudeNative ? "native jump" : "script table only");
         }
     }
-    if ((installed || searched) && statesWrapped && originalContinue && moveLengthSearched) return;
+    if ((installed || searched) && statesWrapped && originalContinue && originalPlayerKeys && moveLengthSearched) return;
     const DWORD now = GetTickCount();
     if (now - lastTry < 1000) return;
     lastTry = now;
     gCScriptAdminExt& admin = GetScriptAdminExt();
     // The game's scripts are registered once the game runs; wrap them then (our DLL loads first).
     if (!statesWrapped && gCSession::GetInstance().IsGameRunning()) WrapStates(admin);
+    if (!originalPlayerKeys && gCSession::GetInstance().IsGameRunning()) {
+        if (auto* script = Find(admin.GetScripts(), "OnPlayerGameKeyPressed"); script && script->m_funcScript) {
+            originalPlayerKeys = script->m_funcScript;
+            script->m_funcScript = &FilterPlayerKeys;
+            Log("downed: gameplay input guard installed");
+        }
+    }
     if (!originalContinue && gCSession::GetInstance().IsGameRunning()) {
         if (auto* script = Find(admin.GetScripts(), "ContinueRoutine"); script && script->m_funcScript && script->m_funcScript != &FilterContinue) {
             originalContinue = script->m_funcScript;
             script->m_funcScript = &FilterContinue;
+            TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                         reinterpret_cast<void*>(originalContinue),
+                         reinterpret_cast<void*>(&FilterContinue), "ai ContinueRoutine script");
             Log("ai: ContinueRoutine wrapped (puppets keep no routine)");
         }
     }
@@ -527,18 +721,29 @@ void Tick()
         if (script && script->m_funcScript && script->m_funcScript != &SafeMoveLength) {
             originalMoveLength = script->m_funcScript;
             script->m_funcScript = &SafeMoveLength;
+            TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                         reinterpret_cast<void*>(originalMoveLength),
+                         reinterpret_cast<void*>(&SafeMoveLength), "ai GetCombatMoveLength script");
         }
         Log(originalMoveLength ? "ai: GetCombatMoveLength wrapped (fight target not bound)" : "ai: GetCombatMoveLength NOT found, not wrapped");
     }
     if (installed || searched) return;
     if (auto* script = Find(admin.GetScripts(), Name); script && script->m_funcScript) {
-        originalScript = WrapPerceptionEntry(script->m_funcScript, reinterpret_cast<void*>(&FilterScript));
+        gFScript nativeScript = script->m_funcScript;
+        originalScript = WrapPerceptionEntry(nativeScript, reinterpret_cast<void*>(&FilterScript));
         script->m_funcScript = &FilterScript;
+        TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                     reinterpret_cast<void*>(nativeScript),
+                     reinterpret_cast<void*>(&FilterScript), "ai perception script");
         installed = true;
         Log("ai: perception filter installed (script)");
     } else if (auto* callback = Find(admin.GetScriptAICallbacks(), Name); callback && callback->m_funcScriptAICallback) {
-        originalCallback = WrapPerceptionEntry(callback->m_funcScriptAICallback, reinterpret_cast<void*>(&FilterCallback));
+        gFScriptAICallback nativeCallback = callback->m_funcScriptAICallback;
+        originalCallback = WrapPerceptionEntry(nativeCallback, reinterpret_cast<void*>(&FilterCallback));
         callback->m_funcScriptAICallback = &FilterCallback;
+        TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
+                     reinterpret_cast<void*>(nativeCallback),
+                     reinterpret_cast<void*>(&FilterCallback), "ai perception callback");
         installed = true;
         Log("ai: perception filter installed (AI callback)");
     } else if (gCSession::GetInstance().IsGameRunning()) {

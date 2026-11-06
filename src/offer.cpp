@@ -4,6 +4,7 @@
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
+#include "persist.h"
 #include "trade.h"
 
 #include <Game.h>
@@ -88,6 +89,7 @@ void Undo(Entity& self, std::vector<Step> const& steps)
 
 bool Apply(net::OfferNote const& note)
 {
+    if (persist::CheckpointBusy()) return false;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero || !gCSession::GetInstance().IsGameRunning() || note.sellerEpoch != trade::Epoch() ||
         !note.buyerEpoch || !note.serial || note.acknowledge || (!note.count && !note.gold) ||
@@ -224,6 +226,10 @@ bool Send(net::OfferNote note)
 
 bool Reserve(net::OfferNote const& note)
 {
+    if (persist::CheckpointBusy()) {
+        Log("trade: exchange reservation waits for the coordinated checkpoint");
+        return false;
+    }
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero || !Idle()) return false;
     Entity self(hero);

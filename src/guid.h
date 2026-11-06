@@ -17,6 +17,7 @@ void CopyEntity(::eCEntity* entity, uint8_t out[16]);
 void Format(::_GUID const& guid, char* out, size_t size);
 void Format(uint8_t const guid[16], char* out, size_t size);
 void FormatEntity(::eCEntity* entity, char* out, size_t size);
+uint32_t Hash(uint8_t const guid[16]);
 
 ::Entity Resolve(::_GUID const& guid);
 ::Entity Resolve(uint8_t const guid[16]);

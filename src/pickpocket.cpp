@@ -56,6 +56,7 @@ int ItemCount(Entity& who)
 
 GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalPick ? originalPick(spu, self, other, args) : 0;
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     const bool before = Picked(victim);
     const GEInt result = originalPick(spu, self, other, args);

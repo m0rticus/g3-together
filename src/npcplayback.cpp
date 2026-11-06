@@ -218,6 +218,15 @@ bool SafeNativeProperty(eEPropertySetType type)
 
 void PropertyDispatch(eCEntityPropertySet* self, void* edx, unsigned phase)
 {
+    if (ai::ShuttingDown()) {
+        if (self) {
+            void** table = *reinterpret_cast<void***>(self);
+            const unsigned count = propertyTableCount.load(std::memory_order_acquire);
+            for (unsigned i = 0; i < count; ++i)
+                if (propertyTables[i].table == table) { propertyTables[i].original[phase](self, edx); return; }
+        }
+        return;
+    }
     const eEPropertySetType type = self->GetPropertySetType();
     const bool partnerRoutine = type == eEPropertySetType_ScriptRoutine && DialogPartner(self->GetEntity());
     if (!partnerRoutine && Passive(self->GetEntity()) &&
@@ -248,6 +257,11 @@ PropertyTable const* PropertyHooks(eCEntityPropertySet* self)
 
 void TriggerEvent(eCEntityPropertySet* self, void* edx, eCEntity* a, eCEntity* b, unsigned index)
 {
+    if (ai::ShuttingDown()) {
+        if (auto* hooks = PropertyHooks(self))
+            reinterpret_cast<TriggerFn>(hooks->events[index])(self, edx, a, b);
+        return;
+    }
     if (Passive(self->GetEntity())) { ++blockedEvents; return; }
     if (auto* hooks = PropertyHooks(self)) reinterpret_cast<TriggerFn>(hooks->events[index])(self, edx, a, b);
 }
@@ -255,6 +269,11 @@ void __fastcall PropertyTrigger(eCEntityPropertySet* self, void* edx, eCEntity* 
 void __fastcall PropertyUntrigger(eCEntityPropertySet* self, void* edx, eCEntity* a, eCEntity* b) { TriggerEvent(self, edx, a, b, 1); }
 void TouchEvent(eCEntityPropertySet* self, void* edx, eCEntity* other, eCContactIterator& contacts, unsigned index)
 {
+    if (ai::ShuttingDown()) {
+        if (auto* hooks = PropertyHooks(self))
+            reinterpret_cast<TouchFn>(hooks->events[index])(self, edx, other, contacts);
+        return;
+    }
     if (Passive(self->GetEntity())) { ++blockedEvents; return; }
     if (auto* hooks = PropertyHooks(self)) reinterpret_cast<TouchFn>(hooks->events[index])(self, edx, other, contacts);
 }
@@ -267,6 +286,11 @@ void __fastcall PropertyUntouch(eCEntityPropertySet* self, void* edx, eCEntity* 
 void __fastcall PropertyDamage(eCEntityPropertySet* self, void* edx, eCEntity* a, eCEntity* b, GEInt c, GEInt d,
                                eCContactIterator& contacts)
 {
+    if (ai::ShuttingDown()) {
+        if (auto* hooks = PropertyHooks(self))
+            reinterpret_cast<DamageFn>(hooks->events[5])(self, edx, a, b, c, d, contacts);
+        return;
+    }
     if (Passive(self->GetEntity()) && self->GetPropertySetType() != eEPropertySetType_DamageReceiver) {
         ++blockedEvents;
         return;
@@ -291,6 +315,8 @@ bool RegisterProperty(eCEntityPropertySet* property)
         Log("FAIL npcplayback: cannot guard native NPC property dispatch");
         return false;
     }
+    std::vector<unsigned char> originalTable(reinterpret_cast<unsigned char*>(table + event),
+                                             reinterpret_cast<unsigned char*>(table + event) + bytes);
     PropertyTable& hook = propertyTables[count];
     hook.table = table;
     for (unsigned i = 0; i < 3; ++i) hook.original[i] = reinterpret_cast<ProcessFn>(table[first + i]);
@@ -305,9 +331,12 @@ bool RegisterProperty(eCEntityPropertySet* property)
     table[event + 3] = reinterpret_cast<void*>(&PropertyIntersect);
     table[event + 4] = reinterpret_cast<void*>(&PropertyUntouch);
     table[event + 5] = reinterpret_cast<void*>(&PropertyDamage);
+    std::vector<unsigned char> installedTable(reinterpret_cast<unsigned char*>(table + event),
+                                               reinterpret_cast<unsigned char*>(table + event) + bytes);
     DWORD ignored = 0;
     if (!VirtualProtect(table + event, bytes, old, &ignored))
         Log("WARN npcplayback: property dispatch page protection could not be restored");
+    ai::TrackPatch(table + event, originalTable.data(), installedTable.data(), bytes, "npcplayback property dispatch vtable");
     return true;
 }
 
@@ -320,6 +349,7 @@ bool RegisterEntity(eCEntity* entity)
 
 GEBool __fastcall AddProperty(eCEntity* self, void* edx, eCEntityPropertySet* property, GEBool flag)
 {
+    if (ai::ShuttingDown()) return originalAddProperty ? originalAddProperty(self, edx, property, flag) : GEFalse;
     if (enabled && clientMode && property && !RegisterProperty(property)) {
         Log("FAIL npcplayback: refusing an unguarded property during client entity creation");
         return GEFalse;
@@ -329,22 +359,26 @@ GEBool __fastcall AddProperty(eCEntity* self, void* edx, eCEntityPropertySet* pr
 
 void __fastcall EntityProcess(eCEntity* self, void* edx, GEBool recursive)
 {
+    if (ai::ShuttingDown()) { if (originalEntityProcess) originalEntityProcess(self, edx, recursive); return; }
     originalEntityProcess(self, edx, recursive);
 }
 
 void __fastcall EntityPre(eCEntity* self, void* edx, GEBool recursive)
 {
+    if (ai::ShuttingDown()) { if (originalEntityPre) originalEntityPre(self, edx, recursive); return; }
     originalEntityPre(self, edx, recursive);
 }
 
 void __fastcall EntityPost(eCEntity* self, void* edx, GEBool recursive)
 {
+    if (ai::ShuttingDown()) { if (originalEntityPost) originalEntityPost(self, edx, recursive); return; }
     originalEntityPost(self, edx, recursive);
 }
 
 
 void __fastcall Routine(eCEntityPropertySet* self, void* edx)
 {
+    if (ai::ShuttingDown()) { if (originalRoutine) originalRoutine(self, edx); return; }
     if (Passive(self->GetEntity()) && !DialogPartner(self->GetEntity())) { ++probe.routineBlocked; ++blockedRoutines; return; }
     const uint8_t player = npcs::ContextPlayer(self->GetEntity());
     guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
@@ -353,6 +387,7 @@ void __fastcall Routine(eCEntityPropertySet* self, void* edx)
 
 void __fastcall Movement(eCEntityPropertySet* self, void* edx)
 {
+    if (ai::ShuttingDown()) { if (originalMovement) originalMovement(self, edx); return; }
     if (Passive(self->GetEntity())) { ++probe.movementBlocked; ++blockedMovement; return; }
     originalMovement(self, edx);
 }
@@ -360,12 +395,14 @@ void __fastcall Movement(eCEntityPropertySet* self, void* edx)
 ProcessFn originalMovementUpdated = nullptr;
 void __fastcall MovementUpdated(eCEntityPropertySet* self, void* edx)
 {
+    if (ai::ShuttingDown()) { if (originalMovementUpdated) originalMovementUpdated(self, edx); return; }
     if (Passive(self->GetEntity())) { ++blockedMovement; return; }
     originalMovementUpdated(self, edx);
 }
 
 bEResult __fastcall Script(gCScriptProcessingUnit* self, void* edx)
 {
+    if (ai::ShuttingDown()) return originalScript ? originalScript(self, edx) : bEResult_Ok;
     if (Passive(self->GetSelfEntity()) && !DialogPartner(self->GetSelfEntity())) { ++probe.scriptBlocked; ++blockedScripts; return bEResult_Ok; }
     return originalScript(self, edx);
 }
@@ -373,6 +410,8 @@ bEResult __fastcall Script(gCScriptProcessingUnit* self, void* edx)
 GEInt __fastcall EventScript(gCScriptAdmin* self, void* edx, bCString const& name,
                             eCEntity* receiver, eCEntity* other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalEventScript
+        ? originalEventScript(self, edx, name, receiver, other, args) : 0;
     const char* event = name.GetText();
     if ((!std::strcmp(event, "OnTick") || !std::strcmp(event, "OnEnterProcessingRange") ||
          !std::strcmp(event, "OnExitProcessingRange") || !std::strcmp(event, "Respawn")) && Passive(receiver)) {
@@ -386,6 +425,7 @@ GEInt __fastcall EventScript(gCScriptAdmin* self, void* edx, bCString const& nam
 void __fastcall Play(eCVisualAnimation_PS* self, void* edx, eCWrapper_emfx2Actor::eEMotionType slot,
                      eCWrapper_emfx2Motion::eSMotionDesc* options)
 {
+    if (ai::ShuttingDown()) { if (originalPlay) originalPlay(self, edx, slot, options); return; }
     if (!presenting && Passive(self->GetEntity())) { ++probe.animationBlocked; ++blockedAnimations; return; }
     originalPlay(self, edx, slot, options);
 }
@@ -393,6 +433,7 @@ void __fastcall Play(eCVisualAnimation_PS* self, void* edx, eCWrapper_emfx2Actor
 void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2Actor::eEMotionType slot,
                           eCWrapper_emfx2Motion& motion, eCWrapper_emfx2Motion::eSMotionDesc* options)
 {
+    if (ai::ShuttingDown()) { if (originalActorPlay) originalActorPlay(self, edx, slot, motion, options); return; }
     if (!presenting && updatingVisual && Passive(visualEntity)) {
         ++probe.animationBlocked;
         ++blockedAnimations;
@@ -429,6 +470,7 @@ bool ApplyPose(eCWrapper_emfx2Actor& actor, NativePose& pose)
 void __fastcall ActorProcess(eCWrapper_emfx2Actor* self, void* edx, bCMatrix const& world, GEBool skeleton,
                             GEBool physics, GEFloat scale)
 {
+    if (ai::ShuttingDown()) { if (originalActorProcess) originalActorProcess(self, edx, world, skeleton, physics, scale); return; }
     auto* animation = updatingVisual && Passive(visualEntity) ? Animation(visualEntity) : nullptr;
     if (presentingPose && animation && animation->GetActor() == self) {
         // Retire stopped native instances without advancing a mirror's animation or blend clocks.
@@ -448,18 +490,21 @@ bool CanonicalFacial(eCVisualAnimationFactory* factory)
 
 GEBool __fastcall FacialStart(eCVisualAnimationFactory* self, void* edx)
 {
+    if (ai::ShuttingDown()) return originalFacialStart ? originalFacialStart(self, edx) : GEFalse;
     if (CanonicalFacial(self) && !self->IsFacialAnimationStarted()) { ++blockedAnimations; return GEFalse; }
     return originalFacialStart(self, edx);
 }
 
 GEBool __fastcall FacialStop(eCVisualAnimationFactory* self, void* edx)
 {
+    if (ai::ShuttingDown()) return originalFacialStop ? originalFacialStop(self, edx) : GEFalse;
     if (CanonicalFacial(self) && self->IsFacialAnimationStarted()) { ++blockedAnimations; return GEFalse; }
     return originalFacialStop(self, edx);
 }
 
 void __fastcall StopMotion(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2Actor::eEMotionType slot, float blend)
 {
+    if (ai::ShuttingDown()) { if (originalStop) originalStop(self, edx, slot, blend); return; }
     auto* animation = Animation(probe.target);
     auto* visual = updatingVisual && Passive(visualEntity) ? Animation(visualEntity) : nullptr;
     if (!presenting && ((animation && animation->GetActor() == self) ||
@@ -481,11 +526,13 @@ bool TaskBlocked(gCScriptRoutine_PS* self, bCString const& task)
 
 void __fastcall SetTask(gCScriptRoutine_PS* self, void* edx, bCString const& task)
 {
+    if (ai::ShuttingDown()) { if (originalSetTask) originalSetTask(self, edx, task); return; }
     if (!TaskBlocked(self, task)) originalSetTask(self, edx, task);
 }
 
 void __fastcall AISetTask(gCScriptRoutine_PS* self, void* edx, bCString const& task)
 {
+    if (ai::ShuttingDown()) { if (originalAISetTask) originalAISetTask(self, edx, task); return; }
     if (net::IsHost() && std::strstr(task.GetText(), "Stumble")) {
         eCEntity* entity = self->GetEntity();
         npcs::HostHit(entity, entity == originEntity ? originPlayer : 0, entity == originEntity ? originSequence : 0);
@@ -1113,7 +1160,7 @@ bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion
     local.phase = 0.0f;
     local.weight = 1.0f;
     if (!PresentMotion(*animation, *actor, 0, motion, local, true)) return false;
-    state.pendingHit = hit;
+    state.pendingHit = static_cast<uint16_t>(hit);
     state.acknowledgedAt = 0;
     state.localStart = now;
     state.localDuration = static_cast<float>(actor->GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
@@ -1142,7 +1189,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     }
     if (record.flags & 3) { state.pendingHit = 0; *state.localMotion = '\0'; }
     const bool acknowledged = state.pendingHit && record.hitPlayer == net::LocalId() &&
-                              static_cast<int32_t>(record.hitSequence - state.pendingHit) >= 0;
+                              static_cast<int16_t>(record.hitSequence - state.pendingHit) >= 0;
     if (acknowledged) {
         state.acknowledgedHit = record.hitSequence;
         if (record.motions[0].instance != state.localOptions.instance) state.pendingHit = 0;

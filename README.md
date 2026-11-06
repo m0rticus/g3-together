@@ -7,7 +7,7 @@
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
 
-The current source speaks **protocol 71**. Its host-authoritative NPC overhaul is experimental and native gameplay
+The current source speaks **protocol 72**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
 acceptance is still in progress; it is not a verified release. Both players need the same build.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
 Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
@@ -30,7 +30,8 @@ personal loot/merchant inventories, shared experience and lethal-blow rescue rul
 - **Trade together.** Use the game's trade screen to move real items freely or give gold. Exchanges synchronize automatically, without partner approval.
   A later host-save load still replaces native world inventories; independent world-inventory save reconstruction is not implemented.
 - **Look out for each other.** Find your partner on the map and compass, jump to their side, and revive them with a healing potion.
-- **Keep your character and campaign.** Show your armor and helmet. The host saves; each player's hero record returns when loading the shared campaign.
+- **Keep your character and campaign.** Either player requests a paired checkpoint: the host's world plus each Steam account's own character record.
+  Wait for the paired-save confirmation before leaving; native gameplay acceptance is pending.
 
 More: [combat, companions, guards and world interactions](docs/PLAYING.md#what-is-shared).
 
@@ -77,10 +78,12 @@ Steam activity uses **Gothic 3 (AppID 39500)**, not Spacewar.
 
 | Host starts first… | Joining player… |
 | --- | --- |
-| Load a saved campaign. | **Wait in the main menu**; the campaign transfers and loads automatically. |
+| Load a saved campaign. | With a saved own character, **wait in the main menu**. A first-time player must start a new game or load their own hero first. |
 | Start a new, unsaved campaign. | **Start a new game too.** Once the host has saved, future joins can load from the main menu. |
 
-The **host saves**. Keep Steam display names unchanged to restore companions. Read about [first-join heroes and saves](docs/PLAYING.md#starting-and-saving).
+**Either player can save**; the host creates the authoritative world checkpoint and every ready player stores it with their own character.
+Keep Steam display names unchanged to restore companions (character records themselves use the Steam account ID).
+Read about [first-join heroes, paired saves and recovery](docs/PLAYING.md#starting-and-saving).
 
 ## A few things to try
 

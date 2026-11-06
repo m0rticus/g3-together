@@ -105,7 +105,7 @@ measured Steam ping. `pending` means no ping sample exists yet; the host's displ
 Errors and compatibility refusals take priority. `g3together.log` appends startup/session, lobby, peer, send-failure and
 periodic connection diagnostics automatically. Review names and Steam IDs before sharing logs.
 
-The current source uses **protocol 71**. Its host-only NPC overhaul is experimental; native gameplay acceptance is still
+The current source uses **protocol 72**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
 in progress, so this source must not be treated as a verified release. Both players need the same build. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
@@ -142,23 +142,67 @@ Your own successful hit shows its local flinch immediately and is claimed reliab
 does not cancel that landed hit. Hit identities, acknowledgements and NPC incarnations prevent duplicate claims and
 suppress the attacking client's echoed flinch; other players still see the host's reaction.
 Damage to your hero remains locally judged against the attack you are shown, not a host-issued HP subtraction.
-NPC projectiles follow their host presentation time. Ragdoll impulses originate only on the host; clients apply them
-after the matching corpse and physics are ready. Ragdoll bones still use local physics, not a transmitted bone stream.
-Each corpse initializes physics once per life. Settled bodies retain their resting pose when physics unloads;
-only a new host impulse can wake them. Revival requires a new host incarnation, not an older buffered alive frame.
+NPC projectiles follow their host presentation time. Every terminal NPC death starts a local client ragdoll, including
+client kills without a host ragdoll flag. A matching host death force is applied once, after its presentation time and
+physics are ready, with its original direction and corpse-relative application point. Forces are bounded by vanilla's
+largest explosion push; nonfinite force data is refused and logged. Without a host force, the body falls under gravity,
+as vanilla does without an attacker/inflictor; a predicted flinch never invents a second death push.
+Ragdoll bones use local physics, not a transmitted bone stream. Settled bodies retain their resting pose when physics
+unloads and are not restarted by repeated death snapshots, late forces or reloading the same corpse.
+Revival requires a new host incarnation, not an older buffered alive frame.
+`CLIENTRAGDOLL action=force` records the selected source, applied count and actual force magnitude/vector.
+Three `action=sample` lines record root/bone positions and velocities at startup, 250 ms and 1 s (or the next frame).
+These diagnostics support manual checking; the physics changes still require native gameplay acceptance.
 Friendly-fire protection applies before local hit feedback as well as before authoritative damage.
 
 ## Starting and saving
 
 1. The host starts Gothic 3 and begins a new game or loads the co-op campaign.
 2. The other player starts Gothic 3.
-   - If the host has loaded or saved a campaign, stay in the main menu. The campaign is transferred
-     and loaded automatically when you join.
+   - If the host has loaded or saved a campaign and you have your own character record for it, stay in the main menu.
+     The campaign is transferred and loaded automatically when you join.
+   - A first-time player without an own character record must start a new game or load their own local hero first.
+     The mod waits rather than loading a copy of the host's character.
    - If the host has started a new game, start a new game as well.
-3. The **host** saves the campaign. Each joining player automatically keeps their own hero record
-   for that save: level, experience, attributes, inventory and so on. It is restored when they rejoin.
-   On the very first join from the main menu, a player uses a copy of the host's hero. To keep your
-   own new hero, start a new game before joining.
+3. **Either player saves** using the normal manual/quick-save controls. A client requests the save from the host;
+   it never replaces the host's world with its own local world. Every ready player captures their own character,
+   then receives the same host-world checkpoint with a common save ID.
+4. Wait for **"Co-op checkpoint saved for every participating player"** before quitting. The immediate native
+   save call reports no synchronous save while coordination is queued; the mod's later confirmation is authoritative.
+   Loading, dialogue, transformation, being downed, unsettled trade, a disconnected partner or disk failure can refuse/cancel
+   the operation. A failure after host publication may leave a usable host checkpoint, but is never reported as a
+   successful save on both machines. Retry once everyone is ready. Player exchanges wait during a checkpoint.
+
+Each checkpoint is an immutable `G3T_<save-id>` native save pair plus a `.g3t` manifest/journal.
+Every participant also publishes the requested menu/quick-save slot as an alias. Each machine stores its own
+`g3t-character-<world-id>-<Steam-account-id>-<save-id>.txt` record (format V4), including
+attributes, current/max health and mana, XP/level/LP, inventory/gold/equipment, skills, spells, quick slots and pose.
+V4 keeps base attributes and aggregate equipment/stat modifiers separately; temporary-effect ownership and
+expiry timers are not reconstructed and remain a native runtime limitation.
+The native world pair still contains the host's single hero; the **mandatory own-character overlay is part of the save**.
+Do not load a transferred native pair without the mod or remove the character files. Back up the whole save folder.
+
+Loading the host's earlier save loads that checkpoint on the client and restores its exact saved character before
+gameplay opens; it does not overwrite that older character record with the currently running hero.
+This also applies when the host reloads the latest checkpoint after continuing to play.
+A missing exact record can explicitly recover the same account's latest record **from this campaign only**;
+a damaged/wrong-account exact record instead stays blocked until repaired. A new menu-only player stays outside
+the world until they start/load their own hero. Record deletion never gives them the host's hero.
+Legacy G3T1 journals remain readable: the native contents identify a conservative legacy campaign,
+and only the exact old slot's complete local hero record can be imported and claimed by one Steam account.
+V3 carries its required spell/quick data inline; V2 can migrate with complete skills/end data and its required sidecar.
+Original V1 and incomplete older V2 records cannot prove a complete character and stay gated rather than supplying host data.
+Original legacy files stay unchanged. Legacy records without pose retain the native spawn position on migration.
+Old stat records preserve effective maxima but cannot recover the original base/bonus split.
+No migration can reconstruct a distinct character that an older save never recorded; supply a genuine local hero in that case.
+Transient record-publication failures remain gated and retry without requiring an edit to the source record.
+
+Coordination uses prepare/ready, host native save, verified world transfer and stored acknowledgments, not a
+distributed engine freeze. Captures are separated by network latency, not literally simultaneous. Only the host's
+native world bytes are distributed. The native manual/quick-save route and lower save API are hooked; no built-in
+autosave/exit-save route was found in the inspected game. The mod does not add a new autosave-on-exit feature.
+Custom save callers get a queued/failed synchronous result and must wait for the mod's confirmation too.
+Immutable checkpoints are retained rather than pruning old quick-save history automatically; allow additional disk space.
 
 ## What is shared
 
@@ -182,8 +226,8 @@ Independent world-inventory persistence across saves/late joins is not implement
   NPC stands at the same place on both PCs.
 - Quest state and previously completed dialogs are shared. Quest rewards go to everyone. Kill
   quests also count enemies killed in the joining player's region.
-- Experience is one pool: whatever either hero earns (kills, quests, dialogs, anything that gives experience) is added for
-  the other too, so both always show the same total and level. A player joining with less is raised to the other's total.
+- Future experience rewards are shared: whatever either hero earns is added for the other too.
+  Saved XP and level remain individual; joining/loading no longer raises one hero to the other's total.
 - The main story is shared to the end: when one player hands over the artefacts at a god's shrine, the chapter changes
   for both, and when one player starts the epilogue, the other sees the same pictures and the game's end at the same time.
   If the other player is in a dialog, a menu or a fight just then, their epilogue starts as soon as that is over (a message
@@ -224,6 +268,14 @@ Independent world-inventory persistence across saves/late joins is not implement
   poison, freeze or otherwise harm one another. Healing and revival still work. Enemy attacks and environmental damage
   are unchanged. Both players must use the same value and restart after changing it. An explicit value from 1 to 100
   retains the previous cross-player damage scaling; setup preserves existing values.
+- Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
+  more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 72 build.
+  To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
+  one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
+  outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.
+  The log's `melee-victim` lines identify the victim, attitude, contact-time focus/target and decision:
+  `local-refused` means no local judgement/claim; `claim-sent` and `host-claim` share the reliable hit sequence.
 - A player within about 20 m hears the other player's dialog. With the game's subtitles on, the lines' text shows as
   well, in your own game language, unless you are in a dialog yourself. You also see the answers your partner can pick
   and then the one they picked; the one who talks chooses.

@@ -4,6 +4,7 @@
 #include "log.h"
 #include "net.h"
 #include "remote.h"
+#include "ai.h"
 
 #include <GFC.h>
 #include <Game.h>
@@ -146,6 +147,7 @@ void DrawOnCompass(CFFGFCWnd* control)
 
 void __fastcall MapPaintDetour(CFFGFCWnd* self, void*)
 {
+    if (ai::ShuttingDown()) { if (originalMap) originalMap(self); return; }
     originalMap(self);
     ++mapPaints;
     if (enabled) DrawOnMap(self);
@@ -153,6 +155,7 @@ void __fastcall MapPaintDetour(CFFGFCWnd* self, void*)
 
 void __fastcall CompassPaintDetour(CFFGFCWnd* self, void*)
 {
+    if (ai::ShuttingDown()) { if (originalCompass) originalCompass(self); return; }
     originalCompass(self);
     ++compassPaints;
     if (enabled) DrawOnCompass(self);
@@ -163,12 +166,7 @@ void* Patch(unsigned char* game, uintptr_t vtable, uintptr_t paint, void* detour
 {
     void** slot = reinterpret_cast<void**>(game + vtable) + PaintSlot;
     if (*slot != game + paint) return nullptr;
-    DWORD old = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
-    void* original = *slot;
-    *slot = detour;
-    VirtualProtect(slot, sizeof(void*), old, &old);
-    return original;
+    return ai::PatchPointer(slot, detour, "mapmarks paint vtable");
 }
 }
 

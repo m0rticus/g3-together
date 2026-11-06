@@ -129,8 +129,8 @@ class Module : public eCEngineComponentBase
     // were deleted and the next frame crashed on them. So forget on both.
     static void ForgetWorld()
     {
-        g3t::npcplayback::OnWorldDeactivate();
         g3t::world::OnWorldDeactivate();
+        g3t::npcplayback::OnWorldDeactivate();
         g3t::remote::OnWorldDeactivate();
         g3t::npcs::OnWorldDeactivate();
         g3t::combat::OnWorldChange();
@@ -158,6 +158,7 @@ class Module : public eCEngineComponentBase
     }
     bEResult WorldActivate() override
     {
+        if (g3t::ai::ShuttingDown()) return bEResult_Ok;
         playbackErrorShown = false;
         g3t::Log("world activated");
         ForgetWorld();
@@ -166,6 +167,7 @@ class Module : public eCEngineComponentBase
     }
     bEResult WorldDeactivate() override
     {
+        if (g3t::ai::ShuttingDown()) return bEResult_Ok;
         g3t::Log("world deactivated");
         ForgetWorld();
         g3t::persist::OnWorldDeactivate();
@@ -173,21 +175,36 @@ class Module : public eCEngineComponentBase
     }
     bEResult PreShutdown() override
     {
-        g3t::npcplayback::OnWorldDeactivate();
-        g3t::world::OnWorldDeactivate();
+        g3t::ai::BeginShutdown();
+        g3t::crashlog::BeginShutdown();
+        ForgetWorld();
+        g3t::crashlog::Stage("world deactivated");
+        g3t::crashlog::Stage("forget done");
         g3t::dialogaudio::OnWorldChange();  // no channel of ours outlives the audio system, whichever way the game ends
         g3t::net::Stop();
-        const GEBool removed = eCModuleAdmin::GetInstance().UnregisterModule(*this);
-        g3t::Logf("pre-shutdown: module unregistered=%d", removed);
+        g3t::crashlog::Stage("steam stopped");
+        g3t::ai::RestorePatches();
+        g3t::crashlog::Stage("hooks removed");
+        if (g3t::crashlog::Shutdown()) g3t::crashlog::Stage("threads joined");
+        g3t::crashlog::StartWatchdog();
+        g3t::crashlog::Stage("pre-shutdown done");
         return bEResult_Ok;
     }
-    bEResult Shutdown() override { return bEResult_Ok; }
+    bEResult Shutdown() override
+    {
+        g3t::ai::BeginShutdown();
+        g3t::crashlog::BeginShutdown();
+        g3t::crashlog::Shutdown();
+        g3t::crashlog::Stage("shutdown called");
+        return bEResult_Ok;
+    }
     bEResult ResetResources(GEBool) override { return bEResult_Ok; }
     bEResult RestoreResources(GEBool) override { return bEResult_Ok; }
     // Also a frame the game runs inside its own load (Session::Start, C 22.10.): there nothing of the mod runs, from the
     // first line on (C 23.10.); the world is half made and the load has not returned.
     void Process() override
     {
+        if (g3t::ai::ShuttingDown()) return;
         FrameScope frame;
         if (!frame.run) return;
         Frame();

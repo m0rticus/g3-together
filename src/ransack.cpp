@@ -9,6 +9,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "trade.h"
+#include "ai.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -126,6 +127,7 @@ void Wide(char const* text, wchar_t* out, int size)
 // robber gets the gold); the player whose puppet it is pays it.
 GEBool __fastcall RobTransfer(PSInventory* self, void*, GEInt stack, GEInt amount, Entity& to)
 {
+    if (ai::ShuttingDown()) return self ? self->TransferAmountTo(stack, amount, to) : GEFalse;
     eCEntity* owner = nullptr;
     if (auto* set = reinterpret_cast<EntityPropertySet*>(self)->m_pEngineEntityPropertySet) owner = set->GetEntity();
     const int id = remote::PuppetOwner(owner);
@@ -175,12 +177,16 @@ void Hook()
     }
     DWORD old = 0;
     if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) { hookFailed = true; return; }
+    unsigned char original[6], installed[6];
+    std::memcpy(original, site, sizeof(original));
     site[0] = 0xE8;  // call rel32 RobTransfer, then a nop: same length, same stack
     const int32_t rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(&RobTransfer) - reinterpret_cast<intptr_t>(site + 5));
     std::memcpy(site + 1, &rel, 4);
     site[5] = 0x90;
+    std::memcpy(installed, site, sizeof(installed));
     VirtualProtect(site, 6, old, &old);
     FlushInstructionCache(GetCurrentProcess(), site, 6);
+    ai::TrackPatch(site, original, installed, sizeof(original), "ransack robbery call");
     hooked = true;
     Log("ransack: robbery hook installed");
 }

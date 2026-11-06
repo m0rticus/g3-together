@@ -1,4 +1,6 @@
 import re
+import os
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -54,7 +56,7 @@ class DownedPolicyTests(unittest.TestCase):
         )
         self.assertIsNotNone(tick)
         start = tick.index("if (dying) {")
-        end = tick.index("if (hero.IsDead())", start)
+        end = tick.index("if (hero.IsDead()", start)
         terminal = tick[start:end]
         self.assertNotIn("SetTask", terminal)
         self.assertNotIn("diedAt", terminal)
@@ -64,7 +66,7 @@ class DownedPolicyTests(unittest.TestCase):
     def test_revive_and_world_change_clear_terminal_death(self):
         revived = function_body(
             self.downed_cpp,
-            r"\bvoid\s+Revived\s*\(\s*int\s+byPlayer\s*\)",
+            r"\bvoid\s+Revived\s*\(\s*int\s+byPlayer\s*,\s*uint32_t\s+sequence\s*\)",
         )
         world_change = function_body(
             self.downed_cpp,
@@ -78,6 +80,54 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("terminalKillSent = false;", world_change)
         self.assertIn("void OnWorldChange();", self.downed_h)
         self.assertIn("g3t::downed::OnWorldChange();", self.script_cpp)
+
+    def test_native_state_and_loading_cannot_clear_the_downed_latch(self):
+        tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(\s*\)")
+        world_change = function_body(self.downed_cpp, r"\bvoid\s+OnWorldChange\s*\(\s*\)")
+        self.assertIn("if (!down && !life.held)", tick)
+        self.assertNotIn("life.held = false;", world_change)
+        self.assertIn("life.Rebind()", world_change)
+        self.assertIn('KeepDown(hero, "tick")', tick)
+        before_terminal = tick[:tick.index("if (dying)")]
+        self.assertNotIn("life.held = false", before_terminal)
+        self.assertNotIn("terminalKillSent = false", before_terminal)
+        ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
+        self.assertLess(ai.index("downed::GuardState(self, name)"), ai.index("if (SpectatorState(name))"))
+        keys = function_body(ai, r"\bGEInt\s+GE_STDCALL\s+FilterPlayerKeys\s*\(")
+        self.assertIn("if (downed::Held()) return 0;", keys)
+        self.assertIn("persist::NativeLoading()", self.downed_cpp)
+        self.assertIn("if (persist::HeroPending())", tick)
+        redirect = function_body(self.downed_cpp, r"\bbool\s+RedirectDeath\s*\(")
+        self.assertIn("!persist::HeroPending()", redirect)
+
+    def test_records_preserve_downed_state_before_restoring_hp(self):
+        hero = (ROOT / "src" / "hero.cpp").read_text(encoding="utf-8")
+        save = function_body(hero, r"\bbool\s+SaveRecordImpl\s*\(")
+        load = function_body(hero, r"\bbool\s+LoadRecordImpl\s*\(")
+        self.assertIn('fprintf(file, "downed %d\\n"', save)
+        self.assertIn('downed::Restore(savedDowned != 0, "hero-record")', load)
+        self.assertLess(load.index("downed::Restore"), load.index("self.Inventory.HoldStacks"))
+        self.assertIn("downed::Held()", load)
+
+    def test_paid_revive_is_bound_to_sender_and_down_episode(self):
+        self.assertIn("sequence != life.sequence", self.downed_cpp)
+        self.assertIn("life.Revive(pendingReviveSequence)", self.downed_cpp)
+        self.assertIn("hero.IsDown() || hero.IsDead()", self.downed_cpp)
+        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        self.assertIn("message.state.npcClass = from;", net)
+        self.assertIn("constexpr uint16_t ProtocolVersion = saving::Protocol;", net)
+
+    def test_engine_free_transition_and_ordering_rules(self):
+        build = ROOT / "build" / "downed-policy-tests"
+        configure = ["cmake", "-S", str(ROOT / "tests" / "downed_policy"), "-B", str(build)]
+        if os.name == "nt":
+            configure += ["-A", "Win32"]
+        for command in (configure, ["cmake", "--build", str(build), "--config", "Debug"]):
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        executable = build / "Debug" / "downed_policy_test.exe" if os.name == "nt" else build / "downed_policy_test"
+        result = subprocess.run([str(executable)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_all_down_and_absence_grace_rules_are_preserved(self):
         all_down = function_body(

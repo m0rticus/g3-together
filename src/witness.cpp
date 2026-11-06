@@ -171,6 +171,7 @@ GEInt GE_STDCALL Murder(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 
 GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalAssess ? originalAssess(spu, self, other, args) : 0;
     if (!depth && enabled && KillReason(args)) {
         // A witness here judged another player's puppet for a killing this machine applied (MurderSeen): the game
         // remembers a crime only against its local player (MemorizePlayerCrime), so the killer's machine judges its hero.
@@ -340,6 +341,9 @@ void Tick()
     if (!native) {  // another build: calls by name only (perceptions call it directly and are missed)
         originalAssess = script->m_funcScript;
         script->m_funcScript = &Assess;
+        ai::TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                         reinterpret_cast<void*>(originalAssess),
+                         reinterpret_cast<void*>(&Assess), "witness AssessTarget script");
     }
     installed = true;
     Logf("witness: AssessTarget wrapped (%s)", native ? "native jump" : "script table only");

@@ -160,6 +160,7 @@ unsigned char* NativeShoot(gFScript registered)
 
 GEInt GE_STDCALL HookShoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalShoot ? originalShoot(spu, self, other, args) : 0;
     eCEntity* shooter = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     const bool own = mirror && OwnCaster(shooter);
@@ -182,6 +183,7 @@ GEInt GE_STDCALL HookShoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid 
 // script table's entry is wrapped; the projectile is then announced like an arrow, with the item cast from.
 GEInt GE_STDCALL WrapMagicProjectile(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalMagicProjectile ? originalMagicProjectile(spu, self, other, args) : 0;
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     const bool own = mirror && OwnCaster(caster);
@@ -216,6 +218,9 @@ void Install()
         if (gSScript* script = Find(GetScriptAdminExt().GetScripts(), "MagicProjectile")) {
             originalMagicProjectile = script->m_funcScript;
             script->m_funcScript = &WrapMagicProjectile;
+            ai::TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                             reinterpret_cast<void*>(originalMagicProjectile),
+                             reinterpret_cast<void*>(&WrapMagicProjectile), "shot MagicProjectile script");
             magicInstalled = true;
             Log("shot: MagicProjectile wrapper installed");
         }

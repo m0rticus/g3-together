@@ -205,7 +205,9 @@ void Apply(net::WorldState const& s, uint8_t from)
     }
     if (s.kind == 8 || s.kind == 9) {  // to player `guard` from player `npcClass`: helped you up (8) / has no potion (9)
         if (s.guard == net::LocalId()) {
-            if (s.kind == 8) downed::Revived(s.npcClass);
+            uint32_t sequence = 0;
+            std::memcpy(&sequence, s.guid, sizeof(sequence));
+            if (s.kind == 8) downed::Revived(s.npcClass, sequence);
             else downed::HelperHasNoPotion(s.npcClass);
         }
         return;
@@ -284,6 +286,12 @@ void Apply(net::WorldState const& s, uint8_t from)
 
 void OnWorldState(uint8_t from, net::WorldState const& s)
 {
+    if (s.kind == 8 || s.kind == 9) {
+        uint32_t sequence = 0;
+        std::memcpy(&sequence, s.guid, sizeof(sequence));
+        Logf("downed: help message kind=%u transport=%u helper=%u target=%u sequence=%u source=world-state",
+             s.kind, from, s.npcClass, s.guard, sequence);
+    }
     if (s.kind == 14 || s.kind == 15) {
         Logf("infocmd: obsolete NPC lifecycle/gesture result from player %u refused; host snapshots own NPC state", from);
         return;
@@ -357,6 +365,7 @@ unsigned refreshCalls = 0, refreshSent = 0;
 
 GEInt GE_STDCALL SectorRefresh(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalRefresh ? originalRefresh(spu, self, other, args) : 0;
     if (!net::IsHost()) return 0;
     struct Before { eCEntity* entity; std::string routine; bCVector position; bCQuaternion rotation; uint8_t companionOf; };
     std::vector<Before> before;

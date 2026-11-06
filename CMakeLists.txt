@@ -31,5 +31,5 @@ target_gothic_script_options(Script_G3Together)
 target_compile_options(Script_G3Together PRIVATE /utf-8)
 # A map file, to turn crash addresses from the engine's report into functions.
 target_link_options(Script_G3Together PRIVATE /MAP)
-target_link_libraries(Script_G3Together PRIVATE g3sdk::SDK enet)
+target_link_libraries(Script_G3Together PRIVATE g3sdk::SDK enet bcrypt)
 set_target_properties(Script_G3Together PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts")

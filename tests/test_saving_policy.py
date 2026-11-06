@@ -1,19 +1,21 @@
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NET_CPP = ROOT / "src" / "net.cpp"
-HERO_CPP = ROOT / "src" / "hero.cpp"
-PERSIST_CPP = ROOT / "src" / "persist.cpp"
 
 
 def function_body(source, signature):
-    match = re.search(signature, source)
-    if not match:
-        return None
-    opening = source.find("{", match.end())
+    opening = -1
+    for match in re.finditer(signature, source):
+        candidate = source.find("{", match.end())
+        if candidate >= 0 and ";" not in source[match.end():candidate]:
+            opening = candidate
+            break
     if opening < 0:
         return None
     depth = 0
@@ -22,7 +24,7 @@ def function_body(source, signature):
             depth += 1
         elif source[index] == "}":
             depth -= 1
-            if depth == 0:
+            if not depth:
                 return source[opening + 1:index]
     return None
 
@@ -30,86 +32,186 @@ def function_body(source, signature):
 class SavingPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.net = NET_CPP.read_text(encoding="utf-8")
-        cls.hero = HERO_CPP.read_text(encoding="utf-8")
-        cls.persist = PERSIST_CPP.read_text(encoding="utf-8")
+        cls.persist = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+        cls.net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        cls.hero = (ROOT / "src" / "hero.cpp").read_text(encoding="utf-8")
 
-    def test_campaign_bypasses_world_gate_only_as_save_notification(self):
+    def test_production_pairing_rules_execute_without_engine(self):
+        compiler = shutil.which("clang++") or shutil.which("g++")
+        if not compiler:
+            self.skipTest("C++17 compiler required for engine-free production policy fixture")
+        with tempfile.TemporaryDirectory() as folder:
+            executable = Path(folder) / "saving-policy.exe"
+            subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                 str(ROOT / "tests" / "saving_policy_test.cpp"), "-o", str(executable)],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+
+    def test_save_controls_are_welcomed_direction_checked_and_gate_exempt(self):
         body = function_body(self.net, r"\bbool\s+Gated\s*\(\s*uint8_t\s+type\s*\)")
+        self.assertIn("case MsgSave:", body)
+        self.assertIn("peers[from] != peer", self.net)
+        self.assertIn("(isHost && !clientOp) || (!isHost && !hostOp)", self.net)
+        self.assertIn("saving::Protocol", self.net)
+        self.assertIn("MsgFileChunk && !isHost", self.net)
+        self.assertIn("MsgFileDone && !isHost", self.net)
+
+    def test_client_save_requests_host_and_never_calls_native_save(self):
+        body = function_body(self.persist, r"\bbool\s+__stdcall\s+SaveDetour\s*\(")
         self.assertIsNotNone(body)
-        self.assertRegex(body, r"MsgCampaign\s*:")
-        for exempt in ("MsgHello", "MsgWelcome", "MsgRefused", "MsgLeave", "MsgFileChunk", "MsgFileDone", "MsgWorld"):
-            self.assertRegex(body, rf"\b{exempt}\b")
+        self.assertIn("SafeName(name->GetText())", body)
+        self.assertIn("net::SaveRequest", body)
+        self.assertIn("net::SendSave(1, note)", body)
+        self.assertNotIn("originalSave(", body)
+        self.assertIn("return false;", body)  # queued != native success
+        timer = function_body(self.persist, r"\bvoid\s+CALLBACK\s+SaveNow\s*\(")
+        self.assertIn("processDepth || nativeLoadDepth || nativeSaveDepth", timer)
+        self.assertIn("barrier.AllReady()", timer)
+        self.assertIn("remote::DespawnAll", timer)
+        self.assertIn("originalSave(", timer)
 
-    def test_v3_embeds_spells_quick_and_validation_before_mutation(self):
-        save_body = function_body(self.hero, r"\bbool\s+SaveRecord\s*\(\s*char\s+const\*\s+path\s*\)")
-        load_body = function_body(self.hero, r"\bbool\s+LoadRecord\s*\(\s*char\s+const\*\s+path\s*\)")
-        self.assertIsNotNone(save_body)
-        self.assertIsNotNone(load_body)
-        self.assertIn("G3THERO 3", save_body)
-        self.assertIn("spell %s", save_body)
-        self.assertIn("quick %d %s %u", save_body)
-        self.assertIn("quick_end %zu %zu", save_body)
-        self.assertIn("SaveQuick(self, path)", save_body)
-        self.assertIn("quick_end", load_body)
-        self.assertIn("declaredInlineSpells", load_body)
-        self.assertIn("declaredInlineQuick", load_body)
-        self.assertRegex(load_body, r"if\s*\(\s*!refused\s*\&\&\s*checking\s*\)")
-        self.assertIn("ApplySpellAndQuick(self, path, inlineSpells, inlineQuick)", load_body)
+    def test_record_selection_never_refreshes_an_old_checkpoint(self):
+        body = function_body(self.persist, r"\bbool\s+ChooseCharacter\s*\(")
+        self.assertIn("saving::Select(Exists(exact), Exists(latest)", body)
+        self.assertIn("hero::ReadRecordKey", body)
+        self.assertIn("saving::SameCharacter", body)
+        self.assertIn("saving::Exact", body)
+        self.assertIn("ClaimLegacy", body)
+        self.assertNotIn("FindFirstFile", self.persist)
+        self.assertNotIn("24ull", self.persist)
+        self.assertNotIn("SnapshotWrittenInWelcome", self.persist)
 
-    def test_snapshot_success_is_welcome_bound_and_file_done_refreshes_exact_record(self):
-        on_file_done = function_body(
-            self.persist,
-            r"\bvoid\s+OnFileDone\s*\(\s*char\s+const\*\s+name\s*,",
-        )
-        on_campaign = function_body(
-            self.persist,
-            r"\bvoid\s+OnCampaign\s*\(\s*uint8_t\s+kind\s*,\s*char\s+const\*\s+name\s*\)",
-        )
-        self.assertIsNotNone(on_file_done)
-        self.assertIsNotNone(on_campaign)
-        self.assertIn("WelcomeSerial()", self.persist)
-        self.assertIn("MarkSnapshotWritten", self.persist)
-        self.assertIn("SnapshotWrittenInWelcome", on_file_done)
-        self.assertIn("hero::SaveRecord(record.c_str())", on_file_done)
-        self.assertIn("QueueSnapshot(record, net::WelcomeSerial(), false)", on_file_done)
-        self.assertIn("QueueOrSaveSnapshot(record)", on_campaign)
-        stable = function_body(
-            self.persist,
-            r"\bbool\s+StableRunningHero\s*\(\s*\)",
-        )
-        self.assertIsNotNone(stable)
-        self.assertIn("pendingRecord.empty()", stable)
-        self.assertIn("refusedRecord.empty()", stable)
+    def test_manifest_binds_native_files_and_is_published_last(self):
+        verify = function_body(self.persist, r"\bbool\s+Verify\s*\(")
+        self.assertIn("manifest.size[f] != data[f].size()", verify)
+        self.assertIn("manifest.crc[f] != Crc32", verify)
+        store = function_body(self.persist, r"\bbool\s+StoreBundle\s*\(")
+        self.assertIn("f < net::FileCount", store)
+        self.assertIn("WriteAtomic(Path(slot, f)", store)
+        atomic = function_body(self.persist, r"\bbool\s+WriteAtomic\s*\(")
+        self.assertIn('path + ".tmp"', atomic)
+        self.assertIn("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH", atomic)
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertLess(load.index("ReadBundle("), load.index("originalLoad("))
+        self.assertLess(load.index("SafeName("), load.index("Path(slot"))
 
-    def test_host_save_and_load_validate_safe_names_before_native_and_path_use(self):
-        save_body = function_body(
-            self.persist,
-            r"\bbool\s+__stdcall\s+SaveDetour\s*\(\s*void\*\s+self\s*,\s*bCString\s+const\*\s+name\s*\)",
-        )
-        load_body = function_body(
-            self.persist,
-            r"\bbool\s+__stdcall\s+LoadDetour\s*\(\s*void\*\s+self\s*,\s*bCString\s+const\*\s+name\s*\)",
-        )
-        safe_body = function_body(self.persist, r"\bbool\s+SafeName\s*\(\s*char\s+const\*\s+name\s*\)")
-        self.assertIsNotNone(save_body)
-        self.assertIsNotNone(load_body)
-        self.assertIsNotNone(safe_body)
-        self.assertLess(save_body.index("SafeName(name->GetText())"), save_body.index("originalSave"))
-        self.assertLess(load_body.index("SafeName(name->GetText())"), load_body.index("originalLoad"))
-        self.assertIn("n > 48", safe_body)
-        self.assertIn("c == '-'", safe_body)
-        self.assertIn("path + \".tmp\"", save_body)
-        self.assertIn("MOVEFILE_REPLACE_EXISTING", save_body)
+    def test_commit_stores_same_world_without_loading_or_recapturing_character(self):
+        body = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
+        self.assertIn("incomingWelcome != net::WelcomeSerial()", body)
+        self.assertIn("incomingNote.epoch != hostWorld.epoch", body)
+        self.assertIn("prepared.welcome == net::WelcomeSerial()", body)
+        self.assertIn("saving::Exact(key, found)", body)
+        self.assertIn("StoreBundle(name, incoming)", body)
+        self.assertIn("const char* alias = prepared.note.name", body)
+        self.assertIn("StoreBundle(alias, incoming)", body)
+        self.assertIn("net::SaveStored", body)
+        self.assertNotIn("hero::SaveRecord", body)
+        self.assertNotIn("originalLoad(", body)
 
-    def test_absent_received_sidecar_clears_the_local_old_file(self):
-        on_file_done = function_body(
-            self.persist,
-            r"\bvoid\s+OnFileDone\s*\(\s*char\s+const\*\s+name\s*,",
-        )
-        self.assertIsNotNone(on_file_done)
-        self.assertRegex(on_file_done, r"if\s*\(\s*!size\[2\]\s*\)")
-        self.assertIn("DeleteFileA(optional.c_str())", on_file_done)
+    def test_missing_and_removed_characters_never_open_gate_with_host_hero(self):
+        body = function_body(self.persist, r"\bvoid\s+WaitForRecord\s*\(")
+        self.assertNotIn("NoCampaignHero", body)
+        self.assertNotIn("GetFileAttributesA", body)
+        self.assertIn("ApplyCharacter()", body)
+        evaluate = function_body(self.persist, r"\bvoid\s+Evaluate\s*\(")
+        self.assertIn("!ownCharacterReady", evaluate)
+        self.assertIn("!pendingRecord.empty()", evaluate)
+        self.assertIn("!waitingImport.empty()", evaluate)
+        self.assertIn("net::WorldWaiting", evaluate)
+
+    def test_failed_or_reused_connections_cannot_ack_a_different_checkpoint(self):
+        poll = function_body(self.persist, r"\bvoid\s+PollSave\s*\(")
+        self.assertIn("net::PeerGeneration(i) != barrier.members[i].generation", poll)
+        self.assertIn("PrepareLimit", poll)
+        self.assertIn("WriteLimit", poll)
+        self.assertIn("TransferLimit", poll)
+        self.assertIn("barrier.AllStored()", poll)
+        self.assertIn("aliasPublished", poll)
+
+    def test_native_load_uses_lower_result_not_only_masking_hud_boolean(self):
+        body = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("hudOk && lowerLoadCalls == 1 && lowerLoadGood", body)
+        lower = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldLoadDetour\s*\(")
+        self.assertIn("lowerLoadGood = lowerLoadGood && ok", lower)
+        self.assertIn("nativeLoadDepth", lower)
+        self.assertIn("ownCharacterReady = false", body)
+
+    def test_reload_uses_world_incarnation_not_only_last_stored_checkpoint(self):
+        evaluate = function_body(self.persist, r"\bvoid\s+Evaluate\s*\(")
+        self.assertIn("saving::WorldMatches(hostWorld.epoch, synced, loadedEpoch", evaluate)
+        commit = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
+        self.assertNotIn("loadedEpoch =", commit)
+        settled = function_body(self.persist, r"\bvoid\s+Settled\s*\(")
+        self.assertIn("loadedEpoch = hostWorld.epoch", settled)
+
+    def test_character_seeding_load_retains_bound_host_import(self):
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("waitingEpoch == hostWorld.epoch", load)
+        self.assertIn("waitingWelcome == net::WelcomeSerial()", load)
+        self.assertIn("waitingImport = deferredImport", load)
+        self.assertIn("!loadingHostCheckpoint", load)
+
+    def test_reserved_names_match_windows_case_rules(self):
+        start = function_body(self.persist, r"\bbool\s+StartSave\s*\(")
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn('saving::Prefix(name, "G3T_")', start)
+        self.assertIn('saving::Prefix(slot, "G3T_")', load)
+        self.assertIn('saving::Prefix(slot, "G3T_host_")', load)
+
+    def test_valid_alias_repairs_the_complete_canonical_bundle_before_load(self):
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("ReadBundle(canonical, stored, canonicalData)", load)
+        self.assertIn("saving::Exact(stored.key, manifest.key)", load)
+        self.assertIn("canonicalData[2] == data[2]", load)
+        self.assertLess(load.index("StoreBundle(canonical, data)"), load.index("originalLoad("))
+        self.assertIn('fopen_s(&journalFile, Path(slot, 2).c_str(), "r")', load)
+
+    def test_transient_publication_retries_without_source_file_edit(self):
+        wait = function_body(self.persist, r"\bvoid\s+WaitForRecord\s*\(")
+        self.assertIn("now - nextRestoreTry", wait)
+        self.assertIn("ApplyResult::PublicationPending ? 5000 : 30000", wait)
+        self.assertIn("Exists(refusedRecord)", wait)
+
+    def test_all_supported_native_save_routes_use_coordinator(self):
+        body = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldSaveDetour\s*\(")
+        self.assertIn("if (nativeSaveDepth) return originalWorldSave", body)
+        self.assertIn("SaveDetour(nullptr, &name)", body)
+        ready = function_body(self.persist, r"\bbool\s+NativeSaveAllowed\s*\(")
+        self.assertLess(ready.index("gCInfoManager_PS::GetInstance()"), ready.index("session.IsSaveAllowed()"))
+        self.assertIn("session.GetPlayer() != session.GetHero()", ready)
+        self.assertIn("downed::Held()", ready)
+
+    def test_legacy_migration_is_content_bound_and_originals_are_preserved(self):
+        legacy = function_body(self.persist, r"\bbool\s+AdoptLegacy\s*\(")
+        self.assertIn("LegacyId(data)", legacy)
+        self.assertIn("StoreBundle(canonical, data)", legacy)
+        self.assertNotIn("StoreBundle(slot,", legacy)
+        self.assertNotIn("DeleteFile", legacy)
+        claim = function_body(self.persist, r"\bbool\s+ClaimLegacy\s*\(")
+        self.assertIn("steam::PlayerId()", claim)
+        self.assertIn("== owner", claim)
+
+    def test_mandatory_legacy_migration_never_uses_permissive_diagnostic_load(self):
+        body = function_body(self.persist, r"\bApplyResult\s+ApplyCharacter\s*\(")
+        self.assertIn("hero::LoadLegacyRecordStrict(pendingRecord.c_str())", body)
+        self.assertNotIn("hero::LoadRecord(pendingRecord.c_str())", body)
+        strict = function_body(self.hero, r"\bbool\s+LoadLegacyRecordStrict\s*\(")
+        self.assertIsNotNone(strict)
+
+    def test_saved_xp_is_not_lifted_to_another_players_total(self):
+        xp = (ROOT / "src" / "xpshare.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("LiftTo", xp)
+        self.assertIn("Gain(static_cast<int>(gain))", xp)
+        self.assertIn("waiting = 0", function_body(xp, r"\bvoid\s+OnWorldChange\s*\("))
+
+    def test_trades_cannot_cross_character_checkpoint_capture(self):
+        trade = (ROOT / "src" / "trade.cpp").read_text(encoding="utf-8")
+        offer = (ROOT / "src" / "offer.cpp").read_text(encoding="utf-8")
+        self.assertIn("persist::CheckpointBusy()", function_body(trade, r"\bbool\s+BuildExchange\s*\("))
+        self.assertIn("persist::CheckpointBusy()", function_body(offer, r"\bbool\s+Apply\s*\("))
+        self.assertIn("persist::CheckpointBusy()", function_body(offer, r"\bbool\s+Reserve\s*\("))
 
 
 if __name__ == "__main__":

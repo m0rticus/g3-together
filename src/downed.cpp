@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "downed.h"
+#include "downed_policy.h"
 
 #include "body.h"
 #include "hud.h"
@@ -7,6 +8,7 @@
 #include "items.h"
 #include "log.h"
 #include "net.h"
+#include "persist.h"
 #include "remote.h"
 
 #include <Game.h>
@@ -53,7 +55,7 @@ constexpr uint32_t StaleState = 5000;  // ms: a remote state older than this doe
 constexpr uint32_t AloneGrace = 5000;  // ms unknown or unavailable partner state can keep the original grace
 constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still says "down" for a moment
 
-bool held = false;              // the local hero lies knocked out and waits for help
+Life life;                     // authority is the paid revive, not the native body's current state
 bool lethal = false;            // the knock-out it lies in replaced its death (RedirectDeath)
 bool lethalSeenDown = false;    // ... and the hero has lain down since (until then a frame without IsDown is no standing up)
 uint32_t lethalAt = 0;          // when RedirectDeath set it
@@ -72,6 +74,67 @@ bool toldDead[net::MaxPlayers] = {};
 uint32_t helpingSince[net::MaxPlayers] = {};  // local hero next to downed player i since then (0: not there)
 bool hinted[net::MaxPlayers] = {};            // "you need a potion" shown for this stay next to player i
 uint32_t paidAt[net::MaxPlayers] = {};        // when we paid a potion for player i
+uint32_t paidSequence[net::MaxPlayers] = {};
+uint32_t pendingReviveSequence = 0;
+unsigned transitions = 0, corrections = 0;
+uint32_t lastCorrection = 0;
+
+void Transition(char const* reason, char const* source)
+{
+    Logf("downed: transition=%u player=%u role=%s held=%d terminal=%d sequence=%u reason=%s source=%s",
+         ++transitions, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
+         terminalKillSent ? 1 : 0, life.sequence, reason, source);
+}
+
+bool DownTask(char const* task)
+{
+    return !std::strcmp(task, KnockOutTask) || !std::strcmp(task, "ZS_Unconscious") || !std::strcmp(task, "ZS_PiercedKO");
+}
+
+bool DownPose(Entity& hero)
+{
+    const auto pose = static_cast<gEAniState>(hero.Routine.AniState);
+    return pose == gEAniState_LieKnockDown || pose == gEAniState_LieKnockOut || pose == gEAniState_LiePiercedKO;
+}
+
+void KeepDown(Entity& hero, char const* source)
+{
+    const bCString task = hero.Routine.GetCurrentTask(), state = hero.Routine.GetCurrentState();
+    const bool repair = !hero.IsDown() || !DownTask(task.GetText()) ||
+                        (std::strcmp(state.GetText(), "ZS_Unconscious_Loop") && !DownTask(state.GetText())) ||
+                        (!std::strcmp(state.GetText(), "ZS_Unconscious_Loop") && !DownPose(hero));
+    const int hp = hero.PlayerMemory.GetHitPoints();
+    if (repair || hp > 1) {
+        ++corrections;
+        if (repair || !lastCorrection || net::Now() - lastCorrection >= 5000) {
+            lastCorrection = net::Now();
+            Logf("downed: hold correction=%u player=%u sequence=%u source=%s task=%s state=%s ai=%d ani=%d hp=%d timer=%.3f repair=%d",
+                 corrections, net::LocalId(), life.sequence, source, task.GetText(), state.GetText(),
+                 static_cast<int>(hero.Routine.AIMode), static_cast<int>(hero.Routine.AniState), hp,
+                 hero.Routine.GetTaskTime(), repair ? 1 : 0);
+        }
+    }
+    if (repair) {
+        hero.Routine.FullStop();
+        hero.CharacterMovement.StopMovement();
+        hero.Routine.SetTask(bCString(KnockOutTask));
+    }
+    // OnPlayerGameKeyPressed refuses AI mode Down (Script_Game.dll 0x10061640).
+    hero.Routine.AIMode = gEAIMode_Down;
+    hero.Routine.SetTaskTime(0.0f);
+    if (hp != 1) hero.PlayerMemory.SetHitPoints(1);
+}
+
+void Hold(char const* reason, char const* source)
+{
+    if (life.held) return;
+    life.Restore(true);
+    aloneSince = 0;
+    revivedBy = 0;
+    pendingReviveSequence = 0;
+    Transition(reason, source);
+    hud::Message(hud::Bad, potionNeeded ? i18n::Text(i18n::KnockedOutNeedsPotion) : i18n::Text(i18n::KnockedOut));
+}
 
 // A remote player who can help: in the same world, in game, recent, and not knocked out, dead, or waiting for help itself.
 bool Able(net::Remote const& r, uint32_t now)
@@ -131,18 +194,28 @@ GEInt SmallestPotion(Entity& hero, char* name, size_t size)
     return best;
 }
 
-void SendToPlayer(uint8_t kind, int player)
+void SendToPlayer(uint8_t kind, int player, uint32_t sequence)
 {
     net::WorldState s{};
     s.kind = kind;
     s.guard = static_cast<uint8_t>(player);      // to this player
     s.npcClass = net::LocalId();                 // from this one (the host passes it on)
+    std::memcpy(s.guid, &sequence, sizeof(sequence)); // kind 8/9 has no entity GUID: bind it to the target's downed life
     net::SendWorldState(s, 0);
 }
 
 // The local hero helps player i up: it pays a healing potion (the smallest it carries) or is told it needs one.
 void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
 {
+    const bCVector& at = hero.GetInstance()->GetWorldPosition();
+    const float here[3] = {at.GetX(), at.GetY(), at.GetZ()};
+    if (life.held || dying || hero.IsDown() || hero.IsDead() || i == net::LocalId() || !Present(r, now) ||
+        !(r.latest.flags & 8) || (r.latest.flags & 4) || !r.latest.downedSequence ||
+        body::Distance(r.latest.position, here) > ReviveRange ||
+        (paidSequence[i] == r.latest.downedSequence && now - paidAt[i] < PaidCooldown)) {
+        Logf("downed: help refused player=%u target=%d sequence=%u reason=not-eligible", net::LocalId(), i, r.latest.downedSequence);
+        return;
+    }
     wchar_t name[32], text[200];
     Wide(r.latest.name, name, 32);
     char potion[64] = "";
@@ -153,7 +226,7 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
             ++refusedNoPotion;
             swprintf_s(text, i18n::Text(i18n::NeedHealingPotion), name);
             hud::Message(hud::Warning, text);
-            SendToPlayer(9, i);
+            SendToPlayer(9, i, r.latest.downedSequence);
             Logf("downed: wants to help player %d without a healing potion", i);
         }
         return;
@@ -163,12 +236,13 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
         ++potionsPaid;
     }
     paidAt[i] = now;
+    paidSequence[i] = r.latest.downedSequence;
     helpingSince[i] = 0;
     hinted[i] = false;
-    SendToPlayer(8, i);
+    SendToPlayer(8, i, r.latest.downedSequence);
     swprintf_s(text, potionNeeded ? i18n::Text(i18n::HelpedUpWithPotion) : i18n::Text(i18n::HelpedUp), name);
     hud::Message(hud::Good, text);
-    Logf("downed: helped player %d up, paid %s", i, *potion ? potion : "nothing");
+    Logf("downed: helped player %d up, paid %s sequence=%u source=help-line", i, *potion ? potion : "nothing", r.latest.downedSequence);
 }
 
 // QA autohelpon (as before 23.10.): the local hero stands next to a downed partner: after ReviveTime it helps it up.
@@ -294,10 +368,11 @@ void Die(Entity& hero)
 {
     if (dying || terminalKillSent) return;
     dying = true;
-    held = false;
+    life.held = false;
     lethal = false;
     lethalSeenDown = false;
     terminalKillSent = true;  // set before the script call: the terminal decision is re-entry safe
+    Transition("nobody-can-help", "end-policy");
     ++deaths;
     Logf("downed: nobody can help; the hero dies (hp=%d)", hero.PlayerMemory.GetHitPoints());
     hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
@@ -320,18 +395,42 @@ bool RedirectDeath(eCEntity* self, char const* state)
     Entity hero(self);
     hero.Routine.FullStop();
     hero.Routine.SetTask(bCString(KnockOutTask));
-    lethal = true;
+    lethal = life.held || !persist::HeroPending();
     lethalSeenDown = false;
     lethalAt = net::Now();
+    if (holdEnabled && !persist::HeroPending()) Hold("redirect-death", state);
     ++redirects;
     Logf("downed: hero would die (%s), knocked out instead (hp=%d)", state, hero.PlayerMemory.GetHitPoints());
     return true;
 }
 
+bool GuardState(eCEntity* self, char const* state)
+{
+    if (!life.held || dying || !self || self != gCSession::GetInstance().GetHero() ||
+        !gCSession::GetInstance().IsGameRunning() || persist::NativeLoading()) return false;
+    Entity hero(self);
+    // A module tick is not a script clock boundary: a long frame or another script can otherwise wake the hero first.
+    if (DownTask(state) || !std::strcmp(state, "ZS_Unconscious_Loop")) {
+        if (!std::strcmp(state, "ZS_Unconscious_Loop") && hero.Routine.GetTaskTime() > 5.0f)
+            Logf("downed: stand refused player=%u sequence=%u source=native-wake timer=%.3f",
+                 net::LocalId(), life.sequence, hero.Routine.GetTaskTime());
+        hero.Routine.AIMode = gEAIMode_Down;
+        hero.Routine.SetTaskTime(0.0f);
+        if (hero.PlayerMemory.GetHitPoints() != 1) hero.PlayerMemory.SetHitPoints(1);
+        return false;
+    }
+    Logf("downed: stand refused player=%u sequence=%u source=AI state=%s", net::LocalId(), life.sequence, state);
+    hero.Routine.FullStop();
+    hero.Routine.SetTask(bCString(KnockOutTask));
+    hero.Routine.AIMode = gEAIMode_Down;
+    hero.CharacterMovement.StopMovement();
+    return true;
+}
+
 // The knocked-out hero gets up when its knock-out loop (ZS_Unconscious_Loop) finds the task time above 5 s
 // and calls ContinueRoutine (static analysis). The task time is held at 0 and the hit points at most 1 (the loop
-// heals +10 per second) until a partner who stood next to the hero for 3 s pays a healing potion for it (owner,
-// 19.10.); then it stands up with a quarter of its hit points. Without a potion the partner is told so and the
+// heals +10 per second) until a partner chooses the help dialog and pays a healing potion; then it stands up
+// with a quarter of its hit points. Without a potion the partner is told so and the
 // hero stays down. When every known, connected partner is down or dead, the hero dies immediately. Unknown, stale,
 // loading, disconnected, or another-world partner state retains the original 5-second grace.
 void Tick()
@@ -339,10 +438,6 @@ void Tick()
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
     if (!instance) {
-        held = false;
-        lethal = false;
-        dying = false;
-        terminalKillSent = false;
         aloneSince = 0;
         revivedBy = 0;
         lastHp = -1;
@@ -350,8 +445,6 @@ void Tick()
         return;
     }
     if (!session.IsGameRunning()) {
-        held = false;
-        lethal = false;
         aloneSince = 0;
         revivedBy = 0;
         return;
@@ -386,7 +479,7 @@ void Tick()
         // Terminal death is one-shot.  The native Kill script, and not a repeating task latch, owns game over.
         // Do not inspect or restart ZS_Dead/ZS_Dead_Loop/PS_Normal here: that lets PS_Normal be accepted without
         // reviving or re-running the death script, while HP remains 0 and stale revive messages stay refused.
-        held = false;
+        life.held = false;
         lethal = false;
         lethalSeenDown = false;
         nativeNoted = false;
@@ -394,25 +487,29 @@ void Tick()
         if (hero.PlayerMemory.GetHitPoints() > 0) hero.PlayerMemory.SetHitPoints(0);
         return;
     }
-    if (hero.IsDead()) { held = false; lethal = false; revivedBy = 0; return; }
+    if (hero.IsDead() && !life.held) { lethal = false; revivedBy = 0; return; }
+    if (persist::HeroPending()) {
+        if (life.held) KeepDown(hero, "hero-restore");
+        aloneSince = 0;
+        return;
+    }
     WatchBlows(hero, now);
     const bool down = hero.IsDown();
-    if (!down) {
+    if (!down && !life.held) {
         for (int i = 0; i < 2; ++i) {
             Entity item = hero.Inventory.GetItemFromSlot(i ? gESlot_LeftHand : gESlot_RightHand);
             inHand[i] = item.GetInstance() ? item.GetName().GetText() : "";
         }
-    } else if (!wasDown && !net::IsHost()) {
+    } else if (down && !wasDown && !net::IsHost()) {
         for (auto const& n : inHand)
             if (!n.empty()) items::NoteOwnDrop(n.c_str());
     }
     wasDown = down;
     if (down && lethal) lethalSeenDown = true;
-    if (!down) {
+    if (!down && !life.held) {
         // The knock-out task RedirectDeath sets makes the hero lie a frame or more later: not standing up yet (22.10.:
         // reset at once, every intercepted death went the game's own way and nobody could help, stages A and A2).
         if (lethal && !lethalSeenDown && now - lethalAt < 3000) return;
-        held = false;
         lethal = false;
         lethalSeenDown = false;
         nativeNoted = false;
@@ -423,7 +520,7 @@ void Tick()
         else OfferHelp(hero, remotes, now);
         return;
     }
-    if (!held) {
+    if (!life.held) {
         if (!holdEnabled) return;  // QA negative control: the game's own timer stands the hero up
         // A knock-out of the game's own at 0 hit points after a blow that meant to kill: a death the game turned into a
         // knock-out; the partner helps it up, else it is one.
@@ -443,23 +540,29 @@ void Tick()
             }
             return;
         }
-        held = true;
-        aloneSince = 0;
-        revivedBy = 0;
+        Hold("lethal-knockout", "tick");
         Logf("downed: hero knocked out, waiting for a partner (hp=%d)", hero.PlayerMemory.GetHitPoints());
-        hud::Message(hud::Bad, potionNeeded ? i18n::Text(i18n::KnockedOutNeedsPotion)
-                                            : i18n::Text(i18n::KnockedOut));
     }
-    hero.Routine.SetTaskTime(0.0f);
-    if (hero.PlayerMemory.GetHitPoints() > 1) hero.PlayerMemory.SetHitPoints(1);
+    KeepDown(hero, "tick");
 
+    if (revivedBy && !Able(remotes[revivedBy], now)) {
+        Logf("downed: revive refused player=%u helper=%d sequence=%u reason=helper-no-longer-able",
+             self, revivedBy, pendingReviveSequence);
+        revivedBy = 0;
+        pendingReviveSequence = 0;
+    }
     if (revivedBy) {
         const int by = revivedBy;
         revivedBy = 0;
-        if (dying || !held || hero.IsDead() || !hero.IsDown()) return;
-        held = false;
+        if (dying || terminalKillSent || !life.Revive(pendingReviveSequence)) return;
+        pendingReviveSequence = 0;
+        lethal = false;
+        lethalSeenDown = false;
+        lethalBlowAt = 0;
+        nativeNoted = false;
         aloneSince = 0;
         ++revives;
+        Transition("paid-revive", "network");
         StandUp(hero);
         Wide(remotes[by].latest.name, name, 32);
         swprintf_s(text, i18n::Text(i18n::RevivedByPartner), name);
@@ -481,37 +584,46 @@ void Tick()
 }
 
 // A partner paid a potion for us (WorldState kind 8 to this player).
-void Revived(int byPlayer)
+void Revived(int byPlayer, uint32_t sequence)
 {
-    if (byPlayer <= 0 || byPlayer >= net::MaxPlayers) {
-        revivedBy = 0;
-        return;
-    }
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
-    if (!held || dying || terminalKillSent || !instance || !session.IsGameRunning()) {
-        revivedBy = 0;
-        return;
-    }
-    Entity hero(instance);
-    if (hero.IsDead() || !hero.IsDown()) {
-        revivedBy = 0;
+    const bool helper = byPlayer > 0 && byPlayer < net::MaxPlayers && byPlayer != net::LocalId() &&
+                        Able(net::Remotes()[byPlayer], net::Now());
+    if (!helper || !life.held || !sequence || sequence != life.sequence || dying || terminalKillSent ||
+        !instance || !session.IsGameRunning() || persist::HeroPending()) {
+        Logf("downed: revive refused player=%u helper=%d sequence=%u current=%u held=%d terminal=%d reason=stale-or-ineligible",
+             net::LocalId(), byPlayer, sequence, life.sequence, life.held ? 1 : 0, terminalKillSent ? 1 : 0);
         return;
     }
     revivedBy = byPlayer;
+    pendingReviveSequence = sequence;
+    Logf("downed: revive accepted player=%u helper=%d sequence=%u source=network", net::LocalId(), byPlayer, sequence);
 }
 
 // A partner stood next to us without a healing potion (kind 9).
 void HelperHasNoPotion(int byPlayer)
 {
-    if (byPlayer <= 0 || byPlayer >= net::MaxPlayers || !held) return;
+    if (byPlayer <= 0 || byPlayer >= net::MaxPlayers || !life.held) return;
     wchar_t name[32], text[160];
     Wide(net::Remotes()[byPlayer].latest.name, name, 32);
     swprintf_s(text, i18n::Text(i18n::HelperHasNoPotion), name);
     hud::Message(hud::Info, text);
 }
 
-bool Held() { return held; }
+bool Held() { return life.held; }
+uint32_t Sequence() { return life.held ? life.sequence : 0; }
+
+void Restore(bool waiting, char const* source)
+{
+    if (dying || terminalKillSent) return;
+    if (waiting && !life.held) {
+        Hold("saved-downed-life", source);
+        lethal = true;
+    } else if (life.held) {
+        Transition("preserve-downed-life", source);
+    }
+}
 
 void NoteBlow()
 {
@@ -523,15 +635,15 @@ void NoteBlow()
 bool NativeDown()
 {
     eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
-    if (!instance || held || lethal || dying || !gCSession::GetInstance().IsGameRunning()) return false;
+    if (!instance || life.held || lethal || dying || !gCSession::GetInstance().IsGameRunning()) return false;
     Entity hero(instance);
     return hero.IsDown() && !hero.IsDead();
 }
 
 void OnWorldChange()
 {
-    held = false;
-    lethal = false;
+    if (life.held) life.Rebind(); // old-world paid revives must not apply after the load
+    lethal = life.held;
     lethalSeenDown = false;
     lethalAt = 0;
     lastHp = -1;
@@ -539,15 +651,18 @@ void OnWorldChange()
     nativeNoted = false;
     dying = false;
     terminalKillSent = false;
+    Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
     wasDown = false;
     aloneSince = 0;
     revivedBy = 0;
+    pendingReviveSequence = 0;
     for (int i = 0; i < net::MaxPlayers; ++i) {
         told[i] = false;
         toldDead[i] = false;
         helpingSince[i] = 0;
         hinted[i] = false;
         paidAt[i] = 0;
+        paidSequence[i] = 0;
     }
     for (int i = 0; i < 2; ++i) inHand[i].clear();
 }
@@ -627,7 +742,7 @@ void Report(LogFn log)
     char line[240];
     Format(line, "DOWNED lethal=%d lethal_only=%d lethal_blows=%d native_lethal=%u enabled=%d hold=%d held=%d redirects=%u revives=%u releases=%u deaths=%u potions_paid=%u no_potion=%u potion_needed=%d"
                     " auto_help=%d help_option=%d offered=%u chosen=%u",
-              lethal ? 1 : 0, lethalOnly ? 1 : 0, lethalBlows ? 1 : 0, nativeLethal, enabled ? 1 : 0, holdEnabled ? 1 : 0, held ? 1 : 0, redirects, revives, releases, deaths, potionsPaid, refusedNoPotion,
+              lethal ? 1 : 0, lethalOnly ? 1 : 0, lethalBlows ? 1 : 0, nativeLethal, enabled ? 1 : 0, holdEnabled ? 1 : 0, life.held ? 1 : 0, redirects, revives, releases, deaths, potionsPaid, refusedNoPotion,
               potionNeeded ? 1 : 0, autoHelp ? 1 : 0, helpOption ? 1 : 0, optionsOffered, optionsChosen);
     log(line);
 }

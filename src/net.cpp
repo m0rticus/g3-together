@@ -6,7 +6,9 @@
 #include "log.h"
 #include "parity.h"
 #include "replication.h"
+#include "saving_policy.h"
 #include "steam.h"
+#include "ai.h"
 
 #include <cmath>
 #include <cstdio>
@@ -17,13 +19,14 @@
 
 namespace g3t::net {
 namespace {
-constexpr uint16_t ProtocolVersion = 71;  // host-only NPC state with complete rendered bone poses on two alternating pose channels, NPC attitude to the players
+constexpr uint16_t ProtocolVersion = saving::Protocol;  // 72: melee intent, downed sequences, and identity-bound saves
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
 // UDP payload per datagram (ENet default 1392 = up to 1420-byte IP packets): VPNs such as Hamachi carry about 1400, so
 // stay well below (C, re/findings/hamachi-net-c.md, 21.10.). ENet splits larger messages into fragments of this size.
 constexpr enet_uint32 Mtu = 1200;
 enum : uint8_t { ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3, ChannelPoses = 4, ChannelPosesAlt = 5, ChannelCount = 6 };
 enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
+enum : uint8_t { MsgSave = 40 };
 
 #pragma pack(push, 1)
 struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };
@@ -48,7 +51,8 @@ struct NpcReleaseHeader {
 };
 struct MotionNameMsg { uint8_t type; uint32_t hash; char name[96]; };
 // to: the player who applies it (the NPC's owner, the hit player); from: who sent it (set by the host).
-struct HitNpcMsg { uint8_t type; uint8_t guid[16]; int32_t delta; uint8_t weapon[16]; uint8_t to; uint8_t from; uint8_t npc[16]; uint8_t outcome; uint32_t seen; uint8_t reaction; uint32_t epoch, sequence, incarnation; };
+struct HitNpcMsg { uint8_t type; uint8_t guid[16]; int32_t delta; uint8_t weapon[16]; uint8_t to; uint8_t from; uint8_t npc[16]; uint8_t outcome; uint32_t seen; uint8_t reaction; uint32_t epoch, sequence, incarnation; MeleeContact contact; };
+static_assert(sizeof(HitNpcMsg) == 112, "NPC hit wire layout changed");
 enum : uint8_t { MsgHitResult = 38 };
 struct HitResultMsg { uint8_t type; HitResult result; };
 struct HitPlayerMsg { uint8_t type; int32_t delta; uint8_t attacker[16]; uint8_t attackerPlayer; uint8_t to; uint8_t meansToKill; };
@@ -79,8 +83,10 @@ struct WitnessMsg { uint8_t type; uint8_t from; uint8_t to; WitnessNote note; };
 struct NpcSpellMsg { uint8_t type; uint8_t from; uint8_t to; char script[32]; uint8_t target[16]; int32_t args; };
 struct EnclaveMsg { uint8_t type; EnclaveNote note; };
 struct WorldMsg { uint8_t type; WorldNote note; };
+struct SaveMsg { uint8_t type; SaveNote note; };
 #pragma pack(pop)
 static_assert(sizeof(NpcsHeader) == 23, "NPC datagram budget must match its wire header");
+static_assert(sizeof(SaveMsg) == 122, "save message wire layout changed");
 
 ENetHost* host = nullptr;
 ENetPeer* server = nullptr;  // client side: the connection to the host
@@ -147,6 +153,7 @@ WitnessHandler witnessHandler = nullptr;
 NpcSpellHandler npcSpellHandler = nullptr;
 EnclaveHandler enclaveHandler = nullptr;
 WorldHandler worldHandler = nullptr;
+SaveHandler saveHandler = nullptr;
 bool inWorld = false;                  // client side: this machine is in the host's world (persist.cpp)
 bool clientInWorld[MaxPlayers] = {};   // host side: that client is in the host's world
 uint32_t generations[MaxPlayers] = {}; // host side: counts the connections a slot was given (PeerGeneration)
@@ -158,11 +165,19 @@ bool Gated(uint8_t type)
 {
     switch (type) {
     case MsgHello: case MsgWelcome: case MsgRefused: case MsgLeave:
-    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld:
+    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld: case MsgSave:
         return false;
     default:
         return true;
     }
+}
+
+bool XpHandshake(void const* data, size_t size)
+{
+    if (size != sizeof(WorldStateMsg) || static_cast<uint8_t const*>(data)[0] != MsgWorldState) return false;
+    WorldStateMsg message;
+    std::memcpy(&message, data, sizeof(message));
+    return message.state.kind == 19 && message.state.dialog >= 1 && message.state.dialog <= 3;
 }
 
 bool Open(ENetPeer* peer)
@@ -182,7 +197,7 @@ PoseRoute poseRoutes[MaxPlayers];
 
 bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool reliable)
 {
-    if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !Open(peer)) { ++gatedOut; return false; }
+    if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !XpHandshake(data, size) && !Open(peer)) { ++gatedOut; return false; }
     if (channel == ChannelPoses && !reliable) {
         PoseRoute& route = poseRoutes[peer - host->peers];
         uint8_t active = route.alt ? ChannelPosesAlt : ChannelPoses;
@@ -261,7 +276,15 @@ void Store(PlayerState const& state)
 {
     if (state.id == 0 || state.id >= MaxPlayers || state.id == localId) return;
     Remote& r = remotes[state.id];
-    if (r.latestTicks && static_cast<int32_t>(state.sequence - r.latest.sequence) <= 0) return;
+    if (r.latestTicks && static_cast<int32_t>(state.sequence - r.latest.sequence) <= 0) {
+        if ((r.latest.flags & 14) != (state.flags & 14))
+            Logf("downed: remote stale player=%u packet=%u current=%u flags=%u current_flags=%u source=player-state",
+                 state.id, state.sequence, r.latest.sequence, state.flags, r.latest.flags);
+        return;
+    }
+    if (!r.latestTicks || (r.latest.flags & 14) != (state.flags & 14) || r.latest.downedSequence != state.downedSequence)
+        Logf("downed: remote player=%u packet=%u downed_sequence=%u flags=%u previous=%u source=player-state",
+             state.id, state.sequence, state.downedSequence, state.flags, r.latest.flags);
     const bool reset = !r.latestTicks || r.latest.world != state.world || std::strcmp(r.latest.shape, state.shape) ||
                        std::strcmp(r.latest.look, state.look);
     r.previous = r.latestTicks ? r.latest : state;
@@ -285,7 +308,7 @@ void Drop(uint8_t id)
 bool Sane(NpcRecord const& record)
 {
     if (!record.incarnation || record.hitPlayer >= MaxPlayers || record.guidePlayer >= MaxPlayers ||
-        record.partyType > 8 || record.waiting > 1 || record.presentationReady > 1 || record.absent > 1 || record.contact > 1 || record.attitude > 8 ||
+        record.partyType > 8 || record.waiting > 1 || record.contact > 1 || record.attitude > 8 ||
         record.aiMode > 11 || record.attackReason > 21 || record.damageType > 7 ||
         record.damageAmount < -1000000 || record.damageAmount > 1000000 ||
         !std::isfinite(record.damageMultiplier) || std::fabs(record.damageMultiplier) > 1000.0f) return false;
@@ -316,7 +339,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     if (packet->dataLength < 1) return;
     const uint8_t type = packet->data[0];
     if (type == MsgPosedNpc) ++poseReceived;
-    if (Gated(type) && !Open(peer)) { ++gatedIn; return; }  // from another world (a client still loading, or the host before a load)
+    const bool xpHandshake = XpHandshake(packet->data, packet->dataLength);
+    if (Gated(type) && !xpHandshake && !Open(peer)) { ++gatedIn; return; }  // live XP/reproduction waits for the world gate
     if (type == MsgHello && isHost && packet->dataLength >= 3) {
         if (peer->data) { Log("net: a second hello from a player who joined already; ignored"); return; }  // it took a new slot each time
         Hello hello{};
@@ -524,7 +548,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         static const uint8_t zero[16] = {};
         if (message.from < 2 || message.from >= MaxPlayers || message.to != 1 || message.delta >= 0 || message.delta < -1000000 ||
             message.epoch != worldEpoch || !message.sequence || !message.incarnation || message.reaction > HitSitKnockDown ||
-            message.outcome > HitDeath ||
+            message.outcome > HitDeath || message.contact.melee > 1 || message.contact.targetOnly > 1 || message.contact.item > 1 ||
             std::memcmp(message.npc, zero, 16)) { Log("net: invalid or stale NPC hit rejected"); return; }
         if (!hitClaims[message.from].Accept(message.sequence)) {
             Log("net: repeated NPC hit ignored; its original reliable result remains authoritative");
@@ -533,7 +557,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         // The sender's destination is only a hint: gameplay resolves the current authority before applying or relaying.
         if (hitNpcHandler && message.from)
             hitNpcHandler(message.from, message.guid, message.delta, message.weapon, message.npc, message.outcome, message.seen,
-                          message.reaction, message.sequence, message.incarnation);
+                          message.reaction, message.sequence, message.incarnation, message.contact);
     } else if (type == MsgHitResult && packet->dataLength == sizeof(HitResultMsg)) {
         if (isHost) return;
         HitResultMsg message;
@@ -780,11 +804,34 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         message.state.routine[sizeof(message.state.routine) - 1] = 0;
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if (isHost && (message.state.kind == 8 || message.state.kind == 9))
+            message.state.npcClass = from; // a client cannot name another player (or an NPC) as its helper
+        if (message.state.kind == 19) {
+            if (message.state.dialog > 3) return;
+            if (isHost) {
+                if (from < 2 || from >= MaxPlayers || peers[from] != peer || message.state.npcClass != from) return;
+            } else if (from != 1 || message.state.npcClass != 1) {
+                return;
+            }
+        }
         if (worldStateHandler && from) worldStateHandler(from, message.state);
     } else if (type == MsgClock && packet->dataLength == sizeof(ClockMsg)) {
         ClockMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         if (clockHandler) clockHandler(message.state);
+    } else if (type == MsgSave && packet->dataLength == sizeof(SaveMsg)) {
+        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && !connected)) return;
+        SaveMsg message{};
+        std::memcpy(&message, packet->data, sizeof(message));
+        SaveNote const& note = message.note;
+        if (note.world[32] || note.save[32] || note.name[48] || note.ok > 1) return;
+        const bool clientOp = note.op == SaveRequest || note.op == SaveReady || note.op == SaveStored;
+        const bool hostOp = note.op == SavePrepare || note.op == SaveCommit || note.op == SaveCancel ||
+                            note.op == SaveResult || note.op == SaveImport;
+        if ((isHost && !clientOp) || (!isHost && !hostOp)) return;
+        if (!note.epoch || (note.op != SaveRequest && (!saving::Id(note.world) || !saving::Id(note.save)))) return;
+        if (saveHandler) saveHandler(from, note);
     } else if (type == MsgCampaign && !isHost && packet->dataLength == sizeof(CampaignMsg)) {
         CampaignMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
@@ -889,6 +936,16 @@ void SendWorld(WorldNote const& note, uint8_t to)
 
 uint32_t HashName(char const* name) { return HashWorld(name); }
 
+uint32_t HashGuid(uint8_t const guid[16])
+{
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 16; ++i) {
+        hash ^= guid[i];
+        hash *= 16777619u;
+    }
+    return hash ? hash : 1u;
+}
+
 uint32_t NextDeedId()
 {
     static uint32_t last = 0;
@@ -980,14 +1037,14 @@ void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player)
 }
 
 uint32_t SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16], uint8_t outcome,
-                    uint32_t seen, uint8_t reaction, uint32_t incarnation)
+                    uint32_t seen, uint8_t reaction, uint32_t incarnation, MeleeContact const& contact)
 {
     if (!host || isHost || !server || !connected || !inWorld || to != 1) {
         Log("net: NPC hit not sent: no ready authoritative host");
         return 0;
     }
     if (++hitSequence == 0) ++hitSequence;
-    HitNpcMsg message{MsgHitNpc, {}, delta, {}, to, localId, {}, outcome, seen, reaction, worldEpoch, hitSequence, incarnation};
+    HitNpcMsg message{MsgHitNpc, {}, delta, {}, to, localId, {}, outcome, seen, reaction, worldEpoch, hitSequence, incarnation, contact};
     std::memcpy(message.guid, guid, 16);
     std::memcpy(message.weapon, weapon, 16);
     if (npc) std::memcpy(message.npc, npc, 16);
@@ -1024,6 +1081,18 @@ void SetKilledHandler(KilledHandler handler) { killedHandler = handler; }
 void SetDeathHandler(DeathHandler handler) { deathHandler = handler; }
 
 void SetCampaignHandler(CampaignHandler handler) { campaignHandler = handler; }
+void SetSaveHandler(SaveHandler handler) { saveHandler = handler; }
+
+bool SendSave(uint8_t to, SaveNote const& note)
+{
+    if (!host) return false;
+    const SaveMsg message{MsgSave, note};
+    if (isHost) {
+        if (to < 2 || to >= MaxPlayers || !peers[to]) return false;
+        return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    }
+    return connected && server && to == 1 && Send(server, &message, sizeof(message), ChannelReliable, true);
+}
 
 void SetClockHandler(ClockHandler handler) { clockHandler = handler; }
 
@@ -1031,9 +1100,28 @@ void SetWorldStateHandler(WorldStateHandler handler) { worldStateHandler = handl
 
 void SendWorldState(WorldState const& state, uint8_t except)
 {
-    if (!host) return;
     const WorldStateMsg message{MsgWorldState, state};
+    if (state.kind == 19) {
+        if (isHost) {
+            if (state.dialog == 0) SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
+            return;
+        }
+        if (connected && server) Send(server, &message, sizeof(message), ChannelReliable, true);
+        return;
+    }
+    if (!host || !isHost) return;
     SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
+}
+
+bool SendWorldStateTo(uint8_t to, WorldState const& state)
+{
+    if (state.kind != 19 || state.dialog > 3 || state.npcClass != localId) return false;
+    const WorldStateMsg message{MsgWorldState, state};
+    if (isHost) {
+        if (to < 2 || to >= MaxPlayers || !peers[to]) return false;
+        return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    }
+    return connected && server && to == 1 && Send(server, &message, sizeof(message), ChannelReliable, true);
 }
 
 void SendClock(ClockState const& state)
@@ -1057,8 +1145,7 @@ bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, vo
     const FileChunkHeader header{MsgFileChunk, file, total, offset, length};
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), data, length);
-    SendToPeer(buffer, sizeof(header) + length, ChannelReliable, true, to);
-    return true;
+    return Send(peers[to], buffer, sizeof(header) + length, ChannelReliable, true);
 }
 
 bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount])
@@ -1068,8 +1155,7 @@ bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], 
     strncpy_s(message.name, name, _TRUNCATE);
     std::memcpy(message.size, size, sizeof(message.size));
     std::memcpy(message.crc, crc, sizeof(message.crc));
-    SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
-    return true;
+    return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
 }
 
 void SendCampaign(uint8_t kind, char const* name)
@@ -1338,6 +1424,41 @@ void Stop()
         enet_deinitialize();
         enetInitialized = false;
     }
+    npcHandler = nullptr;
+    npcPoseHandler = nullptr;
+    playerStateHandler = nullptr;
+    npcReleaseHandler = nullptr;
+    motionNameHandler = nullptr;
+    hitNpcHandler = nullptr;
+    hitResultHandler = nullptr;
+    hitPlayerHandler = nullptr;
+    stateHandler = nullptr;
+    talkHandler = nullptr;
+    itemHandler = nullptr;
+    contentsHandler = nullptr;
+    goodsHandler = nullptr;
+    txHandler = nullptr;
+    txResultHandler = nullptr;
+    watchHandler = nullptr;
+    killedHandler = nullptr;
+    deathHandler = nullptr;
+    campaignHandler = nullptr;
+    clockHandler = nullptr;
+    worldStateHandler = nullptr;
+    fileChunkHandler = nullptr;
+    fileDoneHandler = nullptr;
+    summonHandler = nullptr;
+    shotHandler = nullptr;
+    ragdollHandler = nullptr;
+    dialogLineHandler = nullptr;
+    offerHandler = nullptr;
+    offerResultHandler = nullptr;
+    playerSpellHandler = nullptr;
+    ransackHandler = nullptr;
+    witnessHandler = nullptr;
+    npcSpellHandler = nullptr;
+    enclaveHandler = nullptr;
+    worldHandler = nullptr;
 }
 
 char const* StartupError() { return startupError; }
@@ -1507,6 +1628,7 @@ void RttLog()
 
 void Tick(PlayerState const& local, bool haveLocal)
 {
+    if (g3t::ai::ShuttingDown()) return;
     if (!host) return;
     RttLog();
     steam::Pump();  // Steam -> ENet before the service

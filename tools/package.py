@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STEAM_DLL_SHA256 = 'fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da'
 
 HOST_INI = """# G3 Together: this player hosts the campaign.
-# This package speaks protocol 71 with session-scoped Steam relays: both players need this same package.
+# This package speaks protocol 72 with session-scoped Steam relays and paired saves: both players need this same package.
 role = host
 # Player name is taken from Steam automatically.
 # Steam friends find this game. Steam and G3Together/steam_api.dll are required; there is no direct-IP fallback.
@@ -61,7 +61,7 @@ friendly_fire = 0
 # npc_hp = 1.0
 """
 CLIENT_INI = """# G3 Together: this player joins the host.
-# This package speaks protocol 71 with session-scoped Steam relays: both players need this same package.
+# This package speaks protocol 72 with session-scoped Steam relays and paired saves: both players need this same package.
 role = client
 # Finds the host among your Steam friends; Steam is required. With several friends hosting: steam_host = <their Steam name>.
 transport = steam

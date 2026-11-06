@@ -50,8 +50,10 @@ choose independently; this does not change Gothic 3's own language.
 ## Joining
 
 The host starts Gothic 3 and begins a new campaign or loads the co-op campaign. Start your game
-afterwards. If the host has loaded or saved a campaign, stay in the main menu and wait for the
-campaign to transfer and load. If the host starts a completely new game, start a new game too.
+afterwards. If the host has loaded or saved a campaign and you already have your own character record for it,
+stay in the main menu and wait for the campaign to transfer and load. On your first join without a character record,
+start a new game or load your own local hero first. You are never given a copy of the host's character.
+If the host starts a completely new game, start a new game too.
 
 If joining is refused, open `g3together.log` in the Gothic 3 folder and find the line containing
 `REFUSED by host`. Compare versions and game options with the host. The reason also stays in the top line of the main menu.
@@ -78,7 +80,10 @@ If Steam cannot start, a clear error is shown; fix Steam or the required DLL and
 - Trade with your partner: talk to their character, "Show me your wares!", select items or gold, then use the normal
   Trade/Swap button. Items transfer freely; selected gold is a gift. Your partner does not need to approve, and the
   window can stay open. Equipped gear, quest items and skills remain protected. Gameplay verification is pending.
-- The host saves the campaign.
+- Either player can request a save. Wait for **"Co-op checkpoint saved for every participating player"**
+  before leaving. A client never uploads its world to the host; both saves contain the host world
+  and their respective account's character record. Back up the entire save folder, including `.g3t` and
+  `g3t-character-*.txt`, not only the native save pair. Both players need protocol 72.
 - See **Known issues** in the [full player guide](PLAYING.md) for problems and workarounds.
 
 ## If something goes wrong

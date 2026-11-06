@@ -124,6 +124,7 @@ bool LocalState(net::PlayerState& state)
     // the game's own rules, with the gold a robber would find (ransack.cpp)
     const bool robbable = downed::NativeDown();
     state.flags = 1 | (Entity(own).IsDown() ? 2 : 0) | (Entity(own).IsDead() ? 4 : 0) | (downed::Held() ? 8 : 0) | (robbable ? 16 : 0);
+    state.downedSequence = downed::Sequence();
     state.gold = robbable ? Entity(own).Inventory.GetItemAmount(Template("It_Gold")) : 0;
     state.movementMode = static_cast<uint8_t>(Entity(hero).CharacterMovement.GetMovementMode());
     state.aniState = static_cast<uint8_t>(static_cast<int>(Entity(hero).Routine.AniState));

@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hero.h"
 
+#include "body.h"
+#include "downed.h"
 #include "log.h"
+#include "saving_policy.h"
 
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
 #include <algorithm>
+#include <cerrno>
+#include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -29,6 +37,41 @@ bool writeFault = false;  // QA (stage W2): recordwritefault breaks off the next
 bool restoreQuick = true;  // QA negative control: quickrestoreoff (the quick slots stay empty after a record, as before 27.10.)
 bool restoreSpells = true;  // QA negative control: spellrestoreoff (learned spells come back unlearned, as before 27.10.)
 constexpr int QuickSlots = 16;  // slot numbers asked for, 0 to 15 (the quick bar shows ten)
+
+bool ReadLine(FILE* file, std::string& line, bool* malformed = nullptr)
+{
+    line.clear();
+    int ch;
+    while ((ch = fgetc(file)) != EOF && ch != '\n') {
+        if (ch == 0 || line.size() >= 511) {
+            if (malformed) *malformed = true;
+            return false;
+        }
+        line.push_back(static_cast<char>(ch));
+    }
+    if (ferror(file)) {
+        if (malformed) *malformed = true;
+        return false;
+    }
+    if (ch == EOF && line.empty()) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return true;
+}
+
+template<typename T> bool Integer(std::string const& text, T& value)
+{
+    auto const result = std::from_chars(text.data(), text.data() + text.size(), value);
+    return result.ec == std::errc() && result.ptr == text.data() + text.size();
+}
+
+std::vector<std::string> Words(std::string const& line)
+{
+    std::istringstream input(line);
+    std::vector<std::string> words;
+    std::string word;
+    while (input >> word) words.push_back(word);
+    return words;
+}
 
 struct Stack
 {
@@ -105,6 +148,65 @@ std::vector<Stack> Stacks(Entity& self)
 }
 
 eCDynamicEntity* Hero() { return gCSession::GetInstance().GetHero(); }
+bool Ready(eCDynamicEntity* hero)
+{
+    return hero && hero->GetPropertySet(eEPropertySetType_NPC) && hero->GetPropertySet(eEPropertySetType_Inventory) &&
+           hero->GetPropertySet(eEPropertySetType_PlayerMemory);
+}
+
+bool CaptureAttributes(gCPlayerMemory_PS& memory, std::vector<saving::RecordAttribute>& attrs)
+{
+    for (char const* tag : Tags) {
+        const bCString name(tag);
+        gCAttribute* attribute = memory.GetAttribute(name);
+        if (!attribute) return false;
+        saving::RecordAttribute value;
+        value.tag = tag;
+        value.base = memory.GetBaseValue(name);
+        value.modifier = memory.GetModifier(name);
+        if (saving::StatTag(value.tag)) {
+            auto* stat = dynamic_cast<gCStat*>(attribute);
+            if (!stat) return false;
+            value.baseMaximum = stat->GetBaseMaximum();
+            value.maximumModifier = stat->GetMaximumModifier();
+        }
+        if (!saving::ValidRecordAttribute(value) || memory.GetValue(name) != value.base + value.modifier ||
+            memory.GetMaximum(name) != (saving::StatTag(value.tag) ? value.baseMaximum + value.maximumModifier
+                                                                   : value.base + value.modifier)) return false;
+        attrs.push_back(value);
+    }
+    return true;
+}
+
+bool ApplyAttributes(gCPlayerMemory_PS& memory, std::vector<saving::RecordAttribute> const& attrs)
+{
+    for (auto const& value : attrs) {
+        const bCString name(value.tag.c_str());
+        gCAttribute* attribute = memory.GetAttribute(name);
+        if (!attribute) return false;
+        if (memory.GetModifier(name) != value.modifier && !memory.SetModifier(name, value.modifier)) return false;
+        if (saving::StatTag(value.tag)) {
+            auto* stat = dynamic_cast<gCStat*>(attribute);
+            if (!stat) return false;
+            stat->SetMaximumModifier(value.maximumModifier);
+            stat->SetBaseMaximum(value.baseMaximum);
+        }
+        if (memory.GetBaseValue(name) != value.base && !memory.SetBaseValue(name, value.base)) return false;
+    }
+    for (auto const& value : attrs) {
+        const bCString name(value.tag.c_str());
+        gCAttribute* attribute = memory.GetAttribute(name);
+        if (!attribute || memory.GetBaseValue(name) != value.base || memory.GetModifier(name) != value.modifier ||
+            memory.GetValue(name) != value.base + value.modifier) return false;
+        if (saving::StatTag(value.tag)) {
+            auto* stat = dynamic_cast<gCStat*>(attribute);
+            if (!stat) return false;
+            if (stat->GetBaseMaximum() != value.baseMaximum || stat->GetMaximumModifier() != value.maximumModifier ||
+                memory.GetMaximum(name) != value.baseMaximum + value.maximumModifier) return false;
+        } else if (memory.GetMaximum(name) != value.base + value.modifier) return false;
+    }
+    return true;
+}
 
 // A quick slot sits on its stack (gCInventoryStack::m_iQuickSlot), so a stack the record deletes and makes again comes
 // back without it: after every load of the host's save the client's quick bar was empty (playtest 27.10.). V3 embeds the
@@ -159,6 +261,59 @@ std::vector<Quick> QuickSlotsOf(Entity& self)
     return out;
 }
 
+char const* ValidateContents(std::vector<Stack> const& stacks, std::vector<std::string> const& spells,
+                             std::vector<Quick> const& quick)
+{
+    std::unordered_set<std::string> skills, spellIds, foundSpells;
+    std::map<std::pair<std::string, unsigned>, size_t> stackCounts, quickCounts;
+    for (std::string const& id : spells)
+        if (!saving::Id(id) || !spellIds.insert(id).second) return "an invalid or duplicate spell";
+    for (Stack const& s : stacks) {
+        if (!saving::Id(s.id) || s.amount < 1 || s.amount > 1000000 || s.quality >= 1024 ||
+            s.slot < gESlot_None || s.slot > gESlot_Helmet || s.category < 0 || s.category >= gEItemCategory_Count ||
+            (s.category == gEItemCategory_Skill ? (s.learned < 0 || s.learned > 1 || !skills.insert(s.id).second) : s.learned != -1))
+            return "a stack out of range or a duplicate skill";
+        const Template item = FromHex(s.id);
+        if (!item.IsValid()) return "an invalid item template";
+        eCTemplateEntityProxy proxy;
+        proxy.SetEntity(static_cast<bCPropertyID const&>(item));
+        eCTemplateEntity* templateEntity = proxy.GetEntity();
+        if (!templateEntity || !templateEntity->GetPropertySet(eEPropertySetType_Item))
+            return "a stack whose item does not exist";
+        Entity templateItem(templateEntity);
+        if (static_cast<int>(templateItem.Item.GetCategory()) != s.category) return "a stack with the wrong item category";
+        if (s.category == gEItemCategory_Skill) {
+            Entity skill = templateItem.Item.GetSkill();
+            if (!skill.GetInstance() || !skill.GetTemplate().IsValid()) return "a skill whose template does not exist";
+        }
+        if (s.category == gEItemCategory_Spellbook && spellIds.count(s.id)) {
+            Entity spell = templateItem.Item.GetSpell();
+            if (!spell.GetInstance() || !spell.GetTemplate().IsValid()) return "a spell whose template does not exist";
+            foundSpells.insert(s.id);
+        }
+        ++stackCounts[{s.id, s.quality}];
+    }
+    if (foundSpells.size() != spellIds.size()) return "a missing spell item";
+    bool used[QuickSlots] = {};
+    for (Quick const& q : quick) {
+        if (q.slot < 0 || q.slot >= QuickSlots || used[q.slot] || !saving::Id(q.id) || q.quality >= 1024 ||
+            ++quickCounts[{q.id, q.quality}] > stackCounts[{q.id, q.quality}])
+            return "a missing or duplicate quick slot item";
+        used[q.slot] = true;
+    }
+    return nullptr;
+}
+
+bool SameStacks(std::vector<Stack> const& a, std::vector<Stack> const& b)
+{
+    using Key = std::tuple<std::string, unsigned, int, int, int>;
+    std::map<Key, long long> totals;
+    for (Stack const& s : a) totals[{s.id, s.quality, s.slot, s.category, s.learned}] += s.amount;
+    for (Stack const& s : b) totals[{s.id, s.quality, s.slot, s.category, s.learned}] -= s.amount;
+    for (auto const& entry : totals) if (entry.second != 0) return false;
+    return true;
+}
+
 std::string QuickPath(char const* record)
 {
     std::string path = record;
@@ -188,46 +343,63 @@ bool SaveQuick(Entity& self, char const* record)
 }
 
 // After the record went on: the learned spells first (a spell that is not learned may not go on a quick slot), then each
-// slot back on a stack of its item (that quality first). A file that is not whole changes nothing; an item the hero no
-// longer carries leaves its slot empty.
-void ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::string> const& spells, std::vector<Quick> const& wanted);
-void LoadQuick(Entity& self, char const* record)
+// slot back on a stack of its item (that quality first). A broken legacy sidecar leaves the quick bar unchanged.
+bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::string> const& spells,
+                        std::vector<Quick> const& wanted, bool exactQuality);
+bool ReadQuick(char const* record, std::vector<std::string>& spells, std::vector<Quick>& wanted, bool* present = nullptr)
 {
     const std::string path = QuickPath(record);
     FILE* file = nullptr;
-    if (fopen_s(&file, path.c_str(), "r") || !file) { Logf("hero: no quick slots for %s (a record of before 27.10.)", record); return; }
-    char line[160];
-    std::vector<Quick> wanted;
-    std::vector<std::string> spells;
+    if (present) *present = false;
+    const errno_t error = fopen_s(&file, path.c_str(), "r");
+    if (error || !file) {
+        if (error == ENOENT) { Logf("hero: no quick slots for %s (a record of before 27.10.)", record); return true; }
+        Logf("hero: quick slots %s cannot be read", path.c_str());
+        return false;
+    }
+    if (present) *present = true;
+    std::string line;
     size_t declared = 0;
-    bool ended = false;
-    char const* refused = fgets(line, sizeof(line), file) && !std::strncmp(line, "G3TQUICK 1", 10) ? nullptr : "no header";
-    while (!refused && fgets(line, sizeof(line), file)) {
-        char a[64] = {};
+    bool ended = false, malformed = false;
+    char const* refused = ReadLine(file, line, &malformed) && line == "G3TQUICK 1" ? nullptr : "no header";
+    while (!refused && ReadLine(file, line, &malformed)) {
+        auto const words = Words(line);
         Quick q;
         if (ended) refused = "a line after the end line";
-        else if (sscanf_s(line, "quick %d %63s %u", &q.slot, a, 64u, &q.quality) == 3) {
-            q.id = a;
-            if (q.slot < 0 || q.slot >= QuickSlots || q.id.size() != 32 || q.id.find_first_not_of("0123456789abcdef") != std::string::npos)
+        else if (words.size() == 4 && words[0] == "quick" && Integer(words[1], q.slot) && Integer(words[3], q.quality)) {
+            q.id = words[2];
+            if (q.slot < 0 || q.slot >= QuickSlots || !saving::Id(q.id) || q.quality >= 1024)
                 refused = "a slot out of range";
             wanted.push_back(q);
-        } else if (sscanf_s(line, "spell %63s", a, 64u) == 1) {
-            spells.push_back(a);
-            if (spells.back().size() != 32 || spells.back().find_first_not_of("0123456789abcdef") != std::string::npos)
+        } else if (words.size() == 2 && words[0] == "spell") {
+            spells.push_back(words[1]);
+            if (!saving::Id(spells.back()))
                 refused = "a spell whose item is no template ID";
-        } else if (sscanf_s(line, "end %zu", &declared) == 1) ended = true;
+        } else if (words.size() == 2 && words[0] == "end" && Integer(words[1], declared)) ended = true;
         else refused = "a line that is no quick slot line";
+        if (wanted.size() > QuickSlots || spells.size() > 100000) refused = "too many quick entries";
     }
+    if ((malformed || ferror(file)) && !refused) refused = "the file could not be read completely";
     fclose(file);
     if (!refused && (!ended || declared != spells.size() + wanted.size())) refused = "no end line (the write broke off)";
-    if (refused) { Logf("hero: quick slots %s refused (%s); the quick bar stays as it is", path.c_str(), refused); return; }
-    ApplySpellAndQuick(self, path.c_str(), spells, wanted);
+    if (refused) { Logf("hero: quick slots %s refused (%s); the quick bar stays as it is", path.c_str(), refused); return false; }
+    return true;
+}
+
+bool LoadQuick(Entity& self, char const* record)
+{
+    const std::string path = QuickPath(record);
+    std::vector<Quick> wanted;
+    std::vector<std::string> spells;
+    if (!ReadQuick(record, spells, wanted)) return false;
+    return ApplySpellAndQuick(self, path.c_str(), spells, wanted, false);
 }
 
 // Shared by the legacy <record>.quick.txt sidecar and G3THERO 3 inline spell/quick data. The caller validates the
 // complete spell/quick set before invoking this helper, so the existing restore negative controls are preserved without
 // letting a broken file mutate only part of the hero.
-void ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::string> const& spells, std::vector<Quick> const& wanted)
+bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::string> const& spells,
+                        std::vector<Quick> const& wanted, bool exactQuality)
 {
     unsigned learned = 0, spellsMissing = 0;
     for (std::string const& id : restoreSpells ? spells : std::vector<std::string>()) {
@@ -239,47 +411,101 @@ void ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::strin
             if (Hex(itemId) == id) index = i;
         }
         auto* inventory = static_cast<gCInventory_PS*>(self.GetInstance()->GetPropertySet(eEPropertySetType_Inventory));
-        if (index >= 0 && (StackLearned(self, index) == 1 || (inventory && inventory->LearnStack(index)))) ++learned;
-        else ++spellsMissing;
+        if (index >= 0 && (StackLearned(self, index) == 1 || (inventory && inventory->LearnStack(index))) &&
+            StackLearned(self, index) == 1) ++learned;
+        else { ++spellsMissing; Logf("hero: record %s could not restore spell %s", source, id.c_str()); }
     }
     Logf("hero: spells %s learned again: %u of %zu, %u missing%s", source, learned, spells.size(), spellsMissing,
          restoreSpells ? "" : " (spellrestoreoff)");
-    if (!restoreQuick) { Logf("hero: quick slots %s not put back (quickrestoreoff)", source); return; }
+    if (!restoreQuick) { Logf("hero: quick slots %s not put back (quickrestoreoff)", source); return spellsMissing == 0; }
     unsigned assigned = 0, missing = 0;
+    bool assignedSlots[QuickSlots] = {};
     for (Quick const& q : wanted) {
         int index = -1;
-        for (int pass = 0; pass < 2 && index < 0; ++pass)
+        for (int pass = 0; pass < (exactQuality ? 1 : 2) && index < 0; ++pass)
             for (int i = 0; i < self.Inventory.GetStackCount() && index < 0; ++i) {
                 const Template item = self.Inventory.GetTemplate(i);
                 bCPropertyID const& id = item;
+                const int oldSlot = StackQuickSlot(self, i);
+                if (oldSlot >= 0 && oldSlot < QuickSlots && assignedSlots[oldSlot]) continue;
                 if (Hex(id) == q.id && (pass == 1 || self.Inventory.GetQuality(i) == q.quality)) index = i;
             }
-        if (index >= 0 && self.Inventory.AssignStackToQuickSlot(index, q.slot)) ++assigned;
-        else ++missing;
+        if (index >= 0 && self.Inventory.AssignStackToQuickSlot(index, q.slot) &&
+            self.Inventory.FindStackIndexByQuickSlot(q.slot) == index && StackQuickSlot(self, index) == q.slot) {
+            ++assigned;
+            assignedSlots[q.slot] = true;
+        }
+        else { ++missing; Logf("hero: record %s could not restore quick slot %d item=%s quality=%u", source, q.slot, q.id.c_str(), q.quality); }
+    }
+    if (exactQuality) {
+        const std::vector<Quick> actual = QuickSlotsOf(self);
+        if (actual.size() != wanted.size()) {
+            ++missing;
+        } else for (Quick const& q : wanted)
+            if (std::none_of(actual.begin(), actual.end(), [&q](Quick const& a) {
+                    return a.slot == q.slot && a.id == q.id && a.quality == q.quality;
+                })) ++missing;
     }
     Logf("hero: quick slots %s put back: %u, %u missing", source, assigned, missing);
+    return spellsMissing == 0 && missing == 0;
 }
 }
 
 // Written to <path>.tmp and moved over the old record only once every line and the close went through, with an end line
 // that names the number of stacks (Codex review 22.10. R1: "w" emptied the record at once, and a write that broke off left
 // a record whose next load wiped the inventory and set level and experience to zero).
-bool SaveRecord(char const* path)
+bool SaveRecordImpl(char const* path, saving::Key const* key)
 {
+    if (!path || !*path || (key && !saving::Valid(*key))) {
+        Logf("hero: record not written (invalid path or identity)");
+        return false;
+    }
     eCDynamicEntity* hero = Hero();
-    if (!hero) return false;
-    const std::string temp = std::string(path) + ".tmp";
-    FILE* file = nullptr;
-    if (fopen_s(&file, temp.c_str(), "w") || !file) return false;
+    if (!Ready(hero)) { Logf("hero: record %s not written (hero not ready)", path); return false; }
+    saving::RecordPose pose;
+    if (key) {
+        const bCVector& p = hero->GetWorldPosition();
+        const bCQuaternion q = hero->GetWorldRotation();
+        pose = {{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+        if (!saving::ValidRecordPose(pose)) { Logf("hero: record %s not written (invalid pose)", path); return false; }
+    }
     Entity self(hero);
+    auto* memory = static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory));
     const std::vector<Stack> stacks = Stacks(self);
     const std::vector<std::string> spells = LearnedSpellsOf(self);
     const std::vector<Quick> quick = QuickSlotsOf(self);
-    bool ok = fprintf(file, "G3THERO 3\n") > 0;
+    std::vector<saving::RecordAttribute> attrs;
+    if (key) {
+        char const* invalid = ValidateContents(stacks, spells, quick);
+        const unsigned level = static_cast<unsigned>(self.NPC.Level), levelMax = static_cast<unsigned>(self.NPC.LevelMax);
+        const int xp = static_cast<int>(self.PlayerMemory.XP), lpa = static_cast<int>(self.PlayerMemory.LPAttribs),
+                  lpp = static_cast<int>(self.PlayerMemory.LPPerks);
+        if (!invalid && (level > 1000 || levelMax > 1000 || xp < 0 || xp > 100000000 ||
+                         lpa < 0 || lpa > 100000 || lpp < 0 || lpp > 100000)) invalid = "stats out of range";
+        if (!CaptureAttributes(*memory, attrs)) invalid = "an attribute missing or out of range";
+        if (invalid) { Logf("hero: record %s not written (%s)", path, invalid); return false; }
+    }
+    const std::string temp = std::string(path) + ".tmp";
+    FILE* file = nullptr;
+    if (fopen_s(&file, temp.c_str(), "w") || !file) { Logf("hero: record %s not written (cannot open temporary file)", path); return false; }
+    bool ok = fprintf(file, "G3THERO %d\n", key ? 4 : 3) > 0;
+    if (key) {
+        ok = ok && fprintf(file, "identity %s %s %llu\n", key->world.c_str(), key->save.c_str(),
+                           static_cast<unsigned long long>(key->player)) > 0;
+        ok = ok && fprintf(file, "pose %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n", pose.position[0], pose.position[1], pose.position[2],
+                           pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]) > 0;
+    }
+    else ok = ok && fprintf(file, "downed %d\n", downed::Held() ? 1 : 0) > 0;
     ok = ok && fprintf(file, "level %u %u\n", static_cast<unsigned>(self.NPC.Level), static_cast<unsigned>(self.NPC.LevelMax)) > 0;
     ok = ok && fprintf(file, "xp %d\nlp %d %d\n", static_cast<int>(self.PlayerMemory.XP), static_cast<int>(self.PlayerMemory.LPAttribs),
                        static_cast<int>(self.PlayerMemory.LPPerks)) > 0;
-    for (char const* tag : Tags)
+    if (key) {
+        for (auto const& attr : attrs)
+            ok = ok && (saving::StatTag(attr.tag)
+                            ? fprintf(file, "attr %s %d %d %d %d\n", attr.tag.c_str(), attr.base, attr.modifier,
+                                      attr.baseMaximum, attr.maximumModifier)
+                            : fprintf(file, "attr %s %d %d\n", attr.tag.c_str(), attr.base, attr.modifier)) > 0;
+    } else for (char const* tag : Tags)
         ok = ok && fprintf(file, "attr %s %d %d\n", tag, self.PlayerMemory.GetBaseValue(bCString(tag)), self.PlayerMemory.GetMaximum(bCString(tag))) > 0;
     for (Stack const& s : stacks)
         ok = ok && (s.category == gEItemCategory_Skill
@@ -299,54 +525,175 @@ bool SaveRecord(char const* path)
         DeleteFileA(temp.c_str());
         Logf("hero: record %s not written; the one before stays", path);
     }
-    if (ok) {
+    if (ok && !key) {
         const bool quickOk = SaveQuick(self, path);
         if (!quickOk) {
             ok = false;
             Logf("hero: record %s main data is complete but the quick compatibility sidecar failed; retry is required", path);
         }
     }
+    if (ok && key)
+        Logf("hero: bound record written world=%s save=%s player=%llu level=%u xp=%d lp=%d/%d str=%d dex=%d int=%d hp=%d/%d/%d mp=%d/%d/%d sp=%d/%d/%d stacks=%zu spells=%zu quick=%zu pose=%.9g,%.9g,%.9g rotation=%.9g,%.9g,%.9g,%.9g",
+             key->world.c_str(), key->save.c_str(), static_cast<unsigned long long>(key->player),
+             static_cast<unsigned>(self.NPC.Level), static_cast<int>(self.PlayerMemory.XP),
+             static_cast<int>(self.PlayerMemory.LPAttribs), static_cast<int>(self.PlayerMemory.LPPerks),
+             self.PlayerMemory.GetBaseValue(bCString("STR")), self.PlayerMemory.GetBaseValue(bCString("DEX")),
+             self.PlayerMemory.GetBaseValue(bCString("INT")),
+             self.PlayerMemory.GetHitPoints(), self.PlayerMemory.GetBaseValue(bCString("HP")), self.PlayerMemory.GetMaximum(bCString("HP")),
+             self.PlayerMemory.GetManaPoints(), self.PlayerMemory.GetBaseValue(bCString("MP")), self.PlayerMemory.GetMaximum(bCString("MP")),
+             self.PlayerMemory.GetStaminaPoints(), self.PlayerMemory.GetBaseValue(bCString("SP")), self.PlayerMemory.GetMaximum(bCString("SP")),
+             stacks.size(), spells.size(), quick.size(), pose.position[0], pose.position[1], pose.position[2],
+             pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]);
     return ok;
 }
 
-bool LoadRecord(char const* path)
+bool SaveRecord(char const* path) { return SaveRecordImpl(path, nullptr); }
+bool SaveRecord(char const* path, saving::Key const& key) { return SaveRecordImpl(path, &key); }
+
+bool ReadRecordKey(char const* path, saving::Key& key)
+{
+    FILE* file = nullptr;
+    std::string header, identity, poseLine;
+    saving::Key candidate;
+    saving::RecordPose pose;
+    if (!path || !*path || fopen_s(&file, path, "r") || !file) return false;
+    const bool ok = ReadLine(file, header) && ReadLine(file, identity) && ReadLine(file, poseLine) &&
+                    saving::ParseRecordMetadata(header, identity, poseLine, nullptr, candidate, pose);
+    fclose(file);
+    if (ok) key = candidate;
+    return ok;
+}
+
+bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLegacy)
 {
     eCDynamicEntity* hero = Hero();
     FILE* file = nullptr;
     lastRefusal = nullptr;
-    if (!hero) return false;
-    if (fopen_s(&file, path, "r") || !file) { lastRefusal = "the file cannot be read"; return false; }
+    if (!Ready(hero)) { lastRefusal = "hero not ready"; Logf("hero: record not applied (hero not ready)"); return false; }
+    if (!path || !*path || (expected && !saving::Valid(*expected))) {
+        lastRefusal = "invalid path or identity";
+        Logf("hero: record not applied (%s)", lastRefusal);
+        return false;
+    }
+    if (strictLegacy && !saving::StrictLegacyReady(restoring, checking, restoreSpells, restoreQuick, replaceSkills)) {
+        lastRefusal = "a required legacy restore component is disabled";
+        Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
+        return false;
+    }
+    if (fopen_s(&file, path, "r") || !file) {
+        lastRefusal = "the file cannot be read";
+        Logf("hero: record %s refused (%s)", path, lastRefusal);
+        return false;
+    }
     char line[256];
     if (!fgets(line, sizeof(line), file) || std::strncmp(line, "G3THERO ", 8) ||
-        (line[8] != '1' && line[8] != '2' && line[8] != '3')) {
+        (line[8] != '1' && line[8] != '2' && line[8] != '3' && line[8] != '4') ||
+        (line[9] != '\n' && line[9] != '\r' && line[9] != '\0')) {
         fclose(file);
         lastRefusal = "no hero record header";
         Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
         return false;
     }
     const int version = line[8] - '0';
-    if (!restoring) { fclose(file); return true; }
+    saving::RecordPose pose;
+    saving::Key actual;
+    if ((version == 4) != (expected != nullptr)) {
+        fclose(file);
+        lastRefusal = expected ? "bound load requires a v4 record" : "v4 record requires an identity";
+        Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
+        return false;
+    }
+    if (strictLegacy && (line[9] != '\n' || line[10] != '\0')) {
+        fclose(file);
+        lastRefusal = "invalid legacy record header";
+        Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
+        return false;
+    }
+    if (version == 4) {
+        std::string identity, poseLine;
+        if (std::strcmp(line, "G3THERO 4\n") != 0 || !ReadLine(file, identity) || !ReadLine(file, poseLine) ||
+            !saving::ParseRecordMetadata(std::string(line, 9), identity, poseLine, expected, actual, pose)) {
+            fclose(file);
+            lastRefusal = "invalid or mismatched identity or pose";
+            Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
+            return false;
+        }
+        if (!restoring || !restoreSpells || !restoreQuick || !replaceSkills) {
+            fclose(file);
+            lastRefusal = "a restore component is disabled";
+            Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
+            return false;
+        }
+    } else if (!restoring) { fclose(file); return true; }
     // The whole record is read and checked before the hero changes (R1): a record that broke off, a line that is no
     // record line, a missing field or a value out of range leaves the hero as it is. Version 1 records (before 22.10.)
     // have no end line; they pass when every field is there.
     std::vector<Stack> wanted;
     unsigned level = 0, levelMax = 0;
     int xp = 0, lpa = 0, lpp = 0;
-    struct Attr { std::string tag; int base, max; };
-    std::vector<Attr> attrs;
+    std::vector<saving::RecordAttribute> attrs;
     bool haveLevel = false, haveXp = false, haveLp = false, ended = false;
+    bool haveDowned = false;
+    int savedDowned = 0;
     bool inlineQuickEnded = false;
     std::vector<std::string> inlineSpells;
     std::vector<Quick> inlineQuick;
     size_t declaredInlineSpells = 0, declaredInlineQuick = 0;
     char const* refused = nullptr;
     size_t declared = 0;
-    while (!refused && fgets(line, sizeof(line), file)) {
+    if (version == 4 || strictLegacy) {
+        std::string text;
+        bool malformed = false;
+        while (!refused && ReadLine(file, text, &malformed)) {
+            auto const words = Words(text);
+            Stack s;
+            Quick q;
+            int base = 0, max = 0;
+            saving::RecordAttribute attr;
+            if (ended || words.empty()) refused = "a line after the end or an empty line";
+            else if (inlineQuickEnded) {
+                if (words.size() == 2 && words[0] == "end" && Integer(words[1], declared)) ended = true;
+                else refused = "a line after quick_end";
+            } else if (words.size() == 3 && words[0] == "level" && !haveLevel &&
+                       Integer(words[1], level) && Integer(words[2], levelMax)) haveLevel = true;
+            else if (words.size() == 2 && words[0] == "xp" && !haveXp && Integer(words[1], xp)) haveXp = true;
+            else if (words.size() == 3 && words[0] == "lp" && !haveLp &&
+                     Integer(words[1], lpa) && Integer(words[2], lpp)) haveLp = true;
+            else if (words[0] == "attr" &&
+                     (version == 4 ? saving::ParseRecordAttribute(text, attr)
+                                   : words.size() == 4 && Integer(words[2], base) && Integer(words[3], max) &&
+                                     saving::LegacyRecordAttribute(words[1], base, max, attr))) attrs.push_back(attr);
+            else if ((words.size() == 6 || words.size() == 7) && words[0] == "stack" &&
+                     Integer(words[2], s.amount) && Integer(words[3], s.quality) &&
+                     Integer(words[4], s.slot) && Integer(words[5], s.category) &&
+                     (words.size() == 6 || Integer(words[6], s.learned)) &&
+                     (version != 4 || ((s.category == gEItemCategory_Skill) == (words.size() == 7)))) {
+                s.id = words[1];
+                wanted.push_back(s);
+            } else if (version >= 3 && words.size() == 2 && words[0] == "spell") inlineSpells.push_back(words[1]);
+            else if (version >= 3 && words.size() == 4 && words[0] == "quick" &&
+                     Integer(words[1], q.slot) && Integer(words[3], q.quality)) {
+                q.id = words[2];
+                inlineQuick.push_back(q);
+            } else if (version >= 3 && words.size() == 3 && words[0] == "quick_end" &&
+                       Integer(words[1], declaredInlineSpells) && Integer(words[2], declaredInlineQuick)) inlineQuickEnded = true;
+            else if (version < 3 && words.size() == 2 && words[0] == "end" && Integer(words[1], declared)) ended = true;
+            else refused = "a line that is no record line";
+            if (wanted.size() > 100000 || inlineSpells.size() > 100000 || inlineQuick.size() > QuickSlots ||
+                attrs.size() > sizeof(Tags) / sizeof(Tags[0])) refused = "too many record entries";
+        }
+        if (malformed && !refused) refused = "a damaged or unreadable line";
+    } else while (!refused && fgets(line, sizeof(line), file)) {
         char a[64] = {};
         Stack s;
         int b = 0, c = 0;
         if (ended) refused = "a line after the end line";
-        else if (version == 3 && !inlineQuickEnded && sscanf_s(line, "spell %63s", a, 64u) == 1) inlineSpells.push_back(a);
+        else if (!std::strncmp(line, "downed ", 7)) {
+            char extra = 0;
+            if (version != 3 || haveDowned || sscanf_s(line, "downed %d %c", &savedDowned, &extra, 1u) != 1 ||
+                (savedDowned != 0 && savedDowned != 1)) refused = "invalid downed state";
+            haveDowned = true;
+        } else if (version == 3 && !inlineQuickEnded && sscanf_s(line, "spell %63s", a, 64u) == 1) inlineSpells.push_back(a);
         else if (version == 3) {
             Quick q;
             if (inlineQuickEnded) {
@@ -361,7 +708,11 @@ bool LoadRecord(char const* path)
             } else if (sscanf_s(line, "level %u %u", &level, &levelMax) == 2) haveLevel = true;
             else if (sscanf_s(line, "xp %d", &xp) == 1) haveXp = true;
             else if (sscanf_s(line, "lp %d %d", &lpa, &lpp) == 2) haveLp = true;
-            else if (sscanf_s(line, "attr %63s %d %d", a, 64u, &b, &c) == 3) attrs.push_back({a, b, c});
+            else if (sscanf_s(line, "attr %63s %d %d", a, 64u, &b, &c) == 3) {
+                saving::RecordAttribute attr;
+                if (saving::LegacyRecordAttribute(a, b, c, attr)) attrs.push_back(attr);
+                else refused = "an attribute out of range";
+            }
             else if (const int fields = std::strncmp(line, "stack ", 6) ? 0
                                         : sscanf_s(line, "stack %63s %d %u %d %d %d", a, 64u, &s.amount, &s.quality, &s.slot, &s.category, &s.learned);
                      fields == 5 || fields == 6) {
@@ -374,7 +725,11 @@ bool LoadRecord(char const* path)
         } else if (sscanf_s(line, "level %u %u", &level, &levelMax) == 2) haveLevel = true;
         else if (sscanf_s(line, "xp %d", &xp) == 1) haveXp = true;
         else if (sscanf_s(line, "lp %d %d", &lpa, &lpp) == 2) haveLp = true;
-        else if (sscanf_s(line, "attr %63s %d %d", a, 64u, &b, &c) == 3) attrs.push_back({a, b, c});
+        else if (sscanf_s(line, "attr %63s %d %d", a, 64u, &b, &c) == 3) {
+            saving::RecordAttribute attr;
+            if (saving::LegacyRecordAttribute(a, b, c, attr)) attrs.push_back(attr);
+            else refused = "an attribute out of range";
+        }
         else if (const int fields = std::strncmp(line, "stack ", 6) ? 0
                                     : sscanf_s(line, "stack %63s %d %u %d %d %d", a, 64u, &s.amount, &s.quality, &s.slot, &s.category, &s.learned);
                  fields == 5 || fields == 6) {  // a sixth field: the skill's learned state (23.10.)
@@ -383,24 +738,25 @@ bool LoadRecord(char const* path)
         } else if (sscanf_s(line, "end %zu", &declared) == 1) ended = true;
         else refused = "a line that is no record line";
     }
+    if (ferror(file) && !refused) refused = "the file could not be read completely";
     fclose(file);
-    if (!refused && checking) {
+    if (!refused && (checking || version == 4 || strictLegacy)) {
         if (!haveLevel || !haveXp || !haveLp) refused = "level, experience or learn points missing";
-        else if (version >= 2 && !ended) refused = "no end line (the write broke off)";
+        else if ((version >= 2 || strictLegacy) && !ended) refused = "no end line (the record cannot be verified)";
         else if (ended && declared != wanted.size()) refused = "fewer stacks than the end line names";
-        else if (version == 3 && !inlineQuickEnded) refused = "no quick_end line";
-        else if (version == 3 && (declaredInlineSpells != inlineSpells.size() || declaredInlineQuick != inlineQuick.size()))
+        else if (version >= 3 && !inlineQuickEnded) refused = "no quick_end line";
+        else if (version >= 3 && (declaredInlineSpells != inlineSpells.size() || declaredInlineQuick != inlineQuick.size()))
             refused = "the quick_end counts do not match the inline spell and quick lines";
         else if (level > 1000 || levelMax > 1000 || xp < 0 || xp > 100000000 || lpa < 0 || lpa > 100000 || lpp < 0 || lpp > 100000)
             refused = "level, experience or learn points out of range";
         for (char const* tag : Tags) {
             if (refused) break;
-            if (std::count_if(attrs.begin(), attrs.end(), [tag](Attr const& at) { return at.tag == tag; }) != 1) refused = "an attribute missing or twice";
+            if (std::count_if(attrs.begin(), attrs.end(), [tag](saving::RecordAttribute const& at) { return at.tag == tag; }) != 1) refused = "an attribute missing or twice";
         }
         if (!refused && attrs.size() != sizeof(Tags) / sizeof(Tags[0])) refused = "an attribute this record does not know";
-        for (Attr const& at : attrs)
-            if (!refused && (at.base < -1000000 || at.base > 1000000 || at.max < -1000000 || at.max > 1000000)) refused = "an attribute out of range";
-        if (!refused && version == 3) {
+        for (auto const& at : attrs)
+            if (!refused && !saving::ValidRecordAttribute(at)) refused = "an attribute out of range";
+        if (!refused && version >= 3) {
             for (std::string const& id : inlineSpells)
                 if (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos)
                     refused = "a spell whose item is no template ID";
@@ -417,6 +773,24 @@ bool LoadRecord(char const* path)
                      s.category < 0 || s.category >= gEItemCategory_Count || s.learned < -1 || s.learned > 1 ||
                      (s.learned != -1 && s.category != gEItemCategory_Skill))
                 refused = "a stack out of range";
+            else if (strictLegacy && s.category == gEItemCategory_Skill && s.learned < 0)
+                refused = "legacy skill state was not recorded";
+        }
+        if (!refused && strictLegacy && version < 3) {
+            bool present = false;
+            if (!ReadQuick(path, inlineSpells, inlineQuick, &present)) refused = "legacy quick slots could not be read";
+            else if (!present && !wanted.empty()) refused = "legacy spell and quick state was not recorded";
+        }
+        if (!refused && (version == 4 || strictLegacy)) refused = ValidateContents(wanted, inlineSpells, inlineQuick);
+        if (!refused && (version == 4 || strictLegacy)) {
+            auto* memory = static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory));
+            for (auto const& at : attrs) {
+                gCAttribute* attribute = memory->GetAttribute(bCString(at.tag.c_str()));
+                if (!attribute || (saving::StatTag(at.tag) && !dynamic_cast<gCStat*>(attribute))) {
+                    refused = "a hero attribute is missing or has the wrong type";
+                    break;
+                }
+            }
         }
     }
     if (refused) {
@@ -425,6 +799,7 @@ bool LoadRecord(char const* path)
         return false;
     }
     if (version < 2 && checking) Logf("hero: record %s is of version 1 (no end line); every field is there", path);
+    downed::Restore(savedDowned != 0, "hero-record");
     Entity self(hero);
     // Inventory first: equipment modifies attributes, so the base values go on afterwards.
     // Skills are the record's (Codex review 22.10.: a player loaded into the host's save kept the skills of the host's hero
@@ -435,52 +810,110 @@ bool LoadRecord(char const* path)
     for (Stack const& s : wanted)
         if (s.category == gEItemCategory_Skill) recordSkills.insert(s.id);
     unsigned skillsRemoved = 0, skillsTaught = 0, skillsUnlearned = 0;
-    self.Inventory.HoldStacks(-1, -1);
+    auto fail = [path](char const* reason) {
+        lastRefusal = reason;
+        Logf("hero: record %s could not be fully applied (%s); hero may be partially changed", path, reason);
+        return false;
+    };
+    if (!self.Inventory.HoldStacks(-1, -1) &&
+        (self.Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance() || self.Inventory.GetItemFromSlot(gESlot_LeftHand).GetInstance()))
+        return fail("could not release held items");
     for (int i = self.Inventory.GetStackCount() - 1; i >= 0; --i) {
         if (static_cast<int>(self.Inventory.GetCategory(i)) == gEItemCategory_Skill) {
             const Template skill = self.Inventory.GetTemplate(i);
             bCPropertyID const& id = skill;
             if (!replaceSkills || recordSkills.count(Hex(id))) continue;  // kept; missing ones are taught below
-            if (self.Inventory.DeleteStack(i)) ++skillsRemoved;
+            if (!self.Inventory.DeleteStack(i)) return fail("could not remove a skill stack");
+            ++skillsRemoved;
             continue;
         }
-        if (self.Inventory.GetSlotFromStack(i) != gESlot_None) self.Inventory.UnEquipStack(i);
-        self.Inventory.DeleteStack(i);
+        if (self.Inventory.GetSlotFromStack(i) != gESlot_None && !self.Inventory.UnEquipStack(i))
+            return fail("could not unequip an item");
+        if (!self.Inventory.DeleteStack(i)) return fail("could not remove an item");
     }
     for (Stack const& s : wanted) {
         const Template item = FromHex(s.id);
         if (s.category == gEItemCategory_Skill) {
             if (!replaceSkills) {  // QA negative control: as before 23.10.
-                if (!self.Inventory.HasLearnedSkill(item) && self.Inventory.TeachSkill(item)) ++skillsTaught;
+                if (!self.Inventory.HasLearnedSkill(item)) {
+                    if (!self.Inventory.TeachSkill(item)) return fail("could not teach a skill");
+                    ++skillsTaught;
+                }
                 continue;
             }
             int index = FindSkillStack(self, s.id);
-            if (index < 0) index = self.Inventory.CreateItems(item, 0, 1);  // a perk this hero did not carry: not learned yet
-            const Template skill = index >= 0 ? SkillOf(self, index) : Template();
-            if (s.learned < 0 || !skill.IsValid()) continue;
+            if ((version == 4 || strictLegacy) && index >= 0 &&
+                (self.Inventory.GetQuality(index) != s.quality || self.Inventory.GetAmount(index) != s.amount)) {
+                if (!self.Inventory.DeleteStack(index)) return fail("could not replace a skill stack");
+                index = -1;
+            }
+            if (index < 0) index = self.Inventory.CreateItems(item, (version == 4 || strictLegacy) ? s.quality : 0,
+                                                              (version == 4 || strictLegacy) ? s.amount : 1);
+            if (index < 0) { Logf("hero: record %s could not create skill item %s", path, s.id.c_str()); return fail("could not create a skill item"); }
+            const Template skill = SkillOf(self, index);
+            if (!skill.IsValid()) { Logf("hero: record %s missing skill for item %s", path, s.id.c_str()); return fail("a skill template is missing"); }
+            if (s.learned < 0) continue;
             const bool knows = self.Inventory.HasLearnedSkill(skill) != GEFalse;
-            if (s.learned == 1 && !knows && self.Inventory.TeachSkill(skill)) ++skillsTaught;
-            else if (s.learned == 0 && knows && self.Inventory.DeleteStack(index) && self.Inventory.CreateItems(item, 0, 1) >= 0) ++skillsUnlearned;
+            if (s.learned == 1 && !knows) {
+                if (!self.Inventory.TeachSkill(skill) || !self.Inventory.HasLearnedSkill(skill))
+                    return fail("could not teach a skill");
+                ++skillsTaught;
+            } else if (s.learned == 0 && knows) {
+                if (!self.Inventory.DeleteStack(index)) return fail("could not unlearn a skill");
+                index = self.Inventory.CreateItems(item, (version == 4 || strictLegacy) ? s.quality : 0,
+                                                   (version == 4 || strictLegacy) ? s.amount : 1);
+                if (index < 0 || self.Inventory.HasLearnedSkill(skill)) return fail("could not recreate an unlearned skill");
+                ++skillsUnlearned;
+            }
+            if ((version == 4 || strictLegacy) && s.slot != gESlot_None &&
+                !self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot))) return fail("could not equip a skill item");
             continue;
         }
         const GEInt index = self.Inventory.CreateItems(item, s.quality, s.amount);
-        if (index >= 0 && s.slot != gESlot_None) self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot));
+        if (index < 0) { Logf("hero: record %s could not create item %s", path, s.id.c_str()); return fail("could not create an item"); }
+        if (s.slot != gESlot_None && !self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot)))
+            return fail("could not equip an item");
     }
+    if ((version == 4 || strictLegacy) && !SameStacks(Stacks(self), wanted)) return fail("restored inventory does not match the record");
     self.NPC.Level = level;
     self.NPC.LevelMax = levelMax;
     self.PlayerMemory.XP = xp;
     self.PlayerMemory.LPAttribs = lpa;
     self.PlayerMemory.LPPerks = lpp;
-    for (Attr const& at : attrs) {
-        self.PlayerMemory.SetMaximum(bCString(at.tag.c_str()), at.max);
-        self.PlayerMemory.SetBaseValue(bCString(at.tag.c_str()), at.base);
+    auto* memory = static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory));
+    if (!ApplyAttributes(*memory, attrs)) return fail("an attribute could not be restored");
+    if (downed::Held()) self.PlayerMemory.SetBaseValue(bCString("HP"), 1);
+    if (strictLegacy) Logf("hero: legacy record %s restored with inferred static modifiers and unsplit stat maxima", path);
+    if (!((version >= 3 || strictLegacy)
+              ? ApplySpellAndQuick(self, path, inlineSpells, inlineQuick, version == 4 || strictLegacy)
+              : LoadQuick(self, path)))
+        return fail("spells or quick slots could not be restored");
+    if (version == 4) {
+        self.MoveTo(body::Pose(*hero, pose.position, pose.rotation));
+        const bCVector& p = hero->GetWorldPosition();
+        const bCQuaternion q = hero->GetWorldRotation();
+        const float dx = p.GetX() - pose.position[0], dy = p.GetY() - pose.position[1], dz = p.GetZ() - pose.position[2];
+        const float dot = q.GetX() * pose.rotation[0] + q.GetY() * pose.rotation[1] +
+                          q.GetZ() * pose.rotation[2] + q.GetW() * pose.rotation[3];
+        if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz) || dx * dx + dy * dy + dz * dz > 1.0f ||
+            !std::isfinite(dot) || std::fabs(dot) < 0.99f) return fail("pose could not be restored");
+        Logf("hero: bound record applied world=%s save=%s player=%llu level=%u xp=%d lp=%d/%d str=%d dex=%d int=%d hp=%d/%d/%d mp=%d/%d/%d sp=%d/%d/%d stacks=%zu spells=%zu quick=%zu pose=%.9g,%.9g,%.9g rotation=%.9g,%.9g,%.9g,%.9g",
+             actual.world.c_str(), actual.save.c_str(), static_cast<unsigned long long>(actual.player), level, xp, lpa, lpp,
+             self.PlayerMemory.GetBaseValue(bCString("STR")), self.PlayerMemory.GetBaseValue(bCString("DEX")),
+             self.PlayerMemory.GetBaseValue(bCString("INT")),
+             self.PlayerMemory.GetHitPoints(), self.PlayerMemory.GetBaseValue(bCString("HP")), self.PlayerMemory.GetMaximum(bCString("HP")),
+             self.PlayerMemory.GetManaPoints(), self.PlayerMemory.GetBaseValue(bCString("MP")), self.PlayerMemory.GetMaximum(bCString("MP")),
+             self.PlayerMemory.GetStaminaPoints(), self.PlayerMemory.GetBaseValue(bCString("SP")), self.PlayerMemory.GetMaximum(bCString("SP")),
+             wanted.size(), inlineSpells.size(), inlineQuick.size(), p.GetX(), p.GetY(), p.GetZ(), q.GetX(), q.GetY(), q.GetZ(), q.GetW());
     }
     Logf("hero: record %s applied: %zu skills in it, %u taught, %u unlearned, %u removed", path, recordSkills.size(), skillsTaught,
          skillsUnlearned, skillsRemoved);
-    if (version == 3) ApplySpellAndQuick(self, path, inlineSpells, inlineQuick);
-    else LoadQuick(self, path);
     return true;
 }
+
+bool LoadRecord(char const* path) { return LoadRecordImpl(path, nullptr, false); }
+bool LoadLegacyRecordStrict(char const* path) { return LoadRecordImpl(path, nullptr, true); }
+bool LoadRecord(char const* path, saving::Key const& key) { return LoadRecordImpl(path, &key, false); }
 
 void Dump(LogFn log)
 {

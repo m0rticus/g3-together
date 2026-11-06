@@ -99,6 +99,7 @@ bool NeedsContext(RemoteRegionState& region, bCBox const& context)
 
 GEBool __stdcall MayReleaseContext(eCGeometrySpatialContext* context)
 {
+    if (ai::ShuttingDown()) return previousContextCallback ? previousContextCallback(context) : GETrue;
     if (RemoteJobsPending()) {
         contextRefreshPending = true;
         ++contextsRetained;
@@ -171,6 +172,7 @@ void EvictRemoteEntity(RemoteRegionState& region, eCEntity* entity)
 
 GEBool __fastcall CacheOut(eCPVSPrefetcher3* self, void* edx, eCEntity* entity)
 {
+    if (ai::ShuttingDown()) return originalCacheOut ? originalCacheOut(self, edx, entity) : GETrue;
     auto* renderer = RenderAdmin();
     if (renderer && self == &renderer->GetPVSPrefetcher3()) {
         for (auto& region : hostRegions) EvictRemoteEntity(region, entity);
@@ -199,26 +201,43 @@ bool InstallRemoteCacheOut()
 
 void ReleaseRegion(RemoteRegionState& region);
 
-void CompletePrefetcher(eCPVSPrefetcher3& prefetcher)
+bool CompletePrefetcher(eCPVSPrefetcher3& prefetcher, char const* phase)
 {
     eCPVSPrefetcherJob* job = nullptr;
     std::memcpy(&job, reinterpret_cast<unsigned char const*>(&prefetcher) + 0xc, sizeof(job));
-    if (!job) return;
-    // WaitForEmptyThreadQueue cancels and discards a job; partially cached entities must be committed to cells first.
+    if (!job) {
+        Logf("world: %s prefetcher has no active job", phase);
+        return true;
+    }
+    // WaitForEmptyThreadQueue cancels and discards a job. Finish the job while the cell owners are still alive.
     job->DisableTimeSlice();
-    while (!job->IsFinished()) {
+    const DWORD deadline = GetTickCount() + 5000;
+    unsigned iterations = 0;
+    while (!job->IsFinished() && static_cast<int32_t>(deadline - GetTickCount()) > 0 && iterations < 1000) {
         job->Process();
-        if (!job->IsFinished()) SwitchToThread();
+        ++iterations;
+        if (!job->IsFinished()) {
+            SwitchToThread();
+        }
+    }
+    if (!job->IsFinished()) {
+        Logf("FAIL world: %s prefetch job unfinished after %u bounded iterations", phase, iterations);
+        return false;
     }
     prefetcher.WaitForEmptyThreadQueue();
+    Logf("world: %s prefetch job completed after %u iterations", phase, iterations);
+    return true;
 }
 
 void ReleaseRegion(RemoteRegionState& region)
 {
     if (!region.camera) { region = RemoteRegionState{}; return; }
     if (auto* renderer = RenderAdmin()) {
-        if (region.prefetcher) CompletePrefetcher(*region.prefetcher);
-        CompletePrefetcher(renderer->GetPVSPrefetcher3());
+        if (region.prefetcher) {
+            region.prefetcher->EnablePrefetcher(GEFalse);
+            if (!CompletePrefetcher(*region.prefetcher, "retired remote")) region.failed = true;
+        }
+        if (!CompletePrefetcher(renderer->GetPVSPrefetcher3(), "main renderer")) region.failed = true;
         if (!renderer->FlushThreadQueues()) Log("world: remote region render queues did not flush before release");
         auto& database = region.camera->GetFrustumDatabase();
         const uint32_t index = database.GetFrustumDatabaseIndex();
@@ -227,21 +246,36 @@ void ReleaseRegion(RemoteRegionState& region)
             database.RefreshFrustumData();
             if (region.prefetcher) {
                 region.prefetcher->ClearCells(database);
-                region.prefetcher->WaitForEmptyThreadQueue();
+                if (!CompletePrefetcher(*region.prefetcher, "retired remote cell clear")) region.failed = true;
             }
             if (!renderer->UnregisterDatabase(database))
                 Logf("FAIL world: remote camera database %u could not be unregistered", index);
-            renderer->GetPVSPrefetcher3().WaitForEmptyThreadQueue();
+            if (!CompletePrefetcher(renderer->GetPVSPrefetcher3(), "main renderer database unregister"))
+                region.failed = true;
             if (!renderer->FlushThreadQueues()) Log("FAIL world: remote cell cache-out queues did not flush");
-            Logf("world: retired remote camera database %u before destroying its camera", index);
+            const uint32_t after = database.GetFrustumDatabaseIndex();
+            if (after != 0xffffffffu) {
+                region.failed = true;
+                Logf("FAIL world: remote camera database %u remains registered (after=%u); preserving camera/prefetcher",
+                     index, after);
+            }
+            if (!region.failed)
+                Logf("world: retired remote camera database %u before destroying its camera", index);
         }
-        region.camera.reset();
-        region.prefetcher.reset();
-        if (!renderer->FlushThreadQueues()) Log("FAIL world: remote camera destruction queues did not flush");
+        if (!region.failed) {
+            region.camera.reset();
+            region.prefetcher.reset();
+            if (!renderer->FlushThreadQueues()) Log("FAIL world: remote camera destruction queues did not flush");
+            region = RemoteRegionState{};
+        } else {
+            region.retryAt = net::Now() + 5000;
+            Logf("FAIL world: retirement unsafe for database %u; no owner destroyed", index);
+        }
     } else {
         Log("FAIL world: remote camera retirement has no render system administration");
+        region.failed = true;
+        region.retryAt = net::Now() + 5000;
     }
-    region = RemoteRegionState{};
     contextRefreshPending = true;
 }
 
@@ -250,6 +284,7 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
     if (region.failed) {
         if (static_cast<int32_t>(net::Now() - region.retryAt) < 0) return false;
         ReleaseRegion(region);
+        if (region.failed) return false;
     }
     if (!region.camera) {
         auto* renderer = RenderAdmin();
@@ -367,7 +402,10 @@ void TickHostRegions()
         }
     }
     for (size_t i = groups.size(); i < hostRegions.size(); ++i) ReleaseRegion(hostRegions[i]);
-    hostRegions.resize(groups.size());
+    size_t retained = groups.size();
+    for (size_t i = groups.size(); i < hostRegions.size(); ++i)
+        if (hostRegions[i].camera || hostRegions[i].prefetcher) retained = i + 1;
+    hostRegions.resize(retained);
     for (size_t id = 0; id < groups.size(); ++id) {
         auto& region = hostRegions[id];
         float centre[3];
@@ -477,11 +515,13 @@ bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, u
 
 bool __fastcall NpcIntersects(eCEntityAdmin* admin, void*, bCBox const& box)
 {
+    if (ai::ShuttingDown()) return admin ? admin->IntersectsProcessingRangeRegion(box) : GEFalse;
     return NpcIntersectsAt(admin, box, npcRangeChecks, npcRangeExpanded);
 }
 
 bool __fastcall NpcIntersectsUpdate(eCEntityAdmin* admin, void*, bCBox const& box)
 {
+    if (ai::ShuttingDown()) return admin ? admin->IntersectsProcessingRangeRegion(box) : GEFalse;
     return NpcIntersectsAt(admin, box, npcUpdateChecks, npcUpdateExpanded);
 }
 
@@ -518,6 +558,8 @@ void HookSpheres()
     }
     DWORD old[2] = {};
     const int patched = 2;
+    unsigned char originalBytes[2][5];
+    unsigned char installedBytes[2][5];
     for (int i = 0; i < patched; ++i) {
         if (!VirtualProtect(sites[i].call, 5, PAGE_EXECUTE_READWRITE, &old[i])) {
             Logf("world: cannot patch NPC range call (Windows error %lu); native culling retained", GetLastError());
@@ -530,14 +572,17 @@ void HookSpheres()
             }
             return;
         }
+        std::memcpy(originalBytes[i], sites[i].call, 5);
         const int32_t displacement = static_cast<int32_t>(reinterpret_cast<intptr_t>(sites[i].detour) - reinterpret_cast<intptr_t>(sites[i].call + 5));
         std::memcpy(sites[i].call + 1, &displacement, sizeof(displacement));
+        std::memcpy(installedBytes[i], sites[i].call, 5);
     }
     for (int i = 0; i < patched; ++i) {
         DWORD unused = 0;
         if (!VirtualProtect(sites[i].call, 5, old[i], &unused))
             Logf("world: cannot restore NPC range call protection (Windows error %lu)", GetLastError());
         FlushInstructionCache(GetCurrentProcess(), sites[i].call, 5);
+        ai::TrackPatch(sites[i].call, originalBytes[i], installedBytes[i], 5, "world NPC range call");
     }
     spheresHooked = true;
     Log("world: NPC-only range calls hooked (collection and per-entity update); static culling, native ROI and camera unchanged");
@@ -586,6 +631,10 @@ void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
 
 void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
 {
+    if (ai::ShuttingDown()) {
+        if (originalProcess) originalProcess(admin);
+        return;
+    }
     eCEntity* camera = nullptr;
     camera = reinterpret_cast<eCEntity*>(&eCApplication::GetInstance().GetCurrentCamera());  // Process reads the same one
     PlaceSpheres(admin, camera);
@@ -594,8 +643,8 @@ void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
 
 void __fastcall StopSession(gCSession* session, void* edx)
 {
-    OnWorldDeactivate();
-    originalStopSession(session, edx);
+    if (!ai::ShuttingDown()) OnWorldDeactivate();
+    if (originalStopSession) originalStopSession(session, edx);
 }
 
 void HookElastic()
@@ -663,7 +712,12 @@ void Tick()
 void OnWorldDeactivate()
 {
     for (auto& region : hostRegions) ReleaseRegion(region);
-    hostRegions.clear();
+    for (size_t i = 0; i < hostRegions.size();) {
+        if (!hostRegions[i].camera && !hostRegions[i].prefetcher && !hostRegions[i].failed)
+            hostRegions.erase(hostRegions.begin() + i);
+        else
+            ++i;
+    }
     simulationAnchors.clear();
     anchorsCheckedAt = 0;
     spheres.clear();

@@ -62,6 +62,11 @@ enum Message
     NpcReplayUnavailable,
     NpcRegionUnavailable,
     NpcStatePending,
+    SaveQueued,
+    SavePaired,
+    SaveFailed,
+    SaveCharacterMissing,
+    SaveCharacterRecovered,
     MessageCount
 };
 

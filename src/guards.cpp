@@ -55,6 +55,7 @@ unsigned zonesEntered = 0;
 // Script_Game.dll's import of Entity::GetPlayer (static, __stdcall, the result returned through a hidden pointer).
 Entity* GE_STDCALL ActingGetPlayer(Entity* result)
 {
+    if (ai::ShuttingDown()) return originalGetPlayer ? originalGetPlayer(result) : result;
     if (!actor) {
         Entity* selected = originalGetPlayer(result);
         eCEntity* hero = gCSession::GetInstance().GetHero();
@@ -69,6 +70,7 @@ Entity* GE_STDCALL ActingGetPlayer(Entity* result)
 
 GEBool __fastcall ActingIsPlayer(Entity const* self, void* edx)
 {
+    if (ai::ShuttingDown()) return originalIsPlayer ? originalIsPlayer(self, edx) : GEFalse;
     if (!actor) {
         eCEntity* controlled = remote::ControlledBody();
         if (controlled && self && self->GetInstance() == controlled) return GETrue;
@@ -226,12 +228,14 @@ eCEntity* TargetPuppet(gCScriptProcessingUnit* spu)
 
 GEBool GE_STDCALL OnZone(gCScriptProcessingUnit* spu)
 {
+    if (ai::ShuttingDown()) return originalOnZone ? originalOnZone(spu) : GEFalse;
     Acting acting(TargetPuppet(spu));
     return originalOnZone(spu);
 }
 
 GEBool GE_STDCALL OnWeapon(gCScriptProcessingUnit* spu)
 {
+    if (ai::ShuttingDown()) return originalOnWeapon ? originalOnWeapon(spu) : GEFalse;
     Acting acting(TargetPuppet(spu));
     return originalOnWeapon(spu);
 }
@@ -246,6 +250,7 @@ unsigned sleepChecks = 0, sleepWakes = 0;
 
 GEBool GE_STDCALL OnAnimalSleep(gCScriptProcessingUnit* spu)
 {
+    if (ai::ShuttingDown()) return originalOnSleep ? originalOnSleep(spu) : GEFalse;
     eCEntity* animal = spu ? spu->GetSelfEntity() : nullptr;
     const GEBool result = originalOnSleep(spu);
     if (!animalWake || depth || !animal || !net::Connected() || !animal->GetPropertySet(eEPropertySetType_NPC) ||
@@ -333,10 +338,10 @@ static void KeepChapter(eCEntity* puppet)
     ++chaptersSet;
 }
 
-Acting::Acting(eCEntity* puppet) : before(actor)
+Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor)
 {
     if (puppet) {
-        KeepChapter(puppet);
+        if (keepChapter) KeepChapter(puppet);
         actor = puppet;
     }
 }
@@ -418,12 +423,21 @@ void Tick()
             if (!std::strcmp(name.GetText(), "OnReactToZone") && callback->m_funcScriptAICallback != &OnZone) {
                 originalOnZone = callback->m_funcScriptAICallback;
                 callback->m_funcScriptAICallback = &OnZone;
+                ai::TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
+                                 reinterpret_cast<void*>(originalOnZone),
+                                 reinterpret_cast<void*>(&OnZone), "guards OnReactToZone callback");
             } else if (!std::strcmp(name.GetText(), "OnReactToWeapon") && callback->m_funcScriptAICallback != &OnWeapon) {
                 originalOnWeapon = callback->m_funcScriptAICallback;
                 callback->m_funcScriptAICallback = &OnWeapon;
+                ai::TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
+                                 reinterpret_cast<void*>(originalOnWeapon),
+                                 reinterpret_cast<void*>(&OnWeapon), "guards OnReactToWeapon callback");
             } else if (!std::strcmp(name.GetText(), "OnAnimalSleep") && callback->m_funcScriptAICallback != &OnAnimalSleep) {
                 originalOnSleep = callback->m_funcScriptAICallback;
                 callback->m_funcScriptAICallback = &OnAnimalSleep;
+                ai::TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
+                                 reinterpret_cast<void*>(originalOnSleep),
+                                 reinterpret_cast<void*>(&OnAnimalSleep), "guards OnAnimalSleep callback");
             }
         }
     }

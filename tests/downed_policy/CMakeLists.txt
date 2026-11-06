@@ -1,0 +1,4 @@
+cmake_minimum_required(VERSION 3.24)
+project(DownedPolicyTests LANGUAGES CXX)
+add_executable(downed_policy_test downed_policy_test.cpp)
+target_compile_features(downed_policy_test PRIVATE cxx_std_17)
