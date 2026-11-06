@@ -55,6 +55,7 @@ unsigned dropped = 0;  // client: hits between host-owned bodies, which the host
 unsigned kills = 0;  // host: client hits that killed (OnCheatKill)
 unsigned xpAwarded = 0;                     // client: kills of this player's hits rewarded
 unsigned claimsSent = 0, claimsApplied = 0, playerHitsSent = 0, playerHitsTaken = 0;
+unsigned duplicateClaimsIgnored = 0;
 unsigned npcHitsSent = 0, npcHitsApplied = 0, npcKills = 0, npcHitsUnresolved = 0, partyKills = 0;
 bool partyXp = true;  // QA negative control: PartyXpOff
 bool reactHits = true;  // QA negative control: ReactHitsOff
@@ -168,6 +169,7 @@ void NoteInventoryHit()
 std::unordered_set<std::string> killedHere;  // host: victims killed here for a client's hit or its companion's
 std::unordered_set<std::string> rewarded;    // client: victims this player was rewarded for
 std::unordered_map<std::string, uint32_t> playerSwings;
+std::unordered_map<std::string, uint32_t> playerClaims;
 bool killOnce = true;  // QA negative control: killonceoff
 unsigned killsRepeated = 0, rewardsRepeated = 0;
 // A kill here that did not take kept its victim in killedHere: no later hit of any client counted on it (stageLiberate
@@ -560,12 +562,17 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     uint32_t* consumed = nullptr;
     uint32_t swing = 0;
     if (which < 2 && !bypass && npcs::IsMirrored(victim.GetInstance()) && attacker == remote::ControlledBody() &&
-        body::LocallyAttacking(attacker) && (source == attacker || source == Entity(attacker).Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance())) {
+        body::LocallyAttacking(attacker) && (!source || !source->GetPropertySet(eEPropertySetType_Projectile))) {
         swing = npcplayback::MotionInstance(attacker);
         if (swing) {
             uint8_t guid[16]; Guid(victim.GetInstance(), guid);
-            consumed = &playerSwings[KillKey(guid)];
-            if (*consumed == swing) return 0;
+            const std::string key = KillKey(guid);
+            const auto claimed = playerClaims.find(key);
+            if (claimed != playerClaims.end() && claimed->second == swing) return 0;
+            if (source == attacker || source == Entity(attacker).Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance()) {
+                consumed = &playerSwings[key];
+                if (*consumed == swing) return 0;
+            }
         }
     }
     struct ConsumeSwing {
@@ -739,6 +746,75 @@ bool MeansToKill(eCEntity* attacker, eCEntity* victim)
     return CallScript("HasAttackReasonToKill", attacker, victim, 0) != 0;
 }
 
+enum HostAppliedOriginKind {
+    HostAppliedOriginNone,
+    HostAppliedOriginClaim,
+    HostAppliedOriginNpc
+};
+HostAppliedOriginKind hostAppliedOriginKind = HostAppliedOriginNone;
+uint8_t hostAppliedOriginPlayer = 0;
+uint32_t hostAppliedOriginSequence = 0;
+uint32_t hostAppliedHitIdentity = 0;
+
+struct HostAppliedOriginScope {
+    HostAppliedOriginKind previousKind;
+    uint8_t previousPlayer;
+    uint32_t previousSequence;
+    HostAppliedOriginScope(HostAppliedOriginKind kind, uint8_t player, uint32_t sequence)
+        : previousKind(hostAppliedOriginKind), previousPlayer(hostAppliedOriginPlayer), previousSequence(hostAppliedOriginSequence)
+    {
+        hostAppliedOriginKind = kind;
+        hostAppliedOriginPlayer = player;
+        hostAppliedOriginSequence = sequence;
+    }
+    ~HostAppliedOriginScope()
+    {
+        hostAppliedOriginKind = previousKind;
+        hostAppliedOriginPlayer = previousPlayer;
+        hostAppliedOriginSequence = previousSequence;
+    }
+};
+
+bool IsHostSimulatedNpc(eCEntity* victim)
+{
+    if (!net::IsHost() || !victim || !victim->GetPropertySet(eEPropertySetType_NPC) ||
+        victim == gCSession::GetInstance().GetHero() || victim == remote::ControlledBody() ||
+        remote::IsPuppet(victim) || npcs::IsMirrored(victim) || npcs::OwnerOf(victim) != 0) return false;
+    return true;
+}
+
+void LogAppliedHostNpcHit(eCEntity* victim, eCEntity* attacker, GEInt delta, int before, int after, GEInt result)
+{
+    if (delta >= 0 || !IsHostSimulatedNpc(victim)) return;
+    char const* victimName = Entity(victim).GetName().GetText();
+    char const* attackerName = attacker ? Entity(attacker).GetName().GetText() : "-";
+    if (hostAppliedOriginKind == HostAppliedOriginClaim) {
+        Logf("combat: applied-hit entry=claim attacker=claim-player-%u attacker_name=%s sequence=%u hit=claim-%u npc=%s hp=%d -> %d delta=%d result=%#x",
+             hostAppliedOriginPlayer, attackerName, hostAppliedOriginSequence, hostAppliedOriginSequence,
+             victimName, before, after, static_cast<int>(delta), result);
+    } else if (hostAppliedOriginKind == HostAppliedOriginNpc ||
+               (attacker && attacker->GetPropertySet(eEPropertySetType_NPC))) {
+        const uint32_t identity = ++hostAppliedHitIdentity;
+        Logf("combat: applied-hit entry=npc-origin attacker=%s hit=npc-origin-%u npc=%s hp=%d -> %d delta=%d result=%#x",
+             attackerName, identity, victimName, before, after, static_cast<int>(delta), result);
+    } else {
+        const uint32_t identity = ++hostAppliedHitIdentity;
+        Logf("combat: applied-hit entry=host-native attacker=%s hit=host-native-%u npc=%s hp=%d -> %d delta=%d result=%#x",
+             attackerName, identity, victimName, before, after, static_cast<int>(delta), result);
+    }
+}
+
+GEInt CallOriginalAndLog(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
+    const bool logApplied = args < 0 && IsHostSimulatedNpc(recipient.GetInstance());
+    const int before = logApplied ? HitPoints(recipient) : 0;
+    eCEntity* attacker = Attacker(spu, other);
+    const GEInt result = original(spu, self, other, args);
+    if (logApplied) LogAppliedHostNpcHit(recipient.GetInstance(), attacker, args, before, HitPoints(recipient), result);
+    return result;
+}
+
 GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     ++filterCalls;
@@ -746,7 +822,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
         if (recipient.GetInstance() != remote::ControlledBody()) return GETrue;
     }
-    if (bypass) return original(spu, self, other, args);
+    if (bypass) return CallOriginalAndLog(spu, self, other, args);
     Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     if (args >= 0) {
         if (npcs::IsMirrored(recipient.GetInstance())) return GETrue;
@@ -758,12 +834,15 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             Entity hit = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
             args = Scaled(hit.GetInstance(), Attacker(spu, other), args);
         }
-        return original(spu, self, other, args);
+        return CallOriginalAndLog(spu, self, other, args);
     }
     Entity victim = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* instance = victim.GetInstance();
     eCEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* attacker = Attacker(spu, other);
+    eCEntity* localMeleeActor = remote::ControlledBody();
+    eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    const bool projectileSource = source && source->GetPropertySet(eEPropertySetType_Projectile);
     if (InventoryBlocksNpc(instance, attacker)) {
         NoteInventoryHit();
         return GETrue;
@@ -784,7 +863,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             return GETrue;
         }
         ++localNpcHits;
-        return original(spu, self, other, Scaled(instance, attacker, args));
+        return CallOriginalAndLog(spu, self, other, Scaled(instance, attacker, args));
     }
     if (attacker && attacker != hero && (remote::IsPuppet(attacker) || mirroredNpc)) {
         ++dropped;
@@ -809,19 +888,43 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         uint8_t guid[16], weapon[16] = {};
         Guid(instance, guid);
         // The weapon in the right hand, so that the owner can judge a lethal hit with the same weapon.
-        Entity self(hero);
-        const GEInt held = self.Inventory.FindStackIndex(gESlot_RightHand);
+        Entity player(hero);
+        const GEInt held = player.Inventory.FindStackIndex(gESlot_RightHand);
         if (held >= 0) {
-            const Template item = self.Inventory.GetTemplate(held);
+            const Template item = player.Inventory.GetTemplate(held);
             bCPropertyID const& id = item;
             std::memcpy(weapon, &id.GetCore(), 16);
         }
         lastOutcome = Outcome(victim);
         uint8_t reaction = Reaction(victim);
         if (reaction == net::HitNoReaction && body::LocallyAttacking(remote::ControlledBody())) reaction = net::HitQuickStumble;
+        uint32_t swing = 0;
+        std::string claimKey;
+        if (!projectileSource && localMeleeActor && body::LocallyAttacking(localMeleeActor) && attacker == hero) {
+            swing = npcplayback::MotionInstance(localMeleeActor);
+            if (swing) {
+                claimKey = KillKey(guid);
+                const auto claimed = playerClaims.find(claimKey);
+                if (claimed != playerClaims.end() && claimed->second == swing) {
+                    ++duplicateClaimsIgnored;
+                    static DWORD lastDuplicateClaimLog = 0;
+                    const DWORD now = GetTickCount();
+                    if (duplicateClaimsIgnored <= 40 || now - lastDuplicateClaimLog >= 5000) {
+                        lastDuplicateClaimLog = now ? now : 1;
+                        Logf("combat: duplicate claim ignored victim=%s motion=%u (%u so far)",
+                             victim.GetName().GetText(), swing, duplicateClaimsIgnored);
+                    }
+                    return GETrue;
+                }
+            }
+        }
         const uint32_t hit = net::SendHitNpc(owner, guid, args, weapon, nullptr, lastOutcome, npcs::SeenAt(instance),
                                              reaction, npcs::Incarnation(guid));
-        if (hit) { ++claimsSent; if (reaction != net::HitNoReaction) npcs::LocalHit(instance, hit); }
+        if (hit) {
+            ++claimsSent;
+            if (swing) playerClaims[claimKey] = swing;
+            if (reaction != net::HitNoReaction) npcs::LocalHit(instance, hit);
+        }
         npcplayback::BeginHit(nullptr);
         ScheduleReactionProbe(instance, false);
         return GETrue;
@@ -851,12 +954,12 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         instance && instance->GetPropertySet(eEPropertySetType_NPC) && !remote::IsPuppet(instance)) {
         const uint8_t party = npcs::CompanionOwner(attacker);
         if (party > 1) {
-            uint8_t source[16]; Guid(attacker, source);
-            OnNpcHit(party, victim, args, source, true);
+            uint8_t attackerGuid[16]; Guid(attacker, attackerGuid);
+            OnNpcHit(party, victim, args, attackerGuid, true);
             return GETrue;
         }
     }
-    return original(spu, self, other, Scaled(instance, attacker, args));
+    return CallOriginalAndLog(spu, self, other, Scaled(instance, attacker, args));
 }
 
 // A hit for QA, the way the game's hit paths do it: judge (through OnDamage, which runs the same judgement
@@ -889,6 +992,7 @@ GEInt GameHit(Entity& victim, eCEntity* source, int* pending)
 // earns experience: marked as defeated, the death script pays no one (static analysis of Kill).
 void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16], bool party)
 {
+    HostAppliedOriginScope appliedOrigin(HostAppliedOriginNpc, from, 0);
     uint8_t victimGuid[16]; Guid(target.GetInstance(), victimGuid);
     if (killOnce && killedHere.count(KillKey(victimGuid))) return;
     Entity attacker(npcs::NpcByGuid(npc));
@@ -939,6 +1043,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         net::HitResult result;
         ~Reply() { net::SendHitResult(to, result); }
     } reply{from, {}};
+    HostAppliedOriginScope appliedOrigin(HostAppliedOriginClaim, from, sequence);
     std::memcpy(reply.result.guid, guid, 16);
     reply.result.sequence = sequence;
     reply.result.incarnation = incarnation;
@@ -1250,10 +1355,10 @@ void SyncReport(LogFn log)
     Format(line, "SYNCCOMBAT claims_sent=%u claims_applied=%u local_judgements=%u no_pending_damage=%u "
                  "player_hits_sent=%u player_hits_received=%u inventory_open=%d inventory_hits_ignored=%u "
                  "redirected=%u stale_authority=%u hit_reactions=%u hp_resets=%u local_npc_hits=%u "
-                 "remote_npc_hits_ignored=%u invisible_contacts_ignored=%u friendly_hits_ignored=%u",
+                 "remote_npc_hits_ignored=%u invisible_contacts_ignored=%u friendly_hits_ignored=%u duplicate_claims_ignored=%u",
            claimsSent, claimsApplied, clientJudgements, clientJudgementsWithoutDamage, playerHitsSent, playerHitsTaken,
            hud::InventoryOpen() ? 1 : 0, inventoryHitsIgnored, hitsRedirected, hitsWrongAuthority, hitReactionsApplied, hpResets,
-           localNpcHits, remoteNpcHitsIgnored, invisibleContactsIgnored, friendlyHitsIgnored);
+           localNpcHits, remoteNpcHitsIgnored, invisibleContactsIgnored, friendlyHitsIgnored, duplicateClaimsIgnored);
     log(line);
 }
 
@@ -1408,6 +1513,7 @@ void OnWorldChange()
     unconfirmed.clear();
     rewarded.clear();
     playerSwings.clear();
+    playerClaims.clear();
     knockedAt.clear();
     npcParades.clear();  // QA npcguard: its entities are gone with the world
     pinnedNpc = PinnedNpc{};

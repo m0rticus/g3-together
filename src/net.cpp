@@ -152,12 +152,13 @@ bool clientInWorld[MaxPlayers] = {};   // host side: that client is in the host'
 uint32_t generations[MaxPlayers] = {}; // host side: counts the connections a slot was given (PeerGeneration)
 unsigned gatedIn = 0, gatedOut = 0;
 
-// What passes the world gate: joining, the save transfer and the world messages. Motion names wait for the world too
+// What passes the world gate: joining, campaign notifications, the save transfer and the world messages. Motion names wait for the world too
 // (Fable's review 22.10. 1.8: they were open to a peer that never said Hello); the host resends them all on entry.
 bool Gated(uint8_t type)
 {
     switch (type) {
-    case MsgHello: case MsgWelcome: case MsgRefused: case MsgLeave: case MsgFileChunk: case MsgFileDone: case MsgWorld:
+    case MsgHello: case MsgWelcome: case MsgRefused: case MsgLeave:
+    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld:
         return false;
     default:
         return true;

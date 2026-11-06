@@ -107,8 +107,9 @@ std::vector<Stack> Stacks(Entity& self)
 eCDynamicEntity* Hero() { return gCSession::GetInstance().GetHero(); }
 
 // A quick slot sits on its stack (gCInventoryStack::m_iQuickSlot), so a stack the record deletes and makes again comes
-// back without it: after every load of the host's save the client's quick bar was empty (playtest 27.10.). They go into a
-// file of their own next to the record (<record>.quick.txt), which an older mod never reads: its record stays as it was.
+// back without it: after every load of the host's save the client's quick bar was empty (playtest 27.10.). V3 embeds the
+// complete spell and quick data in the main record; the compatibility <record>.quick.txt is also written for inspection
+// and retained for loading legacy v1/v2 records.
 struct Quick
 {
     int slot = 0;
@@ -189,6 +190,7 @@ bool SaveQuick(Entity& self, char const* record)
 // After the record went on: the learned spells first (a spell that is not learned may not go on a quick slot), then each
 // slot back on a stack of its item (that quality first). A file that is not whole changes nothing; an item the hero no
 // longer carries leaves its slot empty.
+void ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::string> const& spells, std::vector<Quick> const& wanted);
 void LoadQuick(Entity& self, char const* record)
 {
     const std::string path = QuickPath(record);
@@ -219,6 +221,14 @@ void LoadQuick(Entity& self, char const* record)
     fclose(file);
     if (!refused && (!ended || declared != spells.size() + wanted.size())) refused = "no end line (the write broke off)";
     if (refused) { Logf("hero: quick slots %s refused (%s); the quick bar stays as it is", path.c_str(), refused); return; }
+    ApplySpellAndQuick(self, path.c_str(), spells, wanted);
+}
+
+// Shared by the legacy <record>.quick.txt sidecar and G3THERO 3 inline spell/quick data. The caller validates the
+// complete spell/quick set before invoking this helper, so the existing restore negative controls are preserved without
+// letting a broken file mutate only part of the hero.
+void ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::string> const& spells, std::vector<Quick> const& wanted)
+{
     unsigned learned = 0, spellsMissing = 0;
     for (std::string const& id : restoreSpells ? spells : std::vector<std::string>()) {
         int index = -1;
@@ -232,9 +242,9 @@ void LoadQuick(Entity& self, char const* record)
         if (index >= 0 && (StackLearned(self, index) == 1 || (inventory && inventory->LearnStack(index)))) ++learned;
         else ++spellsMissing;
     }
-    Logf("hero: spells %s learned again: %u of %zu, %u missing%s", path.c_str(), learned, spells.size(), spellsMissing,
+    Logf("hero: spells %s learned again: %u of %zu, %u missing%s", source, learned, spells.size(), spellsMissing,
          restoreSpells ? "" : " (spellrestoreoff)");
-    if (!restoreQuick) { Logf("hero: quick slots %s not put back (quickrestoreoff)", path.c_str()); return; }
+    if (!restoreQuick) { Logf("hero: quick slots %s not put back (quickrestoreoff)", source); return; }
     unsigned assigned = 0, missing = 0;
     for (Quick const& q : wanted) {
         int index = -1;
@@ -247,7 +257,7 @@ void LoadQuick(Entity& self, char const* record)
         if (index >= 0 && self.Inventory.AssignStackToQuickSlot(index, q.slot)) ++assigned;
         else ++missing;
     }
-    Logf("hero: quick slots %s put back: %u, %u missing", path.c_str(), assigned, missing);
+    Logf("hero: quick slots %s put back: %u, %u missing", source, assigned, missing);
 }
 }
 
@@ -263,7 +273,9 @@ bool SaveRecord(char const* path)
     if (fopen_s(&file, temp.c_str(), "w") || !file) return false;
     Entity self(hero);
     const std::vector<Stack> stacks = Stacks(self);
-    bool ok = fprintf(file, "G3THERO 2\n") > 0;
+    const std::vector<std::string> spells = LearnedSpellsOf(self);
+    const std::vector<Quick> quick = QuickSlotsOf(self);
+    bool ok = fprintf(file, "G3THERO 3\n") > 0;
     ok = ok && fprintf(file, "level %u %u\n", static_cast<unsigned>(self.NPC.Level), static_cast<unsigned>(self.NPC.LevelMax)) > 0;
     ok = ok && fprintf(file, "xp %d\nlp %d %d\n", static_cast<int>(self.PlayerMemory.XP), static_cast<int>(self.PlayerMemory.LPAttribs),
                        static_cast<int>(self.PlayerMemory.LPPerks)) > 0;
@@ -273,6 +285,11 @@ bool SaveRecord(char const* path)
         ok = ok && (s.category == gEItemCategory_Skill
                         ? fprintf(file, "stack %s %d %u %d %d %d\n", s.id.c_str(), s.amount, s.quality, s.slot, s.category, s.learned)
                         : fprintf(file, "stack %s %d %u %d %d\n", s.id.c_str(), s.amount, s.quality, s.slot, s.category)) > 0;
+    for (std::string const& id : spells)
+        ok = ok && fprintf(file, "spell %s\n", id.c_str()) > 0;
+    for (Quick const& q : quick)
+        ok = ok && fprintf(file, "quick %d %s %u\n", q.slot, q.id.c_str(), q.quality) > 0;
+    ok = ok && fprintf(file, "quick_end %zu %zu\n", spells.size(), quick.size()) > 0;
     ok = ok && fprintf(file, "end %zu\n", stacks.size()) > 0;
     ok = fflush(file) == 0 && ok;
     ok = fclose(file) == 0 && ok;
@@ -282,7 +299,13 @@ bool SaveRecord(char const* path)
         DeleteFileA(temp.c_str());
         Logf("hero: record %s not written; the one before stays", path);
     }
-    if (ok) SaveQuick(self, path);
+    if (ok) {
+        const bool quickOk = SaveQuick(self, path);
+        if (!quickOk) {
+            ok = false;
+            Logf("hero: record %s main data is complete but the quick compatibility sidecar failed; retry is required", path);
+        }
+    }
     return ok;
 }
 
@@ -294,7 +317,8 @@ bool LoadRecord(char const* path)
     if (!hero) return false;
     if (fopen_s(&file, path, "r") || !file) { lastRefusal = "the file cannot be read"; return false; }
     char line[256];
-    if (!fgets(line, sizeof(line), file) || std::strncmp(line, "G3THERO ", 8) || (line[8] != '1' && line[8] != '2')) {
+    if (!fgets(line, sizeof(line), file) || std::strncmp(line, "G3THERO ", 8) ||
+        (line[8] != '1' && line[8] != '2' && line[8] != '3')) {
         fclose(file);
         lastRefusal = "no hero record header";
         Logf("hero: record %s refused (%s); the hero stays as it is", path, lastRefusal);
@@ -311,6 +335,10 @@ bool LoadRecord(char const* path)
     struct Attr { std::string tag; int base, max; };
     std::vector<Attr> attrs;
     bool haveLevel = false, haveXp = false, haveLp = false, ended = false;
+    bool inlineQuickEnded = false;
+    std::vector<std::string> inlineSpells;
+    std::vector<Quick> inlineQuick;
+    size_t declaredInlineSpells = 0, declaredInlineQuick = 0;
     char const* refused = nullptr;
     size_t declared = 0;
     while (!refused && fgets(line, sizeof(line), file)) {
@@ -318,7 +346,32 @@ bool LoadRecord(char const* path)
         Stack s;
         int b = 0, c = 0;
         if (ended) refused = "a line after the end line";
-        else if (sscanf_s(line, "level %u %u", &level, &levelMax) == 2) haveLevel = true;
+        else if (version == 3 && !inlineQuickEnded && sscanf_s(line, "spell %63s", a, 64u) == 1) inlineSpells.push_back(a);
+        else if (version == 3) {
+            Quick q;
+            if (inlineQuickEnded) {
+                if (sscanf_s(line, "end %zu", &declared) == 1) ended = true;
+                else refused = "a line after quick_end";
+            } else if (sscanf_s(line, "quick %d %63s %u", &q.slot, a, 64u, &q.quality) == 3) {
+                q.id = a;
+                inlineQuick.push_back(q);
+            } else if (sscanf_s(line, "quick_end %zu %zu", &declaredInlineSpells, &declaredInlineQuick) == 2) {
+                if (inlineQuickEnded) refused = "a second quick_end line";
+                inlineQuickEnded = true;
+            } else if (sscanf_s(line, "level %u %u", &level, &levelMax) == 2) haveLevel = true;
+            else if (sscanf_s(line, "xp %d", &xp) == 1) haveXp = true;
+            else if (sscanf_s(line, "lp %d %d", &lpa, &lpp) == 2) haveLp = true;
+            else if (sscanf_s(line, "attr %63s %d %d", a, 64u, &b, &c) == 3) attrs.push_back({a, b, c});
+            else if (const int fields = std::strncmp(line, "stack ", 6) ? 0
+                                        : sscanf_s(line, "stack %63s %d %u %d %d %d", a, 64u, &s.amount, &s.quality, &s.slot, &s.category, &s.learned);
+                     fields == 5 || fields == 6) {
+                s.id = a;
+                wanted.push_back(s);
+            } else if (sscanf_s(line, "end %zu", &declared) == 1) {
+                if (!inlineQuickEnded) refused = "quick_end missing before end";
+                else ended = true;
+            } else refused = "a line that is no v3 record line";
+        } else if (sscanf_s(line, "level %u %u", &level, &levelMax) == 2) haveLevel = true;
         else if (sscanf_s(line, "xp %d", &xp) == 1) haveXp = true;
         else if (sscanf_s(line, "lp %d %d", &lpa, &lpp) == 2) haveLp = true;
         else if (sscanf_s(line, "attr %63s %d %d", a, 64u, &b, &c) == 3) attrs.push_back({a, b, c});
@@ -335,6 +388,9 @@ bool LoadRecord(char const* path)
         if (!haveLevel || !haveXp || !haveLp) refused = "level, experience or learn points missing";
         else if (version >= 2 && !ended) refused = "no end line (the write broke off)";
         else if (ended && declared != wanted.size()) refused = "fewer stacks than the end line names";
+        else if (version == 3 && !inlineQuickEnded) refused = "no quick_end line";
+        else if (version == 3 && (declaredInlineSpells != inlineSpells.size() || declaredInlineQuick != inlineQuick.size()))
+            refused = "the quick_end counts do not match the inline spell and quick lines";
         else if (level > 1000 || levelMax > 1000 || xp < 0 || xp > 100000000 || lpa < 0 || lpa > 100000 || lpp < 0 || lpp > 100000)
             refused = "level, experience or learn points out of range";
         for (char const* tag : Tags) {
@@ -344,6 +400,15 @@ bool LoadRecord(char const* path)
         if (!refused && attrs.size() != sizeof(Tags) / sizeof(Tags[0])) refused = "an attribute this record does not know";
         for (Attr const& at : attrs)
             if (!refused && (at.base < -1000000 || at.base > 1000000 || at.max < -1000000 || at.max > 1000000)) refused = "an attribute out of range";
+        if (!refused && version == 3) {
+            for (std::string const& id : inlineSpells)
+                if (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos)
+                    refused = "a spell whose item is no template ID";
+            for (Quick const& q : inlineQuick)
+                if (!refused && (q.slot < 0 || q.slot >= QuickSlots || q.id.size() != 32 ||
+                                 q.id.find_first_not_of("0123456789abcdef") != std::string::npos))
+                    refused = "a quick slot out of range";
+        }
         for (Stack const& s : wanted) {
             if (refused) break;
             if (s.id.size() != 32 || s.id.find_first_not_of("0123456789abcdef") != std::string::npos || !FromHex(s.id).IsValid())
@@ -412,7 +477,8 @@ bool LoadRecord(char const* path)
     }
     Logf("hero: record %s applied: %zu skills in it, %u taught, %u unlearned, %u removed", path, recordSkills.size(), skillsTaught,
          skillsUnlearned, skillsRemoved);
-    LoadQuick(self, path);
+    if (version == 3) ApplySpellAndQuick(self, path, inlineSpells, inlineQuick);
+    else LoadQuick(self, path);
     return true;
 }
 

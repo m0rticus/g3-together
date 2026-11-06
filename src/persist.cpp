@@ -51,7 +51,18 @@ unsigned saves = 0, loads = 0, sidecarsWritten = 0, sidecarsRead = 0;
 std::string lastSave, lastLoad;
 unsigned recordsWritten = 0, recordsApplied = 0;
 std::string pendingRecord;   // client: hero record to apply once the loaded world runs
-std::vector<std::string> deferredTradeRecords;
+struct DeferredSnapshot {
+    std::string path;
+    uint32_t welcome = 0;
+    uint32_t nextTry = 0;
+    unsigned attempts = 0;
+    bool fallbackToLatest = false;
+    bool loggedFailure = false;
+    bool loggedNoHero = false;
+};
+std::vector<DeferredSnapshot> deferredSnapshotRecords;
+struct SuccessfulSnapshot { uint32_t welcome = 0; std::string path; };
+std::vector<SuccessfulSnapshot> successfulSnapshots;
 uint32_t pendingSince = 0;
 
 unsigned char* Resolve(Internal const& fn)
@@ -92,6 +103,7 @@ std::vector<uint8_t> incoming[net::FileCount];
 std::string pendingLoad;                 // client: received campaign to load
 unsigned filesSent = 0, filesReceived = 0, autoLoads = 0;
 std::string lastReceived = "-";
+bool campaignOptionalSidecarAvailable = true;
 
 // --- Which world each machine plays; the world gate (PLAN-2026-10-22 0.1/0.2) --------------------------------
 // A machine is in the startup menu, in a new game of its own or in a loaded save. The host numbers its worlds: a new
@@ -235,6 +247,7 @@ bool SendCampaign(uint8_t to)
     uint32_t sizes[net::FileCount] = {}, crcs[net::FileCount] = {};
     if (!CampaignComplete()) return false;
     for (int f = 0; f < net::FileCount; ++f) {
+        if (f == 2 && !campaignOptionalSidecarAvailable) continue;
         std::vector<uint8_t> data;
         if (!ReadAll(Folder() + campaign + SaveExtension(f), data)) continue;
         sizes[f] = static_cast<uint32_t>(data.size());
@@ -258,6 +271,7 @@ bool SendCampaign(uint8_t to)
 // folder, and a ":" made an NTFS stream, which is not allowed.
 bool SafeName(char const* name)
 {
+    if (!name) return false;
     const size_t n = std::strlen(name);
     if (!n || n > 48) return false;
     for (size_t i = 0; i < n; ++i) {
@@ -366,6 +380,137 @@ std::string LatestOwnRecord()
     return best;
 }
 
+bool StableRunningHero()
+{
+    if (!trade::ReadyForSave() || nativeLoadDepth || !loading.empty() || !pendingRecord.empty() || !refusedRecord.empty()) return false;
+    gCSession& session = gCSession::GetInstance();
+    return session.GetHero() && session.IsGameRunning();
+}
+
+bool HeroMayBecomeAvailable()
+{
+    return nativeLoadDepth || !loading.empty() || newWorld || localKind != net::KindMenu;
+}
+
+bool SnapshotWrittenInWelcome(std::string const& path)
+{
+    const uint32_t welcome = net::WelcomeSerial();
+    for (SuccessfulSnapshot const& success : successfulSnapshots)
+        if (success.welcome == welcome && success.path == path) return true;
+    return false;
+}
+
+void MarkSnapshotWritten(std::string const& path)
+{
+    const uint32_t welcome = net::WelcomeSerial();
+    for (SuccessfulSnapshot& success : successfulSnapshots) {
+        if (success.welcome == welcome && success.path == path) return;
+    }
+    successfulSnapshots.push_back({welcome, path});
+    while (successfulSnapshots.size() > 64) successfulSnapshots.erase(successfulSnapshots.begin());
+}
+
+std::string QuickCompatibilityPath(std::string const& main)
+{
+    std::string base = main;
+    if (base.size() >= 4 && !_stricmp(base.c_str() + base.size() - 4, ".txt")) base.resize(base.size() - 4);
+    return base + ".quick.txt";
+}
+
+bool CopyLatestOwnRecord(std::string const& record)
+{
+    const std::string latest = lastOwnHero ? LatestOwnRecord() : std::string();
+    if (latest.empty()) return false;
+    if (!CopyFileA(latest.c_str(), record.c_str(), FALSE)) {
+        Logf("persist: could not copy latest own hero %s to exact record %s", latest.c_str(), record.c_str());
+        return false;
+    }
+    const std::string latestQuick = QuickCompatibilityPath(latest);
+    const std::string exactQuick = QuickCompatibilityPath(record);
+    DeleteFileA(exactQuick.c_str());
+    if (GetFileAttributesA(latestQuick.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        !CopyFileA(latestQuick.c_str(), exactQuick.c_str(), FALSE))
+        Logf("persist: exact hero record %s copied, but its quick compatibility sidecar was stale or unavailable", record.c_str());
+    Logf("persist: exact hero record %s produced from latest own hero %s", record.c_str(), latest.c_str());
+    return true;
+}
+
+void QueueSnapshot(std::string const& path, uint32_t welcome, bool fallbackToLatest)
+{
+    for (DeferredSnapshot& entry : deferredSnapshotRecords) {
+        if (entry.path != path) continue;
+        entry.welcome = welcome;
+        entry.fallbackToLatest = entry.fallbackToLatest || fallbackToLatest;
+        entry.nextTry = 0;
+        entry.loggedFailure = false;
+        entry.loggedNoHero = false;
+        return;
+    }
+    DeferredSnapshot entry;
+    entry.path = path;
+    entry.welcome = welcome;
+    entry.nextTry = 0;
+    entry.fallbackToLatest = fallbackToLatest;
+    deferredSnapshotRecords.push_back(entry);
+}
+
+bool TrySnapshotRecord(DeferredSnapshot& entry)
+{
+    if (!trade::ReadyForSave() || nativeLoadDepth || !loading.empty()) {
+        ++entry.attempts;
+        const uint32_t now = GetTickCount();
+        entry.nextTry = now ? now + 2000 + std::min(entry.attempts, 4u) * 1000 : 1;
+        if (!entry.loggedNoHero) {
+            Logf("persist: hero record %s waits for player exchange/load settling", entry.path.c_str());
+            entry.loggedNoHero = true;
+        }
+        return false;
+    }
+    if (StableRunningHero()) {
+        const bool ok = hero::SaveRecord(entry.path.c_str());
+        if (ok) {
+            ++recordsWritten;
+            MarkSnapshotWritten(entry.path);
+            Logf("persist: deferred hero record %s written", entry.path.c_str());
+            return true;
+        }
+        ++entry.attempts;
+        const uint32_t now = GetTickCount();
+        entry.nextTry = now ? now + 2000 + std::min(entry.attempts, 4u) * 1000 : 1;
+        if (!entry.loggedFailure) {
+            Logf("persist: hero record %s NOT written; queued for retry", entry.path.c_str());
+            entry.loggedFailure = true;
+        }
+        return false;
+    }
+
+    if (entry.fallbackToLatest && CopyLatestOwnRecord(entry.path)) return true;
+    if (HeroMayBecomeAvailable()) {
+        ++entry.attempts;
+        const uint32_t now = GetTickCount();
+        entry.nextTry = now ? now + 2000 + std::min(entry.attempts, 4u) * 1000 : 1;
+        if (!entry.loggedNoHero) {
+            Logf("persist: hero record %s waits because no stable running hero is available yet", entry.path.c_str());
+            entry.loggedNoHero = true;
+        }
+        return false;
+    }
+    Logf("persist: no own hero available to snapshot %s; no success is claimed", entry.path.c_str());
+    return true;
+}
+
+void QueueOrSaveSnapshot(std::string const& path)
+{
+    DeferredSnapshot entry;
+    entry.path = path;
+    entry.welcome = net::WelcomeSerial();
+    entry.fallbackToLatest = !StableRunningHero();
+    if (TrySnapshotRecord(entry)) return;
+    QueueSnapshot(path, entry.welcome, entry.fallbackToLatest);
+    for (DeferredSnapshot& queued : deferredSnapshotRecords)
+        if (queued.path == path) { queued.attempts = entry.attempts; queued.loggedFailure = entry.loggedFailure; queued.loggedNoHero = entry.loggedNoHero; queued.nextTry = entry.nextTry; }
+}
+
 void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t const crc[net::FileCount])
 {
     if (!SafeName(name)) {
@@ -390,6 +535,13 @@ void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t 
             return;
         }
     }
+    if (!size[2]) {
+        const std::string optional = Folder() + local + SaveExtension(2);
+        if (GetFileAttributesA(optional.c_str()) != INVALID_FILE_ATTRIBUTES && !DeleteFileA(optional.c_str()))
+            Logf("persist: could not clear stale optional sidecar %s", optional.c_str());
+        else
+            Logf("persist: campaign %s has no optional sidecar; its stale local sidecar was cleared", name);
+    }
     for (int f = 0; f < net::FileCount; ++f) {
         if (!size[f]) continue;
         FILE* out = nullptr;
@@ -402,28 +554,39 @@ void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t 
     ++filesReceived;
     lastReceived = local;
     Logf("persist: campaign %s received as %s (host world %08x)", name, local.c_str(), hostWorld.epoch);
-    // First time in this campaign: no record of this player's hero for it yet. If a hero is in play (a new game
-    // started before joining), that hero is kept; from the main menu there is none, and the hero in the host's
-    // save (a copy of the host's) stays.
+    // A repeated name in a rejoin is not proof of a current hero snapshot. Refresh it for this welcome only from a
+    // stable running hero; otherwise preserve the exact file or fall back to the latest own hero for a first menu join.
     const std::string record = hero::RecordPath(local.c_str());
-    if (GetFileAttributesA(record.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        gCSession& session = gCSession::GetInstance();
-        // A save the host made while this player was not there (refused, or not joined yet) has no record of this
-        // player either: its newest own record goes on instead of a copy of the host's hero (the client as a copy of the host's hero after
-        // the host saved alone, playtest 27.10.).
-        const std::string latest = lastOwnHero ? LatestOwnRecord() : std::string();
-        if (session.GetHero() && session.IsGameRunning() && hero::SaveRecord(record.c_str())) {
-            Logf("persist: first time in %s; the current hero is kept as this player's hero", local.c_str());
-        } else if (!latest.empty() && CopyFileA(latest.c_str(), record.c_str(), FALSE)) {
-            std::string quickFrom = latest, quickTo = record;
-            quickFrom.resize(quickFrom.size() - 4);
-            quickTo.resize(quickTo.size() - 4);
-            CopyFileA((quickFrom + ".quick.txt").c_str(), (quickTo + ".quick.txt").c_str(), FALSE);
-            Logf("persist: no hero of this player in %s; its newest own hero (%s) goes on", local.c_str(), latest.c_str());
+    const bool exactExists = GetFileAttributesA(record.c_str()) != INVALID_FILE_ATTRIBUTES;
+    gCSession& session = gCSession::GetInstance();
+    const bool haveRunningHero = session.GetHero() && session.IsGameRunning();
+    if (haveRunningHero && !SnapshotWrittenInWelcome(record)) {
+        if (StableRunningHero()) {
+            const bool ok = hero::SaveRecord(record.c_str());
+            if (ok) {
+                ++recordsWritten;
+                MarkSnapshotWritten(record);
+                Logf("persist: exact hero record %s refreshed for welcome %u", record.c_str(), net::WelcomeSerial());
+            } else {
+                QueueSnapshot(record, net::WelcomeSerial(), false);
+                Logf("persist: exact hero record %s could not be refreshed; queued for retry", record.c_str());
+            }
+        } else {
+            QueueSnapshot(record, net::WelcomeSerial(), false);
+            Logf("persist: exact hero record %s refresh waits for the running hero to settle", record.c_str());
+        }
+    } else if (!exactExists) {
+        if (CopyLatestOwnRecord(record)) {
+            Logf("persist: no hero record yet for %s; latest own hero compatibility files copied", local.c_str());
+        } else if (HeroMayBecomeAvailable()) {
+            QueueSnapshot(record, net::WelcomeSerial(), true);
+            Logf("persist: no exact hero record yet for %s and no stable hero; queued for retry", local.c_str());
         } else {
             hud::Message(hud::Warning, i18n::Text(i18n::NoCampaignHero));
-            Logf("persist: first time in %s and no hero in play; the host's hero is copied", local.c_str());
+            Logf("persist: first time in %s with no own hero available; retaining the host fallback, fully offline restart cannot manufacture one", local.c_str());
         }
+    } else if (!StableRunningHero()) {
+        Logf("persist: exact hero record %s exists but no stable hero is available in welcome %u; preserving it rather than manufacturing state", record.c_str(), net::WelcomeSerial());
     }
     if (autoLoad && loadTicks) pendingLoad = local;  // QA negative control: Tick loads it, as before
     else if (autoLoad) OrderAutoload(local);
@@ -431,7 +594,12 @@ void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t 
 
 bool __stdcall SaveDetour(void* self, bCString const* name)
 {
-    if (!trade::ReadyForSave() || !deferredTradeRecords.empty()) {
+    if (!name || !SafeName(name->GetText())) {
+        Log("persist: save refused; the save name is empty or not a SafeName");
+        hud::Message(hud::Warning, i18n::Text(i18n::SaveDamaged));
+        return false;
+    }
+    if (!trade::ReadyForSave()) {
         Log("persist: save postponed until player exchanges settle");
         hud::Message(hud::Warning, i18n::Text(i18n::TradeSettling));
         return false;
@@ -440,22 +608,41 @@ bool __stdcall SaveDetour(void* self, bCString const* name)
     const bool ok = originalSave(self, name);
     ++saves;
     savedAt = GetTickCount();
-    lastSave = name ? name->GetText() : "";
-    if (ok && name && writing) {
+    lastSave = name->GetText();
+    campaignOptionalSidecarAvailable = false;
+    if (ok && writing) {
         const std::string path = SidecarPath(name);
+        const std::string temp = path + ".tmp";
         FILE* file = nullptr;
-        if (!fopen_s(&file, path.c_str(), "w") && file) {
-            fprintf(file, "G3T 1\n");
-            const unsigned entries = journal::Write(file);
+        bool sidecarOk = !fopen_s(&file, temp.c_str(), "w") && file;
+        unsigned entries = 0;
+        if (sidecarOk) {
+            sidecarOk = fprintf(file, "G3T 1\n") > 0;
+            entries = journal::Write(file);
+            if (sidecarOk) sidecarOk = !ferror(file);
             if (net::IsHost()) npcs::WriteCompanions(file);
-            fclose(file);
+            sidecarOk = !ferror(file) && sidecarOk;
+            sidecarOk = fflush(file) == 0 && sidecarOk;
+            sidecarOk = fclose(file) == 0 && sidecarOk;
+        } else {
+            Logf("persist: could not open the sidecar temp %s", temp.c_str());
+        }
+        if (sidecarOk)
+            sidecarOk = MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        if (!sidecarOk) {
+            DeleteFileA(temp.c_str());
+            if (!DeleteFileA(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND)
+                Logf("persist: could not clear stale sidecar %s after its replacement failed", path.c_str());
+            Logf("persist: could not atomically replace the sidecar of %s", lastSave.c_str());
+        } else {
+            campaignOptionalSidecarAvailable = true;
             ++sidecarsWritten;
             Logf("persist: saved %s with %u journal entries", lastSave.c_str(), entries);
-            if (net::IsHost()) net::SendCampaign(1, lastSave.c_str());  // every client keeps its own hero for it
-            campaign = lastSave;
-        } else {
-            Logf("persist: could not write the sidecar of %s", lastSave.c_str());
         }
+    }
+    if (ok) {
+        campaign = lastSave;
+        if (net::IsHost()) net::SendCampaign(1, lastSave.c_str());  // successful native saves still announce the event
     }
     return ok;
 }
@@ -674,7 +861,12 @@ void HostTick()
 
 bool __stdcall LoadDetour(void* self, bCString const* name)
 {
-    if (!trade::ReadyForSave() || !deferredTradeRecords.empty()) {
+    if (!name || !SafeName(name->GetText())) {
+        Log("persist: load refused; the save name is empty or not a SafeName");
+        hud::Message(hud::Warning, i18n::Text(i18n::SaveDamaged));
+        return false;
+    }
+    if (!trade::ReadyForSave()) {
         Log("persist: load refused while a player exchange is unsettled");
         hud::Message(hud::Warning, i18n::Text(i18n::TradeSettling));
         return false;
@@ -690,6 +882,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     // The loaded campaign replaces whatever the journal held since: read the save's own state, or none.
     unsigned entries = 0;
     bool found = false;
+    campaignOptionalSidecarAvailable = false;
     if (name) {
         FILE* file = nullptr;
         if (!fopen_s(&file, SidecarPath(name).c_str(), "r") && file) {
@@ -698,6 +891,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
                 entries = journal::Read(file);
                 if (net::IsHost()) { fseek(file, 0, SEEK_SET); npcs::ReadCompanions(file); }
                 found = true;
+                campaignOptionalSidecarAvailable = true;
                 ++sidecarsRead;
             }
             fclose(file);
@@ -859,15 +1053,7 @@ void OnCampaign(uint8_t kind, char const* name)
 {
     if (kind != 1 || !SafeName(name)) return;
     const std::string record = hero::RecordPath((std::string("G3T_host_") + name).c_str());
-    if (!trade::ReadyForSave()) {
-        if (std::find(deferredTradeRecords.begin(), deferredTradeRecords.end(), record) == deferredTradeRecords.end())
-            deferredTradeRecords.push_back(record);
-        Logf("persist: hero record for %s waits for the current player exchange", name);
-        return;
-    }
-    const bool ok = hero::SaveRecord(record.c_str());
-    recordsWritten += ok ? 1 : 0;
-    Logf("persist: the host saved %s; own hero record %s", name, ok ? "written" : "NOT written");
+    QueueOrSaveSnapshot(record);
 }
 }
 
@@ -909,13 +1095,11 @@ void Tick()
     // Inside the game's load (one of its own frames): a hero may run already, but the load has not returned. Settling
     // here opened the gate and began the restore within it; an autoload here would start a load inside the load.
     if (earlyGate && nativeLoadDepth) return;
-    if (trade::ReadyForSave() && !deferredTradeRecords.empty()) {
-        for (auto const& record : deferredTradeRecords) {
-            const bool ok = hero::SaveRecord(record.c_str());
-            recordsWritten += ok ? 1 : 0;
-            Logf("persist: deferred exchange-settled hero record %s %s", record.c_str(), ok ? "written" : "NOT written");
-        }
-        deferredTradeRecords.clear();
+    const uint32_t now = GetTickCount();
+    for (auto entry = deferredSnapshotRecords.begin(); entry != deferredSnapshotRecords.end();) {
+        if (entry->nextTry && static_cast<int32_t>(entry->nextTry - now) > 0) { ++entry; continue; }
+        if (TrySnapshotRecord(*entry)) entry = deferredSnapshotRecords.erase(entry);
+        else ++entry;
     }
     StatusHints();
     gCSession& game = gCSession::GetInstance();
@@ -949,7 +1133,6 @@ void Tick()
     if (pendingRecord.empty()) return;
     gCSession& session = gCSession::GetInstance();
     if (!session.GetHero() || !session.IsGameRunning()) { pendingSince = 0; return; }
-    const uint32_t now = GetTickCount();
     if (!pendingSince) { pendingSince = now; return; }
     if (now - pendingSince < 3000) return;  // the loaded world settles first
     const bool ok = hero::LoadRecord(pendingRecord.c_str());
