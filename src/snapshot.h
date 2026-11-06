@@ -24,6 +24,7 @@ struct MotionState
     uint8_t hitPlayer = 0, partyPlayer = 0;
     uint8_t partyType = 0, waiting = 0, guidePlayer = 0;
     uint8_t aiMode = 0;
+    uint32_t combatTarget = 0;
     uint8_t action = 0, attackReason = 0, damageType = 0;
     int32_t damageAmount = 0;
     float damageMultiplier = 0.0f;

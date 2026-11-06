@@ -52,7 +52,8 @@ bool Changed(net::NpcRecord const& a, net::NpcRecord const& b)
     for (int k = 0; k < 4; ++k) q += std::fabs(a.rotation[k] - b.rotation[k]);
     return d > 4.0f || q > 0.002f || a.motion != b.motion || a.flags != b.flags || a.hitPoints != b.hitPoints ||
            a.aniState != b.aniState || a.movementMode != b.movementMode || a.heldRight != b.heldRight || a.heldLeft != b.heldLeft ||
-           a.motions[0].instance != b.motions[0].instance || a.hitPointsMax != b.hitPointsMax || a.partyPlayer != b.partyPlayer;
+           a.motions[0].instance != b.motions[0].instance || a.hitPointsMax != b.hitPointsMax || a.partyPlayer != b.partyPlayer ||
+           a.aiMode != b.aiMode || a.combatTarget != b.combatTarget;
 }
 constexpr uint32_t StaleAfter = 3000;      // ms without a snapshot: hold presentation and reject contacts
 
@@ -176,6 +177,7 @@ struct Mirror
     npcplayback::State replay;
     bool replayReady = false;
     uint32_t shownCombatTarget = 0;
+    uint32_t unresolvedCombatTarget = 0;
     uint32_t contactInstance = 0, contactAt = 0;
     bool contactConsumed = false;
     int contactBone = -1;
@@ -240,6 +242,39 @@ struct Mirror
     eCEntity* watchedFocus = nullptr;
     unsigned focusWatchChanges = 0;
 };
+
+using NpcOpponents = std::unordered_map<uint32_t, eCEntity*>;
+
+NpcOpponents IndexNpcOpponents()
+{
+    NpcOpponents result;
+    const bTObjArray<Entity> all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i) {
+        eCEntity* entity = all.GetAt(i).GetInstance();
+        if (!entity) continue;
+        uint8_t bytes[16];
+        guid::CopyEntity(entity, bytes);
+        const auto inserted = result.emplace(net::HashGuid(bytes), entity);
+        // A wire hash is not an identity: ambiguity must never bind an arbitrary opponent.
+        if (!inserted.second && inserted.first->second != entity) inserted.first->second = nullptr;
+    }
+    return result;
+}
+
+eCEntity* NpcOpponent(NpcOpponents const& opponents, uint32_t hash)
+{
+    const auto found = opponents.find(hash);
+    return found == opponents.end() ? nullptr : found->second;
+}
+
+struct TargetingWatch
+{
+    eCEntity* body = nullptr;
+    int weaponMode = -1, aiMode = -1;
+    uint32_t combatState = 0, loggedAt = 0, killedAt = 0, serial = 0;
+    bool haveKill = false;
+    uint8_t victim[16] = {};
+} targetingWatch;
 
 eCEntity* AutoAimTarget(eCVisualAnimation_PS* animation)
 {
@@ -630,6 +665,7 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         motion.waiting = records[i].waiting;
         motion.guidePlayer = records[i].guidePlayer;
         motion.aiMode = records[i].aiMode;
+        motion.combatTarget = records[i].combatTarget;
         motion.action = records[i].action;
         motion.attackReason = records[i].attackReason;
         motion.damageType = records[i].damageType;
@@ -2265,6 +2301,9 @@ void LogClientDeath(Mirror& m, net::NpcRecord const& shown, uint32_t now)
 {
     if (m.deathLogged || net::IsHost()) return;
     m.deathLogged = true;
+    targetingWatch.haveKill = true;
+    targetingWatch.killedAt = now;
+    std::memcpy(targetingWatch.victim, shown.guid, sizeof(targetingWatch.victim));
 
     if (m.localHitValid && now - m.localHitAt <= 5000)
         std::strcpy(m.killerAttribution, "local_player");
@@ -2327,12 +2366,334 @@ void TickDeathFocusWatch(Mirror& m, uint32_t now)
     }
     m.watchedFocus = selected;
 }
+
+// Expose read-only native predicates without casting a base object to a fictitious derived instance.
+struct FocusInspection : gCFocus_PS
+{
+    static float Range(gCFocus_PS const& focus) { return (focus.*&FocusInspection::GetCurrentMaxRange)(); }
+    static float Priority(gCFocus_PS const& focus, eCEntity* e) { return (focus.*&FocusInspection::GetCurrentPriority)(e); }
+    static bool Valid(gCFocus_PS const& focus, eCEntity* e) { return (focus.*&FocusInspection::IsValidEntity)(e); }
+    static bool Check(gCFocus_PS& focus, eCEntity* e, float& angle)
+    {
+        return (focus.*&FocusInspection::FocusCheck)(e, e, 181.0f, angle);
+    }
+};
+
+std::string FocusIdentity(eCEntity* entity)
+{
+    if (!entity) return "null";
+    char id[40], text[64];
+    guid::FormatEntity(entity, id, sizeof(id));
+    std::snprintf(text, sizeof(text), "%p/%s", entity, id);
+    return text;
+}
+
+bool FocusProcessed(eCEntity* entity)
+{
+    auto* processed = world::ProcessedEntities();
+    if (processed)
+        for (GEU16 i = 0; i < processed->GetCount(); ++i)
+            if (processed->GetAt(i) == entity) return true;
+    return false;
+}
+
+std::string FocusRawIdentity(eCEntity* entity)
+{
+    if (!entity) return "null";
+    if (FocusProcessed(entity)) return FocusIdentity(entity);
+    char text[48];
+    std::snprintf(text, sizeof(text), "%p/not_processed", entity);
+    return text;
+}
+
+uint32_t FocusEntityFlags(eCEntity* entity)
+{
+    uint32_t flags = 0;
+    static_assert(sizeof(eSEntityFlags) == sizeof(flags));
+    std::memcpy(&flags, &entity->GetEntityFlags(), sizeof(flags));
+    return flags;
+}
+
+Mirror const* FocusMirror(eCEntity* entity)
+{
+    uint8_t bytes[16];
+    guid::CopyEntity(entity, bytes);
+    const auto mirror = mirrors.find(Key(bytes));
+    if (mirror != mirrors.end() && mirror->second.entity.GetInstance() == entity) return &mirror->second;
+    const auto corpse = corpses.find(Key(bytes));
+    return corpse != corpses.end() && corpse->second.entity.GetInstance() == entity ? &corpse->second : nullptr;
+}
+
+void LogFocusQueue(uint32_t serial)
+{
+    // PS_Melee_Loop reads this queue before the scan result. Sheathing clears it at Script_Game+0x7A00.
+    static auto* module = reinterpret_cast<unsigned char*>(GetModuleHandleA("Script_Game.dll"));
+    static const bool supported = [] {
+        if (!module) return false;
+        const auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(module);
+        const auto* pe = reinterpret_cast<IMAGE_NT_HEADERS const*>(module + dos->e_lfanew);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || pe->Signature != IMAGE_NT_SIGNATURE ||
+            pe->OptionalHeader.SizeOfImage < 0x118d5c) return false;
+        auto* countCode = module + 0x7e889;
+        auto* dataCode = module + 0x7e89b;
+        uintptr_t countAddress = 0, dataAddress = 0;
+        std::memcpy(&countAddress, countCode + 2, sizeof(countAddress));
+        std::memcpy(&dataAddress, dataCode + 2, sizeof(dataAddress));
+        static unsigned char const stride[] = {0x69, 0xc0, 0xb0, 0, 0, 0};
+        return countCode[0] == 0x83 && countCode[1] == 0x3d && countCode[6] == 0 &&
+            dataCode[0] == 0x8b && dataCode[1] == 0x15 && !std::memcmp(dataCode + 6, "\x83\xc2\x08", 3) &&
+            countAddress == reinterpret_cast<uintptr_t>(module + 0x118d58) &&
+            dataAddress == reinterpret_cast<uintptr_t>(module + 0x118d54) &&
+            !std::memcmp(module + 0xcc4d, stride, sizeof(stride));
+    }();
+    if (!supported) {
+        Logf("npcs: FOCUSQUEUE seq=%u layout=unsupported", serial);
+        return;
+    }
+    struct Queue { unsigned char* data; int count; };
+    Queue queue{};
+    if (!ReadProcessMemory(GetCurrentProcess(), module + 0x118d54, &queue, sizeof(queue), nullptr) ||
+        queue.count < 0 || queue.count > 1024 || (queue.count && !queue.data)) {
+        Logf("npcs: FOCUSQUEUE seq=%u layout=invalid", serial);
+        return;
+    }
+    Logf("npcs: FOCUSQUEUE seq=%u count=%d", serial, queue.count);
+    for (int i = 0; i < queue.count; ++i) {
+        struct Action { int action, argument; eCEntity* target; } entry{};
+        if (!ReadProcessMemory(GetCurrentProcess(), queue.data + i * 0xb0, &entry, sizeof(entry), nullptr)) {
+            Logf("npcs: FOCUSQUEUE seq=%u slot=%d read=failed", serial, i);
+            break;
+        }
+        Logf("npcs: FOCUSQUEUE seq=%u slot=%d action=%d argument=%d target=%s",
+             serial, i, entry.action, entry.argument, FocusRawIdentity(entry.target).c_str());
+    }
+}
+
+void LogFocusVictim(uint32_t serial)
+{
+    Entity victim = Resolve(targetingWatch.victim);
+    eCEntity* entity = victim.GetInstance();
+    if (!entity) {
+        char id[40];
+        guid::Format(targetingWatch.victim, id, sizeof(id));
+        Logf("npcs: FOCUSVICTIM seq=%u id=%s loaded=0", serial, id);
+        return;
+    }
+    auto* routine = static_cast<gCScriptRoutine_PS*>(entity->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    auto* receiver = static_cast<gCDamageReceiver_PS*>(entity->GetPropertySet(eEPropertySetType_DamageReceiver));
+    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+    const Mirror* mirror = FocusMirror(entity);
+    const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    Logf("npcs: FOCUSVICTIM seq=%u id=%s name=%.48s ai=%d hp=%ld dead=%d down=%d combat=%lu entity_flags=%08X group=%d ragdoll=%d life=%u terminal=%d shown_dead=%d latest_flags=%u shown_sent=%u latest_sent=%u",
+         serial, FocusIdentity(entity).c_str(), entity->GetName().GetText(),
+         routine ? static_cast<int>(victim.Routine.AIMode) : -1, receiver ? receiver->GetHitPoints() : -1L,
+         routine && victim.IsDead(), routine && victim.IsDown(), npc ? static_cast<unsigned long>(victim.NPC.CombatState) : 0,
+         FocusEntityFlags(entity), static_cast<int>(entity->GetCollisionGroup()), animation && animation->GetRagDollEnabled(),
+         mirror ? mirror->deathLife.incarnation : 0, mirror && mirror->deathLife.dead, mirror && mirror->killed,
+         mirror ? mirror->latest.flags : 0, mirror ? mirror->shownSent : 0, mirror ? mirror->latestSent : 0);
+    if (npc)
+        Logf("npcs: FOCUSVICTIMBIND seq=%u target=%s alternative=%s attacker=%s last=%s spell=%s",
+             serial, FocusIdentity(victim.NPC.GetCurrentTarget().GetInstance()).c_str(),
+             FocusIdentity(victim.NPC.GetAlternativeTarget().GetInstance()).c_str(),
+             FocusIdentity(victim.NPC.GetCurrentAttacker().GetInstance()).c_str(),
+             FocusIdentity(victim.NPC.GetLastAttacker().GetInstance()).c_str(),
+             FocusIdentity(victim.NPC.GetSpellTarget().GetInstance()).c_str());
+}
+
+bool ReadFocusCandidates(uint32_t serial, gCFocus_PS& focus, std::vector<eCEntity*>& candidates)
+{
+    static const bool supported = [] {
+        auto* game = GetModuleHandleA("Game.dll");
+        auto* code = game ? reinterpret_cast<unsigned char const*>(GetProcAddress(game,
+            "?CollectInteractionEntities@gCFocus_PS@@IAEXM@Z")) : nullptr;
+        unsigned char bytes[0x23] = {};
+        static unsigned char const array[] = {0x8d, 0xbd, 0x78, 0x01, 0, 0};
+        return code && ReadProcessMemory(GetCurrentProcess(), code, bytes, sizeof(bytes), nullptr) &&
+            !std::memcmp(bytes + 8, array, sizeof(array)) && !std::memcmp(bytes + 0x20, "\x89\x5f\x04", 3);
+    }();
+    if (!supported) {
+        Logf("npcs: FOCUSSCAN seq=%u cached_layout=unsupported", serial);
+        return false;
+    }
+    struct List { eCEntity** data; int count, capacity; } list{};
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<unsigned char*>(&focus) + 0x178,
+                           &list, sizeof(list), nullptr) ||
+        list.count < 0 || list.capacity < list.count || list.capacity > 100000 || (list.count && !list.data)) {
+        Logf("npcs: FOCUSSCAN seq=%u cached_layout=invalid", serial);
+        return false;
+    }
+    candidates.resize(static_cast<size_t>(list.count));
+    if (list.count && !ReadProcessMemory(GetCurrentProcess(), list.data, candidates.data(),
+                                       candidates.size() * sizeof(eCEntity*), nullptr)) {
+        Logf("npcs: FOCUSSCAN seq=%u cached_read=failed", serial);
+        candidates.clear();
+        return false;
+    }
+    return true;
+}
+
+void LogFocusCandidate(uint32_t serial, eCEntity* hero, gCFocus_PS& focus, eCEntity* candidate,
+                       gCInteraction_PS* interaction, bool inRoi, bool nativeListed)
+{
+    eCEntity* heroTarget = Entity(hero).NPC.GetCurrentTarget().GetInstance();
+    Entity entity(candidate);
+    const bool item = candidate->GetPropertySet(eEPropertySetType_Item) != nullptr;
+    const bool collected = inRoi && candidate->IsPickable() && static_cast<int>(candidate->GetCollisionGroup()) != 5 &&
+        (!item || !entity.Item.IsEquipped());
+    auto* routine = static_cast<gCScriptRoutine_PS*>(candidate->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    auto* receiver = static_cast<gCDamageReceiver_PS*>(candidate->GetPropertySet(eEPropertySetType_DamageReceiver));
+    auto* inventory = static_cast<gCInventory_PS*>(candidate->GetPropertySet(eEPropertySetType_Inventory));
+    const bool npc = candidate->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    const bool dead = routine && entity.IsDead();
+    bool loot = !inventory || (!dead && !candidate->IsKilled());
+    for (int s = 0; !loot && s < inventory->GetStackCount(); ++s) {
+        const auto* stack = inventory->GetStack(s);
+        loot = stack && static_cast<int>(stack->GetCategory()) != 0 &&
+            static_cast<int>(inventory->GetStackCategory(s)) != 9 && static_cast<int>(stack->GetType().GetValue()) != 2;
+    }
+    float angle = 0.0f;
+    const bool valid = FocusInspection::Valid(focus, candidate);
+    const bool check = collected && valid && FocusInspection::Check(focus, candidate, angle);
+    eCEntity* nativeTarget = npc ? entity.NPC.GetCurrentTarget().GetInstance() : nullptr;
+    const Mirror* mirror = FocusMirror(candidate);
+    const int scriptPriority = GetScriptAdminExt().CallScript(bCString("GetFocusEntityPriority"), candidate, nullptr, 0);
+    Logf("npcs: FOCUSCAND seq=%u id=%s name=%.48s roi=%d collected=%d native_listed=%d type_valid=%d loot=%d native_check=%d angle=%.1f priority=%.1f script=%d ai=%d hp=%ld dead=%d down=%d combat=%lu target=%s same_target=%d host_target=%08X ready=%d shown_sent=%u latest_sent=%u flags=%08X group=%d interaction_priority=%d user=%s",
+         serial, FocusIdentity(candidate).c_str(), candidate->GetName().GetText(), inRoi, collected, nativeListed, valid, loot, check, angle,
+         FocusInspection::Priority(focus, candidate), scriptPriority, routine ? static_cast<int>(entity.Routine.AIMode) : -1,
+         receiver ? receiver->GetHitPoints() : -1L, dead, routine && entity.IsDown(),
+         npc ? static_cast<unsigned long>(entity.NPC.CombatState) : 0, FocusIdentity(nativeTarget).c_str(),
+         npc && nativeTarget == heroTarget, mirror ? mirror->shownCombatTarget : 0, Ready(candidate),
+         mirror ? mirror->shownSent : 0, mirror ? mirror->latestSent : 0, FocusEntityFlags(candidate),
+         static_cast<int>(candidate->GetCollisionGroup()), interaction ? static_cast<int>(interaction->GetFocusPriority().GetValue()) : -1,
+         FocusIdentity(interaction ? interaction->AccessUser().GetEntity() : nullptr).c_str());
+    if (npc)
+        Logf("npcs: FOCUSRULE seq=%u id=%s attitude=%d last_fight=%d party=%s host_flags=%u latest_ai=%u latest_target=%08X life=%u terminal=%d shown_dead=%d",
+             serial, FocusIdentity(candidate).c_str(), static_cast<int>(entity.NPC.AttitudeToPlayer2),
+             static_cast<int>(entity.NPC.LastFightAgainstPlayer),
+             FocusIdentity(candidate->GetPropertySet(eEPropertySetType_Party) ? entity.Party.GetPartyLeader().GetInstance() : nullptr).c_str(),
+             mirror ? mirror->latest.flags : 0, mirror ? mirror->latest.aiMode : 0,
+             mirror ? mirror->latest.combatTarget : 0, mirror ? mirror->deathLife.incarnation : 0,
+             mirror && mirror->deathLife.dead, mirror && mirror->killed);
+}
+
+void LogFocusCandidates(uint32_t serial, eCEntity* hero, gCFocus_PS& focus)
+{
+    auto const& interactions = gCInteractionAdmin::GetInstance().GetInteractionsInROI();
+    const float range = FocusInspection::Range(focus);
+    std::vector<eCEntity*> cached;
+    const bool haveCached = ReadFocusCandidates(serial, focus, cached);
+    std::unordered_set<eCEntity*> native(cached.begin(), cached.end()), roi, seen;
+    Logf("npcs: FOCUSSCAN seq=%u roi_count=%d max_range=%.1f scan_mode=%d cached_available=%d cached_count=%zu source=roi_and_last_native_collection",
+         serial, interactions.GetCount(), range, static_cast<int>(focus.GetCombatMode()), haveCached, cached.size());
+    for (int i = 0; i < interactions.GetCount(); ++i) {
+        auto* interaction = interactions.GetAt(i);
+        eCEntity* candidate = interaction ? interaction->GetEntity() : nullptr;
+        if (candidate) roi.insert(candidate);
+        if (!candidate || candidate == hero || candidate->GetDistanceToEntity(*hero) > range || !seen.insert(candidate).second) continue;
+        LogFocusCandidate(serial, hero, focus, candidate, interaction, true, native.count(candidate) != 0);
+    }
+    for (auto* candidate : cached) {
+        if (!candidate || !seen.insert(candidate).second) continue;
+        if (!FocusProcessed(candidate)) {
+            Logf("npcs: FOCUSCACHED seq=%u target=%s", serial, FocusRawIdentity(candidate).c_str());
+            continue;
+        }
+        auto* interaction = static_cast<gCInteraction_PS*>(candidate->GetPropertySet(eEPropertySetType_Interaction));
+        LogFocusCandidate(serial, hero, focus, candidate, interaction, roi.count(candidate) != 0, true);
+    }
+    // Missing interaction registration is distinguishable from a registered candidate rejected by priority.
+    for (auto const* records : {&mirrors, &corpses})
+        for (auto const& entry : *records) {
+            Entity live = Resolve(entry.second.latest.guid);
+            eCEntity* candidate = live.GetInstance();
+            if (!candidate || candidate == hero || candidate->GetDistanceToEntity(*hero) > range || !seen.insert(candidate).second) continue;
+            auto* interaction = static_cast<gCInteraction_PS*>(candidate->GetPropertySet(eEPropertySetType_Interaction));
+            LogFocusCandidate(serial, hero, focus, candidate, interaction, false, false);
+        }
+}
+
+void LogFocusRelations(uint32_t serial, eCEntity* hero)
+{
+    eCEntity* victim = Resolve(targetingWatch.victim).GetInstance();
+    const bTObjArray<Entity> all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i) {
+        Entity entity = all.GetAt(i);
+        if (!entity.GetInstance() || !entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) continue;
+        eCEntity* target = entity.NPC.GetCurrentTarget().GetInstance();
+        eCEntity* attacker = entity.NPC.GetCurrentAttacker().GetInstance();
+        eCEntity* last = entity.NPC.GetLastAttacker().GetInstance();
+        if (target != hero && attacker != hero && last != hero &&
+            (!victim || (target != victim && attacker != victim && last != victim))) continue;
+        Logf("npcs: FOCUSREL seq=%u npc=%s target=%s attacker=%s last=%s party=%s ai=%d",
+             serial, FocusIdentity(entity.GetInstance()).c_str(), FocusIdentity(target).c_str(),
+             FocusIdentity(attacker).c_str(), FocusIdentity(last).c_str(),
+             FocusIdentity(entity.GetInstance()->GetPropertySet(eEPropertySetType_Party) ? entity.Party.GetPartyLeader().GetInstance() : nullptr).c_str(),
+             entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine) ? static_cast<int>(entity.Routine.AIMode) : -1);
+    }
+}
+
+void TickTargetingWatch(uint32_t now)
+{
+    if (net::IsHost()) return;
+    eCEntity* hero = remote::ControlledBody();
+    if (!hero) hero = gCSession::GetInstance().GetHero();
+    if (!hero || !hero->GetPropertySet(eEPropertySetType_NPC) || !hero->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;
+    Entity local(hero);
+    auto* routine = static_cast<gCScriptRoutine_PS*>(hero->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    auto* focus = static_cast<gCFocus_PS*>(hero->GetPropertySet(eEPropertySetType_Focus));
+    auto* animation = static_cast<eCVisualAnimation_PS*>(hero->GetPropertySet(eEPropertySetType_Animation));
+    const int weaponMode = static_cast<int>(gCEntity::GetCombatMode(hero));
+    const int aiMode = static_cast<int>(local.Routine.AIMode);
+    const uint32_t combat = local.NPC.CombatState;
+    const bool changed = targetingWatch.body != hero || targetingWatch.weaponMode != weaponMode ||
+        targetingWatch.aiMode != aiMode || targetingWatch.combatState != combat;
+    const bool recent = targetingWatch.haveKill && now - targetingWatch.killedAt <= 30000;
+    const bool drawn = weaponMode >= 2 && weaponMode <= 4;
+    targetingWatch.body = hero;
+    targetingWatch.weaponMode = weaponMode;
+    targetingWatch.aiMode = aiMode;
+    targetingWatch.combatState = combat;
+    if (!changed && !(drawn && recent && now - targetingWatch.loggedAt >= 1000)) return;
+    targetingWatch.loggedAt = now;
+    const uint32_t serial = ++targetingWatch.serial;
+    Logf("npcs: FOCUSSTATE seq=%u reason=%s hero=%s weapon=%d drawn=%d ai=%d combat=%u task=%.48s state=%.48s action=%d ani=%d focus_mode=%d lock=%d autocollect=%d autoaim=%d kill_age=%ld range_rating=%d overrides=%.1f/%.1f/%.1f/%.1f draw_name=%d highlight=%d/%d session_hero=%p",
+         serial, changed ? "transition" : "postkill", FocusIdentity(hero).c_str(), weaponMode, drawn, aiMode, combat,
+         local.Routine.GetCurrentTask().GetText(), local.Routine.GetCurrentState().GetText(),
+         static_cast<int>(local.Routine.Action), static_cast<int>(local.Routine.AniState),
+         focus ? static_cast<int>(focus->GetCurrentMode().GetValue()) : -1, focus && focus->GetFocusLocked(),
+         focus && focus->GetAutoCollectFocus(), animation && animation->IsAutoAimingEnabled(),
+         targetingWatch.haveKill ? static_cast<long>(now - targetingWatch.killedAt) : -1L,
+         focus && focus->GetEnableRangeRating(), focus ? focus->GetOverrideItemPriority() : 0.0f,
+         focus ? focus->GetOverrideCharacterPriority() : 0.0f, focus ? focus->GetOverrideInteractPriority() : 0.0f,
+         focus ? focus->GetOverrideRange() : 0.0f, focus && focus->GetDrawFocusName(),
+         focus && focus->GetHighlightFocus(), focus && focus->GetHighlightFocusInFight(), gCSession::GetInstance().GetHero());
+    Logf("npcs: FOCUSBIND seq=%u focus=%s current=%s alternative=%s attacker=%s last=%s spell=%s",
+         serial, FocusIdentity(focus ? local.Focus.GetFocusEntity().GetInstance() : nullptr).c_str(),
+         FocusIdentity(local.NPC.GetCurrentTarget().GetInstance()).c_str(),
+         FocusIdentity(local.NPC.GetAlternativeTarget().GetInstance()).c_str(),
+         FocusIdentity(local.NPC.GetCurrentAttacker().GetInstance()).c_str(),
+         FocusIdentity(local.NPC.GetLastAttacker().GetInstance()).c_str(),
+         FocusIdentity(local.NPC.GetSpellTarget().GetInstance()).c_str());
+    Logf("npcs: FOCUSLOOP seq=%u spu_self=%s spu_target=%s spu_other=%s alignment=%s autoaim=%s right=%p left=%p",
+         serial, FocusRawIdentity(routine->GetSPU().GetSelfEntity()).c_str(),
+         FocusRawIdentity(routine->GetSPU().GetTargetEntity()).c_str(),
+         FocusRawIdentity(routine->GetSPU().GetOtherEntity()).c_str(),
+         FocusIdentity(hero->GetPropertySet(eEPropertySetType_CharacterMovement) ? local.GetAlignmentTarget().GetInstance() : nullptr).c_str(),
+         FocusRawIdentity(AutoAimTarget(animation)).c_str(), gCEntity::GetWeapon(hero, GETrue), gCEntity::GetWeapon(hero, GEFalse));
+    LogFocusQueue(serial);
+    if (recent) {
+        LogFocusVictim(serial);
+        if (focus) LogFocusCandidates(serial, hero, *focus);
+        LogFocusRelations(serial, hero);
+    }
+}
 }
 
 void PassiveMirrorTick()
 {
     if (net::IsHost()) return;
     const uint32_t now = net::Now();
+    const auto opponents = mirrors.empty() ? NpcOpponents{} : IndexNpcOpponents();
     if (!absenceCheckAt || now - absenceCheckAt >= 250) {
         absenceCheckAt = now ? now : 1;
         for (auto const& entry : absences) {
@@ -2431,6 +2792,7 @@ void PassiveMirrorTick()
         shown.waiting = presentation.motion.waiting;
         shown.guidePlayer = presentation.motion.guidePlayer;
         shown.aiMode = presentation.motion.aiMode;
+        shown.combatTarget = presentation.motion.combatTarget;
         shown.action = presentation.motion.action;
         shown.attackReason = presentation.motion.attackReason;
         shown.damageType = presentation.motion.damageType;
@@ -2501,8 +2863,18 @@ void PassiveMirrorTick()
         npcProperties->AccessAttitudeToPlayer2().AccessValue() = static_cast<gEAttitude>(shown.attitude);
         m.shownCombatTarget = shown.combatTarget;
         const uint8_t target = (shown.flags >> 3) & 7;
-        npcProperties->AccessCurrentTargetEntity().SetEntity(target
-            ? (target == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(target)) : nullptr);
+        // Melee priority rejects equal current targets, including null == null (Script_Game+0xAA67C).
+        // Replay the actual NPC opponent, not its party leader; only the raw proxy changes, never native AI.
+        eCEntity* opponent = nullptr;
+        if (!m.killed) {
+            opponent = shown.combatTarget ? NpcOpponent(opponents, shown.combatTarget)
+                : target ? (target == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(target)) : nullptr;
+            if (shown.combatTarget && !opponent && m.unresolvedCombatTarget != shown.combatTarget)
+                Logf("npcs: FOCUSTARGET mirror=%p name=%s hash=%08X result=missing_or_ambiguous",
+                     m.entity.GetInstance(), m.entity.GetName().GetText(), shown.combatTarget);
+        }
+        m.unresolvedCombatTarget = !m.killed && shown.combatTarget && !opponent ? shown.combatTarget : 0;
+        npcProperties->AccessCurrentTargetEntity().SetEntity(opponent);
         auto* receiver = static_cast<gCDamageReceiver_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver));
         receiver->AccessHitPointsMax() = shown.hitPointsMax;
         receiver->AccessHitPoints() = m.killed ? 0 : shown.hitPoints;
@@ -2958,18 +3330,7 @@ bool CombatTarget(eCEntity* entity, eCEntity*& target)
             if (mirror.entity.GetInstance() != entity) continue;
             if (!Ready(entity)) return false;
             if (mirror.shownCombatTarget) {
-                target = nullptr;
-                unsigned matches = 0;
-                const bTObjArray<Entity> all = Entity::GetNPCs();
-                for (int i = 0; i < all.GetCount(); ++i) {
-                    Entity candidate = all.GetAt(i);
-                    if (!candidate.GetInstance()) continue;
-                    uint8_t guidBytes[16];
-                    guid::CopyEntity(candidate.GetInstance(), guidBytes);
-                    if (net::HashGuid(guidBytes) != mirror.shownCombatTarget) continue;
-                    if (++matches == 1) target = candidate.GetInstance();
-                    else { target = nullptr; break; }
-                }
+                target = NpcOpponent(IndexNpcOpponents(), mirror.shownCombatTarget);
                 return target != nullptr;
             }
             target = Entity(entity).NPC.GetCurrentTarget().GetInstance();
@@ -2997,6 +3358,7 @@ bool PresentationPending(eCEntity const* entity)
 
 void OnWorldDeactivate()
 {
+    targetingWatch = TargetingWatch{};
     playerContact = PlayerContact{};
     net::ResetNpcReplication();
     mirrors.clear();
@@ -3073,6 +3435,7 @@ void Tick()
     InstallRagdollHook(net::Now());
     PassiveMirrorTick();
     CorpseTick(net::Now());
+    TickTargetingWatch(net::Now());
 }
 
 void LayDownCorpse(eCEntity* entity)

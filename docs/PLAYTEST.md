@@ -162,6 +162,7 @@ engine freeze; capture timing can differ by network latency. Do not claim runtim
 
 Use the same encounter/save on both copies and compare the joining player's targeting with the host's native
 targeting. Repeat at least ten kills, including several enemies together; keep another living enemy in view.
+Keep the joining player's weapon drawn throughout each series: do not sheathe between kills.
 
 - [ ] With melee weapons drawn, kill the focused enemy while continuing the next swing. Repeat with the host
   and another NPC landing the killing blow, and with an enemy dying behind the joining player. The dead enemy
@@ -185,6 +186,34 @@ auto-aim target pointer. `script_priority` is the game's script result for the a
 candidate guess; native category/range/LOS rules still apply. In melee a corpse must not remain the selected
 combat target. With weapons away a corpse may legitimately be selected for loot. Record exact kill times and
 whether the hero was knocked down/dead, looking away, or using an item/dialog when reporting a mismatch.
+
+`FOCUSSTATE` also records weapon/combat transitions and, while a weapon is drawn, samples once per second
+for 30 seconds after the latest death. Match its `seq` to `FOCUSBIND` (all hero target/attacker proxies),
+`FOCUSLOOP` (SPU target, alignment and auto-aim), `FOCUSQUEUE` (pending native action targets),
+`FOCUSVICTIM`/`FOCUSVICTIMBIND` (native corpse and replicated life/bindings), and `FOCUSREL`
+(NPCs targeting/attacking the hero or the latest victim). Identities include pointer/full GUID.
+A raw queue/SPU/aim pointer outside the engine's processed set is reported as `not_processed`, not dereferenced;
+an unsupported native queue layout is explicitly reported, never read speculatively.
+
+`FOCUSSCAN`/`FOCUSCAND` list the nearby interaction ROI candidates, the last actual native collection
+(`native_listed`), and nearby mirrors missing from that ROI. The native cached list is read only after
+verifying its collector's layout; unsupported/invalid/unreadable layouts are explicit. It is the last
+collection, not a new scan, so compare `scan_mode`, `autocollect`, lock and the current ROI when it is stale.
+They report registration/collection, native type and cone/range/LOS/priority checks, corpse loot, flags,
+HP/AIMode, each mirror's buffered opponent hash and actual native target, and equality with the hero's target.
+`native_check` includes priority; it is an individual admissibility check, not a forced selection or a claim
+that a candidate wins over all others. `FOCUSRULE` adds attitude, party, last-fight and latest-versus-presented
+state. Normal cone/LOS/loot/user and category rules still apply. No diagnostic performs a focus scan or changes
+targets, locks, scripts or queued actions.
+
+For the missing-opponent defect, look for a living combat mirror (`ai=3`) with `host_target` nonzero but
+`target=null`, the hero's `current=null`, `same_target=1`, and `script=-1`: native melee priority rejects even
+two null targets. `FOCUSTARGET ... result=missing_or_ambiguous` explains a hash that cannot be safely resolved.
+With replay working, the native target must resolve to that reported NPC and the false null/null equality
+must disappear. If it does not explain an occurrence, retain the whole sequence through sheathing:
+a corpse returning in `FOCUSQUEUE`, SPU/current target, lock or aim is a different mechanism, not proof of
+this one. Existing logs did not contain candidate target identities, so the historical symptom's attribution
+still requires the manual encounter; builds and replay tests alone cannot establish that.
 
 ### Optional: 30 more minutes for the features of 0.3.0
 

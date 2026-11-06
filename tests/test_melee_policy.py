@@ -176,15 +176,24 @@ int main()
         self.assertIn("hit.contact = contact;", self.combat)
         self.assertIn("hit.incarnation, hit.contact", self.combat)
 
-    def test_npc_opponent_is_metadata_not_a_new_engine_target_binding(self):
+    def test_npc_opponent_replay_and_contact_query_share_collision_checked_identity(self):
         self.assertIn("r.combatTarget = net::HashGuid(targetGuid)", self.npcs)
         self.assertIn("m.shownCombatTarget = shown.combatTarget;", self.npcs)
         query = self.npcs.split("bool CombatTarget(", 1)[1].split("bool PresentationPending(", 1)[0]
-        self.assertIn("net::HashGuid(guidBytes)", query)
-        self.assertIn("matches", query)
+        self.assertIn("NpcOpponent(IndexNpcOpponents(), mirror.shownCombatTarget)", query)
         self.assertIn("return target != nullptr;", query)
         self.assertNotIn("SetEntity", query)
         self.assertNotIn("SetCurrentTarget", query)
+        index = self.npcs.split("NpcOpponents IndexNpcOpponents()", 1)[1].split("struct TargetingWatch", 1)[0]
+        self.assertIn("net::HashGuid(bytes)", index)
+        self.assertIn("inserted.first->second != entity", index)
+        self.assertIn("inserted.first->second = nullptr", index)
+        replay = self.npcs.split("m.shownCombatTarget = shown.combatTarget;", 1)[1].split("auto* receiver =", 1)[0]
+        self.assertIn("if (!m.killed)", replay)
+        self.assertIn("shown.combatTarget ? NpcOpponent(opponents, shown.combatTarget)", replay)
+        self.assertIn("AccessCurrentTargetEntity().SetEntity(opponent)", replay)
+        self.assertNotIn("CallScript", replay)
+        self.assertNotIn("SetCurrentTarget", replay)
         judge = self.combat.split("MeleeVerdict JudgeMelee(", 1)[1].split("void LogMelee(", 1)[0]
         self.assertIn("!npcs::Ready(result.focus)", judge)
         self.assertIn("!npcs::Ready(opponent)", judge)
