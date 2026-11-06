@@ -139,7 +139,7 @@ struct SentStates
 };
 std::unordered_map<std::string, SentStates> sentStates;
 constexpr uint32_t SentStatesFor = 1500;  // ms
-// On by default since 29.10. (stageLagBlock under G3_NETSIM 800: without it every blow on an NPC parrying when the claim came,
+// On by default since 29.10.
 // though the client saw him not parrying, was blocked; with it they land as seen, 4 of 4 runs). QA lagblockon / lagblockoff.
 bool lagBlocks = true;
 unsigned swingSamples = 0, swingArmed = 0;  // Stufe 4.1 (SwingSamples)

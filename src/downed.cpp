@@ -50,7 +50,7 @@ char const* const PotionPrefix = "It_Potion_Health";  // healing potions (the ga
 constexpr float ReviveRange = 250.0f;  // cm: a partner standing next to the hero
 constexpr uint32_t ReviveTime = 3000;  // ms the partner has to stay there
 constexpr uint32_t StaleState = 5000;  // ms: a remote state older than this does not count
-constexpr uint32_t AloneGrace = 5000;  // ms nobody can help before the knocked-out hero dies (a partner loading a save)
+constexpr uint32_t AloneGrace = 5000;  // ms unknown or unavailable partner state can keep the original grace
 constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still says "down" for a moment
 
 bool held = false;              // the local hero lies knocked out and waits for help
@@ -65,7 +65,7 @@ bool dying = false;             // nobody could help: the hero dies like in the 
 uint32_t diedAt = 0;            // when the death task was (last) set
 std::string inHand[2];         // the hero's right and left hand while standing (a knock-out drops them)
 bool wasDown = false;
-uint32_t aloneSince = 0;        // when the knocked-out hero last had nobody able to help (0: someone can)
+uint32_t aloneSince = 0;        // when the knocked-out hero last had nobody known able to help (0: someone can)
 int revivedBy = 0;              // a partner paid for our revive (set by the network, handled in Tick)
 bool told[net::MaxPlayers] = {};  // this player already saw "X is down" for player i
 bool toldDead[net::MaxPlayers] = {};
@@ -73,11 +73,10 @@ uint32_t helpingSince[net::MaxPlayers] = {};  // local hero next to downed playe
 bool hinted[net::MaxPlayers] = {};            // "you need a potion" shown for this stay next to player i
 uint32_t paidAt[net::MaxPlayers] = {};        // when we paid a potion for player i
 
-// A remote player who can help: in the same world, in game, recent, neither dead nor waiting for help itself. One
-// in a knock-out of the game's own stands up by itself shortly.
+// A remote player who can help: in the same world, in game, recent, and not knocked out, dead, or waiting for help itself.
 bool Able(net::Remote const& r, uint32_t now)
 {
-    return r.connected && r.latestTicks && now - r.latestTicks < StaleState && (r.latest.flags & 1) && !(r.latest.flags & 12) &&
+    return r.connected && r.latestTicks && now - r.latestTicks < StaleState && (r.latest.flags & 1) && !(r.latest.flags & 14) &&
            r.latest.world == remote::CurrentWorld();
 }
 
@@ -85,6 +84,22 @@ bool Present(net::Remote const& r, uint32_t now)
 {
     return r.connected && r.latestTicks && now - r.latestTicks < StaleState && (r.latest.flags & 1) &&
            r.latest.world == remote::CurrentWorld();
+}
+
+// Every connected partner is known to be down, knocked out, or dead. Missing, stale, loading, disconnected, or
+// another-world remotes are not authoritative and keep the grace path instead.
+bool AllOthersDown(net::Remote const* remotes, uint32_t now)
+{
+    bool present = false;
+    for (int i = 1; i < net::MaxPlayers; ++i) {
+        if (i == net::LocalId()) continue;
+        net::Remote const& r = remotes[i];
+        if (!r.connected) continue;
+        if (!Present(r, now)) return false;
+        present = true;
+        if (!(r.latest.flags & 14)) return false;
+    }
+    return present;
 }
 
 void Wide(char const* text, wchar_t* out, int size)
@@ -265,7 +280,7 @@ void WatchBlows(Entity& hero, uint32_t now)
 }
 
 // A partner is in the game (any world): only then does a lethal knock-out wait for help, else the game's own rule stands as in
-// single-player (alone, the hero would die after five seconds).
+// single-player.
 bool PartnerPresent(net::Remote const* remotes, uint32_t now)
 {
     for (int i = 1; i < net::MaxPlayers; ++i)
@@ -273,7 +288,8 @@ bool PartnerPresent(net::Remote const* remotes, uint32_t now)
     return false;
 }
 
-// Nobody can help: the hero dies the way the game lets it die (the death task, whose script shows the game over).
+// Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths then die like single-player
+// (the death task, whose script shows the game over).
 void Die(Entity& hero)
 {
     dying = true;
@@ -312,8 +328,8 @@ bool RedirectDeath(eCEntity* self, char const* state)
 // and calls ContinueRoutine (static analysis). The task time is held at 0 and the hit points at most 1 (the loop
 // heals +10 per second) until a partner who stood next to the hero for 3 s pays a healing potion for it (owner,
 // 19.10.); then it stands up with a quarter of its hit points. Without a potion the partner is told so and the
-// hero stays down. When nobody can help for 5 s (alone, everybody down or dead, partner gone), the hero dies like
-// in the single-player game.
+// hero stays down. When every known, connected partner is down or dead, the hero dies immediately. Unknown, stale,
+// loading, disconnected, or another-world partner state retains the original 5-second grace.
 void Tick()
 {
     gCSession& session = gCSession::GetInstance();
@@ -345,7 +361,26 @@ void Tick()
         toldDead[i] = dead;
     }
 
-    if (hero.IsDead()) { held = false; lethal = false; return; }
+    if (hero.IsDead()) { held = false; lethal = false; revivedBy = 0; return; }
+    if (dying) {
+        // Terminal death: ending/dialog state may make the hero look stood up or let the death task be replaced.
+        // Keep the latch and reassert ZS_Dead until the hero is truly dead.
+        held = false;
+        lethal = false;
+        lethalSeenDown = false;
+        nativeNoted = false;
+        revivedBy = 0;
+        if (hero.PlayerMemory.GetHitPoints() > 0) hero.PlayerMemory.SetHitPoints(0);
+        const bCString task = hero.Routine.GetCurrentTask();
+        if (std::strcmp(task.GetText(), DeathTask) != 0 && now - diedAt >= 500) {
+            diedAt = now;
+            Logf("downed: the death task was replaced by %s; dying again", task.GetText());
+            hero.PlayerMemory.SetHitPoints(0);
+            hero.Routine.FullStop();
+            hero.Routine.SetTask(bCString(DeathTask));
+        }
+        return;
+    }
     WatchBlows(hero, now);
     const bool down = hero.IsDown();
     if (!down) {
@@ -372,19 +407,6 @@ void Tick()
         revivedBy = 0;
         if (autoHelp) Help(hero, remotes, now);
         else OfferHelp(hero, remotes, now);
-        return;
-    }
-    if (dying) {
-        // A hit on the dying hero (an orc striking it again) set a knock-out over the death task, and the hero lay
-        // there for good (stage A2, second run). Until it is dead, put the death back.
-        const bCString task = hero.Routine.GetCurrentTask();
-        if (std::strcmp(task.GetText(), DeathTask) != 0 && now - diedAt >= 500) {
-            diedAt = now;
-            Logf("downed: the death task was replaced by %s; dying again", task.GetText());
-            hero.PlayerMemory.SetHitPoints(0);
-            hero.Routine.FullStop();
-            hero.Routine.SetTask(bCString(DeathTask));
-        }
         return;
     }
     if (!held) {
@@ -420,6 +442,7 @@ void Tick()
     if (revivedBy) {
         const int by = revivedBy;
         revivedBy = 0;
+        if (dying || !held || hero.IsDead() || !hero.IsDown()) return;
         held = false;
         aloneSince = 0;
         ++revives;
@@ -435,14 +458,33 @@ void Tick()
     for (int i = 1; i < net::MaxPlayers; ++i)
         if (i != self && Able(remotes[i], now)) helpPossible = true;
     if (helpPossible) { aloneSince = 0; return; }
-    if (!aloneSince) { aloneSince = now ? now : 1; return; }
+    if (AllOthersDown(remotes, now)) {
+        Die(hero);
+        return;
+    }
+    if (!aloneSince) aloneSince = now ? now : 1;
     if (now - aloneSince >= AloneGrace) Die(hero);
 }
 
 // A partner paid a potion for us (WorldState kind 8 to this player).
 void Revived(int byPlayer)
 {
-    if (byPlayer > 0 && byPlayer < net::MaxPlayers) revivedBy = byPlayer;
+    if (byPlayer <= 0 || byPlayer >= net::MaxPlayers) {
+        revivedBy = 0;
+        return;
+    }
+    gCSession& session = gCSession::GetInstance();
+    eCDynamicEntity* instance = session.GetHero();
+    if (!held || dying || !instance || !session.IsGameRunning()) {
+        revivedBy = 0;
+        return;
+    }
+    Entity hero(instance);
+    if (hero.IsDead() || !hero.IsDown()) {
+        revivedBy = 0;
+        return;
+    }
+    revivedBy = byPlayer;
 }
 
 // A partner stood next to us without a healing potion (kind 9).

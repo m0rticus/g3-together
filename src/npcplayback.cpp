@@ -7,7 +7,6 @@
 #include "net.h"
 #include "hud.h"
 #include "i18n.h"
-#include "qa.h"
 #include "remote.h"
 #include "config.h"
 #include "npcs.h"
@@ -190,10 +189,39 @@ bool Passive(eCEntity const* entity)
 // the game does. The host still simulates it; tasks, movement and animation stay blocked and its pose comes from the host.
 bool DialogPartner(eCEntity const* entity) { return entity && talk::TalkingWithHero(entity); }
 
+bool SafeNativeProperty(eEPropertySetType type)
+{
+    switch (type) {
+    case eEPropertySetType_Base:
+    case eEPropertySetType_MeshVisual:
+    case eEPropertySetType_DummyVisual:
+    case eEPropertySetType_Advanced:
+    case eEPropertySetType_DynamicCollisionCircle:
+    case eEPropertySetType_CollisionCircle:
+    case eEPropertySetType_RigidBody:
+    case eEPropertySetType_CollisionShape:
+    case eEPropertySetType_NPC:
+    case eEPropertySetType_Inventory:
+    case eEPropertySetType_Damage:
+    case eEPropertySetType_DamageReceiver:
+    case eEPropertySetType_Interaction:
+    case eEPropertySetType_Focus:
+    case eEPropertySetType_Party:
+    case eEPropertySetType_ArmorSet:
+    case eEPropertySetType_Item:
+    case eEPropertySetType_EditorVisual:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void PropertyDispatch(eCEntityPropertySet* self, void* edx, unsigned phase)
 {
-    const bool partnerRoutine = self->GetPropertySetType() == eEPropertySetType_ScriptRoutine && DialogPartner(self->GetEntity());
-    if (!partnerRoutine && Passive(self->GetEntity()) && !(updatingVisual && self->GetPropertySetType() == eEPropertySetType_Animation)) {
+    const eEPropertySetType type = self->GetPropertySetType();
+    const bool partnerRoutine = type == eEPropertySetType_ScriptRoutine && DialogPartner(self->GetEntity());
+    if (!partnerRoutine && Passive(self->GetEntity()) &&
+        !SafeNativeProperty(type) && !(updatingVisual && type == eEPropertySetType_Animation)) {
         ++blockedProperties;
         if (self->GetEntity() == probe.target) ++probe.propertiesBlocked;
         return;
@@ -301,19 +329,16 @@ GEBool __fastcall AddProperty(eCEntity* self, void* edx, eCEntityPropertySet* pr
 
 void __fastcall EntityProcess(eCEntity* self, void* edx, GEBool recursive)
 {
-    if (Passive(self) && !DialogPartner(self)) { ++probe.entityBlocked; ++blockedEntities; return; }
     originalEntityProcess(self, edx, recursive);
 }
 
 void __fastcall EntityPre(eCEntity* self, void* edx, GEBool recursive)
 {
-    if (Passive(self) && !DialogPartner(self)) { ++blockedEntities; return; }
     originalEntityPre(self, edx, recursive);
 }
 
 void __fastcall EntityPost(eCEntity* self, void* edx, GEBool recursive)
 {
-    if (Passive(self) && !DialogPartner(self)) { ++blockedEntities; return; }
     originalEntityPost(self, edx, recursive);
 }
 
@@ -1373,76 +1398,4 @@ void Tick()
     ++probe.frames;
 }
 
-void Probe(char const* argument, LogFn log)
-{
-    if (!qa::Enabled() || !net::IsHost()) {
-        log("REFUSED passiveprobe needs=qa_running_host");
-        return;
-    }
-    if (argument && !std::strcmp(argument, "prepare")) {
-        log(Install() ? "PASSIVEPROBE prepared=1" : "REFUSED passiveprobe reason=unsupported_native_hooks");
-        return;
-    }
-    if (!gCSession::GetInstance().IsGameRunning()) { log("REFUSED passiveprobe reason=not_in_game"); return; }
-    if (argument && !std::strncmp(argument, "clone_", 6)) {
-        constexpr char TargetName[] = "G3T_ReplayProbe";
-        const Entity source = Entity::GetEntity(bCString(argument + 6));
-        const Template shape(argument + 6);
-        if (!source.GetInstance() || !shape.IsValid() || Entity::GetEntity(bCString(TargetName)).GetInstance()) {
-            log("REFUSED passiveprobe reason=invalid_or_existing_clone");
-            return;
-        }
-        Entity target = Entity::Spawn(shape, source.GetInstance()->GetWorldMatrix());
-        if (!target.GetInstance()) { log("REFUSED passiveprobe reason=clone_spawn_failed"); return; }
-        target.GetInstance()->SetName(bCString(TargetName));
-        target.EnableProcessing(GETrue);
-        log("PASSIVEPROBE cloned=1 name=G3T_ReplayProbe");
-        return;
-    }
-    if (argument && !std::strcmp(argument, "off")) { Stop(); log("PASSIVEPROBE active=0"); return; }
-    if (argument && *argument && std::strcmp(argument, "report")) {
-        const bool exactPose = !std::strncmp(argument, "pose_", 5);
-        if (exactPose) argument += 5;
-        char sourceName[96] = {}, targetName[96] = {}, tail = '\0';
-        if (std::sscanf(argument, "%95[^-]-%95s%c", sourceName, targetName, &tail) != 2) {
-            log("REFUSED passiveprobe expected=source-target");
-            return;
-        }
-        eCEntity* source = Entity::GetEntity(bCString(sourceName)).GetInstance();
-        eCEntity* target = Entity::GetEntity(bCString(targetName)).GetInstance();
-        auto isNpc = [](eCEntity* entity) {
-            return entity && entity->GetPropertySet(eEPropertySetType_NPC) &&
-                   entity->GetPropertySet(eEPropertySetType_ScriptRoutine) &&
-                   entity != remote::ControlledBody() && entity != gCSession::GetInstance().GetHero() && !remote::IsPuppet(entity);
-        };
-        if (!isNpc(source) || !isNpc(target) || source == target || !Animation(target) || !Animation(source) ||
-            !Animation(source)->GetActor()) {
-            log("REFUSED passiveprobe reason=invalid_source_or_target");
-            return;
-        }
-        if (!Install()) { log("REFUSED passiveprobe reason=unsupported_native_hooks"); return; }
-        if (!RegisterEntity(target)) { log("REFUSED passiveprobe reason=unsupported_property_dispatch"); return; }
-        Stop();
-        probe.source = source;
-        probe.exactPose = exactPose;
-        probe.originalPose = target->GetWorldMatrix();
-        probe.originalTask = Entity(target).Routine.GetCurrentTask();
-        Entity(target).Routine.FullStop();
-        Entity(target).CharacterMovement.StopMovement();
-        probe.target = target;
-        Tick();
-    }
-    char line[768];
-    Format(line, "PASSIVEPROBE active=%d failed=%d frames=%u routine_blocked=%u script_blocked=%u movement_blocked=%u "
-                 "animation_blocked=%u stop_blocked=%u entity_blocked=%u properties_blocked=%u slot_checks=%u slot_errors=%u replays=%u waiting_options=%u "
-                 "max_position_error=%.3f max_rotation_error=%.6f max_phase_error=%.6f bone_checks=%u max_bone_error=%.3f immediate_bone_error=%.3f bone_lookup_error=%.3f worst_bone=%s",
-           probe.target ? 1 : 0, probe.failed ? 1 : 0, probe.frames, probe.routineBlocked, probe.scriptBlocked,
-           probe.movementBlocked, probe.animationBlocked, probe.animationStopsBlocked, probe.entityBlocked, probe.propertiesBlocked,
-           probe.slotChecks, probe.slotErrors, probe.replays,
-           probe.waitingForOptions,
-           probe.maximumPositionError, probe.maximumRotationError, probe.maximumPhaseError, probe.boneChecks,
-           probe.maximumBoneError, probe.maximumImmediateBoneError, probe.maximumBoneLookupError,
-           *probe.maximumBoneName ? probe.maximumBoneName : "-");
-    log(line);
-}
 }

@@ -10,7 +10,6 @@
 #include "net.h"
 #include "npcs.h"
 #include "processing.h"
-#include "qa.h"
 #include "remote.h"
 
 #include <Engine.h>
@@ -29,7 +28,7 @@
 
 namespace g3t::world {
 namespace {
-struct StreamProbeState {
+struct RemoteRegionState {
     std::unique_ptr<eCCameraBase> camera;
     std::unique_ptr<eCPVSPrefetcher3> prefetcher;
     float position[3] = {};
@@ -38,8 +37,7 @@ struct StreamProbeState {
     bool failed = false;
     uint32_t retryAt = 0;
 };
-StreamProbeState streamProbe;
-std::vector<StreamProbeState> hostRegions;
+std::vector<RemoteRegionState> hostRegions;
 std::vector<std::array<float, 3>> simulationAnchors;
 uint32_t anchorsCheckedAt = 0;
 unsigned remoteRegionFailures = 0;
@@ -60,8 +58,6 @@ eCRenderSystemAdmin* RenderAdmin()
 
 using CacheOutFn = GEBool(__fastcall*)(eCPVSPrefetcher3*, void*, eCEntity*);
 CacheOutFn originalCacheOut = nullptr;
-using DestroyEntityFn = void(__fastcall*)(eCEntity*, void*);
-DestroyEntityFn originalDestroyEntity = nullptr;
 unsigned remoteEntityEvictions = 0;
 using ContextCacheOutFn = GEBool(__stdcall*)(eCGeometrySpatialContext*);
 using ContextCallbackGetter = ContextCacheOutFn(__thiscall*)(eCPVSPrefetcher3 const*);
@@ -73,7 +69,6 @@ bool contextRefreshPending = false;
 
 bool RemoteJobsPending()
 {
-    if (streamProbe.prefetcher && streamProbe.prefetcher->IsJobRunning()) return true;
     for (auto& region : hostRegions)
         if (region.prefetcher && region.prefetcher->IsJobRunning()) return true;
     return false;
@@ -86,7 +81,7 @@ void RefreshContexts()
     contextRefreshPending = false;
 }
 
-bool NeedsContext(StreamProbeState& region, bCBox const& context)
+bool NeedsContext(RemoteRegionState& region, bCBox const& context)
 {
     if (!region.camera || !region.prefetcher || region.failed) return false;
     bTSmallArray<eCPVSCellItem*> cells;
@@ -109,7 +104,6 @@ GEBool __stdcall MayReleaseContext(eCGeometrySpatialContext* context)
         ++contextsRetained;
         return GEFalse;
     }
-    if (NeedsContext(streamProbe, context->GetContextBox())) { ++contextsRetained; return GEFalse; }
     for (auto& region : hostRegions)
         if (NeedsContext(region, context->GetContextBox())) { ++contextsRetained; return GEFalse; }
     return previousContextCallback ? previousContextCallback(context) : GETrue;
@@ -153,7 +147,7 @@ void RestoreContextOwnership()
     contextRefreshPending = false;
 }
 
-void EvictRemoteEntity(StreamProbeState& region, eCEntity* entity)
+void EvictRemoteEntity(RemoteRegionState& region, eCEntity* entity)
 {
     if (!region.camera || !region.prefetcher || !entity) return;
     const uint32_t index = region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex();
@@ -179,35 +173,12 @@ GEBool __fastcall CacheOut(eCPVSPrefetcher3* self, void* edx, eCEntity* entity)
 {
     auto* renderer = RenderAdmin();
     if (renderer && self == &renderer->GetPVSPrefetcher3()) {
-        EvictRemoteEntity(streamProbe, entity);
         for (auto& region : hostRegions) EvictRemoteEntity(region, entity);
     } else {
-        if (self == streamProbe.prefetcher.get()) { EvictRemoteEntity(streamProbe, entity); return GETrue; }
         for (auto& region : hostRegions)
             if (self == region.prefetcher.get()) { EvictRemoteEntity(region, entity); return GETrue; }
     }
     return originalCacheOut(self, edx, entity);
-}
-
-void __fastcall DestroyEntityDiagnostic(eCEntity* entity, void* edx)
-{
-    uint32_t flags = 0, databases = 0;
-    std::memcpy(&flags, reinterpret_cast<unsigned char const*>(entity) + 0x3c, sizeof(flags));
-    std::memcpy(&databases, reinterpret_cast<unsigned char const*>(entity) + 0x16c, sizeof(databases));
-    if ((flags & 0x100) || databases) {
-        unsigned cells = 0, permanent = 0;
-        if (auto* renderer = RenderAdmin()) {
-            bTSmallArray<eCPVSCellItem*> all;
-            auto& pvs = renderer->GetPVSPrefetcher3();
-            pvs.GetAllValidCells(all);
-            for (GEU16 i = 0; i < all.GetCount(); ++i) cells += all.GetAt(i)->ExistsEntity(entity) ? 1 : 0;
-            auto* cell = pvs.GetNonDeactivationCell();
-            permanent = cell && cell->ExistsEntity(entity);
-        }
-        Logf("world: cached destruction entity=%p name=%s flags=%08x databases=%08x global_cells=%u permanent=%u",
-             entity, entity->GetName().GetText(), flags, databases, cells, permanent);
-    }
-    originalDestroyEntity(entity, edx);
 }
 
 bool InstallRemoteCacheOut()
@@ -223,19 +194,10 @@ bool InstallRemoteCacheOut()
     }
     originalCacheOut = reinterpret_cast<CacheOutFn>(ai::JumpTo(code, reinterpret_cast<void*>(&CacheOut), sizeof(expected)));
     if (!originalCacheOut) Log("FAIL world: native remote cache-out hook could not be installed");
-    if (originalCacheOut && qa::Enabled() && !originalDestroyEntity) {
-        auto* destroy = reinterpret_cast<unsigned char*>(GetProcAddress(engine, "?Destroy@eCEntity@@UAEXXZ"));
-        const unsigned char prefix[] = {0x51, 0x56, 0x57, 0x8b, 0xf1};
-        if (destroy && !std::memcmp(destroy, prefix, sizeof(prefix))) {
-            originalDestroyEntity = reinterpret_cast<DestroyEntityFn>(
-                ai::JumpTo(destroy, reinterpret_cast<void*>(&DestroyEntityDiagnostic), sizeof(prefix)));
-        }
-        if (!originalDestroyEntity) Log("QA world: cached-destruction diagnostics could not be installed");
-    }
     return originalCacheOut != nullptr;
 }
 
-void ReleaseRegion(StreamProbeState& region);
+void ReleaseRegion(RemoteRegionState& region);
 
 void CompletePrefetcher(eCPVSPrefetcher3& prefetcher)
 {
@@ -251,32 +213,9 @@ void CompletePrefetcher(eCPVSPrefetcher3& prefetcher)
     prefetcher.WaitForEmptyThreadQueue();
 }
 
-void ResetStreamProbe()
+void ReleaseRegion(RemoteRegionState& region)
 {
-    ReleaseRegion(streamProbe);
-}
-
-void TickStreamProbe()
-{
-    if (!streamProbe.camera || !streamProbe.prefetcher || streamProbe.failed) return;
-    auto* renderer = RenderAdmin();
-    if (!renderer) {
-        Log("world: stream probe stopped: render system administration is unavailable");
-        streamProbe.failed = true;
-        return;
-    }
-    eCFrustumDatabase& database = streamProbe.camera->GetFrustumDatabase();
-    if (!streamProbe.prefetcher->Process(database)) {
-        Log("world: stream probe stopped: the prefetcher refused its database");
-        streamProbe.failed = true;
-        return;
-    }
-    ++streamProbe.frames;
-}
-
-void ReleaseRegion(StreamProbeState& region)
-{
-    if (!region.camera) { region = StreamProbeState{}; return; }
+    if (!region.camera) { region = RemoteRegionState{}; return; }
     if (auto* renderer = RenderAdmin()) {
         if (region.prefetcher) CompletePrefetcher(*region.prefetcher);
         CompletePrefetcher(renderer->GetPVSPrefetcher3());
@@ -302,11 +241,11 @@ void ReleaseRegion(StreamProbeState& region)
     } else {
         Log("FAIL world: remote camera retirement has no render system administration");
     }
-    region = StreamProbeState{};
+    region = RemoteRegionState{};
     contextRefreshPending = true;
 }
 
-bool PlaceRegion(StreamProbeState& region, float const at[3], float radius)
+bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
 {
     if (region.failed) {
         if (static_cast<int32_t>(net::Now() - region.retryAt) < 0) return false;
@@ -578,9 +517,7 @@ void HookSpheres()
         }
     }
     DWORD old[2] = {};
-    // QA negative control (only with the QA bot): patch the collection path alone, as the first fix did.
-    const int patched = qa::Enabled() && std::getenv("G3T_QA_COLLECTION_HOOK_ONLY") ? 1 : 2;
-    if (patched == 1) Log("world: QA control: only the collection call site is patched");
+    const int patched = 2;
     for (int i = 0; i < patched; ++i) {
         if (!VirtualProtect(sites[i].call, 5, PAGE_EXECUTE_READWRITE, &old[i])) {
             Logf("world: cannot patch NPC range call (Windows error %lu); native culling retained", GetLastError());
@@ -632,10 +569,6 @@ void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
         for (auto const& anchor : simulationAnchors) {
             std::memcpy(wanted[n].at, anchor.data(), sizeof(wanted[n].at));
             wanted[n++].radius = GetConfig().hostRoi + step;
-        }
-        if (streamProbe.camera && !streamProbe.failed) {
-            std::memcpy(wanted[n].at, streamProbe.position, sizeof(wanted[n].at));
-            wanted[n++].radius = streamProbe.radius + step;
         }
     }
     bool changed = n != sphereCount;
@@ -707,7 +640,6 @@ void Tick()
     HookElastic();
     if (spheresHooked && originalStopSession && gCSession::GetInstance().IsGameRunning()) {
         TickHostRegions();
-        TickStreamProbe();
         RefreshContexts();
     }
     if (GetConfig().hostSimSpheres && net::Now() - elasticLogged >= 5000) {
@@ -737,69 +669,7 @@ void OnWorldDeactivate()
     spheres.clear();
     sphereCount = 0;
     lastAdmin = nullptr;
-    ResetStreamProbe();
     RestoreContextOwnership();
-}
-
-void StreamProbe(char const* argument, LogFn log)
-{
-    if (!qa::Enabled() || !net::IsHost() || !gCSession::GetInstance().IsGameRunning()) {
-        log("REFUSED streamprobe needs=qa_running_host");
-        return;
-    }
-    if (argument && !std::strcmp(argument, "off")) {
-        ResetStreamProbe();
-        RequestProcessingUpdate();
-        log("STREAMPROBE active=0");
-        return;
-    }
-    if (argument && *argument && std::strcmp(argument, "report")) {
-        float at[3] = {}, radius = 0.0f;
-        char tail = '\0';
-        if (std::sscanf(argument, "%f_%f_%f_%f%c", &at[0], &at[1], &at[2], &radius, &tail) != 4 ||
-            !std::isfinite(at[0]) || !std::isfinite(at[1]) || !std::isfinite(at[2]) ||
-            !std::isfinite(radius) || radius < 1000.0f || radius > 15000.0f) {
-            log("REFUSED streamprobe expected=X_Y_Z_radius radius_cm=1000..15000");
-            return;
-        }
-        ResetStreamProbe();
-        if (!PlaceRegion(streamProbe, at, radius)) {
-            log("REFUSED streamprobe reason=remote_region_setup_failed");
-            return;
-        }
-        RequestProcessingUpdate();
-    }
-    if (!streamProbe.camera) { log("STREAMPROBE active=0"); return; }
-    auto* renderer = RenderAdmin();
-    if (!renderer) { log("REFUSED streamprobe reason=no_render_admin"); return; }
-    auto& database = streamProbe.camera->GetFrustumDatabase();
-    bTSmallArray<eCPVSCellItem*> cells;
-    if (!streamProbe.prefetcher) { log("REFUSED streamprobe reason=no_private_prefetcher"); return; }
-    streamProbe.prefetcher->GetValidCells(database, cells);
-    unsigned nearbyNpcs = 0, processed = 0, navigation = 0, floors = 0;
-    if (auto* entities = Processed())
-        for (GEU16 i = 0; i < entities->GetCount(); ++i) {
-            eCEntity* entity = entities->GetAt(i);
-            if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) continue;
-            ++processed;
-            float at[3];
-            PositionOf(entity, at);
-            if (body::Distance(at, streamProbe.position) > streamProbe.radius) continue;
-            ++nearbyNpcs;
-            if (entity->GetPropertySet(eEPropertySetType_Navigation) && Entity(entity).Navigation.GetCurrentZone().GetInstance())
-                ++navigation;
-            if (auto* movement = static_cast<gCCharacterMovement_PS*>(entity->GetPropertySet(eEPropertySetType_CharacterMovement))) {
-                const float ground = movement->GetDistToGround(entity->GetWorldPosition(), GETrue);
-                if (std::isfinite(ground) && std::fabs(ground) < 2000.0f) ++floors;
-            }
-        }
-    char line[320];
-    Format(line, "STREAMPROBE active=1 failed=%d database=%u cells=%d frames=%u job=%d processed_npcs=%u near_npcs=%u nav_npcs=%u floor_npcs=%u "
-                 "position=%.1f,%.1f,%.1f radius=%.0f",
-           streamProbe.failed ? 1 : 0, database.GetFrustumDatabaseIndex(), cells.GetCount(), streamProbe.frames,
-           streamProbe.prefetcher->IsJobRunning() ? 1 : 0, processed, nearbyNpcs, navigation, floors, streamProbe.position[0],
-           streamProbe.position[1], streamProbe.position[2], streamProbe.radius);
-    log(line);
 }
 
 void ProcessingReport(LogFn log)

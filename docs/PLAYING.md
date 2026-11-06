@@ -25,12 +25,11 @@ This is a test version. See the known issues and limitations below.
 ## Installation
 
 **Setup:** once Gothic 3 and both patches are installed, unpack the whole package anywhere and double-click
-`Setup.cmd` (`Einrichten.cmd` for German, `Instalacja.cmd` for Polish). It does the copying and the INI for you: it finds Gothic 3 (Steam, GOG or the
+`Setup.cmd`. It does the copying and the INI for you: it finds Gothic 3 (Steam, GOG or the
 folder you name), checks Community Patch 1.75.14 and Parallel Universe Patch 1.1.1, moves another co-op mod out of
 `scripts`, copies the mod into `scripts` and writes `g3together.ini` from your role. Your display name comes from Steam automatically.
 Steam and the verified `steam_api.dll` are required; setup stops if that DLL cannot be installed.
-Replaced files are kept in `G3Together-backup` in the game folder. The setup was checked on test
-folders, not yet by players; the steps below do the same by hand.
+Replaced files are kept in `G3Together-backup` in the game folder. The steps below do the same by hand.
 
 1. Install Gothic 3 from Steam, then **Community Patch 1.75.14**.
 2. Install [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm)
@@ -100,8 +99,6 @@ goes through Steam, relayed by Valve where needed.
   There is no fallback. ENet's UDP sockets bind only to localhost and accept linked Steam relays, not direct-IP players.
 - The Steam overlay's invite may not open in Gothic 3. It is not needed: the joining player's game finds the host by
   itself, and "Join game" in the Steam friends list works as well while their game is running.
-
-This connection was tested with a stand-in for Steam on one PC; play between two real Steam accounts is still unverified.
 
 The main menu reports creating/hosting/searching/joined states, accepted and ready clients, linked Steam peers and
 measured Steam ping. `pending` means no ping sample exists yet; the host's displayed ping is the maximum linked-peer RTT.
@@ -204,8 +201,9 @@ Independent world-inventory persistence across saves/late joins is not implement
   helper's inventory is consumed.
   Without a potion, both players see a notice and the downed player waits for their partner to
   return with one.
-- If nobody can help because everyone is down, or the partner is disconnected, in another world
-  or out of the game for more than five seconds, the hero dies as in single-player. The host loads a
+- If everybody is known to be down or dead, the hero dies immediately as in single-player.
+  Missing, disconnected, loading, stale, or another-world partner state keeps the original
+  five-second grace instead. The host loads a
   save; the other player is loaded into it automatically.
 - The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
   While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
@@ -259,7 +257,7 @@ Independent world-inventory persistence across saves/late joins is not implement
 | The game may crash during combat or shortly after an enemy dies. The known orc-raid crash has a guard, but other crashes remain possible. | The host should save before difficult fights. Record the time and enemy, and preserve both players' logs before restarting. The host loads the last good save; the other player is loaded into it automatically (if their own game crashed, they restart it and wait in the main menu). |
 | The other player's character briefly lags behind while being hit, or shows a movement inaccurately. | Regroup and wait briefly; use **Page Down** if needed. If enemies, health or positions remain clearly different, stop the fight and record the problem. |
 | Enemies or companions behave differently on the two PCs after joining. | Check that both players see the same characters and movements near the host. If the difference persists, preserve the logs and restart together from the last good save. |
-| "<Name> is using this." when you want to sit down or use a campfire, anvil or other place | Your partner uses it right now; wait until they get up. Only stools were tested by bots; if someone still gets stuck at such a place, record the bug and reload together. |
+| "<Name> is using this." when you want to sit down or use a campfire, anvil or other place | Your partner uses it right now; wait until they get up. If someone gets stuck at such a place, record the bug and reload together. |
 | Saving while transformed into a creature has not been checked. | Transform back before saving. |
 | A controlled or tamed NPC does not follow reliably or leaves the party. | Do not rely on these abilities yet. Record the NPC and time; casting the spell again is not a verified workaround. |
 | Stun and hypnosis cast by the joining player only take effect through the host. | Record failures; the host can cast the spell instead. |
@@ -303,10 +301,10 @@ Independent world-inventory persistence across saves/late joins is not implement
 - Transformations: the other player sees the creature moving, then sees the hero again after the
   transformation ends. Wolf and Bloodfly were tested using the same setup as the game's spell.
   In creature form you fight as yourself: your hits count as yours (knock-outs, kills, experience, murders), and an
-  enemy's hits hurt the creature, not your hidden human body (Wolf tested by bots). Saving while transformed remains
+  enemy's hits hurt the creature, not your hidden human body. Saving while transformed remains
   untested.
 - A partner's hailstorm: its weather now stays at your partner on your PC (it used to darken the sky and strike around your
-  own hero; checked by bots by position and screenshot). Damage comes only from the caster's own hailstorm, as in
+  own hero). Damage comes only from the caster's own hailstorm, as in
   single-player.
 - Enemies attack both players. Their attitude toward a joining player comes from the hero on the
   PC currently simulating the NPC. For example, the host's poor standing with orcs also applies
@@ -325,15 +323,13 @@ Independent world-inventory persistence across saves/late joins is not implement
 - Ice and fire spells that put out burning or freezing (and make such projectiles fall apart) work on the other
   player's NPCs only on your own PC. You will rarely notice this.
 - An NPC with news stops walking up to you when you go more than about 25 m away from it; talk to it yourself.
-- Not checked yet, because the bots cannot set these scenes up: the uprising in Cape Dun, freeing a town in the middle of
-  the game (bots checked Ardea in the opening), quests to drive someone away (their dialog fight) and plundering. They
-  are on the playtest checklist.
-- The main story was played by bots to Innos' ending (with the Nordmar fire chalices). The Adanos and Beliar endings,
+- Not yet checked in a full human session: the uprising in Cape Dun, freeing a town in the middle of
+  the game, quests to drive someone away (their dialog fight) and plundering. They are on the playtest checklist.
+- The Adanos and Beliar endings,
   Xardas' plan and the fifth temple have not been played through together yet, and what happens to the connection after
   the game's end is not known yet.
-- Swimming forward has not been tried by a person yet (the bots cannot swim forward).
+- Swimming forward has not been tried by a person yet.
 - Untested: monsters continuing to attack a downed hero, real internet
-  play, and more than two players. The features above were checked with bots. A first short human
-  test with two windows on one PC found two bugs: enemies ignored the joining player, and combat
-  was not visible on that player's PC. Both were fixed and checked with bots, but have not yet
-  been checked again by human players.
+  play, and more than two players. A first short human test with two windows on one PC found two bugs:
+  enemies ignored the joining player, and combat was not visible on that player's PC. Those fixes need
+  further human verification.

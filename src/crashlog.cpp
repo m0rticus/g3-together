@@ -2,8 +2,6 @@
 #include "crashlog.h"
 
 #include "log.h"
-#include "qa.h"
-
 #include <Game.h>
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -313,13 +311,12 @@ void Tick()
 {
     InstallDumps();  // every player: last-chance minidumps
     if (installed) { TakeScripts(); return; }
-    if (!qa::Enabled()) return;
     installed = true;
     FindModules();
     HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
     undecorate = dbghelp ? reinterpret_cast<UndecorateFn>(GetProcAddress(dbghelp, "UnDecorateSymbolName")) : nullptr;
     AddVectoredExceptionHandler(1, &OnException);
-    Log("crashlog: access violations are logged (QA)");
+    Log("crashlog: access violations are logged");
 }
 
 void NamesOff(LogFn log)

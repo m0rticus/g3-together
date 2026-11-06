@@ -16,8 +16,6 @@ struct Config
     char puppetTemplate[64] = "PC_Hero";  // template used to show other players (the hero himself) who chose no look
     char look[32] = "";                  // this player's own look: the template the others show it as (empty: theirs)
     char partnerKey[16] = "PAGEDOWN";     // key that jumps to the other player (partner.cpp)
-    char qaHostHint[16] = "";             // QA negative controls, only with the QA bot: off (no menu hints), norefusal (no refusal there)
-    bool qaResendGuardOff = false;  // qa_resendguard = off: the host sends its save again while one is on its way (persist.cpp)
     char trace[8] = "off";                // off | on | all: runtime trace to g3trace.log (trace.cpp)
     // Town reputation (enclaves.cpp; the host's setting counts): shared = one town counter for both, the guard pursues
     // the one who did it; together = shared, and both answer for it; personal = each player's own counters.
@@ -32,8 +30,7 @@ struct Config
     bool hostSimSpheres = true;
     // puppet_lead = auto | off (body.cpp, Stufe 3.2): auto shows the other players' puppets where they probably are now (their
     // last movement carried on by half the round trip, at most 150 ms) instead of where their last state came from; off: as
-    // before. Each player for the puppets on its own screen. Auto by default since 28.10. (stageWalk under G3_NETSIM: the
-    // puppet's still frames in curves about halved).
+    // before. Each player for the puppets on its own screen. Auto by default since 28.10.
     bool puppetLead = true;
     // motion_seek = on | off (body.cpp, display step 4, 29.10.): on shows the other machine's blows (its puppet, mirrored NPCs)
     // where the sender's motion is now instead of from their start. On by default since 29.10. (stageSeek under NETSIM 80,40,3:

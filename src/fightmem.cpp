@@ -328,49 +328,4 @@ int Upset(eCEntity* npc, eCEntity* puppet)
     return 1;
 }
 
-std::string Kept(eCEntity* npc)
-{
-    std::string out;
-    if (!IsNpc(npc)) return "-";
-    for (int id = 1; id <= net::MaxPlayers; ++id) {
-        auto it = grudges.find(Key(npc, id));
-        if (it == grudges.end()) continue;
-        char part[64];
-        Format(part, "%s%d:%d:%.1f:%d", out.empty() ? "" : ",", id, it->second.value, it->second.at, it->second.reason);
-        out += part;
-    }
-    return out.empty() ? "-" : out;
-}
-
-void Report(LogFn log)
-{
-    char line[420];
-    Format(line, "FIGHTMEM on=%d installed=%d sound=%d defeated=%d defeat=%d cancel=%d watch=%d sounds=%u defeats=%u watched=%u ends=%u state_runs=%u sent=%u applied=%u defeats_seen=%u defeats_yes=%u",
-              on ? 1 : 0, installed ? 1 : 0, originalSound != nullptr, originalDefeated != nullptr, originalDefeat != nullptr,
-              originalCancel != nullptr, originalWatch != nullptr, sounds, defeats, watched, ends, stateRuns, sent, applied, defeatsSeen,
-              defeatsYes);
-    char more[100];
-    Format(more, " apart=%d kept=%u upset_asked=%u upsets=%u forget=%d forgotten=%u", apart ? 1 : 0, static_cast<unsigned>(grudges.size()),
-              upsetAsked, upsets, forget ? 1 : 0, forgotten);
-    strcat_s(line, more);
-    log(line);
-}
-
-void Off(LogFn log)
-{
-    on = false;
-    log("FIGHTMEMOFF ok=1");
-}
-
-void ApartOff(LogFn log)
-{
-    apart = false;
-    log("GRUDGEOFF ok=1");
-}
-
-void KeepOff(LogFn log)
-{
-    forget = false;
-    log("GRUDGELOADOFF ok=1");
-}
 }

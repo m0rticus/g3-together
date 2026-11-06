@@ -62,7 +62,6 @@ void NpcStill(char const* guid, LogFn log);       // QA P4: the NPC stops (its f
 void NpcPin(char const* guid, LogFn log);         // QA: pin a host NPC's root for five minutes, or off; its AI/animation still run
 void NpcWalk(char const* argument, LogFn log);   // QA: GUID_X_Y_Z, a locally simulated NPC walks to a test goal
 void NpcAttack(char const* guid, LogFn log);     // QA: this exact locally simulated NPC attacks the other player's puppet
-void HitProbe(char const* guid, LogFn log);  // QA P4: parade, strength and protection as the game judges them here  // QA P4: shield in the left hand, parrying, full stamina
 void Swing(char const* state, LogFn log);  // QA: the local hero swings as a key press would
 void PlayerKey(char const* argument, LogFn log);  // QA: key_pressed_pressedBefore_duration, native player input script
 }

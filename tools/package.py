@@ -1,5 +1,5 @@
-"""Build a player package: the mod DLL, the setup (Setup.cmd, Einrichten.cmd, Instalacja.cmd, tools/setup.ps1), example configuration,
-the player guides, the test plan, the log collector and the licences.
+"""Build a production player package: the mod DLL, English setup, player guides,
+manual copy preflight, hang diagnosis, log collection and licences.
 
     python tools/package.py <built Script_G3Together.dll> <output folder> [<steam_api.dll>]
 
@@ -8,8 +8,8 @@ Steamworks.NET Standalone release 2025.164.1, checked by its SHA-256) it goes in
 Steam is the only supported transport; without that DLL the setup must download it before installing the mod.
 """
 import hashlib
+import argparse
 import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -96,10 +96,17 @@ friendly_fire = 0
 
 
 def main():
-    dll, out = Path(sys.argv[1]), Path(sys.argv[2])
-    steam_dll = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+    parser = argparse.ArgumentParser(
+        description="Build a production and manual-support G3 Together package."
+    )
+    parser.add_argument("dll", type=Path, help="built Script_G3Together.dll")
+    parser.add_argument("output", type=Path, help="directory for the ZIP package")
+    parser.add_argument("steam_dll", nargs="?", type=Path, help="optional tested Valve 32-bit steam_api.dll")
+    args = parser.parse_args()
+
+    dll, out, steam_dll = args.dll, args.output, args.steam_dll
     if steam_dll and hashlib.sha256(steam_dll.read_bytes()).hexdigest() != STEAM_DLL_SHA256:
-        sys.exit(f'{steam_dll} is not the tested steam_api.dll (SHA-256 {STEAM_DLL_SHA256})')
+        raise SystemExit(f'{steam_dll} is not the tested steam_api.dll (SHA-256 {STEAM_DLL_SHA256})')
     out.mkdir(parents=True, exist_ok=True)
     version = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip() or 'dev'
     target = out / f'G3Together-{version}.zip'
@@ -110,10 +117,15 @@ def main():
         # Explicit English public guides only.
         for guide in ('PLAYING.md', 'JOINING.md', 'PLAYTEST.md'):
             z.write(ROOT / 'docs' / guide, guide)
-        z.write(ROOT / 'tools/collect_logs.py', 'tools/collect_logs.py')
-        z.write(ROOT / 'tools/setup.ps1', 'tools/setup.ps1')
-        for launcher in ('Setup.cmd', 'Einrichten.cmd', 'Instalacja.cmd'):
-            z.write(ROOT / launcher, launcher)
+        for support in (
+            'tools/collect_logs.py',
+            'tools/copy_preflight.py',
+            'tools/hangstack.py',
+            'tools/setup.ps1',
+            'tools/startup_videos.py',
+        ):
+            z.write(ROOT / support, support)
+        z.write(ROOT / 'Setup.cmd', 'Setup.cmd')
         z.write(ROOT / 'COPYING', 'COPYING')
         z.write(ROOT / 'COPYING.STEAMWORKS', 'COPYING.STEAMWORKS')  # GPLv3 section 7: the Steamworks API library
         enet = ROOT / 'thirdparty/enet/LICENSE'

@@ -44,19 +44,11 @@ bool Same(Entity& self, int stack, Template const& item, unsigned quality = AnyQ
            (quality == AnyQuality || self.Inventory.GetQuality(stack) == quality);
 }
 
-bool Tradable(Entity& self, int stack)
-{
-    if (self.Inventory.GetSlotFromStack(stack) != gESlot_None) return false;
-    Entity item = self.Inventory.GetTemplateItem(stack);
-    return item.GetInstance() && !item.Item.IsMissionItem() && item.Item.GetCategory() != gEItemCategory_Skill &&
-           std::strcmp(item.GetName().GetText(), "Fist");
-}
-
 int Amount(Entity& self, Template const& item, unsigned quality = AnyQuality)
 {
     int amount = 0;
     for (int i = 0; i < self.Inventory.GetStackCount(); ++i)
-        if (Same(self, i, item, quality) && Tradable(self, i)) amount += self.Inventory.GetAmount(i);
+        if (Same(self, i, item, quality) && trade::TradableStack(self, i)) amount += self.Inventory.GetAmount(i);
     return amount;
 }
 
@@ -66,7 +58,7 @@ int Take(Entity& self, Template const& item, unsigned quality, int amount, std::
 {
     int taken = 0;
     for (int i = self.Inventory.GetStackCount() - 1; i >= 0 && taken < amount; --i) {
-        if (!Same(self, i, item, quality) || !Tradable(self, i)) continue;
+        if (!Same(self, i, item, quality) || !trade::TradableStack(self, i)) continue;
         const int n = std::min(amount - taken, self.Inventory.GetAmount(i));
         if (n <= 0) continue;
         const unsigned q = self.Inventory.GetQuality(i);
@@ -115,8 +107,7 @@ bool Apply(net::OfferNote const& note)
         eCTemplateEntityProxy proxy;
         proxy.SetEntity(static_cast<bCPropertyID const&>(item));
         Entity entity(proxy.GetEntity());
-        if (!entity.GetInstance() || entity.Item.IsMissionItem() || entity.Item.GetCategory() == gEItemCategory_Skill ||
-            !std::strcmp(entity.GetName().GetText(), "Fist")) return false;
+        if (!trade::TradableItem(entity)) return false;
         if (entry.amount > 0 && Amount(self, item, entry.quality) < entry.amount) return false;
     }
     if (note.gold > 0 && Amount(self, gold) < note.gold) return false;

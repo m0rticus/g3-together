@@ -7,6 +7,7 @@
 #include "net.h"
 #include "offer.h"
 #include "remote.h"
+#include "tradeview.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -73,20 +74,12 @@ uint16_t Quality(std::string const& key)
     return value;
 }
 
-bool Tradable(Entity& self, int stack)
-{
-    if (self.Inventory.GetSlotFromStack(stack) != gESlot_None) return false;
-    Entity item = self.Inventory.GetTemplateItem(stack);
-    return item.GetInstance() && !item.Item.IsMissionItem() && item.Item.GetCategory() != gEItemCategory_Skill &&
-           std::strcmp(item.GetName().GetText(), "Fist");
-}
-
 void Read(Entity& self, Content& items, int32_t& gold)
 {
     items.clear();
     gold = 0;
     for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
-        if (!Tradable(self, i)) continue;
+        if (!TradableStack(self, i)) continue;
         Entity item = self.Inventory.GetTemplateItem(i);
         if (!std::strcmp(item.GetName().GetText(), Gold)) {
             gold += self.Inventory.GetAmount(i);
@@ -216,7 +209,7 @@ bool BuildExchange(gCInventory_PS* heroInventory, gCInventory_PS* puppetInventor
         for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
             const int amount = Selected(inventory, i, entity.Inventory.GetAmount(i));
             if (!amount) continue;
-            if (!Tradable(entity, i)) return false;
+            if (!TradableStack(entity, i)) return false;
             const int signedAmount = side ? amount : -amount;
             Entity item = entity.Inventory.GetTemplateItem(i);
             if (!std::strcmp(item.GetName().GetText(), Gold)) gold += signedAmount;
@@ -289,6 +282,7 @@ bool __stdcall NativeCanExchange(void* controls, int playerValue, int partnerVal
 
 void HookNative()
 {
+    tradeview::Install();
     if (nativeHooked || nativeFailed) return;
     auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleA("Game.dll"));
     if (!base) return;
@@ -341,6 +335,20 @@ bool OnResult(net::OfferNote const& note, bool accepted)
     deliveryFailed = !ok;
     return ok;
 }
+}
+
+bool TradableItem(Entity const& item)
+{
+    return item.GetInstance() && !item.Item.IsMissionItem() &&
+           item.Item.GetCategory() != gEItemCategory_Skill &&
+           item.Item.GetCategory() != gEItemCategory_Spellbook &&
+           std::strcmp(item.GetName().GetText(), "Fist");
+}
+
+bool TradableStack(Entity& self, int stack)
+{
+    if (self.Inventory.GetSlotFromStack(stack) != gESlot_None) return false;
+    return TradableItem(self.Inventory.GetTemplateItem(stack));
 }
 
 uint64_t Epoch()
@@ -580,7 +588,7 @@ bool Exchange(eCEntity* body, char const* name, int amount, bool take)
     ClearSelection(Inventory(body));
     for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
         Entity item = entity.Inventory.GetTemplateItem(i);
-        if (item.GetInstance() && itemName == item.GetName().GetText() && Tradable(entity, i) &&
+        if (item.GetInstance() && itemName == item.GetName().GetText() && TradableStack(entity, i) &&
             (quality < 0 || entity.Inventory.GetQuality(i) == static_cast<unsigned>(quality)) &&
             entity.Inventory.GetAmount(i) >= amount) {
             inventory->SetTransactionAmount(i, amount);

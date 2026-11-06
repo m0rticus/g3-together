@@ -19,7 +19,7 @@ and ragdoll impulses travel only from host to client.
 Player-puppet smoothing remains separate. Party identity, friendly-fire protection, automatic player exchanges,
 personal loot/merchant inventories, shared experience and lethal-blow rescue rules are retained.
 
-> **Beta — back up your saves.** Tested mainly with bots driving two real game clients on one PC, plus one evening of human play. Bots reached Innos' ending; no human co-op playthrough has been completed yet. Internet play remains unverified; only two players have been tested.
+> **Beta — back up your saves.** Human co-op testing is limited; no complete human co-op playthrough has been completed. Internet play remains unverified; only two players have been tested.
 
 ## What you can do together
 
@@ -50,7 +50,7 @@ Prefer a separate game copy for co-op. Keep other co-op mods out of `scripts`.
 
 ### 2. Run setup on both PCs
 
-Unpack the **whole mod package built from this fork** and run `Setup.cmd` (Deutsch: `Einrichten.cmd`; Polski: `Instalacja.cmd`). GitHub's source-code ZIP does not include the built mod.
+Unpack the **whole mod package built from this fork** and run `Setup.cmd`. GitHub's source-code ZIP does not include the built mod.
 
 Choose one **host** and one **joining player**. Player names come from Steam automatically. Setup finds the game, checks patches and installs the required
 Steam DLL and mod with `g3together.ini`. If the verified Steam DLL cannot be installed, setup stops.
@@ -109,7 +109,7 @@ damage setting. Set `friendly_fire = 0` on both PCs and restart for full protect
 ## Know the limits
 
 - **Crashes and sync issues remain possible.** Save before difficult fights; see [known issues and workarounds](docs/PLAYING.md#known-issues-21-october-2026).
-- **Human testing is limited.** Setup was checked on test folders; trading through the game's functions was checked by bots. Mouse trading and forward swimming still need human testing.
+- **Human testing is limited.** Setup and the manual playtest checklist still need broader human verification. Mouse trading and forward swimming need human testing.
 - **Untested story paths:** Adanos and Beliar endings, Xardas' plan, the fifth temple, Cape Dun's uprising, midgame town liberation, drive-away quests and plundering.
 - **Soul travel:** your partner sees your ghost, not the body left behind.
 - **Fire/ice effects that extinguish burning or freezing** on NPCs simulated by your partner only take effect on your PC.
@@ -149,7 +149,7 @@ Native hostility, immortality, duel and damage rules remain in effect; this does
 
 ## For developers
 
-Built on the unofficial [Gothic 3 SDK](https://github.com/georgeto/gothic3sdk) for the Genome engine. [Development stages](docs/STAGES.md) covers implementation and testing, following the [coop-anything](https://github.com/cranebeaker/coop-anything) playbook.
+Built on the unofficial [Gothic 3 SDK](https://github.com/georgeto/gothic3sdk) for the Genome engine.
 
 ### Build
 
@@ -162,74 +162,60 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A Win32
 cmake --build build --config Release
 ```
 
-### Test workspace
+### Unit tests
+
+The engine-free unit suite uses temporary files and mocked/synthetic data. It does not boot Gothic 3, start Steam, install a mod, or inspect private workspace contents:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+### Private manual workspace
 
 ```text
-dev/
-  g3-together/            Public source: src/, thirdparty/enet/, qa/, docs/, tools/
-    workspace/            Private and gitignored: SDK, builds, isolated game copies, receipts, logs and research
-  coop-anything/          Development playbook; findings go back as pull requests
+g3-together/
+  src/
+  docs/
+  tools/
+  workspace/                Private and gitignored
+    tools/gothic3sdk/
+    builds/
+    game-copies/
+    logs/
 ```
 
-Keep the workspace private and uncommitted. Its `build-mod.ps1` helper is not included here.
+Keep `workspace/` private and uncommitted. Use separate Gothic 3 installation, profile and save folders for manual co-op
+work. Back up real saves before installing or replacing files. Do not share private workspace contents or use them as
+the source of a release package.
 
-Bot suites need **Python 3.12+** and a **configured private workspace** with `project.json`, two disposable game copies
-and their isolated profiles; a fresh clone is insufficient. Default: `workspace/` in the repository; override with
-`G3_WORKSPACE`. `project.json` names the absolute `protected_save_dir`. Before launching, the checked-in isolation
-verifier requires the game modules' folder imports to point to the existing `g3qa32.dll` isolation shim, rejects redirected
-or shared writable paths, and checks matching mod DLLs. Existing private deployment receipts and verification scripts
-are still checked when configured.
+Run `Setup.cmd` inside a release package for manual installation into a separate copy. Follow the
+[installation guide](docs/PLAYING.md#installation) and use the [manual playtest checklist](docs/PLAYTEST.md).
+To collect a bug report manually or with Python, use [the log collection guide](docs/JOINING.md#if-something-goes-wrong).
+
+Before manual play, optionally check that two separate Gothic 3 copies are safe to use:
 
 ```powershell
-$env:G3_FAKESTEAM = "$PWD\build\artifacts\fakesteam\Release\fake_steam_api.dll"
-python qa\together.py --suite stage2
-python qa\together.py --suite stage2 --negative-control
+python "tools\copy_preflight.py" --copy "<first Gothic 3 folder>" --copy "<second Gothic 3 folder>"
 ```
 
-These `stage2` runs drive two isolated game copies; the negative control is expected to report `RESULT: FAIL`. The runner checks isolation and hashes the owner's real saves before and after each run. Other suites include `stage1`, `stage3a` and `stage3b`; see [development stages](docs/STAGES.md).
+The preflight can instead use `G3_WORKSPACE` or `workspace/project.json` for the configured copies and absolute
+`protected_save_dir`. It checks filesystem layout and installed files; it does not launch or drive Gothic 3.
 
-The compiled QA bot activates only with `qa-enable.txt`. Use it only in disposable test installations.
-
-### Saved-world QA baseline
-
-Create the baseline once, then verify it from fresh game processes:
+For an explicitly hung Gothic 3 process, collect its stack data with:
 
 ```powershell
-$env:G3_FAKESTEAM = "$PWD\build\artifacts\fakesteam\Release\fake_steam_api.dll"
-python qa\together.py --suite sandboxsave --seconds 900
-python qa\together.py --suite sandboxcheck --seconds 600
+python "tools\hangstack.py" --pid <PID> --output "<output.txt>"
 ```
 
-Use the workspace's bundled `workspace\tools\python-3.14.10\python.exe` instead of `python` if the system interpreter is
-older than 3.12. The save is `G3T_Sandbox`, stored privately under
-`workspace\runtime\fixtures\sandbox-p1` (or `sandbox-p<G3_PAIR>`). It contains the native world and host hero, mod sidecar,
-client hero and quickbar records, plus a versioned SHA-256 manifest, native game identity and hero/position baselines.
+Startup videos can be disabled or restored manually while stopped:
 
-`sandboxsave` clears the opening battle once, disables tutorial popups and moves the heroes to the flat island off Ardea
-(around native coordinates `77000, -280, -61000`), unarmed, at full health, at noon.
-No surrounding NPCs are killed to manufacture an empty area. Creation must pass a
-real host/client save/load and a walk on the ground before the fixture replaces any previous baseline.
-Campaign transfer and fixture validation support both native CP and alternative-balancing CPX save files; the transfer
-uses the same balancing option as the engine rather than assuming every installation writes CPX.
-Native loads put both players at the saved host position. The fixture loader verifies that position, then places the
-client at its fixed 8 m offset; the client's own inventory and attributes come from its saved hero record.
+```powershell
+python "tools\startup_videos.py" --disable --root "<Gothic 3 folder>"
+python "tools\startup_videos.py" --restore --root "<Gothic 3 folder>"
+```
 
-`sandboxcheck` loads from the main menus without starting a new game, checks both heroes' positions, attributes,
-inventories, ground contact, empty 40 m surroundings and mutual visibility, walks, then spawns a controlled
-NPC on both machines. It changes gold, health and positions and reloads the baseline, requiring the original hero
-state to return and the spawned NPC to disappear. It idles afterward to check continued stability, and checks that
-the fixture itself and the real saves are unchanged.
-
-Location-independent stages (`stageW2`, `stageWear`, `stageHealOther`, `stagePlayerTrade`) and `warm` use this save
-by default. A missing, damaged or incompatible fixture is an error, never a silent new-game start. The shared-session
-runner runs these stages independently from the fixture so inventory, flags and spawned entities cannot leak between
-tests. Town/quest/startup/raid-specific stages keep their existing setup; forcing them all onto an empty map would
-invalidate their coverage. `G3_SANDBOX=0` explicitly opts compatible stages out; `sandboxcheck` cannot opt out.
-
-For new isolated scenarios, add the stage to `SANDBOX_STAGES`, call `join_both(copies)`, and use
-`spawn_sandbox_npc(copies, 'Scavenger')` to create the same GUID on both machines. Do not save scenario mutations over
-the fixture. Recreate it when native game files or the saved-state contract changes. Fast regression checks:
-`python -m unittest discover -s qa -p "test_*.py"`.
+These manual tools read or modify only the files and processes explicitly named. They do not launch, drive, inspect,
+or assert a game session.
 
 ## License and credits
 

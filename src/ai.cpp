@@ -322,7 +322,7 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
             ++attitudeRedirected;
             Entity asHero(hero);
             eCEntity* const before = redirectedFor;
-            redirectedFor = target;  // QA p7probe: whom the parts of GetAttitude answer for meanwhile
+            redirectedFor = target;
             const GEInt result = originalAttitude(spu, self, &asHero, args);
             redirectedFor = before;
             return result;

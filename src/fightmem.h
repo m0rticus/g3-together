@@ -22,10 +22,4 @@ void AfterState(eCEntity* self);                         // ai.cpp, after that s
 void OnState(uint8_t from, net::WorldState const& s);     // kind 18: an NPC's memory of a fight with this player
 void OnWorldChange();  // a load or a new world: the grudges kept for other players belong to the world before
 int Upset(eCEntity* npc, eCEntity* puppet);  // guards.cpp: the NPC takes up a fight it gave up against that puppet's player
-std::string Kept(eCEntity* npc);             // QA: "<player>:<memory>:<time>:<reason>" kept here for other players, or -
-using LogFn = void (*)(char const*);
-void Report(LogFn log);  // QA: FIGHTMEM line
-void Off(LogFn log);     // QA negative control (fightmemoff): as before 26.10.
-void ApartOff(LogFn log);  // QA negative control (grudgeoff): the NPC keeps another player's fight as its own, no grudge
-void KeepOff(LogFn log);   // QA negative control (grudgeloadoff): the grudges outlive a load, as before 26.10.
 }

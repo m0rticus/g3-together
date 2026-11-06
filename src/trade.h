@@ -4,8 +4,11 @@
 
 #include <cstdint>
 class eCEntity;
+class Entity;
 
 namespace g3t::trade {
+bool TradableItem(Entity const& item);
+bool TradableStack(Entity& self, int stack);
 void Start();
 void Tick();
 void OnWorldChange();

@@ -374,6 +374,18 @@ bool KnocksOut(Entity& npc)
     return species == gESpecies_Human || species == gESpecies_Orc;
 }
 
+bool HostileToClaimant(Entity& victim, eCEntity* claimant)
+{
+    if (!victim.GetInstance() || !claimant || !remote::IsPuppet(claimant)) return false;
+    guards::Acting player(claimant);
+    GEInt attitude = CallScript("GetAttitude", victim.GetInstance(), claimant, 0);
+    if (attitude == gEAttitude_Panic) {
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        if (hero) attitude = ai::PlainAttitude(victim.GetInstance(), hero);
+    }
+    return attitude == gEAttitude_Hostile || attitude == gEAttitude_Predator;
+}
+
 void Guid(eCEntity* entity, uint8_t out[16])
 {
     guid::CopyEntity(entity, out);
@@ -1002,9 +1014,10 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         return;
     }
     if (knockOuts && !finishing) {
+        const bool hostileToClaimant = HostileToClaimant(target, attacker);
         // As the game decided on the sender's machine; a hit judged there as neither (that machine's copy had more hit points
         // left) by the species rule.
-        if (outcome == net::HitKnockOut || (outcome == net::HitUnjudged && KnocksOut(target))) {
+        if (!hostileToClaimant && (outcome == net::HitKnockOut || (outcome == net::HitUnjudged && KnocksOut(target)))) {
             // The game's way, as in the bout above: ZS_Unconscious runs Defeat(CurrentAttacker, victim). The puppet as attacker;
             // remote.cpp lets go of it when the puppet goes. The experience on the sender's machine, once per victim (OnKilled).
             eCEntity* victim = target.GetInstance();
@@ -1313,7 +1326,7 @@ void HitNpc(char const* guid, LogFn log)
     const int before = HitPoints(target);
     const int spBefore = HasDamageReceiver(target.GetInstance()) ? static_cast<int>(target.DamageReceiver.StaminaPoints) : -1;
     const unsigned sentBefore = claimsSent, callsBefore = filterCalls;
-    // 29.10.: under G3_NETSIM 800 a blow now and then went in here (claim_sent=0): whether the NPC was mirrored then, and by whom
+    // A blow now and then went in here (claim_sent=0): whether the NPC was mirrored then, and by whom
     const int mirroredBefore = npcs::IsMirrored(target.GetInstance()) ? 1 : 0;
     const unsigned ownerBefore = npcs::OwnerOf(target.GetInstance());
     int pending = 0;
@@ -1925,34 +1938,6 @@ void NpcParade(char const* guid, LogFn log)
 
 // QA, P4 hit judgement: what the game's own scripts say on this machine about a blow of an NPC (GUID) on the local hero:
 // parrying (IsInParadeMode), able to parry that move (CanParadeMoveOf), the attacker's strength and the hero's
-// protection against its weapon.
-void HitProbe(char const* guid, LogFn log)
-{
-    char line[400];
-    _GUID raw;
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!guid::Parse(guid, raw) || !hero) { log("REFUSED hitprobe: bad GUID or no hero"); return; }
-    Entity attacker = guid::Resolve(raw);
-    if (!attacker.GetInstance()) { log("REFUSED hitprobe: no such NPC"); return; }
-    char const* kind = "";
-    eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker.GetInstance()), &kind);
-    Entity self(hero);
-    Entity weapon(source);
-    if (paradeUntil && static_cast<int32_t>(GetTickCount() - paradeUntil) < 0) self.Routine.AniState = gEAniState_Parade;
-    Format(line, "HITPROBE attacker=%s source=%s parade_mode=%d can_parade=%d strength=%d level=%d current_level=%d hero_level=%d "
-              "protection=%d hero_strength=%d ani_state=%d action=%d attacker_action=%d damage=%d type=%d fov=%d",
-              attacker.GetName().GetText(), kind, CallScript("IsInParadeMode", hero, nullptr, 0),
-              CallScript("CanParadeMoveOf", hero, attacker.GetInstance(), 0), CallScript("GetStrength", attacker.GetInstance(), nullptr, 0),
-              static_cast<int>(attacker.NPC.Level), CallScript("GetCurrentLevel", attacker.GetInstance(), nullptr, 0),
-              static_cast<int>(self.NPC.Level), CallScript("GetProtection", hero, source, 0),
-              CallScript("GetStrength", hero, nullptr, 0), static_cast<int>(self.Routine.AniState), static_cast<int>(self.Routine.Action),
-              static_cast<int>(attacker.Routine.Action),
-              source && source->GetPropertySet(eEPropertySetType_Damage) ? static_cast<int>(weapon.Damage.DamageAmount) : -1,
-              source && source->GetPropertySet(eEPropertySetType_Damage) ? static_cast<int>(weapon.Damage.DamageType) : -1,
-              self.IsInFOV(attacker) ? 1 : 0);
-    log(line);
-}
-
 // QA, stage A: an NPC (GUID) hits player 2's puppet on the host through the game's hit judgement.
 void HitPuppetBy(char const* argument, LogFn log)
 {

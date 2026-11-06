@@ -4,7 +4,6 @@
 // with the other players and shows them as puppets.
 #include "ai.h"
 #include "combat.h"
-#include "hitprobe.h"
 #include "net.h"
 #include "story.h"
 #include "talk.h"
@@ -39,7 +38,6 @@
 #include "npcs.h"
 #include "npcplayback.h"
 #include "offer.h"
-#include "qa.h"
 #include "remote.h"
 #include "crashlog.h"
 #include "shot.h"
@@ -208,7 +206,6 @@ class Module : public eCEngineComponentBase
         g3t::ai::Tick();
         g3t::combat::Tick();
         g3t::summon::Tick();
-        g3t::hitprobe::Tick();
         g3t::story::Tick();
         g3t::talk::Tick();
         g3t::downed::Tick();
@@ -237,8 +234,7 @@ class Module : public eCEngineComponentBase
         g3t::xpshare::Tick();
         g3t::dialogaudio::Tick();
         g3t::offer::Tick();
-        g3t::qa::Tick();
-        g3t::shot::Tick();  // after QA: a QA shot is re-aimed there before it is announced
+        g3t::shot::Tick();
         g3t::spells::Tick();
     }
     void PostProcess() override {}
@@ -258,7 +254,6 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
 {
     static gSScriptInit scripts;
     g3t::OpenLog("g3together.log");
-    g3t::qa::Init();
     g3t::LoadConfig();
     const bool playbackReady = g3t::npcplayback::Start(!g3t::GetConfig().host);
     g3t::trace::Configure(g3t::GetConfig().trace);

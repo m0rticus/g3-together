@@ -88,8 +88,6 @@ Config const& LoadConfig()
         else if (!_stricmp(key, "puppet_template")) strncpy_s(config.puppetTemplate, value, _TRUNCATE);
         else if (!_stricmp(key, "look")) strncpy_s(config.look, value, _TRUNCATE);
         else if (!_stricmp(key, "partner_key")) strncpy_s(config.partnerKey, value, _TRUNCATE);
-        else if (!_stricmp(key, "qa_resendguard")) config.qaResendGuardOff = !_stricmp(value, "off");
-        else if (!_stricmp(key, "qa_hosthint")) strncpy_s(config.qaHostHint, value, _TRUNCATE);
         else if (!_stricmp(key, "trace")) strncpy_s(config.trace, value, _TRUNCATE);
         else if (!_stricmp(key, "reputation")) strncpy_s(config.reputation, value, _TRUNCATE);
         else if (!_stricmp(key, "host_sim")) {

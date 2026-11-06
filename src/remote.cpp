@@ -44,8 +44,6 @@ struct Puppet
 };
 Puppet puppets[net::MaxPlayers];
 bool started = false;
-bool trace = false;  // test copies only: 5 Hz trace of hero and puppet motion
-uint32_t lastTrace = 0;
 uint32_t lastSyncReport = 0;
 bool templateWarned = false;
 bool haveAnchor = false;
@@ -551,18 +549,8 @@ eCEntity* PuppetOf(int playerId)
     return puppets[playerId].entity.GetInstance();
 }
 
-bool TraceEnabled() { return trace; }
-
 void Start()
 {
-    char flag[MAX_PATH] = {};
-    HMODULE self = nullptr;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(&Start), &self) && GetModuleFileNameA(self, flag, MAX_PATH)) {
-        for (int part = 0; part != 2; ++part) { char* sep = strrchr(flag, '\\'); if (sep) *sep = '\0'; }
-        strcat_s(flag, "\\qa-enable.txt");
-        trace = GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
-    }
     Config const& config = GetConfig();
     parity::Compute();
     net::SetPlayerStateHandler(&FeedPlayer);
@@ -621,34 +609,6 @@ void Tick()
         body::SyncReport(&Log);
         npcs::SyncReport(&Log);
         combat::SyncReport(&Log);
-    }
-    if (!trace || now - lastTrace < 200) return;
-    lastTrace = now;
-    if (haveLocal) {
-        // Diagnostic (soak crash): gCNavigationMap::DetectEvades takes an entity from the walker's navigation
-        // (+0xac, else +200) and asks it for its nav zone without a null check; which entities are these?
-        char zone[64] = "-", alt[64] = "-";
-        eCDynamicEntity* self = gCSession::GetInstance().GetHero();
-        if (auto* nav = self ? reinterpret_cast<unsigned char*>(self->GetPropertySet(eEPropertySetType_Navigation)) : nullptr) {
-            if (eCEntity* z = reinterpret_cast<eCEntityProxy*>(nav + 0xac)->GetEntity()) strncpy_s(zone, z->GetName().GetText(), _TRUNCATE);
-            if (eCEntity* z = reinterpret_cast<eCEntityProxy*>(nav + 200)->GetEntity()) strncpy_s(alt, z->GetName().GetText(), _TRUNCATE);
-        }
-        Logf("TRACE hero pos=%.0f,%.0f,%.0f motion=%s navzone=%s navalt=%s", local.position[0], local.position[1], local.position[2],
-             local.animation, zone, alt);
-    }
-    for (int id = 1; id < net::MaxPlayers; ++id) {
-        Puppet& puppet = puppets[id];
-        eCEntity* instance = puppet.spawned ? puppet.entity.GetInstance() : nullptr;
-        if (!instance) continue;
-        char motion[128] = {};
-        body::CurrentMotion(instance, motion, sizeof(motion));
-        const bCVector& at = instance->GetWorldPosition();
-        const float current[3] = {at.GetX(), at.GetY(), at.GetZ()};
-        Logf("TRACE puppet%d pos=%.0f,%.0f,%.0f error=%.0f walking=%d mode=%d/%d pacified=%u task=%s state=%s motion=%s remote_motion=%s", id,
-             current[0], current[1], current[2], body::Distance(current, remotes[id].latest.position), puppet.body.walking,
-             static_cast<int>(puppet.entity.CharacterMovement.GetMovementMode()), remotes[id].latest.movementMode,
-             puppet.body.repacified, puppet.entity.Routine.GetCurrentTask().GetText(),
-             puppet.entity.Routine.GetCurrentState().GetText(), motion, remotes[id].latest.animation);
     }
 }
 

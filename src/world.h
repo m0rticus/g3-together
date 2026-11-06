@@ -13,7 +13,6 @@ using LogFn = void (*)(char const*);
 bTSmallArray<eCEntity*> const* ProcessedEntities();
 void Tick();  // host: NPC-only extra ranges; native camera, ROI and static culling stay unchanged
 void ProcessingReport(LogFn log);
-void StreamProbe(char const* argument, LogFn log);  // QA: X_Y_Z_radius, report, or off; never moves the player's camera
 void OnWorldDeactivate();
 // host_sim = elastic or spheres: whether the host's game processes around the other players too in this frame, and whether
 // it processes this place (margin cm inside the edge of its sphere or of one of its spheres).

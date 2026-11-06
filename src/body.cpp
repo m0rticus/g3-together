@@ -788,7 +788,7 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             entity.Routine.AniState = static_cast<gEAniState>(target.aniState);
         // A stance motion replayed while the player stood (an idle loop, a gesture: StartPlayAni or a play-ani instruction)
         // kept slot 0 when it walked off: the body travelled but showed it standing (stageGlide 23.10.: 13-16 % of the
-        // travel under G3_NETSIM, nearly all of it steered). End it as the body sets off, and again while it travels.
+        // nearly all of it steered). End it as the body sets off, and again while it travels.
         if (settleStance && (!state.walking || static_cast<int32_t>(now - state.settleAt) >= 0)) {
             state.settleAt = now + 250;
             char shows[128];

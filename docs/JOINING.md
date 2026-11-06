@@ -13,12 +13,11 @@
 ## Installation
 
 **Setup:** once Gothic 3 and both patches are installed, unpack the whole package anywhere and double-click
-`Setup.cmd` (`Einrichten.cmd` for German, `Instalacja.cmd` for Polish). It does the copying and the INI for you: it finds Gothic 3 (Steam, GOG or the
+`Setup.cmd`. It does the copying and the INI for you: it finds Gothic 3 (Steam, GOG or the
 folder you name), checks Community Patch 1.75.14 and Parallel Universe Patch 1.1.1, moves another co-op mod out of
 `scripts`, copies the mod into `scripts` and writes `g3together.ini` from your role. Names come from Steam automatically.
 Steam is required; setup stops if the verified `steam_api.dll` cannot be installed. Replaced files are kept in `G3Together-backup`.
-The setup was checked on test
-folders, not yet by players; the steps below do the same by hand.
+The steps below also let you install by hand.
 
 1. Install Gothic 3 from Steam, then **Community Patch 1.75.14**, then
    [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm)

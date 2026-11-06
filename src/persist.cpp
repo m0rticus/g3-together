@@ -11,7 +11,6 @@
 #include "journal.h"
 #include "net.h"
 #include "npcs.h"
-#include "qa.h"
 #include "log.h"
 #include "lobby.h"
 #include "remote.h"
@@ -117,7 +116,7 @@ struct Client { uint32_t told = 0; std::string toldCampaign; uint32_t ready = 0;
                 uint32_t sentAt = 0;         // GetTickCount() of the last send of the campaign to this player
                 bool arrivedSinceSend = false; };  // the player came into the host's world since that send
 uint32_t savedAt = 0;            // GetTickCount() of the host's last save: the game writes the files after SaveGame returns
-// A send still on its way is not repeated for a player who is only in its menu or starting a game (29.10. under G3_NETSIM 800:
+// A send still on its way is not repeated for a player who is only in its menu or starting a game:
 // menu then new game sent the 2-MB save twice more; they arrived 1.5 and 3 min later, and each loaded the client's world again,
 // the second in the middle of play). QA resendguardoff: sent again, as before.
 constexpr uint32_t ResendGuard = 180000;  // ms
@@ -256,7 +255,7 @@ bool SendCampaign(uint8_t to)
 }
 
 // A save name from the host: letters, digits, underscore, minus and space only (Fable's review 22.10. 1.4: "..\\" left the save
-// folder, and a ":" made an NTFS stream, which creates its file, e.g. qa-enable.txt).
+// folder, and a ":" made an NTFS stream, which is not allowed.
 bool SafeName(char const* name)
 {
     const size_t n = std::strlen(name);
@@ -610,7 +609,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
         c.ready = 0;
         net::SetInWorld(from, false);
         Logf("persist: player %u (%s) plays another world (%s %s)", from, net::PeerName(from), KindName(note.kind), note.campaign);
-        const bool onItsWay = resendGuard && !GetConfig().qaResendGuardOff && c.sentAt && !c.arrivedSinceSend && GetTickCount() - c.sentAt < ResendGuard &&
+        const bool onItsWay = resendGuard && c.sentAt && !c.arrivedSinceSend && GetTickCount() - c.sentAt < ResendGuard &&
                               c.sent == epoch && (note.kind == net::KindMenu || note.kind == net::KindNew);
         if (onItsWay) {
             ++resendsSkipped;
@@ -784,11 +783,9 @@ void StatusHints()
     static uint32_t menuAt = 0, hintedAt = 0;
     static bool startupShown = false;
     Config const& config = GetConfig();
-    const bool hintsOff = qa::Enabled() && !_stricmp(config.qaHostHint, "off");
-    const bool refusalOff = hintsOff || (qa::Enabled() && !_stricmp(config.qaHostHint, "norefusal"));
     const uint32_t now = GetTickCount();
     if (*net::StartupError()) {
-        if (hintsOff || now - menuAt < 1000) return;
+        if (now - menuAt < 1000) return;
         menuAt = now;
         wchar_t text[500], reason[256] = {};
         MultiByteToWideChar(CP_UTF8, 0, net::StartupError(), -1, reason, 255);
@@ -827,17 +824,15 @@ void StatusHints()
     const bool running = gCSession::GetInstance().IsGameRunning();
     const uint32_t trying = net::ConnectingFor();
     if (!running) {
-        if (!refusal.empty() && !refusalOff) {
+        if (!refusal.empty()) {
             if (hud::MenuLine(refusal.c_str())) menuSet = true;
-        } else if (!hintsOff) {
+        } else {
             wchar_t text[700] = {};
             lobby::Format(lobby::Snapshot(), text, 700);
             if (hud::MenuLine(text)) menuSet = true;
-        } else if (menuSet && hud::MenuLine(nullptr)) {
-            menuSet = false;
         }
     }
-    if (!hintsOff && trying >= 15000 && refusal.empty()) {
+    if (trying >= 15000 && refusal.empty()) {
         wchar_t text[400], hostName[80] = {};
         MultiByteToWideChar(CP_UTF8, 0, steam::HostName(), -1, hostName, 79);
         if (*hostName) _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SteamConnecting), hostName, trying / 1000);

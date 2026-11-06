@@ -18,7 +18,6 @@ eCEntity* PuppetOf(int playerId);
 void DespawnAll(char const* reason);  // before a native save: puppets are hero entities (two heroes = fatal on load)
 // An NPC dealt with a puppet (judged it, was hit by it, hit it, attacked it): it lets go of the puppet when that goes.
 void NoteContact(eCEntity* npc, eCEntity* puppet);
-bool TraceEnabled();
 using LogFn = void (*)(char const*);
 void Report(LogFn log);   // QA: one REMOTE line per known player
 void PuppetPartyOff(LogFn log);  // QA negative control: puppets do not join the local hero's party
