@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "trade.h"
 
+#include "goods_schedule.h"
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
@@ -40,8 +41,9 @@ int32_t filledGold[net::MaxPlayers] = {};
 Content sentItems;
 int32_t sentGold = -1;
 uint64_t epoch = 0;
-uint32_t serial = 0;
-DWORD lastScan = 0, lastSent = 0;
+uint32_t serial = 0, nextSerial = 0;
+GoodsSchedule goodsSchedule;
+DWORD lastScan = 0;
 int partner = 0;
 bool puppetDialog = false, windowOpen = false, fillOff = false, overflowWarned = false;
 DWORD dialogOverSince = 0;
@@ -408,12 +410,15 @@ uint32_t Publish()
         strncpy_s(entry.name, names[key].c_str(), _TRUNCATE);
         entries.push_back(entry);
     }
-    if (net::SendGoods(Epoch(), serial + 1, gold, entries.data(), static_cast<int>(entries.size()))) {
-        ++serial;
+    // A partial broadcast can have reached some recipients even if queuing another failed.
+    // Never reuse its serial for a later, possibly different snapshot.
+    if (++nextSerial == 0) ++nextSerial;
+    if (net::SendGoods(Epoch(), nextSerial, gold, entries.data(), static_cast<int>(entries.size()))) {
+        serial = nextSerial;
         ++goodsSent;
         sentItems = items;
         sentGold = gold;
-        lastSent = GetTickCount();
+        goodsSchedule.Published(GetTickCount(), net::JoinCount(), net::WorldEntryCount());
     }
     return serial;
 }
@@ -471,7 +476,7 @@ void Tick()
     Content items;
     int32_t gold = 0;
     Read(hero, items, gold);
-    if (items != sentItems || gold != sentGold || now - lastSent > 2000) Publish();
+    if (goodsSchedule.Due(now, items != sentItems || gold != sentGold, net::JoinCount(), net::WorldEntryCount())) Publish();
 }
 
 bool OnOpen(eCEntity* body)
@@ -497,8 +502,9 @@ void OnWorldChange()
     for (auto& gold : filledGold) gold = 0;
     sentItems.clear();
     sentGold = -1;
-    serial = 0;
-    lastScan = lastSent = 0;
+    serial = nextSerial = 0;
+    goodsSchedule = GoodsSchedule{};
+    lastScan = 0;
     partner = 0;
     puppetDialog = windowOpen = deliveryFailed = false;
     dialogOverSince = 0;

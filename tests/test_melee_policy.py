@@ -24,12 +24,16 @@ class MeleePolicyTests(unittest.TestCase):
         source = r'''
 #include "melee_policy.h"
 #include "net.h"
+#include "npcwire_control.h"
 #include <cassert>
 using namespace g3t::melee;
 int main()
 {
-    static_assert(23 + g3t::net::NpcsPerSend * sizeof(g3t::net::NpcRecord) <= 1200);
-    static_assert(g3t::net::NpcsPerSend == 2);
+    static_assert(g3t::net::NpcDatagramBudget == 1172);
+    static_assert(g3t::net::NpcsPerSend <= g3t::net::MaxNpcsPerMessage);
+    static_assert(23 + sizeof(g3t::npcwire::WireBatchHeader) +
+                  sizeof(g3t::npcwire::WireControl) + 8 * sizeof(g3t::npcwire::WireMotionTick) +
+                  sizeof(g3t::npcwire::WireQuaternion) <= g3t::net::NpcDatagramBudget);
     static_assert(sizeof(g3t::net::NpcRecord) == 588);
     static_assert(sizeof(g3t::net::NpcRecord{}.combatTarget) == 4);
     static_assert(sizeof(g3t::net::NpcRecord{}.hitSequence) == 2);

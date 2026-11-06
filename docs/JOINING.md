@@ -83,7 +83,7 @@ If Steam cannot start, a clear error is shown; fix Steam or the required DLL and
 - Either player can request a save. Wait for **"Co-op checkpoint saved for every participating player"**
   before leaving. A client never uploads its world to the host; both saves contain the host world
   and their respective account's character record. Back up the entire save folder, including `.g3t` and
-  `g3t-character-*.txt`, not only the native save pair. Both players need protocol 72.
+  `g3t-character-*.txt`, not only the native save pair. Both players need protocol 73.
 - See **Known issues** in the [full player guide](PLAYING.md) for problems and workarounds.
 
 ## If something goes wrong

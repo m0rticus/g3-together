@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/saving_policy.h"
+#include "../src/npcwire_bones.h"
 #include <cassert>
 #include <limits>
 
 int main()
 {
     using namespace g3t::saving;
+    static_assert(Protocol == 73, "NPC wire peers must use protocol 73");
+    static_assert(Protocol == g3t::npcwire::bones::Version, "pose codec and network protocol must agree");
     const std::string world(32, 'a'), checkpoint(32, 'b'), previous(32, 'c');
     const Key alice{world, checkpoint, 123}, bob{world, checkpoint, 456};
     assert(Valid(alice) && !Valid({world, checkpoint, 0}));

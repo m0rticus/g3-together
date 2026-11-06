@@ -88,7 +88,7 @@ struct NpcRecord
 };
 #pragma pack(pop)
 static_assert(sizeof(NpcMotion) == 61, "NPC motion wire layout changed");
-static_assert(sizeof(NpcRecord) == 588, "NPC snapshot wire layout changed");
+static_assert(sizeof(NpcRecord) == 588, "NPC full-record fallback wire layout changed");
 
 struct Remote
 {
@@ -124,6 +124,7 @@ bool IsHost();
 // Increments whenever a client enters the host's world (after a join, or after loading the host's save again); the host
 // resends its motion-name table and container contents then.
 uint32_t JoinCount();
+uint32_t WorldEntryCount();  // client: local world-gate openings, including re-entry on the same connection
 
 // The world gate (persist.cpp, PLAN-2026-10-22 0.1/0.2): gameplay messages flow only between the host and clients that
 // are in the host's world. Joining, the save transfer and MsgWorld itself always pass.
@@ -166,17 +167,19 @@ void SetWorldHandler(WorldHandler handler);
 // NPC snapshots (normally unreliable; life transitions reliable) and motion names (reliable).
 // Only the host publishes NPC state. Motion slots and pose share one capture time.
 constexpr int MaxNpcsPerMessage = 48;  // receiving limit
-constexpr int NpcsPerSend = 2;
-// These retained checks size the application envelope; ENet's own headers can require fragmentation.
-static_assert(NpcsPerSend == 2, "NPC datagrams must carry exactly two records");
-static_assert(NpcsPerSend >= 2, "NPC batches must retain two records per datagram");
-static_assert(23 + NpcsPerSend * sizeof(NpcRecord) <= 1200, "two NPC records must fit one 1200-byte datagram");
-static_assert(23 + NpcsPerSend * sizeof(NpcRecord) == 1199, "two NPC records must use the 1199-byte envelope");
+constexpr int NpcsPerSend = MaxNpcsPerMessage;
+constexpr int NpcDatagramBudget = 1172; // ENet payload before fragmentation.
+static_assert(NpcsPerSend <= MaxNpcsPerMessage, "NPC batch exceeds receive limit");
 void SendNpcs(NpcRecord const* records, int count, bool reliable = false);
 void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags = 0);
+// Per-recipient variants return false if the message could not be queued.
+bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable = false);
+bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones, int count,
+                    uint8_t poseFlags = 0, bool reliable = false);
 using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool reliable);
 void SetNpcPoseHandler(NpcPoseHandler handler);
 void SendNpcRelease(uint8_t const* guids, int count);  // host retires interest; this never restores client NPC AI
+bool SendNpcReleaseTo(uint8_t to, uint8_t const* guids, int count);
 using NpcReleaseHandler = int (*)(uint8_t owner, uint32_t generation, uint8_t* guids, int count);
 void SetNpcReleaseHandler(NpcReleaseHandler handler);
 void ResetNpcReplication();  // forget ordering/history fences on a world change, not the host publication clock

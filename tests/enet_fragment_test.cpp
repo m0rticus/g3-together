@@ -47,21 +47,23 @@ void Queue(size_t size, enet_uint32 flags, enet_uint8 command, bool reliable, un
 int main(int argc, char** argv)
 {
     assert(argc == 2);
-    constexpr size_t batch = 23 + g3t::net::NpcsPerSend * sizeof(g3t::net::NpcRecord);
-    static_assert(batch == 1199);
+    constexpr size_t legacyBatch = 1199;
+    static_assert(legacyBatch == 1199);
+    static_assert(g3t::net::NpcDatagramBudget == 1172);
+    static_assert(g3t::net::NpcDatagramBudget < legacyBatch);
     static_assert(sizeof(ENetProtocolHeader) + sizeof(ENetProtocolSendFragment) == 28);
     const auto bestEffort = g3t::net::PacketFlags(false);
     const auto reliable = g3t::net::PacketFlags(true);
     if (!std::strcmp(argv[1], "boundary")) {
-        Queue(batch, 0, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2);  // reproduce the old implicit promotion
-        Queue(batch, bestEffort, ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT, false, 2);
+        Queue(legacyBatch, 0, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2);  // reproduce the old implicit promotion
+        Queue(legacyBatch, bestEffort, ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT, false, 2);
         for (size_t size : {611u, 1172u})
             Queue(size, bestEffort, ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE, false, 1);
         for (size_t size : {1173u, 1174u, 1200u})
             Queue(size, bestEffort, ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT, false, 2);
     } else if (!std::strcmp(argv[1], "reliable")) {
         Queue(611, reliable, ENET_PROTOCOL_COMMAND_SEND_RELIABLE, true, 1);
-        Queue(batch, reliable, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2);
+        Queue(legacyBatch, reliable, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2);
         Queue(10000, reliable, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 9);
         Queue(10000, bestEffort, ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT, false, 9);
     } else if (!std::strcmp(argv[1], "negotiated")) {
@@ -71,7 +73,7 @@ int main(int argc, char** argv)
         Queue(1169, bestEffort, ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT, false, 2, 1200, true);
     } else if (!std::strcmp(argv[1], "epoch")) {
         // ENet's own reliable epoch rollover is intentional, unlike an unflagged near-MTU snapshot.
-        Queue(batch, bestEffort, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2, 1200, false, 0xffff);
+        Queue(legacyBatch, bestEffort, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2, 1200, false, 0xffff);
         Queue(611, bestEffort, ENET_PROTOCOL_COMMAND_SEND_RELIABLE, true, 1, 1200, false, 0xffff);
     } else {
         assert(false);

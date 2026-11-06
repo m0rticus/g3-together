@@ -136,14 +136,13 @@ payload bytes. These are instantaneous queue snapshots, not interval maxima. Non
 packet loss or pure one-way wire latency.
 
 Best-effort sends explicitly allow unreliable fragmentation at ENet's actual negotiated MTU/header budget. At MTU 1200,
-the fragment payload budget is 1172 bytes (1168 with an ENet checksum), not 1200. The unchanged 1199-byte two-record NPC
-application batch therefore uses two unreliable fragments rather than silently becoming reliable; small packets remain
-ordinary sequenced unreliable. Explicit reliable events and ENet's reliable sequence rollover retain their semantics.
-This removes an unintended ACK/retransmission dependency, not the large full-pose stream's bandwidth cost; bandwidth
-and recipient/rate reductions remain separate work.
+the fragment payload budget is 1172 bytes (1168 with an ENet checksum), not 1200. A best-effort packet above that budget
+uses unreliable fragments rather than silently becoming reliable; small packets remain ordinary sequenced unreliable.
+Compact NPC control batches are capped at 1172 bytes. Explicit reliable events and ENet's reliable sequence rollover
+retain their semantics.
 
-The current source uses **protocol 72**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
-in progress, so this source must not be treated as a verified release. Both players need the same build. Personal loot,
+The current source uses **protocol 73**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
+in progress, so this source must not be treated as a verified release. Both players need the same build; protocol 72 peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
 The host simulates all NPCs, including remote companions, guides and summons. Separate non-rendered prefetch cameras
@@ -152,14 +151,14 @@ load distant simulation regions; the real camera, static-world culling and build
 simulation to a client.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
-A slow host cannot produce 60 distinct samples per second: `SYNCNPC` logs capture ticks, missed deadlines and elapsed
-capture time. Clients interpolate final bone poses, facial-rig state and eight motion slots on one buffered timeline.
-NPC buffering starts at a **34 ms floor** (two 60 Hz intervals rounded up), then follows two measured capture intervals
-plus twice measured arrival jitter, capped at the existing 250 ms maximum. A full-interval underrun raises it by one
-measured interval at most once per 100 ms and prevents decay for the existing two-second recovery window; single missing
-60 Hz samples are covered without predicting future NPC movement. Buffer changes slew the existing monotonic timeline,
-not a position/animation jump. The predictive player-puppet policy remains at its existing 50 ms minimum/100 ms startup.
-Clients do not predict future NPC movement or resume NPC AI when packets stop. HP, stance and
+per-client interest and change detection decide which captured states are actually sent. Moving or fighting NPCs near
+a player retain the high-rate stream, while changed idle poses are limited to 10 Hz and unchanged states receive a full
+refresh every second. The interest radius is 80 m on entry and 100 m on exit; combat with or a party relationship to a
+player also keeps an NPC relevant. The host cannot see another player's camera direction or focus in player state, so
+nearby and potentially visible moving NPCs are treated conservatively. A slow host cannot produce 60 distinct samples
+per second: `SYNCNPC` logs capture ticks, missed deadlines and elapsed capture time. Clients interpolate final bone poses,
+facial-rig state and eight motion slots on one buffered timeline, normally at least 50 ms behind the host; the existing
+latency adaptation then smooths the buffer without predicting future NPC movement. HP, stance and
 life transitions follow that same presentation timeline. Missing or stale presentation cannot authorize an incoming hit.
 Player-puppet smoothing remains separate.
 `SYNCLATENCY` reports desired buffer and actual `shown_lag` separately: slew/holds can make them differ.
@@ -180,11 +179,25 @@ packet can neither hold back nor starve the live pose stream. ENet's RTT-jitter 
 fixed-rate pose frames. Native clip bookkeeping or a pending clip name cannot invalidate a successfully rendered host skeleton.
 
 The host sends final skeletal matrices because native blend-out layers survive outside the eight motion slots.
-Poses retain matrix shear and use sub-centimetre translation quantization. They travel on a separate lossy ENet channel;
-essential life/party/hit changes remain reliable without making the pose stream wait for them. Owned loopback sockets
+Poses retain matrix shear and use sub-centimetre translation quantization. Ordinary poses travel on a separate lossy
+ENet channel; essential life/party/hit changes remain reliable on the NPC channel. Owned loopback sockets
 have burst capacity for crowded scenes. `NPCPOSE` and `PASSIVE` diagnostics distinguish queued/received poses,
 presentation waits and completed skeletal updates. This full-pose stream costs more bandwidth than clip-only replay;
 internet throughput and multi-player resource limits still need acceptance.
+
+Protocol 73 caches bone layouts and full NPC motion baselines per world. After each client acknowledges them, updates
+send the existing bone values without repeated names and compact anchored control records; full records remain the
+fallback for a missing dictionary, an unacknowledged baseline or values outside the compact range. The log reports layout
+sizes, resync requests, anchors and fallback failures.
+Every five seconds, host and clients log `net: bandwidth` summaries. Kind entries are
+`message-id=tx-packets/bytes,rx-packets/bytes`: successful ENet queue operations are counted once per recipient,
+and received logical messages include those rejected by validation or the world gate. Empty internal packets have
+no kind. The `npc_per_s` fields count scheduler decisions per second, not deliveries. `enet_loopback_*` is the ENet
+host's local UDP packet and byte counter delta, including protocol
+overhead, retransmissions and acknowledgements, but not IP headers or Steam traffic. ENet's transmit packet counter
+also includes a zero-byte socket-would-block attempt. None of these figures measures Steam's actual network usage.
+Snapshots of player trade goods are sent on changes and roughly every 30 seconds while active; world entry and joins
+also trigger synchronization. Explicit transaction publications remain reliable and immediate.
 
 Your own successful hit shows its local flinch immediately and is claimed reliably from the host. A host-side parry
 does not cancel that landed hit. Hit identities, acknowledgements and NPC incarnations prevent duplicate claims and
@@ -318,7 +331,7 @@ Independent world-inventory persistence across saves/late joins is not implement
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
-  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 72 build.
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 73 build.
   To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
   one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
   outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.

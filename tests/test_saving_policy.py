@@ -58,6 +58,16 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("MsgFileChunk && !isHost", self.net)
         self.assertIn("MsgFileDone && !isHost", self.net)
 
+    def test_incompatible_protocol_is_refused_before_welcome(self):
+        receive = function_body(self.net, r"\bvoid\s+OnReceive\s*\(")
+        mismatch = receive.index("hello.version != ProtocolVersion")
+        refusal = receive.index("different G3 Together version (protocol %u, host %u)")
+        refused = receive.index("enet_peer_disconnect_later(peer, 1)")
+        welcome = receive.index("const Welcome welcome")
+        self.assertLess(mismatch, refusal)
+        self.assertLess(refusal, refused)
+        self.assertLess(refused, welcome)
+
     def test_client_save_requests_host_and_never_calls_native_save(self):
         body = function_body(self.persist, r"\bbool\s+__stdcall\s+SaveDetour\s*\(")
         self.assertIsNotNone(body)

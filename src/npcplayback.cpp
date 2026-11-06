@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npcplayback.h"
+#include "npcsend_policy.h"
 
 #include "ai.h"
 #include "body.h"
@@ -1350,7 +1351,7 @@ void Tick()
     if (!poseCleanupAt || cleanupNow - poseCleanupAt >= 1000) {
         poseCleanupAt = cleanupNow;
         for (auto it = receivedPoses.begin(); it != receivedPoses.end();)
-            if (cleanupNow - it->second.arrived > 5000) it = receivedPoses.erase(it);
+            if (cleanupNow - it->second.arrived > npcsend::PoseRetentionMs) it = receivedPoses.erase(it);
             else ++it;
         for (auto it = sourceSkeletons.begin(); it != sourceSkeletons.end();)
             if (cleanupNow - it->second.seen > 5000) it = sourceSkeletons.erase(it);

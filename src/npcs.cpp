@@ -10,11 +10,13 @@
 #include "ai.h"
 #include "log.h"
 #include "net.h"
+#include "net_metrics.h"
 #include "remote.h"
 #include "journal.h"
 #include "talk.h"
 #include "world.h"
 #include "npcplayback.h"
+#include "npcsend_policy.h"
 #include "replication.h"
 #include "ragdoll_force.h"
 #include "contact.h"
@@ -30,20 +32,20 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace g3t::npcs {
 namespace {
 constexpr float InterestRadius = 4000.0f;  // cm around any player
-// At 20 Hz only what changed since its last snapshot goes out every time; an unchanged NPC still every 100 ms, so the
-// bandwidth stays near the old one while moving NPCs show twice as often.
-constexpr uint32_t FullEvery = 100;        // ms
+constexpr uint32_t FullEvery = 100;        // ms, legacy client ownership cadence
 bool fastNpcs = true;  // QA negative control: fastnpcsoff (every NPC every 100 ms, as before)
-// send_rate (60 Hz by default): the tick of the NPC scan. Every NPC that changed goes out each tick; unchanged ones every FullEvery.
 uint32_t SendTick() { return fastNpcs ? std::max<uint32_t>(8, 1000u / static_cast<uint32_t>(GetConfig().sendRate) - 1) : FullEvery; }
-struct LastSent { net::NpcRecord record; uint32_t at = 0; };
+struct LastSent { net::NpcRecord record; uint32_t at = 0, movingUntil = 0; };
 std::unordered_map<std::string, LastSent> lastSent;
-unsigned npcsUnchangedSkipped = 0;
+std::unordered_map<std::string, npcsend::State> recipientNpcs[net::MaxPlayers];
+uint32_t recipientGenerations[net::MaxPlayers] = {};
+constexpr uint32_t StaleAfter = npcsend::MirrorStaleMs;  // hold presentation and reject stale contacts
 bool Changed(net::NpcRecord const& a, net::NpcRecord const& b)
 {
     float d = 0.0f;
@@ -55,7 +57,6 @@ bool Changed(net::NpcRecord const& a, net::NpcRecord const& b)
            a.motions[0].instance != b.motions[0].instance || a.hitPointsMax != b.hitPointsMax || a.partyPlayer != b.partyPlayer ||
            a.aiMode != b.aiMode || a.combatTarget != b.combatTarget;
 }
-constexpr uint32_t StaleAfter = 3000;      // ms without a snapshot: hold presentation and reject contacts
 
 // Owned NPCs (the host's processing area; a client's own region): sent to the others
 uint32_t lastSend = 0;
@@ -735,14 +736,21 @@ uint8_t FightFlags(Entity& npc)
 void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
 {
     if (!net::IsHost()) return;
-    const auto previousOwned = owned;
     owned.clear();
     lastPlayerCount = playerCount;
     for (int k = 0; k < playerCount; ++k) std::memcpy(lastPlayers[k], players[k], sizeof(float) * 3);
     eCEntity* controlled = remote::ControlledBody();
     const bTObjArray<Entity> all = Entity::GetNPCs();
-    net::NpcRecord batch[net::MaxNpcsPerMessage];
-    int n = 0;
+    eCEntity* hostFocus = controlled && controlled->GetPropertySet(eEPropertySetType_Focus)
+        ? Entity(controlled).Focus.GetFocusEntity().GetInstance() : nullptr;
+    eCEntity* hostTarget = controlled && controlled->GetPropertySet(eEPropertySetType_NPC)
+        ? Entity(controlled).NPC.GetCurrentTarget().GetInstance() : nullptr;
+    net::Remote const* remotes = net::Remotes();
+    const auto countSkipped = [&](std::string const& key, net::NpcSendDecision decision) {
+        for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+            if (net::InWorld(id) && remotes[id].connected && !recipientNpcs[id].count(key))
+                net::RecordNpcSendDecision(decision);
+    };
     std::vector<pose::Bone> bones;
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity const& npc = all.GetAt(i);
@@ -753,8 +761,12 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         guid::CopyEntity(instance, guid);
         SendNote& note = sendNotes[Key(guid)];
         note.at = net::Now();
-        if (journal::Pending(instance)) { note.reason = "pending"; continue; }  // a recorded death not applied yet: never show it alive
-        if (mirrors.count(Key(guid))) { note.reason = "mirror"; continue; }      // simulated elsewhere: we show theirs
+        if (journal::Pending(instance)) {
+            note.reason = "pending"; countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
+        }  // a recorded death not applied yet: never show it alive
+        if (mirrors.count(Key(guid))) {
+            note.reason = "mirror"; countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
+        }
         if (deadStays && !net::IsHost() && deadOnHost.count(Key(guid))) {
             Entity corpse(instance);
             KeepDead(corpse);
@@ -762,7 +774,9 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             continue;
         }
         const auto back = givenBack.find(Key(guid));
-        if (back != givenBack.end() && static_cast<int32_t>(net::Now() - back->second) < 0) { note.reason = "givenback"; continue; }  // handed back
+        if (back != givenBack.end() && static_cast<int32_t>(net::Now() - back->second) < 0) {
+            note.reason = "givenback"; countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
+        }
         const bCVector& p = instance->GetWorldPosition();
         const float at[3] = {p.GetX(), p.GetY(), p.GetZ()};
         float nearest = 1e30f;
@@ -782,10 +796,11 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             if (held != sending.end() && static_cast<int32_t>(t - held->second.last) <= 1500) {  // ours until now
                 const bool young = static_cast<int32_t>(t - held->second.since) < static_cast<int32_t>(MinHold);
                 const bool fighting = Entity(instance).Routine.AIMode == gEAIMode_Combat;
-                if (nearest <= KeepRadius || ((young || fighting) && nearest <= KeepRadius + 2000.0f)) { inRange = true; ++heldBand; }
+                const float retain = std::max(KeepRadius, GetConfig().hostRoi + 2000.0f);
+                if (nearest <= retain || ((young || fighting) && nearest <= retain + 2000.0f)) { inRange = true; ++heldBand; }
             }
         }
-        if (!inRange) { note.reason = "range"; continue; }
+        if (!inRange) { note.reason = "range"; countSkipped(Key(guid), net::NpcSendDecision::SkippedFar); continue; }
         note.reason = "sent";
         {
             Held& held = sending[Key(guid)];
@@ -793,8 +808,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             if (!held.last || static_cast<int32_t>(t - held.last) > 1500) held.since = t;
             held.last = t;
         }
-        net::NpcRecord& r = batch[n];
-        r = net::NpcRecord{};
+        net::NpcRecord r{};
         std::memcpy(r.guid, guid, 16);
         owned.insert(Key(guid));
         std::memcpy(r.position, at, sizeof(at));
@@ -875,64 +889,118 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             });
         r.contact = motionReady && (r.flags & 128 ? motionReady : posed) &&
                     r.motions[0].weight > 0.0001f && body::LocallyAttacking(instance) ? 1 : 0;
-        bool essential = false;
+        bool moving = false;
         {
             LastSent& last = lastSent[Key(guid)];
             const uint32_t t = net::Now();
             if (!(posed || motionReady) && !(r.flags & 1) && (!last.at))
                 Logf("npcs: %s is waiting for its native skeletal pose; contacts remain disabled", self.GetName().GetText());
-            const bool terminalChanged = (r.flags & 3) &&
-                                         (!last.at || (r.flags & 3) != (last.record.flags & 3));
             const bool revived = last.at && (last.record.flags & 3) && !(r.flags & 3);
             if (revived && (last.record.flags & 1) && r.incarnation == last.record.incarnation) {
-                uint32_t& incarnation = incarnations[Key(guid)];
-                if (++incarnation == 0) ++incarnation;
-                r.incarnation = incarnation;
+                uint32_t& revivedIncarnation = incarnations[Key(guid)];
+                if (++revivedIncarnation == 0) ++revivedIncarnation;
+                r.incarnation = revivedIncarnation;
                 hostHits.erase(Key(guid));
                 forceHistory.erase(Key(guid));
                 r.hitPlayer = 0;
                 r.hitSequence = 0;
             }
-            const bool ragdollNow = (r.flags & 128) && !(last.record.flags & 128);
-            const bool partyChanged = last.at && (r.partyPlayer != last.record.partyPlayer || r.waiting != last.record.waiting ||
-                                                  r.partyType != last.record.partyType || r.guidePlayer != last.record.guidePlayer);
-            const bool hitChanged = last.at && (last.record.hitSequence != r.hitSequence || last.record.hitPlayer != r.hitPlayer);
-            const bool contactChanged = last.at && last.record.contact != r.contact;
-            const bool attitudeChanged = last.at && last.record.attitude != r.attitude;
+            if (last.at) {
+                float same = 0.0f, opposite = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const float a = r.rotation[k] - last.record.rotation[k];
+                    const float b = r.rotation[k] + last.record.rotation[k];
+                    same += a * a;
+                    opposite += b * b;
+                }
+                if (body::Distance(r.position, last.record.position) >= npcsend::MovementPositionCm ||
+                    std::min(same, opposite) >= npcsend::MovementQuaternionComponent * npcsend::MovementQuaternionComponent)
+                    last.movingUntil = t + npcsend::MovementHoldMs;
+            }
+            moving = last.movingUntil && static_cast<int32_t>(last.movingUntil - t) > 0;
             last.record = r;
             last.at = t;
             SentStates& states = sentStates[Key(guid)];
             states.at[states.next] = r.sent;
             states.parrying[states.next] = parrying;
             states.next = (states.next + 1) % StateHistory;
-            if (terminalChanged || revived || ragdollNow || partyChanged || hitChanged || contactChanged || attitudeChanged) {
-                essential = true;
+        }
+        const std::string key = Key(guid);
+        for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+            if (!net::InWorld(id) || !remotes[id].connected || !(remotes[id].latest.flags & 1) ||
+                remotes[id].latest.world != remote::CurrentWorld()) {
+                if (net::InWorld(id) && net::PeerJoined(id))
+                    net::RecordNpcSendDecision(net::NpcSendDecision::SkippedIrrelevant);
+                continue;
+            }
+            const float distance = body::Distance(at, remotes[id].latest.position);
+            auto& states = recipientNpcs[id];
+            const auto existing = states.find(key);
+            npcsend::State fresh;
+            npcsend::State& state = existing == states.end() ? fresh : existing->second;
+            npcsend::Input input;
+            input.record = &r;
+            input.bones = posed ? bones.data() : nullptr;
+            input.boneCount = posed ? static_cast<int>(bones.size()) : 0;
+            input.poseFlags = posed ? poseFlags : 0;
+            input.now = r.sent;
+            input.distanceCm = distance;
+            input.interest = (((r.flags >> 3) & 7) == id || r.partyPlayer == id || r.guidePlayer == id)
+                ? npcsend::Interest::Include : npcsend::Interest::Distance;
+            input.focused = distance <= npcsend::ContactSafetyCm ||
+                ((hostFocus == instance || hostTarget == instance) && distance <= npcsend::InterestExitCm);
+            input.combat = (r.flags & 4) != 0;
+            input.contact = r.contact != 0;
+            input.moving = moving;
+            // Camera orientation is not in player state. Keep every potentially visible mover at capture rate.
+            input.nearby = distance <= npcsend::InterestExitCm;
+            const npcsend::Result result = npcsend::Evaluate(state, input);
+            if (result.decision == npcsend::Decision::Outside) {
+                net::RecordNpcSendDecision(net::NpcSendDecision::SkippedFar);
+            } else if (result.decision == npcsend::Decision::Wait) {
+                net::RecordNpcSendDecision(net::NpcSendDecision::SkippedUnchanged);
+            } else if (result.decision == npcsend::Decision::Invalid || result.decision == npcsend::Decision::Ineligible) {
+                static unsigned invalid = 0;
+                if (invalid++ < 20) Logf("npcs: invalid send policy input for recipient %u", id);
+                net::RecordNpcSendDecision(net::NpcSendDecision::SkippedIrrelevant);
+            } else if (result.decision == npcsend::Decision::FinalAndRelease) {
+                const bool finalQueued = net::SendNpcsTo(id, &r, 1, true);
+                const bool releaseQueued = finalQueued && net::SendNpcReleaseTo(id, guid, 1);
+                if (releaseQueued && npcsend::Commit(state, input, result.decision)) {
+                    states.erase(key);
+                    net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
+                } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
+            } else {
+                // A reliable posed state carries both the essential record and its pose in one publication.
+                const bool queued = posed
+                    ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, result.essential)
+                    : net::SendNpcsTo(id, &r, 1, result.essential);
+                if (queued && npcsend::Commit(state, input, result.decision)) {
+                    if (existing == states.end()) states.emplace(key, std::move(fresh));
+                    net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
+                } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
             }
         }
-        if (posed) {
-            if (essential) net::SendNpcs(&r, 1, true);
-            net::SendPosedNpc(r, bones.data(), static_cast<int>(bones.size()), poseFlags);
-            continue;
-        }
-        if (essential) { net::SendNpcs(&r, 1, true); continue; }
-        if (++n == net::NpcsPerSend) { net::SendNpcs(batch, n); n = 0; }
     }
-    if (n) net::SendNpcs(batch, n);
-    uint8_t released[net::MaxNpcsPerMessage * 16];
-    int count = 0;
-    for (auto const& key : previousOwned) {
-        if (owned.count(key)) continue;
-        const auto note = sendNotes.find(key);
-        const auto final = lastSent.find(key);
-        if (note != sendNotes.end() && !std::strcmp(note->second.reason, "range") && final != lastSent.end())
-            net::SendNpcs(&final->second.record, 1, true);  // final known pose precedes its ordered release
-        std::memcpy(released + count++ * 16, key.data(), 16);
-        if (count == net::MaxNpcsPerMessage) {
-            net::SendNpcRelease(released, count);
-            count = 0;
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+        auto& states = recipientNpcs[id];
+        for (auto it = states.begin(); it != states.end();) {
+            if (owned.count(it->first)) { ++it; continue; }
+            const auto note = sendNotes.find(it->first);
+            const auto final = lastSent.find(it->first);
+            const bool range = note != sendNotes.end() && !std::strcmp(note->second.reason, "range");
+            const bool finalQueued = !range || (final != lastSent.end() && net::SendNpcsTo(id, &final->second.record, 1, true));
+            const bool released = finalQueued && net::SendNpcReleaseTo(id,
+                reinterpret_cast<uint8_t const*>(it->first.data()), 1);
+            if (released) {
+                net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
+                it = states.erase(it);
+            } else {
+                net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
+                ++it;
+            }
         }
     }
-    if (count) net::SendNpcRelease(released, count);
 }
 
 // Host, host_sim = elastic: takes back the clients' NPCs inside its sphere (see ReclaimAfter).
@@ -1017,6 +1085,7 @@ void HostTick()
     if (net::JoinCount() != knownJoins) {  // a new client needs every motion name again
         knownJoins = net::JoinCount();
         namesSent.clear();
+        for (auto& states : recipientNpcs) states.clear();
         for (auto const& entry : forceHistory) for (auto const& force : entry.second) net::SendRagdoll(force);
     }
     // Players in this world: the host's hero and every remote player here.
@@ -1031,6 +1100,11 @@ void HostTick()
     net::Remote const* remotes = net::Remotes();
     bool anyClient = false;
     for (int id = 2; id < net::MaxPlayers; ++id) {
+        const uint32_t generation = net::PeerGeneration(static_cast<uint8_t>(id));
+        if (!net::InWorld(static_cast<uint8_t>(id)) || !remotes[id].connected || recipientGenerations[id] != generation) {
+            recipientNpcs[id].clear();
+            recipientGenerations[id] = generation;
+        }
         if (!remotes[id].connected) { joinedAt[id] = 0; continue; }
         anyClient = true;
         if (!(remotes[id].latest.flags & 1) || remotes[id].latest.world != remote::CurrentWorld()) continue;
@@ -3380,6 +3454,8 @@ void OnWorldDeactivate()
     inSphereSince.clear();
     deadOnHost.clear();
     lastSent.clear();
+    for (auto& states : recipientNpcs) states.clear();
+    std::fill(recipientGenerations, recipientGenerations + net::MaxPlayers, 0);
     incarnations.clear();
     hostHits.clear();
     forceHistory.clear();

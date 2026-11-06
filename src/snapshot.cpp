@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "snapshot.h"
+#include "npcsend_policy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -80,7 +81,8 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
             track = Track{};
             track.serial = serial;
             track.predictive = predictive;
-        } else {
+        } else if (track.predictive || static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs) {
+            // Sparse idle NPC keyframes are intentional, not evidence of network jitter.
             const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, 100u);
             if (arrived - track.cadenceWindowAt >= OffsetWindow) {
                 track.previousCadenceMin = track.cadenceMin;

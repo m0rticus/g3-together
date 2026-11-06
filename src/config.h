@@ -37,8 +37,7 @@ struct Config
     // p95 off 315-432 ms, on 66-134 ms).
     bool motionSeek = true;
     bool movementSmoothing = true;  // movement_smoothing = on | off; buffered replica poses, not local input delay
-    // send_rate = 20..60 (Hz, default 60): how often player states and every NPC that changed are sent. A higher rate lets the
-    // receiving side show them with a shorter display buffer; unchanged NPCs still go out only every 100 ms.
+    // send_rate = 20..60 (Hz, default 60): player-state rate. NPC capture and per-recipient send policy are independent.
     int sendRate = 60;
     // listener_textbox = off | on (dialogaudio.cpp, owner 28.10.): off (default; stageDialogOptions 28.10.: no box, the lines as
     // subtitles) a player who only listens to the other's dialog sees its lines as subtitles, as the game shows the talk of

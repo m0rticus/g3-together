@@ -7,8 +7,8 @@
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
 
-The current source speaks **protocol 72**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
-acceptance is still in progress; it is not a verified release. Both players need the same build.
+The current source speaks **protocol 73**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
+acceptance is still in progress; it is not a verified release. Both players need the same build; protocol 72 peers are refused.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
 Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
 autonomous tasks or prediction. Final poses include native blend-out layers that motion slots alone do not describe.

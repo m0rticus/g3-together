@@ -126,7 +126,7 @@ last step (`CRASH end-flow last_step=...`), both logs and any dump; `kill-return
 bundled dump writer rejects detailed flags, the log should report a `MiniDumpNormal` retry; record any dump
 write/rewind failure or empty dump. Do not trigger a crash just to check the diagnostic.
 
-### Paired-save failure and migration checks (protocol 72)
+### Paired-save failure and migration checks (protocol 73)
 
 Use only backed-up isolated profiles; never the protected user save folder.
 
