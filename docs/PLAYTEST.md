@@ -93,6 +93,39 @@ choose independently; the setting changes only mod messages.
 With only 60 minutes, prioritize joining, combat, helping up, recruiting and dismissing a companion,
 and paired saving initiated from both machines. Test separate regions and rejoining in a follow-up session.
 
+### Both down and revive regression
+
+Use the backed-up, isolated paired test save on both PCs and an enemy, not friendly fire. Record observations
+on both sides; these are manual checks, not a claim that the scenarios have passed.
+
+1. With the host able to help, knock down only the client. Wait more than five seconds and check the client
+   stays down despite native standing/healing animations or snapshots. The host chooses "I will help you.";
+   check the client stands up and exactly one host healing potion is consumed. Repeat with the host down and
+   the client helping; exactly one client potion is consumed. Also check the no-potion notice and no revival.
+2. Reload the paired test save between terminal attempts. Knock both players down nearly simultaneously;
+   then repeat with the host down first and with the client down first. When each sees the other as present
+   and down/dead, expect game over without a crash or a repeated death task. Check both screens and logs.
+3. Knock one player down while the partner is in a menu/loading or otherwise not known to be present. The
+   absence is not immediate `all-down`: allow at least five seconds of continuous inability to help and
+   expect `alone-grace` if no eligible helper returns. Repeat with the partner returning before the grace
+   expires; the waiting player should remain down and be revivable.
+4. With one player down, have the helper go down while speaking the help line or while its revive message is
+   pending. Record the ordering: if the helper is already unable to help before the pending revive is applied,
+   it must be refused and must not stand the target up; if application completed first, the earlier successful
+   revive is not retroactively refused. Neither a late nor duplicate message may revive a terminal life.
+   Record potion counts and whether both reach game over if both are down.
+5. Reload and repeat the above, including both helper directions. As a smoke check, perform a quick trade
+   in each direction and verify inventories, then make and load a paired save and verify each player's own
+   character and shared world.
+
+For each terminal life, inspect `g3together.log` manually for the decision reason `all-down` or `alone-grace`
+and one `downed: end step=kill-enter` followed by one `kill-return` when the native call returns. Reentry
+may log `skipped-terminal` but must not issue another Kill. The native script contract is `Kill(killer, victim)`:
+the killer may be null, but the victim must be the local hero. If a crash occurs inside the call, record the
+last step (`CRASH end-flow last_step=...`), both logs and any dump; `kill-return` will be absent. If the
+bundled dump writer rejects detailed flags, the log should report a `MiniDumpNormal` retry; record any dump
+write/rewind failure or empty dump. Do not trigger a crash just to check the diagnostic.
+
 ### Paired-save failure and migration checks (protocol 72)
 
 Use only backed-up isolated profiles; never the protected user save folder.

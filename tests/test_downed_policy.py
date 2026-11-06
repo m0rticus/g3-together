@@ -39,14 +39,35 @@ class DownedPolicyTests(unittest.TestCase):
     def test_die_is_idempotent_and_calls_native_kill_once(self):
         body = function_body(
             self.downed_cpp,
-            r"\bvoid\s+Die\s*\(\s*Entity\s*&\s*hero\s*\)",
+            r"\bvoid\s+Die\s*\(\s*Entity\s*&\s*hero\s*,\s*char\s+const\s*\*\s*reason\s*\)",
         )
         self.assertIsNotNone(body)
-        self.assertIn("if (dying || terminalKillSent) return;", body)
-        self.assertIn("terminalKillSent = true;", body)
-        kill = 'GetScriptAdminExt().CallScript(bCString("Kill"), hero.GetInstance(), nullptr, 0)'
+        self.assertTrue(body.strip().startswith("if (!life.End())"))
+        guard = function_body(body, r"\bif\s*\(\s*!life\.End\(\)\s*\)")
+        self.assertIsNotNone(guard)
+        self.assertIn('EndStep("skipped-terminal");', guard)
+        self.assertIn("return;", guard)
+        for native in ("CallScript", "SetHitPoints", "FullStop", "GetInstance"):
+            self.assertNotIn(native, guard)
+        kill = 'GetScriptAdminExt().CallScript(bCString("Kill"), nullptr, hero.GetInstance(), 0)'
+        self.assertEqual(body.count("CallScript("), 1)
         self.assertEqual(body.count(kill), 1)
-        self.assertLess(body.index("terminalKillSent = true;"), body.index(kill))
+        self.assertEqual(body.count("terminalKillSent = true;"), 1)
+        ordered = (
+            'EndStep("decision");',
+            'EndStep("set-hp");',
+            "hero.PlayerMemory.SetHitPoints(0);",
+            'EndStep("full-stop");',
+            "hero.Routine.FullStop();",
+            "terminalKillSent = true;",
+            'EndStep("kill-enter");',
+            kill,
+            'EndStep("kill-return");',
+        )
+        self.assertEqual([body.index(step) for step in ordered],
+                         sorted(body.index(step) for step in ordered))
+        between = body[body.index("terminalKillSent = true;") + len("terminalKillSent = true;"):body.index(kill)]
+        self.assertRegex(between, r'^\s*EndStep\("kill-enter"\);\s*(?:const\s+\w+\s+\w+\s*=\s*)?$')
         self.assertNotIn("SetTask", body)
 
     def test_terminal_tick_latch_never_restarts_a_death_task(self):
@@ -55,15 +76,21 @@ class DownedPolicyTests(unittest.TestCase):
             r"\bvoid\s+Tick\s*\(\s*\)",
         )
         self.assertIsNotNone(tick)
-        start = tick.index("if (dying) {")
+        start = tick.index("if (life.terminal) {")
         end = tick.index("if (hero.IsDead()", start)
         terminal = tick[start:end]
         self.assertNotIn("SetTask", terminal)
+        self.assertNotIn("CallScript", terminal)
+        self.assertNotIn("KeepDown", terminal)
+        self.assertNotIn("FullStop", terminal)
+        self.assertNotIn("StandUp", terminal)
         self.assertNotIn("diedAt", terminal)
         self.assertNotIn("dying again", terminal)
         self.assertIn("hero.PlayerMemory.GetHitPoints() > 0", terminal)
+        self.assertIn("hero.PlayerMemory.SetHitPoints(0)", terminal)
+        self.assertIn("return;", terminal)
 
-    def test_revive_and_world_change_clear_terminal_death(self):
+    def test_revive_refuses_terminal_and_world_change_resets_it(self):
         revived = function_body(
             self.downed_cpp,
             r"\bvoid\s+Revived\s*\(\s*int\s+byPlayer\s*,\s*uint32_t\s+sequence\s*\)",
@@ -73,11 +100,20 @@ class DownedPolicyTests(unittest.TestCase):
             r"\bvoid\s+OnWorldChange\s*\(\s*\)",
         )
         self.assertIsNotNone(revived)
-        self.assertIn("dying", revived)
-        self.assertIn("terminalKillSent", revived)
+        guard = function_body(revived, r"\bif\s*\(\s*!helper\b[^{}]*\)")
+        self.assertIsNotNone(guard)
+        for condition in ("!life.held", "!sequence", "sequence != life.sequence", "life.terminal",
+                          "terminalKillSent", "!instance", "!session.IsGameRunning()", "persist::HeroPending()"):
+            self.assertIn(condition, revived[:revived.index("{", revived.index("if (!helper"))])
+        self.assertIn("return;", guard)
+        for condition in ("byPlayer > 0", "byPlayer < net::MaxPlayers", "byPlayer != net::LocalId()"):
+            self.assertIn(condition, revived[:revived.index("if (!helper")])
+        self.assertLess(revived.index("Able(net::Remotes()[byPlayer], net::Now())"), revived.index("revivedBy = byPlayer;"))
+        self.assertLess(revived.index("if (!helper"), revived.index("pendingReviveSequence = sequence;"))
         self.assertIsNotNone(world_change)
-        self.assertIn("dying = false;", world_change)
+        self.assertIn("life.OnWorldChange();", world_change)
         self.assertIn("terminalKillSent = false;", world_change)
+        self.assertIn("pendingReviveSequence = 0;", world_change)
         self.assertIn("void OnWorldChange();", self.downed_h)
         self.assertIn("g3t::downed::OnWorldChange();", self.script_cpp)
 
@@ -86,9 +122,9 @@ class DownedPolicyTests(unittest.TestCase):
         world_change = function_body(self.downed_cpp, r"\bvoid\s+OnWorldChange\s*\(\s*\)")
         self.assertIn("if (!down && !life.held)", tick)
         self.assertNotIn("life.held = false;", world_change)
-        self.assertIn("life.Rebind()", world_change)
+        self.assertIn("life.OnWorldChange()", world_change)
         self.assertIn('KeepDown(hero, "tick")', tick)
-        before_terminal = tick[:tick.index("if (dying)")]
+        before_terminal = tick[:tick.index("if (life.terminal)")]
         self.assertNotIn("life.held = false", before_terminal)
         self.assertNotIn("terminalKillSent = false", before_terminal)
         ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
@@ -113,9 +149,110 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("sequence != life.sequence", self.downed_cpp)
         self.assertIn("life.Revive(pendingReviveSequence)", self.downed_cpp)
         self.assertIn("hero.IsDown() || hero.IsDead()", self.downed_cpp)
+        tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(\s*\)")
+        refused = function_body(tick, r"\bif\s*\(\s*revivedBy\s*&&\s*!Able\(remotes\[revivedBy\],\s*now\)\s*\)")
+        self.assertIsNotNone(refused)
+        self.assertIn("revivedBy = 0;", refused)
+        self.assertIn("pendingReviveSequence = 0;", refused)
+        self.assertLess(tick.index("revivedBy && !Able(remotes[revivedBy], now)"),
+                        tick.index("life.Revive(pendingReviveSequence)"))
+        self.assertIn("life.terminal || terminalKillSent || !life.Revive(pendingReviveSequence)", tick)
         net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
         self.assertIn("message.state.npcClass = from;", net)
         self.assertIn("constexpr uint16_t ProtocolVersion = saving::Protocol;", net)
+
+    def test_client_revive_world_states_and_kind_19_routing(self):
+        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        send = function_body(net, r"\bvoid\s+SendWorldState\s*\(")
+        special = function_body(send, r"\bif\s*\(\s*state\.kind\s*==\s*19\s*\)")
+        self.assertIsNotNone(special)
+        # The special XP handshake must keep its host broadcast/client direct-send paths and returns.
+        self.assertEqual(
+            " ".join(special.split()),
+            "if (isHost) { if (state.dialog == 0) SendBroadcastExcept(&message, sizeof(message), "
+            "ChannelReliable, true, except); return; } "
+            "if (connected && server) Send(server, &message, sizeof(message), ChannelReliable, true); return;",
+        )
+        gate = "if (!host || (!isHost && state.kind != 8 && state.kind != 9)) return;"
+        broadcast = "SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);"
+        self.assertIn(gate, send)
+        self.assertLess(send.index("if (state.kind == 19)"), send.index(gate))
+        self.assertLess(send.index(gate), send.rindex(broadcast))
+        broadcast_body = function_body(net, r"\bvoid\s+SendBroadcastExcept\s*\(")
+        self.assertIn("if (!isHost) { SendToServer(data, size, channel, reliable); return; }", broadcast_body)
+        self.assertIn("if (peers[i] && i != except) Send(peers[i], data, size, channel, reliable);", broadcast_body)
+
+        receive = function_body(
+            net,
+            r"\belse\s+if\s*\(\s*type\s*==\s*MsgWorldState\s*&&\s*"
+            r"packet->dataLength\s*==\s*sizeof\(WorldStateMsg\)\s*\)",
+        )
+        self.assertIsNotNone(receive)
+        sanitization = "if (isHost && (message.state.kind == 8 || message.state.kind == 9))"
+        self.assertIn("isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1", receive)
+        self.assertIn(sanitization, receive)
+        self.assertRegex(receive, re.escape(sanitization) + r"\s*message\.state\.npcClass = from;")
+        self.assertLess(receive.index(sanitization), receive.index("message.state.npcClass = from;"))
+        self.assertLess(receive.index("message.state.npcClass = from;"), receive.index("worldStateHandler(from, message.state)"))
+        special_receive = function_body(receive, r"\bif\s*\(\s*message\.state\.kind\s*==\s*19\s*\)")
+        self.assertIn("if (message.state.dialog > 3) return;", special_receive)
+        self.assertIn("from < 2 || from >= MaxPlayers || peers[from] != peer || message.state.npcClass != from", special_receive)
+        self.assertIn("from != 1 || message.state.npcClass != 1", special_receive)
+        infocmd = (ROOT / "src" / "infocmd.cpp").read_text(encoding="utf-8")
+        self.assertIn("if (net::IsHost() && s.kind != 3 && s.kind != 16) net::SendWorldState(s, from);", infocmd)
+        apply = function_body(infocmd, r"\bvoid\s+Apply\s*\(")
+        help_message = function_body(apply, r"\bif\s*\(\s*s\.kind\s*==\s*8\s*\|\|\s*s\.kind\s*==\s*9\s*\)")
+        target = function_body(help_message, r"\bif\s*\(\s*s\.guard\s*==\s*net::LocalId\(\)\s*\)")
+        self.assertIn("std::memcpy(&sequence, s.guid, sizeof(sequence));", target)
+        self.assertIn("if (s.kind == 8) downed::Revived(s.npcClass, sequence);", target)
+        self.assertIn("else downed::HelperHasNoPotion(s.npcClass);", target)
+
+    def test_cached_end_step_reaches_crash_handlers(self):
+        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        crash_h = (ROOT / "src" / "crashlog.h").read_text(encoding="utf-8")
+        end_step = function_body(self.downed_cpp, r"\bvoid\s+EndStep\s*\(")
+        self.assertIn("crashlog::EndStep(step);", end_step)
+        self.assertIn("downed: end step=%s", end_step)
+        transition = function_body(self.downed_cpp, r"\bvoid\s+Transition\s*\(")
+        self.assertIn("life.terminal ? 1 : 0", transition)
+        self.assertIn("void EndStep(char const* step);", crash_h)
+        self.assertIn("std::atomic<char const*> lastEndStep{nullptr};", crash)
+        cache = function_body(crash, r"\bvoid\s+EndStep\s*\(")
+        report = function_body(crash, r"\bvoid\s+LogEndStep\s*\(")
+        self.assertIn("lastEndStep.store(step);", cache)
+        self.assertIn("lastEndStep.load()", report)
+        self.assertIn("CRASH end-flow last_step=%s", report)
+        world_change = function_body(self.downed_cpp, r"\bvoid\s+OnWorldChange\s*\(")
+        self.assertIn('crashlog::EndStep("world-change");', world_change)
+        for handler in ("OnException", "LastChance"):
+            body = function_body(crash, rf"\bLONG\s+(?:CALLBACK|WINAPI)\s+{handler}\s*\(")
+            self.assertIsNotNone(body)
+            self.assertIn("LogEndStep();", body)
+
+    def test_minidump_fallback_is_limited_and_truncates_before_retry(self):
+        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        dump = function_body(crash, r"\bbool\s+WriteDump\s*\(")
+        self.assertIsNotNone(dump)
+        for flag in ("MiniDumpWithThreadInfo", "MiniDumpWithHandleData", "MiniDumpWithUnloadedModules",
+                     "MiniDumpWithDataSegs", "MiniDumpWithIndirectlyReferencedMemory"):
+            self.assertIn(flag, dump)
+        self.assertEqual(dump.count("writeDump("), 2)
+        self.assertLess(dump.index("file, type, exception"), dump.index("DWORD error = GetLastError();"))
+        retry = function_body(
+            dump,
+            r"\bif\s*\(\s*error\s*==\s*ERROR_INVALID_PARAMETER\s*\|\|\s*"
+            r"error\s*==\s*static_cast<DWORD>\(E_INVALIDARG\)\s*\)",
+        )
+        self.assertIsNotNone(retry)
+        self.assertLess(retry.index("SetFilePointerEx(file, start, nullptr, FILE_BEGIN)"),
+                        retry.index("SetEndOfFile(file)"))
+        self.assertLess(retry.index("SetEndOfFile(file)"), retry.index("file, MiniDumpNormal, exception"))
+        self.assertIn("crash dump rewind failed", retry)
+        self.assertIn("return false;", retry[:retry.index("file, MiniDumpNormal, exception")])
+        self.assertIn("error = GetLastError();", retry[retry.index("file, MiniDumpNormal, exception"):])
+        self.assertIn("crash dump write failed", dump)
+        self.assertIn("WriteDump(file, dumpInfo ? &exception : nullptr);", crash)
+        self.assertIn("WriteDump(file, nullptr);", crash)
 
     def test_engine_free_transition_and_ordering_rules(self):
         build = ROOT / "build" / "downed-policy-tests"
@@ -141,10 +278,28 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIsNotNone(all_down)
         self.assertIn("r.latest.flags & 14", all_down)
         self.assertIn("Present(r, now)", all_down)
+        self.assertIn("if (i == net::LocalId()) continue;", all_down)
+        self.assertIn("if (!r.connected) continue;", all_down)
+        self.assertIn("if (!Present(r, now)) return false;", all_down)
+        self.assertIn("if (!(r.latest.flags & 14)) return false;", all_down)
+        self.assertIn("return present;", all_down)
         self.assertIn("constexpr uint32_t AloneGrace = 5000;", self.downed_cpp)
         self.assertIsNotNone(tick)
         self.assertIn("AllOthersDown(remotes, now)", tick)
         self.assertIn("now - aloneSince >= AloneGrace", tick)
+        self.assertIn('Die(hero, "all-down")', tick)
+        self.assertIn('Die(hero, "alone-grace")', tick)
+        self.assertIn("if (helpPossible) { aloneSince = 0; return; }", tick)
+        self.assertIn("if (!aloneSince) aloneSince = now ? now : 1;", tick)
+        self.assertLess(tick.index("if (helpPossible)"), tick.index("AllOthersDown(remotes, now)"))
+        self.assertLess(tick.index("AllOthersDown(remotes, now)"), tick.index("now - aloneSince >= AloneGrace"))
+        able = function_body(self.downed_cpp, r"\bbool\s+Able\s*\(")
+        present = function_body(self.downed_cpp, r"\bbool\s+Present\s*\(")
+        for body in (able, present):
+            for requirement in ("r.connected", "r.latestTicks", "now - r.latestTicks < StaleState",
+                                "r.latest.flags & 1", "r.latest.world == remote::CurrentWorld()"):
+                self.assertIn(requirement, body)
+        self.assertIn("!(r.latest.flags & 14)", able)
 
 
 if __name__ == "__main__":

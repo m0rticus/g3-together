@@ -3,6 +3,7 @@
 #include "downed_policy.h"
 
 #include "body.h"
+#include "crashlog.h"
 #include "hud.h"
 #include "i18n.h"
 #include "items.h"
@@ -47,7 +48,6 @@ bool helpStarted[net::MaxPlayers] = {};  // our option for player i is the runni
 uint32_t lastOffer = 0;
 unsigned optionsOffered = 0, optionsChosen = 0;
 char const* const KnockOutTask = "ZS_LieKnockDown";
-char const* const DeathTask = "ZS_Dead";
 char const* const PotionPrefix = "It_Potion_Health";  // healing potions (the game's own templates)
 constexpr float ReviveRange = 250.0f;  // cm: a partner standing next to the hero
 constexpr uint32_t ReviveTime = 3000;  // ms the partner has to stay there
@@ -63,7 +63,6 @@ int lastHp = -1;                // the hero's hit points a frame ago
 uint32_t lethalBlowAt = 0;      // when a blow by someone who means to kill took hit points off the hero
 unsigned nativeLethal = 0;      // knock-outs of the game's own that were a lethal blow (promoted to the partner's help)
 bool nativeNoted = false;       // logged once per knock-out of the game's own
-bool dying = false;             // nobody could help: the hero dies like in the single-player game
 bool terminalKillSent = false;  // the native Kill/game-over script was called once for this life
 std::string inHand[2];         // the hero's right and left hand while standing (a knock-out drops them)
 bool wasDown = false;
@@ -83,7 +82,15 @@ void Transition(char const* reason, char const* source)
 {
     Logf("downed: transition=%u player=%u role=%s held=%d terminal=%d sequence=%u reason=%s source=%s",
          ++transitions, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
-         terminalKillSent ? 1 : 0, life.sequence, reason, source);
+         life.terminal ? 1 : 0, life.sequence, reason, source);
+}
+
+void EndStep(char const* step)
+{
+    crashlog::EndStep(step);
+    Logf("downed: end step=%s player=%u role=%s held=%d terminal=%d kill_sent=%d sequence=%u",
+         step, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
+         life.terminal ? 1 : 0, terminalKillSent ? 1 : 0, life.sequence);
 }
 
 bool DownTask(char const* task)
@@ -127,7 +134,7 @@ void KeepDown(Entity& hero, char const* source)
 
 void Hold(char const* reason, char const* source)
 {
-    if (life.held) return;
+    if (life.held || life.terminal) return;
     life.Restore(true);
     aloneSince = 0;
     revivedBy = 0;
@@ -209,7 +216,7 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
 {
     const bCVector& at = hero.GetInstance()->GetWorldPosition();
     const float here[3] = {at.GetX(), at.GetY(), at.GetZ()};
-    if (life.held || dying || hero.IsDown() || hero.IsDead() || i == net::LocalId() || !Present(r, now) ||
+    if (life.held || life.terminal || hero.IsDown() || hero.IsDead() || i == net::LocalId() || !Present(r, now) ||
         !(r.latest.flags & 8) || (r.latest.flags & 4) || !r.latest.downedSequence ||
         body::Distance(r.latest.position, here) > ReviveRange ||
         (paidSequence[i] == r.latest.downedSequence && now - paidAt[i] < PaidCooldown)) {
@@ -364,21 +371,41 @@ bool PartnerPresent(net::Remote const* remotes, uint32_t now)
 
 // Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths end this life once.
 // The native Kill script shows game over immediately. Starting ZS_Dead as well would call Kill a second time.
-void Die(Entity& hero)
+void Die(Entity& hero, char const* reason)
 {
-    if (dying || terminalKillSent) return;
-    dying = true;
-    life.held = false;
+    if (!life.End()) {
+        EndStep("skipped-terminal");
+        return;
+    }
     lethal = false;
     lethalSeenDown = false;
-    terminalKillSent = true;  // set before the script call: the terminal decision is re-entry safe
-    Transition("nobody-can-help", "end-policy");
+    revivedBy = 0;
+    pendingReviveSequence = 0;
+    EndStep("decision");
+    Transition(reason, "end-policy");
     ++deaths;
-    Logf("downed: nobody can help; the hero dies (hp=%d)", hero.PlayerMemory.GetHitPoints());
+    Logf("downed: nobody can help; the hero dies reason=%s hero=%p hp=%d task=%s state=%s ai=%d",
+         reason, hero.GetInstance(), hero.PlayerMemory.GetHitPoints(), hero.Routine.GetCurrentTask().GetText(),
+         hero.Routine.GetCurrentState().GetText(), static_cast<int>(hero.Routine.AIMode));
+    const uint32_t now = net::Now();
+    for (int i = 1; i < net::MaxPlayers; ++i) {
+        if (i == net::LocalId() || !net::Remotes()[i].connected) continue;
+        net::Remote const& r = net::Remotes()[i];
+        Logf("downed: end partner=%d flags=%u sequence=%u packet=%u age=%u present=%d able=%d",
+             i, r.latest.flags, r.latest.downedSequence, r.latest.sequence, now - r.latestTicks,
+             Present(r, now) ? 1 : 0, Able(r, now) ? 1 : 0);
+    }
     hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
+    EndStep("set-hp");
     hero.PlayerMemory.SetHitPoints(0);
+    EndStep("full-stop");
     hero.Routine.FullStop();
-    const GEInt killed = GetScriptAdminExt().CallScript(bCString("Kill"), hero.GetInstance(), nullptr, 0);
+    // Kill(killer, victim), unlike ResetAll(self): Script_Game.dll RVA 0x1bc30 resets OTHER before showing game over.
+    // No killer is needed here; a null victim crashes in ResetAll -> Entity::SetLookAtTarget.
+    terminalKillSent = true;
+    EndStep("kill-enter");
+    const GEInt killed = GetScriptAdminExt().CallScript(bCString("Kill"), nullptr, hero.GetInstance(), 0);
+    EndStep("kill-return");
     Logf("downed: native Kill/game-over script called once (result=%d)", killed);
 }
 }
@@ -390,7 +417,7 @@ void Die(Entity& hero)
 // can help any more (Die).
 bool RedirectDeath(eCEntity* self, char const* state)
 {
-    if (!enabled || dying || !self || self != gCSession::GetInstance().GetHero()) return false;
+    if (!enabled || life.terminal || !self || self != gCSession::GetInstance().GetHero()) return false;
     if (std::strcmp(state, "ZS_Dead") != 0 && std::strcmp(state, "ZS_RagDollDead") != 0) return false;
     Entity hero(self);
     hero.Routine.FullStop();
@@ -406,7 +433,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
 
 bool GuardState(eCEntity* self, char const* state)
 {
-    if (!life.held || dying || !self || self != gCSession::GetInstance().GetHero() ||
+    if (!life.held || life.terminal || !self || self != gCSession::GetInstance().GetHero() ||
         !gCSession::GetInstance().IsGameRunning() || persist::NativeLoading()) return false;
     Entity hero(self);
     // A module tick is not a script clock boundary: a long frame or another script can otherwise wake the hero first.
@@ -475,7 +502,7 @@ void Tick()
         toldDead[i] = dead;
     }
 
-    if (dying) {
+    if (life.terminal) {
         // Terminal death is one-shot.  The native Kill script, and not a repeating task latch, owns game over.
         // Do not inspect or restart ZS_Dead/ZS_Dead_Loop/PS_Normal here: that lets PS_Normal be accepted without
         // reviving or re-running the death script, while HP remains 0 and stale revive messages stay refused.
@@ -513,7 +540,6 @@ void Tick()
         lethal = false;
         lethalSeenDown = false;
         nativeNoted = false;
-        dying = false;
         aloneSince = 0;
         revivedBy = 0;
         if (autoHelp) Help(hero, remotes, now);
@@ -554,7 +580,7 @@ void Tick()
     if (revivedBy) {
         const int by = revivedBy;
         revivedBy = 0;
-        if (dying || terminalKillSent || !life.Revive(pendingReviveSequence)) return;
+        if (life.terminal || terminalKillSent || !life.Revive(pendingReviveSequence)) return;
         pendingReviveSequence = 0;
         lethal = false;
         lethalSeenDown = false;
@@ -576,11 +602,11 @@ void Tick()
         if (i != self && Able(remotes[i], now)) helpPossible = true;
     if (helpPossible) { aloneSince = 0; return; }
     if (AllOthersDown(remotes, now)) {
-        Die(hero);
+        Die(hero, "all-down");
         return;
     }
     if (!aloneSince) aloneSince = now ? now : 1;
-    if (now - aloneSince >= AloneGrace) Die(hero);
+    if (now - aloneSince >= AloneGrace) Die(hero, "alone-grace");
 }
 
 // A partner paid a potion for us (WorldState kind 8 to this player).
@@ -590,10 +616,10 @@ void Revived(int byPlayer, uint32_t sequence)
     eCDynamicEntity* instance = session.GetHero();
     const bool helper = byPlayer > 0 && byPlayer < net::MaxPlayers && byPlayer != net::LocalId() &&
                         Able(net::Remotes()[byPlayer], net::Now());
-    if (!helper || !life.held || !sequence || sequence != life.sequence || dying || terminalKillSent ||
+    if (!helper || !life.held || !sequence || sequence != life.sequence || life.terminal || terminalKillSent ||
         !instance || !session.IsGameRunning() || persist::HeroPending()) {
         Logf("downed: revive refused player=%u helper=%d sequence=%u current=%u held=%d terminal=%d reason=stale-or-ineligible",
-             net::LocalId(), byPlayer, sequence, life.sequence, life.held ? 1 : 0, terminalKillSent ? 1 : 0);
+             net::LocalId(), byPlayer, sequence, life.sequence, life.held ? 1 : 0, life.terminal ? 1 : 0);
         return;
     }
     revivedBy = byPlayer;
@@ -616,7 +642,7 @@ uint32_t Sequence() { return life.held ? life.sequence : 0; }
 
 void Restore(bool waiting, char const* source)
 {
-    if (dying || terminalKillSent) return;
+    if (life.terminal || terminalKillSent) return;
     if (waiting && !life.held) {
         Hold("saved-downed-life", source);
         lethal = true;
@@ -635,22 +661,22 @@ void NoteBlow()
 bool NativeDown()
 {
     eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
-    if (!instance || life.held || lethal || dying || !gCSession::GetInstance().IsGameRunning()) return false;
+    if (!instance || life.held || lethal || life.terminal || !gCSession::GetInstance().IsGameRunning()) return false;
     Entity hero(instance);
     return hero.IsDown() && !hero.IsDead();
 }
 
 void OnWorldChange()
 {
-    if (life.held) life.Rebind(); // old-world paid revives must not apply after the load
+    life.OnWorldChange(); // old-world paid revives must not apply after the load
     lethal = life.held;
     lethalSeenDown = false;
     lethalAt = 0;
     lastHp = -1;
     lethalBlowAt = 0;
     nativeNoted = false;
-    dying = false;
     terminalKillSent = false;
+    crashlog::EndStep("world-change");
     Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
     wasDown = false;
     aloneSince = 0;

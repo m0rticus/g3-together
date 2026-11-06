@@ -9,6 +9,7 @@
 namespace g3t::crashlog {
 using LogFn = void (*)(char const*);
 void Tick();              // installs the handler once QA is enabled; takes the script names once a game runs
+void EndStep(char const* step); // cache a static-lifetime step name; safe to report without reading game objects
 void NamesOff(LogFn log); // QA negative control (crashnamesoff): crash lines without function names
 void Probe(LogFn log);    // QA crashprobe: a caught access violation in Engine.dll, CRASHPROBE line
 void Stage(char const* name);

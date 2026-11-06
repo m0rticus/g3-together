@@ -8,6 +8,7 @@ namespace g3t::downed {
 struct Life
 {
     bool held = false;
+    bool terminal = false;
     uint32_t sequence = 0;
 
     void Rebind()
@@ -17,6 +18,7 @@ struct Life
 
     void Hold()
     {
+        if (terminal) return;
         if (!held) Rebind();
         held = true;
     }
@@ -28,9 +30,23 @@ struct Life
 
     bool Revive(uint32_t request)
     {
-        if (!held || !request || request != sequence) return false;
+        if (terminal || !held || !request || request != sequence) return false;
         held = false;
         return true;
+    }
+
+    bool End()
+    {
+        if (terminal) return false;
+        terminal = true;
+        held = false;
+        return true;
+    }
+
+    void OnWorldChange()
+    {
+        if (held) Rebind();
+        terminal = false;
     }
 };
 }

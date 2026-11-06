@@ -7,6 +7,7 @@
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <TlHelp32.h>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,13 @@ namespace {
 bool installed = false, dumpInstalled = false;
 volatile bool probing = false;
 LONG logged = 0;
+std::atomic<char const*> lastEndStep{nullptr};
+
+void LogEndStep()
+{
+    if (char const* step = lastEndStep.load())
+        Logf("CRASH end-flow last_step=%s pid=%lu thread=%lu", step, GetCurrentProcessId(), GetCurrentThreadId());
+}
 
 using DumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
                              PMINIDUMP_CALLBACK_INFORMATION);
@@ -58,6 +66,29 @@ void DeriveDumpDir()
     }
 }
 
+bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception)
+{
+    if (!writeDump) { Log("crashlog: crash dump writer unavailable"); return false; }
+    const auto type = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+        MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
+    if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type, exception, nullptr, nullptr)) return true;
+    DWORD error = GetLastError();
+    // The game ships dbghelp 5.2, which rejects newer flags with HRESULT E_INVALIDARG and leaves an empty dump.
+    if (error == ERROR_INVALID_PARAMETER || error == static_cast<DWORD>(E_INVALIDARG)) {
+        Logf("crashlog: detailed minidump unsupported error=%lu; retrying MiniDumpNormal", error);
+        const LARGE_INTEGER start{};
+        if (!SetFilePointerEx(file, start, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) {
+            Logf("crashlog: crash dump rewind failed error=%lu", GetLastError());
+            return false;
+        }
+        if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, exception, nullptr, nullptr)) return true;
+        error = GetLastError();
+    }
+    Logf("crashlog: crash dump write failed error=%lu", error);
+    return false;
+}
+
 DWORD WINAPI DumpThread(LPVOID)
 {
     for (;;) {
@@ -76,13 +107,10 @@ DWORD WINAPI DumpThread(LPVOID)
         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file != INVALID_HANDLE_VALUE) {
             MINIDUMP_EXCEPTION_INFORMATION exception{dumpThreadId, dumpInfo, FALSE};
-            const auto type = static_cast<MINIDUMP_TYPE>(
-                MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
-                MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
-            if (!writeDump || !writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type,
-                                         dumpInfo ? &exception : nullptr, nullptr, nullptr))
-                Log("crashlog: crash dump write failed");
+            WriteDump(file, dumpInfo ? &exception : nullptr);
             CloseHandle(file);
+        } else {
+            Logf("crashlog: crash dump create failed error=%lu", GetLastError());
         }
         SetEvent(dumpDone);
     }
@@ -103,6 +131,7 @@ LONG WINAPI LastChance(EXCEPTION_POINTERS* info)
 {
     if (ai::ShuttingDown() || GetCurrentThreadId() == dumpWorkerThreadId)
         return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
+    LogEndStep();
     if (InterlockedIncrement(&dumps) <= 4) Dump(info);
     return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -282,6 +311,7 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     // Drivers can handle their own first-chance exceptions. Dumping those may block graphics teardown.
     // Unhandled exceptions from any module still reach LastChance.
     if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
+    LogEndStep();
     if (!probing && GetCurrentThreadId() != dumpWorkerThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps)
         Dump(info);  // before anything
     // that could fault again
@@ -524,11 +554,7 @@ void WriteWatchdogDump(char const* path)
         Logf("shutdown watchdog: dmp create failed error=%lu", GetLastError());
         return;
     }
-    const auto type = static_cast<MINIDUMP_TYPE>(
-        MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
-        MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
-    if (!writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type, nullptr, nullptr, nullptr))
-        Logf("shutdown watchdog: dmp write failed error=%lu", GetLastError());
+    WriteDump(file, nullptr);
     CloseHandle(file);
 }
 
@@ -553,6 +579,11 @@ DWORD WINAPI WatchdogThread(LPVOID)
     Logf("shutdown watchdog: files=%s ; %s", dmp, txt);
     return 0;
 }
+}
+
+void EndStep(char const* step)
+{
+    lastEndStep.store(step);
 }
 
 void Tick()

@@ -1109,7 +1109,8 @@ void SendWorldState(WorldState const& state, uint8_t except)
         if (connected && server) Send(server, &message, sizeof(message), ChannelReliable, true);
         return;
     }
-    if (!host || !isHost) return;
+    // A client may still pay to revive a partner; the host binds kind 8/9's helper to the sending peer.
+    if (!host || (!isHost && state.kind != 8 && state.kind != 9)) return;
     SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
 }
 
