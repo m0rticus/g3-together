@@ -12,6 +12,7 @@ void OnWorldDeactivate();
 void CaptureCacheInventory();
 bool NewLife(uint8_t const guid[16]);
 bool LocalAuthority(eCEntity const* entity);
+void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, int after);
 char const* UnavailabilityReason(eCEntity* entity);
 bool Fenced(eCEntity const* entity);
 bool SuppressHostPublication(uint8_t const guid[16]);

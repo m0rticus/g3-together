@@ -15,8 +15,91 @@ using namespace g3t::npclease;
 static_assert(MaxOverlayText == 2 * (20 + MaxLeases * detail::SavedWireSize) + sizeof(SavePrefix),
               "Save text bound must follow binary row size");
 
+static void TestHitReadiness()
+{
+    ClientReadiness ready;
+    assert(!ready.LossReason());
+    const auto check = [&](bool ClientReadiness::* field, bool value, char const* reason) {
+        auto changed = ready;
+        changed.*field = value;
+        assert(std::strcmp(changed.LossReason(), reason) == 0);
+    };
+    check(&ClientReadiness::running, false, "session/world unavailable");
+    check(&ClientReadiness::enabled, false, "authority fallback disabled");
+    check(&ClientReadiness::checkpointBusy, true, "checkpoint barrier");
+    check(&ClientReadiness::processed, false, "native processing unavailable");
+    check(&ClientReadiness::actor, false, "native animation actor unavailable");
+    check(&ClientReadiness::eligible, false, "native eligibility changed");
+    check(&ClientReadiness::expired, true, "conservative lease expired");
+
+    Checkpoint state;
+    state.templateId[0] = 1;
+    std::strcpy(state.name, "Wolf");
+    state.maxHp = state.hp = 1000;
+    Lease host;
+    ClientWindow client;
+    assert(host.Offer(2, 7, 1, 100, state));
+    assert(client.Prepare(1, 100, LeaseMs, 120));
+    assert(host.Prepared(1, 130));
+    assert(client.Commit(1, 150));
+    AuthorityGuard guard{true, true, 0, client.deadline};
+    for (uint32_t revision = 1; revision <= 32; ++revision) {
+        const uint32_t now = 150 + revision * 50;
+        state.hp -= 10;
+        state.aiMode = revision % 2 ? 3 : 2;
+        state.action = revision % 2 ? 4 : 0;
+        state.busy = revision % 2;
+        state.attitude = 4;
+        state.targetPlayer = 2;
+        state.position[0] += 100;
+        assert(!ready.LossReason()); // stumble/fight/flee state is not native availability
+        assert(host.AcceptState(2, 7, 1, 1, revision, state));
+        assert(host.phase == Phase::Client && host.owner == 2 && host.epoch == 1);
+        assert(client.mode == ClientWindow::Mode::Active && client.Active(1, now));
+        assert(guard.Local(now) && !guard.Fenced(now));
+        assert(!host.AcceptState(2, 7, 1, 1, revision, state));
+        assert(!host.AcceptState(2, 7, 1, 1, revision - 1, state));
+        assert(!host.AcceptState(2, 8, 1, 1, revision + 1, state));
+        assert(host.phase == Phase::Client && host.owner == 2);
+        assert(client.Renew(1, now, LeaseMs, now + 10));
+        guard.deadline = client.deadline;
+        assert(!client.Renew(1, now, LeaseMs, now + 20));
+        assert(!client.Renew(1, now - 50, LeaseMs, now + 20));
+    }
+    const auto accepted = host.state;
+    Checkpoint lostState = state;
+    lostState.hp -= 10;
+    // A dropped state/renew leaves the current owner live only until its existing permit.
+    assert(host.state.hp == accepted.hp && host.state.hp != lostState.hp);
+    assert(client.Active(1, client.deadline - 1) && guard.Local(client.deadline - 1));
+    assert(!client.Active(1, client.deadline) && guard.Fenced(client.deadline));
+    assert(!client.Renew(1, client.deadline, LeaseMs, client.deadline));
+    assert(!host.AcceptState(2, 7, 1, 2, 33, lostState));
+    // A later accepted checkpoint can skip a lost revision without changing authority.
+    assert(host.AcceptState(2, 7, 1, 1, 34, lostState));
+    assert(host.phase == Phase::Client && host.owner == 2 && host.state.hp == lostState.hp);
+    state = lostState;
+    assert(CommitEffect(state, NativeDeath));
+    assert(!CommitEffect(state, NativeDeath));
+    state.hp = 0;
+    assert(host.AcceptState(2, 7, 1, 1, 35, state));
+    assert(!host.AcceptState(2, 7, 1, 1, 36, accepted));
+    assert(host.Cut(2, 7, 1, 1, 36, state));
+    client.Freeze();
+    assert(!client.Renew(1, 1900, LeaseMs, 1910));
+    assert(host.HandBack(2, 1920));
+    assert(host.owner == 1 && host.state.dead && host.state.hp == 0);
+    assert(host.state.effects == NativeDeath);
+    assert(!host.AcceptState(2, 7, 1, 1, 37, accepted));
+    ClientReadiness expired = ready;
+    expired.expired = true;
+    assert(expired.LossReason());
+    assert(!client.Active(1, client.deadline));
+}
+
 int main()
 {
+    TestHitReadiness();
     ClientWindow client;
     assert(!client.Commit(1, 10));
     assert(!client.Prepare(1, 0, LeaseMs, LeaseMs));

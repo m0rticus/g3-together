@@ -43,10 +43,12 @@ struct Entry {
     uint32_t appliedRevision = 0;
     uint32_t presentationFloor = 0;
     uint32_t unavailableAt = 0;
+    uint32_t lastHit = 0;
     bool hasPresentationFloor = false;
     uint8_t previousOwner = 0;
     eCEntity* applied = nullptr;
     bool active = false, prepared = false, cut = false, committed = false, hasBaseline = false;
+    bool captureFailed = false;
     bool adopted = false;
     char sentRoutine[64]{};
 };
@@ -226,14 +228,23 @@ bool ValidDiscovery(Checkpoint const& state)
 bool Processed(eCEntity const* entity)
 {
     if (!entity || entity->IsProcessingDisabled()) return false;
-    const auto all = Entity::GetNPCs();
-    for (int i = 0; i < all.GetCount(); ++i) if (all.GetAt(i).GetInstance() == entity) return true;
+    // GetNPCs is the frame-cached interaction ROI, not the native processing inventory.
+    const auto* all = world::ProcessedEntities();
+    if (!all) return false;
+    for (int i = 0; i < all->GetCount(); ++i) if (all->GetAt(i) == entity) return true;
     return false;
 }
 bool NativeReady(eCEntity* entity)
 {
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
     return Processed(entity) && animation && animation->GetActor();
+}
+ClientReadiness Readiness(eCEntity* entity, Entry const& entry, uint32_t now)
+{
+    auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
+    return {Running(), GetConfig().npcAuthorityFallback, persist::CheckpointBusy(),
+        Processed(entity), animation && animation->GetActor(), Eligible(entity),
+        Reached(now, entry.localDeadline)};
 }
 bool CanResumePresentation(eCEntity* entity)
 {
@@ -431,6 +442,25 @@ void Diagnostic(char const* action, GuidKey const& key, Entry const& entry, char
          action, text, entry.lease.state.name, entry.lease.owner, entry.lease.epoch, entry.lease.incarnation, entry.lease.revision,
          why, began ? net::Now() - began : 0);
 }
+void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& entry, eCEntity* entity,
+                         ClientReadiness const& readiness, char const* why)
+{
+    Diagnostic(action, key, entry, why);
+    char text[40];
+    guid::Format(key.data(), text, sizeof(text));
+    Entity npc(entity);
+    Logf("npclease: readiness guid=%s epoch=%u revision=%u active=%u processed=%u actor=%u eligible=%u "
+         "running=%u enabled=%u checkpoint=%u remaining_ms=%d last_hit_age_ms=%u hp=%d ai=%d task=%s state=%s",
+         text, entry.lease.epoch, entry.lease.revision, entry.active ? 1 : 0,
+         readiness.processed ? 1 : 0, readiness.actor ? 1 : 0, readiness.eligible ? 1 : 0,
+         readiness.running ? 1 : 0, readiness.enabled ? 1 : 0, readiness.checkpointBusy ? 1 : 0,
+         static_cast<int32_t>(entry.localDeadline - net::Now()),
+         entry.lastHit ? net::Now() - entry.lastHit : UINT32_MAX,
+         entity ? static_cast<int>(npc.DamageReceiver.HitPoints) : entry.lease.state.hp,
+         entity ? static_cast<int>(npc.Routine.AIMode) : -1,
+         entity ? npc.Routine.GetCurrentTask().GetText() : "-",
+         entity ? npc.Routine.GetCurrentState().GetText() : "-");
+}
 void CommitDeath(GuidKey const& key, Entry& entry)
 {
     if (!entry.lease.state.dead || !(entry.lease.state.effects & NativeDeath) ||
@@ -612,8 +642,12 @@ void ReceiveClient(Message const& note)
         if (!entry.prepared || entry.cut || !Running() || !entry.window.Commit(note.epoch, now)) { ++refused; return; }
         entry.lease.phase = Phase::Client;
         entry.active = true; entry.prepared = false; entry.echo = now;
-        if (!Activate(npcs::NpcByGuid(note.guid), entry, note.guid)) {
+        auto* entity = npcs::NpcByGuid(note.guid);
+        if (!Activate(entity, entry, note.guid)) {
             entry.active = false; entry.lease.phase = Phase::Frozen;
+            const auto readiness = Readiness(entity, entry, now);
+            ReadinessDiagnostic("activation-failed", key, entry, entity, readiness,
+                readiness.LossReason() ? readiness.LossReason() : "native guard/import unavailable");
             Log("FAIL npclease: committed client instance is unavailable; authority remains fenced");
             return;
         }
@@ -820,8 +854,12 @@ void TickClient(uint32_t now)
         auto* entity = npcs::NpcByGuid(reinterpret_cast<uint8_t const*>(item.first.data()));
         Checkpoint state = entry.lease.state;
         const bool captured = CaptureNative(entity, state);
-        const bool lost = !Running() || !GetConfig().npcAuthorityFallback || persist::CheckpointBusy() ||
-            !NativeReady(entity) || !Eligible(entity) || Reached(now, entry.localDeadline);
+        const auto readiness = Readiness(entity, entry, now);
+        const char* lost = readiness.LossReason();
+        if (!captured && !entry.captureFailed)
+            ReadinessDiagnostic("state-unavailable", item.first, entry, entity, readiness,
+                lost ? lost : "native checkpoint invalid; renewal cannot advance");
+        entry.captureFailed = !captured;
         if (lost || (entry.recallAt && captured && (!state.busy || now - entry.recallAt >= RecallWaitMs))) {
             // Status tasks cannot be restarted from a scalar duration; defer their cut while the lease remains healthy.
             if (!lost && !TransferableStatus(state)) continue;
@@ -830,9 +868,9 @@ void TickClient(uint32_t now)
             if (captured) entry.lease.state = state;
             ++entry.lease.revision; entry.echo = now;
             PublishGuard(item.first, entry);
+            ReadinessDiagnostic("frozen", item.first, entry, entity, readiness, lost ? lost : "safe recall cut");
             Stop(entity);
             Send(item.first, entry, Kind::Cut);
-            Diagnostic("frozen", item.first, entry, lost ? "lease/readiness/barrier" : "safe recall cut");
             continue;
         }
         const bool event = captured && (state.hp != entry.lease.state.hp || state.dead != entry.lease.state.dead ||
@@ -845,6 +883,7 @@ void TickClient(uint32_t now)
                 Log("FAIL npclease: revision exhausted"); continue;
             }
             entry.echo = now;
+            if (event) Diagnostic("state-event", item.first, entry, "native HP/life/attitude/status changed; owner unchanged");
             if (Send(item.first, entry, Kind::State)) { entry.lastState = now; ++stateSent; }
         }
     }
@@ -884,6 +923,24 @@ void TickClient(uint32_t now)
 bool LocalAuthority(eCEntity const* entity)
 {
     return ReadGuard(entity).Local(net::Now());
+}
+void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, int after)
+{
+    Entry* entry = Find(victim);
+    if (!entry || net::IsHost() || !entry->active || entry->lease.owner != net::LocalId()) return;
+    const uint32_t now = net::Now();
+    entry->lastHit = now ? now : 1;
+    const auto readiness = Readiness(victim, *entry, now);
+    char text[40];
+    guid::Format(Key(victim).data(), text, sizeof(text));
+    Entity npc(victim);
+    Logf("npclease: hit guid=%s epoch=%u revision=%u path=%s attacker=%s hp=%d->%d local=%u "
+         "processed=%u actor=%u remaining_ms=%d ai=%d task=%s state=%s reason=%s",
+         text, entry->lease.epoch, entry->lease.revision, path, source ? Entity(source).GetName().GetText() : "-",
+         before, after, LocalAuthority(victim) ? 1 : 0, readiness.processed ? 1 : 0, readiness.actor ? 1 : 0,
+         static_cast<int32_t>(entry->localDeadline - now), static_cast<int>(npc.Routine.AIMode),
+         npc.Routine.GetCurrentTask().GetText(), npc.Routine.GetCurrentState().GetText(),
+         readiness.LossReason() ? readiness.LossReason() : "native owner retained");
 }
 char const* UnavailabilityReason(eCEntity* entity)
 {

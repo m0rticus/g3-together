@@ -64,9 +64,48 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
 
     def test_expired_owners_never_resume_without_authorization(self):
         client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
-        self.assertIn("Reached(now, entry.localDeadline)", client)
+        readiness = section(self.runtime, "ClientReadiness Readiness(", "bool CanResumePresentation(")
+        self.assertIn("Reached(now, entry.localDeadline)", readiness)
+        self.assertIn("readiness.LossReason()", client)
         self.assertLess(client.index("entry.window.Freeze()"), client.index("Send(item.first, entry, Kind::Cut)"))
         self.assertNotIn("Kind::Commit", client)
+
+    def test_owner_readiness_uses_native_processing_not_interaction_roi(self):
+        processed = section(self.runtime, "bool Processed(", "bool NativeReady(")
+        self.assertIn("world::ProcessedEntities()", processed)
+        self.assertIn("entity->IsProcessingDisabled()", processed)
+        self.assertNotIn("Entity::GetNPCs()", processed)
+        readiness = section(self.runtime, "ClientReadiness Readiness(", "bool CanResumePresentation(")
+        self.assertIn("Processed(entity)", readiness)
+        self.assertNotIn("busy", readiness)
+        self.assertNotIn("AIMode", readiness)
+        self.assertNotIn("HitPoints", readiness)
+        world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
+        self.assertIn("GetEntitiesInProcessingRange()", section(world, "bTSmallArray<eCEntity*> const* Processed()", "\n}\n\nbTSmallArray"))
+
+    def test_hits_only_observe_owner_and_publish_reliable_state(self):
+        note = section(self.runtime, "void NoteHit(", "char const* UnavailabilityReason(")
+        for mutation in ("entry->active =", "entry->lease.phase =", "entry->window.Freeze",
+                         "Stop(", "Kind::Cut", "Import("):
+            self.assertNotIn(mutation, note)
+        self.assertIn("entry->lastHit = ", note)
+        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
+        event = section(client, "const bool event =", "if (captured && (event")
+        self.assertIn("state.hp != entry.lease.state.hp", event)
+        self.assertIn('Diagnostic("state-event"', client)
+        combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
+        self.assertIn('npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints"', combat)
+        self.assertIn("npclease::NoteHit(victim.GetInstance(), attacker, Judgements[which]", combat)
+
+    def test_failure_diagnostics_precede_stop_and_distinguish_causes(self):
+        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
+        cut = section(client, "if (lost ||", "const bool event =")
+        self.assertLess(cut.index('ReadinessDiagnostic("frozen"'), cut.index("Stop(entity)"))
+        self.assertIn('ReadinessDiagnostic("state-unavailable"', client)
+        diagnostic = section(self.runtime, "void ReadinessDiagnostic(", "void CommitDeath(")
+        for field in ("guid=%s", "epoch=%u", "processed=%u", "actor=%u", "remaining_ms=%d",
+                      "last_hit_age_ms=%u", "task=%s", "state=%s"):
+            self.assertIn(field, diagnostic)
 
     def test_kill_ledger_precedes_native_effects(self):
         kill = section(self.runtime, "GEInt GE_STDCALL Kill(", "bool Install()")

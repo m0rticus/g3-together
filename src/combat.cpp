@@ -883,7 +883,10 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     if (playerHitMirror && ai::detail::damageReceiver != victim.GetInstance())
         npcplayback::BeginHit(victim.GetInstance());
     ai::DamagePerception perception(playerHitMirror ? victim.GetInstance() : nullptr);
+    const bool leaseHit = npclease::LocalAuthority(victim.GetInstance());
+    const int leaseHp = leaseHit ? HitPoints(victim) : 0;
     auto observed = [&](GEInt result) {
+        if (leaseHit) npclease::NoteHit(victim.GetInstance(), attacker, Judgements[which], leaseHp, HitPoints(victim));
         if (attacker && (attacker == hero || attacker == remote::ControlledBody()) && npcs::IsMirrored(victim.GetInstance())) {
             ++clientJudgements;
             if (Pending(victim) <= 0) {
@@ -1095,9 +1098,11 @@ GEInt CallOriginalAndLog(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid ot
 {
     Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     const bool logApplied = args < 0 && IsHostSimulatedNpc(recipient.GetInstance());
-    const int before = logApplied ? HitPoints(recipient) : 0;
+    const bool leaseHit = args < 0 && npclease::LocalAuthority(recipient.GetInstance());
+    const int before = logApplied || leaseHit ? HitPoints(recipient) : 0;
     eCEntity* attacker = Attacker(spu, other);
     const GEInt result = original(spu, self, other, args);
+    if (leaseHit) npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints", before, HitPoints(recipient));
     if (logApplied) LogAppliedHostNpcHit(recipient.GetInstance(), attacker, args, before, HitPoints(recipient), result);
     return result;
 }

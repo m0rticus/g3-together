@@ -4,6 +4,23 @@
 #include "npclease.h"
 
 namespace g3t::npclease {
+struct ClientReadiness {
+    bool running = true, enabled = true, checkpointBusy = false;
+    bool processed = true, actor = true, eligible = true, expired = false;
+
+    char const* LossReason() const
+    {
+        if (!running) return "session/world unavailable";
+        if (!enabled) return "authority fallback disabled";
+        if (checkpointBusy) return "checkpoint barrier";
+        if (!processed) return "native processing unavailable";
+        if (!actor) return "native animation actor unavailable";
+        if (!eligible) return "native eligibility changed";
+        if (expired) return "conservative lease expired";
+        return nullptr;
+    }
+};
+
 struct ClientWindow {
     enum class Mode { Idle, Prepared, Active, Frozen };
     Mode mode = Mode::Idle;
