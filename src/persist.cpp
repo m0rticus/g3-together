@@ -43,7 +43,6 @@
 namespace g3t::persist {
 namespace {
 constexpr size_t Stolen = saving::native::Stolen;
-constexpr uint32_t FileLimit = saving::store::Limit;
 constexpr UINT_PTR SaveTimer = 0x47335453;
 using FileFn = bool(__stdcall*)(void*, bCString const*);
 using Getter = void*(__cdecl*)();
@@ -91,6 +90,11 @@ using Bytes = saving::store::Bytes;
 using Save = saving::store::Save;
 Save current, savingManifest;
 std::string requestedSlot, stagingSlot, lastSaveFailure;
+bool nativeSaved = false;
+uint32_t nativeSavedAt = 0;
+saving::store::IoError lastIoFailure;
+struct PendingCleanup { std::string path; uint32_t until = 0, nextTry = 0; };
+std::vector<PendingCleanup> pendingCleanup;
 saving::Key pendingKey;
 HWND saveWindow = nullptr;
 
@@ -346,22 +350,16 @@ std::string Path(std::string const& slot, int file)
 }
 bool Exists(std::string const& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
+void LogIo(saving::store::IoError const& error)
+{
+    Logf("persist: file operation=%s path=%s destination=%s error=%lu",
+         error.operation, error.path.c_str(), error.destination.c_str(), static_cast<unsigned long>(error.code));
+}
 bool ReadAll(std::string const& path, std::vector<uint8_t>& out)
 {
-    out.clear();
-    // Sharing only with readers also checks that no native writer still holds this file.
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER size{};
-    bool ok = GetFileSizeEx(file, &size) && size.QuadPart >= 0 && size.QuadPart <= FileLimit;
-    if (ok) {
-        out.resize(static_cast<size_t>(size.QuadPart));
-        DWORD read = 0;
-        ok = out.empty() || (ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read, nullptr) && read == out.size());
-    }
-    CloseHandle(file);
-    if (!ok) out.clear();
-    return ok;
+    if (saving::store::Read(path, out, &lastIoFailure)) return true;
+    LogIo(lastIoFailure);
+    return false;
 }
 
 bool KnownPup(HMODULE module)
@@ -770,8 +768,11 @@ void SaveFailure(char const* code)
 }
 bool WriteAtomic(std::string const& path, Bytes const& bytes)
 {
-    if (saving::store::Atomic(path, bytes)) return true;
-    Logf("persist: atomic write failed path=%s error=%lu bytes=%zu", path.c_str(), GetLastError(), bytes.size());
+    if (saving::store::Atomic(path, bytes, nullptr, &lastIoFailure)) {
+        Logf("persist: file operation=atomic-publish path=%s bytes=%zu ok=1", path.c_str(), bytes.size());
+        return true;
+    }
+    LogIo(lastIoFailure);
     return false;
 }
 std::string CharacterPath()
@@ -873,10 +874,30 @@ void CleanupStaging()
     if (stagingSlot.empty()) return;
     for (int f = 0; f < 2; ++f) {
         const std::string path = Path(stagingSlot, f);
-        if (Exists(path) && !DeleteFileA(path.c_str()))
-            Logf("persist: staging cleanup failed path=%s error=%lu", path.c_str(), GetLastError());
+        for (auto const& item : {path, path + ".tmp"}) {
+            saving::store::IoError error;
+            const bool removed = saving::store::Remove(item, &error);
+            if (!removed) {
+                LogIo(error);
+            }
+            // Retain a short tombstone for a native file that appears after failure cleanup.
+            if (removed || saving::store::Busy(error.code))
+                pendingCleanup.push_back({item, GetTickCount() + 3000, GetTickCount() + 200});
+        }
     }
     stagingSlot.clear();
+}
+void RetryCleanup(uint32_t now)
+{
+    for (auto it = pendingCleanup.begin(); it != pendingCleanup.end();) {
+        if (static_cast<int32_t>(now - it->nextTry) < 0) { ++it; continue; }
+        saving::store::IoError error;
+        const bool removed = saving::store::Remove(it->path, &error);
+        if (static_cast<int32_t>(now - it->until) >= 0 || (!removed && !saving::store::Busy(error.code))) {
+            if (!removed) LogIo(error);
+            it = pendingCleanup.erase(it);
+        } else { it->nextTry = now + 200; ++it; }
+    }
 }
 void FinishSave(bool ok, char const* why)
 {
@@ -897,6 +918,7 @@ void FinishSave(bool ok, char const* why)
     }
     StopSaveTimer();
     operation = {};
+    nativeSaved = false;
     CleanupStaging();
     if (ok) Notice(i18n::SaveComplete); else SaveFailure(why);
 }
@@ -966,10 +988,22 @@ bool RestoreNpcLease(uint32_t savedVersion, Bytes const& bytes)
 }
 bool Materialize(std::string const& slot, Save const& save)
 {
-    for (int f = 0; f < 2; ++f) {
-        auto const* block = saving::store::Find(save, f ? saving::store::NativeWorld : saving::store::NativeHeader);
-        if (!block || !WriteAtomic(Path(slot, f), block->bytes)) return false;
-    }
+    const std::string paths[2] = {Path(slot, 0), Path(slot, 1)};
+    saving::store::IoError recovery;
+    const bool ok = saving::store::Repair(paths, save, lastIoFailure, recovery);
+    if (!ok) LogIo(lastIoFailure);
+    if (recovery.code) LogIo(recovery);
+    Logf("persist: file operation=cache-repair header=%s world=%s ok=%d",
+         paths[0].c_str(), paths[1].c_str(), ok ? 1 : 0);
+    return ok;
+}
+bool TracePublish(saving::store::PublishStage stage, saving::store::IoError&)
+{
+    const bool marker = stage == saving::store::PublishStage::Marker;
+    const int file = stage == saving::store::PublishStage::World ? 1 :
+                     stage == saving::store::PublishStage::Header ? 0 : 2;
+    Logf("persist: file operation=publish-stage stage=%u path=%s",
+         static_cast<unsigned>(stage), (Path(requestedSlot, file) + (marker ? ".publish" : "")).c_str());
     return true;
 }
 bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
@@ -993,13 +1027,13 @@ bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
     if (recoverable && !Materialize(slot, intact)) Logf("persist: delete recovery failed slot=%s", slot.c_str());
     Logf("persist: slot deletion failed slot=%s native_ok=%d error=%lu; container retained recoverable=%d",
          slot.c_str(), nativeOk ? 1 : 0, failure, recoverable ? 1 : 0);
-    SaveFailure("disk-write");
+    SaveFailure(saving::store::IoReason({ "delete", path, {}, failure }, "save-delete-failed"));
     return false;
 }
 void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
 {
     if (npclease::ActiveLeases()) {
-        CancelSave("NPC lease active: save would lose client-owned NPC state");
+        CancelSave("npc-lease-active");
         return;
     }
     if (processDepth || nativeLoadDepth || nativeSaveDepth || !operation.active || !AllReady()) return;
@@ -1010,57 +1044,84 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         if (member.generation && (!net::InWorld(i) || member.generation != net::PeerGeneration(i) ||
                                   member.account != net::PeerAccount(i))) { CancelSave("peer-left"); return; }
     }
-    if (char const* reason = SaveReadiness()) { CancelSave(reason); return; }
-    if (!doors::SettleForSave()) return;
-    void* manager = FileManager(false);
-    if (!manager || !writing) { CancelSave("native-hooks"); return; }
-    Bytes hero, state;
-    if (!CaptureCharacter(savingManifest.key, hero)) { CancelSave("character-write"); return; }
-    saving::store::Set(savingManifest, {saving::store::Character, 4, steam::PlayerId(), std::move(hero)});
-    if (!containers::CapturePersonal(state)) { CancelSave("personal-record"); return; }
-    saving::store::Set(savingManifest, {saving::store::Personal, 1, steam::PlayerId(), std::move(state)});
-    if (!CaptureJournal(state)) { CancelSave("journal-write"); return; }
-    saving::store::Set(savingManifest, {saving::store::Journal, 1, 0, std::move(state)});
-    if (!CaptureExtensions(savingManifest)) { CancelSave("extension"); return; }
-    if (requestedSlot == "QuickSave") {
-        void* capture = uiEntries[4];
-        __asm {
-            push esi
-            mov esi, manager
-            call capture
-            pop esi
+    if (!nativeSaved) {
+        if (char const* reason = SaveReadiness()) { CancelSave(reason); return; }
+        if (!doors::SettleForSave()) return;
+        void* manager = FileManager(false);
+        if (!manager || !writing) { CancelSave("native-hooks"); return; }
+        Bytes hero, state;
+        if (!CaptureCharacter(savingManifest.key, hero)) { CancelSave("character-write"); return; }
+        saving::store::Set(savingManifest, {saving::store::Character, 4, steam::PlayerId(), std::move(hero)});
+        if (!containers::CapturePersonal(state)) { CancelSave("personal-record"); return; }
+        saving::store::Set(savingManifest, {saving::store::Personal, 1, steam::PlayerId(), std::move(state)});
+        if (!CaptureJournal(state)) { CancelSave("journal-write"); return; }
+        saving::store::Set(savingManifest, {saving::store::Journal, 1, 0, std::move(state)});
+        if (!CaptureExtensions(savingManifest)) { CancelSave("extension"); return; }
+        {
+            void* capture = uiEntries[4];
+            __asm {
+                push esi
+                mov esi, manager
+                call capture
+                pop esi
+            }
         }
+        remote::DespawnAll("host-managed save");
+        const bCString name(stagingSlot.c_str());
+        Logf("persist: native invoke=HUD.SaveGame save=%s slot=%s player=%llu",
+             savingManifest.key.save.c_str(), stagingSlot.c_str(), steam::PlayerId());
+        lowerSaveCalls = 0; lowerSaveGood = true;
+        ++nativeSaveDepth;
+        const bool nativeOk = originalSave(manager, &name);
+        --nativeSaveDepth;
+        ++saves;
+        Logf("persist: native result=HUD.SaveGame save=%s ok=%d lower_calls=%u lower_ok=%d",
+             savingManifest.key.save.c_str(), nativeOk ? 1 : 0, lowerSaveCalls, lowerSaveGood ? 1 : 0);
+        if (!nativeOk || lowerSaveCalls != 1 || !lowerSaveGood) { CancelSave("native-save"); return; }
+        nativeSaved = true;
+        nativeSavedAt = GetTickCount();
+        Logf("persist: native files expected header=%s world=%s",
+             Path(stagingSlot, 0).c_str(), Path(stagingSlot, 1).c_str());
     }
-    remote::DespawnAll("host-managed save");
-    const bCString name(stagingSlot.c_str());
-    Logf("persist: native invoke=HUD.SaveGame save=%s slot=%s player=%llu",
-         savingManifest.key.save.c_str(), stagingSlot.c_str(), steam::PlayerId());
-    lowerSaveCalls = 0; lowerSaveGood = true;
-    ++nativeSaveDepth;
-    const bool nativeOk = originalSave(manager, &name);
-    --nativeSaveDepth;
-    ++saves;
-    Logf("persist: native result=HUD.SaveGame save=%s ok=%d lower_calls=%u lower_ok=%d",
-         savingManifest.key.save.c_str(), nativeOk ? 1 : 0, lowerSaveCalls, lowerSaveGood ? 1 : 0);
-    if (!nativeOk || lowerSaveCalls != 1 || !lowerSaveGood) { CancelSave("native-save"); return; }
     for (int f = 0; f < 2; ++f) {
+        const uint32_t type = f ? saving::store::NativeWorld : saving::store::NativeHeader;
+        if (saving::store::Find(savingManifest, type)) continue;
         Bytes bytes;
-        if (!ReadAll(Path(stagingSlot, f), bytes) || bytes.empty()) { CancelSave("disk-write"); return; }
-        saving::store::Set(savingManifest, {f ? saving::store::NativeWorld : saving::store::NativeHeader, 1, 0, std::move(bytes)});
+        saving::store::IoError error;
+        const std::string path = Path(stagingSlot, f);
+        std::string source;
+        if (!saving::store::ReadNative(path, bytes, error, source) || bytes.empty()) {
+            if (!error.code) error = {"native-empty", source, {}, ERROR_HANDLE_EOF};
+            LogIo(error);
+            if (saving::store::RetryNative(error, GetTickCount() - nativeSavedAt)) return;
+            CancelSave(saving::store::NativeReason(error)); return;
+        }
+        Logf("persist: file operation=native-read path=%s bytes=%zu native_rename_recovered=%d ok=1",
+             source.c_str(), bytes.size(), source != path ? 1 : 0);
+        saving::store::Set(savingManifest, {type, 1, 0, std::move(bytes)});
     }
     Bytes encoded;
     if (!saving::store::Encode(savingManifest, encoded)) {
         Logf("persist: container encoding refused save=%s blocks=%zu", savingManifest.key.save.c_str(), savingManifest.blocks.size());
         CancelSave("container-format"); return;
     }
-    if (!WriteAtomic(Path(requestedSlot, 2), encoded)) { CancelSave("disk-write"); return; }
+    const std::string paths[3] = {Path(requestedSlot, 0), Path(requestedSlot, 1), Path(requestedSlot, 2)};
+    saving::store::IoError error, recovery;
+    const bool published = saving::store::Publish(paths, savingManifest, encoded, error, recovery, &TracePublish);
+    if (recovery.code) LogIo(recovery);
+    if (!published) {
+        LogIo(error);
+        const bool container = error.path == paths[2] + ".tmp" || error.path == paths[2];
+        const char* reason = !container ? "cache-publish-failed" :
+                             !std::strcmp(error.operation, "rename") ? "publish-rename-failed" : "container-write-failed";
+        CancelSave(saving::store::IoReason(error, reason)); return;
+    }
     current = savingManifest;
     lastSave = requestedSlot;
     // Saving is not a world change: do not reset epochs, admission, or the client's live character.
-    const bool menuOk = Materialize(requestedSlot, current);
     Logf("persist: host container published save=%s slot=%s bytes=%zu records=%zu menu_ok=%d network_world_bytes=0",
-         current.key.save.c_str(), requestedSlot.c_str(), encoded.size(), current.blocks.size(), menuOk ? 1 : 0);
-    FinishSave(menuOk, menuOk ? "durable host container" : "disk-write");
+         current.key.save.c_str(), requestedSlot.c_str(), encoded.size(), current.blocks.size(), 1);
+    FinishSave(true, "durable host container");
 }
 bool StartSave(char const* name)
 {
@@ -1090,6 +1151,7 @@ bool StartSave(char const* name)
                    block.type >= saving::store::Extension) savingManifest.blocks.push_back(std::move(block));
     }
     requestedSlot = name; stagingSlot = "G3T_pending_" + savingManifest.key.save;
+    nativeSaved = false;
     operation = {};
     operation.active = true; operation.epoch = epoch; operation.started = GetTickCount();
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
@@ -1444,6 +1506,10 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
         Logf("persist: load refused slot=%s reason=container-read", slot.c_str());
         Notice(i18n::SaveDamaged, true); return false;
     }
+    if (hasSidecar && bytes.empty()) {
+        Logf("persist: load refused slot=%s reason=empty-container", slot.c_str());
+        Notice(i18n::SaveDamaged, true); return false;
+    }
     const bool managed = saving::store::Modern(bytes);
     if (managed) {
         if (!saving::store::Decode(bytes, save)) {
@@ -1454,8 +1520,14 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
         if (!own || !ValidateCharacter(own->bytes, {save.key.world, save.key.save, steam::PlayerId()})) {
             SaveFailure("character-record"); return false;
         }
-        if (!Materialize(slot, save)) { SaveFailure("disk-write"); return false; }
+        if (!Materialize(slot, save)) {
+            SaveFailure(saving::store::IoReason(lastIoFailure, "cache-publish-failed")); return false;
+        }
     } else {
+        if (Exists(Path(slot, 2) + ".publish")) {
+            Logf("persist: load refused slot=%s reason=uncommitted-publication", slot.c_str());
+            SaveFailure("publish-incomplete"); return false;
+        }
         if (!ReadLegacy(slot, bytes, save)) {
             Logf("persist: load refused slot=%s reason=legacy-format-or-native-crc bytes=%zu", slot.c_str(), bytes.size());
             Notice(i18n::SaveDamaged, true); return false;
@@ -1464,6 +1536,10 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
             Bytes native;
             if (!ReadAll(Path(slot, f), native) || native.empty()) { SaveFailure("native-load"); return false; }
         }
+    }
+    saving::store::IoError markerError;
+    if (managed && !saving::store::Remove(Path(slot, 2) + ".publish", &markerError)) {
+        LogIo(markerError); SaveFailure(saving::store::IoReason(markerError, "cache-publish-failed")); return false;
     }
     if (self != FileManager(true)) { SaveFailure("native-load"); return false; }
     Logf("persist: load validated slot=%s managed=%d sidecar=%d save=%s blocks=%zu", slot.c_str(),
@@ -1474,6 +1550,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     NewEpoch();
     ++loads; newWorld = false;
     dialogaudio::OnWorldChange(); containers::OnWorldChange(); remote::DespawnAll("host load");
+    story::OnWorldChange(); doors::OnWorldChange(); journal::Clear();
     world::OnWorldDeactivate();
     lowerLoadCalls = 0; lowerLoadGood = true;
     ++nativeLoadDepth;
@@ -1624,6 +1701,7 @@ void Tick()
 {
     if (nativeLoadDepth || nativeSaveDepth) return;
     const uint32_t now = GetTickCount();
+    RetryCleanup(now);
     RetryReplies(now); StatusHints();
     auto& game = gCSession::GetInstance();
     const bool running = game.GetHero() && game.IsGameRunning();

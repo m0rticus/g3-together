@@ -75,8 +75,12 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertEqual(timer.count("originalSave("), 1)
         self.assertIn("lowerSaveCalls != 1 || !lowerSaveGood", timer)
         self.assertIn("operation.Expired(GetTickCount())", timer)
-        self.assertLess(timer.index("saving::store::Encode"), timer.index("Materialize("))
-        self.assertIn("WriteAtomic(Path(requestedSlot, 2)", timer)
+        self.assertLess(timer.index("saving::store::Encode"), timer.index("saving::store::Publish("))
+        self.assertIn("if (!nativeSaved)", timer)
+        self.assertIn("nativeSavedAt", timer)
+        self.assertIn("saving::store::RetryNative", timer)
+        self.assertIn("saving::store::ReadNative", timer)
+        self.assertNotIn('"disk-write"', timer)
         self.assertNotIn("NewEpoch", timer)
         self.assertNotIn("localKind =", timer)
 
@@ -101,6 +105,10 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertLess(load.index("saving::store::Decode"), load.index('CancelSave("canceled-load")'))
         self.assertLess(load.index("Materialize"), load.index("const bool hudOk"))
         self.assertIn('saving::Prefix(slot, "G3T_pending_")', load)
+        self.assertIn("hasSidecar && bytes.empty()", load)
+        self.assertIn('"publish-incomplete"', load)
+        self.assertLess(load.index("story::OnWorldChange()"), load.index("const bool hudOk"))
+        self.assertLess(load.index("doors::OnWorldChange()"), load.index("const bool hudOk"))
         self.assertNotIn('saving::Prefix(slot, "G3T_")', load)  # G3T_Sandbox is a normal legacy/native slot.
 
     def test_records_retries_bound_to_epoch_account_and_generation(self):

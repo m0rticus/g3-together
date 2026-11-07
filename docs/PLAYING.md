@@ -359,7 +359,9 @@ Friendly-fire protection applies before local hit feedback as well as before aut
 
 The host's `<menu-slot>.g3t` is a self-contained **G3TSAVE3** container: native header/world,
 shared journal/companions, individual G3THERO4 and bounded personal-state records, and versioned extension blocks. Whole-file
-and block CRCs detect corruption. A flushed temporary file atomically replaces the container.
+and block CRCs detect corruption. Native file completion is checked after the native save returns;
+brief missing/locked-file retries do not invoke the native save again.
+The menu caches are published with rollback, then a flushed temporary file atomically replaces the container.
 The game's ordinary native menu pair is a recoverable cache, rebuilt from the container on load.
 There are no client manifests, aliases, paired native saves, or 2 MB network save transfers.
 Back up/copy the host's `.g3t` with its menu pair (or the whole isolated save folder). The `.g3t`
@@ -367,6 +369,11 @@ alone contains all data, but the game's load menu needs its native header cache 
 The host's native Delete menu also removes `.g3t`; deleting files manually must include the entire slot.
 Do not treat the cache alone as a complete co-op save.
 Interrupted `G3T_pending_*` staging slots cannot be loaded.
+A `.g3t.publish` marker guards interrupted cache publication: an intact container repairs the pair
+on load, while an interrupted first save without a complete container is refused. Save again to repair it.
+File failures name missing/empty/locked native files, denied access, container write/rename, or menu-cache
+publication separately. The log records the operation, paths and original Windows error.
+Disk-space advice is shown only when Windows reports disk-full or quota exhaustion.
 
 G3THERO4 preserves stats, base/aggregate equipment modifiers, current/max HP/MP/stamina,
 XP/level/LP, inventory/gold/equipment, skills/spells, quick slots and position/orientation.

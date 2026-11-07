@@ -5,6 +5,7 @@
 #include "personal_store.h"
 #include <algorithm>
 #include <cstdio>
+#include <cerrno>
 #include <limits>
 #ifdef _WIN32
 #include <Windows.h>
@@ -240,37 +241,253 @@ inline bool Decode(Bytes const& bytes, Save& out)
 // Production atomic writer shared with engine-free fault tests. The old destination is never opened for writing.
 enum class WriteStage { Opened, Written, Flushed, Closed };
 using ContinueWrite = bool (*)(WriteStage);
-inline bool Atomic(std::string const& path, Bytes const& bytes, ContinueWrite proceed = nullptr)
+struct IoError {
+    char const* operation = "";
+    std::string path, destination;
+    uint32_t code = 0;
+};
+inline uint32_t LastIoError()
 {
-    if (path.empty() || bytes.size() > Limit) return false;
+#ifdef _WIN32
+    return GetLastError();
+#else
+    return static_cast<uint32_t>(errno);
+#endif
+}
+inline bool Fail(IoError* error, char const* operation, std::string const& path,
+                 uint32_t code, std::string const& destination = {})
+{
+    if (error) *error = {operation, path, destination, code};
+    return false;
+}
+inline bool Missing(uint32_t code)
+{
+#ifdef _WIN32
+    return code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
+#else
+    return code == ENOENT;
+#endif
+}
+inline bool Busy(uint32_t code)
+{
+#ifdef _WIN32
+    return code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION;
+#else
+    return code == EBUSY || code == EAGAIN;
+#endif
+}
+inline char const* IoReason(IoError const& error, char const* fallback)
+{
+#ifdef _WIN32
+    if (error.code == ERROR_DISK_FULL || error.code == ERROR_HANDLE_DISK_FULL ||
+        error.code == ERROR_NOT_ENOUGH_QUOTA) return "disk-full";
+    if (error.code == ERROR_ACCESS_DENIED || error.code == ERROR_PRIVILEGE_NOT_HELD) return "save-access-denied";
+#else
+    if (error.code == ENOSPC || error.code == EDQUOT) return "disk-full";
+    if (error.code == EACCES || error.code == EPERM) return "save-access-denied";
+#endif
+    return fallback;
+}
+inline bool Read(std::string const& path, Bytes& out, IoError* error = nullptr)
+{
+    if (error) *error = {};
+    out.clear();
+#ifdef _WIN32
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return Fail(error, "read-open", path, GetLastError());
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(file, &size) != 0;
+    if (!ok) Fail(error, "read-size", path, GetLastError());
+    else if (size.QuadPart < 0 || size.QuadPart > Limit)
+        ok = Fail(error, "read-limit", path, ERROR_FILE_TOO_LARGE);
+    if (ok) {
+        out.resize(static_cast<size_t>(size.QuadPart));
+        DWORD read = 0;
+        if (!out.empty() && !ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read, nullptr))
+            ok = Fail(error, "read", path, GetLastError());
+        else if (read != out.size()) ok = Fail(error, "read-short", path, ERROR_HANDLE_EOF);
+    }
+    if (!CloseHandle(file) && ok) ok = Fail(error, "read-close", path, GetLastError());
+#else
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (!file) return Fail(error, "read-open", path, LastIoError());
+    bool ok = std::fseek(file, 0, SEEK_END) == 0;
+    const long size = ok ? std::ftell(file) : -1;
+    if (!ok || size < 0) ok = Fail(error, "read-size", path, LastIoError());
+    else if (static_cast<unsigned long>(size) > Limit) ok = Fail(error, "read-limit", path, EFBIG);
+    else {
+        out.resize(static_cast<size_t>(size));
+        if (std::fseek(file, 0, SEEK_SET) || std::fread(out.data(), 1, out.size(), file) != out.size())
+            ok = Fail(error, "read", path, LastIoError());
+    }
+    if (std::fclose(file) && ok) ok = Fail(error, "read-close", path, LastIoError());
+#endif
+    if (!ok) out.clear();
+    return ok;
+}
+inline bool Remove(std::string const& path, IoError* error = nullptr)
+{
+#ifdef _WIN32
+    if (DeleteFileA(path.c_str())) return true;
+#else
+    if (std::remove(path.c_str()) == 0) return true;
+#endif
+    const uint32_t code = LastIoError();
+    return Missing(code) || Fail(error, "delete", path, code);
+}
+inline bool ReadNative(std::string const& path, Bytes& bytes, IoError& error, std::string& source)
+{
+    source = path;
+    if (Read(path, bytes, &error)) return true;
+    if (!Missing(error.code)) return false;
+    const IoError missing = error;
+    // SaveGameWorld closes both streams but does not check its final MoveFileA calls.
+    source = path + ".tmp";
+    if (Read(source, bytes, &error)) return true;
+    if (Missing(error.code)) { error = missing; source = path; }
+    return false;
+}
+inline char const* NativeReason(IoError const& error)
+{
+    return IoReason(error, Missing(error.code) ? "native-files-missing" :
+                           Busy(error.code) ? "native-files-busy" :
+#ifdef _WIN32
+                           error.code == ERROR_HANDLE_EOF
+#else
+                           error.code == ENODATA
+#endif
+                           ? "native-files-empty" : "native-files-read");
+}
+inline bool RetryNative(IoError const& error, uint32_t elapsed)
+{
+    return elapsed < 3000 && (Missing(error.code) || Busy(error.code) ||
+#ifdef _WIN32
+                             error.code == ERROR_HANDLE_EOF
+#else
+                             error.code == ENODATA
+#endif
+                             );
+}
+inline bool Atomic(std::string const& path, Bytes const& bytes, ContinueWrite proceed = nullptr,
+                   IoError* error = nullptr)
+{
+    if (path.empty() || bytes.size() > Limit) return Fail(error, "write-limit", path, 0);
     const std::string temp = path + ".tmp";
     auto next = [proceed](WriteStage stage) { return !proceed || proceed(stage); };
 #ifdef _WIN32
     HANDLE file = CreateFileA(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
+    if (file == INVALID_HANDLE_VALUE) return Fail(error, "write-open", temp, GetLastError());
     DWORD written = 0;
-    bool ok = next(WriteStage::Opened) && WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
-              written == bytes.size() && next(WriteStage::Written) && FlushFileBuffers(file) && next(WriteStage::Flushed);
-    ok = CloseHandle(file) != 0 && ok;
-    ok = next(WriteStage::Closed) && ok;
-    if (ok) ok = MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-    if (!ok) DeleteFileA(temp.c_str());
+    bool ok = next(WriteStage::Opened);
+    if (!ok) Fail(error, "write-injected", temp, GetLastError());
+    if (ok && !WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr))
+        ok = Fail(error, "write", temp, GetLastError());
+    if (ok && written != bytes.size()) ok = Fail(error, "write-short", temp, ERROR_WRITE_FAULT);
+    if (ok && !next(WriteStage::Written)) ok = Fail(error, "write-injected", temp, GetLastError());
+    if (ok && !FlushFileBuffers(file)) ok = Fail(error, "flush", temp, GetLastError());
+    if (ok && !next(WriteStage::Flushed)) ok = Fail(error, "flush-injected", temp, GetLastError());
+    if (!CloseHandle(file) && ok) ok = Fail(error, "write-close", temp, GetLastError());
+    if (ok && !next(WriteStage::Closed)) ok = Fail(error, "close-injected", temp, GetLastError());
+    if (ok && !MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        ok = Fail(error, "rename", temp, GetLastError(), path);
+    if (!ok) Remove(temp);
 #else
     int file = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (file < 0) return false;
+    if (file < 0) return Fail(error, "write-open", temp, LastIoError());
     bool ok = next(WriteStage::Opened);
+    if (!ok) Fail(error, "write-injected", temp, LastIoError());
     size_t at = 0;
     while (ok && at < bytes.size()) {
         const ssize_t n = write(file, bytes.data() + at, bytes.size() - at);
-        if (n <= 0) ok = false;
+        if (n <= 0) ok = Fail(error, "write", temp, LastIoError());
         else at += static_cast<size_t>(n);
     }
-    ok = ok && next(WriteStage::Written) && fsync(file) == 0 && next(WriteStage::Flushed);
-    ok = close(file) == 0 && ok;
-    ok = next(WriteStage::Closed) && ok;
-    if (ok) ok = std::rename(temp.c_str(), path.c_str()) == 0;
-    if (!ok) std::remove(temp.c_str());
+    if (ok && !next(WriteStage::Written)) ok = Fail(error, "write-injected", temp, LastIoError());
+    if (ok && fsync(file)) ok = Fail(error, "flush", temp, LastIoError());
+    if (ok && !next(WriteStage::Flushed)) ok = Fail(error, "flush-injected", temp, LastIoError());
+    if (close(file) && ok) ok = Fail(error, "write-close", temp, LastIoError());
+    if (ok && !next(WriteStage::Closed)) ok = Fail(error, "close-injected", temp, LastIoError());
+    if (ok && std::rename(temp.c_str(), path.c_str())) ok = Fail(error, "rename", temp, LastIoError(), path);
+    if (!ok) Remove(temp);
 #endif
     return ok;
+}
+
+enum class PublishStage { Marker, World, Header, Container };
+using ContinuePublish = bool (*)(PublishStage, IoError&);
+inline bool Repair(std::string const (&paths)[2], Save const& save, IoError& error,
+                   IoError& recovery, ContinuePublish proceed = nullptr)
+{
+    error = {}; recovery = {};
+    if (!Find(save, NativeHeader) || !Find(save, NativeWorld))
+        return Fail(&error, "cache-format", paths[0], 0);
+    Bytes previous[2];
+    bool present[2]{}, changed[2]{};
+    for (int i = 0; i < 2; ++i) {
+        present[i] = Read(paths[i], previous[i], &error);
+        if (!present[i] && !Missing(error.code)) return false;
+    }
+    for (int i : {1, 0}) {
+        auto const* block = Find(save, i ? NativeWorld : NativeHeader);
+        if (!block) return Fail(&error, "cache-format", paths[i], 0);
+        if (present[i] && previous[i] == block->bytes) continue;
+        const auto stage = i ? PublishStage::World : PublishStage::Header;
+        if ((proceed && !proceed(stage, error)) || !Atomic(paths[i], block->bytes, nullptr, &error)) {
+            for (int j = 0; j < 2; ++j) {
+                if (!changed[j]) continue;
+                IoError rollback;
+                if (!(present[j] ? Atomic(paths[j], previous[j], nullptr, &rollback) : Remove(paths[j], &rollback)))
+                    recovery = std::move(rollback);
+            }
+            return false;
+        }
+        changed[i] = true;
+    }
+    error = {};
+    return true;
+}
+inline bool Publish(std::string const (&paths)[3], Save const& save, Bytes const& encoded,
+                    IoError& error, IoError& recovery, ContinuePublish proceed = nullptr)
+{
+    error = {}; recovery = {};
+    Save checked;
+    if (!Decode(encoded, checked) || !Exact(save.key, checked.key))
+        return Fail(&error, "publish-format", paths[2], 0);
+    auto const* header = Find(checked, NativeHeader);
+    auto const* world = Find(checked, NativeWorld);
+    Bytes previous[2];
+    bool present[2]{};
+    for (int i = 0; i < 2; ++i) {
+        IoError read;
+        present[i] = Read(paths[i], previous[i], &read);
+        if (!present[i] && !Missing(read.code)) { error = std::move(read); return false; }
+    }
+    const std::string marker = paths[2] + ".publish";
+    auto step = [&](PublishStage stage, std::string const& path, Bytes const& bytes) {
+        return (!proceed || proceed(stage, error)) && Atomic(path, bytes, nullptr, &error);
+    };
+    if (!step(PublishStage::Marker, marker, {'G','3','T','P','U','B','1'})) return false;
+    bool changed[2]{};
+    bool ok = step(PublishStage::World, paths[1], world->bytes);
+    changed[1] = ok;
+    if (ok) { ok = step(PublishStage::Header, paths[0], header->bytes); changed[0] = ok; }
+    if (ok) ok = step(PublishStage::Container, paths[2], encoded);
+    if (!ok) {
+        bool restored = true;
+        for (int i = 0; i < 2; ++i) {
+            if (!changed[i]) continue;
+            IoError rollback;
+            if (!(present[i] ? Atomic(paths[i], previous[i], nullptr, &rollback) : Remove(paths[i], &rollback))) {
+                restored = false;
+                recovery = std::move(rollback);
+            }
+        }
+        if (restored && !Remove(marker, &recovery)) return false;
+        return false;
+    }
+    // A leftover marker is safe: load repairs from the now-complete container.
+    Remove(marker, &recovery);
+    return true;
 }
 }
