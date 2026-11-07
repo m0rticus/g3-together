@@ -44,6 +44,10 @@ struct Entry {
     uint32_t presentationFloor = 0;
     uint32_t unavailableAt = 0;
     uint32_t lastHit = 0;
+    uint32_t activationAt = 0, ownerReportAt = 0, rangeChangedAt = 0, processableChangedAt = 0;
+    eCEntity* observedEntity = nullptr;
+    bool observedRange = false, observedProcessable = false;
+    bool nativeActivated = false, processingQueued = false;
     bool hasPresentationFloor = false;
     uint8_t previousOwner = 0;
     eCEntity* applied = nullptr;
@@ -118,9 +122,10 @@ void PublishGuard(GuidKey const& key, Entry const& entry)
     }
     AuthorityGuard guard;
     guard.leased = true;
-    guard.locallyDriven = !net::IsHost() && entry.active && entry.world == net::WorldEpoch() &&
+    guard.processingAllowed = !net::IsHost() && entry.active && entry.world == net::WorldEpoch() &&
         entry.welcome == net::WelcomeSerial() && Running() && !persist::CheckpointBusy() &&
         entry.window.Active(entry.lease.epoch, net::Now());
+    guard.locallyDriven = guard.processingAllowed && entry.nativeActivated;
     guard.deadline = entry.window.deadline;
     guard.owner = net::IsHost() && entry.lease.ActiveLeases() ? entry.lease.owner : 0;
     guardStates.Put(key, guard);
@@ -254,24 +259,34 @@ bool ValidDiscovery(Checkpoint const& state)
 }
 bool Processed(eCEntity const* entity)
 {
-    if (!entity || entity->IsProcessingDisabled()) return false;
+    if (!entity || !entity->IsEnabled() || entity->IsProcessingDisabled()) return false;
     // GetNPCs is the frame-cached interaction ROI, not the native processing inventory.
     const auto* all = world::ProcessedEntities();
     if (!all) return false;
-    for (int i = 0; i < all->GetCount(); ++i) if (all->GetAt(i) == entity) return true;
+    for (GEU16 i = 0; i < all->GetCount(); ++i) if (all->GetAt(i) == entity) return true;
     return false;
 }
 bool NativeReady(eCEntity* entity)
 {
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
-    return Processed(entity) && animation && animation->GetActor();
+    return Processed(entity) && world::ProcessingOf(entity).processable && animation && animation->GetActor();
 }
 ClientReadiness Readiness(eCEntity* entity, Entry const& entry, uint32_t now)
 {
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
-    return {Running(), GetConfig().npcAuthorityFallback, persist::CheckpointBusy(),
+    ClientReadiness result{Running(), GetConfig().npcAuthorityFallback, persist::CheckpointBusy(),
         Processed(entity), animation && animation->GetActor(), Eligible(entity),
         Reached(now, entry.localDeadline)};
+    result.processingEnabled = entity && entity->IsEnabled() && !entity->IsProcessingDisabled();
+    result.processable = world::ProcessingOf(entity).processable;
+    auto* hero = remote::ControlledBody();
+    if (!net::IsHost()) {
+        result.insideRange = entity && hero &&
+            LeaseProcessingRange(true, (entity->GetWorldPosition() - hero->GetWorldPosition()).GetMagnitude());
+    }
+    result.collecting = entry.processingQueued &&
+        AwaitingInitialCollection(entry.nativeActivated, entry.activationAt, now);
+    return result;
 }
 bool CanResumePresentation(eCEntity* entity)
 {
@@ -392,15 +407,21 @@ bool Activate(eCEntity* entity, Entry& entry, uint8_t const identity[16])
     const auto resume = entry.lease.phase;
     const bool active = entry.active;
     entry.active = false;
+    entry.nativeActivated = false;
     entry.lease.phase = net::IsHost() ? Phase::Dormant : Phase::Frozen;
     PublishGuard(Key(identity), entry);
     if (!NativeReady(entity) || !npcplayback::GuardForLease(entity)) return false;
     npcs::LeaseReleaseMirror(identity);
     if (!Import(entity, entry.lease.state)) return false;
-    npcplayback::ReleaseUnavailable(entity);
     entry.lease.phase = resume;
     entry.active = active;
+    entry.nativeActivated = true;
     PublishGuard(Key(identity), entry);
+    if (!npcplayback::ReleaseNativePresentation(entity)) {
+        entry.nativeActivated = false;
+        PublishGuard(Key(identity), entry);
+        return false;
+    }
     Entity npc(entity);
     if (entry.lease.state.dead) {
         npc.Routine.SetTask(bCString("ZS_Dead"));
@@ -479,7 +500,9 @@ void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& en
     Entity npc(entity);
     Logf("npclease: readiness guid=%s epoch=%u revision=%u active=%u processed=%u actor=%u eligible=%u "
          "running=%u enabled=%u checkpoint=%u remaining_ms=%d last_hit_age_ms=%u hp=%d ai=%d task=%s state=%s "
-         "disabled=%u right=%s left=%s body=%s helmet=%s eligibility_reason=%s",
+         "disabled=%u right=%s left=%s body=%s helmet=%s eligibility_reason=%s "
+         "reason=%s ptr=%p e0=%u e8=%u entity_enabled=%u native=%u collecting=%u "
+         "e0_changed_age_ms=%u e8_changed_age_ms=%u hero_cm=%.0f camera_cm=%.0f",
          text, entry.lease.epoch, entry.lease.revision, entry.active ? 1 : 0,
          readiness.processed ? 1 : 0, readiness.actor ? 1 : 0, readiness.eligible ? 1 : 0,
          readiness.running ? 1 : 0, readiness.enabled ? 1 : 0, readiness.checkpointBusy ? 1 : 0,
@@ -495,7 +518,26 @@ void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& en
          entity ? npc.Inventory.GetItemFromSlot(gESlot_Body).GetName().GetText() : "-",
          entity ? npc.Inventory.GetItemFromSlot(gESlot_Helmet).GetName().GetText() : "-",
          readiness.eligible ? "eligible" : entity && EquipmentReason(npc) ? EquipmentReason(npc) :
-             UnavailabilityReason(entity));
+             UnavailabilityReason(entity),
+         why, entity, world::ProcessingOf(entity).range ? 1 : 0,
+         readiness.processable ? 1 : 0, entity && entity->IsEnabled() ? 1 : 0,
+         entry.nativeActivated ? 1 : 0, readiness.collecting ? 1 : 0,
+         net::Now() - entry.rangeChangedAt, net::Now() - entry.processableChangedAt,
+         entity && remote::ControlledBody() ?
+             (entity->GetWorldPosition() - remote::ControlledBody()->GetWorldPosition()).GetMagnitude() : -1.0f,
+         entity ? (entity->GetWorldPosition() - eCApplication::GetInstance().GetCurrentCamera().GetPosition()).GetMagnitude() : -1.0f);
+}
+
+void ObserveProcessing(Entry& entry, eCEntity* entity, uint32_t now)
+{
+    const auto membership = world::ProcessingOf(entity);
+    if (entry.observedEntity != entity || entry.observedRange != membership.range)
+        entry.rangeChangedAt = now;
+    if (entry.observedEntity != entity || entry.observedProcessable != membership.processable)
+        entry.processableChangedAt = now;
+    entry.observedEntity = entity;
+    entry.observedRange = membership.range;
+    entry.observedProcessable = membership.processable;
 }
 void CommitDeath(GuidKey const& key, Entry& entry)
 {
@@ -678,17 +720,20 @@ void ReceiveClient(Message const& note)
         if (!entry.prepared || entry.cut || !Running() || !entry.window.Commit(note.epoch, now)) { ++refused; return; }
         entry.lease.phase = Phase::Client;
         entry.active = true; entry.prepared = false; entry.echo = now;
+        entry.nativeActivated = false; entry.activationAt = now; entry.ownerReportAt = 0;
         auto* entity = npcs::NpcByGuid(note.guid);
-        if (!Activate(entity, entry, note.guid)) {
-            entry.active = false; entry.lease.phase = Phase::Frozen;
-            const auto readiness = Readiness(entity, entry, now);
-            ReadinessDiagnostic("activation-failed", key, entry, entity, readiness,
-                readiness.LossReason() ? readiness.LossReason() : "native guard/import unavailable");
-            Log("FAIL npclease: committed client instance is unavailable; authority remains fenced");
-            return;
+        PublishGuard(key, entry);
+        entry.processingQueued = false;
+        if (entity && !entity->IsProcessingDisabled() && Eligible(entity) &&
+            ProcessingAuthority(entity) && npcplayback::GuardForLease(entity)) {
+            Entity(entity).EnableProcessing(GETrue);
+            entry.processingQueued = world::QueueEntityProcessing(entity);
         }
         Send(key, entry, Kind::Ack);
-        Diagnostic("active", key, entry, "native client AI; latency from first unavailable request");
+        ObserveProcessing(entry, entity, now);
+        ReadinessDiagnostic("activation-queued", key, entry, entity, Readiness(entity, entry, now),
+            entry.processingQueued ? "committed permit; awaiting native e0/e8 collection" :
+                                     "native processing registration unavailable; donor fenced");
     } else if (note.kind == Kind::Renew) {
         if (!entry.active || entry.cut || !entry.window.Renew(note.epoch, note.echo, note.duration, now)) { ++refused; return; }
         entry.localDeadline = entry.window.deadline;
@@ -888,14 +933,34 @@ void TickClient(uint32_t now)
         }
         if (!entry.active) continue;
         auto* entity = npcs::NpcByGuid(reinterpret_cast<uint8_t const*>(item.first.data()));
-        Checkpoint state = entry.lease.state;
-        const bool captured = CaptureNative(entity, state);
-        const auto readiness = Readiness(entity, entry, now);
+        ObserveProcessing(entry, entity, now);
+        auto readiness = Readiness(entity, entry, now);
         const char* lost = readiness.LossReason();
+        if (!entry.nativeActivated && !lost) {
+            if (!entry.processingQueued) lost = "native processing registration unavailable";
+            else if (readiness.processed && readiness.processable) {
+                if (Activate(entity, entry, item.first.data())) {
+                    readiness = Readiness(entity, entry, now);
+                    lost = readiness.LossReason();
+                    ReadinessDiagnostic("active", item.first, entry, entity, readiness,
+                        lost ? lost : "native client AI; collected baseline imported and playback retired");
+                    entry.ownerReportAt = now;
+                } else {
+                    entry.active = true;
+                    lost = "native guard/import/restart unavailable";
+                }
+            } else continue;
+        }
+        Checkpoint state = entry.lease.state;
+        const bool captured = entry.nativeActivated && CaptureNative(entity, state);
         if (!captured && !entry.captureFailed)
             ReadinessDiagnostic("state-unavailable", item.first, entry, entity, readiness,
                 lost ? lost : "native checkpoint invalid; renewal cannot advance");
         entry.captureFailed = !captured;
+        if (entry.nativeActivated && (!entry.ownerReportAt || now - entry.ownerReportAt >= 1000)) {
+            ReadinessDiagnostic("owner", item.first, entry, entity, readiness, lost ? lost : "native owner retained");
+            entry.ownerReportAt = now;
+        }
         if (lost || (entry.recallAt && captured && (!state.busy || now - entry.recallAt >= RecallWaitMs))) {
             // Status tasks cannot be restarted from a scalar duration; defer their cut while the lease remains healthy.
             if (!lost && !TransferableStatus(state)) continue;
@@ -905,6 +970,7 @@ void TickClient(uint32_t now)
             ++entry.lease.revision; entry.echo = now;
             PublishGuard(item.first, entry);
             ReadinessDiagnostic("frozen", item.first, entry, entity, readiness, lost ? lost : "safe recall cut");
+            entry.nativeActivated = false;
             Stop(entity);
             Send(item.first, entry, Kind::Cut);
             continue;
@@ -959,6 +1025,13 @@ void TickClient(uint32_t now)
 bool LocalAuthority(eCEntity const* entity)
 {
     return ReadGuard(entity).Local(net::Now());
+}
+bool ProcessingAuthority(eCEntity const* entity)
+{
+    auto* hero = remote::ControlledBody();
+    return entity && hero && !net::IsHost() && !npcs::RedundantClientEntity(entity) &&
+        !npcremoval::Suppressed(entity) && LeaseProcessingRange(ReadGuard(entity).Processing(net::Now()),
+        (entity->GetWorldPosition() - hero->GetWorldPosition()).GetMagnitude());
 }
 void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, int after)
 {

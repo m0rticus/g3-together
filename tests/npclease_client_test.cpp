@@ -31,6 +31,9 @@ static void TestHitReadiness()
     check(&ClientReadiness::actor, false, "native animation actor unavailable");
     check(&ClientReadiness::eligible, false, "native eligibility changed");
     check(&ClientReadiness::expired, true, "conservative lease expired");
+    check(&ClientReadiness::processingEnabled, false, "native entity disabled");
+    check(&ClientReadiness::processable, false, "native processable membership unavailable");
+    check(&ClientReadiness::insideRange, false, "client processing range lost");
 
     Checkpoint state;
     state.templateId[0] = 1;
@@ -97,9 +100,52 @@ static void TestHitReadiness()
     assert(!client.Active(1, client.deadline));
 }
 
+static void TestInitialCollection()
+{
+    ClientReadiness pending;
+    pending.processed = pending.processable = false;
+    pending.collecting = AwaitingInitialCollection(false, 100, 100);
+    assert(pending.collecting && !pending.LossReason());
+    pending.collecting = AwaitingInitialCollection(false, 100, 599);
+    assert(pending.collecting && !pending.LossReason());
+    pending.collecting = AwaitingInitialCollection(false, 100, 600);
+    assert(!pending.collecting && pending.LossReason());
+    pending.collecting = AwaitingInitialCollection(true, 100, 101);
+    assert(!pending.collecting && pending.LossReason()); // no grace after native activation
+    pending.collecting = AwaitingInitialCollection(false, UINT32_MAX - 100, 398);
+    assert(pending.collecting);
+    assert(!AwaitingInitialCollection(false, UINT32_MAX - 100, 399));
+    for (auto field : {&ClientReadiness::expired, &ClientReadiness::checkpointBusy}) {
+        auto lost = pending;
+        lost.*field = true;
+        assert(lost.LossReason());
+    }
+    for (auto field : {&ClientReadiness::actor, &ClientReadiness::processingEnabled,
+                       &ClientReadiness::running, &ClientReadiness::enabled,
+                       &ClientReadiness::eligible, &ClientReadiness::insideRange}) {
+        auto lost = pending;
+        lost.*field = false;
+        assert(lost.LossReason()); // collection cannot bypass other fences
+    }
+    AuthorityGuard guard{true, false, 0, 1000, true};
+    assert(guard.Processing(999) && !guard.Local(999) && guard.Fenced(999));
+    assert(!guard.Processing(1000));
+    guard.locallyDriven = true;
+    assert(guard.Local(999) && !guard.Local(1000));
+    guard.processingAllowed = false;
+    assert(!guard.Processing(999));
+    assert(LeaseProcessingRange(true, ClientRadiusCm));
+    assert(!LeaseProcessingRange(true, ClientRadiusCm + 1));
+    assert(!LeaseProcessingRange(false, 0));
+    assert(!LeaseProcessingRange(true, -1));
+    assert(!LeaseProcessingRange(true, INFINITY));
+    assert(!LeaseProcessingRange(true, NAN));
+}
+
 int main()
 {
     TestHitReadiness();
+    TestInitialCollection();
     ClientWindow client;
     assert(!client.Commit(1, 10));
     assert(!client.Prepare(1, 0, LeaseMs, LeaseMs));

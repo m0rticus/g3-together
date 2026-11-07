@@ -4,7 +4,7 @@
 
 namespace g3t::world {
 // CP 1.75 FourceFullROIUpdate clears membership before setting this dirty byte.
-// Request only its recollection step; Process preserves still-eligible members.
+// Request its incremental rebuild; newly enabled entities must also enter the native dirty queue.
 inline bool QueueProcessingRebuild(unsigned char* admin, unsigned char const* refresh)
 {
     constexpr unsigned char signature[] = {

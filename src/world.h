@@ -7,10 +7,15 @@
 #include <Engine.h>
 
 namespace g3t::world {
-void RequestProcessingUpdate();  // queue recollection without exiting existing entities (including the local hero)
+void RequestProcessingUpdate();  // incremental range refresh; never exit the local hero to force recollection
 using LogFn = void (*)(char const*);
 // Every entity the engine processes here, static ones included (doors, ore veins); null before the scene exists.
 bTSmallArray<eCEntity*> const* ProcessedEntities();
+struct ProcessingMembership {
+    bool range = false, processable = false;
+};
+ProcessingMembership ProcessingOf(eCEntity const* entity);
+bool QueueEntityProcessing(eCEntity* entity);
 void Tick();  // host: NPC-only extra ranges; native camera, ROI and static culling stay unchanged
 void ProcessingReport(LogFn log);
 void Start();

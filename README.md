@@ -23,6 +23,13 @@ Missing idle resources retain native rendering with an explicit unproven-pose di
 Statues and other non-character interaction entities are excluded from NPC presentation. This is not native
 routine walking or authority delegation for humans, merchants or story actors; those still require portable
 inventory/equipment and world-script transactions before safe client ownership and latest-state hand-back.
+Host-authorized generic creature leases explicitly queue native entity processing before starting AI. Initial
+collection remains script-fenced for at most 500 ms; running owners have no processing-loss grace. Only a valid
+client lease within 10000 cm of its controlled hero extends creature processing, without changing the camera,
+static culling or hero ROI membership. Native activation retires passive zero-speed animation slots before
+restarting the routine. `npclease: readiness` at activation and once per second reports `e0` (range), `e8`
+(processable), `entity_enabled`, `disabled`, `native`, `collecting`, task/state, hero/camera distances and the
+remaining permit. Frozen/cut diagnostics retain the exact loss reason; expiry never restarts client AI.
 NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.
 A client's successful hit plays an immediate presentation-only flinch and counts despite a host-side parry.
 Hit identities suppress the corresponding echoed reaction. Hero damage is judged against locally presented contacts,

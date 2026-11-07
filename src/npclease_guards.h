@@ -14,8 +14,10 @@ struct AuthorityGuard {
     bool leased = false, locallyDriven = false;
     uint8_t owner = 0;
     uint32_t deadline = 0;
+    bool processingAllowed = false;
 
     bool Local(uint32_t now) const { return locallyDriven && !Reached(now, deadline); }
+    bool Processing(uint32_t now) const { return processingAllowed && !Reached(now, deadline); }
     bool Fenced(uint32_t now) const { return leased && !Local(now); }
 };
 

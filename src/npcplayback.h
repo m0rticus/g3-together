@@ -56,6 +56,7 @@ void Stats(LogFn log);
 void UpdatePresentation(eCEntity* entity);
 bool HoldUnavailable(eCEntity* entity, State& state);
 void ReleaseUnavailable(eCEntity* entity);
+bool ReleaseNativePresentation(eCEntity* entity);
 bool Capture(eCEntity* entity, net::NpcRecord& record, PublishName publish);
 bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flags, PublishName publish);
 uint32_t PoseInterval(net::NpcRecord const& record);

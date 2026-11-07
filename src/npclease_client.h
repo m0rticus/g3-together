@@ -2,8 +2,21 @@
 #pragma once
 
 #include "npclease.h"
+#include <cmath>
 
 namespace g3t::npclease {
+constexpr uint32_t ActivationCollectMs = 500;
+
+inline bool LeaseProcessingRange(bool permit, float distance)
+{
+    return permit && std::isfinite(distance) && distance >= 0.0f && distance <= ClientRadiusCm;
+}
+
+inline bool AwaitingInitialCollection(bool activated, uint32_t began, uint32_t now)
+{
+    return !activated && now - began < ActivationCollectMs;
+}
+
 inline bool PortableCreatureSlot(bool occupied, bool hand, bool natural, bool templateDefault)
 {
     return !occupied || (hand && natural && templateDefault);
@@ -12,13 +25,17 @@ inline bool PortableCreatureSlot(bool occupied, bool hand, bool natural, bool te
 struct ClientReadiness {
     bool running = true, enabled = true, checkpointBusy = false;
     bool processed = true, actor = true, eligible = true, expired = false;
+    bool processingEnabled = true, processable = true, insideRange = true, collecting = false;
 
     char const* LossReason() const
     {
         if (!running) return "session/world unavailable";
         if (!enabled) return "authority fallback disabled";
         if (checkpointBusy) return "checkpoint barrier";
-        if (!processed) return "native processing unavailable";
+        if (!processingEnabled) return "native entity disabled";
+        if (!insideRange) return "client processing range lost";
+        if (!processed && !collecting) return "native processing unavailable";
+        if (!processable && !collecting) return "native processable membership unavailable";
         if (!actor) return "native animation actor unavailable";
         if (!eligible) return "native eligibility changed";
         if (expired) return "conservative lease expired";

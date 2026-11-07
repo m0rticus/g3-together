@@ -10,6 +10,7 @@
 #include "config.h"
 #include "net.h"
 #include "npcs.h"
+#include "npclease_runtime.h"
 #include "npcremoval.h"
 #include "processing.h"
 #include "remote.h"
@@ -523,6 +524,21 @@ bTSmallArray<eCEntity*> const* Processed()
 
 bTSmallArray<eCEntity*> const* ProcessedEntities() { return Processed(); }
 
+ProcessingMembership ProcessingOf(eCEntity const* entity)
+{
+    ProcessingMembership result;
+    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
+    if (!entity || !scene) return result;
+    auto& admin = scene->GetAccessToEntityAdmin();
+    const auto contains = [entity](bTSmallArray<eCEntity*> const& list) {
+        for (GEU16 i = 0; i < list.GetCount(); ++i) if (list.GetAt(i) == entity) return true;
+        return false;
+    };
+    result.range = contains(admin.GetEntitiesInProcessingRange());
+    result.processable = contains(admin.GetProcessableEntities());
+    return result;
+}
+
 namespace {
 bool MarkProcessingDirty(eCEntityAdmin* admin)
 {
@@ -549,6 +565,20 @@ void RequestProcessingUpdate()
             movement::Touch(remote::ControlledBody(), "ROI-dirty", "membership-preserved", _ReturnAddress());
     }
     else Log("world: cannot refresh NPC processing range; scene administration is unavailable");
+}
+
+bool QueueEntityProcessing(eCEntity* entity)
+{
+    if (!entity || retirementGate.Paused() || ai::ShuttingDown()) return false;
+    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
+    if (!scene) {
+        Log("FAIL world: cannot queue native entity processing; scene administration unavailable");
+        return false;
+    }
+    auto& admin = scene->GetAccessToEntityAdmin();
+    if (!MarkProcessingDirty(&admin)) return false;
+    admin.AddDirtyProcessingRangeEntity(entity, GETrue);
+    return true;
 }
 
 // Extra ranges are only for NPC collection. Moving the camera, resizing the engine ROI, or globally replacing its
@@ -616,6 +646,7 @@ bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, u
     auto const* entity = reinterpret_cast<eCEntity const*>(reinterpret_cast<char const*>(&box) - 0xe8);
     if (npcremoval::ExcludeFromProcessing(entity)) return false;
     if (native) return true;
+    if (!net::IsHost()) return npclease::ProcessingAuthority(entity);
     const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
     ++checks;
     const bool included = processing::IncludesNpc(native, npc, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount);
@@ -642,6 +673,11 @@ void HookSpheres()
         "?CollectDynamicProcessingRangeEntity@eCEntityAdmin@@IAEXPAVeCEntity@@AAV?$bTSmallArray@PAVeCEntity@@@@1@Z")) : nullptr;
     auto* update = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
         "?UpdateProcessingRangeEntity@eCEntityAdmin@@QAEXPAVeCEntity@@AAV?$bTSmallArray@PAVeCEntity@@@@1@Z")) : nullptr;
+    if (!update && engine) {
+        auto* candidate = reinterpret_cast<unsigned char*>(engine) + 0x231520;
+        constexpr unsigned char arguments[] = {0x8b, 0x7c, 0x24, 0x10, 0x8b, 0x4f, 0x3c};
+        if (!std::memcmp(candidate + 0x3d, arguments, sizeof(arguments))) update = candidate;
+    }
     auto* intersects = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
         "?IntersectsProcessingRangeRegion@eCEntityAdmin@@QAE_NABVbCBox@@@Z")) : nullptr;
     // Engine 1.75 (Engine.dll SHA-256 ac0fb505...): the CALL of IntersectsProcessingRangeRegion in both dynamic-entity paths.
@@ -746,7 +782,7 @@ void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
     }
     eCEntity* camera = nullptr;
     camera = reinterpret_cast<eCEntity*>(&eCApplication::GetInstance().GetCurrentCamera());  // Process reads the same one
-    PlaceSpheres(admin, camera);
+    if (net::IsHost()) PlaceSpheres(admin, camera);
     originalProcess(admin);
 }
 
@@ -796,8 +832,8 @@ void Tick()
 {
     Start();
     if (retirementGate.Paused() || ai::ShuttingDown()) return;
-    if (!net::IsHost()) return;
     HookElastic();
+    if (!net::IsHost()) return;
     if (spheresHooked && originalStopSession && gCSession::GetInstance().IsGameRunning()) {
         TickHostRegions();
         RefreshContexts();

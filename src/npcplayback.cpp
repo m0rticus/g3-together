@@ -1684,6 +1684,23 @@ void ReleaseUnavailable(eCEntity* entity)
     unavailable.erase(found);
 }
 
+bool ReleaseNativePresentation(eCEntity* entity)
+{
+    if (!entity || Passive(entity)) return false;
+    auto* animation = Animation(entity);
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    if (!actor) return false;
+    ReleaseUnavailable(entity);
+    provenPoses.erase(EntityKey(entity));
+    if (!animation->GetRagDollEnabled()) {
+        for (int i = 0; i < Slots; ++i) {
+            const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
+            if (actor->HasMotionInstance(slot)) actor->StopMotion(slot, 0.0f);
+        }
+    }
+    return true;
+}
+
 void UpdatePresentation(eCEntity* entity)
 {
     auto* animation = Animation(entity);

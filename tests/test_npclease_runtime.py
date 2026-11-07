@@ -1,6 +1,8 @@
 from pathlib import Path
+import os
 import unittest
 
+from test_hud_notices import read_rva
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -35,6 +37,8 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         activate = section(self.runtime, "bool Activate(", "Interest InterestOf(")
         self.assertLess(activate.index("PublishGuard("), activate.index("npcs::LeaseReleaseMirror("))
         self.assertLess(activate.index("Import(entity"), activate.index("npc.Routine.ContinueRoutine()"))
+        self.assertLess(activate.index("entry.nativeActivated = true"), activate.index("ReleaseNativePresentation"))
+        self.assertLess(activate.index("ReleaseNativePresentation"), activate.index("npc.Routine.ContinueRoutine()"))
         self.assertNotIn("Kill", activate)
         self.assertNotIn("GiveXP", activate)
         self.assertNotIn("CreateItems", activate)
@@ -84,6 +88,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         processed = section(self.runtime, "bool Processed(", "bool NativeReady(")
         self.assertIn("world::ProcessedEntities()", processed)
         self.assertIn("entity->IsProcessingDisabled()", processed)
+        self.assertIn("entity->IsEnabled()", processed)
         self.assertNotIn("Entity::GetNPCs()", processed)
         readiness = section(self.runtime, "ClientReadiness Readiness(", "bool CanResumePresentation(")
         self.assertIn("Processed(entity)", readiness)
@@ -92,6 +97,70 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertNotIn("HitPoints", readiness)
         world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
         self.assertIn("GetEntitiesInProcessingRange()", section(world, "bTSmallArray<eCEntity*> const* Processed()", "\n}\n\nbTSmallArray"))
+
+    def test_committed_collection_is_fenced_and_never_restarts_expired_owner(self):
+        receive = section(self.runtime, "void ReceiveClient(", "void Receive(uint8_t")
+        commit = section(receive, "if (note.kind == Kind::Commit) {", "} else if (note.kind == Kind::Renew)")
+        self.assertLess(commit.index("entry.window.Commit"), commit.index("EnableProcessing(GETrue)"))
+        self.assertLess(commit.index("PublishGuard(key, entry)"), commit.index("EnableProcessing(GETrue)"))
+        self.assertIn("world::QueueEntityProcessing(entity)", commit)
+        self.assertIn("entry.nativeActivated = false", commit)
+        guard = section(self.runtime, "void PublishGuard(", "AuthorityGuard ReadGuard(")
+        self.assertIn("entry.window.Active(entry.lease.epoch", guard)
+        self.assertIn("guard.processingAllowed && entry.nativeActivated", guard)
+        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
+        self.assertLess(client.index("readiness.LossReason()"), client.index("Activate(entity"))
+        self.assertIn("readiness.processed && readiness.processable", client)
+        self.assertIn("entry.nativeActivated && CaptureNative", client)
+        readiness = section(self.runtime, "ClientReadiness Readiness(", "bool CanResumePresentation(")
+        self.assertIn("AwaitingInitialCollection(entry.nativeActivated", readiness)
+        self.assertIn("LeaseProcessingRange", readiness)
+
+    def test_entity_queue_and_client_range_preserve_native_hero_membership(self):
+        world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
+        queue = section(world, "bool QueueEntityProcessing(", "// Extra ranges")
+        self.assertIn("admin.AddDirtyProcessingRangeEntity(entity, GETrue)", queue)
+        self.assertIn("MarkProcessingDirty(&admin)", queue)
+        for destructive in ("ClearProcessingRangeList", "FourceFullROIUpdate()", "EnterProcessingRange(",
+                            "ExitProcessingRange(", "GetEntitiesInProcessingRange"):
+            self.assertNotIn(destructive, queue)
+        membership = section(world, "ProcessingMembership ProcessingOf(", "namespace {\nbool MarkProcessingDirty")
+        self.assertIn("GetEntitiesInProcessingRange()", membership)
+        self.assertIn("GetProcessableEntities()", membership)
+        cull = section(world, "bool NpcIntersectsAt(", "bool __fastcall NpcIntersects(")
+        self.assertIn("if (!net::IsHost()) return npclease::ProcessingAuthority(entity)", cull)
+        self.assertLess(cull.index("npcremoval::ExcludeFromProcessing"), cull.index("ProcessingAuthority"))
+        tick = section(world, "void Tick()", "void OnWorldDeactivate()")
+        self.assertLess(tick.index("HookElastic()"), tick.index("if (!net::IsHost()) return"))
+        permit = section(self.runtime, "bool ProcessingAuthority(", "void NoteHit(")
+        self.assertIn("ReadGuard(entity).Processing(net::Now())", permit)
+        self.assertIn("LeaseProcessingRange", permit)
+        self.assertIn("!npcs::RedundantClientEntity(entity)", permit)
+        self.assertIn("!npcremoval::Suppressed(entity)", permit)
+
+    def test_native_restart_retires_zero_speed_playback_instances(self):
+        playback = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        release = section(playback, "bool ReleaseNativePresentation(", "void UpdatePresentation(")
+        self.assertIn("Passive(entity)", release)
+        self.assertIn("actor->StopMotion(slot, 0.0f)", release)
+        self.assertIn("provenPoses.erase(EntityKey(entity))", release)
+        self.assertIn("!animation->GetRagDollEnabled()", release)
+        self.assertNotIn("SetPlaySpeed", release)
+
+    def test_supported_native_dirty_queue_and_both_range_calls(self):
+        game = os.environ.get("G3T_GAME_DLL")
+        if not game:
+            self.skipTest("G3T_GAME_DLL required for read-only Engine.dll byte verification")
+        engine = Path(game).parent / "Engine.dll"
+        data = engine.read_bytes()
+        self.assertEqual(read_rva(data, 0x2544a0, 7), bytes.fromhex("8d81e0000000c3"))
+        self.assertEqual(read_rva(data, 0x7a270, 7), bytes.fromhex("8d81e8000000c3"))
+        self.assertEqual(read_rva(data, 0x23155d, 7), bytes.fromhex("8b7c24108b4f3c"))
+        self.assertEqual(read_rva(data, 0x23157f, 9), bytes.fromhex("8d97e8000000528bcd"))
+        self.assertEqual(read_rva(data, 0x230854, 9), bytes.fromhex("8d87e8000000508bcd"))
+        self.assertEqual(read_rva(data, 0x231b88, 16),
+                         bytes.fromhex("8d4c240c518d8ed8000000e818040000"))
+        self.assertEqual(read_rva(data, 0x230c14, 9), bytes.fromhex("80bdfd000000017462"))
 
     def test_hits_only_observe_owner_and_publish_reliable_state(self):
         note = section(self.runtime, "void NoteHit(", "char const* UnavailabilityReason(")
@@ -114,8 +183,11 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn('ReadinessDiagnostic("state-unavailable"', client)
         diagnostic = section(self.runtime, "void ReadinessDiagnostic(", "void CommitDeath(")
         for field in ("guid=%s", "epoch=%u", "processed=%u", "actor=%u", "remaining_ms=%d",
-                      "last_hit_age_ms=%u", "task=%s", "state=%s"):
+                      "last_hit_age_ms=%u", "task=%s", "state=%s", "e0=%u", "e8=%u",
+                      "entity_enabled=%u", "collecting=%u", "hero_cm=%.0f", "camera_cm=%.0f"):
             self.assertIn(field, diagnostic)
+        self.assertIn('ReadinessDiagnostic("owner"', client)
+        self.assertIn("now - entry.ownerReportAt >= 1000", client)
 
     def test_kill_ledger_precedes_native_effects(self):
         kill = section(self.runtime, "GEInt GE_STDCALL Kill(", "bool Install()")
