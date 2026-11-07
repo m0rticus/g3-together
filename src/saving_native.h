@@ -21,6 +21,9 @@ inline constexpr Site Sites[] = {
 };
 constexpr size_t Missing = static_cast<size_t>(-1);
 constexpr size_t Stolen = 6; // push ebp / mov ebp,esp / and esp,-8; no relative operand
+constexpr uint32_t PupReceiverRva = 0x157f0, PupImageSize = 0xa8000;
+inline constexpr char PupReceiverBytes[] =
+    "558bec6affff35????????ff15????????6a006a01ff35????????ff15????????a1????????5dffe0";
 
 inline int Hex(char c)
 {
@@ -54,12 +57,41 @@ inline size_t FindUnique(uint8_t const* data, size_t size, char const* pattern, 
     }
     return matches == 1 ? found : Missing;
 }
+inline bool Matches(uint8_t const* data, size_t size, char const* pattern)
+{
+    const auto bytes = Decode(pattern);
+    if (!data || bytes.empty() || bytes.size() > size) return false;
+    for (size_t i = 0; i < bytes.size(); ++i)
+        if (bytes[i] >= 0 && data[i] != bytes[i]) return false;
+    return true;
+}
 inline bool Range(size_t size, size_t at, size_t length) { return at <= size && length <= size - at; }
 inline uint32_t Word(uint8_t const* data, size_t at)
 {
     uint32_t value;
     std::memcpy(&value, data + at, sizeof(value));
     return value;
+}
+inline bool BranchTarget(uint8_t const* data, size_t size, uint32_t address, uint8_t opcode, uint32_t& target)
+{
+    if (!data || size < 5 || data[0] != opcode || (opcode != 0xe8 && opcode != 0xe9)) return false;
+    target = address + 5u + Word(data, 1);
+    return true;
+}
+inline bool PupEntryTarget(uint8_t const* data, size_t size, uint32_t address, uint32_t& target)
+{
+    return Matches(data, size, "e9????????90") && BranchTarget(data, size, address, 0xe9, target);
+}
+inline bool PupShimTarget(uint8_t const* data, size_t size, uint32_t address, uint32_t& target)
+{
+    return Matches(data, size, "870c2451e9????????") && BranchTarget(data + 4, size - 4, address + 4, 0xe9, target);
+}
+inline bool PupReceiver(uint8_t const* data, size_t size, uint32_t base)
+{
+    return Matches(data, size, PupReceiverBytes) &&
+           Word(data, 7) == base + 0x99510 && Word(data, 13) == base + 0x677a0 &&
+           Word(data, 23) == base + 0x99510 && Word(data, 29) == base + 0x677a4 &&
+           Word(data, 34) == base + 0x97578;
 }
 inline bool Calls(uint8_t const* image, size_t size, size_t at, size_t target)
 {
@@ -70,13 +102,10 @@ inline bool Calls(uint8_t const* image, size_t size, size_t at, size_t target)
 }
 
 // CP 1.75 HUD call edges and singleton operand relationships, checked after unique matching.
-inline bool Links(uint8_t const* image, size_t size, uint32_t base, size_t const (&site)[5],
-                  size_t& singleton, size_t& vtable)
+inline bool GetterLinks(uint8_t const* image, size_t size, uint32_t base, size_t getter,
+                        size_t& singleton, size_t& vtable)
 {
-    for (size_t at : site) if (!Range(size, at, 60)) return false;
-    if (!Calls(image, size, site[0] + 0xb9, site[2]) ||
-        !Calls(image, size, site[1] + 0x2b2, site[3])) return false;
-    const size_t getter = site[4];
+    if (!Range(size, getter, 60)) return false;
     const uint32_t owner = Word(image, getter + 28), table = Word(image, getter + 32),
                    flag = Word(image, getter + 7);
     if (Word(image, getter + 15) != flag || Word(image, getter + 37) != owner + 4 ||
@@ -89,5 +118,13 @@ inline bool Links(uint8_t const* image, size_t size, uint32_t base, size_t const
     singleton = owner - base;
     vtable = table - base;
     return true;
+}
+inline bool Links(uint8_t const* image, size_t size, uint32_t base, size_t const (&site)[5],
+                  size_t& singleton, size_t& vtable)
+{
+    for (size_t at : site) if (!Range(size, at, 60)) return false;
+    return Calls(image, size, site[0] + 0xb9, site[2]) &&
+           Calls(image, size, site[1] + 0x2b2, site[3]) &&
+           GetterLinks(image, size, base, site[4], singleton, vtable);
 }
 }

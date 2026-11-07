@@ -147,7 +147,7 @@ class SavingPolicyTests(unittest.TestCase):
         lower = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldLoadDetour\s*\(")
         self.assertIn("lowerLoadGood = lowerLoadGood && ok", lower)
         self.assertIn("nativeLoadDepth", lower)
-        self.assertLess(lower.index("if (pairedEnabled && !observed)"), lower.index("originalWorldLoad("))
+        self.assertLess(lower.index("if (pairedEnabled && !observed)"), lower.index("const bool ok = originalWorldLoad("))
         self.assertIn("use HUD.LoadGame", lower)
         self.assertIn("ownCharacterReady = false", body)
 
@@ -231,7 +231,10 @@ class SavingPolicyTests(unittest.TestCase):
     def test_real_native_hooks_have_unique_named_resolution_and_safe_partial_fallback(self):
         resolve = function_body(self.persist, r"\bbool\s+ResolveNative\s*\(")
         install = function_body(self.persist, r"\bvoid\s+Install\s*\(")
-        self.assertIn("saving::native::FindUnique", resolve)
+        self.assertIn("FindCode(", resolve)
+        scan = function_body(self.persist, r"\bsize_t\s+FindCode\s*\(")
+        self.assertIn("saving::native::FindUnique", scan)
+        self.assertIn("matches == 1", scan)
         self.assertIn("matches == 1", resolve)
         self.assertIn("GetProcAddress(game, fn.symbol)", resolve)
         self.assertIn("saving::native::Links", resolve)
@@ -244,6 +247,67 @@ class SavingPolicyTests(unittest.TestCase):
         load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
         self.assertIn("if (!pairedEnabled) return originalLoad", load)
         self.assertLess(load.index("self != FileManager(true)"), load.index("const bool hudOk = originalLoad("))
+
+    def test_pup_world_load_entry_is_recognized_but_never_overwritten(self):
+        resolve = function_body(self.persist, r"\bbool\s+ResolveNative\s*\(")
+        self.assertIn("i == 3 ? Stolen : 0", resolve)
+        self.assertIn("fn.bytes + skip * 2", resolve)
+        self.assertIn("PupLoadEntry(image + sites[i])", resolve)
+        pup = function_body(self.persist, r"\bbool\s+PupLoadEntry\s*\(")
+        self.assertIn("saving::native::PupEntryTarget", pup)
+        self.assertIn("saving::native::PupShimTarget", pup)
+        self.assertIn('GetModuleHandleA("Script_paru.dll")', pup)
+        self.assertIn('GetModuleHandleA("paru_s2.dll")', pup)
+        self.assertIn("saving::native::PupReceiverRva", pup)
+        self.assertIn("KnownPup(pup)", pup)
+        self.assertIn("saving::native::PupReceiver(", pup)
+        self.assertIn('GetProcAddress(kernel, "WaitForSingleObject")', pup)
+        self.assertIn('GetProcAddress(kernel, "ReleaseSemaphore")', pup)
+        self.assertIn("GetHandleInformation(", pup)
+        install = function_body(self.persist, r"\bvoid\s+Install\s*\(")
+        self.assertIn("originalWorldLoad = reinterpret_cast<WorldLoadFn>(resolved[3])", install)
+        self.assertIn("HookWorldLoadCall(resolved[1] + 0x2b2, resolved[3])", install)
+        self.assertNotIn("ai::JumpTo(resolved[3]", install)
+        lower = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldLoadDetour\s*\(")
+        self.assertIn("originalWorldLoad(self, name, nativeFlag)", lower)
+
+    def test_native_entries_and_owned_call_are_reverified_before_use(self):
+        verify = function_body(self.persist, r"\bbool\s+ReverifyNative\s*\(")
+        self.assertIn("i < 5", verify)
+        self.assertIn("guard == reinterpret_cast<uintptr_t>(originals[i]) - 24", verify)
+        self.assertIn("target == reinterpret_cast<uintptr_t>(detours[i])", verify)
+        self.assertIn("target == reinterpret_cast<uintptr_t>(entry + Stolen)", verify)
+        self.assertIn("PupLoadEntry(entry)", verify)  # Allows the verified late PUP install only.
+        self.assertIn("target != reinterpret_cast<uintptr_t>(&WorldLoadDetour)", verify)
+        self.assertIn("saving::native::GetterLinks", verify)
+        self.assertIn('Unresolved(fn.name, entry, "before-use")', verify)
+        for signature in (
+            r"\bvoid\*\s+FileManager\s*\(",
+            r"\bbool\s+__stdcall\s+SaveDetour\s*\(",
+            r"\bbool\s+__stdcall\s+LoadDetour\s*\(",
+            r"\bbool\s+__fastcall\s+WorldSaveDetour\s*\(",
+            r"\bbool\s+__fastcall\s+WorldLoadDetour\s*\(",
+        ):
+            self.assertIn("NativeReady()", function_body(self.persist, signature))
+        ready = function_body(self.persist, r"\bbool\s+NativeReady\s*\(")
+        self.assertIn("pairedEnabled = false", ready)
+        self.assertIn('CancelSave("native hooks changed before use")', ready)
+        self.assertIn('DropAutoload("native hooks changed before use")', ready)
+        self.assertIn("prepared = Prepared{}", ready)
+        self.assertIn("file.clear()", ready)
+        receive = function_body(self.persist, r"\bvoid\s+OnSave\s*\(")
+        self.assertIn("if (!pairedEnabled || !NativeReady())", receive)
+        self.assertLess(receive.index("NativeReady()"), receive.index("CaptureCharacter(key)"))
+
+    def test_world_load_call_patch_is_checked_tracked_and_shutdown_safe(self):
+        hook = function_body(self.persist, r"\bbool\s+HookWorldLoadCall\s*\(")
+        self.assertLess(hook.index("target != reinterpret_cast<uintptr_t>(entry)"), hook.index("VirtualProtect("))
+        self.assertIn("std::memcpy(call + 1, &relative", hook)
+        self.assertIn("ai::TrackPatch(call, before, after", hook)
+        self.assertIn("FlushInstructionCache", hook)
+        self.assertIn("return restored && flushed", hook)
+        lower = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldLoadDetour\s*\(")
+        self.assertIn("if (ai::ShuttingDown() || !pairedEnabled) return originalWorldLoad", lower)
 
     def test_transfer_total_is_bound_and_import_lifetime_is_bounded(self):
         chunk = function_body(self.persist, r"\bvoid\s+OnFileChunk\s*\(")

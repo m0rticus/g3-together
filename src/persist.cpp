@@ -54,6 +54,9 @@ unsigned lowerLoadCalls = 0;
 bool lowerLoadGood = false;
 unsigned char* saveTarget = nullptr;
 unsigned char* loadTarget = nullptr;
+unsigned char* nativeEntries[5]{}, *nativeImage = nullptr;
+size_t nativeImageSize = 0;
+bool loadCallInstalled = false;
 bool installed = false, pairedEnabled = false, writing = true, transferring = true, syncing = true;
 bool earlyGate = true, byGeneration = true, resendGuard = true, loadTicks = false, autoloadHold = false;
 uint32_t pausedUntil = 0;
@@ -123,8 +126,15 @@ Autoload autoload;
 
 void Evaluate();
 void OrderAutoload(std::string const& slot);
+void DropAutoload(char const* why);
 void CancelSave(char const* why);
+bool __stdcall SaveDetour(void* self, bCString const* name);
 bool __stdcall LoadDetour(void* self, bCString const* name);
+bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGfxImageData* image, void* metadata, GEU32 size);
+bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool nativeFlag);
+bool PupLoadEntry(unsigned char* entry);
+bool ReverifyNative();
+bool NativeReady();
 
 bool Readable(void const* address, size_t size)
 {
@@ -142,13 +152,45 @@ bool Readable(void const* address, size_t size)
     return true;
 }
 
+bool Executable(void const* address)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    return address && VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+           !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+           (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+size_t FindCode(unsigned char* image, size_t size, IMAGE_SECTION_HEADER const* sections,
+                unsigned sectionCount, char const* pattern, unsigned& matches)
+{
+    matches = 0;
+    size_t found = saving::native::Missing;
+    for (unsigned section = 0; section < sectionCount; ++section) {
+        auto const& part = sections[section];
+        if (!(part.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const size_t length = part.Misc.VirtualSize;
+        if (!saving::native::Range(size, part.VirtualAddress, length) || !Readable(image + part.VirtualAddress, length)) continue;
+        unsigned count = 0;
+        const size_t at = saving::native::FindUnique(image + part.VirtualAddress, length, pattern, count);
+        if (at != saving::native::Missing) found = part.VirtualAddress + at;
+        matches += count;
+    }
+    return matches == 1 ? found : saving::native::Missing;
+}
+void Unresolved(char const* name, unsigned char* entry, char const* phase)
+{
+    char bytes[25] = "unreadable";
+    if (Readable(entry, 12))
+        for (size_t b = 0; b < 12; ++b) Format(bytes + b * 2, 3, "%02x", entry[b]);
+    Logf("persist: unresolved %s phase=%s live=%s; paired saves off", name, phase, bytes);
+}
+
 bool ResolveNative(unsigned char* (&resolved)[5])
 {
     HMODULE game = GetModuleHandleA("Game.dll");
     auto* image = reinterpret_cast<unsigned char*>(game);
     if (!Readable(image, sizeof(IMAGE_DOS_HEADER))) { Log("persist: unresolved Game.dll; paired saves off"); return false; }
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
         !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32))) {
         Log("persist: unresolved Game.dll PE header; paired saves off");
         return false;
@@ -172,20 +214,16 @@ bool ResolveNative(unsigned char* (&resolved)[5])
     for (size_t i = 0; i < 5; ++i) {
         auto const& fn = saving::native::Sites[i];
         unsigned matches = 0;
-        sites[i] = saving::native::Missing;
-        for (unsigned section = 0; section < nt->FileHeader.NumberOfSections; ++section) {
-            auto const& part = sections[section];
-            if (!(part.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-            const size_t length = part.Misc.VirtualSize;
-            if (!saving::native::Range(size, part.VirtualAddress, length) ||
-                !Readable(image + part.VirtualAddress, length)) continue;
-            unsigned count = 0;
-            const size_t at = saving::native::FindUnique(image + part.VirtualAddress, length, fn.bytes, count);
-            if (at != saving::native::Missing) sites[i] = part.VirtualAddress + at;
-            matches += count;
-        }
+        const size_t skip = i == 3 ? Stolen : 0;
+        sites[i] = FindCode(image, size, sections, nt->FileHeader.NumberOfSections, fn.bytes + skip * 2, matches);
+        if (sites[i] != saving::native::Missing)
+            sites[i] = sites[i] >= skip ? sites[i] - skip : saving::native::Missing;
+        const size_t length = saving::native::Decode(fn.bytes).size();
         if (matches == 1 && sites[i] != saving::native::Missing &&
-            (!fn.symbol || reinterpret_cast<unsigned char*>(GetProcAddress(game, fn.symbol)) == image + sites[i])) {
+            (!fn.symbol || reinterpret_cast<unsigned char*>(GetProcAddress(game, fn.symbol)) == image + sites[i]) &&
+            Readable(image + sites[i], length) && Executable(image + sites[i]) &&
+            (saving::native::Matches(image + sites[i], length, fn.bytes) ||
+             (i == 3 && PupLoadEntry(image + sites[i])))) {
             resolved[i] = image + sites[i];
             continue;
         }
@@ -201,30 +239,40 @@ bool ResolveNative(unsigned char* (&resolved)[5])
     if (!good) return false;
     const bool saveLink = Readable(resolved[0] + 0xb9, 5) && saving::native::Calls(image, size, sites[0] + 0xb9, sites[2]);
     const bool loadLink = Readable(resolved[1] + 0x2b2, 5) && saving::native::Calls(image, size, sites[1] + 0x2b2, sites[3]);
-    if (!saveLink) Log("persist: unresolved SaveGameFn->WorldSaveGameFn call edge; paired saves off");
-    if (!loadLink) Log("persist: unresolved LoadGameFn->WorldLoadGameFn call edge; paired saves off");
+    if (!saveLink) Unresolved("SaveGameFn->WorldSaveGameFn call edge", resolved[0] + 0xb9, "install");
+    if (!loadLink) Unresolved("LoadGameFn->WorldLoadGameFn call edge", resolved[1] + 0x2b2, "install");
     if (!saveLink || !loadLink) return false;
     size_t singleton = 0, vtable = 0;
     const uintptr_t table = saving::native::Word(image, sites[4] + 32);
     if (!Readable(reinterpret_cast<void const*>(table), sizeof(void*)) ||
         !saving::native::Links(image, size, reinterpret_cast<uintptr_t>(image), sites, singleton, vtable) ||
         !Readable(image + singleton, 12) || !Readable(image + vtable, sizeof(void*))) {
-        Log("persist: unresolved FileManagerGetter singleton/vtable layout; paired saves off");
+        Unresolved("FileManagerGetter singleton/vtable layout", resolved[4], "install");
         return false;
     }
     fileManagerGetter = reinterpret_cast<Getter>(resolved[4]);
     fileManagerSingleton = image + singleton;
     fileManagerVtable = image + vtable;
+    nativeImage = image;
+    nativeImageSize = size;
+    std::copy_n(resolved, 5, nativeEntries);
     return true;
 }
 
 void* FileManager(bool forLoad)
 {
-    if (!pairedEnabled || !fileManagerGetter || !Readable(fileManagerSingleton, 12)) return nullptr;
+    if (!NativeReady()) return nullptr;
+    if (!fileManagerGetter || !Readable(fileManagerSingleton, 12)) {
+        Unresolved("FileManagerGetter singleton", static_cast<unsigned char*>(fileManagerSingleton), "before-use");
+        return nullptr;
+    }
     void* self = fileManagerGetter();
     void* vtable = nullptr;
     void* menu = nullptr;
-    if (self != fileManagerSingleton) return nullptr;
+    if (self != fileManagerSingleton) {
+        Logf("persist: native FileManagerGetter returned unexpected singleton load=%d player=%llu", forLoad ? 1 : 0, steam::PlayerId());
+        return nullptr;
+    }
     std::memcpy(&vtable, self, sizeof(vtable));
     std::memcpy(&menu, static_cast<unsigned char*>(self) + 4, sizeof(menu));
     if (vtable != fileManagerVtable || (forLoad && !Readable(menu, 0x4c))) {
@@ -287,6 +335,191 @@ bool ReadAll(std::string const& path, std::vector<uint8_t>& out)
     CloseHandle(file);
     if (!ok) out.clear();
     return ok;
+}
+
+bool KnownPup(HMODULE module)
+{
+    static HMODULE verified = nullptr;
+    if (module == verified && module) return true;
+    char path[MAX_PATH]{};
+    std::vector<uint8_t> bytes;
+    const DWORD length = module ? GetModuleFileNameA(module, path, MAX_PATH) : 0;
+    if (!length || length >= MAX_PATH || !ReadAll(path, bytes) || bytes.empty()) return false;
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    uint8_t digest[32]{};
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (status >= 0) status = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0);
+    if (status >= 0) status = BCryptHashData(hash, bytes.data(), static_cast<ULONG>(bytes.size()), 0);
+    if (status >= 0) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (status < 0 || !saving::native::Matches(digest, sizeof(digest),
+        "60fccba5e27ca544fc1e72fe5ba4cbc33aad107c1cbc90845b275f81b58c349c")) {
+        Logf("persist: unresolved WorldLoadGameFn PUP identity path=%s status=%08lx; paired saves off", path, status);
+        return false;
+    }
+    verified = module;
+    return true;
+}
+
+bool PupLoadEntry(unsigned char* entry)
+{
+    uint32_t bridge = 0, receiver = 0;
+    if (!Readable(entry, 6) ||
+        !saving::native::PupEntryTarget(entry, 6, reinterpret_cast<uintptr_t>(entry), bridge) ||
+        !Readable(reinterpret_cast<void const*>(bridge), 9) || !Executable(reinterpret_cast<void const*>(bridge)) ||
+        !saving::native::PupShimTarget(reinterpret_cast<uint8_t const*>(bridge), 9, bridge, receiver)) return false;
+    HMODULE pup = GetModuleHandleA("paru_s2.dll");
+    auto* image = reinterpret_cast<unsigned char*>(pup);
+    if (!GetModuleHandleA("Script_paru.dll") || !pup ||
+        receiver != reinterpret_cast<uintptr_t>(image) + saving::native::PupReceiverRva || !KnownPup(pup) ||
+        !Readable(image, sizeof(IMAGE_DOS_HEADER))) return false;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
+        !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32))) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
+    auto* sections = IMAGE_FIRST_SECTION(nt);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+        nt->OptionalHeader.SizeOfImage != saving::native::PupImageSize ||
+        !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
+        !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections))) return false;
+    unsigned matches = 0;
+    if (FindCode(image, saving::native::PupImageSize, sections, nt->FileHeader.NumberOfSections,
+                 saving::native::PupReceiverBytes, matches) != saving::native::PupReceiverRva) return false;
+    auto const* code = reinterpret_cast<uint8_t const*>(receiver);
+    if (!Readable(code, 41) || !Executable(code) ||
+        !saving::native::PupReceiver(code, 41, reinterpret_cast<uintptr_t>(image)) ||
+        !Readable(image + 0x677a0, 8) || !Readable(image + 0x97578, 4) || !Readable(image + 0x99510, 4)) return false;
+    HMODULE kernel = GetModuleHandleA("kernel32.dll");
+    if (saving::native::Word(image, 0x677a0) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "WaitForSingleObject")) ||
+        saving::native::Word(image, 0x677a4) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "ReleaseSemaphore"))) return false;
+    const uintptr_t original = saving::native::Word(image, 0x97578);
+    DWORD flags = 0;
+    return original != reinterpret_cast<uintptr_t>(entry) && original != bridge && original != receiver &&
+           Executable(reinterpret_cast<void const*>(original)) &&
+           GetHandleInformation(reinterpret_cast<HANDLE>(saving::native::Word(image, 0x99510)), &flags);
+}
+
+bool ReverifyNative()
+{
+    if (reinterpret_cast<unsigned char*>(GetModuleHandleA("Game.dll")) != nativeImage) {
+        Unresolved("Game.dll", nativeImage, "before-use");
+        return false;
+    }
+    void* originals[3]{reinterpret_cast<void*>(originalSave), reinterpret_cast<void*>(originalLoad),
+                       reinterpret_cast<void*>(originalWorldSave)};
+    void* detours[3]{reinterpret_cast<void*>(&SaveDetour), reinterpret_cast<void*>(&LoadDetour),
+                    reinterpret_cast<void*>(&WorldSaveDetour)};
+    for (size_t i = 0; i < 5; ++i) {
+        auto const& fn = saving::native::Sites[i];
+        auto* entry = nativeEntries[i];
+        const size_t length = saving::native::Decode(fn.bytes).size();
+        bool ok = Readable(entry, length);
+        if (ok && i < 3) {
+            uint32_t guard = 0, target = 0;
+            ok = saving::native::PupEntryTarget(entry, Stolen, reinterpret_cast<uintptr_t>(entry), guard) &&
+                 guard == reinterpret_cast<uintptr_t>(originals[i]) - 24 &&
+                 Readable(reinterpret_cast<void const*>(guard), 24 + Stolen + 5) &&
+                 Executable(reinterpret_cast<void const*>(guard)) &&
+                 saving::native::Matches(reinterpret_cast<uint8_t const*>(guard), 24,
+                     "9c833d????????0074069de9????????9de9????????") &&
+                 saving::native::BranchTarget(reinterpret_cast<uint8_t const*>(guard + 11), 5, guard + 11, 0xe9, target) &&
+                 target == reinterpret_cast<uintptr_t>(originals[i]) &&
+                 saving::native::BranchTarget(reinterpret_cast<uint8_t const*>(guard + 17), 5, guard + 17, 0xe9, target) &&
+                 target == reinterpret_cast<uintptr_t>(detours[i]) &&
+                 saving::native::BranchTarget(static_cast<uint8_t const*>(originals[i]) + Stolen, 5,
+                     reinterpret_cast<uintptr_t>(originals[i]) + Stolen, 0xe9, target) &&
+                 target == reinterpret_cast<uintptr_t>(entry + Stolen) &&
+                 saving::native::Matches(static_cast<uint8_t const*>(originals[i]), Stolen, "558bec83e4f8") &&
+                 saving::native::Matches(entry + Stolen, length - Stolen, fn.bytes + Stolen * 2);
+        } else if (ok && i == 3) {
+            ok = saving::native::Matches(entry, length, fn.bytes) ||
+                 (saving::native::Matches(entry + Stolen, length - Stolen, fn.bytes + Stolen * 2) && PupLoadEntry(entry));
+        } else if (ok) ok = saving::native::Matches(entry, length, fn.bytes);
+        if (ok && fn.symbol)
+            ok = reinterpret_cast<unsigned char*>(GetProcAddress(reinterpret_cast<HMODULE>(nativeImage), fn.symbol)) == entry;
+        if (!ok) { Unresolved(fn.name, entry, "before-use"); return false; }
+    }
+    uint32_t target = 0;
+    auto* call = nativeEntries[1] + 0x2b2;
+    if (!Readable(call, 5) || !loadCallInstalled ||
+        !saving::native::BranchTarget(call, 5, reinterpret_cast<uintptr_t>(call), 0xe8, target) ||
+        target != reinterpret_cast<uintptr_t>(&WorldLoadDetour)) {
+        Unresolved("LoadGameFn->WorldLoadGameFn call edge", call, "before-use");
+        return false;
+    }
+    call = nativeEntries[0] + 0xb9;
+    if (!Readable(call, 5) ||
+        !saving::native::BranchTarget(nativeEntries[0] + 0xb9, 5, reinterpret_cast<uintptr_t>(nativeEntries[0] + 0xb9), 0xe8, target) ||
+        target != reinterpret_cast<uintptr_t>(nativeEntries[2])) {
+        Unresolved("SaveGameFn->WorldSaveGameFn call edge", call, "before-use");
+        return false;
+    }
+    size_t singleton = 0, table = 0;
+    const uintptr_t vtable = saving::native::Word(nativeEntries[4], 32);
+    if (!Readable(reinterpret_cast<void const*>(vtable), 4) ||
+        !saving::native::GetterLinks(nativeImage, nativeImageSize, reinterpret_cast<uintptr_t>(nativeImage),
+                                    nativeEntries[4] - nativeImage, singleton, table) ||
+        nativeImage + singleton != fileManagerSingleton || nativeImage + table != fileManagerVtable) {
+        Unresolved("FileManagerGetter layout", nativeEntries[4], "before-use");
+        return false;
+    }
+    static unsigned char* reportedLoad = nullptr;
+    static bool reportedPup = false;
+    const bool pup = nativeEntries[3][0] == 0xe9;
+    if (reportedLoad != nativeEntries[3] || reportedPup != pup) {
+        reportedLoad = nativeEntries[3];
+        reportedPup = pup;
+        Logf("persist: native reverified before use WorldLoadGameFn=%p owner=%s; original entry preserved",
+             nativeEntries[3], pup ? "PUP/paru_s2.dll" : "Game.dll");
+    }
+    return true;
+}
+
+bool NativeReady()
+{
+    if (!pairedEnabled || ai::ShuttingDown()) return false;
+    if (ReverifyNative()) return true;
+    pairedEnabled = false;
+    CancelSave("native hooks changed before use");
+    DropAutoload("native hooks changed before use");
+    prepared = Prepared{};
+    requestPending = false;
+    receiving = false;
+    incomingFailed = true;
+    for (auto& file : incoming) file.clear();
+    Log("persist: native pre-use verification failed; paired saves off");
+    return false;
+}
+
+bool HookWorldLoadCall(unsigned char* call, unsigned char* entry)
+{
+    uint32_t target = 0;
+    if (!Readable(call, 5) ||
+        !saving::native::BranchTarget(call, 5, reinterpret_cast<uintptr_t>(call), 0xe8, target) ||
+        target != reinterpret_cast<uintptr_t>(entry)) {
+        Unresolved("LoadGameFn->WorldLoadGameFn call edge", call, "install");
+        return false;
+    }
+    unsigned char before[5], after[5];
+    std::memcpy(before, call, sizeof(before));
+    DWORD old = 0;
+    if (!VirtualProtect(call, sizeof(before), PAGE_EXECUTE_READWRITE, &old)) {
+        Logf("persist: WorldLoadGameFn call hook failed error=%lu; paired saves off", GetLastError());
+        return false;
+    }
+    const uint32_t relative = reinterpret_cast<uintptr_t>(&WorldLoadDetour) - reinterpret_cast<uintptr_t>(call + 5);
+    std::memcpy(call + 1, &relative, sizeof(relative));
+    std::memcpy(after, call, sizeof(after));
+    DWORD ignored = 0;
+    const bool restored = VirtualProtect(call, sizeof(before), old, &ignored) != 0;
+    if (!restored) Logf("persist: WorldLoadGameFn call protection restore failed error=%lu; paired saves off", GetLastError());
+    const bool flushed = FlushInstructionCache(GetCurrentProcess(), call, sizeof(before)) != 0;
+    if (!flushed) Logf("persist: WorldLoadGameFn call instruction-cache flush failed error=%lu; paired saves off", GetLastError());
+    ai::TrackPatch(call, before, after, sizeof(before), "paired world-load call");
+    return restored && flushed;
 }
 
 bool WriteAtomic(std::string const& path, std::vector<uint8_t> const& data)
@@ -766,6 +999,7 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
 
 bool StartSave(char const* name)
 {
+    if (pairedEnabled && !NativeReady()) { Notice(i18n::SaveFailed, true); return false; }
     if (!pairedEnabled || !SafeName(name) || saving::Prefix(name, "G3T_") || barrier.phase != saving::Barrier::Idle || !StableRunningHero() ||
         !originalSave || !originalLoad || !originalWorldSave || !originalWorldLoad || !writing || !NativeSaveAllowed()) {
         Logf("persist: save request refused slot=%s (unsafe/reserved name, busy or no own stable hero)", name ? name : "-");
@@ -807,6 +1041,7 @@ bool StartSave(char const* name)
 bool __stdcall SaveDetour(void* self, bCString const* name)
 {
     if (!pairedEnabled) return originalSave && originalSave(self, name);
+    if (!NativeReady()) { Notice(i18n::SaveFailed, true); return false; }
     if (!name || !SafeName(name->GetText())) {
         Log("persist: save refused; the name is not a SafeName");
         Notice(i18n::SaveFailed, true);
@@ -848,6 +1083,7 @@ bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGf
 {
     // HUD/manual/quicksave reaches this only under our native-save scope. Other native callers join the same protocol.
     if (!pairedEnabled) return originalWorldSave(self, name, image, metadata, size);
+    if (!NativeReady()) { Notice(i18n::SaveFailed, true); return false; }
     if (nativeSaveDepth) {
         Logf("persist: native invoke=World.SaveGameWorld save=%s player=%llu metadata_size=%lu",
              savingManifest.key.save.c_str(), steam::PlayerId(), size);
@@ -860,6 +1096,8 @@ bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGf
 }
 bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool nativeFlag)
 {
+    if (ai::ShuttingDown() || !pairedEnabled) return originalWorldLoad(self, name, nativeFlag);
+    if (!NativeReady()) { Notice(i18n::SaveFailed, true); return false; }
     const bool observed = nativeLoadDepth != 0;
     if (pairedEnabled && !observed) {
         Logf("persist: load refused function=World.LoadGameWorld slot=%s player=%llu; paired saves off for this load, use HUD.LoadGame",
@@ -953,7 +1191,7 @@ void PollSave()
 
 void OnSave(uint8_t from, net::SaveNote const& note)
 {
-    if (!pairedEnabled) {
+    if (!pairedEnabled || !NativeReady()) {
         if (note.op == net::SaveRequest || note.op == net::SavePrepare) {
             net::SaveNote answer = note;
             answer.op = net::IsHost() ? net::SaveResult : net::SaveReady;
@@ -1243,6 +1481,7 @@ void OrderAutoload(std::string const& slot)
 bool __stdcall LoadDetour(void* self, bCString const* name)
 {
     if (!pairedEnabled) return originalLoad && originalLoad(self, name);
+    if (!NativeReady()) { Notice(i18n::SaveFailed, true); return false; }
     if (!name || !SafeName(name->GetText()) || nativeLoadDepth || nativeSaveDepth || !trade::ReadyForSave()) {
         Log("persist: load refused (unsafe name, nested native operation or unsettled exchange)");
         Notice(i18n::SaveFailed, true);
@@ -1647,14 +1886,17 @@ void Install()
     originalLoad = reinterpret_cast<FileFn>(ai::JumpTo(resolved[1], reinterpret_cast<void*>(&LoadDetour), Stolen));
     // Six whole, position-independent bytes: push ebp / mov ebp,esp / and esp,-8.
     originalWorldSave = reinterpret_cast<WorldSaveFn>(ai::JumpTo(resolved[2], reinterpret_cast<void*>(&WorldSaveDetour), Stolen));
-    originalWorldLoad = reinterpret_cast<WorldLoadFn>(ai::JumpTo(resolved[3], reinterpret_cast<void*>(&WorldLoadDetour), Stolen));
-    pairedEnabled = originalSave && originalLoad && originalWorldSave && originalWorldLoad;
+    // Keep PUP's export entry and generated calling-convention bridge untouched.
+    originalWorldLoad = reinterpret_cast<WorldLoadFn>(resolved[3]);
+    loadCallInstalled = HookWorldLoadCall(resolved[1] + 0x2b2, resolved[3]);
+    pairedEnabled = originalSave && originalLoad && originalWorldSave && originalWorldLoad && loadCallInstalled;
+    if (pairedEnabled) pairedEnabled = ReverifyNative();
     if (originalSave) saveTarget = resolved[0];
     if (originalLoad) loadTarget = resolved[1];
     installed = true;
     if (!pairedEnabled) {
         Logf("persist: save/load hook installation failed SaveGameFn=%d LoadGameFn=%d WorldSaveGameFn=%d WorldLoadGameFn=%d; partial hooks pass through, paired saves off",
-             originalSave != nullptr, originalLoad != nullptr, originalWorldSave != nullptr, originalWorldLoad != nullptr);
+             originalSave != nullptr, originalLoad != nullptr, originalWorldSave != nullptr, loadCallInstalled ? 1 : 0);
         return;
     }
     Logf("persist: save and load hooked SaveGameFn=%p LoadGameFn=%p WorldSaveGameFn=%p WorldLoadGameFn=%p FileManagerGetter=%p protocol=%u",
