@@ -120,6 +120,15 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
     }
     if (!track.count && !track.predictive)
         track.delayMs = std::max(NpcBufferFloor, static_cast<int32_t>(track.poseIntervalMs * 2));
+    if (track.count) {
+        const int32_t gap = static_cast<int32_t>(arrived - track.lastArrived);
+        if (gap >= 0) {
+            ++track.gapCount;
+            track.gapSumMs += static_cast<uint32_t>(gap);
+            track.gapMinMs = std::min(track.gapMinMs, static_cast<uint32_t>(gap));
+            track.gapMaxMs = std::max(track.gapMaxMs, static_cast<uint32_t>(gap));
+        }
+    }
     track.lastArrived = arrived;
     const int32_t offset = static_cast<int32_t>(arrived - sent);
     if (!track.haveOffset) {

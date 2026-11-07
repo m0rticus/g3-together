@@ -6,7 +6,9 @@
 #include <cstring>
 
 namespace g3t::npcwire::bones {
-constexpr uint32_t PoseKeyMs = 1000;
+// An independent key is only a periodic safety net: every delta already references a frame the client acknowledged, and a
+// missing reference triggers an immediate key request. 5 s keeps a quiet NPC from paying a ~1.6 KB key every second.
+constexpr uint32_t PoseKeyMs = 5000;
 constexpr size_t PoseWindow = 32; // 0.53 s at 60 Hz; longer RTT safely falls back to keys
 constexpr size_t DeltaHeaderBytes = 6; // layout:u16, acknowledged reference:u32 (zero = key)
 // A mode byte follows: 0 = raw 24-byte affine key per bone; 1 = twelve

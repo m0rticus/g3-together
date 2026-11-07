@@ -203,7 +203,7 @@ send the existing bone values without repeated names and compact anchored contro
 use a 33 ms (30 Hz) interval; distant movers and idle animation use 100 ms (10 Hz). Combat, focus, contact and dialogue
 stay at capture rate. Fast and ordinary tiers have 2 s exit holds, and new interest gets a 200 ms warm-up.
 Exact sparse pose residuals preserve scale/shear and Q12/Q2 integers. Loss, reordering, life/layout changes and missing
-references fall back to keys; periodic keys are due every 1 s within the 32-pose retention window. Full records remain the
+references fall back to keys; periodic keys are due every 5 s within the 32-pose retention window. Full records remain the
 fallback for a missing dictionary, an unacknowledged baseline or values outside the compact range. The log reports layout
 sizes, resync requests, anchors and fallback failures.
 Pose interval hints announce slower presentation tiers before the rate drops. The mirror buffers two advertised
@@ -221,10 +221,16 @@ also includes a zero-byte socket-would-block attempt. None of these figures meas
 `net: pose bandwidth` adds advertised-tier update/byte rates, bone payload bytes and bones per selected update,
 key/delta counts, ACK misses, missing references and decode failures. Bone payload counts include its compact
 flags/interval/reference/mask envelope. Kind 51 is the lossy generation/life-fenced pose ACK or key request.
-When the integrated per-peer budget is present, optional NPC updates preview its active or far/idle class before
-queueing. Deferred updates remain dirty for the next scan; essential gameplay and releases do not take this optional
-gate. The common send path alone debits credit. `npc_per_s`'s `budget` counter distinguishes a budget deferral from
-an unchanged NPC or a queue failure; standalone builds permit the preview without requiring the budget module.
+When the integrated per-peer valve is present it never gates the normal NPC stream: every due update is sent. A real
+congestion signal (ENet's packet throttle, a standing outgoing queue, RTT growth with queued data, fresh loss) multiplies
+every NPC interval and staleness limit by one common factor (`npc_stretch_permille`, 1000 = normal, at most 4000), so all
+NPCs slow down together instead of some being skipped. A first update for an NPC (join or world entry) is spread at
+60 NPCs/s per recipient; established NPCs are unaffected. `npc_per_s`'s `paced` counter counts those deferrals and
+distinguishes them from an unchanged NPC or a queue failure. `SYNCSTREAM` (host) reports the achieved update interval per tier
+(min/avg/max ms, count, `overdue` beyond the 100/150/300 ms staleness limits), edges, quiet heartbeats, join-burst
+duration and the stretch; `SYNCSTREAM` (client) reports update spacing and how many mirrors are older than 150/400/1000 ms.
+Independent keys are due every 5 s; every delta references a frame the client acknowledged.
+`net: bandwidth rates` `tx_total_bytes_per_s` is ENet bytes plus relay-header bytes per second, the envelope-inclusive figure.
 Small poses are queued without intermediate flushes and share ENet datagrams; keys exceeding 1,172 bytes
 keep explicit unreliable fragmentation. Rates and exact compression reduce traffic, but all-combat scenes,
 long RTT beyond the 32-pose retention horizon and frequent descriptor changes can exceed 1 MB/s.
@@ -235,15 +241,14 @@ Player state defaults to `send_rate = 30` (20-60 Hz supported). Full-float trans
 are retained; names, equipment, appearance and focus/target references travel reliably on changes and in
 five-second keyframes, rather than repeating fixed-size strings every frame. Player smoothing retains its
 100 ms buffer; local controls and reliable combat events are not rate limited.
-`network_budget_kib = 256` sets a per-outgoing-peer admission budget (64-4096 KiB/s).
-Gameplay and player state remain protected. Optional NPC presentation can use the priority budget;
-the cap is not a physical-link guarantee because reliable events, retransmissions and ACKs may exceed it.
+`network_budget_kib = 256` sets the pacing base of the bulk save channel per outgoing peer (64-4096 KiB/s); it is not a cap on
+NPC, player-state or gameplay traffic, which are never refused (see the NPC valve above).
 Save bundles use a separate ordered reliable channel, 1,148-byte data chunks, at most four chunks per frame,
 and a quarter-rate bulk allowance. Congestion pauses the retained cursor without discarding data.
 Story join snapshots are sent only to the joining peer and split into unfragmented batches.
 The five-second `kind_bps` lines show application bytes/s; `rates` shows ENet and successful Steam API
-datagrams/bytes per second and exact relay framing share. `budget` reports credit, queue, pressure and protected
-overflow. Steam API counts still exclude encryption, SDR, UDP/IP and other physical-network overhead.
+datagrams/bytes per second and exact relay framing share. `valve` reports the NPC stretch, the congestion signals that raised it,
+queue, offered rate and the bulk pacing credit. Steam API counts still exclude encryption, SDR, UDP/IP and other physical-network overhead.
 Range-coder compression remains disabled: the engine-free benchmark shows benefits for compact players and
 structured control data, but no saving for high-entropy data. Representative pose traffic and its CPU cost
 must be measured before enabling compression globally.

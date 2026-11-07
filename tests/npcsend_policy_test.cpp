@@ -1,15 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#ifdef TEST_NPC_BANDWIDTH_PREVIEW
-#include "../src/net.h"
-#ifndef G3T_REMOTE_NPC_FOCUS_SUPPORTED
-#define G3T_REMOTE_NPC_FOCUS_SUPPORTED 1
-namespace g3t::net {
-enum class BudgetClass : uint8_t { GameplayReliable, PlayerState, NpcActive, BulkReliable, NpcFarIdle };
-enum class BudgetDecision : uint8_t { Allow, Defer, Shed, NeedsChunking };
-BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t bytes);
-}
-#endif
-#endif
 #include "../src/npcsend_policy.h"
 #include "../src/net_metrics.h"
 #include <cassert>
@@ -20,23 +9,6 @@ BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t bytes
 
 using namespace g3t;
 using namespace g3t::npcsend;
-
-#ifdef G3T_REMOTE_NPC_FOCUS_SUPPORTED
-namespace g3t::net {
-static BudgetDecision previewResult = BudgetDecision::Allow;
-static BudgetClass previewClass = BudgetClass::NpcActive;
-static unsigned previewCalls = 0;
-static uint32_t previewBytes = 0;
-BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t bytes)
-{
-    assert(to == 2);
-    ++previewCalls;
-    previewClass = priority;
-    previewBytes = bytes;
-    return previewResult;
-}
-}
-#endif
 
 struct Fixture {
     net::NpcRecord record{};
@@ -594,42 +566,177 @@ static void TestNearbyIdleAndOrdinaryExit()
     f.Send(Decision::Changed);
 }
 
-static void TestBandwidthPreview()
+static void TestPacedCounter()
 {
-    Fixture f(80);
-    f.Send(Decision::Initial);
-    f.bones[0].values[9] += 4;
-    f.in.now = IdleIntervalMs;
-    const Result dirty = f.Eval();
-    assert(dirty.decision == Decision::Changed);
-#ifdef G3T_REMOTE_NPC_FOCUS_SUPPORTED
-    for (auto decision : {net::BudgetDecision::Defer, net::BudgetDecision::Shed, net::BudgetDecision::NeedsChunking}) {
-        net::previewResult = decision;
-        assert(!CanQueue(2, f.in, dirty));
-        assert(f.state.sentAt == 0 && f.state.bones[0].values[9] != f.bones[0].values[9]);
-        assert(f.Eval().decision == Decision::Changed); // remains dirty, retry next scan
-    }
-    for (auto tier : {Tier::Fast, Tier::Ordinary, Tier::MovingFar, Tier::Idle}) {
-        net::previewResult = net::BudgetDecision::Allow;
-        const unsigned calls = net::previewCalls;
-        assert(CanQueue(2, f.in, {Decision::Changed, tier, false}));
-        assert(net::previewCalls == calls + 1);
-        assert(net::previewClass == (tier == Tier::Fast || tier == Tier::Ordinary
-            ? net::BudgetClass::NpcActive : net::BudgetClass::NpcFarIdle));
-        assert(net::previewBytes >= 23 + sizeof(net::NpcRecord) + 4 + 80 * sizeof(pose::Bone));
-    }
-    net::previewResult = net::BudgetDecision::Shed;
-    const unsigned calls = net::previewCalls;
-    assert(CanQueue(2, f.in, {Decision::Initial, Tier::Fast, true}));
-    f.record.hitPoints++;
-    assert(CanQueue(2, f.in, f.Eval()));
-    assert(net::previewCalls == calls); // essential gameplay is not optional
-#else
-    assert(CanQueue(2, f.in, dirty)); // standalone fallback
-#endif
     net::detail::BandwidthCounters counters;
-    counters.Npc(net::NpcSendDecision::SkippedBudget, 1);
-    assert(counters.considered == 1 && counters.skippedBudget == 1 && !counters.sent && !counters.sendFailed);
+    counters.Npc(net::NpcSendDecision::SkippedPaced, 1);
+    assert(counters.considered == 1 && counters.skippedPaced == 1 && !counters.sent && !counters.sendFailed);
+}
+
+static void TestPhaseCarryingDeadlines()
+{
+    Fixture ordinary;
+    ordinary.in.moving = true;
+    ordinary.Send(Decision::Initial);
+    Stats stats;
+    uint32_t previous = 0, count = 0;
+    for (uint32_t now = 22; now <= 10000; now += 22) {
+        ordinary.in.now = now;
+        ordinary.record.position[0] += 1;
+        const auto result = ordinary.Eval();
+        assert(result.tier == Tier::Ordinary);
+        if (result.decision == Decision::Wait) continue;
+        assert(result.decision == Decision::Changed);
+        assert(now - previous == (count % 2 == 0 ? 44u : 22u));
+        stats.Record(result.decision, result.tier, now - previous, ordinary.in.stretchPermille, true);
+        assert(Commit(ordinary.state, ordinary.in, result.decision));
+        previous = now;
+        ++count;
+    }
+    assert(count > 300);
+    assert(std::fabs(double(previous) / count - OrdinaryIntervalMs) <= 1.0);
+    assert(stats.tiers[1].count == count && stats.tiers[1].minMs == 22 && stats.tiers[1].maxMs == 44);
+    assert(std::fabs(stats.tiers[1].AverageMs() - OrdinaryIntervalMs) <= 1.0 && stats.edges == 0);
+
+    Fixture hitch;
+    hitch.in.moving = true;
+    hitch.Send(Decision::Initial);
+    hitch.record.position[0] = 1;
+    hitch.in.now = 44;
+    hitch.Send(Decision::Changed);
+    assert(hitch.state.idealAt == 33);
+    hitch.record.position[0] = 2;
+    hitch.in.now = 133;
+    hitch.Send(Decision::Changed);
+    assert(hitch.state.idealAt == 133);
+    hitch.record.position[0] = 3;
+    hitch.in.now = 165;
+    assert(hitch.Eval().decision == Decision::Wait);
+    ++hitch.in.now;
+    hitch.Send(Decision::Changed);
+
+    for (uint32_t frame : {16u, 22u}) {
+        Fixture fast;
+        fast.in.combat = true;
+        fast.Send(Decision::Initial);
+        for (uint32_t now = frame; now <= 1000; now += frame) {
+            fast.in.now = now;
+            fast.record.position[0] += 1;
+            assert(fast.Eval().tier == Tier::Fast);
+            fast.Send(Decision::Changed);
+        }
+    }
+}
+
+static void TestStretchScaling()
+{
+    for (Tier tier : {Tier::Ordinary, Tier::MovingFar, Tier::Idle}) {
+        Fixture f;
+        f.in.moving = tier != Tier::Idle;
+        f.in.distanceCm = tier == Tier::MovingFar ? 3000 : 1000;
+        f.in.stretchPermille = 2000;
+        f.Send(Decision::Initial);
+        f.record.position[0] = 1;
+        f.in.now = 2 * Interval(tier) - 1;
+        assert(f.Eval().tier == tier && f.Eval().decision == Decision::Wait);
+        ++f.in.now;
+        assert(f.Eval().tier == tier);
+        f.Send(Decision::Changed);
+    }
+    Fixture heartbeat;
+    heartbeat.in.stretchPermille = 2000;
+    heartbeat.Send(Decision::Initial);
+    heartbeat.in.now = 2 * KeyframeMs - 1;
+    assert(heartbeat.Eval().decision == Decision::Wait);
+    ++heartbeat.in.now;
+    heartbeat.Send(Decision::Keyframe);
+
+    Fixture defaultStretch, explicitStretch;
+    defaultStretch.in.moving = explicitStretch.in.moving = true;
+    explicitStretch.in.stretchPermille = 1000;
+    defaultStretch.Send(Decision::Initial);
+    explicitStretch.Send(Decision::Initial);
+    for (uint32_t now = 11; now <= 10000; now += 11) {
+        defaultStretch.in.now = explicitStretch.in.now = now;
+        defaultStretch.record.position[0] += 1;
+        explicitStretch.record.position[0] += 1;
+        const auto a = defaultStretch.Eval(), b = explicitStretch.Eval();
+        assert(a.decision == b.decision && a.tier == b.tier);
+        if (a.decision != Decision::Wait) {
+            assert(Commit(defaultStretch.state, defaultStretch.in, a.decision));
+            assert(Commit(explicitStretch.state, explicitStretch.in, b.decision));
+            assert(defaultStretch.state.idealAt == explicitStretch.state.idealAt);
+        }
+    }
+}
+
+static void TestMaxStaleAndStats()
+{
+    assert(MaxStale(Tier::Fast) == 100 && MaxStale(Tier::Ordinary) == 150);
+    assert(MaxStale(Tier::MovingFar) == 300 && MaxStale(Tier::Idle) == 300);
+    assert(MaxStale(Tier::Fast, 2000) == 200 && MaxStale(Tier::Ordinary, 2000) == 300);
+    assert(MaxStale(Tier::Idle, 2000) == 600);
+    assert(Stretched(33, 1001) == 34 && Stretched(33, 0) == 33 && Stretched(33, 5000) == 132);
+
+    Stats stats;
+    stats.Record(Decision::Initial, Tier::Fast, 0, 1000, false);
+    stats.Record(Decision::Keyframe, Tier::Idle, 2000, 2000, false);
+    stats.Record(Decision::Semantic, Tier::Fast, 15, 1000, false);
+    stats.Record(Decision::Semantic, Tier::Ordinary, 1000, 1000, false);
+    stats.Record(Decision::Changed, Tier::Fast, 16, 1000, true);
+    stats.Record(Decision::Changed, Tier::Fast, 100, 1000, true);
+    stats.Record(Decision::Changed, Tier::Fast, 101, 1000, true);
+    stats.Record(Decision::Changed, Tier::Ordinary, 22, 1000, true);
+    stats.Record(Decision::Changed, Tier::Ordinary, 44, 1000, true);
+    stats.Record(Decision::Changed, Tier::Ordinary, 66, 2000, true);
+    stats.Record(Decision::Semantic, Tier::Ordinary, 300, 2000, true);
+    stats.Record(Decision::Changed, Tier::Ordinary, 301, 2000, true);
+    stats.Record(Decision::Changed, Tier::MovingFar, 100, 1000, true);
+    stats.Record(Decision::Changed, Tier::Idle, 300, 1000, true);
+    stats.Record(Decision::Changed, Tier::Idle, 301, 1000, true);
+    stats.Record(Decision::Wait, Tier::Fast, 500, 1000, true);
+    stats.Record(Decision::FinalAndRelease, Tier::Fast, 500, 1000, true);
+    assert(stats.initials == 1 && stats.heartbeats == 1 && stats.edges == 2);
+    assert(stats.tiers[0].count == 3 && stats.tiers[0].overdue == 1);
+    assert(stats.tiers[0].minMs == 16 && stats.tiers[0].maxMs == 101 && stats.tiers[0].sumMs == 217);
+    assert(std::fabs(stats.tiers[0].AverageMs() - 217.0 / 3) < 0.001);
+    assert(stats.tiers[1].count == 5 && stats.tiers[1].overdue == 1 && stats.tiers[1].sumMs == 733);
+    assert(stats.tiers[1].minMs == 22 && stats.tiers[1].maxMs == 301);
+    assert(stats.tiers[2].count == 3 && stats.tiers[2].overdue == 1 && stats.tiers[2].sumMs == 701);
+}
+
+static void TestInitialPacer()
+{
+    InitialPacer pacer;
+    unsigned admitted = 0;
+    for (; admitted < InitialBurst; ++admitted) assert(pacer.Admit(0, 1000));
+    assert(!pacer.Admit(0, 1000));
+    uint32_t finishedAt = 0;
+    for (uint32_t now = 22; admitted < 75 && now <= 1300; now += 22) {
+        while (admitted < 75 && pacer.Admit(now, 1000)) ++admitted;
+        finishedAt = now;
+    }
+    assert(admitted == 75 && finishedAt <= 1300);
+    assert(pacer.active && pacer.admittedInBurst == 75 - InitialBurst);
+    const uint32_t lastDeferred = pacer.lastDeferredAt;
+    pacer.Poll(lastDeferred + InitialBurstQuietMs - 1);
+    assert(pacer.active && pacer.bursts == 0);
+    pacer.Poll(lastDeferred + InitialBurstQuietMs);
+    assert(!pacer.active && pacer.bursts == 1);
+    assert(pacer.lastBurstMs == lastDeferred && pacer.lastBurstNpcs == 75 - InitialBurst);
+    pacer.Reset();
+    assert(!pacer.started && !pacer.active && pacer.bursts == 0);
+    for (unsigned i = 0; i < InitialBurst; ++i) assert(pacer.Admit(2000, 1000));
+    assert(!pacer.Admit(2000, 1000));
+
+    for (uint32_t stretch : {1000u, 2000u}) {
+        InitialPacer rate;
+        for (unsigned i = 0; i < InitialBurst; ++i) assert(rate.Admit(0, stretch));
+        unsigned extra = 0;
+        for (uint32_t now = 20; now <= 1000; now += 20)
+            while (rate.Admit(now, stretch)) ++extra;
+        assert(extra == (stretch == 1000 ? 60u : 30u));
+    }
 }
 
 int main()
@@ -647,6 +754,10 @@ int main()
     TestRotatedBoneSensitivity();
     TestWarmupAndUrgentHold();
     TestNearbyIdleAndOrdinaryExit();
-    TestBandwidthPreview();
+    TestPacedCounter();
+    TestPhaseCarryingDeadlines();
+    TestStretchScaling();
+    TestMaxStaleAndStats();
+    TestInitialPacer();
     TestSimulation();
 }

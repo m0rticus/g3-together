@@ -61,6 +61,9 @@ struct Track
     uint32_t poseIntervalMs = 0;
     float jitterMs = 0.0f;
     int32_t delayMs = BufferDelay;
+    // Diagnostics only: spacing of received updates since the last SYNCSTREAM report (arrival clock).
+    uint32_t gapCount = 0, gapMinMs = UINT32_MAX, gapMaxMs = 0;
+    uint64_t gapSumMs = 0;
 };
 
 struct Presentation

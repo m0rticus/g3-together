@@ -142,10 +142,13 @@ void SetBandwidthBudget(uint32_t bytesPerSecond);
 uint32_t RemoteFocusNpc(uint8_t player);
 uint32_t RemoteTargetNpc(uint8_t player);
 uint32_t RemoteStateAgeMs(uint8_t player); // UINT32_MAX when no current in-world state is known
-// Preview only; successful network sends charge once in Send. Do not CommitQueued again
-// from the NPC loop. Use NpcActive or NpcFarIdle for optional presentation traffic.
+// Only the bulk save channel is ever refused (paced); every other class, NPC traffic included, is always Allow.
+// Successful network sends charge once in Send. Do not CommitQueued again from callers.
 BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t payloadBytes);
 BudgetSnapshot PeerBandwidth(uint8_t to);
+// Emergency congestion factor for the NPC scheduler: 1000 normally, up to 4000 only on real congestion signals
+// (ENet throttle, a standing outgoing queue, RTT growth with queued data, fresh loss). Applied to every NPC alike.
+uint32_t NpcStretchPermille(uint8_t to);
 uint8_t LocalId();
 // Host: always. Client: welcomed by the host and in the host's world (SetInWorld); gameplay pauses otherwise.
 bool Connected();

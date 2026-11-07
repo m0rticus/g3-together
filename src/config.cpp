@@ -151,7 +151,7 @@ Config const& LoadConfig()
          config.movementSmoothing ? "on" : "off");
     Logf("config: transport=steam session_id=%s steam_lobby=%s steam_host=%s", config.sessionIdValid ? config.sessionId : "(invalid)", *config.steamLobby ? config.steamLobby : "-",
          *config.steamHost ? config.steamHost : "-");
-    Logf("config: send_rate=%d Hz (compact player states; reliable gameplay immediate; NPC policy independent) network_budget_kib=%d per peer",
+    Logf("config: send_rate=%d Hz (compact player states; reliable gameplay immediate; NPC policy independent) network_budget_kib=%d per peer (bulk save pacing base; never caps NPC/gameplay traffic)",
          config.sendRate, config.networkBudgetKib);
     return config;
 }

@@ -3,9 +3,31 @@
 
 #include <cassert>
 
+static void TestArrivalGapDiagnostics()
+{
+    using namespace g3t::body;
+    Track track;
+    const float position[3] = {};
+    const float rotation[4] = {0, 0, 0, 1};
+    Feed(track, position, rotation, 1000, 1100);
+    assert(track.gapCount == 0 && track.gapMinMs == UINT32_MAX && track.gapMaxMs == 0);
+    Feed(track, position, rotation, 1016, 1116);
+    Feed(track, position, rotation, 1032, 1156);
+    Feed(track, position, rotation, 1032, 1300); // duplicate
+    Feed(track, position, rotation, 1031, 1300); // older snapshot
+    Feed(track, position, rotation, 1048, 1156);
+    assert(track.gapCount == 3 && track.gapMinMs == 0 && track.gapMaxMs == 40 && track.gapSumMs == 56);
+
+    Track wrapped;
+    Feed(wrapped, position, rotation, UINT32_MAX - 10, UINT32_MAX - 5);
+    Feed(wrapped, position, rotation, 4, 14);
+    assert(wrapped.gapCount == 1 && wrapped.gapMinMs == 20 && wrapped.gapMaxMs == 20 && wrapped.gapSumMs == 20);
+}
+
 int main()
 {
     using namespace g3t::body;
+    TestArrivalGapDiagnostics();
     Track npc;
     npc.predictive = false;
     float position[3] = {};

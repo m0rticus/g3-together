@@ -303,14 +303,14 @@ void UpdateBudgets(uint32_t now)
         sample.reliableInFlightBytes = peer.reliableDataInTransit;
         sample.reliableWindowBytes = (std::max)(peer.mtu, peer.packetThrottle * peer.windowSize / ENET_PEER_PACKET_THROTTLE_SCALE);
         sample.rttMs = peer.roundTripTime;
-        sample.referenceRttMs = peer.lastRoundTripTime;
-        sample.rttVarianceMs = peer.roundTripTimeVariance;
         sample.throttle = peer.packetThrottle;
         sample.validRtt = peer.lastReceiveTime != 0 && peer.packetsSent >= 32;
         if (peer.packetsLost != budgetLastLost[i]) {
             budgetLastLost[i] = peer.packetsLost;
             budgetLossAt[i] = now;
         }
+        sample.packetsSent = peer.packetsSent;
+        sample.packetsLost = peer.packetsLost;
         sample.lossPermille = peer.packetsSent >= 32
             ? static_cast<uint32_t>((std::min)(uint64_t(1000), uint64_t(peer.packetsLost) * 1000 / peer.packetsSent)) : 0;
         sample.validLoss = peer.packetsSent >= 32;
@@ -1912,6 +1912,13 @@ BudgetSnapshot PeerBandwidth(uint8_t to)
     return host && peer ? peerBudgets[PeerIndex(peer)].Snapshot() : BudgetSnapshot{};
 }
 
+uint32_t NpcStretchPermille(uint8_t to)
+{
+    ENetPeer* peer = isHost ? (to < MaxPlayers ? peers[to] : nullptr) : server;
+    return host && peer && peer->state == ENET_PEER_STATE_CONNECTED
+        ? peerBudgets[PeerIndex(peer)].NpcStretchPermille() : PeerBudget::StretchNormal;
+}
+
 void ResetNpcReplication()
 {
     for (auto& origins : npcOrigins) origins.clear();
@@ -3016,12 +3023,12 @@ void BandwidthLog()
     const uint64_t enetHeaderBytes = traffic.txEnetProtocolBytes - lastSteamTraffic.txEnetProtocolBytes;
     const uint64_t enetAckBytes = traffic.txEnetAckBytes - lastSteamTraffic.txEnetAckBytes;
     Logf("net: bandwidth role=%s window_ms=%u enet_loopback_tx_packets_bytes=%u/%u enet_loopback_rx_packets_bytes=%u/%u "
-         "npc_per_s=considered:%.1f,sent:%.1f,unchanged:%.1f,far:%.1f,irrelevant:%.1f,send_failed:%.1f,budget:%.1f",
+         "npc_per_s=considered:%.1f,sent:%.1f,unchanged:%.1f,far:%.1f,irrelevant:%.1f,send_failed:%.1f,paced:%.1f",
          isHost ? "host" : "client", elapsed, sentPackets - lastSentPackets, sentData - lastSentData,
          receivedPackets - lastReceivedPackets, receivedData - lastReceivedData,
          bandwidth.considered * perSecond, bandwidth.sent * perSecond, bandwidth.skippedUnchanged * perSecond,
          bandwidth.skippedFar * perSecond, bandwidth.skippedIrrelevant * perSecond, bandwidth.sendFailed * perSecond,
-         bandwidth.skippedBudget * perSecond);
+         bandwidth.skippedPaced * perSecond);
     const uint64_t updates = bandwidth.poseKeys + bandwidth.poseDeltas;
     Logf("net: pose bandwidth tier_per_s=fast:%.1f,ordinary:%.1f,slow:%.1f tier_bytes_per_s=%.0f,%.0f,%.0f "
          "bone_bytes_per_update=%.1f bones_per_update=%.1f keys=%llu deltas=%llu acks=%llu ack_misses=%llu "
@@ -3033,15 +3040,19 @@ void BandwidthLog()
          static_cast<unsigned long long>(bandwidth.poseAcks), static_cast<unsigned long long>(bandwidth.poseAckMisses),
          static_cast<unsigned long long>(bandwidth.poseReferenceMisses), static_cast<unsigned long long>(bandwidth.poseDecodeFailures));
     detail::ForEachKindLine(bandwidth, [](char const* line) { Logf("%s", line); });
+    // tx_total_bytes_per_s = (ENet bytes + relay-header bytes x datagrams) / window: the envelope-inclusive figure to hold
+    // against 1 MB/s. steam.cpp's envelope counter already includes the payload, so the header share is the difference.
     Logf("net: bandwidth rates enet_tx_datagrams_per_s=%.1f enet_tx_bytes_per_s=%.1f "
-         "steam_api_tx_datagrams_per_s=%.1f steam_api_tx_bytes_per_s=%.1f relay_header_bytes_per_s=%.1f relay_header_pct=%.2f",
+         "steam_api_tx_datagrams_per_s=%.1f steam_api_tx_bytes_per_s=%.1f tx_total_bytes_per_s=%.1f "
+         "relay_header_bytes_per_s=%.1f relay_header_pct=%.2f",
          (sentPackets - lastSentPackets) * perSecond, (sentData - lastSentData) * perSecond,
          steamPackets * perSecond, steamBytes * perSecond, framingBytes * perSecond,
-         steamBytes ? 100.0 * framingBytes / steamBytes : 0.0);
+         (framingBytes - steamBytes) * perSecond,
+         steamBytes ? 100.0 * (framingBytes - steamBytes) / steamBytes : 0.0);
     Logf("net: bandwidth overhead enet_header_bytes_per_s=%.1f enet_ack_bytes_per_s=%.1f "
          "protocol_overhead_pct=%.2f enet_parse_failures=%llu enet_unparsed_datagrams=%llu",
          enetHeaderBytes * perSecond, enetAckBytes * perSecond,
-         steamBytes ? 100.0 * (framingBytes + enetHeaderBytes) / steamBytes : 0.0,
+         steamBytes ? 100.0 * ((framingBytes - steamBytes) + enetHeaderBytes) / steamBytes : 0.0,
          static_cast<unsigned long long>(traffic.txEnetParseFailures - lastSteamTraffic.txEnetParseFailures),
          static_cast<unsigned long long>(traffic.txEnetUnparsedDatagrams - lastSteamTraffic.txEnetUnparsedDatagrams));
     // Each line is bounded below Logf's 900-byte buffer.
@@ -3051,14 +3062,15 @@ void BandwidthLog()
         ENetPeer const& peer = host->peers[i];
         if (peer.state != ENET_PEER_STATE_CONNECTED) continue;
         auto const snapshot = peerBudgets[i].Snapshot();
-        Logf("net: budget peer=%u cap_bytes_per_s=%u level=%u credit_bytes=%lld queue_bytes=%u "
-             "reliable_inflight=%u rtt_ms=%u throttle=%u deferred=%llu shed=%llu transitions=%u overflow_bytes=%llu",
-             isHost ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer.data)) : 1u, budgetRate,
-             static_cast<unsigned>(snapshot.pressure), static_cast<long long>(snapshot.creditBytes),
-             static_cast<unsigned>(snapshot.queueBytes), peer.reliableDataInTransit, peer.roundTripTime, peer.packetThrottle,
-             static_cast<unsigned long long>(snapshot.deferredCount),              static_cast<unsigned long long>(snapshot.shedCount),
-             snapshot.pressureTransitions,
-             static_cast<unsigned long long>(snapshot.overflowBytes));
+        Logf("net: valve peer=%u npc_stretch_permille=%u level=%u signals=%u queue_bytes=%u offered_bytes_per_s=%llu "
+             "reliable_inflight=%u rtt_ms=%u base_rtt_ms=%u throttle=%u transitions=%u "
+             "bulk_pace_bytes_per_s=%u bulk_credit_bytes=%lld bulk_deferred=%llu",
+             isHost ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer.data)) : 1u, snapshot.stretchPermille,
+             static_cast<unsigned>(snapshot.pressure), static_cast<unsigned>(snapshot.signals),
+             static_cast<unsigned>(snapshot.queueBytes), static_cast<unsigned long long>(snapshot.offeredBytesPerSecond),
+             peer.reliableDataInTransit, peer.roundTripTime, snapshot.baseRttMs, peer.packetThrottle,
+             snapshot.pressureTransitions, budgetRate / 4, static_cast<long long>(snapshot.bulkCreditBytes),
+             static_cast<unsigned long long>(snapshot.deferredCount));
     }
     bandwidth = detail::BandwidthCounters{};
     bandwidthSince = now;

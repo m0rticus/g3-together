@@ -19,8 +19,9 @@ and ragdoll impulses travel only from host to client.
 Player-puppet smoothing remains separate. Party identity, friendly-fire protection, automatic player exchanges,
 personal loot/merchant inventories, shared experience and lethal-blow rescue rules are retained.
 Player states default to 30 Hz with reliable changed metadata and recovery keyframes.
-`network_budget_kib` defaults to 256 KiB/s per outgoing peer; reliable gameplay is protected,
-and save bundles are paced at a quarter of that budget on a separate reliable channel.
+`network_budget_kib` (default 256 KiB/s per outgoing peer) is only the pacing base of the bulk save channel: save bundles are
+paced at a quarter of it on a separate reliable channel. NPC, player-state and gameplay traffic are never capped by it;
+only real congestion signals stretch the NPC intervals uniformly.
 
 > **Beta — back up your saves.** Human co-op testing is limited; no complete human co-op playthrough has been completed. Internet play remains unverified; only two players have been tested.
 

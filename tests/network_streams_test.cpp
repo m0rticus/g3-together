@@ -16,6 +16,7 @@ int main()
         fakePeers[i].channelCount = ChannelCount;
         fakePeers[i].state = ENET_PEER_STATE_CONNECTED;
         fakePeers[i].mtu = Mtu;
+        fakePeers[i].packetThrottle = ENET_PEER_DEFAULT_PACKET_THROTTLE;
         fakePeers[i].data = reinterpret_cast<void*>(uintptr_t(i + 2));
         fakePeers[i].outgoingCommands.sentinel.next = &fakePeers[i].outgoingCommands.sentinel;
         fakePeers[i].outgoingCommands.sentinel.previous = &fakePeers[i].outgoingCommands.sentinel;
@@ -170,8 +171,9 @@ int main()
 
     // Congestion pauses bulk, but never refuses a reliable hit/result.
     BudgetTelemetry congested;
-    congested.queuedPayloadBytes = 100000;
+    congested.throttle = 16;
     peerBudgets[0].Advance(fakeTime, congested);
+    assert(peerBudgets[0].Pressure() == BudgetPressure::Critical);
     files[0].resize(1); files[1].resize(1); files[2].resize(1);
     const uint32_t tiny[FileCount]{1, 1, 1};
     assert(QueueFileTransfer(2, note, name.c_str(), files, tiny, crcs));

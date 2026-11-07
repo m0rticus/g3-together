@@ -9,7 +9,7 @@
 #include <cstring>
 
 namespace g3t::net {
-enum class NpcSendDecision { Sent, SkippedUnchanged, SkippedFar, SkippedIrrelevant, SendFailed, SkippedBudget };
+enum class NpcSendDecision { Sent, SkippedUnchanged, SkippedFar, SkippedIrrelevant, SendFailed, SkippedPaced };
 
 // Classify each NPC scheduling decision exactly once. "Sent" means queued successfully, not delivered;
 // use SendFailed when a selected publication could not be queued. If decisions are made per recipient,
@@ -24,7 +24,7 @@ struct PacketCounts {
 
 struct BandwidthCounters {
     PacketCounts kinds[256] = {};
-    uint64_t considered = 0, sent = 0, skippedUnchanged = 0, skippedFar = 0, skippedIrrelevant = 0, sendFailed = 0, skippedBudget = 0;
+    uint64_t considered = 0, sent = 0, skippedUnchanged = 0, skippedFar = 0, skippedIrrelevant = 0, sendFailed = 0, skippedPaced = 0;
     uint64_t tierUpdates[3] = {}, tierBytes[3] = {};
     uint64_t poseBytes = 0, poseBones = 0, poseKeys = 0, poseDeltas = 0;
     uint64_t poseAcks = 0, poseAckMisses = 0, poseReferenceMisses = 0, poseDecodeFailures = 0;
@@ -47,7 +47,7 @@ struct BandwidthCounters {
         case NpcSendDecision::SkippedFar: skippedFar += count; break;
         case NpcSendDecision::SkippedIrrelevant: skippedIrrelevant += count; break;
         case NpcSendDecision::SendFailed: sendFailed += count; break;
-        case NpcSendDecision::SkippedBudget: skippedBudget += count; break;
+        case NpcSendDecision::SkippedPaced: skippedPaced += count; break;
         default: return;
         }
         considered += count;

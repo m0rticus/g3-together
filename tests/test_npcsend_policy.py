@@ -23,16 +23,11 @@ class NpcSendPolicyTests(unittest.TestCase):
             else:
                 command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O2",
                            str(source), "-o", str(executable)]
-            for preview in (False, True):
-                with self.subTest(bandwidth_preview=preview):
-                    define = "/DTEST_NPC_BANDWIDTH_PREVIEW" if Path(compiler).stem.lower() == "cl" else "-DTEST_NPC_BANDWIDTH_PREVIEW"
-                    compiled = subprocess.run(command + ([define] if preview else []),
-                                              cwd=build, capture_output=True, text=True, timeout=120)
-                    self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-                    executed = subprocess.run([str(executable)], cwd=build, capture_output=True, text=True, timeout=60)
-                    self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
-                    if not preview:
-                        print(executed.stdout, end="")
+            compiled = subprocess.run(command, cwd=build, capture_output=True, text=True, timeout=120)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            executed = subprocess.run([str(executable)], cwd=build, capture_output=True, text=True, timeout=60)
+            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+            print(executed.stdout, end="")
         finally:
             shutil.rmtree(build)
 

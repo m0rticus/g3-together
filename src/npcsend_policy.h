@@ -25,6 +25,12 @@ constexpr uint32_t FastIntervalMs = 16, OrdinaryIntervalMs = 33, MovingFarInterv
 // 200 ms buffer before captures become sparse, including movement-to-idle.
 constexpr uint32_t UrgentHoldMs = 2000, OrdinaryHoldMs = 2000, InterestWarmupMs = 200;
 constexpr uint32_t KeyframeMs = 1000;
+// A due update (not a quiet heartbeat) that leaves later than this counts as overdue in the diagnostics; one frame hitch
+// of ~60 ms fits every tier. Multiplied by the congestion stretch like every interval.
+constexpr uint32_t FastMaxStaleMs = 100, OrdinaryMaxStaleMs = 150, SlowMaxStaleMs = 300;
+// Join burst: new recipients receive their first (key) update per NPC at this paced rate, spread over about a second
+// for a 75-NPC crowd, instead of one reliable+key burst in a single tick. Established NPCs are never affected.
+constexpr uint32_t InitialPerSecond = 60, InitialBurst = 6, InitialBurstQuietMs = 250;
 constexpr uint32_t QuietCadenceMs = 250; // ms; intentional quiet heartbeat is not playback jitter
 constexpr uint32_t MirrorStaleMs = 10000; // ms without a snapshot before a mirror is stale
 constexpr uint32_t PoseRetentionMs = 10000; // ms to retain received pose history
@@ -48,6 +54,20 @@ inline uint32_t Interval(Tier tier)
     return tier == Tier::Fast ? FastIntervalMs : tier == Tier::Ordinary ? OrdinaryIntervalMs :
            tier == Tier::MovingFar ? MovingFarIntervalMs : IdleIntervalMs;
 }
+// The congestion stretch (net::PeerBudget::NpcStretchPermille) is 1000 under normal conditions and is applied
+// identically to every NPC and tier.
+constexpr uint32_t StretchNormal = 1000, StretchMax = 4000;
+inline uint32_t Stretched(uint32_t ms, uint32_t stretchPermille)
+{
+    const uint32_t stretch = stretchPermille < StretchNormal ? StretchNormal :
+                             stretchPermille > StretchMax ? StretchMax : stretchPermille;
+    return static_cast<uint32_t>((uint64_t(ms) * stretch + 999) / 1000);
+}
+inline uint32_t MaxStale(Tier tier, uint32_t stretchPermille = StretchNormal)
+{
+    return Stretched(tier == Tier::Fast ? FastMaxStaleMs : tier == Tier::Ordinary ? OrdinaryMaxStaleMs : SlowMaxStaleMs,
+                     stretchPermille);
+}
 enum class Decision { Ineligible, Invalid, Outside, Wait, Initial, Semantic, Changed, Keyframe, FinalAndRelease };
 
 struct Input {
@@ -61,6 +81,7 @@ struct Input {
     bool eligible = true; // connection/world/ownership gate, not an interest-range decision
     bool nearby = false, focused = false, combat = false, contact = false, moving = false;
     bool force = false; // one-shot caller-known discrete event or pose discontinuity
+    uint32_t stretchPermille = StretchNormal; // emergency congestion factor for every interval, 1000 = none
 };
 
 // Keep exactly one State per (recipient generation, NPC GUID). Reset externally on
@@ -69,6 +90,9 @@ struct State {
     bool live = false, nearTier = false;
     uint8_t urgent = 0; // independently acknowledged focus/combat/contact edges
     uint32_t sentAt = 0;
+    // Ideal send time of the last update. Advancing it by whole intervals (not resetting to the frame time) carries the
+    // phase, so a 33 ms tier on 22 ms frames averages 30 Hz instead of 22.7 Hz.
+    uint32_t idealAt = 0;
     uint32_t enteredAt = 0, urgentUntil = 0, ordinaryUntil = 0;
     bool haveUrgentHold = false, haveOrdinaryHold = false;
     net::NpcRecord record{};
@@ -81,24 +105,6 @@ struct Result {
     Tier tier = Tier::Idle;
     bool essential = false; // queue the state reliably; computed against this recipient's last successful send
 };
-
-inline bool CanQueue(uint8_t to, Input const& in, Result const& result)
-{
-#ifdef G3T_REMOTE_NPC_FOCUS_SUPPORTED
-    if (!result.essential) {
-        const auto priority = result.tier == Tier::Fast || result.tier == Tier::Ordinary
-            ? net::BudgetClass::NpcActive : net::BudgetClass::NpcFarIdle;
-        // Bound the full-hash fallback, not just the compact case. Preview
-        // consumes no credit; successful common sends debit exactly once.
-        const uint32_t bytes = static_cast<uint32_t>(sizeof(net::NpcRecord) + 32 +
-            static_cast<size_t>(in.boneCount) * sizeof(pose::Bone));
-        return net::PreviewBandwidth(to, priority, bytes) == net::BudgetDecision::Allow;
-    }
-#else
-    (void)to; (void)in; (void)result;
-#endif
-    return true;
-}
 
 // Keep reliable transitions independent of global/last-captured bookkeeping.
 // The caller must compare against its own last successfully queued state.
@@ -288,10 +294,12 @@ inline Result Evaluate(State& state, Input const& in)
         detail::RotationChanged(state.record.rotation, in.record->rotation, RotationDiscontinuityDegrees))
         return {Decision::Semantic, tier, essential};
     const uint32_t elapsed = in.now - state.sentAt;
-    if (elapsed >= KeyframeMs) return {Decision::Keyframe, tier};
-    const uint32_t interval = Interval(tier);
-    if (elapsed >= interval && detail::SemanticRecord(state.record, *in.record)) return {Decision::Semantic, tier};
-    if (elapsed >= interval && detail::DynamicChanged(state, in)) return {Decision::Changed, tier};
+    const uint32_t stretch = in.stretchPermille;
+    if (elapsed >= Stretched(KeyframeMs, stretch)) return {Decision::Keyframe, tier};
+    const uint32_t interval = Stretched(Interval(tier), stretch);
+    const bool due = in.now - state.idealAt >= interval;
+    if (due && detail::SemanticRecord(state.record, *in.record)) return {Decision::Semantic, tier};
+    if (due && detail::DynamicChanged(state, in)) return {Decision::Changed, tier};
     return {Decision::Wait, tier};
 }
 
@@ -303,9 +311,13 @@ inline bool Commit(State& state, Input const& in, Decision decision)
 {
     if (decision != Decision::Initial && decision != Decision::Semantic && decision != Decision::Changed &&
         decision != Decision::Keyframe && decision != Decision::FinalAndRelease) return false;
-    if (Evaluate(state, in).decision != decision) return false;
+    const Result evaluated = Evaluate(state, in);
+    if (evaluated.decision != decision) return false;
     if (decision == Decision::FinalAndRelease) { state = State{}; return true; }
     const bool wasLive = state.live;
+    const uint32_t interval = Stretched(Interval(evaluated.tier), in.stretchPermille);
+    const uint32_t behind = in.now - state.idealAt;
+    state.idealAt = wasLive && behind >= interval && behind < 2 * interval ? state.idealAt + interval : in.now;
     state.record = *in.record;
     state.sentAt = in.now;
     state.poseFlags = in.poseFlags;
@@ -324,4 +336,77 @@ inline uint32_t PresentationInterval(State const& state, Input const& in)
     return (nearBand || in.nearby) && in.moving ? OrdinaryIntervalMs :
         in.moving ? MovingFarIntervalMs : IdleIntervalMs;
 }
+
+// Achieved-rate diagnostics (local only, never on the wire). One entry per scheduling tier: 0 fast, 1 ordinary, 2 slow.
+inline unsigned StatsTier(Tier tier) { return tier == Tier::Fast ? 0u : tier == Tier::Ordinary ? 1u : 2u; }
+struct TierStats {
+    uint32_t count = 0, overdue = 0, minMs = UINT32_MAX, maxMs = 0;
+    uint64_t sumMs = 0;
+    double AverageMs() const { return count ? double(sumMs) / count : 0.0; }
+};
+struct Stats {
+    TierStats tiers[3];
+    uint32_t edges = 0, heartbeats = 0, initials = 0, paced = 0;
+
+    // elapsed: time since this NPC's previous update to the same recipient. onSchedule: the update left because its phase
+    // deadline (State::idealAt + interval) was reached, as opposed to an immediate edge (essential/motion/discontinuity).
+    // On-schedule updates feed the per-tier achieved interval (with phase carrying, gaps alternate around the interval,
+    // e.g. 22/44 ms for a 33 ms tier on 22 ms frames); edges and quiet heartbeats are counted apart.
+    void Record(Decision decision, Tier tier, uint32_t elapsedMs, uint32_t stretchPermille, bool onSchedule)
+    {
+        if (decision == Decision::Initial) { ++initials; return; }
+        if (decision == Decision::Keyframe) { ++heartbeats; return; }
+        if (decision != Decision::Changed && decision != Decision::Semantic) return;
+        if (!onSchedule) { ++edges; return; }
+        TierStats& s = tiers[StatsTier(tier)];
+        ++s.count;
+        s.sumMs += elapsedMs;
+        if (elapsedMs < s.minMs) s.minMs = elapsedMs;
+        if (elapsedMs > s.maxMs) s.maxMs = elapsedMs;
+        if (elapsedMs > MaxStale(tier, stretchPermille)) ++s.overdue;
+    }
+};
+
+// Token bucket that spreads the first (key) update of every NPC for one recipient over time after a join or world
+// entry. It only ever delays NPCs that have never been sent to this recipient.
+struct InitialPacer {
+    bool started = false, active = false;
+    uint32_t lastAt = 0, burstStartedAt = 0, lastDeferredAt = 0;
+    int64_t milliTokens = 0;
+    uint32_t admittedInBurst = 0, lastBurstMs = 0, lastBurstNpcs = 0, bursts = 0;
+
+    void Reset() { *this = InitialPacer{}; }
+
+    bool Admit(uint32_t now, uint32_t stretchPermille)
+    {
+        const int64_t cap = int64_t(InitialBurst) * 1000;
+        if (!started) { started = true; lastAt = now; milliTokens = cap; }
+        const uint32_t elapsed = now - lastAt;
+        if (elapsed && elapsed < 0x7fffffffu) {
+            // InitialPerSecond tokens/s = InitialPerSecond milli-tokens per ms, slowed by the congestion stretch.
+            milliTokens += int64_t(elapsed) * InitialPerSecond * StretchNormal /
+                           (stretchPermille < StretchNormal ? StretchNormal : stretchPermille);
+            if (milliTokens > cap) milliTokens = cap;
+            lastAt = now;
+        }
+        if (milliTokens < 1000) {
+            if (!active) { active = true; burstStartedAt = now; admittedInBurst = 0; }
+            lastDeferredAt = now;
+            return false;
+        }
+        milliTokens -= 1000;
+        if (active) ++admittedInBurst;
+        return true;
+    }
+
+    // Call once per scheduling pass; closes a burst after the deferrals stop.
+    void Poll(uint32_t now)
+    {
+        if (!active || now - lastDeferredAt < InitialBurstQuietMs) return;
+        active = false;
+        lastBurstMs = lastDeferredAt - burstStartedAt;
+        lastBurstNpcs = admittedInBurst;
+        ++bursts;
+    }
+};
 }

@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-// Pure network budget policy. NPC integration: preview by priority, then queue through the net sender;
-// the caller does not CommitQueued again. Parent-owned Send commits one conservative BudgetCharge once
-// only after the common successful send, and batch/fragment charge is committed once, not per fragment.
+// Pure per-peer transport policy. It is an emergency valve plus bulk pacing, NOT a bandwidth cap:
+//  * NPC pose/control, player state and gameplay reliable traffic are never refused or charged against a credit.
+//    Preview() returns Allow for them in every state, so the normal NPC stream is not gated by this module.
+//  * Real congestion signals (ENet's own packet throttle, a standing outgoing queue, RTT growth while data is queued,
+//    fresh loss with a meaningful sample) raise NpcStretchPermille() from 1000 (normal) to 4000. The NPC scheduler multiplies
+//    every tier interval and staleness limit by that one factor: all NPCs slow down together and proportionally, none is selected,
+//    shed or starved. Normal LAN-like conditions keep the factor at exactly 1000.
+//  * BulkReliable (the paced save transfer on channel 6) has its own token bucket: bytesPerSecond/4 when clear,
+//    /8 when constrained, deferred while critical. It is decoupled from the NPC stream.
+// Parent-owned Send commits one conservative BudgetCharge once only after the common successful send.
 
 #include <algorithm>
 #include <cstdint>
@@ -32,7 +39,18 @@ enum class BudgetPressure : uint8_t {
     Critical
 };
 
+// Which real congestion signal raised the stretch, for diagnostics.
+enum BudgetSignal : uint8_t {
+    SignalNone = 0,
+    SignalThrottle = 1,
+    SignalQueue = 2,
+    SignalRtt = 4,
+    SignalLoss = 8,
+    SignalWindow = 16
+};
+
 struct BudgetConfig {
+    // Pacing base of the bulk save channel only; never applied to NPC, player or gameplay traffic.
     uint32_t bytesPerSecond = 256u * 1024u;
     uint32_t mtuBytes = 1200u;
     uint32_t envelopeBytes = 16u;
@@ -44,25 +62,26 @@ struct BudgetTelemetry {
     uint64_t reliableInFlightBytes = 0;
     uint64_t reliableWindowBytes = 0;
     uint32_t rttMs = 0;
-    uint32_t referenceRttMs = 500u;
-    uint32_t rttVarianceMs = 0;
-    uint32_t throttle = 32u;
+    uint32_t throttle = 32u;          // ENet packetThrottle, 32 = unthrottled
     uint32_t lossPermille = 0;
     uint32_t retrySampleAt = 0;
+    uint32_t packetsSent = 0;
+    uint32_t packetsLost = 0;
     bool validRtt = false;
     bool validLoss = false;
 };
 
 struct BudgetSnapshot {
     BudgetPressure pressure = BudgetPressure::Clear;
-    int64_t creditBytes = 0;
+    uint32_t stretchPermille = 1000;
+    uint8_t signals = SignalNone;
     uint64_t queueBytes = 0;
     uint64_t chargedBytes = 0;
+    uint64_t offeredBytesPerSecond = 0;
     uint64_t deferredCount = 0;
     uint64_t shedCount = 0;
-    uint64_t overflowBytes = 0;
     uint32_t pressureTransitions = 0;
-
+    uint32_t baseRttMs = 0;
     int64_t bulkCreditBytes = 0;
 };
 
@@ -89,199 +108,132 @@ inline uint64_t BudgetCharge(uint64_t payload, uint32_t mtu = 1200u,
 
 class PeerBudget {
 public:
+    static constexpr uint32_t StretchNormal = 1000u;
+    static constexpr uint32_t StretchMax = 4000u;
+    static constexpr uint32_t ThrottleScale = 32u;
+    // The outgoing queue is judged against what this peer is actually being offered, never below this drain rate,
+    // so one frame-end flush or a reliable burst on a healthy link is not congestion.
+    static constexpr uint64_t DrainFloorBytesPerSecond = 512u * 1024u;
+    static constexpr uint32_t QueueSignalMs = 100u;
+    static constexpr uint32_t QueueSustainMs = 250u;
+    static constexpr uint32_t DecayPermillePerSecond = 1000u;
+    static constexpr uint32_t RttWindowMs = 10000u;
+    static constexpr uint32_t MinLossSamples = 200u;
+    static constexpr uint32_t MinLostPackets = 4u;
+    static constexpr double RttOfferedFloorBytesPerSecond = 65536.0;
+
     PeerBudget() = default;
 
     void Reset(uint32_t nowMs, const BudgetConfig& config = BudgetConfig{})
     {
         config_ = config;
         if (!config_.mtuBytes) config_.mtuBytes = 1200u;
-
-        const uint64_t mtu = config_.mtuBytes;
-        const uint64_t rate = config_.bytesPerSecond;
-        burstBytes_ = (std::max)(uint64_t(4) * mtu, rate / 10u);
-        debtFloorBytes_ = (std::max)(uint64_t(4) * mtu, rate / 2u);
-        reserveBytes_ = 2ull * mtu;
-        bulkCapBytes_ = (std::max)(uint64_t(2) * mtu, rate / 40u);
-
-        if (burstBytes_ > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
-            burstBytes_ = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
-        if (debtFloorBytes_ > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
-            debtFloorBytes_ = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
-        if (reserveBytes_ > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
-            reserveBytes_ = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
-        if (bulkCapBytes_ > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
-            bulkCapBytes_ = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
-
+        bulkCapBytes_ = (std::max)(uint64_t(2) * config_.mtuBytes, uint64_t(config_.bytesPerSecond) / 40u);
         lastNowMs_ = nowMs;
-        mainCreditMilli_ = static_cast<int64_t>(burstBytes_) * 1000;
         bulkCreditMilli_ = static_cast<int64_t>(bulkCapBytes_) * 1000;
-        if (static_cast<uint64_t>(mainCreditMilli_) > static_cast<uint64_t>(burstBytes_) * 1000)
-            mainCreditMilli_ = static_cast<int64_t>(burstBytes_) * 1000;
-
+        telemetry_ = BudgetTelemetry{};
         pressure_ = BudgetPressure::Clear;
-        queueBytes_ = 0;
-        chargedBytes_ = 0;
-        deferredCount_ = 0;
-        shedCount_ = 0;
-        overflowBytes_ = 0;
+        stretch_ = StretchNormal;
+        signals_ = SignalNone;
+        queueBytes_ = chargedBytes_ = deferredCount_ = shedCount_ = 0;
+        offeredBytesPerSecond_ = 0.0;
+        offeredSinceAdvance_ = 0;
         pressureTransitions_ = 0;
-        lastOverflowMs_ = UINT32_MAX;
-        recoverySinceMs_ = UINT32_MAX;
+        queueSinceMs_ = UINT32_MAX;
+        rttMinCurrent_ = rttMinPrevious_ = UINT32_MAX;
+        rttWindowAtMs_ = nowMs;
+        baseRttMs_ = 0;
     }
 
     void Advance(uint32_t nowMs, const BudgetTelemetry& telemetry = BudgetTelemetry{})
     {
         const uint32_t elapsed = Elapsed(lastNowMs_, nowMs);
         if (elapsed) {
-            Refill(elapsed);
+            const double window = elapsed > 1000u ? 1000.0 : static_cast<double>(elapsed);
+            const double alpha = window / 1000.0;
+            const double sample = static_cast<double>(offeredSinceAdvance_) * 1000.0 / static_cast<double>(elapsed);
+            offeredBytesPerSecond_ += (sample - offeredBytesPerSecond_) * alpha;
+            offeredSinceAdvance_ = 0;
+            RefillBulk(elapsed);
             lastNowMs_ = nowMs;
         }
         telemetry_ = telemetry;
         queueBytes_ = telemetry.queuedPayloadBytes;
+        TrackBaseRtt(nowMs, telemetry);
 
         const uint64_t queueMs = QueueMilliseconds(telemetry.queuedPayloadBytes);
-        BudgetPressure candidate = Candidate(queueMs, telemetry);
+        uint8_t mask = SignalNone;
+        const uint32_t target = StretchTarget(nowMs, queueMs, telemetry, mask);
+        if (target >= stretch_) {
+            stretch_ = target;
+        } else {
+            const uint64_t decay = static_cast<uint64_t>(elapsed) * DecayPermillePerSecond / 1000u;
+            stretch_ = (std::max)(target, static_cast<uint32_t>(stretch_ > decay ? stretch_ - decay : StretchNormal));
+        }
+        if (stretch_ < StretchNormal) stretch_ = StretchNormal;
+        if (stretch_ > StretchMax) stretch_ = StretchMax;
+        signals_ = mask;
 
-        if (candidate > pressure_) {
-            pressure_ = candidate;
+        BudgetPressure next = BudgetPressure::Clear;
+        const bool windowBlocked = (mask & SignalWindow) != 0;
+        if (stretch_ >= 2000u || (windowBlocked && queueMs >= 200u)) next = BudgetPressure::Critical;
+        else if (stretch_ > StretchNormal || windowBlocked) next = BudgetPressure::Constrained;
+        if (next != pressure_) {
+            pressure_ = next;
             ++pressureTransitions_;
-            recoverySinceMs_ = UINT32_MAX;
-            return;
         }
-
-        if (pressure_ == BudgetPressure::Clear) {
-            recoverySinceMs_ = UINT32_MAX;
-            return;
-        }
-
-        if (!RecoveryEligible(nowMs, queueMs, telemetry)) {
-            recoverySinceMs_ = UINT32_MAX;
-            return;
-        }
-
-        if (recoverySinceMs_ == UINT32_MAX) {
-            recoverySinceMs_ = nowMs;
-            return;
-        }
-        if (Elapsed(recoverySinceMs_, nowMs) < 1000u) return;
-
-        pressure_ = pressure_ == BudgetPressure::Critical
-            ? BudgetPressure::Constrained : BudgetPressure::Clear;
-        ++pressureTransitions_;
-        recoverySinceMs_ = nowMs;
     }
 
+    // Only the bulk save channel is ever refused. Everything else is always admitted.
     BudgetDecision Preview(BudgetClass cls, uint64_t chargedBytes) const
     {
-        if (cls == BudgetClass::GameplayReliable || cls == BudgetClass::PlayerState)
-            return BudgetDecision::Allow;
-        if (OverCapacity(chargedBytes)) return BudgetDecision::NeedsChunking;
-        if (cls == BudgetClass::BulkReliable && chargedBytes > bulkCapBytes_)
-            return BudgetDecision::NeedsChunking;
-
-        switch (cls) {
-        case BudgetClass::GameplayReliable:
-        case BudgetClass::PlayerState:
-            return BudgetDecision::Allow;
-
-        case BudgetClass::NpcActive:
-            if (pressure_ == BudgetPressure::Critical) return BudgetDecision::Shed;
-            if (chargedBytes <= Allowance(cls))
-                return BudgetDecision::Allow;
-            return BudgetDecision::Defer;
-
-        case BudgetClass::NpcFarIdle:
-            if (pressure_ != BudgetPressure::Clear) return BudgetDecision::Shed;
-            if (chargedBytes <= Allowance(cls))
-                return BudgetDecision::Allow;
-            return BudgetDecision::Shed;
-
-        case BudgetClass::BulkReliable:
-            if (pressure_ == BudgetPressure::Critical) return BudgetDecision::Defer;
-            if (chargedBytes <= Allowance(cls))
-                return BudgetDecision::Allow;
-            return BudgetDecision::Defer;
-
-        default:
-            return BudgetDecision::Shed;
-        }
+        if (cls != BudgetClass::BulkReliable) return BudgetDecision::Allow;
+        if (chargedBytes > bulkCapBytes_) return BudgetDecision::NeedsChunking;
+        if (pressure_ == BudgetPressure::Critical) return BudgetDecision::Defer;
+        return chargedBytes <= BulkAllowance() ? BudgetDecision::Allow : BudgetDecision::Defer;
     }
 
-    uint64_t Allowance(BudgetClass cls) const
+    uint64_t BulkAllowance() const
     {
-        if (cls == BudgetClass::BulkReliable) {
-            if (pressure_ == BudgetPressure::Critical ||
-                (pressure_ == BudgetPressure::Constrained && QueueMilliseconds(queueBytes_) >= 25u)) return 0;
-            const int64_t mainSigned = CreditBytes();
-            const uint64_t main = mainSigned > static_cast<int64_t>(reserveBytes_)
-                ? static_cast<uint64_t>(mainSigned) - reserveBytes_ : 0u;
-            const uint64_t bulk = (std::min)(BulkCreditBytes(), BulkLimit());
-            return main < bulk ? main : bulk;
-        }
-        if (cls == BudgetClass::NpcActive || cls == BudgetClass::NpcFarIdle) {
-            if (pressure_ == BudgetPressure::Critical ||
-                (cls == BudgetClass::NpcFarIdle && pressure_ != BudgetPressure::Clear)) return 0;
-            const int64_t mainSigned = CreditBytes();
-            const uint64_t credit = mainSigned > 0 ? static_cast<uint64_t>(mainSigned) : 0u;
-            return credit > reserveBytes_ ? credit - reserveBytes_ : 0u;
-        }
-        if (mainCreditMilli_ >= 0)
-            return static_cast<uint64_t>(mainCreditMilli_ / 1000);
-        const uint64_t debtAvailable = static_cast<uint64_t>(
-            static_cast<int64_t>(debtFloorBytes_) * 1000 + mainCreditMilli_) / 1000;
-        return debtAvailable;
+        if (pressure_ == BudgetPressure::Critical) return 0;
+        return (std::min)(BulkCreditBytes(), BulkLimit());
     }
 
     void CommitQueued(BudgetClass cls, uint64_t chargedBytes)
     {
         if (!chargedBytes) return;
-
-        const int64_t floorMilli = -static_cast<int64_t>(debtFloorBytes_) * 1000;
-        const int64_t availableMilli = SaturatingSubtract(mainCreditMilli_, floorMilli);
-        const uint64_t availableBytes = availableMilli > 0
-            ? static_cast<uint64_t>(availableMilli / 1000) : 0u;
-        if (chargedBytes > availableBytes) {
-            overflowBytes_ = SaturatingAdd(overflowBytes_, chargedBytes - availableBytes);
-            mainCreditMilli_ = floorMilli;
-            lastOverflowMs_ = lastNowMs_;
-        } else {
-            const int64_t charge = static_cast<int64_t>(chargedBytes) * 1000;
-            mainCreditMilli_ = SaturatingSubtract(mainCreditMilli_, charge);
-            if (mainCreditMilli_ < floorMilli) mainCreditMilli_ = floorMilli;
-        }
-
-        if (cls == BudgetClass::BulkReliable) {
-            const int64_t charge = chargedBytes <=
-                static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) / 1000u
-                ? static_cast<int64_t>(chargedBytes) * 1000
-                    : (std::numeric_limits<int64_t>::max)();
-            bulkCreditMilli_ = SaturatingSubtract(bulkCreditMilli_, charge);
-            if (bulkCreditMilli_ < 0) bulkCreditMilli_ = 0;
-        }
-
         chargedBytes_ = SaturatingAdd(chargedBytes_, chargedBytes);
         queueBytes_ = SaturatingAdd(queueBytes_, chargedBytes);
+        offeredSinceAdvance_ = SaturatingAdd(offeredSinceAdvance_, chargedBytes);
+        if (cls != BudgetClass::BulkReliable) return;
+        const int64_t charge = chargedBytes <= static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) / 1000u
+            ? static_cast<int64_t>(chargedBytes) * 1000 : (std::numeric_limits<int64_t>::max)();
+        bulkCreditMilli_ = bulkCreditMilli_ > charge ? bulkCreditMilli_ - charge : 0;
     }
 
     void RecordDecision(BudgetDecision decision)
     {
-        if (decision == BudgetDecision::Defer)
-            deferredCount_ = SaturatingAdd(deferredCount_, 1u);
-        else if (decision == BudgetDecision::Shed)
-            shedCount_ = SaturatingAdd(shedCount_, 1u);
+        if (decision == BudgetDecision::Defer) deferredCount_ = SaturatingAdd(deferredCount_, 1u);
+        else if (decision == BudgetDecision::Shed) shedCount_ = SaturatingAdd(shedCount_, 1u);
     }
+
+    // 1000 = unthrottled. Every NPC interval and staleness limit is multiplied by this single factor.
+    uint32_t NpcStretchPermille() const { return stretch_; }
+    BudgetPressure Pressure() const { return pressure_; }
 
     BudgetSnapshot Snapshot() const
     {
         BudgetSnapshot snapshot;
         snapshot.pressure = pressure_;
-        snapshot.creditBytes = mainCreditMilli_ / 1000;
+        snapshot.stretchPermille = stretch_;
+        snapshot.signals = signals_;
         snapshot.queueBytes = queueBytes_;
         snapshot.chargedBytes = chargedBytes_;
+        snapshot.offeredBytesPerSecond = static_cast<uint64_t>(offeredBytesPerSecond_);
         snapshot.deferredCount = deferredCount_;
         snapshot.shedCount = shedCount_;
-        snapshot.overflowBytes = overflowBytes_;
         snapshot.pressureTransitions = pressureTransitions_;
+        snapshot.baseRttMs = baseRttMs_;
         snapshot.bulkCreditBytes = bulkCreditMilli_ / 1000;
         return snapshot;
     }
@@ -293,24 +245,6 @@ private:
             ? (std::numeric_limits<uint64_t>::max)() : left + right;
     }
 
-    static int64_t SaturatingAdd(int64_t left, int64_t right)
-    {
-        if (right > 0 && left > (std::numeric_limits<int64_t>::max)() - right)
-            return (std::numeric_limits<int64_t>::max)();
-        if (right < 0 && left < (std::numeric_limits<int64_t>::min)() - right)
-            return (std::numeric_limits<int64_t>::min)();
-        return left + right;
-    }
-
-    static int64_t SaturatingSubtract(int64_t left, int64_t right)
-    {
-        if (right > 0 && left < (std::numeric_limits<int64_t>::min)() + right)
-            return (std::numeric_limits<int64_t>::min)();
-        if (right < 0 && left > (std::numeric_limits<int64_t>::max)() + right)
-            return (std::numeric_limits<int64_t>::max)();
-        return left - right;
-    }
-
     static uint32_t Elapsed(uint32_t from, uint32_t to)
     {
         const int32_t difference = static_cast<int32_t>(to - from);
@@ -320,17 +254,9 @@ private:
     uint64_t QueueMilliseconds(uint64_t queued) const
     {
         if (!queued) return 0;
-        const uint64_t rate = config_.bytesPerSecond;
-        if (!rate) return (std::numeric_limits<uint64_t>::max)();
-        if (queued > (std::numeric_limits<uint64_t>::max)() / 1000u)
-            return (std::numeric_limits<uint64_t>::max)();
-        const uint64_t numerator = queued * 1000u;
-        return numerator / rate + (numerator % rate ? 1u : 0u);
-    }
-
-    int64_t CreditBytes() const
-    {
-        return mainCreditMilli_ / 1000;
+        const uint64_t drain = (std::max)(DrainFloorBytesPerSecond, static_cast<uint64_t>(offeredBytesPerSecond_));
+        if (queued > (std::numeric_limits<uint64_t>::max)() / 1000u) return (std::numeric_limits<uint64_t>::max)();
+        return queued * 1000u / drain;
     }
 
     uint64_t BulkCreditBytes() const
@@ -345,140 +271,97 @@ private:
         return (std::max)(uint64_t(config_.mtuBytes) + 32 + config_.envelopeBytes, bulkCapBytes_ / 2);
     }
 
-    bool OverCapacity(uint64_t charged) const
+    void RefillBulk(uint32_t elapsedMs)
     {
-        if (!charged) return false;
-        const uint64_t mtuLimit = 4u * config_.mtuBytes;
-        uint64_t limit = burstBytes_ > mtuLimit ? burstBytes_ : mtuLimit;
-        if (config_.bytesPerSecond == 0) limit = mtuLimit;
-        if (charged > limit) return true;
-        return false;
+        if (pressure_ == BudgetPressure::Critical) return;
+        const uint64_t perSecond = static_cast<uint64_t>(config_.bytesPerSecond) /
+                                   (pressure_ == BudgetPressure::Constrained ? 8u : 4u);
+        const int64_t cap = static_cast<int64_t>(BulkLimit()) * 1000;
+        const uint64_t add = perSecond * elapsedMs;
+        bulkCreditMilli_ = add >= static_cast<uint64_t>(cap) ? cap : (std::min)(cap, bulkCreditMilli_ + static_cast<int64_t>(add));
     }
 
-    void Refill(uint32_t elapsedMs)
+    void TrackBaseRtt(uint32_t nowMs, const BudgetTelemetry& telemetry)
     {
-        const uint64_t mainAdd = static_cast<uint64_t>(config_.bytesPerSecond) *
-                                 static_cast<uint64_t>(elapsedMs);
-        const uint64_t bulkAdd = (static_cast<uint64_t>(config_.bytesPerSecond) /
-                                 (pressure_ == BudgetPressure::Constrained ? 8u : 4u)) *
-                                 static_cast<uint64_t>(elapsedMs);
-
-        const int64_t mainCap = static_cast<int64_t>(burstBytes_) * 1000;
-        const int64_t bulkCap = static_cast<int64_t>(BulkLimit()) * 1000;
-
-        if (mainAdd <= static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
-            const int64_t addMilli = static_cast<int64_t>(mainAdd);
-            mainCreditMilli_ = SaturatingAdd(mainCreditMilli_, addMilli);
-        } else {
-            mainCreditMilli_ = mainCap;
+        if (Elapsed(rttWindowAtMs_, nowMs) >= RttWindowMs) {
+            rttMinPrevious_ = rttMinCurrent_;
+            rttMinCurrent_ = UINT32_MAX;
+            rttWindowAtMs_ = nowMs;
         }
-        if (mainCreditMilli_ > mainCap) mainCreditMilli_ = mainCap;
-
-        if (bulkAdd <= static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
-            const int64_t addMilli = static_cast<int64_t>(bulkAdd);
-            bulkCreditMilli_ = SaturatingAdd(bulkCreditMilli_, addMilli);
-        } else {
-            bulkCreditMilli_ = bulkCap;
-        }
-        if (bulkCreditMilli_ > bulkCap) bulkCreditMilli_ = bulkCap;
+        if (telemetry.validRtt && telemetry.rttMs && telemetry.rttMs < rttMinCurrent_) rttMinCurrent_ = telemetry.rttMs;
+        const uint32_t base = (std::min)(rttMinCurrent_, rttMinPrevious_);
+        baseRttMs_ = base == UINT32_MAX ? 0u : base;
     }
 
-    static uint64_t Maximum(uint64_t left, uint64_t right) { return left > right ? left : right; }
-
-    BudgetPressure Candidate(uint64_t queueMs, const BudgetTelemetry& telemetry) const
+    // The target never exceeds StretchMax and is exactly StretchNormal without a real congestion signal.
+    uint32_t StretchTarget(uint32_t nowMs, uint64_t queueMs, const BudgetTelemetry& telemetry, uint8_t& mask)
     {
-        BudgetPressure candidate = BudgetPressure::Clear;
-        if (mainCreditMilli_ <= -static_cast<int64_t>(debtFloorBytes_) * 1000 ||
-            (lastOverflowMs_ != UINT32_MAX && Elapsed(lastOverflowMs_, lastNowMs_) < 1000))
-            candidate = BudgetPressure::Critical;
+        uint32_t target = StretchNormal;
+        auto raise = [&](uint32_t value, BudgetSignal signal) {
+            mask |= signal;
+            if (value > target) target = value;
+        };
 
-        if (queueMs >= 200u) candidate = BudgetPressure::Critical;
-        else if (queueMs >= 75u && candidate < BudgetPressure::Constrained) candidate = BudgetPressure::Constrained;
+        // ENet lowers its throttle itself when round trips outgrow their mean; follow it proportionally.
+        if (telemetry.throttle < ThrottleScale)
+            raise(ThrottleScale * 1000u / (std::max)(telemetry.throttle, 8u), SignalThrottle);
+
+        // A queue deeper than QueueSignalMs of the offered rate that persists is congestion. A momentary
+        // frame-end backlog or a reliable burst that drains is not.
+        if (queueMs >= QueueSignalMs) {
+            if (queueSinceMs_ == UINT32_MAX) queueSinceMs_ = nowMs;
+            if (Elapsed(queueSinceMs_, nowMs) >= QueueSustainMs)
+                raise(StretchNormal + static_cast<uint32_t>((std::min<uint64_t>)(queueMs * 5u, 3000u)), SignalQueue);
+        } else {
+            queueSinceMs_ = UINT32_MAX;
+        }
+
+        // RTT growth counts only while this peer is really being fed (a standing queue, or a stream of at least
+        // RttOfferedFloorBytesPerSecond): a stalled (loading) peer receives nothing and measures a large ENet RTT without any
+        // congestion. Steam's own send queue sits behind the loopback socket where ENet cannot see it; it shows up as
+        // this RTT growth while the stream is on.
+        if (telemetry.validRtt && baseRttMs_ && telemetry.rttMs > baseRttMs_ &&
+            (queueMs >= 25u || offeredBytesPerSecond_ >= RttOfferedFloorBytesPerSecond)) {
+            const uint32_t excess = telemetry.rttMs - baseRttMs_;
+            if (excess >= (std::max)(75u, baseRttMs_))
+                raise(StretchNormal + (std::min)(excess * 4u, 3000u), SignalRtt);
+        }
+
+        if (telemetry.validLoss && telemetry.packetsSent >= MinLossSamples &&
+            telemetry.packetsLost >= MinLostPackets && RetryFresh(nowMs, telemetry.retrySampleAt)) {
+            if (telemetry.lossPermille >= 150u) raise(2500u, SignalLoss);
+            else if (telemetry.lossPermille >= 50u) raise(1500u, SignalLoss);
+        }
 
         const bool windowBlocked = telemetry.reliableWindowBytes != 0 &&
-            telemetry.reliableInFlightBytes >= telemetry.reliableWindowBytes;
-        if (windowBlocked && telemetry.queuedPayloadBytes != 0) {
-            const uint64_t effectiveMs = queueMs > 25u ? queueMs : 25u;
-            if (effectiveMs >= 200u) candidate = BudgetPressure::Critical;
-            else if (effectiveMs >= 75u || effectiveMs >= 25u) {
-                if (candidate < BudgetPressure::Constrained)
-                    candidate = BudgetPressure::Constrained;
-            }
-        }
-
-        if (telemetry.validLoss) {
-            const bool fresh = RetryFresh(lastNowMs_, telemetry.retrySampleAt);
-            if (fresh) {
-                if (telemetry.lossPermille >= 100u) {
-                    if (candidate < BudgetPressure::Critical)
-                        candidate = BudgetPressure::Critical;
-                } else if (telemetry.lossPermille >= 20u &&
-                           candidate < BudgetPressure::Constrained) {
-                    candidate = BudgetPressure::Constrained;
-                }
-            }
-        }
-
-        if (telemetry.validRtt && telemetry.referenceRttMs && queueMs >= 25u &&
-            telemetry.rttMs >= telemetry.referenceRttMs) {
-            const uint64_t halfReference = telemetry.referenceRttMs / 2u;
-            const uint64_t threshold = Maximum(25u, halfReference);
-            if (static_cast<uint64_t>(telemetry.rttMs) >=
-                static_cast<uint64_t>(telemetry.referenceRttMs) + threshold) {
-                if (queueMs >= 75u) {
-                    if (candidate < BudgetPressure::Critical)
-                        candidate = BudgetPressure::Critical;
-                } else if (candidate < BudgetPressure::Constrained) {
-                    candidate = BudgetPressure::Constrained;
-                }
-            }
-        }
-
-        if (telemetry.throttle < 32u && queueMs >= 25u &&
-            candidate < BudgetPressure::Constrained)
-            candidate = BudgetPressure::Constrained;
-
-        return candidate;
+            telemetry.reliableInFlightBytes >= telemetry.reliableWindowBytes && telemetry.queuedPayloadBytes != 0;
+        if (windowBlocked) mask |= SignalWindow;
+        return target;
     }
 
-    bool RetryFresh(uint32_t nowMs, uint32_t retryMs) const
+    static bool RetryFresh(uint32_t nowMs, uint32_t retryMs)
     {
         const uint32_t age = Elapsed(retryMs, nowMs);
         return age != 0u ? age <= 2000u : nowMs == retryMs;
-    }
-
-    bool RecoveryEligible(uint32_t nowMs, uint64_t queueMs,
-                          const BudgetTelemetry& telemetry) const
-    {
-        if (queueMs >= 25u) return false;
-        if (mainCreditMilli_ / 1000 <= static_cast<int64_t>(reserveBytes_)) return false;
-        if (lastOverflowMs_ != UINT32_MAX &&
-            Elapsed(lastOverflowMs_, nowMs) < 1000u) return false;
-
-        if (!telemetry.validLoss) return true;
-        if (telemetry.lossPermille < 10u) return true;
-        if (pressure_ == BudgetPressure::Critical && telemetry.lossPermille < 100u) return true;
-        return !RetryFresh(nowMs, telemetry.retrySampleAt);
     }
 
     BudgetConfig config_{};
     BudgetTelemetry telemetry_{};
     BudgetPressure pressure_ = BudgetPressure::Clear;
     uint32_t lastNowMs_ = 0;
-    uint64_t burstBytes_ = 4u * 1200u;
-    uint64_t debtFloorBytes_ = 4u * 1200u;
-    uint64_t reserveBytes_ = 2u * 1200u;
+    uint32_t stretch_ = StretchNormal;
+    uint8_t signals_ = SignalNone;
     uint64_t bulkCapBytes_ = 2u * 1200u;
-    int64_t mainCreditMilli_ = 0;
     int64_t bulkCreditMilli_ = 0;
     uint64_t queueBytes_ = 0;
     uint64_t chargedBytes_ = 0;
     uint64_t deferredCount_ = 0;
     uint64_t shedCount_ = 0;
-    uint64_t overflowBytes_ = 0;
+    uint64_t offeredSinceAdvance_ = 0;
+    double offeredBytesPerSecond_ = 0.0;
     uint32_t pressureTransitions_ = 0;
-    uint32_t lastOverflowMs_ = UINT32_MAX;
-    uint32_t recoverySinceMs_ = UINT32_MAX;
+    uint32_t queueSinceMs_ = UINT32_MAX;
+    uint32_t rttMinCurrent_ = UINT32_MAX, rttMinPrevious_ = UINT32_MAX, rttWindowAtMs_ = 0, baseRttMs_ = 0;
 };
 
 }

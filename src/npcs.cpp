@@ -45,6 +45,9 @@ struct LastSent { net::NpcRecord record; uint32_t at = 0, movingUntil = 0; };
 std::unordered_map<std::string, LastSent> lastSent;
 std::unordered_map<std::string, npcsend::State> recipientNpcs[net::MaxPlayers];
 uint32_t recipientGenerations[net::MaxPlayers] = {};
+npcsend::InitialPacer initialPacers[net::MaxPlayers];
+npcsend::Stats sendStats;  // host: achieved update intervals per tier since the last SYNCNPC report
+uint32_t sendStatsNpcs = 0;
 constexpr uint32_t StaleAfter = npcsend::MirrorStaleMs;  // hold presentation and reject stale contacts
 bool Changed(net::NpcRecord const& a, net::NpcRecord const& b)
 {
@@ -753,6 +756,9 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                 net::RecordNpcSendDecision(decision);
     };
     std::vector<pose::Bone> bones;
+    uint32_t stretchOf[net::MaxPlayers];
+    for (uint8_t id = 0; id < net::MaxPlayers; ++id)
+        stretchOf[id] = id >= 2 ? net::NpcStretchPermille(id) : npcsend::StretchNormal;
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity const& npc = all.GetAt(i);
         eCEntity* instance = npc.GetInstance();
@@ -958,6 +964,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             input.contact = r.contact != 0;
             input.moving = moving;
             input.nearby = false; // distance-band hysteresis, not the whole interest radius
+            input.stretchPermille = stretchOf[id];
             const npcsend::Result result = npcsend::Evaluate(state, input);
             if (result.decision == npcsend::Decision::Outside) {
                 net::RecordNpcSendDecision(net::NpcSendDecision::SkippedFar);
@@ -975,21 +982,28 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                     net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
                 } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
             } else {
-                if (!npcsend::CanQueue(id, input, result)) {
-                    net::RecordNpcSendDecision(net::NpcSendDecision::SkippedBudget);
+                // No bandwidth gate: every due update is sent. Only a first update (a join or world-entry burst) is spread over
+                // time, and only for NPCs this recipient has never had.
+                if (result.decision == npcsend::Decision::Initial && !initialPacers[id].Admit(r.sent, stretchOf[id])) {
+                    ++sendStats.paced;
+                    net::RecordNpcSendDecision(net::NpcSendDecision::SkippedPaced);
                     continue;
                 }
                 const bool queued = posed
                     ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, result.essential,
                                          static_cast<uint8_t>(npcsend::PresentationInterval(state, input)))
                     : net::SendNpcsTo(id, &r, 1, result.essential);
+                const uint32_t previousSentAt = state.sentAt;
+                const bool onSchedule = r.sent - state.idealAt >= npcsend::Stretched(npcsend::Interval(result.tier), stretchOf[id]);
                 if (queued && npcsend::Commit(state, input, result.decision)) {
+                    sendStats.Record(result.decision, result.tier, r.sent - previousSentAt, stretchOf[id], onSchedule);
                     if (existing == states.end()) states.emplace(key, std::move(fresh));
                     net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
                 } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
             }
         }
     }
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id) initialPacers[id].Poll(net::Now());
     for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
         auto& states = recipientNpcs[id];
         for (auto it = states.begin(); it != states.end();) {
@@ -1093,7 +1107,8 @@ void HostTick()
     if (net::JoinCount() != knownJoins) {  // a new client needs every motion name again
         knownJoins = net::JoinCount();
         namesSent.clear();
-        for (auto& states : recipientNpcs) states.clear();
+        // Only the newcomer's per-recipient send state is reset (PeerGeneration below); resending every NPC to the
+        // established recipients was part of the join burst.
         for (auto const& entry : forceHistory) for (auto const& force : entry.second) net::SendRagdoll(force);
     }
     // Players in this world: the host's hero and every remote player here.
@@ -1112,6 +1127,7 @@ void HostTick()
         if (!net::InWorld(static_cast<uint8_t>(id)) || !remotes[id].connected || recipientGenerations[id] != generation) {
             recipientNpcs[id].clear();
             recipientGenerations[id] = generation;
+            initialPacers[id].Reset();
         }
         if (!remotes[id].connected) { joinedAt[id] = 0; continue; }
         anyClient = true;
@@ -4146,7 +4162,7 @@ void MirrorStats(LogFn log)
 
 void SyncReport(LogFn log)
 {
-    char line[400];
+    char line[800];
     unsigned accepted, rejected, stale;
     net::NpcReplicationCounts(accepted, rejected, stale);
     Format(line, "SYNCNPC role=%s simulated=%zu mirrors=%zu takebacks=%u awaiting_drive=%u awaiting_alignment=%u "
@@ -4200,6 +4216,51 @@ void SyncReport(LogFn log)
            shownTracks ? static_cast<unsigned>(shownLagSum / shownTracks) : 0u, shownLagMax,
            arrivalAgeMax, transitExcessMax, tracked ? jitterSum / tracked : 0.0, jitterMax, underruns);
     log(line);
+    if (net::IsHost()) {
+        // Achieved update interval per scheduling tier since the previous report (interval-paced updates only), and how many
+        // left later than the tier's staleness limit. Edges are immediate essential/motion updates, heartbeats are quiet
+        // 1 s refreshes of unchanged NPCs. With no bandwidth gate overdue should stay 0 apart from frame hitches.
+        static char const* const names[3] = {"fast", "ordinary", "slow"};
+        char streams[360] = "";
+        size_t used = 0;
+        for (unsigned tier = 0; tier < 3; ++tier) {
+            auto const& s = sendStats.tiers[tier];
+            const int written = std::snprintf(streams + used, sizeof(streams) - used, " %s=n:%u,min:%u,avg:%.1f,max:%u,overdue:%u",
+                names[tier], s.count, s.count ? s.minMs : 0u, s.AverageMs(), s.maxMs, s.overdue);
+            if (written > 0 && used + static_cast<size_t>(written) < sizeof(streams)) used += static_cast<size_t>(written);
+        }
+        auto const& pacer = initialPacers[2];
+        Format(line, "SYNCSTREAM role=host npcs=%zu%s edges=%u heartbeats=%u initials=%u paced=%u join_bursts=%u "
+                     "last_join_burst_ms=%u last_join_burst_npcs=%u limits_ms=%u/%u/%u stretch_permille=%u",
+               owned.size(), streams, sendStats.edges, sendStats.heartbeats, sendStats.initials, sendStats.paced, pacer.bursts,
+               pacer.lastBurstMs, pacer.lastBurstNpcs, npcsend::FastMaxStaleMs, npcsend::OrdinaryMaxStaleMs,
+               npcsend::SlowMaxStaleMs, net::NpcStretchPermille(2));
+        log(line);
+        sendStats = npcsend::Stats{};
+    } else {
+        // What this mirror set actually received: spacing of arrivals, and how many mirrors have not heard anything lately.
+        unsigned gaps = 0, gapMin = UINT32_MAX, gapMax = 0, older150 = 0, older400 = 0, older1000 = 0, live = 0;
+        uint64_t gapSum = 0;
+        for (auto& entry : mirrors) {
+            auto& track = entry.second.body.track;
+            if (!track.count) continue;
+            ++live;
+            const uint32_t age = now - track.lastArrived;
+            if (age > 150) ++older150;
+            if (age > 400) ++older400;
+            if (age > 1000) ++older1000;
+            gaps += track.gapCount;
+            gapSum += track.gapSumMs;
+            if (track.gapCount) gapMin = std::min(gapMin, track.gapMinMs);
+            gapMax = std::max(gapMax, track.gapMaxMs);
+            track.gapCount = 0; track.gapSumMs = 0; track.gapMinMs = UINT32_MAX; track.gapMaxMs = 0;
+        }
+        Format(line, "SYNCSTREAM role=client mirrors=%u updates=%u gap_min_ms=%u gap_avg_ms=%.1f gap_max_ms=%u "
+                     "older_150ms=%u older_400ms=%u older_1000ms=%u",
+               live, gaps, gaps ? gapMin : 0u, gaps ? static_cast<double>(gapSum) / gaps : 0.0, gapMax, older150, older400,
+               older1000);
+        log(line);
+    }
     Format(line, "SYNCRAGDOLL hooked=%d forces_sent=%u forces_received=%u forces_applied=%u forces_late=%u ragdolls_started=%u not_ready=%u gravity_deaths=%u",
            originalAddForce ? 1 : 0, ragdollForcesSent, ragdollForcesReceived, ragdollForcesApplied, ragdollForcesLate,
            ragdollsStarted, ragdollsNotReady, ragdollGravityDeaths);
