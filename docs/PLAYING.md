@@ -364,8 +364,25 @@ Friendly-fire protection applies before local hit feedback as well as before aut
    own **rejoin template** through the game's normal load path, then receives the host's world state and its
    account-exact saved character. A connection-only rejoin in the same live world keeps that player's live character.
 
+**Automatic client entry (`client_autoload`):** the host's reliable world announcement is the load event; there is no
+protocol or save-transfer change. With `client_autoload = on` (the default, set in each client's own `g3together.ini`; the
+host's INI ignores it) the client waits until the host's world is playable and has stopped changing, shows
+*"The host's world is ready. Entering automatically in N s with your saved character. Press Esc to stay in the menu."*
+(4 seconds, in the menu or as a HUD notice; rapid host loads restart the countdown, so only the latest world is
+entered) and then enters it with its own account character, or a clearly worded fresh hero if the account has no record,
+never the host's hero. This works while playing (the old world is replaced once dialogue, trade, a pending
+co-op save result and native loading are done), from the title screen, and for a client that joins after the host has
+already loaded; while the host is in its menu or loading the client waits. **Esc** during the countdown, or choosing
+**New Game** yourself, cancels it for that host world only (the next host load asks again); `client_autoload = off`
+disables it, then **New Game** (also in the in-game menu) enters on demand. Before the rejoin template exists (first
+launch of Gothic 3) the automatic entry is the same first New Game you would choose; it also saves the template.
+A failed start is retried after 3 s and 8 s, then reported; 60 seconds without the host's admission shows a notice and
+never leaves the world. A client already playing in the host's world (initial startup, same-epoch reconnect) is
+never restarted, and a protocol/install mismatch never enters.
+
 **Client rejoin template:** the first time you choose **New Game** after launching Gothic 3 (also the way to
-join the very first time), the game saves the fresh starting world once into your normal save folder as the
+join the very first time; with `client_autoload = on` and a joined host world that first New Game is started for you),
+the game saves the fresh starting world once into your normal save folder as the
 slot `G3T_client_template` (three small files; nothing else is created, replaced or deleted, and it is never
 sent over the network). It is made on your own machine from your own New Game, so it matches your installed
 game; it is rebuilt automatically if the game files change. Later host loads/new campaigns use it to replace

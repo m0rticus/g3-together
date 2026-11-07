@@ -77,6 +77,15 @@ enum Message
     ClientRejoinFailed,
     ClientMenuNewGame,
     ClientRestartToRejoin,
+    ClientAutoloadWaitHost,
+    ClientAutoloadCountdown,
+    ClientAutoloadCountdownFresh,
+    ClientAutoloadEntering,
+    ClientAutoloadCanceled,
+    ClientAutoloadRetry,
+    ClientAutoloadGaveUp,
+    ClientAutoloadEntered,
+    ClientAutoloadStalled,
     MessageCount
 };
 

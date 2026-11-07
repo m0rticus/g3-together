@@ -131,23 +131,43 @@ void NativeFixtures()
 {
     using namespace g3t::saving::native;
     std::vector<uint8_t> image(0xb0000, 0xcc);
-    for (auto const& site : {native::Command, native::Loader, native::MenuGate, native::Button}) {
+    const auto fill = [&](Site const& site) {
         const auto bytes = Decode(site.bytes);
         for (size_t i = 0; i < bytes.size(); ++i) image[site.hint + i] = bytes[i] < 0 ? 0 : static_cast<uint8_t>(bytes[i]);
-    }
+    };
+    for (auto const& site : {native::Command, native::Loader, native::MenuGate, native::Button, native::Confirmed}) fill(site);
+    fill(Sites[4]); // FileManagerGetter: the confirmed branch must pass this very singleton
+    const uint32_t singleton = 0x10403c20;
+    Put(image, Sites[4].hint + 28, singleton);
+    Put(image, native::Confirmed.hint + native::ConfirmedSingleton, singleton);
     image[0x90a1b] = 0xe8;
     Put(image, 0x90a1c, native::Loader.hint - 0x90a20);
+    image[native::ConfirmedCall] = 0xe8;
+    Put(image, native::ConfirmedCall + 1, native::Confirmed.hint - (native::ConfirmedCall + 5));
     assert(native::Matches(image.data(), image.size()));
-    for (auto const& site : {native::Command, native::Loader, native::MenuGate, native::Button}) {
+    for (auto const& site : {native::Command, native::Loader, native::MenuGate, native::Button, native::Confirmed}) {
         const auto bytes = Decode(site.bytes);
         for (size_t i = 0; i < bytes.size(); ++i) {
-            image[site.hint + i] ^= 1;
-            assert(native::Matches(image.data(), image.size()) == (bytes[i] < 0));
-            image[site.hint + i] ^= 1;
+            const size_t at = site.hint + i;
+            // Wildcards that carry a verified relation (call edge, singleton operand) are not free.
+            const bool linked = (at >= 0x90a1c && at < 0x90a20) ||
+                                (at >= native::Confirmed.hint + native::ConfirmedSingleton &&
+                                 at < native::Confirmed.hint + native::ConfirmedSingleton + 4);
+            image[at] ^= 1;
+            assert(native::Matches(image.data(), image.size()) == (bytes[i] < 0 && !linked));
+            image[at] ^= 1;
         }
     }
     image[0x90a1c] ^= 1;
     assert(!native::Matches(image.data(), image.size()));
+    image[0x90a1c] ^= 1;
+    image[native::ConfirmedCall + 1] ^= 1; // the command must call exactly the confirmed branch
+    assert(!native::Matches(image.data(), image.size()));
+    image[native::ConfirmedCall + 1] ^= 1;
+    image[Sites[4].hint + 28] ^= 1; // a different singleton than the file-manager getter's
+    assert(!native::Matches(image.data(), image.size()));
+    image[Sites[4].hint + 28] ^= 1;
+    assert(native::Matches(image.data(), image.size()));
     assert(!native::Matches(image.data(), 10));
     assert(!native::Matches(nullptr, 0));
     static_assert(native::CommandStolen == 5 && native::LoaderStolen == 7);

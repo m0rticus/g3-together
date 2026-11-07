@@ -55,6 +55,9 @@ struct Config
     int friendlyFire = 0;
     float npcDamage = 1.0f;
     float npcHp = 1.0f;
+    // client_autoload = on | off (persist.cpp, client only, local choice): when the host loads a save or starts a campaign the
+    // client returns to its menu and, after a cancelable countdown, enters the host's world with its own account character.
+    bool clientAutoload = true;
 };
 
 // Reads <game dir>\g3together.ini (key = value lines, # comments). Missing file: defaults, host role.

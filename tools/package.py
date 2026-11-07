@@ -62,6 +62,9 @@ partner_key = PAGEDOWN
 friendly_fire = 0
 # npc_damage = 1.0
 # npc_hp = 1.0
+# When the host loads a save or starts a campaign, the joining player is brought back to the menu and enters your world
+# again automatically (its own saved character; a fresh hero only if it has none). This is each client's own client_autoload
+# choice in its INI (default on); the host's INI ignores it.
 """
 CLIENT_INI = """# G3 Together: this player joins the host.
 # This package speaks protocol 77 with host-managed saves and guarded bone packing: both players need this same package.
@@ -95,6 +98,11 @@ partner_key = PAGEDOWN
 friendly_fire = 0
 # npc_damage = 1.0
 # npc_hp = 1.0
+# on (default): when the host loads a save or starts a campaign you return to the menu and, after a 4 s countdown, enter the
+# host's world again by yourself with your own account character (a fresh hero only if you have none, never the host's hero).
+# Esc during the countdown (or choosing New Game yourself) keeps you in the menu until the host loads again; off: always
+# choose New Game yourself.
+# client_autoload = off
 """
 
 

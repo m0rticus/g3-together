@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "config.h"
 #include "client_rejoin.h"
+#include "client_autoload.h"
 #include "containers.h"
 #include "crashlog.h"
 #include "dialogaudio.h"
@@ -17,6 +18,7 @@
 #include "lobby.h"
 #include "net.h"
 #include "npcs.h"
+#include "partner.h"
 #include "remote.h"
 #include "saving_native.h"
 #include "saving_policy.h"
@@ -90,6 +92,14 @@ void (*worldCleanup)() = nullptr;
 bool rejoinHooks = false, nativeNewGame = false, requestCharacterAgain = false;
 bool clientWorldEntered = false;
 rejoin::tmpl::Capture templateCapture;
+// Client autoload (client_autoload.h decides; EnterHostWorld / the first New Game perform). An entry queued by a host epoch
+// change waits for the controller's approval; a manual one (New Game command) does not.
+autoload::Controller autoloadState;
+autoload::Status autoloadStatus = autoload::Status::Off;
+uint32_t autoloadRemainingMs = 0, menuButtonSeen = 0, routeCheckedAt = 0;
+bool entryManual = false, entryApproved = false, autoloadAwaiting = false, routeAvailable = false, escWasDown = false;
+using ConfirmedStartFn = bool(__cdecl*)();
+ConfirmedStartFn confirmedStart = nullptr;
 unsigned menuCommandDepth = 0;
 rejoin::Wait rejoinWait = rejoin::Wait::None;
 bool hostAdmissionAck = false;
@@ -771,6 +781,17 @@ void SaveFailure(char const* code)
     if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
     else hud::MenuLine(text);
 }
+bool AutoloadAvailable()
+{
+    return !net::IsHost() && GetConfig().clientAutoload && rejoinHooks && !ai::ShuttingDown();
+}
+void AutoloadCancel(char const* by, bool notify = false)
+{
+    if (autoloadState.Held()) return;
+    autoloadState.Cancel();
+    Logf("persist: client autoload canceled epoch=%08x by=%s; no automatic entry until the host's world changes", hostWorld.epoch, by);
+    if (notify) Notice(i18n::ClientAutoloadCanceled);
+}
 void QueueClientReturn()
 {
     clientRejoin.Queue();
@@ -785,11 +806,19 @@ void __fastcall NewGameCommandDetour(void* self, void*)
         originalNewGameCommand(self);
         return;
     }
+    AutoloadCancel("manual New Game"); // the player chose; autoload never races a menu command or its dialog
     if (gCSession::GetInstance().GetPlayer() || clientRejoin.pending || captured.valid || requestPending) {
         Logf("persist: client enter state=queued reason=new-game-command epoch=%08x", hostWorld.epoch);
+        entryManual = true;
         QueueClientReturn();
         Notice(i18n::ClientReturningToMenu);
         return; // The native player-present branch terminates Gothic 3.
+    }
+    if (clientWorldEntered && HostWorldEntryAvailable()) {
+        // Title screen after this process entered a world: the native New Game would be refused, enter through the template.
+        entryManual = true;
+        if (EnterHostWorld("new-game-command") != EnterResult::Unavailable) Notice(i18n::ClientReturningToMenu);
+        return;
     }
     ++menuCommandDepth;
     originalNewGameCommand(self);
@@ -1554,8 +1583,11 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
             hostWorld.kind != net::KindMenu, gCSession::GetInstance().GetPlayer() != nullptr, clientRejoin.pending);
         if (replacing) {
             Logf("persist: client enter state=queued reason=host-world-changed epoch=%08x->%08x", hostWorld.epoch, note.epoch);
-            QueueClientReturn(); Notice(i18n::ClientHostWorldChanged, true);
+            QueueClientReturn();
+            // Autoload: the entry still needs this epoch's countdown (and the config/cancel decision); otherwise the player enters manually.
+            Notice(AutoloadAvailable() ? i18n::ClientHostWorldChanged : i18n::ClientChooseNewGame, true);
         }
+        entryApproved = autoloadAwaiting = false; // a newer epoch restarts the countdown of an automatic entry not yet started
         if (captured.valid || requestPending) Notice(i18n::ClientSaveCanceledByWorld, true);
         captured = {}; requestPending = false; receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
         needsNewHero = false; restoreFailed = false; synced = 0; ownCharacterReady = false; hostAdmissionAck = false;
@@ -1742,6 +1774,167 @@ bool ApplyCharacter(Bytes const& bytes, saving::Key const& key)
     if (ok) ++recordsApplied;
     return ok;
 }
+char const* AutoloadName(autoload::Status status)
+{
+    using S = autoload::Status;
+    switch (status) {
+    case S::Off: return "off";
+    case S::NotJoined: return "not-joined";
+    case S::Refused: return "refused";
+    case S::HostLoading: return "host-loading";
+    case S::WaitRecord: return "wait-record";
+    case S::Busy: return "busy";
+    case S::NoRoute: return "no-route";
+    case S::InWorld: return "in-world";
+    case S::Countdown: return "countdown";
+    case S::Retry: return "retry";
+    case S::Entering: return "entering";
+    case S::Admitting: return "admitting";
+    case S::Stalled: return "stalled";
+    case S::Idle: return "idle";
+    case S::Held: return "held";
+    case S::GaveUp: return "gave-up";
+    }
+    return "?";
+}
+bool RecordKnown()
+{
+    return receivedNote.epoch == hostWorld.epoch && receivedWelcome == net::WelcomeSerial() &&
+           (!receivedRecord.empty() || needsNewHero);
+}
+// First entry of this launch, before a rejoin template exists: the native New Game a confirmed click starts.
+bool FirstEntryPossible()
+{
+    return confirmedStart && worldCleanup && !clientWorldEntered;
+}
+autoload::Snapshot AutoloadSnapshot(uint32_t now)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    autoload::Snapshot s;
+    s.enabled = AutoloadAvailable();
+    s.joined = net::Joined();
+    s.refused = *net::RefusalReason() != 0;
+    s.epoch = hostWorld.epoch;
+    s.hostPlayable = hostWorld.kind != net::KindMenu;
+    s.localWorld = game.GetPlayer() != nullptr || game.IsGameRunning();
+    s.queued = clientRejoin.pending && !entryManual && !entryApproved;
+    s.admitted = hostWorld.epoch && ownCharacterReady && synced == hostWorld.epoch && net::InWorld(net::LocalId());
+    s.busy = nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth || captured.valid || requestPending;
+    s.recordKnown = RecordKnown();
+    if (s.enabled && s.joined && s.epoch && s.hostPlayable && !s.admitted) {
+        // The template check reads files: once a second, and only while it can matter.
+        if (!routeCheckedAt || now - routeCheckedAt >= 1000) {
+            routeCheckedAt = now ? now : 1;
+            routeAvailable = HostWorldEntryAvailable();
+        }
+        s.routeAvailable = routeAvailable || (FirstEntryPossible() && !s.localWorld);
+        const bool menuReady = manager && manager->IsMenuOpen() && menuButtonSeen && now - menuButtonSeen < 2500;
+        s.entryReady = s.queued || (!s.localWorld && menuReady);
+    }
+    return s;
+}
+void CountdownText(wchar_t* buffer, size_t size, unsigned seconds)
+{
+    _snwprintf_s(buffer, size, _TRUNCATE,
+                 i18n::Text(needsNewHero ? i18n::ClientAutoloadCountdownFresh : i18n::ClientAutoloadCountdown), seconds);
+}
+void NoteAutoload(autoload::Decision const& decision)
+{
+    autoloadRemainingMs = decision.remainingMs;
+    if (decision.status == autoloadStatus) return;
+    autoloadStatus = decision.status;
+    Logf("persist: client autoload status=%s epoch=%08x kind=%u entries=%u queued=%d record=%d", AutoloadName(decision.status),
+         hostWorld.epoch, hostWorld.kind, autoloadState.Entries(), clientRejoin.pending ? 1 : 0, RecordKnown() ? 1 : 0);
+    using S = autoload::Status;
+    if (decision.status == S::Stalled) Notice(i18n::ClientAutoloadStalled, true);
+    else if (decision.status == S::GaveUp) Notice(i18n::ClientAutoloadGaveUp, true);
+    else if (decision.status == S::HostLoading && clientRejoin.pending && gCSession::GetInstance().IsGameRunning())
+        hud::Message(hud::Info, i18n::Text(i18n::ClientAutoloadWaitHost)); // frozen stale world: the menu line is not visible
+    else if (decision.status == S::Countdown && gCSession::GetInstance().IsGameRunning()) {
+        // The stale world is frozen (queued entry): the menu line is not visible, so say it once on the HUD.
+        wchar_t text[500] = {};
+        CountdownText(text, 500, autoload::CountdownMs / 1000);
+        hud::Message(hud::Info, text);
+    }
+}
+// The first native New Game of this launch (no template yet): synchronous, through NewGameDetour's guard.
+bool FirstEntryNow(uint32_t now)
+{
+    auto& game = gCSession::GetInstance();
+    if (!FirstEntryPossible() || clientRejoin.pending || game.GetPlayer() || game.IsGameRunning() || !FileManager(true)) {
+        Log("persist: client autoload first entry refused; native state not ready");
+        autoloadState.Entered(false, now);
+        return false;
+    }
+    Logf("persist: client autoload entering host world epoch=%08x via the first native New Game (no template yet)", hostWorld.epoch);
+    hud::MenuLine(i18n::Text(i18n::ClientAutoloadEntering));
+    clientRejoin.Left(); // no player exists: an older freshness cannot authorize this entry
+    confirmedStart();
+    const bool ok = clientRejoin.fresh && !clientRejoin.failed;
+    autoloadState.Entered(ok, GetTickCount());
+    Logf("persist: client autoload first entry %s epoch=%08x entries=%u", ok ? "started" : "failed", hostWorld.epoch, autoloadState.Entries());
+    if (ok) Notice(i18n::ClientAutoloadEntered);
+    return true;
+}
+// Outer module boundary (before FrameScope): never inside ENet dispatch, native load/save, nested frames or menu commands.
+// Approves queued template entries (the transition then runs them at its own safe boundary) and starts queued-less ones.
+bool ProcessAutoload()
+{
+    if (nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth) return false;
+    const uint32_t now = GetTickCount();
+    if (autoloadAwaiting && !clientRejoin.pending) { // the approved entry ran (or was dropped): learn its outcome
+        autoloadAwaiting = entryApproved = false;
+        const bool ok = clientRejoin.fresh && !clientRejoin.failed;
+        autoloadState.Entered(ok, now);
+        Logf("persist: client autoload entry %s epoch=%08x entries=%u", ok ? "started" : "failed", hostWorld.epoch, autoloadState.Entries());
+        if (ok) Notice(i18n::ClientAutoloadEntered);
+    }
+    const bool escDown = partner::Focused() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    if (escDown && !escWasDown && autoload::Cancelable(autoloadStatus)) AutoloadCancel("Esc", true);
+    escWasDown = escDown;
+    const auto decision = autoloadState.Step(AutoloadSnapshot(now), now);
+    NoteAutoload(decision);
+    if (decision.status == autoload::Status::NoRoute && clientRejoin.pending && !entryManual && !entryApproved &&
+        !HostWorldEntryAvailable()) {
+        // No way back in: let the transition report it and release the frozen world instead of waiting forever.
+        entryApproved = true;
+        return false;
+    }
+    if (decision.action != autoload::Action::Enter) return false;
+    if (HostWorldEntryAvailable()) {
+        if (!clientRejoin.pending) {
+            const auto queued = EnterHostWorld("autoload");
+            if (queued != EnterResult::Queued && queued != EnterResult::AlreadyQueued) {
+                autoloadState.Entered(false, now);
+                return false;
+            }
+        }
+        entryApproved = autoloadAwaiting = true;
+        Logf("persist: client autoload approved entry epoch=%08x attempt=%u record=%s", hostWorld.epoch, autoloadState.Entries() + 1,
+             needsNewHero ? "none (fresh hero)" : RecordKnown() ? "own" : "pending");
+        return false; // ProcessClientTransition continues and runs the entry as soon as its boundary is quiet
+    }
+    return FirstEntryNow(now);
+}
+wchar_t const* AutoloadMenuText(wchar_t* buffer, size_t size)
+{
+    using S = autoload::Status;
+    if (!AutoloadAvailable()) return nullptr;
+    const unsigned seconds = (autoloadRemainingMs + 999) / 1000;
+    switch (autoloadStatus) {
+    case S::HostLoading:
+    case S::WaitRecord: return i18n::Text(i18n::ClientAutoloadWaitHost);
+    case S::Countdown: CountdownText(buffer, size, seconds); return buffer;
+    case S::Retry:
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::ClientAutoloadRetry), seconds);
+        return buffer;
+    case S::Held: return i18n::Text(i18n::ClientAutoloadCanceled);
+    case S::GaveUp: return i18n::Text(i18n::ClientAutoloadGaveUp);
+    case S::NoRoute: return i18n::Text(i18n::ClientRestartToRejoin);
+    default: return nullptr;
+    }
+}
 void StatusHints()
 {
     static bool wasJoined = false, everJoined = false, unreachableHinted = false, menuSet = false;
@@ -1792,11 +1985,17 @@ void StatusHints()
     auto* manager = gCSession::GetInstance().GetGUIManager();
     const bool inMenu = manager && manager->IsMenuOpen();
     const uint32_t trying = net::ConnectingFor();
-    if (!config.host && rejoinHooks && !clientRejoin.pending)
-        hud::ClientNewGameEnabled(rejoin::MenuEnabled(true, rejoinHooks, nativeLoadDepth || nativeSaveDepth));
+    if (!config.host && rejoinHooks && !clientRejoin.pending) {
+        if (hud::ClientNewGameEnabled(rejoin::MenuEnabled(true, rejoinHooks, nativeLoadDepth || nativeSaveDepth))) menuButtonSeen = now ? now : 1;
+    }
+    wchar_t autoloadBuffer[700] = {};
+    wchar_t const* autoloadText = nullptr;
     if (!running || inMenu) {
         if (!refusal.empty()) {
             if (hud::MenuLine(refusal.c_str())) menuSet = true;
+        } else if (!config.host && !(clientRejoin.pending && (entryManual || entryApproved)) &&
+                   (autoloadText = AutoloadMenuText(autoloadBuffer, 700)) != nullptr) {
+            if (hud::MenuLine(autoloadText)) menuSet = true;
         } else if (!config.host && clientRejoin.pending) {
             const auto hint = rejoinWait == rejoin::Wait::Save ? i18n::ClientRejoinWaitSave :
                               rejoinWait == rejoin::Wait::Interaction ? i18n::ClientRejoinWaitTrade : i18n::ClientReturningToMenu;
@@ -1907,6 +2106,7 @@ bool ProcessClientTransition()
 {
     static uint32_t queuedAt = 0;
     if (net::IsHost() || !rejoinHooks || ai::ShuttingDown()) return false;
+    if (ProcessAutoload()) return true; // the first-entry New Game consumed this frame; otherwise only approves queued entries
     if (!clientRejoin.pending && !templateCapture.wanted) { queuedAt = 0; return false; }
     // Never inspect a half-built native world, including frames nested in confirmation dialogs.
     if (nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth) return false;
@@ -1943,6 +2143,9 @@ bool ProcessClientTransition()
                i18n::ClientReturningToMenu);
     }
     if (!worldCleanup || !clientRejoin.CanRetire(boundary)) return false;
+    // An automatic entry (host epoch change) waits for the autoload decision: countdown, Esc, config; manual ones do not.
+    if (!entryManual && !entryApproved) return false;
+    entryManual = entryApproved = false;
     const uint32_t startedAt = queuedAt;
     queuedAt = 0;
     if (rejoin::ChooseRoute(TemplateValid(), originalLoad != nullptr && FileManager(true) != nullptr) != rejoin::Route::Template) {
@@ -2165,7 +2368,10 @@ void Install()
         originalNewGame = reinterpret_cast<NewGameFn>(ai::JumpTo(nativeImage + rejoin::native::Loader.hint,
             reinterpret_cast<void*>(&NewGameDetour), rejoin::native::LoaderStolen));
         rejoinHooks = originalNewGameCommand && originalNewGame && pairedEnabled;
-        Logf("persist: client rejoin native hooks ready=%d; menu player gate and process-exit branch guarded", rejoinHooks ? 1 : 0);
+        // Called, never hooked: the confirmed-click branch that Matches() verified (bytes, call edge and file-manager operand).
+        if (rejoinHooks) confirmedStart = reinterpret_cast<ConfirmedStartFn>(nativeImage + rejoin::native::Confirmed.hint);
+        Logf("persist: client rejoin native hooks ready=%d; menu player gate and process-exit branch guarded; autoload=%s", rejoinHooks ? 1 : 0,
+             rejoinHooks && GetConfig().clientAutoload ? "on" : "off");
     } else if (!net::IsHost()) {
         clientRejoin.failed = true;
         Log("persist: client rejoin unavailable; native menu/loader ABI mismatch");

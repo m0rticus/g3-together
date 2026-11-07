@@ -95,6 +95,15 @@ inline constexpr Site Command = {
 inline constexpr Site Loader = {
     "HUD.NewGame", 0xa9740, "8b44240483ec1883780400752c8b0d????????8b11526aff6a006a0068????????6a03", nullptr
 };
+// The command's confirmed branch (IDYES): a no-argument cdecl that builds/gets the HUD file-manager singleton and calls the
+// loader. Autoload calls it to start what a confirmed click starts, without the modal dialog; it is not hooked.
+inline constexpr Site Confirmed = {
+    "Menu.NewGame confirmed", 0x909e0,
+    "b8010000008405????????75290905????????33c068????????c705????????????????a3????????a3????????e8????????83c40468????????e8????????c3",
+    nullptr
+};
+constexpr uint32_t ConfirmedCall = 0x909ca; // Command's call to Confirmed
+constexpr size_t ConfirmedSingleton = 0x37;  // Confirmed's push of the HUD file-manager singleton (the loader's argument)
 constexpr size_t CommandStolen = 5, LoaderStolen = 7;
 // These identify the client-only control and the dangerous native player-present branch.
 inline constexpr Site MenuGate = {
@@ -109,12 +118,17 @@ inline constexpr Site Button = {
 inline bool Matches(uint8_t const* image, size_t size)
 {
     if (!image) return false;
-    for (auto const& site : {Command, Loader, MenuGate, Button}) {
+    for (auto const& site : {Command, Loader, MenuGate, Button, Confirmed}) {
         const size_t count = std::strlen(site.bytes) / 2;
         if (!saving::native::Range(size, site.hint, count) ||
             !saving::native::Matches(image + site.hint, count, site.bytes)) return false;
     }
-    return saving::native::Calls(image, size, 0x90a1b, Loader.hint);
+    // The confirmed branch must hand the loader the very singleton FileManagerGetter returns.
+    const size_t getter = saving::native::Sites[4].hint;
+    return saving::native::Calls(image, size, 0x90a1b, Loader.hint) &&
+           saving::native::Calls(image, size, ConfirmedCall, Confirmed.hint) &&
+           saving::native::Range(size, getter, 32) && saving::native::Range(size, Confirmed.hint, ConfirmedSingleton + 4) &&
+           saving::native::Word(image, Confirmed.hint + ConfirmedSingleton) == saving::native::Word(image, getter + 28);
 }
 }
 }

@@ -124,6 +124,10 @@ Config const& LoadConfig()
                 config.networkBudgetKib = static_cast<int>(kib);
             else Logf("config: network_budget_kib %s out of 64-4096; using %d", value, config.networkBudgetKib);
         }
+        else if (!_stricmp(key, "client_autoload")) {
+            config.clientAutoload = _stricmp(value, "off") != 0;
+            if (config.clientAutoload && _stricmp(value, "on")) Logf("config: unknown client_autoload '%s', using on", value);
+        }
         else if (!_stricmp(key, "listener_textbox")) {
             config.listenerTextbox = !_stricmp(value, "on");
             if (!config.listenerTextbox && _stricmp(value, "off")) Logf("config: unknown listener_textbox '%s', using off", value);
@@ -161,6 +165,8 @@ Config const& LoadConfig()
     Logf("config: role=%s name=Steam puppet_template=%s look=%s language=%s", config.host ? "host" : "client",
          config.puppetTemplate, *config.look ? config.look : "-", config.language);
     if (config.host) Logf("config: host_roi=%.0f host_sim=%s", config.hostRoi, config.hostSimElastic ? "elastic" : config.hostSimSpheres ? "spheres" : "off");
+    else Logf("config: client_autoload=%s (enter the host's world automatically after a host load; Esc cancels the countdown)",
+              config.clientAutoload ? "on" : "off");
     Logf("config: puppet_lead=%s motion_seek=%s listener_textbox=%s friendly_fire=%d npc_damage=%.2f npc_hp=%.2f",
          config.puppetLead ? "auto" : "off", config.motionSeek ? "on" : "off", config.listenerTextbox ? "on" : "off", config.friendlyFire, config.npcDamage, config.npcHp);
     Logf("config: movement_smoothing=%s (100 ms replica display buffer; local controls remain native)",

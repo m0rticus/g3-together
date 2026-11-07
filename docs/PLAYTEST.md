@@ -440,7 +440,8 @@ save folder gets one new slot, `G3T_client_template.*` (`.g3savcp`, `.g3savcpdat
 3. Host loads while the client is in the menu opened during play, in a dialogue/trade (deferral notice, then entry after closing),
    with a client save awaiting its result, and during the client's own loading screen: the entry waits for the boundary, no nested teardown, no crash.
 4. Choose **New Game** from the client's in-game menu: it queues the same template entry (no native process exit, no freeze). A **New Game**
-   from the title screen after a world was already entered in this launch is refused with the restart notice.
+   from the title screen after a world was already entered in this launch enters through the template too (or shows the restart notice when no
+   template exists); the native New Game is never run twice in a launch.
 5. Delete `G3T_client_template.*` in the isolated client profile (only those files), host-load: the client keeps its old world, shows the
    "restart Gothic 3 and choose New Game once" notice and logs `state=failed reason=no-template`; after a restart + New Game the template is rebuilt.
 6. A campaign with no record for the client's account: the template's fresh hero is used, never the host's hero; nothing overwrites the earlier record.
@@ -448,6 +449,32 @@ save folder gets one new slot, `G3T_client_template.*` (`.g3savcp`, `.g3savcpdat
    line (that line is printed only when a native world operation runs longer than 15 s and gives the main thread's module+RVA candidates).
    No native world transfer to/from the host is allowed; only the client's own template is loaded. Static policy/native-byte tests and the Release build
    do not establish these visual/native acceptance results.
+
+### Client autoload on host load (`client_autoload`)
+
+Human checks with the two isolated copies after deployment (client INI default `client_autoload = on`; automated tests only prove the
+decision policy and source/native-byte wiring). Never use the protected user save folder. Keep both logs; the log lines to look for are
+`persist: client autoload status=...`, `approved entry`, `entry started|failed`, `canceled ... by=Esc|manual New Game`.
+
+1. Client in the world, host loads a save. The client freezes the stale world (`client enter state=queued reason=host-world-changed`), shows the HUD
+   notice *"The host's world is ready. Entering automatically in 4 s with your saved character. Press Esc to stay in the menu."* once the host
+   world is playable, then `approved entry`, `state=cleanup`, `state=native-load`, `state=returned`, `entry started` and
+   `admission confirmed` on the host, with no click. The hero must be the account's saved character, never the host hero.
+2. Client at the title screen (start it after a previous launch made the template, or on the first launch with no template): same countdown in the
+   menu text, then the template entry (or, first launch only, `via the first native New Game`, which also saves the template).
+   Host starting a new campaign: *fresh hero* wording, and only the last of the three New Game epochs is entered.
+3. Host loads repeatedly (a second load within about 10 s): the countdown restarts for the newest epoch; no crash; `entries` never above 3 per epoch.
+4. Host quits to its menu: the client stays where it is (a played world is frozen and outside admission, with the notice *"Waiting for
+   the host's world..."*) without entering; when the host loads or starts a world the countdown starts by itself.
+5. Cancel: Esc during the countdown (menu text *"Automatic entry canceled..."*, log `canceled ... by=Esc`); the client stays in the menu
+   (or in the frozen stale world, outside admission). **New Game** then enters on demand (`by=manual New Game`). The next host load asks again.
+   Set `client_autoload = off`, restart the client: no countdown; the host load notice says to choose New Game, and New Game works.
+6. Client joins after the host already loaded (start the client last): once joined, the same countdown and entry.
+7. Edge states: host load while the client is in dialogue/trade (countdown, then the deferral notice until it closes), downed or dead (no delay),
+   awaiting a co-op save result, or inside its own New Game loading screen (finishes first, then the newer epoch is followed). A mismatched
+   install/protocol must refuse and never start an entry.
+8. Failure: delete the template files while a world was already entered (no route): *"restart Gothic 3 ..."* and the old world is released, not frozen.
+   An entered client the host never admits shows *"The host has not admitted you yet..."* once after 60 s and stays where it is.
 
 ### Targeting after deaths
 
