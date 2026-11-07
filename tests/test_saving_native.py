@@ -24,7 +24,7 @@ class SavingNativeTests(unittest.TestCase):
         )
         cls.addClassCleanup(cls.executable.unlink, missing_ok=True)
 
-    def test_unique_patterns_call_edges_and_singleton_validation(self):
+    def test_paired_save_recognizer_and_unique_native_patterns(self):
         subprocess.run([str(self.executable)], check=True, capture_output=True, text=True)
 
     def test_configured_real_dll_exports_patterns_and_aslr(self):
@@ -37,7 +37,7 @@ class SavingNativeTests(unittest.TestCase):
             args.extend(["--pup", pup])
         subprocess.run(args, check=True, capture_output=True, text=True)
 
-    def test_configured_pup_dll_callback_operands_and_relocations(self):
+    def test_configured_pup_dll_receiver_owner_operands_and_relocations(self):
         path = os.environ.get("G3T_PUP_DLL")
         if not path or not Path(path).is_file():
             self.skipTest("Set G3T_PUP_DLL to the read-only PUP companion paru_s2.dll")

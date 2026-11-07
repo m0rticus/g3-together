@@ -93,6 +93,11 @@ inline bool PupReceiver(uint8_t const* data, size_t size, uint32_t base)
            Word(data, 23) == base + 0x99510 && Word(data, 29) == base + 0x677a4 &&
            Word(data, 34) == base + 0x97578;
 }
+inline bool PupReceiverAt(uint8_t const* data, size_t size, uint32_t address, uint32_t base, uint32_t imageSize)
+{
+    return base && imageSize == PupImageSize && address >= base && address - base == PupReceiverRva &&
+           PupReceiver(data, size, base);
+}
 inline bool Calls(uint8_t const* image, size_t size, size_t at, size_t target)
 {
     if (!Range(size, at, 5) || image[at] != 0xe8 || target >= size) return false;

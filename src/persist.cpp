@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "config.h"
 #include "containers.h"
+#include "crashlog.h"
 #include "dialogaudio.h"
 #include "downed.h"
 #include "hero.h"
@@ -132,8 +133,8 @@ bool __stdcall SaveDetour(void* self, bCString const* name);
 bool __stdcall LoadDetour(void* self, bCString const* name);
 bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGfxImageData* image, void* metadata, GEU32 size);
 bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool nativeFlag);
-bool PupLoadEntry(unsigned char* entry);
-bool ReverifyNative();
+bool PupLoadEntry(unsigned char* entry, bool beforeUse = false);
+bool ReverifyNative(bool beforeUse = false);
 bool NativeReady();
 
 bool Readable(void const* address, size_t size)
@@ -344,7 +345,10 @@ bool KnownPup(HMODULE module)
     char path[MAX_PATH]{};
     std::vector<uint8_t> bytes;
     const DWORD length = module ? GetModuleFileNameA(module, path, MAX_PATH) : 0;
-    if (!length || length >= MAX_PATH || !ReadAll(path, bytes) || bytes.empty()) return false;
+    if (!length || length >= MAX_PATH || !ReadAll(path, bytes) || bytes.empty()) {
+        Logf("persist: unresolved WorldLoadGameFn PUP identity read path=%s error=%lu; paired saves off", path, GetLastError());
+        return false;
+    }
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     uint8_t digest[32]{};
@@ -363,46 +367,96 @@ bool KnownPup(HMODULE module)
     return true;
 }
 
-bool PupLoadEntry(unsigned char* entry)
+bool PupRefused(char const* stage, unsigned char* entry, uint32_t bridge, uint32_t receiver, bool beforeUse)
+{
+    const uintptr_t observed = receiver ? receiver : bridge ? bridge : reinterpret_cast<uintptr_t>(entry);
+    auto* at = reinterpret_cast<unsigned char const*>(observed);
+    char bytes[19] = "unreadable";
+    if (Readable(at, 9))
+        for (size_t i = 0; i < 9; ++i) Format(bytes + i * 2, 3, "%02x", at[i]);
+    Logf("persist: unresolved WorldLoadGameFn PUP phase=%s stage=%s entry=%p bridge=%08x receiver=%08x observed=%p live=%s; paired saves off",
+         beforeUse ? "before-use" : "install", stage, entry, bridge, receiver, at, bytes);
+    return false;
+}
+
+bool PupLoadEntry(unsigned char* entry, bool beforeUse)
 {
     uint32_t bridge = 0, receiver = 0;
     if (!Readable(entry, 6) ||
-        !saving::native::PupEntryTarget(entry, 6, reinterpret_cast<uintptr_t>(entry), bridge) ||
-        !Readable(reinterpret_cast<void const*>(bridge), 9) || !Executable(reinterpret_cast<void const*>(bridge)) ||
-        !saving::native::PupShimTarget(reinterpret_cast<uint8_t const*>(bridge), 9, bridge, receiver)) return false;
-    HMODULE pup = GetModuleHandleA("paru_s2.dll");
+        !saving::native::PupEntryTarget(entry, 6, reinterpret_cast<uintptr_t>(entry), bridge))
+        return PupRefused("entry", entry, bridge, receiver, beforeUse);
+    if (!Readable(reinterpret_cast<void const*>(bridge), 9) || !Executable(reinterpret_cast<void const*>(bridge)))
+        return PupRefused("shim-memory", entry, bridge, receiver, beforeUse);
+    if (!saving::native::PupShimTarget(reinterpret_cast<uint8_t const*>(bridge), 9, bridge, receiver))
+        return PupRefused("shim-bytes", entry, bridge, receiver, beforeUse);
+    HMODULE pup = nullptr;
+    // The callback's actual owner is authoritative, even before the main Script_paru DLL loads.
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(receiver), &pup) || !pup)
+        return PupRefused("receiver-module", entry, bridge, receiver, beforeUse);
     auto* image = reinterpret_cast<unsigned char*>(pup);
-    if (!GetModuleHandleA("Script_paru.dll") || !pup ||
-        receiver != reinterpret_cast<uintptr_t>(image) + saving::native::PupReceiverRva || !KnownPup(pup) ||
-        !Readable(image, sizeof(IMAGE_DOS_HEADER))) return false;
+    if (receiver < reinterpret_cast<uintptr_t>(image) || receiver - reinterpret_cast<uintptr_t>(image) != saving::native::PupReceiverRva)
+        return PupRefused("receiver-rva", entry, bridge, receiver, beforeUse);
+    if (!KnownPup(pup)) return PupRefused("companion-identity", entry, bridge, receiver, beforeUse);
+    if (!Readable(image, sizeof(IMAGE_DOS_HEADER)))
+        return PupRefused("companion-memory", entry, bridge, receiver, beforeUse);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
-        !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32))) return false;
+        !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32)))
+        return PupRefused("companion-header", entry, bridge, receiver, beforeUse);
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
     auto* sections = IMAGE_FIRST_SECTION(nt);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
         nt->OptionalHeader.SizeOfImage != saving::native::PupImageSize ||
         !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
-        !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections))) return false;
+        !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections)))
+        return PupRefused("companion-layout", entry, bridge, receiver, beforeUse);
     unsigned matches = 0;
     if (FindCode(image, saving::native::PupImageSize, sections, nt->FileHeader.NumberOfSections,
-                 saving::native::PupReceiverBytes, matches) != saving::native::PupReceiverRva) return false;
+                 saving::native::PupReceiverBytes, matches) != saving::native::PupReceiverRva)
+        return PupRefused("receiver-pattern", entry, bridge, receiver, beforeUse);
     auto const* code = reinterpret_cast<uint8_t const*>(receiver);
     if (!Readable(code, 41) || !Executable(code) ||
-        !saving::native::PupReceiver(code, 41, reinterpret_cast<uintptr_t>(image)) ||
-        !Readable(image + 0x677a0, 8) || !Readable(image + 0x97578, 4) || !Readable(image + 0x99510, 4)) return false;
+        !saving::native::PupReceiverAt(code, 41, receiver, reinterpret_cast<uintptr_t>(image), nt->OptionalHeader.SizeOfImage))
+        return PupRefused("receiver-operands", entry, bridge, receiver, beforeUse);
+    // Mutable imports/adapter/semaphore are readiness, not the identity of an installed PUP hook.
+    static unsigned char* reportedEntry = nullptr;
+    static uint32_t reportedBridge = 0, reportedReceiver = 0;
+    static uint32_t readyBridge = 0, readyReceiver = 0;
+    if (!beforeUse) {
+        if (reportedEntry != entry || reportedBridge != bridge || reportedReceiver != receiver) {
+            reportedEntry = entry;
+            reportedBridge = bridge;
+            reportedReceiver = receiver;
+            Logf("persist: WorldLoadGameFn PUP chain entry=%p bridge=%08x receiver=%08x owner=%p; runtime verification pending first use",
+                 entry, bridge, receiver, image);
+        }
+        return true;
+    }
+    if (!Readable(image + 0x677a0, 8) || !Readable(image + 0x97578, 4) || !Readable(image + 0x99510, 4))
+        return PupRefused("runtime-memory", entry, bridge, receiver, beforeUse);
     HMODULE kernel = GetModuleHandleA("kernel32.dll");
     if (saving::native::Word(image, 0x677a0) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "WaitForSingleObject")) ||
-        saving::native::Word(image, 0x677a4) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "ReleaseSemaphore"))) return false;
+        saving::native::Word(image, 0x677a4) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "ReleaseSemaphore")))
+        return PupRefused("runtime-imports", entry, bridge, receiver, beforeUse);
     const uintptr_t original = saving::native::Word(image, 0x97578);
+    if (!original || original == reinterpret_cast<uintptr_t>(entry) || original == bridge || original == receiver ||
+        !Executable(reinterpret_cast<void const*>(original)))
+        return PupRefused("runtime-adapter", entry, bridge, receiver, beforeUse);
     DWORD flags = 0;
-    return original != reinterpret_cast<uintptr_t>(entry) && original != bridge && original != receiver &&
-           Executable(reinterpret_cast<void const*>(original)) &&
-           GetHandleInformation(reinterpret_cast<HANDLE>(saving::native::Word(image, 0x99510)), &flags);
+    if (!GetHandleInformation(reinterpret_cast<HANDLE>(saving::native::Word(image, 0x99510)), &flags))
+        return PupRefused("runtime-semaphore", entry, bridge, receiver, beforeUse);
+    if (readyBridge != bridge || readyReceiver != receiver) {
+        readyBridge = bridge;
+        readyReceiver = receiver;
+        Logf("persist: WorldLoadGameFn PUP ready entry=%p bridge=%08x receiver=%08x owner=%p adapter=%p",
+             entry, bridge, receiver, image, reinterpret_cast<void*>(original));
+    }
+    return true;
 }
 
-bool ReverifyNative()
+bool ReverifyNative(bool beforeUse)
 {
     if (reinterpret_cast<unsigned char*>(GetModuleHandleA("Game.dll")) != nativeImage) {
         Unresolved("Game.dll", nativeImage, "before-use");
@@ -436,7 +490,7 @@ bool ReverifyNative()
                  saving::native::Matches(entry + Stolen, length - Stolen, fn.bytes + Stolen * 2);
         } else if (ok && i == 3) {
             ok = saving::native::Matches(entry, length, fn.bytes) ||
-                 (saving::native::Matches(entry + Stolen, length - Stolen, fn.bytes + Stolen * 2) && PupLoadEntry(entry));
+                 (saving::native::Matches(entry + Stolen, length - Stolen, fn.bytes + Stolen * 2) && PupLoadEntry(entry, beforeUse));
         } else if (ok) ok = saving::native::Matches(entry, length, fn.bytes);
         if (ok && fn.symbol)
             ok = reinterpret_cast<unsigned char*>(GetProcAddress(reinterpret_cast<HMODULE>(nativeImage), fn.symbol)) == entry;
@@ -469,7 +523,7 @@ bool ReverifyNative()
     static unsigned char* reportedLoad = nullptr;
     static bool reportedPup = false;
     const bool pup = nativeEntries[3][0] == 0xe9;
-    if (reportedLoad != nativeEntries[3] || reportedPup != pup) {
+    if (beforeUse && (reportedLoad != nativeEntries[3] || reportedPup != pup)) {
         reportedLoad = nativeEntries[3];
         reportedPup = pup;
         Logf("persist: native reverified before use WorldLoadGameFn=%p owner=%s; original entry preserved",
@@ -481,7 +535,7 @@ bool ReverifyNative()
 bool NativeReady()
 {
     if (!pairedEnabled || ai::ShuttingDown()) return false;
-    if (ReverifyNative()) return true;
+    if (ReverifyNative(true)) return true;
     pairedEnabled = false;
     CancelSave("native hooks changed before use");
     DropAutoload("native hooks changed before use");
@@ -717,7 +771,6 @@ void ClearIncoming()
 
 bool SendCampaign(uint8_t to, bool commit = false)
 {
-    if (net::FileTransferBusy(to)) return false;
     Manifest manifest;
     std::vector<uint8_t> data[net::FileCount];
     if (!pairedEnabled || !transferring || !ReadBundle(campaign, manifest, data)) {
@@ -725,12 +778,17 @@ bool SendCampaign(uint8_t to, bool commit = false)
         return false;
     }
     const net::SaveNote note = Note(commit ? net::SaveCommit : net::SaveImport, manifest);
+    if (!net::SendSave(to, note)) return false;
     uint32_t sizes[net::FileCount]{}, crcs[net::FileCount]{};
     for (int f = 0; f < net::FileCount; ++f) {
         sizes[f] = static_cast<uint32_t>(data[f].size());
         crcs[f] = Crc32(data[f].data(), data[f].size());
+        for (size_t at = 0; at < data[f].size(); at += net::MaxChunk) {
+            const auto length = static_cast<uint16_t>(std::min<size_t>(net::MaxChunk, data[f].size() - at));
+            if (!net::SendFileChunk(to, static_cast<uint8_t>(f), sizes[f], static_cast<uint32_t>(at), data[f].data() + at, length)) return false;
+        }
     }
-    if (!net::QueueFileTransfer(to, note, campaign.c_str(), data, sizes, crcs)) return false;
+    if (!net::SendFileDone(to, campaign.c_str(), sizes, crcs)) return false;
     ++filesSent;
     clients[to].sentAt = GetTickCount();
     clients[to].arrived = false;
@@ -862,7 +920,6 @@ void OnFileChunk(uint8_t file, uint32_t total, uint32_t offset, uint8_t const* d
     }
     incomingTotal[file] = total;
     incoming[file].insert(incoming[file].end(), data, data + length);
-    if (prepared.valid) prepared.since = GetTickCount();
 }
 
 void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t const crc[net::FileCount])
@@ -938,7 +995,6 @@ void StopSaveTimer()
 }
 void FinishSave(bool ok, char const* why)
 {
-    if (!ok) net::CancelFileTransfers();
     Logf("persist: checkpoint %s world=%s save=%s player=%llu slot=%s reason=%s",
          ok ? "paired" : "incomplete", savingManifest.key.world.c_str(), savingManifest.key.save.c_str(),
          steam::PlayerId(), requestedSlot.c_str(), why);
@@ -1108,7 +1164,9 @@ bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool
     if (observed) ++lowerLoadCalls;
     if (observed) Logf("persist: native invoke=World.LoadGameWorld save=%s player=%llu flag=%d",
                        current.key.save.c_str(), steam::PlayerId(), nativeFlag ? 1 : 0);
+    crashlog::WorldEntryScope operation("native World.LoadGameWorld / PUP bridge");
     const bool ok = originalWorldLoad(self, name, nativeFlag);
+    operation.Complete();
     if (observed) lowerLoadGood = lowerLoadGood && ok;
     if (observed) Logf("persist: native result=World.LoadGameWorld save=%s player=%llu ok=%d",
                        current.key.save.c_str(), steam::PlayerId(), ok ? 1 : 0);
@@ -1147,10 +1205,6 @@ void PollSave()
         }
     }
     const uint32_t now = GetTickCount();
-    if (barrier.phase == saving::Barrier::Committing) {
-        for (uint8_t i = 2; i < net::MaxPlayers; ++i)
-            if (barrier.members[i].generation && net::FileTransferBusy(i)) saveStarted = now;
-    }
     if ((barrier.phase == saving::Barrier::Preparing && now - saveStarted > PrepareLimit) ||
         (barrier.phase == saving::Barrier::Writing && now - nativeReturnedAt > WriteLimit) ||
         (barrier.phase == saving::Barrier::Committing && now - saveStarted > TransferLimit)) {
@@ -1285,8 +1339,15 @@ void SendAnswer(uint8_t op)
 }
 void Evaluate()
 {
-    if (!net::Joined() || !hostWorld.epoch || nativeLoadDepth || !loading.empty() || newWorld) return;
+    if (!net::Joined()) { crashlog::WorldEntryWait("host welcome"); return; }
+    if (!hostWorld.epoch) { crashlog::WorldEntryWait("host world announcement"); return; }
+    if (nativeLoadDepth) { crashlog::WorldEntryWait("native HUD.LoadGame return"); return; }
+    if (!loading.empty() || newWorld) { crashlog::WorldEntryWait("engine hero/game readiness"); return; }
     if (!pendingRecord.empty() || !refusedRecord.empty() || !waitingImport.empty() || !ownCharacterReady) {
+        crashlog::WorldEntryWait(hostWorld.kind == net::KindMenu ? "host settled world" :
+                                !pendingRecord.empty() ? "own character restore" :
+                                !refusedRecord.empty() ? "validated own character" :
+                                !waitingImport.empty() ? "own character import" : "own character readiness");
         net::SetInWorld(net::LocalId(), false);
         SendAnswer(net::WorldWaiting);
         return;
@@ -1300,8 +1361,10 @@ void Evaluate()
         everIn = true;
         net::SetInWorld(net::LocalId(), true);
         SendAnswer(net::WorldReady);
+        crashlog::WorldEntryWait(nullptr);
         return;
     }
+    crashlog::WorldEntryWait(hostWorld.kind == net::KindMenu ? "host settled world" : "matching host world");
     net::SetInWorld(net::LocalId(), false);
     SendAnswer(net::WorldOther);
     if (hinted != hostWorld.epoch) {
@@ -1325,7 +1388,6 @@ void Tell(uint8_t to)
 void NewEpoch()
 {
     CancelSave("host world changed");
-    net::CancelFileTransfers();
     static const uint32_t nonce = ((GetTickCount() * 2654435761u) ^ (GetCurrentProcessId() << 16)) & 0xffff0000u;
     epoch = nonce | (++epochs & 0xffff);
     if (!epoch) epoch = ++epochs;
@@ -1370,6 +1432,11 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
 {
     if (!net::IsHost()) {
         if (note.op != net::WorldHost) return;
+        if (note.epoch != hostWorld.epoch || note.kind != hostWorld.kind ||
+            std::strcmp(note.campaign, hostWorld.campaign))
+            Logf("persist: host world received previous=%08x epoch=%08x kind=%s local=%s loading=%s new_world=%d own=%d",
+                 hostWorld.epoch, note.epoch, KindName(note.kind), KindName(localKind),
+                 loading.empty() ? "-" : loading.c_str(), newWorld ? 1 : 0, ownCharacterReady ? 1 : 0);
         if (note.epoch != hostWorld.epoch) {
             prepared = Prepared{};
             requestPending = false;
@@ -1394,8 +1461,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
     } else if (note.op == net::WorldOther || note.op == net::WorldWaiting) {
         client.ready = 0;
         net::SetInWorld(from, false);
-        const bool onWay = net::FileTransferBusy(from) ||
-            (resendGuard && client.sentAt && !client.arrived && GetTickCount() - client.sentAt < TransferLimit);
+        const bool onWay = resendGuard && client.sentAt && !client.arrived && GetTickCount() - client.sentAt < TransferLimit;
         if (!campaign.empty() && !onWay && transferring && (client.sent != epoch || client.resends < 2)) {
             if (client.sent == epoch) ++client.resends;
             client.sent = epoch;
@@ -1442,10 +1508,14 @@ void DropAutoload(char const* why)
 void CALLBACK AutoloadNow(HWND window, UINT, UINT_PTR id, DWORD)
 {
     if (!autoload.valid || !autoload.armed) { KillTimer(window, id); return; }
-    if (processDepth || nativeLoadDepth || nativeSaveDepth) return;
+    if (processDepth || nativeLoadDepth || nativeSaveDepth) {
+        crashlog::WorldEntryWait(nativeLoadDepth ? "native load before autoload" :
+                                nativeSaveDepth ? "native save before autoload" : "engine frame before autoload");
+        return;
+    }
     if (net::IsHost() || !net::Joined() || autoload.welcome != net::WelcomeSerial() ||
         autoload.epoch != hostWorld.epoch || autoload.loads != loads) { DropAutoload("world/welcome/load changed"); return; }
-    if (autoloadHold) return;
+    if (autoloadHold) { crashlog::WorldEntryWait("autoload hold"); return; }
     const std::string slot = autoload.slot;
     KillTimer(window, id);
     autoload = Autoload{};
@@ -1614,8 +1684,12 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
          manifest.key.world.c_str(), manifest.key.save.c_str(), steam::PlayerId(), slot.c_str(),
          manifest.size[0], manifest.size[1], manifest.crc[0], manifest.crc[1]);
     ++nativeLoadDepth;
+    crashlog::WorldEntryWait("native HUD.LoadGame return");
+    crashlog::WorldEntryScope operation("native HUD.LoadGame");
     const bool hudOk = originalLoad(self, name);
+    operation.Complete();
     --nativeLoadDepth;
+    crashlog::WorldEntryWait("engine hero/game readiness");
     const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
     if (ok && net::IsHost()) downed::Restore(savedDowned, "host-save");
     Logf("persist: native load returned function=HUD.LoadGame slot=%s save=%s player=%llu ok=%d hud_ok=%d lower_calls=%u lower_ok=%d frames=%u",
@@ -1645,6 +1719,7 @@ FILETIME WriteTime(std::string const& path)
 enum class ApplyResult { Restored, Refused, PublicationPending };
 ApplyResult ApplyCharacter()
 {
+    crashlog::WorldEntryScope operation("own character validation/restoration");
     const bool ok = pendingLegacy ? hero::LoadLegacyRecordStrict(pendingRecord.c_str()) :
                                    hero::LoadRecord(pendingRecord.c_str(), pendingKey);
     if (!CharacterDigest("restore", pendingKey, pendingRecord, ok)) return ApplyResult::Refused;
@@ -1775,6 +1850,7 @@ bool BeginFrame()
 {
     if (nativeLoadDepth || nativeSaveDepth) {
         ++loadFrames;
+        crashlog::WorldEntryWait(nativeLoadDepth ? "native HUD.LoadGame return" : "native save return");
         if (!loadTicks) return false;
         ++loadFramesRan;
     }
@@ -1814,6 +1890,8 @@ void Tick()
             newWorld = false;
             Settled(net::KindSaved, slot);
         } else if (newWorld) { newWorld = false; Settled(net::KindNew, ""); }
+    } else if (newWorld || !loading.empty()) {
+        crashlog::WorldEntryWait("engine hero/game readiness");
     }
     if (net::IsHost()) { PollSave(); HostTick(); }
     else {

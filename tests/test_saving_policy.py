@@ -256,11 +256,14 @@ class SavingPolicyTests(unittest.TestCase):
         pup = function_body(self.persist, r"\bbool\s+PupLoadEntry\s*\(")
         self.assertIn("saving::native::PupEntryTarget", pup)
         self.assertIn("saving::native::PupShimTarget", pup)
-        self.assertIn('GetModuleHandleA("Script_paru.dll")', pup)
-        self.assertIn('GetModuleHandleA("paru_s2.dll")', pup)
+        self.assertIn("GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS", pup)
+        self.assertIn("GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT", pup)
+        self.assertIn("reinterpret_cast<LPCSTR>(receiver), &pup", pup)
+        self.assertNotIn('GetModuleHandleA("Script_paru.dll")', pup)
+        self.assertNotIn('GetModuleHandleA("paru_s2.dll")', pup)
         self.assertIn("saving::native::PupReceiverRva", pup)
         self.assertIn("KnownPup(pup)", pup)
-        self.assertIn("saving::native::PupReceiver(", pup)
+        self.assertIn("saving::native::PupReceiverAt(", pup)
         self.assertIn('GetProcAddress(kernel, "WaitForSingleObject")', pup)
         self.assertIn('GetProcAddress(kernel, "ReleaseSemaphore")', pup)
         self.assertIn("GetHandleInformation(", pup)
@@ -277,7 +280,7 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("guard == reinterpret_cast<uintptr_t>(originals[i]) - 24", verify)
         self.assertIn("target == reinterpret_cast<uintptr_t>(detours[i])", verify)
         self.assertIn("target == reinterpret_cast<uintptr_t>(entry + Stolen)", verify)
-        self.assertIn("PupLoadEntry(entry)", verify)  # Allows the verified late PUP install only.
+        self.assertIn("PupLoadEntry(entry, beforeUse)", verify)  # Allows the verified late PUP install only.
         self.assertIn("target != reinterpret_cast<uintptr_t>(&WorldLoadDetour)", verify)
         self.assertIn("saving::native::GetterLinks", verify)
         self.assertIn('Unresolved(fn.name, entry, "before-use")', verify)
@@ -290,6 +293,7 @@ class SavingPolicyTests(unittest.TestCase):
         ):
             self.assertIn("NativeReady()", function_body(self.persist, signature))
         ready = function_body(self.persist, r"\bbool\s+NativeReady\s*\(")
+        self.assertIn("ReverifyNative(true)", ready)
         self.assertIn("pairedEnabled = false", ready)
         self.assertIn('CancelSave("native hooks changed before use")', ready)
         self.assertIn('DropAutoload("native hooks changed before use")', ready)
@@ -298,6 +302,29 @@ class SavingPolicyTests(unittest.TestCase):
         receive = function_body(self.persist, r"\bvoid\s+OnSave\s*\(")
         self.assertIn("if (!pairedEnabled || !NativeReady())", receive)
         self.assertLess(receive.index("NativeReady()"), receive.index("CaptureCharacter(key)"))
+
+    def test_pup_install_identity_is_separate_from_first_use_readiness(self):
+        pup = function_body(self.persist, r"\bbool\s+PupLoadEntry\s*\(")
+        identity = pup.index("saving::native::PupReceiverAt(")
+        install = pup.index("if (!beforeUse)")
+        imports = pup.index('GetProcAddress(kernel, "WaitForSingleObject")')
+        adapter = pup.index("const uintptr_t original")
+        semaphore = pup.index("GetHandleInformation(")
+        self.assertLess(identity, install)
+        self.assertLess(install, imports)
+        self.assertLess(imports, adapter)
+        self.assertLess(adapter, semaphore)
+        self.assertIn("runtime verification pending first use", pup)
+        for stage in (
+            "entry", "shim-memory", "shim-bytes", "receiver-module", "receiver-rva",
+            "companion-identity", "companion-layout", "receiver-pattern",
+            "receiver-operands", "runtime-imports", "runtime-adapter", "runtime-semaphore",
+        ):
+            self.assertIn('PupRefused("' + stage + '"', pup)
+        fail = function_body(self.persist, r"\bbool\s+PupRefused\s*\(")
+        self.assertIn("stage=%s", fail)
+        self.assertIn("bridge=%08x receiver=%08x", fail)
+        self.assertIn("live=%s; paired saves off", fail)
 
     def test_world_load_call_patch_is_checked_tracked_and_shutdown_safe(self):
         hook = function_body(self.persist, r"\bbool\s+HookWorldLoadCall\s*\(")

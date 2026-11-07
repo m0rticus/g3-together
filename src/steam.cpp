@@ -22,6 +22,7 @@
 #include "relaywire.h"
 
 #include "config.h"
+#include "crashlog.h"
 #include "latency.h"
 #include "log.h"
 #include "net.h"
@@ -907,6 +908,7 @@ unsigned __stdcall TransportThread(void*)
             Fail("transport stop event failed");
             break;
         }
+        crashlog::PollWorldEntry();
         PumpOnce();
         HANDLE events[] = {stopEvent, wakeEvent, pollTimer};
         if (pollTimer) {

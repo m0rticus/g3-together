@@ -178,13 +178,44 @@ Old visible-contact logs prove an attack was shown, not that damage was applied.
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified native entry points. `persist: unresolved <function> ... live=<bytes>; paired saves off`
 means no paired-save claim is valid; preserve that line and the preceding native module identity.
+The optional engine-free check `G3T_GAME_DLL` reads a selected CP 1.75 Game.dll and verifies unique
+signatures, named world exports, call edges and ASLR without loading or executing the DLL.
+
+For each host- and client-initiated save, follow `checkpoint requested`, each `character capture`
+(own player ID, record size/CRC), `native invoke=HUD.SaveGame`, successful HUD/world results,
+`host checkpoint published`, client `checkpoint stored`, both `checkpoint ack` phases, then
+`checkpoint paired`. Native three-file sizes/CRCs must agree on both copies; individual character
+CRCs need not agree. A client request must invoke native save only on the host. Wait for the final
+paired result, not the immediate queued call; the native menu may show its generic failure dialog
+because no synchronous save has completed yet.
+
+After loading, require `native load returned ... ok=1 hud_ok=1 lower_calls=1 lower_ok=1` and
+`character restore ... ok=1`/`own character restored` on the overlay recipient before world admission.
+The complete record is checked before native loading; template/attribute checks require the loaded
+world and run before hero mutation. An unsupported direct `World.LoadGameWorld` call is refused
+instead of bypassing own-character restoration; use the normal menu/quick-load HUD path.
+Check different stats, HP/MP, inventory/gold/equipment, learned spells, quick slots and positions,
+alongside the same quest/NPC/door state. Reload the latest checkpoint after playing further,
+then rejoin and check the first shared XP reward. Legacy V3 records include their downed latch;
+missing or damaged counterparts must remain refused or explicitly recover the same player's
+same-campaign record, never use the native host hero. These are still human acceptance checks:
+static bytes and a passing build do not establish that the running copies executed this path.
+
+Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
+verified native entry points. `persist: unresolved <function> ... live=<bytes>; paired saves off`
+means no paired-save claim is valid; preserve that line and the preceding native module identity.
 PUP owns the original world-load entry: the verified `E9 ... 90` entry and `87 0C 24 51 E9 ...`
 bridge lead to its `paru_s2.dll` companion. The mod leaves that entry untouched and observes the
 verified HUD load call instead; `native reverified before use ... owner=PUP/paru_s2.dll` confirms
 the preserved path. The other four entries, installed hooks and HUD call edges are also checked
-before use. An unknown initial or later hook disables paired saves and cancels pending coordination,
+before use. The companion is selected by the shim receiver's actual module address, not by requiring
+the main `Script_paru.dll` to be visible during startup. `PUP chain ... runtime verification pending
+first use` confirms startup identity; `PUP ready ...` confirms the adapter/import/semaphore preflight
+before native use. An unknown initial or later hook disables paired saves and cancels pending coordination,
 with the function name and observed bytes; the mod still runs. PUP installing after this mod is
 accepted only when the same verified bridge and companion identity match.
+If rejected, preserve the `PUP phase=... stage=... entry=... bridge=... receiver=... live=...` line.
+The jump distances vary with ASLR/private allocation; neither rel32 is compared to a captured literal.
 The optional engine-free checks `G3T_GAME_DLL` and `G3T_PUP_DLL` read selected CP 1.75 Game.dll
 and PUP companion files and verify unique patterns, exports/call edges, operands and ASLR without
 loading or executing either DLL.

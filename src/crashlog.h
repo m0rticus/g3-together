@@ -6,8 +6,23 @@
 // First chance, so exceptions the game catches itself show up too; at most a few are logged.
 #pragma once
 
+#include "worldentry.h"
+
 namespace g3t::crashlog {
 using LogFn = void (*)(char const*);
+// Production world-entry progress: written on the engine thread, polled without engine access.
+void WorldEntryWait(char const* step);
+void PollWorldEntry();
+class WorldEntryScope {
+    worldentry::Step previous;
+    bool active = false;
+  public:
+    explicit WorldEntryScope(char const* operation);
+    ~WorldEntryScope();
+    void Complete();
+    WorldEntryScope(WorldEntryScope const&) = delete;
+    WorldEntryScope& operator=(WorldEntryScope const&) = delete;
+};
 void Tick();              // installs the handler once QA is enabled; takes the script names once a game runs
 void EndStep(char const* step); // cache a static-lifetime step name; safe to report without reading game objects
 void NamesOff(LogFn log); // QA negative control (crashnamesoff): crash lines without function names

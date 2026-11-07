@@ -90,6 +90,16 @@ If Steam cannot start, a clear error is shown; fix Steam or the required DLL and
 
 ## If something goes wrong
 
+If world entry stalls, `g3together.log` reports `world-entry: still waiting for ...`
+every five seconds from the transport worker, independently of the game frame.
+The line gives the wait age, current mod/native operation, host epoch and welcome serial.
+`world-entry: activation cleanup returned` followed by `operation=engine outside mod`
+and a wait for the first in-world frame places the stall after the mod's activation callback.
+An operation naming a cleanup, native load or character restore instead identifies that boundary.
+`world-entry: complete` means this client passed the host-world readiness gate; it is not
+logged merely because the Steam lobby joined. These diagnostics do not restart a load,
+skip a missing character record or open the readiness gate early.
+
 Open PowerShell in the extracted package folder, where this file is located, and run the following
 command. Python is required:
 

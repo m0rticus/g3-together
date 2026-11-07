@@ -3,6 +3,8 @@
 
 #include "log.h"
 #include "ai.h"
+#include "config.h"
+#include "net.h"
 #include <Game.h>
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -19,6 +21,9 @@ bool installed = false, dumpInstalled = false;
 volatile bool probing = false;
 LONG logged = 0;
 std::atomic<char const*> lastEndStep{nullptr};
+worldentry::Progress entryOperation, entryGate;
+std::atomic<uint32_t> entryEpoch{0}, entryWelcome{0};
+worldentry::Reports entryReports;
 
 void LogEndStep()
 {
@@ -579,6 +584,45 @@ DWORD WINAPI WatchdogThread(LPVOID)
     Logf("shutdown watchdog: files=%s ; %s", dmp, txt);
     return 0;
 }
+}
+
+void WorldEntryWait(char const* step)
+{
+    if (GetConfig().host || ai::ShuttingDown()) return;
+    entryEpoch.store(net::WorldEpoch());
+    entryWelcome.store(net::WelcomeSerial());
+    const auto previous = entryGate.Set(step, GetTickCount());
+    if (!step && previous.name)
+        Logf("world-entry: complete epoch=%08x welcome=%u", entryEpoch.load(), entryWelcome.load());
+}
+
+WorldEntryScope::WorldEntryScope(char const* operation)
+{
+    active = !GetConfig().host && !ai::ShuttingDown() && entryGate.Read().name;
+    if (active) previous = entryOperation.Set(operation, GetTickCount());
+}
+
+WorldEntryScope::~WorldEntryScope()
+{
+    Complete();
+}
+
+void WorldEntryScope::Complete()
+{
+    if (!active) return;
+    entryOperation.Restore(previous);
+    active = false;
+}
+
+void PollWorldEntry()
+{
+    worldentry::Step gate, operation;
+    if (!entryGate.Read(gate) || !gate.name || !entryOperation.Read(operation)) return;
+    const uint32_t now = GetTickCount();
+    if (!entryReports.Due(now, operation, gate)) return;
+    Logf("world-entry: still waiting for %s for %u s; operation=%s operation_ms=%u epoch=%08x welcome=%u",
+         gate.name, (now - gate.since) / 1000, operation.name ? operation.name : "engine outside mod",
+         operation.name ? now - operation.since : 0, entryEpoch.load(), entryWelcome.load());
 }
 
 void EndStep(char const* step)

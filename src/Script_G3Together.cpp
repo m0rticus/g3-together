@@ -127,50 +127,65 @@ class Module : public eCEngineComponentBase
     // Forget every entity the mod holds. Loading a save (gCHUDFileManager::LoadGame) replaces the world's
     // entities and only activates the world again, without deactivating it first: the puppets kept from before
     // were deleted and the next frame crashed on them. So forget on both.
+    static void ForgetStep(char const* name, void (*forget)())
+    {
+        g3t::crashlog::WorldEntryScope operation(name);
+        forget();
+    }
     static void ForgetWorld()
     {
-        g3t::world::OnWorldDeactivate();
-        g3t::npcplayback::OnWorldDeactivate();
-        g3t::remote::OnWorldDeactivate();
-        g3t::npcs::OnWorldDeactivate();
-        g3t::combat::OnWorldChange();
-        g3t::shot::OnWorldChange();
-        g3t::summon::OnWorldChange();
-        g3t::fightmem::OnWorldChange();
-        g3t::xpshare::OnWorldChange();
-        g3t::talk::OnWorldChange();
-        g3t::journal::OnWorldChange();
-        g3t::story::OnWorldChange();
-        g3t::infocmd::OnWorldChange();
-        g3t::guide::OnWorldChange();
-        g3t::arena::OnWorldChange();
-        g3t::ending::OnWorldChange();
-        g3t::downed::OnWorldChange();
-        g3t::doors::OnWorldChange();
-        g3t::enclaves::OnWorldChange();
-        g3t::occupancy::OnWorldChange();
-        g3t::address::OnWorldChange();
-        g3t::dialogaudio::OnWorldChange();
-        g3t::containers::OnWorldChange();
-        g3t::ransack::OnWorldChange();
-        g3t::trade::OnWorldChange();  // forget the old hero before retiring its automatic transactions
-        g3t::offer::OnWorldChange();
+        ForgetStep("world cleanup / native prefetch queues", &g3t::world::OnWorldDeactivate);
+        ForgetStep("NPC playback cleanup / source-options mutex", &g3t::npcplayback::OnWorldDeactivate);
+        ForgetStep("remote puppet cleanup", &g3t::remote::OnWorldDeactivate);
+        ForgetStep("NPC cleanup / replication reset", &g3t::npcs::OnWorldDeactivate);
+        ForgetStep("combat cleanup", &g3t::combat::OnWorldChange);
+        ForgetStep("shot cleanup", &g3t::shot::OnWorldChange);
+        ForgetStep("summon cleanup", &g3t::summon::OnWorldChange);
+        ForgetStep("fight memory cleanup", &g3t::fightmem::OnWorldChange);
+        ForgetStep("XP share cleanup", &g3t::xpshare::OnWorldChange);
+        ForgetStep("talk cleanup", &g3t::talk::OnWorldChange);
+        ForgetStep("journal cleanup", &g3t::journal::OnWorldChange);
+        ForgetStep("story cleanup", &g3t::story::OnWorldChange);
+        ForgetStep("info command cleanup", &g3t::infocmd::OnWorldChange);
+        ForgetStep("guide cleanup", &g3t::guide::OnWorldChange);
+        ForgetStep("arena cleanup", &g3t::arena::OnWorldChange);
+        ForgetStep("ending cleanup", &g3t::ending::OnWorldChange);
+        {
+            g3t::crashlog::WorldEntryScope operation("downed cleanup");
+            g3t::downed::OnWorldChange();
+        }
+        ForgetStep("door cleanup", &g3t::doors::OnWorldChange);
+        ForgetStep("enclave cleanup", &g3t::enclaves::OnWorldChange);
+        ForgetStep("occupancy cleanup", &g3t::occupancy::OnWorldChange);
+        ForgetStep("address cleanup", &g3t::address::OnWorldChange);
+        ForgetStep("dialog audio cleanup / native channels", &g3t::dialogaudio::OnWorldChange);
+        ForgetStep("container cleanup", &g3t::containers::OnWorldChange);
+        ForgetStep("ransack cleanup", &g3t::ransack::OnWorldChange);
+        ForgetStep("trade cleanup", &g3t::trade::OnWorldChange);  // forget the old hero before retiring its automatic transactions
+        ForgetStep("offer cleanup", &g3t::offer::OnWorldChange);
     }
     bEResult WorldActivate() override
     {
         if (g3t::ai::ShuttingDown()) return bEResult_Ok;
         playbackErrorShown = false;
+        g3t::crashlog::WorldEntryWait("world activation cleanup");
+        g3t::crashlog::WorldEntryScope operation("WorldActivate callback");
         g3t::Log("world activated");
         ForgetWorld();
         g3t::persist::OnWorldActivate();
+        g3t::Log("world-entry: activation cleanup returned");
+        g3t::crashlog::WorldEntryWait("engine first in-world frame");
         return bEResult_Ok;
     }
     bEResult WorldDeactivate() override
     {
         if (g3t::ai::ShuttingDown()) return bEResult_Ok;
+        g3t::crashlog::WorldEntryWait("engine world activation");
+        g3t::crashlog::WorldEntryScope operation("WorldDeactivate callback");
         g3t::Log("world deactivated");
         ForgetWorld();
         g3t::persist::OnWorldDeactivate();
+        g3t::Log("world-entry: deactivation cleanup returned");
         return bEResult_Ok;
     }
     bEResult PreShutdown() override
@@ -205,9 +220,13 @@ class Module : public eCEngineComponentBase
     void Process() override
     {
         if (g3t::ai::ShuttingDown()) return;
+        g3t::crashlog::WorldEntryScope entryProcess("engine module Process");
         FrameScope frame;
         if (!frame.run) return;
-        Frame();
+        {
+            g3t::crashlog::WorldEntryScope operation("frame report");
+            Frame();
+        }
         if (!g3t::npcplayback::Available()) {
             g3t::hud::MenuLine(g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
             if (!playbackErrorShown && gCSession::GetInstance().IsGameRunning()) {
@@ -219,7 +238,10 @@ class Module : public eCEngineComponentBase
         g3t::crashlog::Tick();
         g3t::world::Tick();
         g3t::npcplayback::Tick();
-        g3t::remote::Tick();
+        {
+            g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
+            g3t::remote::Tick();
+        }
         g3t::npcs::Tick();
         g3t::ai::Tick();
         g3t::combat::Tick();
@@ -232,7 +254,10 @@ class Module : public eCEngineComponentBase
         g3t::doors::Tick();
         g3t::enclaves::Tick();
         g3t::journal::Tick();
-        g3t::persist::Tick();
+        {
+            g3t::crashlog::WorldEntryScope operation("persist tick");
+            g3t::persist::Tick();
+        }
         g3t::clock::Tick();
         g3t::infocmd::Tick();
         g3t::guide::Tick();
