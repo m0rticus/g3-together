@@ -4,6 +4,20 @@
 #include <cstdint>
 
 namespace g3t::downed {
+inline bool CombatUnavailable(bool player, bool held, bool terminal, bool nativeDown, bool nativeDead, uint8_t flags)
+{
+    return player && (held || terminal || nativeDown || nativeDead || (flags & 14) != 0);
+}
+
+enum TargetBinding : uint32_t {
+    Current = 1, Alternative = 2, Attacker = 4, LastAttacker = 8, Spell = 16, Alignment = 32, Inflictor = 64
+};
+
+inline bool StopTargetInstruction(uint32_t bindings)
+{
+    return (bindings & (Current | Spell)) != 0;
+}
+
 // Native animation, HP and loaded alive snapshots are not authority to release a downed life.
 struct Life
 {

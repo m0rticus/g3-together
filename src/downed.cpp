@@ -638,6 +638,68 @@ void HelperHasNoPotion(int byPlayer)
 }
 
 bool Held() { return life.held; }
+
+bool CombatUnavailable(eCEntity* entity)
+{
+    if (!entity) return false;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (hero && (entity == hero || entity == remote::ControlledBody())) {
+        Entity player(entity);
+        return CombatUnavailable(true, life.held, life.terminal, player.IsDown(), player.IsDead(), 0);
+    }
+    const int id = remote::PuppetOwner(entity);
+    if (!id) return false;
+    net::Remote const& r = net::Remotes()[id];
+    // Latest accepted player state is authority. Native Down on the puppet is an output of this rule,
+    // not an input: otherwise publishing Down would latch it forever after the owner revives.
+    return r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld() &&
+           CombatUnavailable(true, false, false, false, false, r.latest.flags);
+}
+
+uint32_t UnavailablePlayers()
+{
+    uint32_t players = 0;
+    const unsigned local = net::LocalId();
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    eCEntity* controlled = hero ? remote::ControlledBody() : nullptr;
+    if (local && local < net::MaxPlayers && (CombatUnavailable(hero) || CombatUnavailable(controlled)))
+        players |= uint32_t{1} << local;
+    for (unsigned id = 1; id < net::MaxPlayers; ++id)
+        if (id != local && CombatUnavailable(remote::PuppetOf(id))) players |= uint32_t{1} << id;
+    return players;
+}
+
+void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bool transition)
+{
+    static unsigned decisions = 0;
+    static uint32_t lastLog = 0;
+    const uint32_t now = net::Now();
+    ++decisions;
+    if (!transition && decisions > 40 && now - lastLog < 5000) return;
+    lastLog = now;
+    const int remoteId = remote::PuppetOwner(player);
+    const unsigned id = remoteId ? static_cast<unsigned>(remoteId) : net::LocalId();
+    const uint8_t flags = remoteId ? net::Remotes()[remoteId].latest.flags : 0;
+    const uint32_t sequence = remoteId ? net::Remotes()[remoteId].latest.downedSequence : life.sequence;
+    const uint32_t age = remoteId ? now - net::Remotes()[remoteId].latestTicks : 0;
+    const bool hasNpc = npc && npc->GetPropertySet(eEPropertySetType_NPC);
+    const bool hasRoutine = npc && npc->GetPropertySet(eEPropertySetType_ScriptRoutine);
+    Entity actor(npc);
+    Logf("DOWNEDTARGET role=%s player=%u episode=%u flags=%u age=%u excluded=%#x held=%d terminal=%d decision=%s npc=%s ptr=%p ai=%d task=%s state=%s",
+         net::IsHost() ? "host" : "client", id, sequence, flags, age, UnavailablePlayers(),
+         !remoteId && life.held ? 1 : 0, !remoteId && life.terminal ? 1 : 0, decision,
+         npc ? actor.GetName().GetText() : "-", npc, hasRoutine ? static_cast<int>(actor.Routine.AIMode) : -1,
+         hasRoutine ? actor.Routine.GetCurrentTask().GetText() : "-",
+         hasRoutine ? actor.Routine.GetCurrentState().GetText() : "-");
+    if (hasNpc)
+        Logf("DOWNEDBIND npc=%p player=%p current=%p alternative=%p attacker=%p last=%p spell=%p alignment=%p inflictor=%p combat=%u",
+             npc, player, actor.NPC.GetCurrentTarget().GetInstance(), actor.NPC.GetAlternativeTarget().GetInstance(),
+             actor.NPC.GetCurrentAttacker().GetInstance(), actor.NPC.GetLastAttacker().GetInstance(),
+             actor.NPC.GetSpellTarget().GetInstance(), actor.GetAlignmentTarget().GetInstance(),
+             npc->GetPropertySet(eEPropertySetType_DamageReceiver) ? actor.DamageReceiver.GetLastInflictor().GetInstance() : nullptr,
+             static_cast<unsigned>(actor.NPC.CombatState));
+}
+
 uint32_t Sequence() { return life.held ? life.sequence : 0; }
 
 void Restore(bool waiting, char const* source)

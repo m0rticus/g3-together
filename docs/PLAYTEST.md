@@ -126,6 +126,35 @@ last step (`CRASH end-flow last_step=...`), both logs and any dump; `kill-return
 bundled dump writer rejects detailed flags, the log should report a `MiniDumpNormal` retry; record any dump
 write/rewind failure or empty dump. Do not trigger a crash just to check the diagnostic.
 
+### Downed player target eligibility
+
+Use the existing isolated host (`test-install`) and joining (`test-client`) copies with a matching
+coordinated build. Do not automate game launches or encounters. Runtime acceptance is still manual.
+
+1. Let an enemy group knock out the client while the host stays able to help. Wait more than five seconds.
+   The enemies must drop the client and attack another valid enemy or disengage. Check both screens:
+   no further HP/stamina loss, harmful statuses, hit reactions or attack knockback on the client.
+2. Repeat with the host knocked out and the client standing. Include creatures/animals, bow attacks,
+   hostile magic and followers/summons. NPC-vs-NPC combat and attacks on the standing player must continue.
+3. Revive through "I will help you." in each direction. Exactly one potion is consumed for the matching
+   downed episode; the revived player becomes an ordinary eligible enemy again. NPCs must not remain
+   artificially friendly or require a reload to re-engage.
+4. Knock both down and verify immediate `all-down` game over with one native Kill per life. Repeat the
+   unavailable-helper `alone-grace` check above. Smoke-check friendly melee protection, one hit per swing,
+   partner trade and paired save/load.
+
+The host startup should log `downed AssessTarget guard installed at native and script entries`.
+`SCRIPT ONLY` is an explicit unsupported-native-hook diagnostic, not full native-guard confirmation.
+Match `DOWNEDTARGET player/episode/flags` to the existing `downed: remote` and transition records.
+Expect `publish-down` (puppet AIMode 8), `frame-release` or `state-release`, then `released`;
+`DOWNEDBIND` shows the five target pointers and active combat slot before/after cleanup.
+`excluded` is a player-id bitset, not a list of NPCs. On revival expect `publish-alive` (puppet mode 10).
+`attitude-refused`, `perception-refused` and `assessment-refused` explain rejected acquisition.
+`DOWNEDHIT` records blocked in-flight judgement/status/HP/visible-contact paths before native effects.
+Repeated acquisition/hit refusals are limited to the first 40 records and one sample per five seconds;
+actual binding/life transitions are logged independently. No QA command or control is needed.
+Old visible-contact logs prove an attack was shown, not that damage was applied.
+
 ### Paired-save failure and migration checks (protocol 73)
 
 Use only backed-up isolated profiles; never the protected user save folder.

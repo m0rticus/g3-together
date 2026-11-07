@@ -310,6 +310,10 @@ Independent world-inventory persistence across saves/late joins is not implement
   Missing, disconnected, loading, stale, or another-world partner state keeps the original
   five-second grace instead. The host loads a
   save; the other player is loaded into it automatically.
+- While either player is knocked out, host-controlled NPCs and creatures drop that player as a combat
+  target and choose another eligible enemy or return to their routine. Further attacks cannot damage,
+  stagger, push, or apply harmful statuses to the downed player. After revival, normal hostility and
+  target selection resume; becoming downed does not make enemies permanently friendly.
 - The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
   While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
   monsters, an intruder; not a duel, the arena, a guard's arrest or another player) counts as a death: you stay down until
@@ -327,7 +331,7 @@ Independent world-inventory persistence across saves/late joins is not implement
   parries blocks either player's blows the same way.
 - Friendly fire is off by default (`friendly_fire = 0`): players and their followers cannot damage, stagger, knock down,
   poison, freeze or otherwise harm one another. Healing and revival still work. Enemy attacks and environmental damage
-  are unchanged. Both players must use the same value and restart after changing it. An explicit value from 1 to 100
+  are unchanged for standing players. Both players must use the same value and restart after changing it. An explicit value from 1 to 100
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,

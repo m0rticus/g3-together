@@ -267,6 +267,25 @@ bool HasDamageReceiver(eCEntity* entity) { return entity && entity->GetPropertyS
 
 int Pending(Entity& entity) { return HasDamageReceiver(entity.GetInstance()) ? static_cast<int>(entity.DamageReceiver.DamageAmount) : 0; }
 
+bool RejectDownedHit(eCEntity* victim, eCEntity* attacker, char const* entry)
+{
+    if (!downed::CombatUnavailable(victim)) return false;
+    Entity player(victim);
+    static unsigned refused = 0;
+    static uint32_t lastLog = 0;
+    const uint32_t now = net::Now();
+    if (++refused <= 40 || now - lastLog >= 5000) {
+        lastLog = now;
+        Logf("DOWNEDHIT entry=%s victim=%s ptr=%p hp=%d pending=%d refused=%u decision=reject-before-effects",
+             entry, player.GetName().GetText(), victim,
+             victim->GetPropertySet(eEPropertySetType_PlayerMemory) ? player.PlayerMemory.GetHitPoints() : HitPoints(player),
+             Pending(player), refused);
+        downed::LogCombatDecision(attacker, victim, entry, true);
+    }
+    if (HasDamageReceiver(victim)) player.DamageReceiver.DamageAmount = 0;
+    return true;
+}
+
 GEInt CallScript(char const* name, eCEntity* self, eCEntity* other, GEInt args)
 {
     return GetScriptAdminExt().CallScript(bCString(name), self, other, args);
@@ -709,6 +728,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         : Entity(spu ? (which == 0 ? spu->GetSelfEntity() : spu->GetOtherEntity()) : nullptr);
     eCEntity* attacker = Attacker(nullptr, &damageSource);
     eCEntity* source = damageSource.GetInstance();
+    if (!ai::ShuttingDown() && RejectDownedHit(victim.GetInstance(), attacker, Judgements[which])) return 0;
     if (!bypass && !forwarded && npcs::IsMirrored(victim.GetInstance()) && IsLocalMelee(attacker, source) &&
         ai::detail::damageReceiver != victim.GetInstance() &&
         !LocalMeleeAllowed(victim.GetInstance(), attacker, CaptureMelee(attacker, source))) return 0;
@@ -986,12 +1006,12 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 {
     if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     ++filterCalls;
+    Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
+    if (args < 0 && RejectDownedHit(recipient.GetInstance(), Attacker(spu, other), "AddHitPoints")) return GETrue;
     if (!bypass && shot::InNpcReplicaContact()) {
-        Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
         if (recipient.GetInstance() != remote::ControlledBody()) return GETrue;
     }
     if (bypass) return CallOriginalAndLog(spu, self, other, args);
-    Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     if (args >= 0) {
         if (npcs::IsMirrored(recipient.GetInstance())) return GETrue;
         return original(spu, self, other, args);
@@ -1424,6 +1444,7 @@ void OnHitPlayer(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlay
     // P6: in an animal form the creature the player controls takes it, not the hidden human body (GetHero).
     eCEntity* hero = gCSession::GetInstance().GetHero() ? (shapeHits ? remote::ControlledBody() : gCSession::GetInstance().GetHero()) : nullptr;
     if (!hero || delta >= 0) return;
+    if (RejectDownedHit(hero, remote::PuppetOf(attackerPlayer), "received-player-hit")) return;
     if (IgnoreFriendlyHit(hero, remote::PuppetOf(attackerPlayer), attackerPlayer)) return;
     ++playerHitsTaken;
     if (meansToKill) downed::NoteBlow();
@@ -2377,6 +2398,7 @@ bool LocalBlow(eCEntity* attacker)
     eCEntity* body = remote::ControlledBody();
     if (!installed || !body || !attacker || gCSession::GetInstance().GetCheats().GetCheatGodEnabled()) return false;
     Entity self(body);
+    if (RejectDownedHit(body, attacker, "visible-NPC-contact")) return false;
     if (self.IsDead() || self.IsDown()) return false;
     if (hud::InventoryOpen()) { NoteInventoryHit(); return false; }
     char const* kind = "";

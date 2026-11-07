@@ -19,6 +19,9 @@ void OnWorldChange();                 // reset terminal death, but carry an unfi
 void Revived(int byPlayer, uint32_t sequence); // a paid revive for this particular downed life
 void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us without one
 bool Held();             // the local hero lies knocked out, waiting for help
+bool CombatUnavailable(eCEntity* entity); // player life truth, never the puppet's interpolated pose/native mode
+uint32_t UnavailablePlayers(); // player-id bits; stale held packets do not make a player eligible again
+void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bool transition = false);
 uint32_t Sequence();      // zero while not waiting; carried by player state and paid revive requests
 void Restore(bool waiting, char const* source); // saves may restore a downed life, never release an existing one
 void NoteBlow();         // combat.cpp: a blow on the local hero came from an NPC that means to kill (judged on its owner's machine)

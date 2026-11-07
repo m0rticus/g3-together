@@ -7,6 +7,7 @@
 #include "talk.h"
 #include "items.h"
 #include "downed.h"
+#include "downed_policy.h"
 #include "guards.h"
 #include "fightmem.h"
 #include "infocmd.h"
@@ -95,6 +96,101 @@ eCEntity* Self(gCScriptProcessingUnit* spu, GELPVoid self)
     return spu ? spu->GetSelfEntity() : nullptr;
 }
 
+bool HostNpc(eCEntity* entity)
+{
+    return net::IsHost() && entity && entity->GetPropertySet(eEPropertySetType_NPC) &&
+           !guards::IsLocalPlayer(entity) && !Driven(entity);
+}
+
+bool RejectDownedTarget(eCEntity* npc, eCEntity* target, char const* decision)
+{
+    if (!HostNpc(npc) || !downed::CombatUnavailable(target)) return false;
+    downed::LogCombatDecision(npc, target, decision);
+    return true;
+}
+
+bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProcessingUnit* spu = nullptr)
+{
+    if (!HostNpc(instance) || !downed::UnavailablePlayers() ||
+        !instance->GetPropertySet(eEPropertySetType_ScriptRoutine)) return false;
+    Entity npc(instance);
+    if (npc.IsDead() || npc.IsDown()) return false;
+    const Entity current = npc.NPC.GetCurrentTarget(), alternative = npc.NPC.GetAlternativeTarget(),
+                 attacker = npc.NPC.GetCurrentAttacker(), last = npc.NPC.GetLastAttacker(),
+                 spell = npc.NPC.GetSpellTarget(), alignment = npc.GetAlignmentTarget();
+    const Entity inflictor = instance->GetPropertySet(eEPropertySetType_DamageReceiver)
+        ? npc.DamageReceiver.GetLastInflictor() : Entity();
+    uint32_t bindings = 0;
+    eCEntity* down = nullptr;
+    auto check = [&](Entity const& target, downed::TargetBinding binding) {
+        if (downed::CombatUnavailable(target.GetInstance())) {
+            bindings |= binding;
+            if (!down) down = target.GetInstance();
+        }
+    };
+    check(current, downed::Current);
+    check(alternative, downed::Alternative);
+    check(attacker, downed::Attacker);
+    check(last, downed::LastAttacker);
+    check(spell, downed::Spell);
+    check(alignment, downed::Alignment);
+    check(inflictor, downed::Inflictor);
+    if (!bindings) return false;
+    downed::LogCombatDecision(instance, down, boundary, true);
+    const bool stop = downed::StopTargetInstruction(bindings);
+    // A combat instruction owns saved target arguments. Retire it before changing its target proxies.
+    if (stop) {
+        npc.Routine.FullStop();
+        npc.Routine.StopAICombatMove();
+        npc.CharacterMovement.StopMovement();
+    }
+    Entity none;
+    if (bindings & downed::Current) npc.NPC.SetCurrentTarget(none);
+    if (bindings & downed::Alternative) npc.NPC.SetAlternativeTarget(none);
+    if (bindings & downed::Attacker) npc.NPC.SetCurrentAttacker(none);
+    if (bindings & downed::LastAttacker) npc.NPC.SetLastAttacker(none);
+    if (bindings & downed::Spell) npc.NPC.SetSpellTarget(none);
+    if (bindings & downed::Alignment) npc.SetAlignmentTarget(none);
+    if (bindings & downed::Inflictor) npc.DamageReceiver.SetLastInflictor(none);
+    if (stop) {
+        if (!spu) spu = &static_cast<gCScriptRoutine_PS*>(instance->GetPropertySet(eEPropertySetType_ScriptRoutine))->GetSPU();
+        if (downed::CombatUnavailable(spu->GetOtherEntity())) spu->SetOtherEntity(nullptr);
+        if ((bindings & downed::Current) || !current.GetInstance()) {
+            // Native participant lists derive from CombatState and CurrentTarget (+0x1880).
+            // Do not run ZS_Attack_End with the defeated player: its lethal branch may finish them.
+            npc.NPC.CombatState = 0;
+            npc.Routine.AIMode = gEAIMode_Reaction;
+            npc.Routine.ContinueRoutine();
+        } else {
+            npc.Routine.SetTask(bCString("ZS_Attack")); // stale spell, still a valid current opponent
+        }
+    }
+    downed::LogCombatDecision(instance, down, "released", true);
+    return stop;
+}
+
+void SyncDownedTargets()
+{
+    if (!net::IsHost() || !gCSession::GetInstance().IsGameRunning()) return;
+    for (int id = 1; id < net::MaxPlayers; ++id) {
+        eCEntity* puppet = remote::PuppetOf(id);
+        if (!puppet || !puppet->GetPropertySet(eEPropertySetType_ScriptRoutine)) continue;
+        Entity player(puppet);
+        const bool unavailable = downed::CombatUnavailable(puppet);
+        if (unavailable && player.Routine.AIMode != gEAIMode_Down) {
+            player.Routine.AIMode = gEAIMode_Down;
+            downed::LogCombatDecision(puppet, puppet, "publish-down", true);
+        } else if (!unavailable && player.Routine.AIMode == gEAIMode_Down) {
+            player.Routine.AIMode = gEAIMode_Abandoned;
+            downed::LogCombatDecision(puppet, puppet, "publish-alive", true);
+        }
+    }
+    if (!downed::UnavailablePlayers()) return;
+    const bTObjArray<Entity> all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i)
+        ReleaseDownedTargets(all.GetAt(i).GetInstance(), "frame-release");
+}
+
 template <typename Function>
 Function WrapPerceptionEntry(Function function, void* replacement)
 {
@@ -122,6 +218,8 @@ GEInt GE_STDCALL FilterScript(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
     // While another player's puppet stands for the game's player (an Acting scope), this machine's own hero is no player to the
     // scripts and would take part in the fight it hears as a villager does (ZS_WatchFight, ZS_Applaud; 2 Nov.): it perceives nothing then.
     if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return 0; }
+    eCEntity* sender = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (RejectDownedTarget(receiver, sender, "perception-refused")) return 0;
     if (receiver && receiver == detail::damageReceiver) return GETrue;
     return originalScript(spu, self, other, args);
 }
@@ -141,6 +239,7 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
     if (downed::GuardState(self, name)) return GEFalse;
     if (npcplayback::IsPassive(self)) { ++skipped; return GEFalse; }
+    if (ReleaseDownedTargets(self, "state-release", spu)) return GEFalse;
     // A mirrored NPC runs its death state only once the host reported it dead (npcs.cpp sets it then);
     // the client's own hit judgement must not decide that.
     const bool dying = (strncmp(name, "ZS_Dead", 7) == 0 || strncmp(name, "ZS_RagDollDead", 14) == 0) && npcs::DiedOnHost(self);
@@ -459,8 +558,9 @@ namespace {
 GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ShuttingDown()) return originalAttitude ? originalAttitude(spu, self, other, args) : 0;
-    if (playerAttitudeQueries) return originalAttitude(spu, self, other, args);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (RejectDownedTarget(Self(spu, self), target, "attitude-refused")) return gEAttitude_None;
+    if (playerAttitudeQueries) return originalAttitude(spu, self, other, args);
     if (target && remote::IsPuppet(target)) {
         ++attitudeAsked;
         eCEntity* judge = Self(spu, self);
@@ -523,8 +623,46 @@ GEBool GE_STDCALL FilterCallback(gCScriptProcessingUnit* spu)
     eCEntity* receiver = spu ? spu->GetSelfEntity() : nullptr;
     if (PerceptionBlocked(receiver, Driven(receiver))) { ++blocked; return GEFalse; }
     if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return GEFalse; }
+    if (RejectDownedTarget(receiver, spu ? spu->GetOtherEntity() : nullptr, "perception-refused")) return GEFalse;
     if (receiver && receiver == detail::damageReceiver) return GETrue;
     return originalCallback(spu);
+}
+
+gFScript originalAssessTarget = nullptr;
+bool assessTargetSearched = false;
+
+GEInt GE_STDCALL FilterAssessTarget(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    if (ShuttingDown()) return originalAssessTarget ? originalAssessTarget(spu, self, other, args) : 0;
+    eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (RejectDownedTarget(Self(spu, self), target, "assessment-refused")) return 0;
+    return originalAssessTarget(spu, self, other, args);
+}
+
+void WrapAssessTarget(gCScriptAdminExt& admin)
+{
+    auto* script = Find(admin.GetScripts(), "AssessTarget");
+    if (!script || !script->m_funcScript) {
+        Log("ai: AssessTarget not found; downed target native assessment guard unavailable");
+        return;
+    }
+    const gFScript native = script->m_funcScript;
+    originalAssessTarget = native;
+    HMODULE module = GetModuleHandleA("Script_Game.dll");
+    auto* code = module ? reinterpret_cast<unsigned char*>(module) + 0x31470 : nullptr;
+    static const unsigned char head[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x54, 0x01, 0x00, 0x00};
+    bool nativeGuard = false;
+    if (code && reinterpret_cast<void*>(native) == code && !std::memcmp(code, head, sizeof(head))) {
+        if (void* trampoline = JumpTo(code, reinterpret_cast<void*>(&FilterAssessTarget))) {
+            originalAssessTarget = reinterpret_cast<gFScript>(trampoline);
+            nativeGuard = true;
+        }
+    }
+    script->m_funcScript = &FilterAssessTarget;
+    TrackPointer(reinterpret_cast<void*>(&script->m_funcScript), reinterpret_cast<void*>(native),
+                 reinterpret_cast<void*>(&FilterAssessTarget), "ai downed AssessTarget script");
+    Log(nativeGuard ? "ai: downed AssessTarget guard installed at native and script entries"
+                    : "ai: downed AssessTarget guard SCRIPT ONLY; native address/prologue or jump unavailable");
 }
 }
 
@@ -672,6 +810,11 @@ void Describe(char const* name, void (*log)(char const*))
 
 void Tick()
 {
+    SyncDownedTargets();
+    if (!assessTargetSearched && gCSession::GetInstance().IsGameRunning()) {
+        assessTargetSearched = true;
+        WrapAssessTarget(GetScriptAdminExt());
+    }
     if (!attitudeInstalled && gCSession::GetInstance().IsGameRunning()) {
         if (auto* script = Find(GetScriptAdminExt().GetScripts(), "GetAttitude")) {
             // The registered function is the native one 29 functions call directly (OnAttack, AssessTarget, damage
