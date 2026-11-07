@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ending.h"
 
+#include "downed.h"
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
@@ -54,7 +55,7 @@ bool Knows(Entity& hero, gCInfo_PS* info)
 
 void Tick()
 {
-    if (!on) return;
+    if (!on || downed::Terminal()) return;
     const uint32_t now = net::Now();
     if (static_cast<int32_t>(now - nextCheck) < 0) return;
     nextCheck = now + CheckEvery;

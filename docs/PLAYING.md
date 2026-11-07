@@ -190,6 +190,8 @@ changes before deploying this source. It adds the required canonical-state/effec
 an honest save gate. Until wired, the unchanged saver cannot preserve leased NPCs; do not save during a lease.
 The conservative gate refuses active, unimported or pending-effect leases with
 "NPC lease active: save would lose client-owned NPC state"; live-owner checkpoint barriers are not enabled.
+The restore hook passes the saving world's assigned epoch so the first network publication, including a
+later client join after a solo reload, cannot clear already restored NPC state or effect watermarks.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
@@ -403,6 +405,10 @@ Independent world-inventory persistence across saves/late joins is not implement
   makes activity stale; the additional five-second grace then starts. A stale position or another
   world alone does not make an active partner unavailable. The host loads a
   save; the other player is loaded into it automatically.
+  On each PC, the local hero enters native death once (death scream, ragdoll and
+  the localized game-over/"The End" message). Both heroes and their remote bodies
+  stay dead; neither healing nor a late revive can restore gameplay. The native
+  menu remains available to load a save; death does not automatically reload.
 - While either player is knocked out, host-controlled NPCs and creatures drop that player as a combat
   target and choose another eligible enemy or return to their routine. Further attacks cannot damage,
   stagger, push, or apply harmful statuses to the downed player. After revival, normal hostility and

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 namespace g3t::downed {
 inline bool HeldPuppet(uint8_t flags, uint32_t sequence)
@@ -66,6 +67,8 @@ struct Life
 {
     bool held = false;
     bool terminal = false;
+    bool deathStarted = false;
+    bool deathFinished = false;
     uint32_t sequence = 0;
 
     void Rebind()
@@ -100,10 +103,45 @@ struct Life
         return true;
     }
 
+    bool BeginDeath()
+    {
+        if (!terminal || deathStarted) return false;
+        deathStarted = true;
+        return true;
+    }
+
+    void FinishDeath(bool nativeDead)
+    {
+        if (terminal && deathStarted && nativeDead) deathFinished = true;
+    }
+
+    bool TerminalStateAllowed(char const* state) const
+    {
+        if (!terminal) return true;
+        return !std::strcmp(state, deathStarted ? "ZS_RagDollDead_Loop" : "ZS_RagDollDead");
+    }
+
+    bool TerminalTaskAllowed(char const* task) const
+    {
+        return !terminal || (!deathStarted && !std::strcmp(task, "ZS_RagDollDead"));
+    }
+
+    bool TerminalModeAllowed(int mode) const
+    {
+        return !terminal || mode == 9 || (!deathStarted && mode == 1);
+    }
+
+    bool TerminalHpAllowed(int hp) const
+    {
+        return !terminal || hp <= 0;
+    }
+
     void OnWorldChange()
     {
         if (held) Rebind();
         terminal = false;
+        deathStarted = false;
+        deathFinished = false;
     }
 };
 }

@@ -286,10 +286,11 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     eCEntity* localHero = gCSession::GetInstance().GetHero();
     const bool localTerminalState = localHero && self == localHero && downed::Terminal() &&
                                     std::strcmp(name, "ZS_RagDollDead") == 0;
-    if (localTerminalState) downed::ObserveDeathState(self, true);
+    if (localTerminalState && !downed::ObserveDeathState(self, true)) return GEFalse;
     const GEBool result = it->second(stack, spu);
     if (localTerminalState) downed::ObserveDeathState(self, false, result != GEFalse);
     if (fighter) fightmem::AfterState(self);
+    downed::ObserveTerminal(self, name);
     return result;
 }
 
@@ -596,8 +597,18 @@ GEInt GE_STDCALL FilterContinue(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 GEInt GE_STDCALL FilterPlayerKeys(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     // This is the local keyboard dispatcher; its script self can be unset.
-    if (downed::Held()) return 0;
+    if (downed::Held() || downed::Terminal()) return 0;
     return originalPlayerKeys(spu, self, other, args);
+}
+
+gFScriptAIRoutine originalPlayerRoutine = nullptr;
+
+GEBool GE_STDCALL FilterPlayerRoutine(gCScriptProcessingUnit* spu)
+{
+    if (!ShuttingDown() && downed::GuardState(spu ? spu->GetSelfEntity() : nullptr, "Rtn_Player")) return GETrue;
+    const GEBool result = originalPlayerRoutine(spu);
+    downed::ObserveTerminal(spu ? spu->GetSelfEntity() : nullptr, "Rtn_Player");
+    return result;
 }
 
 GEInt GE_STDCALL SafeMoveLength(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -829,7 +840,9 @@ void Tick()
             Logf("ai: GetAttitude wrapped (%s; puppets count as the local hero)", attitudeNative ? "native jump" : "script table only");
         }
     }
-    if ((installed || searched) && statesWrapped && originalContinue && originalPlayerKeys && moveLengthSearched) return;
+    if (gCSession::GetInstance().IsGameRunning()) downed::InstallTerminalGuards();
+    if ((installed || searched) && statesWrapped && originalContinue && originalPlayerKeys &&
+        originalPlayerRoutine && moveLengthSearched) return;
     const DWORD now = GetTickCount();
     if (now - lastTry < 1000) return;
     lastTry = now;
@@ -840,7 +853,20 @@ void Tick()
         if (auto* script = Find(admin.GetScripts(), "OnPlayerGameKeyPressed"); script && script->m_funcScript) {
             originalPlayerKeys = script->m_funcScript;
             script->m_funcScript = &FilterPlayerKeys;
+            TrackPointer(reinterpret_cast<void*>(&script->m_funcScript),
+                         reinterpret_cast<void*>(originalPlayerKeys),
+                         reinterpret_cast<void*>(&FilterPlayerKeys), "downed player gameplay keys");
             Log("downed: gameplay input guard installed");
+        }
+    }
+    if (!originalPlayerRoutine && gCSession::GetInstance().IsGameRunning()) {
+        if (auto* routine = Find(admin.GetScriptAIRoutines(), "Rtn_Player"); routine && routine->m_funcScriptAIRoutine) {
+            originalPlayerRoutine = routine->m_funcScriptAIRoutine;
+            routine->m_funcScriptAIRoutine = &FilterPlayerRoutine;
+            TrackPointer(reinterpret_cast<void*>(&routine->m_funcScriptAIRoutine),
+                         reinterpret_cast<void*>(originalPlayerRoutine),
+                         reinterpret_cast<void*>(&FilterPlayerRoutine), "downed Rtn_Player");
+            Log("downed: Rtn_Player terminal guard installed");
         }
     }
     if (!originalContinue && gCSession::GetInstance().IsGameRunning()) {
@@ -893,6 +919,24 @@ void Tick()
 }
 
 namespace g3t::ai {
+bool EnterTerminalDeath(eCEntity* hero)
+{
+    if (!hero || hero != gCSession::GetInstance().GetHero() || !downed::Terminal() || ShuttingDown()) return false;
+    auto* routine = static_cast<gCScriptRoutine_PS*>(hero->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    if (originalStates.find("ZS_RagDollDead") == originalStates.end()) WrapStates(GetScriptAdminExt());
+    if (!routine || originalStates.find("ZS_RagDollDead") == originalStates.end()) {
+        Log("downed: ANOMALY native terminal entry unavailable");
+        return false;
+    }
+    // Native SetState replaces the SPU's active stack. Do not dispatch on that stack or recursively pump ProcessScript.
+    bTObjStack<gScriptRunTimeSingleState> stack;
+    gScriptRunTimeSingleState state;
+    state.m_strScriptName = "ZS_RagDollDead";
+    stack.Add(state);
+    guards::Acting localPlayer(hero, false); // native Kill's GO_GameOver comparison must use this PC's hero
+    return Run(originalStates, stack, &routine->GetSPU()) != GEFalse;
+}
+
 // QA diagnostic: every registered script, AI callback, state, function and routine whose name contains text.
 void ListNames(char const* text, void (*log)(char const*))
 {

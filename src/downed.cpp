@@ -2,6 +2,7 @@
 #include "downed.h"
 #include "downed_policy.h"
 
+#include "ai.h"
 #include "body.h"
 #include "crashlog.h"
 #include "hud.h"
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 #include <string>
 
 namespace g3t::downed {
@@ -62,10 +64,14 @@ int lastHp = -1;                // the hero's hit points a frame ago
 uint32_t lethalBlowAt = 0;      // when a blow by someone who means to kill took hit points off the hero
 unsigned nativeLethal = 0;      // knock-outs of the game's own that were a lethal blow (promoted to the partner's help)
 bool nativeNoted = false;       // logged once per knock-out of the game's own
-bool terminalStateQueued = false;
 unsigned terminalStateEntries = 0, terminalStateReturns = 0;
 unsigned nativeTerminalKills = 0;
 bool nativeTerminalKillChecked = false;
+uint32_t terminalAt = 0, terminalSampleAt = 0;
+std::string terminalTask, terminalState;
+int terminalHp = -1, terminalAi = -1, terminalMovement = -1;
+unsigned terminalMutations = 0;
+uint32_t terminalMutationAt = 0;
 std::string inHand[2];         // the hero's right and left hand while standing (a knock-out drops them)
 bool wasDown = false;
 uint32_t aloneSince = 0;        // when the knocked-out hero last had nobody known able to help (0: someone can)
@@ -93,6 +99,151 @@ void EndStep(char const* step)
     Logf("downed: end step=%s player=%u role=%s held=%d terminal=%d native_kills=%u sequence=%u",
          step, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
          life.terminal ? 1 : 0, nativeTerminalKills, life.sequence);
+}
+
+bool LocalTerminal(eCEntity* entity)
+{
+    return life.terminal && entity && entity == gCSession::GetInstance().GetHero() &&
+           !persist::NativeLoading() && !ai::ShuttingDown();
+}
+
+void Caller(void* address, char* text, size_t size)
+{
+    HMODULE module = nullptr;
+    char path[MAX_PATH] = {};
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCSTR>(address), &module) && GetModuleFileNameA(module, path, MAX_PATH)) {
+        char const* name = std::strrchr(path, '\\');
+        Format(text, size, "%s+0x%x", name ? name + 1 : path,
+               static_cast<unsigned>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)));
+    } else {
+        Format(text, size, "%p", address);
+    }
+}
+
+void Mutation(char const* source, char const* field, char const* requested, bool refused, void* caller = nullptr)
+{
+    const uint32_t now = net::Now();
+    ++terminalMutations;
+    if (refused && terminalMutations > 40 && now - terminalMutationAt < 1000) return;
+    terminalMutationAt = now;
+    char from[MAX_PATH + 16] = "-";
+    if (caller) Caller(caller, from, sizeof(from));
+    Logf("downed: terminal mutation=%u player=%u role=%s source=%s field=%s requested=%s refused=%d caller=%s",
+         terminalMutations, net::LocalId(), net::IsHost() ? "host" : "client", source, field, requested,
+         refused ? 1 : 0, from);
+    if (!caller) return;
+    void* frames[6] = {};
+    const USHORT count = CaptureStackBackTrace(2, 6, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        Caller(frames[i], from, sizeof(from));
+        Logf("downed: terminal caller mutation=%u frame=%u at=%s", terminalMutations, i, from);
+    }
+}
+
+using SetModeFn = void(__fastcall*)(gCScriptRoutine_PS*, void*, bTPropertyContainer<gEAIMode> const&);
+using SetHpFn = GEBool(__fastcall*)(gCPlayerMemory_PS*, void*, bCString const&, GEInt);
+using SetTaskFn = void(__fastcall*)(gCScriptProcessingUnit*, void*, bCString, GEBool);
+using SetStateFn = void(__fastcall*)(gCScriptProcessingUnit*, void*, bCString);
+SetModeFn originalSetMode = nullptr;
+SetHpFn originalSetHp = nullptr;
+SetTaskFn originalSetTask = nullptr;
+SetStateFn originalSetState = nullptr;
+bool terminalGuardsInstalled = false;
+
+void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer<gEAIMode> const& value)
+{
+    eCEntity* entity = self ? self->GetEntity() : nullptr;
+    if (LocalTerminal(entity)) {
+        const int mode = static_cast<int>(value.GetValue());
+        const bool refused = !life.TerminalModeAllowed(mode);
+        if (refused || static_cast<int>(self->GetAIMode().GetValue()) != mode) {
+            char text[24];
+            Format(text, "%d", mode);
+            Mutation("SetAIMode", "ai", text, refused, _ReturnAddress());
+        }
+        if (refused) return;
+    }
+    originalSetMode(self, edx, value);
+    ObserveTerminal(entity, "SetAIMode");
+}
+
+GEBool __fastcall SetHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
+{
+    eCEntity* entity = self ? self->GetEntity() : nullptr;
+    if (LocalTerminal(entity) && tag == "HP") {
+        const bool refused = !life.TerminalHpAllowed(value);
+        if (refused || Entity(entity).PlayerMemory.GetHitPoints() != value) {
+            char text[24];
+            Format(text, "%d", value);
+            Mutation("SetBaseValue(HP)", "hp", text, refused, _ReturnAddress());
+        }
+        if (refused) return GEFalse;
+    }
+    const GEBool result = originalSetHp(self, edx, tag, value);
+    ObserveTerminal(entity, "SetBaseValue");
+    return result;
+}
+
+void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, GEBool caught)
+{
+    eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
+    if (LocalTerminal(entity)) {
+        const bool refused = !life.TerminalTaskAllowed(task.GetText());
+        Mutation("AISetTask", "task", task.GetText(), refused, _ReturnAddress());
+        if (refused) return;
+    }
+    originalSetTask(self, edx, task, caught);
+    ObserveTerminal(entity, "AISetTask");
+}
+
+void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state)
+{
+    eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
+    if (LocalTerminal(entity)) {
+        const bool refused = !life.TerminalStateAllowed(state.GetText());
+        Mutation("AISetState", "state", state.GetText(), refused, _ReturnAddress());
+        if (refused) return;
+    }
+    originalSetState(self, edx, state);
+    ObserveTerminal(entity, "AISetState");
+}
+
+template <size_t N>
+void* InstallGuard(HMODULE game, char const* name, unsigned char const (&bytes)[N], void* detour)
+{
+    auto* entry = reinterpret_cast<unsigned char*>(GetProcAddress(game, name));
+    if (!entry || std::memcmp(entry, bytes, N)) {
+        Logf("downed: ANOMALY terminal guard prologue mismatch function=%s; not installed", name);
+        return nullptr;
+    }
+    void* original = ai::JumpTo(entry, detour, N);
+    if (!original) Logf("downed: ANOMALY terminal guard patch failed function=%s", name);
+    return original;
+}
+
+void KeepTerminal(Entity& hero, char const* source)
+{
+    ObserveTerminal(hero.GetInstance(), source);
+    if (hero.PlayerMemory.GetHitPoints() > 0) {
+        Mutation(source, "hp", "0", false);
+        hero.PlayerMemory.SetHitPoints(0);
+    }
+    if (!life.deathFinished) return;
+    auto* routine = static_cast<gCScriptRoutine_PS*>(hero.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    if (hero.Routine.AIMode != gEAIMode_Dead) {
+        Mutation(source, "ai", "9", false);
+        hero.Routine.AIMode = gEAIMode_Dead;
+    }
+    // Repair the displayed task without re-queuing the fatal entry; only its corpse loop may be restarted.
+    if (hero.Routine.GetCurrentTask() != "ZS_RagDollDead") {
+        Mutation(source, "task", "ZS_RagDollDead (field only)", false);
+        routine->SetCurrentTask(bCString("ZS_RagDollDead"));
+    }
+    if (hero.Routine.GetCurrentState() != "ZS_RagDollDead_Loop") {
+        Mutation(source, "state", "ZS_RagDollDead_Loop", false);
+        routine->AISetState(bCString("ZS_RagDollDead_Loop"));
+    }
 }
 
 bool DownTask(char const* task)
@@ -434,7 +585,7 @@ bool PartnerPresent(net::Remote const* remotes, uint32_t now)
 }
 
 // Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths end this life once.
-// ZS_RagDollDead is the sole native terminal entry; queue it once rather than starting any second kill path.
+// ZS_RagDollDead is the sole native terminal entry; dispatch once without waiting on the unconscious scheduler.
 void Die(Entity& hero, char const* reason)
 {
     if (!life.End()) {
@@ -452,6 +603,8 @@ void Die(Entity& hero, char const* reason)
          reason, hero.GetInstance(), hero.PlayerMemory.GetHitPoints(), hero.Routine.GetCurrentTask().GetText(),
          hero.Routine.GetCurrentState().GetText(), static_cast<int>(hero.Routine.AIMode));
     const uint32_t now = net::Now();
+    terminalAt = now;
+    terminalSampleAt = now - 100;
     LogHelpers(&hero, reason, now);
     hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
     EndStep("set-hp");
@@ -460,7 +613,7 @@ void Die(Entity& hero, char const* reason)
     hero.Routine.FullStop();
     hero.CharacterMovement.StopMovement();
     // ZS_RagDollDead obtains the native killer and lethal-hit force from these fields. Clear both
-    // before queuing the state so native Kill receives killer=null and no stale inflictor can AddForce.
+    // before entering the state so native Kill receives killer=null and no stale inflictor can AddForce.
     Entity clearAttacker;
     Entity clearInflictor;
     hero.NPC.SetCurrentAttacker(clearAttacker);
@@ -474,36 +627,93 @@ void Die(Entity& hero, char const* reason)
     // ZS_RagDollDead is the native death-presentation entry: it requests DEAD, calls its direct
     // native Kill, and enables ragdoll movement mode 14.
     hero.Routine.AIMode = gEAIMode_Reaction;
-    if (!terminalStateQueued) {
-        terminalStateQueued = true;
-        hero.Routine.SetTask(bCString("ZS_RagDollDead"));
-        EndStep("death-state-queued");
-        Logf("downed: local death state queued once player=%u task=ZS_RagDollDead ai=%d hp=%d",
-             net::LocalId(), static_cast<int>(hero.Routine.AIMode),
-             hero.PlayerMemory.GetHitPoints());
+    auto* routine = static_cast<gCScriptRoutine_PS*>(hero.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    routine->AISetTask(bCString("ZS_RagDollDead"));
+    EndStep("death-state-dispatch");
+    const bool ran = ai::EnterTerminalDeath(hero.GetInstance());
+    if (!ran || !life.deathFinished) {
+        EndStep("death-state-failed");
+        Logf("downed: ANOMALY terminal native entry failed player=%u ran=%d entered=%u returned=%u dead=%d",
+             net::LocalId(), ran ? 1 : 0, terminalStateEntries, terminalStateReturns, hero.IsDead() ? 1 : 0);
     } else {
-        Logf("downed: ANOMALY terminal state queue repeated player=%u", net::LocalId());
+        EndStep("death-state-complete");
     }
+    ObserveTerminal(hero.GetInstance(), "Die-return");
 }
 }
 
-void ObserveDeathState(eCEntity* self, bool entered, bool successful)
+void InstallTerminalGuards()
+{
+    if (terminalGuardsInstalled || ai::ShuttingDown()) return;
+    HMODULE game = GetModuleHandleA("Game.dll");
+    if (!game) return; // scripts/engine have not loaded yet
+    terminalGuardsInstalled = true;
+    // Complete, position-independent instructions verified against CP 1.75.20108.14.
+    static unsigned char const modeBytes[] = {0x56, 0x8b, 0xf1, 0x8b, 0x06, 0x8b, 0x50, 0x58};
+    static unsigned char const hpBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08, 0x56};
+    static unsigned char const taskBytes[] = {0x57, 0x8b, 0xf9, 0x80, 0x7f, 0x64, 0x01};
+    static unsigned char const stateBytes[] = {0x8d, 0x44, 0x24, 0x04, 0x50};
+    originalSetMode = reinterpret_cast<SetModeFn>(InstallGuard(game,
+        "?SetAIMode@gCScriptRoutine_PS@@QAEXABV?$bTPropertyContainer@W4gEAIMode@@@@@Z", modeBytes,
+        reinterpret_cast<void*>(&SetMode)));
+    originalSetHp = reinterpret_cast<SetHpFn>(InstallGuard(game,
+        "?SetBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&SetHp)));
+    originalSetTask = reinterpret_cast<SetTaskFn>(InstallGuard(game,
+        "?AISetTask@gCScriptProcessingUnit@@QAEXVbCString@@_N@Z", taskBytes, reinterpret_cast<void*>(&SetTask)));
+    originalSetState = reinterpret_cast<SetStateFn>(InstallGuard(game,
+        "?AISetState@gCScriptProcessingUnit@@QAEXVbCString@@@Z", stateBytes, reinterpret_cast<void*>(&SetState)));
+    Logf("downed: terminal native guards installed mode=%d hp=%d task=%d state=%d",
+         originalSetMode != nullptr, originalSetHp != nullptr, originalSetTask != nullptr, originalSetState != nullptr);
+}
+
+void ObserveTerminal(eCEntity* self, char const* source)
+{
+    if (!LocalTerminal(self)) return;
+    Entity hero(self);
+    const bCString task = hero.Routine.GetCurrentTask(), state = hero.Routine.GetCurrentState();
+    const int hp = hero.PlayerMemory.GetHitPoints(), aiMode = static_cast<int>(hero.Routine.AIMode);
+    const int movement = static_cast<int>(hero.CharacterMovement.GetMovementMode());
+    const uint32_t now = net::Now();
+    const bool changed = terminalTask != task.GetText() || terminalState != state.GetText() ||
+                         terminalHp != hp || terminalAi != aiMode || terminalMovement != movement;
+    if (!changed && (now - terminalAt > 5000 || now - terminalSampleAt < 100)) return;
+    terminalSampleAt = now;
+    terminalTask = task.GetText();
+    terminalState = state.GetText();
+    terminalHp = hp;
+    terminalAi = aiMode;
+    terminalMovement = movement;
+    auto* routine = static_cast<gCScriptRoutine_PS*>(self->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    Logf("downed: end-state player=%u role=%s elapsed_ms=%u source=%s changed=%d hp=%d ai=%d task=%s "
+         "state=%s movement=%d output=%d task_pos=%d state_pos=%d entered=%u returned=%u native_kills=%u",
+         net::LocalId(), net::IsHost() ? "host" : "client", now - terminalAt, source, changed ? 1 : 0,
+         hp, aiMode, task.GetText(), state.GetText(), movement, routine->GetSPU().IsOutputPlaying() ? 1 : 0,
+         routine->GetSPU().AIGetTaskPosition(), routine->GetSPU().AIGetStatePosition(),
+         terminalStateEntries, terminalStateReturns, nativeTerminalKills);
+}
+
+bool ObserveDeathState(eCEntity* self, bool entered, bool successful)
 {
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!life.terminal || !self || self != hero) return;
+    if (!life.terminal || !self || self != hero) return true;
     Entity entity(hero);
     if (entered) {
+        if (!life.BeginDeath()) {
+            Logf("downed: ANOMALY terminal native entry admission failed player=%u", net::LocalId());
+            return false;
+        }
         ++terminalStateEntries;
         if (terminalStateEntries == 1) {
             Logf("downed: local ZS_RagDollDead entry player=%u native_sound=DEAD owner=local "
-                 "task=%s hp=%d ai=%d",
+                 "task=%s hp=%d ai=%d native_player_is_hero=%d",
                  net::LocalId(), entity.Routine.GetCurrentTask().GetText(),
-                 entity.PlayerMemory.GetHitPoints(), static_cast<int>(entity.Routine.AIMode));
+                 entity.PlayerMemory.GetHitPoints(), static_cast<int>(entity.Routine.AIMode),
+                 Entity::GetPlayer().GetInstance() == hero ? 1 : 0);
         } else {
             Logf("downed: ANOMALY repeated ZS_RagDollDead entry player=%u count=%u",
                  net::LocalId(), terminalStateEntries);
         }
-        return;
+        return true;
     }
     ++terminalStateReturns;
     auto* animation = static_cast<eCVisualAnimation_PS*>(hero->GetPropertySet(eEPropertySetType_Animation));
@@ -522,6 +732,7 @@ void ObserveDeathState(eCEntity* self, bool entered, bool successful)
         const bool deadMode = entity.Routine.AIMode == gEAIMode_Dead &&
                               static_cast<int>(entity.Routine.AIMode) == 9;
         if (dead && deadMode) {
+            life.FinishDeath(true);
             nativeTerminalKills = 1;
             Logf("downed: native Kill confirmed from ZS_RagDollDead player=%u killer=null victim=hero "
                  "dead=%d ai=%d",
@@ -532,6 +743,7 @@ void ObserveDeathState(eCEntity* self, bool entered, bool successful)
                  net::LocalId(), dead ? 1 : 0, static_cast<int>(entity.Routine.AIMode));
         }
     }
+    return true;
 }
 
 // A hero's death runs through the tasks ZS_Dead or ZS_RagDollDead (the hit judgement and the kill cheat set
@@ -557,9 +769,15 @@ bool RedirectDeath(eCEntity* self, char const* state)
 
 bool GuardState(eCEntity* self, char const* state)
 {
-    if (!life.held || life.terminal || !self || self != gCSession::GetInstance().GetHero() ||
+    if ((!life.held && !life.terminal) || !self || self != gCSession::GetInstance().GetHero() ||
         !gCSession::GetInstance().IsGameRunning() || persist::NativeLoading()) return false;
     Entity hero(self);
+    if (life.terminal) {
+        if (life.TerminalStateAllowed(state)) return false;
+        Mutation(state, "AI", state, true);
+        KeepTerminal(hero, "GuardState");
+        return true;
+    }
     // A module tick is not a script clock boundary: a long frame or another script can otherwise wake the hero first.
     if (DownTask(state) || !std::strcmp(state, "ZS_Unconscious_Loop")) {
         if (!std::strcmp(state, "ZS_Unconscious_Loop") && hero.Routine.GetTaskTime() > 5.0f)
@@ -627,15 +845,12 @@ void Tick()
     }
 
     if (life.terminal) {
-        // Terminal death is one-shot.  The native Kill script, and not a repeating task latch, owns game over.
-        // Do not inspect or restart ZS_Dead/ZS_Dead_Loop/PS_Normal here: that lets PS_Normal be accepted without
-        // reviving or re-running the death script, while HP remains 0 and stale revive messages stay refused.
         life.held = false;
         lethal = false;
         lethalSeenDown = false;
         nativeNoted = false;
         revivedBy = 0;
-        if (hero.PlayerMemory.GetHitPoints() > 0) hero.PlayerMemory.SetHitPoints(0);
+        KeepTerminal(hero, "Tick-terminal");
         return;
     }
     if (hero.IsDead() && !life.held) { lethal = false; revivedBy = 0; return; }
@@ -866,11 +1081,16 @@ void OnWorldChange()
     lastHp = -1;
     lethalBlowAt = 0;
     nativeNoted = false;
-    terminalStateQueued = false;
     terminalStateEntries = 0;
     terminalStateReturns = 0;
     nativeTerminalKills = 0;
     nativeTerminalKillChecked = false;
+    terminalAt = terminalSampleAt = 0;
+    terminalTask.clear();
+    terminalState.clear();
+    terminalHp = terminalAi = terminalMovement = -1;
+    terminalMutations = 0;
+    terminalMutationAt = 0;
     crashlog::EndStep("world-change");
     Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
     wasDown = false;

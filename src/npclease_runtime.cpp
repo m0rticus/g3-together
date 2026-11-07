@@ -48,6 +48,7 @@ struct GuidHash {
 };
 std::unordered_map<GuidKey, Entry, GuidHash> entries;
 GuardRegistry guardStates;
+RestoreEpochBinding restoreEpoch;
 uint32_t authoritySerial = 0, scanAt = 0, reportAt = 0, seenWorld = 0, seenWelcome = 0;
 unsigned granted = 0, recalled = 0, recovered = 0, refused = 0, stateSent = 0, stateReceived = 0;
 unsigned contactsRefused = 0, nativeDeaths = 0, repeatedDeaths = 0;
@@ -835,7 +836,7 @@ SaveOverlay Capture()
     }
     return result;
 }
-bool Restore(SaveOverlay const& overlay)
+bool Restore(SaveOverlay const& overlay, uint32_t expectedWorldEpoch)
 {
     std::vector<uint8_t> bytes;
     if (!EncodeOverlay(overlay, bytes)) {
@@ -844,9 +845,11 @@ bool Restore(SaveOverlay const& overlay)
         return false;
     }
     OnWorldDeactivate();
+    const uint32_t restoredWorld = expectedWorldEpoch ? expectedWorldEpoch : net::WorldEpoch();
+    restoreEpoch.Bind(net::WorldEpoch(), restoredWorld);
     for (auto const& saved : overlay) {
         Entry& entry = entries[Key(saved.guid)];
-        entry.world = net::WorldEpoch(); entry.lease.state = saved.state;
+        entry.world = restoredWorld; entry.lease.state = saved.state;
         entry.lease.incarnation = saved.incarnation; entry.lease.epoch = saved.epoch;
         entry.lease.revision = saved.revision; entry.lease.phase = Phase::Dormant;
         entry.hasBaseline = true;
@@ -855,6 +858,8 @@ bool Restore(SaveOverlay const& overlay)
     }
     seenWorld = net::WorldEpoch(); seenWelcome = net::WelcomeSerial();
     Logf("npclease: restored %u dormant canonical NPCs; no saved lease owner resumed", static_cast<unsigned>(overlay.size()));
+    if (restoreEpoch.expected)
+        Logf("npclease: restored world %08x awaiting first network publication", restoreEpoch.expected);
     return true;
 }
 bool WriteSnapshot(FILE* file)
@@ -879,6 +884,7 @@ void OnWorldDeactivate()
 {
     entries.clear();
     guardStates.Clear();
+    restoreEpoch.expected = 0;
     scanAt = 0;
     seenWorld = net::WorldEpoch(); seenWelcome = net::WelcomeSerial();
 }
@@ -899,6 +905,10 @@ void Tick()
 {
     if (ai::ShuttingDown() || persist::NativeLoading() || !remote::ControlledBody()) return;
     if (!Install()) return;
+    if (net::IsHost() && restoreEpoch.Consume(net::WorldEpoch())) {
+        seenWorld = net::WorldEpoch();
+        Logf("npclease: canonical restore bound to published world %08x", seenWorld);
+    }
     if (seenWorld != net::WorldEpoch() || (!net::IsHost() && seenWelcome != net::WelcomeSerial())) OnWorldDeactivate();
     const uint32_t now = net::Now();
     if (scanAt && now - scanAt < 100) return;

@@ -118,7 +118,9 @@ on both sides; these are manual checks, not a claim that the scenarios have pass
    even after five seconds. A later knock-out is a new episode with its own single payment.
 2. Reload the paired test save between terminal attempts. Knock both players down nearly simultaneously;
    then repeat with the host down first and with the client down first. When each sees the other as present
-   and down/dead, expect game over without a crash or a repeated death task. Check both screens and logs.
+   and down/dead, both local heroes must scream/ragdoll once and show native game-over/"The End" text.
+   Both partner bodies must be corpses. Wait at least ten seconds and try movement, weapon draw, attacks
+   and helping: neither local hero may stand up, fight or revive. The native menu/load must still work.
 3. Knock one player down while the partner is in a menu/loading or otherwise not known to be present. The
    absence is not immediate `all-down`: allow at least five seconds of continuous inability to help and
    expect `alone-grace` if no eligible helper returns. Repeat with the partner returning before the grace
@@ -139,10 +141,17 @@ on both sides; these are manual checks, not a claim that the scenarios have pass
    If testing genuinely different loaded worlds, the helper must return to the target's world before helping.
 
 For each terminal life, inspect `g3together.log` manually for the decision reason `all-down` or `alone-grace`
-and one `downed: end step=kill-enter` followed by one `kill-return` when the native call returns. Reentry
-may log `skipped-terminal` but must not issue another Kill. The native script contract is `Kill(killer, victim)`:
-the killer may be null, but the victim must be the local hero. If a crash occurs inside the call, record the
-last step (`CRASH end-flow last_step=...`), both logs and any dump; `kill-return` will be absent. If the
+and one `death-state-dispatch`, one `local ZS_RagDollDead entry`, one return with HP 0/AIMode 9/
+movement 14/ragdoll/controller enabled, `native Kill confirmed`, and `death-state-complete` on each PC.
+Reentry may log `skipped-terminal` but must not execute another death entry/Kill/scream. The native
+script contract is `Kill(killer, victim)`: the killer is null and the victim is the local hero.
+`end-state` samples run every 100 ms for the first five seconds and on later changes. They must retain
+AIMode 9 and `ZS_RagDollDead_Loop`, not `PS_Normal` or a weapon task. A `terminal mutation`
+reports the named setter/state boundary, attempted field/value, refusal and caller module/RVA;
+the following `terminal caller` frames identify native/mod callers beyond the Script.dll wrapper.
+`StartPuppetTerminal-before-SVM`/`after-SVM` changes isolate partner speech from local death.
+If a crash occurs inside the call, record the last step (`CRASH end-flow last_step=...`), both logs
+and any dump; `death-state-complete` will be absent. If the
 bundled dump writer rejects detailed flags, the log should report a `MiniDumpNormal` retry; record any dump
 write/rewind failure or empty dump. Do not trigger a crash just to check the diagnostic.
 

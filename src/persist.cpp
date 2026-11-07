@@ -1947,7 +1947,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     crashlog::WorldEntryWait("engine hero/game readiness");
     const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
     if (ok && net::IsHost()) {
-        if (leaseRead) npclease::Restore(leaseOverlay);
+        if (leaseRead) npclease::Restore(leaseOverlay, epoch);
         else npclease::RejectSnapshot("missing or invalid");
     }
     if (ok && net::IsHost()) downed::Restore(savedDowned, "host-save");

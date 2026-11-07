@@ -33,6 +33,7 @@ inline bool PerceptionBlocked(eCEntity* receiver, bool driven)
 }
 
 void Tick();             // installs the filter once the game's scripts have registered it
+bool EnterTerminalDeath(eCEntity* hero); // synchronous native entry on an isolated runtime stack
 bool PerceptionFiltered();
 unsigned BlockedCount(); // perceptions refused for driven bodies so far
 unsigned SkippedCount(); // AI states/functions not run for driven bodies so far

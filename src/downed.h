@@ -10,7 +10,9 @@ class eCEntity;
 namespace g3t::downed {
 // Called by the AI wrapper before an AI state runs for the local hero; true when it replaced a death state.
 bool RedirectDeath(eCEntity* self, char const* state);
-bool GuardState(eCEntity* self, char const* state); // before native AI runs: only the down task/loop may run while held
+bool GuardState(eCEntity* self, char const* state); // held: knockout only; terminal: one native entry, then corpse loop
+void InstallTerminalGuards();
+void ObserveTerminal(eCEntity* self, char const* source);
 // Once per frame: a knocked-out hero stays down while a partner could help; a partner who talks to its puppet and
 // chooses "Ich werde dir helfen." pays a healing potion and stands it up (owner 23.10.). Active, alive partners count
 // anywhere; nobody able to help for 5 s after genuine absence: the hero dies. Other players are told
@@ -36,7 +38,7 @@ void LethalOnlyOff(LogFn log);  // QA negative control: every knock-out waits fo
 void GivePotion(char const* argument, LogFn log);  // QA: "Template[-Amount]" into the hero's inventory ("-0" takes all away)
 void Potions(LogFn log); // QA: POTION lines for the hero's potions
 void Report(LogFn log);  // QA: DOWNED line
-void ObserveDeathState(eCEntity* self, bool entered, bool successful = true);
+bool ObserveDeathState(eCEntity* self, bool entered, bool successful = true); // false refuses duplicate native entry
 void AutoHelpOn(LogFn log);     // QA: standing next to a downed partner for 3 s helps it up again (as before 23.10.)
 void HelpOptionOff(LogFn log);  // QA negative control: a downed partner's puppet offers no help option
 void HelpLineSaid();  // infocmd.cpp: the line "Ich werde dir helfen." of the help option is being spoken

@@ -164,6 +164,59 @@ void HelperEligibilityAroundPendingRevive()
     assert(!pending.Apply(true) && life.terminal && !life.held);
 }
 
+void NativeTerminalAdmissionAndRepair()
+{
+    Life life;
+    assert(!life.BeginDeath()); // native KO/death before the terminal decision is not terminal admission
+    for (int episode = 0; episode < 100; ++episode) {
+        life.Hold();
+        PendingRevive pending{life};
+        const uint32_t sequence = life.sequence;
+        pending.Receive(sequence, true);
+        assert(life.End());
+        assert(!pending.Apply(true)); // paid before all-down, delivered/applied after terminal
+        assert(life.TerminalTaskAllowed("ZS_RagDollDead"));
+        assert(life.TerminalStateAllowed("ZS_RagDollDead"));
+        assert(!life.TerminalStateAllowed("ZS_RagDollDead_Loop"));
+        assert(life.TerminalModeAllowed(1) && life.TerminalModeAllowed(9));
+        assert(life.TerminalHpAllowed(0) && !life.TerminalHpAllowed(1));
+        assert(life.BeginDeath());
+        assert(!life.BeginDeath()); // neither the queued task nor a native callback can kill twice
+        assert(!life.TerminalTaskAllowed("ZS_RagDollDead"));
+        assert(!life.TerminalStateAllowed("ZS_RagDollDead"));
+        assert(life.TerminalStateAllowed("ZS_RagDollDead_Loop"));
+        life.FinishDeath(false);
+        assert(!life.deathFinished && life.terminal);
+        life.FinishDeath(true); // verified native return; repeated loop returns cannot release life
+        assert(life.deathFinished && life.deathStarted);
+        life.FinishDeath(false);
+        for (int tick = 0; tick < 100; ++tick) {
+            life.Restore(false); // partner alive/held/dead echoes are not local life authority
+            life.Restore(true);
+            pending.Receive(sequence, true);
+            assert(!pending.Apply(true) && !life.Revive(sequence));
+            assert(!life.BeginDeath() && !life.End());
+            assert(life.terminal && !life.held && life.deathFinished);
+            for (char const* task : {"PS_Normal", "PS_Melee", "ZS_StandUp", "ZS_Unconscious_Loop",
+                                    "ZS_Dead", "ZS_Dead_Loop", "Rtn_Player", "ContinueRoutine"}) {
+                assert(!life.TerminalTaskAllowed(task));
+                assert(!life.TerminalStateAllowed(task));
+            }
+            for (int mode : {0, 1, 6, 8, 10}) assert(!life.TerminalModeAllowed(mode));
+            assert(life.TerminalModeAllowed(9));
+            for (int hp : {1, 20, 50, 1000}) assert(!life.TerminalHpAllowed(hp));
+        }
+        life.OnWorldChange();
+        assert(!life.terminal && !life.deathStarted && !life.deathFinished);
+        assert(life.TerminalTaskAllowed("PS_Normal"));
+        assert(life.TerminalStateAllowed("Rtn_Player"));
+        assert(life.TerminalModeAllowed(0) && life.TerminalHpAllowed(100));
+        life.Hold();
+        assert(!life.Revive(sequence));
+        assert(life.Revive(life.sequence)); // ordinary revive still works in the next world/life
+    }
+}
+
 g3t::downed::Availability AvailabilityOf(g3t::net::Remote const& r, uint32_t now)
 {
     return g3t::downed::HelperAvailability(r.connected, r.activity.known, r.activity.ticks, r.activity.flags, now);
@@ -252,6 +305,7 @@ int main()
     TerminalAndWorldChanges();
     ReorderedSnapshotsAndRevives();
     HelperEligibilityAroundPendingRevive();
+    NativeTerminalAdmissionAndRepair();
     LocationAndPresentationDoNotDecideAvailability();
     RealUnavailableAndAllDown();
     ActivityOrderingAndTimerWrap();

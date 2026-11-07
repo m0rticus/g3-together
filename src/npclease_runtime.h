@@ -20,7 +20,8 @@ bool ContactAllowed(eCEntity const* victim, eCEntity const* source);
 bool ActiveLeases();
 // Canonical state only; no entity access, IO, native calls or live owner clocks.
 SaveOverlay Capture();
-bool Restore(SaveOverlay const& overlay);
+// Pass the saving world's epoch when restoring before its first network publication.
+bool Restore(SaveOverlay const& overlay, uint32_t expectedWorldEpoch = 0);
 bool WriteSnapshot(FILE* file);
 bool ReadSnapshot(FILE* file, SaveOverlay& overlay);
 void RejectSnapshot(char const* reason);

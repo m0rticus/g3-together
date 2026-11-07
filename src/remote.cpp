@@ -468,7 +468,9 @@ void StartPuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t 
     if (!puppet.terminalSound) {
         puppet.terminalSound = true;
         Entity target(const_cast<eCEntity*>(&hero));
+        downed::ObserveTerminal(target.GetInstance(), "StartPuppetTerminal-before-SVM");
         puppet.entity.StartSaySVM(target, bCString("DEAD"), GEFalse);
+        downed::ObserveTerminal(target.GetInstance(), "StartPuppetTerminal-after-SVM");
         Logf("downed: puppet player=%d action=sound svm=DEAD requested=1 source=puppet target=local-hero",
              id);
     }

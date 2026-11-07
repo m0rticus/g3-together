@@ -36,7 +36,7 @@ class DownedPolicyTests(unittest.TestCase):
         cls.downed_cpp = DOWNED_CPP.read_text(encoding="utf-8")
         cls.script_cpp = SCRIPT_CPP.read_text(encoding="utf-8")
 
-    def test_die_is_idempotent_and_queues_native_ragdoll_death_once(self):
+    def test_die_is_idempotent_and_dispatches_native_ragdoll_death_once(self):
         body = function_body(
             self.downed_cpp,
             r"\bvoid\s+Die\s*\(\s*Entity\s*&\s*hero\s*,\s*char\s+const\s*\*\s*reason\s*\)",
@@ -52,7 +52,8 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertNotIn("CallScript", body)
         self.assertNotIn('bCString("Kill")', body)
         self.assertEqual(body.count('bCString("ZS_RagDollDead")'), 1)
-        self.assertEqual(body.count("hero.Routine.SetTask"), 1)
+        self.assertEqual(body.count("routine->AISetTask"), 1)
+        self.assertEqual(body.count("ai::EnterTerminalDeath"), 1)
         self.assertIn("hero.Routine.AIMode = gEAIMode_Reaction;", body)
         self.assertIn("hero.CharacterMovement.StopMovement();", body)
         self.assertIn("Entity clearAttacker;", body)
@@ -64,7 +65,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertLess(body.index("hero.CharacterMovement.StopMovement();"),
                         body.index("hero.NPC.SetCurrentAttacker(clearAttacker);"))
         self.assertLess(body.index("hero.DamageReceiver.SetLastInflictor(clearInflictor);"),
-                        body.index('hero.Routine.SetTask(bCString("ZS_RagDollDead"));'))
+                        body.index('routine->AISetTask(bCString("ZS_RagDollDead"));'))
         ordered = (
             'EndStep("decision");',
             'EndStep("set-hp");',
@@ -76,7 +77,8 @@ class DownedPolicyTests(unittest.TestCase):
             "hero.DamageReceiver.SetLastInflictor(clearInflictor);",
             "hero.Routine.AIMode = gEAIMode_Reaction;",
             'bCString("ZS_RagDollDead")',
-            'EndStep("death-state-queued");',
+            'EndStep("death-state-dispatch");',
+            "ai::EnterTerminalDeath(hero.GetInstance())",
         )
         self.assertEqual([body.index(step) for step in ordered],
                          sorted(body.index(step) for step in ordered))
@@ -97,8 +99,16 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertNotIn("StandUp", terminal)
         self.assertNotIn("diedAt", terminal)
         self.assertNotIn("dying again", terminal)
-        self.assertIn("hero.PlayerMemory.GetHitPoints() > 0", terminal)
-        self.assertIn("hero.PlayerMemory.SetHitPoints(0)", terminal)
+        self.assertIn('KeepTerminal(hero, "Tick-terminal")', terminal)
+        repair = function_body(self.downed_cpp, r"\bvoid\s+KeepTerminal\s*\(")
+        self.assertIn("hero.PlayerMemory.SetHitPoints(0)", repair)
+        self.assertIn("if (!life.deathFinished) return;", repair)
+        self.assertIn("hero.Routine.AIMode = gEAIMode_Dead", repair)
+        self.assertIn('routine->SetCurrentTask(bCString("ZS_RagDollDead"))', repair)
+        self.assertIn('routine->AISetState(bCString("ZS_RagDollDead_Loop"))', repair)
+        self.assertNotIn("AISetTask", repair)
+        self.assertNotIn("EnterTerminalDeath", repair)
+        self.assertNotIn("FullStop", repair)
         self.assertIn("return;", terminal)
 
     def test_revive_refuses_terminal_and_world_change_resets_it(self):
@@ -125,7 +135,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("life.OnWorldChange();", world_change)
         self.assertIn("nativeTerminalKills = 0;", world_change)
         self.assertIn("nativeTerminalKillChecked = false;", world_change)
-        self.assertIn("terminalStateQueued = false;", world_change)
+        self.assertIn("terminalTask.clear();", world_change)
         self.assertIn("pendingReviveSequence = 0;", world_change)
         self.assertIn("void OnWorldChange();", self.downed_h)
         self.assertIn("bool Terminal();", self.downed_h)
@@ -150,7 +160,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertNotIn("nativeTerminalKill", ai)
         observe = function_body(
             self.downed_cpp,
-            r"\bvoid\s+ObserveDeathState\s*\(\s*eCEntity\s*\*\s*self\s*,\s*bool\s+entered\s*,\s*bool\s+successful\s*\)",
+            r"\bbool\s+ObserveDeathState\s*\(\s*eCEntity\s*\*\s*self\s*,\s*bool\s+entered\s*,\s*bool\s+successful\s*\)",
         )
         self.assertIsNotNone(observe)
         self.assertIn("if (successful && !nativeTerminalKillChecked)", observe)
@@ -162,14 +172,48 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("native Kill confirmed from ZS_RagDollDead", observe)
         self.assertIn("ANOMALY native Kill not confirmed", observe)
         self.assertIn("killer=null victim=hero", observe)
+        self.assertIn("if (!life.BeginDeath())", observe)
+        self.assertIn("life.FinishDeath(true)", observe)
         self.assertNotIn("ObserveNativeKill", self.downed_h)
         self.assertNotIn("ObserveNativeKill", self.downed_cpp)
         keys = function_body(ai, r"\bGEInt\s+GE_STDCALL\s+FilterPlayerKeys\s*\(")
-        self.assertIn("if (downed::Held()) return 0;", keys)
+        self.assertIn("if (downed::Held() || downed::Terminal()) return 0;", keys)
         self.assertIn("persist::NativeLoading()", self.downed_cpp)
         self.assertIn("if (persist::HeroPending())", tick)
         redirect = function_body(self.downed_cpp, r"\bbool\s+RedirectDeath\s*\(")
         self.assertIn("!persist::HeroPending()", redirect)
+
+    def test_terminal_native_boundaries_are_guarded_and_observed(self):
+        ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
+        enter = function_body(ai, r"\bbool\s+EnterTerminalDeath\s*\(")
+        self.assertIn("bTObjStack<gScriptRunTimeSingleState> stack;", enter)
+        self.assertIn("gScriptRunTimeSingleState state;", enter)
+        self.assertIn('state.m_strScriptName = "ZS_RagDollDead";', enter)
+        self.assertIn("stack.Add(state)", enter)
+        self.assertIn("guards::Acting localPlayer(hero, false)", enter)
+        self.assertIn("Run(originalStates, stack, &routine->GetSPU())", enter)
+        self.assertNotIn("ProcessScript()", enter)
+        self.assertNotIn("CallScript", enter)
+        player_routine = function_body(ai, r"\bGEBool\s+GE_STDCALL\s+FilterPlayerRoutine\s*\(")
+        self.assertIn("downed::GuardState", player_routine)
+        self.assertLess(player_routine.index("downed::GuardState"), player_routine.index("originalPlayerRoutine(spu)"))
+        guard = function_body(self.downed_cpp, r"\bbool\s+GuardState\s*\(")
+        self.assertIn("life.TerminalStateAllowed(state)", guard)
+        self.assertIn('KeepTerminal(hero, "GuardState")', guard)
+        for name, policy in (("SetMode", "TerminalModeAllowed"), ("SetHp", "TerminalHpAllowed"),
+                             ("SetTask", "TerminalTaskAllowed"), ("SetState", "TerminalStateAllowed")):
+            setter = function_body(self.downed_cpp, rf"\b(?:void|GEBool)\s+__fastcall\s+{name}\s*\(")
+            self.assertIn("LocalTerminal(entity)", setter)
+            self.assertIn(policy, setter)
+            self.assertIn("_ReturnAddress()", setter)
+            self.assertIn("ObserveTerminal", setter)
+        samples = function_body(self.downed_cpp, r"\bvoid\s+ObserveTerminal\s*\(")
+        self.assertIn("now - terminalAt > 5000", samples)
+        self.assertIn("now - terminalSampleAt < 100", samples)
+        self.assertIn("end-state player=", samples)
+        self.assertIn("hp=%d ai=%d task=%s", samples)
+        ending = (ROOT / "src" / "ending.cpp").read_text(encoding="utf-8")
+        self.assertIn("if (!on || downed::Terminal()) return;", function_body(ending, r"\bvoid\s+Tick\s*\("))
 
     def test_records_preserve_downed_state_before_restoring_hp(self):
         hero = (ROOT / "src" / "hero.cpp").read_text(encoding="utf-8")

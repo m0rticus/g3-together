@@ -124,5 +124,18 @@ int main()
         if (j % 7 == 0) guards.Clear();
     }
     for (auto& reader : readers) reader.join();
+    RestoreEpochBinding binding;
+    binding.Bind(10, 11);
+    assert(!binding.Consume(10));
+    assert(!binding.Consume(12)); // an unrelated world change must still discard the restore
+    assert(binding.expected == 11);
+    assert(binding.Consume(11));
+    assert(!binding.Consume(11));
+    assert(!binding.Consume(12));
+    binding.Bind(0, 42); // the first host publication may follow a solo native import
+    assert(!binding.Consume(0));
+    assert(binding.Consume(42));
+    binding.Bind(42, 42);
+    assert(!binding.Consume(42));
     std::cout << "npclease_client_test: PASS (200 transfers, conservative expiry, loss/reorder/duplicates)\n";
 }

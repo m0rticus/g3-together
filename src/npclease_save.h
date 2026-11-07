@@ -10,6 +10,17 @@ namespace g3t::npclease {
 inline constexpr char SavePrefix[] = "npclease1 ";
 inline constexpr size_t MaxOverlayText = 2 * (20 + MaxLeases * 261) + sizeof(SavePrefix);
 
+struct RestoreEpochBinding {
+    uint32_t expected = 0;
+
+    void Bind(uint32_t current, uint32_t restored) { expected = restored != current ? restored : 0; }
+    bool Consume(uint32_t current)
+    {
+        if (!expected || current != expected) return false;
+        expected = 0;
+        return true;
+    }
+};
 inline bool EncodeSaveText(SaveOverlay const& overlay, std::string& output)
 {
     std::vector<uint8_t> bytes;
