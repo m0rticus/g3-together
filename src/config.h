@@ -24,6 +24,7 @@ struct Config
     // host_roi: desired NPC coverage in cm. Extends NPC collection only; never shrinks or changes the engine's native ROI.
     float hostRoi = 8000.0f;
     uint8_t ardeaRemoveNpcs = npcremoval::policy::Defaults; // host: reviewed Ardea instances only; empty list disables
+    bool npcAuthorityFallback = true; // npc_authority_fallback = on | off; restricted wildlife leases
     // host_sim = elastic | off: elastic adds one NPC-only range covering the players; the real camera never moves.
     bool hostSimElastic = false;
     // host_sim = spheres (world.cpp, Stufe 2 in full, 28.10.): instead of one sphere around all, the host processes one sphere

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npcplayback.h"
 #include "npcsend_policy.h"
+#include "npclease_runtime.h"
 
 #include "ai.h"
 #include "body.h"
@@ -181,10 +182,10 @@ bool Passive(eCEntity const* entity)
 {
     if (!entity) return false;
     if (entity == probe.target) return true;
-    if (!enabled || !clientMode || !entity->GetPropertySet(eEPropertySetType_NPC)) return false;
+    if (!enabled || !entity->GetPropertySet(eEPropertySetType_NPC)) return false;
     if (entity->GetPropertySet(eEPropertySetType_PlayerMemory) || entity == gCSession::GetInstance().GetHero() ||
         entity == remote::ControlledBody() || remote::IsPuppet(entity)) return false;
-    return true;
+    return npclease::Fenced(entity) || (clientMode && !npclease::LocalAuthority(entity));
 }
 
 // The one NPC our hero is talking to: its script routine runs here so the dialog speaks the NPC's lines and waits for them as
@@ -352,7 +353,7 @@ bool RegisterEntity(eCEntity* entity)
 GEBool __fastcall AddProperty(eCEntity* self, void* edx, eCEntityPropertySet* property, GEBool flag)
 {
     if (ai::ShuttingDown()) return originalAddProperty ? originalAddProperty(self, edx, property, flag) : GEFalse;
-    if (enabled && clientMode && property && !RegisterProperty(property)) {
+    if (enabled && (clientMode || npclease::Fenced(self)) && property && !RegisterProperty(property)) {
         Log("FAIL npcplayback: refusing an unguarded property during client entity creation");
         return GEFalse;
     }
@@ -949,6 +950,7 @@ uint32_t PoseInterval(net::NpcRecord const& record)
 }
 
 bool IsPassive(eCEntity const* entity) { return Passive(entity); }
+bool GuardForLease(eCEntity* entity) { return enabled && entity && RegisterEntity(entity); }
 
 void Silence(eCEntity* entity)
 {

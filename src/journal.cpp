@@ -111,6 +111,25 @@ void Apply(Entity& npc, Death& d)
 
 void Start() { net::SetDeathHandler(&OnDeath); }
 
+bool LeaseDeath(eCEntity* entity, unsigned char owner)
+{
+    if (!net::IsHost() || !entity || !owner || owner >= net::MaxPlayers) return false;
+    Entity npc(entity);
+    if (!npc.IsDead()) return false;
+    const auto key = Key(entity);
+    auto existing = deaths.find(key);
+    if (existing != deaths.end()) return existing->second.applied && !existing->second.questPending;
+    if (!gCQuestManager_PS::GetInstance()) {
+        Log("FAIL npclease: quest manager unavailable; canonical death effect remains pending");
+        return false;
+    }
+    Death death;
+    death.by = owner; death.applied = true; death.name = npc.GetName().GetText();
+    deaths.emplace(key, death); // guard native quest callbacks before entering them
+    CountQuest(npc);
+    return true;
+}
+
 unsigned Write(FILE* file)
 {
     unsigned n = 0;

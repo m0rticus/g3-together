@@ -155,7 +155,7 @@ The current source uses **protocol 75**. Its host-only NPC overhaul and paired s
 in progress, so this source must not be treated as a verified release. Both players need the same build; older protocol peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
-The host simulates all NPCs, including remote companions, guides and summons. Separate non-rendered prefetch cameras
+The host normally simulates NPCs, including remote companions, guides and summons. Separate non-rendered prefetch cameras
 load distant simulation regions; the real camera, static-world culling and building LOD remain unchanged.
 `host_roi` controls NPC coverage, not rendering distance. The old `host_sim = off/elastic` choices no longer transfer
 simulation to a client.
@@ -167,6 +167,29 @@ The host can select `ardea_remove_npcs = Goblin,Ogre`, `Goblin`, `Ogre`, or an e
 the rule. Names are exact; invalid/duplicate names are logged and leave the previous setting unchanged.
 Clients follow the host's reliable removal records, including after rejoining/loading.
 Choose the setting before making the co-op save: disabled entity flags already written into a save are retained.
+`npc_authority_fallback = on` (the default on both copies) enables real client AI for ordinary, unequipped
+Wolf, Boar, Deer and Scavenger instances. The host must already know the animal's native identity/state;
+unknown remote spawns are not adopted from client reports. Named variants, humans, dialogue/merchant/party actors,
+and encounters within 40 m of excluded actors remain host-owned. Leases require exactly one connected client.
+The client must be within 40 m of the animal. The host grants after three seconds without a processed animation
+instance, or beyond its own hero/real-camera reach: `max(120 m, host_roi + 20 m)`. Remote prefetch cameras do not
+count as primary host reach. The host fences its instance while the client runs native movement, combat and death;
+local leased NPCs are ready for hits without waiting for a host pose stream.
+
+When a usable host instance comes within the recall band (20 m inside the admission radius), the client freezes
+a calm state, the host imports its transform/HP/life/routine, and a newer authority epoch returns it to ordinary
+mirroring. A fight can defer the cut for at most ten seconds; no executing AI stack or attack animation is copied.
+Burning/poison/disease ages transfer in native game seconds. Frozen/transformed/unsupported task states remain
+fenced if they cannot finish before expiry. Disconnects, loading, a paused/unresponsive host or disabled fallback
+freeze client AI before its three-second lease expires; the host adopts only its last accepted state.
+Personal loot stays personal; hand-back never reruns the native death/XP/treasure script.
+`npc_authority_fallback = off` keeps the pure host model.
+
+**Integration requirement:** the separate `npclease-save-integration.patch` must be reconciled with the paired-save
+changes before deploying this source. It adds the required canonical-state/effect-watermark journal record and
+an honest save gate. Until wired, the unchanged saver cannot preserve leased NPCs; do not save during a lease.
+The conservative gate refuses active, unimported or pending-effect leases with
+"NPC lease active: save would lose client-owned NPC state"; live-owner checkpoint barriers are not enabled.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use

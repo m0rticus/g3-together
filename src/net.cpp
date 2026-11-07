@@ -45,6 +45,7 @@ enum : uint8_t { MsgPlayerActivity = 50 };
 enum : uint8_t { MsgPoseAck = 51 };
 enum : uint8_t { MsgNpcRemoval = 52 };
 constexpr uint8_t MsgPlayerResync = 60;
+constexpr uint8_t MsgNpcLease = 61;
 
 #pragma pack(push, 1)
 struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };
@@ -203,6 +204,7 @@ unsigned controlBaselineLogs = 0, controlRequestLogs = 0, controlBatchLogs = 0, 
 detail::BandwidthCounters bandwidth;
 uint32_t bandwidthSince = 0, lastSentData = 0, lastSentPackets = 0, lastReceivedData = 0, lastReceivedPackets = 0;
 NpcHandler npcHandler = nullptr;
+NpcLeaseHandler npcLeaseHandler = nullptr;
 NpcPoseHandler npcPoseHandler = nullptr;
 PlayerStateHandler playerStateHandler = nullptr;
 NpcReleaseHandler npcReleaseHandler = nullptr;
@@ -895,6 +897,21 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     if (type == MsgPosedNpc || type == MsgCompactPosedNpc || type == MsgControlPose) ++poseReceived;
     const bool xpHandshake = XpHandshake(packet->data, packet->dataLength);
     if (Gated(type) && !xpHandshake && !Open(peer)) { ++gatedIn; return; }  // live XP/reproduction waits for the world gate
+    if (type == MsgNpcLease) {
+        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) ||
+            (!isHost && (!connected || peer != server)) ||
+            packet->dataLength != sizeof(npclease::Message) + 1 ||
+            !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
+        npclease::Message note;
+        std::memcpy(&note, packet->data + 1, sizeof(note));
+        if (!npclease::Valid(note) || note.world != worldEpoch) {
+            Log("net: invalid NPC lease identity/state refused");
+            return;
+        }
+        if (npcLeaseHandler) npcLeaseHandler(from, note);
+        return;
+    }
     if (type == MsgHello && isHost && packet->dataLength >= 3) {
         if (peer->data) { Log("net: a second hello from a player who joined already; ignored"); return; }  // it took a new slot each time
         Hello hello{};
@@ -1801,6 +1818,17 @@ uint32_t HashWorld(char const* name)
 
 uint32_t Now() { return enet_time_get(); }
 uint32_t WorldEpoch() { return worldEpoch; }
+
+bool SendNpcLease(uint8_t to, npclease::Message const& note)
+{
+    if (!npclease::Valid(note) || note.world != worldEpoch || !Connected()) return false;
+    ENetPeer* peer = isHost ? (to > 1 && to < MaxPlayers ? peers[to] : nullptr) : server;
+    uint8_t bytes[sizeof(note) + 1];
+    bytes[0] = MsgNpcLease;
+    std::memcpy(bytes + 1, &note, sizeof(note));
+    return Send(peer, bytes, sizeof(bytes), ChannelReliable, true);
+}
+void SetNpcLeaseHandler(NpcLeaseHandler handler) { npcLeaseHandler = handler; }
 uint8_t LocalId() { return localId; }
 bool IsHost() { return isHost; }
 uint32_t JoinCount() { return joins; }

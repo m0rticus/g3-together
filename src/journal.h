@@ -8,6 +8,7 @@ class eCEntity;
 
 namespace g3t::journal {
 void Start();
+bool LeaseDeath(eCEntity* entity, unsigned char owner); // canonical host death/quest journal, never native Kill
 void Tick();                               // once per frame
 void OnWorldChange();                      // entities of the old world are gone
 // The campaign's journal in the host's save sidecar (persist.cpp): one line per death.

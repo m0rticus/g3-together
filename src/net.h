@@ -7,6 +7,7 @@
 #include <vector>
 #include "netbudget.h"
 #include "pose.h"
+#include "npclease.h"
 
 namespace g3t::net {
 constexpr int NpcMotionSlots = 8;
@@ -158,6 +159,9 @@ uint32_t HashWorld(char const* name);
 uint32_t HashName(char const* name);
 uint32_t HashGuid(uint8_t const guid[16]);
 bool IsHost();
+bool SendNpcLease(uint8_t to, npclease::Message const& note);
+using NpcLeaseHandler = void (*)(uint8_t from, npclease::Message const& note);
+void SetNpcLeaseHandler(NpcLeaseHandler handler);
 // Increments whenever a client enters the host's world (after a join, or after loading the host's save again); the host
 // resends its motion-name table and container contents then.
 uint32_t JoinCount();

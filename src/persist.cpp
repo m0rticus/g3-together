@@ -15,6 +15,7 @@
 #include "lobby.h"
 #include "net.h"
 #include "npcs.h"
+#include "npclease_runtime.h"
 #include "remote.h"
 #include "saving_native.h"
 #include "saving_policy.h"
@@ -851,6 +852,11 @@ char const* NativeSaveReason()
 {
     if (!eCApplication::IsInitialised()) return "not-running";
     if (nativeLoadDepth || nativeSaveDepth || !loading.empty()) return "loading";
+    if (npclease::ActiveLeases()) {
+        Log("save refusal reason=npc-lease-active");
+        hud::Message(hud::Warning, L"NPC lease active: save would lose client-owned NPC state");
+        return "npc-lease-active";
+    }
     gCSession& session = gCSession::GetInstance();
     if (!session.IsGameRunning() || !session.GetHero()) return "not-running";
     if (session.GetPlayer() != session.GetHero()) return "control";
@@ -869,9 +875,22 @@ char const* NativeSaveReason()
     if (reason) return reason;
     return session.IsSaveAllowed() ? nullptr : "native-save";
 }
-bool NativeSaveAllowed() { return NativeSaveReason() == nullptr; }
+bool NativeSaveAllowed()
+{
+    if (npclease::ActiveLeases()) {
+        Log("save refusal reason=npc-lease-active");
+        hud::Message(hud::Warning, L"NPC lease active: save would lose client-owned NPC state");
+        return false;
+    }
+    return NativeSaveReason() == nullptr;
+}
 char const* SaveReadiness()
 {
+    if (npclease::ActiveLeases()) {
+        Log("save refusal reason=npc-lease-active");
+        hud::Message(hud::Warning, L"NPC lease active: save would lose client-owned NPC state");
+        return "npc-lease-active";
+    }
     if (char const* reason = NativeSaveReason()) return reason;
     if (!ownCharacterReady || !pendingRecord.empty() || !refusedRecord.empty() || !waitingImport.empty()) return "own-character";
     if (!trade::ReadyForSave()) return "trade";
@@ -1177,7 +1196,8 @@ bool CaptureJournal(std::string const& slot)
     journal::Write(file);
     npcs::WriteCompanions(file);
     if (net::IsHost()) fprintf(file, "downed %d\n", downed::Held() ? 1 : 0);
-    bool ok = !ferror(file);
+    const bool leaseOk = !net::IsHost() || npclease::WriteSnapshot(file);
+    bool ok = leaseOk && !ferror(file);
     ok = fflush(file) == 0 && ok;
     ok = fclose(file) == 0 && ok;
     if (ok) ok = ReadAll(path, savedJournal);
@@ -1188,6 +1208,10 @@ bool CaptureJournal(std::string const& slot)
 void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
 {
     if (processDepth || nativeLoadDepth || nativeSaveDepth || barrier.phase != saving::Barrier::Preparing || !barrier.AllReady()) return;
+    if (npclease::ActiveLeases()) {
+        CancelSave("NPC lease active: save would lose client-owned NPC state");
+        return;
+    }
     if (barrier.epoch != epoch) { CancelSave("world"); return; }
     if (char const* reason = SaveReadiness()) { CancelSave(reason); return; }
     const std::string slot = saving::Slot(barrier.save);
@@ -1875,6 +1899,8 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     FILE* journalFile = nullptr;
     bool journalRead = false;
     bool savedDowned = false;
+    npclease::SaveOverlay leaseOverlay;
+    bool leaseRead = false;
     if (!fopen_s(&journalFile, Path(slot, 2).c_str(), "r") && journalFile) {
         char header[32]{};
         if (fgets(header, sizeof(header), journalFile) && (!std::strncmp(header, "G3T 1", 5) || !std::strncmp(header, "G3T 2", 5))) {
@@ -1882,6 +1908,8 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
             if (net::IsHost()) {
                 fseek(journalFile, 0, SEEK_SET);
                 npcs::ReadCompanions(journalFile);
+                rewind(journalFile);
+                leaseRead = npclease::ReadSnapshot(journalFile, leaseOverlay);
                 rewind(journalFile);
                 char line[256];
                 while (fgets(line, sizeof(line), journalFile)) {
@@ -1918,6 +1946,10 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     --nativeLoadDepth;
     crashlog::WorldEntryWait("engine hero/game readiness");
     const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
+    if (ok && net::IsHost()) {
+        if (leaseRead) npclease::Restore(leaseOverlay);
+        else npclease::RejectSnapshot("missing or invalid");
+    }
     if (ok && net::IsHost()) downed::Restore(savedDowned, "host-save");
     Logf("persist: native load returned function=HUD.LoadGame slot=%s save=%s player=%llu ok=%d hud_ok=%d lower_calls=%u lower_ok=%d frames=%u",
          slot.c_str(), manifest.key.save.c_str(), steam::PlayerId(), ok ? 1 : 0, hudOk ? 1 : 0,

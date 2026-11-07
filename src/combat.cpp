@@ -15,6 +15,7 @@
 #include "net.h"
 #include "npcs.h"
 #include "npcremoval.h"
+#include "npclease_runtime.h"
 #include "npcplayback.h"
 #include "remote.h"
 #include "ranged.h"
@@ -729,6 +730,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         : Entity(spu ? (which == 0 ? spu->GetSelfEntity() : spu->GetOtherEntity()) : nullptr);
     eCEntity* attacker = Attacker(nullptr, &damageSource);
     eCEntity* source = damageSource.GetInstance();
+    if (!ai::ShuttingDown() && !npclease::ContactAllowed(victim.GetInstance(), attacker)) return 0;
     if (!ai::ShuttingDown() && RejectDownedHit(victim.GetInstance(), attacker, Judgements[which])) return 0;
     if (!bypass && !forwarded && npcs::IsMirrored(victim.GetInstance()) && IsLocalMelee(attacker, source) &&
         ai::detail::damageReceiver != victim.GetInstance() &&
@@ -1031,6 +1033,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     eCEntity* attacker = Attacker(spu, other);
     eCEntity* localMeleeActor = remote::ControlledBody();
     eCEntity* source = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (!npclease::ContactAllowed(instance, attacker)) return GETrue;
     if (InventoryBlocksNpc(instance, attacker)) {
         NoteInventoryHit();
         return GETrue;

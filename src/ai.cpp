@@ -13,6 +13,7 @@
 #include "infocmd.h"
 #include "ransack.h"
 #include "npcplayback.h"
+#include "npclease_runtime.h"
 #include "net.h"
 
 #include <Game.h>
@@ -98,7 +99,7 @@ eCEntity* Self(gCScriptProcessingUnit* spu, GELPVoid self)
 
 bool HostNpc(eCEntity* entity)
 {
-    return net::IsHost() && entity && entity->GetPropertySet(eEPropertySetType_NPC) &&
+    return (net::IsHost() || npclease::LocalAuthority(entity)) && entity && entity->GetPropertySet(eEPropertySetType_NPC) &&
            !guards::IsLocalPlayer(entity) && !Driven(entity);
 }
 
@@ -207,6 +208,7 @@ GEInt GE_STDCALL FilterScript(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
     // scripts and would take part in the fight it hears as a villager does (ZS_WatchFight, ZS_Applaud; 2 Nov.): it perceives nothing then.
     if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return 0; }
     eCEntity* sender = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (!npclease::ContactAllowed(receiver, sender)) return 0;
     if (RejectDownedTarget(receiver, sender, "perception-refused")) return 0;
     if (receiver && receiver == detail::damageReceiver) return GETrue;
     return originalScript(spu, self, other, args);

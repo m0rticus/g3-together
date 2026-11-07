@@ -148,6 +148,14 @@ Config const& LoadConfig()
             if (!npcremoval::policy::ParseNames(value, config.ardeaRemoveNpcs))
                 Logf("config: invalid ardea_remove_npcs '%s'; use Goblin,Ogre or an empty value; keeping previous setting", value);
         }
+        else if (!_stricmp(key, "npc_authority_fallback")) {
+            if (!_stricmp(value, "on")) config.npcAuthorityFallback = true;
+            else if (!_stricmp(value, "off")) config.npcAuthorityFallback = false;
+            else {
+                config.npcAuthorityFallback = false;
+                Logf("config: unknown npc_authority_fallback '%s'; restricted leases disabled", value);
+            }
+        }
     }
     fclose(file);
     Logf("config: role=%s name=Steam puppet_template=%s look=%s language=%s", config.host ? "host" : "client",

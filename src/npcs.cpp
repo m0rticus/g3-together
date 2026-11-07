@@ -18,6 +18,7 @@
 #include "npcplayback.h"
 #include "npcremoval.h"
 #include "npcsend_policy.h"
+#include "npclease_runtime.h"
 #include "replication.h"
 #include "ragdoll_force.h"
 #include "contact.h"
@@ -539,6 +540,7 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
     for (int i = 0; i < count; ++i) {
         if (npcremoval::Suppressed(records[i].guid)) continue;
         const std::string key = Key(records[i].guid);
+        if (npclease::IgnoreHostSnapshot(records[i].guid)) continue;
         const uint32_t captured = records[i].sent ? records[i].sent : sent;
         const auto existing = mirrors.find(key);
         if (existing != mirrors.end() &&
@@ -769,6 +771,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         if (npcremoval::Suppressed(instance)) continue;
         uint8_t guid[16];
         guid::CopyEntity(instance, guid);
+        if (npclease::SuppressHostPublication(guid)) continue;
         SendNote& note = sendNotes[Key(guid)];
         note.at = net::Now();
         if (journal::Pending(instance)) {
@@ -2822,6 +2825,7 @@ void PassiveMirrorTick()
     lastFrameAt = now;
     for (auto it = mirrors.begin(); it != mirrors.end();) {
         Mirror& m = it->second;
+        if (npclease::IgnoreHostSnapshot(m.latest.guid)) { ++it; continue; }
         if (m.released) { it = mirrors.erase(it); continue; }
         eCEntity* previous = m.entity.GetInstance();
         Entity live = Resolve(m.latest.guid);
@@ -3407,6 +3411,7 @@ void Despawn(eCEntity* entity)
 
 uint32_t Incarnation(uint8_t const guid[16])
 {
+    if (const uint32_t life = npclease::Life(guid)) return life;
     const std::string key = Key(guid);
     if (net::IsHost()) {
         const auto found = incarnations.find(key);
@@ -3439,6 +3444,7 @@ bool LocalReaction(eCEntity const* entity, char const* state)
 
 bool IsMirrored(eCEntity const* entity)
 {
+    if (npclease::LocalAuthority(entity)) return false;
     if (npcplayback::IsPassive(entity)) return true;
     if (!entity) return false;
     for (auto const& entry : mirrors)
@@ -3446,9 +3452,40 @@ bool IsMirrored(eCEntity const* entity)
     return false;
 }
 
+void LeaseBaseline(eCEntity* entity, char* routine, size_t capacity, uint8_t& defeated)
+{
+    if (!entity || !routine || !capacity) return;
+    uint8_t identity[16];
+    Guid(entity, identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end()) return;
+    auto const& mirror = found->second;
+    if (mirror.body.pacified) strncpy_s(routine, capacity, mirror.body.routine, _TRUNCATE);
+    if (mirror.guarded) defeated = mirror.defeatedBefore ? 1 : 0;
+}
+
+void LeaseReleaseMirror(uint8_t const identity[16])
+{
+    const auto key = Key(identity);
+    const auto found = mirrors.find(key);
+    if (found != mirrors.end()) {
+        auto& mirror = found->second;
+        if (mirror.entity.GetInstance()) {
+            body::Release(mirror.entity, mirror.body);
+            if (mirror.guarded) mirror.entity.NPC.DefeatedByPlayer = mirror.defeatedBefore;
+        }
+        mirrors.erase(found);
+    }
+    deadOnHost.erase(key);
+    corpses.erase(key);
+    absences.erase(key);
+}
+
 bool Ready(eCEntity const* entity)
 {
     if (npcremoval::Suppressed(entity)) return false;
+    if (npclease::LocalAuthority(entity)) return true;
+    if (npclease::Fenced(entity)) return false;
     if (!IsMirrored(entity)) return true;
     for (auto const& entry : mirrors)
         if (entry.second.entity.GetInstance() == entity)
@@ -3494,6 +3531,7 @@ bool PresentationPending(eCEntity const* entity)
 
 void OnWorldDeactivate()
 {
+    npclease::OnWorldDeactivate();
     targetingWatch = TargetingWatch{};
     playerContact = PlayerContact{};
     net::ResetNpcReplication();
@@ -3569,6 +3607,7 @@ void Tick()
     const int xp = static_cast<int>(hero.PlayerMemory.XP);
     if (lastXp >= 0 && xp != lastXp) Logf("xp: %+d total=%d", xp - lastXp, xp);
     lastXp = xp;
+    npclease::Tick();
     if (net::IsHost()) HostTick();
     InstallRagdollHook(net::Now());
     PassiveMirrorTick();
@@ -3841,6 +3880,7 @@ bool Follow(uint8_t const guid[16], uint8_t player, uint8_t memberType, bool wai
 void NewLife(uint8_t const guid[16])
 {
     if (npcremoval::Suppressed(guid)) return;
+    if (!npclease::NewLife(guid)) return;
     if (net::IsHost()) {
         uint32_t& incarnation = incarnations[Key(guid)];
         if (!incarnation) incarnation = 1;
@@ -3882,7 +3922,8 @@ uint8_t RemoteOwner(uint8_t const guid[16])
 
 uint8_t OwnerOf(eCEntity const* entity)
 {
-    if (net::IsHost()) return 0;
+    if (npclease::LocalAuthority(entity)) return 0;
+    if (net::IsHost()) return npclease::RemoteOwner(entity);
     if (npcplayback::IsPassive(entity)) return 1;
     if (!entity) return 0;
     uint8_t guid[16];
@@ -3892,6 +3933,7 @@ uint8_t OwnerOf(eCEntity const* entity)
 
 bool PaysDeathWithoutKiller(eCEntity const* victim)
 {
+    if (npclease::LocalAuthority(victim)) return true;
     if (npcplayback::IsPassive(victim)) return false;
     if (net::IsHost() || !farXpGuard || !victim || IsMirrored(victim) || Claimed(victim)) return true;
     uint8_t guid[16];

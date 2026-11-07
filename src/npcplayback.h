@@ -41,6 +41,7 @@ bool Start(bool client);
 bool Available();
 bool IsPassive(eCEntity const* entity);
 void Silence(eCEntity* entity);  // stop and clear task/state restored directly by a native save or processing-range entry
+bool GuardForLease(eCEntity* entity); // register every native property fence before suspending either donor
 uint32_t MotionInstance(eCEntity* entity, int slot = 0);
 void BeginHit(eCEntity const* entity);
 char const* HitTask(eCEntity const* entity);
