@@ -157,11 +157,18 @@ Corpse presentation uses local ragdoll initialization or observed death-loop ani
 Physics and bone poses are independent on each machine; death and quest/XP outcomes still synchronize.
 
 Player-puppet smoothing retains its own movement controller and prediction. NPCs instead interpolate received samples
-on an adaptive buffered timeline (at least 50 ms), hold on an underrun, and cannot authorize stale contacts.
+on an adaptive buffered timeline (at least 50 ms) and hold on an underrun. A mirror's attacks against the local player
+require a current visible contact; the player's attacks do not require successful NPC animation replay.
 NPC HP and life state follow that same timeline. Local hero controls are not buffered.
 Combat/perception hooks also cover native direct calls when their instruction prologues match, and damage judgement can
 recognize a local player's hit on a mirrored NPC without enabling that NPC's independent AI.
 Native hostility, immortality, duel and damage rules remain in effect; this does not force friendly NPCs to become enemies.
+Received attitude, party, guide and combat-target data are usable independently of skeletal replay. Interactable or
+fighting NPCs receive their initial reliable state without join pacing; relation changes are reliable compact updates.
+If a contacted NPC or its relations are not known locally, the client submits the swing to the host without a predicted
+hit reaction. The host checks eligibility and computes damage natively before returning its result. `SYNCCOMBAT`
+reports `host_judged_claims_sent`, `host_contact_judgements` and `local_melee_refused`; residual missing-data contacts
+use the compact `claim-host-judged` diagnostic instead of an interrupting HUD warning.
 
 ## For developers
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "snapshot.h"
 #include "npcsend_policy.h"
+#include "combat_timing.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,19 @@ constexpr uint32_t OffsetWindow = 2000;
 constexpr uint32_t RestartAfter = 1500;
 constexpr float MaximumTravelSpeed = 3000.0f;  // cm/s; larger jumps are discontinuities, not interpolation paths
 
+bool IncomingCombatAt(Track const& track, uint32_t sent)
+{
+    if (track.predictive || !track.combatPlayer || !track.count) return false;
+    auto incoming = [&](Track::Snap const& snap) {
+        return combat_timing::IncomingCombat(snap.motion.flags, snap.motion.combatTarget, track.combatPlayer);
+    };
+    // Protect before the start is displayed, and until the displayed combat has ended.
+    if (incoming(track.snaps[track.count - 1])) return true;
+    for (int i = track.count - 1; i > 0; --i)
+        if (static_cast<int32_t>(sent - track.snaps[i].sent) >= 0) return incoming(track.snaps[i]);
+    return incoming(track.snaps[0]);
+}
+
 uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
 {
     const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
@@ -23,6 +37,9 @@ uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
         return track.renderSent + (now - track.renderNow) + static_cast<uint32_t>(shift - track.renderShift);
     }
     const uint32_t elapsed = now - track.renderNow;
+    const bool hadRenderTime = track.haveRenderTime;
+    const uint32_t previousRender = track.renderSent;
+    track.combatClockProtected = IncomingCombatAt(track, track.haveRenderTime ? track.renderSent : desired);
     if (!track.haveRenderTime || elapsed > RestartAfter) {
         track.renderSent = desired;
         track.fractionalAdvance = 0.0;
@@ -31,11 +48,20 @@ uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
         // Slew clock-offset changes instead of rewinding or jumping the presentation timeline.
         const int32_t error = static_cast<int32_t>(desired - (track.renderSent + elapsed));
         const double maximumAdjustment = elapsed * 0.1;
-        const double advance = elapsed + std::clamp(static_cast<double>(error), -maximumAdjustment, maximumAdjustment)
+        const double advance = elapsed + std::clamp(static_cast<double>(error), -maximumAdjustment,
+                                                    track.combatClockProtected ? 0.0 : maximumAdjustment)
                                + track.fractionalAdvance;
         const uint32_t whole = static_cast<uint32_t>(advance);
         track.renderSent += whole;
         track.fractionalAdvance = advance - whole;
+    }
+    if (track.combatClockProtected &&
+        static_cast<int32_t>(track.renderSent - track.snaps[track.count - 1].sent) > 0) {
+        // Do not accumulate invisible time while an incoming windup's pose is held.
+        const uint32_t newest = track.snaps[track.count - 1].sent;
+        track.renderSent = hadRenderTime && static_cast<int32_t>(previousRender - newest) > 0
+            ? previousRender : newest;
+        track.fractionalAdvance = 0.0;
     }
     track.renderNow = now;
     track.renderShift = shift;
@@ -87,10 +113,12 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
             Distance(last.position, position) > 300.0f + MaximumTravelSpeed * span / 1000.0f) {
             const uint32_t serial = track.serial + 1;
             const bool predictive = track.predictive;
+            const uint8_t combatPlayer = track.combatPlayer;
             const uint32_t interval = track.poseIntervalMs;
             track = Track{};
             track.serial = serial;
             track.predictive = predictive;
+            track.combatPlayer = combatPlayer;
             SetPoseInterval(track, interval);
         } else if (track.predictive || static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs) {
             // Sparse idle NPC keyframes are intentional, not evidence of network jitter.

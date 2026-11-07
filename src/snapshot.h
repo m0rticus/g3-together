@@ -36,6 +36,7 @@ struct MotionState
 struct Track
 {
     bool predictive = true;  // player puppets may lead; NPCs only interpolate received host state
+    uint8_t combatPlayer = 0; // only NPC attacks on this client's own hero protect the display clock
     struct Snap {
         uint32_t sent = 0;
         float position[3] = {};
@@ -61,6 +62,7 @@ struct Track
     uint32_t poseIntervalMs = 0;
     float jitterMs = 0.0f;
     int32_t delayMs = BufferDelay;
+    bool combatClockProtected = false;
     // Diagnostics only: spacing of received updates since the last SYNCSTREAM report (arrival clock).
     uint32_t gapCount = 0, gapMinMs = UINT32_MAX, gapMaxMs = 0;
     uint64_t gapSumMs = 0;

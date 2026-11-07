@@ -307,6 +307,8 @@ static void TestReliableRetry()
     b.record.flags ^= 32; reliable();
     b.record.flags ^= 128; reliable();
     b.record.aiMode++; reliable();
+    b.record.flags ^= 4; reliable();
+    b.record.flags ^= 16; reliable();
     b.record.incarnation++; reliable();
     b.record.hitPoints++; reliable();
     b.record.hitPointsMax++; reliable();
@@ -318,6 +320,8 @@ static void TestReliableRetry()
     b.record.hitSequence++; reliable();
     b.record.contact++; reliable();
     b.record.attitude++; reliable();
+    b.record.aiMode++; reliable();
+    b.record.attackReason++; reliable();
     b.record.heldRight++; reliable();
     b.record.heldLeft++; reliable();
     b.record.combatTarget++; reliable();
@@ -773,6 +777,48 @@ static void TestInitialPacer()
     }
 }
 
+static void TestImmediateCombatPublication()
+{
+    Fixture f;
+    f.in.distanceCm = NearExitCm;
+    assert(ImmediateInitial(f.in));
+    f.in.distanceCm = NearExitCm + 1;
+    assert(!ImmediateInitial(f.in));
+    f.in.focused = true;
+    assert(ImmediateInitial(f.in));
+    f.in.focused = false;
+    f.in.combat = true;
+    assert(ImmediateInitial(f.in));
+    f.in.combat = false;
+    f.in.contact = true;
+    assert(ImmediateInitial(f.in));
+    f.in.contact = false;
+    f.record.partyPlayer = 2;
+    assert(ImmediateInitial(f.in));
+    f.record.partyPlayer = 0;
+    f.record.guidePlayer = 2;
+    assert(ImmediateInitial(f.in));
+    f.record.guidePlayer = 0;
+    f.record.contact = 1;
+    assert(ImmediateInitial(f.in));
+    f.record.contact = 0;
+    f.in.distanceCm = 100;
+    f.record.attitude = 4;
+    f.record.aiMode = 3;
+    f.record.partyPlayer = 2;
+    f.record.guidePlayer = 2;
+    f.record.combatTarget = 123;
+    assert(f.Eval().decision == Decision::Initial && f.Eval().essential);
+    f.Send(Decision::Initial);
+    assert(f.state.record.attitude == 4 && f.state.record.aiMode == 3 &&
+           f.state.record.partyPlayer == 2 && f.state.record.guidePlayer == 2 &&
+           f.state.record.combatTarget == 123);
+    f.state = State{}; // reconnect/resync/interest reentry cannot inherit an incomplete initial record
+    assert(f.Eval().decision == Decision::Initial && f.Eval().essential && ImmediateInitial(f.in));
+    f.in.record = nullptr;
+    assert(!ImmediateInitial(f.in));
+}
+
 int main()
 {
     static_assert(QuietCadenceMs == 250 && MirrorStaleMs == 10000 && PoseRetentionMs == 10000);
@@ -794,5 +840,6 @@ int main()
     TestStretchScaling();
     TestMaxStaleAndStats();
     TestInitialPacer();
+    TestImmediateCombatPublication();
     TestSimulation();
 }

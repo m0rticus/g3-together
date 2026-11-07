@@ -59,6 +59,7 @@ unsigned long long frames = 0;
 DWORD lastReport = 0;
 bool faulted = false;
 bool playbackErrorShown = false;
+unsigned moduleProcessDepth = 0;
 
 // Yaw in degrees around the up axis (Y in Gothic 3).
 float Yaw(bCQuaternion const& q)
@@ -100,8 +101,15 @@ void Frame()
 
 // One frame of the module for persist (BeginFrame/EndFrame), closed on every way out of Process.
 struct FrameScope {
-    FrameScope() : run(g3t::persist::BeginFrame()) {}
-    ~FrameScope() { if (run) { g3t::net::Flush(); g3t::persist::EndFrame(); } }
+    FrameScope() : run(g3t::persist::BeginFrame()) { if (run) ++moduleProcessDepth; }
+    ~FrameScope()
+    {
+        if (run) {
+            g3t::net::Flush();
+            g3t::persist::EndFrame();
+            if (--moduleProcessDepth == 0) g3t::hud::Tick();
+        }
+    }
     FrameScope(FrameScope const&) = delete;
     FrameScope& operator=(FrameScope const&) = delete;
     const bool run;
@@ -153,6 +161,7 @@ class Module : public eCEngineComponentBase
         ForgetStep("guide cleanup", &g3t::guide::OnWorldChange);
         ForgetStep("arena cleanup", &g3t::arena::OnWorldChange);
         ForgetStep("ending cleanup", &g3t::ending::OnWorldChange);
+        ForgetStep("HUD observation cleanup", &g3t::hud::OnWorldChange);
         {
             g3t::crashlog::WorldEntryScope operation("downed cleanup");
             g3t::downed::OnWorldChange();

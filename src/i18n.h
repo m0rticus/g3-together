@@ -61,7 +61,6 @@ enum Message
     TradeSettling,
     NpcReplayUnavailable,
     NpcRegionUnavailable,
-    NpcStatePending,
     SaveQueued,
     SaveComplete,
     SaveFailed,

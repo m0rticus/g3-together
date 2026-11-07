@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <cstdint>
 
 namespace g3t::melee {
 enum Attitude { None = 0, Friendly = 1, Neutral = 2, Angry = 3, Hostile = 4, Predator = 5, Panic = 6 };
@@ -13,6 +14,17 @@ struct Victim {
 };
 
 enum class Decision { Allow, Party, Bystander, FightingEnemy, FriendlyCombatant, NeutralCombatant, TargetOnly };
+enum class ClientDecision { Reject, Predict, HostJudge };
+
+constexpr ClientDecision JudgeClient(bool allowed, bool relationsKnown)
+{
+    return !relationsKnown ? ClientDecision::HostJudge : allowed ? ClientDecision::Predict : ClientDecision::Reject;
+}
+
+constexpr bool ClaimedSwing(std::uint32_t swing, std::uint32_t currentLife, std::uint32_t unknownLife)
+{
+    return swing && (swing == currentLife || swing == unknownLife);
+}
 
 // Script_Game.dll CP 1.75: OnTouchDamage B492E..B4E78 (player branch), then
 // DoLogicalDamage B51C0..B520C and B54F8..B5748 (melee relational gates).

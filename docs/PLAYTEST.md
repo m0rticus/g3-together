@@ -226,6 +226,28 @@ allow the existing native half-gold robbery. Check corpse/chest loot and partner
 
 ### Host-managed save/load acceptance (protocol 77)
 
+### HUD notices without movement interruption
+
+Use matching builds in the two isolated copies; this is a manual check, not a game-launching test.
+Keep the client's forward movement key held while the host goes down and `Host is down` appears.
+Repeat walking and attacking, then reverse roles for `Client is down`. Revive using the ordinary help
+option: one potion is consumed, the held owner stays guarded until paid revival, and the helper's
+input is not reset by the help notice. Repeat with save request/result and connection lost/reconnected
+notices. An actual native save/load pause or the owner's knockdown/get-up is not a notice side effect.
+
+All existing texts, kind codes, colors, positioning and six-second fade remain unchanged.
+Require `hud: passive native message list ready` in the log. An ABI mismatch or presentation-unavailable
+line is explicit failure/deferment, not a successful display or permission to use a modal fallback.
+Each existing `hud: [kind] text` now has a `hud-motion: notice=N` group with `before`, `after`,
+`100ms` and `500ms` snapshots. Compare task/state, AI/action/animation, position/rotation/velocity,
+movement control/enabled flags, `held/terminal`, `can_move`, session/device/GUI input, GUI active/focus
+handles and camera identity. The immediate before/after must not change those states or handles;
+position should continue advancing with input held. `display_us` measures only the native text insertion,
+not diagnostic log I/O. Delayed samples report their actual elapsed time; a load/body replacement
+explicitly cancels them instead of inspecting an old hero.
+smoke-check partner trade, native/nonlethal knockout, terminal death, save/load, NPC leases/mirroring and
+join/rejoin. No QA command or negative-control switch is needed.
+
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified save/load entry points; `save UI hooked` also identifies the verified quicksave handler,
 menu-new call, native availability predicate and screenshot helper. World.DeleteSaveGame at RVA 19C0D0

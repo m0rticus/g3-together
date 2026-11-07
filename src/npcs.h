@@ -9,6 +9,8 @@
 
 class eCEntity;
 
+namespace g3t::net { struct NpcRecord; }
+
 namespace g3t::npcs {
 void Start();
 void Tick();
@@ -17,9 +19,10 @@ void LeaseReleaseMirror(uint8_t const guid[16]);
 void OnWorldDeactivate();
 bool IsMirrored(eCEntity const* entity);  // a client NPC currently driven from host snapshots
 bool Ready(eCEntity const* entity);
-// Actual opponent in the displayed host state, including NPCs rather than only the player's side.
+net::NpcRecord const* CombatRecord(eCEntity const* entity); // received relations, independent of visual replay
+// Actual opponent in received host state, including NPCs rather than only the player's side.
 bool CombatTarget(eCEntity* entity, eCEntity*& target);
-bool PresentationPending(eCEntity const* entity);  // live, non-removed NPCs only; dead bodies do not need a new pose stream
+void AwaitHit(eCEntity* entity, uint32_t sequence); // no predicted reaction until the host accepts
 void LocalHit(eCEntity* entity);  // our hero hit this mirror: its stagger shows here at once, as this game judged it (owner 2 Nov.: favour the client's feel)
 void LocalHit(eCEntity* entity, uint32_t sequence);
 void HostHit(eCEntity* entity, uint8_t player, uint32_t sequence);

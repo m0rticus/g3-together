@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npcplayback.h"
 #include "npcsend_policy.h"
+#include "combat_timing.h"
 #include "npclease_runtime.h"
 
 #include "ai.h"
@@ -43,6 +44,8 @@ struct CapturedOptions {
     bool available = false;
     bool defaults = false;
     uint32_t instance = 0;
+    uint32_t started = 0;
+    uint8_t timedPlayer = 0;
 };
 std::unordered_map<eCWrapper_emfx2Actor*, std::array<CapturedOptions, Slots>> sourceOptions;
 std::mutex sourceOptionsMutex;
@@ -50,6 +53,7 @@ uint32_t nextInstance = 0;
 struct Motion {
     MotionOptions options{};
     uint32_t instance = 0;
+    uint32_t started = 0;
     eCResourceAnimationMotion_PS* resource = nullptr;
     char name[96] = {};
     float time = 0.0f, duration = 0.0f, speed = 0.0f, weight = 0.0f, intro = 0.0f, extro = 0.0f;
@@ -126,9 +130,6 @@ std::atomic<uint32_t> blockedEvents{0};
 std::atomic<uint32_t> blockedNpcTicks{0};
 std::atomic<uint32_t> posedFrames{0}, poseWaits{0}, stalePoses{0};
 float maximumReplayPhaseError = 0.0f;
-std::unordered_map<std::string, uint32_t> presentationMissingAt;
-uint32_t presentationNoticeAt = 0;
-unsigned presentationWarnings = 0;
 using ProcessFn = void(__fastcall*)(eCEntityPropertySet*, void*);
 using ScriptFn = bEResult(__fastcall*)(gCScriptProcessingUnit*, void*);
 using EventScriptFn = GEInt(__fastcall*)(gCScriptAdmin*, void*, bCString const&, eCEntity*, eCEntity*, GEInt);
@@ -447,6 +448,7 @@ void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2
     if (options) std::memcpy(captured.words.data(), options, sizeof(captured.words));
     captured.motion = &motion;
     captured.defaults = options == nullptr;
+    captured.started = net::Now();
     originalActorPlay(self, edx, slot, motion, options);
     if (presenting || index < 0 || index >= Slots || !self->HasMotionInstance(slot)) return;
     std::lock_guard<std::mutex> lock(sourceOptionsMutex);
@@ -725,6 +727,7 @@ bool Capture(eCEntity* entity, Frame& frame, float offset = 0.0f)
         motion.options = options.words;
         motion.defaults = options.defaults;
         motion.instance = options.instance;
+        motion.started = options.started;
         const float maximum = static_cast<float>(actor->GetMaxTime(slot));
         if (!(maximum > 0.0f) || !std::isfinite(maximum)) return false;
         motion.duration = maximum;
@@ -902,8 +905,6 @@ void Stop()
 
 void OnWorldDeactivate()
 {
-    presentationMissingAt.clear();
-    presentationNoticeAt = 0;
     probe = ProbeState{};
     receivedPoses.clear();
     sourceSkeletons.clear();
@@ -987,12 +988,11 @@ void Stats(LogFn log)
     Format(line, "PASSIVE enabled=%d client=%d routines_blocked=%u scripts_blocked=%u movement_blocked=%u "
                  "tasks_blocked=%u animations_blocked=%u entities_blocked=%u properties_blocked=%u "
                  "local_hits=%u echo_skipped=%u presented_frames=%u events_blocked=%u ticks_blocked=%u phase_error_ms=%.3f "
-                 "posed_frames=%u pose_waits=%u stale_poses=%u pending_npcs=%u readiness_warnings=%u",
+                 "posed_frames=%u pose_waits=%u stale_poses=%u",
            enabled, clientMode, blockedRoutines.load(), blockedScripts.load(), blockedMovement.load(),
            blockedTasks.load(), blockedAnimations.load(), blockedEntities.load(), blockedProperties.load(),
            predictedHits.load(), skippedEchoes.load(), presentedFrames.load(), blockedEvents.load(), blockedNpcTicks.load(),
-           maximumReplayPhaseError * 1000.0f, posedFrames.load(), poseWaits.load(), stalePoses.load(),
-           static_cast<unsigned>(presentationMissingAt.size()), presentationWarnings);
+           maximumReplayPhaseError * 1000.0f, posedFrames.load(), poseWaits.load(), stalePoses.load());
     log(line);
 }
 
@@ -1068,6 +1068,25 @@ bool Capture(eCEntity* entity, net::NpcRecord& record, PublishName publish)
         motion.blend = static_cast<int32_t>(source.blend);
         std::memcpy(motion.options, source.options.data(), sizeof(motion.options));
         if (publish) publish(motion.name, source.name);
+    }
+    const uint8_t player = (record.flags >> 3) & 7u;
+    const Motion& first = frame.motions[0];
+    if (net::IsHost() && first.active && combat_timing::RemoteCombat(record.flags, record.combatTarget)) {
+        bool logStart = false;
+        {
+            std::lock_guard<std::mutex> lock(sourceOptionsMutex);
+            auto found = sourceOptions.find(animation->GetActor());
+            if (found != sourceOptions.end() && found->second[0].instance == first.instance &&
+                found->second[0].timedPlayer != player) {
+                found->second[0].timedPlayer = player;
+                logStart = true;
+            }
+        }
+        if (logStart)
+            Logf("combat: NPCATTACK stage=host-motion npc=%s player=%u instance=%u host_started=%u host_captured=%u "
+                 "motion=%s phase=%.4f duration_ms=%.1f native_speed=%.3f native_hit_phase=%.3f",
+                 entity->GetName().GetText(), player, first.instance, first.started, record.sent, first.name,
+                 record.motions[0].phase, first.duration * 1000.0f, first.speed, combat_timing::NativeHitPhase);
     }
     return true;
 }
@@ -1292,6 +1311,19 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
             return false;
         }
         ++posedFrames;
+        const auto& first = record.motions[0];
+        if (first.active && state.timedInstance != first.instance &&
+            combat_timing::IncomingCombat(record.flags, record.combatTarget, net::LocalId())) {
+            state.timedInstance = first.instance;
+            const float duration = static_cast<float>(actor->GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
+            const float seekMs = duration * first.phase * 1000.0f;
+            const float ageMs = first.speed > 0.0f ? seekMs / first.speed : 0.0f;
+            const uint32_t started = record.sent - static_cast<uint32_t>(ageMs);
+            Logf("combat: NPCATTACK stage=display npc=%s player=%u instance=%u host_start_est=%u host_sample=%u "
+                 "client_displayed=%u phase=%.4f seek_ms=%.1f duration_ms=%.1f native_speed=%.3f motion=%s",
+                 entity->GetName().GetText(), net::LocalId(), first.instance, started, record.sent, now,
+                 first.phase, seekMs, duration * 1000.0f, first.speed, names(first.name));
+        }
         // The authoritative bones are the visible pose. Secondary native clip bookkeeping cannot invalidate them.
         return true;
     }
@@ -1378,11 +1410,6 @@ void Tick()
     }
     if (enabled && clientMode && gCSession::GetInstance().IsGameRunning()) {
         const auto all = Entity::GetNPCs();
-        bool waiting = false;
-        std::string waitingName;
-        std::unordered_map<std::string, uint32_t> pending;
-        const uint32_t now = net::Now();
-        eCEntity* hero = remote::ControlledBody();
         for (int i = 0; i < all.GetCount(); ++i) {
             Entity npc = all.GetAt(i);
             if (!Passive(npc.GetInstance())) continue;
@@ -1391,27 +1418,6 @@ void Tick()
                 npc.EnableProcessing(GEFalse);
             }
             Silence(npc.GetInstance());
-            if (hero && net::Connected() && npcs::PresentationPending(npc.GetInstance())) {
-                const bCVector delta = npc.GetInstance()->GetWorldPosition() - hero->GetWorldPosition();
-                if (delta.GetSquareMagnitude() < 3000.0f * 3000.0f) {
-                    const eCEntityProxy proxy(npc.GetInstance());
-                    const std::string key(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
-                    const auto previous = presentationMissingAt.find(key);
-                    const uint32_t since = previous == presentationMissingAt.end() ? now : previous->second;
-                    pending.emplace(key, since);
-                    if (now - since >= 2000) {
-                        waiting = true;
-                        waitingName = npc.GetInstance()->GetName().GetText();
-                    }
-                }
-            }
-        }
-        presentationMissingAt = std::move(pending);
-        if (waiting && (!presentationNoticeAt || now - presentationNoticeAt >= 30000)) {
-            hud::Message(hud::Warning, i18n::Text(i18n::NpcStatePending));
-            ++presentationWarnings;
-            Logf("npcplayback: %s has lacked a usable presentation for at least 2 seconds", waitingName.c_str());
-            presentationNoticeAt = now ? now : 1;
         }
     }
     if (!probe.target || probe.failed) return;

@@ -22,6 +22,7 @@
 #include "replication.h"
 #include "ragdoll_force.h"
 #include "contact.h"
+#include "combat_timing.h"
 #include "guards.h"
 
 #include <Game.h>
@@ -45,6 +46,8 @@ bool fastNpcs = true;  // QA negative control: fastnpcsoff (every NPC every 100 
 uint32_t SendTick() { return fastNpcs ? std::max<uint32_t>(8, 1000u / static_cast<uint32_t>(GetConfig().sendRate) - 1) : FullEvery; }
 struct LastSent { net::NpcRecord record; uint32_t at = 0, movingUntil = 0; };
 std::unordered_map<std::string, LastSent> lastSent;
+struct AwaitedHit { uint32_t sequence = 0, incarnation = 0; };
+std::unordered_map<std::string, AwaitedHit> awaitedHits;
 std::unordered_map<std::string, npcsend::State> recipientNpcs[net::MaxPlayers];
 uint32_t recipientGenerations[net::MaxPlayers] = {};
 npcsend::InitialPacer initialPacers[net::MaxPlayers];
@@ -647,6 +650,12 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         m.owner = owner;
         m.ownerGeneration = generation;
         m.hostSession = net::WelcomeSerial();
+        if (records[i].motions[0].active &&
+            combat_timing::IncomingCombat(records[i].flags, records[i].combatTarget, net::LocalId()) &&
+            (!m.latestTicks || m.latest.motions[0].instance != records[i].motions[0].instance))
+            Logf("combat: NPCATTACK stage=receive npc_hash=%08X player=%u instance=%u host_sample=%u client_received=%u phase=%.4f",
+                 net::HashGuid(records[i].guid), net::LocalId(), records[i].motions[0].instance, captured, now,
+                 records[i].motions[0].phase);
         m.previous = m.latestTicks ? m.latest : records[i];
         m.previousTicks = m.latestTicks ? m.latestTicks : now;
         m.previousSent = m.latestTicks ? m.latestSent : captured;
@@ -683,6 +692,7 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         motion.attitude = records[i].attitude;
         std::memcpy(motion.motions, records[i].motions, sizeof(motion.motions));
         m.body.track.predictive = false;
+        m.body.track.combatPlayer = net::IsHost() ? 0 : net::LocalId();
         body::SetPoseInterval(m.body.track, npcplayback::PoseInterval(records[i]));
         // Feed every packet, including several packets serviced in one engine frame.
         body::Feed(m.body.track, records[i].position, records[i].rotation, captured, now, records[i].movementMode, motion);
@@ -990,7 +1000,8 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             } else {
                 // No bandwidth gate: every due update is sent. Only a first update (a join or world-entry burst) is spread over
                 // time, and only for NPCs this recipient has never had.
-                if (result.decision == npcsend::Decision::Initial && !initialPacers[id].Admit(r.sent, stretchOf[id])) {
+                if (result.decision == npcsend::Decision::Initial && !npcsend::ImmediateInitial(input) &&
+                    !initialPacers[id].Admit(r.sent, stretchOf[id])) {
                     ++sendStats.paced;
                     net::RecordNpcSendDecision(net::NpcSendDecision::SkippedPaced);
                     continue;
@@ -1000,8 +1011,15 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                                          static_cast<uint8_t>(npcsend::PresentationInterval(state, input)))
                     : net::SendNpcsTo(id, &r, 1, result.essential);
                 const uint32_t previousSentAt = state.sentAt;
+                const bool attackStart = combat_timing::RemoteCombat(r.flags, r.combatTarget) &&
+                    r.motions[0].active && state.record.motions[0].instance != r.motions[0].instance;
                 const bool onSchedule = r.sent - state.idealAt >= npcsend::Stretched(npcsend::Interval(result.tier), stretchOf[id]);
                 if (queued && npcsend::Commit(state, input, result.decision)) {
+                    if (attackStart)
+                        Logf("combat: NPCATTACK stage=send npc=%s player=%u instance=%u host_captured=%u host_sent=%u "
+                             "phase=%.4f reliable=%d",
+                             self.GetName().GetText(), id, r.motions[0].instance, r.sent, net::Now(), r.motions[0].phase,
+                             result.essential ? 1 : 0);
                     sendStats.Record(result.decision, result.tier, r.sent - previousSentAt, stretchOf[id], onSchedule);
                     if (existing == states.end()) states.emplace(key, std::move(fresh));
                     net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
@@ -1638,6 +1656,13 @@ void OnRagdollNote(net::RagdollNote const& note)
 
 void OnHitResult(net::HitResult const& result)
 {
+    const auto awaited = awaitedHits.find(Key(result.guid));
+    if (awaited != awaitedHits.end() && awaited->second.sequence == result.sequence &&
+        (!awaited->second.incarnation || awaited->second.incarnation == result.incarnation)) {
+        awaitedHits.erase(awaited);
+        if (result.accepted && result.incarnation == Incarnation(result.guid))
+            LocalHit(NpcByGuid(result.guid), result.sequence);
+    }
     const auto found = mirrors.find(Key(result.guid));
     if (found == mirrors.end()) return;
     Mirror& m = found->second;
@@ -2086,16 +2111,16 @@ void SamplePlayerContact(uint32_t now)
     playerContact.ready = previous;
 }
 
-void TryPlayerBlow(Mirror& m)
+void TryPlayerBlow(eCEntity* victim)
 {
     eCEntity* hero = remote::ControlledBody();
-    if (!playerContact.ready || !hero || !m.replayReady || m.killed) return;
+    if (!playerContact.ready || !hero || !victim || Entity(victim).IsDead() || npcremoval::Suppressed(victim)) return;
     ++playerSweepTests;
-    if (!SweepsBody(m.entity.GetInstance(), playerContact.previousA, playerContact.previousB,
+    if (!SweepsBody(victim, playerContact.previousA, playerContact.previousB,
                     playerContact.a, playerContact.b, playerContact.thickness, playerContact.bone == -2)) return;
     ++playerOverlaps;
-    if (!ClearContact(hero, m.entity.GetInstance())) { ++playerObstructed; return; }
-    if (combat::PlayerBlow(m.entity.GetInstance())) ++playerContactHits;
+    if (!ClearContact(hero, victim)) { ++playerObstructed; return; }
+    if (combat::PlayerBlow(victim)) ++playerContactHits;
 }
 
 void LogClientDeath(Mirror& m, net::NpcRecord const& shown, uint32_t now);
@@ -2125,6 +2150,11 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
                  at.GetX(), at.GetY(), at.GetZ());
         }
     }
+    if (!combat_timing::HitPhaseReached(shown.motions[0].phase)) {
+        // Never sweep from the opening windup into contact: native OnHit has not fired yet.
+        m.contactAt = 0;
+        return;
+    }
     const bool previous = m.contactAt && now - m.contactAt <= 100 && m.contactBone == bone;
     float oldA[3], oldB[3];
     std::memcpy(oldA, m.contactA, sizeof(oldA)); std::memcpy(oldB, m.contactB, sizeof(oldB));
@@ -2138,6 +2168,15 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
     if (!ClearContact(m.entity.GetInstance(), hero)) { ++localContactWalls; ++localBlowsOutOfReach; return; }
     m.contactConsumed = true;
     ++localBlowsJudged;
+    const int32_t bufferMs = static_cast<int32_t>(now - (shown.sent + static_cast<uint32_t>(m.body.track.offset)));
+    const uint32_t oneWayMs = net::RoundTrip(m.owner) / 2;
+    Logf("combat: NPCATTACK stage=local-contact npc=%s player=%u instance=%u host_sample=%u client_judged=%u "
+         "phase=%.4f native_hit_phase=%.3f presentation_ms=%d one_way_est_ms=%u compensation_est_ms=%d "
+         "clock_protected=%d block_state=%d authority=defender-local",
+         m.entity.GetName().GetText(), net::LocalId(), instance, shown.sent, now, shown.motions[0].phase,
+         combat_timing::NativeHitPhase, bufferMs, oneWayMs, bufferMs + static_cast<int32_t>(oneWayMs),
+         m.body.track.combatClockProtected ? 1 : 0,
+         combat::InParadeMode(hero) ? 1 : 0);
     combat::LocalBlow(m.entity.GetInstance());
 }
 
@@ -3080,10 +3119,16 @@ void PassiveMirrorTick()
             m.body.lastAt = now;
             m.body.contactTarget = (shown.flags & 4) && ((shown.flags >> 3) & 7) == net::LocalId()
                                       ? remote::ControlledBody() : nullptr;
-            TryPlayerBlow(m);
             TryLocalBlow(m, shown, now);
         }
         ++it;
+    }
+    if (playerContact.ready) {
+        const auto all = Entity::GetNPCs();
+        for (int i = 0; i < all.GetCount(); ++i) {
+            eCEntity* victim = all.GetAt(i).GetInstance();
+            if (npcplayback::IsPassive(victim)) TryPlayerBlow(victim);
+        }
     }
 }
 
@@ -3368,6 +3413,7 @@ void ReleaseRemovedAim(eCEntity* entity)
 void ForgetRemoved(uint8_t const guid[16])
 {
     const std::string key = Key(guid);
+    awaitedHits.erase(key);
     mirrors.erase(key);
     corpses.erase(key);
     absences.erase(key);
@@ -3493,44 +3539,48 @@ bool Ready(eCEntity const* entity)
     return false;
 }
 
+net::NpcRecord const* CombatRecord(eCEntity const* entity)
+{
+    if (!entity || npcremoval::Suppressed(entity) || npclease::Fenced(entity) || !net::Connected()) return nullptr;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.released || found->second.hostSession != net::WelcomeSerial() ||
+        found->second.latest.incarnation != Incarnation(identity) ||
+        net::Now() - found->second.latestTicks > StaleAfter) return nullptr;
+    return &found->second.latest;
+}
+
 bool CombatTarget(eCEntity* entity, eCEntity*& target)
 {
     target = nullptr;
     if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return false;
     if (IsMirrored(entity)) {
-        for (auto const& entry : mirrors) {
-            auto const& mirror = entry.second;
-            if (mirror.entity.GetInstance() != entity) continue;
-            if (!Ready(entity)) return false;
-            if (mirror.shownCombatTarget) {
-                target = NpcOpponent(IndexNpcOpponents(), mirror.shownCombatTarget);
-                return target != nullptr;
-            }
-            target = Entity(entity).NPC.GetCurrentTarget().GetInstance();
-            return true;
+        auto const* record = CombatRecord(entity);
+        if (!record) return false;
+        if (record->combatTarget) {
+            target = NpcOpponent(IndexNpcOpponents(), record->combatTarget);
+            return target != nullptr;
         }
-        return false;
+        const uint8_t player = (record->flags >> 3) & 7;
+        target = player ? (player == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(player)) : nullptr;
+        return !player || target;
     }
     target = Entity(entity).NPC.GetCurrentTarget().GetInstance();
     return true;
 }
 
-bool PresentationPending(eCEntity const* entity)
+void AwaitHit(eCEntity* entity, uint32_t sequence)
 {
-    if (!entity || !IsMirrored(entity)) return false;
-    uint8_t guid[16];
-    Guid(const_cast<eCEntity*>(entity), guid);
-    const auto key = Key(guid);
-    if (absences.count(key)) return false;
-    const auto found = mirrors.find(key);
-    if (found == mirrors.end()) return !Entity(const_cast<eCEntity*>(entity)).IsDead();
-    const auto& mirror = found->second;
-    if (mirror.killed || (mirror.latest.flags & 1)) return false;
-    return net::Now() - mirror.latestTicks > StaleAfter || !mirror.replayReady;
+    if (!entity || !sequence) return;
+    uint8_t identity[16];
+    Guid(entity, identity);
+    awaitedHits[Key(identity)] = {sequence, Incarnation(identity)};
 }
 
 void OnWorldDeactivate()
 {
+    awaitedHits.clear();
     npclease::OnWorldDeactivate();
     targetingWatch = TargetingWatch{};
     playerContact = PlayerContact{};

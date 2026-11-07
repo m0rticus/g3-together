@@ -61,6 +61,7 @@ unsigned dropped = 0;  // client: hits between host-owned bodies, which the host
 unsigned kills = 0;  // host: client hits that killed (OnCheatKill)
 unsigned xpAwarded = 0;                     // client: kills of this player's hits rewarded
 unsigned claimsSent = 0, claimsApplied = 0, playerHitsSent = 0, playerHitsTaken = 0;
+unsigned hostJudgedClaimsSent = 0, hostContactJudgements = 0, localMeleeRefused = 0;
 unsigned duplicateClaimsIgnored = 0;
 unsigned npcHitsSent = 0, npcHitsApplied = 0, npcKills = 0, npcHitsUnresolved = 0, partyKills = 0;
 bool partyXp = true;  // QA negative control: PartyXpOff
@@ -195,6 +196,17 @@ std::string KillKey(uint8_t const guid[16])
     const uint32_t incarnation = npcs::Incarnation(guid);
     key.append(reinterpret_cast<char const*>(&incarnation), sizeof(incarnation));
     return key;
+}
+
+bool ClaimedPlayerSwing(uint8_t const identity[16], uint32_t swing)
+{
+    const auto current = playerClaims.find(KillKey(identity));
+    std::string unknown(reinterpret_cast<char const*>(identity), 16);
+    const uint32_t life = 0;
+    unknown.append(reinterpret_cast<char const*>(&life), sizeof(life));
+    const auto initial = playerClaims.find(unknown);
+    return melee::ClaimedSwing(swing, current == playerClaims.end() ? 0 : current->second,
+                              initial == playerClaims.end() ? 0 : initial->second);
 }
 // Arena and duel (owner's decision 22.10., variant b; re/findings/defeat-arena-c.md): an NPC fighting a duel or an arena
 // bout (attack reason Duel or Arena) takes hits only from its opponent there; a second player's hits do not count. Its
@@ -569,6 +581,7 @@ eCEntity* PartyLeader(eCEntity* entity)
 
 int RawAttitude(eCEntity* entity)
 {
+    if (auto const* record = npcs::CombatRecord(entity)) return record->attitude;
     return entity && entity->GetPropertySet(eEPropertySetType_NPC)
         ? static_cast<int>(static_cast<gEAttitude>(Entity(entity).NPC.AttitudeToPlayer2)) : melee::None;
 }
@@ -578,7 +591,7 @@ struct MeleeVerdict {
     eCEntity* focus = nullptr;
     int relation = -1;
     char const* decision = "missing-claimant";
-    bool allowed = false;
+    bool allowed = false, relationsKnown = false;
 };
 struct PlayerMeleeContact {
     net::MeleeContact contact;
@@ -590,6 +603,11 @@ MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, ne
 {
     MeleeVerdict result;
     if (!claimant || !claimant->GetPropertySet(eEPropertySetType_NPC)) return result;
+    auto const* record = npcs::CombatRecord(victim);
+    if (npcs::IsMirrored(victim) && !record) {
+        result.decision = "missing-victim-record";
+        return result;
+    }
     result.focus = HasIdentity(contact.focus) ? guid::Resolve(contact.focus).GetInstance() : nullptr;
     eCEntity* aimed = HasIdentity(contact.target) ? guid::Resolve(contact.target).GetInstance() : nullptr;
     if ((HasIdentity(contact.focus) && !result.focus) || (HasIdentity(contact.target) && !aimed)) {
@@ -601,23 +619,28 @@ MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, ne
         result.decision = "unresolved-opponent";
         return result;
     }
-    if ((result.focus && !npcs::Ready(result.focus)) || (opponent && !npcs::Ready(opponent))) {
-        result.decision = "unready-relations";
+    if ((npcs::IsMirrored(result.focus) && !npcs::CombatRecord(result.focus)) ||
+        (npcs::IsMirrored(opponent) && !npcs::CombatRecord(opponent))) {
+        result.decision = "missing-relation-record";
         return result;
     }
     auto& v = result.victim;
     v.attitude = RawAttitude(victim);
     v.focusAttitude = RawAttitude(result.focus);
     v.targetAttitude = RawAttitude(opponent);
-    v.combat = body::AIModeOf(victim) == gEAIMode_Combat;
+    v.combat = (record ? record->aiMode : body::AIModeOf(victim)) == gEAIMode_Combat;
     v.hasFocus = result.focus != nullptr;
     v.focused = result.focus == victim;
     v.targeted = aimed == victim;
     v.hasTarget = opponent != nullptr;
     v.targetsPlayer = opponent == claimant;
-    v.ledByPlayer = PartyLeader(victim) == claimant || npcs::CompanionOwner(victim) == player;
-    v.playerLedByVictim = PartyLeader(claimant) == victim;
-    v.targetsPlayerParty = opponent && (PartyLeader(opponent) == claimant || npcs::CompanionOwner(opponent) == player);
+    v.ledByPlayer = (record && record->partyPlayer == player) || PartyLeader(victim) == claimant ||
+        npcs::CompanionOwner(victim) == player;
+    v.playerLedByVictim = (record && record->guidePlayer == player) || PartyLeader(claimant) == victim;
+    auto const* opponentRecord = npcs::CombatRecord(opponent);
+    v.targetsPlayerParty = opponent &&
+        ((opponentRecord && opponentRecord->partyPlayer == player) || PartyLeader(opponent) == claimant ||
+         npcs::CompanionOwner(opponent) == player);
     v.targetOnly = contact.targetOnly != 0;
     v.item = contact.item != 0;
     if (claimant->GetPropertySet(eEPropertySetType_Party)) {
@@ -637,6 +660,7 @@ MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, ne
         result.decision = "focus-attitude-unavailable";
         return result;
     }
+    result.relationsKnown = true;
     Entity npc(victim);
     if (arenaRule && InBout(npc) && !v.targetsPlayer) {
         result.decision = "outside-bout";
@@ -666,13 +690,14 @@ void LogMelee(char const* entry, uint8_t player, uint32_t sequence, eCEntity* vi
 bool LocalMeleeAllowed(eCEntity* victim, eCEntity* attacker, net::MeleeContact const& contact)
 {
     auto verdict = JudgeMelee(victim, attacker, net::LocalId(), contact);
-    if (verdict.allowed && contact.item && !Entity(attacker).IsInFOV(Entity(victim))) {
+    if ((verdict.allowed || !verdict.relationsKnown) && contact.item && !Entity(attacker).IsInFOV(Entity(victim))) {
         verdict.allowed = false;
+        verdict.relationsKnown = true;
         verdict.decision = "outside-native-fov";
     }
     uint8_t identity[16]; Guid(victim, identity);
     const auto key = KillKey(identity);
-    if (verdict.allowed) {
+    if (melee::JudgeClient(verdict.allowed, verdict.relationsKnown) != melee::ClientDecision::Reject) {
         playerMeleeContacts[key] = {contact, verdict};
         return true;
     }
@@ -680,9 +705,48 @@ bool LocalMeleeAllowed(eCEntity* victim, eCEntity* attacker, net::MeleeContact c
     if (refused.motion != contact.motion || refused.reason != verdict.decision) {
         refused.motion = contact.motion;
         refused.reason = verdict.decision;
+        ++localMeleeRefused;
         LogMelee("local-refused", net::LocalId(), 0, victim, contact, verdict);
     }
     return false;
+}
+
+bool SendHostJudgedMelee(eCEntity* victim, net::MeleeContact contact)
+{
+    uint8_t identity[16], weapon[16] = {};
+    Guid(victim, identity);
+    const auto key = KillKey(identity);
+    if (ClaimedPlayerSwing(identity, contact.motion)) return false;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero || !contact.motion) {
+        Log("combat: contact claim has no local hero or swing identity");
+        return false;
+    }
+    if (IgnoreFriendlyHit(victim, remote::ControlledBody())) return false;
+    const GEInt held = Entity(hero).Inventory.FindStackIndex(gESlot_RightHand);
+    if (held >= 0) {
+        const Template item = Entity(hero).Inventory.GetTemplate(held);
+        bCPropertyID const& id = item;
+        std::memcpy(weapon, &id.GetCore(), 16);
+    }
+    contact.melee = net::HostJudgedMelee;
+    const uint32_t hit = net::SendHitNpc(1, identity, 0, weapon, nullptr, net::HitUnjudged,
+        npcs::SeenAt(victim), net::HitNoReaction, npcs::Incarnation(identity), contact);
+    if (!hit) return false;
+    playerClaims[key] = contact.motion;
+    ++claimsSent;
+    ++hostJudgedClaimsSent;
+    npcs::AwaitHit(victim, hit);
+    const auto context = playerMeleeContacts.find(key);
+    if (context != playerMeleeContacts.end()) {
+        static DWORD lastMissingRelationLog = 0;
+        const DWORD now = GetTickCount();
+        if (hostJudgedClaimsSent <= 8 || now - lastMissingRelationLog >= 5000) {
+            lastMissingRelationLog = now ? now : 1;
+            LogMelee("claim-host-judged", net::LocalId(), hit, victim, contact, context->second.verdict);
+        }
+    }
+    return true;
 }
 
 // Stufe 4.1: the game judges a blow (DoLogicalDamage: AssessHit's stumble, the hit sound and blood, the fight-sound perception)
@@ -730,11 +794,19 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         : Entity(spu ? (which == 0 ? spu->GetSelfEntity() : spu->GetOtherEntity()) : nullptr);
     eCEntity* attacker = Attacker(nullptr, &damageSource);
     eCEntity* source = damageSource.GetInstance();
-    if (!ai::ShuttingDown() && !npclease::ContactAllowed(victim.GetInstance(), attacker)) return 0;
+    const bool localMelee = !bypass && !forwarded && npcs::IsMirrored(victim.GetInstance()) &&
+        IsLocalMelee(attacker, source) && ai::detail::damageReceiver != victim.GetInstance();
+    if (!ai::ShuttingDown() && !localMelee && !npclease::ContactAllowed(victim.GetInstance(), attacker)) return 0;
     if (!ai::ShuttingDown() && RejectDownedHit(victim.GetInstance(), attacker, Judgements[which])) return 0;
-    if (!bypass && !forwarded && npcs::IsMirrored(victim.GetInstance()) && IsLocalMelee(attacker, source) &&
-        ai::detail::damageReceiver != victim.GetInstance() &&
-        !LocalMeleeAllowed(victim.GetInstance(), attacker, CaptureMelee(attacker, source))) return 0;
+    if (localMelee) {
+        const auto contact = CaptureMelee(attacker, source);
+        if (!LocalMeleeAllowed(victim.GetInstance(), attacker, contact)) return 0;
+        uint8_t identity[16]; Guid(victim.GetInstance(), identity);
+        if (!playerMeleeContacts.at(KillKey(identity)).verdict.relationsKnown) {
+            if (which < 2) SendHostJudgedMelee(victim.GetInstance(), contact);
+            return 0;
+        }
+    }
     if (ai::ShuttingDown()) return judge[which] ? judge[which](spu, self, other, args) : 0;
     if (IsPuppetMeleeJudgement(victim.GetInstance(), attacker, source)) {
         ++foreignSkipped;
@@ -745,10 +817,6 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         ++foreignSkipped;
         return 0;
     }
-    if (!bypass && npcs::IsMirrored(victim.GetInstance()) && !npcs::Ready(victim.GetInstance())) {
-        ++invisibleContactsIgnored;
-        return 0;
-    }
     if (IgnoreFriendlyHit(victim.GetInstance(), attacker)) return 0;
     uint32_t* consumed = nullptr;
     uint32_t swing = 0;
@@ -757,8 +825,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         if (swing) {
             uint8_t guid[16]; Guid(victim.GetInstance(), guid);
             const std::string key = KillKey(guid);
-            const auto claimed = playerClaims.find(key);
-            if (claimed != playerClaims.end() && claimed->second == swing) return 0;
+            if (ClaimedPlayerSwing(guid, swing)) return 0;
             if (source == attacker || source == Entity(attacker).Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance()) {
                 consumed = &playerSwings[key];
                 if (*consumed == swing) return 0;
@@ -1095,8 +1162,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             swing = npcplayback::MotionInstance(localMeleeActor);
             if (swing) {
                 claimKey = KillKey(guid);
-                const auto claimed = playerClaims.find(claimKey);
-                if (claimed != playerClaims.end() && claimed->second == swing) {
+                if (ClaimedPlayerSwing(guid, swing)) {
                     ++duplicateClaimsIgnored;
                     static DWORD lastDuplicateClaimLog = 0;
                     const DWORD now = GetTickCount();
@@ -1117,6 +1183,10 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             } else {
                 contact = CaptureMelee(localMeleeActor, source);
                 if (!LocalMeleeAllowed(instance, localMeleeActor, contact)) return GETrue;
+            }
+            if (!playerMeleeContacts.at(KillKey(guid)).verdict.relationsKnown) {
+                SendHostJudgedMelee(instance, contact);
+                return GETrue;
             }
         }
         const uint32_t hit = net::SendHitNpc(owner, guid, args, weapon, nullptr, lastOutcome, npcs::SeenAt(instance),
@@ -1143,7 +1213,14 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (const int owner = remote::PuppetOwner(instance)) {
         if (attacker && attacker != hero) remote::NoteContact(attacker, instance);
         // A hit on a puppet is not evidence that the remote hero was hit in that player's game.
-        if (attacker && attacker != hero) return GETrue;
+        if (attacker && attacker != hero) {
+            if (net::IsHost() && body::LocallyAttacking(attacker))
+                Logf("combat: NPCATTACK stage=host-contact npc=%s player=%d instance=%u host_judged=%u "
+                     "phase=%.4f puppet_block=%d damage_forwarded=0 compensation_ms=0 authority=defender-local",
+                     Entity(attacker).GetName().GetText(), owner, npcplayback::MotionInstance(attacker), net::Now(),
+                     body::SwingProgress(attacker), InParadeMode(instance) ? 1 : 0);
+            return GETrue;
+        }
         uint8_t guid[16] = {};
         uint8_t attackerPlayer = 0;
         if (attacker && attacker == hero) attackerPlayer = net::LocalId();
@@ -1169,6 +1246,20 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 // A hit for QA, the way the game's hit paths do it: judge (through OnDamage, which runs the same judgement
 // as the paths above but without their swing-in-progress gates), then AddHitPoints(-recorded damage).
 // The weapon's damage type is None outside a swing (the game sets it for the swing); set it for this hit.
+GEInt JudgeDamage(Entity& victim, eCEntity* source, int* pending, bool apply = false)
+{
+    Entity weapon(source);
+    const bool armed = source && source->GetPropertySet(eEPropertySetType_Damage);
+    const gEDamageType type = armed ? static_cast<gEDamageType>(weapon.Damage.DamageType) : gEDamageType_None;
+    if (armed && type == gEDamageType_None) weapon.Damage.DamageType = gEDamageType_Blade;
+    victim.DamageReceiver.DamageAmount = 0;
+    const GEInt result = CallScript("OnDamage", victim.GetInstance(), source, 0);
+    *pending = Pending(victim);
+    if (apply && result) CallScript("AddHitPoints", victim.GetInstance(), source, -*pending);
+    if (armed) weapon.Damage.DamageType = type;
+    return result;
+}
+
 GEInt GameHit(Entity& victim, eCEntity* source, int* pending)
 {
     // QA guard: the local hero still parries (the block key held); the parade state alone falls back to standing.
@@ -1180,15 +1271,7 @@ GEInt GameHit(Entity& victim, eCEntity* source, int* pending)
         Logf("combat: guard judged: parade_mode=%d fov=%d attacker=%s", CallScript("IsInParadeMode", victim.GetInstance(), nullptr, 0),
              victim.IsInFOV(by) ? 1 : 0, by.GetInstance() ? by.GetName().GetText() : "none");
     }
-    Entity weapon(source);
-    const bool armed = source && source->GetPropertySet(eEPropertySetType_Damage);
-    const gEDamageType type = armed ? static_cast<gEDamageType>(weapon.Damage.DamageType) : gEDamageType_None;
-    if (armed && type == gEDamageType_None) weapon.Damage.DamageType = gEDamageType_Blade;
-    const GEInt result = CallScript("OnDamage", victim.GetInstance(), source, 0);
-    *pending = Pending(victim);
-    if (result) CallScript("AddHitPoints", victim.GetInstance(), source, -*pending);
-    if (armed) weapon.Damage.DamageType = type;
-    return result;
+    return JudgeDamage(victim, source, pending, true);
 }
 
 // Owner of the NPC: another machine's NPC hit it there (where their regions meet). Applied with that NPC (our
@@ -1251,11 +1334,16 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     std::memcpy(reply.result.guid, guid, 16);
     reply.result.sequence = sequence;
     reply.result.incarnation = incarnation;
-    if (!net::IsHost() || incarnation != npcs::Incarnation(guid)) {
+    const bool hostJudged = contact.melee == net::HostJudgedMelee;
+    if (!net::ValidHitContact(delta, incarnation, seen, outcome, reaction, contact)) {
+        Logf("combat: hit %u refused: invalid contact", sequence);
+        return;
+    }
+    if (!net::IsHost() || (incarnation && incarnation != npcs::Incarnation(guid))) {
         Logf("combat: hit %u refused: stale NPC incarnation", sequence);
         return;
     }
-    if (delta >= 0 || delta < -1000000) return;
+    reply.result.incarnation = npcs::Incarnation(guid);
     Entity target(npcs::NpcByGuid(guid));  // an NPC only: no chest, door, hero or puppet (Fable 1.7)
     if (!target.GetInstance() || target.IsDead()) return;
     if (killOnce && killedHere.count(KillKey(guid))) {  // killed already, its death task not running yet (R9)
@@ -1283,6 +1371,45 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         Logf("combat: player %u hit %s, who fights a duel or arena bout with someone else; not counted", from, target.GetName().GetText());
         return;
     }
+    // Native judgement can start a new knockout; only an already-downed victim is a finishing blow.
+    bool finishing = false;
+    if (knockOuts && attacker) {
+        const auto at = knockedAt.find(KillKey(guid));
+        const DWORD since = at != knockedAt.end() ? GetTickCount() - at->second : 0xffffffff;
+        if (target.IsDown() || since < 3000) {
+            if (since < 2000 || (arenaRule && InBout(target))) {
+                ++finishRefused;
+                return;
+            }
+            finishing = true;
+        }
+    }
+    if (hostJudged) {
+        if (!net::InWorld(from) || downed::CombatUnavailable(attacker) ||
+            !npclease::ContactAllowed(target.GetInstance(), attacker)) {
+            Logf("combat: hit %u refused: claimant unavailable or NPC authority fenced", sequence);
+            return;
+        }
+        guards::Acting player(attacker, false);
+        struct JudgeScope {
+            bool before = forwarded;
+            JudgeScope() { forwarded = true; }
+            ~JudgeScope() { forwarded = before; }
+        } scope;
+        npcplayback::HitOrigin origin(target.GetInstance(), from, sequence);
+        char const* kind = "";
+        int pending = 0;
+        ++hostContactJudgements;
+        const GEInt result = JudgeDamage(target, DamageSource(static_cast<eCDynamicEntity*>(attacker), &kind), &pending);
+        if (!result || pending <= 0 || pending > 1000000) {
+            Logf("combat: host-judged hit %u on %s produced no valid damage result=%#x pending=%d",
+                 sequence, target.GetName().GetText(), result, pending);
+            return;
+        }
+        delta = -pending;
+        outcome = Outcome(target);
+        reaction = Reaction(target);
+    }
     delta = Scaled(target.GetInstance(), attacker, delta);  // friendly_fire, npc_hp (the claim carries the game's damage)
     remote::NoteContact(target.GetInstance(), attacker);  // only an eligible hit may turn it on the puppet
     npcplayback::HitOrigin origin(target.GetInstance(), from, sequence);
@@ -1296,18 +1423,6 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     // P7: a blow on one lying knocked out is the game's finishing blow, whatever its hit points (the host's hero: five blows
     // without effect while it fell, then dead). Judged here: the sender's copy is not down there, so its game judged every
     // such blow a new knock-out (stageMurder 24.10.). The fall is timed for our own knock-outs only (2 s).
-    bool finishing = false;
-    if (knockOuts && attacker) {
-        const auto at = knockedAt.find(KillKey(guid));
-        const DWORD since = at != knockedAt.end() ? GetTickCount() - at->second : 0xffffffff;
-        if (target.IsDown() || since < 3000) {
-            if (since < 2000 || (arenaRule && InBout(target))) {
-                ++finishRefused;  // still falling, or the end of a bout (never a murder there)
-                return;
-            }
-            finishing = true;
-        }
-    }
     ++claimsApplied;
     reply.result.accepted = 1;
     if (!finishing && (HitPoints(target) + delta > 0 || !attacker)) {
@@ -1328,8 +1443,8 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         // talking on while the client struck it (friendlydiag 20.10.). Let it judge the attacker as the game does when an
         // NPC takes damage: fight back, complain, flee or call for help (React).
         if (reactHits && attacker && !target.IsDead() && !target.IsDown()) React(target, attacker);
-        if (reaction != net::HitNoReaction) npcs::HostHit(target.GetInstance(), from, sequence);
-        ApplyReaction(target, attacker, reaction);
+        if (hostJudged || reaction != net::HitNoReaction) npcs::HostHit(target.GetInstance(), from, sequence);
+        if (!hostJudged) ApplyReaction(target, attacker, reaction);
         witness::HitSeen(target.GetInstance(), attacker);  // and those around hear the fight (P7)
         return;
     }
@@ -1574,14 +1689,16 @@ gFScript WrapDamageScript(gSScript& script, gFScript replacement, char const* na
 
 void SyncReport(LogFn log)
 {
-    char line[600];
+    char line[768];
     Format(line, "SYNCCOMBAT claims_sent=%u claims_applied=%u local_judgements=%u no_pending_damage=%u "
                  "player_hits_sent=%u player_hits_received=%u inventory_open=%d inventory_hits_ignored=%u "
                  "redirected=%u stale_authority=%u hit_reactions=%u hp_resets=%u local_npc_hits=%u "
-                 "remote_npc_hits_ignored=%u invisible_contacts_ignored=%u friendly_hits_ignored=%u duplicate_claims_ignored=%u",
+                 "remote_npc_hits_ignored=%u invisible_contacts_ignored=%u friendly_hits_ignored=%u duplicate_claims_ignored=%u "
+                 "host_judged_claims_sent=%u host_contact_judgements=%u local_melee_refused=%u",
            claimsSent, claimsApplied, clientJudgements, clientJudgementsWithoutDamage, playerHitsSent, playerHitsTaken,
            hud::InventoryOpen() ? 1 : 0, inventoryHitsIgnored, hitsRedirected, hitsWrongAuthority, hitReactionsApplied, hpResets,
-           localNpcHits, remoteNpcHitsIgnored, invisibleContactsIgnored, friendlyHitsIgnored, duplicateClaimsIgnored);
+           localNpcHits, remoteNpcHitsIgnored, invisibleContactsIgnored, friendlyHitsIgnored, duplicateClaimsIgnored,
+           hostJudgedClaimsSent, hostContactJudgements, localMeleeRefused);
     log(line);
 }
 
@@ -2410,26 +2527,39 @@ bool LocalBlow(eCEntity* attacker)
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker), &kind);
     int pending = 0;
     if (MeansToKill(attacker, body)) downed::NoteBlow();
+    auto stamina = [&]() {
+        return HasPlayerMemory(body) ? self.PlayerMemory.GetStaminaPoints()
+            : HasDamageReceiver(body) ? static_cast<int>(self.DamageReceiver.StaminaPoints) : -1;
+    };
+    const int hpBefore = HitPoints(self), spBefore = stamina();
+    const bool blocking = InParadeMode(body);
     forwarded = true;
     heroForward = true;
     const GEInt result = GameHit(self, source, &pending);
     heroForward = false;
     forwarded = false;
     ++localNpcHits;
-    if (localNpcHits <= 40)
-        Logf("combat: %s's visible blow judged here: result=%#x pending=%d", Entity(attacker).GetName().GetText(), result, pending);
+    Logf("combat: NPCATTACK stage=local-result npc=%s client_judged=%u block_state=%d result=%#x pending=%d "
+         "hp=%d->%d stamina=%d->%d",
+         Entity(attacker).GetName().GetText(), net::Now(), blocking ? 1 : 0, result, pending,
+         hpBefore, HitPoints(self), spBefore, stamina());
     return true;
 }
 
 bool PlayerBlow(eCEntity* victim)
 {
     eCEntity* hero = remote::ControlledBody();
-    if (!installed || bypass || net::IsHost() || !hero || !victim || !npcplayback::IsPassive(victim) || !npcs::Ready(victim) ||
+    if (!installed || bypass || net::IsHost() || !hero || !victim || !npcplayback::IsPassive(victim) ||
         !body::LocallyAttacking(hero) || IgnoreFriendlyHit(victim, hero)) return false;
     Entity player(hero), target(victim);
     if (player.IsDown() || player.IsDead() || target.IsDead()) return false;
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(hero), &kind);
+    const auto contact = CaptureMelee(hero, source);
+    if (!LocalMeleeAllowed(victim, hero, contact)) return false;
+    uint8_t identity[16]; Guid(victim, identity);
+    if (!playerMeleeContacts.at(KillKey(identity)).verdict.relationsKnown)
+        return SendHostJudgedMelee(victim, contact);
     int pending = 0;
     const GEInt result = GameHit(target, source, &pending);
     if (result && pending > 0) PlayHitEffect(victim, false);

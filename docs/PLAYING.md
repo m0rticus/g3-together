@@ -64,6 +64,10 @@ Gothic 3 texts: German for a German game, Polish for a Polish one, English other
 `language` line the messages are English. Each player may choose independently. This setting does not change
 Gothic 3's own language. The message examples in this guide assume English.
 
+Gameplay notices are passive HUD text: they do not activate a GUI window, interrupt movement or
+dispatch a hero animation/dialog. Knockout, revival, a chosen dialog and actual save/load still have
+their normal gameplay effects; displaying their notice adds none.
+
 ## Connecting over the internet
 
 Steam is the only connection path. No host address, VPN or router port forwarding is needed.
@@ -315,6 +319,15 @@ Your own successful hit shows its local flinch immediately and is claimed reliab
 does not cancel that landed hit. Hit identities, acknowledgements and NPC incarnations prevent duplicate claims and
 suppress the attacking client's echoed flinch; other players still see the host's reaction.
 Damage to your hero remains locally judged against the attack you are shown, not a host-issued HP subtraction.
+Incoming NPC melee contacts wait for vanilla's hit point (60% of the displayed attack Hit clip), not the first
+overlap during its windup. The same display clock drives motion, bones and contacts; it cannot catch up faster
+than native time while that NPC fights your hero. Network jitter may extend a telegraph, never compress it.
+Blocks, parries and retreat use your real hero immediately, not the host puppet's delayed stance or position.
+Incoming combat motion starts are reliable without changing pose/control rates or the wire layout.
+The permanent `combat: NPCATTACK` lines correlate host motion start/capture/send and contact, client receive/display/seek
+and contact, and the native local block, HP and stamina result by NPC and motion instance. `host_*` timestamps
+use the host clock, `client_*` the client clock; `presentation_ms` excludes the track's estimated link/clock offset.
+`compensation_est_ms` adds half the measured RTT to that presentation age; it is an estimate, not a host damage delay.
 NPC projectiles follow their host presentation time. Every terminal NPC death starts a local client ragdoll, including
 client kills without a host ragdoll flag. A matching host death force is applied once, after its presentation time and
 physics are ready, with its original direction and corpse-relative application point. Forces are bounded by vanilla's

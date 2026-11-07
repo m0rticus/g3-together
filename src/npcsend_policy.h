@@ -2,6 +2,7 @@
 #pragma once
 
 #include "net.h"
+#include "combat_timing.h"
 
 #include <cmath>
 #include <cstdint>
@@ -110,7 +111,12 @@ struct Result {
 // The caller must compare against its own last successfully queued state.
 inline bool EssentialChanged(net::NpcRecord const& sent, net::NpcRecord const& current)
 {
-    return ((sent.flags ^ current.flags) & 0xBFu) != 0 || // life, combat and player opponent (parry is a motion edge)
+    const bool incomingMotion = combat_timing::RemoteCombat(current.flags, current.combatTarget) &&
+        current.motions[0].active &&
+        (sent.motions[0].instance != current.motions[0].instance ||
+         sent.motions[0].name != current.motions[0].name || !sent.motions[0].active);
+    return incomingMotion ||
+        ((sent.flags ^ current.flags) & 0xBFu) != 0 || // life, combat and player opponent (parry is a motion edge)
         sent.aiMode != current.aiMode ||
         sent.incarnation != current.incarnation ||
         sent.hitPoints != current.hitPoints || sent.hitPointsMax != current.hitPointsMax ||
@@ -118,8 +124,15 @@ inline bool EssentialChanged(net::NpcRecord const& sent, net::NpcRecord const& c
         sent.waiting != current.waiting || sent.guidePlayer != current.guidePlayer ||
         sent.hitPlayer != current.hitPlayer || sent.hitSequence != current.hitSequence ||
         sent.contact != current.contact || sent.attitude != current.attitude ||
+        sent.attackReason != current.attackReason ||
         sent.heldRight != current.heldRight || sent.heldLeft != current.heldLeft ||
         sent.combatTarget != current.combatTarget;
+}
+
+inline bool ImmediateInitial(Input const& in)
+{
+    return in.record && (in.distanceCm <= NearExitCm || in.focused || in.combat || in.contact ||
+        in.record->contact || in.record->partyPlayer || in.record->guidePlayer);
 }
 
 namespace detail {

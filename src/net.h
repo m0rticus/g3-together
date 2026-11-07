@@ -260,14 +260,26 @@ void SetPlayerStateHandler(PlayerStateHandler handler);  // each accepted networ
 // seen: the owner's send time of the NPC's state the sender showed when its hero struck (Stufe 3.3), 0 unknown.
 enum HitOutcome : uint8_t { HitUnjudged = 0, HitKnockOut = 1, HitDeath = 2 };
 enum HitReaction : uint8_t { HitNoReaction = 0, HitQuickStumble = 1, HitStumble = 2, HitPierceStumble = 3, HitSitKnockDown = 4 };
+enum MeleeMode : uint8_t { NotMelee = 0, PredictedMelee = 1, HostJudgedMelee = 2 };
 #pragma pack(push, 1)
 struct MeleeContact {
+    // HostJudgedMelee submits contact intent without a local damage judgement or reaction.
     uint8_t melee = 0, targetOnly = 0, item = 0;
     uint8_t focus[16] = {}, target[16] = {};
     uint32_t motion = 0;
 };
 #pragma pack(pop)
 static_assert(sizeof(MeleeContact) == 39, "melee contact wire layout changed");
+inline bool ValidHitContact(int32_t delta, uint32_t incarnation, uint32_t seen,
+                            uint8_t outcome, uint8_t reaction, MeleeContact const& contact)
+{
+    if (contact.melee > HostJudgedMelee || contact.targetOnly > 1 || contact.item > 1 ||
+        outcome > HitDeath || reaction > HitSitKnockDown) return false;
+    if (contact.melee == HostJudgedMelee)
+        return delta == 0 && outcome == HitUnjudged && reaction == HitNoReaction && contact.motion &&
+               (incarnation || !seen);
+    return incarnation && delta < 0 && delta >= -1000000;
+}
 uint32_t SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t const weapon[16], uint8_t const npc[16] = nullptr,
                    uint8_t outcome = HitUnjudged, uint32_t seen = 0, uint8_t reaction = HitNoReaction, uint32_t incarnation = 1,
                    MeleeContact const& contact = {});

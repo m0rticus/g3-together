@@ -38,6 +38,35 @@ int main()
     static_assert(sizeof(g3t::net::NpcRecord{}.combatTarget) == 4);
     static_assert(sizeof(g3t::net::NpcRecord{}.hitSequence) == 2);
     static_assert(sizeof(g3t::net::MeleeContact) == 39);
+    static_assert(JudgeClient(false, false) == ClientDecision::HostJudge);
+    static_assert(JudgeClient(true, false) == ClientDecision::HostJudge);
+    static_assert(JudgeClient(false, true) == ClientDecision::Reject);
+    static_assert(JudgeClient(true, true) == ClientDecision::Predict);
+    assert(ClaimedSwing(2082, 0, 2082)); // first snapshot must not permit the same unknown-life swing twice
+    assert(ClaimedSwing(2082, 2082, 0));
+    assert(!ClaimedSwing(2083, 2082, 2082));
+    assert(!ClaimedSwing(0, 0, 0));
+    g3t::net::MeleeContact contact;
+    contact.melee = g3t::net::HostJudgedMelee;
+    contact.motion = 2082;
+    for (auto life : {0u, 1u, 123u}) {
+        assert(g3t::net::ValidHitContact(0, life, 0, 0, 0, contact));
+        assert(!g3t::net::ValidHitContact(-1, life, 0, 0, 0, contact));
+        assert(!g3t::net::ValidHitContact(1, life, 0, 0, 0, contact));
+        assert(!g3t::net::ValidHitContact(0, life, 0, 1, 0, contact));
+        assert(!g3t::net::ValidHitContact(0, life, 0, 0, 1, contact));
+    }
+    assert(!g3t::net::ValidHitContact(0, 0, 1, 0, 0, contact)); // unknown life cannot carry old presentation
+    contact.motion = 0;
+    assert(!g3t::net::ValidHitContact(0, 1, 0, 0, 0, contact));
+    contact.motion = 1;
+    contact.melee = g3t::net::PredictedMelee;
+    assert(g3t::net::ValidHitContact(-1, 1, 0, 0, 0, contact));
+    assert(!g3t::net::ValidHitContact(-1, 0, 0, 0, 0, contact));
+    assert(!g3t::net::ValidHitContact(0, 1, 0, 0, 0, contact));
+    assert(!g3t::net::ValidHitContact(-1000001, 1, 0, 0, 0, contact));
+    contact.melee = 3;
+    assert(!g3t::net::ValidHitContact(-1, 1, 0, 0, 0, contact));
     for (int attitude = None; attitude <= Panic; ++attitude) {
         for (int focus = None; focus <= Panic; ++focus) {
             Victim v;
@@ -46,6 +75,9 @@ int main()
             v.focusRelation = focus;
             auto expected = attitude < focus && attitude < Hostile ? Decision::Bystander : Decision::Allow;
             assert(Judge(v) == expected);
+            assert(JudgeClient(Judge(v) == Decision::Allow, true) ==
+                   (expected == Decision::Allow ? ClientDecision::Predict : ClientDecision::Reject));
+            assert(JudgeClient(Judge(v) == Decision::Allow, false) == ClientDecision::HostJudge);
             v.combat = true;
             v.attitude = attitude;
             v.focusAttitude = focus;
@@ -183,8 +215,10 @@ int main()
     def test_npc_opponent_replay_and_contact_query_share_collision_checked_identity(self):
         self.assertIn("r.combatTarget = net::HashGuid(targetGuid)", self.npcs)
         self.assertIn("m.shownCombatTarget = shown.combatTarget;", self.npcs)
-        query = self.npcs.split("bool CombatTarget(", 1)[1].split("bool PresentationPending(", 1)[0]
-        self.assertIn("NpcOpponent(IndexNpcOpponents(), mirror.shownCombatTarget)", query)
+        query = self.npcs.split("bool CombatTarget(", 1)[1].split("void AwaitHit(", 1)[0]
+        self.assertIn("NpcOpponent(IndexNpcOpponents(), record->combatTarget)", query)
+        self.assertIn("CombatRecord(entity)", query)
+        self.assertNotIn("Ready(", query)
         self.assertIn("return target != nullptr;", query)
         self.assertNotIn("SetEntity", query)
         self.assertNotIn("SetCurrentTarget", query)
@@ -199,9 +233,60 @@ int main()
         self.assertNotIn("CallScript", replay)
         self.assertNotIn("SetCurrentTarget", replay)
         judge = self.combat.split("MeleeVerdict JudgeMelee(", 1)[1].split("void LogMelee(", 1)[0]
-        self.assertIn("!npcs::Ready(result.focus)", judge)
-        self.assertIn("!npcs::Ready(opponent)", judge)
-        self.assertLess(judge.index('result.decision = "unready-relations"'), judge.index("v.attitude = RawAttitude("))
+        self.assertNotIn("npcs::Ready(", judge)
+        self.assertIn("npcs::CombatRecord(result.focus)", judge)
+        self.assertIn("npcs::CombatRecord(opponent)", judge)
+        self.assertLess(judge.index('result.decision = "missing-relation-record"'), judge.index("v.attitude = RawAttitude("))
+
+    def test_incomplete_contacts_are_sent_before_local_damage_or_reaction(self):
+        judge = self.combat.split("GEInt Judge(int which", 1)[1].split("// Owner of the NPC:", 1)[0]
+        send = judge.index("SendHostJudgedMelee(")
+        for operation in ("npcplayback::BeginHit(", "ai::DamagePerception perception", "judge[which](spu"):
+            self.assertLess(send, judge.index(operation))
+        self.assertNotIn("npcs::Ready(", judge)
+        submit = self.combat.split("bool SendHostJudgedMelee(", 1)[1].split("// Stufe 4.1:", 1)[0]
+        self.assertIn("ClaimedPlayerSwing(identity, contact.motion)", submit)
+        self.assertIn("contact.melee = net::HostJudgedMelee;", submit)
+        self.assertIn("identity, 0, weapon, nullptr, net::HitUnjudged", submit)
+        self.assertIn("net::HitNoReaction", submit)
+        self.assertLess(submit.index("if (!hit) return false;"), submit.index("playerClaims[key] = contact.motion"))
+        self.assertIn("npcs::AwaitHit(victim, hit)", submit)
+        for forbidden in ("GameHit(", "npcs::LocalHit(", "PlayHitEffect(", "BeginHit(", "DamagePerception"):
+            self.assertNotIn(forbidden, submit)
+        host = self.combat.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
+        self.assertLess(host.index("if (!verdict.allowed) return;"), host.index("JudgeDamage("))
+        self.assertLess(host.index("IgnoreFriendlyHit("), host.index("JudgeDamage("))
+        self.assertLess(host.index("OutsideBout("), host.index("JudgeDamage("))
+        self.assertLess(host.index("bool finishing = false;"), host.index("JudgeDamage("))
+        self.assertLess(host.index("if (target.IsDown() || since < 3000)"), host.index("JudgeDamage("))
+        self.assertIn("reply.result.incarnation = npcs::Incarnation(guid)", host)
+        self.assertIn("delta = -pending;", host)
+
+    def test_visible_player_sweeps_and_notice_do_not_depend_on_replay_success(self):
+        record = self.npcs.split("net::NpcRecord const* CombatRecord(", 1)[1].split("bool CombatTarget(", 1)[0]
+        self.assertNotIn("replayReady", record)
+        self.assertIn("hostSession != net::WelcomeSerial()", record)
+        self.assertIn("latest.incarnation != Incarnation(identity)", record)
+        sweep = self.npcs.split("void TryPlayerBlow(", 1)[1].split("void LogClientDeath(", 1)[0]
+        self.assertNotIn("replayReady", sweep)
+        self.assertIn("SweepsBody(victim", sweep)
+        self.assertIn("ClearContact(hero, victim)", sweep)
+        tick = self.npcs.split("void PassiveMirrorTick()", 1)[1].split("bool MirrorFightsHero()", 1)[0]
+        self.assertIn("npcplayback::IsPassive(victim)) TryPlayerBlow(victim)", tick)
+        blow = self.combat.split("bool PlayerBlow(", 1)[1].split("bool Switch(", 1)[0]
+        self.assertNotIn("npcs::Ready(", blow)
+        self.assertLess(blow.index("SendHostJudgedMelee("), blow.index("GameHit("))
+        replay = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("NpcStatePending", replay)
+        self.assertNotIn("presentationMissingAt", replay)
+        self.assertNotIn("Waiting for NPC presentation", (ROOT / "src" / "i18n.cpp").read_text(encoding="utf-8"))
+
+    def test_resync_republishes_gameplay_and_queue_failure_is_not_counted_as_success(self):
+        signal = self.net.split("} else if (type == MsgControlSignal)", 1)[1].split("} else if (type == MsgBoneDictionary)", 1)[0]
+        self.assertIn("SendFullNpc(peers[peerId], state->second.latest, true)", signal)
+        send = self.net.split("uint32_t SendHitNpc(", 1)[1].split("void SetHitResultHandler(", 1)[0]
+        self.assertIn("if (!Send(server, &message, sizeof(message), ChannelCombat, true))", send)
+        self.assertIn("ValidHitContact(", send)
 
     def test_contact_context_and_dedup_are_retained_until_send_then_cleared(self):
         self.assertIn("context->second.contact.motion == npcplayback::MotionInstance(localMeleeActor)", self.combat)
@@ -219,7 +304,7 @@ int main()
         self.assertIn('result.decision = "outside-bout";', self.combat)
         local = self.combat.split("bool LocalMeleeAllowed(", 1)[1].split("// Stufe 4.1:", 1)[0]
         self.assertIn("!Entity(attacker).IsInFOV(Entity(victim))", local)
-        self.assertIn("verdict.allowed && contact.item", local)
+        self.assertIn("contact.item && !Entity(attacker).IsInFOV(Entity(victim))", local)
         self.assertLess(local.index("IsInFOV("), local.index("playerMeleeContacts[key]"))
 
 

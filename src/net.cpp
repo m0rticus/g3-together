@@ -190,6 +190,7 @@ struct ControlState {
     uint16_t id = 0, nextBaseline = 0;
     uint32_t nextAnchor = 0;
     npcwire::BaselineRef current{};
+    NpcRecord latest{};
     uint8_t lifeFlags = 0;
 };
 struct ControlOffer { npcwire::BaselineRef ref{}; uint32_t at = 0, serial = 0; };
@@ -204,6 +205,7 @@ std::unordered_map<uint16_t, npcwire::BaselineRef> controlAcknowledged[MaxPlayer
 uint32_t requestedControlAt = 0, requestedControlGeneration = 0;
 uint16_t requestedControlId = 0;
 unsigned controlBaselineLogs = 0, controlRequestLogs = 0, controlBatchLogs = 0, controlErrors = 0;
+bool SendFullNpc(ENetPeer* peer, NpcRecord const& record, bool reliable);
 detail::BandwidthCounters bandwidth;
 uint32_t bandwidthSince = 0, lastSentData = 0, lastSentPackets = 0, lastReceivedData = 0, lastReceivedPackets = 0;
 NpcHandler npcHandler = nullptr;
@@ -759,6 +761,7 @@ PreparedControl PrepareControl(NpcRecord const& record)
     }
     if (!npcwire::FromNpcRecord(record, state.current.anchor, state.current.baseline, false, dynamic)) return result;
     result.available = true;
+    state.latest = record;
     result.ref = state.current;
     result.value = std::move(dynamic);
     std::vector<uint8_t> encoded;
@@ -1118,6 +1121,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             prepared.available = true;
             prepared.ref = state->second.current;
             OfferControl(static_cast<uint8_t>(peerId), prepared, true);
+            SendFullNpc(peers[peerId], state->second.latest, true);
         }
     } else if (type == MsgBoneDictionary) {
         if (isHost || peer != server || !(packet->flags & ENET_PACKET_FLAG_RELIABLE) ||
@@ -1505,9 +1509,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
         }
         static const uint8_t zero[16] = {};
-        if (message.from < 2 || message.from >= MaxPlayers || message.to != 1 || message.delta >= 0 || message.delta < -1000000 ||
-            message.epoch != worldEpoch || !message.sequence || !message.incarnation || message.reaction > HitSitKnockDown ||
-            message.outcome > HitDeath || message.contact.melee > 1 || message.contact.targetOnly > 1 || message.contact.item > 1 ||
+        if (message.from < 2 || message.from >= MaxPlayers || message.to != 1 ||
+            message.epoch != worldEpoch || !message.sequence ||
+            !ValidHitContact(message.delta, message.incarnation, message.seen, message.outcome, message.reaction, message.contact) ||
             std::memcmp(message.npc, zero, 16)) { Log("net: invalid or stale NPC hit rejected"); return; }
         if (!hitClaims[message.from].Accept(message.sequence)) {
             Log("net: repeated NPC hit ignored; its original reliable result remains authoritative");
@@ -2434,12 +2438,19 @@ uint32_t SendHitNpc(uint8_t to, uint8_t const guid[16], int32_t delta, uint8_t c
         Log("net: NPC hit not sent: no ready authoritative host");
         return 0;
     }
+    if (!ValidHitContact(delta, incarnation, seen, outcome, reaction, contact)) {
+        Log("net: NPC hit not sent: invalid contact judgement");
+        return 0;
+    }
     if (++hitSequence == 0) ++hitSequence;
     HitNpcMsg message{MsgHitNpc, {}, delta, {}, to, localId, {}, outcome, seen, reaction, worldEpoch, hitSequence, incarnation, contact};
     std::memcpy(message.guid, guid, 16);
     std::memcpy(message.weapon, weapon, 16);
     if (npc) std::memcpy(message.npc, npc, 16);
-    if (server && connected) Send(server, &message, sizeof(message), ChannelCombat, true);
+    if (!Send(server, &message, sizeof(message), ChannelCombat, true)) {
+        Log("net: NPC hit could not be queued");
+        return 0;
+    }
     return hitSequence;
 }
 

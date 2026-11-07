@@ -289,7 +289,7 @@ int main()
     assert(transmissions.size() == 3 && transmissions[2].bytes[0] == MsgNpcs);
 
     // Client rejoin loses its tables: the compact packet requests the ID and
-    // the host resends the current generation's ID and baseline reliably.
+    // the host resends the ID, baseline and latest gameplay record reliably.
     NpcRecord fresh = records[1];
     transmissions.clear();
     SendNpcs(&fresh, 1, false);
@@ -307,14 +307,18 @@ int main()
     transmissions.clear();
     isHost = true;
     Deliver(&fakePeer, request);
-    assert(transmissions.size() == 2 && transmissions[0].bytes[0] == MsgControlId &&
-           transmissions[1].bytes[0] == MsgControlBaseline);
-    const auto resentId = transmissions[0], resentBaseline = transmissions[1];
+    assert(transmissions.size() == 3 && transmissions[0].bytes[0] == MsgControlId &&
+           transmissions[1].bytes[0] == MsgControlBaseline && transmissions[2].bytes[0] == MsgNpcs &&
+           (transmissions[2].flags & ENET_PACKET_FLAG_RELIABLE));
+    const auto resentId = transmissions[0], resentBaseline = transmissions[1], resentGameplay = transmissions[2];
     transmissions.clear();
     isHost = false;
     Deliver(&fakePeer, resentId);
     Deliver(&fakePeer, resentBaseline);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
+    Deliver(&fakePeer, resentGameplay);
+    assert(receivedRecords.size() == beforeUnknown + 1);
+    assert(std::memcmp(&receivedRecords.back(), &fresh, sizeof(NpcRecord)) == 0);
     const auto resyncAck = transmissions[0];
     transmissions.clear();
     isHost = true;
@@ -325,7 +329,7 @@ int main()
     transmissions.clear();
     isHost = false;
     Deliver(&fakePeer, recovered);
-    assert(receivedRecords.size() == beforeUnknown + 1);
+    assert(receivedRecords.size() == beforeUnknown + 2);
 
     // Reliable life transitions remain full records and precede reliable release.
     isHost = true;
@@ -506,7 +510,8 @@ int main()
     transmissions.clear();
     isHost = true;
     Deliver(&fakePeer, missingRequest);
-    assert(transmissions.size() == 2);
+    assert(transmissions.size() == 3 && transmissions[2].bytes[0] == MsgNpcs &&
+           (transmissions[2].flags & ENET_PACKET_FLAG_RELIABLE));
     const auto resentControlId = transmissions[0], resentControlBaseline = transmissions[1];
     transmissions.clear();
     isHost = false;
@@ -789,5 +794,56 @@ int main()
                 assert(std::abs(int(appliedBones[i].values[k]) - rigidBones[i].values[k]) <= (k < 9 ? 2 : 0));
     }
     assert(rigidPackets);
+
+    // Real reliable contact handlers accept host-judged missing-life intent,
+    // reject malformed intent, deduplicate, and report send failure honestly.
+    unsigned contacts = 0;
+    static unsigned* contactCount = nullptr;
+    contactCount = &contacts;
+    SetHitHandlers([](uint8_t from, uint8_t const*, int32_t delta, uint8_t const*, uint8_t const*,
+                      uint8_t outcome, uint32_t seen, uint8_t reaction, uint32_t sequence,
+                      uint32_t incarnation, MeleeContact const& contact) {
+        assert(from == 2 && delta == 0 && outcome == HitUnjudged && !seen &&
+               reaction == HitNoReaction && sequence && !incarnation &&
+               contact.melee == HostJudgedMelee && contact.motion == 2082 &&
+               contact.focus[0] == 8 && contact.target[0] == 9);
+        ++*contactCount;
+    }, nullptr);
+    isHost = false;
+    connected = true;
+    localId = 2;
+    MeleeContact contact;
+    contact.melee = HostJudgedMelee;
+    contact.motion = 2082;
+    contact.focus[0] = 8;
+    contact.target[0] = 9;
+    uint8_t weapon[16] = {};
+    transmissions.clear();
+    assert(SendHitNpc(1, rigidRecord.guid, 0, weapon, nullptr, HitUnjudged, 0, HitNoReaction, 0, contact));
+    assert(transmissions.size() == 1 && transmissions[0].channel == ChannelCombat &&
+           (transmissions[0].flags & ENET_PACKET_FLAG_RELIABLE));
+    const auto intent = transmissions[0];
+    auto malformed = intent;
+    HitNpcMsg invalid{};
+    std::memcpy(&invalid, malformed.bytes.data(), sizeof(invalid));
+    invalid.delta = -1;
+    std::memcpy(malformed.bytes.data(), &invalid, sizeof(invalid));
+    transmissions.clear();
+    isHost = true;
+    Deliver(&fakePeer, malformed);
+    assert(contacts == 0);
+    Deliver(&fakePeer, intent);
+    assert(contacts == 1);
+    Deliver(&fakePeer, intent);
+    assert(contacts == 1);
+    isHost = false;
+    failSend = true;
+    assert(!SendHitNpc(1, rigidRecord.guid, 0, weapon, nullptr, HitUnjudged, 0, HitNoReaction, 0, contact));
+    failSend = false;
+    assert(transmissions.empty());
+    assert(!SendHitNpc(1, rigidRecord.guid, -1, weapon, nullptr, HitUnjudged, 0, HitNoReaction, 0, contact));
+    contact.melee = PredictedMelee;
+    assert(!SendHitNpc(1, rigidRecord.guid, -1, weapon, nullptr, HitUnjudged, 0, HitNoReaction, 0, contact));
+    assert(transmissions.empty());
     return 0;
 }
