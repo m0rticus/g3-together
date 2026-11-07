@@ -33,7 +33,7 @@ void BeginShutdown();
 bool Shutdown();
 void StartWatchdog();
 void CancelWatchdog();
-enum class CacheKind { Cameras, Prefetchers, PrivateEntities, Spheres, Anchors, ProcessingRange, Puppets, Disabled, Summons, Count };
+enum class CacheKind { Cameras, Prefetchers, PrivateEntities, Spheres, Anchors, ProcessingRange, Puppets, Disabled, Summons, Leases, Count };
 // Engine thread publishes values only; reporting never follows a native pointer on a worker.
 void CacheObjects(CacheKind kind, uint32_t count, void const* first);
 void LogCacheInventory(char const* phase);

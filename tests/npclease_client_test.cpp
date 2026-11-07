@@ -12,6 +12,9 @@
 
 using namespace g3t::npclease;
 
+static_assert(MaxOverlayText == 2 * (20 + MaxLeases * detail::SavedWireSize) + sizeof(SavePrefix),
+              "Save text bound must follow binary row size");
+
 int main()
 {
     ClientWindow client;
@@ -81,13 +84,30 @@ int main()
     corrupt[sizeof(SavePrefix)] = '!';
     assert(!DecodeSaveText(corrupt, restored));
     assert(!DecodeSaveText(std::string(MaxOverlayText + 1, '0'), restored));
+    Saved adopted;
+    adopted.guid[0] = 4;
+    adopted.epoch = 7;
+    adopted.state = falling;
+    adopted.adopted = 1;
+    SaveOverlay withAdoption{adopted};
+    std::string adoptedText;
+    assert(EncodeSaveText(withAdoption, adoptedText));
+    assert(DecodeSaveText(adoptedText, restored));
+    assert(restored.size() == 1 && restored[0].adopted == 1 && restored[0].epoch == 7);
+    auto invalidAdoption = withAdoption;
+    invalidAdoption[0].adopted = 2;
+    const auto unchangedText = adoptedText;
+    assert(!EncodeSaveText(invalidAdoption, adoptedText));
+    assert(adoptedText == unchangedText);
     auto stream = [&](std::string const& data, bool expected) {
-        FILE* file = tmpfile();
+        const char* path = "npclease-save-stream-test.txt";
+        FILE* file = std::fopen(path, "w+b");
         assert(file);
         assert(fwrite(data.data(), 1, data.size(), file) == data.size());
         rewind(file);
         assert(ReadSaveStream(file, restored) == expected);
         assert(fclose(file) == 0);
+        assert(std::remove(path) == 0);
     };
     stream("G3T 2\njournal data\n" + text + "downed 0\n", true);
     stream(text + text, false);

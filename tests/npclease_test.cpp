@@ -42,7 +42,13 @@ static Checkpoint ValidCheckpoint(uint8_t seed = 1)
 
 static_assert(sizeof(Checkpoint) == 233, "Unexpected packed Checkpoint size");
 static_assert(sizeof(Message) == 278, "Unexpected packed Message size");
-static_assert(detail::SavedWireSize == 261, "Unexpected overlay payload record size");
+static_assert(detail::LegacySavedWireSize == 261, "Unexpected legacy overlay row size");
+static_assert(detail::SavedWireSize == 262, "Unexpected overlay payload record size");
+static_assert(FullMessageWireSize == 278 && StateMessageWireSize == 150 &&
+              RenewMessageWireSize == 46, "Unexpected message wire sizes");
+static_assert(static_cast<uint8_t>(Kind::Reject) == 11 && static_cast<uint8_t>(Kind::Adopt) == 12 &&
+              static_cast<uint8_t>(Kind::StateFull) == 13,
+              "Existing operation numbers must remain stable");
 
 static void TestValidityAndWire()
 {
@@ -71,7 +77,7 @@ static void TestValidityAndWire()
     m.guid[0] = 9;
     m.state = ValidCheckpoint();
     assert(Valid(m));
-    m.version = 2;
+    m.version = 1;
     assert(!Valid(m));
     m.version = WireVersion;
     m.owner = 8;
@@ -85,6 +91,137 @@ static void TestValidityAndWire()
     assert(Valid(m));
     assert(sizeof(Checkpoint) <= 512);
     assert(sizeof(Message) < 1000);
+}
+
+static void TestMessageCodec()
+{
+    Message sent{};
+    sent.world = 0x10203040;
+    sent.epoch = 8;
+    sent.incarnation = 9;
+    sent.generation = 10;
+    sent.revision = 11;
+    sent.echo = 12;
+    sent.duration = 0x345;
+    sent.owner = 2;
+    sent.guid[0] = 9;
+    sent.state = ValidCheckpoint();
+    sent.state.statusAge[4] = 0x10203040;
+    sent.state.effects = NativeDeath | QuestDeath;
+    Message received{};
+    std::vector<uint8_t> bytes;
+
+    for (uint8_t kind = 1; kind <= 13; ++kind) {
+        sent.kind = static_cast<Kind>(kind);
+        assert(EncodeMessage(sent, bytes));
+        const size_t expected = sent.kind == Kind::State ? StateMessageWireSize :
+                                sent.kind == Kind::Renew ? RenewMessageWireSize : FullMessageWireSize;
+        assert(bytes.size() == expected);
+        assert(bytes[0] == 2 && bytes[1] == kind && bytes[3] == 0x40 && bytes[6] == 0x10);
+        assert(bytes[27] == 0x45 && bytes[28] == 0x03);
+        assert(DecodeMessage(bytes.data(), bytes.size(), received));
+        assert(received.version == sent.version && received.kind == sent.kind && received.owner == sent.owner);
+        assert(received.world == sent.world && received.epoch == sent.epoch &&
+               received.incarnation == sent.incarnation && received.generation == sent.generation &&
+               received.revision == sent.revision && received.echo == sent.echo &&
+               received.duration == sent.duration);
+        assert(!std::memcmp(received.guid, sent.guid, sizeof(sent.guid)));
+        if (sent.kind == Kind::State) {
+            assert(ValidStateFields(received.state));
+            assert(!Valid(received.state));
+            assert(received.state.name[0] == 0 && received.state.routine[0] == 0);
+            assert(received.state.statusAge[4] == sent.state.statusAge[4]);
+            std::memcpy(received.state.name, sent.state.name, sizeof(sent.state.name));
+            std::memcpy(received.state.routine, sent.state.routine, sizeof(sent.state.routine));
+            assert(detail::ExactState(received.state, sent.state));
+        } else if (sent.kind == Kind::Renew) {
+            assert(received.state.effects == sent.state.effects);
+            assert(!detail::GuidNonzero(received.state.templateId));
+            assert(received.state.name[0] == 0 && received.state.routine[0] == 0);
+        } else {
+            assert(detail::ExactState(received.state, sent.state));
+        }
+
+        Message unchanged = received;
+        assert(!DecodeMessage(bytes.data(), bytes.size() - 1, received));
+        assert(!std::memcmp(&received, &unchanged, sizeof(received)));
+        bytes.push_back(0);
+        assert(!DecodeMessage(bytes.data(), bytes.size(), received));
+        assert(!std::memcmp(&received, &unchanged, sizeof(received)));
+    }
+
+    sent.kind = Kind::State;
+    assert(EncodeMessage(sent, bytes));
+    const auto validState = bytes;
+    auto reject = [&](size_t offset, uint8_t value) {
+        auto bad = validState;
+        bad[offset] = value;
+        Message unchanged = received;
+        assert(!DecodeMessage(bad.data(), bad.size(), received));
+        assert(!std::memcmp(&received, &unchanged, sizeof(received)));
+    };
+    reject(0, 1);
+    reject(0, 3);
+    reject(1, 0);
+    reject(1, 14);
+    reject(1, static_cast<uint8_t>(Kind::Offer)); // compact payload cannot masquerade as full
+    reject(2, 8);
+    reject(11, 0); // incarnation has no other set bytes
+    reject(MessageHeaderWireSize + 76, 2); // dead must be boolean
+    reject(MessageHeaderWireSize + 82, 4); // effect mask
+    reject(MessageHeaderWireSize + 84, 8); // target player
+    std::vector<uint8_t> bad = validState;
+    bad[MessageHeaderWireSize + 16] = 0;
+    bad[MessageHeaderWireSize + 17] = 0;
+    bad[MessageHeaderWireSize + 18] = 0xc0;
+    bad[MessageHeaderWireSize + 19] = 0x7f; // NaN
+    assert(!DecodeMessage(bad.data(), bad.size(), received));
+    bad = validState;
+    std::memset(bad.data() + 29, 0, 16);
+    assert(!DecodeMessage(bad.data(), bad.size(), received));
+    assert(!DecodeMessage(nullptr, 0, received));
+
+    sent.kind = Kind::StateFull;
+    std::strcpy(sent.state.routine, "NewRoutine");
+    assert(EncodeMessage(sent, bytes));
+    assert(bytes.size() == FullMessageWireSize);
+    assert(DecodeMessage(bytes.data(), bytes.size(), received));
+    assert(Valid(received) && detail::ExactState(received.state, sent.state));
+    const Checkpoint updatedCanonical = received.state;
+    bad = bytes;
+    std::memset(bad.data() + MessageHeaderWireSize + 84, 'x', 64);
+    assert(!DecodeMessage(bad.data(), bad.size(), received));
+    bad = bytes;
+    bad[MessageHeaderWireSize + 82] = 4;
+    assert(!DecodeMessage(bad.data(), bad.size(), received));
+    sent.kind = Kind::State;
+    sent.state.hp = 8;
+    assert(EncodeMessage(sent, bytes));
+    assert(DecodeMessage(bytes.data(), bytes.size(), received));
+    assert(received.state.routine[0] == 0);
+    std::memcpy(received.state.name, updatedCanonical.name, sizeof(updatedCanonical.name));
+    std::memcpy(received.state.routine, updatedCanonical.routine, sizeof(updatedCanonical.routine));
+    assert(Valid(received) && detail::ExactState(received.state, sent.state));
+
+    sent.kind = Kind::Renew;
+    assert(EncodeMessage(sent, bytes));
+    bytes.back() = 4;
+    assert(!DecodeMessage(bytes.data(), bytes.size(), received));
+    sent.state.effects = 4;
+    const auto savedBytes = bytes;
+    assert(!EncodeMessage(sent, bytes));
+    assert(bytes == savedBytes);
+    sent.state.effects = 0;
+    sent.kind = Kind::Adopt;
+    sent.state.name[0] = 0;
+    assert(!EncodeMessage(sent, bytes));
+    sent.kind = Kind::StateFull;
+    assert(!EncodeMessage(sent, bytes));
+    sent.kind = Kind::Commit;
+    assert(!EncodeMessage(sent, bytes));
+    sent.kind = Kind::Ack;
+    std::memset(sent.state.name, 'x', sizeof(sent.state.name));
+    assert(!EncodeMessage(sent, bytes));
 }
 
 static void TestNativeDomainActions()
@@ -154,7 +291,7 @@ static void TestEligibilityAndWrap()
     Interest interest{};
     interest.hostRoi = 8000;
     interest.hostDistance = 12000;
-    interest.clientDistance = 4000;
+    interest.clientDistance = ClientRadiusCm;
     assert(!eligibility.Delegate(interest, 100));
     assert(!eligibility.Delegate(interest, 3099));
     assert(eligibility.Delegate(interest, 3100));
@@ -203,9 +340,7 @@ static void TestHostPresenceEligibility()
     interest.clientDistance = 3000;
     interest.hostPresent = false;
 
-    assert(!unavailable.Delegate(interest, 100));
-    assert(!unavailable.Delegate(interest, 3099));
-    assert(unavailable.Delegate(interest, 3100));
+    assert(unavailable.Delegate(interest, 100));
     assert(unavailable.farHeld);
     assert(!unavailable.Recall(interest));
 
@@ -223,9 +358,8 @@ static void TestHostPresenceEligibility()
     unavailable = Eligibility{};
     interest.hostDistance = 20000;
     interest.hostPresent = false;
-    interest.clientDistance = 4000;
-    assert(!unavailable.Delegate(interest, 500));
-    assert(unavailable.Delegate(interest, 3500));
+    interest.clientDistance = ClientRadiusCm;
+    assert(unavailable.Delegate(interest, 500));
     assert(unavailable.farHeld);
     assert(!unavailable.Recall(interest));
 
@@ -246,15 +380,32 @@ static void TestHostPresenceEligibility()
     interest.hostDistance = 1000;
     interest.clientDistance = 3000;
     interest.hostPresent = false;
-    assert(!jitter.Delegate(interest, 100));
+    assert(jitter.Delegate(interest, 100));
     interest.hostPresent = true;
     assert(!jitter.Delegate(interest, 2000));
     assert(!jitter.farHeld && jitter.farSince == 0);
     interest.hostPresent = false;
-    assert(!jitter.Delegate(interest, 2500));
-    assert(!jitter.Delegate(interest, 5499));
-    assert(jitter.Delegate(interest, 5500));
+    assert(jitter.Delegate(interest, 2500));
     assert(jitter.farHeld);
+
+    Eligibility range{};
+    interest.clientDistance = ClientRadiusCm + 1;
+    assert(!range.Delegate(interest, 100));
+    assert(!range.farHeld && !range.dwellActive);
+    interest.clientDistance = ClientRadiusCm;
+    assert(range.Delegate(interest, 101));
+    interest.clientDistance = ClientRadiusCm + 1;
+    assert(!range.Delegate(interest, 102));
+
+    Eligibility bypass{};
+    interest.hostPresent = true;
+    interest.hostDistance = 12000;
+    interest.clientDistance = ClientRadiusCm;
+    assert(!bypass.Delegate(interest, 100));
+    assert(bypass.dwellActive);
+    interest.hostPresent = false;
+    assert(bypass.Delegate(interest, 101));
+    assert(!bypass.dwellActive);
 }
 
 static void TestLeaseGrantAndExpiry()
@@ -594,6 +745,40 @@ static void TestTerminalRecoveryWatermark()
     assert((restored[0].state.effects & (NativeDeath | QuestDeath)) == (NativeDeath | QuestDeath));
 }
 
+static void TestDisconnectLedger()
+{
+    Lease lease;
+    Checkpoint baseline = ValidCheckpoint();
+    assert(lease.Offer(2, 77, 42, 100, baseline));
+    assert(lease.Prepared(42, 101));
+    Checkpoint accepted = baseline;
+    accepted.hp = 0;
+    assert(CommitEffect(accepted, NativeDeath));
+    assert(CommitEffect(accepted, QuestDeath));
+    assert(lease.AcceptState(2, 77, 42, 1, 3, accepted));
+    Checkpoint unacknowledged = accepted;
+    unacknowledged.position[0] += 10;
+    assert(!lease.AcceptState(2, 76, 42, 1, 4, unacknowledged));
+    assert(lease.Recover(lease.deadline));
+    assert(lease.phase == Phase::Dormant && lease.revision == 3);
+    assert(detail::ExactState(lease.state, accepted));
+    assert(!CommitEffect(lease.state, NativeDeath));
+    assert(!CommitEffect(lease.state, QuestDeath));
+    assert(!lease.AcceptState(2, 77, 42, 1, 4, unacknowledged));
+    Checkpoint erased = accepted;
+    erased.effects = NativeDeath;
+    assert(!lease.Offer(3, 78, 43, 4000, erased));
+    assert(lease.Offer(3, 78, 43, 4000, accepted));
+    assert(lease.state.dead && lease.state.effects == (NativeDeath | QuestDeath));
+}
+
+static void RecalculateOverlayCrc(std::vector<uint8_t>& bytes)
+{
+    std::vector<uint8_t> checked(bytes.begin(), bytes.begin() + 16);
+    checked.insert(checked.end(), bytes.begin() + 20, bytes.end());
+    detail::Put32(bytes, 16, detail::Crc32(checked.data(), checked.size()));
+}
+
 static void TestOverlay()
 {
     SaveOverlay overlay;
@@ -605,16 +790,17 @@ static void TestOverlay()
         saved.epoch = i + 10;
         saved.revision = i + 20;
         saved.state = ValidCheckpoint(static_cast<uint8_t>((i % 15) + 1));
+        saved.adopted = static_cast<uint8_t>(i % 2);
         overlay.push_back(saved);
     }
 
     std::vector<uint8_t> encoded;
     assert(EncodeOverlay(overlay, encoded));
     assert(detail::Get32(encoded.data()) == detail::OverlayMagic);
-    assert(detail::Get32(encoded.data() + 4) == WireVersion);
+    assert(detail::Get32(encoded.data() + 4) == detail::OverlayVersion);
     assert(detail::Get32(encoded.data() + 8) == 512);
     assert(detail::Get32(encoded.data() + 12) == 512 * detail::SavedWireSize);
-    assert(encoded.size() == 133652);
+    assert(encoded.size() == 134164);
 
     SaveOverlay decoded;
     assert(DecodeOverlay(encoded.data(), encoded.size(), decoded));
@@ -622,6 +808,27 @@ static void TestOverlay()
     assert(std::memcmp(decoded[511].guid, overlay[511].guid, 16) == 0);
     assert(decoded[511].incarnation == overlay[511].incarnation);
     assert(decoded[511].state.hp == overlay[511].state.hp);
+    assert(decoded[511].adopted == 1 && decoded[510].adopted == 0);
+
+    static constexpr uint8_t crcSample[] = {'1','2','3','4','5','6','7','8','9'};
+    assert(detail::Crc32(crcSample, sizeof(crcSample)) == 0xcbf43926u);
+    std::vector<uint8_t> legacy(encoded.begin(), encoded.begin() + 20);
+    for (size_t i = 0; i < overlay.size(); ++i) {
+        const auto row = encoded.begin() + 20 + i * detail::SavedWireSize;
+        legacy.insert(legacy.end(), row, row + detail::LegacySavedWireSize);
+    }
+    detail::Put32(legacy, 4, detail::LegacyOverlayVersion);
+    detail::Put32(legacy, 12, static_cast<uint32_t>(overlay.size() * detail::LegacySavedWireSize));
+    RecalculateOverlayCrc(legacy);
+    assert(legacy.size() == 133652);
+    SaveOverlay legacyDecoded;
+    assert(DecodeOverlay(legacy.data(), legacy.size(), legacyDecoded));
+    assert(legacyDecoded.size() == overlay.size());
+    for (size_t i = 0; i < overlay.size(); ++i) {
+        assert(legacyDecoded[i].adopted == 0);
+        assert(legacyDecoded[i].epoch == overlay[i].epoch);
+        assert(detail::ExactState(legacyDecoded[i].state, overlay[i].state));
+    }
 
     std::vector<uint8_t> corrupt = encoded;
     corrupt[corrupt.size() - 1] ^= 0x80;
@@ -639,10 +846,47 @@ static void TestOverlay()
     for (size_t i = 20; i < 20 + detail::SavedWireSize; ++i) corrupt[i] ^= 0x11;
     assert(!DecodeOverlay(corrupt.data(), corrupt.size(), atomic));
 
+    auto rejectValidCrc = [&](std::vector<uint8_t> bad) {
+        RecalculateOverlayCrc(bad);
+        SaveOverlay unchanged = atomic;
+        assert(!DecodeOverlay(bad.data(), bad.size(), atomic));
+        assert(atomic.size() == unchanged.size());
+        assert(atomic[0].epoch == unchanged[0].epoch &&
+               atomic[0].adopted == unchanged[0].adopted);
+    };
+    corrupt = encoded;
+    corrupt[20 + detail::SavedWireSize - 1] = 2;
+    rejectValidCrc(corrupt);
+    corrupt = encoded;
+    detail::Put32(corrupt, 20 + 20, 0); // epoch
+    rejectValidCrc(corrupt);
+    corrupt = legacy;
+    detail::Put32(corrupt, 20 + 20, 0);
+    rejectValidCrc(corrupt);
+    corrupt = encoded;
+    detail::Put32(corrupt, 20 + 16, 0); // incarnation
+    rejectValidCrc(corrupt);
+    corrupt = encoded;
+    std::memcpy(corrupt.data() + 20 + detail::SavedWireSize, corrupt.data() + 20, 16);
+    rejectValidCrc(corrupt);
+    corrupt = encoded;
+    detail::Put32(corrupt, 4, 3);
+    rejectValidCrc(corrupt);
+    corrupt = encoded;
+    detail::Put32(corrupt, 4, detail::LegacyOverlayVersion); // mismatched row size
+    rejectValidCrc(corrupt);
+
     SaveOverlay duplicate = overlay;
     duplicate[511].guid[0] = duplicate[0].guid[0];
     duplicate[511].guid[15] = duplicate[0].guid[15];
     std::vector<uint8_t> duplicateBytes;
+    assert(!EncodeOverlay(duplicate, duplicateBytes));
+    assert(duplicateBytes.empty());
+    duplicate = overlay;
+    duplicate[0].adopted = 2;
+    assert(!EncodeOverlay(duplicate, duplicateBytes));
+    duplicate = overlay;
+    duplicate[0].epoch = 0;
     assert(!EncodeOverlay(duplicate, duplicateBytes));
 
     SaveOverlay oversized;
@@ -656,6 +900,7 @@ static void TestOverlay()
 int main()
 {
     TestValidityAndWire();
+    TestMessageCodec();
     TestNativeDomainActions();
     TestEligibilityAndWrap();
     TestHostPresenceEligibility();
@@ -665,6 +910,7 @@ int main()
     TestMultipleOffersAndReorderedControl();
     TestRecoverAndClientComposition();
     TestTerminalRecoveryWatermark();
+    TestDisconnectLedger();
     TestOverlay();
     std::fprintf(stdout, "sizeof(Checkpoint)=%zu sizeof(Message)=%zu overlayHeader=%u maxPayload=%zu maxEncoded=%zu\n",
                  sizeof(Checkpoint), sizeof(Message), 20u,

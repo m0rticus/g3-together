@@ -6,6 +6,7 @@
 
 #include "ai.h"
 #include "body.h"
+#include "downed.h"
 #include "log.h"
 #include "net.h"
 #include "hud.h"
@@ -101,6 +102,13 @@ struct NativePose {
 };
 struct ReceivedPose { pose::History history; uint32_t arrived = 0, incarnation = 0; uint8_t intervalMs = 16; };
 std::unordered_map<std::string, ReceivedPose> receivedPoses;
+struct Unavailable {
+    eCEntity const* entity = nullptr;
+    State state;
+    uint32_t seen = 0;
+    bool noted = false, failed = false, hidden = false;
+};
+std::unordered_map<std::string, Unavailable> unavailable;
 struct SourceSkeleton {
     void const* instance = nullptr;
     void const* nodes = nullptr;
@@ -520,6 +528,7 @@ void __fastcall StopMotion(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx
 bool TaskBlocked(gCScriptRoutine_PS* self, bCString const& task)
 {
     eCEntity* entity = self->GetEntity();
+    if (downed::RejectReaction(entity, task.GetText(), "routine-task")) return true;
     if (!Passive(entity) || task.GetLength() == 0) return false;
     if (ai::detail::damageReceiver == entity) {
         verdictEntity = entity;
@@ -907,6 +916,7 @@ void OnWorldDeactivate()
 {
     probe = ProbeState{};
     receivedPoses.clear();
+    unavailable.clear();
     sourceSkeletons.clear();
     poseCleanupAt = 0;
     std::lock_guard<std::mutex> lock(sourceOptionsMutex);
@@ -919,7 +929,8 @@ bool Start(bool client)
     clientMode = client;
     enabled = true;
     net::SetNpcPoseHandler([](net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool, uint8_t interval) {
-        if (net::IsHost() || npcremoval::Suppressed(record.guid)) return;
+        if (net::IsHost() || npcremoval::Suppressed(record.guid) ||
+            npclease::IgnoreHostSnapshot(record.guid, record.sent)) return;
         auto& received = receivedPoses[std::string(reinterpret_cast<char const*>(record.guid), 16)];
         if (received.history.Push(record.incarnation, record.sent, bones, count, flags)) {
             received.arrived = net::Now();
@@ -941,6 +952,7 @@ bool Available() { return enabled; }
 void ForgetRemoved(uint8_t const guid[16])
 {
     receivedPoses.erase(std::string(reinterpret_cast<char const*>(guid), 16));
+    unavailable.erase(std::string(reinterpret_cast<char const*>(guid), 16));
 }
 
 uint32_t PoseInterval(net::NpcRecord const& record)
@@ -1375,6 +1387,43 @@ bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> co
     return frozen.evaluated && frozen.applied && frozen.valid;
 }
 
+bool HoldUnavailable(eCEntity* entity, State& state)
+{
+    if (!entity || !Passive(entity) || npcremoval::Suppressed(entity)) return false;
+    Entity npc(entity);
+    if (npc.IsDead() || npc.IsDown()) return false;
+    auto* animation = Animation(entity);
+    if (!animation || !animation->GetActor()) return false;
+    if (!state.holding) {
+        if (!CapturePose(entity, state.heldPose, state.heldFlags, nullptr)) return false;
+        const auto& p = entity->GetWorldPosition();
+        const auto q = entity->GetWorldRotation();
+        state.heldPosition[0] = p.GetX(); state.heldPosition[1] = p.GetY(); state.heldPosition[2] = p.GetZ();
+        state.heldRotation[0] = q.GetX(); state.heldRotation[1] = q.GetY();
+        state.heldRotation[2] = q.GetZ(); state.heldRotation[3] = q.GetW();
+        state.holding = true;
+    }
+    if (animation->GetRagDollEnabled()) animation->StopRagDoll();
+    npc.CharacterMovement.StopMovement();
+    const auto root = body::Pose(*entity, state.heldPosition, state.heldRotation);
+    entity->SetToWorldMatrix(root);
+    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+        rigid->SetPose(root);
+    return ReplayFrozenPose(entity, state, state.heldPose, state.heldFlags);
+}
+
+void ReleaseUnavailable(eCEntity* entity)
+{
+    if (!entity) return;
+    const eCEntityProxy proxy(entity);
+    const std::string key(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
+    const auto found = unavailable.find(key);
+    if (found == unavailable.end()) return;
+    if (found->second.entity == entity && found->second.hidden && !npcremoval::Suppressed(entity))
+        entity->EnableRendering(GETrue);
+    unavailable.erase(found);
+}
+
 void UpdatePresentation(eCEntity* entity)
 {
     auto* animation = Animation(entity);
@@ -1407,6 +1456,9 @@ void Tick()
         for (auto it = sourceSkeletons.begin(); it != sourceSkeletons.end();)
             if (cleanupNow - it->second.seen > 5000) it = sourceSkeletons.erase(it);
             else ++it;
+        for (auto it = unavailable.begin(); it != unavailable.end();)
+            if (cleanupNow - it->second.seen > 5000 && !it->second.hidden) it = unavailable.erase(it);
+            else ++it;
     }
     if (enabled && clientMode && gCSession::GetInstance().IsGameRunning()) {
         const auto all = Entity::GetNPCs();
@@ -1418,6 +1470,37 @@ void Tick()
                 npc.EnableProcessing(GEFalse);
             }
             Silence(npc.GetInstance());
+            uint8_t identity[16];
+            const eCEntityProxy proxy(npc.GetInstance());
+            std::memcpy(identity, &proxy.GetEntityID().GetCore(), sizeof(identity));
+            const std::string key(reinterpret_cast<char const*>(identity), sizeof(identity));
+            if (!npcs::HostPresentationAvailable(npc.GetInstance()) && !npc.IsDead() && !npc.IsDown() &&
+                !npcremoval::Suppressed(npc.GetInstance())) {
+                auto& held = unavailable[key];
+                if (held.entity != npc.GetInstance()) held = Unavailable{};
+                held.entity = npc.GetInstance();
+                held.seen = cleanupNow;
+                if (!held.noted) {
+                    Logf("npclease: degraded name=%s reason=%s contacts=off",
+                         npc.GetName().GetText(), npclease::UnavailabilityReason(npc.GetInstance()));
+                    held.noted = true;
+                }
+                if (!HoldUnavailable(npc.GetInstance(), held.state)) {
+                    if (!held.failed) {
+                        Logf("FAIL npclease: unavailable pose cannot be captured name=%s", npc.GetName().GetText());
+                        held.failed = true;
+                    }
+                    if (npc.GetInstance()->IsRenderingEnabled()) {
+                        held.hidden = true;
+                        npc.GetInstance()->EnableRendering(GEFalse);
+                        Logf("npclease: degraded name=%s reason=no valid skeletal pose; hidden until ready",
+                             npc.GetName().GetText());
+                    }
+                } else if (held.hidden) {
+                    npc.GetInstance()->EnableRendering(GETrue);
+                    held.hidden = false;
+                }
+            } else ReleaseUnavailable(npc.GetInstance());
         }
     }
     if (!probe.target || probe.failed) return;

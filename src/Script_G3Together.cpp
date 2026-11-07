@@ -38,6 +38,7 @@
 #include "log.h"
 #include "npcs.h"
 #include "npcplayback.h"
+#include "npclease_runtime.h"
 #include "offer.h"
 #include "remote.h"
 #include "crashlog.h"
@@ -182,6 +183,7 @@ class Module : public eCEngineComponentBase
         g3t::world::CaptureCacheInventory();
         g3t::remote::CaptureCacheInventory();
         g3t::npcremoval::CaptureCacheInventory();
+        g3t::npclease::CaptureCacheInventory();
         g3t::summon::CaptureCacheInventory();
         g3t::crashlog::LogCacheInventory(phase);
     }

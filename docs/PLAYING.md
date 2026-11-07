@@ -171,31 +171,36 @@ The host can select `ardea_remove_npcs = Goblin,Ogre`, `Goblin`, `Ogre`, or an e
 the rule. Names are exact; invalid/duplicate names are logged and leave the previous setting unchanged.
 Clients follow the host's reliable removal records, including after rejoining/loading.
 Choose the setting before making the co-op save: disabled entity flags already written into a save are retained.
-`npc_authority_fallback = on` (the default on both copies) enables real client AI for ordinary, unequipped
-Wolf, Boar, Deer and Scavenger instances. The host must already know the animal's native identity/state;
-unknown remote spawns are not adopted from client reports. Named variants, humans, dialogue/merchant/party actors,
-and encounters within 40 m of excluded actors remain host-owned. Leases require exactly one connected client.
-The client must be within 40 m of the animal. The host grants after three seconds without a processed animation
-instance, or beyond its own hero/real-camera reach: `max(120 m, host_roi + 20 m)`. Remote prefetch cameras do not
-count as primary host reach. The host fences its instance while the client runs native movement, combat and death;
-local leased NPCs are ready for hits without waiting for a host pose stream.
+`npc_authority_fallback = on` (the default on both copies) enables host-authorized client AI for generic,
+mortal, unequipped creatures, including the original wildlife plus trolls, minecrawlers, lurkers, golems,
+gargoyles and other explicitly supported creature species. Instance and creator names must match the generic
+species template; named variants, humans/humanoids, livestock, equipped, dialogue/merchant/teacher/party/summon
+actors remain host-owned. Exactly one connected client is supported, within 100 m of the NPC.
 
-When a usable host instance comes within the recall band (20 m inside the admission radius), the client freezes
-a calm state, the host imports its transform/HP/life/routine, and a newer authority epoch returns it to ordinary
-mirroring. A fight can defer the cut for at most ten seconds; no executing AI stack or attack animation is copied.
-Burning/poison/disease ages transfer in native game seconds. Frozen/transformed/unsupported task states remain
-fenced if they cannot finish before expiry. Disconnects, loading, a paused/unresponsive host or disabled fallback
-freeze client AI before its three-second lease expires; the host adopts only its last accepted state.
-Personal loot stays personal; hand-back never reruns the native death/XP/treasure script.
-`npc_authority_fallback = off` keeps the pure host model.
+Missing host processing or presentation no longer has a three-second admission delay. A reliable
+Offer/Prepared/Commit cut still precedes native client driving; packet loss or an unavailable host never
+authorizes speculative double simulation. Client-streamed creatures without a host instance can be adopted
+after native-template validation, without spawning a duplicate host entity. Released or late live mirrors
+hold their last valid skeletal pose with contacts disabled; an entity without a valid pose is temporarily
+hidden, not made dead. Excluded actors use this same harmless degraded presentation.
 
-**Integration requirement:** the separate `npclease-save-integration.patch` must be reconciled with the paired-save
-changes before deploying this source. It adds the required canonical-state/effect-watermark journal record and
-an honest save gate. Until wired, the unchanged saver cannot preserve leased NPCs; do not save during a lease.
-The conservative gate refuses active, unimported or pending-effect leases with
-"NPC lease active: save would lose client-owned NPC state"; live-owner checkpoint barriers are not enabled.
-The restore hook passes the saving world's assigned epoch so the first network publication, including a
-later client join after a solo reload, cannot clear already restored NPC state or effect watermarks.
+Hand-back requires a usable host instance in the primary host ROI, inside the distance hysteresis band.
+The client cuts a calm state, the host imports latest accepted transform/HP/life/routine/status and restarts
+before committing a newer authority epoch. Late pre-handoff poses cannot overwrite the cut. Combat can defer
+the cut for at most ten seconds; no executing AI stack, equipment inventory or PhysX state is copied.
+Personal loot stays personal; import never reruns Kill, XP or treasure generation.
+Disconnects, loading, a paused/unresponsive host, lost native readiness or disabled fallback freeze client AI
+before its three-second lease expires. The host retains the last accepted state until it can import it.
+New takeover during a host stall is not implemented: that requires pre-issued standby permits.
+`npc_authority_fallback = off` keeps the pure host model and safe unavailable presentation.
+
+The existing paired-save extension type 256 now stores the adoption marker and canonical state/effect
+watermarks in overlay version 2; version 1 saves remain readable. Saves still refuse active, unimported or
+pending-effect leases with "NPC lease active: save would lose client-owned NPC state".
+The overlay is not a complete native inventory/task/reward transaction, so live-owner saves are not enabled.
+The restore epoch binding preserves dormant records through the first network publication.
+Both copies must use the same rebuilt DLL; the coordinator must reconcile these lease wire changes with
+the protocol version before deployment.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
@@ -459,8 +464,14 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   menu remains available to load a save; death does not automatically reload.
 - While either player is knocked out, host-controlled NPCs and creatures drop that player as a combat
   target and choose another eligible enemy or return to their routine. Further attacks cannot damage,
-  stagger, push, or apply harmful statuses to the downed player. After revival, normal hostility and
-  target selection resume; becoming downed does not make enemies permanently friendly.
+  stagger, push, or apply harmful statuses to the held player, including in-flight attacks and
+  ongoing poison/burning or environmental damage. Protection is local to the hero's owning PC.
+  Paid revival remains protected through standing up and for another 1.5 seconds; normal hostility
+  and target selection resume without making enemies permanently friendly.
+  Remote puppets use the owner's existing held/pose/motion snapshots for matching recovery protection,
+  rather than inferring it from their talkable native mode.
+  Ordinary knockdowns retain vanilla's exact Sit/Lie knockdown pose protection for melee contacts,
+  not a new invulnerability timer for all stumbles, falls, spells or environmental damage.
 - The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
   While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
   monsters, an intruder; not a duel, the arena, a guard's arrest or another player) counts as a death: you stay down until

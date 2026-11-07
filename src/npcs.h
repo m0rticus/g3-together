@@ -16,6 +16,9 @@ void Start();
 void Tick();
 void LeaseBaseline(eCEntity* entity, char* routine, size_t capacity, uint8_t& defeated);
 void LeaseReleaseMirror(uint8_t const guid[16]);
+bool HostPresentationAvailable(eCEntity const* entity);
+uint32_t HostPresentationAge(eCEntity const* entity);
+bool HostCanPresent(uint8_t const guid[16]);
 void OnWorldDeactivate();
 bool IsMirrored(eCEntity const* entity);  // a client NPC currently driven from host snapshots
 bool Ready(eCEntity const* entity);

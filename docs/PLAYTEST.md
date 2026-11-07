@@ -178,7 +178,8 @@ coordinated build. Do not automate game launches or encounters. Runtime acceptan
 2. Repeat with the host knocked out and the client standing. Include creatures/animals, bow attacks,
    hostile magic and followers/summons. NPC-vs-NPC combat and attacks on the standing player must continue.
 3. Revive through "I will help you." in each direction. Exactly one potion is consumed for the matching
-   downed episode; the revived player becomes an ordinary eligible enemy again. NPCs must not remain
+   downed episode; no damage/stagger/knockback while rising or in the 1.5 seconds after standing.
+   The revived player then becomes an ordinary eligible enemy again. NPCs must not remain
    artificially friendly or require a reload to re-engage.
 4. Knock both down and verify immediate `all-down` game over with one native Kill per life. Repeat the
    unavailable-helper `alone-grace` check above. Smoke-check friendly melee protection, one hit per swing,
@@ -186,6 +187,10 @@ coordinated build. Do not automate game launches or encounters. Runtime acceptan
 5. In an isolated encounter, knock out one player while the helper stays alive but beyond enemy perception
    range. With no other enemy near, the attacker should relax and stow its weapon the vanilla way, not
    acquire the downed player again. Return and revive through talk, then confirm ordinary re-engagement.
+6. Include pre-existing poison/burning, harmful area spells, projectiles and environmental damage
+   while held, in both directions. Healing/talk/trade and the terminal all-down Kill must still work.
+   Compare an ordinary Sit/Lie knockdown against native host combat: synthetic contacts must respect
+   the same protected pose; other stumbles/falls and normal combat remain vanilla.
 
 The host startup should log `downed AssessTarget guard installed at native and script entries`.
 `SCRIPT ONLY` is an explicit unsupported-native-hook diagnostic, not full native-guard confirmation.
@@ -206,6 +211,15 @@ animation on both copies: mode 8 would make normal interaction choose loot befor
 Combat exclusion still follows the owner's flags, so on revival the excluded player bit clears.
 `attitude-refused`, `perception-refused` and `assessment-refused` explain rejected acquisition.
 `DOWNEDHIT` records blocked in-flight judgement/status/HP/visible-contact paths before native effects.
+`GROUNDHIT` records every local ground/recovery damage/contact event without sampling: path, attacker,
+HP before/after, episode, held/terminal, rising/grace, AIMode/AniState and native task/state.
+`vanilla-prone-reject` identifies the restored synthetic melee gate; `reject-before-effects` is held/
+recovery immunity. A contact record alone does not prove damage; check its HP pair and decision.
+`downed: recovery standing` starts the 1500 ms post-standing grace. Startup must report
+`ground HP guards set=1 add=1 value=1` and native/table wrapping for `OnTouchDamage`.
+The other PC reports `downed: puppet recovery begin` / `standing` from the owner's existing snapshots.
+`downed: recovery waiting ... reason=no-current-motion` is an observation failure: protection stays
+conservative until standing is known; do not accept a test in which recovery never reaches `standing`.
 Repeated acquisition/hit refusals are limited to the first 40 records and one sample per five seconds;
 actual binding/life transitions are logged independently. No QA command or control is needed.
 Old visible-contact logs prove an attack was shown, not that damage was applied.

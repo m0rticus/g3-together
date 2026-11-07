@@ -902,11 +902,10 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
         if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) ||
             (!isHost && (!connected || peer != server)) ||
-            packet->dataLength != sizeof(npclease::Message) + 1 ||
             !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         npclease::Message note;
-        std::memcpy(&note, packet->data + 1, sizeof(note));
-        if (!npclease::Valid(note) || note.world != worldEpoch) {
+        if (!npclease::DecodeMessage(packet->data + 1, packet->dataLength - 1, note) ||
+            note.world != worldEpoch) {
             Log("net: invalid NPC lease identity/state refused");
             return;
         }
@@ -1867,12 +1866,12 @@ uint32_t WorldEpoch() { return worldEpoch; }
 
 bool SendNpcLease(uint8_t to, npclease::Message const& note)
 {
-    if (!npclease::Valid(note) || note.world != worldEpoch || !Connected()) return false;
+    if (note.world != worldEpoch || !Connected()) return false;
     ENetPeer* peer = isHost ? (to > 1 && to < MaxPlayers ? peers[to] : nullptr) : server;
-    uint8_t bytes[sizeof(note) + 1];
-    bytes[0] = MsgNpcLease;
-    std::memcpy(bytes + 1, &note, sizeof(note));
-    return Send(peer, bytes, sizeof(bytes), ChannelReliable, true);
+    std::vector<uint8_t> bytes;
+    if (!npclease::EncodeMessage(note, bytes)) return false;
+    bytes.insert(bytes.begin(), MsgNpcLease);
+    return Send(peer, bytes.data(), bytes.size(), ChannelReliable, true);
 }
 void SetNpcLeaseHandler(NpcLeaseHandler handler) { npcLeaseHandler = handler; }
 uint8_t LocalId() { return localId; }

@@ -9,9 +9,10 @@
 
 namespace g3t::npclease {
 
-constexpr uint8_t WireVersion = 1;
+constexpr uint8_t WireVersion = 2;
 constexpr uint32_t LeaseMs = 3000, LeaseSafetyMs = 300, FarDwellMs = 3000;
 constexpr uint32_t RecallWaitMs = 10000, PrepareMs = 3000, StateMs = 200;
+constexpr float ClientRadiusCm = 10000.0f;
 constexpr size_t MaxLeases = 512;
 
 enum class Kind : uint8_t {
@@ -25,7 +26,9 @@ enum class Kind : uint8_t {
     Recall,
     Cut,
     Abort,
-    Reject
+    Reject,
+    Adopt = 12,
+    StateFull = 13
 };
 
 enum class Phase : uint8_t { Host, Offering, Client, Recalling, Frozen, Dormant };
@@ -92,11 +95,9 @@ inline bool ExactState(Checkpoint const& a, Checkpoint const& b)
 
 } // namespace detail
 
-inline bool Valid(Checkpoint const& c)
+inline bool ValidStateFields(Checkpoint const& c)
 {
-    if (!detail::GuidNonzero(c.templateId) ||
-        !detail::CstrValid(c.name, sizeof(c.name)) ||
-        !detail::CstrValidEmptyAllowed(c.routine, sizeof(c.routine))) return false;
+    if (!detail::GuidNonzero(c.templateId)) return false;
 
     for (float v : c.position) if (!std::isfinite(v) || std::fabs(v) > 1e7f) return false;
 
@@ -121,17 +122,33 @@ inline bool Valid(Checkpoint const& c)
     return true;
 }
 
-inline bool Valid(Message const& m)
+inline bool Valid(Checkpoint const& c)
+{
+    return ValidStateFields(c) &&
+           detail::CstrValid(c.name, sizeof(c.name)) &&
+           detail::CstrValidEmptyAllowed(c.routine, sizeof(c.routine));
+}
+
+inline bool ValidMetadata(Message const& m)
 {
     if (m.version != WireVersion) return false;
-    if (m.kind < Kind::Request || m.kind > Kind::Reject) return false;
+    if (m.kind < Kind::Request || m.kind > Kind::StateFull) return false;
     if (!m.world || !m.incarnation || m.owner >= 8 || m.duration > LeaseMs) return false;
     if (!detail::GuidNonzero(m.guid)) return false;
-
-    if (m.kind == Kind::Request || m.kind == Kind::Offer ||
-        m.kind == Kind::State || m.kind == Kind::Cut)
-        return Valid(m.state);
     return true;
+}
+
+inline bool Valid(Message const& m)
+{
+    if (!ValidMetadata(m)) return false;
+    if (m.kind == Kind::Request || m.kind == Kind::Offer ||
+        m.kind == Kind::State || m.kind == Kind::StateFull || m.kind == Kind::Commit ||
+        m.kind == Kind::Cut || m.kind == Kind::Adopt)
+        return Valid(m.state);
+    if (m.kind == Kind::Renew)
+        return (m.state.effects & static_cast<uint8_t>(~uint8_t(NativeDeath | QuestDeath))) == 0;
+    return detail::CstrValidEmptyAllowed(m.state.name, sizeof(m.state.name)) &&
+           detail::CstrValidEmptyAllowed(m.state.routine, sizeof(m.state.routine));
 }
 
 inline bool Reached(uint32_t now, uint32_t deadline)
@@ -180,18 +197,28 @@ struct Eligibility {
                                 interest.hostRoi + 2000.0f : 12000.0f;
         const float recallRadius = farRadius - 2000.0f;
 
+        if (farHeld && interest.hostPresent && interest.hostDistance <= recallRadius) {
+            farSince = 0;
+            farHeld = false;
+            dwellActive = false;
+            return false;
+        }
+        if (interest.clientDistance > ClientRadiusCm) {
+            farSince = 0;
+            dwellActive = false;
+            return false;
+        }
+        if (!interest.hostPresent) {
+            farSince = 0;
+            farHeld = true;
+            dwellActive = false;
+            return true;
+        }
         if (farHeld) {
-            if (interest.hostPresent && interest.hostDistance <= recallRadius) {
-                farSince = 0;
-                farHeld = false;
-                dwellActive = false;
-                return false;
-            }
             return true;
         }
 
-        if ((interest.hostDistance >= farRadius || !interest.hostPresent) &&
-            interest.clientDistance <= 4000.0f) {
+        if (interest.hostDistance >= farRadius) {
             if (!dwellActive) {
                 farSince = now;
                 dwellActive = true;
@@ -358,6 +385,7 @@ struct Saved {
     uint8_t guid[16]{};
     uint32_t incarnation = 1, epoch = 0, revision = 0;
     Checkpoint state{};
+    uint8_t adopted = 0;
 };
 
 using SaveOverlay = std::vector<Saved>;
@@ -365,7 +393,9 @@ using SaveOverlay = std::vector<Saved>;
 namespace detail {
 
 constexpr uint32_t OverlayMagic = 0x314c504eu;
-constexpr uint32_t SavedWireSize = 16u + 4u + 4u + 4u + sizeof(Checkpoint);
+constexpr uint32_t OverlayVersion = 2, LegacyOverlayVersion = 1;
+constexpr uint32_t LegacySavedWireSize = 16u + 4u + 4u + 4u + sizeof(Checkpoint);
+constexpr uint32_t SavedWireSize = LegacySavedWireSize + 1u;
 
 inline void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value)
 {
@@ -381,6 +411,17 @@ inline uint32_t Get32(uint8_t const* bytes)
            (uint32_t(bytes[1]) << 8) |
            (uint32_t(bytes[2]) << 16) |
            (uint32_t(bytes[3]) << 24);
+}
+
+inline void Put16(std::vector<uint8_t>& bytes, size_t offset, uint16_t value)
+{
+    bytes[offset] = static_cast<uint8_t>(value);
+    bytes[offset + 1] = static_cast<uint8_t>(value >> 8);
+}
+
+inline uint16_t Get16(uint8_t const* bytes)
+{
+    return static_cast<uint16_t>(uint16_t(bytes[0]) | (uint16_t(bytes[1]) << 8));
 }
 
 inline void PutI32(std::vector<uint8_t>& bytes, size_t offset, int32_t value)
@@ -476,6 +517,81 @@ inline size_t ReadCheckpoint(uint8_t const* data, size_t offset, Checkpoint& c)
 
 } // namespace detail
 
+constexpr size_t MessageHeaderWireSize = 45;
+constexpr size_t FullMessageWireSize = MessageHeaderWireSize + sizeof(Checkpoint);
+constexpr size_t StateMessageWireSize = MessageHeaderWireSize + 84 + 21;
+constexpr size_t RenewMessageWireSize = MessageHeaderWireSize + 1;
+static_assert(FullMessageWireSize == sizeof(Message), "Full message wire size");
+static_assert(offsetof(Checkpoint, name) == 84 && offsetof(Checkpoint, targetPlayer) == 212,
+              "Compact state ranges must match checkpoint layout");
+
+inline bool EncodeMessage(Message const& message, std::vector<uint8_t>& output)
+{
+    if (!Valid(message)) return false;
+    const size_t size = message.kind == Kind::State ? StateMessageWireSize :
+                        message.kind == Kind::Renew ? RenewMessageWireSize : FullMessageWireSize;
+    std::vector<uint8_t> encoded(size);
+    encoded[0] = message.version;
+    encoded[1] = static_cast<uint8_t>(message.kind);
+    encoded[2] = message.owner;
+    detail::Put32(encoded, 3, message.world);
+    detail::Put32(encoded, 7, message.epoch);
+    detail::Put32(encoded, 11, message.incarnation);
+    detail::Put32(encoded, 15, message.generation);
+    detail::Put32(encoded, 19, message.revision);
+    detail::Put32(encoded, 23, message.echo);
+    detail::Put16(encoded, 27, message.duration);
+    std::memcpy(encoded.data() + 29, message.guid, sizeof(message.guid));
+    if (message.kind == Kind::Renew) {
+        encoded[MessageHeaderWireSize] = message.state.effects;
+    } else if (message.kind == Kind::State) {
+        std::vector<uint8_t> state(sizeof(Checkpoint));
+        detail::WriteCheckpoint(state, 0, message.state);
+        std::memcpy(encoded.data() + MessageHeaderWireSize, state.data(), 84);
+        std::memcpy(encoded.data() + MessageHeaderWireSize + 84, state.data() + 212, 21);
+    } else {
+        detail::WriteCheckpoint(encoded, MessageHeaderWireSize, message.state);
+    }
+    output.swap(encoded);
+    return true;
+}
+
+inline bool DecodeMessage(uint8_t const* data, size_t size, Message& output)
+{
+    if (!data || size < MessageHeaderWireSize) return false;
+    Message decoded;
+    decoded.version = data[0];
+    decoded.kind = static_cast<Kind>(data[1]);
+    decoded.owner = data[2];
+    decoded.world = detail::Get32(data + 3);
+    decoded.epoch = detail::Get32(data + 7);
+    decoded.incarnation = detail::Get32(data + 11);
+    decoded.generation = detail::Get32(data + 15);
+    decoded.revision = detail::Get32(data + 19);
+    decoded.echo = detail::Get32(data + 23);
+    decoded.duration = detail::Get16(data + 27);
+    std::memcpy(decoded.guid, data + 29, sizeof(decoded.guid));
+    if (!ValidMetadata(decoded)) return false;
+    const size_t expected = decoded.kind == Kind::State ? StateMessageWireSize :
+                            decoded.kind == Kind::Renew ? RenewMessageWireSize : FullMessageWireSize;
+    if (size != expected) return false;
+    if (decoded.kind == Kind::Renew) {
+        decoded.state.effects = data[MessageHeaderWireSize];
+        if (!Valid(decoded)) return false;
+    } else if (decoded.kind == Kind::State) {
+        std::vector<uint8_t> state(sizeof(Checkpoint), 0);
+        std::memcpy(state.data(), data + MessageHeaderWireSize, 84);
+        std::memcpy(state.data() + 212, data + MessageHeaderWireSize + 84, 21);
+        detail::ReadCheckpoint(state.data(), 0, decoded.state);
+        if (!ValidStateFields(decoded.state)) return false;
+    } else {
+        detail::ReadCheckpoint(data, MessageHeaderWireSize, decoded.state);
+        if (!Valid(decoded)) return false;
+    }
+    output = decoded;
+    return true;
+}
+
 inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& output)
 {
     if (overlay.size() > MaxLeases) return false;
@@ -483,7 +599,8 @@ inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& outp
 
     for (size_t i = 0; i < overlay.size(); ++i) {
         const Saved& saved = overlay[i];
-        if (!detail::GuidNonzero(saved.guid) || !saved.incarnation || !Valid(saved.state)) return false;
+        if (!detail::GuidNonzero(saved.guid) || !saved.incarnation || !saved.epoch ||
+            saved.adopted > 1 || !Valid(saved.state)) return false;
         for (size_t j = 0; j < i; ++j)
             if (std::memcmp(saved.guid, overlay[j].guid, 16) == 0) return false;
     }
@@ -491,7 +608,7 @@ inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& outp
     const size_t payloadSize = overlay.size() * detail::SavedWireSize;
     std::vector<uint8_t> encoded(20 + payloadSize);
     detail::Put32(encoded, 0, detail::OverlayMagic);
-    detail::Put32(encoded, 4, WireVersion);
+    detail::Put32(encoded, 4, detail::OverlayVersion);
     detail::Put32(encoded, 8, static_cast<uint32_t>(overlay.size()));
     detail::Put32(encoded, 12, static_cast<uint32_t>(payloadSize));
     detail::Put32(encoded, 16, 0);
@@ -503,6 +620,7 @@ inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& outp
         detail::Put32(encoded, offset, saved.epoch); offset += 4;
         detail::Put32(encoded, offset, saved.revision); offset += 4;
         offset = detail::WriteCheckpoint(encoded, offset, saved.state);
+        encoded[offset++] = saved.adopted;
     }
 
     uint32_t combined = 0xffffffffu;
@@ -525,13 +643,16 @@ inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& outp
 inline bool DecodeOverlay(uint8_t const* data, size_t size, SaveOverlay& output)
 {
     if (!data || size < 20) return false;
-    if (detail::Get32(data) != detail::OverlayMagic ||
-        detail::Get32(data + 4) != WireVersion) return false;
+    if (detail::Get32(data) != detail::OverlayMagic) return false;
+    const uint32_t version = detail::Get32(data + 4);
+    if (version != detail::OverlayVersion && version != detail::LegacyOverlayVersion) return false;
+    const uint32_t rowSize = version == detail::OverlayVersion ?
+                             detail::SavedWireSize : detail::LegacySavedWireSize;
 
     const uint32_t count = detail::Get32(data + 8);
     const uint32_t payloadSize = detail::Get32(data + 12);
     if (count > MaxLeases) return false;
-    if (payloadSize != uint64_t(count) * detail::SavedWireSize) return false;
+    if (payloadSize != uint64_t(count) * rowSize) return false;
     if (size != size_t(20) + size_t(payloadSize)) return false;
 
     uint32_t combined = 0xffffffffu;
@@ -558,7 +679,9 @@ inline bool DecodeOverlay(uint8_t const* data, size_t size, SaveOverlay& output)
         saved.epoch = detail::Get32(data + offset); offset += 4;
         saved.revision = detail::Get32(data + offset); offset += 4;
         offset = detail::ReadCheckpoint(data, offset, saved.state);
-        if (!detail::GuidNonzero(saved.guid) || !saved.incarnation || !Valid(saved.state)) return false;
+        if (version == detail::OverlayVersion) saved.adopted = data[offset++];
+        if (!detail::GuidNonzero(saved.guid) || !saved.incarnation || !saved.epoch ||
+            saved.adopted > 1 || !Valid(saved.state)) return false;
         for (Saved const& prior : decoded)
             if (std::memcmp(prior.guid, saved.guid, 16) == 0) return false;
         decoded.push_back(saved);

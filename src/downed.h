@@ -24,6 +24,11 @@ void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us 
 bool Held();             // the local hero lies knocked out, waiting for help
 bool Terminal();         // the local hero's life is in the native terminal death presentation
 bool CombatUnavailable(eCEntity* entity); // player life truth, never the puppet's interpolated pose/native mode
+bool HarmProtected(eCEntity* entity); // co-op held or paid recovery; never blocks terminal death or loading
+bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path);
+bool RejectReaction(eCEntity* victim, char const* state, char const* path);
+void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int before, int after, char const* decision);
+bool SyntheticProne(eCEntity* victim); // restore vanilla's exact pose gate on defender-local synthetic hits only
 uint32_t UnavailablePlayers(); // player-id bits; stale held packets do not make a player eligible again
 void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bool transition = false);
 uint32_t Sequence();      // zero while not waiting; carried by player state and paid revive requests

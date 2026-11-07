@@ -8,7 +8,7 @@
 
 namespace g3t::npclease {
 inline constexpr char SavePrefix[] = "npclease1 ";
-inline constexpr size_t MaxOverlayText = 2 * (20 + MaxLeases * 261) + sizeof(SavePrefix);
+inline constexpr size_t MaxOverlayText = 2 * (20 + MaxLeases * detail::SavedWireSize) + sizeof(SavePrefix);
 
 struct RestoreEpochBinding {
     uint32_t expected = 0;

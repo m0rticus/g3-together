@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 
 namespace g3t::downed {
 inline bool HeldPuppet(uint8_t flags, uint32_t sequence)
@@ -18,6 +19,71 @@ inline bool UnpaidEpisode(uint32_t sequence, uint32_t paidSequence)
 inline bool CombatUnavailable(bool player, bool held, bool terminal, bool nativeDown, bool nativeDead, uint8_t flags)
 {
     return player && (held || terminal || nativeDown || nativeDead || (flags & 14) != 0);
+}
+
+// DoLogicalDamage +0xB51A8/+0xB51B7, CP 1.75: not a blanket stumble or fall timer.
+constexpr bool VanillaProne(int animation)
+{
+    return animation == 15 || animation == 16;
+}
+
+constexpr uint32_t ReviveGraceMs = 1500;
+
+struct Recovery
+{
+    bool rising = false, grace = false;
+    uint32_t stoodAt = 0;
+
+    void Begin() { rising = true; grace = false; }
+    void Clear() { rising = grace = false; stoodAt = 0; }
+    bool Protected(uint32_t now) const { return rising || (grace && now - stoodAt < ReviveGraceMs); }
+
+    void Observe(bool standing, uint32_t now)
+    {
+        if (rising && standing) {
+            rising = false;
+            grace = true;
+            stoodAt = now;
+        }
+        if (grace && now - stoodAt >= ReviveGraceMs) grace = false;
+    }
+};
+
+inline bool RecoveryStanding(int animation, bool nativeDown, char const* motion)
+{
+    return (animation == 2 || animation == 3 || animation == 4) && !nativeDown && motion && *motion &&
+           !std::strstr(motion, "GetUp") && !std::strstr(motion, "StandUp");
+}
+
+struct PeerRecovery
+{
+    bool held = false;
+    Recovery recovery;
+
+    void Clear() { held = false; recovery.Clear(); }
+    void Observe(bool present, uint8_t flags, bool standing, uint32_t now)
+    {
+        if (!present || !(flags & 1) || (flags & 4)) { Clear(); return; }
+        if (flags & 8) { held = true; recovery.Clear(); return; }
+        if (held) { held = false; recovery.Begin(); }
+        recovery.Observe(standing && !(flags & 2), now);
+    }
+};
+
+inline bool HarmImmune(bool player, bool held, bool terminal, uint8_t flags, bool recovering)
+{
+    return player && !terminal && !(flags & 4) && (held || (flags & 8) || recovering);
+}
+
+inline bool HarmfulReaction(char const* state)
+{
+    for (char const* prefix : {"ZS_QuickStumble", "ZS_Stumble", "ZS_PierceStumble", "ZS_ParadeStumble",
+                              "ZS_QuickParadeStumble", "ZS_HeavyParadeStumble", "ZS_Freeze"})
+        if (!std::strncmp(state, prefix, std::strlen(prefix))) return true;
+    for (char const* entry : {"ZS_SitKnockDown", "ZS_LieKnockDown", "ZS_Unconscious", "ZS_PiercedKO",
+                             "ZS_Dead", "ZS_RagDollDead", "ZS_PiercedDead"})
+        if (!std::strcmp(state, entry)) return true;
+    return false;
 }
 
 enum TargetBinding : uint32_t {

@@ -980,7 +980,7 @@ bool RestoreNpcLease(uint32_t savedVersion, Bytes const& bytes)
         npclease::OnWorldDeactivate();
         return true;
     }
-    if (savedVersion != 1 || bytes.size() > npclease::MaxOverlayText) return false;
+    if ((savedVersion != 1 && savedVersion != 2) || bytes.size() > npclease::MaxOverlayText) return false;
     std::string text(bytes.begin(), bytes.end());
     npclease::SaveOverlay overlay;
     if (!npclease::DecodeSaveText(text, overlay)) return false;
@@ -1804,7 +1804,7 @@ void Install()
     net::SetSaveHandler(&OnSave);
     net::SetCharacterHandler(&OnCharacter);
     net::SetWorldHandler(&OnWorld);
-    if (!SaveExtensions::Register("npclease", NpcLeaseExtension, 1, &CaptureNpcLease, &RestoreNpcLease))
+    if (!SaveExtensions::Register("npclease", NpcLeaseExtension, 2, &CaptureNpcLease, &RestoreNpcLease))
         Log("persist: NPC lease save overlay registration failed; lease gate remains active");
     unsigned char* resolved[5]{};
     if (!ResolveNative(resolved)) {

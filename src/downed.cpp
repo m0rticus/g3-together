@@ -57,6 +57,10 @@ constexpr uint32_t StaleState = 5000;  // ms: a remote state older than this doe
 constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still says "down" for a moment
 
 Life life;                     // authority is the paid revive, not the native body's current state
+Recovery recovery;
+PeerRecovery puppetRecovery[net::MaxPlayers];
+bool recoveryUnknownNoted = false;
+bool maintainingHp = false;
 bool lethal = false;            // the knock-out it lies in replaced its death (RedirectDeath)
 bool lethalSeenDown = false;    // ... and the hero has lain down since (until then a frame without IsDown is no standing up)
 uint32_t lethalAt = 0;          // when RedirectDeath set it
@@ -85,6 +89,22 @@ uint32_t paidSequence[net::MaxPlayers] = {};
 uint32_t pendingReviveSequence = 0;
 unsigned transitions = 0, corrections = 0;
 uint32_t lastCorrection = 0;
+
+bool TrackPuppetRecovery(int id)
+{
+    net::Remote const& r = net::Remotes()[id];
+    PeerRecovery& peer = puppetRecovery[id];
+    const bool wasHeld = peer.held, wasGrace = peer.recovery.grace;
+    const uint32_t now = net::Now();
+    const bool present = r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld();
+    peer.Observe(present, r.latest.flags,
+                 RecoveryStanding(r.latest.aniState, (r.latest.flags & 2) != 0, r.latest.animation), now);
+    if (wasHeld && !peer.held && peer.recovery.Protected(now))
+        Logf("downed: puppet recovery begin player=%d flags=%u motion=%s", id, r.latest.flags, r.latest.animation);
+    if (!wasGrace && peer.recovery.grace)
+        Logf("downed: puppet recovery standing player=%d grace_ms=%u motion=%s", id, ReviveGraceMs, r.latest.animation);
+    return peer.recovery.Protected(now);
+}
 
 void Transition(char const* reason, char const* source)
 {
@@ -147,9 +167,25 @@ using SetTaskFn = void(__fastcall*)(gCScriptProcessingUnit*, void*, bCString, GE
 using SetStateFn = void(__fastcall*)(gCScriptProcessingUnit*, void*, bCString);
 SetModeFn originalSetMode = nullptr;
 SetHpFn originalSetHp = nullptr;
+SetHpFn originalAddHp = nullptr, originalSetValue = nullptr;
 SetTaskFn originalSetTask = nullptr;
 SetStateFn originalSetState = nullptr;
 bool terminalGuardsInstalled = false;
+
+struct MaintainHp
+{
+    bool before = maintainingHp;
+    MaintainHp() { maintainingHp = true; }
+    ~MaintainHp() { maintainingHp = before; }
+};
+
+bool RejectHp(eCEntity* entity, bCString const& tag, int value, bool additive, char const* path)
+{
+    if (tag != "HP" || maintainingHp || !entity) return false;
+    const int before = Entity(entity).PlayerMemory.GetHitPoints();
+    if ((additive ? value < 0 : value < before) && RejectHarm(entity, nullptr, path)) return true;
+    return false;
+}
 
 void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer<gEAIMode> const& value)
 {
@@ -171,6 +207,7 @@ void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer
 GEBool __fastcall SetHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
 {
     eCEntity* entity = self ? self->GetEntity() : nullptr;
+    if (RejectHp(entity, tag, value, false, "SetBaseValue(HP)")) return GEFalse;
     if (LocalTerminal(entity) && tag == "HP") {
         const bool refused = !life.TerminalHpAllowed(value);
         if (refused || Entity(entity).PlayerMemory.GetHitPoints() != value) {
@@ -180,14 +217,50 @@ GEBool __fastcall SetHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag,
         }
         if (refused) return GEFalse;
     }
+    const int before = entity && tag == "HP" ? Entity(entity).PlayerMemory.GetHitPoints() : 0;
     const GEBool result = originalSetHp(self, edx, tag, value);
+    if (entity && tag == "HP" && !maintainingHp)
+        LogGroundEvent(entity, nullptr, "SetBaseValue(HP)", before, Entity(entity).PlayerMemory.GetHitPoints(), "native");
     ObserveTerminal(entity, "SetBaseValue");
+    return result;
+}
+
+GEBool __fastcall AddHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
+{
+    eCEntity* entity = self ? self->GetEntity() : nullptr;
+    if (RejectHp(entity, tag, value, true, "AddBaseValue(HP)")) return GEFalse;
+    if (LocalTerminal(entity) && tag == "HP" && value > 0) {
+        Mutation("AddBaseValue(HP)", "hp", "positive delta", true, _ReturnAddress());
+        return GEFalse;
+    }
+    const int before = entity && tag == "HP" ? Entity(entity).PlayerMemory.GetHitPoints() : 0;
+    const GEBool result = originalAddHp(self, edx, tag, value);
+    if (entity && tag == "HP")
+        LogGroundEvent(entity, nullptr, "AddBaseValue(HP)", before, Entity(entity).PlayerMemory.GetHitPoints(), "native");
+    ObserveTerminal(entity, "AddBaseValue");
+    return result;
+}
+
+GEBool __fastcall SetValue(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
+{
+    eCEntity* entity = self ? self->GetEntity() : nullptr;
+    if (RejectHp(entity, tag, value, false, "SetValue(HP)")) return GEFalse;
+    if (LocalTerminal(entity) && tag == "HP" && !life.TerminalHpAllowed(value)) {
+        Mutation("SetValue(HP)", "hp", "positive value", true, _ReturnAddress());
+        return GEFalse;
+    }
+    const int before = entity && tag == "HP" ? Entity(entity).PlayerMemory.GetHitPoints() : 0;
+    const GEBool result = originalSetValue(self, edx, tag, value);
+    if (entity && tag == "HP")
+        LogGroundEvent(entity, nullptr, "SetValue(HP)", before, Entity(entity).PlayerMemory.GetHitPoints(), "native");
+    ObserveTerminal(entity, "SetValue");
     return result;
 }
 
 void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, GEBool caught)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
+    if (RejectReaction(entity, task.GetText(), "AISetTask")) return;
     if (LocalTerminal(entity)) {
         const bool refused = !life.TerminalTaskAllowed(task.GetText());
         Mutation("AISetTask", "task", task.GetText(), refused, _ReturnAddress());
@@ -200,6 +273,7 @@ void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, 
 void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
+    if (RejectReaction(entity, state.GetText(), "AISetState")) return;
     if (LocalTerminal(entity)) {
         const bool refused = !life.TerminalStateAllowed(state.GetText());
         Mutation("AISetState", "state", state.GetText(), refused, _ReturnAddress());
@@ -259,6 +333,7 @@ bool DownPose(Entity& hero)
 
 void KeepDown(Entity& hero, char const* source)
 {
+    MaintainHp maintenance;
     const bCString task = hero.Routine.GetCurrentTask(), state = hero.Routine.GetCurrentState();
     const bool repair = !hero.IsDown() || !DownTask(task.GetText()) ||
                         (std::strcmp(state.GetText(), "ZS_Unconscious_Loop") && !DownTask(state.GetText())) ||
@@ -290,6 +365,7 @@ void CancelAlone(char const* source);
 void Hold(char const* reason, char const* source)
 {
     if (life.held || life.terminal) return;
+    recovery.Clear();
     life.Restore(true);
     CancelAlone("new-held-life");
     revivedBy = 0;
@@ -592,6 +668,7 @@ void Die(Entity& hero, char const* reason)
         EndStep("skipped-terminal");
         return;
     }
+    recovery.Clear();
     lethal = false;
     lethalSeenDown = false;
     revivedBy = 0;
@@ -651,6 +728,7 @@ void InstallTerminalGuards()
     // Complete, position-independent instructions verified against CP 1.75.20108.14.
     static unsigned char const modeBytes[] = {0x56, 0x8b, 0xf1, 0x8b, 0x06, 0x8b, 0x50, 0x58};
     static unsigned char const hpBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08, 0x56};
+    static unsigned char const valueBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08};
     static unsigned char const taskBytes[] = {0x57, 0x8b, 0xf9, 0x80, 0x7f, 0x64, 0x01};
     static unsigned char const stateBytes[] = {0x8d, 0x44, 0x24, 0x04, 0x50};
     originalSetMode = reinterpret_cast<SetModeFn>(InstallGuard(game,
@@ -658,12 +736,18 @@ void InstallTerminalGuards()
         reinterpret_cast<void*>(&SetMode)));
     originalSetHp = reinterpret_cast<SetHpFn>(InstallGuard(game,
         "?SetBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&SetHp)));
+    originalAddHp = reinterpret_cast<SetHpFn>(InstallGuard(game,
+        "?AddBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&AddHp)));
+    originalSetValue = reinterpret_cast<SetHpFn>(InstallGuard(game,
+        "?SetValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", valueBytes, reinterpret_cast<void*>(&SetValue)));
     originalSetTask = reinterpret_cast<SetTaskFn>(InstallGuard(game,
         "?AISetTask@gCScriptProcessingUnit@@QAEXVbCString@@_N@Z", taskBytes, reinterpret_cast<void*>(&SetTask)));
     originalSetState = reinterpret_cast<SetStateFn>(InstallGuard(game,
         "?AISetState@gCScriptProcessingUnit@@QAEXVbCString@@@Z", stateBytes, reinterpret_cast<void*>(&SetState)));
     Logf("downed: terminal native guards installed mode=%d hp=%d task=%d state=%d",
          originalSetMode != nullptr, originalSetHp != nullptr, originalSetTask != nullptr, originalSetState != nullptr);
+    Logf("downed: ground HP guards set=%d add=%d value=%d revive_grace_ms=%u",
+         originalSetHp != nullptr, originalAddHp != nullptr, originalSetValue != nullptr, ReviveGraceMs);
 }
 
 void ObserveTerminal(eCEntity* self, char const* source)
@@ -769,6 +853,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
 
 bool GuardState(eCEntity* self, char const* state)
 {
+    if (RejectReaction(self, state, "AI-state")) return true;
     if ((!life.held && !life.terminal) || !self || self != gCSession::GetInstance().GetHero() ||
         !gCSession::GetInstance().IsGameRunning() || persist::NativeLoading()) return false;
     Entity hero(self);
@@ -780,6 +865,7 @@ bool GuardState(eCEntity* self, char const* state)
     }
     // A module tick is not a script clock boundary: a long frame or another script can otherwise wake the hero first.
     if (DownTask(state) || !std::strcmp(state, "ZS_Unconscious_Loop")) {
+        MaintainHp maintenance;
         if (!std::strcmp(state, "ZS_Unconscious_Loop") && hero.Routine.GetTaskTime() > 5.0f)
             Logf("downed: stand refused player=%u sequence=%u source=native-wake timer=%.3f",
                  net::LocalId(), life.sequence, hero.Routine.GetTaskTime());
@@ -820,6 +906,21 @@ void Tick()
     }
     Entity hero(instance);
     const uint32_t now = net::Now();
+    if (recovery.rising) {
+        char motion[256] = {};
+        const bool known = body::CurrentMotion(instance, motion, sizeof(motion)) && motion[0];
+        const int pose = static_cast<int>(hero.Routine.AniState);
+        if (!known && !recoveryUnknownNoted)
+            Logf("downed: recovery waiting player=%u sequence=%u ani=%d reason=no-current-motion",
+                 net::LocalId(), life.sequence, pose);
+        recoveryUnknownNoted = !known;
+        recovery.Observe(RecoveryStanding(pose, hero.IsDown(), known ? motion : nullptr), now);
+        if (!recovery.rising)
+            Logf("downed: recovery standing player=%u sequence=%u grace_ms=%u motion=%s",
+                 net::LocalId(), life.sequence, ReviveGraceMs, motion);
+    } else {
+        recovery.Observe(false, now);
+    }
     net::Remote const* remotes = net::Remotes();
     const uint8_t self = net::LocalId();
     wchar_t name[32], text[200];
@@ -827,6 +928,7 @@ void Tick()
     // Tell this player when someone else goes down or dies.
     for (int i = 1; i < net::MaxPlayers; ++i) {
         if (i == self) continue;
+        TrackPuppetRecovery(i);
         const bool present = Playing(HelperState(remotes[i], now));
         const bool dead = present && (remotes[i].activity.flags & 4);
         const bool down = present && (remotes[i].activity.flags & 8) && !dead;
@@ -920,6 +1022,8 @@ void Tick()
         const int by = revivedBy;
         revivedBy = 0;
         if (life.terminal || !life.Revive(pendingReviveSequence)) return;
+        recovery.Begin();
+        recoveryUnknownNoted = false;
         pendingReviveSequence = 0;
         lethal = false;
         lethalSeenDown = false;
@@ -983,6 +1087,71 @@ void HelperHasNoPotion(int byPlayer)
 
 bool Held() { return life.held; }
 
+bool HarmProtected(eCEntity* entity)
+{
+    if (!entity || ai::ShuttingDown() || persist::NativeLoading() || persist::HeroPending() ||
+        !gCSession::GetInstance().IsGameRunning()) return false;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (hero && (entity == hero || entity == remote::ControlledBody()))
+        return HarmImmune(true, life.held, life.terminal, 0, recovery.Protected(net::Now()));
+    const int id = remote::PuppetOwner(entity);
+    if (id <= 0 || id >= net::MaxPlayers) return false;
+    net::Remote const& r = net::Remotes()[id];
+    const bool present = r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld();
+    return HarmImmune(present, false, false, r.latest.flags, TrackPuppetRecovery(id));
+}
+
+bool SyntheticProne(eCEntity* victim)
+{
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    return victim && hero && (victim == hero || victim == remote::ControlledBody()) &&
+           !life.terminal && !persist::NativeLoading() && !persist::HeroPending() &&
+           VanillaProne(static_cast<int>(Entity(victim).Routine.AniState));
+}
+
+void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int before, int after, char const* decision)
+{
+    if (!victim || ai::ShuttingDown()) return;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero || (victim != hero && victim != remote::ControlledBody())) return;
+    Entity player(victim);
+    const bCString task = player.Routine.GetCurrentTask(), state = player.Routine.GetCurrentState();
+    const int pose = static_cast<int>(player.Routine.AniState);
+    const uint32_t now = net::Now();
+    if (!life.held && !life.terminal && !recovery.Protected(now) && !(pose >= 15 && pose <= 21) &&
+        !HarmfulReaction(task.GetText()) && !HarmfulReaction(state.GetText()) &&
+        !std::strstr(task.GetText(), "Fall") && !std::strstr(state.GetText(), "Fall")) return;
+    Logf("GROUNDHIT role=%s player=%u episode=%u path=%s attacker=%s hp=%d->%d held=%d terminal=%d "
+         "rising=%d grace_ms=%u ai=%d ani=%d task=%s state=%s decision=%s",
+         net::IsHost() ? "host" : "client", net::LocalId(), life.sequence, path,
+         attacker ? Entity(attacker).GetName().GetText() : "-", before, after,
+         life.held ? 1 : 0, life.terminal ? 1 : 0, recovery.rising ? 1 : 0,
+         recovery.grace && now - recovery.stoodAt < ReviveGraceMs ? ReviveGraceMs - (now - recovery.stoodAt) : 0,
+         static_cast<int>(player.Routine.AIMode), pose, task.GetText(), state.GetText(), decision);
+}
+
+bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path)
+{
+    if (!HarmProtected(victim)) return false;
+    Entity player(victim);
+    const int hp = victim->GetPropertySet(eEPropertySetType_PlayerMemory)
+        ? player.PlayerMemory.GetHitPoints() : static_cast<int>(player.DamageReceiver.HitPoints);
+    LogGroundEvent(victim, attacker, path, hp, hp, "reject-before-effects");
+    if (victim->GetPropertySet(eEPropertySetType_DamageReceiver)) player.DamageReceiver.DamageAmount = 0;
+    return true;
+}
+
+bool RejectReaction(eCEntity* victim, char const* state, char const* path)
+{
+    if (!victim || !HarmfulReaction(state) || !HarmProtected(victim)) return false;
+    // The held task itself and its native loop must still establish/maintain the lying pose.
+    if (life.held && victim == gCSession::GetInstance().GetHero() && DownTask(state)) return false;
+    eCEntity* attacker = Entity(victim).NPC.GetCurrentAttacker().GetInstance();
+    if (!RejectHarm(victim, attacker, path)) return false;
+    Logf("downed: ground reaction refused player=%u path=%s requested=%s", net::LocalId(), path, state);
+    return true;
+}
+
 bool CombatUnavailable(eCEntity* entity)
 {
     if (!entity) return false;
@@ -993,6 +1162,7 @@ bool CombatUnavailable(eCEntity* entity)
     }
     const int id = remote::PuppetOwner(entity);
     if (!id) return false;
+    TrackPuppetRecovery(id);
     net::Remote const& r = net::Remotes()[id];
     // Latest accepted player state is authority, not the talkable puppet's native mode or lying animation.
     return r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld() &&
@@ -1075,6 +1245,8 @@ bool NativeDown()
 void OnWorldChange()
 {
     life.OnWorldChange(); // old-world paid revives must not apply after the load
+    recovery.Clear();
+    recoveryUnknownNoted = false;
     lethal = life.held;
     lethalSeenDown = false;
     lethalAt = 0;
@@ -1098,6 +1270,7 @@ void OnWorldChange()
     revivedBy = 0;
     pendingReviveSequence = 0;
     for (int i = 0; i < net::MaxPlayers; ++i) {
+        puppetRecovery[i].Clear();
         told[i] = false;
         toldDead[i] = false;
         helpingSince[i] = 0;

@@ -9,11 +9,14 @@ class eCEntity;
 namespace g3t::npclease {
 void Tick();
 void OnWorldDeactivate();
+void CaptureCacheInventory();
 bool NewLife(uint8_t const guid[16]);
 bool LocalAuthority(eCEntity const* entity);
+char const* UnavailabilityReason(eCEntity* entity);
 bool Fenced(eCEntity const* entity);
 bool SuppressHostPublication(uint8_t const guid[16]);
 bool IgnoreHostSnapshot(uint8_t const guid[16]);
+bool IgnoreHostSnapshot(uint8_t const guid[16], uint32_t captured);
 uint8_t RemoteOwner(eCEntity const* entity);
 uint32_t Life(uint8_t const guid[16]);
 bool ContactAllowed(eCEntity const* victim, eCEntity const* source);

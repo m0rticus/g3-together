@@ -3,6 +3,7 @@
 #include "npclease_client.h"
 #include "npclease_save.h"
 #include "npclease_guards.h"
+#include "npclease_presentation.h"
 
 #include "ai.h"
 #include "body.h"
@@ -13,10 +14,12 @@
 #include "net.h"
 #include "npcplayback.h"
 #include "npcs.h"
+#include "npcremoval.h"
 #include "persist.h"
 #include "remote.h"
 #include "talk.h"
 #include "world.h"
+#include "crashlog.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -38,9 +41,14 @@ struct Entry {
     uint32_t echo = 0, welcome = 0, world = 0, recallAt = 0;
     uint32_t previousGeneration = 0;
     uint32_t appliedRevision = 0;
+    uint32_t presentationFloor = 0;
+    uint32_t unavailableAt = 0;
+    bool hasPresentationFloor = false;
     uint8_t previousOwner = 0;
     eCEntity* applied = nullptr;
     bool active = false, prepared = false, cut = false, committed = false, hasBaseline = false;
+    bool adopted = false;
+    char sentRoutine[64]{};
 };
 using GuidKey = std::array<uint8_t, 16>;
 struct GuidHash {
@@ -52,6 +60,7 @@ RestoreEpochBinding restoreEpoch;
 uint32_t authoritySerial = 0, scanAt = 0, reportAt = 0, seenWorld = 0, seenWelcome = 0;
 unsigned granted = 0, recalled = 0, recovered = 0, refused = 0, stateSent = 0, stateReceived = 0;
 unsigned contactsRefused = 0, nativeDeaths = 0, repeatedDeaths = 0;
+unsigned discovered = 0;
 unsigned scanSamples = 0, scanTotalMs = 0, scanMaxMs = 0;
 bool installed = false, installFailed = false;
 gFScript originalKill = nullptr;
@@ -127,6 +136,36 @@ char const* SpeciesName(Entity& npc)
     case gESpecies_Boar: return "Boar";
     case gESpecies_Deer: return "Deer";
     case gESpecies_Scavenger: return "Scavenger";
+    case gESpecies_Golem: return "Golem";
+    case gESpecies_Demon: return "Demon";
+    case gESpecies_Troll: return "Troll";
+    case gESpecies_Minecrawler: return "Minecrawler";
+    case gESpecies_Sabertooth: return "Sabertooth";
+    case gESpecies_Shadowbeast: return "Shadowbeast";
+    case gESpecies_Bison: return "Bison";
+    case gESpecies_Rhino: return "Rhino";
+    case gESpecies_Ripper: return "Ripper";
+    case gESpecies_Lurker: return "Lurker";
+    case gESpecies_Varan: return "Varan";
+    case gESpecies_Snapper: return "Snapper";
+    case gESpecies_Alligator: return "Alligator";
+    case gESpecies_Trex: return "Trex";
+    case gESpecies_FireVaran: return "FireVaran";
+    case gESpecies_Bloodfly: return "Bloodfly";
+    case gESpecies_Lizard: return "Lizard";
+    case gESpecies_Meatbug: return "Meatbug";
+    case gESpecies_Rabbit: return "Rabbit";
+    case gESpecies_Molerat: return "Molerat";
+    case gESpecies_Snake: return "Snake";
+    case gESpecies_Spider: return "Spider";
+    case gESpecies_Turtle: return "Turtle";
+    case gESpecies_Gargoyle: return "Gargoyle";
+    case gESpecies_SwampLurker: return "SwampLurker";
+    case gESpecies_Ogre: return "Ogre";
+    case gESpecies_Scorpion: return "Scorpion";
+    case gESpecies_FireGolem: return "FireGolem";
+    case gESpecies_IceGolem: return "IceGolem";
+    case gESpecies_Stalker: return "Stalker";
     default: return nullptr;
     }
 }
@@ -139,9 +178,21 @@ bool GenericName(char const* name, char const* species)
     for (size_t i = length; name[i]; ++i) if (name[i] < '0' || name[i] > '9') return false;
     return name[length] != '\0';
 }
+bool ExcludedRole(eCEntity* entity)
+{
+    auto* dialog = static_cast<gCDialog_PS*>(entity->GetPropertySet(eEPropertySetType_Dialog));
+    if (dialog && (dialog->GetTradeEnabled() || dialog->GetTeachEnabled() || dialog->GetPartyEnabled()))
+        return true;
+    auto* party = static_cast<gCParty_PS*>(entity->GetPropertySet(eEPropertySetType_Party));
+    if (!party) return false;
+    Entity npc(entity);
+    return npc.Party.GetPartyLeader().GetInstance() || npc.Party.Waiting ||
+        static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) != gEPartyMemberType_None ||
+        party->GetMembers().GetCount() != 0;
+}
 bool Eligible(eCEntity* entity)
 {
-    if (!entity || Player(entity) || !entity->GetPropertySet(eEPropertySetType_NPC) ||
+    if (!entity || npcremoval::Suppressed(entity) || Player(entity) || !entity->GetPropertySet(eEPropertySetType_NPC) ||
         !entity->GetPropertySet(eEPropertySetType_DamageReceiver) ||
         !entity->GetPropertySet(eEPropertySetType_ScriptRoutine) ||
         !entity->GetPropertySet(eEPropertySetType_CharacterMovement) ||
@@ -149,15 +200,28 @@ bool Eligible(eCEntity* entity)
         !entity->GetPropertySet(eEPropertySetType_Navigation)) return false;
     Entity npc(entity);
     const char* species = SpeciesName(npc);
-    if (!species || !GenericName(npc.GetName().GetText(), species) || npc.NPC.Immortal) return false;
+    if (!species || !GenericName(npc.GetName().GetText(), species) || npc.NPC.Immortal || ExcludedRole(entity))
+        return false;
     const auto* creator = entity->GetCreator();
     if (!creator || std::strcmp(creator->GetName().GetText(), species)) return false;
-    if (entity->GetPropertySet(eEPropertySetType_Party) &&
-        (npc.Party.GetPartyLeader().GetInstance() || npc.Party.Waiting)) return false;
     if (talk::IsHeld(entity) || talk::TalkingWithHero(entity)) return false;
     for (auto slot : {gESlot_RightHand, gESlot_LeftHand, gESlot_Body, gESlot_Helmet})
         if (npc.Inventory.GetItemFromSlot(slot).GetInstance()) return false;
     return true;
+}
+bool ValidDiscovery(Checkpoint const& state)
+{
+    if (!Valid(state) || state.dead || state.status) return false;
+    _GUID raw;
+    std::memcpy(&raw, state.templateId, sizeof(raw));
+    eCTemplateEntityProxy proxy;
+    proxy.SetEntity(guid::Property(raw));
+    auto* prototype = proxy.GetEntity();
+    if (!prototype || !prototype->GetPropertySet(eEPropertySetType_NPC)) return false;
+    Entity npc(prototype);
+    const auto* species = SpeciesName(npc);
+    return species && !npc.NPC.Immortal && !ExcludedRole(prototype) && GenericName(state.name, species) &&
+        !std::strcmp(prototype->GetName().GetText(), species);
 }
 bool Processed(eCEntity const* entity)
 {
@@ -170,6 +234,12 @@ bool NativeReady(eCEntity* entity)
 {
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
     return Processed(entity) && animation && animation->GetActor();
+}
+bool CanResumePresentation(eCEntity* entity)
+{
+    std::vector<pose::Bone> bones;
+    uint8_t flags = 0;
+    return NativeReady(entity) && npcplayback::CapturePose(entity, bones, flags, nullptr);
 }
 bool TransferableStatus(Checkpoint const& state)
 {
@@ -288,6 +358,7 @@ bool Activate(eCEntity* entity, Entry& entry, uint8_t const identity[16])
     if (!NativeReady(entity) || !npcplayback::GuardForLease(entity)) return false;
     npcs::LeaseReleaseMirror(identity);
     if (!Import(entity, entry.lease.state)) return false;
+    npcplayback::ReleaseUnavailable(entity);
     entry.lease.phase = resume;
     entry.active = active;
     PublishGuard(Key(identity), entry);
@@ -327,14 +398,6 @@ Interest InterestOf(Checkpoint const& state, uint8_t client, eCEntity* hostNpc)
     unsigned clients = 0;
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) clients += net::InWorld(i) && net::Remotes()[i].connected;
     value.conflict = clients != 1;
-    const auto all = Entity::GetNPCs();
-    for (int i = 0; i < all.GetCount(); ++i) {
-        eCEntity* entity = all.GetAt(i).GetInstance();
-        if (!entity || Player(entity) || Eligible(entity) || Entity(entity).IsDead()) continue;
-        const auto& p = entity->GetWorldPosition();
-        const float at[3] = {p.GetX(), p.GetY(), p.GetZ()};
-        if (body::Distance(at, state.position) < 4000) { value.conflict = true; break; }
-    }
     return value;
 }
 Message Control(GuidKey const& key, Entry const& entry, Kind kind)
@@ -344,13 +407,18 @@ Message Control(GuidKey const& key, Entry const& entry, Kind kind)
     note.owner = entry.lease.owner; note.generation = entry.lease.generation;
     note.incarnation = entry.lease.incarnation; note.revision = entry.lease.revision;
     note.echo = entry.echo; note.state = entry.lease.state;
+    if (kind == Kind::Commit && entry.lease.owner == 1) note.echo = net::Now();
     std::memcpy(note.guid, key.data(), 16);
     return note;
 }
 bool Send(GuidKey const& key, Entry& entry, Kind kind)
 {
+    if (kind == Kind::State && std::strcmp(entry.sentRoutine, entry.lease.state.routine))
+        kind = Kind::StateFull;
     const auto note = Control(key, entry, kind);
     if (!net::SendNpcLease(net::IsHost() ? entry.lease.owner : 1, note)) return false;
+    if (kind == Kind::Offer || kind == Kind::StateFull || kind == Kind::Cut)
+        std::memcpy(entry.sentRoutine, entry.lease.state.routine, sizeof(entry.sentRoutine));
     entry.lastControl = net::Now();
     return true;
 }
@@ -359,8 +427,8 @@ void Diagnostic(char const* action, GuidKey const& key, Entry const& entry, char
     char text[40];
     guid::Format(reinterpret_cast<uint8_t const*>(key.data()), text, sizeof(text));
     const uint32_t began = entry.recallAt ? entry.recallAt : entry.lease.started;
-    Logf("npclease: %s guid=%s owner=%u epoch=%u life=%u revision=%u reason=%s duration_ms=%u",
-         action, text, entry.lease.owner, entry.lease.epoch, entry.lease.incarnation, entry.lease.revision,
+    Logf("npclease: %s guid=%s name=%s class=generic_creature owner=%u epoch=%u life=%u revision=%u reason=%s duration_ms=%u",
+         action, text, entry.lease.state.name, entry.lease.owner, entry.lease.epoch, entry.lease.incarnation, entry.lease.revision,
          why, began ? net::Now() - began : 0);
 }
 void CommitDeath(GuidKey const& key, Entry& entry)
@@ -385,7 +453,7 @@ void ReceiveHost(uint8_t from, Message const& note)
     const auto key = Key(note.guid);
     auto found = entries.find(key);
     const uint32_t now = net::Now();
-    if (note.kind == Kind::Request) {
+    if (note.kind == Kind::Request || note.kind == Kind::Adopt) {
         if (!Running() || persist::CheckpointBusy() || !GetConfig().npcAuthorityFallback ||
             from < 2 || from >= net::MaxPlayers || !note.echo) return;
         if (found == entries.end() && !CapacityAvailable()) return;
@@ -397,10 +465,18 @@ void ReceiveHost(uint8_t from, Message const& note)
             if (entry.lease.state.dead) baseline = entry.lease.state;
             entry.hasBaseline = true;
         } else if (entry.hasBaseline && Valid(entry.lease.state)) baseline = entry.lease.state;
-        else {
+        else if (note.incarnation == 1 && ValidDiscovery(note.state)) {
+            baseline = note.state;
+            entry.hasBaseline = true;
+            if (!entry.adopted) {
+                entry.adopted = true;
+                ++discovered;
+                Diagnostic("discovered", key, entry, "verified native template; no host instance created");
+            }
+        } else {
             ++refused;
             if (!entry.lastRequest || now - entry.lastRequest >= 5000) {
-                Diagnostic("refused", key, entry, "no canonical host instance/baseline");
+                Diagnostic("refused", key, entry, "no canonical baseline or safe native discovery template");
                 entry.lastRequest = now ? now : 1;
             }
             return;
@@ -409,9 +485,10 @@ void ReceiveHost(uint8_t from, Message const& note)
             std::strcmp(note.state.name, baseline.name)) { ++refused; return; }
         entry.lease.state = baseline;
         auto interest = InterestOf(baseline, from, native);
+        interest.hostPresent = interest.hostPresent && npcs::HostCanPresent(note.guid);
         if (!entry.interest.Delegate(interest, now)) return;
         if (baseline.status || baseline.dead) { ++refused; return; }
-        if (baseline.busy) {
+        if (baseline.busy && interest.hostPresent) {
             if (!entry.recallAt) entry.recallAt = now ? now : 1;
             if (now - entry.recallAt < RecallWaitMs) return;
         }
@@ -419,14 +496,14 @@ void ReceiveHost(uint8_t from, Message const& note)
         if (authoritySerial == UINT32_MAX) { ++refused; Log("FAIL npclease: authority epoch exhausted"); return; }
         entry.world = note.world; entry.echo = note.echo;
         entry.recallAt = 0;
-        entry.lease.incarnation = npcs::Incarnation(note.guid);
+        entry.lease.incarnation = entry.adopted ? note.incarnation : npcs::Incarnation(note.guid);
         entry.previousOwner = from;
         entry.previousGeneration = net::PeerGeneration(from);
         if (!entry.lease.Offer(from, net::PeerGeneration(from), ++authoritySerial, now, baseline)) { ++refused; return; }
         PublishGuard(key, entry);
         Stop(native);
         Send(key, entry, Kind::Offer);
-        Diagnostic("offer", key, entry, "outside primary host reach");
+        Diagnostic("offer", key, entry, interest.hostPresent ? "outside primary reach" : "host presentation unavailable");
         return;
     }
     if (found == entries.end()) { ++refused; return; }
@@ -450,7 +527,7 @@ void ReceiveHost(uint8_t from, Message const& note)
         } else if (entry.lease.phase == Phase::Client && !entry.committed) Send(key, entry, Kind::Commit);
     } else if (note.kind == Kind::Ack) {
         entry.committed = true;
-    } else if (note.kind == Kind::State) {
+    } else if (note.kind == Kind::State || note.kind == Kind::StateFull) {
         Checkpoint value = note.state;
         value.effects |= entry.lease.state.effects; // the client's copy need not have seen the host's quest watermark yet
         if (entry.lease.AcceptState(from, note.generation, note.epoch, note.incarnation, note.revision, value)) {
@@ -493,8 +570,10 @@ void ReceiveClient(Message const& note)
         entry.world = note.world; entry.welcome = net::WelcomeSerial();
         entry.lease.owner = note.owner; entry.lease.generation = note.generation;
         entry.lease.incarnation = note.incarnation; entry.lease.epoch = note.epoch;
-        entry.lease.started = now;
+        entry.lease.started = entry.unavailableAt ? entry.unavailableAt : now;
         entry.lease.revision = note.revision; entry.lease.state = note.state; entry.lease.phase = Phase::Offering;
+        entry.hasBaseline = true;
+        std::memcpy(entry.sentRoutine, note.state.routine, sizeof(entry.sentRoutine));
         entry.localDeadline = note.echo + note.duration - LeaseSafetyMs;
         entry.echo = now;
         PublishGuard(key, entry);
@@ -511,7 +590,10 @@ void ReceiveClient(Message const& note)
         entry.lease.epoch = note.epoch; entry.lease.owner = 1; entry.lease.phase = Phase::Host;
         entry.lease.generation = note.generation;
         entry.lease.state = note.state; entry.lease.revision = note.revision;
+        entry.presentationFloor = note.echo;
+        entry.hasPresentationFloor = true;
         entry.prepared = false; entry.cut = false; entry.recallAt = 0;
+        entry.unavailableAt = 0;
         entry.window.Reset(note.epoch);
         entry.echo = now;
         PublishGuard(key, entry);
@@ -536,7 +618,7 @@ void ReceiveClient(Message const& note)
             return;
         }
         Send(key, entry, Kind::Ack);
-        Diagnostic("active", key, entry, "native client AI");
+        Diagnostic("active", key, entry, "native client AI; latency from first unavailable request");
     } else if (note.kind == Kind::Renew) {
         if (!entry.active || entry.cut || !entry.window.Renew(note.epoch, note.echo, note.duration, now)) { ++refused; return; }
         entry.localDeadline = entry.window.deadline;
@@ -555,10 +637,25 @@ void ReceiveClient(Message const& note)
 }
 void Receive(uint8_t from, Message const& note)
 {
-    if (!installed || !Valid(note) || note.world != net::WorldEpoch() || persist::NativeLoading()) { ++refused; return; }
-    if (net::IsHost()) ReceiveHost(from, note);
-    else if (from == 1 && note.owner == net::LocalId()) ReceiveClient(note);
-    else if (from == 1 && note.kind == Kind::Commit && note.owner == 1) ReceiveClient(note);
+    if (!installed || npcremoval::Suppressed(note.guid) || note.world != net::WorldEpoch() ||
+        persist::NativeLoading()) { ++refused; return; }
+    Message hydrated = note;
+    if (note.kind == Kind::State || note.kind == Kind::Renew) {
+        const auto found = entries.find(Key(note.guid));
+        if (found == entries.end() || !found->second.hasBaseline) { ++refused; return; }
+        auto const& canonical = found->second.lease.state;
+        if (note.kind == Kind::Renew) {
+            hydrated.state = canonical;
+            hydrated.state.effects |= note.state.effects;
+        } else {
+            std::memcpy(hydrated.state.name, canonical.name, sizeof(canonical.name));
+            std::memcpy(hydrated.state.routine, canonical.routine, sizeof(canonical.routine));
+        }
+    }
+    if (!Valid(hydrated)) { ++refused; return; }
+    if (net::IsHost()) ReceiveHost(from, hydrated);
+    else if (from == 1 && note.owner == net::LocalId()) ReceiveClient(hydrated);
+    else if (from == 1 && note.kind == Kind::Commit && note.owner == 1) ReceiveClient(hydrated);
     else ++refused;
 }
 GEBool __fastcall Quest(gCQuestManager_PS* self, void* edx, eCEntity const& victim)
@@ -621,7 +718,7 @@ bool Install()
     ai::PatchPointer(reinterpret_cast<void**>(&script->m_funcScript), reinterpret_cast<void*>(&Kill), "npclease Kill script");
     net::SetNpcLeaseHandler(&Receive);
     installed = true;
-    Log("npclease: restricted wildlife authority ready; lease_ms=3000 state_hz=5 primary_far_cm=max(12000,ROI+2000)");
+    Log("npclease: generic creature authority ready; discovery=on absence_dwell_ms=0 lease_ms=3000 state_hz=5");
     return true;
 }
 void TickHost(uint32_t now)
@@ -648,6 +745,8 @@ void TickHost(uint32_t now)
         }
         if (entry.lease.phase == Phase::Client || entry.lease.phase == Phase::Recalling) {
             auto value = InterestOf(entry.lease.state, entry.lease.owner, entity);
+            value.hostPresent = value.hostPresent && value.hostDistance <= value.hostRoi &&
+                CanResumePresentation(entity);
             if (entry.interest.Recall(value) || !Running() || entry.lease.state.dead) {
                 if (entry.lease.Recall(now)) {
                     ++recalled; entry.recallAt = now ? now : 1;
@@ -672,11 +771,10 @@ void TickHost(uint32_t now)
                 const uint8_t client = entry.lease.owner;
                 if (entry.lease.HandBack(++authoritySerial, now)) {
                     entry.committed = false;
-                    const auto note = Control(key, entry, Kind::Commit);
-                    net::SendNpcLease(client, note);
-                    if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data())))
+                    if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data()))) {
+                        net::SendNpcLease(client, Control(key, entry, Kind::Commit));
                         Diagnostic("host-active", key, entry, "imported frozen client cut");
-                    else Diagnostic("host-held", key, entry, "native restart unavailable");
+                    } else Diagnostic("host-held", key, entry, "native restart unavailable");
                 }
             }
         }
@@ -702,8 +800,8 @@ void TickHost(uint32_t now)
             const uint8_t client = entry.previousOwner;
             entry.lease.phase = Phase::Host; entry.lease.owner = 1;
             entry.lease.generation = 0; entry.committed = false;
-            if (client > 1) net::SendNpcLease(client, Control(key, entry, Kind::Commit));
-            Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data()));
+            if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data())) && client > 1)
+                net::SendNpcLease(client, Control(key, entry, Kind::Commit));
         }
         PublishGuard(key, entry);
     }
@@ -723,7 +821,7 @@ void TickClient(uint32_t now)
         Checkpoint state = entry.lease.state;
         const bool captured = CaptureNative(entity, state);
         const bool lost = !Running() || !GetConfig().npcAuthorityFallback || persist::CheckpointBusy() ||
-            !NativeReady(entity) || Reached(now, entry.localDeadline);
+            !NativeReady(entity) || !Eligible(entity) || Reached(now, entry.localDeadline);
         if (lost || (entry.recallAt && captured && (!state.busy || now - entry.recallAt >= RecallWaitMs))) {
             // Status tasks cannot be restarted from a scalar duration; defer their cut while the lease remains healthy.
             if (!lost && !TransferableStatus(state)) continue;
@@ -760,16 +858,25 @@ void TickClient(uint32_t now)
         if (!Eligible(entity) || !NativeReady(entity)) continue;
         const auto key = Key(entity);
         const auto found = entries.find(key);
+        if (npcs::HostPresentationAvailable(entity)) {
+            if (found != entries.end() && found->second.lease.phase == Phase::Host)
+                found->second.unavailableAt = 0;
+            continue;
+        }
         if (found == entries.end() && !CapacityAvailable()) continue;
         Entry& entry = entries[key];
+        if (!entry.unavailableAt) entry.unavailableAt = now ? now : 1;
         if (entry.active || entry.prepared || entry.cut || now - entry.lastRequest < 500) continue;
         Checkpoint state;
-        if (!CaptureNative(entity, state) || state.dead || state.status || body::Distance(here, state.position) > 4000) continue;
+        if (!CaptureNative(entity, state) || state.dead || state.status ||
+            body::Distance(here, state.position) > ClientRadiusCm) continue;
         entry.world = net::WorldEpoch(); entry.lease.state = state; entry.lease.owner = net::LocalId();
+        entry.hasBaseline = true;
         entry.lease.incarnation = npcs::Incarnation(reinterpret_cast<uint8_t const*>(key.data()));
         if (!entry.lease.incarnation) entry.lease.incarnation = 1;
         entry.echo = now;
-        if (Send(key, entry, Kind::Request)) entry.lastRequest = now;
+        const auto kind = npcs::HostPresentationAge(entity) == UINT32_MAX ? Kind::Adopt : Kind::Request;
+        if (Send(key, entry, kind)) entry.lastRequest = now;
     }
 }
 }
@@ -777,6 +884,19 @@ void TickClient(uint32_t now)
 bool LocalAuthority(eCEntity const* entity)
 {
     return ReadGuard(entity).Local(net::Now());
+}
+char const* UnavailabilityReason(eCEntity* entity)
+{
+    if (!GetConfig().npcAuthorityFallback) return "fallback disabled; host-only presentation unavailable";
+    if (!installed || installFailed) return "native authority guards unavailable; host-owned";
+    if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return "native NPC instance unavailable";
+    Entity npc(entity);
+    if (!SpeciesName(npc)) return "unverified NPC class/scripts/equipment; host-owned";
+    if (npc.NPC.Immortal) return "immortal/story actor; host-owned";
+    if (ExcludedRole(entity) || talk::IsHeld(entity) || talk::TalkingWithHero(entity))
+        return "dialogue/trade/teacher/party/summon dependency; host-owned";
+    return Eligible(entity) ? "awaiting reliable host-authorized creature cut" :
+        "named/equipped or incomplete native template; host-owned";
 }
 bool Fenced(eCEntity const* entity)
 {
@@ -786,6 +906,15 @@ bool SuppressHostPublication(uint8_t const identity[16])
 {
     const auto found = entries.find(Key(identity));
     return found != entries.end() && found->second.lease.epoch && found->second.lease.phase != Phase::Host;
+}
+bool IgnoreHostSnapshot(uint8_t const identity[16], uint32_t captured)
+{
+    if (net::IsHost()) return false;
+    const auto found = entries.find(Key(identity));
+    if (found == entries.end()) return false;
+    const auto& entry = found->second;
+    return (entry.lease.epoch && entry.lease.phase != Phase::Host) ||
+        (entry.hasPresentationFloor && !Newer(captured, entry.presentationFloor));
 }
 bool IgnoreHostSnapshot(uint8_t const identity[16])
 {
@@ -832,6 +961,7 @@ SaveOverlay Capture()
         std::memcpy(saved.guid, item.first.data(), 16);
         saved.incarnation = lease.incarnation; saved.epoch = lease.epoch; saved.revision = lease.revision;
         saved.state = lease.state;
+        saved.adopted = item.second.adopted ? 1 : 0;
         result.push_back(saved);
     }
     return result;
@@ -853,6 +983,7 @@ bool Restore(SaveOverlay const& overlay, uint32_t expectedWorldEpoch)
         entry.lease.incarnation = saved.incarnation; entry.lease.epoch = saved.epoch;
         entry.lease.revision = saved.revision; entry.lease.phase = Phase::Dormant;
         entry.hasBaseline = true;
+        entry.adopted = saved.adopted != 0;
         authoritySerial = std::max(authoritySerial, saved.epoch);
         PublishGuard(Key(saved.guid), entry);
     }
@@ -886,7 +1017,15 @@ void OnWorldDeactivate()
     guardStates.Clear();
     restoreEpoch.expected = 0;
     scanAt = 0;
+    crashlog::CacheObjects(crashlog::CacheKind::Leases, 0, nullptr);
     seenWorld = net::WorldEpoch(); seenWelcome = net::WelcomeSerial();
+}
+void CaptureCacheInventory()
+{
+    void const* first = nullptr;
+    for (auto const& item : entries)
+        if (item.second.applied) { first = item.second.applied; break; }
+    crashlog::CacheObjects(crashlog::CacheKind::Leases, static_cast<uint32_t>(entries.size()), first);
 }
 bool NewLife(uint8_t const identity[16])
 {
@@ -916,6 +1055,7 @@ void Tick()
     const DWORD began = GetTickCount();
     if (net::IsHost()) TickHost(now);
     else TickClient(now);
+    CaptureCacheInventory();
     const auto elapsedScan = GetTickCount() - began;
     ++scanSamples; scanTotalMs += elapsedScan; scanMaxMs = std::max(scanMaxMs, static_cast<unsigned>(elapsedScan));
     if (!reportAt || now - reportAt >= 5000) {
@@ -925,10 +1065,10 @@ void Tick()
             dormant += item.second.lease.phase == Phase::Dormant;
         }
         const uint32_t elapsed = reportAt ? now - reportAt : 5000;
-        Logf("npclease: role=%s leased=%u dormant=%u grants=%u recalls=%u recovered=%u refused=%u "
+        Logf("npclease: role=%s class=generic_creature leased=%u dormant=%u grants=%u recalls=%u recovered=%u refused=%u adopted=%u "
              "state_tx_per_s=%.1f state_rx_per_s=%.1f native_deaths=%u repeated_deaths=%u foreign_contacts=%u "
              "scan_avg_ms=%u scan_max_ms=%u",
-             net::IsHost() ? "host" : "client", active, dormant, granted, recalled, recovered, refused,
+             net::IsHost() ? "host" : "client", active, dormant, granted, recalled, recovered, refused, discovered,
              stateSent * 1000.0 / elapsed, stateReceived * 1000.0 / elapsed, nativeDeaths, repeatedDeaths, contactsRefused,
              scanSamples ? scanTotalMs / scanSamples : 0, scanMaxMs);
         scanSamples = scanTotalMs = scanMaxMs = 0;

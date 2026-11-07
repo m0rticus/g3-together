@@ -283,7 +283,10 @@ int Pending(Entity& entity) { return HasDamageReceiver(entity.GetInstance()) ? s
 
 bool RejectDownedHit(eCEntity* victim, eCEntity* attacker, char const* entry)
 {
-    if (!downed::CombatUnavailable(victim)) return false;
+    if (!downed::CombatUnavailable(victim) && !downed::HarmProtected(victim)) return false;
+    if (downed::Terminal() && victim && (victim == gCSession::GetInstance().GetHero() || victim == remote::ControlledBody()))
+        return false;
+    downed::RejectHarm(victim, attacker, entry);
     Entity player(victim);
     static unsigned refused = 0;
     static uint32_t lastLog = 0;
@@ -299,6 +302,31 @@ bool RejectDownedHit(eCEntity* victim, eCEntity* attacker, char const* entry)
     if (HasDamageReceiver(victim)) player.DamageReceiver.DamageAmount = 0;
     return true;
 }
+
+struct GroundProbe
+{
+    eCEntity* victim;
+    eCEntity* attacker;
+    char const* path;
+    int before;
+    GroundProbe(eCEntity* who, eCEntity* by, char const* entry)
+        : victim(nullptr), attacker(by), path(entry), before(0)
+    {
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        if (who && hero && (who == hero || who == remote::ControlledBody())) {
+            victim = who;
+            Entity player(who);
+            before = HitPoints(player);
+        }
+    }
+    ~GroundProbe()
+    {
+        if (victim) {
+            Entity player(victim);
+            downed::LogGroundEvent(victim, attacker, path, before, HitPoints(player), "complete");
+        }
+    }
+};
 
 GEInt CallScript(char const* name, eCEntity* self, eCEntity* other, GEInt args)
 {
@@ -355,6 +383,7 @@ uint8_t Reaction(Entity& victim)
 
 void ApplyReaction(Entity& victim, eCEntity* attacker, uint8_t reaction)
 {
+    if (RejectDownedHit(victim.GetInstance(), attacker, "received-reaction")) return;
     char const* task = nullptr;
     switch (reaction) {
     case net::HitQuickStumble: task = "ZS_QuickStumble"; break;
@@ -793,6 +822,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     Entity damageSource = sourceArg ? *static_cast<Entity*>(sourceArg)
         : Entity(spu ? (which == 0 ? spu->GetSelfEntity() : spu->GetOtherEntity()) : nullptr);
     eCEntity* attacker = Attacker(nullptr, &damageSource);
+    GroundProbe ground(victim.GetInstance(), attacker, Judgements[which]);
     eCEntity* source = damageSource.GetInstance();
     const bool localMelee = !bypass && !forwarded && npcs::IsMirrored(victim.GetInstance()) &&
         IsLocalMelee(attacker, source) && ai::detail::damageReceiver != victim.GetInstance();
@@ -1077,6 +1107,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     ++filterCalls;
     Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
+    GroundProbe ground(recipient.GetInstance(), Attacker(spu, other), "AddHitPoints");
     if (args < 0 && RejectDownedHit(recipient.GetInstance(), Attacker(spu, other), "AddHitPoints")) return GETrue;
     if (!bypass && shot::InNpcReplicaContact()) {
         if (recipient.GetInstance() != remote::ControlledBody()) return GETrue;
@@ -1262,6 +1293,14 @@ GEInt JudgeDamage(Entity& victim, eCEntity* source, int* pending, bool apply = f
 
 GEInt GameHit(Entity& victim, eCEntity* source, int* pending)
 {
+    GroundProbe ground(victim.GetInstance(), source, "synthetic-hit");
+    *pending = 0;
+    if (RejectDownedHit(victim.GetInstance(), source, "synthetic-hit")) return 0;
+    if (downed::SyntheticProne(victim.GetInstance())) {
+        victim.DamageReceiver.DamageAmount = 0;
+        downed::LogGroundEvent(victim.GetInstance(), source, "synthetic-hit", ground.before, ground.before, "vanilla-prone-reject");
+        return 0;
+    }
     // QA guard: the local hero still parries (the block key held); the parade state alone falls back to standing.
     if (paradeUntil && static_cast<int32_t>(GetTickCount() - paradeUntil) < 0 && victim.GetInstance() == gCSession::GetInstance().GetHero()) {
         victim.Routine.AniState = gEAniState_Parade;
@@ -1564,6 +1603,7 @@ void OnHitPlayer(int32_t delta, uint8_t const attacker[16], uint8_t attackerPlay
     // P6: in an animal form the creature the player controls takes it, not the hidden human body (GetHero).
     eCEntity* hero = gCSession::GetInstance().GetHero() ? (shapeHits ? remote::ControlledBody() : gCSession::GetInstance().GetHero()) : nullptr;
     if (!hero || delta >= 0) return;
+    GroundProbe ground(hero, remote::PuppetOf(attackerPlayer), "received-player-hit");
     if (RejectDownedHit(hero, remote::PuppetOf(attackerPlayer), "received-player-hit")) return;
     if (IgnoreFriendlyHit(hero, remote::PuppetOf(attackerPlayer), attackerPlayer)) return;
     ++playerHitsTaken;
@@ -1655,6 +1695,18 @@ void Start()
 }
 
 namespace {
+gFScript originalTouchDamage = nullptr;
+
+GEInt GE_STDCALL TouchDamage(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    if (ai::ShuttingDown()) return originalTouchDamage ? originalTouchDamage(spu, self, other, args) : 0;
+    eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    eCEntity* source = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+    GroundProbe ground(victim, source, "OnTouchDamage");
+    if (RejectDownedHit(victim, source, "OnTouchDamage")) return 0;
+    return originalTouchDamage(spu, self, other, args);
+}
+
 gFScript WrapDamageScript(gSScript& script, gFScript replacement, char const* name)
 {
     gFScript originalFunction = script.m_funcScript;
@@ -1748,6 +1800,9 @@ void Tick()
         if (!judgement || !judgement->m_funcScript) { Logf("combat: no %s script; its native friendly-fire protection is unavailable", Judgements[i]); continue; }
         judge[i] = WrapDamageScript(*judgement, wrappers[i], Judgements[i]);
     }
+    gSScript* touch = Find(GetScriptAdminExt().GetScripts(), "OnTouchDamage");
+    if (touch && touch->m_funcScript) originalTouchDamage = WrapDamageScript(*touch, &TouchDamage, "OnTouchDamage");
+    else Log("combat: ANOMALY OnTouchDamage unavailable; ground contact guard not installed");
     // The OnTick callbacks run through the pointer stored at their registration (SG 0xe1ef0), not through the script table:
     // replacing the table's entry left the game's tick untouched (stageFightMusic 28.10.: music_ticks=0). Jump from the
     // function itself, after checking its first bytes (CP 1.75.14).
@@ -2520,6 +2575,7 @@ bool LocalBlow(eCEntity* attacker)
     eCEntity* body = remote::ControlledBody();
     if (!installed || !body || !attacker || gCSession::GetInstance().GetCheats().GetCheatGodEnabled()) return false;
     Entity self(body);
+    GroundProbe ground(body, attacker, "visible-NPC-contact");
     if (RejectDownedHit(body, attacker, "visible-NPC-contact")) return false;
     if (self.IsDead() || self.IsDown()) return false;
     if (hud::InventoryOpen()) { NoteInventoryHit(); return false; }

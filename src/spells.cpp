@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "combat.h"
+#include "downed.h"
 #include "guid.h"
 #include "infocmd.h"
 #include "log.h"
@@ -83,7 +84,8 @@ bTObjArray<Entity> GE_STDCALL AreaTargets()
     if (ai::ShuttingDown()) return targets;
     if (areaCaster)
         for (int i = targets.GetCount() - 1; i >= 0; --i)
-            if (combat::IgnoreFriendlyHit(targets.GetAt(i).GetInstance(), areaCaster)) targets.RemoveAt(i);
+            if (downed::RejectHarm(targets.GetAt(i).GetInstance(), areaCaster, "area-spell") ||
+                combat::IgnoreFriendlyHit(targets.GetAt(i).GetInstance(), areaCaster)) targets.RemoveAt(i);
     return targets;
 }
 
@@ -122,6 +124,7 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (shot::InNpcReplicaContact() && target != remote::ControlledBody()) return 0;
+    if (HarmfulTarget(I) && downed::RejectHarm(target, caster, Specs[I].name)) return 0;
     if (HarmfulTarget(I) && combat::IgnoreFriendlyHit(target, caster)) return 0;
     const bool own = mirror && caster && caster == remote::ControlledBody();
     if (own && (Specs[I].kind == OnNpc || Specs[I].kind == OnPlayer) &&
@@ -287,6 +290,7 @@ void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_
     }
     Entity self(puppet);
     Entity other = onNpc || at ? target : Entity(puppet);
+    if (HarmfulTarget(index) && downed::RejectHarm(target.GetInstance(), puppet, Specs[index].name)) return;
     if (HarmfulTarget(index) && combat::IgnoreFriendlyHit(target.GetInstance(), puppet, from)) return;
     // Poison and disease judge the target by the caster's spell (re/findings/poison-plan-c.md): the puppet holds none, so
     // it gets the spell's item and that spell for the replay, as copies of spell projectiles do (shot.cpp).

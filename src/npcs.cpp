@@ -3,6 +3,7 @@
 
 #include "body.h"
 #include "combat.h"
+#include "downed.h"
 #include "config.h"
 #include "guide.h"
 #include "guid.h"
@@ -19,6 +20,7 @@
 #include "npcremoval.h"
 #include "npcsend_policy.h"
 #include "npclease_runtime.h"
+#include "npclease_presentation.h"
 #include "replication.h"
 #include "ragdoll_force.h"
 #include "contact.h"
@@ -543,8 +545,8 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
     for (int i = 0; i < count; ++i) {
         if (npcremoval::Suppressed(records[i].guid)) continue;
         const std::string key = Key(records[i].guid);
-        if (npclease::IgnoreHostSnapshot(records[i].guid)) continue;
         const uint32_t captured = records[i].sent ? records[i].sent : sent;
+        if (npclease::IgnoreHostSnapshot(records[i].guid, captured)) continue;
         const auto existing = mirrors.find(key);
         if (existing != mirrors.end() &&
             static_cast<int32_t>(records[i].incarnation - existing->second.latest.incarnation) < 0) continue;
@@ -1375,6 +1377,7 @@ void __fastcall HookAddForce(void* self, void* edx, Vec3 force, Vec3 at)
     }
     auto* set = self ? *static_cast<eCEntityPropertySet**>(self) : nullptr;  // PSAnimation starts with its engine property set
     eCEntity* entity = set ? set->GetEntity() : nullptr;
+    if (downed::RejectHarm(entity, nullptr, "AddForceAtPos")) return;
     if (npcplayback::IsPassive(entity)) return;
     originalAddForce(self, edx, force, at);
     if (!net::IsHost()) return;
@@ -2865,7 +2868,6 @@ void PassiveMirrorTick()
     for (auto it = mirrors.begin(); it != mirrors.end();) {
         Mirror& m = it->second;
         if (npclease::IgnoreHostSnapshot(m.latest.guid)) { ++it; continue; }
-        if (m.released) { it = mirrors.erase(it); continue; }
         eCEntity* previous = m.entity.GetInstance();
         Entity live = Resolve(m.latest.guid);
         if (live.GetInstance() != m.entity.GetInstance() || (m.resolved && !IsNpc(live.GetInstance()))) {
@@ -2905,6 +2907,11 @@ void PassiveMirrorTick()
             m.missing = !m.resolved;
             if (!m.resolved) { ++it; continue; }
             npcplayback::Silence(m.entity.GetInstance());
+            if (auto* routine = static_cast<gCScriptRoutine_PS*>(
+                m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine))) {
+                strncpy_s(m.body.routine, static_cast<bCString const&>(routine->GetRoutine()).GetText(), _TRUNCATE);
+                m.body.aiMode = static_cast<int>(static_cast<gEAIMode>(m.entity.Routine.AIMode));
+            }
             m.body.pacified = true;
             m.defeatedBefore = m.entity.NPC.DefeatedByPlayer;
             m.entity.NPC.DefeatedByPlayer = GETrue;
@@ -2917,7 +2924,32 @@ void PassiveMirrorTick()
         }
         TickDeathFocusWatch(m, now);
         m.replayReady = false;
-        if (!net::Connected() || now - m.latestTicks > StaleAfter) { ++it; continue; }
+        if (!HostPresentationAvailable(m.entity.GetInstance())) {
+            if (!m.staleHeld) {
+                m.staleHeld = true;
+                ++staleMirrorReleases;
+                Logf("npclease: degraded name=%s reason=%s age_ms=%u contacts=off",
+                     m.entity.GetName().GetText(), m.released ? "host release" : "presentation unavailable",
+                     now - m.latestTicks);
+            }
+            if (m.latest.flags & 1) {
+                m.deathLife.Observe(m.latest.incarnation, true);
+                m.killed = true;
+                if (!m.killedAt) m.killedAt = now ? now : 1;
+                m.entity.DamageReceiver.HitPoints = 0;
+                KeepDead(m.entity);
+                m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
+                    m.deathReferencesCleared != m.entity.GetInstance());
+                m.deathReferencesCleared = m.entity.GetInstance();
+                LayDown(m, now);
+                UpdateCorpsePresentation(m, now);
+            } else if (!(m.latest.flags & 2)) {
+                npcplayback::HoldUnavailable(m.entity.GetInstance(), m.replay);
+            }
+            ++it;
+            continue;
+        }
+        m.replay.holding = false;
         body::Presentation presentation;
         net::NpcRecord shown = m.latest;
         m.body.track.predictive = false;
@@ -3517,7 +3549,10 @@ void LeaseReleaseMirror(uint8_t const identity[16])
     if (found != mirrors.end()) {
         auto& mirror = found->second;
         if (mirror.entity.GetInstance()) {
-            body::Release(mirror.entity, mirror.body);
+            // Detach while the lease fence is held; Activate imports before the sole native restart.
+            if (auto* routine = static_cast<gCScriptRoutine_PS*>(
+                mirror.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine)))
+                static_cast<bCString&>(routine->AccessRoutine()) = bCString(mirror.body.routine);
             if (mirror.guarded) mirror.entity.NPC.DefeatedByPlayer = mirror.defeatedBefore;
         }
         mirrors.erase(found);
@@ -3525,6 +3560,34 @@ void LeaseReleaseMirror(uint8_t const identity[16])
     deadOnHost.erase(key);
     corpses.erase(key);
     absences.erase(key);
+}
+
+uint32_t HostPresentationAge(eCEntity const* entity)
+{
+    if (!entity) return UINT32_MAX;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    return found == mirrors.end() || !found->second.latestTicks ? UINT32_MAX :
+        net::Now() - found->second.latestTicks;
+}
+
+bool HostPresentationAvailable(eCEntity const* entity)
+{
+    if (!entity) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
+    const auto& mirror = found->second;
+    return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
+        npcplayback::PoseInterval(mirror.latest));
+}
+
+bool HostCanPresent(uint8_t const identity[16])
+{
+    const auto found = lastSent.find(Key(identity));
+    return found != lastSent.end() && net::Now() - found->second.at <= npclease::PresentationGraceMs;
 }
 
 bool Ready(eCEntity const* entity)
@@ -3535,7 +3598,7 @@ bool Ready(eCEntity const* entity)
     if (!IsMirrored(entity)) return true;
     for (auto const& entry : mirrors)
         if (entry.second.entity.GetInstance() == entity)
-            return net::Connected() && net::Now() - entry.second.latestTicks <= StaleAfter && entry.second.replayReady;
+            return HostPresentationAvailable(entity) && entry.second.replayReady;
     return false;
 }
 

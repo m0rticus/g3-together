@@ -32,7 +32,7 @@ struct CacheSnapshot {
 };
 CacheSnapshot cacheSnapshots[static_cast<size_t>(CacheKind::Count)];
 char const* const cacheNames[] = {"cameras", "prefetchers", "private_entities", "spheres", "anchors",
-                                 "native_range", "puppets", "disabled", "summon_records"};
+                                 "native_range", "puppets", "disabled", "summon_records", "npc_lease_records"};
 static_assert(std::size(cacheNames) == std::size(cacheSnapshots), "cache inventory names");
 
 void LogEndStep()
