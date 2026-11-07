@@ -3,14 +3,18 @@
 
 #include "body.h"
 #include "combat.h"
+#include "clock.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "story_policy.h"
 
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,20 +34,22 @@ Entity Named(char const* name)
 
 namespace {
 constexpr DWORD PollInterval = 500;
-using States = std::unordered_map<std::string, uint8_t>;
+using States = std::unordered_map<std::string, uint32_t>;
 
 struct Domain {
     uint8_t kind;
     char const* label;
     bool (*ready)();
     void (*snapshot)(States&);
-    bool (*apply)(char const* name, uint8_t value);  // true if the game's own function did it, false if set directly
+    bool (*apply)(char const* name, uint32_t value);  // true if the game's own function did it, false if set directly
     States known;  // host: values last sent; client: the host's values as far as this client knows them
     // Host: names that went back to 0 while the game ran here. The full state sends their zeros: a client that loads the
     // host's save got them as set, since the save is older (Codex review 22.10. R8). All zeros would be thousands of infos.
     std::unordered_set<std::string> zeroed;
     bool primed = false;
     bool wasConnected = false;
+    policy::Baseline baseline;
+    DWORD nextRequest = 0;
     unsigned sent = 0, received = 0, applied = 0, forced = 0, claims = 0, requests = 0, skipped = 0;
 };
 
@@ -52,8 +58,20 @@ bool fullZeros = true;  // QA negative control (host, stage W4): storyzerosoff (
 bool reloadReset = true;  // QA negative control (client, stageStoryReload): storyreloadoff
 unsigned reloads = 0;
 DWORD lastPoll = 0;
+bool admissionRequested = false;
+bool admissionApplied = false;
+std::unordered_map<std::string, std::string> questNames, infoNames;
+bool namesReady = false;
+struct InitialReplay {
+    uint32_t generation = 0;
+    bool captured = false;
+    uint8_t sent = 0;
+    std::array<States, 5> values;
+    std::array<States, 5> latest;
+};
+std::array<InitialReplay, net::MaxPlayers> initialReplays;
 
-void Track(Domain& d, std::string const& name, uint8_t value)
+void Track(Domain& d, std::string const& name, uint32_t value)
 {
     if (!net::IsHost()) return;
     auto it = d.known.find(name);
@@ -75,7 +93,7 @@ void QuestSnapshot(States& states)
 }
 
 // Through the game's own functions where one exists (journal entries, experience), else set directly.
-bool QuestApply(char const* name, uint8_t status)
+bool QuestApply(char const* name, uint32_t status)
 {
     gCQuestManager_PS* manager = Quests();
     const bCString id(name);
@@ -92,6 +110,47 @@ bool QuestApply(char const* name, uint8_t status)
     return false;
 }
 
+void QuestRuntimeSnapshot(States& states)
+{
+    auto& all = Quests()->AccessQuests();
+    for (int i = 0; i < all.GetCount(); ++i) {
+        auto* quest = static_cast<gCQuest_PS*>(all.AccessAt(i));
+        if (!quest) continue;
+        const std::string key = std::string(quest->AccessName().GetText()) + '\x1f';
+        states[key + "y"] = quest->AccessActivationTime_Year();
+        states[key + "d"] = quest->AccessActivationTime_Day();
+        states[key + "h"] = quest->AccessActivationTime_Hour();
+        auto& counters = quest->AccessDeliveryCounter();
+        states[key + "n"] = counters.GetCount();
+        for (int c = 0; c < counters.GetCount(); ++c)
+            states[key + "c" + std::to_string(c)] = static_cast<uint32_t>(counters.AccessAt(c));
+    }
+}
+bool QuestRuntimeApply(char const* name, uint32_t value)
+{
+    std::string id, field;
+    if (!policy::RuntimeKey(name, id, field)) return false;
+    auto* quest = Quests()->GetQuest(bCString(id.c_str()));
+    if (!quest) return false;
+    if (field == "y") quest->AccessActivationTime_Year() = value;
+    else if (field == "d") quest->AccessActivationTime_Day() = value;
+    else if (field == "h") quest->AccessActivationTime_Hour() = value;
+    else {
+        auto& counters = quest->AccessDeliveryCounter();
+        if (field == "n") {
+            if (value > 512) return false;
+            const int previous = counters.GetCount();
+            counters.SetCount(static_cast<int>(value));
+            for (int i = previous; i < counters.GetCount(); ++i) counters.AccessAt(i) = 0;
+        } else {
+            uint32_t index = 0;
+            if (!policy::Number(field.substr(1), index) || index >= static_cast<uint32_t>(counters.GetCount())) return false;
+            counters.AccessAt(static_cast<int>(index)) = static_cast<GEI32>(value);
+        }
+    }
+    return true;
+}
+
 // --- dialog options ---
 gCInfoManager_PS* Infos() { return Running() ? gCInfoManager_PS::GetInstance() : nullptr; }
 bool InfosReady() { return Infos() != nullptr; }
@@ -103,7 +162,7 @@ void InfoSnapshot(States& states)
         if (gCInfo_PS* info = all.AccessAt(i)) states[info->AccessName().GetText()] = info->AccessInfoGiven() ? 1 : 0;
 }
 
-bool InfoApply(char const* name, uint8_t given)
+bool InfoApply(char const* name, uint32_t given)
 {
     if (gCInfo_PS* info = Infos()->GetInfo(bCString(name))) info->AccessInfoGiven() = given != 0;
     return false;  // no game function marks a dialog as told without running it
@@ -134,26 +193,40 @@ void EventSnapshot(States& states)
     if (chapterSharing) states[ChapterEntry] = static_cast<uint8_t>(Entity(hero).PlayerMemory.Chapter);
 }
 
-bool EventApply(char const* name, uint8_t known)
+bool EventApply(char const* name, uint32_t known)
 {
     Entity hero(gCSession::GetInstance().GetHero());
     if (!std::strcmp(name, ChapterEntry)) {
         if (!chapterSharing) return true;
-        if (known && static_cast<int>(hero.PlayerMemory.Chapter) != known) Logf("story: chapter %d -> %d", static_cast<int>(hero.PlayerMemory.Chapter), known);
+        if (known && static_cast<uint32_t>(hero.PlayerMemory.Chapter) != known) Logf("story: chapter %d -> %u", static_cast<int>(hero.PlayerMemory.Chapter), known);
         if (known) hero.PlayerMemory.Chapter = known;
         return true;
     }
     const bCString event(name);
     if (known) hero.PlayerMemory.SetGameEvent(event);
     else hero.PlayerMemory.ClearGameEvent(event);
-    everSeen[name] = known;
+    everSeen[name] = known ? 1 : 0;
     return true;
 }
 
+bool ClockReady() { net::ClockState state{}; return clock::CaptureAdmission(state); }
+void ClockSnapshot(States& states)
+{
+    net::ClockState state{};
+    if (clock::CaptureAdmission(state)) states[policy::ClockText(state)] = 1;
+}
+bool ClockApply(char const* name, uint32_t value)
+{
+    if (!value) return true; // A cleared older date is not a second clock update.
+    net::ClockState state{};
+    return value == 1 && policy::ReadClock(name, state) && clock::RestoreAdmission(state);
+}
 Domain domains[] = {
     {net::StateQuests, "quests", &QuestsReady, &QuestSnapshot, &QuestApply},
     {net::StateInfos, "infos", &InfosReady, &InfoSnapshot, &InfoApply},
     {net::StateEvents, "events", &EventsReady, &EventSnapshot, &EventApply},
+    {net::StateQuestRuntime, "quest runtime", &QuestsReady, &QuestRuntimeSnapshot, &QuestRuntimeApply},
+    {net::StateWorldClock, "world clock", &ClockReady, &ClockSnapshot, &ClockApply},
 };
 
 Domain* Find(uint8_t kind)
@@ -163,60 +236,242 @@ Domain* Find(uint8_t kind)
     return nullptr;
 }
 
-void Send(Domain& d, std::vector<net::StateEntry> const& entries, uint8_t to = 0)
+bool BuildNames()
 {
-    for (size_t at = 0; at < entries.size(); at += net::MaxStatesPerMessage) {
-        const size_t left = entries.size() - at;
-        const int count = static_cast<int>(left < net::MaxStatesPerMessage ? left : net::MaxStatesPerMessage);
-        if (to) net::SendStatesTo(to, d.kind, entries.data() + at, count);
-        else net::SendStates(d.kind, entries.data() + at, count);
-        d.sent += count;
-    }
+    if (namesReady) return true;
+    if (!QuestsReady() || !InfosReady()) return false;
+    questNames.clear(); infoNames.clear();
+    auto add = [](auto& names, char const* name) {
+        const std::string id = policy::NameId(name);
+        const auto found = names.find(id);
+        if (found != names.end() && found->second != name) {
+            Logf("story: name identity collision id=%s; admission refused", id.c_str()); return false;
+        }
+        names[id] = name;
+        return true;
+    };
+    auto& quests = Quests()->AccessQuests();
+    auto& infos = Infos()->AccessInfos();
+    if (!quests.GetCount() || !infos.GetCount()) return false;
+    for (int i = 0; i < quests.GetCount(); ++i)
+        if (auto* q = static_cast<gCQuest_PS*>(quests.AccessAt(i)); q && !add(questNames, q->AccessName().GetText())) return false;
+    for (int i = 0; i < infos.GetCount(); ++i)
+        if (auto* info = infos.AccessAt(i); info && !add(infoNames, info->AccessName().GetText())) return false;
+    namesReady = true;
+    return true;
 }
 
-bool Entry(Domain& d, std::string const& name, uint8_t value, std::vector<net::StateEntry>& out)
+bool Send(Domain& d, std::vector<net::StateEntry> const& entries, uint8_t to = 0, bool snapshot = false, bool catchup = false)
 {
-    net::StateEntry entry{value, {}};
-    if (name.size() >= sizeof(entry.name)) { ++d.skipped; return false; }  // would arrive as another name
-    strcpy_s(entry.name, name.c_str());
+    const uint8_t kind = d.kind | (snapshot ? policy::Snapshot : 0) | (catchup ? policy::Catchup : 0);
+    auto ordered = entries;
+    if (d.kind == net::StateQuestRuntime)
+        std::stable_sort(ordered.begin(), ordered.end(), [](auto const& a, auto const& b) {
+            auto size = [](auto const& entry) {
+                std::string key, quest, field;
+                uint32_t value = 0;
+                return policy::UnpackRuntime(entry.name, key, value) && policy::RuntimeKey(key, quest, field) && field == "n";
+            };
+            return size(a) && !size(b);
+        });
+    for (size_t at = 0; at < ordered.size(); at += net::MaxStatesPerMessage) {
+        const size_t left = ordered.size() - at;
+        const int count = static_cast<int>(left < net::MaxStatesPerMessage ? left : net::MaxStatesPerMessage);
+        if (to ? !net::SendStatesTo(to, kind, ordered.data() + at, count) :
+                 !net::SendStates(kind, ordered.data() + at, count)) return false;
+        d.sent += count;
+    }
+    return true;
+}
+
+bool Entry(Domain& d, std::string const& name, uint32_t value, std::vector<net::StateEntry>& out)
+{
+    net::StateEntry entry{static_cast<uint8_t>(value), {}};
+    std::string packed = name;
+    if (d.kind == net::StateQuestRuntime) {
+        std::string quest, field;
+        if (!policy::RuntimeKey(name, quest, field) ||
+            !policy::PackRuntime(policy::NameId(quest) + '\x1f' + field, value, sizeof(entry.name), packed)) {
+            Logf("story: quest runtime cannot be encoded name=%s; snapshot refused", name.c_str());
+            ++d.skipped; return false;
+        }
+        entry.value = 1;
+    } else if (d.kind == net::StateQuests || d.kind == net::StateInfos) packed = policy::NameId(name);
+    if (packed.size() >= sizeof(entry.name)) {
+        Logf("story: named state too long kind=%u name=%s; snapshot refused", d.kind, name.c_str());
+        ++d.skipped; return false;
+    }
+    strcpy_s(entry.name, packed.c_str());
     out.push_back(entry);
     return true;
 }
 
-void Apply(Domain& d, char const* name, uint8_t value)
+void Apply(Domain& d, char const* name, uint32_t value, bool restoring = false)
 {
+    if (restoring && d.kind == net::StateQuests) {
+        if (auto* quest = Quests()->GetQuest(bCString(name)))
+            quest->AccessStatus() = static_cast<gEQuestStatus>(value);
+        ++d.applied;
+        return;
+    }
     if (!d.apply(name, value)) ++d.forced;
     ++d.applied;
 }
 
+bool CommitBaselines()
+{
+    for (Domain const& d : domains) if (!d.baseline.complete || !d.ready()) return false;
+    Domain& runtime = *Find(net::StateQuestRuntime);
+    for (auto const& entry : runtime.baseline.values) {
+        std::string quest, field;
+        uint32_t index = 0;
+        if (policy::RuntimeKey(entry.first, quest, field) && field[0] == 'c' &&
+            policy::Number(field.substr(1), index)) {
+            const auto count = runtime.baseline.values.find(quest + '\x1f' + "n");
+            if (count == runtime.baseline.values.end() || index >= count->second) {
+                Logf("story: contradictory quest counter baseline name=%s; admission retry required", quest.c_str());
+                runtime.baseline = {}; runtime.nextRequest = 0;
+                return false;
+            }
+        }
+    }
+    // Clock and runtime precede statuses; no Running quest evaluates against the fresh world's date.
+    for (Domain& d : domains) {
+        States current;
+        d.snapshot(current);
+        for (auto const& entry : current) {
+            if (d.kind == net::StateQuestRuntime) {
+                std::string quest, field;
+                uint32_t index = 0;
+                if (policy::RuntimeKey(entry.first, quest, field) && field[0] == 'c' &&
+                    policy::Number(field.substr(1), index)) {
+                    const auto length = d.baseline.values.find(quest + '\x1f' + "n");
+                    if (length == d.baseline.values.end() || index >= length->second) continue;
+                }
+            }
+            if (!d.baseline.values.count(entry.first)) d.baseline.values[entry.first] = 0;
+        }
+    }
+    for (auto const& entry : Find(net::StateWorldClock)->baseline.values)
+        if (entry.second && !ClockApply(entry.first.c_str(), entry.second)) return false;
+    for (int phase = 0; phase < 2; ++phase)
+        for (auto const& entry : runtime.baseline.values)
+            if ((entry.first.back() == 'n') == (phase == 0)) Apply(runtime, entry.first.c_str(), entry.second, true);
+    for (Domain& d : domains) {
+        if (d.kind != net::StateQuestRuntime && d.kind != net::StateWorldClock)
+            for (auto const& entry : d.baseline.values) Apply(d, entry.first.c_str(), entry.second, true);
+        d.known.clear();
+        for (auto const& entry : d.baseline.values) d.known[entry.first] = entry.second;
+        d.primed = true; d.wasConnected = true;
+        Logf("story: authoritative %s baseline restored entries=%zu rewards=0", d.label, d.known.size());
+    }
+    admissionApplied = true;
+    return true;
+}
+
 void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int count)
 {
-    Domain* d = Find(kind);
+    const bool snapshot = (kind & policy::Snapshot) != 0, end = (kind & policy::End) != 0;
+    const bool catchup = (kind & policy::Catchup) != 0;
+    Domain* d = Find(kind & policy::KindMask);
     if (disabled || !d || !d->ready()) return;
+    if (catchup && (net::IsHost() || from != 1 || !snapshot || end || count <= 0)) return;
     d->received += count;
-    if (net::IsHost() && count == 0) {
+    if (net::IsHost() && count == 0 && snapshot && !end) {
+        if (!net::InWorld(1) || !net::PeerJoined(from)) return;
         // A client entered the game (or reconnected): everything off its default, so it continues the
         // host's story. Existing peers already know it.
-        States current;
-        d->snapshot(current);
+        auto& replay = initialReplays[from];
+        const uint32_t generation = net::PeerGeneration(from);
+        if (replay.generation != generation) { replay = {}; replay.generation = generation; }
+        if (!replay.captured) {
+            for (Domain const& domain : domains) if (!domain.ready()) return;
+            for (Domain& domain : domains) domain.snapshot(replay.values[domain.kind - 1]);
+            replay.latest = replay.values;
+            replay.captured = true;
+        }
+        States const& current = replay.values[d->kind - 1];
         std::vector<net::StateEntry> all;
         size_t zeros = 0;
         for (auto const& [name, value] : current) {
-            if (value != 0) Entry(*d, name, value, all);
-            else if (fullZeros && d->zeroed.count(name) && Entry(*d, name, 0, all)) ++zeros;
+            if (value != 0 && !Entry(*d, name, value, all)) return;
+            else if (!value && fullZeros && d->zeroed.count(name) && Entry(*d, name, 0, all)) ++zeros;
         }
-        Send(*d, all, from);
+        const uint8_t wire = d->kind | policy::Snapshot;
+        const bool sent = net::SendStatesTo(from, wire, nullptr, 0) && Send(*d, all, from, true) &&
+                          net::SendStatesTo(from, wire | policy::End, nullptr, 0);
+        if (sent) replay.sent |= static_cast<uint8_t>(1u << (d->kind - 1));
+        if (!sent) Logf("story: full %s state queue failed player=%u; admission retry required", d->label, from);
         Logf("story: full %s state (%zu entries, %zu of them cleared here) for player %u", d->label, all.size(), zeros, from);
+        return;
+    }
+    if ((net::IsHost() && snapshot) || (!net::IsHost() && (!admissionRequested || (snapshot && !catchup && d->baseline.complete)))) return;
+    if (!net::IsHost() && snapshot && !count) {
+        if (!end) { d->baseline.Begin(); return; }
+        if (!d->baseline.Finish()) return;
+        CommitBaselines();
+        return;
+    }
+    std::vector<std::pair<std::string, uint32_t>> decoded;
+    auto reject = [&]() {
+        if (!net::IsHost() && snapshot) { d->baseline = {}; d->nextRequest = 0; }
+    };
+    for (int i = 0; i < count; ++i) {
+        std::string name = entries[i].name;
+        uint32_t value = entries[i].value;
+        if (d->kind == net::StateQuestRuntime &&
+            (entries[i].value != 1 || !policy::UnpackRuntime(name, name, value))) {
+            Logf("story: malformed quest runtime from player=%u; ignored", from); reject(); return;
+        }
+        if (d->kind == net::StateWorldClock) {
+            net::ClockState state{};
+            if (!snapshot || value > 1 || !policy::ReadClock(name, state)) {
+                Log("story: invalid bootstrap clock; admission retry required"); reject(); return;
+            }
+        }
+        if (d->kind != net::StateEvents && d->kind != net::StateWorldClock) {
+            if (!BuildNames()) { reject(); return; }
+            std::string id = name, field;
+            if (d->kind == net::StateQuestRuntime && !policy::RuntimeKey(name, id, field)) return;
+            auto const& names = d->kind == net::StateInfos ? infoNames : questNames;
+            auto found = names.find(id);
+            if (found == names.end()) {
+                Logf("story: unknown named-state identity=%s kind=%u; snapshot refused", id.c_str(), d->kind); reject(); return;
+            }
+            name = found->second;
+            if (d->kind == net::StateQuestRuntime) {
+                if ((field == "n" && value > 512) || (field == "h" && value > 23)) {
+                    Logf("story: invalid quest runtime field=%s value=%u; snapshot refused", field.c_str(), value); reject(); return;
+                }
+                name += '\x1f' + field;
+            }
+        }
+        if (d->kind == net::StateQuests && value > gEQuestStatus_Won) {
+            Logf("story: invalid quest status from player=%u; ignored", from); reject(); return;
+        }
+        if (d->kind == net::StateInfos && value > 1) {
+            Logf("story: invalid dialog-state flag from player=%u; ignored", from); reject(); return;
+        }
+        decoded.emplace_back(std::move(name), value);
+    }
+    if (!net::IsHost() && snapshot && !catchup) {
+        for (auto const& entry : decoded)
+            if (!d->baseline.Add(entry.first, entry.second)) return;
+        return;
+    }
+    if (!net::IsHost() && !admissionApplied) {
+        if (d->baseline.begun)
+            for (auto const& entry : decoded) d->baseline.values[entry.first] = entry.second;
         return;
     }
     if (net::IsHost()) {
         // A client changed these: apply, then tell everyone the host's resulting values.
-        for (int i = 0; i < count; ++i) Apply(*d, entries[i].name, entries[i].value);
+        for (auto const& entry : decoded) Apply(*d, entry.first.c_str(), entry.second);
         States current;
         d->snapshot(current);
         std::vector<net::StateEntry> result;
-        for (int i = 0; i < count; ++i) {
-            auto it = current.find(entries[i].name);
+        for (auto const& entry : decoded) {
+            auto it = current.find(entry.first);
             if (it == current.end()) continue;
             Track(*d, it->first, it->second);
             d->known[it->first] = it->second;
@@ -225,17 +480,31 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
         Send(*d, result);
         Logf("story: applied %d %s change(s) from player %u", count, d->label, from);
     } else {
-        for (int i = 0; i < count; ++i) {
-            d->known[entries[i].name] = entries[i].value;
-            Apply(*d, entries[i].name, entries[i].value);
+        for (auto const& entry : decoded) {
+            if (d->kind == net::StateWorldClock && !ClockApply(entry.first.c_str(), entry.second)) {
+                admissionApplied = false; d->baseline = {}; d->nextRequest = 0; return;
+            }
+            d->known[entry.first] = entry.second;
+            if (d->kind != net::StateWorldClock) Apply(*d, entry.first.c_str(), entry.second, catchup);
         }
     }
 }
 
 void Poll(Domain& d)
 {
-    if (!net::IsHost() && !net::Connected()) d.wasConnected = false;
-    if (!d.ready() || (!net::IsHost() && !net::Connected())) return;
+    if (!net::IsHost() && !net::Joined()) d.wasConnected = false;
+    if (!d.ready() || (net::IsHost() ? !net::InWorld(1) : !net::Joined() || !admissionRequested)) return;
+    if (!net::IsHost() && !admissionApplied) {
+        const DWORD now = GetTickCount();
+        if (!d.baseline.complete && static_cast<int32_t>(now - d.nextRequest) >= 0) {
+            d.nextRequest = now + 1000;
+            net::SendStates(d.kind | policy::Snapshot, nullptr, 0);
+            ++d.requests;
+        }
+        return;
+    }
+    if (d.kind == net::StateWorldClock) return; // Ordinary time sharing remains clock.cpp's existing protocol.
+    if (!net::IsHost() && !net::InWorld(net::LocalId())) return;
     States current;
     d.snapshot(current);
     if (!d.primed) {
@@ -244,11 +513,7 @@ void Poll(Domain& d)
             if (!d.known.count(name)) d.known[name] = value;
         d.primed = true;
     }
-    if (!net::IsHost() && !d.wasConnected) {
-        net::SendStates(d.kind, nullptr, 0);
-        ++d.requests;
-    }
-    d.wasConnected = net::IsHost() || net::Connected();
+    d.wasConnected = net::IsHost() || net::Joined();
     std::vector<net::StateEntry> changes;
     for (auto const& [name, value] : current) {
         auto it = d.known.find(name);
@@ -266,6 +531,66 @@ void Poll(Domain& d)
 
 void Start() { net::SetStateHandler(&OnStates); }
 
+void PrepareAdmission()
+{
+    if (net::IsHost()) return;
+    admissionRequested = true;
+    admissionApplied = false;
+    for (Domain& d : domains) {
+        d.baseline = {}; d.wasConnected = false; d.nextRequest = 0;
+    }
+}
+bool AdmissionReady()
+{
+    if (net::IsHost()) return true;
+    return admissionRequested && admissionApplied;
+}
+bool AdmissionStarted() { return admissionRequested; }
+bool FinishAdmission(unsigned char player)
+{
+    if (!net::IsHost() || player < 2 || player >= net::MaxPlayers) return false;
+    auto& replay = initialReplays[player];
+    if (!replay.captured || replay.sent != 0x1f || replay.generation != net::PeerGeneration(player)) return false;
+    std::array<States, 5> captured;
+    for (Domain& domain : domains) {
+        if (!domain.ready()) return false;
+        domain.snapshot(captured[domain.kind - 1]);
+    }
+    std::unordered_set<std::string> changedQuests;
+    for (auto const& entry : policy::Changes(replay.latest[net::StateQuests - 1], captured[net::StateQuests - 1]))
+        changedQuests.insert(entry.first);
+    for (uint8_t kind : {net::StateWorldClock, net::StateQuestRuntime, net::StateQuests, net::StateInfos, net::StateEvents}) {
+        Domain& d = *Find(kind);
+        States& current = captured[d.kind - 1];
+        States delta = policy::Changes(replay.latest[d.kind - 1], current);
+        if (kind == net::StateQuestRuntime) {
+            for (auto const& entry : delta) {
+                std::string quest, field;
+                if (policy::RuntimeKey(entry.first, quest, field)) changedQuests.insert(quest);
+            }
+            // Resizing a delivery counter requires its full row, not just the one changed element.
+            for (auto const& entry : current) {
+                std::string quest, field;
+                if (policy::RuntimeKey(entry.first, quest, field) && changedQuests.count(quest)) delta[entry.first] = entry.second;
+            }
+        }
+        std::vector<net::StateEntry> changes;
+        for (auto const& entry : delta) {
+            if (d.kind == net::StateQuestRuntime) {
+                std::string quest, field;
+                uint32_t index = 0;
+                if (policy::RuntimeKey(entry.first, quest, field) && field[0] == 'c' && policy::Number(field.substr(1), index)) {
+                    const auto size = current.find(quest + '\x1f' + "n");
+                    if (size == current.end() || index >= size->second) continue;
+                }
+            }
+            if (!Entry(d, entry.first, entry.second, changes)) return false;
+        }
+        if (!Send(d, changes, player, true, true)) return false;
+        replay.latest[d.kind - 1] = std::move(current);
+    }
+    return true;
+}
 // The client's known values were the host's as far as it knew them in the world before. After a load (the host's save,
 // or its own) the first poll took every difference to the loaded save for its own player's changes and sent them; the
 // host applied them, and what it changed during the client's load went back to the save's value (review 26.10.: a quest
@@ -273,11 +598,16 @@ void Start() { net::SetStateHandler(&OnStates); }
 // its first join, and asks for the host's full state.
 void OnWorldChange()
 {
+    namesReady = false;
+    initialReplays = {};
     if (!reloadReset || net::IsHost()) return;
+    admissionRequested = false;
+    admissionApplied = false;
     for (Domain& d : domains) {
         d.known.clear();
         d.primed = false;
         d.wasConnected = false;
+        d.baseline = {};
     }
     ++reloads;
 }

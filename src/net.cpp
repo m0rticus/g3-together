@@ -15,6 +15,7 @@
 #include "parity.h"
 #include "replication.h"
 #include "saving_policy.h"
+#include "saving_store.h"
 #include "steam.h"
 #include "ai.h"
 
@@ -28,10 +29,11 @@
 #include <utility>
 #include <vector>
 #include <cstddef>
+#include "story_policy.h"
 
 namespace g3t::net {
 namespace {
-constexpr uint16_t ProtocolVersion = saving::Protocol;  // 76: guarded rotations and exact sparse control packing
+constexpr uint16_t ProtocolVersion = saving::Protocol;  // 77: host-managed saves and guarded bone packing
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
 // UDP payload per datagram (ENet default 1392 = up to 1420-byte IP packets): VPNs such as Hamachi carry about 1400, so
 // stay well below (C, re/findings/hamachi-net-c.md, 21.10.). ENet splits larger messages into fragments of this size.
@@ -44,17 +46,15 @@ enum : uint8_t { MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 4
 enum : uint8_t { MsgPlayerActivity = 50 };
 enum : uint8_t { MsgPoseAck = 51 };
 enum : uint8_t { MsgNpcRemoval = 52 };
+constexpr uint8_t MsgCharacter = 53;
 constexpr uint8_t MsgPlayerResync = 60;
 constexpr uint8_t MsgNpcLease = 61;
 
 #pragma pack(push, 1)
 struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };
 struct RefusedMsg { uint8_t type; char reason[160]; };
-struct CampaignMsg { uint8_t type; uint8_t kind; char name[64]; };
 struct ClockMsg { uint8_t type; ClockState state; };
 struct WorldStateMsg { uint8_t type; WorldState state; };
-struct FileChunkHeader { uint8_t type; uint8_t file; uint32_t total; uint32_t offset; uint16_t length; };
-struct FileDoneMsg { uint8_t type; char name[64]; uint32_t size[FileCount]; uint32_t crc[FileCount]; };
 struct Welcome { uint8_t type; uint8_t id; };
 struct State { uint8_t type; PlayerState state; };
 struct ActivityMsg {
@@ -112,9 +112,11 @@ struct NpcSpellMsg { uint8_t type; uint8_t from; uint8_t to; char script[32]; ui
 struct EnclaveMsg { uint8_t type; EnclaveNote note; };
 struct WorldMsg { uint8_t type; WorldNote note; };
 struct SaveMsg { uint8_t type; SaveNote note; };
+struct CharacterMsg { uint8_t type; CharacterNote note; };
 #pragma pack(pop)
 static_assert(sizeof(NpcsHeader) == 23, "NPC datagram budget must match its wire header");
 static_assert(sizeof(SaveMsg) == 122, "save message wire layout changed");
+static_assert(sizeof(CharacterMsg) == 88, "character envelope wire layout changed");
 static_assert(sizeof(ActivityMsg) == 19, "player activity heartbeat wire layout changed");
 static_assert(sizeof(BoneRequestMsg) == 7, "Bone request wire layout changed");
 static_assert(sizeof(BonePosePrefix) == 4 && sizeof(PoseAckMsg) == 37, "Pose interval/ack wire layout changed");
@@ -226,11 +228,8 @@ TxResultHandler txResultHandler = nullptr;
 WatchHandler watchHandler = nullptr;
 KilledHandler killedHandler = nullptr;
 DeathHandler deathHandler = nullptr;
-CampaignHandler campaignHandler = nullptr;
 ClockHandler clockHandler = nullptr;
 WorldStateHandler worldStateHandler = nullptr;
-FileChunkHandler fileChunkHandler = nullptr;
-FileDoneHandler fileDoneHandler = nullptr;
 ENetPeer* peers[MaxPlayers] = {};  // host side: peer for each client id
 SummonHandler summonHandler = nullptr;
 ShotHandler shotHandler = nullptr;
@@ -245,6 +244,7 @@ NpcSpellHandler npcSpellHandler = nullptr;
 EnclaveHandler enclaveHandler = nullptr;
 WorldHandler worldHandler = nullptr;
 SaveHandler saveHandler = nullptr;
+CharacterHandler characterHandler = nullptr;
 bool inWorld = false;                  // client side: this machine is in the host's world (persist.cpp)
 bool clientInWorld[MaxPlayers] = {};   // host side: that client is in the host's world
 uint32_t generations[MaxPlayers] = {}; // host side: counts the connections a slot was given (PeerGeneration)
@@ -258,16 +258,6 @@ uint32_t queuedAt = 0, lastServiceAt = 0;
 latency::Samples enqueueDelays, serviceGaps;
 unsigned serviceCaps = 0, serviceErrors = 0;
 steam::TrafficCounters lastSteamTraffic;
-struct FileTransfer {
-    SaveNote note;
-    FileDoneMsg done{};
-    std::vector<uint8_t> files[FileCount];
-    uint32_t generation = 0, progressedAt = 0;
-    uint32_t offset = 0;
-    uint8_t file = 0;
-    bool active = false, prefixed = false;
-};
-FileTransfer fileTransfers[MaxPlayers];
 struct BulkRefusal {
     uint32_t at = 0;
     int reason = -1;
@@ -330,18 +320,39 @@ void UpdateBudgets(uint32_t now)
     }
 }
 
-// What passes the world gate: joining, campaign notifications, the save transfer and the world messages. Motion names wait for the world too
+// What passes the world gate: joining, small save/character controls and world messages. Motion names wait for the world too
 // (Fable's review 22.10. 1.8: they were open to a peer that never said Hello); the host resends them all on entry.
 bool Gated(uint8_t type)
 {
     switch (type) {
     case MsgHello: case MsgWelcome: case MsgRefused: case MsgLeave:
-    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld: case MsgSave:
+    case MsgWorld: case MsgSave: case MsgCharacter:
     case MsgPlayerActivity:
         return false;
     default:
         return true;
     }
+}
+
+bool StoryHandshake(void const* data, size_t size)
+{
+    if (size < sizeof(StatesHeader) || static_cast<uint8_t const*>(data)[0] != MsgStates) return false;
+    StatesHeader header{};
+    std::memcpy(&header, data, sizeof(header));
+    const uint8_t kind = header.kind & story::policy::KindMask;
+    return (header.kind & story::policy::Snapshot) && kind >= StateQuests && kind <= StateWorldClock &&
+           header.count <= MaxStatesPerMessage && size == sizeof(header) + header.count * sizeof(StateEntry) &&
+           (!(header.kind & story::policy::End) || !header.count) &&
+           (!(header.kind & story::policy::Catchup) || (header.count && !(header.kind & story::policy::End)));
+}
+
+bool DoorHandshake(void const* data, size_t size)
+{
+    if (size != sizeof(WorldStateMsg) || static_cast<uint8_t const*>(data)[0] != MsgWorldState) return false;
+    WorldStateMsg message{};
+    std::memcpy(&message, data, sizeof(message));
+    return message.state.kind == 10 && (message.state.npcClass == 0x80 ||
+           ((message.state.npcClass & 0x40) && !(message.state.npcClass & ~0x43)));
 }
 
 bool XpHandshake(void const* data, size_t size)
@@ -370,7 +381,8 @@ PoseRoute poseRoutes[MaxPlayers];
 bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool reliable)
 {
     if (!host || !peer || (size && !data)) return false;
-    if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !XpHandshake(data, size) && !Open(peer)) { ++gatedOut; return false; }
+    if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !XpHandshake(data, size) &&
+        !(reliable && (StoryHandshake(data, size) || DoorHandshake(data, size))) && !Open(peer)) { ++gatedOut; return false; }
     const BudgetClass priority = SendPriority(size ? static_cast<uint8_t const*>(data)[0] : 0, channel, reliable);
     const uint64_t charge = BudgetCharge(size, peer->mtu, relayEnvelopeBytes, host->checksum ? 4 : 0);
     PeerBudget& budget = peerBudgets[PeerIndex(peer)];
@@ -424,17 +436,7 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
             Log("net: outgoing packet could not be queued");
             return false;
         }
-        auto& refusal = bulkRefusals[PeerIndex(peer)];
-        const uint32_t now = enet_time_get();
-        if (!refusal.at || refusal.reason != -1 || now - refusal.at >= 5000) {
-            refusal = {now | 1u, -1};
-            const unsigned to = static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer->data));
-            const auto& transfer = fileTransfers[to < MaxPlayers ? to : 0];
-            Logf("net: outgoing packet could not be queued player=%u save=%s file=%u offset=%u channel=%u kind=%u bytes=%zu enet=%d queue=%u in_flight=%u",
-                 to, transfer.note.save, transfer.file, transfer.offset, channel,
-                 size ? static_cast<uint8_t const*>(data)[0] : 0, size, queued,
-                 QueueBytes(peer->outgoingCommands) + QueueBytes(peer->outgoingSendReliableCommands), peer->reliableDataInTransit);
-        }
+        Logf("net: outgoing bulk packet could not be queued channel=%u bytes=%zu enet=%d", channel, size, queued);
         return false;
     }
     budget.CommitQueued(priority, charge);
@@ -633,8 +635,6 @@ void Drop(uint8_t id)
     for (auto& senders : playerSenders) senders[id] = {};
     for (auto& forced : forcePlayerFull[id]) forced = false;
     for (auto& forced : forcePlayerFull) forced[id] = false;
-    if (fileTransfers[id].active) Logf("net: checkpoint transfer canceled after player %u disconnected", id);
-    fileTransfers[id] = {};
     peers[id] = nullptr;
     clientInWorld[id] = false;
     goodsCache[id].clear();
@@ -892,7 +892,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     const uint8_t type = packet->data[0];
     if (type == MsgPosedNpc || type == MsgCompactPosedNpc || type == MsgControlPose) ++poseReceived;
     const bool xpHandshake = XpHandshake(packet->data, packet->dataLength);
-    if (Gated(type) && !xpHandshake && !Open(peer)) { ++gatedIn; return; }  // live XP/reproduction waits for the world gate
+    const bool storyHandshake = (packet->flags & ENET_PACKET_FLAG_RELIABLE) &&
+                               (StoryHandshake(packet->data, packet->dataLength) || DoorHandshake(packet->data, packet->dataLength));
+    if (Gated(type) && !xpHandshake && !storyHandshake && !Open(peer)) { ++gatedIn; return; }
     if (type == MsgNpcLease) {
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
         if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) ||
@@ -1532,9 +1534,17 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         if (hitPlayerHandler) hitPlayerHandler(message.delta, message.attacker, message.attackerPlayer, message.meansToKill != 0);
     } else if (type == MsgStates && packet->dataLength >= sizeof(StatesHeader)) {
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && peer != server)) return;
         StatesHeader header;
         std::memcpy(&header, packet->data, sizeof(header));
+        const uint8_t domain = header.kind & story::policy::KindMask;
+        const bool snapshot = (header.kind & story::policy::Snapshot) != 0;
+        if (domain < StateQuests || domain > StateWorldClock ||
+            ((header.kind & story::policy::End) && (!snapshot || header.count)) ||
+            ((header.kind & story::policy::Catchup) && (!snapshot || !header.count || (header.kind & story::policy::End))) ||
+            (isHost && snapshot && (header.count || (header.kind & (story::policy::End | story::policy::Catchup))))) return;
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && !connected)) return;
         if (header.count <= MaxStatesPerMessage && packet->dataLength == sizeof(header) + header.count * sizeof(StateEntry) &&
             stateHandler && from) {
             StateEntry entries[MaxStatesPerMessage];
@@ -1754,17 +1764,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         const uint8_t from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
         if (watchHandler && from) watchHandler(from, message.guid);
-    } else if (type == MsgFileChunk && !isHost && packet->dataLength >= sizeof(FileChunkHeader)) {
-        FileChunkHeader header;
-        std::memcpy(&header, packet->data, sizeof(header));
-        if (packet->dataLength == sizeof(header) + header.length && fileChunkHandler)
-            fileChunkHandler(header.file, header.total, header.offset, packet->data + sizeof(header), header.length);
-    } else if (type == MsgFileDone && !isHost && packet->dataLength == sizeof(FileDoneMsg)) {
-        FileDoneMsg message;
-        std::memcpy(&message, packet->data, sizeof(message));
-        message.name[sizeof(message.name) - 1] = 0;
-        if (fileDoneHandler) fileDoneHandler(message.name, message.size, message.crc);
     } else if (type == MsgWorldState && packet->dataLength == sizeof(WorldStateMsg)) {
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && peer != server)) return;
         WorldStateMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         message.state.routine[sizeof(message.state.routine) - 1] = 0;
@@ -1784,27 +1785,39 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         ClockMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         if (clockHandler) clockHandler(message.state);
+    } else if (type == MsgCharacter && packet->dataLength >= sizeof(CharacterMsg)) {
+        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && (!connected || peer != server)) ||
+            !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
+        CharacterMsg message{};
+        std::memcpy(&message, packet->data, sizeof(message));
+        auto const& note = message.note;
+        if (note.world[32] || note.save[32] || !saving::Id(note.world) || !saving::Id(note.save) ||
+            !note.epoch || !note.account || note.length > saving::store::PlayerLimit ||
+            packet->dataLength - sizeof(message) != note.length ||
+            (isHost ? note.purpose != CharacterCapture || note.account != steam::PeerId(peer->address.port)
+                    : note.purpose != CharacterRestore || note.account != steam::PlayerId())) return;
+        std::vector<uint8_t> bytes(packet->data + sizeof(message), packet->data + packet->dataLength);
+        if (note.crc != saving::store::Crc(bytes)) {
+            Logf("net: character record CRC refused player=%u save=%s bytes=%u", from, note.save, note.length);
+            return;
+        }
+        if (characterHandler) characterHandler(from, note, bytes);
     } else if (type == MsgSave && packet->dataLength == sizeof(SaveMsg)) {
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
-        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && !connected)) return;
+        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && (!connected || peer != server))) return;
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         SaveMsg message{};
         std::memcpy(&message, packet->data, sizeof(message));
         SaveNote const& note = message.note;
         if (note.world[32] || note.save[32] || note.name[48] || note.ok > 1) return;
-        const bool clientOp = note.op == SaveRequest || note.op == SaveReady || note.op == SaveStored || note.op == SaveCancel;
-        const bool hostOp = note.op == SavePrepare || note.op == SaveCommit || note.op == SaveCancel ||
-                            note.op == SaveResult || note.op == SaveImport;
+        const bool clientOp = note.op == SaveRequest || note.op == SaveReady || note.op == SaveCancel;
+        const bool hostOp = note.op == SavePrepare || note.op == SaveCancel || note.op == SaveResult;
         if ((isHost && !clientOp) || (!isHost && !hostOp)) return;
         // A client may cancel its request before Prepare supplies the shared-world ID.
         const bool pendingCancel = isHost && note.op == SaveCancel && !*note.world;
-        if (!note.epoch || (note.op != SaveRequest && ((!pendingCancel && !saving::Id(note.world)) ||
-            !saving::Id(note.save)))) return;
+        if (!note.epoch || !saving::Id(note.save) || (!pendingCancel && !saving::Id(note.world))) return;
         if (saveHandler) saveHandler(from, note);
-    } else if (type == MsgCampaign && !isHost && packet->dataLength == sizeof(CampaignMsg)) {
-        CampaignMsg message;
-        std::memcpy(&message, packet->data, sizeof(message));
-        message.name[sizeof(message.name) - 1] = 0;
-        if (campaignHandler) campaignHandler(message.kind, message.name);
     } else if (type == MsgDeath && !isHost && packet->dataLength == sizeof(DeathMsg)) {
         DeathMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
@@ -1825,6 +1838,10 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         message.note.campaign[sizeof(message.note.campaign) - 1] = 0;
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || !message.note.epoch || message.note.kind > KindSaved ||
+            (isHost ? from < 2 || from >= MaxPlayers || peers[from] != peer ||
+                      (message.note.op != WorldReady && message.note.op != WorldWaiting && message.note.op != WorldOther)
+                    : peer != server || !connected || (message.note.op != WorldHost && message.note.op != WorldReady))) return;
         if (!isHost && message.note.op == WorldHost && worldEpoch != message.note.epoch) {
             ResetNpcReplication();
             worldEpoch = message.note.epoch;
@@ -1927,9 +1944,9 @@ char const* PeerName(uint8_t id) { return id < MaxPlayers ? remotes[id].latest.n
 void GateCounts(unsigned& in, unsigned& out) { in = gatedIn; out = gatedOut; }
 void SetWorldHandler(WorldHandler handler) { worldHandler = handler; }
 
-void SendWorld(WorldNote const& note, uint8_t to)
+bool SendWorld(WorldNote const& note, uint8_t to)
 {
-    if (!host) return;
+    if (!host) return false;
     if (isHost && note.op == WorldHost && worldEpoch != note.epoch) {
         ResetNpcReplication();
         worldEpoch = note.epoch;
@@ -1937,9 +1954,10 @@ void SendWorld(WorldNote const& note, uint8_t to)
     const WorldMsg message{MsgWorld, note};
     if (isHost) {
         if (to > 1 && to < MaxPlayers && peers[to])
-            SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
+            return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
     } else if (server && connected)
-        SendToServer(&message, sizeof(message), ChannelReliable, true);
+        return Send(server, &message, sizeof(message), ChannelReliable, true);
+    return false;
 }
 
 uint32_t HashName(char const* name) { return HashWorld(name); }
@@ -2453,8 +2471,27 @@ void SetKilledHandler(KilledHandler handler) { killedHandler = handler; }
 
 void SetDeathHandler(DeathHandler handler) { deathHandler = handler; }
 
-void SetCampaignHandler(CampaignHandler handler) { campaignHandler = handler; }
 void SetSaveHandler(SaveHandler handler) { saveHandler = handler; }
+void SetCharacterHandler(CharacterHandler handler) { characterHandler = handler; }
+uint64_t PeerAccount(uint8_t id)
+{
+    return isHost && id >= 2 && id < MaxPlayers && peers[id] ? steam::PeerId(peers[id]->address.port) : 0;
+}
+bool SendCharacter(uint8_t to, CharacterNote const& note, std::vector<uint8_t> const& bytes)
+{
+    if (!host || note.length != bytes.size() || bytes.size() > saving::store::PlayerLimit ||
+        note.crc != saving::store::Crc(bytes)) return false;
+    const CharacterMsg message{MsgCharacter, note};
+    std::vector<uint8_t> packet(sizeof(message) + bytes.size());
+    std::memcpy(packet.data(), &message, sizeof(message));
+    if (!bytes.empty()) std::memcpy(packet.data() + sizeof(message), bytes.data(), bytes.size());
+    if (isHost) {
+        if (to < 2 || to >= MaxPlayers || !peers[to] || note.purpose != CharacterRestore) return false;
+        return Send(peers[to], packet.data(), packet.size(), ChannelReliable, true);
+    }
+    return connected && server && to == 1 && note.purpose == CharacterCapture &&
+           Send(server, packet.data(), packet.size(), ChannelReliable, true);
+}
 
 bool SendSave(uint8_t to, SaveNote const& note)
 {
@@ -2483,13 +2520,15 @@ void SendWorldState(WorldState const& state, uint8_t except)
         return;
     }
     // A client may still pay to revive a partner; the host binds kind 8/9's helper to the sending peer.
-    if (!host || (!isHost && state.kind != 8 && state.kind != 9)) return;
+    if (!host || (!isHost && state.kind != 8 && state.kind != 9 && state.kind != 10)) return;
     SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
 }
 
 bool SendWorldStateTo(uint8_t to, WorldState const& state)
 {
-    if (state.kind != 19 || state.dialog > 3 || state.npcClass != localId) return false;
+    if (state.kind == 19) {
+        if (state.dialog > 3 || state.npcClass != localId) return false;
+    } else if (state.kind != 10 || (isHost ? !(state.npcClass & 0x40) : state.npcClass != 0x80)) return false;
     const WorldStateMsg message{MsgWorldState, state};
     if (isHost) {
         if (to < 2 || to >= MaxPlayers || !peers[to]) return false;
@@ -2502,140 +2541,6 @@ void SendClock(ClockState const& state)
 {
     if (!host) return;
     const ClockMsg message{MsgClock, state};
-    SendBroadcast(&message, sizeof(message), ChannelReliable, true);
-}
-
-void SetFileHandlers(FileChunkHandler chunk, FileDoneHandler done)
-{
-    fileChunkHandler = chunk;
-    fileDoneHandler = done;
-}
-
-bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, void const* data, uint16_t length)
-{
-    if (!host || !isHost || to >= MaxPlayers || !peers[to]) return false;
-    static uint8_t buffer[sizeof(FileChunkHeader) + MaxChunk];
-    if (!data || !length || length > MaxChunk || file >= FileCount || offset > total || length > total - offset) return false;
-    const FileChunkHeader header{MsgFileChunk, file, total, offset, length};
-    std::memcpy(buffer, &header, sizeof(header));
-    std::memcpy(buffer + sizeof(header), data, length);
-    return Send(peers[to], buffer, sizeof(header) + length, ChannelBulk, true);
-}
-
-bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount])
-{
-    if (!host || !isHost || to >= MaxPlayers || !peers[to]) return false;
-    FileDoneMsg message{MsgFileDone, {}, {}, {}};
-    strncpy_s(message.name, name, _TRUNCATE);
-    std::memcpy(message.size, size, sizeof(message.size));
-    std::memcpy(message.crc, crc, sizeof(message.crc));
-    return Send(peers[to], &message, sizeof(message), ChannelBulk, true);
-}
-
-bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
-                       std::vector<uint8_t> (&files)[FileCount],
-                       uint32_t const size[FileCount], uint32_t const crc[FileCount])
-{
-    char const* rejected = !host || !isHost ? "not-host" : to < 2 || to >= MaxPlayers ? "recipient" :
-        !peers[to] || peers[to]->state != ENET_PEER_STATE_CONNECTED || !generations[to] ? "disconnected" :
-        fileTransfers[to].active ? "busy" : !name || !saving::SafeName(name) ? "name" :
-        (note.op != SaveCommit && note.op != SaveImport) ? "operation" : nullptr;
-    if (rejected) {
-        Logf("net: checkpoint queue refused player=%u reason=%s", to, rejected);
-        return false;
-    }
-    constexpr uint32_t FileLimit = 64u * 1024 * 1024;
-    for (int f = 0; f < FileCount; ++f) {
-        if (!size[f] || size[f] > FileLimit || files[f].size() != size[f]) {
-            Logf("net: checkpoint queue refused player=%u reason=file-size file=%d declared=%u actual=%zu limit=%u",
-                 to, f, size[f], files[f].size(), FileLimit);
-            return false;
-        }
-    }
-    FileTransfer transfer;
-    transfer.note = note;
-    transfer.done.type = MsgFileDone;
-    strncpy_s(transfer.done.name, name, _TRUNCATE);
-    std::memcpy(transfer.done.size, size, sizeof(transfer.done.size));
-    std::memcpy(transfer.done.crc, crc, sizeof(transfer.done.crc));
-    for (int f = 0; f < FileCount; ++f) transfer.files[f] = std::move(files[f]);
-    transfer.generation = generations[to];
-    transfer.progressedAt = enet_time_get();
-    transfer.active = true;
-    fileTransfers[to] = std::move(transfer);
-    const uint32_t chunks = (size[0] + MaxChunk - 1) / MaxChunk + (size[1] + MaxChunk - 1) / MaxChunk +
-                            (size[2] + MaxChunk - 1) / MaxChunk;
-    Logf("net: checkpoint transfer paced player=%u save=%s bytes=%llu chunks=%u chunk=%u bulk_bytes_per_s=%u queue=%u in_flight=%u",
-         to, note.save, uint64_t(size[0]) + size[1] + size[2], chunks, MaxChunk, budgetRate / 4,
-         QueueBytes(peers[to]->outgoingCommands) + QueueBytes(peers[to]->outgoingSendReliableCommands),
-         peers[to]->reliableDataInTransit);
-    return true;
-}
-
-bool FileTransferBusy(uint8_t to) { return to < MaxPlayers && fileTransfers[to].active; }
-
-void CancelFileTransfers(char const* save)
-{
-    for (uint8_t i = 2; i < MaxPlayers; ++i) {
-        if (save && std::strcmp(fileTransfers[i].note.save, save)) continue;
-        if (fileTransfers[i].active) Logf("net: checkpoint transfer canceled for player %u", i);
-        fileTransfers[i] = {};
-    }
-}
-
-namespace {
-void PumpFileTransfers()
-{
-    if (!isHost) return;
-    const uint32_t now = enet_time_get();
-    for (uint8_t to = 2; to < MaxPlayers; ++to) {
-        FileTransfer& transfer = fileTransfers[to];
-        if (!transfer.active) continue;
-        if (!peers[to] || generations[to] != transfer.generation || now - transfer.progressedAt >= 180000) {
-            Logf("net: checkpoint transfer canceled player=%u save=%s reason=%s file=%u offset=%u age_ms=%u",
-                 to, transfer.note.save, !peers[to] ? "disconnected" :
-                 generations[to] != transfer.generation ? "generation" : "no-progress",
-                 transfer.file, transfer.offset, now - transfer.progressedAt);
-            transfer = {};
-            continue;
-        }
-        if (!transfer.prefixed) {
-            const SaveMsg prefix{MsgSave, transfer.note};
-            if (!Send(peers[to], &prefix, sizeof(prefix), ChannelBulk, true)) continue;
-            transfer.prefixed = true;
-            transfer.progressedAt = now;
-            Logf("net: checkpoint prefix queued player=%u save=%s channel=%u", to, transfer.note.save, ChannelBulk);
-        }
-        for (unsigned chunks = 0; chunks < 4 && transfer.file < FileCount; ++chunks) {
-            auto const& bytes = transfer.files[transfer.file];
-            const uint16_t length = static_cast<uint16_t>((std::min)(size_t(MaxChunk), bytes.size() - transfer.offset));
-            if (!SendFileChunk(to, transfer.file, static_cast<uint32_t>(bytes.size()), transfer.offset,
-                               bytes.data() + transfer.offset, length)) break;
-            transfer.offset += length;
-            transfer.progressedAt = now;
-            if (transfer.offset == bytes.size()) {
-                Logf("net: checkpoint file queued player=%u save=%s file=%u bytes=%zu",
-                     to, transfer.note.save, transfer.file, bytes.size());
-                transfer.offset = 0;
-                ++transfer.file;
-            }
-        }
-        if (transfer.file == FileCount &&
-            Send(peers[to], &transfer.done, sizeof(transfer.done), ChannelBulk, true)) {
-            Logf("net: checkpoint transfer fully queued player=%u save=%s queue=%u in_flight=%u",
-                 to, transfer.note.save, QueueBytes(peers[to]->outgoingCommands) +
-                 QueueBytes(peers[to]->outgoingSendReliableCommands), peers[to]->reliableDataInTransit);
-            transfer = {};
-        }
-    }
-}
-}
-
-void SendCampaign(uint8_t kind, char const* name)
-{
-    if (!host || !isHost) return;
-    CampaignMsg message{MsgCampaign, kind, {}};
-    strncpy_s(message.name, name, _TRUNCATE);
     SendBroadcast(&message, sizeof(message), ChannelReliable, true);
 }
 
@@ -2855,9 +2760,10 @@ void SendTalk(bool begin, uint8_t const guid[16])
 }
 
 namespace {
-void QueueStates(uint8_t to, uint8_t kind, StateEntry const* entries, int count)
+bool QueueStates(uint8_t to, uint8_t kind, StateEntry const* entries, int count)
 {
-    if (!host || count < 0 || count > MaxStatesPerMessage || (count == 0 && isHost)) return;
+    if (!host || count < 0 || count > MaxStatesPerMessage || (count && !entries) ||
+        (count == 0 && isHost && !(kind & story::policy::Snapshot))) return false;
     constexpr int Batch = (1168 - sizeof(StatesHeader)) / sizeof(StateEntry);
     uint8_t buffer[sizeof(StatesHeader) + Batch * sizeof(StateEntry)];
     for (int at = 0; at < count || (at == 0 && count == 0); at += Batch) {
@@ -2866,13 +2772,18 @@ void QueueStates(uint8_t to, uint8_t kind, StateEntry const* entries, int count)
         std::memcpy(buffer, &header, sizeof(header));
         if (chunk) std::memcpy(buffer + sizeof(header), entries + at, chunk * sizeof(StateEntry));
         const size_t size = sizeof(header) + chunk * sizeof(StateEntry);
-        if (to) SendToPeer(buffer, size, ChannelReliable, true, to);
-        else SendBroadcast(buffer, size, ChannelReliable, true);
+        if (!isHost) {
+            if (!connected || !server || (to && to != 1) || !Send(server, buffer, size, ChannelReliable, true)) return false;
+        } else if (to) {
+            if (to < 2 || to >= MaxPlayers || !peers[to] || !Send(peers[to], buffer, size, ChannelReliable, true)) return false;
+        } else for (uint8_t id = 2; id < MaxPlayers; ++id)
+            if (peers[id] && Open(peers[id]) && !Send(peers[id], buffer, size, ChannelReliable, true)) return false;
     }
+    return true;
 }
 }
-void SendStates(uint8_t kind, StateEntry const* entries, int count) { QueueStates(0, kind, entries, count); }
-void SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count) { QueueStates(to, kind, entries, count); }
+bool SendStates(uint8_t kind, StateEntry const* entries, int count) { return QueueStates(0, kind, entries, count); }
+bool SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count) { return QueueStates(to, kind, entries, count); }
 
 void SendMotionName(uint32_t hash, char const* name)
 {
@@ -2888,7 +2799,6 @@ void Stop()
 {
     // Tell the others right away; otherwise a closed game only shows up after the long peer timeout.
     if (host) {
-        CancelFileTransfers();
         if (isHost) {
             for (uint8_t i = 2; i < MaxPlayers; ++i)
                 if (peers[i]) enet_peer_disconnect_now(peers[i], 0);
@@ -2934,11 +2844,8 @@ void Stop()
     watchHandler = nullptr;
     killedHandler = nullptr;
     deathHandler = nullptr;
-    campaignHandler = nullptr;
     clockHandler = nullptr;
     worldStateHandler = nullptr;
-    fileChunkHandler = nullptr;
-    fileDoneHandler = nullptr;
     summonHandler = nullptr;
     shotHandler = nullptr;
     ragdollHandler = nullptr;
@@ -3126,7 +3033,6 @@ void Service(PlayerState const& local, bool haveLocal)
 void Flush()
 {
     if (!host || g3t::ai::ShuttingDown()) return;
-    PumpFileTransfers();
     if (haveQueued) {
         enqueueDelays.Add(enet_time_get() - queuedAt);
         haveQueued = false;

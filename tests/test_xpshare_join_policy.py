@@ -30,7 +30,8 @@ class XPShareJoinPolicyTests(unittest.TestCase):
         self.assertIn("peer.outgoing.Total(earned)", source)
         self.assertIn("peer.Snapshot(theirNonce, theirEarned)", source)
         net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
-        self.assertIn("!XpHandshake(data, size) && !Open(peer)", net)
+        self.assertIn("!XpHandshake(data, size)", net)
+        self.assertIn("!Open(peer)) { ++gatedOut; return false; }", net)
         self.assertIn("XpHandshake(packet->data, packet->dataLength)", net)
         self.assertIn("peers[from] != peer || message.state.npcClass != from", net)
 

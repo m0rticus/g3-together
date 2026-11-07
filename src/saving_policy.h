@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace g3t::saving {
-constexpr uint16_t Protocol = 76;
+constexpr uint16_t Protocol = 77;
 
 inline bool Id(std::string const& value)
 {
@@ -57,83 +57,34 @@ inline bool SameCharacter(Key const& a, Key const& b)
     return Valid(a) && Valid(b) && a.world == b.world && a.player == b.player;
 }
 inline bool Exact(Key const& a, Key const& b) { return SameCharacter(a, b) && a.save == b.save; }
-inline std::string Slot(std::string const& save) { return Id(save) ? "G3T_" + save : std::string(); }
-inline std::string RecordName(Key const& key, bool latest)
-{
-    return "g3t-character-" + key.world + "-" + std::to_string(key.player) + "-" +
-           (latest ? "latest" : key.save) + ".txt";
-}
-inline uint64_t LegacyNativeOwner(std::string const& slot, uint64_t localAccount)
-{
-    return Prefix(slot, "G3T_host_") ? UINT64_MAX : localAccount;
-}
-inline bool ChunkFits(uint32_t declared, size_t received, uint32_t total, uint32_t offset,
-                      uint16_t length, uint32_t limit)
-{
-    return total && total <= limit && (!declared || declared == total) && length &&
-           offset <= total && length <= total - offset && received == offset;
-}
-inline bool PreparedMatches(Key const& captured, Key const& incoming, uint32_t welcome,
-                            uint32_t currentWelcome, uint32_t epoch, uint32_t currentEpoch,
-                            std::string const& slot, std::string const& incomingSlot)
-{
-    return Exact(captured, incoming) && welcome == currentWelcome && epoch == currentEpoch &&
-           SafeName(slot.c_str()) && slot == incomingSlot;
-}
-inline bool WorldMatches(uint32_t hostEpoch, uint32_t admittedEpoch, uint32_t loadedEpoch,
-                         bool sameCheckpoint, bool freshNewWorld)
-{
-    return hostEpoch && (admittedEpoch == hostEpoch || (loadedEpoch == hostEpoch && sameCheckpoint) || freshNewWorld);
-}
 inline char const* NativeSaveRefusal(bool dialog, bool controlled, bool dead, bool defeated)
 {
     return dialog ? "dialog" : controlled ? "control" : dead ? "dead" : defeated ? "defeated" : nullptr;
 }
 
-enum class Restore { Exact, Latest, Legacy, NewHero, Wait };
-inline Restore Select(bool exactExists, bool latestExists, bool legacyExists, bool cleanHero)
-{
-    // Existence, not validity: a damaged exact record must be refused, never bypassed.
-    return exactExists ? Restore::Exact : latestExists ? Restore::Latest : legacyExists ? Restore::Legacy
-         : cleanHero ? Restore::NewHero : Restore::Wait;
-}
-
-struct Barrier {
-    enum Phase { Idle, Preparing, Writing, Committing };
-    struct Member { uint32_t generation = 0; bool ready = false, stored = false, queued = false; };
+struct CaptureRound {
+    struct Member {
+        uint32_t generation = 0, nextTry = 0;
+        uint64_t account = 0;
+        bool ready = false;
+    };
+    bool active = false;
+    uint32_t epoch = 0, started = 0;
     std::array<Member, 8> members{};
-    Phase phase = Idle;
-    std::string save;
-    uint32_t epoch = 0;
-
-    bool Matches(std::string const& id, uint32_t worldEpoch) const
+    bool Accept(unsigned peer, uint32_t generation, uint64_t account, uint32_t worldEpoch)
     {
-        return phase != Idle && Id(id) && save == id && epoch == worldEpoch;
-    }
-    bool Ready(unsigned id, uint32_t generation, std::string const& checkpoint, uint32_t worldEpoch)
-    {
-        if (phase != Preparing || !Matches(checkpoint, worldEpoch) || id < 2 || id >= members.size() ||
-            !generation || members[id].generation != generation) return false;
-        members[id].ready = true;
-        return true;
-    }
-    bool Stored(unsigned id, uint32_t generation, std::string const& checkpoint, uint32_t worldEpoch)
-    {
-        if (phase != Committing || !Matches(checkpoint, worldEpoch) || id < 2 || id >= members.size() ||
-            !generation || members[id].generation != generation || !members[id].ready) return false;
-        members[id].stored = true;
+        if (!active || peer < 2 || peer >= members.size() || epoch != worldEpoch ||
+            !generation || !account || members[peer].generation != generation || members[peer].account != account) return false;
+        members[peer].ready = true;
         return true;
     }
     bool AllReady() const
     {
+        if (!active) return false;
         for (auto const& m : members) if (m.generation && !m.ready) return false;
         return true;
     }
-    bool AllStored() const
-    {
-        for (auto const& m : members) if (m.generation && !m.stored) return false;
-        return true;
-    }
+    bool Expired(uint32_t now) const { return active && now - started > 10000; }
 };
 
 struct RecordPose {

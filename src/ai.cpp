@@ -274,7 +274,7 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     if (strcmp(name, "ZS_RansackBody") == 0 && ransack::OnRobbing(spu)) return GEFalse;
     if (self && self == gCSession::GetInstance().GetHero() && strcmp(name, "_AI_TakeItem") == 0) {
         // The world item this hero takes vanishes into a stack (its GUID is gone afterwards): note it first.
-        items::BeforeTake(spu);
+        if (!items::BeforeTake(spu)) return GETrue;
         const GEBool result = it->second(stack, spu);
         items::AfterTake(spu);
         return result;

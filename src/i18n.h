@@ -63,11 +63,11 @@ enum Message
     NpcRegionUnavailable,
     NpcStatePending,
     SaveQueued,
-    SavePaired,
+    SaveComplete,
     SaveFailed,
     SaveCharacterMissing,
-    SaveCharacterRecovered,
     SaveFailureReason,
+    HostLoadsOnly,
     MessageCount
 };
 

@@ -8,7 +8,7 @@
 //    fresh loss with a meaningful sample) raise NpcStretchPermille() from 1000 (normal) to 4000. The NPC scheduler multiplies
 //    every tier interval and staleness limit by that one factor: all NPCs slow down together and proportionally, none is selected,
 //    shed or starved. Normal LAN-like conditions keep the factor at exactly 1000.
-//  * BulkReliable (the paced save transfer on channel 6) has its own token bucket: bytesPerSecond/4 when clear,
+//  * BulkReliable (reserved bulk traffic on channel 6) has its own token bucket: bytesPerSecond/4 when clear,
 //    /8 when constrained, deferred while critical. It is decoupled from the NPC stream.
 // Parent-owned Send commits one conservative BudgetCharge once only after the common successful send.
 
@@ -50,7 +50,7 @@ enum BudgetSignal : uint8_t {
 };
 
 struct BudgetConfig {
-    // Pacing base of the bulk save channel only; never applied to NPC, player or gameplay traffic.
+    // Reserved bulk-channel pacing; never applied to NPC, player, character-save or gameplay traffic.
     uint32_t bytesPerSecond = 256u * 1024u;
     uint32_t mtuBytes = 1200u;
     uint32_t envelopeBytes = 16u;
@@ -184,7 +184,7 @@ public:
         }
     }
 
-    // Only the bulk save channel is ever refused. Everything else is always admitted.
+    // Only reserved bulk traffic is ever refused. Gameplay and character saves are always admitted.
     BudgetDecision Preview(BudgetClass cls, uint64_t chargedBytes) const
     {
         if (cls != BudgetClass::BulkReliable) return BudgetDecision::Allow;

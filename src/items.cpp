@@ -5,6 +5,7 @@
 #include "guid.h"
 #include "log.h"
 #include "net.h"
+#include "world.h"
 
 #include <Game.h>
 #include <Windows.h>
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 
 namespace g3t::items {
@@ -100,6 +102,7 @@ char takingName[64] = "";
 bool taking = false;
 uint32_t takingAmount = 1;
 std::map<std::string, int> carriedBefore;  // the hero's inventory when the take began: item template -> amount
+std::set<std::string> consumed, denied;
 
 std::map<std::string, int> Carried(eCDynamicEntity* hero)
 {
@@ -116,27 +119,37 @@ unsigned tookCount = 0, ignoredRemotePickups = 0;
 char lastTook[200] = "-";
 }
 
-void BeforeTake(gCScriptProcessingUnit* spu)
+bool BeforeTake(gCScriptProcessingUnit* spu)
 {
+    if (!spu || spu->GetSelfEntity() != gCSession::GetInstance().GetHero()) return true;
     eCEntity* item = spu ? spu->GetTargetEntity() : nullptr;
     if (!item) item = spu ? spu->GetOtherEntity() : nullptr;
-    taking = item != nullptr;
-    if (!taking) return;
+    taking = item && Entity(item).IsItem() && !Entity(item).GetOwner().GetInstance();
+    if (!taking) return true;
     ++takesBegun;
     const eCEntityProxy proxy(item);
     std::memcpy(takingGuid, &proxy.GetEntityID().GetCore(), 16);
+    const std::string key(reinterpret_cast<char const*>(takingGuid), 16);
+    if (consumed.count(key)) {
+        taking = false;
+        if (denied.insert(key).second) Log("items: saved personal pickup denied; native retirement pending");
+        return false;
+    }
     strncpy_s(takingName, Entity(item).GetName().GetText(), _TRUNCATE);
     takingAmount = Entity(item).Item.GetAmount();
     carriedBefore = Carried(gCSession::GetInstance().GetHero());
+    return true;
 }
 
-void AfterTake(gCScriptProcessingUnit*)
+void AfterTake(gCScriptProcessingUnit* spu)
 {
+    if (!spu || spu->GetSelfEntity() != gCSession::GetInstance().GetHero()) return;
     if (!taking) return;
     _GUID raw;
     std::memcpy(&raw, takingGuid, 16);
     if (guid::Resolve(raw).GetInstance()) return;  // not taken yet (the animation runs over frames)
     taking = false;
+    consumed.insert(std::string(reinterpret_cast<char const*>(takingGuid), 16));
     ++tookCount;
     // What actually arrived can differ from the world item (a gold stack turns into coins): compare.
     for (auto const& [name, amount] : Carried(gCSession::GetInstance().GetHero())) {
@@ -165,6 +178,41 @@ void Start()
 {
     net::SetItemHandler(&OnItem);
     Log("items: loose world pickups are personal; chest/corpse loot and NPC merchant stock are personal too");
+}
+
+void AppendPersonal(saving::personal::Snapshot& snapshot)
+{
+    for (auto const& key : consumed) {
+        saving::personal::Inventory row;
+        row.kind = static_cast<decltype(row.kind)>(4);
+        snapshot[key] = std::move(row);
+    }
+}
+bool RestorePersonal(saving::personal::Snapshot const& snapshot)
+{
+    consumed.clear(); denied.clear(); taking = false; carriedBefore.clear();
+    for (auto const& entry : snapshot)
+        if (static_cast<uint8_t>(entry.second.kind) == 4) consumed.insert(entry.first);
+    TickPersonal();
+    return true;
+}
+void TickPersonal()
+{
+    if (!gCSession::GetInstance().IsGameRunning()) return;
+    auto const* all = world::ProcessedEntities();
+    for (GEU16 i = 0; all && i < all->GetCount(); ++i) {
+        Entity item(all->GetAt(i));
+        if (!item.GetInstance() || !item.IsItem() || item.GetOwner().GetInstance()) continue;
+        const eCEntityProxy proxy(item.GetInstance());
+        const std::string key(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
+        if (!consumed.count(key)) continue;
+        item.Decay();
+        // Decay is void and may defer removal. Keep the tombstone and retry while the item remains processed.
+    }
+}
+void OnWorldChange()
+{
+    consumed.clear(); denied.clear(); taking = false; carriedBefore.clear();
 }
 
 void NoteOwnDrop(char const* name)

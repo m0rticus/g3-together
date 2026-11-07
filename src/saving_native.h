@@ -31,6 +31,11 @@ inline constexpr Site UiSites[] = {
      "e8????????85c07423578bc8e8????????8b4e0885c98bf8740e8b018b5024ffd2c7460800000000897e085fc3", nullptr}
 };
 constexpr size_t GuiStolen = 7;
+inline constexpr Site DeleteSite = {
+    "World.DeleteSaveGame", 0x19c0d0,
+    "83ec105356578b7c242068????????8d44241050578d4c241c518d54242452e8????????",
+    "?DeleteSaveGame@gCWorld@@QAE_NABVbCString@@@Z"
+};
 constexpr size_t Missing = static_cast<size_t>(-1);
 constexpr size_t Stolen = 6; // push ebp / mov ebp,esp / and esp,-8; no relative operand
 constexpr uint32_t PupReceiverRva = 0x157f0, PupImageSize = 0xa8000;

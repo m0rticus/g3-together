@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NetworkStreamsTests(unittest.TestCase):
-    def test_player_bulk_story_and_budget_integration(self):
+    def test_player_character_story_and_budget_integration(self):
         compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
         if not compiler:
             self.skipTest("A C++17 compiler is required")

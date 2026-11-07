@@ -70,7 +70,11 @@ net::ClockState Now()
     return state;
 }
 
-bool Ready() { return gCSession::GetInstance().IsGameRunning() && Entity::GetWorldEntity().GetInstance(); }
+bool Ready()
+{
+    auto* entity = Entity::GetWorldEntity().GetInstance();
+    return gCSession::GetInstance().IsGameRunning() && entity && entity->GetPropertySet(eEPropertySetType_Clock);
+}
 
 // "Until morning" (spell Spl_DuskToDawn, state PS_DuskToDawn): the game runs this machine's clock fast and slows its
 // whole simulation (timer.fTimeScale=0.3) until the hour passes 8 (re/findings/p1-p2-p3-static-b.md, P2). In co-op the
@@ -136,6 +140,32 @@ void OnClock(net::ClockState const& host)
 }
 
 void Start() { net::SetClockHandler(&OnClock); }
+bool CaptureAdmission(net::ClockState& state)
+{
+    if (!Ready()) return false;
+    const Entity entity = Entity::GetWorldEntity();
+    const int year = entity.Clock.GetYear(), day = entity.Clock.GetDay(), hour = entity.Clock.GetHour(), minute = entity.Clock.GetMinute();
+    if (year < 0 || year > 65535 || day < 0 || day > 65535 || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        Logf("clock: bootstrap capture refused invalid date=%d/%d %d:%d", year, day, hour, minute); return false;
+    }
+    state = Now();
+    return true;
+}
+bool RestoreAdmission(net::ClockState const& state)
+{
+    if (!following || !Ready() || state.hour > 23 || state.minute > 59) {
+        Log("clock: bootstrap restore refused; clock unavailable, following disabled, or invalid date"); return false;
+    }
+    Apply(state);
+    requestedAt = 0; waitJumped = false;
+    net::ClockState actual{};
+    if (!CaptureAdmission(actual) || actual.year != state.year || actual.day != state.day ||
+        actual.hour != state.hour || actual.minute != state.minute) {
+        Log("clock: bootstrap native date did not settle; admission refused"); return false;
+    }
+    Logf("clock: authoritative bootstrap date=%u/%u %02u:%02u; no sleep request", state.year, state.day, state.hour, state.minute);
+    return true;
+}
 
 void Tick()
 {

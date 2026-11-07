@@ -9,6 +9,7 @@
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
+#include <io.h>
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -340,6 +341,7 @@ bool SaveQuick(Entity& self, char const* record)
     for (Quick const& q : quick) ok = ok && fprintf(file, "quick %d %s %u\n", q.slot, q.id.c_str(), q.quality) > 0;
     ok = ok && fprintf(file, "end %zu\n", spells.size() + quick.size()) > 0;
     ok = fflush(file) == 0 && ok;
+    ok = _commit(_fileno(file)) == 0 && ok;
     ok = fclose(file) == 0 && ok;
     if (ok) ok = MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
     if (!ok) {
@@ -525,6 +527,7 @@ bool SaveRecordImpl(char const* path, saving::Key const* key)
     ok = ok && fprintf(file, "quick_end %zu %zu\n", spells.size(), quick.size()) > 0;
     ok = ok && fprintf(file, "end %zu\n", stacks.size()) > 0;
     ok = fflush(file) == 0 && ok;
+    ok = _commit(_fileno(file)) == 0 && ok;
     ok = fclose(file) == 0 && ok;
     if (ok && writeFault) ok = writeFault = false;  // QA (stage W2): the write breaks off before the record is replaced
     if (ok) ok = MoveFileExA(temp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;

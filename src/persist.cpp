@@ -7,6 +7,7 @@
 #include "crashlog.h"
 #include "dialogaudio.h"
 #include "downed.h"
+#include "doors.h"
 #include "hero.h"
 #include "hud.h"
 #include "i18n.h"
@@ -16,10 +17,13 @@
 #include "net.h"
 #include "npcs.h"
 #include "npclease_runtime.h"
+#include "npclease_save.h"
 #include "remote.h"
 #include "saving_native.h"
 #include "saving_policy.h"
+#include "saving_store.h"
 #include "steam.h"
+#include "story.h"
 #include "trade.h"
 #include "world.h"
 
@@ -39,16 +43,19 @@
 namespace g3t::persist {
 namespace {
 constexpr size_t Stolen = saving::native::Stolen;
-constexpr uint32_t FileLimit = 64u * 1024 * 1024;
-constexpr uint32_t PrepareLimit = 15000, WriteLimit = 60000, TransferLimit = 180000;
-constexpr uint32_t PreparedLimit = PrepareLimit + WriteLimit + TransferLimit;
-constexpr UINT_PTR SaveTimer = 0x47335453, AutoloadTimer = 0x47335436;
+constexpr uint32_t FileLimit = saving::store::Limit;
+constexpr UINT_PTR SaveTimer = 0x47335453;
 using FileFn = bool(__stdcall*)(void*, bCString const*);
 using Getter = void*(__cdecl*)();
 using WorldSaveFn = bool(__thiscall*)(gCWorld*, bCString const&, eCGfxImageData*, void*, GEU32);
 using WorldLoadFn = bool(__thiscall*)(gCWorld*, bCString const&, bool);
 using GuiMessageFn = bool(__thiscall*)(gCGUIManager*, GEUInt, GEUInt, GEInt);
 using NewSlotFn = bool(__stdcall*)(void*);
+using DeleteFn = bool(__thiscall*)(gCWorld*, bCString const&);
+DeleteFn originalDelete = nullptr;
+unsigned char* deleteTarget = nullptr;
+unsigned lowerSaveCalls = 0;
+bool lowerSaveGood = true;
 GuiMessageFn originalGuiMessage = nullptr;
 NewSlotFn originalNewSlot = nullptr;
 unsigned char* uiEntries[5]{};
@@ -67,96 +74,80 @@ unsigned char* loadTarget = nullptr;
 unsigned char* nativeEntries[5]{}, *nativeImage = nullptr;
 size_t nativeImageSize = 0;
 bool loadCallInstalled = false;
-bool installed = false, pairedEnabled = false, writing = true, transferring = true, syncing = true;
-bool earlyGate = true, byGeneration = true, resendGuard = true, loadTicks = false, autoloadHold = false;
-uint32_t pausedUntil = 0;
+bool installed = false, pairedEnabled = false, writing = true;
 unsigned processDepth = 0, nativeLoadDepth = 0, nativeSaveDepth = 0;
-unsigned saves = 0, loads = 0, sidecarsWritten = 0, sidecarsRead = 0;
-unsigned recordsWritten = 0, recordsApplied = 0, filesSent = 0, filesReceived = 0, autoLoads = 0;
-unsigned loadFrames = 0, loadFramesRan = 0, autoloadSerial = 0, autoloadPosted = 0, autoloadStale = 0;
-unsigned epochs = 0, worldChanges = 0, readies = 0, others = 0;
-std::string lastSave, lastLoad, lastReceived = "-", campaign, loading;
+unsigned saves = 0, loads = 0;
+unsigned recordsWritten = 0, recordsApplied = 0, loadFrames = 0, epochs = 0;
+std::string lastSave, lastLoad, campaign, loading;
 uint8_t localKind = net::KindMenu;
-std::string localSave;
-bool newWorld = false, ownCharacterReady = false, everIn = false;
-uint32_t epoch = 0, settledAt = 0, synced = 0, loadedEpoch = 0, hinted = 0;
+bool newWorld = false, ownCharacterReady = false, needsNewHero = false, restoreFailed = false;
+bool freshLocalHero = false, resetLocalWorld = false;
+bool hostAdmissionAck = false;
+uint32_t nextAdmissionTry = 0;
+uint32_t seenWelcome = 0;
+uint32_t epoch = 0, synced = 0;
 net::WorldNote hostWorld{};
+using Bytes = saving::store::Bytes;
+using Save = saving::store::Save;
+Save current, savingManifest;
+std::string requestedSlot, stagingSlot, lastSaveFailure;
+saving::Key pendingKey;
+HWND saveWindow = nullptr;
 
-struct Manifest {
-    saving::Key key; // player is the owner of the native hero, not the recipient's character
-    uint32_t size[2] = {}, crc[2] = {};
-    std::string legacy;
-};
-Manifest current;
+saving::CaptureRound operation;
 struct Client {
-    uint32_t generation = 0, told = 0, ready = 0, sent = 0, sentAt = 0, hinted = 0;
-    std::string toldCampaign;
-    bool wants = false, arrived = false;
-    unsigned resends = 0;
+    uint32_t generation = 0, ready = 0, recordSent = 0, nextTry = 0, cutover = 0;
 };
 Client clients[net::MaxPlayers]{};
-
-saving::Barrier barrier;
-Manifest savingManifest;
-std::string requestedSlot;
-std::vector<uint8_t> savedJournal;
-uint32_t saveStarted = 0, nativeReturnedAt = 0;
-HWND saveWindow = nullptr;
-bool aliasPublished = false;
-
-struct Prepared {
+struct Captured {
     net::SaveNote note{};
-    uint32_t welcome = 0, since = 0;
+    Bytes bytes;
+    uint32_t welcome = 0, started = 0, nextTry = 0;
     bool valid = false;
-    bool stored = false;
-    bool committing = false;
+    bool queued = false;
 };
-Prepared prepared;
-struct SaveReply {
+Captured captured;
+net::SaveNote requested{};
+uint32_t requestWelcome = 0, requestStarted = 0, requestRetry = 0;
+bool requestPending = false;
+struct Reply {
     net::SaveNote note{};
-    uint32_t binding = 0, nextTry = 0;
+    uint32_t generation = 0, nextTry = 0, expires = 0;
     bool pending = false;
 };
-SaveReply hostReplies[net::MaxPlayers], clientReply;
-net::SaveNote incomingNote{};
-uint32_t incomingWelcome = 0;
-bool receiving = false, incomingFailed = false;
-std::vector<uint8_t> incoming[net::FileCount];
-uint32_t incomingTotal[net::FileCount]{}, incomingAt = 0;
-uint32_t requestAt = 0, requestWelcome = 0;
-bool requestPending = false;
-std::string requestId;
-std::string lastSaveFailure;
-
-std::string pendingRecord, refusedRecord, waitingImport;
-saving::Key pendingKey, desiredKey;
-bool pendingLegacy = false;
-uint32_t pendingSince = 0, refusedHinted = 0;
-uint32_t nextImportTry = 0, waitingEpoch = 0, waitingWelcome = 0, nextRestoreTry = 0;
-FILETIME refusedWritten{};
-struct Autoload {
-    std::string slot;
-    uint32_t epoch = 0, welcome = 0;
-    unsigned loads = 0, serial = 0;
-    HWND window = nullptr;
-    bool valid = false, armed = false;
+Reply hostReplies[net::MaxPlayers], clientReply;
+struct RequestCache {
+    std::string token, transaction;
+    net::SaveNote result{};
+    uint32_t generation = 0, epoch = 0;
+    bool complete = false;
 };
-Autoload autoload;
+RequestCache requests[net::MaxPlayers]{};
+struct ExtensionEntry {
+    std::string name;
+    uint32_t type = 0, version = 0;
+    SaveExtensions::Capture capture = nullptr;
+    SaveExtensions::Restore restore = nullptr;
+};
+std::vector<ExtensionEntry> extensions;
+uint32_t restoreAt = 0, receivedWelcome = 0;
+Bytes receivedRecord, receivedPersonal;
+net::CharacterNote receivedNote{};
 
 void Evaluate();
-void OrderAutoload(std::string const& slot);
-void DropAutoload(char const* why);
 void CancelSave(char const* why);
 bool __stdcall SaveDetour(void* self, bCString const* name);
 bool __stdcall LoadDetour(void* self, bCString const* name);
-bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGfxImageData* image, void* metadata, GEU32 size);
-bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool nativeFlag);
-bool PupLoadEntry(unsigned char* entry, bool beforeUse = false);
+bool __fastcall WorldSaveDetour(gCWorld*, void*, bCString const&, eCGfxImageData*, void*, GEU32);
+bool __fastcall WorldLoadDetour(gCWorld*, void*, bCString const&, bool);
+bool PupLoadEntry(unsigned char*, bool beforeUse = false);
 bool ReverifyNative(bool beforeUse = false);
 bool NativeReady();
-bool __fastcall GuiMessageDetour(gCGUIManager* self, void*, GEUInt message, GEUInt key, GEInt flags);
-bool __stdcall MenuNewSlot(void* self);
-
+bool __fastcall GuiMessageDetour(gCGUIManager*, void*, GEUInt, GEUInt, GEInt);
+bool __stdcall MenuNewSlot(void*);
+bool __fastcall DeleteDetour(gCWorld*, void*, bCString const&);
+bool ReadAll(std::string const&, Bytes&);
+void SaveFailure(char const*);
 bool Readable(void const* address, size_t size)
 {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
@@ -202,18 +193,18 @@ void Unresolved(char const* name, unsigned char* entry, char const* phase)
     char bytes[25] = "unreadable";
     if (Readable(entry, 12))
         for (size_t b = 0; b < 12; ++b) Format(bytes + b * 2, 3, "%02x", entry[b]);
-    Logf("persist: unresolved %s phase=%s live=%s; paired saves off", name, phase, bytes);
+    Logf("persist: unresolved %s phase=%s live=%s; host-managed saves off", name, phase, bytes);
 }
 
 bool ResolveNative(unsigned char* (&resolved)[5])
 {
     HMODULE game = GetModuleHandleA("Game.dll");
     auto* image = reinterpret_cast<unsigned char*>(game);
-    if (!Readable(image, sizeof(IMAGE_DOS_HEADER))) { Log("persist: unresolved Game.dll; paired saves off"); return false; }
+    if (!Readable(image, sizeof(IMAGE_DOS_HEADER))) { Log("persist: unresolved Game.dll; host-managed saves off"); return false; }
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
         !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32))) {
-        Log("persist: unresolved Game.dll PE header; paired saves off");
+        Log("persist: unresolved Game.dll PE header; host-managed saves off");
         return false;
     }
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
@@ -223,7 +214,7 @@ bool ResolveNative(unsigned char* (&resolved)[5])
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC || !size || size > 128u * 1024 * 1024 ||
         !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
         !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections))) {
-        Log("persist: unresolved Game.dll PE layout; paired saves off");
+        Log("persist: unresolved Game.dll PE layout; host-managed saves off");
         return false;
     }
     char path[MAX_PATH]{};
@@ -251,7 +242,7 @@ bool ResolveNative(unsigned char* (&resolved)[5])
         char bytes[25] = "unreadable";
         if (saving::native::Range(size, fn.hint, 12) && Readable(image + fn.hint, 12))
             for (size_t b = 0; b < 12; ++b) Format(bytes + b * 2, 3, "%02x", image[fn.hint + b]);
-        Logf("persist: unresolved %s matches=%u hint=%08lx live=%s match=%p export=%p; paired saves off",
+        Logf("persist: unresolved %s matches=%u hint=%08lx live=%s match=%p export=%p; host-managed saves off",
              fn.name, matches, static_cast<unsigned long>(fn.hint), bytes,
              sites[i] == saving::native::Missing ? nullptr : image + sites[i],
              fn.symbol ? GetProcAddress(game, fn.symbol) : nullptr);
@@ -264,11 +255,19 @@ bool ResolveNative(unsigned char* (&resolved)[5])
         const size_t site = FindCode(image, size, sections, nt->FileHeader.NumberOfSections, fn.bytes, matches);
         if (site == saving::native::Missing || (fn.symbol &&
             reinterpret_cast<unsigned char*>(GetProcAddress(game, fn.symbol)) != image + site)) {
-            Logf("persist: unresolved %s matches=%u; paired saves off", fn.name, matches);
+            Logf("persist: unresolved %s matches=%u; host-managed saves off", fn.name, matches);
             return false;
         }
         uiEntries[i] = image + site;
     }
+    auto const& deletion = saving::native::DeleteSite;
+    unsigned deleteMatches = 0;
+    const size_t deleteRva = FindCode(image, size, sections, nt->FileHeader.NumberOfSections, deletion.bytes, deleteMatches);
+    if (deleteRva == saving::native::Missing || reinterpret_cast<unsigned char*>(GetProcAddress(game, deletion.symbol)) != image + deleteRva) {
+        Logf("persist: unresolved %s matches=%u", deletion.name, deleteMatches);
+        return false;
+    }
+    deleteTarget = image + deleteRva;
     if (!saving::native::Calls(image, size, uiEntries[2] - image, resolved[4] - image)) {
         Unresolved("Menu.NewSaveSlotCall getter edge", uiEntries[2], "install");
         return false;
@@ -347,56 +346,6 @@ std::string Path(std::string const& slot, int file)
 }
 bool Exists(std::string const& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
-void Notice(i18n::Message message, bool bad = false)
-{
-    if (gCSession::GetInstance().IsGameRunning()) hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
-    else hud::MenuLine(i18n::Text(message));
-}
-void SaveFailure(char const* code)
-{
-    lastSaveFailure = code;
-    Logf("persist: save refusal reason=%s player=%llu host=%d phase=%u prepared=%d receiving=%d request=%d",
-         code, steam::PlayerId(), net::IsHost() ? 1 : 0, static_cast<unsigned>(barrier.phase),
-         prepared.valid ? 1 : 0, receiving ? 1 : 0, requestPending ? 1 : 0);
-    wchar_t text[500]{};
-    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SaveFailureReason), i18n::SaveReason(code));
-    if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
-    else hud::MenuLine(text);
-}
-void QueueReply(uint8_t to, net::SaveNote const& note)
-{
-    auto& reply = net::IsHost() ? hostReplies[to] : clientReply;
-    reply = {note, net::IsHost() ? net::PeerGeneration(to) : net::WelcomeSerial(), GetTickCount() + 250, true};
-    if (net::SendSave(to, note)) reply.pending = false;
-    else Logf("persist: checkpoint control retry queued player_slot=%u save=%s op=%u", to, note.save, note.op);
-}
-void RetryReplies(uint32_t now)
-{
-    for (uint8_t to = net::IsHost() ? 2 : 1; to < (net::IsHost() ? net::MaxPlayers : 2); ++to) {
-        auto& reply = net::IsHost() ? hostReplies[to] : clientReply;
-        if (!reply.pending) continue;
-        if ((net::IsHost() ? !net::PeerJoined(to) || reply.binding != net::PeerGeneration(to) :
-             !net::Joined() || reply.binding != net::WelcomeSerial()) ||
-            reply.note.epoch != (net::IsHost() ? epoch : hostWorld.epoch)) { reply = {}; continue; }
-        if (static_cast<int32_t>(now - reply.nextTry) < 0) continue;
-        reply.nextTry = now + 250;
-        if (net::SendSave(to, reply.note)) {
-            reply.pending = false;
-            Logf("persist: checkpoint control retry sent player_slot=%u save=%s op=%u", to, reply.note.save, reply.note.op);
-        }
-    }
-}
-
-uint32_t Crc32(uint8_t const* data, size_t size)
-{
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < size; ++i) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320u : 0);
-    }
-    return crc ^ 0xffffffffu;
-}
-
 bool ReadAll(std::string const& path, std::vector<uint8_t>& out)
 {
     out.clear();
@@ -423,7 +372,7 @@ bool KnownPup(HMODULE module)
     std::vector<uint8_t> bytes;
     const DWORD length = module ? GetModuleFileNameA(module, path, MAX_PATH) : 0;
     if (!length || length >= MAX_PATH || !ReadAll(path, bytes) || bytes.empty()) {
-        Logf("persist: unresolved WorldLoadGameFn PUP identity read path=%s error=%lu; paired saves off", path, GetLastError());
+        Logf("persist: unresolved WorldLoadGameFn PUP identity read path=%s error=%lu; host-managed saves off", path, GetLastError());
         return false;
     }
     BCRYPT_ALG_HANDLE algorithm = nullptr;
@@ -437,7 +386,7 @@ bool KnownPup(HMODULE module)
     if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
     if (status < 0 || !saving::native::Matches(digest, sizeof(digest),
         "60fccba5e27ca544fc1e72fe5ba4cbc33aad107c1cbc90845b275f81b58c349c")) {
-        Logf("persist: unresolved WorldLoadGameFn PUP identity path=%s status=%08lx; paired saves off", path, status);
+        Logf("persist: unresolved WorldLoadGameFn PUP identity path=%s status=%08lx; host-managed saves off", path, status);
         return false;
     }
     verified = module;
@@ -451,7 +400,7 @@ bool PupRefused(char const* stage, unsigned char* entry, uint32_t bridge, uint32
     char bytes[19] = "unreadable";
     if (Readable(at, 9))
         for (size_t i = 0; i < 9; ++i) Format(bytes + i * 2, 3, "%02x", at[i]);
-    Logf("persist: unresolved WorldLoadGameFn PUP phase=%s stage=%s entry=%p bridge=%08x receiver=%08x observed=%p live=%s; paired saves off",
+    Logf("persist: unresolved WorldLoadGameFn PUP phase=%s stage=%s entry=%p bridge=%08x receiver=%08x observed=%p live=%s; host-managed saves off",
          beforeUse ? "before-use" : "install", stage, entry, bridge, receiver, at, bytes);
     return false;
 }
@@ -533,7 +482,7 @@ bool PupLoadEntry(unsigned char* entry, bool beforeUse)
     return true;
 }
 
-bool OwnedHook(unsigned char* entry, void* original, void* detour, size_t stolen, char const* pattern)
+bool OwnedHook(unsigned char* entry, void* original, void* detour, size_t stolen, char const* pattern, char const* prefix = nullptr)
 {
     uint32_t guard = 0, target = 0;
     const size_t length = saving::native::Decode(pattern).size();
@@ -553,7 +502,7 @@ bool OwnedHook(unsigned char* entry, void* original, void* detour, size_t stolen
         target == reinterpret_cast<uintptr_t>(entry + stolen) &&
         (stolen == Stolen || entry[6] == 0x90) &&
         saving::native::Matches(static_cast<uint8_t const*>(original), stolen,
-            stolen == Stolen ? "558bec83e4f8" : "8b44240483ec68") &&
+            prefix ? prefix : stolen == Stolen ? "558bec83e4f8" : "8b44240483ec68") &&
         saving::native::Matches(entry + stolen, length - stolen, pattern + stolen * 2);
 }
 
@@ -581,6 +530,11 @@ bool ReverifyNative(bool beforeUse)
         if (ok && fn.symbol)
             ok = reinterpret_cast<unsigned char*>(GetProcAddress(reinterpret_cast<HMODULE>(nativeImage), fn.symbol)) == entry;
         if (!ok) { Unresolved(fn.name, entry, "before-use"); return false; }
+    }
+    if (!OwnedHook(deleteTarget, reinterpret_cast<void*>(originalDelete), reinterpret_cast<void*>(&DeleteDetour),
+                   Stolen, saving::native::DeleteSite.bytes, "83ec10535657")) {
+        Unresolved(saving::native::DeleteSite.name, deleteTarget, "before-use");
+        return false;
     }
     uint32_t target = 0;
     for (size_t i = 0; i < 5; ++i) {
@@ -644,14 +598,8 @@ bool NativeReady()
     if (ReverifyNative(true)) return true;
     pairedEnabled = false;
     CancelSave("native-hooks");
-    DropAutoload("native hooks changed before use");
-    prepared = Prepared{};
-    clientReply = {};
-    requestPending = false;
-    receiving = false;
-    incomingFailed = true;
-    for (auto& file : incoming) file.clear();
-    Log("persist: native pre-use verification failed; paired saves off");
+    ownCharacterReady = false;
+    Log("persist: native pre-use verification failed; host-managed saves disabled");
     return false;
 }
 
@@ -668,7 +616,7 @@ bool HookNativeCall(unsigned char* call, void* entry, void* detour, char const* 
     std::memcpy(before, call, sizeof(before));
     DWORD old = 0;
     if (!VirtualProtect(call, sizeof(before), PAGE_EXECUTE_READWRITE, &old)) {
-        Logf("persist: %s hook failed error=%lu; paired saves off", label, GetLastError());
+        Logf("persist: %s hook failed error=%lu; host-managed saves off", label, GetLastError());
         return false;
     }
     const uint32_t relative = reinterpret_cast<uintptr_t>(detour) - reinterpret_cast<uintptr_t>(call + 5);
@@ -676,34 +624,15 @@ bool HookNativeCall(unsigned char* call, void* entry, void* detour, char const* 
     std::memcpy(after, call, sizeof(after));
     DWORD ignored = 0;
     const bool restored = VirtualProtect(call, sizeof(before), old, &ignored) != 0;
-    if (!restored) Logf("persist: %s protection restore failed error=%lu; paired saves off", label, GetLastError());
+    if (!restored) Logf("persist: %s protection restore failed error=%lu; host-managed saves off", label, GetLastError());
     const bool flushed = FlushInstructionCache(GetCurrentProcess(), call, sizeof(before)) != 0;
-    if (!flushed) Logf("persist: %s instruction-cache flush failed error=%lu; paired saves off", label, GetLastError());
+    if (!flushed) Logf("persist: %s instruction-cache flush failed error=%lu; host-managed saves off", label, GetLastError());
     ai::TrackPatch(call, before, after, sizeof(before), label);
     return restored && flushed;
 }
 bool HookWorldLoadCall(unsigned char* call, unsigned char* entry)
 {
-    return HookNativeCall(call, entry, reinterpret_cast<void*>(&WorldLoadDetour), "paired world-load call");
-}
-
-bool WriteAtomic(std::string const& path, std::vector<uint8_t> const& data)
-{
-    if (path.empty()) { Log("persist: checkpoint path unavailable; paired saves off for this save"); return false; }
-    const std::string temp = path + ".tmp";
-    FILE* file = nullptr;
-    bool ok = !fopen_s(&file, temp.c_str(), "wb") && file;
-    if (ok) {
-        ok = fwrite(data.data(), 1, data.size(), file) == data.size();
-        ok = fflush(file) == 0 && ok;
-        ok = fclose(file) == 0 && ok;
-    }
-    if (ok) ok = MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-    if (!ok) {
-        DeleteFileA(temp.c_str());
-        Logf("persist: atomic checkpoint write failed: %s (error %lu)", path.c_str(), GetLastError());
-    }
-    return ok;
+    return HookNativeCall(call, entry, reinterpret_cast<void*>(&WorldLoadDetour), "host world-load call");
 }
 
 std::string HexId(uint8_t const* bytes)
@@ -720,133 +649,6 @@ std::string RandomId()
         return {};
     }
     return HexId(bytes);
-}
-std::string LegacyId(std::vector<uint8_t> const (&data)[net::FileCount])
-{
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD length = 0, returned = 0;
-    bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0;
-    if (ok) ok = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&length), sizeof(length), &returned, 0) >= 0;
-    std::vector<uint8_t> object(length);
-    if (ok) ok = BCryptCreateHash(algorithm, &hash, object.data(), length, nullptr, 0, 0) >= 0;
-    // Length-prefix the two files; their boundary is part of the legacy identity.
-    for (int f = 0; ok && f < 2; ++f) {
-        const uint32_t size = static_cast<uint32_t>(data[f].size());
-        ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<uint32_t*>(&size)), sizeof(size), 0) >= 0 &&
-             BCryptHashData(hash, const_cast<PUCHAR>(data[f].data()), size, 0) >= 0;
-    }
-    uint8_t digest[32]{};
-    if (ok) ok = BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0;
-    if (hash) BCryptDestroyHash(hash);
-    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (!ok) { Log("persist: legacy checkpoint fingerprint failed"); return {}; }
-    return HexId(digest);
-}
-
-bool ParseManifest(std::vector<uint8_t> const& bytes, Manifest& manifest)
-{
-    if (bytes.empty()) return false;
-    std::istringstream input(std::string(bytes.begin(), bytes.end()));
-    std::string line, tag, extra;
-    if (!std::getline(input, line) || (line != "G3T 2" && line != "G3T 2\r") || !std::getline(input, line)) return false;
-    Manifest found;
-    std::istringstream fields(line);
-    if (!(fields >> tag >> found.key.world >> found.key.save >> found.key.player >>
-          found.size[0] >> found.crc[0] >> found.size[1] >> found.crc[1]) || fields >> extra ||
-        tag != "checkpoint" || !saving::Valid(found.key) || !found.size[0] || !found.size[1] ||
-        found.size[0] > FileLimit || found.size[1] > FileLimit) return false;
-    bool ended = false;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (ended && !line.empty()) return false;
-        if (line.compare(0, 7, "legacy ") == 0) {
-            found.legacy = line.substr(7);
-            if (!SafeName(found.legacy.c_str())) return false;
-        }
-        if (line.compare(0, 15, "checkpoint_end ") == 0) {
-            if (line.substr(15) != found.key.save || ended) return false;
-            ended = true;
-        }
-    }
-    if (!ended) return false;
-    manifest = found;
-    return true;
-}
-
-bool ManifestAt(std::string const& slot, Manifest& manifest)
-{
-    std::vector<uint8_t> bytes;
-    return ReadAll(Path(slot, 2), bytes) && ParseManifest(bytes, manifest);
-}
-bool Verify(Manifest const& manifest, std::vector<uint8_t> const (&data)[net::FileCount])
-{
-    for (int f = 0; f < 2; ++f)
-        if (manifest.size[f] != data[f].size() || manifest.crc[f] != Crc32(data[f].data(), data[f].size())) return false;
-    return true;
-}
-bool ReadBundle(std::string const& slot, Manifest& manifest, std::vector<uint8_t> (&data)[net::FileCount])
-{
-    for (int f = 0; f < net::FileCount; ++f) if (!ReadAll(Path(slot, f), data[f])) return false;
-    return ParseManifest(data[2], manifest) && Verify(manifest, data);
-}
-std::vector<uint8_t> ManifestBytes(Manifest const& manifest, std::vector<uint8_t> const& journal)
-{
-    std::ostringstream text;
-    text << "G3T 2\ncheckpoint " << manifest.key.world << ' ' << manifest.key.save << ' ' << manifest.key.player << ' '
-         << manifest.size[0] << ' ' << manifest.crc[0] << ' ' << manifest.size[1] << ' ' << manifest.crc[1] << '\n';
-    if (!manifest.legacy.empty()) text << "legacy " << manifest.legacy << '\n';
-    text << std::string(journal.begin(), journal.end());
-    text << "\ncheckpoint_end " << manifest.key.save << '\n';
-    const std::string bytes = text.str();
-    return std::vector<uint8_t>(bytes.begin(), bytes.end());
-}
-bool StoreBundle(std::string const& slot, std::vector<uint8_t> const (&data)[net::FileCount])
-{
-    // Immutable checkpoint names plus a manifest-last publication make interrupted copies detectable.
-    for (int f = 0; f < net::FileCount; ++f) if (!WriteAtomic(Path(slot, f), data[f])) return false;
-    return true;
-}
-
-std::string CharacterPath(saving::Key const& key)
-{
-    const std::string folder = Folder();
-    return folder.empty() ? std::string() : folder + saving::RecordName(key, false);
-}
-std::string LatestPath(saving::Key const& key)
-{
-    const std::string folder = Folder();
-    return folder.empty() ? std::string() : folder + saving::RecordName(key, true);
-}
-bool PublishLatest(saving::Key const& key)
-{
-    std::vector<uint8_t> bytes;
-    if (!ReadAll(CharacterPath(key), bytes) || !WriteAtomic(LatestPath(key), bytes)) {
-        Logf("persist: latest character not published world=%s save=%s player=%llu", key.world.c_str(), key.save.c_str(), key.player);
-        return false;
-    }
-    return true;
-}
-bool CharacterDigest(char const* phase, saving::Key const& key, std::string const& path, bool applied = true)
-{
-    std::vector<uint8_t> data;
-    const bool ok = applied && ReadAll(path, data) && !data.empty();
-    Logf("persist: character %s world=%s save=%s player=%llu ok=%d size=%zu crc=%08x",
-         phase, key.world.c_str(), key.save.c_str(), key.player, ok ? 1 : 0, data.size(),
-         ok ? Crc32(data.data(), data.size()) : 0);
-    return ok;
-}
-bool CaptureCharacter(saving::Key const& key)
-{
-    const std::string path = CharacterPath(key);
-    const bool ok = hero::SaveRecord(path.c_str(), key);
-    return CharacterDigest("capture", key, path, ok);
-}
-bool StableRunningHero()
-{
-    gCSession& game = gCSession::GetInstance();
-    return ownCharacterReady && trade::ReadyForSave() && !nativeLoadDepth && !nativeSaveDepth && loading.empty() &&
-           pendingRecord.empty() && refusedRecord.empty() && game.GetHero() && game.IsGameRunning();
 }
 char const* NativeSaveReason()
 {
@@ -875,15 +677,6 @@ char const* NativeSaveReason()
     if (reason) return reason;
     return session.IsSaveAllowed() ? nullptr : "native-save";
 }
-bool NativeSaveAllowed()
-{
-    if (npclease::ActiveLeases()) {
-        Log("save refusal reason=npc-lease-active");
-        hud::Message(hud::Warning, L"NPC lease active: save would lose client-owned NPC state");
-        return false;
-    }
-    return NativeSaveReason() == nullptr;
-}
 char const* SaveReadiness()
 {
     if (npclease::ActiveLeases()) {
@@ -892,435 +685,9 @@ char const* SaveReadiness()
         return "npc-lease-active";
     }
     if (char const* reason = NativeSaveReason()) return reason;
-    if (!ownCharacterReady || !pendingRecord.empty() || !refusedRecord.empty() || !waitingImport.empty()) return "own-character";
+    if (!ownCharacterReady) return "own-character";
     if (!trade::ReadyForSave()) return "trade";
     return nullptr;
-}
-
-net::SaveNote Note(uint8_t op, Manifest const& manifest, bool ok = true)
-{
-    net::SaveNote note{};
-    note.op = op;
-    note.ok = ok ? 1 : 0;
-    note.epoch = net::IsHost() ? epoch : hostWorld.epoch;
-    strncpy_s(note.world, manifest.key.world.c_str(), _TRUNCATE);
-    strncpy_s(note.save, manifest.key.save.c_str(), _TRUNCATE);
-    const std::string slot = saving::Slot(manifest.key.save);
-    strncpy_s(note.name, slot.c_str(), _TRUNCATE);
-    return note;
-}
-void ClearIncoming()
-{
-    receiving = false;
-    incomingFailed = false;
-    for (auto& bytes : incoming) bytes.clear();
-    std::fill(std::begin(incomingTotal), std::end(incomingTotal), 0);
-    incomingAt = 0;
-}
-
-void CancelClientSave(char const* reason)
-{
-    if (net::IsHost() || (!prepared.valid && !requestPending)) return;
-    net::SaveNote note = prepared.valid ? prepared.note : net::SaveNote{};
-    if (!prepared.valid) {
-        note.epoch = hostWorld.epoch;
-        strncpy_s(note.world, current.key.world.c_str(), _TRUNCATE);
-        strncpy_s(note.save, requestId.c_str(), _TRUNCATE);
-    }
-    note.op = net::SaveCancel;
-    note.ok = 0;
-    strncpy_s(note.name, reason, _TRUNCATE);
-    QueueReply(1, note);
-    prepared = {};
-    requestPending = false;
-    ClearIncoming();
-    SaveFailure(reason);
-}
-
-bool SendCampaign(uint8_t to, bool commit = false)
-{
-    if (net::FileTransferBusy(to)) return false;
-    Manifest manifest;
-    std::vector<uint8_t> data[net::FileCount];
-    if (!pairedEnabled || !transferring || !ReadBundle(campaign, manifest, data)) {
-        Logf("persist: checkpoint %s is incomplete; not sent to player %u", campaign.c_str(), to);
-        if (commit && pairedEnabled && transferring) CancelSave("transfer-manifest");
-        return false;
-    }
-    const net::SaveNote note = Note(commit ? net::SaveCommit : net::SaveImport, manifest);
-    uint32_t sizes[net::FileCount]{}, crcs[net::FileCount]{};
-    for (int f = 0; f < net::FileCount; ++f) {
-        sizes[f] = static_cast<uint32_t>(data[f].size());
-        crcs[f] = Crc32(data[f].data(), data[f].size());
-    }
-    if (!net::QueueFileTransfer(to, note, campaign.c_str(), data, sizes, crcs)) return false;
-    ++filesSent;
-    clients[to].sentAt = GetTickCount();
-    clients[to].arrived = false;
-    Logf("persist: checkpoint queued world=%s save=%s native_owner=%llu player_slot=%u mode=%s size=%u/%u/%u crc=%08x/%08x/%08x",
-         manifest.key.world.c_str(), manifest.key.save.c_str(), manifest.key.player, to, commit ? "store" : "load",
-         sizes[0], sizes[1], sizes[2], crcs[0], crcs[1], crcs[2]);
-    return true;
-}
-
-bool AdoptLegacy(std::string const& slot, Manifest& manifest)
-{
-    std::vector<uint8_t> data[net::FileCount];
-    if (!ReadAll(Path(slot, 0), data[0]) || !ReadAll(Path(slot, 1), data[1]) || data[0].empty() || data[1].empty()) return false;
-    // A malformed modern manifest must never be treated as an old save.
-    if (Exists(Path(slot, 2))) {
-        if (!ReadAll(Path(slot, 2), data[2])) return false;
-        const std::string text(data[2].begin(), data[2].end());
-        if (text.compare(0, 5, "G3T 2") == 0) return false;
-        if (!data[2].empty() && text.compare(0, 5, "G3T 1") != 0) return false;
-    }
-    manifest.key.world = LegacyId(data);
-    manifest.key.save = manifest.key.world;
-    // An old transferred blob has somebody else's native hero, even when its host ID was never recorded.
-    manifest.key.player = saving::LegacyNativeOwner(slot, steam::PlayerId());
-    manifest.legacy = slot;
-    if (!saving::Valid(manifest.key)) return false;
-    for (int f = 0; f < 2; ++f) {
-        manifest.size[f] = static_cast<uint32_t>(data[f].size());
-        manifest.crc[f] = Crc32(data[f].data(), data[f].size());
-    }
-    const std::vector<uint8_t> oldJournal = data[2];
-    data[2] = ManifestBytes(manifest, oldJournal);
-    const std::string canonical = saving::Slot(manifest.key.save);
-    if (!StoreBundle(canonical, data)) return false;
-    Logf("persist: legacy world adopted without changing source slot=%s world=%s save=%s", slot.c_str(),
-         manifest.key.world.c_str(), manifest.key.save.c_str());
-    return true;
-}
-
-bool ClaimLegacy(std::string const& path)
-{
-    const std::string ownerPath = path + ".owner";
-    std::vector<uint8_t> bytes;
-    const std::string owner = std::to_string(steam::PlayerId()) + "\n";
-    if (Exists(ownerPath)) return ReadAll(ownerPath, bytes) && std::string(bytes.begin(), bytes.end()) == owner;
-    return steam::PlayerId() && WriteAtomic(ownerPath, std::vector<uint8_t>(owner.begin(), owner.end()));
-}
-
-bool ChooseCharacter(std::string const& slot, Manifest const& manifest)
-{
-    desiredKey = {manifest.key.world, manifest.key.save, steam::PlayerId()};
-    if (!saving::Valid(desiredKey)) return false;
-    const std::string exact = CharacterPath(desiredKey), latest = LatestPath(desiredKey);
-    std::string legacy;
-    if (!manifest.legacy.empty()) {
-        const std::string oldName = saving::Prefix(manifest.legacy, "G3T_host_") ? manifest.legacy : "G3T_host_" + manifest.legacy;
-        legacy = hero::RecordPath(oldName.c_str());
-    } else if (saving::Prefix(slot, "G3T_host_")) legacy = hero::RecordPath(slot.c_str());
-    const auto selection = saving::Select(Exists(exact), Exists(latest), !legacy.empty() && Exists(legacy),
-                                         StableRunningHero() && NativeSaveAllowed());
-    pendingLegacy = false;
-    pendingKey = desiredKey;
-    if (selection == saving::Restore::Exact || selection == saving::Restore::Latest) {
-        pendingRecord = selection == saving::Restore::Exact ? exact : latest;
-        saving::Key found;
-        if (!hero::ReadRecordKey(pendingRecord.c_str(), found) || !saving::SameCharacter(found, desiredKey) ||
-            (selection == saving::Restore::Exact && !saving::Exact(found, desiredKey))) {
-            Logf("persist: character identity refused world=%s save=%s player=%llu record=%s", desiredKey.world.c_str(),
-                 desiredKey.save.c_str(), desiredKey.player, pendingRecord.c_str());
-            pendingRecord.clear();
-            Notice(i18n::SaveCharacterMissing, true);
-            return false;
-        }
-        pendingKey = found;
-        if (selection == saving::Restore::Latest) {
-            Logf("persist: missing exact character, recovering same-account/campaign record world=%s requested=%s recovered=%s player=%llu",
-                 desiredKey.world.c_str(), desiredKey.save.c_str(), found.save.c_str(), found.player);
-            Notice(i18n::SaveCharacterRecovered, true);
-        }
-    } else if (selection == saving::Restore::Legacy) {
-        if (!ClaimLegacy(legacy)) {
-            Logf("persist: legacy character belongs to another account or cannot be claimed: %s", legacy.c_str());
-            Notice(i18n::SaveCharacterMissing, true);
-            return false;
-        }
-        pendingRecord = legacy;
-        pendingLegacy = true;
-        Logf("persist: exact legacy character migration world=%s save=%s player=%llu source=%s", desiredKey.world.c_str(),
-             desiredKey.save.c_str(), desiredKey.player, legacy.c_str());
-    } else if (selection == saving::Restore::NewHero) {
-        if (!CaptureCharacter(desiredKey)) {
-            Log("persist: clean local character could not be captured before world import");
-            SaveFailure("character-write");
-            return false;
-        }
-        ++recordsWritten;
-        pendingRecord = exact;
-        Logf("persist: captured clean local character before import world=%s save=%s player=%llu",
-             desiredKey.world.c_str(), desiredKey.save.c_str(), desiredKey.player);
-    } else {
-        Logf("persist: no own character world=%s save=%s player=%llu; waiting for a new/local character, never using native host hero",
-             desiredKey.world.c_str(), desiredKey.save.c_str(), desiredKey.player);
-        Notice(i18n::SaveCharacterMissing, true);
-        return false;
-    }
-    if (!(pendingLegacy ? hero::ValidateLegacyRecord(pendingRecord.c_str()) :
-                          hero::ValidateRecord(pendingRecord.c_str(), pendingKey))) {
-        Logf("persist: character preflight refused world=%s save=%s player=%llu reason=%s; native load not invoked",
-             desiredKey.world.c_str(), desiredKey.save.c_str(), desiredKey.player,
-             hero::LastRefusal() ? hero::LastRefusal() : "record validation failed");
-        pendingRecord.clear();
-        Notice(i18n::SaveCharacterMissing, true);
-        return false;
-    }
-    pendingSince = 0;
-    return true;
-}
-
-void OnFileChunk(uint8_t file, uint32_t total, uint32_t offset, uint8_t const* data, uint16_t length)
-{
-    if (!receiving || incomingWelcome != net::WelcomeSerial() || incomingNote.epoch != hostWorld.epoch) return;
-    if (incomingFailed) return;
-    if (file >= net::FileCount || !data ||
-        !saving::ChunkFits(incomingTotal[file], incoming[file].size(), total, offset, length, FileLimit)) {
-        incomingFailed = true;
-        Logf("persist: checkpoint chunk rejected save=%s player=%llu file=%u total=%u offset=%u size=%u",
-             incomingNote.save, steam::PlayerId(), file, total, offset, length);
-        return;
-    }
-    incomingTotal[file] = total;
-    incoming[file].insert(incoming[file].end(), data, data + length);
-    incomingAt = GetTickCount();
-}
-
-void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t const crc[net::FileCount])
-{
-    if (!receiving || incomingWelcome != net::WelcomeSerial() || incomingNote.epoch != hostWorld.epoch) { ClearIncoming(); return; }
-    char const* reason = incomingFailed ? "transfer-chunk" :
-        !SafeName(name) || name != saving::Slot(incomingNote.save) ? "name" : nullptr;
-    for (int f = 0; !reason && f < net::FileCount; ++f) {
-        if (!size[f] || incomingTotal[f] != size[f] || incoming[f].size() != size[f]) reason = "transfer-length";
-        else if (Crc32(incoming[f].data(), incoming[f].size()) != crc[f]) reason = "transfer-crc";
-    }
-    Manifest manifest;
-    if (!reason && (!ParseManifest(incoming[2], manifest) || !Verify(manifest, incoming) ||
-        manifest.key.world != incomingNote.world || manifest.key.save != incomingNote.save)) reason = "transfer-manifest";
-    const bool commit = incomingNote.op == net::SaveCommit;
-    if (!reason && commit) {
-        saving::Key key{incomingNote.world, incomingNote.save, steam::PlayerId()}, found;
-        if (!prepared.valid || prepared.welcome != net::WelcomeSerial() ||
-            std::strcmp(prepared.note.save, incomingNote.save) || !hero::ReadRecordKey(CharacterPath(key).c_str(), found) ||
-            !saving::Exact(key, found)) reason = "character-record";
-    }
-    if (!reason && !StoreBundle(name, incoming)) reason = "disk-write";
-    if (!reason && commit) {
-        const char* alias = prepared.note.name;
-        if (!SafeName(alias) || saving::Prefix(alias, "G3T_") || !StoreBundle(alias, incoming)) reason = "alias-write";
-        if (reason) Logf("persist: client checkpoint alias not published save=%s slot=%s player=%llu",
-                      incomingNote.save, alias, steam::PlayerId());
-    }
-    if (reason) {
-        Logf("persist: checkpoint transfer refused save=%s player=%llu mode=%s size=%u/%u/%u crc=%08x/%08x/%08x reason=%s",
-             incomingNote.save, steam::PlayerId(), commit ? "store" : "load",
-             size[0], size[1], size[2], crc[0], crc[1], crc[2], reason);
-        SaveFailure(reason);
-        if (commit) {
-            net::SaveNote answer = incomingNote;
-            answer.op = net::SaveStored;
-            answer.ok = 0;
-            strncpy_s(answer.name, reason, _TRUNCATE);
-            QueueReply(1, answer);
-            prepared = {};
-            requestPending = false;
-        }
-        ClearIncoming();
-        return;
-    }
-    ++filesReceived;
-    lastReceived = name;
-    Logf("persist: checkpoint stored world=%s save=%s player=%llu size=%u/%u/%u crc=%08x/%08x/%08x mode=%s",
-         manifest.key.world.c_str(), manifest.key.save.c_str(), steam::PlayerId(),
-         size[0], size[1], size[2], crc[0], crc[1], crc[2], commit ? "store" : "load");
-    ClearIncoming();
-    if (commit) {
-        const saving::Key key{manifest.key.world, manifest.key.save, steam::PlayerId()};
-        const bool latestOk = PublishLatest(key);
-        if (latestOk) {
-            current = manifest;
-            localKind = net::KindSaved;
-            localSave = name;
-        }
-        net::SaveNote answer = Note(net::SaveStored, manifest, latestOk);
-        if (!latestOk) strncpy_s(answer.name, "character-write", _TRUNCATE);
-        QueueReply(1, answer);
-        prepared.stored = latestOk;
-        if (!latestOk) { prepared = {}; SaveFailure("character-write"); }
-    } else {
-        waitingImport = name;
-        waitingEpoch = hostWorld.epoch;
-        waitingWelcome = net::WelcomeSerial();
-        nextImportTry = GetTickCount() + 2000;
-        if (ChooseCharacter(name, manifest)) {
-            // Selection is made again at the actual load. Never replace an exact record with the running hero.
-            pendingRecord.clear();
-            OrderAutoload(name);
-        }
-    }
-}
-
-void StopSaveTimer()
-{
-    if (saveWindow) KillTimer(saveWindow, SaveTimer);
-    saveWindow = nullptr;
-}
-void FinishSave(bool ok, char const* why)
-{
-    if (!ok) net::CancelFileTransfers(savingManifest.key.save.c_str());
-    Logf("persist: checkpoint %s world=%s save=%s player=%llu slot=%s reason=%s",
-         ok ? "paired" : "incomplete", savingManifest.key.world.c_str(), savingManifest.key.save.c_str(),
-         steam::PlayerId(), requestedSlot.c_str(), why);
-    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-        if (!barrier.members[i].generation || !net::PeerJoined(i) || net::PeerGeneration(i) != barrier.members[i].generation) continue;
-        net::SaveNote result = Note(ok ? net::SaveResult : net::SaveCancel, savingManifest, ok);
-        if (!ok) strncpy_s(result.name, why, _TRUNCATE);
-        QueueReply(i, result);
-    }
-    if (ok) Notice(i18n::SavePaired);
-    else SaveFailure(why);
-    StopSaveTimer();
-    barrier = saving::Barrier{};
-    savedJournal.clear();
-}
-void CancelSave(char const* why) { if (barrier.phase != saving::Barrier::Idle) FinishSave(false, why); }
-
-bool CaptureJournal(std::string const& slot)
-{
-    const std::string path = Path(slot, 2) + ".state";
-    FILE* file = nullptr;
-    if (fopen_s(&file, path.c_str(), "wb") || !file) { Logf("persist: cannot capture world journal %s", path.c_str()); return false; }
-    journal::Write(file);
-    npcs::WriteCompanions(file);
-    if (net::IsHost()) fprintf(file, "downed %d\n", downed::Held() ? 1 : 0);
-    const bool leaseOk = !net::IsHost() || npclease::WriteSnapshot(file);
-    bool ok = leaseOk && !ferror(file);
-    ok = fflush(file) == 0 && ok;
-    ok = fclose(file) == 0 && ok;
-    if (ok) ok = ReadAll(path, savedJournal);
-    DeleteFileA(path.c_str());
-    return ok;
-}
-
-void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
-{
-    if (processDepth || nativeLoadDepth || nativeSaveDepth || barrier.phase != saving::Barrier::Preparing || !barrier.AllReady()) return;
-    if (npclease::ActiveLeases()) {
-        CancelSave("NPC lease active: save would lose client-owned NPC state");
-        return;
-    }
-    if (barrier.epoch != epoch) { CancelSave("world"); return; }
-    if (char const* reason = SaveReadiness()) { CancelSave(reason); return; }
-    const std::string slot = saving::Slot(barrier.save);
-    void* manager = FileManager(false);
-    if (!manager || !originalSave || !writing) { CancelSave("native-hooks"); return; }
-    if (!CaptureJournal(slot)) { CancelSave("journal-write"); return; }
-    if (!CaptureCharacter(savingManifest.key)) { CancelSave("character-write"); return; }
-    ++recordsWritten;
-    if (requestedSlot == "QuickSave") {
-        // The verified native capture helper takes its file manager in ESI, not ECX.
-        void* capture = uiEntries[4];
-        __asm {
-            push esi
-            mov esi, manager
-            call capture
-            pop esi
-        }
-    }
-    remote::DespawnAll("coordinated save");
-    const bCString name(slot.c_str());
-    Logf("persist: native invoke=HUD.SaveGame world=%s save=%s player=%llu slot=%s",
-         savingManifest.key.world.c_str(), savingManifest.key.save.c_str(), savingManifest.key.player, slot.c_str());
-    ++nativeSaveDepth;
-    const bool ok = originalSave(manager, &name);
-    --nativeSaveDepth;
-    ++saves;
-    Logf("persist: native result=HUD.SaveGame save=%s player=%llu ok=%d", savingManifest.key.save.c_str(),
-         savingManifest.key.player, ok ? 1 : 0);
-    if (!ok) { CancelSave("native-save"); return; }
-    nativeReturnedAt = GetTickCount();
-    barrier.phase = saving::Barrier::Writing;
-    Logf("persist: native checkpoint save returned world=%s save=%s player=%llu; waiting for disk completion",
-         savingManifest.key.world.c_str(), savingManifest.key.save.c_str(), savingManifest.key.player);
-}
-
-bool StartSave(char const* name)
-{
-    if (!pairedEnabled || !NativeReady() || !writing) { SaveFailure("native-hooks"); return false; }
-    if (!SafeName(name) || saving::Prefix(name, "G3T_")) { SaveFailure("name"); return false; }
-    if (barrier.phase != saving::Barrier::Idle) { SaveFailure("busy"); return false; }
-    if (char const* reason = SaveReadiness()) { SaveFailure(reason); return false; }
-    savingManifest = Manifest{};
-    savingManifest.key = {current.key.world.empty() ? RandomId() : current.key.world, RandomId(), steam::PlayerId()};
-    if (!saving::Valid(savingManifest.key)) {
-        Logf("persist: checkpoint identity unavailable world=%s save=%s player=%llu; paired saves off for this save",
-             savingManifest.key.world.c_str(), savingManifest.key.save.c_str(), steam::PlayerId());
-        SaveFailure("identity");
-        return false;
-    }
-    barrier = saving::Barrier{};
-    barrier.phase = saving::Barrier::Preparing;
-    barrier.save = savingManifest.key.save;
-    barrier.epoch = epoch;
-    requestedSlot = name;
-    saveStarted = GetTickCount();
-    nativeReturnedAt = 0;
-    aliasPublished = false;
-    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-        if (!net::PeerJoined(i)) continue;
-        if (!net::InWorld(i)) { CancelSave("peer-loading"); return false; }
-        barrier.members[i].generation = net::PeerGeneration(i);
-        net::SaveNote prepare = Note(net::SavePrepare, savingManifest);
-        strncpy_s(prepare.name, requestedSlot.c_str(), _TRUNCATE);
-        if (!net::SendSave(i, prepare)) { CancelSave("control-send"); return false; }
-    }
-    saveWindow = eCApplication::GetInstance().GetHandle();
-    if (!saveWindow || !SetTimer(saveWindow, SaveTimer, 50, &SaveNow)) { CancelSave("timer"); return false; }
-    Logf("persist: checkpoint requested world=%s save=%s player=%llu slot=%s epoch=%08x",
-         savingManifest.key.world.c_str(), savingManifest.key.save.c_str(), steam::PlayerId(), name, epoch);
-    Notice(i18n::SaveQueued);
-    return true;
-}
-
-bool __stdcall SaveDetour(void* self, bCString const* name)
-{
-    if (!pairedEnabled) return originalSave && originalSave(self, name);
-    ++saveRequestsSeen;
-    if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
-    if (!name || !SafeName(name->GetText())) {
-        Log("persist: save refused; the name is not a SafeName");
-        SaveFailure("name");
-        return false;
-    }
-    if (char const* reason = SaveReadiness()) { SaveFailure(reason); return false; }
-    if (net::IsHost()) StartSave(name->GetText());
-    else if (!net::Joined()) SaveFailure("host-offline");
-    else if (!net::InWorld(net::LocalId())) SaveFailure("peer-loading");
-    else if (requestPending || prepared.valid) SaveFailure("busy");
-    else {
-        net::SaveNote note{};
-        note.op = net::SaveRequest;
-        note.epoch = hostWorld.epoch;
-        requestId = RandomId();
-        if (requestId.empty()) { SaveFailure("identity"); return false; }
-        strncpy_s(note.save, requestId.c_str(), _TRUNCATE);
-        const std::string world = saving::Id(current.key.world) ? current.key.world : std::string(32, '0');
-        strncpy_s(note.world, world.c_str(), _TRUNCATE);
-        strncpy_s(note.name, name->GetText(), _TRUNCATE);
-        if (net::SendSave(1, note)) {
-            requestAt = GetTickCount();
-            requestWelcome = net::WelcomeSerial();
-            requestPending = true;
-            Logf("persist: client requested authoritative world save slot=%s epoch=%08x player=%llu",
-                 note.name, note.epoch, steam::PlayerId());
-            Notice(i18n::SaveQueued);
-        } else SaveFailure("control-send");
-    }
-    // The engine has not saved yet. Do not return success for a queued distributed operation.
-    return false;
 }
 
 bool __fastcall GuiMessageDetour(gCGUIManager* self, void*, GEUInt message, GEUInt key, GEInt flags)
@@ -1337,6 +704,9 @@ bool __stdcall MenuNewSlot(void* self)
 {
     if (ai::ShuttingDown() || !pairedEnabled) return originalNewSlot(self);
     if (!NativeReady()) { SaveFailure("native-hooks"); return true; }
+    if (!net::IsHost() && !net::Joined()) { SaveFailure("host-offline"); return true; }
+    if (!net::IsHost() && !net::InWorld(net::LocalId())) { SaveFailure("peer-loading"); return true; }
+    if (char const* reason = SaveReadiness()) { SaveFailure(reason); return true; }
     const unsigned before = saveRequestsSeen;
     originalNewSlot(self); // Retain the game's menu-slot allocation; SaveDetour queues the request.
     if (before == saveRequestsSeen) SaveFailure("slot-allocation");
@@ -1349,9 +719,11 @@ bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGf
     if (!pairedEnabled) return originalWorldSave(self, name, image, metadata, size);
     if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
     if (nativeSaveDepth) {
+        ++lowerSaveCalls;
         Logf("persist: native invoke=World.SaveGameWorld save=%s player=%llu metadata_size=%lu",
              savingManifest.key.save.c_str(), steam::PlayerId(), size);
         const bool ok = originalWorldSave(self, name, image, metadata, size);
+        lowerSaveGood = lowerSaveGood && ok;
         Logf("persist: native result=World.SaveGameWorld save=%s player=%llu ok=%d metadata_size=%lu",
              savingManifest.key.save.c_str(), steam::PlayerId(), ok ? 1 : 0, size);
         return ok;
@@ -1364,7 +736,7 @@ bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool
     if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
     const bool observed = nativeLoadDepth != 0;
     if (pairedEnabled && !observed) {
-        Logf("persist: load refused function=World.LoadGameWorld slot=%s player=%llu; paired saves off for this load, use HUD.LoadGame",
+        Logf("persist: load refused function=World.LoadGameWorld slot=%s player=%llu; host-managed saves off for this load, use HUD.LoadGame",
              name.GetText(), steam::PlayerId());
         SaveFailure("native-load");
         return false;
@@ -1372,656 +744,767 @@ bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool
     if (observed) ++lowerLoadCalls;
     if (observed) Logf("persist: native invoke=World.LoadGameWorld save=%s player=%llu flag=%d",
                        current.key.save.c_str(), steam::PlayerId(), nativeFlag ? 1 : 0);
-    crashlog::WorldEntryScope operation("native World.LoadGameWorld / PUP bridge");
+    crashlog::WorldEntryScope scope("native World.LoadGameWorld / PUP bridge");
     const bool ok = originalWorldLoad(self, name, nativeFlag);
-    operation.Complete();
+    scope.Complete();
     if (observed) lowerLoadGood = lowerLoadGood && ok;
     if (observed) Logf("persist: native result=World.LoadGameWorld save=%s player=%llu ok=%d",
                        current.key.save.c_str(), steam::PlayerId(), ok ? 1 : 0);
     return ok;
 }
 
-bool CampaignComplete(std::string const& slot)
+void Notice(i18n::Message message, bool bad = false)
 {
-    static std::string observed;
-    static WIN32_FILE_ATTRIBUTE_DATA seen[2]{};
-    static uint32_t since = 0;
-    WIN32_FILE_ATTRIBUTE_DATA now[2]{};
-    for (int f = 0; f < 2; ++f) {
-        if (!GetFileAttributesExA(Path(slot, f).c_str(), GetFileExInfoStandard, &now[f]) || now[f].nFileSizeHigh || !now[f].nFileSizeLow) return false;
-    }
-    bool changed = observed != slot;
-    for (int f = 0; f < 2; ++f)
-        if (seen[f].nFileSizeLow != now[f].nFileSizeLow || CompareFileTime(&seen[f].ftLastWriteTime, &now[f].ftLastWriteTime)) changed = true;
-    if (changed) {
-        observed = slot;
-        std::copy(std::begin(now), std::end(now), std::begin(seen));
-        since = GetTickCount();
-    }
-    return !changed && GetTickCount() - since >= 1000;
+    if (gCSession::GetInstance().IsGameRunning()) hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
+    else hud::MenuLine(i18n::Text(message));
 }
-
-void PollSave()
+void SaveFailure(char const* code)
 {
-    if (barrier.phase == saving::Barrier::Idle) return;
-    if (barrier.epoch != epoch) { CancelSave("world"); return; }
-    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-        if (!barrier.members[i].generation) continue;
-        if (!net::PeerJoined(i) || net::PeerGeneration(i) != barrier.members[i].generation) {
-            CancelSave("peer-left");
-            return;
-        }
+    lastSaveFailure = code;
+    Logf("persist: save refusal reason=%s player=%llu host=%d active=%d", code, steam::PlayerId(),
+         net::IsHost() ? 1 : 0, operation.active ? 1 : 0);
+    wchar_t text[500]{};
+    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SaveFailureReason), i18n::SaveReason(code));
+    if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
+    else hud::MenuLine(text);
+}
+bool WriteAtomic(std::string const& path, Bytes const& bytes)
+{
+    if (saving::store::Atomic(path, bytes)) return true;
+    Logf("persist: atomic write failed path=%s error=%lu bytes=%zu", path.c_str(), GetLastError(), bytes.size());
+    return false;
+}
+std::string CharacterPath()
+{
+    const std::string folder = Folder();
+    return folder.empty() ? std::string() : folder + "g3t-character-" + std::to_string(steam::PlayerId()) + "-local.txt";
+}
+bool ValidateCharacter(Bytes const& bytes, saving::Key const& key)
+{
+    saving::Key found;
+    if (!saving::store::HeroKey(bytes, found) || !saving::Exact(found, key)) return false;
+    const std::string base = CharacterPath();
+    if (base.empty()) return false;
+    const std::string path = base + ".validate";
+    if (!WriteAtomic(path, bytes)) return false;
+    const bool ok = hero::ValidateRecord(path.c_str(), key);
+    DeleteFileA(path.c_str());
+    return ok;
+}
+bool CaptureCharacter(saving::Key const& key, Bytes& bytes)
+{
+    const std::string path = CharacterPath();
+    const bool ok = !path.empty() && hero::SaveRecord(path.c_str(), key) && ReadAll(path, bytes) &&
+                    bytes.size() <= saving::store::CharacterLimit && ValidateCharacter(bytes, key);
+    Logf("persist: character capture world=%s save=%s player=%llu ok=%d bytes=%zu crc=%08x",
+         key.world.c_str(), key.save.c_str(), key.player, ok ? 1 : 0, bytes.size(), saving::store::Crc(bytes));
+    if (ok) ++recordsWritten;
+    return ok;
+}
+bool CapturePlayer(saving::Key const& key, Bytes& bytes, char const*& reason)
+{
+    Bytes hero, state;
+    if (!CaptureCharacter(key, hero)) { reason = "character-write"; return false; }
+    if (!containers::CapturePersonal(state) || !saving::store::PackPlayer(hero, state, bytes)) {
+        reason = "personal-record"; return false;
     }
+    Logf("persist: player envelope captured account=%llu hero_bytes=%zu personal_bytes=%zu total=%zu",
+         key.player, hero.size(), state.size(), bytes.size());
+    return true;
+}
+bool PersonalReadyForRestore(Bytes const& bytes)
+{
+    if (bytes.empty() || containers::PersonalHooksReady()) return true;
+    saving::personal::Snapshot snapshot;
+    if (!saving::personal::Decode(bytes, snapshot)) return false;
+    for (auto const& entry : snapshot)
+        if (static_cast<uint8_t>(entry.second.kind) != 4) return false;
+    return true;
+}
+net::SaveNote Note(uint8_t op, Save const& save, bool ok = true)
+{
+    net::SaveNote note{};
+    note.op = op; note.ok = ok ? 1 : 0; note.epoch = net::IsHost() ? epoch : hostWorld.epoch;
+    strncpy_s(note.world, save.key.world.c_str(), _TRUNCATE);
+    strncpy_s(note.save, save.key.save.c_str(), _TRUNCATE);
+    strncpy_s(note.name, requestedSlot.c_str(), _TRUNCATE);
+    return note;
+}
+void QueueReply(uint8_t to, net::SaveNote const& note)
+{
+    if (to >= net::MaxPlayers) return;
+    auto& reply = net::IsHost() ? hostReplies[to] : clientReply;
     const uint32_t now = GetTickCount();
-    if ((barrier.phase == saving::Barrier::Preparing && now - saveStarted > PrepareLimit) ||
-        (barrier.phase == saving::Barrier::Writing && now - nativeReturnedAt > WriteLimit) ||
-        (barrier.phase == saving::Barrier::Committing && now - saveStarted > TransferLimit)) {
-        CancelSave(barrier.phase == saving::Barrier::Preparing ? "prepare-timeout" :
-                   barrier.phase == saving::Barrier::Writing ? "write-timeout" : "transfer-timeout");
-        return;
-    }
-    if (barrier.phase == saving::Barrier::Preparing) return; // native call is exclusively in SaveNow
-    if (barrier.phase == saving::Barrier::Committing) {
-        for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-            auto& member = barrier.members[i];
-            if (!member.generation || member.queued) continue;
-            const bool queued = SendCampaign(i, true);
-            if (barrier.phase != saving::Barrier::Committing) return;
-            member.queued = queued;
-        }
-        if (barrier.AllStored()) FinishSave(aliasPublished, aliasPublished ? "all participant stores acknowledged" : "alias-write");
-        return;
-    }
-    const std::string slot = saving::Slot(barrier.save);
-    if (now - nativeReturnedAt < 2000 || !CampaignComplete(slot)) return;
-    std::vector<uint8_t> data[net::FileCount];
-    for (int f = 0; f < 2; ++f) if (!ReadAll(Path(slot, f), data[f]) || data[f].empty()) return;
-    for (int f = 0; f < 2; ++f) {
-        savingManifest.size[f] = static_cast<uint32_t>(data[f].size());
-        savingManifest.crc[f] = Crc32(data[f].data(), data[f].size());
-    }
-    data[2] = ManifestBytes(savingManifest, savedJournal);
-    if (!WriteAtomic(Path(slot, 2), data[2])) { CancelSave("disk-write"); return; }
-    ++sidecarsWritten;
-    if (!PublishLatest(savingManifest.key)) { CancelSave("character-write"); return; }
-    campaign = slot;
-    current = savingManifest;
-    localKind = net::KindSaved;
-    localSave = slot;
-    lastSave = requestedSlot;
-    aliasPublished = StoreBundle(requestedSlot, data);
-    if (!aliasPublished) { CancelSave("alias-write"); return; }
-    barrier.phase = saving::Barrier::Committing;
-    saveStarted = now;
-    Logf("persist: host checkpoint published world=%s save=%s player=%llu alias=%s alias_ok=%d size=%u/%u/%zu crc=%08x/%08x/%08x",
-         current.key.world.c_str(), current.key.save.c_str(), current.key.player, requestedSlot.c_str(), aliasPublished ? 1 : 0,
-         current.size[0], current.size[1], data[2].size(), current.crc[0], current.crc[1], Crc32(data[2].data(), data[2].size()));
+    reply = {note, net::IsHost() ? net::PeerGeneration(to) : net::WelcomeSerial(), now + 250, now + 10000, true};
+    if (net::SendSave(to, note)) reply.pending = false;
 }
-
+void RetryReplies(uint32_t now)
+{
+    for (uint8_t to = net::IsHost() ? 2 : 1; to < (net::IsHost() ? net::MaxPlayers : 2); ++to) {
+        auto& reply = net::IsHost() ? hostReplies[to] : clientReply;
+        if (!reply.pending) continue;
+        if (static_cast<int32_t>(now - reply.expires) >= 0 ||
+            (net::IsHost() ? !net::PeerJoined(to) || reply.generation != net::PeerGeneration(to)
+                          : !net::Joined() || reply.generation != net::WelcomeSerial()) ||
+            reply.note.epoch != (net::IsHost() ? epoch : hostWorld.epoch)) { reply.pending = false; continue; }
+        if (static_cast<int32_t>(now - reply.nextTry) < 0) continue;
+        reply.nextTry = now + 250;
+        if (net::SendSave(to, reply.note)) reply.pending = false;
+    }
+}
+bool SendRecord(uint8_t to, uint8_t purpose, saving::Key const& key, Bytes const& bytes)
+{
+    net::CharacterNote note{};
+    note.purpose = purpose; note.epoch = net::IsHost() ? epoch : hostWorld.epoch;
+    note.account = key.player; note.length = static_cast<uint32_t>(bytes.size()); note.crc = saving::store::Crc(bytes);
+    strncpy_s(note.world, key.world.c_str(), _TRUNCATE); strncpy_s(note.save, key.save.c_str(), _TRUNCATE);
+    const bool ok = net::SendCharacter(to, note, bytes);
+    Logf("persist: character send purpose=%u peer=%u account=%llu save=%s bytes=%zu crc=%08x queued=%d",
+         purpose, to, key.player, note.save, bytes.size(), note.crc, ok ? 1 : 0);
+    return ok;
+}
+void StopSaveTimer()
+{
+    if (saveWindow) KillTimer(saveWindow, SaveTimer);
+    saveWindow = nullptr;
+}
+void CleanupStaging()
+{
+    if (stagingSlot.empty()) return;
+    for (int f = 0; f < 2; ++f) {
+        const std::string path = Path(stagingSlot, f);
+        if (Exists(path) && !DeleteFileA(path.c_str()))
+            Logf("persist: staging cleanup failed path=%s error=%lu", path.c_str(), GetLastError());
+    }
+    stagingSlot.clear();
+}
+void FinishSave(bool ok, char const* why)
+{
+    if (!operation.active) return;
+    Logf("persist: host save %s world=%s save=%s slot=%s elapsed_ms=%u reason=%s",
+         ok ? "complete" : "failed", savingManifest.key.world.c_str(), savingManifest.key.save.c_str(),
+         requestedSlot.c_str(), GetTickCount() - operation.started, why);
+    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
+        if (!operation.members[i].generation || operation.members[i].generation != net::PeerGeneration(i)) continue;
+        auto result = Note(net::SaveResult, savingManifest, ok);
+        if (!ok) strncpy_s(result.name, why, _TRUNCATE);
+        auto& request = requests[i];
+        if (request.transaction == savingManifest.key.save && request.generation == net::PeerGeneration(i)) {
+            request.result = result;
+            request.complete = true;
+        }
+        QueueReply(i, result);
+    }
+    StopSaveTimer();
+    operation = {};
+    CleanupStaging();
+    if (ok) Notice(i18n::SaveComplete); else SaveFailure(why);
+}
+void CancelSave(char const* why) { FinishSave(false, why); }
+bool AllReady()
+{
+    return operation.AllReady();
+}
+bool CaptureJournal(Bytes& bytes)
+{
+    const std::string path = Path(stagingSlot, 2) + ".state";
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "wb") || !file) return false;
+    journal::Write(file); npcs::WriteCompanions(file);
+    fprintf(file, "downed %d\n", downed::Held() ? 1 : 0);
+    bool ok = !ferror(file);
+    ok = fflush(file) == 0 && ok;
+    ok = fclose(file) == 0 && ok;
+    if (ok) ok = ReadAll(path, bytes);
+    DeleteFileA(path.c_str());
+    return ok;
+}
+bool CaptureExtensions(Save& save)
+{
+    for (auto const& entry : extensions) {
+        Bytes bytes;
+        if (!entry.capture(bytes) || bytes.size() > saving::store::ExtensionLimit) {
+            Logf("persist: extension capture refused name=%s type=%u bytes=%zu", entry.name.c_str(), entry.type, bytes.size());
+            return false;
+        }
+        saving::store::Set(save, {entry.type, entry.version, 0, std::move(bytes)});
+    }
+    return true;
+}
+bool RestoreExtensions()
+{
+    const Bytes empty;
+    for (auto const& entry : extensions) {
+        auto* block = saving::store::Find(current, entry.type);
+        if (!entry.restore(block ? block->version : 0, block ? block->bytes : empty)) {
+            Logf("persist: extension restore refused name=%s type=%u version=%u",
+                 entry.name.c_str(), entry.type, block ? block->version : 0);
+            return false;
+        }
+    }
+    return true;
+}
+constexpr uint32_t NpcLeaseExtension = saving::store::Extension;
+bool CaptureNpcLease(Bytes& bytes)
+{
+    std::string text;
+    if (!npclease::EncodeSaveText(npclease::Capture(), text)) return false;
+    bytes.assign(text.begin(), text.end());
+    return bytes.size() <= saving::store::ExtensionLimit;
+}
+bool RestoreNpcLease(uint32_t savedVersion, Bytes const& bytes)
+{
+    if (!savedVersion) {
+        npclease::OnWorldDeactivate();
+        return true;
+    }
+    if (savedVersion != 1 || bytes.size() > npclease::MaxOverlayText) return false;
+    std::string text(bytes.begin(), bytes.end());
+    npclease::SaveOverlay overlay;
+    if (!npclease::DecodeSaveText(text, overlay)) return false;
+    return npclease::Restore(overlay, epoch);
+}
+bool Materialize(std::string const& slot, Save const& save)
+{
+    for (int f = 0; f < 2; ++f) {
+        auto const* block = saving::store::Find(save, f ? saving::store::NativeWorld : saving::store::NativeHeader);
+        if (!block || !WriteAtomic(Path(slot, f), block->bytes)) return false;
+    }
+    return true;
+}
+bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
+{
+    if (!pairedEnabled || nativeSaveDepth || ai::ShuttingDown()) return originalDelete(self, name);
+    if (!SafeName(name.GetText())) { SaveFailure("name"); return false; }
+    if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
+    const std::string slot = name.GetText(), path = Path(slot, 2);
+    if (operation.active && requestedSlot == slot) CancelSave("canceled-delete");
+    if (!Exists(path)) return originalDelete(self, name);
+    Bytes bytes;
+    Save intact;
+    const bool recoverable = ReadAll(path, bytes) && saving::store::Decode(bytes, intact);
+    const bool nativeOk = originalDelete(self, name);
+    const bool gone = !Exists(Path(slot, 0)) && !Exists(Path(slot, 1));
+    if (gone && (!Exists(path) || DeleteFileA(path.c_str()))) {
+        Logf("persist: host slot deleted slot=%s native_ok=%d", slot.c_str(), nativeOk ? 1 : 0);
+        return true;
+    }
+    const DWORD failure = GetLastError();
+    if (recoverable && !Materialize(slot, intact)) Logf("persist: delete recovery failed slot=%s", slot.c_str());
+    Logf("persist: slot deletion failed slot=%s native_ok=%d error=%lu; container retained recoverable=%d",
+         slot.c_str(), nativeOk ? 1 : 0, failure, recoverable ? 1 : 0);
+    SaveFailure("disk-write");
+    return false;
+}
+void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
+{
+    if (npclease::ActiveLeases()) {
+        CancelSave("NPC lease active: save would lose client-owned NPC state");
+        return;
+    }
+    if (processDepth || nativeLoadDepth || nativeSaveDepth || !operation.active || !AllReady()) return;
+    if (operation.epoch != epoch) { CancelSave("world"); return; }
+    if (operation.Expired(GetTickCount())) { CancelSave("world-state"); return; }
+    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
+        auto const& member = operation.members[i];
+        if (member.generation && (!net::InWorld(i) || member.generation != net::PeerGeneration(i) ||
+                                  member.account != net::PeerAccount(i))) { CancelSave("peer-left"); return; }
+    }
+    if (char const* reason = SaveReadiness()) { CancelSave(reason); return; }
+    if (!doors::SettleForSave()) return;
+    void* manager = FileManager(false);
+    if (!manager || !writing) { CancelSave("native-hooks"); return; }
+    Bytes hero, state;
+    if (!CaptureCharacter(savingManifest.key, hero)) { CancelSave("character-write"); return; }
+    saving::store::Set(savingManifest, {saving::store::Character, 4, steam::PlayerId(), std::move(hero)});
+    if (!containers::CapturePersonal(state)) { CancelSave("personal-record"); return; }
+    saving::store::Set(savingManifest, {saving::store::Personal, 1, steam::PlayerId(), std::move(state)});
+    if (!CaptureJournal(state)) { CancelSave("journal-write"); return; }
+    saving::store::Set(savingManifest, {saving::store::Journal, 1, 0, std::move(state)});
+    if (!CaptureExtensions(savingManifest)) { CancelSave("extension"); return; }
+    if (requestedSlot == "QuickSave") {
+        void* capture = uiEntries[4];
+        __asm {
+            push esi
+            mov esi, manager
+            call capture
+            pop esi
+        }
+    }
+    remote::DespawnAll("host-managed save");
+    const bCString name(stagingSlot.c_str());
+    Logf("persist: native invoke=HUD.SaveGame save=%s slot=%s player=%llu",
+         savingManifest.key.save.c_str(), stagingSlot.c_str(), steam::PlayerId());
+    lowerSaveCalls = 0; lowerSaveGood = true;
+    ++nativeSaveDepth;
+    const bool nativeOk = originalSave(manager, &name);
+    --nativeSaveDepth;
+    ++saves;
+    Logf("persist: native result=HUD.SaveGame save=%s ok=%d lower_calls=%u lower_ok=%d",
+         savingManifest.key.save.c_str(), nativeOk ? 1 : 0, lowerSaveCalls, lowerSaveGood ? 1 : 0);
+    if (!nativeOk || lowerSaveCalls != 1 || !lowerSaveGood) { CancelSave("native-save"); return; }
+    for (int f = 0; f < 2; ++f) {
+        Bytes bytes;
+        if (!ReadAll(Path(stagingSlot, f), bytes) || bytes.empty()) { CancelSave("disk-write"); return; }
+        saving::store::Set(savingManifest, {f ? saving::store::NativeWorld : saving::store::NativeHeader, 1, 0, std::move(bytes)});
+    }
+    Bytes encoded;
+    if (!saving::store::Encode(savingManifest, encoded)) {
+        Logf("persist: container encoding refused save=%s blocks=%zu", savingManifest.key.save.c_str(), savingManifest.blocks.size());
+        CancelSave("container-format"); return;
+    }
+    if (!WriteAtomic(Path(requestedSlot, 2), encoded)) { CancelSave("disk-write"); return; }
+    current = savingManifest;
+    lastSave = requestedSlot;
+    // Saving is not a world change: do not reset epochs, admission, or the client's live character.
+    const bool menuOk = Materialize(requestedSlot, current);
+    Logf("persist: host container published save=%s slot=%s bytes=%zu records=%zu menu_ok=%d network_world_bytes=0",
+         current.key.save.c_str(), requestedSlot.c_str(), encoded.size(), current.blocks.size(), menuOk ? 1 : 0);
+    FinishSave(menuOk, menuOk ? "durable host container" : "disk-write");
+}
+bool StartSave(char const* name)
+{
+    if (!pairedEnabled || !NativeReady() || !writing) { SaveFailure("native-hooks"); return false; }
+    if (!SafeName(name) || saving::Prefix(name, "G3T_pending_")) { SaveFailure("name"); return false; }
+    if (operation.active) {
+        if (requestedSlot == name) return true;
+        SaveFailure("busy"); return false;
+    }
+    if (char const* reason = SaveReadiness()) { SaveFailure(reason); return false; }
+    savingManifest = {};
+    savingManifest.key = {saving::Id(current.key.world) ? current.key.world : RandomId(), RandomId(), steam::PlayerId()};
+    if (!saving::Valid(savingManifest.key)) { SaveFailure("identity"); return false; }
+    // Retain absent accounts and unknown extensions, but never data from another campaign.
+    for (auto block : current.blocks) {
+        if (block.type == saving::store::Character && block.account != steam::PlayerId()) {
+            if (!saving::store::Rebind(block.bytes, {savingManifest.key.world, savingManifest.key.save, block.account})) {
+                SaveFailure("character-record"); return false;
+            }
+            savingManifest.blocks.push_back(std::move(block));
+            bool present = false;
+            for (uint8_t i = 2; i < net::MaxPlayers; ++i)
+                if (net::PeerJoined(i) && net::PeerAccount(i) == savingManifest.blocks.back().account) present = true;
+            if (!present) Logf("persist: retained absent character account=%llu save=%s; no offline progress captured",
+                               savingManifest.blocks.back().account, savingManifest.key.save.c_str());
+        } else if ((block.type == saving::store::Personal && block.account != steam::PlayerId()) ||
+                   block.type >= saving::store::Extension) savingManifest.blocks.push_back(std::move(block));
+    }
+    requestedSlot = name; stagingSlot = "G3T_pending_" + savingManifest.key.save;
+    operation = {};
+    operation.active = true; operation.epoch = epoch; operation.started = GetTickCount();
+    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
+        if (!net::PeerJoined(i)) continue;
+        const uint64_t account = net::PeerAccount(i);
+        if (!net::InWorld(i)) { CancelSave("peer-loading"); return false; }
+        if (!account || account == steam::PlayerId()) { CancelSave("identity"); return false; }
+        for (uint8_t j = 2; j < i; ++j)
+            if (operation.members[j].account == account) { CancelSave("identity"); return false; }
+        operation.members[i] = {net::PeerGeneration(i), 0, account, false};
+        QueueReply(i, Note(net::SavePrepare, savingManifest));
+    }
+    saveWindow = eCApplication::GetInstance().GetHandle();
+    if (!saveWindow || !SetTimer(saveWindow, SaveTimer, 30, &SaveNow)) { CancelSave("timer"); return false; }
+    Logf("persist: host save requested world=%s save=%s slot=%s epoch=%08x", savingManifest.key.world.c_str(),
+         savingManifest.key.save.c_str(), name, epoch);
+    Notice(i18n::SaveQueued);
+    return true;
+}
+bool __stdcall SaveDetour(void* self, bCString const* name)
+{
+    if (!pairedEnabled) return originalSave && originalSave(self, name);
+    ++saveRequestsSeen;
+    if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
+    if (!name || !SafeName(name->GetText()) || saving::Prefix(name->GetText(), "G3T_pending_")) { SaveFailure("name"); return false; }
+    if (net::IsHost()) { StartSave(name->GetText()); return false; }
+    if (!net::Joined()) { SaveFailure("host-offline"); return false; }
+    if (!net::InWorld(net::LocalId())) { SaveFailure("peer-loading"); return false; }
+    if (requestPending || captured.valid) { SaveFailure("busy"); return false; }
+    if (char const* reason = SaveReadiness()) { SaveFailure(reason); return false; }
+    requested = {};
+    requested.op = net::SaveRequest; requested.ok = 1; requested.epoch = hostWorld.epoch;
+    const std::string id = RandomId(), world = saving::Id(current.key.world) ? current.key.world : std::string(32, '0');
+    if (id.empty()) { SaveFailure("identity"); return false; }
+    strncpy_s(requested.save, id.c_str(), _TRUNCATE); strncpy_s(requested.world, world.c_str(), _TRUNCATE);
+    strncpy_s(requested.name, name->GetText(), _TRUNCATE);
+    requestPending = true; requestWelcome = net::WelcomeSerial(); requestStarted = GetTickCount(); requestRetry = requestStarted + 500;
+    net::SendSave(1, requested); // Retry admission without allocating a different request.
+    Logf("persist: client save requested token=%s slot=%s epoch=%08x", requested.save, requested.name, requested.epoch);
+    Notice(i18n::SaveQueued);
+    return false; // UI wrappers own the asynchronous outcome.
+}
+void PollSave(uint32_t now)
+{
+    if (!operation.active) return;
+    if (operation.epoch != epoch) { CancelSave("world"); return; }
+    if (operation.Expired(now)) { CancelSave(AllReady() ? "world-state" : "prepare-timeout"); return; }
+    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
+        auto& member = operation.members[i];
+        if (!member.generation) continue;
+        if (!net::PeerJoined(i) || member.generation != net::PeerGeneration(i) || member.account != net::PeerAccount(i)) {
+            CancelSave("peer-left"); return;
+        }
+        if (!member.ready && static_cast<int32_t>(now - member.nextTry) >= 0) {
+            member.nextTry = now + 500;
+            QueueReply(i, Note(net::SavePrepare, savingManifest));
+        }
+    }
+}
 void OnSave(uint8_t from, net::SaveNote const& note)
 {
-    if (!pairedEnabled || !NativeReady()) {
-        if (note.op == net::SaveRequest || note.op == net::SavePrepare) {
-            net::SaveNote answer = note;
-            answer.op = net::IsHost() ? net::SaveResult : net::SaveReady;
-            answer.ok = 0;
-            strncpy_s(answer.name, "native-hooks", _TRUNCATE);
-            QueueReply(net::IsHost() ? from : 1, answer);
-            Logf("persist: checkpoint refused save=%s player=%llu; paired saves off", note.save, steam::PlayerId());
-        }
-        return;
-    }
+    if (!pairedEnabled) return;
     if (net::IsHost()) {
-        if (note.epoch != epoch || from < 2 || from >= net::MaxPlayers) return;
+        if (from < 2 || from >= net::MaxPlayers || note.epoch != epoch) return;
         if (note.op == net::SaveRequest) {
-            if (!saving::Id(note.world) || !saving::Id(note.save)) return;
-            if (!net::InWorld(from) || !SafeName(note.name) || !StartSave(note.name)) {
-                net::SaveNote answer = note;
-                answer.op = net::SaveResult;
-                answer.ok = 0;
-                const char* reason = !net::InWorld(from) ? "peer-loading" : !SafeName(note.name) ? "name" : lastSaveFailure.c_str();
-                strncpy_s(answer.name, reason, _TRUNCATE);
-                QueueReply(from, answer);
-            }
-        } else if ((note.op == net::SaveReady || note.op == net::SaveStored || note.op == net::SaveCancel) &&
-                   barrier.Matches(note.save, note.epoch) &&
-                   (note.world == savingManifest.key.world || (note.op == net::SaveCancel && !*note.world))) {
-            if (barrier.members[from].generation != net::PeerGeneration(from) ||
-                !barrier.members[from].generation ||
-                (note.op == net::SaveReady && barrier.phase != saving::Barrier::Preparing) ||
-                (note.op == net::SaveStored && barrier.phase != saving::Barrier::Committing)) return;
-            if (!note.ok) {
-                Logf("persist: checkpoint partner refused player_slot=%u save=%s op=%u reason=%s", from, note.save, note.op, note.name);
-                CancelSave(note.name);
+            auto& cached = requests[from];
+            if (cached.token == note.save && cached.generation == net::PeerGeneration(from) && cached.epoch == epoch) {
+                if (cached.complete) QueueReply(from, cached.result);
+                else if (operation.active && cached.transaction == savingManifest.key.save)
+                    QueueReply(from, Note(net::SavePrepare, savingManifest));
                 return;
             }
-            if (note.op == net::SaveReady) barrier.Ready(from, net::PeerGeneration(from), note.save, note.epoch);
-            else if (note.op == net::SaveStored) barrier.Stored(from, net::PeerGeneration(from), note.save, note.epoch);
-            Logf("persist: checkpoint ack=%s save=%s player_slot=%u generation=%u ok=%u",
-                 note.op == net::SaveReady ? "ready" : "stored", note.save, from, net::PeerGeneration(from), note.ok);
-        }
+            cached = {note.save, {}, {}, net::PeerGeneration(from), epoch, false};
+            const char* refusal = !net::InWorld(from) ? "peer-loading" : !SafeName(note.name) ? "name" : nullptr;
+            if (refusal || !StartSave(note.name)) {
+                auto result = note; result.op = net::SaveResult; result.ok = 0;
+                strncpy_s(result.name, refusal ? refusal : lastSaveFailure.c_str(), _TRUNCATE);
+                cached.result = result; cached.complete = true;
+                QueueReply(from, result);
+            } else {
+                cached.transaction = savingManifest.key.save;
+                // Prepare identifies the transaction even when the request raced the host's same-slot save.
+                QueueReply(from, Note(net::SavePrepare, savingManifest));
+            }
+        } else if (note.op == net::SaveCancel && operation.active && !*note.world && !note.ok &&
+                   requests[from].token == note.save && requests[from].transaction == savingManifest.key.save &&
+                   requests[from].generation == net::PeerGeneration(from)) CancelSave("request-timeout");
+        else if ((note.op == net::SaveReady || note.op == net::SaveCancel) && operation.active &&
+                   note.save == savingManifest.key.save && note.world == savingManifest.key.world &&
+                   operation.members[from].generation == net::PeerGeneration(from) && !note.ok) CancelSave(note.name);
         return;
     }
     if (note.epoch != hostWorld.epoch) return;
     if (note.op == net::SavePrepare) {
         const saving::Key key{note.world, note.save, steam::PlayerId()};
-        const saving::Key captured{prepared.note.world, prepared.note.save, steam::PlayerId()};
-        if (prepared.valid && saving::PreparedMatches(captured, key, prepared.welcome, net::WelcomeSerial(),
-                                                     prepared.note.epoch, hostWorld.epoch, prepared.note.name, note.name)) {
-            net::SaveNote answer = note;
-            answer.op = net::SaveReady;
-            if (prepared.stored) answer.op = net::SaveStored;
-            QueueReply(1, answer);
+        if (!saving::Valid(key) || !SafeName(note.name)) return;
+        if (captured.valid && captured.note.save == std::string(note.save) && captured.welcome == net::WelcomeSerial()) {
+            if (!captured.queued) captured.queued = SendRecord(1, net::CharacterCapture, key, captured.bytes);
             return;
-        }
-        if (!saving::Valid(key) || !SafeName(note.name) || saving::Prefix(note.name, "G3T_")) {
-            net::SaveNote answer = note;
-            answer.op = net::SaveReady;
-            answer.ok = 0;
-            strncpy_s(answer.name, "name", _TRUNCATE);
-            QueueReply(1, answer);
-            SaveFailure("name");
-            return;
-        }
-        if (prepared.valid) {
-            Logf("persist: prepared checkpoint superseded previous=%s save=%s player=%llu", prepared.note.save, note.save, steam::PlayerId());
-            prepared = {};
-            ClearIncoming();
         }
         const char* reason = !net::InWorld(net::LocalId()) ? "peer-loading" : SaveReadiness();
-        if (!reason && !CaptureCharacter(key)) reason = "character-write";
-        const bool ok = !reason;
-        if (ok) {
-            prepared = {note, net::WelcomeSerial(), GetTickCount(), true};
-            ++recordsWritten;
-            requestPending = false;
+        Bytes bytes;
+        if (!reason) CapturePlayer(key, bytes, reason);
+        requestPending = false;
+        if (reason) {
+            auto answer = note; answer.op = net::SaveReady; answer.ok = 0;
+            strncpy_s(answer.name, reason, _TRUNCATE); QueueReply(1, answer); SaveFailure(reason); return;
         }
-        net::SaveNote answer = note;
-        answer.op = net::SaveReady;
-        answer.ok = ok ? 1 : 0;
-        if (reason) strncpy_s(answer.name, reason, _TRUNCATE);
-        QueueReply(1, answer);
-        requestPending = false;
-        Logf("persist: checkpoint character prepare world=%s save=%s player=%llu ok=%d", note.world, note.save, steam::PlayerId(), ok ? 1 : 0);
-        if (!ok) SaveFailure(reason);
-    } else if (note.op == net::SaveCommit || note.op == net::SaveImport) {
-        if (!SafeName(note.name) || note.name != saving::Slot(note.save)) return;
-        if (note.op == net::SaveCommit && (!prepared.valid || prepared.welcome != net::WelcomeSerial() ||
-            std::strcmp(prepared.note.save, note.save) || std::strcmp(prepared.note.world, note.world))) return;
-        ClearIncoming();
-        incomingNote = note;
-        incomingWelcome = net::WelcomeSerial();
-        receiving = true;
-        incomingAt = GetTickCount();
-        if (note.op == net::SaveCommit) { prepared.since = incomingAt; prepared.committing = true; }
-        Logf("persist: checkpoint receive begin save=%s player=%llu mode=%s epoch=%08x",
-             note.save, steam::PlayerId(), note.op == net::SaveCommit ? "store" : "load", note.epoch);
-    } else if (note.op == net::SaveCancel || note.op == net::SaveResult) {
-        const bool relevant = prepared.valid ? !std::strcmp(prepared.note.save, note.save) :
-                              (requestPending && requestId == note.save) || current.key.save == note.save ||
-                              std::string(clientReply.note.save) == note.save;
-        if (!relevant) return;
-        prepared = Prepared{};
-        requestPending = false;
-        if (clientReply.note.save == std::string(note.save)) clientReply = {};
-        if (!note.ok && receiving && !std::strcmp(incomingNote.save, note.save)) ClearIncoming();
-        Logf("persist: host checkpoint result world=%s save=%s player=%llu ok=%u", note.world, note.save, steam::PlayerId(), note.ok);
-        if (note.ok) Notice(i18n::SavePaired);
-        else SaveFailure(note.name);
+        captured = {note, std::move(bytes), net::WelcomeSerial(), GetTickCount(), GetTickCount() + 500, true};
+        captured.queued = SendRecord(1, net::CharacterCapture, key, captured.bytes);
+    } else if (note.op == net::SaveResult || note.op == net::SaveCancel) {
+        if (!((captured.welcome == net::WelcomeSerial() && captured.note.save == std::string(note.save)) ||
+              (requestPending && requested.save == std::string(note.save)))) return;
+        captured = {}; requestPending = false;
+        Logf("persist: host save result save=%s ok=%u reason=%s", note.save, note.ok, note.name);
+        if (note.ok) Notice(i18n::SaveComplete); else SaveFailure(note.name);
     }
 }
-
-char const* KindName(uint8_t kind) { return kind == net::KindNew ? "new-game" : kind == net::KindSaved ? "save" : "menu"; }
-void SendAnswer(uint8_t op)
+void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& bytes)
 {
-    net::WorldNote note{};
-    note.op = op;
-    note.kind = localKind;
-    note.epoch = hostWorld.epoch;
-    strncpy_s(note.campaign, localSave.c_str(), _TRUNCATE);
-    net::SendWorld(note, 1);
-    ++(op == net::WorldReady ? readies : others);
-}
-void Evaluate()
-{
-    if (net::IsHost()) return;
-    if (!net::Joined()) { crashlog::WorldEntryWait("host welcome"); return; }
-    if (!hostWorld.epoch) { crashlog::WorldEntryWait("host world announcement"); return; }
-    if (nativeLoadDepth) { crashlog::WorldEntryWait("native HUD.LoadGame return"); return; }
-    if (!loading.empty() || newWorld) { crashlog::WorldEntryWait("engine hero/game readiness"); return; }
-    if (!pendingRecord.empty() || !refusedRecord.empty() || !waitingImport.empty() || !ownCharacterReady) {
-        crashlog::WorldEntryWait(hostWorld.kind == net::KindMenu ? "host settled world" :
-                                !pendingRecord.empty() ? "own character restore" :
-                                !refusedRecord.empty() ? "validated own character" :
-                                !waitingImport.empty() ? "own character import" : "own character readiness");
-        net::SetInWorld(net::LocalId(), false);
-        SendAnswer(net::WorldWaiting);
+    const saving::Key key{note.world, note.save, note.account};
+    if (net::IsHost()) {
+        if (!operation.active || note.epoch != epoch || from < 2 || from >= net::MaxPlayers ||
+            key.world != savingManifest.key.world || key.save != savingManifest.key.save) return;
+        auto& member = operation.members[from];
+        if (!member.generation || member.generation != net::PeerGeneration(from) ||
+            member.account != key.player || net::PeerAccount(from) != key.player) return;
+        if (member.ready) return;
+        Bytes hero, state;
+        if (!saving::store::UnpackPlayer(bytes, hero, state) || !ValidateCharacter(hero, key)) {
+            CancelSave("character-record"); return;
+        }
+        saving::store::Set(savingManifest, {saving::store::Character, 4, key.player, std::move(hero)});
+        saving::store::Set(savingManifest, {saving::store::Personal, 1, key.player, std::move(state)});
+        operation.Accept(from, net::PeerGeneration(from), key.player, note.epoch);
+        Logf("persist: character received save=%s account=%llu bytes=%zu all_ready=%d",
+             note.save, key.player, bytes.size(), AllReady() ? 1 : 0);
         return;
     }
-    const bool matchingSave = localKind == net::KindSaved && hostWorld.kind == net::KindSaved &&
-                              localSave == hostWorld.campaign && localSave == saving::Slot(current.key.save);
-    const bool freshNewWorld = hostWorld.kind == net::KindNew && localKind == net::KindNew &&
-                               (!everIn || loadedEpoch == hostWorld.epoch);
-    if (saving::WorldMatches(hostWorld.epoch, synced, loadedEpoch, matchingSave, freshNewWorld)) {
-        synced = hostWorld.epoch;
-        everIn = true;
-        net::SetInWorld(net::LocalId(), true);
-        SendAnswer(net::WorldReady);
-        crashlog::WorldEntryWait(nullptr);
-        return;
+    if (note.epoch != hostWorld.epoch || key.player != steam::PlayerId()) return;
+    if (synced == hostWorld.epoch && ownCharacterReady) {
+        // Duplicate restoration after admission must never rewind a live character.
+        Evaluate(); return;
     }
-    crashlog::WorldEntryWait(hostWorld.kind == net::KindMenu ? "host settled world" : "matching host world");
-    net::SetInWorld(net::LocalId(), false);
-    SendAnswer(net::WorldOther);
-    if (hinted != hostWorld.epoch) {
-        hinted = hostWorld.epoch;
-        Notice(hostWorld.kind == net::KindMenu ? i18n::HostInMenu : hostWorld.kind == net::KindNew ? i18n::HostNewGame :
-               everIn ? i18n::HostLoadedSave : i18n::LoadingHostSave);
+    if (receivedNote.save == std::string(note.save) && receivedNote.epoch == note.epoch &&
+        receivedWelcome == net::WelcomeSerial() && (!receivedRecord.empty() || needsNewHero)) return;
+    receivedNote = note; receivedWelcome = net::WelcomeSerial(); restoreAt = GetTickCount() + 100;
+    receivedRecord.clear(); receivedPersonal.clear(); restoreFailed = false; synced = 0;
+    ownCharacterReady = false; hostAdmissionAck = false; nextAdmissionTry = 0; net::SetInWorld(net::LocalId(), false);
+    current = {}; current.key = key;
+    if (bytes.empty()) {
+        needsNewHero = true;
+        if (!containers::RestorePersonal({})) { restoreFailed = true; SaveFailure("personal-record"); return; }
+        if (freshLocalHero && !resetLocalWorld && gCSession::GetInstance().IsGameRunning()) {
+            needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
+            synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+        } else Notice(i18n::SaveCharacterMissing, true);
+        Logf("persist: no saved character account=%llu epoch=%08x; fresh New Game required", key.player, note.epoch);
+    } else {
+        needsNewHero = false;
+        saving::Key embedded;
+        if (!saving::store::UnpackPlayer(bytes, receivedRecord, receivedPersonal) ||
+            !saving::store::HeroKey(receivedRecord, embedded) || !saving::Exact(embedded, key)) {
+            restoreFailed = true; receivedRecord.clear(); SaveFailure("character-record");
+        }
     }
-}
-void Tell(uint8_t to)
-{
-    net::WorldNote note{};
-    note.op = net::WorldHost;
-    note.kind = localKind == net::KindMenu ? net::KindMenu : campaign.empty() ? net::KindNew : net::KindSaved;
-    note.flags = syncing ? 0 : net::WorldSyncOff;
-    note.epoch = epoch;
-    strncpy_s(note.campaign, campaign.c_str(), _TRUNCATE);
-    net::SendWorld(note, to);
-    clients[to].told = epoch;
-    clients[to].toldCampaign = campaign;
 }
 void NewEpoch()
 {
     CancelSave("world");
-    net::CancelFileTransfers();
     static const uint32_t nonce = ((GetTickCount() * 2654435761u) ^ (GetCurrentProcessId() << 16)) & 0xffff0000u;
     epoch = nonce | (++epochs & 0xffff);
     if (!epoch) epoch = ++epochs;
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-        clients[i].resends = 0;
+        clients[i].ready = clients[i].recordSent = clients[i].cutover = 0;
         net::SetInWorld(i, false);
+        if (!net::PeerJoined(i)) continue;
+        net::WorldNote notice{};
+        notice.op = net::WorldHost; notice.kind = net::KindMenu; notice.epoch = epoch;
+        strncpy_s(notice.campaign, campaign.c_str(), _TRUNCATE);
+        net::SendWorld(notice, i);
     }
-    Logf("persist: host world %08x: %s %s", epoch, KindName(localKind), campaign.c_str());
+    Logf("persist: host world epoch=%08x kind=%u campaign=%s", epoch, localKind, campaign.c_str());
 }
-void Changing(uint8_t kind)
+void Evaluate()
 {
-    localKind = kind;
-    localSave.clear();
-    ++worldChanges;
-    if (net::IsHost()) {
-        if (kind == net::KindMenu) { campaign.clear(); current = Manifest{}; }
-        NewEpoch();
-    } else {
-        CancelClientSave("world");
-        synced = 0;
-        loadedEpoch = 0;
-        prepared = Prepared{};
-        requestPending = false;
-        ClearIncoming();
-        refusedRecord.clear();
-        net::SetInWorld(net::LocalId(), false);
+    if (net::IsHost() || !net::Joined() || !hostWorld.epoch || hostWorld.kind == net::KindMenu) return;
+    if (seenWelcome != net::WelcomeSerial()) { net::SetInWorld(net::LocalId(), false); return; }
+    const bool ready = !nativeLoadDepth && loading.empty() && !newWorld && ownCharacterReady &&
+                       !needsNewHero && !restoreFailed && synced == hostWorld.epoch &&
+                       story::AdmissionReady() && doors::AdmissionReady();
+    bool admitted = ready && hostAdmissionAck && net::InWorld(net::LocalId());
+    net::WorldNote answer{};
+    answer.op = ready ? net::WorldReady : net::WorldWaiting; answer.kind = localKind; answer.epoch = hostWorld.epoch;
+    if (ready && hostAdmissionAck) answer.flags = net::WorldEntryConfirmed;
+    strncpy_s(answer.campaign, hostWorld.campaign, _TRUNCATE);
+    const uint32_t now = GetTickCount();
+    if (!ready || static_cast<int32_t>(now - nextAdmissionTry) >= 0) {
+        nextAdmissionTry = now + 500;
+        if (net::SendWorld(answer, 1) && ready && hostAdmissionAck) admitted = true;
     }
-}
-void Settled(uint8_t kind, std::string const& save)
-{
-    localKind = kind;
-    localSave = kind == net::KindSaved && saving::Valid(current.key) ? saving::Slot(current.key.save) : save;
-    settledAt = GetTickCount();
-    if (!net::IsHost()) loadedEpoch = hostWorld.epoch;
-    if (kind == net::KindNew) ownCharacterReady = true;
-    Logf("persist: world settled kind=%s slot=%s world=%s save=%s player=%llu own=%d", KindName(kind), localSave.c_str(),
-         current.key.world.c_str(), current.key.save.c_str(), steam::PlayerId(), ownCharacterReady ? 1 : 0);
-    if (net::IsHost()) {
-        if (kind == net::KindNew) { campaign.clear(); current = Manifest{}; current.key.world = RandomId(); NewEpoch(); }
-    } else Evaluate();
+    net::SetInWorld(net::LocalId(), admitted);
+    crashlog::WorldEntryWait(admitted ? nullptr : "host character / personal inventory / authoritative baselines / host admission ACK");
 }
 void OnWorld(uint8_t from, net::WorldNote const& note)
 {
-    if (!net::IsHost()) {
-        if (note.op != net::WorldHost) return;
-        if (note.epoch != hostWorld.epoch || note.kind != hostWorld.kind ||
-            std::strcmp(note.campaign, hostWorld.campaign))
-            Logf("persist: host world received previous=%08x epoch=%08x kind=%s local=%s loading=%s new_world=%d own=%d",
-                 hostWorld.epoch, note.epoch, KindName(note.kind), KindName(localKind),
-                 loading.empty() ? "-" : loading.c_str(), newWorld ? 1 : 0, ownCharacterReady ? 1 : 0);
-        if (note.epoch != hostWorld.epoch) {
-            prepared = Prepared{};
-            requestPending = false;
-            ClearIncoming();
-            waitingImport.clear();
-            pendingRecord.clear();
-            refusedRecord.clear();
-            synced = 0;
-            net::SetInWorld(net::LocalId(), false);
-        }
-        hostWorld = note;
+    if (net::IsHost()) {
+        if (from < 2 || from >= net::MaxPlayers || note.epoch != epoch) return;
+        if (note.op == net::WorldReady && clients[from].recordSent == epoch && ownCharacterReady && loading.empty()) {
+            if (note.flags & net::WorldEntryConfirmed) {
+                if (clients[from].cutover != epoch) return;
+                if (clients[from].ready != epoch && (!story::FinishAdmission(from) || !doors::FinishAdmission(from))) return;
+                const bool first = clients[from].ready != epoch;
+                clients[from].ready = epoch;
+                net::SetInWorld(from, true); // One-shot NPC/motion replays are now behind the client's applied cutover.
+                if (first) Logf("persist: admission confirmed peer=%u account=%llu epoch=%08x baselines=1",
+                                from, net::PeerAccount(from), epoch);
+                return;
+            }
+            if (!story::FinishAdmission(from) || !doors::FinishAdmission(from)) return;
+            const bool first = clients[from].cutover != epoch;
+            clients[from].cutover = epoch;
+            if (first) Logf("persist: admission cutover queued peer=%u account=%llu epoch=%08x; waiting for applied confirmation",
+                            from, net::PeerAccount(from), epoch);
+            net::WorldNote ack{};
+            ack.op = net::WorldReady; ack.kind = localKind; ack.epoch = epoch;
+            strncpy_s(ack.campaign, campaign.c_str(), _TRUNCATE);
+            net::SendWorld(ack, from);
+        } else if (note.op == net::WorldWaiting || note.op == net::WorldOther) net::SetInWorld(from, false);
+        return;
+    }
+    if (note.op == net::WorldReady) {
+        if (seenWelcome != net::WelcomeSerial() || note.epoch != hostWorld.epoch || note.kind == net::KindMenu || !ownCharacterReady ||
+            synced != hostWorld.epoch || !story::AdmissionReady()) return;
+        hostAdmissionAck = true;
         Evaluate();
         return;
     }
-    if (from < 2 || from >= net::MaxPlayers || note.epoch != epoch) return;
-    Client& client = clients[from];
-    if (note.op == net::WorldReady) {
-        client.ready = epoch;
-        if (!nativeLoadDepth && ownCharacterReady && pendingRecord.empty() && refusedRecord.empty())
-            net::SetInWorld(from, true);
-        client.arrived = true;
-    } else if (note.op == net::WorldOther || note.op == net::WorldWaiting) {
-        client.ready = 0;
-        net::SetInWorld(from, false);
-        const bool onWay = resendGuard && client.sentAt && !client.arrived && GetTickCount() - client.sentAt < TransferLimit;
-        if (!campaign.empty() && !onWay && transferring && (client.sent != epoch || client.resends < 2)) {
-            if (client.sent == epoch) ++client.resends;
-            client.sent = epoch;
-            client.wants = true;
+    if (note.op != net::WorldHost) return;
+    if (note.epoch != hostWorld.epoch) {
+        const bool replacing = hostWorld.epoch != 0 && hostWorld.kind != net::KindMenu;
+        resetLocalWorld = replacing && gCSession::GetInstance().IsGameRunning();
+        if (resetLocalWorld) {
+            freshLocalHero = false;
+            Notice(i18n::HostLoadsOnly, true);
         }
-        if (note.op == net::WorldWaiting && client.hinted != epoch) {
-            client.hinted = epoch;
-            Logf("persist: player %u (%s) waits for its own character in world %08x", from, net::PeerName(from), epoch);
-        }
+        captured = {}; requestPending = false; receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
+        needsNewHero = false; restoreFailed = false; synced = 0; ownCharacterReady = false; hostAdmissionAck = false;
+        nextAdmissionTry = 0;
+        net::SetInWorld(net::LocalId(), false);
+        remote::DespawnAll("host world replaced");
+        dialogaudio::OnWorldChange(); containers::OnWorldChange();
+        story::OnWorldChange(); doors::OnWorldChange();
+        journal::Clear();
     }
+    hostWorld = note;
+    Evaluate();
 }
-void HostTick()
+void HostTick(uint32_t now)
 {
-    if ((localKind != net::KindMenu && !ownCharacterReady) || !loading.empty() ||
-        !pendingRecord.empty() || !refusedRecord.empty()) {
-        for (uint8_t i = 2; i < net::MaxPlayers; ++i) net::SetInWorld(i, false);
-        return;
-    }
     if (!epoch) NewEpoch();
-    if (static_cast<int32_t>(pausedUntil - GetTickCount()) > 0) return;
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-        Client& client = clients[i];
-        if (!net::PeerJoined(i)) { client = Client{}; continue; }
-        if (client.generation != net::PeerGeneration(i)) {
-            client = Client{};
-            client.generation = net::PeerGeneration(i);
+        auto& client = clients[i];
+        if (!net::PeerJoined(i)) { client = {}; continue; }
+        const uint32_t generation = net::PeerGeneration(i);
+        if (client.generation != generation) { client = {}; client.generation = generation; }
+        if (client.ready == epoch) continue;
+        if (static_cast<int32_t>(now - client.nextTry) < 0) continue;
+        client.nextTry = now + 1000;
+        net::WorldNote note{};
+        note.op = net::WorldHost; note.kind = ownCharacterReady && loading.empty() && !restoreFailed ? localKind : net::KindMenu;
+        note.epoch = epoch;
+        strncpy_s(note.campaign, campaign.c_str(), _TRUNCATE);
+        net::SendWorld(note, i); // Same reliable channel before the character.
+        if (note.kind == net::KindMenu) continue;
+        if (client.recordSent == epoch) continue; // ENet reliably delivers the accepted record; do not duplicate large payloads.
+        const uint64_t account = net::PeerAccount(i);
+        if (!account) { Logf("persist: join account unavailable peer=%u", i); continue; }
+        if (!saving::Valid(current.key)) {
+            current.key = {RandomId(), RandomId(), steam::PlayerId()};
+            if (!saving::Valid(current.key)) { SaveFailure("identity"); return; }
         }
-        if (client.told != epoch || client.toldCampaign != campaign) Tell(i);
-        if (client.ready == epoch && !nativeLoadDepth) net::SetInWorld(i, true);
-        if (client.wants && barrier.phase == saving::Barrier::Idle) {
-            if (client.ready == epoch || SendCampaign(i)) client.wants = false;
+        auto const* record = saving::store::Find(current, saving::store::Character, account);
+        Bytes envelope, state;
+        if (record) {
+            auto const* personal = saving::store::Find(current, saving::store::Personal, account);
+            if (personal) state = personal->bytes;
+            else if (!saving::personal::Encode({}, state)) { SaveFailure("personal-record"); return; }
+            if (!saving::store::PackPlayer(record->bytes, state, envelope)) { SaveFailure("character-record"); return; }
         }
+        if (SendRecord(i, net::CharacterRestore, {current.key.world, current.key.save, account},
+                       envelope)) client.recordSent = epoch;
     }
 }
-
-void DropAutoload(char const* why)
+bool ReadLegacy(std::string const& slot, Bytes const& sidecar, Save& save)
 {
-    if (!autoload.valid) return;
-    if (autoload.armed && autoload.window) KillTimer(autoload.window, AutoloadTimer);
-    ++autoloadStale;
-    Logf("persist: autoload canceled slot=%s order=%u reason=%s", autoload.slot.c_str(), autoload.serial, why);
-    autoload = Autoload{};
+    if (sidecar.size() >= 5 && std::memcmp(sidecar.data(), "G3T 2", 5) == 0) {
+        saving::store::LegacyManifest manifest;
+        if (!saving::store::ParseLegacy(sidecar, manifest)) return false;
+        for (int f = 0; f < 2; ++f) {
+            Bytes bytes;
+            if (!ReadAll(Path(slot, f), bytes) || bytes.size() != manifest.size[f] ||
+                saving::store::Crc(bytes) != manifest.crc[f]) return false;
+        }
+        save.key = {manifest.key.world, manifest.key.save, steam::PlayerId()};
+    } else if (!sidecar.empty() && !(sidecar.size() >= 5 && std::memcmp(sidecar.data(), "G3T 1", 5) == 0)) return false;
+    if (!saving::Id(save.key.world) || !saving::Id(save.key.save)) save.key = {RandomId(), RandomId(), steam::PlayerId()};
+    saving::store::Set(save, {saving::store::Journal, 1, 0, sidecar});
+    // A plain native world is loadable before Steam publishes the host account; it grants no character authority.
+    return saving::Id(save.key.world) && saving::Id(save.key.save);
 }
-void CALLBACK AutoloadNow(HWND window, UINT, UINT_PTR id, DWORD)
+bool RestoreJournal()
 {
-    if (!autoload.valid || !autoload.armed) { KillTimer(window, id); return; }
-    if (processDepth || nativeLoadDepth || nativeSaveDepth) {
-        crashlog::WorldEntryWait(nativeLoadDepth ? "native load before autoload" :
-                                nativeSaveDepth ? "native save before autoload" : "engine frame before autoload");
-        return;
+    auto const* block = saving::store::Find(current, saving::store::Journal);
+    if (!block || block->bytes.empty()) { journal::Clear(); npcs::ClearCompanions(); downed::Restore(false, "plain-save"); return true; }
+    const std::string path = Path(lastLoad, 2) + ".read";
+    if (!WriteAtomic(path, block->bytes)) return false;
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "rb") || !file) { DeleteFileA(path.c_str()); return false; }
+    journal::Read(file); rewind(file); npcs::ReadCompanions(file); rewind(file);
+    bool held = false;
+    char line[256]{};
+    while (fgets(line, sizeof(line), file)) {
+        if (std::strncmp(line, "downed ", 7)) continue;
+        int value = 0; char extra = 0;
+        if (sscanf_s(line, "downed %d %c", &value, &extra, 1u) != 1 || (value != 0 && value != 1)) {
+            fclose(file); DeleteFileA(path.c_str()); return false;
+        }
+        held = value != 0;
     }
-    if (net::IsHost() || !net::Joined() || autoload.welcome != net::WelcomeSerial() ||
-        autoload.epoch != hostWorld.epoch || autoload.loads != loads) { DropAutoload("world/welcome/load changed"); return; }
-    if (autoloadHold) { crashlog::WorldEntryWait("autoload hold"); return; }
-    const std::string slot = autoload.slot;
-    KillTimer(window, id);
-    autoload = Autoload{};
-    void* manager = FileManager(true);
-    if (!manager || !originalLoad) {
-        Logf("persist: autoload preflight failed save=%s player=%llu; paired load not invoked", slot.c_str(), steam::PlayerId());
-        SaveFailure("native-load");
-        return;
-    }
-    const bCString name(slot.c_str());
-    ++autoLoads;
-    LoadDetour(manager, &name);
+    const bool ok = !ferror(file); fclose(file); DeleteFileA(path.c_str());
+    if (ok) downed::Restore(held, "host-save");
+    return ok;
 }
-bool ArmAutoload()
-{
-    HWND window = eCApplication::GetInstance().GetHandle();
-    if (!window || !SetTimer(window, AutoloadTimer, USER_TIMER_MINIMUM, &AutoloadNow)) {
-        Logf("persist: autoload timer unavailable slot=%s error=%lu", autoload.slot.c_str(), GetLastError());
-        return false;
-    }
-    autoload.window = window;
-    autoload.armed = true;
-    ++autoloadPosted;
-    return true;
-}
-void OrderAutoload(std::string const& slot)
-{
-    DropAutoload("new import");
-    autoload = {slot, hostWorld.epoch, net::WelcomeSerial(), loads, ++autoloadSerial, nullptr, true, false};
-    ArmAutoload();
-}
-
 bool __stdcall LoadDetour(void* self, bCString const* name)
 {
     if (!pairedEnabled) return originalLoad && originalLoad(self, name);
+    if (!net::IsHost()) { Notice(i18n::HostLoadsOnly, true); return false; }
     if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
     if (!name || !SafeName(name->GetText()) || nativeLoadDepth || nativeSaveDepth || !trade::ReadyForSave()) {
-        Log("persist: load refused (unsafe name, nested native operation or unsettled exchange)");
-        SaveFailure(!name || !SafeName(name->GetText()) ? "name" :
-                    nativeLoadDepth || nativeSaveDepth ? "loading" : "trade");
-        return false;
-    }
-    CancelSave("canceled-load");
-    CancelClientSave("canceled-load");
-    if (net::IsHost()) net::CancelFileTransfers();
-    if (self != FileManager(true)) {
-        Logf("persist: native load preflight failed player=%llu; paired load not invoked", steam::PlayerId());
-        SaveFailure("native-load");
-        return false;
+        SaveFailure(!name || !SafeName(name->GetText()) ? "name" : !trade::ReadyForSave() ? "trade" : "loading"); return false;
     }
     const std::string slot = name->GetText();
-    Manifest manifest;
-    std::vector<uint8_t> data[net::FileCount];
-    bool managed = ManifestAt(slot, manifest);
-    if (managed && !ReadBundle(slot, manifest, data)) {
-        Logf("persist: checkpoint native CRC/length mismatch slot=%s; not loaded", slot.c_str());
-        Notice(i18n::SaveDamaged, true);
-        return false;
+    Logf("persist: host load requested slot=%s player=%llu", slot.c_str(), steam::PlayerId());
+    if (saving::Prefix(slot, "G3T_pending_")) {
+        Logf("persist: load refused slot=%s reason=uncommitted-staging", slot.c_str());
+        Notice(i18n::SaveDamaged, true); return false;
     }
-    if (!managed && saving::Prefix(slot, "G3T_") && !saving::Prefix(slot, "G3T_host_")) {
-        Logf("persist: managed checkpoint has no valid manifest slot=%s; not loaded", slot.c_str());
-        Notice(i18n::SaveDamaged, true);
-        return false;
+    Save save; Bytes bytes;
+    const bool hasSidecar = Exists(Path(slot, 2));
+    if (hasSidecar && !ReadAll(Path(slot, 2), bytes)) {
+        Logf("persist: load refused slot=%s reason=container-read", slot.c_str());
+        Notice(i18n::SaveDamaged, true); return false;
     }
-    if (!managed && Exists(Path(slot, 2))) {
-        std::vector<uint8_t> bytes;
-        if (!ReadAll(Path(slot, 2), bytes) || std::string(bytes.begin(), bytes.end()).compare(0, 5, "G3T 2") == 0) {
-            Logf("persist: malformed modern checkpoint manifest slot=%s", slot.c_str());
-            Notice(i18n::SaveDamaged, true);
-            return false;
+    const bool managed = saving::store::Modern(bytes);
+    if (managed) {
+        if (!saving::store::Decode(bytes, save)) {
+            Logf("persist: load refused slot=%s reason=container-format bytes=%zu", slot.c_str(), bytes.size());
+            Notice(i18n::SaveDamaged, true); return false;
+        }
+        auto const* own = saving::store::Find(save, saving::store::Character, steam::PlayerId());
+        if (!own || !ValidateCharacter(own->bytes, {save.key.world, save.key.save, steam::PlayerId()})) {
+            SaveFailure("character-record"); return false;
+        }
+        if (!Materialize(slot, save)) { SaveFailure("disk-write"); return false; }
+    } else {
+        if (!ReadLegacy(slot, bytes, save)) {
+            Logf("persist: load refused slot=%s reason=legacy-format-or-native-crc bytes=%zu", slot.c_str(), bytes.size());
+            Notice(i18n::SaveDamaged, true); return false;
+        }
+        for (int f = 0; f < 2; ++f) {
+            Bytes native;
+            if (!ReadAll(Path(slot, f), native) || native.empty()) { SaveFailure("native-load"); return false; }
         }
     }
-    if (!managed && (net::IsHost() || saving::Prefix(slot, "G3T_host_"))) {
-        if (!AdoptLegacy(slot, manifest)) { Logf("persist: legacy adoption failed slot=%s", slot.c_str()); SaveFailure("disk-write"); return false; }
-        managed = true;
-        if (!ReadBundle(saving::Slot(manifest.key.save), manifest, data)) {
-            Logf("persist: adopted legacy bundle could not be verified slot=%s", slot.c_str());
-            Notice(i18n::SaveDamaged, true);
-            return false;
-        }
-    }
-    if (managed && net::IsHost()) {
-        const std::string canonical = saving::Slot(manifest.key.save);
-        Manifest stored;
-        std::vector<uint8_t> canonicalData[net::FileCount];
-        const bool validCanonical = ReadBundle(canonical, stored, canonicalData) &&
-            saving::Exact(stored.key, manifest.key) && stored.size[0] == manifest.size[0] &&
-            stored.size[1] == manifest.size[1] && stored.crc[0] == manifest.crc[0] && stored.crc[1] == manifest.crc[1] &&
-            canonicalData[2] == data[2];
-        if (!validCanonical) {
-            if (!StoreBundle(canonical, data)) {
-                Logf("persist: canonical bundle repair failed slot=%s canonical=%s", slot.c_str(), canonical.c_str());
-                SaveFailure("disk-write");
-                return false;
-            }
-            Logf("persist: canonical bundle repaired from verified alias slot=%s canonical=%s", slot.c_str(), canonical.c_str());
-        }
-    }
-    pendingRecord.clear();
-    refusedRecord.clear();
-    const bool overlay = managed && (manifest.legacy.empty() || !net::IsHost() || manifest.key.player != steam::PlayerId());
-    if (overlay && !ChooseCharacter(slot, manifest)) {
-        if (!net::IsHost()) {
-            waitingImport = slot;
-            waitingEpoch = hostWorld.epoch;
-            waitingWelcome = net::WelcomeSerial();
-            nextImportTry = GetTickCount() + 2000;
-            net::SetInWorld(net::LocalId(), false);
-        }
-        return false;
-    }
-    const bool loadingHostCheckpoint = managed && saving::Slot(manifest.key.save) == hostWorld.campaign;
-    const std::string deferredImport = !net::IsHost() && !loadingHostCheckpoint && net::Joined() &&
-        waitingEpoch == hostWorld.epoch && waitingWelcome == net::WelcomeSerial() ? waitingImport : std::string();
-    ++loads;
-    DropAutoload("load began");
-    waitingImport = deferredImport;
-    const std::string record = pendingRecord;
-    const saving::Key selected = pendingKey, desired = desiredKey;
-    const bool legacy = pendingLegacy;
-    lastLoad = slot;
-    loading = slot;
-    Changing(net::KindSaved);
-    pendingRecord = record;
-    pendingKey = selected;
-    desiredKey = desired;
-    pendingLegacy = legacy;
-    current = manifest;
-    ownCharacterReady = !overlay;
-    if (net::IsHost()) {
-        campaign = managed ? saving::Slot(manifest.key.save) : slot;
-    }
-    FILE* journalFile = nullptr;
-    bool journalRead = false;
-    bool savedDowned = false;
-    npclease::SaveOverlay leaseOverlay;
-    bool leaseRead = false;
-    if (!fopen_s(&journalFile, Path(slot, 2).c_str(), "r") && journalFile) {
-        char header[32]{};
-        if (fgets(header, sizeof(header), journalFile) && (!std::strncmp(header, "G3T 1", 5) || !std::strncmp(header, "G3T 2", 5))) {
-            journal::Read(journalFile);
-            if (net::IsHost()) {
-                fseek(journalFile, 0, SEEK_SET);
-                npcs::ReadCompanions(journalFile);
-                rewind(journalFile);
-                leaseRead = npclease::ReadSnapshot(journalFile, leaseOverlay);
-                rewind(journalFile);
-                char line[256];
-                while (fgets(line, sizeof(line), journalFile)) {
-                    if (std::strncmp(line, "downed ", 7)) continue;
-                    int waiting = 0;
-                    char extra = 0;
-                    if (sscanf_s(line, "downed %d %c", &waiting, &extra, 1u) == 1 && (waiting == 0 || waiting == 1))
-                        savedDowned = waiting != 0;
-                    else Log("downed: invalid host-save state; current downed life retained");
-                }
-            }
-            journalRead = true;
-            ++sidecarsRead;
-        }
-        fclose(journalFile);
-    }
-    if (!journalRead) { journal::Clear(); if (net::IsHost()) npcs::ClearCompanions(); }
-    Logf("persist: loading slot=%s world=%s save=%s native_owner=%llu player=%llu overlay=%s",
-         slot.c_str(), manifest.key.world.c_str(), manifest.key.save.c_str(), manifest.key.player, steam::PlayerId(),
-         pendingRecord.empty() ? "native-own" : pendingRecord.c_str());
-    dialogaudio::OnWorldChange();
-    containers::OnWorldChange();
+    if (self != FileManager(true)) { SaveFailure("native-load"); return false; }
+    Logf("persist: load validated slot=%s managed=%d sidecar=%d save=%s blocks=%zu", slot.c_str(),
+         managed ? 1 : 0, hasSidecar ? 1 : 0, save.key.save.c_str(), save.blocks.size());
+    CancelSave("canceled-load"); // Only a validated replacement cancels an in-flight save.
+    lastLoad = slot; loading = slot; current = std::move(save); campaign = slot;
+    localKind = net::KindMenu; ownCharacterReady = false; restoreFailed = false;
+    NewEpoch();
+    ++loads; newWorld = false;
+    dialogaudio::OnWorldChange(); containers::OnWorldChange(); remote::DespawnAll("host load");
     world::OnWorldDeactivate();
-    lowerLoadCalls = 0;
-    lowerLoadGood = true;
-    Logf("persist: native invoke=HUD.LoadGame world=%s save=%s player=%llu slot=%s size=%u/%u crc=%08x/%08x",
-         manifest.key.world.c_str(), manifest.key.save.c_str(), steam::PlayerId(), slot.c_str(),
-         manifest.size[0], manifest.size[1], manifest.crc[0], manifest.crc[1]);
+    lowerLoadCalls = 0; lowerLoadGood = true;
     ++nativeLoadDepth;
-    crashlog::WorldEntryWait("native HUD.LoadGame return");
-    crashlog::WorldEntryScope operation("native HUD.LoadGame");
+    crashlog::WorldEntryScope scope("native HUD.LoadGame");
     const bool hudOk = originalLoad(self, name);
-    operation.Complete();
+    scope.Complete();
     --nativeLoadDepth;
-    crashlog::WorldEntryWait("engine hero/game readiness");
     const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
-    if (ok && net::IsHost()) {
-        if (leaseRead) npclease::Restore(leaseOverlay, epoch);
-        else npclease::RejectSnapshot("missing or invalid");
-    }
-    if (ok && net::IsHost()) downed::Restore(savedDowned, "host-save");
-    Logf("persist: native load returned function=HUD.LoadGame slot=%s save=%s player=%llu ok=%d hud_ok=%d lower_calls=%u lower_ok=%d frames=%u",
-         slot.c_str(), manifest.key.save.c_str(), steam::PlayerId(), ok ? 1 : 0, hudOk ? 1 : 0,
-         lowerLoadCalls, lowerLoadGood ? 1 : 0, loadFrames);
-    if (!ok) {
-        loading.clear();
-        pendingRecord.clear();
-        ownCharacterReady = false;
-        if (net::IsHost()) {
-            current = Manifest{};
-            campaign.clear();
-            localKind = net::KindMenu;
-            NewEpoch();
-        }
-        SaveFailure("native-load");
-    }
+    Logf("persist: native load returned slot=%s save=%s ok=%d hud_ok=%d lower_calls=%u lower_ok=%d managed=%d",
+         slot.c_str(), current.key.save.c_str(), ok ? 1 : 0, hudOk ? 1 : 0, lowerLoadCalls, lowerLoadGood ? 1 : 0, managed ? 1 : 0);
+    if (!ok) { loading.clear(); restoreFailed = true; SaveFailure("native-load"); return false; }
+    receivedRecord.clear();
+    receivedPersonal.clear();
+    if (managed) receivedRecord = saving::store::Find(current, saving::store::Character, steam::PlayerId())->bytes;
+    if (auto const* personal = saving::store::Find(current, saving::store::Personal, steam::PlayerId())) receivedPersonal = personal->bytes;
+    pendingKey = {current.key.world, current.key.save, steam::PlayerId()};
+    restoreAt = GetTickCount() + 100;
+    return true;
+}
+bool ApplyCharacter(Bytes const& bytes, saving::Key const& key)
+{
+    const std::string base = CharacterPath();
+    if (base.empty()) return false;
+    const std::string path = base + ".restore";
+    if (!WriteAtomic(path, bytes)) return false;
+    const bool ok = hero::LoadRecord(path.c_str(), key);
+    DeleteFileA(path.c_str());
+    Logf("persist: character restore account=%llu save=%s bytes=%zu ok=%d reason=%s",
+         key.player, key.save.c_str(), bytes.size(), ok ? 1 : 0, hero::LastRefusal() ? hero::LastRefusal() : "-");
+    if (ok) ++recordsApplied;
     return ok;
-}
-
-FILETIME WriteTime(std::string const& path)
-{
-    WIN32_FILE_ATTRIBUTE_DATA info{};
-    GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &info);
-    return info.ftLastWriteTime;
-}
-enum class ApplyResult { Restored, Refused, PublicationPending };
-ApplyResult ApplyCharacter()
-{
-    crashlog::WorldEntryScope operation("own character validation/restoration");
-    const bool ok = pendingLegacy ? hero::LoadLegacyRecordStrict(pendingRecord.c_str()) :
-                                   hero::LoadRecord(pendingRecord.c_str(), pendingKey);
-    if (!CharacterDigest("restore", pendingKey, pendingRecord, ok)) return ApplyResult::Refused;
-    const std::string exact = CharacterPath(desiredKey);
-    if (pendingLegacy || !saving::Exact(pendingKey, desiredKey)) {
-        if (!CaptureCharacter(desiredKey)) return ApplyResult::PublicationPending;
-        ++recordsWritten;
-    }
-    if (!PublishLatest(desiredKey)) return ApplyResult::PublicationPending;
-    ++recordsApplied;
-    ownCharacterReady = true;
-    Logf("persist: own character restored world=%s save=%s player=%llu source=%s legacy=%d",
-         desiredKey.world.c_str(), desiredKey.save.c_str(), desiredKey.player, pendingRecord.c_str(), pendingLegacy ? 1 : 0);
-    return ApplyResult::Restored;
-}
-void WaitForRecord()
-{
-    const uint32_t now = GetTickCount();
-    const FILETIME written = WriteTime(refusedRecord);
-    if ((CompareFileTime(&written, &refusedWritten) != 0 || static_cast<int32_t>(now - nextRestoreTry) >= 0) &&
-        Exists(refusedRecord)) {
-        refusedWritten = written;
-        pendingRecord = refusedRecord;
-        const ApplyResult result = ApplyCharacter();
-        if (result == ApplyResult::Restored) {
-            refusedRecord.clear();
-            pendingRecord.clear();
-            Notice(i18n::RecordBack);
-            Evaluate();
-            return;
-        }
-        nextRestoreTry = now + (result == ApplyResult::PublicationPending ? 5000 : 30000);
-        Logf("persist: own character retry blocked world=%s save=%s player=%llu phase=%s",
-             desiredKey.world.c_str(), desiredKey.save.c_str(), desiredKey.player,
-             result == ApplyResult::PublicationPending ? "publication" : "validation/application");
-        pendingRecord.clear();
-    }
-    if (!refusedHinted || now - refusedHinted >= 30000) {
-        refusedHinted = now;
-        Logf("persist: waiting for own character world=%s save=%s player=%llu record=%s; deletion never permits host fallback",
-             desiredKey.world.c_str(), desiredKey.save.c_str(), desiredKey.player, refusedRecord.c_str());
-        Notice(i18n::SaveCharacterMissing, true);
-    }
 }
 void StatusHints()
 {
@@ -2074,7 +1557,7 @@ void StatusHints()
     if (!running) {
         if (!refusal.empty()) {
             if (hud::MenuLine(refusal.c_str())) menuSet = true;
-        } else if (joined && !waitingImport.empty()) {
+        } else if (joined && needsNewHero) {
             if (hud::MenuLine(i18n::Text(i18n::SaveCharacterMissing))) menuSet = true;
         } else {
             wchar_t text[700] = {};
@@ -2103,6 +1586,7 @@ void StatusHints()
         if (running) hud::Message(hud::Good, i18n::Text(i18n::HostReached));
     }
 }
+
 }
 
 bool BeginFrame()
@@ -2110,123 +1594,143 @@ bool BeginFrame()
     if (nativeLoadDepth || nativeSaveDepth) {
         ++loadFrames;
         crashlog::WorldEntryWait(nativeLoadDepth ? "native HUD.LoadGame return" : "native save return");
-        if (!loadTicks) return false;
-        ++loadFramesRan;
+        return false;
     }
-    ++processDepth;
-    return true;
+    ++processDepth; return true;
 }
 void EndFrame() { if (processDepth) --processDepth; }
 bool NativeLoading() { return nativeLoadDepth != 0; }
 bool HeroPending()
 {
-    return pairedEnabled && (NativeLoading() || !loading.empty() || !pendingRecord.empty() || !refusedRecord.empty() ||
-                             !waitingImport.empty() || !ownCharacterReady);
+    return pairedEnabled && (NativeLoading() || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
+                             (!net::IsHost() && !net::InWorld(net::LocalId()) &&
+                              (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady())));
 }
 void OnWorldActivate()
 {
     if (!loading.empty() || nativeSaveDepth) return;
-    if (localKind == net::KindSaved && GetTickCount() - settledAt < 5000) return;
     newWorld = true;
-    if (localKind != net::KindMenu) Changing(net::KindMenu);
+    freshLocalHero = true;
+    if (net::IsHost()) { current = {}; campaign.clear(); ownCharacterReady = false; localKind = net::KindMenu; NewEpoch(); }
 }
 void OnWorldDeactivate()
 {
     if (!loading.empty() || nativeSaveDepth) return;
-    ownCharacterReady = false;
-    Changing(net::KindMenu);
+    ownCharacterReady = false; localKind = net::KindMenu;
+    if (net::IsHost()) { current = {}; campaign.clear(); NewEpoch(); }
+    else net::SetInWorld(net::LocalId(), false);
 }
 void Tick()
 {
     if (nativeLoadDepth || nativeSaveDepth) return;
     const uint32_t now = GetTickCount();
-    RetryReplies(now);
-    StatusHints();
-    gCSession& game = gCSession::GetInstance();
-    if (game.GetHero() && game.IsGameRunning()) {
-        if (!loading.empty()) {
-            const std::string slot = loading;
-            loading.clear();
-            newWorld = false;
-            Settled(net::KindSaved, slot);
-        } else if (newWorld) { newWorld = false; Settled(net::KindNew, ""); }
-    } else if (newWorld || !loading.empty()) {
-        crashlog::WorldEntryWait("engine hero/game readiness");
+    RetryReplies(now); StatusHints();
+    auto& game = gCSession::GetInstance();
+    const bool running = game.GetHero() && game.IsGameRunning();
+    if (newWorld && running) {
+        newWorld = false; localKind = net::KindNew;
+        resetLocalWorld = false;
+        // Only a freshly initialized local hero is permitted when the host has no account record.
+        if (net::IsHost()) {
+            ownCharacterReady = true; current.key = {RandomId(), RandomId(), steam::PlayerId()}; NewEpoch();
+        } else if (needsNewHero) {
+            needsNewHero = false; freshLocalHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
+            story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+        }
     }
-    if (net::IsHost()) { PollSave(); HostTick(); }
-    else {
-        if (receiving && (!net::Joined() || incomingWelcome != net::WelcomeSerial() ||
-            incomingNote.epoch != hostWorld.epoch || now - incomingAt > TransferLimit)) {
-            Logf("persist: checkpoint receive expired save=%s player=%llu mode=%s",
-                 incomingNote.save, steam::PlayerId(), incomingNote.op == net::SaveCommit ? "store" : "load");
-            ClearIncoming();
-            if (incomingNote.op == net::SaveCommit) {
-                net::SaveNote answer = incomingNote;
-                answer.op = net::SaveStored;
-                answer.ok = 0;
-                strncpy_s(answer.name, "transfer-timeout", _TRUNCATE);
-                QueueReply(1, answer);
-                prepared = {};
+    if (net::IsHost()) {
+        PollSave(now);
+        if (!loading.empty() && running && static_cast<int32_t>(now - restoreAt) >= 0) {
+            if (!PersonalReadyForRestore(receivedPersonal)) {
+                if (now - restoreAt > 10000) { restoreFailed = true; loading.clear(); SaveFailure("personal-hooks"); }
+                HostTick(now); return;
             }
-            requestPending = false;
-            SaveFailure(!net::Joined() ? "peer-left" : incomingNote.epoch != hostWorld.epoch ? "world" : "transfer-timeout");
-        }
-        if (!waitingImport.empty() && (!net::Joined() || waitingEpoch != hostWorld.epoch || waitingWelcome != net::WelcomeSerial())) {
-            Log("persist: deferred host import canceled after world/welcome changed");
-            waitingImport.clear();
-        }
-        if (prepared.valid && (!net::Joined() || prepared.welcome != net::WelcomeSerial() ||
-            prepared.note.epoch != hostWorld.epoch ||
-            now - prepared.since > (prepared.committing ? TransferLimit : PreparedLimit))) {
-            Logf("persist: prepared checkpoint expired save=%s player=%llu", prepared.note.save, steam::PlayerId());
-            const char* reason = !net::Joined() ? "peer-left" :
-                prepared.note.epoch != hostWorld.epoch ? "world" : "transfer-timeout";
-            CancelClientSave(reason);
-        }
-        if (requestPending && (!net::Joined() || requestWelcome != net::WelcomeSerial() || now - requestAt > PrepareLimit)) {
-            requestPending = false;
-            SaveFailure(!net::Joined() ? "host-offline" : "request-timeout");
-        }
-        if (autoload.valid) {
-            if (!net::Joined() || autoload.welcome != net::WelcomeSerial() || autoload.epoch != hostWorld.epoch) DropAutoload("left host/world changed");
-            else if (!autoload.armed) ArmAutoload();
-        } else if (!waitingImport.empty() && pendingRecord.empty() && refusedRecord.empty() &&
-                   static_cast<int32_t>(now - nextImportTry) >= 0) {
-            nextImportTry = now + 2000;
-            Manifest manifest;
-            if (ManifestAt(waitingImport, manifest) && ChooseCharacter(waitingImport, manifest)) {
-                pendingRecord.clear();
-                OrderAutoload(waitingImport);
+            const bool ownOk = receivedRecord.empty() || ApplyCharacter(receivedRecord, pendingKey);
+            const char* refusal = !ownOk ? "character-record" : !containers::RestorePersonal(receivedPersonal) ? "personal-record" :
+                                  !RestoreJournal() ? "journal-write" :
+                                  !RestoreExtensions() ? "extension" : nullptr;
+            if (refusal) {
+                restoreFailed = true; loading.clear(); SaveFailure(refusal); return;
             }
+            receivedRecord.clear(); receivedPersonal.clear(); loading.clear(); ownCharacterReady = true; localKind = net::KindSaved;
+            Logf("persist: host load settled save=%s epoch=%08x own_character=1", current.key.save.c_str(), epoch);
+        }
+        HostTick(now);
+        return;
+    }
+    if (!net::Joined()) { captured = {}; requestPending = false; return; }
+    if (seenWelcome != net::WelcomeSerial()) {
+        seenWelcome = net::WelcomeSerial(); synced = 0;
+        hostAdmissionAck = false; nextAdmissionTry = 0;
+        if (receivedWelcome != seenWelcome) { receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; }
+        // An admitted same-epoch reconnect keeps its own live character; a new host epoch always restores the save.
+        if (ownCharacterReady && hostWorld.epoch && !needsNewHero) {
+            synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
         }
     }
-    if (!refusedRecord.empty()) { WaitForRecord(); return; }
-    if (pendingRecord.empty() || !game.GetHero() || !game.IsGameRunning()) return;
-    if (!pendingSince) { pendingSince = now; return; }
-    if (now - pendingSince < 3000) return;
-    const ApplyResult result = ApplyCharacter();
-    if (result != ApplyResult::Restored) {
-        refusedRecord = pendingRecord;
-        refusedWritten = WriteTime(refusedRecord);
-        refusedHinted = 0;
-        nextRestoreTry = now + (result == ApplyResult::PublicationPending ? 5000 : 30000);
-        ownCharacterReady = false;
-        Logf("persist: character refused world=%s save=%s player=%llu reason=%s", desiredKey.world.c_str(), desiredKey.save.c_str(),
-             desiredKey.player, result == ApplyResult::PublicationPending ? "record publication failed; will retry" :
-             (hero::LastRefusal() ? hero::LastRefusal() : "record application failed"));
+    if (requestPending) {
+        if (requestWelcome != net::WelcomeSerial() || requested.epoch != hostWorld.epoch || now - requestStarted > 10000) {
+            if (requestWelcome == net::WelcomeSerial() && requested.epoch == hostWorld.epoch) {
+                auto cancel = requested; cancel.op = net::SaveCancel; cancel.ok = 0; cancel.world[0] = 0;
+                strncpy_s(cancel.name, "request-timeout", _TRUNCATE); QueueReply(1, cancel);
+            }
+            requestPending = false; SaveFailure("request-timeout");
+        } else if (static_cast<int32_t>(now - requestRetry) >= 0) {
+            requestRetry = now + 500; net::SendSave(1, requested);
+        }
     }
-    pendingRecord.clear();
-    Evaluate();
+    if (captured.valid) {
+        if (captured.welcome != net::WelcomeSerial() || captured.note.epoch != hostWorld.epoch || now - captured.started > 15000) {
+            captured.valid = false; captured.bytes.clear(); SaveFailure("result-timeout");
+        } else if (!captured.queued && static_cast<int32_t>(now - captured.nextTry) >= 0) {
+            captured.nextTry = now + 500;
+            captured.queued = SendRecord(1, net::CharacterCapture, {captured.note.world, captured.note.save, steam::PlayerId()}, captured.bytes);
+        }
+    }
+    if (!receivedRecord.empty() && !restoreFailed && !resetLocalWorld && running && receivedWelcome == net::WelcomeSerial() &&
+        receivedNote.epoch == hostWorld.epoch && static_cast<int32_t>(now - restoreAt) >= 0) {
+        if (!PersonalReadyForRestore(receivedPersonal)) {
+            if (now - restoreAt > 10000) { restoreFailed = true; SaveFailure("personal-hooks"); }
+            return;
+        }
+        if (!ApplyCharacter(receivedRecord, {receivedNote.world, receivedNote.save, steam::PlayerId()})) {
+            restoreFailed = true; SaveFailure("character-record"); return;
+        }
+        if (!containers::RestorePersonal(receivedPersonal)) {
+            restoreFailed = true; SaveFailure("personal-record"); return;
+        }
+        receivedRecord.clear(); receivedPersonal.clear(); ownCharacterReady = true; synced = hostWorld.epoch;
+        story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+    }
+    if (ownCharacterReady && !net::InWorld(net::LocalId()) && synced == hostWorld.epoch &&
+        story::AdmissionReady() && doors::AdmissionReady()) Evaluate();
+}
+
+namespace SaveExtensions {
+bool Register(char const* name, uint32_t type, uint32_t version, Capture capture, Restore restore)
+{
+    if (!name || !*name || std::strlen(name) > 48 || type < saving::store::Extension || !version || !capture || !restore ||
+        extensions.size() >= 32 || std::any_of(extensions.begin(), extensions.end(), [=](auto const& e) {
+            return e.type == type || e.name == name;
+        })) {
+        Logf("persist: extension registration refused name=%s type=%u version=%u", name ? name : "-", type, version);
+        return false;
+    }
+    extensions.push_back({name, type, version, capture, restore});
+    return true;
+}
 }
 void Install()
 {
     if (installed) return;
     net::SetSaveHandler(&OnSave);
-    net::SetFileHandlers(&OnFileChunk, &OnFileDone);
+    net::SetCharacterHandler(&OnCharacter);
     net::SetWorldHandler(&OnWorld);
+    if (!SaveExtensions::Register("npclease", NpcLeaseExtension, 1, &CaptureNpcLease, &RestoreNpcLease))
+        Log("persist: NPC lease save overlay registration failed; lease gate remains active");
     unsigned char* resolved[5]{};
     if (!ResolveNative(resolved)) {
-        Log("persist: save/load hooks not installed; paired saves off");
+        Log("persist: save/load hooks not installed; host-managed saves off");
         installed = true;
         return;
     }
@@ -2240,88 +1744,51 @@ void Install()
     originalGuiMessage = reinterpret_cast<GuiMessageFn>(ai::JumpTo(uiEntries[0],
         reinterpret_cast<void*>(&GuiMessageDetour), saving::native::GuiStolen));
     originalNewSlot = reinterpret_cast<NewSlotFn>(uiEntries[1]);
-    uiCallInstalled = HookNativeCall(uiEntries[2] + 6, uiEntries[1], reinterpret_cast<void*>(&MenuNewSlot), "paired menu-save call");
+    originalDelete = reinterpret_cast<DeleteFn>(ai::JumpTo(deleteTarget, reinterpret_cast<void*>(&DeleteDetour), Stolen));
+    uiCallInstalled = HookNativeCall(uiEntries[2] + 6, uiEntries[1], reinterpret_cast<void*>(&MenuNewSlot), "host menu-save call");
     pairedEnabled = originalSave && originalLoad && originalWorldSave && originalWorldLoad && loadCallInstalled &&
-                    originalGuiMessage && uiCallInstalled;
+                    originalGuiMessage && uiCallInstalled && originalDelete;
     if (pairedEnabled) pairedEnabled = ReverifyNative();
     if (originalSave) saveTarget = resolved[0];
     if (originalLoad) loadTarget = resolved[1];
     installed = true;
     if (!pairedEnabled) {
-        Logf("persist: save/load hook installation failed SaveGameFn=%d LoadGameFn=%d WorldSaveGameFn=%d WorldLoadGameFn=%d; partial hooks pass through, paired saves off",
+        Logf("persist: save/load hook installation failed SaveGameFn=%d LoadGameFn=%d WorldSaveGameFn=%d WorldLoadGameFn=%d; partial hooks pass through, host-managed saves off",
              originalSave != nullptr, originalLoad != nullptr, originalWorldSave != nullptr, loadCallInstalled ? 1 : 0);
         return;
     }
     Logf("persist: save and load hooked SaveGameFn=%p LoadGameFn=%p WorldSaveGameFn=%p WorldLoadGameFn=%p FileManagerGetter=%p protocol=%u",
          resolved[0], resolved[1], resolved[2], resolved[3], resolved[4], saving::Protocol);
-    Logf("persist: paired save UI hooked GUI.HandleMessage=%p Menu.NewSaveSlotCall=%p Session.IsSaveAllowed=%p HUD.CaptureSaveImage=%p",
+    Logf("persist: host-managed save UI hooked GUI.HandleMessage=%p Menu.NewSaveSlotCall=%p Session.IsSaveAllowed=%p HUD.CaptureSaveImage=%p",
          uiEntries[0], uiEntries[2] + 6, uiEntries[3], uiEntries[4]);
 }
 void* SaveTarget() { return saveTarget; }
 void* LoadTarget() { return loadTarget; }
-bool CheckpointBusy()
-{
-    return barrier.phase != saving::Barrier::Idle || prepared.valid || requestPending || nativeSaveDepth;
-}
-
-// Keep existing diagnostic entry points; negative controls may not reintroduce a host-character fallback.
+bool CheckpointBusy() { return operation.active || captured.valid || requestPending || nativeSaveDepth; }
 void Off(LogFn log) { writing = false; log("PERSISTOFF ok=1"); }
-void CampaignOff(LogFn log) { transferring = false; log("CAMPAIGNOFF ok=1"); }
-void WorldSyncOff(LogFn log) { syncing = false; log("WORLDSYNCOFF ok=1"); }
-void GenerationOff(LogFn log) { byGeneration = false; log("GENERATIONOFF retired=1"); }
-void WorldGateLate(LogFn log) { earlyGate = false; log("WORLDGATELATE retired=1"); }
-void RecordWaitOff(LogFn log) { log("RECORDWAITOFF retired=1 (own character is mandatory)"); }
-void Pause(char const* argument, LogFn log)
-{
-    const int ms = std::atoi(argument);
-    if (net::IsHost() && ms > 0 && ms <= 30000) pausedUntil = GetTickCount() + static_cast<uint32_t>(ms);
-    log("PERSISTPAUSE");
+void CampaignOff(LogFn log) { log("CAMPAIGNOFF retired=1 (no world transfer)"); }
+void WorldSyncOff(LogFn log) { log("WORLDSYNCOFF retired=1"); }
+void GenerationOff(LogFn log) { log("GENERATIONOFF retired=1"); }
+void WorldGateLate(LogFn log) { log("WORLDGATELATE retired=1"); }
+void RecordWaitOff(LogFn log) { log("RECORDWAITOFF retired=1"); }
+void Pause(char const*, LogFn log) { log("PERSISTPAUSE retired=1"); }
+void BadTransfer(LogFn log) { log("BADTRANSFER retired=1 (no world transfer)"); }
+void Waiting(LogFn log) {
+    char line[128]; Format(line, "RECORDWAIT waiting=%d", HeroPending() ? 1 : 0); log(line);
 }
-void BadTransfer(LogFn log)
-{
-    if (!net::IsHost()) return;
-    uint8_t junk[32]{};
-    uint32_t sizes[net::FileCount] = {100, 100, 0}, crcs[net::FileCount]{};
-    for (uint8_t i = 2; i < net::MaxPlayers; ++i) if (net::PeerJoined(i)) {
-        net::SendFileChunk(i, 0, 100, 0xfffffff0u, junk, sizeof(junk));
-        net::SendFileDone(i, "..\\..\\G3T_evil", sizes, crcs);
+void LoadTicksOff(char const*, LogFn log) { log("LOADTICKSOFF retired=1"); }
+void WorldReport(LogFn log) {
+    char line[256]; Format(line, "WORLD role=%s epoch=%08x host_epoch=%08x own=%d save_id=%s",
+        net::IsHost() ? "host" : "client", epoch, hostWorld.epoch, ownCharacterReady ? 1 : 0, current.key.save.c_str()); log(line);
+}
+void Report(LogFn log) {
+    char line[256]; Format(line, "PERSIST hooked=%d saves=%u loads=%u records_written=%u records_applied=%u active=%d network_world_bytes=0",
+        pairedEnabled ? 1 : 0, saves, loads, recordsWritten, recordsApplied, operation.active ? 1 : 0); log(line);
+}
+bool Switch(char const* action, LogFn log) {
+    if (!std::strcmp(action, "resendguardoff") || !std::strcmp(action, "lastownherooff")) {
+        log("SWITCH retired=1"); return true;
     }
-    log("BADTRANSFER");
-}
-void Waiting(LogFn log)
-{
-    char line[400];
-    Format(line, "RECORDWAIT waiting=%d record=%.300s", !refusedRecord.empty() || !waitingImport.empty(), refusedRecord.c_str());
-    log(line);
-}
-void LoadTicksOff(char const* argument, LogFn log)
-{
-    if (argument && !std::strcmp(argument, "hold")) autoloadHold = true;
-    else if (argument && !std::strcmp(argument, "release")) autoloadHold = false;
-    else if (argument && !std::strcmp(argument, "welcome")) net::AdvanceWelcomeSerialForTest();
-    else loadTicks = true;
-    log("LOADTICKSOFF");
-}
-void WorldReport(LogFn log)
-{
-    char line[700];
-    Format(line, "WORLD role=%s kind=%s save=%s epoch=%08x host_epoch=%08x synced=%08x own=%d world_id=%s save_id=%s",
-         net::IsHost() ? "host" : "client", KindName(localKind), localSave.c_str(), epoch, hostWorld.epoch, synced,
-         ownCharacterReady ? 1 : 0, current.key.world.c_str(), current.key.save.c_str());
-    log(line);
-}
-void Report(LogFn log)
-{
-    char line[900];
-    Format(line, "PERSIST hooked=%d saves=%u loads=%u written=%u read=%u last_save=%s last_load=%s records_written=%u records_applied=%u campaign=%s sent=%u received=%u auto_loads=%u phase=%d player=%llu",
-         originalSave && originalLoad, saves, loads, sidecarsWritten, sidecarsRead, lastSave.c_str(), lastLoad.c_str(),
-         recordsWritten, recordsApplied, campaign.c_str(), filesSent, filesReceived, autoLoads, static_cast<int>(barrier.phase), steam::PlayerId());
-    log(line);
-}
-bool Switch(char const* action, LogFn log)
-{
-    if (!std::strcmp(action, "resendguardoff")) { resendGuard = false; log("SWITCH resendguardoff ok=1"); return true; }
-    if (!std::strcmp(action, "lastownherooff")) { log("SWITCH lastownherooff retired=1"); return true; }
     return false;
 }
 }

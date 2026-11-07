@@ -252,7 +252,7 @@ class DownedPolicyTests(unittest.TestCase):
             "ChannelReliable, true, except); return; } "
             "if (connected && server) Send(server, &message, sizeof(message), ChannelReliable, true); return;",
         )
-        gate = "if (!host || (!isHost && state.kind != 8 && state.kind != 9)) return;"
+        gate = "if (!host || (!isHost && state.kind != 8 && state.kind != 9 && state.kind != 10)) return;"
         broadcast = "SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);"
         self.assertIn(gate, send)
         self.assertLess(send.index("if (state.kind == 19)"), send.index(gate))

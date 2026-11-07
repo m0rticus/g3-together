@@ -186,12 +186,14 @@ char const* PeerName(uint8_t id);
 void GateCounts(unsigned& in, unsigned& out);  // gameplay messages dropped at the gate so far
 // World identity, reliable. Host -> one client: WorldHost, the world the host plays (epoch changes with every load, new
 // game and return to the menu; campaign: the save a player loads to be in it). Client -> host: WorldReady (this player is
-// in that world now) or WorldOther (it is not: another save, a new game of its own, or no game), or WorldWaiting (it is in
+// ready for that world); host -> client WorldReady acknowledges after reliable initial catch-up. WorldOther means
+// another save, a new game of its own, or no game. WorldWaiting means it is in
 // the host's save, but its own hero record was refused; it waits until the record loads, owner 23.10.; hosts before it
 // ignore the op).
 enum : uint8_t { WorldHost = 1, WorldReady = 2, WorldOther = 3, WorldWaiting = 4 };
 enum : uint8_t { KindMenu = 0, KindNew = 1, KindSaved = 2 };
 enum : uint8_t { WorldSyncOff = 1 };  // flags: QA negative control, the host passes no world change on (the old behaviour)
+enum : uint8_t { WorldEntryConfirmed = 2 };  // client confirms applied cutover after the host's WorldReady ACK
 #pragma pack(push, 1)
 struct WorldNote {
     uint8_t op = 0;
@@ -201,7 +203,7 @@ struct WorldNote {
     char campaign[64] = {};
 };
 #pragma pack(pop)
-void SendWorld(WorldNote const& note, uint8_t to);  // host: to client `to`; client: to the host (to ignored)
+bool SendWorld(WorldNote const& note, uint8_t to);  // reliable queue result; host: client `to`; client: host
 using WorldHandler = void (*)(uint8_t from, WorldNote const& note);
 void SetWorldHandler(WorldHandler handler);
 
@@ -296,12 +298,8 @@ void SetKilledHandler(KilledHandler handler);
 void SendDeath(uint8_t const guid[16], uint8_t by, uint8_t except);
 using DeathHandler = void (*)(uint8_t by, uint8_t const guid[16]);
 void SetDeathHandler(DeathHandler handler);
-// Host -> every client: the campaign was saved under `name` (kind 1).
-void SendCampaign(uint8_t kind, char const* name);
-using CampaignHandler = void (*)(uint8_t kind, char const* name);
-void SetCampaignHandler(CampaignHandler handler);
-// Protocol 72: reliable, host-coordinated checkpoints. No client world files travel to the host.
-enum SaveOp : uint8_t { SaveRequest = 1, SavePrepare, SaveReady, SaveCommit, SaveStored, SaveCancel, SaveResult, SaveImport };
+// Reliable host-save controls. Values 4/5/8 from paired checkpoints are retired.
+enum SaveOp : uint8_t { SaveRequest = 1, SavePrepare = 2, SaveReady = 3, SaveCancel = 6, SaveResult = 7 };
 #pragma pack(push, 1)
 struct SaveNote {
     uint8_t op = 0, ok = 0;
@@ -313,23 +311,21 @@ static_assert(sizeof(SaveNote) == 121, "save note wire layout changed");
 bool SendSave(uint8_t to, SaveNote const& note); // client: to 1; host: to one welcomed client
 using SaveHandler = void (*)(uint8_t from, SaveNote const& note);
 void SetSaveHandler(SaveHandler handler);
-// Host -> one client: the campaign save files (.g3savcpx, .g3savcpxdat, .g3t) in chunks, then a summary
-// with sizes and CRC-32s (persist.cpp).
-constexpr int FileCount = 3;
-constexpr uint16_t MaxChunk = 1148; // 12-byte file header + data fits even the 1168-byte checksum budget
-bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, void const* data, uint16_t length);
-bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount]);
-// Takes the complete immutable bundle atomically; ordered prefix/chunks/done are
-// paced on a separate reliable channel. Refusal does not consume the files; retry a busy recipient.
-bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
-                       std::vector<uint8_t> (&files)[FileCount],
-                       uint32_t const size[FileCount], uint32_t const crc[FileCount]);
-bool FileTransferBusy(uint8_t to);
-// An ID cancels only that checkpoint; nullptr also cancels unrelated join imports on world changes.
-void CancelFileTransfers(char const* save = nullptr);
-using FileChunkHandler = void (*)(uint8_t file, uint32_t total, uint32_t offset, uint8_t const* data, uint16_t length);
-using FileDoneHandler = void (*)(char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount]);
-void SetFileHandlers(FileChunkHandler chunk, FileDoneHandler done);
+enum CharacterPurpose : uint8_t { CharacterCapture = 1, CharacterRestore = 2 };
+#pragma pack(push, 1)
+struct CharacterNote {
+    uint8_t purpose = 0;
+    uint32_t epoch = 0;
+    uint64_t account = 0;
+    uint32_t length = 0, crc = 0;
+    char world[33] = {}, save[33] = {};
+};
+#pragma pack(pop)
+static_assert(sizeof(CharacterNote) == 87, "character wire header changed");
+bool SendCharacter(uint8_t to, CharacterNote const& note, std::vector<uint8_t> const& bytes);
+using CharacterHandler = void (*)(uint8_t from, CharacterNote const&, std::vector<uint8_t> const&);
+void SetCharacterHandler(CharacterHandler handler);
+uint64_t PeerAccount(uint8_t id);
 // Host -> every client: the game clock (clock.cpp).
 #pragma pack(push, 1)
 struct ClockState { uint32_t timestamp = 0; uint16_t year = 0; uint16_t day = 0; uint8_t hour = 0; uint8_t minute = 0; };
@@ -363,23 +359,23 @@ struct WorldState {
 #pragma pack(pop)
 static_assert(sizeof(WorldState) == 102, "world state wire layout changed");
 void SendWorldState(WorldState const& state, uint8_t except);
-// XP sharing is the only kind sent by a client; deliver a baseline or ack to one
-// peer, or from a client directly to the host.
+// Targeted XP baseline/ack and shared-door snapshot request/reply, including pre-admission restoration.
 bool SendWorldStateTo(uint8_t to, WorldState const& state);
 using WorldStateHandler = void (*)(uint8_t from, WorldState const& state);
 void SetWorldStateHandler(WorldStateHandler handler);
 
 // Named story state (story.cpp), reliable. Host -> all clients: the host's values. Client -> host: values this
-// player changed; an empty message asks the host for its full state of that kind. A message holds at most
-// MaxStatesPerMessage entries; callers split larger sets.
-enum : uint8_t { StateQuests = 1, StateInfos = 2, StateEvents = 3 };
+// player changed. Kind flag 0x80 brackets a pre-admission snapshot; empty 0x80 requests/begins it,
+// empty 0xc0 ends it; 0xa0 carries reward-free cutover changes before entry confirmation.
+// Quest/info names use stable IDs; runtime uses named u32 values; domain 5 carries the bootstrap calendar.
+enum : uint8_t { StateQuests = 1, StateInfos = 2, StateEvents = 3, StateQuestRuntime = 4, StateWorldClock = 5 };
 struct StateEntry {
     uint8_t value;
     char name[63];
 };
 constexpr int MaxStatesPerMessage = 64;
-void SendStates(uint8_t kind, StateEntry const* entries, int count);
-void SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count);
+bool SendStates(uint8_t kind, StateEntry const* entries, int count);
+bool SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count);
 using StateHandler = void (*)(uint8_t from, uint8_t kind, StateEntry const* entries, int count);  // from: client id, 1 = host
 void SetStateHandler(StateHandler handler);
 

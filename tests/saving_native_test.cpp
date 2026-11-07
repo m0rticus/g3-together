@@ -489,12 +489,13 @@ void ApplyRelocations(std::vector<uint8_t>& image, PeImage const& pe, uint32_t d
     }
 }
 
+template<size_t N>
 void CheckNamedExports(std::vector<uint8_t> const& image, size_t optional,
-                       size_t const (&entry)[5], Site const (&catalog)[5])
+                       size_t const (&entry)[N], Site const (&catalog)[N])
 {
     const size_t exports = Get(image, optional + 96);
     if (!exports) throw std::runtime_error("missing configured PE export directory");
-    for (size_t i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < N; ++i) {
         if (!catalog[i].symbol) continue;
         unsigned found = 0;
         const uint32_t names = Get(image, exports + 32);
@@ -580,6 +581,21 @@ void CheckRealPe(std::vector<uint8_t> const& image, PeImage const& pe, uint32_t 
     assert(Matches(image.data() + ui[0], GuiStolen, "8b44240483ec68"));
     CheckNamedExports(image, pe.optional, sites, Sites);
     CheckNamedExports(image, pe.optional, ui, UiSites);
+    unsigned deletionCount = 0;
+    size_t deletion = Missing;
+    for (auto const& section : pe.sections) {
+        if (!(section.flags & 0x20000000) || !Range(image.size(), section.at, section.size)) continue;
+        unsigned found = 0;
+        const size_t at = FindUnique(image.data() + section.at, section.size, DeleteSite.bytes, found);
+        if (at != Missing) deletion = section.at + at;
+        deletionCount += found;
+    }
+    if (deletionCount != 1 || deletion != DeleteSite.hint ||
+        !Matches(image.data() + deletion, Stolen, "83ec10535657"))
+        throw std::runtime_error("configured native slot deletion signature mismatch");
+    const size_t deletionEntries[1]{deletion};
+    const Site deletionSites[1]{DeleteSite};
+    CheckNamedExports(image, pe.optional, deletionEntries, deletionSites);
 
     const std::vector<int> original = Decode(Sites[3].bytes);
     if (!Range(image.size(), sites[3], original.size()) ||

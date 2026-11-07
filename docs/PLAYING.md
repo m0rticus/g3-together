@@ -151,7 +151,7 @@ uses unreliable fragments rather than silently becoming reliable; small packets 
 Compact NPC control batches are capped at 1172 bytes. Explicit reliable events and ENet's reliable sequence rollover
 retain their semantics.
 
-The current source uses **protocol 76**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
+The current source uses **protocol 77**. Its host-only NPC overhaul and host-managed saves are experimental; native gameplay acceptance is still
 in progress, so this source must not be treated as a verified release. Both players need the same build; older protocol peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
@@ -331,51 +331,50 @@ Friendly-fire protection applies before local hit feedback as well as before aut
 ## Starting and saving
 
 1. The host starts Gothic 3 and begins a new game or loads the co-op campaign.
-2. The other player starts Gothic 3.
-   - If the host has loaded or saved a campaign and you have your own character record for it, stay in the main menu.
-     The campaign is transferred and loaded automatically when you join.
-   - A first-time player without an own character record must start a new game or load their own local hero first.
-     The mod waits rather than loading a copy of the host's character.
-   - If the host has started a new game, start a new game as well.
-3. **Either player saves** using the normal manual/quick-save controls. A client requests the save from the host;
-   it never replaces the host's world with its own local world. Every ready player captures their own character,
-   then receives the same host-world checkpoint with a common save ID.
-4. Wait for **"Co-op checkpoint saved for every participating player"** before quitting. The immediate native
-   save call reports no synchronous save while coordination is queued; the mod's later confirmation is authoritative.
-   Loading, dialogue, transformation, being downed, unsettled trade, a disconnected partner or disk failure can refuse/cancel
-   the operation. A failure after host publication may leave a usable host checkpoint, but is never reported as a
-   successful save on both machines. Retry once everyone is ready. Player exchanges wait during a checkpoint.
+2. The other player starts **New Game** locally. Before admission, the host restores that Steam account's
+   saved character and personal loot/merchant state if present. The host calendar, authoritative story/quest-runtime
+   and nearby shared-door snapshots finish before admission. The applied cutover is confirmed before NPC/motion
+   entry replays. A new account gets a fresh character, never the host's hero.
+3. **Either player requests a save** using manual/quick-save controls. The host collects small current
+   character/personal-state records and performs **one native save**. Clients never save or receive native world files.
+4. Wait for **"Co-op save complete"** before quitting. Dialog, downed/control, loading or an unsettled
+   player exchange can refuse explicitly; combat alone is not a native refusal. Retry after the stated
+   condition clears. A disconnected account retains its preceding saved character, not unseen progress.
+5. **Only the host loads** from the normal menu/quick-load controls. After the host loads, clients start
+   **New Game** again to reset their local world, then receive their account-exact saved character.
+   A connection-only rejoin in the same live world keeps that player's live character.
 
-Each checkpoint is an immutable `G3T_<save-id>` native save pair plus a `.g3t` manifest/journal.
-Every participant also publishes the requested menu/quick-save slot as an alias. Each machine stores its own
-`g3t-character-<world-id>-<Steam-account-id>-<save-id>.txt` record (format V4), including
-attributes, current/max health and mana, XP/level/LP, inventory/gold/equipment, skills, spells, quick slots and pose.
-V4 keeps base attributes and aggregate equipment/stat modifiers separately; temporary-effect ownership and
-expiry timers are not reconstructed and remain a native runtime limitation.
-The native world pair still contains the host's single hero; the **mandatory own-character overlay is part of the save**.
-Do not load a transferred native pair without the mod or remove the character files. Back up the whole save folder.
+The host's `<menu-slot>.g3t` is a self-contained **G3TSAVE3** container: native header/world,
+shared journal/companions, individual G3THERO4 and bounded personal-state records, and versioned extension blocks. Whole-file
+and block CRCs detect corruption. A flushed temporary file atomically replaces the container.
+The game's ordinary native menu pair is a recoverable cache, rebuilt from the container on load.
+There are no client manifests, aliases, paired native saves, or 2 MB network save transfers.
+Back up/copy the host's `.g3t` with its menu pair (or the whole isolated save folder). The `.g3t`
+alone contains all data, but the game's load menu needs its native header cache to list the slot.
+The host's native Delete menu also removes `.g3t`; deleting files manually must include the entire slot.
+Do not treat the cache alone as a complete co-op save.
+Interrupted `G3T_pending_*` staging slots cannot be loaded.
 
-Loading the host's earlier save loads that checkpoint on the client and restores its exact saved character before
-gameplay opens; it does not overwrite that older character record with the currently running hero.
-This also applies when the host reloads the latest checkpoint after continuing to play.
-A missing exact record can explicitly recover the same account's latest record **from this campaign only**;
-a damaged/wrong-account exact record instead stays blocked until repaired. A new menu-only player stays outside
-the world until they start/load their own hero. Record deletion never gives them the host's hero.
-Legacy G3T1 journals remain readable: the native contents identify a conservative legacy campaign,
-and only the exact old slot's complete local hero record can be imported and claimed by one Steam account.
-V3 carries its required spell/quick data inline; V2 can migrate with complete skills/end data and its required sidecar.
-Original V1 and incomplete older V2 records cannot prove a complete character and stay gated rather than supplying host data.
-Original legacy files stay unchanged. Legacy records without pose retain the native spawn position on migration.
-Old stat records preserve effective maxima but cannot recover the original base/bonus split.
-No migration can reconstruct a distinct character that an older save never recorded; supply a genuine local hero in that case.
-Transient record-publication failures remain gated and retry without requiring an edit to the source record.
+G3THERO4 preserves stats, base/aggregate equipment modifiers, current/max HP/MP/stamina,
+XP/level/LP, inventory/gold/equipment, skills/spells, quick slots and position/orientation.
+Temporary-effect ownership/expiry and live inventory/equipment mutation still require manual acceptance.
+Each client keeps a small account-local character backup when sending a save record; it is insurance,
+**not an automatic latest-character fallback**. The host's save is the source of truth.
+An absent/wrong account starts new; a corrupt existing record/container blocks admission/load.
 
-Coordination uses prepare/ready, host native save, verified world transfer and stored acknowledgments, not a
-distributed engine freeze. Captures are separated by network latency, not literally simultaneous. Only the host's
-native world bytes are distributed. The native manual/quick-save route and lower save API are hooked; no built-in
-autosave/exit-save route was found in the inspected game. The mod does not add a new autosave-on-exit feature.
-Custom save callers get a queued/failed synchronous result and must wait for the mod's confirmation too.
-Immutable checkpoints are retained rather than pruning old quick-save history automatically; allow additional disk space.
+Plain native saves, G3T-prefixed old slots such as `G3T_Sandbox`, and intact G3T1/G3T2 journals
+remain host-loadable. Old external client records are not silently imported or reassigned to another account;
+clients start fresh if the host lacks an account-bound record. Keep original legacy backups.
+Earlier G3TSAVE3 containers also load; a missing personal-state block uses native/fresh defaults, not a local latest backup.
+Previously unrecorded client loot depletion cannot be reconstructed from those older containers.
+
+**Acceptance boundary:** clients use a fresh local world, account-specific overlays and authoritative replication,
+not the host's serialized world. Initial quest restoration sets status/runtime data without granting rewards again,
+after restoring the host's calendar rather than evaluating saved timers against New Game time;
+shared doors are queried from the host rather than assumed identical. Arbitrary native serialized objects,
+client-created loose drops and temporary effects are not a complete per-player world save. The two-copy checks
+in PLAYTEST.md remain mandatory before relying on long campaigns. Pick up dropped equipment before saving.
+No autosave-on-exit is added.
 
 ## What is shared
 
@@ -383,9 +382,13 @@ Protocol 62 makes ground pickups, corpse loot, chest contents and NPC merchant i
 Taking or buying an item changes only that player's copy; each player pays from their own gold.
 Chest locks and use reservations are local too; other shared doors and usable places are unchanged.
 Direct trades between players still transfer real items rather than copying them.
-This does not restore items already removed during an earlier session. A host-save transfer/load replaces the client's world
-with the host's saved world, including native loot, merchant stock and generated-inventory flags.
-Independent world-inventory persistence across saves/late joins is not implemented; this is not yet a persistent per-player world save.
+New host saves preserve each account's generated/depleted chest/corpse stock, merchant stock and consumed
+loose pickup GUIDs. Inventory quality/type and personal chest door/lock state are restored lazily before use.
+Unloaded entries remain in the record. Missing blocks in legacy saves use native/fresh defaults.
+Required inventory hooks are checked against the supported binaries. Dirty inventories that unload before a reliable
+refresh refuse saving rather than silently use stale stock. Startup restoration waits for those hooks before changing
+the hero. Consumed loose pickups cannot grant items again while native removal is still pending.
+This is a bounded personal overlay, not a reconstruction of every dynamically created native world object.
 
 - Players see each other, including movement, combat animations and falls.
 - The host simulates NPCs around every player; clients replay that state without NPC AI, navigation or autonomous tasks.
@@ -429,7 +432,7 @@ Independent world-inventory persistence across saves/late joins is not implement
   per second, independent of NPC interest and world/presentation gates. Five seconds of silence
   makes activity stale; the additional five-second grace then starts. A stale position or another
   world alone does not make an active partner unavailable. The host loads a
-  save; the other player is loaded into it automatically.
+  save; the other player starts New Game locally and receives their saved character before admission.
   On each PC, the local hero enters native death once (death scream, ragdoll and
   the localized game-over/"The End" message). Both heroes and their remote bodies
   stay dead; neither healing nor a late revive can restore gameplay. The native
@@ -459,7 +462,7 @@ Independent world-inventory persistence across saves/late joins is not implement
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
-  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 76 build.
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 77 build.
   To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
   one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
   outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.

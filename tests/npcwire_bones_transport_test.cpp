@@ -92,6 +92,8 @@ namespace ai { bool ShuttingDown() { return false; } }
 namespace steam {
 TrafficCounters Traffic() { return {}; }
 bool IsPeerRelay(unsigned short) { return true; }
+uint64_t PeerId(unsigned short port) { return port == 12 ? 12 : port == 13 ? 13 : 0; }
+uint64_t PlayerId() { return 12; }
 bool Start(bool, unsigned short) { return false; }
 unsigned short RelayPort() { return 0; }
 void Pump() {}

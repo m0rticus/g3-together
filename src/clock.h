@@ -6,9 +6,12 @@
 
 #include <cstdint>
 
+namespace g3t::net { struct ClockState; }
 namespace g3t::clock {
 void Start();
 void Tick();             // once per frame
+bool CaptureAdmission(net::ClockState& state);
+bool RestoreAdmission(net::ClockState const& state);  // clock setters and sleep-origin reset, before quest timers
 using LogFn = void (*)(char const*);
 void Report(LogFn log);  // QA: CLOCK line
 void Set(char const* hhmm, LogFn log);  // QA: set the local clock to "HH_MM"

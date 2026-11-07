@@ -7,7 +7,7 @@
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
 
-The current source speaks **protocol 76**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
+The current source speaks **protocol 77**. Its host-authoritative NPC overhaul and host-managed saves are experimental and native gameplay
 acceptance is still in progress; it is not a verified release. Both players need the same build; older protocol peers are refused.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
 World teardown finishes their PVS jobs and releases every private cell before unregistering the cameras.
@@ -36,10 +36,10 @@ only real congestion signals stretch the NPC intervals uniformly.
 - **Personal loot and shops.** Ground pickups, corpse loot, chest contents and NPC merchant stock belong to each player's copy.
   Taking or buying something does not deplete the other player's copy. Picked pockets still use shared NPC state.
 - **Trade together.** Use the game's trade screen to move real items freely or give gold. Exchanges synchronize automatically, without partner approval.
-  A later host-save load still replaces native world inventories; independent world-inventory save reconstruction is not implemented.
+  Host saves preserve each account's personal chest/corpse loot, merchant stock and consumed loose pickups.
 - **Look out for each other.** Find your partner on the map and compass, jump to their side, and revive them with a healing potion.
-- **Keep your character and campaign.** Either player requests a paired checkpoint: the host's world plus each Steam account's own character record.
-  Wait for the paired-save confirmation before leaving; native gameplay acceptance is pending.
+- **Host-managed saves.** Either player requests one host save containing the world and each Steam account's character.
+  Wait for "Co-op save complete"; native world bytes are never transferred. Gameplay acceptance is pending.
 
 More: [combat, companions, guards and world interactions](docs/PLAYING.md#what-is-shared).
 
@@ -87,12 +87,14 @@ Steam activity uses **Gothic 3 (AppID 39500)**, not Spacewar.
 
 | Host starts first… | Joining player… |
 | --- | --- |
-| Load a saved campaign. | With a saved own character, **wait in the main menu**. A first-time player must start a new game or load their own hero first. |
-| Start a new, unsaved campaign. | **Start a new game too.** Once the host has saved, future joins can load from the main menu. |
+| Load a saved campaign. | Start **New Game locally** and wait for your account's saved character; a missing account starts fresh. |
+| Start a new, unsaved campaign. | **Start a new game too.** Only the host loads saved campaigns. |
 
-**Either player can save**; the host creates the authoritative world checkpoint and every ready player stores it with their own character.
+**Either player can request a save**; only the host saves/loads the world. Clients start New Game to re-enter,
+then receive their account-exact character and personal loot state. Story/quest-runtime and nearby shared-door
+snapshots complete before admission without replaying quest rewards. Native gameplay still needs manual acceptance.
 Keep Steam display names unchanged to restore companions (character records themselves use the Steam account ID).
-Read about [first-join heroes, paired saves and recovery](docs/PLAYING.md#starting-and-saving).
+Read about [host saves, character restoration and recovery](docs/PLAYING.md#starting-and-saving).
 
 ## A few things to try
 

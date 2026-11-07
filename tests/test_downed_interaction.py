@@ -101,11 +101,18 @@ int main()
 
     def test_native_and_script_loot_guard_precedes_window_and_keeps_trade(self):
         tick = function_body(self.source["containers"], r"\bvoid\s+Tick\s*\(")
+        install = function_body(self.source["containers"], r"\bbool\s+InstallAccessGuards\s*\(")
+        self.assertIn("InstallAccessGuards()", tick)
         self.assertIn("constexpr uintptr_t OpenLootRva = 0x6bfd0", self.source["containers"])
-        self.assertIn("0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x54, 0x01, 0x00, 0x00", tick)
+        self.assertIn("0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x54, 0x01, 0x00, 0x00", install)
         for required in ("std::memcmp", "ai::JumpTo", "loot->m_funcScript = &OpenLoot",
                          "reinterpret_cast<void*>(nativeLoot)", "SCRIPT ONLY"):
-            self.assertIn(required, tick)
+            self.assertIn(required, install)
+        self.assertIn("reinterpret_cast<void*>(nativeLoot) == base + OpenLootRva", install)
+        self.assertIn("!std::memcmp(base + OpenLootRva, head, sizeof(head))", install)
+        self.assertLess(install.index("std::memcmp"), install.index("ai::JumpTo"))
+        self.assertLess(install.index("ai::JumpTo"), install.index("loot->m_funcScript = &OpenLoot"))
+        self.assertIn("trade->m_funcScript = &OpenTrade", install)
         loot = function_body(self.source["containers"], r"\bGEInt\s+GE_STDCALL\s+OpenLoot\s*\(")
         self.assertLess(loot.index("remote::PuppetOwner"), loot.index("Opened("))
         self.assertLess(loot.index("remote::IsHeldPuppet"), loot.index('CallScript(bCString("AssessTalk")'))

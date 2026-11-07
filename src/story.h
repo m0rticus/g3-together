@@ -3,8 +3,8 @@
 // - quests: each quest's status;
 // - infos: each dialog option's InfoGiven flag ("already told"), which other dialogs' conditions read.
 // The host polls every entry and sends changes to all clients; a client asks for the host's full state once
-// it is in the game (it connects from the main menu) and after every reconnect. A client applies the host's
-// values (quests through the game's own quest functions: journal, experience) and sends its own player's
+// its character is restored, before admission (it connects from the main menu), and after every reconnect. A client applies the host's
+// values (initial restoration without quest rewards; live transitions through native quest functions) and sends its own player's
 // changes to the host, which applies and redistributes them. Effects of a dialog (items, teaching) stay with
 // the player who held it; the dialog then counts as held for everyone.
 #pragma once
@@ -13,6 +13,10 @@ namespace g3t::story {
 void Start();
 void Tick();
 void OnWorldChange();  // client: a load or a new world; what it knew of the host's values was about the world before
+void PrepareAdmission();
+bool AdmissionStarted();
+bool AdmissionReady();  // all authoritative story/runtime snapshots applied before gameplay
+bool FinishAdmission(unsigned char player);  // host: queue reward-free changes since the immutable initial snapshot
 using LogFn = void (*)(char const*);
 void Event(char const* action, char const* name, LogFn log);  // QA: event | setevent | clearevent <name>
 void Report(LogFn log);   // QA: one STORY line per kind, then "STORY end"

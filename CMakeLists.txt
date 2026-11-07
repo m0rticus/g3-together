@@ -32,7 +32,7 @@ target_sources(Script_G3Together PRIVATE src/npcremoval.cpp)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/npcwire_control.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 # Sources are UTF-8: without /utf-8 MSVC reads them as Windows-1252 and HUD texts show "lÃ¤uft" (plan 3.5).
-target_compile_options(Script_G3Together PRIVATE /utf-8)
+target_compile_options(Script_G3Together PRIVATE /utf-8 /wd4530)
 # A map file, to turn crash addresses from the engine's report into functions.
 target_link_options(Script_G3Together PRIVATE /MAP)
 target_link_libraries(Script_G3Together PRIVATE g3sdk::SDK enet bcrypt)

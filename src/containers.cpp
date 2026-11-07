@@ -3,12 +3,15 @@
 
 #include "body.h"
 #include "guid.h"
+#include "items.h"
 #include "log.h"
 #include "net.h"
+#include "personal_store.h"
 #include "remote.h"
 #include "trade.h"
 #include "ai.h"
 #include "downed.h"
+#include "world.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -20,7 +23,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +46,15 @@ unsigned contentsSent = 0, contentsReceived = 0, rewrites = 0, txSent = 0, txApp
          reverted = 0, handsReleased = 0;
 unsigned ignoredSharedMessages = 0;
 DWORD lastLocalPoll = 0;
+namespace personal = saving::personal;
+personal::Snapshot personalLedger;
+size_t personalLedgerBytes = 12;
+std::set<std::string> personalPending;
+std::set<std::string> personalErrors;
+std::set<std::string> personalRestoreErrors;
+std::set<std::string> personalUncertain;
+bool personalErrorOverflow = false;
+std::set<std::string> restoredPersonal, openedPersonalTrade, seenPersonalTradePage;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
@@ -273,6 +288,704 @@ float DistanceTo(eCEntity* entity, float const at[3])
     return body::Distance(q, at);
 }
 
+bool PersonalKind(Entity& entity, personal::Kind& kind)
+{
+    if (!Shared(entity)) return false;
+    if (Corpse(entity)) kind = personal::Kind::Corpse;
+    else if (IsTrader(entity)) kind = personal::Kind::Trader;
+    else if (IsChest(entity)) kind = personal::Kind::Chest;
+    else return false;
+    return true;
+}
+
+std::string EntityKey(eCEntity* entity)
+{
+    uint8_t raw[16];
+    guid::CopyEntity(entity, raw);
+    return Key(raw);
+}
+
+// Listener notifications can arrive during an operation or teardown, not necessarily after it.
+// They only mark state dirty; snapshots are committed at known completion boundaries.
+struct PersonalObserver final : gCInventoryListener {
+    std::string key;
+    gCInventory_PS* inventory = nullptr;
+    gCInventory_PS* retiredInventory = nullptr;
+    eCEntity* owner = nullptr;
+    personal::ChangeTracker changes;
+    unsigned depth = 0;
+    bool active = false;
+
+    void Changed() { if (active && !ai::ShuttingDown()) changes.Changed(); }
+    void OnStackCreate(GEInt, gCInventoryStack const*) override { Changed(); }
+    void OnStackChange(GEInt, gCInventoryStack const*) override { Changed(); }
+    void OnStackDelete(GEInt, gCInventoryStack const*) override { Changed(); }
+    void OnSortInventory() override { Changed(); }
+    void OnDestroyInventory() override
+    {
+        if (!active || ai::ShuttingDown()) return;
+        changes.Destroyed();
+        retiredInventory = inventory;
+        inventory = nullptr;
+        if (changes.uncertain || depth) {
+            personalUncertain.insert(key);
+            Log("FAIL containers: personal inventory unloaded with uncommitted changes; saving refused");
+        }
+        if (personalLedger.count(key)) personalPending.insert(key);
+    }
+};
+
+constexpr size_t MaxPersonalObservers = 65536;
+std::vector<std::unique_ptr<PersonalObserver>> personalObservers;
+std::vector<PersonalObserver*> reusablePersonalObservers;
+std::map<std::string, PersonalObserver*> currentPersonalObservers;
+
+void RetirePersonalObservers()
+{
+    for (auto const& entry : currentPersonalObservers) {
+        PersonalObserver* observer = entry.second;
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(entry.first.data()));
+        eCEntity* instance = entity.GetInstance();
+        if (observer->inventory && instance &&
+            instance->GetPropertySet(eEPropertySetType_Inventory) == observer->inventory) {
+            observer->inventory->RemoveListener(observer);
+            observer->active = false;
+            observer->inventory = nullptr;
+            reusablePersonalObservers.push_back(observer);
+        } else {
+            // A destroyed or unresolvable inventory may still be unwinding its callbacks.
+            observer->active = false;
+        }
+    }
+    currentPersonalObservers.clear();
+}
+
+bool ObservePersonal(Entity& entity)
+{
+    eCEntity* instance = entity.GetInstance();
+    if (!instance) return false;
+    const std::string key = EntityKey(instance);
+    auto* inventory = static_cast<gCInventory_PS*>(instance->GetPropertySet(eEPropertySetType_Inventory));
+    if (!inventory || personalUncertain.count(key)) return false;
+    auto existing = currentPersonalObservers.find(key);
+    if (existing != currentPersonalObservers.end()) {
+        PersonalObserver* observer = existing->second;
+        if (observer->inventory == inventory && observer->changes.CanRefresh()) return true;
+        if (observer->changes.dirty && !observer->changes.destroyed) {
+            personalUncertain.insert(key);
+            return false;
+        }
+        observer->active = false;
+        currentPersonalObservers.erase(existing);
+    }
+    PersonalObserver* observer = nullptr;
+    if (!reusablePersonalObservers.empty()) {
+        observer = reusablePersonalObservers.back();
+        reusablePersonalObservers.pop_back();
+    } else {
+        if (personalObservers.size() >= MaxPersonalObservers) {
+            personalErrorOverflow = true;
+            Log("FAIL containers: personal inventory observer limit reached");
+            return false;
+        }
+        personalObservers.push_back(std::make_unique<PersonalObserver>());
+        observer = personalObservers.back().get();
+    }
+    observer->key = key;
+    observer->inventory = inventory;
+    observer->retiredInventory = nullptr;
+    observer->owner = instance;
+    observer->changes = {};
+    observer->depth = 0;
+    observer->active = true;
+    currentPersonalObservers[key] = observer;
+    inventory->AddListener(observer);
+    return true;
+}
+
+bool PersonalTeardown(Entity& entity)
+{
+    if (!entity.GetInstance()) return false;
+    auto observer = currentPersonalObservers.find(EntityKey(entity.GetInstance()));
+    return observer != currentPersonalObservers.end() && observer->second->changes.destroyed &&
+           observer->second->owner == entity.GetInstance() &&
+           entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory) == observer->second->retiredInventory;
+}
+
+bool PersonalCounted(Entity& entity, int index)
+{
+    if (!Counted(entity, index)) return false;
+    if (entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) {
+        const gEItemCategory category = entity.Inventory.GetCategory(index);
+        if ((category == gEItemCategory_Skill || category == gEItemCategory_Spellbook) &&
+            !entity.Inventory.IsStackMerchandise(index)) return false;
+    }
+    return true;
+}
+
+bool ReadPersonal(Entity& entity, personal::Inventory& row)
+{
+    personal::Kind kind;
+    if (!PersonalKind(entity, kind)) return false;
+    auto* inventory = static_cast<gCInventory_PS*>(entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory));
+    if (!inventory) return false;
+    personal::Inventory result;
+    result.kind = kind;
+    if (entity.Inventory.IsGeneratedPlunder()) result.flags |= personal::GeneratedPlunder;
+    if (entity.Inventory.IsGeneratedTrade()) result.flags |= personal::GeneratedTrade;
+    if (entity.GetInstance()->GetPropertySet(eEPropertySetType_Door)) {
+        result.flags |= personal::HasDoor;
+        if (entity.Door.IsOpen()) result.flags |= personal::DoorOpen;
+    }
+    if (entity.GetInstance()->GetPropertySet(eEPropertySetType_Lock)) {
+        result.flags |= personal::HasLock;
+        if (entity.Lock.IsLocked()) result.flags |= personal::Locked;
+    }
+    for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
+        if (entity.Inventory.GetSlotFromStack(i) != gESlot_None) continue;
+        Entity item = entity.Inventory.GetTemplateItem(i);
+        auto* stack = inventory->GetStack(i);
+        if (!item.GetInstance() || !stack) return false;
+        if (!std::strcmp(item.GetName().GetText(), "Fist")) continue;
+        if (!PersonalCounted(entity, i)) continue;
+        if (!item.GetInstance()->GetPropertySet(eEPropertySetType_Item)) return false;
+        const gEStackType type = stack->GetType();
+        if (type != gEStackType_Normal && type != gEStackType_Treasure && type != gEStackType_Merchandise)
+            return false;
+        const int amount = entity.Inventory.GetAmount(i);
+        if (amount <= 0) return false;
+        if (result.stacks.size() == personal::MaxStacks) return false;
+        result.stacks.push_back({TemplateKey(entity, i), static_cast<uint32_t>(amount),
+                                 entity.Inventory.GetQuality(i),
+                                 type == gEStackType_Merchandise ? personal::Stock::Merchandise : personal::Stock::Normal});
+    }
+    if (!personal::Valid(result)) return false;
+    row = std::move(result);
+    return true;
+}
+
+bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
+{
+    personal::Kind kind;
+    if (!PersonalKind(entity, kind) || kind != row.kind) return false;
+    eCEntity* instance = entity.GetInstance();
+    auto* inventory = static_cast<gCInventory_PS*>(instance->GetPropertySet(eEPropertySetType_Inventory));
+    if (!inventory ||
+        ((row.flags & personal::HasDoor) != 0) != (instance->GetPropertySet(eEPropertySetType_Door) != nullptr) ||
+        ((row.flags & personal::HasLock) != 0) != (instance->GetPropertySet(eEPropertySetType_Lock) != nullptr)) return false;
+
+    std::vector<eCTemplateEntity*> templates;
+    for (auto const& stack : row.stacks) {
+        _GUID raw;
+        std::memcpy(&raw, stack.item.data(), 16);
+        eCTemplateEntityProxy proxy;
+        proxy.SetEntity(guid::Property(raw));
+        eCTemplateEntity* item = proxy.GetEntity();
+        auto* itemProperty = item ? static_cast<gCItem_PS*>(item->GetPropertySet(eEPropertySetType_Item)) : nullptr;
+        if (!itemProperty) return false;
+        const gEItemCategory category = itemProperty->GetCategory();
+        if (instance->GetPropertySet(eEPropertySetType_NPC) && stack.type == personal::Stock::Normal &&
+            (category == gEItemCategory_Skill || category == gEItemCategory_Spellbook)) return false;
+        for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
+            if (!PersonalCounted(entity, i) && TemplateKey(entity, i) == stack.item)
+                return false;  // creation could merge personal loot into authoritative equipment
+        }
+        templates.push_back(item);
+    }
+    // Validate the existing inventory too, before removing anything.
+    personal::Inventory before;
+    if (!ReadPersonal(entity, before)) return false;
+    for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i)
+        if (PersonalCounted(entity, i) && !entity.Inventory.DeleteStack(i)) return false;
+    for (size_t i = 0; i < row.stacks.size(); ++i) {
+        auto const& stack = row.stacks[i];
+        const gEStackType type = stack.type == personal::Stock::Merchandise ? gEStackType_Merchandise : gEStackType_Normal;
+        if (inventory->CreateItems(templates[i], stack.quality, stack.amount, type) < 0) return false;
+    }
+    inventory->AccessGeneratedPlunder() = (row.flags & personal::GeneratedPlunder) != 0;
+    inventory->AccessGeneratedTrade() = (row.flags & personal::GeneratedTrade) != 0;
+    if (row.flags & personal::HasLock)
+        entity.Lock.Status = (row.flags & personal::Locked) ? gELockStatus_Locked : gELockStatus_Unlocked;
+    if (row.flags & personal::HasDoor) {
+        const bool open = entity.Door.IsOpen() != GEFalse;
+        if ((row.flags & personal::DoorOpen) && !open) entity.Door.Open(GEFalse);
+        else if (!(row.flags & personal::DoorOpen) && open) entity.Door.Close(GEFalse);
+    }
+    personal::Inventory after;
+    if (!ReadPersonal(entity, after)) return false;
+    if (row.kind != after.kind || row.flags != after.flags) return false;
+    using StackKey = std::tuple<std::string, uint32_t, personal::Stock>;
+    std::map<StackKey, uint64_t> totals;
+    for (auto const& stack : row.stacks) totals[{stack.item, stack.quality, stack.type}] += stack.amount;
+    for (auto const& stack : after.stacks) totals[{stack.item, stack.quality, stack.type}] -= stack.amount;
+    for (auto const& entry : totals) if (entry.second != 0) return false;
+    return true;
+}
+
+// A corpse record for an NPC that has not yet received its mirrored death is intentionally deferred.
+bool AwaitingDeath(Entity& entity, personal::Inventory const& row)
+{
+    return row.kind == personal::Kind::Corpse && entity.GetInstance() &&
+           entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC) && !entity.IsDead();
+}
+
+bool EnsurePersonal(Entity& entity)
+{
+    eCEntity* instance = entity.GetInstance();
+    if (!instance) return true;
+    const std::string key = EntityKey(instance);
+    if (personalUncertain.count(key)) return false;
+    if (PersonalTeardown(entity)) return false;
+    auto pending = personalPending.find(key);
+    if (pending == personalPending.end()) return true;
+    auto row = personalLedger.find(key);
+    if (row == personalLedger.end()) return false;
+    if (AwaitingDeath(entity, row->second)) return false;
+    if (!ApplyPersonal(entity, row->second)) {
+        if (personalRestoreErrors.insert(key).second)
+            Logf("FAIL containers: personal restore failed for %s; access and save refused", NameOf(entity).c_str());
+        return false;
+    }
+    if (!ObservePersonal(entity)) {
+        Logf("FAIL containers: cannot observe restored inventory for %s", NameOf(entity).c_str());
+        return false;
+    }
+    personalRestoreErrors.erase(key);
+    restoredPersonal.insert(key);
+    personalPending.erase(pending);
+    return true;
+}
+
+bool RememberPersonal(Entity& entity)
+{
+    if (!EnsurePersonal(entity)) return false;
+    const std::string key = EntityKey(entity.GetInstance());
+    if (!ObservePersonal(entity)) return false;
+    PersonalObserver* observer = currentPersonalObservers[key];
+    if (observer->depth || !observer->changes.CanRefresh()) return false;
+    personal::Inventory row;
+    if (!personal::Id(key) || !ReadPersonal(entity, row)) {
+        if (!personalErrors.count(key)) {
+            if (personalErrors.size() < personal::MaxInventoryRows) {
+                personalErrors.insert(key);
+                Logf("FAIL containers: cannot capture personal inventory for %s", NameOf(entity).c_str());
+            } else personalErrorOverflow = true;
+        }
+        return false;
+    }
+    auto old = personalLedger.find(key);
+    const size_t oldSize = old == personalLedger.end() ? 0 : 20 + 25 * old->second.stacks.size();
+    const size_t newSize = 20 + 25 * row.stacks.size();
+    if ((old == personalLedger.end() && personalLedger.size() >= personal::MaxInventoryRows) ||
+        personalLedgerBytes - oldSize + newSize > personal::Limit) {
+        if (!personalErrors.count(key)) {
+            if (personalErrors.size() < personal::MaxInventoryRows) {
+                personalErrors.insert(key);
+                Logf("FAIL containers: personal inventory ledger limit reached for %s", NameOf(entity).c_str());
+            } else personalErrorOverflow = true;
+        }
+        return false;
+    }
+    personalLedgerBytes = personalLedgerBytes - oldSize + newSize;
+    personalErrors.erase(key);
+    personalLedger[key] = std::move(row);
+    observer->changes.Refreshed();
+    return true;
+}
+
+bool PersonalAdmitted()
+{
+    return !net::Connected() || net::IsHost() || net::InWorld(net::LocalId());
+}
+
+bool TrackPersonalFocus()
+{
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero || !PersonalAdmitted()) return true;
+    Entity focus = Entity(hero).Focus.GetFocusEntity();
+    personal::Kind kind;
+    if (!PersonalKind(focus, kind)) return true;
+    const std::string key = EntityKey(focus.GetInstance());
+    auto pending = personalLedger.find(key);
+    if (personalPending.count(key) && pending != personalLedger.end() && AwaitingDeath(focus, pending->second)) return true;
+    return RememberPersonal(focus);
+}
+
+// Pending records are applied every frame, including before client admission. Ordinary tracking waits for admission.
+bool PersonalPass(bool capture, std::set<std::string>* attempted = nullptr)
+{
+    if (!capture && personalPending.empty()) return true;
+    bool ok = true;
+    auto const* every = world::ProcessedEntities();
+    for (GEU16 i = 0; every && i < every->GetCount(); ++i) {
+        eCEntity* instance = every->GetAt(i);
+        if (!instance) continue;
+        const std::string key = EntityKey(instance);
+        auto pending = personalPending.find(key);
+        Entity entity(instance);
+        if (PersonalTeardown(entity)) continue;
+        if (pending != personalPending.end()) {
+            auto row = personalLedger.find(key);
+            if (row != personalLedger.end() && AwaitingDeath(entity, row->second)) continue;
+            if (attempted) attempted->insert(key);
+            if (!EnsurePersonal(entity)) { ok = false; continue; }
+        }
+        if (!capture || !PersonalAdmitted()) continue;
+        personal::Kind kind;
+        if (!PersonalKind(entity, kind)) continue;
+        const bool generated = entity.Inventory.IsGeneratedPlunder() || entity.Inventory.IsGeneratedTrade();
+        if (personalLedger.count(key) || generated) ok = RememberPersonal(entity) && ok;
+    }
+    return ok;
+}
+
+bool FlushPersonalObservers()
+{
+    if (!personalUncertain.empty()) return false;
+    for (auto const& entry : currentPersonalObservers) {
+        PersonalObserver* observer = entry.second;
+        if (!observer->active || !observer->changes.dirty) continue;
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(entry.first.data()));
+        eCEntity* instance = entity.GetInstance();
+        if (observer->depth) return false;
+        if (!observer->inventory || !instance ||
+            instance->GetPropertySet(eEPropertySetType_Inventory) != observer->inventory) {
+            personalUncertain.insert(entry.first);
+            Log("FAIL containers: dirty personal inventory is no longer available; saving refused");
+            return false;
+        }
+        if (!RememberPersonal(entity)) return false;
+    }
+    return personalUncertain.empty();
+}
+
+class PersonalMutation {
+public:
+    bool Enter(gCInventory_PS* inventory)
+    {
+        if (!inventory) return true;
+        for (auto* observer : held_) if (observer->inventory == inventory) return true;
+        Entity entity(inventory->GetEntity());
+        if (!entity.GetInstance()) return true;
+        const std::string key = EntityKey(entity.GetInstance());
+        const bool wasPending = personalPending.count(key) != 0;
+        if (wasPending && !EnsurePersonal(entity)) return false;
+        if (wasPending) return false;  // stack indices and trade selections came from the old inventory
+        personal::Kind kind;
+        if (!PersonalKind(entity, kind)) return true;
+        if (!PersonalAdmitted() || personalUncertain.count(key)) return false;
+        auto found = currentPersonalObservers.find(key);
+        PersonalObserver* observer = found == currentPersonalObservers.end() ? nullptr : found->second;
+        if (!observer || observer->inventory != inventory || !observer->depth) {
+            if (!RememberPersonal(entity)) return false;
+            observer = currentPersonalObservers[key];
+        }
+        ++observer->depth;
+        held_.push_back(observer);
+        return true;
+    }
+
+    bool StillAvailable(gCInventory_PS* inventory) const
+    {
+        for (auto* observer : held_) {
+            if (observer->inventory != inventory) continue;
+            Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(observer->key.data()));
+            return observer->active && !observer->changes.destroyed && entity.GetInstance() &&
+                   entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory) == inventory;
+        }
+        return false;
+    }
+
+    void Finish()
+    {
+        for (PersonalObserver* observer : held_) {
+            if (!observer->depth || --observer->depth) continue;
+            Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(observer->key.data()));
+            eCEntity* instance = entity.GetInstance();
+            if (!observer->active || !observer->inventory || !instance ||
+                instance->GetPropertySet(eEPropertySetType_Inventory) != observer->inventory) {
+                personalUncertain.insert(observer->key);
+                Log("FAIL containers: personal mutation completed after inventory unload; saving refused");
+                continue;
+            }
+            if (!RememberPersonal(entity))
+                Log("FAIL containers: cannot cache completed personal inventory mutation");
+        }
+        held_.clear();
+    }
+
+    ~PersonalMutation() { Finish(); }
+private:
+    std::vector<PersonalObserver*> held_;
+};
+
+using PersonalGenerateFn = GEBool (__fastcall *)(gCInventory_PS*, void*);
+using PersonalBeginTradeFn = GEBool (__fastcall *)(gCGUIManager*, void*, eCEntity*);
+using PersonalTransferItemsFn = GEBool (__fastcall *)(gCInventory_PS*, void*, gCInventory_PS*, GEInt, GEInt, gEStackType);
+using PersonalTransferStackFn = GEBool (__fastcall *)(gCInventory_PS*, void*, gCInventory_PS*, GEInt, gEStackType);
+using PersonalTransferAllFn = GEBool (__fastcall *)(gCInventory_PS*, void*, gCInventory_PS*, gEStackType);
+using PersonalTransactionFn = GEBool (__fastcall *)(gCInventory_PS*, void*, gCInventory_PS*, gEStackType, gEStackType);
+using PersonalScriptTransferFn = GEBool (__fastcall *)(PSInventory*, void*, GEInt, GEInt, Entity&);
+PersonalGenerateFn nativePlunder = nullptr, nativeTrade = nullptr, nativeRefreshTrade = nullptr;
+PersonalBeginTradeFn nativeBeginTrade = nullptr;
+PersonalTransferItemsFn nativeTransferItems = nullptr;
+PersonalTransferStackFn nativeTransferStack = nullptr;
+PersonalTransferAllFn nativeTransferAll = nullptr, nativeTransferTransaction = nullptr;
+PersonalTransactionFn nativeTransaction = nullptr;
+PersonalScriptTransferFn nativeScriptTransfer = nullptr;
+std::map<std::string, gFScriptAIState> personalStates;
+bool personalStateHooks = false;
+
+GEBool __fastcall GeneratePersonal(gCInventory_PS* inventory, void* edx, bool trade)
+{
+    PersonalGenerateFn original = trade ? nativeTrade : nativePlunder;
+    if (!original) return GEFalse;
+    if (ai::ShuttingDown() || !inventory) return original(inventory, edx);
+    Entity entity(inventory->GetEntity());
+    const bool wasPending = entity.GetInstance() && personalPending.count(EntityKey(entity.GetInstance())) != 0;
+    if (wasPending && !EnsurePersonal(entity)) return GEFalse;
+    personal::Kind kind;
+    if (!PersonalKind(entity, kind)) return original(inventory, edx);
+    if (!PersonalAdmitted() || !EnsurePersonal(entity)) return GEFalse;
+    if ((wasPending || restoredPersonal.count(EntityKey(entity.GetInstance()))) &&
+        ((trade && entity.Inventory.IsGeneratedTrade()) || (!trade && entity.Inventory.IsGeneratedPlunder()))) return GETrue;
+    PersonalMutation mutation;
+    if (!mutation.Enter(inventory)) return GEFalse;
+    const GEBool result = original(inventory, edx);
+    if (result) {
+        if (!mutation.StillAvailable(inventory)) return GEFalse;
+        if (trade) inventory->AccessGeneratedTrade() = GETrue;
+        else inventory->AccessGeneratedPlunder() = GETrue;
+    }
+    return result;
+}
+
+GEBool __fastcall GeneratePersonalPlunder(gCInventory_PS* inventory, void* edx)
+{
+    return GeneratePersonal(inventory, edx, false);
+}
+GEBool __fastcall GeneratePersonalTrade(gCInventory_PS* inventory, void* edx)
+{
+    return GeneratePersonal(inventory, edx, true);
+}
+
+bool PersonalPlayerTransfer(gCInventory_PS* from, gCInventory_PS* to)
+{
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    return hero && ((from && from->GetEntity() == hero) || (to && to->GetEntity() == hero));
+}
+
+GEBool __fastcall RefreshPersonalTrade(gCInventory_PS* inventory, void* edx)
+{
+    if (!nativeRefreshTrade) return GEFalse;
+    if (ai::ShuttingDown() || !inventory) return nativeRefreshTrade(inventory, edx);
+    Entity entity(inventory->GetEntity());
+    if (entity.GetInstance() && personalPending.count(EntityKey(entity.GetInstance())) && !EnsurePersonal(entity)) return GEFalse;
+    if (!IsTrader(entity) || remote::IsPuppet(entity.GetInstance())) return nativeRefreshTrade(inventory, edx);
+    if (!EnsurePersonal(entity) || !PersonalAdmitted()) return GEFalse;
+    if (restoredPersonal.count(EntityKey(entity.GetInstance())) && entity.Inventory.IsGeneratedTrade()) return GETrue;
+    PersonalMutation mutation;
+    if (!mutation.Enter(inventory)) return GEFalse;
+    return nativeRefreshTrade(inventory, edx);
+}
+
+GEBool __fastcall TransferPersonalItems(gCInventory_PS* from, void* edx, gCInventory_PS* to,
+                                       GEInt stack, GEInt amount, gEStackType type)
+{
+    if (!nativeTransferItems) return GEFalse;
+    if (ai::ShuttingDown()) return nativeTransferItems(from, edx, to, stack, amount, type);
+    if (!PersonalPlayerTransfer(from, to)) return nativeTransferItems(from, edx, to, stack, amount, type);
+    PersonalMutation mutation;
+    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
+    return nativeTransferItems(from, edx, to, stack, amount, type);
+}
+
+GEBool __fastcall TransferPersonalStack(gCInventory_PS* from, void* edx, gCInventory_PS* to,
+                                       GEInt stack, gEStackType type)
+{
+    if (!nativeTransferStack) return GEFalse;
+    if (ai::ShuttingDown()) return nativeTransferStack(from, edx, to, stack, type);
+    if (!PersonalPlayerTransfer(from, to)) return nativeTransferStack(from, edx, to, stack, type);
+    PersonalMutation mutation;
+    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
+    return nativeTransferStack(from, edx, to, stack, type);
+}
+
+GEBool __fastcall TransferPersonalAll(gCInventory_PS* from, void* edx, gCInventory_PS* to, gEStackType type)
+{
+    if (!nativeTransferAll) return GEFalse;
+    if (ai::ShuttingDown()) return nativeTransferAll(from, edx, to, type);
+    if (!PersonalPlayerTransfer(from, to)) return nativeTransferAll(from, edx, to, type);
+    PersonalMutation mutation;
+    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
+    return nativeTransferAll(from, edx, to, type);
+}
+
+GEBool __fastcall TransferPersonalTransaction(gCInventory_PS* from, void* edx, gCInventory_PS* to, gEStackType type)
+{
+    if (!nativeTransferTransaction) return GEFalse;
+    if (ai::ShuttingDown()) return nativeTransferTransaction(from, edx, to, type);
+    if (!PersonalPlayerTransfer(from, to)) return nativeTransferTransaction(from, edx, to, type);
+    PersonalMutation mutation;
+    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
+    return nativeTransferTransaction(from, edx, to, type);
+}
+
+GEBool __fastcall PerformPersonalTransaction(gCInventory_PS* from, void* edx, gCInventory_PS* to,
+                                            gEStackType fromType, gEStackType toType)
+{
+    if (!nativeTransaction) return GEFalse;
+    if (ai::ShuttingDown()) return nativeTransaction(from, edx, to, fromType, toType);
+    if (!PersonalPlayerTransfer(from, to)) return nativeTransaction(from, edx, to, fromType, toType);
+    PersonalMutation mutation;
+    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
+    return nativeTransaction(from, edx, to, fromType, toType);
+}
+
+GEBool __fastcall TransferPersonalScript(PSInventory* from, void* edx, GEInt stack, GEInt amount, Entity& to)
+{
+    if (!nativeScriptTransfer) return GEFalse;
+    if (ai::ShuttingDown()) return nativeScriptTransfer(from, edx, stack, amount, to);
+    auto* property = from ? reinterpret_cast<EntityPropertySet*>(from)->m_pEngineEntityPropertySet : nullptr;
+    auto* inventory = property ? static_cast<gCInventory_PS*>(property) : nullptr;
+    auto* target = to.GetInstance()
+        ? static_cast<gCInventory_PS*>(to.GetInstance()->GetPropertySet(eEPropertySetType_Inventory)) : nullptr;
+    if (!PersonalPlayerTransfer(inventory, target)) return nativeScriptTransfer(from, edx, stack, amount, to);
+    PersonalMutation mutation;
+    if (!mutation.Enter(inventory) || !mutation.Enter(target)) return GEFalse;
+    return nativeScriptTransfer(from, edx, stack, amount, to);
+}
+
+GEBool __fastcall BeginPersonalTrade(gCGUIManager* manager, void* edx, eCEntity* partner)
+{
+    if (!nativeBeginTrade) return GEFalse;
+    if (ai::ShuttingDown()) return nativeBeginTrade(manager, edx, partner);
+    Entity entity(partner);
+    if (partner && personalPending.count(EntityKey(partner)) && !EnsurePersonal(entity)) return GEFalse;
+    const bool trader = IsTrader(entity) && !remote::IsPuppet(partner);
+    const std::string key = trader ? EntityKey(partner) : std::string();
+    if (trader) {
+        if (!PersonalAdmitted() || !EnsurePersonal(entity) || !RememberPersonal(entity)) return GEFalse;
+    }
+    const GEBool result = nativeBeginTrade(manager, edx, partner);
+    if (result && !key.empty() && restoredPersonal.count(key)) openedPersonalTrade.insert(key);
+    return result;
+}
+
+GEBool GE_STDCALL PersonalState(bTObjStack<gScriptRunTimeSingleState>& stack, gCScriptProcessingUnit* spu)
+{
+    const char* name = stack.GetCount() ? stack.Peek().m_strScriptName.GetText() : "";
+    auto original = personalStates.find(name);
+    if (original == personalStates.end()) return GEFalse;
+    if (ai::ShuttingDown()) return original->second(stack, spu);
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    Entity focus(hero ? Entity(hero).Focus.GetFocusEntity() : Entity());
+    Entity target(spu ? spu->GetTargetEntity() : nullptr);
+    const bool local = hero && spu && spu->GetSelfEntity() == hero;
+    Entity* chest = local && IsChest(target) ? &target : local && IsChest(focus) ? &focus : nullptr;
+    if (chest && (!PersonalAdmitted() || !EnsurePersonal(*chest) || !RememberPersonal(*chest))) return GEFalse;
+    const std::string key = chest ? EntityKey(chest->GetInstance()) : std::string();
+    const GEBool result = original->second(stack, spu);
+    if (!key.empty()) {
+        Entity current = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
+        if (current.GetInstance() && !PersonalTeardown(current) && !RememberPersonal(current)) return GEFalse;
+    }
+    return result;
+}
+
+void* InstallPersonalNative(char const* symbol, void* detour, char const* module = "Game.dll")
+{
+    HMODULE game = GetModuleHandleA(module);
+    auto const* site = personal::native::Find(module, symbol);
+    auto* entry = game ? reinterpret_cast<unsigned char*>(GetProcAddress(game, symbol)) : nullptr;
+    const bool expectedAddress = site && entry &&
+        reinterpret_cast<uintptr_t>(entry) == reinterpret_cast<uintptr_t>(game) + site->rva;
+    const size_t stolen = expectedAddress
+        ? personal::native::Match(*site, site->rva, entry, site->headSize) : 0;
+    if (!stolen) {
+        Logf("FAIL containers: unsupported native personal inventory guard %s", symbol);
+        return nullptr;
+    }
+    void* original = ai::JumpTo(entry, detour, stolen);
+    if (!original) Logf("FAIL containers: cannot install personal inventory guard %s", symbol);
+    return original;
+}
+
+bool InstallPersonalGuards()
+{
+    if (!nativePlunder)
+        nativePlunder = reinterpret_cast<PersonalGenerateFn>(InstallPersonalNative(
+            "?GeneratePlunderInvFromTreasureSets@gCInventory_PS@@QAE_NXZ", reinterpret_cast<void*>(&GeneratePersonalPlunder)));
+    if (!nativeTrade)
+        nativeTrade = reinterpret_cast<PersonalGenerateFn>(InstallPersonalNative(
+            "?GenerateTradeInvFromTreasureSets@gCInventory_PS@@QAE_NXZ", reinterpret_cast<void*>(&GeneratePersonalTrade)));
+    if (!nativeRefreshTrade)
+        nativeRefreshTrade = reinterpret_cast<PersonalGenerateFn>(InstallPersonalNative(
+            "?RefreshTradeInvFromTreasureSets@gCInventory_PS@@QAE_NXZ", reinterpret_cast<void*>(&RefreshPersonalTrade)));
+    if (!nativeBeginTrade)
+        nativeBeginTrade = reinterpret_cast<PersonalBeginTradeFn>(InstallPersonalNative(
+            "?BeginTrade@gCGUIManager@@QAE_NPAVeCEntity@@@Z", reinterpret_cast<void*>(&BeginPersonalTrade)));
+    if (!nativeTransferItems)
+        nativeTransferItems = reinterpret_cast<PersonalTransferItemsFn>(InstallPersonalNative(
+            "?TransferItemsTo@gCInventory_PS@@QAE_NPAV1@HHW4gEStackType@@@Z", reinterpret_cast<void*>(&TransferPersonalItems)));
+    if (!nativeTransferStack)
+        nativeTransferStack = reinterpret_cast<PersonalTransferStackFn>(InstallPersonalNative(
+            "?TransferStackTo@gCInventory_PS@@QAE_NPAV1@HW4gEStackType@@@Z", reinterpret_cast<void*>(&TransferPersonalStack)));
+    if (!nativeTransferAll)
+        nativeTransferAll = reinterpret_cast<PersonalTransferAllFn>(InstallPersonalNative(
+            "?TransferAllTo@gCInventory_PS@@QAE_NPAV1@W4gEStackType@@@Z", reinterpret_cast<void*>(&TransferPersonalAll)));
+    if (!nativeTransferTransaction)
+        nativeTransferTransaction = reinterpret_cast<PersonalTransferAllFn>(InstallPersonalNative(
+            "?TransferTransactionItemsTo@gCInventory_PS@@IAE_NPAV1@W4gEStackType@@@Z", reinterpret_cast<void*>(&TransferPersonalTransaction)));
+    if (!nativeTransaction)
+        nativeTransaction = reinterpret_cast<PersonalTransactionFn>(InstallPersonalNative(
+            "?PerformTransaction@gCInventory_PS@@QAE_NPAV1@W4gEStackType@@1@Z", reinterpret_cast<void*>(&PerformPersonalTransaction)));
+    if (!nativeScriptTransfer)
+        nativeScriptTransfer = reinterpret_cast<PersonalScriptTransferFn>(InstallPersonalNative(
+            "?TransferAmountTo@PSInventory@@QAE_NHHAAVEntity@@@Z", reinterpret_cast<void*>(&TransferPersonalScript), "Script.dll"));
+    if (!personalStateHooks) {
+        bool chest = false, pirate = false, hud = false;
+        auto& states = GetScriptAdminExt().GetScriptAIStates();
+        GE_MAP_FOR_EACH(name, state, states) {
+            const char* text = name.GetText();
+            const bool c = !std::strncmp(text, "PS_Interact_Chest", 17);
+            const bool p = !std::strncmp(text, "PS_Interact_PirateTreasure", 26);
+            const bool h = !std::strcmp(text, "PS_HUD_Loop");
+            if (!(c || p || h) || !state || !state->m_funcScriptAIState) continue;
+            chest |= c; pirate |= p; hud |= h;
+            if (personalStates.count(text)) continue;
+            personalStates[text] = state->m_funcScriptAIState;
+            state->m_funcScriptAIState = &PersonalState;
+            ai::TrackPointer(reinterpret_cast<void*>(&state->m_funcScriptAIState),
+                             reinterpret_cast<void*>(personalStates[text]), reinterpret_cast<void*>(&PersonalState),
+                             "personal container state");
+        }
+        personalStateHooks = chest && pirate && hud;
+        if (!personalStateHooks) Log("FAIL containers: personal chest interaction guards unavailable");
+    }
+    return nativePlunder && nativeTrade && nativeRefreshTrade && nativeBeginTrade && personalStateHooks &&
+           nativeTransferItems && nativeTransferStack && nativeTransferAll && nativeTransferTransaction &&
+           nativeTransaction && nativeScriptTransfer;
+}
+
+void TrackPersonalTradeClose()
+{
+    if (openedPersonalTrade.empty() || !PersonalAdmitted()) return;
+    gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
+    gCInfoManager_PS* infos = gCInfoManager_PS::GetInstance();
+    eCEntity* partner = manager && infos && manager->GetActivePage() == gEGamePage_Trade ? infos->GetDialogPartnerNPC() : nullptr;
+    const std::string active = partner ? EntityKey(partner) : std::string();
+    for (auto it = openedPersonalTrade.begin(); it != openedPersonalTrade.end();) {
+        if (*it == active) { seenPersonalTradePage.insert(*it); ++it; continue; }
+        if (!seenPersonalTradePage.count(*it)) { ++it; continue; }
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(it->data()));
+        if (!entity.GetInstance() || !RememberPersonal(entity)) { ++it; continue; }
+        restoredPersonal.erase(*it);
+        seenPersonalTradePage.erase(*it);
+        it = openedPersonalTrade.erase(it);
+    }
+}
+
 // --- host ---
 std::unordered_map<std::string, Content> lastSent;
 std::unordered_map<std::string, DWORD> watched;  // traders a client deals with: key -> until
@@ -284,8 +997,10 @@ void Broadcast(std::string const& key, Content const& content)
     const std::vector<net::ContentEntry> entries = Entries(content);
     if (!net::SendContents(reinterpret_cast<uint8_t const*>(key.data()), entries.data(), static_cast<int>(entries.size()))) {
         // Not marked as sent, so it goes out again once it fits (Codex review R4: marked anyway, it never went again).
-        if (!lastSent.count(key) || lastSent[key] != content)
-            Logf("containers: contents of %s not sent (%zu entries, at most %d)", NameOf(guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()))).c_str(), entries.size(), net::MaxContentEntries);
+        if (!lastSent.count(key) || lastSent[key] != content) {
+            Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
+            Logf("containers: contents of %s not sent (%zu entries, at most %d)", NameOf(entity).c_str(), entries.size(), net::MaxContentEntries);
+        }
         return;
     }
     auto before = lastSent.find(key);
@@ -299,28 +1014,46 @@ void Broadcast(std::string const& key, Content const& content)
 
 bool hostFill = true;  // false: the host fills a trader only when a client comes close (as before 27.10.)
 
-void PrepareLocalLoot(Entity& entity)
+bool PrepareLocalLoot(Entity& entity)
 {
-    if (!IsContainer(entity) || remote::IsPuppet(entity.GetInstance()) || entity.Inventory.IsGeneratedPlunder()) return;
-    entity.Inventory.GeneratePlunderInvFromTreasureSets();
+    if (!IsContainer(entity) || remote::IsPuppet(entity.GetInstance())) return true;
+    if (!PersonalAdmitted() || !EnsurePersonal(entity)) return false;
+    if (entity.Inventory.IsGeneratedPlunder()) return RememberPersonal(entity);
+    if (!entity.Inventory.GeneratePlunderInvFromTreasureSets()) {
+        Logf("FAIL containers: cannot generate personal loot for %s", NameOf(entity).c_str());
+        return false;
+    }
     entity.Inventory.SetGeneratedPlunder(GETrue);
     Note("containers: personal loot generated once for %s", NameOf(entity).c_str());
+    return RememberPersonal(entity);
 }
 
-void PrepareLocalTrade(Entity& entity)
+bool PrepareLocalTrade(Entity& entity)
 {
-    if (!IsTrader(entity) || remote::IsPuppet(entity.GetInstance()) || entity.Inventory.IsGeneratedTrade()) return;
-    entity.Inventory.GenerateTradeInvFromTreasureSets();
+    if (!IsTrader(entity) || remote::IsPuppet(entity.GetInstance())) return true;
+    if (!PersonalAdmitted() || !EnsurePersonal(entity)) return false;
+    if (entity.Inventory.IsGeneratedTrade()) return RememberPersonal(entity);
+    if (!entity.Inventory.GenerateTradeInvFromTreasureSets()) {
+        Logf("FAIL containers: cannot generate personal stock for %s", NameOf(entity).c_str());
+        return false;
+    }
     if (static_cast<GEFloat>(entity.Dialog.EndDialogTimestamp) == 0.0f)
-        entity.Inventory.RefreshTradeInvFromTreasureSets();
+        if (!entity.Inventory.RefreshTradeInvFromTreasureSets()) {
+            Logf("FAIL containers: cannot refresh personal stock for %s", NameOf(entity).c_str());
+            return false;
+        }
     Note("containers: personal merchant stock prepared for %s", NameOf(entity).c_str());
+    return RememberPersonal(entity);
 }
 
 void LocalInventoryTick()
 {
+    if (!PersonalAdmitted()) return;
+    TrackPersonalFocus();
     const DWORD now = GetTickCount();
     if (now - lastLocalPoll < 1000) return;
     lastLocalPoll = now;
+    PersonalPass(true);
     eCEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero) return;
     gCInfoManager_PS* infos = gCInfoManager_PS::GetInstance();
@@ -835,18 +1568,18 @@ void ClientTick()
 
 // The game's own entry points for opening loot and trade: remember what this client's player opened.
 gFScript originalLoot = nullptr, originalTrade = nullptr;
-bool hooked = false;
+bool hooked = false, nativeLootGuard = false;
 constexpr uintptr_t OpenLootRva = 0x6bfd0;
 DWORD lastHookTry = 0;
 
-void Opened(gCScriptProcessingUnit* spu, GELPVoid other, bool trade)
+bool Opened(gCScriptProcessingUnit* spu, GELPVoid other, bool trade)
 {
     Entity partner = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     // Trade with another player's puppet, on any machine: filled with that player's goods (trade.cpp), never a container.
-    if (trade && partner.GetInstance() && trade::OnOpen(partner.GetInstance())) return;
-    if (disabled || !partner.GetInstance()) return;
-    if (trade) PrepareLocalTrade(partner);
-    else PrepareLocalLoot(partner);
+    if (trade && partner.GetInstance() && trade::OnOpen(partner.GetInstance())) return true;
+    if (!partner.GetInstance()) return true;
+    if (personalPending.count(EntityKey(partner.GetInstance())) && !EnsurePersonal(partner)) return false;
+    return trade ? PrepareLocalTrade(partner) : PrepareLocalLoot(partner);
 }
 
 GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -866,7 +1599,7 @@ GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         Note("containers: loot of %s refused (another player)", NameOf(partner).c_str());
         return 0;
     }
-    Opened(spu, other, false);
+    if (!Opened(spu, other, false)) return 0;
     return originalLoot(spu, self, other, args);
 }
 
@@ -878,7 +1611,7 @@ GEInt GE_STDCALL OpenTrade(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid 
         Log("trade: native player exchange unavailable; opening refused");
         return 0;
     }
-    Opened(spu, other, true);
+    if (!Opened(spu, other, true)) return 0;
     return originalTrade(spu, self, other, args);
 }
 
@@ -895,7 +1628,28 @@ GEBool __fastcall QuickTake(PSInventory* self, void*, GEInt stack, GEInt amount,
     eCEntity* owner = nullptr;
     if (auto* set = reinterpret_cast<EntityPropertySet*>(self)->m_pEngineEntityPropertySet) owner = set->GetEntity();
     if (remote::PuppetOwner(owner)) { ++quickRefused; return GEFalse; }  // another player's puppet (ransack.cpp): never looted
-    if (owner && to.GetInstance() == gCSession::GetInstance().GetHero()) ++quickTakes;
+    Entity entity(owner);
+    const bool toHero = owner && to.GetInstance() == gCSession::GetInstance().GetHero();
+    const bool wasPending = toHero && personalPending.count(EntityKey(owner)) != 0;
+    if (wasPending) {
+        EnsurePersonal(entity);  // the saved stack index may have changed, even on successful restoration
+        ++quickRefused;
+        return GEFalse;
+    }
+    personal::Kind kind;
+    if (toHero && PersonalKind(entity, kind)) {
+        if (!PersonalAdmitted()) { ++quickRefused; return GEFalse; }
+        if (!EnsurePersonal(entity)) { ++quickRefused; return GEFalse; }
+        if (!RememberPersonal(entity)) { ++quickRefused; return GEFalse; }
+        const std::string key = EntityKey(owner);
+        const GEBool moved = self->TransferAmountTo(stack, amount, to);
+        if (moved) {
+            ++quickTakes;
+            Entity current = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
+            if (current.GetInstance() && !PersonalTeardown(current)) RememberPersonal(current);
+        }
+        return moved;
+    }
     return self->TransferAmountTo(stack, amount, to);
 }
 
@@ -1011,6 +1765,18 @@ bool IsPersonalInventory(eCEntity* instance)
 
 void OnWorldChange()
 {
+    RetirePersonalObservers();
+    items::OnWorldChange();
+    personalLedger.clear();
+    personalLedgerBytes = 12;
+    personalPending.clear();
+    personalErrors.clear();
+    personalRestoreErrors.clear();
+    personalUncertain.clear();
+    personalErrorOverflow = false;
+    restoredPersonal.clear();
+    openedPersonalTrade.clear();
+    seenPersonalTradePage.clear();
     if (forgetOff) return;
     // A load brings the containers back as saved: what was known, open, sent or pending belongs to the world before.
     // Kept, a client compared the reloaded container with its old copy and reported the difference as a deposit
@@ -1025,11 +1791,10 @@ void OnWorldChange()
     lastLocalPoll = 0;
 }
 
-void Tick()
+bool InstallAccessGuards()
 {
-    if (disabled || !gCSession::GetInstance().IsGameRunning()) return;
-    if (!hooked && GetTickCount() - lastHookTry > 1000) {
-        lastHookTry = GetTickCount();
+    if (!gCSession::GetInstance().IsGameRunning()) return false;
+    if (!hooked) {
         gSScript *loot = nullptr, *trade = nullptr;
         auto& scripts = GetScriptAdminExt().GetScripts();
         if (scripts.GetAt(bCString("PlayerOpenLoot"), loot) && loot && scripts.GetAt(bCString("PlayerOpenTrade"), trade) && trade) {
@@ -1037,12 +1802,11 @@ void Tick()
             originalLoot = nativeLoot;
             auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleA("Script_Game.dll"));
             static const unsigned char head[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x54, 0x01, 0x00, 0x00};
-            bool nativeGuard = false;
             if (base && reinterpret_cast<void*>(nativeLoot) == base + OpenLootRva &&
                 !std::memcmp(base + OpenLootRva, head, sizeof(head))) {
                 if (void* trampoline = ai::JumpTo(base + OpenLootRva, reinterpret_cast<void*>(&OpenLoot))) {
                     originalLoot = reinterpret_cast<gFScript>(trampoline);
-                    nativeGuard = true;
+                    nativeLootGuard = true;
                 }
             }
             loot->m_funcScript = &OpenLoot;
@@ -1056,11 +1820,117 @@ void Tick()
                              reinterpret_cast<void*>(&OpenTrade), "containers PlayerOpenTrade script");
             hooked = true;
             Log("containers: loot and trade hooks installed");
-            Log(nativeGuard ? "containers: player loot guard installed at native and script entries"
+            Log(nativeLootGuard ? "containers: player loot guard installed at native and script entries"
                             : "containers: player loot guard SCRIPT ONLY; native address/prologue or jump unavailable");
         }
     }
     if (!quickHooked && !quickHookFailed) HookQuickLoot();
+    InstallPersonalGuards();
+    return PersonalHooksReady();
+}
+
+bool PersonalHooksReady()
+{
+    return !ai::ShuttingDown() && hooked && nativeLootGuard && quickHooked && nativePlunder && nativeTrade &&
+           nativeRefreshTrade && nativeBeginTrade && personalStateHooks && nativeTransferItems &&
+           nativeTransferStack && nativeTransferAll && nativeTransferTransaction && nativeTransaction && nativeScriptTransfer;
+}
+
+bool CapturePersonal(std::vector<uint8_t>& out)
+{
+    if (!PersonalAdmitted() || !InstallAccessGuards() || !FlushPersonalObservers() ||
+        !TrackPersonalFocus() || !PersonalPass(true)) {
+        Log("FAIL containers: personal capture refused: admission, access guard or pending restore");
+        return false;
+    }
+    // ProcessedEntities may not include every still-loaded entity. Refresh all resolvable ledger entries now.
+    for (auto& entry : personalLedger) {
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(entry.first.data()));
+        if (!entity.GetInstance()) continue;
+        if (PersonalTeardown(entity)) continue;
+        if (personalPending.count(entry.first) && AwaitingDeath(entity, entry.second)) continue;
+        if (!EnsurePersonal(entity) || !RememberPersonal(entity)) {
+            Log("FAIL containers: personal capture refused: available entry is unresolved");
+            return false;
+        }
+    }
+    personal::Snapshot ground;
+    items::AppendPersonal(ground);
+    personal::Snapshot combined = personalLedger;
+    for (auto const& entry : ground) {
+        if (entry.second.kind != personal::Kind::GroundTaken || !personal::Valid(entry.second) ||
+            !combined.emplace(entry).second) {
+            Log("FAIL containers: invalid or conflicting personal pickup record");
+            return false;
+        }
+    }
+    if (personalErrorOverflow || !personalErrors.empty() || !personal::Encode(combined, out)) {
+        Log("FAIL containers: personal capture exceeds limits or contains an invalid entry");
+        return false;
+    }
+    return true;
+}
+
+bool RestorePersonal(std::vector<uint8_t> const& bytes)
+{
+    personal::Snapshot snapshot;
+    if (!bytes.empty() && !personal::Decode(bytes, snapshot)) {
+        Log("FAIL containers: invalid personal inventory snapshot");
+        return false;
+    }
+    if (!items::RestorePersonal(snapshot)) {
+        Log("FAIL containers: personal pickup restore failed");
+        return false;
+    }
+    items::TickPersonal();
+    for (auto it = snapshot.begin(); it != snapshot.end();) {
+        if (it->second.kind == personal::Kind::GroundTaken) it = snapshot.erase(it);
+        else ++it;
+    }
+    RetirePersonalObservers();
+    personalLedger.swap(snapshot);
+    personalLedgerBytes = 12;
+    for (auto const& entry : personalLedger) personalLedgerBytes += 20 + 25 * entry.second.stacks.size();
+    personalPending.clear();
+    personalErrors.clear();
+    personalRestoreErrors.clear();
+    personalUncertain.clear();
+    personalErrorOverflow = false;
+    restoredPersonal.clear();
+    openedPersonalTrade.clear();
+    seenPersonalTradePage.clear();
+    for (auto const& entry : personalLedger) personalPending.insert(entry.first);
+    if (personalLedger.empty()) return true;
+    if (!InstallAccessGuards()) {
+        Log("FAIL containers: personal restore refused: required access guards unavailable");
+        return false;
+    }
+    std::set<std::string> attempted;
+    bool ok = PersonalPass(false, &attempted);
+    for (auto it = personalPending.begin(); it != personalPending.end();) {
+        const std::string key = *it++;
+        if (attempted.count(key)) continue;
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
+        if (!entity.GetInstance()) continue;
+        if (PersonalTeardown(entity)) continue;
+        auto row = personalLedger.find(key);
+        if (row != personalLedger.end() && AwaitingDeath(entity, row->second)) continue;
+        if (!EnsurePersonal(entity)) ok = false;
+    }
+    return ok;
+}
+
+void Tick()
+{
+    if (!gCSession::GetInstance().IsGameRunning()) return;
+    items::TickPersonal();
+    if (disabled) return;
+    if (GetTickCount() - lastHookTry > 1000) {
+        lastHookTry = GetTickCount();
+        InstallAccessGuards();
+    }
+    PersonalPass(false);
+    TrackPersonalTradeClose();
     LocalInventoryTick();
 }
 
@@ -1102,6 +1972,10 @@ void Take(char const* argument, LogFn log)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     Entity container = guid::Parse(guid, raw) ? guid::Resolve(raw) : Entity();
     if (!hero || !container.GetInstance()) { log("REFUSED loottake: no hero or container"); return; }
+    if (personalPending.count(EntityKey(container.GetInstance())) && !EnsurePersonal(container)) {
+        log("REFUSED loottake: personal restore unavailable"); return;
+    }
+    if (!PrepareLocalLoot(container)) { log("REFUSED loottake: personal restore unavailable"); return; }
     for (int i = 0; i < container.Inventory.GetStackCount(); ++i) {
         if (!Counted(container, i)) continue;
         Entity item = container.Inventory.GetTemplateItem(i);
@@ -1109,6 +1983,7 @@ void Take(char const* argument, LogFn log)
         const GEInt amount = container.Inventory.GetAmount(i);
         Entity self(hero);
         const GEBool ok = container.Inventory.TransferAmountTo(i, amount, self);
+        if (ok) RememberPersonal(container);
         char line[200];
         Format(line, "LOOTTAKE guid=%s name=%s amount=%d ok=%d", guid, item.GetInstance() ? item.GetName().GetText() : "-", amount, ok ? 1 : 0);
         log(line);
@@ -1268,6 +2143,9 @@ void TradeBuy(char const* argument, LogFn log)
         log(ok ? "TRADEBUY price=0 native_exchange=1" : "REFUSED tradebuy: player exchange unavailable");
         return;
     }
+    if ((personalPending.count(EntityKey(trader.GetInstance())) && !EnsurePersonal(trader)) || !PrepareLocalTrade(trader)) {
+        log("REFUSED tradebuy: personal restore unavailable"); return;
+    }
     Entity self(hero);
     char only[64];
     const int quality = SplitQuality(wanted, only);
@@ -1281,6 +2159,7 @@ void TradeBuy(char const* argument, LogFn log)
     if (gold < 0 || self.Inventory.GetAmount(gold) < price) { log("REFUSED tradebuy: not enough gold"); return; }
     const GEBool got = trader.Inventory.TransferAmountTo(stack, 1, self);
     const GEBool paid = self.Inventory.TransferAmountTo(StackOf(self, "It_Gold", false), price, trader);
+    if (got || paid) RememberPersonal(trader);
     char line[200];
     Format(line, "TRADEBUY trader=%s name=%s price=%d got=%d paid=%d quality=%u", trader.GetName().GetText(), name.c_str(), price, got ? 1 : 0,
               paid ? 1 : 0, stackQuality);
@@ -1299,6 +2178,9 @@ void TradeSell(char const* argument, LogFn log)
         log(ok ? "TRADESELL price=0 native_exchange=1" : "REFUSED tradesell: player exchange unavailable");
         return;
     }
+    if ((personalPending.count(EntityKey(trader.GetInstance())) && !EnsurePersonal(trader)) || !PrepareLocalTrade(trader)) {
+        log("REFUSED tradesell: personal restore unavailable"); return;
+    }
     Entity self(hero);
     char only[64];
     const int quality = SplitQuality(wanted, only);
@@ -1312,6 +2194,7 @@ void TradeSell(char const* argument, LogFn log)
     if (gold < 0 || trader.Inventory.GetAmount(gold) < price) { log("REFUSED tradesell: the trader has not enough gold"); return; }
     const GEBool gave = self.Inventory.TransferAmountTo(stack, 1, trader);
     const GEBool paid = trader.Inventory.TransferAmountTo(StackOf(trader, "It_Gold", false), price, self);
+    if (gave || paid) RememberPersonal(trader);
     char line[200];
     Format(line, "TRADESELL trader=%s name=%s price=%d gave=%d paid=%d quality=%u", trader.GetName().GetText(), name.c_str(), price, gave ? 1 : 0,
               paid ? 1 : 0, stackQuality);

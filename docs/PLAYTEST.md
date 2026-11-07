@@ -19,7 +19,7 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ### Players and installations
 
-- [ ] Assign exactly two roles: host and joining player. The host starts or loads the shared campaign; either player may request a paired save.
+- [ ] Assign exactly two roles: host and joining player. The host starts or loads the shared campaign; either player may request a host save.
 - [ ] Both PCs use the tested baseline: Gothic 3 from Steam, then **Community Patch 1.75.14**, then
   [Parallel Universe Patch **1.1.1**](https://www.worldofgothic.de/dl/download_678.htm), then the same G3 Together
   build and protocol version. Compatibility without PUP has not been established. Remove other co-op mods
@@ -82,9 +82,8 @@ choose independently; the setting changes only mod messages.
 - [ ] With matching `friendly_fire = 0` (the default), allied melee, projectiles and harmful spells must not cost victim
   HP or blocking stamina, stagger, knock down or apply statuses. Include followers and both attack directions.
   Healing and enemy hits must still work. Knock-out/revive checks below require an enemy, not your partner.
-- [ ] If the host begins a new game, the other player does too. If the host has loaded or saved, a returning player
-  joins from the main menu and waits for the campaign transfer. A first-time player without an own character record
-  starts a new game or loads their own local hero first; they must never receive the host's character.
+- [ ] The client starts New Game locally on initial entry and after every host load. The host sends only
+  that account's saved character before admission. A missing account starts fresh, never as the host's hero.
 
 ## A 90-minute session
 
@@ -96,15 +95,15 @@ choose independently; the setting changes only mod messages.
 | 28–38 min | Knock-out and help | In a safe setting, let one player be knocked down in a controlled way. Their partner first stands next to them for a few seconds: nothing should happen. Then the partner talks to them and chooses "I will help you.". Check the recovery, notice and consumption of one healing potion. Without a potion, both should receive a notice and the player should remain down. Optionally at the end, before reloading: with both players down, both die and reach game over. |
 | 38–50 min | Dialog, quest, trade and loot | Speak to an NPC, trigger a known quest step, trade and loot. Then open "Show me your wares!" on the partner; dismiss the first tutorial with Ok. Using the mouse and native Trade/Swap button, take an item for free, then give one back without closing. The other player takes no action. Check both inventories immediately after synchronization, unchanged gold and preserved quality. Select gold explicitly and give it in each direction without items; check exact balance changes. Repeat with zero gold, close just after a swap, reopen, and check protected gear/quest items. Verify an NPC still charges its normal prices. These native controls require manual verification. |
 | 50–70 min | Distance, separate regions and regrouping | Move apart. Beyond about 35 m, check that no distance message appears on either PC (no "Far from host", no "is far away"). While separated, each player fights a different NPC in their region; record whether results agree and whether anything appears to be simulated twice. Regroup and check that no message appears ("Back near the host." is gone) and that the world state matches. Accept a kill quest and kill a target in the joining player's region: the counter in the host's quest log should increase. |
-| 70–82 min | Save and load | Make the heroes visibly different (attributes/LP, current HP/MP, gold, inventory/equipment, a learned spell and quick slot, and position). Change a quest/NPC/door, save on the host and wait for paired confirmation. Change both heroes/world again, then request a save on the client and wait for the same confirmation. Load the earlier host slot and let the client load/rejoin the matching checkpoint. Compare each earlier individual hero and the same earlier world, not the later character. Logs on both must show the same world/save IDs and native CRCs, different player IDs, and no host-character fallback. Repeat with a quick save. If the joining player had a companion, it should follow them after loading/rejoining. |
+| 70–82 min | Save and load | Make heroes visibly different (stats/LP, HP/MP/SP, gold, items/equipment, spells/quick slots and position). Change a quest/NPC/door; host-save and wait for "Co-op save complete". Change both heroes, request a client save, then host-load the earlier slot. Client starts New Game again and restores its account's character. Compare both saved heroes and shared world state; no native world file is transferred. Repeat quicksaves and companion ownership. World rewind is an acceptance boundary, not established by static tests. |
 | 82–90 min | Rejoin and bug report | If time remains, test a clean disconnect and rejoin, in the same process or after restarting. Record campaign, hero record, NPC ownership and companion state. If something failed, collect both players' logs as described below and give them privately to the host. |
 
 With only 60 minutes, prioritize joining, combat, helping up, recruiting and dismissing a companion,
-and paired saving initiated from both machines. Test separate regions and rejoining in a follow-up session.
+and host saving requested from both machines. Test separate regions and rejoining in a follow-up session.
 
 ### Both down and revive regression
 
-Use the backed-up, isolated paired test save on both PCs and an enemy, not friendly fire. Record observations
+Use a backed-up, isolated host test save and client New Game re-entry, with an enemy, not friendly fire. Record observations
 on both sides; these are manual checks, not a claim that the scenarios have passed.
 
 1. With the host able to help, knock down only the client. Wait more than five seconds and check the client
@@ -116,7 +115,7 @@ on both sides; these are manual checks, not a claim that the scenarios have pass
    the client helping; exactly one client potion is consumed. Also check the no-potion notice and no revival.
    Repeated interaction while the owner update settles must never consume another potion for that episode,
    even after five seconds. A later knock-out is a new episode with its own single payment.
-2. Reload the paired test save between terminal attempts. Knock both players down nearly simultaneously;
+2. Host-reload the test save and client-re-enter between terminal attempts. Knock both players down nearly simultaneously;
    then repeat with the host down first and with the client down first. When each sees the other as present
    and down/dead, both local heroes must scream/ragdoll once and show native game-over/"The End" text.
    Both partner bodies must be corpses. Wait at least ten seconds and try movement, weapon draw, attacks
@@ -131,7 +130,7 @@ on both sides; these are manual checks, not a claim that the scenarios have pass
    revive is not retroactively refused. Neither a late nor duplicate message may revive a terminal life.
    Record potion counts and whether both reach game over if both are down.
 5. Reload and repeat the above, including both helper directions. As a smoke check, perform a quick trade
-   in each direction and verify inventories, then make and load a paired save and verify each player's own
+   in each direction and verify inventories, then host-save/load with client re-entry and verify each player's own
    character and shared world.
 6. Knock out only the client, then walk the living host several hundred metres away and keep playing there
    for several minutes. The client must stay down indefinitely. Walk back without teleporting: the client's
@@ -182,7 +181,7 @@ coordinated build. Do not automate game launches or encounters. Runtime acceptan
    artificially friendly or require a reload to re-engage.
 4. Knock both down and verify immediate `all-down` game over with one native Kill per life. Repeat the
    unavailable-helper `alone-grace` check above. Smoke-check friendly melee protection, one hit per swing,
-   partner trade and paired save/load.
+   partner trade and host save/load with client re-entry.
 
 The host startup should log `downed AssessTarget guard installed at native and script entries`.
 `SCRIPT ONLY` is an explicit unsupported-native-hook diagnostic, not full native-guard confirmation.
@@ -212,13 +211,13 @@ to the first 40 records plus one sample per five seconds. Inventory presence is 
 While waiting, NPCs must ignore the body rather than rob it; ordinary nonlethal guard knock-outs still
 allow the existing native half-gold robbery. Check corpse/chest loot and partner trade remain normal.
 
-### Paired-save failure and migration checks (protocol 76)
+### Host-managed save/load acceptance (protocol 77)
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
-verified save/load entry points; `paired save UI hooked` also identifies the verified quicksave handler,
-menu-new call, native availability predicate and screenshot helper.
-`persist: unresolved <function> ... live=<bytes>; paired saves off`
-means no paired-save claim is valid; preserve that line and the preceding native module identity.
+verified save/load entry points; `save UI hooked` also identifies the verified quicksave handler,
+menu-new call, native availability predicate and screenshot helper. World.DeleteSaveGame at RVA 19C0D0
+is also signature/export-checked so native slot deletion removes the container.
+`persist: unresolved <function> ...` means no save/load claim is valid; preserve that line and native identity.
 PUP owns the original world-load entry: the verified `E9 ... 90` entry and `87 0C 24 51 E9 ...`
 bridge lead to its `paru_s2.dll` companion. The mod leaves that entry untouched and observes the
 verified HUD load call instead; `native reverified before use ... owner=PUP/paru_s2.dll` confirms
@@ -226,7 +225,7 @@ the preserved path. The other four entries, installed hooks and HUD call edges a
 before use. The companion is selected by the shim receiver's actual module address, not by requiring
 the main `Script_paru.dll` to be visible during startup. `PUP chain ... runtime verification pending
 first use` confirms startup identity; `PUP ready ...` confirms the adapter/import/semaphore preflight
-before native use. An unknown initial or later hook disables paired saves and cancels pending coordination,
+before native use. An unknown initial or later hook disables co-op saves and cancels pending coordination,
 with the function name and observed bytes; the mod still runs. PUP installing after this mod is
 accepted only when the same verified bridge and companion identity match.
 If rejected, preserve the `PUP phase=... stage=... entry=... bridge=... receiver=... live=...` line.
@@ -235,67 +234,47 @@ The optional engine-free checks `G3T_GAME_DLL` and `G3T_PUP_DLL` read selected C
 and PUP companion files and verify unique patterns, exports/call edges, operands and ASLR without
 loading or executing either DLL.
 
-For each host- and client-initiated save, follow `checkpoint requested`, each `character capture`
-(own player ID, record size/CRC), `native invoke=HUD.SaveGame`, successful HUD/world results,
-`host checkpoint published`, client `checkpoint stored`, both `checkpoint ack` phases, then
-`checkpoint paired`. Native three-file sizes/CRCs must agree on both copies; individual character
-CRCs need not agree. A client request must invoke native save only on the host. Wait for the final
-paired result, not the immediate queued call. Quicksave and menu-new events are handled without
-claiming synchronous native success or displaying its misleading generic failure.
-`net: checkpoint transfer paced` gives participant, bytes, chunk count and queue depth;
-`checkpoint bulk deferred` gives budget decision, pressure and credit (normal pacing is not failure);
-`outgoing packet could not be queued ... enet=...` reports the ENet return code; `checkpoint file queued` and
-`checkpoint transfer fully queued` show progress. A busy/transient admission is retried, not canceled.
-Repeat host and client menu saves and quicksaves immediately after each final paired result.
-Requesting another while one is active should identify `busy`, then work as soon as it completes.
-Every actual refusal logs `save refusal reason=...` and displays its localized specific reason.
-Leave dialog/downed/control/trade, retry immediately, and require no stale prepared-state delay.
-Native CP 1.75 `IsSaveAllowed` blocks dialog, controlled NPC, death or `DefeatedByPlayer`;
-combat, a drawn weapon, water or the save-menu pause alone are not independent native gates.
-Test combat and dialog separately rather than assuming both must refuse.
+Use only backed-up isolated profiles, after coordinator deployment. Do not use the protected user save folder,
+test hooks, bots or automated engine launches. Static tests/builds do not establish two-copy success.
 
-After loading, require `native load returned ... ok=1 hud_ok=1 lower_calls=1 lower_ok=1` and
-`character restore ... ok=1`/`own character restored` on both modern-checkpoint players before world admission.
-The complete record is checked before native loading; template/attribute checks require the loaded
-world and run before hero mutation. Use the normal menu/quick-load HUD path. Other mods calling
-the lower world-load export directly are not intercepted: preserving PUP's entry avoids taking
-ownership of those callers, but their individual-character restoration is not supported.
-Check different stats, HP/MP, inventory/gold/equipment, learned spells, quick slots and positions,
-alongside the same quest/NPC/door state. Reload the latest checkpoint after playing further,
-then rejoin and check the first shared XP reward. Legacy V3 records include their downed latch;
-missing or damaged counterparts must remain refused or explicitly recover the same player's
-same-campaign record, never use the native host hero. These are still human acceptance checks:
-static bytes and a passing build do not establish that the running copies executed this path.
-
-Use only backed-up isolated profiles; never the protected user save folder.
-
-1. Rejoin without restarting, then after restarting from the menu. The same account keeps its own character.
-2. Load an older G3T1/V3 test checkpoint. Its exact old character record migrates to V4; original files remain.
-   The one-time migration has no old pose to restore, so the native spawn position is retained.
-3. On a copied test profile only, remove an exact V4 record but retain its campaign/account latest record.
-   Require an explicit latest-character recovery notice. A damaged/wrong-account exact record must instead block
-   admission until repaired; deleting it must never admit a host clone.
-4. Join from the menu with a new account/no character record. Require a start/load-own-hero notice and a closed
-   world gate. Start a new game/load that account's local hero, then confirm normal import and own-character restore.
-   Reusing the same network slot/display name must not select the previous player's V4 record.
-5. Request a save while the partner is disconnected, loading, talking or an exchange is unsettled. Require a refusal,
-   cancellation or clearly incomplete result, never a paired-success message. An offline host can save alone.
-   Attempt a player exchange while coordination is pending; it must wait/refuse without losing goods.
-6. Interrupt a test checkpoint transfer or a native-pair replacement on a copied profile. Missing manifests or CRC/size
-   mismatches must be refused before native load. A valid host checkpoint can remain after a peer failure.
-7. Continue playing after the most recent checkpoint, then have the host reload that same checkpoint.
-   The client must restore its saved hero and world, not retain the later running state. Check quick-load aliases on both copies.
-8. Use equipment with attribute and maximum-health/mana bonuses. Compare base values, effective values and current HP/MP/SP
-   before and after reload; bonuses must not be inherited from the host or doubled. Temporary-effect expiry remains unverified.
-9. Award shared XP immediately after joining, then leave/rejoin and load a checkpoint. Only future shared gains should apply;
-   no first reward may be lost, historical rewards replayed, or saved XP/level lifted to the other hero's total.
-10. On a copied profile, remove one canonical native file but retain a complete manual-slot alias. Loading that alias must repair
-    the canonical bundle and allow the client to join. Clear a temporary publication/disk failure and require recovery without
-    touching the unchanged source character record.
-
-The bundle is the native pair **plus** `.g3t` and the account's character record. Loading a transferred native pair
-without this mod is not an individual-character restore. The protocol is coordinated, not a simultaneous distributed
-engine freeze; capture timing can differ by network latency. Do not claim runtime acceptance from policy tests/builds.
+1. Start the host world and client **New Game**. Make visibly different heroes: stats/LP, HP/MP/SP,
+   gold/items/equipment, skills/spells, quick slots and positions. Change a quest, door and NPC.
+2. Host menu-save. Require "Co-op save complete" on both copies. Host logs one HUD/world save,
+   `lower_calls=1 lower_ok=1`, `host container published ... network_world_bytes=0`, and completion elapsed_ms.
+   Client logs only the character/personal-state envelope and host result; **no client native save, native world transfer or manifest**.
+   Measure the requested 1–2-second latency; it is not guaranteed by static validation.
+3. Change both heroes, request a client menu-save, then repeat host/client quicksaves back to back.
+   Same-slot simultaneous requests should share one transaction; a different active slot refuses busy.
+   Each completed save has one host `.g3t` plus recoverable native menu caches, not new client world files.
+4. Continue playing, then **host-load the earlier slot**. Require HUD and exactly one lower PUP-chained load success.
+   The client chooses **New Game locally again**, waits for account-exact character/personal-state restoration
+   and the host calendar plus all story/runtime/nearby shared-door baselines, applied cutover and entry confirmation.
+   Compare both distinct saved heroes and shared quest/NPC/door/loot state. Recheck the first shared XP reward.
+   Check quest counters/timers and no repeated quest XP, gold, reputation or item rewards. Loot a chest/corpse
+   and loose item, buy/sell with a merchant, save, reload and revisit after leaving the region: no rerolled or
+   duplicated stock. Shared loaded doors must match even if the host has not changed them since loading.
+   Test a saved client position far from the host, and change a quest/door while that client is joining:
+   no missing baseline, stale state, skipped motion mapping or reward-producing replay. Calendar/activation dates must agree.
+   Clients receive no native serialized world; arbitrary dynamically created loose drops and temporary effects
+   remain an acceptance boundary. Any mismatch blocks campaign acceptance.
+5. Disconnect/rejoin in the same live epoch: keep the live client character. Restart/rejoin after a host load:
+   restore the saved account record. A different account gets a fresh hero, never the previous slot occupant.
+   A local backup is not imported automatically, even if it contains later progress.
+6. Host-load a plain native or intact G3T1/G3T2 save, including `G3T_Sandbox`. It must reach native load without
+   a manifest-prefix error. Also load an earlier G3TSAVE3 container with no personal block; use native/fresh defaults.
+   Old unbound client records are not silently migrated; absent accounts start fresh.
+   Client Load must explain "Only the host loads saved games" without invoking a native world load.
+7. Test combat separately from dialog/control/dead/defeated/downed and unsettled player exchange.
+   Combat/drawn weapon/water/menu pause alone are not native save restrictions. Specific refusals clear on retry.
+   Host-alone save retains absent accounts' preceding records; disconnection during capture cancels safely.
+8. On disposable backed-up slots only, test interrupted publication, malformed/truncated `.g3t`,
+   checksum damage and missing native caches. A damaged container must refuse before native loading;
+   intact containers repair caches. `G3T_pending_*` slots must refuse. Existing good containers survive precommit failures.
+   Delete a slot through the host native menu and check its `.g3t` disappears; interrupted deletion may retain a
+   complete orphan container, which can be recovered, not silently loaded as a half-save.
+9. Verify equipment base/bonus splits and current HP/MP/SP, no doubled bonuses or host inheritance.
+   Temporary-effect ownership/expiry and exact native inventory mutations remain manual acceptance.
+   Check option parity, NPC mirroring, companion leases, trade, downed/revive/end, XP sharing and kill-once.
 
 ### Targeting after deaths
 
@@ -420,8 +399,8 @@ Both use Steam and are Steam friends; see [PLAYING.md](PLAYING.md#over-steam-exp
 | Finding the host | The host starts first, then the joining player without an address: within a few seconds it joins (note how long). Steam shows Gothic 3 and player names match their Steam names. The menu shows lobby status and ping. |
 | Latency breakdown | With the coordinator's two isolated copies and no artificial relay, confirm the client's menu says transport RTT and normally reads low single digits, not 15/16/31/32 ms clock steps or a fixed 110 ms. Compare `STEAMSTATUS ping` with the separate ENet RTT after at least 60 seconds in-world. Transport should keep responding while one game loads; ENet may retain frame/ACK delay. Check worker poll gaps, socket/send failures, batch/service caps and send-to-flush maxima. Do not interpret smoothed ENet loss alone as continuing physical loss. |
 | Burst/fragment queues | Record `queued_commands`, `reliable_queued`, `reliable_inflight` and `reliable_bytes` in the same quiet and NPC-heavy windows. Two-record batches remain 1199 bytes and still fragment; best-effort near-MTU snapshots must no longer introduce reliable ACK dependencies. Large full poses were already unreliable-fragmented, so high traffic can remain. Queue snapshots can miss short bursts; do not claim throughput or gameplay acceptance from the queue-only ENet tests. |
-| Buffered presentation | On a clean 60 Hz link, `SYNCLATENCY buffer_avg_ms` should settle near 34 ms; actual `shown_lag` should settle without rewinds. Jitter/slower captures may increase the buffer up to 250 ms. Check NPC running/turning/stopping, melee/parries/hit reactions, targeting after kills, ragdolls, downed/revive, trade and paired save/load. Policy tests and builds do not establish native visual/gameplay acceptance. |
-| Different networks | Play from two different homes without a VPN or port forwarding: check joining, save transfer and an hour of play. Record latency and stutters. |
+| Buffered presentation | On a clean 60 Hz link, `SYNCLATENCY buffer_avg_ms` should settle near 34 ms; actual `shown_lag` should settle without rewinds. Jitter/slower captures may increase the buffer up to 250 ms. Check NPC running/turning/stopping, melee/parries/hit reactions, targeting after kills, ragdolls, downed/revive, trade and host save/load with client re-entry. Policy tests and builds do not establish native visual/gameplay acceptance. |
+| Different networks | Play from two different homes without a VPN or port forwarding: check joining, character-record save requests and an hour of play. Record latency and stutters. |
 | Join game | The joining player's game runs first; then "Join game" on the host in the Steam friends list: it joins. |
 | Leaving | The joining player quits: the host sees it gone at once. It starts again and rejoins. |
 | Without Steam | Close Steam and start the game: co-op startup must fail with a clear message and no alternative connection. Repeat on the host. |

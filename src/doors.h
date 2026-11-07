@@ -14,6 +14,10 @@ using LogFn = void (*)(char const*);
 void Tick();                                           // once per frame; scans every 500 ms
 void OnState(uint8_t from, net::WorldState const& s);  // kind 10 from the network
 void OnWorldChange();                                  // a save was loaded: forget what was seen
+void PrepareAdmission();
+bool AdmissionReady();                                 // initial nearby native door states have been applied
+bool FinishAdmission(uint8_t player);                   // host: recheck initial interests before acknowledging entry
+bool SettleForSave();                                  // host: persist settled shared door state, not pending deltas
 void Report(LogFn log);                                // QA: DOORS line
 void SyncOff(LogFn log);                               // QA negative control: nothing sent or applied
 void Movers(LogFn log);                                // QA: MOVER lines, the mechanisms processed here (not synchronized)

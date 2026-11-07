@@ -7,7 +7,7 @@
 int main()
 {
     using namespace g3t::saving;
-    static_assert(Protocol == 76, "predictive bone and sparse control peers must use protocol 76");
+    static_assert(Protocol == 77, "host-managed save and guarded bone peers must use protocol 77");
     static_assert(g3t::npcwire::bones::Version == 74, "bone dictionary format version advances separately");
     const std::string world(32, 'a'), checkpoint(32, 'b'), previous(32, 'c');
     const Key alice{world, checkpoint, 123}, bob{world, checkpoint, 456};
@@ -18,46 +18,15 @@ int main()
     assert(!SameCharacter(alice, bob));
     assert(!SameCharacter(alice, {previous, checkpoint, 123}));
     assert(Exact(alice, {world, checkpoint, 123}));
-    assert(RecordName(alice, false) != RecordName(bob, false));
-    assert(RecordName(alice, true) != RecordName(bob, true));
-    assert(RecordName(alice, false) != RecordName({world, previous, 123}, false));
-    assert(RecordName(alice, true) == RecordName({world, previous, 123}, true));
-    assert(RecordName(alice, true) != RecordName({previous, checkpoint, 123}, true));
-    assert(LegacyNativeOwner("old-host-save", 123) == 123);
-    assert(LegacyNativeOwner("G3T_host_old-save", 123) != 123);
-    assert(LegacyNativeOwner("g3t_HOST_old-save", 123) != 123);
     assert(Prefix("g3t_" + checkpoint, "G3T_"));
     assert(Prefix("G3t_HoSt_save", "G3T_host_"));
     assert(!Prefix("G3", "G3T_") && !Prefix("myG3T_save", "G3T_"));
-    assert(WorldMatches(7, 7, 0, false, false)); // An admitted live world may continue after saving.
-    assert(!WorldMatches(7, 0, 0, true, false)); // Stored is not loaded.
-    assert(!WorldMatches(8, 7, 7, true, false)); // Reloading the same checkpoint is a new incarnation.
-    assert(WorldMatches(8, 0, 8, true, false));
-    assert(!WorldMatches(8, 0, 8, false, false));
-    assert(WorldMatches(8, 0, 0, false, true));
-    assert(!WorldMatches(0, 0, 0, true, true));
     assert(!NativeSaveRefusal(false, false, false, false)); // Combat/water/weapon/menu alone are not native save gates.
     assert(std::string(NativeSaveRefusal(true, false, false, false)) == "dialog");
     assert(std::string(NativeSaveRefusal(false, true, false, false)) == "control");
     assert(std::string(NativeSaveRefusal(false, false, true, false)) == "dead");
     assert(std::string(NativeSaveRefusal(false, false, false, true)) == "defeated");
     assert(std::string(NativeSaveRefusal(true, true, true, true)) == "dialog");
-    assert(ChunkFits(0, 0, 100, 0, 10, 100));
-    assert(ChunkFits(100, 10, 100, 10, 90, 100));
-    assert(!ChunkFits(100, 10, 99, 10, 89, 100)); // Total cannot change between chunks.
-    assert(!ChunkFits(100, 10, 101, 10, 91, 100));
-    assert(!ChunkFits(0, 0, 101, 0, 10, 100));
-    assert(!ChunkFits(100, 10, 100, 9, 10, 100)); // Duplicate/out-of-order offset.
-    assert(!ChunkFits(100, 10, 100, 11, 10, 100));
-    assert(!ChunkFits(100, 10, 100, 10, 91, 100));
-    assert(!ChunkFits(0, 0, 0, 0, 0, 100));
-    assert(!ChunkFits(100, 100, 100, UINT32_MAX, 1, 100));
-    assert(PreparedMatches(alice, alice, 3, 3, 7, 7, "QuickSave", "QuickSave"));
-    assert(!PreparedMatches(alice, bob, 3, 3, 7, 7, "QuickSave", "QuickSave"));
-    assert(!PreparedMatches(alice, {previous, checkpoint, 123}, 3, 3, 7, 7, "QuickSave", "QuickSave"));
-    assert(!PreparedMatches(alice, alice, 2, 3, 7, 7, "QuickSave", "QuickSave"));
-    assert(!PreparedMatches(alice, alice, 3, 3, 6, 7, "QuickSave", "QuickSave"));
-    assert(!PreparedMatches(alice, alice, 3, 3, 7, 7, "QuickSave", "another"));
     int savedDowned = 9;
     assert(ParseRecordDowned("downed 0", 3, false, savedDowned) && savedDowned == 0);
     assert(ParseRecordDowned("downed 1", 4, false, savedDowned) && savedDowned == 1);
@@ -154,50 +123,12 @@ int main()
     RecordAttribute outOfRange{"HP", 1, 0, 1000000, 1};
     assert(!ValidRecordAttribute(outOfRange));
 
-    assert(Slot(checkpoint) == "G3T_" + checkpoint && Slot("../bad").empty());
-    assert(SafeName(Slot(checkpoint).c_str()));
+    assert(SafeName("G3T_Sandbox") && SafeName("G3_World_01_0002"));
     assert(SafeName("G3_World_01_0002") && SafeName("My test-save 2"));
     assert(SafeName(std::string(48, 'x').c_str()) && !SafeName(std::string(49, 'x').c_str()));
     for (auto name : {"", "..\\escape", "../escape", "C:stream", "slot.txt", "name ", "CON", "nul", "COM1", "lpt9"})
         assert(!SafeName(name));
     assert(!SafeName(nullptr));
 
-    // Existence precedence is deliberate: corruption of an exact record cannot select latest/live/host.
-    assert(Select(true, true, true, true) == Restore::Exact);
-    assert(Select(false, true, true, true) == Restore::Latest);
-    assert(Select(false, false, true, true) == Restore::Legacy);
-    assert(Select(false, false, false, true) == Restore::NewHero);
-    assert(Select(false, false, false, false) == Restore::Wait);
 
-    Barrier barrier;
-    assert(!barrier.Ready(2, 1, checkpoint, 7));
-    barrier.phase = Barrier::Preparing;
-    barrier.save = checkpoint;
-    barrier.epoch = 7;
-    barrier.members[2].generation = 3;
-    barrier.members[3].generation = 9;
-    assert(!barrier.AllReady());
-    assert(!barrier.Ready(2, 2, checkpoint, 7)); // same slot, another connection
-    assert(!barrier.Ready(2, 3, previous, 7));   // reused menu slot, older checkpoint
-    assert(!barrier.Ready(2, 3, checkpoint, 6)); // old world
-    assert(!barrier.Ready(4, 1, checkpoint, 7)); // nonparticipant
-    assert(!barrier.Ready(8, 1, checkpoint, 7));
-    assert(!barrier.Ready(1, 1, checkpoint, 7));
-    assert(barrier.Ready(2, 3, checkpoint, 7));
-    assert(barrier.Ready(2, 3, checkpoint, 7)); // replay is idempotent
-    assert(!barrier.AllReady());
-    assert(barrier.Ready(3, 9, checkpoint, 7) && barrier.AllReady());
-    assert(!barrier.Stored(2, 3, checkpoint, 7)); // ready is not durable commit
-    barrier.phase = Barrier::Writing;
-    assert(!barrier.Ready(2, 3, checkpoint, 7));
-    assert(!barrier.Stored(2, 3, checkpoint, 7));
-    barrier.phase = Barrier::Committing;
-    assert(!barrier.AllStored());
-    assert(barrier.Stored(2, 3, checkpoint, 7));
-    assert(!barrier.AllStored()); // one machine missing must never be reported as paired success
-    assert(!barrier.Stored(3, 10, checkpoint, 7));
-    assert(!barrier.Stored(3, 9, previous, 7));
-    assert(barrier.Stored(3, 9, checkpoint, 7) && barrier.AllStored());
-    barrier = Barrier{};
-    assert(!barrier.Stored(2, 3, checkpoint, 7)); // canceled/expired transaction
 }

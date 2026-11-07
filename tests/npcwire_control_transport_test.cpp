@@ -123,7 +123,7 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     RefusedMsg refusal{};
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 72, host 76") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 72, host 77") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 73;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -131,15 +131,15 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 73, host 76") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 73, host 77") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
-    oldHello.version = 75;
+    oldHello.version = 76;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
     transmissions.clear();
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 75, host 76") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 76, host 77") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     fakePeers[1].data = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
     transmissions.clear();

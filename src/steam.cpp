@@ -247,6 +247,7 @@ struct Published
     int linked = 0, ping = -1;
     uint32_t pingSampleAt = 0;
     unsigned short ports[MaxRemotes] = {};
+    u64 accounts[MaxRemotes] = {};
     char hostName[64] = {}, error[256] = {}, status[900] = {};
     TrafficCounters traffic;
 } published;
@@ -302,7 +303,7 @@ void Publish()
     for (int i = 0; i < MaxRemotes; ++i) {
         auto const& r = remotes[i];
         if (!r.id) continue;
-        if (r.linked) next.ports[i] = r.relayPort;
+        if (r.linked) { next.ports[i] = r.relayPort; next.accounts[i] = r.id; }
         if (!isHost && r.id == owner) next.hostLinked = r.linked;
         n += Format(next.status + n, sizeof(next.status) - n, " peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
                     r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
@@ -1057,6 +1058,15 @@ bool IsPeerRelay(unsigned short port)
     if (!published.ready || !isHost || !port) return false;
     for (auto const linkedPort : published.ports) if (linkedPort == port) return true;
     return false;
+}
+
+uint64_t PeerId(unsigned short port)
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    if (!published.ready || !isHost || !port) return 0;
+    for (int i = 0; i < MaxRemotes; ++i)
+        if (published.ports[i] == port) return published.accounts[i];
+    return 0;
 }
 
 namespace {
