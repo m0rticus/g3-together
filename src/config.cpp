@@ -113,6 +113,13 @@ Config const& LoadConfig()
             if (hz >= 20 && hz <= 60) config.sendRate = hz;
             else Logf("config: send_rate %s out of 20-60; using %d", value, config.sendRate);
         }
+        else if (!_stricmp(key, "network_budget_kib")) {
+            char* end = nullptr;
+            const long kib = std::strtol(value, &end, 10);
+            if (end != value && !*end && kib >= 64 && kib <= 4096)
+                config.networkBudgetKib = static_cast<int>(kib);
+            else Logf("config: network_budget_kib %s out of 64-4096; using %d", value, config.networkBudgetKib);
+        }
         else if (!_stricmp(key, "listener_textbox")) {
             config.listenerTextbox = !_stricmp(value, "on");
             if (!config.listenerTextbox && _stricmp(value, "off")) Logf("config: unknown listener_textbox '%s', using off", value);
@@ -144,7 +151,8 @@ Config const& LoadConfig()
          config.movementSmoothing ? "on" : "off");
     Logf("config: transport=steam session_id=%s steam_lobby=%s steam_host=%s", config.sessionIdValid ? config.sessionId : "(invalid)", *config.steamLobby ? config.steamLobby : "-",
          *config.steamHost ? config.steamHost : "-");
-    Logf("config: send_rate=%d Hz (player states and every NPC that changed; unchanged NPCs every 100 ms)", config.sendRate);
+    Logf("config: send_rate=%d Hz (compact player states; reliable gameplay immediate; NPC policy independent) network_budget_kib=%d per peer",
+         config.sendRate, config.networkBudgetKib);
     return config;
 }
 }

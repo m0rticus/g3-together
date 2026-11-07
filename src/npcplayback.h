@@ -48,6 +48,7 @@ void Stats(LogFn log);
 void UpdatePresentation(eCEntity* entity);
 bool Capture(eCEntity* entity, net::NpcRecord& record, PublishName publish);
 bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flags, PublishName publish);
+uint32_t PoseInterval(net::NpcRecord const& record);
 bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindName names, uint32_t now);
 bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> const& bones, uint8_t flags);
 bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now);

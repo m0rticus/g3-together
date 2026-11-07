@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifdef TEST_NPC_BANDWIDTH_PREVIEW
+#include "../src/net.h"
+#ifndef G3T_REMOTE_NPC_FOCUS_SUPPORTED
+#define G3T_REMOTE_NPC_FOCUS_SUPPORTED 1
+namespace g3t::net {
+enum class BudgetClass : uint8_t { GameplayReliable, PlayerState, NpcActive, BulkReliable, NpcFarIdle };
+enum class BudgetDecision : uint8_t { Allow, Defer, Shed, NeedsChunking };
+BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t bytes);
+}
+#endif
+#endif
 #include "../src/npcsend_policy.h"
+#include "../src/net_metrics.h"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -8,6 +20,23 @@
 
 using namespace g3t;
 using namespace g3t::npcsend;
+
+#ifdef G3T_REMOTE_NPC_FOCUS_SUPPORTED
+namespace g3t::net {
+static BudgetDecision previewResult = BudgetDecision::Allow;
+static BudgetClass previewClass = BudgetClass::NpcActive;
+static unsigned previewCalls = 0;
+static uint32_t previewBytes = 0;
+BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t bytes)
+{
+    assert(to == 2);
+    ++previewCalls;
+    previewClass = priority;
+    previewBytes = bytes;
+    return previewResult;
+}
+}
+#endif
 
 struct Fixture {
     net::NpcRecord record{};
@@ -40,8 +69,12 @@ struct Fixture {
     Result Eval() { return Evaluate(state, in); }
     void Send(Decision expected)
     {
+        if (Eval().decision != expected)
+            std::fprintf(stderr, "policy expected=%d actual=%d now=%u sent=%u\n",
+                         int(expected), int(Eval().decision), in.now, state.sentAt);
         assert(Eval().decision == expected);
         assert(Commit(state, in, expected));
+        if (expected == Decision::Initial) state.enteredAt = in.now - InterestWarmupMs;
     }
 };
 
@@ -70,18 +103,19 @@ static void TestInitialAndHysteresis()
 
     f.in.moving = true;
     f.in.distanceCm = NearEnterCm;
-    assert(f.Eval().tier == Tier::Fast);
+    assert(f.Eval().tier == Tier::Ordinary);
     f.in.distanceCm = NearExitCm;
-    assert(f.Eval().tier == Tier::Fast);
+    assert(f.Eval().tier == Tier::Ordinary);
     f.in.distanceCm = NearExitCm + 1;
+    f.in.now += OrdinaryHoldMs;
     assert(f.Eval().tier == Tier::MovingFar);
     f.in.distanceCm = NearEnterCm + 1;
     assert(f.Eval().tier == Tier::MovingFar);
     f.in.distanceCm = NearEnterCm;
-    assert(f.Eval().tier == Tier::Fast);
+    assert(f.Eval().tier == Tier::Ordinary);
     f.in.nearby = true;
     f.in.distanceCm = NearExitCm + 1;
-    assert(f.Eval().tier == Tier::Fast);
+    assert(f.Eval().tier == Tier::Ordinary);
     f.in.interest = Interest::Exclude;
     assert(f.Eval().decision == Decision::FinalAndRelease);
     f.Send(Decision::FinalAndRelease);
@@ -148,18 +182,21 @@ static void TestCadenceAndUrgency()
     f.Send(Decision::Initial);
     f.record.position[0] = 1;
     f.in.moving = true;
-    f.in.now = FastIntervalMs - 1;
-    assert(f.Eval().decision == Decision::Wait && f.Eval().tier == Tier::Fast);
-    f.in.now = FastIntervalMs;
+    f.in.now = OrdinaryIntervalMs - 1;
+    assert(f.Eval().decision == Decision::Wait && f.Eval().tier == Tier::Ordinary);
+    f.in.now = OrdinaryIntervalMs;
     f.Send(Decision::Changed);
-    f.record.position[0] = 2;
     f.in.distanceCm = NearExitCm + 1;
+    f.in.now += OrdinaryHoldMs;
+    f.Send(Decision::Keyframe);
+    f.record.position[0] = 2;
     f.in.now += MovingFarIntervalMs - 1;
     assert(f.Eval().decision == Decision::Wait && f.Eval().tier == Tier::MovingFar);
     ++f.in.now;
     f.Send(Decision::Changed);
     f.record.position[0] = 3;
     f.in.moving = false;
+    f.in.distanceCm = NearExitCm + 1;
     f.in.now += IdleIntervalMs - 1;
     assert(f.Eval().decision == Decision::Wait && f.Eval().tier == Tier::Idle);
     ++f.in.now;
@@ -203,8 +240,9 @@ static void TestCadenceAndUrgency()
 static void TestDiscreteFields()
 {
     Fixture f(1);
+    f.in.moving = true;
     f.Send(Decision::Initial);
-    f.in.now = 1;
+    f.in.now = OrdinaryIntervalMs;
     const net::NpcRecord baseline = f.record;
     auto check = [&]() { assert(f.Eval().decision == Decision::Semantic); f.record = baseline; };
     f.record.movementMode++; check();
@@ -253,10 +291,10 @@ static void TestDiscreteFields()
     assert(f.Eval().decision == Decision::Semantic);
     f.bones[0].name--;
     f.bones[0].values[9] += BoneTranslationDiscontinuity;
-    assert(f.Eval().decision == Decision::Semantic);
+    assert(f.Eval().decision == Decision::Changed);
     f.bones[0].values[9] -= BoneTranslationDiscontinuity;
     f.bones[0].values[1] += BoneBasisDiscontinuity;
-    assert(f.Eval().decision == Decision::Semantic);
+    assert(f.Eval().decision == Decision::Changed);
     f.bones[0].values[1] -= BoneBasisDiscontinuity;
     f.bones.clear();
     f.Bind();
@@ -307,6 +345,7 @@ static void TestReliableRetry()
     b.record.heldLeft++; reliable();
     b.record.combatTarget++; reliable();
     b.record.action++;
+    b.in.now += IdleIntervalMs;
     assert(b.Eval().decision == Decision::Semantic && !b.Eval().essential);
     b.record = sent;
     b.in.distanceCm = InterestExitCm + 1;
@@ -376,9 +415,9 @@ static void TestIndependentStatesAndWrap()
     a.Send(Decision::Semantic);
     assert(b.Eval().decision == Decision::Wait);
     b.record.position[0] = 1;
-    b.in.now = 6; // elapsed 17 ms across uint32 wrap
+    b.in.now = OrdinaryIntervalMs; // ordinary interval across uint32 wrap
     b.Send(Decision::Changed);
-    b.in.now = 6 + KeyframeMs;
+    b.in.now = OrdinaryIntervalMs + KeyframeMs;
     b.Send(Decision::Keyframe);
 }
 
@@ -450,7 +489,7 @@ static void TestSimulation()
             f.in.combat = kind == 0;
             f.in.moving = kind == 1 || kind == 2;
             f.in.distanceCm = kind < 2 ? 1000 : 3000;
-            // Production conservatively treats every in-interest mover as potentially visible.
+            // Exercise the explicit nearby override independently of distance hysteresis.
             f.in.nearby = f.in.distanceCm <= InterestExitCm;
             // Animated classes change every scan; stationary class stays byte-identical.
             if (kind != 4) {
@@ -477,7 +516,7 @@ static void TestSimulation()
     constexpr uint64_t oldSends = uint64_t(npcCount) * oldHz * seconds;
     static_assert(payload == 2854 && fragments == 3 && udpBytes == 2932, "simulation assumptions");
     assert(sends < oldSends && byClass[0] >= 5u * seconds * 42u &&
-           byClass[1] >= 7u * seconds * 42u && byClass[2] >= 3u * seconds * 42u &&
+           byClass[1] >= 7u * seconds * 10u && byClass[2] >= 3u * seconds * 8u &&
            byClass[3] >= 50u * seconds * 8u && byClass[4] >= 10u * seconds);
     std::printf("75 NPC, %ds, one recipient, 80 bones, estimated unreliable-only/no batching/control: "
                 "old %llu sends, %llu datagrams, %llu UDP-payload bytes; "
@@ -490,6 +529,107 @@ static void TestSimulation()
                 static_cast<unsigned long long>(byClass[0]), static_cast<unsigned long long>(byClass[1]),
                 static_cast<unsigned long long>(byClass[2]), static_cast<unsigned long long>(byClass[3]),
                 static_cast<unsigned long long>(byClass[4]));
+}
+
+static void TestWarmupAndUrgentHold()
+{
+    Fixture f(1);
+    f.in.moving = true;
+    assert(Commit(f.state, f.in, Decision::Initial));
+    assert(PresentationInterval(f.state, f.in) == OrdinaryIntervalMs);
+    for (uint32_t now : {16u, 32u, 100u, 199u}) {
+        f.in.now = now;
+        assert(f.Eval().tier == Tier::Fast);
+    }
+    f.in.now = InterestWarmupMs;
+    assert(f.Eval().tier == Tier::Ordinary);
+    f.in.combat = true;
+    f.in.now++;
+    f.Send(Decision::Semantic);
+    f.in.combat = false;
+    assert(PresentationInterval(f.state, f.in) == OrdinaryIntervalMs);
+    f.in.now += UrgentHoldMs - 1;
+    assert(f.Eval().tier == Tier::Fast);
+    ++f.in.now;
+    assert(f.Eval().tier == Tier::Ordinary);
+    // Large ordinary skeletal motion cannot bypass the pacing interval.
+    f.in.now += 100;
+    f.Send(Decision::Keyframe);
+    f.record.motions[0].phase += .01f;
+    f.in.now += OrdinaryIntervalMs;
+    f.Send(Decision::Changed);
+    ++f.in.now;
+    f.bones[0].values[1] += BoneBasisDiscontinuity;
+    assert(f.Eval().decision == Decision::Wait);
+    f.record.hitPoints++;
+    assert(f.Eval().decision == Decision::Semantic && f.Eval().essential);
+}
+
+static void TestNearbyIdleAndOrdinaryExit()
+{
+    Fixture f(80);
+    f.Send(Decision::Initial);
+    f.bones[0].values[9] += 4;
+    assert(PresentationInterval(f.state, f.in) == IdleIntervalMs);
+    f.in.now = IdleIntervalMs - 1;
+    assert(f.Eval().decision == Decision::Wait && f.Eval().tier == Tier::Idle);
+    ++f.in.now;
+    f.Send(Decision::Changed);
+    f.in.moving = true;
+    f.record.position[0] += 1;
+    f.in.now += OrdinaryIntervalMs;
+    f.Send(Decision::Changed);
+    f.in.moving = false;
+    // Announce 200 ms buffering while ordinary captures continue for two seconds.
+    assert(PresentationInterval(f.state, f.in) == IdleIntervalMs);
+    f.in.now += OrdinaryHoldMs - 1;
+    assert(f.Eval().tier == Tier::Ordinary);
+    ++f.in.now;
+    assert(f.Eval().tier == Tier::Idle);
+    f.Send(Decision::Keyframe);
+    f.bones[0].values[9] += 4;
+    f.in.now += IdleIntervalMs - 1;
+    assert(f.Eval().decision == Decision::Wait);
+    ++f.in.now;
+    f.Send(Decision::Changed);
+}
+
+static void TestBandwidthPreview()
+{
+    Fixture f(80);
+    f.Send(Decision::Initial);
+    f.bones[0].values[9] += 4;
+    f.in.now = IdleIntervalMs;
+    const Result dirty = f.Eval();
+    assert(dirty.decision == Decision::Changed);
+#ifdef G3T_REMOTE_NPC_FOCUS_SUPPORTED
+    for (auto decision : {net::BudgetDecision::Defer, net::BudgetDecision::Shed, net::BudgetDecision::NeedsChunking}) {
+        net::previewResult = decision;
+        assert(!CanQueue(2, f.in, dirty));
+        assert(f.state.sentAt == 0 && f.state.bones[0].values[9] != f.bones[0].values[9]);
+        assert(f.Eval().decision == Decision::Changed); // remains dirty, retry next scan
+    }
+    for (auto tier : {Tier::Fast, Tier::Ordinary, Tier::MovingFar, Tier::Idle}) {
+        net::previewResult = net::BudgetDecision::Allow;
+        const unsigned calls = net::previewCalls;
+        assert(CanQueue(2, f.in, {Decision::Changed, tier, false}));
+        assert(net::previewCalls == calls + 1);
+        assert(net::previewClass == (tier == Tier::Fast || tier == Tier::Ordinary
+            ? net::BudgetClass::NpcActive : net::BudgetClass::NpcFarIdle));
+        assert(net::previewBytes >= 23 + sizeof(net::NpcRecord) + 4 + 80 * sizeof(pose::Bone));
+    }
+    net::previewResult = net::BudgetDecision::Shed;
+    const unsigned calls = net::previewCalls;
+    assert(CanQueue(2, f.in, {Decision::Initial, Tier::Fast, true}));
+    f.record.hitPoints++;
+    assert(CanQueue(2, f.in, f.Eval()));
+    assert(net::previewCalls == calls); // essential gameplay is not optional
+#else
+    assert(CanQueue(2, f.in, dirty)); // standalone fallback
+#endif
+    net::detail::BandwidthCounters counters;
+    counters.Npc(net::NpcSendDecision::SkippedBudget, 1);
+    assert(counters.considered == 1 && counters.skippedBudget == 1 && !counters.sent && !counters.sendFailed);
 }
 
 int main()
@@ -505,5 +645,8 @@ int main()
     TestIndependentStatesAndWrap();
     TestLostSnapshotSelfHeals();
     TestRotatedBoneSensitivity();
+    TestWarmupAndUrgentHold();
+    TestNearbyIdleAndOrdinaryExit();
+    TestBandwidthPreview();
     TestSimulation();
 }

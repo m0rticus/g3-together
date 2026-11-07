@@ -58,6 +58,7 @@ struct Track
     bool haveRenderTime = false;
     uint32_t lastArrived = 0, cadenceWindowAt = 0, recoveryUntil = 0, underrunAt = 0;
     uint32_t cadenceMin = 50, previousCadenceMin = 50;
+    uint32_t poseIntervalMs = 0;
     float jitterMs = 0.0f;
     int32_t delayMs = BufferDelay;
 };
@@ -76,6 +77,7 @@ extern bool arrivalSpeed;
 extern unsigned sampledBetween, sampledAhead, sampledHeld, sampledOldest;
 float Distance(float const a[3], float const b[3]);
 int32_t PlaybackDelay(Track const& track);
+void SetPoseInterval(Track& track, uint32_t interval);
 bool IsLocomotionMotion(char const* motion);
 void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived, int movementMode = -1,
           MotionState const& motion = MotionState{});

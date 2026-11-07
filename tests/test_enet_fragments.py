@@ -30,6 +30,8 @@ class EnetFragmentTests(unittest.TestCase):
         enet = ROOT / "thirdparty" / "enet"
         include = enet / "include"
         sources = list(enet.glob("*.c"))
+        protocol = enet / "protocol.c"
+        sources.remove(protocol)
         if msvc:
             command = [str(c_compiler), "/nologo", "/TC", "/c", f"/I{include}",
                        *(str(source) for source in sources), f"/Fo{directory}\\"]
@@ -41,6 +43,16 @@ class EnetFragmentTests(unittest.TestCase):
         result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
         if result.returncode:
             raise RuntimeError(f"Vendored ENet compilation failed:\n{result.stdout}{result.stderr}")
+        if msvc:
+            command = [str(c_compiler), "/nologo", "/TC", "/c", f"/I{include}",
+                       "/Denet_socket_send=g3t_test_socket_send", str(protocol), f"/Fo{directory}\\protocol.obj"]
+        else:
+            command = [str(c_compiler), "-std=c99", "-c", "-I", str(include),
+                       "-Denet_socket_send=g3t_test_socket_send", str(protocol)]
+        result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f"ENet mock-socket compilation failed:\n{result.stdout}{result.stderr}")
+        sources.append(protocol)
         source = ROOT / "tests" / "enet_fragment_test.cpp"
         objects = [str(directory / (source.stem + suffix)) for source in sources]
         if msvc:
@@ -70,6 +82,9 @@ class EnetFragmentTests(unittest.TestCase):
 
     def test_enet_reliable_epoch_rollover_remains_intact(self):
         self.run_case("epoch")
+
+    def test_compact_poses_share_real_enet_datagrams(self):
+        self.run_case("packing")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,16 @@
 #include <cassert>
 #include <cstring>
 #include <initializer_list>
+#include <vector>
+
+std::vector<size_t> datagramSizes;
+extern "C" int g3t_test_socket_send(ENetSocket, ENetAddress const*, ENetBuffer const* buffers, size_t count)
+{
+    size_t bytes = 0;
+    for (size_t i = 0; i < count; ++i) bytes += buffers[i].dataLength;
+    datagramSizes.push_back(bytes);
+    return static_cast<int>(bytes);
+}
 
 namespace {
 void Queue(size_t size, enet_uint32 flags, enet_uint8 command, bool reliable, unsigned fragments,
@@ -75,6 +85,37 @@ int main(int argc, char** argv)
         // ENet's own reliable epoch rollover is intentional, unlike an unflagged near-MTU snapshot.
         Queue(legacyBatch, bestEffort, ENET_PROTOCOL_COMMAND_SEND_FRAGMENT, true, 2, 1200, false, 0xffff);
         Queue(611, bestEffort, ENET_PROTOCOL_COMMAND_SEND_RELIABLE, true, 1, 1200, false, 0xffff);
+    } else if (!std::strcmp(argv[1], "packing")) {
+        ENetHost host{};
+        ENetPeer peer{};
+        ENetChannel channel{};
+        host.peers = &peer;
+        host.peerCount = 1;
+        host.mtu = 1200;
+        host.maximumPacketSize = ENET_HOST_DEFAULT_MAXIMUM_PACKET_SIZE;
+        enet_list_clear(&host.dispatchQueue);
+        peer.host = &host;
+        enet_list_clear(&peer.acknowledgements);
+        enet_list_clear(&peer.sentReliableCommands);
+        enet_list_clear(&peer.outgoingCommands);
+        enet_list_clear(&peer.outgoingSendReliableCommands);
+        enet_list_clear(&peer.dispatchedCommands);
+        enet_peer_reset(&peer);
+        peer.channels = &channel;
+        peer.channelCount = 1;
+        peer.state = ENET_PEER_STATE_CONNECTED;
+        peer.mtu = 1200;
+        peer.packetThrottle = ENET_PEER_PACKET_THROTTLE_SCALE;
+        // Four 450-byte logical poses must share exactly two datagrams.
+        // Only the socket-send call is mocked; the real ENet packer runs.
+        for (int i = 0; i < 4; ++i) {
+            auto* packet = enet_packet_create(nullptr, 450, bestEffort);
+            assert(packet && enet_peer_send(&peer, 0, packet) == 0);
+        }
+        enet_host_flush(&host);
+        assert(datagramSizes.size() == 2);
+        for (size_t bytes : datagramSizes) assert(bytes >= 916 && bytes <= 1200);
+        assert(host.totalSentPackets == 2);
     } else {
         assert(false);
     }

@@ -82,7 +82,11 @@ goes through Steam, relayed by Valve where needed.
 - Set the same `session_id` in both players' `g3together.ini`, or choose it in setup. It is a case-sensitive label
   of 1-63 ASCII letters, digits, underscores or hyphens, shown in the menu and log. Missing settings use `default`;
   empty or invalid values stop networking. Different IDs are rejected before joining a Steam lobby, and every
-  relay message also checks the ID and native Steam lobby number before forwarding any gameplay/save data.
+  relay message also checks the exact ID and native Steam lobby number before forwarding any gameplay/save data.
+  The compact v3 envelope is little-endian lobby number, a `0x80|length` marker, exact session bytes and unchanged
+  ENet payload. With `default` it is 16 bytes instead of the old 72-byte header, while a 63-byte ID retains the 72-byte
+  maximum; a different case or an ID prefix is never an exact match. Truncated, legacy, marker-invalid and lobby/session
+  mismatch packets are dropped before a Steam peer is reserved.
 - For three independent pairs, set `session_id = pair-red`, `pair-green` or `pair-blue` on each pair's host and client.
   These IDs do not change the existing per-lobby player limit or impose a two-player cap. Use one host per ID;
   if multiple hosts deliberately share an ID, automatic search still selects the first matching friend.
@@ -119,8 +123,14 @@ high-resolution or legacy wait path. `poll_gap_avg_ms`,
 not measured wire or per-packet queue time; relay intervals/ages also use QPC, reduced to integer milliseconds.
 `receive_caps`/`forward_caps` count exhausted bounded relay batches;
 `socket_failures`, `socket_error`, `receive_failures`, `send_failures` and `invalid_pongs` expose failures instead of
-silently attributing them to lag. A clean local link should normally have low-single-digit transport RTT, but an
+silently attributing them to lag. `tx_datagrams`, `tx_bytes`, `tx_envelope_bytes`, `rx_datagrams`, `rx_bytes`,
+`rx_envelope_bytes`, `tx_data_datagrams` and `tx_data_bytes` are successful Steam/API relay counters; byte figures include
+the exact envelope for transmitted datagrams and payload bytes for ENet data. A clean local link should normally have low-single-digit transport RTT, but an
 overloaded OS or a real Steam route can legitimately take longer.
+`tx_enet_protocol_bytes` and `tx_enet_ack_bytes` estimate uncompressed outgoing ENet command and ACK header bytes.
+`tx_enet_parse_failures` and `tx_enet_unparsed_datagrams` expose malformed or compressed packets that cannot be counted.
+The five-second `enet_header_bytes_per_s`, `enet_ack_bytes_per_s` and `protocol_overhead_pct` fields separate ENet
+headers and ACKs from ENet application payload; they do not include the Steam envelope or the physical network.
 
 The separate `net: rtt=` line measures smoothed ENet ACK RTT, including both engine service loops.
 `transport_max_rtt_ms` repeats the menu's maximum fresh transport echo, not a per-peer native Steam statistic.
@@ -141,8 +151,8 @@ uses unreliable fragments rather than silently becoming reliable; small packets 
 Compact NPC control batches are capped at 1172 bytes. Explicit reliable events and ENet's reliable sequence rollover
 retain their semantics.
 
-The current source uses **protocol 73**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
-in progress, so this source must not be treated as a verified release. Both players need the same build; protocol 72 peers are refused. Personal loot,
+The current source uses **protocol 75**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
+in progress, so this source must not be treated as a verified release. Both players need the same build; older protocol peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
 The host simulates all NPCs, including remote companions, guides and summons. Separate non-rendered prefetch cameras
@@ -151,13 +161,16 @@ load distant simulation regions; the real camera, static-world culling and build
 simulation to a client.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
-per-client interest and change detection decide which captured states are actually sent. Moving or fighting NPCs near
-a player retain the high-rate stream, while changed idle poses are limited to 10 Hz and unchanged states receive a full
-refresh every second. The interest radius is 80 m on entry and 100 m on exit; combat with or a party relationship to a
-player also keeps an NPC relevant. The host cannot see another player's camera direction or focus in player state, so
-nearby and potentially visible moving NPCs are treated conservatively. A slow host cannot produce 60 distinct samples
+Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
+30 Hz; combat, focus, contact and dialogue retain the high-rate stream. Changed idle poses and distant movers use
+10 Hz, and unchanged states receive an independent refresh every second. The interest radius is 80 m on entry and
+100 m on exit; combat with or a party relationship to a player also keeps an NPC relevant.
+The integrated player-state stream supplies fresh remote focus/target hints; standalone pose builds retain safe
+zero-valued fallbacks. Remote camera direction remains unknown, so nearby movers are treated conservatively.
+A slow host cannot produce 60 distinct samples
 per second: `SYNCNPC` logs capture ticks, missed deadlines and elapsed capture time. Clients interpolate final bone poses,
-facial-rig state and eight motion slots on one buffered timeline, normally at least 50 ms behind the host; the existing
+facial-rig state and eight motion slots on one buffered timeline, at least 34 ms behind the host for fast captures,
+66 ms for ordinary movement and 200 ms for slow captures; the existing
 latency adaptation then smooths the buffer without predicting future NPC movement. HP, stance and
 life transitions follow that same presentation timeline. Missing or stale presentation cannot authorize an incoming hit.
 Player-puppet smoothing remains separate.
@@ -185,10 +198,19 @@ have burst capacity for crowded scenes. `NPCPOSE` and `PASSIVE` diagnostics dist
 presentation waits and completed skeletal updates. This full-pose stream costs more bandwidth than clip-only replay;
 internet throughput and multi-player resource limits still need acceptance.
 
-Protocol 73 caches bone layouts and full NPC motion baselines per world. After each client acknowledges them, updates
-send the existing bone values without repeated names and compact anchored control records; full records remain the
+The unchanged internal bone format 73 caches bone layouts and full NPC motion baselines per world. After each client acknowledges them, updates
+send the existing bone values without repeated names and compact anchored control records. Ordinary nearby moving NPCs
+use a 33 ms (30 Hz) interval; distant movers and idle animation use 100 ms (10 Hz). Combat, focus, contact and dialogue
+stay at capture rate. Fast and ordinary tiers have 2 s exit holds, and new interest gets a 200 ms warm-up.
+Exact sparse pose residuals preserve scale/shear and Q12/Q2 integers. Loss, reordering, life/layout changes and missing
+references fall back to keys; periodic keys are due every 1 s within the 32-pose retention window. Full records remain the
 fallback for a missing dictionary, an unacknowledged baseline or values outside the compact range. The log reports layout
 sizes, resync requests, anchors and fallback failures.
+Pose interval hints announce slower presentation tiers before the rate drops. The mirror buffers two advertised
+intervals plus bounded jitter, preserves the 34 ms fast floor, and slews its clock without rewinding.
+Hints do not mask a slower measured host cadence; the larger interval still increases the buffer.
+Native motion-only reconstruction remains disabled: final blend/constraint/facial output is not determined by
+the eight motion descriptors, and canonical bone playback remains necessary for contact safety.
 Every five seconds, host and clients log `net: bandwidth` summaries. Kind entries are
 `message-id=tx-packets/bytes,rx-packets/bytes`: successful ENet queue operations are counted once per recipient,
 and received logical messages include those rejected by validation or the world gate. Empty internal packets have
@@ -196,8 +218,35 @@ no kind. The `npc_per_s` fields count scheduler decisions per second, not delive
 host's local UDP packet and byte counter delta, including protocol
 overhead, retransmissions and acknowledgements, but not IP headers or Steam traffic. ENet's transmit packet counter
 also includes a zero-byte socket-would-block attempt. None of these figures measures Steam's actual network usage.
+`net: pose bandwidth` adds advertised-tier update/byte rates, bone payload bytes and bones per selected update,
+key/delta counts, ACK misses, missing references and decode failures. Bone payload counts include its compact
+flags/interval/reference/mask envelope. Kind 51 is the lossy generation/life-fenced pose ACK or key request.
+When the integrated per-peer budget is present, optional NPC updates preview its active or far/idle class before
+queueing. Deferred updates remain dirty for the next scan; essential gameplay and releases do not take this optional
+gate. The common send path alone debits credit. `npc_per_s`'s `budget` counter distinguishes a budget deferral from
+an unchanged NPC or a queue failure; standalone builds permit the preview without requiring the budget module.
+Small poses are queued without intermediate flushes and share ENet datagrams; keys exceeding 1,172 bytes
+keep explicit unreliable fragmentation. Rates and exact compression reduce traffic, but all-combat scenes,
+long RTT beyond the 32-pose retention horizon and frequent descriptor changes can exceed 1 MB/s.
 Snapshots of player trade goods are sent on changes and roughly every 30 seconds while active; world entry and joins
 also trigger synchronization. Explicit transaction publications remain reliable and immediate.
+
+Player state defaults to `send_rate = 30` (20-60 Hz supported). Full-float transforms and motion/life timing
+are retained; names, equipment, appearance and focus/target references travel reliably on changes and in
+five-second keyframes, rather than repeating fixed-size strings every frame. Player smoothing retains its
+100 ms buffer; local controls and reliable combat events are not rate limited.
+`network_budget_kib = 256` sets a per-outgoing-peer admission budget (64-4096 KiB/s).
+Gameplay and player state remain protected. Optional NPC presentation can use the priority budget;
+the cap is not a physical-link guarantee because reliable events, retransmissions and ACKs may exceed it.
+Save bundles use a separate ordered reliable channel, 1,148-byte data chunks, at most four chunks per frame,
+and a quarter-rate bulk allowance. Congestion pauses the retained cursor without discarding data.
+Story join snapshots are sent only to the joining peer and split into unfragmented batches.
+The five-second `kind_bps` lines show application bytes/s; `rates` shows ENet and successful Steam API
+datagrams/bytes per second and exact relay framing share. `budget` reports credit, queue, pressure and protected
+overflow. Steam API counts still exclude encryption, SDR, UDP/IP and other physical-network overhead.
+Range-coder compression remains disabled: the engine-free benchmark shows benefits for compact players and
+structured control data, but no saving for high-entropy data. Representative pose traffic and its CPU cost
+must be measured before enabling compression globally.
 
 Your own successful hit shows its local flinch immediately and is claimed reliably from the host. A host-side parry
 does not cancel that landed hit. Hit identities, acknowledgements and NPC incarnations prevent duplicate claims and
@@ -340,7 +389,7 @@ Independent world-inventory persistence across saves/late joins is not implement
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
-  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 73 build.
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 75 build.
   To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
   one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
   outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.

@@ -7,8 +7,8 @@
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
 
-The current source speaks **protocol 73**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
-acceptance is still in progress; it is not a verified release. Both players need the same build; protocol 72 peers are refused.
+The current source speaks **protocol 75**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
+acceptance is still in progress; it is not a verified release. Both players need the same build; older protocol peers are refused.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
 Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
 autonomous tasks or prediction. Final poses include native blend-out layers that motion slots alone do not describe.
@@ -18,6 +18,9 @@ Hit identities suppress the corresponding echoed reaction. Hero damage is judged
 and ragdoll impulses travel only from host to client.
 Player-puppet smoothing remains separate. Party identity, friendly-fire protection, automatic player exchanges,
 personal loot/merchant inventories, shared experience and lethal-blow rescue rules are retained.
+Player states default to 30 Hz with reliable changed metadata and recovery keyframes.
+`network_budget_kib` defaults to 256 KiB/s per outgoing peer; reliable gameplay is protected,
+and save bundles are paced at a quarter of that budget on a separate reliable channel.
 
 > **Beta — back up your saves.** Human co-op testing is limited; no complete human co-op playthrough has been completed. Internet play remains unverified; only two players have been tested.
 

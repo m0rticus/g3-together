@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace g3t::saving {
-constexpr uint16_t Protocol = 73;
+constexpr uint16_t Protocol = 75;
 
 inline bool Id(std::string const& value)
 {

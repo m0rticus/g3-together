@@ -59,6 +59,15 @@ float Distance(float const a[3], float const b[3])
     return std::sqrt(x * x + y * y + z * z);
 }
 
+void SetPoseInterval(Track& track, uint32_t interval)
+{
+    if (track.predictive || interval < 16 || interval > 100 || interval == track.poseIntervalMs) return;
+    track.poseIntervalMs = interval;
+    // Escalate the buffer immediately on a slower tier. Faster tiers still
+    // decay gradually, without rewinding the presentation clock.
+    track.delayMs = std::max(track.delayMs, static_cast<int32_t>(interval * 2));
+}
+
 void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived, int movementMode,
           MotionState const& motion)
 {
@@ -78,9 +87,11 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
             Distance(last.position, position) > 300.0f + MaximumTravelSpeed * span / 1000.0f) {
             const uint32_t serial = track.serial + 1;
             const bool predictive = track.predictive;
+            const uint32_t interval = track.poseIntervalMs;
             track = Track{};
             track.serial = serial;
             track.predictive = predictive;
+            SetPoseInterval(track, interval);
         } else if (track.predictive || static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs) {
             // Sparse idle NPC keyframes are intentional, not evidence of network jitter.
             const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, 100u);
@@ -96,7 +107,10 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
                 const float variation = static_cast<float>(std::min(std::abs(static_cast<double>(arrivalSpan) - span), 250.0));
                 track.jitterMs += (variation - track.jitterMs) / 16.0f;
             }
-            const int32_t required = std::clamp(static_cast<int32_t>(2 * std::min(track.cadenceMin, track.previousCadenceMin)
+            const uint32_t measuredCadence = std::min(track.cadenceMin, track.previousCadenceMin);
+            const uint32_t cadence = !track.predictive && track.poseIntervalMs
+                ? std::max(track.poseIntervalMs, measuredCadence) : measuredCadence;
+            const int32_t required = std::clamp(static_cast<int32_t>(2 * cadence
                                                                    + std::ceil(track.jitterMs * 2.0f)),
                                                 track.predictive ? PlayerBufferFloor : NpcBufferFloor, 250);
             if (required > track.delayMs) track.delayMs = required;
@@ -104,7 +118,8 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
                 --track.delayMs;
         }
     }
-    if (!track.count && !track.predictive) track.delayMs = NpcBufferFloor;
+    if (!track.count && !track.predictive)
+        track.delayMs = std::max(NpcBufferFloor, static_cast<int32_t>(track.poseIntervalMs * 2));
     track.lastArrived = arrived;
     const int32_t offset = static_cast<int32_t>(arrived - sent);
     if (!track.haveOffset) {
@@ -151,7 +166,8 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
             if (counted) {
                 ++sampledHeld, track.lastCase = 3;
                 const int32_t late = static_cast<int32_t>(render - newest.sent);
-                const uint32_t interval = std::min(track.cadenceMin, track.previousCadenceMin);
+                const uint32_t measuredCadence = std::min(track.cadenceMin, track.previousCadenceMin);
+                const uint32_t interval = track.poseIntervalMs ? std::max(track.poseIntervalMs, measuredCadence) : measuredCadence;
                 // A whole missing interval, not a rounding-boundary hold, warrants more buffering.
                 if (track.count >= 2 && late > static_cast<int32_t>(interval) && !(newest.motion.flags & 1) &&
                     (!track.underrunAt || now - track.underrunAt >= 100)) {

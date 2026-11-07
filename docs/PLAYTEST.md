@@ -173,7 +173,7 @@ Repeated acquisition/hit refusals are limited to the first 40 records and one sa
 actual binding/life transitions are logged independently. No QA command or control is needed.
 Old visible-contact logs prove an attack was shown, not that damage was applied.
 
-### Paired-save failure and migration checks (protocol 73)
+### Paired-save failure and migration checks (protocol 75)
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified native entry points. `persist: unresolved <function> ... live=<bytes>; paired saves off`

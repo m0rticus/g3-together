@@ -9,6 +9,23 @@
 #include <cstdint>
 
 namespace g3t::steam {
+struct TrafficCounters
+{
+    uint32_t envelopeBytes = 16;
+    uint64_t txDatagrams = 0;
+    uint64_t txBytes = 0;
+    uint64_t txEnvelopeBytes = 0;
+    uint64_t rxDatagrams = 0;
+    uint64_t rxBytes = 0;
+    uint64_t rxEnvelopeBytes = 0;
+    uint64_t txDataDatagrams = 0;
+    uint64_t txDataBytes = 0;
+    uint64_t txEnetProtocolBytes = 0;
+    uint64_t txEnetAckBytes = 0;
+    uint64_t txEnetParseFailures = 0;
+    uint64_t txEnetUnparsedDatagrams = 0;
+};
+
 // Loads required steam_api.dll, starts the Steam API as Gothic 3 and, for a host, opens a friends-only lobby. enetPort: the host's
 // ENet port (each friend's datagrams go there over 127.0.0.1). False if Steam cannot be used; Error() says why.
 bool Start(bool host, unsigned short enetPort);
@@ -31,6 +48,7 @@ char const* HostName();
 bool HostLinked();
 // Host: friends whose relay is linked to this game.
 int LinkedCount();
+TrafficCounters Traffic(); // successful Steam API submissions and accepted relay datagrams, copied by the existing published mutex
 // QA (steamstatus): one line with role, lobby, peers, relay counters.
 void Status(void (*log)(char const*));
 }

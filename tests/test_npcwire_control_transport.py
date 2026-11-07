@@ -31,7 +31,8 @@ class NpcControlTransportTests(unittest.TestCase):
             command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
                        f"-I{include}", *map(str, sources), "-o", str(executable)]
         subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True)
-        subprocess.run([str(executable)], cwd=ROOT, check=True, capture_output=True, text=True)
+        result = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

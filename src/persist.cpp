@@ -484,6 +484,7 @@ void ClearIncoming()
 
 bool SendCampaign(uint8_t to, bool commit = false)
 {
+    if (net::FileTransferBusy(to)) return false;
     Manifest manifest;
     std::vector<uint8_t> data[net::FileCount];
     if (!pairedEnabled || !transferring || !ReadBundle(campaign, manifest, data)) {
@@ -491,17 +492,12 @@ bool SendCampaign(uint8_t to, bool commit = false)
         return false;
     }
     const net::SaveNote note = Note(commit ? net::SaveCommit : net::SaveImport, manifest);
-    if (!net::SendSave(to, note)) return false;
     uint32_t sizes[net::FileCount]{}, crcs[net::FileCount]{};
     for (int f = 0; f < net::FileCount; ++f) {
         sizes[f] = static_cast<uint32_t>(data[f].size());
         crcs[f] = Crc32(data[f].data(), data[f].size());
-        for (size_t at = 0; at < data[f].size(); at += net::MaxChunk) {
-            const auto length = static_cast<uint16_t>(std::min<size_t>(net::MaxChunk, data[f].size() - at));
-            if (!net::SendFileChunk(to, static_cast<uint8_t>(f), sizes[f], static_cast<uint32_t>(at), data[f].data() + at, length)) return false;
-        }
     }
-    if (!net::SendFileDone(to, campaign.c_str(), sizes, crcs)) return false;
+    if (!net::QueueFileTransfer(to, note, campaign.c_str(), data, sizes, crcs)) return false;
     ++filesSent;
     clients[to].sentAt = GetTickCount();
     clients[to].arrived = false;
@@ -633,6 +629,7 @@ void OnFileChunk(uint8_t file, uint32_t total, uint32_t offset, uint8_t const* d
     }
     incomingTotal[file] = total;
     incoming[file].insert(incoming[file].end(), data, data + length);
+    if (prepared.valid) prepared.since = GetTickCount();
 }
 
 void OnFileDone(char const* name, uint32_t const size[net::FileCount], uint32_t const crc[net::FileCount])
@@ -708,6 +705,7 @@ void StopSaveTimer()
 }
 void FinishSave(bool ok, char const* why)
 {
+    if (!ok) net::CancelFileTransfers();
     Logf("persist: checkpoint %s world=%s save=%s player=%llu slot=%s reason=%s",
          ok ? "paired" : "incomplete", savingManifest.key.world.c_str(), savingManifest.key.save.c_str(),
          steam::PlayerId(), requestedSlot.c_str(), why);
@@ -911,6 +909,10 @@ void PollSave()
         }
     }
     const uint32_t now = GetTickCount();
+    if (barrier.phase == saving::Barrier::Committing) {
+        for (uint8_t i = 2; i < net::MaxPlayers; ++i)
+            if (barrier.members[i].generation && net::FileTransferBusy(i)) saveStarted = now;
+    }
     if ((barrier.phase == saving::Barrier::Preparing && now - saveStarted > PrepareLimit) ||
         (barrier.phase == saving::Barrier::Writing && now - nativeReturnedAt > WriteLimit) ||
         (barrier.phase == saving::Barrier::Committing && now - saveStarted > TransferLimit)) {
@@ -1085,6 +1087,7 @@ void Tell(uint8_t to)
 void NewEpoch()
 {
     CancelSave("host world changed");
+    net::CancelFileTransfers();
     static const uint32_t nonce = ((GetTickCount() * 2654435761u) ^ (GetCurrentProcessId() << 16)) & 0xffff0000u;
     epoch = nonce | (++epochs & 0xffff);
     if (!epoch) epoch = ++epochs;
@@ -1153,7 +1156,8 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
     } else if (note.op == net::WorldOther || note.op == net::WorldWaiting) {
         client.ready = 0;
         net::SetInWorld(from, false);
-        const bool onWay = resendGuard && client.sentAt && !client.arrived && GetTickCount() - client.sentAt < TransferLimit;
+        const bool onWay = net::FileTransferBusy(from) ||
+            (resendGuard && client.sentAt && !client.arrived && GetTickCount() - client.sentAt < TransferLimit);
         if (!campaign.empty() && !onWay && transferring && (client.sent != epoch || client.resends < 2)) {
             if (client.sent == epoch) ++client.resends;
             client.sent = epoch;

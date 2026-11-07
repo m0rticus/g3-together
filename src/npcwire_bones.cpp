@@ -144,6 +144,19 @@ bool Dictionary::HasLayout(uint16_t layoutId) const
     return layouts_.find(layoutId) != layouts_.end();
 }
 
+Status Dictionary::IdentityPose(uint16_t layoutId, std::vector<pose::Bone>& bones) const
+{
+    const auto found = layouts_.find(layoutId);
+    if (found == layouts_.end()) return Status::UnknownLayout;
+    std::vector<pose::Bone> result(found->second.size());
+    for (size_t i = 0; i < result.size(); ++i) {
+        result[i].name = found->second[i];
+        result[i].values[0] = result[i].values[4] = result[i].values[8] = 4096;
+    }
+    bones = std::move(result);
+    return Status::Ok;
+}
+
 Status Dictionary::EncodeDictionary(uint16_t layoutId, std::vector<uint8_t>& message) const
 {
     if (!world_ || !generation_) return Status::NotInitialized;

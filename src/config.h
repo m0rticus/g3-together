@@ -37,8 +37,9 @@ struct Config
     // p95 off 315-432 ms, on 66-134 ms).
     bool motionSeek = true;
     bool movementSmoothing = true;  // movement_smoothing = on | off; buffered replica poses, not local input delay
-    // send_rate = 20..60 (Hz, default 60): player-state rate. NPC capture and per-recipient send policy are independent.
-    int sendRate = 60;
+    // Player state defaults to 30 Hz; reliable gameplay is not rate limited.
+    int sendRate = 30;
+    int networkBudgetKib = 256; // per outgoing peer, 64..4096 KiB/s admission budget
     // listener_textbox = off | on (dialogaudio.cpp, owner 28.10.): off (default; stageDialogOptions 28.10.: no box, the lines as
     // subtitles) a player who only listens to the other's dialog sees its lines as subtitles, as the game shows the talk of
     // others, but not the speaker's menu of answers in a box; on: the menu too, as before.

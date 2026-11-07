@@ -323,7 +323,8 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertLess(service.index("MsgPlayerActivity"), service.index("if (!haveLocal"))
         self.assertIn("now - lastActivitySend >= 1000", service)
         self.assertIn("local.downedSequence != lastActivityDowned", service)
-        self.assertIn("message.state.downedSequence != previousDowned", service)
+        self.assertIn("local.downedSequence != currentLocal.downedSequence", service)
+        self.assertIn("local.actionSeq != currentLocal.actionSeq", service)
 
     def test_world_gate_clears_only_presentation_disconnect_clears_activity(self):
         net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")

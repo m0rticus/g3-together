@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
+#include "netbudget.h"
 #include "pose.h"
 
 namespace g3t::net {
@@ -50,6 +52,7 @@ struct PlayerState
     // nothing runs), so the receiver can show a mirrored blow where it is at the sender (body.cpp, motion_seek)
     uint16_t motionFrac = 65535;
     uint32_t downedSequence = 0; // the owning player's current downed life; paid revives must echo it
+    uint32_t focusNpc = 0, targetNpc = 0; // GUID HashGuid references, 0 = no NPC
 };
 #pragma pack(pop)
 
@@ -133,7 +136,16 @@ void Reconnect(void (*log)(char const*));  // QA, client (stage W1): leave the h
 void Tick(PlayerState const& local, bool haveLocal);
 // Flush all gameplay queued after Tick in this frame and wake the independent Steam relay.
 void Flush();
-void SetSendRate(int hz);  // 20..60 Hz for player states; NPC captures have their own fixed 60 Hz deadline
+void SetSendRate(int hz);  // 20..60 Hz for player states, default 30; NPC captures are independent
+void SetBandwidthBudget(uint32_t bytesPerSecond);
+#define G3T_REMOTE_NPC_FOCUS_SUPPORTED 1
+uint32_t RemoteFocusNpc(uint8_t player);
+uint32_t RemoteTargetNpc(uint8_t player);
+uint32_t RemoteStateAgeMs(uint8_t player); // UINT32_MAX when no current in-world state is known
+// Preview only; successful network sends charge once in Send. Do not CommitQueued again
+// from the NPC loop. Use NpcActive or NpcFarIdle for optional presentation traffic.
+BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t payloadBytes);
+BudgetSnapshot PeerBandwidth(uint8_t to);
 uint8_t LocalId();
 // Host: always. Client: welcomed by the host and in the host's world (SetInWorld); gameplay pauses otherwise.
 bool Connected();
@@ -197,9 +209,12 @@ void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, u
 // Per-recipient variants return false if the message could not be queued.
 bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable = false);
 bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones, int count,
-                    uint8_t poseFlags = 0, bool reliable = false);
-using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool reliable);
+                    uint8_t poseFlags = 0, bool reliable = false, uint8_t intervalMs = 16);
+using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool reliable, uint8_t intervalMs);
 void SetNpcPoseHandler(NpcPoseHandler handler);
+uint32_t RemoteFocusNpc(uint8_t player);
+uint32_t RemoteTargetNpc(uint8_t player);
+uint32_t RemoteStateAgeMs(uint8_t player);
 void SendNpcRelease(uint8_t const* guids, int count);  // host retires interest; this never restores client NPC AI
 bool SendNpcReleaseTo(uint8_t to, uint8_t const* guids, int count);
 using NpcReleaseHandler = int (*)(uint8_t owner, uint32_t generation, uint8_t* guids, int count);
@@ -284,9 +299,16 @@ void SetSaveHandler(SaveHandler handler);
 // Host -> one client: the campaign save files (.g3savcpx, .g3savcpxdat, .g3t) in chunks, then a summary
 // with sizes and CRC-32s (persist.cpp).
 constexpr int FileCount = 3;
-constexpr uint16_t MaxChunk = 16000;
+constexpr uint16_t MaxChunk = 1148; // 12-byte file header + data fits even the 1168-byte checksum budget
 bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, void const* data, uint16_t length);
 bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount]);
+// Takes the complete immutable bundle atomically; ordered prefix/chunks/done are
+// paced on a separate reliable channel. A busy recipient must finish or disconnect.
+bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
+                       std::vector<uint8_t> (&files)[FileCount],
+                       uint32_t const size[FileCount], uint32_t const crc[FileCount]);
+bool FileTransferBusy(uint8_t to);
+void CancelFileTransfers();
 using FileChunkHandler = void (*)(uint8_t file, uint32_t total, uint32_t offset, uint8_t const* data, uint16_t length);
 using FileDoneHandler = void (*)(char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount]);
 void SetFileHandlers(FileChunkHandler chunk, FileDoneHandler done);
@@ -339,6 +361,7 @@ struct StateEntry {
 };
 constexpr int MaxStatesPerMessage = 64;
 void SendStates(uint8_t kind, StateEntry const* entries, int count);
+void SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count);
 using StateHandler = void (*)(uint8_t from, uint8_t kind, StateEntry const* entries, int count);  // from: client id, 1 = host
 void SetStateHandler(StateHandler handler);
 

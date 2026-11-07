@@ -90,6 +90,7 @@ int Format(char* out, size_t size, char const* format, ...)
 }
 namespace ai { bool ShuttingDown() { return false; } }
 namespace steam {
+TrafficCounters Traffic() { return {}; }
 bool IsPeerRelay(unsigned short) { return true; }
 bool Start(bool, unsigned short) { return false; }
 unsigned short RelayPort() { return 0; }
@@ -111,11 +112,13 @@ using namespace g3t::net;
 
 unsigned applied = 0;
 uint8_t appliedFlags = 0;
+uint8_t appliedInterval = 0;
 std::vector<pose::Bone> appliedBones;
-void GotPose(NpcRecord const&, pose::Bone const* bones, int count, uint8_t flags, bool)
+void GotPose(NpcRecord const&, pose::Bone const* bones, int count, uint8_t flags, bool, uint8_t interval)
 {
     ++applied;
     appliedFlags = flags;
+    appliedInterval = interval;
     appliedBones.assign(bones, bones + count);
 }
 int GotRecords(NpcRecord*, int count, uint32_t, uint32_t, uint8_t, uint32_t) { return count; }
@@ -197,15 +200,15 @@ int main()
     assert(transmissions[2].peer == &fakePeers[1] && transmissions[2].bytes[0] == MsgPosedNpc);
     Drop(3);
     const Transmission compact = transmissions[0];
-    assert(compact.bytes.size() == sizeof(NpcsHeader) + sizeof(NpcRecord) + sizeof(BonePosePrefix) + count * 24);
-    assert(fallback.bytes.size() - compact.bytes.size() == 4 * count);
+    assert(compact.bytes.size() == sizeof(NpcsHeader) + sizeof(NpcRecord) + sizeof(BonePosePrefix) + 5 + count * 24);
+    assert(fallback.bytes.size() - compact.bytes.size() == 4 * count - 5);
     const size_t poseOffset = sizeof(NpcsHeader) + sizeof(NpcRecord);
     assert(compact.bytes[poseOffset] == pose::Facial);
-    assert(compact.bytes[poseOffset + 1] == 1 && compact.bytes[poseOffset + 2] == 0);
+    assert(compact.bytes[poseOffset + 1] == 16 && compact.bytes[poseOffset + 2] == 1 && compact.bytes[poseOffset + 3] == 0);
     for (int i = 0; i < count; ++i)
         for (int j = 0; j < 12; ++j) {
             const uint16_t bits = static_cast<uint16_t>(input[i].values[j]);
-            const size_t at = poseOffset + sizeof(BonePosePrefix) + i * 24 + j * 2;
+            const size_t at = poseOffset + sizeof(BonePosePrefix) + 5 + i * 24 + j * 2;
             assert(compact.bytes[at] == static_cast<uint8_t>(bits));
             assert(compact.bytes[at + 1] == static_cast<uint8_t>(bits >> 8));
         }
@@ -345,8 +348,8 @@ int main()
         });
     };
     assert(logged("new bone layout=1 bones=80 definition_bytes=341"));
-    assert(logged("pose=full bones=80 pose_bytes=2243"));
-    assert(logged("pose=compact bones=80 pose_bytes=1923"));
+    assert(logged("pose=full bones=80 pose_bytes=2244"));
+    assert(logged("pose=compact bones=80 pose_bytes=1929"));
     assert(logged("bone layout IDs exhausted"));
     assert(logged("full-hash pose fallback failed"));
     return 0;

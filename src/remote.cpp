@@ -8,6 +8,7 @@
 #include "config.h"
 #include "downed.h"
 #include "downed_policy.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -139,6 +140,16 @@ bool LocalState(net::PlayerState& state)
     state.actionSeq = body::ActionSeq(hero, heroClock, state.animation, &state.actionMs);
     state.motionFrac = body::MotionFraction(hero);  // protocol 59
     Entity self(hero);
+    auto npcHash = [](eCEntity* entity) {
+        if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return uint32_t(0);
+        uint8_t id[16]{};
+        guid::CopyEntity(entity, id);
+        return net::HashGuid(id);
+    };
+    state.focusNpc = hero->GetPropertySet(eEPropertySetType_Focus)
+        ? npcHash(self.Focus.GetFocusEntity().GetInstance()) : 0;
+    state.targetNpc = hero->GetPropertySet(eEPropertySetType_NPC)
+        ? npcHash(self.NPC.GetCurrentTarget().GetInstance()) : 0;
     const Entity right = self.Inventory.GetItemFromSlot(gESlot_RightHand), left = self.Inventory.GetItemFromSlot(gESlot_LeftHand);
     strncpy_s(state.heldRight, right.GetInstance() ? right.GetName().GetText() : "", _TRUNCATE);
     strncpy_s(state.heldLeft, left.GetInstance() ? left.GetName().GetText() : "", _TRUNCATE);
@@ -608,6 +619,7 @@ void Start()
     parity::Compute();
     net::SetPlayerStateHandler(&FeedPlayer);
     net::SetSendRate(config.sendRate);
+    net::SetBandwidthBudget(static_cast<uint32_t>(config.networkBudgetKib) * 1024);
     started = net::Start(config.host);
 }
 

@@ -676,6 +676,7 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         motion.attitude = records[i].attitude;
         std::memcpy(motion.motions, records[i].motions, sizeof(motion.motions));
         m.body.track.predictive = false;
+        body::SetPoseInterval(m.body.track, npcplayback::PoseInterval(records[i]));
         // Feed every packet, including several packets serviced in one engine frame.
         body::Feed(m.body.track, records[i].position, records[i].rotation, captured, now, records[i].movementMode, motion);
         records[accepted++] = records[i];
@@ -926,6 +927,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             states.next = (states.next + 1) % StateHistory;
         }
         const std::string key = Key(guid);
+        const uint32_t npcHash = net::HashGuid(guid);
         for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
             if (!net::InWorld(id) || !remotes[id].connected || !(remotes[id].latest.flags & 1) ||
                 remotes[id].latest.world != remote::CurrentWorld()) {
@@ -948,12 +950,14 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             input.interest = (((r.flags >> 3) & 7) == id || r.partyPlayer == id || r.guidePlayer == id)
                 ? npcsend::Interest::Include : npcsend::Interest::Distance;
             input.focused = distance <= npcsend::ContactSafetyCm ||
-                ((hostFocus == instance || hostTarget == instance) && distance <= npcsend::InterestExitCm);
+                ((hostFocus == instance || hostTarget == instance || talk::IsHeld(instance) ||
+                  talk::TalkingWithHero(instance)) && distance <= npcsend::InterestExitCm) ||
+                (npcHash && net::RemoteStateAgeMs(id) <= 1000 &&
+                 (net::RemoteFocusNpc(id) == npcHash || net::RemoteTargetNpc(id) == npcHash));
             input.combat = (r.flags & 4) != 0;
             input.contact = r.contact != 0;
             input.moving = moving;
-            // Camera orientation is not in player state. Keep every potentially visible mover at capture rate.
-            input.nearby = distance <= npcsend::InterestExitCm;
+            input.nearby = false; // distance-band hysteresis, not the whole interest radius
             const npcsend::Result result = npcsend::Evaluate(state, input);
             if (result.decision == npcsend::Decision::Outside) {
                 net::RecordNpcSendDecision(net::NpcSendDecision::SkippedFar);
@@ -971,9 +975,13 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                     net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
                 } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
             } else {
-                // A reliable posed state carries both the essential record and its pose in one publication.
+                if (!npcsend::CanQueue(id, input, result)) {
+                    net::RecordNpcSendDecision(net::NpcSendDecision::SkippedBudget);
+                    continue;
+                }
                 const bool queued = posed
-                    ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, result.essential)
+                    ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, result.essential,
+                                         static_cast<uint8_t>(npcsend::PresentationInterval(state, input)))
                     : net::SendNpcsTo(id, &r, 1, result.essential);
                 if (queued && npcsend::Commit(state, input, result.decision)) {
                     if (existing == states.end()) states.emplace(key, std::move(fresh));

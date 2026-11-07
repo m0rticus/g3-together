@@ -19,6 +19,7 @@
 #include <windows.h>
 
 #include "steam.h"
+#include "relaywire.h"
 
 #include "config.h"
 #include "latency.h"
@@ -180,9 +181,7 @@ constexpr int LobbyFriendsOnly = 1;
 constexpr int FriendFlagImmediate = 4;
 constexpr uint32_t GothicAppId = 39500;
 char const LobbyTag[] = "g3together";
-char const LobbyVersion[] = "2";  // session-scoped relay framing; version 1 cannot isolate sessions
-struct RelayHeader { u64 lobby; char session[SessionIdSize]; };
-static_assert(sizeof(RelayHeader) == 72, "session relay wire header");
+char const LobbyVersion[] = "3";  // compact LE lobby + marker/length + exact ASCII session relay framing
 // No silence timeout below ENet's own: a world load stops the game loop (and so Pump) for many seconds, and net.cpp gives
 // ENet peers up to 180 s for it. A friend who quits leaves the lobby, which ends the link at once.
 constexpr uint32_t SilenceMs = 180000;
@@ -248,6 +247,7 @@ struct Published
     uint32_t pingSampleAt = 0;
     unsigned short ports[MaxRemotes] = {};
     char hostName[64] = {}, error[256] = {}, status[900] = {};
+    TrafficCounters traffic;
 } published;
 std::mutex publishedMutex;
 HANDLE worker = nullptr, stopEvent = nullptr, wakeEvent = nullptr, pollTimer = nullptr;
@@ -255,6 +255,7 @@ uint32_t lastPump = 0;
 latency::Samples pollGaps, pumpWork;
 unsigned receiveCaps = 0, forwardCaps = 0, socketFailures = 0, receiveFailures = 0, invalidPongs = 0;
 int socketError = 0;
+TrafficCounters traffic;
 
 double PingSeconds()
 {
@@ -280,6 +281,8 @@ void Publish()
     next.ready = ready;
     next.lobby = lobby;
     next.linked = CountLinked();
+    next.traffic = traffic;
+    next.traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetConfig().sessionId));
     for (auto const& r : remotes)
         if (r.linked && r.ping.Value(now) > next.ping) {
             next.ping = r.ping.Value(now);
@@ -329,24 +332,43 @@ void Identity(char (&buffer)[160], u64 id)
 
 int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
 {
-    char packet[sizeof(RelayHeader) + 4096];
-    if (!lobby || size > 4096) {
+    char packet[RelayMaxEnvelopeSize];
+    if (!lobby || size > RelayPayloadLimit) {
         Logf("steam: cannot send relay message (lobby=%llu bytes=%u)", lobby, size);
         return 2;
     }
-    RelayHeader header{lobby, {}};
-    strcpy_s(header.session, GetConfig().sessionId);
-    std::memcpy(packet, &header, sizeof(header));
-    std::memcpy(packet + sizeof(header), data, size);
+    std::size_t encodedSize = 0;
+    if (!RelayEncode(lobby, GetConfig().sessionId, data, size, packet, sizeof(packet), &encodedSize)) {
+        Logf("steam: cannot encode relay message (lobby=%llu bytes=%u)", lobby, size);
+        return 2;
+    }
     char identity[160];
     Identity(identity, to);
-    const int result = api.SendToUser(messages, identity, packet, size + sizeof(header), flags | SendNoNagle | SendAutoRestart, channel);
+    const int result = api.SendToUser(messages, identity, packet, static_cast<unsigned>(encodedSize),
+                                      flags | SendNoNagle | SendAutoRestart, channel);
     if (result != ResultOk) {
         ++sendFailures;
         const uint32_t now = Now();
         if (!lastSendFailure || now - lastSendFailure >= 5000) {
             lastSendFailure = now ? now : 1;
             Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)", to, result, channel, size, sendFailures);
+        }
+    } else {
+        ++traffic.txDatagrams;
+        traffic.txBytes += size;
+        traffic.txEnvelopeBytes += encodedSize;
+        if (channel == ChannelData) {
+            ++traffic.txDataDatagrams;
+            traffic.txDataBytes += size;
+            EnetPacketParse enet;
+            if (!ParseEnetDataPacket(data, size, &enet))
+                ++traffic.txEnetParseFailures;
+            else if (enet.compressed)
+                ++traffic.txEnetUnparsedDatagrams;
+            else {
+                traffic.txEnetProtocolBytes += enet.protocolBytes;
+                traffic.txEnetAckBytes += enet.ackBytes;
+            }
         }
     }
     return result;
@@ -641,8 +663,10 @@ void OnCallback(int callback, char const* p, int size)
 
 void OnControl(Remote& r, char const* data, int size)
 {
+    if (!data || size <= 0) return;
     switch (data[0]) {
     case 'H':
+        if (size != 1) break;
         if (isHost && lobby && !r.linked && InLobby(r.id)) {
             if (CountLinked() + 1 >= net::MaxPlayers) {
                 Logf("steam: %llu refused, the game is full", r.id);
@@ -659,13 +683,14 @@ void OnControl(Remote& r, char const* data, int size)
         if (r.linked) Control(r.id, 'W', true);
         break;
     case 'W':
+        if (size != 1) break;
         if (!isHost && r.id == owner && !r.linked) {
             r.linked = true;
             Logf("steam: welcomed by the host %s; ENet goes over Steam now", hostName);
         }
         break;
     case 'P':
-        if (size >= 9) {
+        if (size == 9) {
             char pong[9];
             std::memcpy(pong, data, 9);
             pong[0] = 'Q';
@@ -673,14 +698,14 @@ void OnControl(Remote& r, char const* data, int size)
         }
         break;
     case 'Q':
-        if (size >= 9) {
+        if (size == 9) {
             double sent = 0;
             std::memcpy(&sent, data + 1, 8);
             if (!r.ping.Reply(sent, PingSeconds(), Now())) ++invalidPongs;
         }
         break;
     case 'B':
-        Drop(&r, "said bye");
+        if (size == 1) Drop(&r, "said bye");
         break;
     default:
         break;
@@ -730,17 +755,19 @@ void Receive(int channel)
             std::memcpy(&data, m, sizeof(data));  // SteamNetworkingMessage_t (32-bit): data at 0, size at 4
             std::memcpy(&size, m + 4, sizeof(size));
             const u64 from = Sender(m);
-            RelayHeader header{};
-            if (data && size > static_cast<int>(sizeof(header))) std::memcpy(&header, data, sizeof(header));
-            char session[SessionIdSize] = {};
-            strcpy_s(session, GetConfig().sessionId);
-            if (!lobby || header.lobby != lobby || std::memcmp(header.session, session, sizeof(session))) {
+            void const* payload = nullptr;
+            std::size_t payloadSize = 0;
+            if (!lobby || size < 0 || !RelayDecode(data, static_cast<std::size_t>(size), lobby,
+                                                     GetConfig().sessionId, &payload, &payloadSize)) {
                 ++isolatedDrops;
                 api.MessageRelease(batch[i]);
                 continue;
             }
-            data += sizeof(header);
-            size -= sizeof(header);
+            ++traffic.rxDatagrams;
+            traffic.rxBytes += payloadSize;
+            traffic.rxEnvelopeBytes += static_cast<std::size_t>(size);
+            data = static_cast<char const*>(payload);
+            size = static_cast<int>(payloadSize);
             // Host: a slot only for a member of its lobby (checked before Get reserves one), or one it has already.
             Remote* r = !from || (!isHost && from != owner) ? nullptr : isHost && !Find(from) && !(lobby && InLobby(from)) ? nullptr : Get(from);
             if (r && size > 0) {
@@ -945,6 +972,8 @@ bool Start(bool host, unsigned short port)
     if (tried) return Ready();
     SteamFpScope floatingPoint("startup");
     tried = true;
+    traffic = {};
+    traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetConfig().sessionId));
     isHost = host;
     enetPort = port;
     if (!GetConfig().sessionIdValid || !ValidSessionId(GetConfig().sessionId))
@@ -1169,6 +1198,12 @@ int LinkedCount()
 {
     std::lock_guard<std::mutex> lock(publishedMutex);
     return published.linked;
+}
+
+TrafficCounters Traffic()
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return published.traffic;
 }
 
 void Status(void (*log)(char const*))

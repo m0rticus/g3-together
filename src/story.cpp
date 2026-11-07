@@ -163,12 +163,13 @@ Domain* Find(uint8_t kind)
     return nullptr;
 }
 
-void Send(Domain& d, std::vector<net::StateEntry> const& entries)
+void Send(Domain& d, std::vector<net::StateEntry> const& entries, uint8_t to = 0)
 {
     for (size_t at = 0; at < entries.size(); at += net::MaxStatesPerMessage) {
         const size_t left = entries.size() - at;
         const int count = static_cast<int>(left < net::MaxStatesPerMessage ? left : net::MaxStatesPerMessage);
-        net::SendStates(d.kind, entries.data() + at, count);
+        if (to) net::SendStatesTo(to, d.kind, entries.data() + at, count);
+        else net::SendStates(d.kind, entries.data() + at, count);
         d.sent += count;
     }
 }
@@ -195,7 +196,7 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
     d->received += count;
     if (net::IsHost() && count == 0) {
         // A client entered the game (or reconnected): everything off its default, so it continues the
-        // host's story. Sent to everyone; applying a value twice changes nothing.
+        // host's story. Existing peers already know it.
         States current;
         d->snapshot(current);
         std::vector<net::StateEntry> all;
@@ -204,7 +205,7 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
             if (value != 0) Entry(*d, name, value, all);
             else if (fullZeros && d->zeroed.count(name) && Entry(*d, name, 0, all)) ++zeros;
         }
-        Send(*d, all);
+        Send(*d, all, from);
         Logf("story: full %s state (%zu entries, %zu of them cleared here) for player %u", d->label, all.size(), zeros, from);
         return;
     }

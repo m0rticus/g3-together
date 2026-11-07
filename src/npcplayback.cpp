@@ -93,7 +93,7 @@ struct NativePose {
     int count = 0;
     bool applied = false, evaluated = false, valid = true;
 };
-struct ReceivedPose { pose::History history; uint32_t arrived = 0; };
+struct ReceivedPose { pose::History history; uint32_t arrived = 0, incarnation = 0; uint8_t intervalMs = 16; };
 std::unordered_map<std::string, ReceivedPose> receivedPoses;
 struct SourceSkeleton {
     void const* instance = nullptr;
@@ -915,10 +915,14 @@ bool Start(bool client)
 {
     clientMode = client;
     enabled = true;
-    net::SetNpcPoseHandler([](net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool) {
+    net::SetNpcPoseHandler([](net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool, uint8_t interval) {
         if (net::IsHost()) return;
         auto& received = receivedPoses[std::string(reinterpret_cast<char const*>(record.guid), 16)];
-        if (received.history.Push(record.incarnation, record.sent, bones, count, flags)) received.arrived = net::Now();
+        if (received.history.Push(record.incarnation, record.sent, bones, count, flags)) {
+            received.arrived = net::Now();
+            received.incarnation = record.incarnation;
+            received.intervalMs = interval;
+        }
         else ++stalePoses;
     });
     if (!Install()) {
@@ -930,6 +934,13 @@ bool Start(bool client)
 }
 
 bool Available() { return enabled; }
+
+uint32_t PoseInterval(net::NpcRecord const& record)
+{
+    const auto found = receivedPoses.find(std::string(reinterpret_cast<char const*>(record.guid), 16));
+    return found != receivedPoses.end() && found->second.incarnation == record.incarnation
+        ? found->second.intervalMs : 0;
+}
 
 bool IsPassive(eCEntity const* entity) { return Passive(entity); }
 

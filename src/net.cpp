@@ -8,8 +8,10 @@
 #include "log.h"
 #include "npcwire_adapter.h"
 #include "npcwire_bones.h"
+#include "npcwire_pose.h"
 #include "npcwire_control.h"
 #include "net_metrics.h"
+#include "playerwire.h"
 #include "parity.h"
 #include "replication.h"
 #include "saving_policy.h"
@@ -29,17 +31,19 @@
 
 namespace g3t::net {
 namespace {
-constexpr uint16_t ProtocolVersion = saving::Protocol;  // 73: NPC control and bone dictionaries
+constexpr uint16_t ProtocolVersion = saving::Protocol;  // 75: compact players and paced bulk channel
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
 // UDP payload per datagram (ENet default 1392 = up to 1420-byte IP packets): VPNs such as Hamachi carry about 1400, so
 // stay well below (C, re/findings/hamachi-net-c.md, 21.10.). ENet splits larger messages into fragments of this size.
 constexpr enet_uint32 Mtu = 1200;
-enum : uint8_t { ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3, ChannelPoses = 4, ChannelPosesAlt = 5, ChannelCount = 6 };
+enum : uint8_t { ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3, ChannelPoses = 4, ChannelPosesAlt = 5, ChannelBulk = 6, ChannelCount = 7 };
 enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
 enum : uint8_t { MsgSave = 40, MsgBoneDictionary = 41, MsgBoneAck = 42, MsgBoneRequest = 43, MsgCompactPosedNpc = 44 };
 enum : uint8_t { MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 47,
                  MsgControlSignal = 48, MsgControlPose = 49 };
 enum : uint8_t { MsgPlayerActivity = 50 };
+enum : uint8_t { MsgPoseAck = 51 };
+constexpr uint8_t MsgPlayerResync = 60;
 
 #pragma pack(push, 1)
 struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };
@@ -55,6 +59,7 @@ struct ActivityMsg {
     uint8_t type, id, flags;
     uint32_t sequence, world, epoch, downedSequence;
 };
+struct PlayerResyncMsg { uint8_t type, player; };
 struct Leave { uint8_t type; uint8_t id; };
 struct NpcsHeader {
     uint8_t type;
@@ -62,7 +67,8 @@ struct NpcsHeader {
     uint8_t count, owner;
 };
 struct BoneRequestMsg { uint8_t type; uint32_t epoch; uint16_t layoutId; };
-struct BonePosePrefix { uint8_t flags; uint16_t layoutId; };
+struct BonePosePrefix { uint8_t flags, intervalMs; uint16_t layoutId; };
+struct PoseAckMsg { uint8_t type; uint32_t epoch; uint64_t generation; uint8_t guid[16]; uint32_t incarnation, token; };
 struct NpcReleaseHeader {
     uint8_t type;
     uint32_t sequence, epoch, generation, publication;
@@ -108,8 +114,8 @@ static_assert(sizeof(NpcsHeader) == 23, "NPC datagram budget must match its wire
 static_assert(sizeof(SaveMsg) == 122, "save message wire layout changed");
 static_assert(sizeof(ActivityMsg) == 19, "player activity heartbeat wire layout changed");
 static_assert(sizeof(BoneRequestMsg) == 7, "Bone request wire layout changed");
-static_assert(sizeof(BonePosePrefix) == 3, "Compact pose overhead must match full pose");
-static_assert(offsetof(BoneRequestMsg, layoutId) == 5 && offsetof(BonePosePrefix, layoutId) == 1,
+static_assert(sizeof(BonePosePrefix) == 4 && sizeof(PoseAckMsg) == 37, "Pose interval/ack wire layout changed");
+static_assert(offsetof(BoneRequestMsg, layoutId) == 5 && offsetof(BonePosePrefix, layoutId) == 2,
               "Bone request or pose field offsets changed");
 static_assert(sizeof(NpcsHeader) + sizeof(npcwire::WireBatchHeader) + sizeof(npcwire::WireControl) +
               npcwire::MotionSlots * sizeof(npcwire::WireMotionTick) + sizeof(npcwire::WireQuaternion) <= NpcDatagramBudget,
@@ -137,7 +143,19 @@ uint32_t lastActivitySend = 0;
 uint8_t lastActivityFlags = 0;
 uint32_t lastActivityDowned = 0;
 bool activitySent = false;
-int sendRate = 60;  // Hz of the player state; npcs.cpp uses the same setting (config send_rate)
+int sendRate = 30;
+uint32_t budgetRate = 256 * 1024;
+uint32_t relayEnvelopeBytes = 16;
+PeerBudget peerBudgets[MaxPlayers];
+uint32_t budgetLossAt[MaxPlayers]{}, budgetLastLost[MaxPlayers]{};
+playerwire::Encoder playerSenders[MaxPlayers][MaxPlayers];
+playerwire::Decoder playerReceivers[MaxPlayers];
+uint32_t playerRequestAt[MaxPlayers]{};
+PlayerState currentLocal;
+bool haveCurrentLocal = false;
+playerwire::Cadence playerCadence;
+bool forcePlayerFull[MaxPlayers][MaxPlayers]{};
+static_assert(1 + playerwire::FixedBytes + 352 <= 1168, "full compact player keyframe must fit ENet without fragmentation");
 Remote remotes[MaxPlayers] = {};
 uint32_t joins = 0;
 uint32_t npcSequence = 0;
@@ -148,6 +166,7 @@ unsigned npcAccepted = 0, npcRejected = 0, npcStale = 0;
 unsigned poseSent = 0, poseReceived = 0, poseSendFailed = 0;
 namespace bonewire = npcwire::bones;
 bonewire::Dictionary boneLayouts;
+std::unordered_map<std::string, bonewire::PoseCache> sentPoses[MaxPlayers], decodedPoses;
 // Generation and layout IDs are never reused during this process, even on a
 // replication reset. Delayed packets cannot acquire a new layout's identity.
 uint64_t boneGeneration = 0, receivedBoneGeneration = 0;
@@ -232,6 +251,73 @@ bool haveQueued = false;
 uint32_t queuedAt = 0, lastServiceAt = 0;
 latency::Samples enqueueDelays, serviceGaps;
 unsigned serviceCaps = 0, serviceErrors = 0;
+steam::TrafficCounters lastSteamTraffic;
+struct FileTransfer {
+    SaveNote note;
+    FileDoneMsg done{};
+    std::vector<uint8_t> files[FileCount];
+    uint32_t generation = 0, progressedAt = 0;
+    uint32_t offset = 0;
+    uint8_t file = 0;
+    bool active = false, prefixed = false;
+};
+FileTransfer fileTransfers[MaxPlayers];
+
+size_t PeerIndex(ENetPeer const* peer) { return static_cast<size_t>(peer - host->peers); }
+
+uint32_t QueueBytes(ENetList const& list)
+{
+    uint64_t bytes = 0;
+    for (auto* node = list.sentinel.next; node != &list.sentinel; node = node->next)
+        bytes += reinterpret_cast<ENetOutgoingCommand const*>(node)->fragmentLength;
+    return static_cast<uint32_t>((std::min)(bytes, uint64_t(UINT32_MAX)));
+}
+
+BudgetClass SendPriority(uint8_t kind, uint8_t channel, bool reliable)
+{
+    if (channel == ChannelBulk) return BudgetClass::BulkReliable;
+    if (reliable) return BudgetClass::GameplayReliable;
+    if (kind == MsgState) return BudgetClass::PlayerState;
+    return BudgetClass::NpcActive;
+}
+
+void ResetBudget(ENetPeer* peer)
+{
+    BudgetConfig config;
+    config.bytesPerSecond = budgetRate;
+    config.mtuBytes = peer->mtu;
+    config.envelopeBytes = relayEnvelopeBytes;
+    config.checksumBytes = host->checksum ? 4 : 0;
+    peerBudgets[PeerIndex(peer)].Reset(enet_time_get(), config);
+    budgetLossAt[PeerIndex(peer)] = budgetLastLost[PeerIndex(peer)] = 0;
+}
+
+void UpdateBudgets(uint32_t now)
+{
+    for (size_t i = 0; i < host->peerCount; ++i) {
+        ENetPeer const& peer = host->peers[i];
+        if (peer.state != ENET_PEER_STATE_CONNECTED) continue;
+        BudgetTelemetry sample;
+        const uint64_t queued = uint64_t(QueueBytes(peer.outgoingCommands)) + QueueBytes(peer.outgoingSendReliableCommands);
+        sample.queuedPayloadBytes = static_cast<uint32_t>((std::min)(queued, uint64_t(UINT32_MAX)));
+        sample.reliableInFlightBytes = peer.reliableDataInTransit;
+        sample.reliableWindowBytes = (std::max)(peer.mtu, peer.packetThrottle * peer.windowSize / ENET_PEER_PACKET_THROTTLE_SCALE);
+        sample.rttMs = peer.roundTripTime;
+        sample.referenceRttMs = peer.lastRoundTripTime;
+        sample.rttVarianceMs = peer.roundTripTimeVariance;
+        sample.throttle = peer.packetThrottle;
+        sample.validRtt = peer.lastReceiveTime != 0 && peer.packetsSent >= 32;
+        if (peer.packetsLost != budgetLastLost[i]) {
+            budgetLastLost[i] = peer.packetsLost;
+            budgetLossAt[i] = now;
+        }
+        sample.lossPermille = peer.packetsSent >= 32
+            ? static_cast<uint32_t>((std::min)(uint64_t(1000), uint64_t(peer.packetsLost) * 1000 / peer.packetsSent)) : 0;
+        sample.validLoss = peer.packetsSent >= 32;
+        sample.retrySampleAt = budgetLossAt[i];
+        peerBudgets[i].Advance(now, sample);
+    }
+}
 
 // What passes the world gate: joining, campaign notifications, the save transfer and the world messages. Motion names wait for the world too
 // (Fable's review 22.10. 1.8: they were open to a peer that never said Hello); the host resends them all on entry.
@@ -239,7 +325,8 @@ bool Gated(uint8_t type)
 {
     switch (type) {
     case MsgHello: case MsgWelcome: case MsgRefused: case MsgLeave:
-    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld: case MsgSave: case MsgPlayerActivity:
+    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld: case MsgSave:
+    case MsgPlayerActivity:
         return false;
     default:
         return true;
@@ -271,7 +358,16 @@ PoseRoute poseRoutes[MaxPlayers];
 
 bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool reliable)
 {
+    if (!host || !peer || (size && !data)) return false;
     if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !XpHandshake(data, size) && !Open(peer)) { ++gatedOut; return false; }
+    const BudgetClass priority = SendPriority(size ? static_cast<uint8_t const*>(data)[0] : 0, channel, reliable);
+    const uint64_t charge = BudgetCharge(size, peer->mtu, relayEnvelopeBytes, host->checksum ? 4 : 0);
+    PeerBudget& budget = peerBudgets[PeerIndex(peer)];
+    if (priority == BudgetClass::BulkReliable) {
+        const auto decision = budget.Preview(priority, charge);
+        budget.RecordDecision(decision);
+        if (decision != BudgetDecision::Allow) return false;
+    }
     if (channel == ChannelPoses && !reliable) {
         PoseRoute& route = poseRoutes[peer - host->peers];
         uint8_t active = route.alt ? ChannelPosesAlt : ChannelPoses;
@@ -296,10 +392,41 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
         channel = active;
     }
     ENetPacket* packet = enet_packet_create(data, size, PacketFlags(reliable));
-    if (!packet) return false;
-    if (enet_peer_send(peer, channel, packet) < 0) { enet_packet_destroy(packet); return false; }
+    if (!packet) { Log("net: outgoing packet allocation failed"); return false; }
+    if (enet_peer_send(peer, channel, packet) < 0) {
+        enet_packet_destroy(packet);
+        Log("net: outgoing packet could not be queued");
+        return false;
+    }
+    budget.CommitQueued(priority, charge);
     if (!haveQueued) { haveQueued = true; queuedAt = enet_time_get(); }
     if (size) bandwidth.Tx(static_cast<uint8_t const*>(data)[0], size);
+    return true;
+}
+
+uint8_t DestinationId(ENetPeer const* peer)
+{
+    return isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+}
+
+bool SendPlayerState(ENetPeer* peer, PlayerState const& state)
+{
+    const uint8_t to = DestinationId(peer);
+    if (!to || to >= MaxPlayers || !state.id || state.id >= MaxPlayers) return false;
+    auto& encoder = playerSenders[to][state.id];
+    playerwire::Packet encoded;
+    const uint32_t now = enet_time_get();
+    if (encoder.Plan(state, now, forcePlayerFull[to][state.id], encoded) != playerwire::Status::Ok) {
+        Logf("net: local player state refused by compact encoder player=%u", state.id);
+        return false;
+    }
+    std::vector<uint8_t> message;
+    message.reserve(1 + encoded.bytes.size());
+    message.push_back(MsgState);
+    message.insert(message.end(), encoded.bytes.begin(), encoded.bytes.end());
+    if (!Send(peer, message.data(), message.size(), ChannelState, encoded.reliable)) return false;
+    encoder.Commit(state, now, encoded);
+    forcePlayerFull[to][state.id] = false;
     return true;
 }
 
@@ -329,6 +456,7 @@ void ForgetBonePeer(uint8_t id)
 {
     boneOffered[id].clear();
     boneAcknowledged[id].clear();
+    sentPoses[id].clear();
 }
 
 void ForgetControlPeer(uint8_t id)
@@ -460,6 +588,14 @@ void Drop(uint8_t id)
     ForgetBonePeer(id);
     ForgetControlPeer(id);
     remotes[id] = Remote{};
+    playerReceivers[id] = {};
+    playerRequestAt[id] = 0;
+    for (auto& sender : playerSenders[id]) sender = {};
+    for (auto& senders : playerSenders) senders[id] = {};
+    for (auto& forced : forcePlayerFull[id]) forced = false;
+    for (auto& forced : forcePlayerFull) forced[id] = false;
+    if (fileTransfers[id].active) Logf("net: checkpoint transfer canceled after player %u disconnected", id);
+    fileTransfers[id] = {};
     peers[id] = nullptr;
     clientInWorld[id] = false;
     goodsCache[id].clear();
@@ -756,6 +892,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         for (uint8_t i = 2; i < MaxPlayers && !id; ++i) if (!peers[i]) id = i;
         if (!id) { enet_peer_disconnect(peer, 2); return; }
         peers[id] = peer;
+        for (auto& sender : playerSenders[id]) sender = {};
+        for (auto& forced : forcePlayerFull[id]) forced = false;
         ++generations[id];
         peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
         remotes[id].connected = true; // joined; activity and presentation have separate readiness
@@ -804,20 +942,52 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 if (peers[i] && i != message.id &&
                     !Send(peers[i], &message, sizeof(message), ChannelState, true))
                     Logf("net: player activity relay to player %u failed", i);
-    } else if (type == MsgState && packet->dataLength == sizeof(State)) {
-        State message;
-        std::memcpy(&message, packet->data, sizeof(message));
-        if (!Sane(message.state)) return;
-        if (isHost) {
-            // The host decides who sent it; a client cannot speak for another player.
-            message.state.id = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-            Store(message.state);
-            for (uint8_t i = 2; i < MaxPlayers; ++i)
-                if (peers[i] && i != message.state.id)
-                    Send(peers[i], &message, sizeof(message), ChannelState, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
-        } else {
-            Store(message.state);
+    } else if (type == MsgState) {
+        if (!isHost && peer != server) return;
+        if (packet->dataLength >= 1 + playerwire::FixedBytes &&
+            (packet->data[2] || BoneWire16(packet->data + 1 + playerwire::FixedBytes - 2)) &&
+            !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) {
+            Log("net: unreliable player metadata refused");
+            return;
         }
+        uint8_t player = 0;
+        if (!playerwire::PeekPlayerId(packet->data + 1, packet->dataLength - 1, player)) {
+            Log("net: compact player state has an invalid header");
+            return;
+        }
+        if (isHost) player = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        if (!player || player >= MaxPlayers || player == localId) return;
+        PlayerState state;
+        const auto status = playerReceivers[player].Decode(packet->data + 1, packet->dataLength - 1, state, player);
+        if (status == playerwire::Status::NeedKeyframe) {
+            const uint32_t now = enet_time_get();
+            if (!playerRequestAt[player] || now - playerRequestAt[player] >= 1000) {
+                const PlayerResyncMsg request{MsgPlayerResync, player};
+                if (Send(peer, &request, sizeof(request), ChannelReliable, true)) {
+                    playerRequestAt[player] = now | 1u;
+                    Logf("net: player metadata keyframe requested player=%u", player);
+                }
+            }
+            return;
+        }
+        if (status == playerwire::Status::Stale) return;
+        if (status != playerwire::Status::Ok || !Sane(state)) {
+            Logf("net: invalid compact player state player=%u", player);
+            return;
+        }
+        Store(state);
+        if (isHost) {
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i] && i != player) SendPlayerState(peers[i], state);
+        }
+    } else if (type == MsgPlayerResync && packet->dataLength == sizeof(PlayerResyncMsg) &&
+               (packet->flags & ENET_PACKET_FLAG_RELIABLE)) {
+        PlayerResyncMsg request{};
+        std::memcpy(&request, packet->data, sizeof(request));
+        const uint8_t to = DestinationId(peer);
+        if (!to || to >= MaxPlayers || !request.player || request.player >= MaxPlayers ||
+            (!isHost && (peer != server || request.player != localId))) return;
+        forcePlayerFull[to][request.player] = true;
     } else if (type == MsgControlId) {
         if (isHost || peer != server || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
         auto* data = packet->data + 1;
@@ -919,6 +1089,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             status = candidate.DecodeDictionary(data, size);
             if (status == bonewire::Status::Ok) {
                 boneLayouts = std::move(candidate);
+                decodedPoses.clear();
                 receivedBoneGeneration = generation;
                 requestedBoneEpoch = 0;
             }
@@ -938,6 +1109,19 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             if (BoneLog(boneDefinitionFailureLogs))
                 Logf("net: could not acknowledge bone layout %u", static_cast<unsigned>(layoutId));
         }
+    } else if (type == MsgPoseAck) {
+        if (!isHost || packet->dataLength != sizeof(PoseAckMsg)) { ++npcRejected; return; }
+        const uintptr_t id = reinterpret_cast<uintptr_t>(peer->data);
+        if (id < 2 || id >= MaxPlayers || peers[id] != peer) { ++npcRejected; return; }
+        PoseAckMsg ack;
+        std::memcpy(&ack, packet->data, sizeof(ack));
+        const auto found = sentPoses[id].find(NpcKey(ack.guid));
+        if (ack.epoch != worldEpoch || ack.generation != boneGeneration || !ack.incarnation ||
+            found == sentPoses[id].end() || !found->second.Ack(ack.token, ack.incarnation)) {
+            ++bandwidth.poseAckMisses;
+            return;
+        }
+        ++bandwidth.poseAcks;
     } else if (type == MsgBoneAck || type == MsgBoneRequest) {
         if (!isHost || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
         const uintptr_t id = reinterpret_cast<uintptr_t>(peer->data);
@@ -982,6 +1166,10 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         uint16_t boneCount = 0;
         uint8_t poseFlags = 0;
+        uint8_t intervalMs = 16;
+        uint16_t poseLayout = 0;
+        size_t receivedPoseBytes = 0;
+        bool receivedPoseKey = true;
         const pose::Bone* bones = nullptr;
         std::vector<pose::Bone> decodedBones;
         std::vector<NpcRecord> controlRecords;
@@ -1008,21 +1196,35 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             }
             offset += controlSize;
             if (type == MsgControlPose) {
-                if (packet->dataLength < offset + sizeof(BonePosePrefix) + bonewire::TransformBytes) {
+                if (packet->dataLength < offset + 2 + bonewire::DeltaHeaderBytes + 1) {
                     ++npcRejected;
                     return;
                 }
                 poseFlags = packet->data[offset++];
+                intervalMs = packet->data[offset++];
                 if (poseFlags & ~pose::Facial) { ++npcRejected; return; }
                 uint16_t layoutId = 0;
-                const auto status = boneLayouts.DecodePose(packet->data + offset, packet->dataLength - offset,
-                                                           decodedBones, layoutId);
+                auto const& record = controlRecords.front();
+                const auto status = decodedPoses[NpcKey(record.guid)].Decode(boneLayouts, packet->data + offset,
+                    packet->dataLength - offset, record.incarnation, poseFlags, decodedBones, layoutId);
                 if (status == bonewire::Status::UnknownLayout) {
                     RequestBoneLayout(peer, layoutId);
                     ++npcRejected;
                     return;
                 }
-                if (status != bonewire::Status::Ok) { ++npcRejected; return; }
+                if (status != bonewire::Status::Ok) {
+                    if (status == bonewire::Status::UnknownPose) {
+                        const PoseAckMsg request{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, record.incarnation, 0};
+                        auto message = request;
+                        std::memcpy(message.guid, record.guid, 16);
+                        if (!Send(peer, &message, sizeof(message), ChannelState, false)) ++bandwidth.poseAckMisses;
+                        ++bandwidth.poseReferenceMisses;
+                    } else ++bandwidth.poseDecodeFailures;
+                    ++npcRejected; return;
+                }
+                poseLayout = layoutId;
+                receivedPoseBytes = packet->dataLength - sizeof(header) - 2 - controlSize;
+                receivedPoseKey = bonewire::ReadPose32(packet->data + offset + 2) == 0;
                 bones = decodedBones.data();
                 boneCount = static_cast<uint16_t>(decodedBones.size());
             }
@@ -1032,52 +1234,69 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 return;
             }
         } else if (type == MsgPosedNpc) {
-            if (header.count != 1 || packet->dataLength < recordsSize + sizeof(boneCount) + sizeof(poseFlags)) { ++npcRejected; return; }
+            if (header.count != 1 || packet->dataLength < recordsSize + sizeof(boneCount) + 2) { ++npcRejected; return; }
             std::memcpy(&boneCount, packet->data + recordsSize, sizeof(boneCount));
             std::memcpy(&poseFlags, packet->data + recordsSize + sizeof(boneCount), sizeof(poseFlags));
+            intervalMs = packet->data[recordsSize + sizeof(boneCount) + 1];
             if (!boneCount || boneCount > pose::MaxBones ||
                 (poseFlags & ~pose::Facial) ||
-                packet->dataLength != recordsSize + sizeof(boneCount) + sizeof(poseFlags) + boneCount * sizeof(pose::Bone)) {
+                packet->dataLength != recordsSize + sizeof(boneCount) + 2 + boneCount * sizeof(pose::Bone)) {
                 ++npcRejected;
                 return;
             }
-            bones = reinterpret_cast<pose::Bone const*>(packet->data + recordsSize + sizeof(boneCount) + sizeof(poseFlags));
+            bones = reinterpret_cast<pose::Bone const*>(packet->data + recordsSize + sizeof(boneCount) + 2);
+            receivedPoseBytes = packet->dataLength - recordsSize;
             for (int i = 0; i < boneCount; ++i) {
                 if (!bones[i].name) { ++npcRejected; return; }
                 for (int k = 0; k < i; ++k)
                     if (bones[k].name == bones[i].name) { ++npcRejected; return; }
             }
         } else if (type == MsgCompactPosedNpc) {
-            if (header.count != 1 || packet->dataLength < recordsSize + sizeof(BonePosePrefix) + bonewire::TransformBytes ||
+            if (header.count != 1 || packet->dataLength < recordsSize + 2 + bonewire::DeltaHeaderBytes + 1 ||
                 !worldEpoch) {
                 ++npcRejected;
                 if (BoneLog(boneInvalidLogs)) Log("net: rejected truncated or invalid compact pose");
                 return;
             }
             poseFlags = packet->data[recordsSize];
+            intervalMs = packet->data[recordsSize + 1];
             if (poseFlags & ~pose::Facial) {
                 ++npcRejected;
                 if (BoneLog(boneInvalidLogs)) Logf("net: rejected compact pose flags=%u", static_cast<unsigned>(poseFlags));
                 return;
             }
-            uint8_t const* data = packet->data + recordsSize + 1;
-            const size_t size = packet->dataLength - recordsSize - 1;
+            uint8_t const* data = packet->data + recordsSize + 2;
+            const size_t size = packet->dataLength - recordsSize - 2;
             uint16_t layoutId = 0;
-            const auto status = boneLayouts.DecodePose(data, size, decodedBones, layoutId);
+            NpcRecord posedRecord;
+            std::memcpy(&posedRecord, packet->data + sizeof(header), sizeof(posedRecord));
+            if (!Sane(posedRecord)) { ++npcRejected; return; }
+            const auto status = decodedPoses[NpcKey(posedRecord.guid)].Decode(boneLayouts, data, size,
+                posedRecord.incarnation, poseFlags, decodedBones, layoutId);
             if (status == bonewire::Status::UnknownLayout) {
                 RequestBoneLayout(peer, layoutId);
                 ++npcRejected;
                 return;
             }
             if (status != bonewire::Status::Ok) {
+                if (status == bonewire::Status::UnknownPose) {
+                    PoseAckMsg request{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, posedRecord.incarnation, 0};
+                    std::memcpy(request.guid, posedRecord.guid, 16);
+                    if (!Send(peer, &request, sizeof(request), ChannelState, false)) ++bandwidth.poseAckMisses;
+                    ++bandwidth.poseReferenceMisses;
+                } else ++bandwidth.poseDecodeFailures;
                 ++npcRejected;
                 if (BoneLog(boneInvalidLogs))
                     Logf("net: invalid compact pose layout (%u)", static_cast<unsigned>(status));
                 return;
             }
             bones = decodedBones.data();
+            poseLayout = layoutId;
+            receivedPoseBytes = packet->dataLength - recordsSize;
+            receivedPoseKey = bonewire::ReadPose32(data + 2) == 0;
             boneCount = static_cast<uint16_t>(decodedBones.size());
         } else if (packet->dataLength != recordsSize) { ++npcRejected; return; }
+        if (bones && (intervalMs < 16 || intervalMs > 100)) { ++npcRejected; return; }
         if (isHost) {
             header.owner = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
             if (header.owner < 2 || header.owner >= MaxPlayers) return;
@@ -1095,8 +1314,17 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
                                          : npcPublications[key].Snapshot(header.owner, header.publication);
                 if (!newer) { ++npcStale; continue; }
+                if (bones && poseLayout) {
+                    decodedPoses[key].Store(header.publication, record.incarnation, poseLayout, poseFlags,
+                                           bones, boneCount, enet_time_get(), false);
+                    PoseAckMsg ack{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, record.incarnation, header.publication};
+                    std::memcpy(ack.guid, record.guid, 16);
+                    if (!Send(peer, &ack, sizeof(ack), ChannelState, false)) ++bandwidth.poseAckMisses;
+                    else ++bandwidth.poseAcks;
+                }
+                if (bones) bandwidth.Pose(intervalMs, packet->dataLength, receivedPoseBytes, boneCount, receivedPoseKey);
                 if (bones && npcPoseHandler)
-                    npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+                    npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0, intervalMs);
                 records[count++] = record;
             }
             return count;
@@ -1155,6 +1383,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
                                      : npcPublications[key].Release(header.owner, header.publication);
             if (!newer) { ++npcStale; continue; }
+            decodedPoses.erase(key);
             std::memcpy(guids + count++ * 16, guid, 16);
         }
         const int accepted = count && npcReleaseHandler ? npcReleaseHandler(header.owner, header.generation, guids, count) : 0;
@@ -1533,9 +1762,12 @@ void SetInWorld(uint8_t id, bool in)
     if (!isHost) {
         if (inWorld == in) return;
         inWorld = in;
+        for (auto& receiver : playerReceivers) receiver = {};
+        for (auto& senders : playerSenders) for (auto& sender : senders) sender = {};
         if (!in) {
             for (uint8_t i = 0; i < MaxPlayers; ++i) ClearPresentation(i);
             boneLayouts.Clear();
+            decodedPoses.clear();
             receivedBoneGeneration = 0;
             requestedBoneEpoch = 0;
             controlReceiver = npcwire::Context{};
@@ -1555,6 +1787,8 @@ void SetInWorld(uint8_t id, bool in)
         ForgetControlPeer(id);
     }
     clientInWorld[id] = in;
+    playerReceivers[id] = {};
+    for (auto& sender : playerSenders[id]) sender = {};
     if (in) {
         ++joins;  // like a join for everything that sends a newcomer the whole state
         for (uint8_t from = 2; from < MaxPlayers; ++from)
@@ -1631,7 +1865,52 @@ void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names)
 void SetNpcPoseHandler(NpcPoseHandler handler) { npcPoseHandler = handler; }
 
 void SetPlayerStateHandler(PlayerStateHandler handler) { playerStateHandler = handler; }
+#ifndef G3T_REMOTE_NPC_FOCUS_SUPPORTED
+// Standalone pose branch: the player-state branch supplies these on integration.
+uint32_t RemoteFocusNpc(uint8_t) { return 0; }
+uint32_t RemoteTargetNpc(uint8_t) { return 0; }
+uint32_t RemoteStateAgeMs(uint8_t) { return UINT32_MAX; }
+#endif
 void SetSendRate(int hz) { sendRate = hz < 20 ? 20 : hz > 60 ? 60 : hz; }
+
+void SetBandwidthBudget(uint32_t bytesPerSecond)
+{
+    budgetRate = (std::clamp)(bytesPerSecond, 64u * 1024, 4096u * 1024);
+    if (host) for (size_t i = 0; i < host->peerCount; ++i) ResetBudget(&host->peers[i]);
+}
+
+uint32_t RemoteStateAgeMs(uint8_t player)
+{
+    return player < MaxPlayers && remotes[player].connected && InWorld(player)
+        ? enet_time_get() - remotes[player].latestTicks : UINT32_MAX;
+}
+
+uint32_t RemoteFocusNpc(uint8_t player)
+{
+    return RemoteStateAgeMs(player) < 1000 ? remotes[player].latest.focusNpc : 0;
+}
+
+uint32_t RemoteTargetNpc(uint8_t player)
+{
+    return RemoteStateAgeMs(player) < 1000 ? remotes[player].latest.targetNpc : 0;
+}
+
+BudgetDecision PreviewBandwidth(uint8_t to, BudgetClass priority, uint32_t payloadBytes)
+{
+    ENetPeer* peer = isHost ? (to < MaxPlayers ? peers[to] : nullptr) : server;
+    if (!host || !peer || peer->state != ENET_PEER_STATE_CONNECTED) return BudgetDecision::Shed;
+    auto& budget = peerBudgets[PeerIndex(peer)];
+    const auto decision = budget.Preview(priority,
+        BudgetCharge(payloadBytes, peer->mtu, relayEnvelopeBytes, host->checksum ? 4 : 0));
+    budget.RecordDecision(decision);
+    return decision;
+}
+
+BudgetSnapshot PeerBandwidth(uint8_t to)
+{
+    ENetPeer* peer = isHost ? (to < MaxPlayers ? peers[to] : nullptr) : server;
+    return host && peer ? peerBudgets[PeerIndex(peer)].Snapshot() : BudgetSnapshot{};
+}
 
 void ResetNpcReplication()
 {
@@ -1786,9 +2065,11 @@ void SendNpcs(NpcRecord const* records, int count, bool reliable)
     SendNpcsTo(0, records, count, reliable);
 }
 
-bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags, bool reliable)
+bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones, int count, uint8_t poseFlags, bool reliable,
+                    uint8_t intervalMs)
 {
     if (!host || !isHost || !bones || count <= 0 || count > pose::MaxBones || (poseFlags & ~pose::Facial) ||
+        intervalMs < 16 || intervalMs > 100 ||
         (to && (to < 2 || to >= MaxPlayers || !peers[to]))) return false;
     uint32_t hashes[pose::MaxBones], sorted[pose::MaxBones];
     for (int i = 0; i < count; ++i) hashes[i] = sorted[i] = bones[i].name;
@@ -1824,23 +2105,30 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
     } else if (BoneLog(boneInvalidLogs)) {
         Log("net: bone dictionary has no epoch or generation; using full-hash pose");
     }
-    uint8_t buffer[sizeof(NpcsHeader) + sizeof(NpcRecord) + sizeof(uint16_t) + sizeof(poseFlags) + pose::MaxBones * sizeof(pose::Bone)];
-    const NpcsHeader header{MsgPosedNpc, ++npcSequence, enet_time_get(), worldEpoch, 1, ++npcPublication, 1, 1};
+    uint8_t buffer[sizeof(NpcsHeader) + sizeof(NpcRecord) + sizeof(uint16_t) + 2 + pose::MaxBones * sizeof(pose::Bone)];
+    NpcsHeader header{MsgPosedNpc, 0, enet_time_get(), worldEpoch, 1, 0, 1, 1};
     const auto preparedControl = PrepareControl(record, reliable);
     const uint16_t boneCount = static_cast<uint16_t>(count);
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), &record, sizeof(record));
     std::memcpy(buffer + sizeof(header) + sizeof(record), &boneCount, sizeof(boneCount));
     std::memcpy(buffer + sizeof(header) + sizeof(record) + sizeof(boneCount), &poseFlags, sizeof(poseFlags));
-    std::memcpy(buffer + sizeof(header) + sizeof(record) + sizeof(boneCount) + sizeof(poseFlags), bones, count * sizeof(*bones));
-    const size_t size = sizeof(header) + sizeof(record) + sizeof(boneCount) + sizeof(poseFlags) + count * sizeof(*bones);
+    buffer[sizeof(header) + sizeof(record) + sizeof(boneCount) + 1] = intervalMs;
+    std::memcpy(buffer + sizeof(header) + sizeof(record) + sizeof(boneCount) + 2, bones, count * sizeof(*bones));
+    const size_t size = sizeof(header) + sizeof(record) + sizeof(boneCount) + 2 + count * sizeof(*bones);
     std::vector<uint8_t> definition, compactMessage, controlPoseMessage;
-    bool definitionAttempted = false, definitionReady = false, compactAttempted = false, controlAttempted = false;
+    bool definitionAttempted = false, definitionReady = false;
     bool queued = false;
     for (uint8_t i = 2; i < MaxPlayers; ++i) {
         if (to && i != to) continue;
         if (!peers[i] || !clientInWorld[i]) continue;
-        if (reliable) queued = SendFullNpc(peers[i], record, true) || queued;
+        if (reliable && !SendFullNpc(peers[i], record, true)) return false;
+        // Essential state is an earlier publication, never a fence that makes
+        // its own accompanying pose stale when reliable traffic arrives first.
+        header.sequence = ++npcSequence;
+        header.publication = ++npcPublication;
+        if (!header.publication) header.publication = ++npcPublication;
+        std::memcpy(buffer, &header, sizeof(header));
         OfferControl(i, preparedControl);
         if (layoutId && !boneAcknowledged[i].count(layoutId)) {
             const auto sent = boneOffered[i].find(layoutId);
@@ -1859,26 +2147,30 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
             }
         }
         bool compactReady = layoutId && boneAcknowledged[i].count(layoutId);
-        if (compactReady && !compactAttempted) {
-            compactAttempted = true;
+        bool poseKey = true;
+        compactMessage.clear();
+        controlPoseMessage.clear();
+        auto& poseCache = sentPoses[i][NpcKey(record.guid)];
+        if (compactReady) {
             std::vector<uint8_t> compact;
-            const auto status = boneLayouts.EncodePose(layoutId, bones, count, compact);
+            const auto status = poseCache.Encode(boneLayouts, layoutId, record.incarnation, poseFlags, bones, count,
+                                                enet_time_get(), compact, poseKey);
             if (status == bonewire::Status::Ok) {
-                compactMessage.resize(sizeof(header) + sizeof(record) + sizeof(poseFlags) + compact.size());
+                compactMessage.resize(sizeof(header) + sizeof(record) + 2 + compact.size());
                 NpcsHeader compactHeader = header;
                 compactHeader.type = MsgCompactPosedNpc;
                 std::memcpy(compactMessage.data(), &compactHeader, sizeof(compactHeader));
                 std::memcpy(compactMessage.data() + sizeof(header), &record, sizeof(record));
                 compactMessage[sizeof(header) + sizeof(record)] = poseFlags;
-                std::memcpy(compactMessage.data() + sizeof(header) + sizeof(record) + 1, compact.data(), compact.size());
+                compactMessage[sizeof(header) + sizeof(record) + 1] = intervalMs;
+                std::memcpy(compactMessage.data() + sizeof(header) + sizeof(record) + 2, compact.data(), compact.size());
             } else if (BoneLog(boneInvalidLogs)) {
                 Logf("net: could not encode bone layout %u (%u); using full-hash pose",
                      static_cast<unsigned>(layoutId), static_cast<unsigned>(status));
             }
         }
         compactReady = compactReady && !compactMessage.empty();
-        if (compactReady && ControlReady(i, preparedControl) && !controlAttempted) {
-            controlAttempted = true;
+        if (compactReady && ControlReady(i, preparedControl)) {
             std::vector<uint8_t> batch;
             const std::vector<npcwire::Control> values{preparedControl.value};
             if (npcwire::EncodeBatch(controlSender, header.publication, values, batch) && batch.size() <= UINT16_MAX) {
@@ -1897,13 +2189,19 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         const void* data = controlReady ? static_cast<void const*>(controlPoseMessage.data())
             : compactReady ? static_cast<void const*>(compactMessage.data()) : buffer;
         const size_t bytes = controlReady ? controlPoseMessage.size() : compactReady ? compactMessage.size() : size;
-        const size_t poseBytes = compactReady ? sizeof(BonePosePrefix) + count * bonewire::TransformBytes
-                                              : sizeof(boneCount) + sizeof(poseFlags) + count * sizeof(pose::Bone);
+        const size_t poseBytes = compactReady ? compactMessage.size() - sizeof(header) - sizeof(record)
+                                              : sizeof(boneCount) + 2 + count * sizeof(pose::Bone);
         if (BoneLog(compactReady ? boneCompactPoseLogs : boneFullPoseLogs))
             Logf("net: player %u pose=%s bones=%d pose_bytes=%u datagram_bytes=%u", static_cast<unsigned>(i),
                  compactReady ? "compact" : "full", count, static_cast<unsigned>(poseBytes),
                  static_cast<unsigned>(bytes));
-        if (Send(peers[i], data, bytes, ChannelPoses, false)) { ++poseSent; queued = true; }
+        if (Send(peers[i], data, bytes, ChannelPoses, false)) {
+            ++poseSent; queued = true;
+            if (compactReady)
+                poseCache.Store(header.publication, record.incarnation, layoutId, poseFlags, bones, count,
+                                enet_time_get(), poseKey);
+            bandwidth.Pose(intervalMs, bytes, poseBytes, count, poseKey || !compactReady);
+        }
         else {
             ++poseSendFailed;
             if (!compactReady && BoneLog(boneFallbackFailureLogs))
@@ -1929,9 +2227,15 @@ bool SendNpcReleaseTo(uint8_t to, uint8_t const* guids, int count)
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), guids, count * 16u);
     const size_t size = sizeof(header) + count * 16u;
-    if (to) return Send(peers[to], buffer, size, ChannelNpcs, true);
-    SendBroadcast(buffer, size, ChannelNpcs, true);
-    return true;
+    bool queued = false;
+    for (uint8_t id = 2; id < MaxPlayers; ++id) {
+        if ((to && id != to) || !peers[id]) continue;
+        if (Send(peers[id], buffer, size, ChannelNpcs, true)) {
+            queued = true;
+            for (int i = 0; i < count; ++i) sentPoses[id].erase(NpcKey(guids + i * 16));
+        }
+    }
+    return queued;
 }
 
 void SendNpcRelease(uint8_t const* guids, int count)
@@ -2053,11 +2357,11 @@ bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, vo
 {
     if (!host || !isHost || to >= MaxPlayers || !peers[to]) return false;
     static uint8_t buffer[sizeof(FileChunkHeader) + MaxChunk];
-    if (length > MaxChunk) return false;
+    if (!data || !length || length > MaxChunk || file >= FileCount || offset > total || length > total - offset) return false;
     const FileChunkHeader header{MsgFileChunk, file, total, offset, length};
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), data, length);
-    return Send(peers[to], buffer, sizeof(header) + length, ChannelReliable, true);
+    return Send(peers[to], buffer, sizeof(header) + length, ChannelBulk, true);
 }
 
 bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount])
@@ -2067,7 +2371,86 @@ bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], 
     strncpy_s(message.name, name, _TRUNCATE);
     std::memcpy(message.size, size, sizeof(message.size));
     std::memcpy(message.crc, crc, sizeof(message.crc));
-    return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+    return Send(peers[to], &message, sizeof(message), ChannelBulk, true);
+}
+
+bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
+                       std::vector<uint8_t> (&files)[FileCount],
+                       uint32_t const size[FileCount], uint32_t const crc[FileCount])
+{
+    if (!host || !isHost || to < 2 || to >= MaxPlayers || !peers[to] || fileTransfers[to].active ||
+        !name || !saving::SafeName(name) || (note.op != SaveCommit && note.op != SaveImport)) return false;
+    constexpr uint32_t FileLimit = 64u * 1024 * 1024;
+    for (int f = 0; f < FileCount; ++f) {
+        if (!size[f] || size[f] > FileLimit || files[f].size() != size[f]) {
+            Logf("net: checkpoint transfer refused for player %u (file %d size)", to, f);
+            return false;
+        }
+    }
+    FileTransfer transfer;
+    transfer.note = note;
+    transfer.done.type = MsgFileDone;
+    strncpy_s(transfer.done.name, name, _TRUNCATE);
+    std::memcpy(transfer.done.size, size, sizeof(transfer.done.size));
+    std::memcpy(transfer.done.crc, crc, sizeof(transfer.done.crc));
+    for (int f = 0; f < FileCount; ++f) transfer.files[f] = std::move(files[f]);
+    transfer.generation = generations[to];
+    transfer.progressedAt = enet_time_get();
+    transfer.active = true;
+    fileTransfers[to] = std::move(transfer);
+    Logf("net: checkpoint transfer paced player=%u bytes=%llu chunk=%u bulk_bytes_per_s=%u",
+         to, uint64_t(size[0]) + size[1] + size[2], MaxChunk, budgetRate / 4);
+    return true;
+}
+
+bool FileTransferBusy(uint8_t to) { return to < MaxPlayers && fileTransfers[to].active; }
+
+void CancelFileTransfers()
+{
+    for (uint8_t i = 2; i < MaxPlayers; ++i) {
+        if (fileTransfers[i].active) Logf("net: checkpoint transfer canceled for player %u", i);
+        fileTransfers[i] = {};
+    }
+}
+
+namespace {
+void PumpFileTransfers()
+{
+    if (!isHost) return;
+    const uint32_t now = enet_time_get();
+    for (uint8_t to = 2; to < MaxPlayers; ++to) {
+        FileTransfer& transfer = fileTransfers[to];
+        if (!transfer.active) continue;
+        if (!peers[to] || generations[to] != transfer.generation || now - transfer.progressedAt >= 180000) {
+            Logf("net: checkpoint transfer canceled player=%u (stale generation or no progress)", to);
+            transfer = {};
+            continue;
+        }
+        if (!transfer.prefixed) {
+            const SaveMsg prefix{MsgSave, transfer.note};
+            if (!Send(peers[to], &prefix, sizeof(prefix), ChannelBulk, true)) continue;
+            transfer.prefixed = true;
+            transfer.progressedAt = now;
+        }
+        for (unsigned chunks = 0; chunks < 4 && transfer.file < FileCount; ++chunks) {
+            auto const& bytes = transfer.files[transfer.file];
+            const uint16_t length = static_cast<uint16_t>((std::min)(size_t(MaxChunk), bytes.size() - transfer.offset));
+            if (!SendFileChunk(to, transfer.file, static_cast<uint32_t>(bytes.size()), transfer.offset,
+                               bytes.data() + transfer.offset, length)) break;
+            transfer.offset += length;
+            transfer.progressedAt = now;
+            if (transfer.offset == bytes.size()) {
+                transfer.offset = 0;
+                ++transfer.file;
+            }
+        }
+        if (transfer.file == FileCount &&
+            Send(peers[to], &transfer.done, sizeof(transfer.done), ChannelBulk, true)) {
+            Logf("net: checkpoint transfer fully queued player=%u", to);
+            transfer = {};
+        }
+    }
+}
 }
 
 void SendCampaign(uint8_t kind, char const* name)
@@ -2293,16 +2676,25 @@ void SendTalk(bool begin, uint8_t const guid[16])
     SendToServer(&message, sizeof(message), ChannelReliable, true);
 }
 
-void SendStates(uint8_t kind, StateEntry const* entries, int count)
+namespace {
+void QueueStates(uint8_t to, uint8_t kind, StateEntry const* entries, int count)
 {
     if (!host || count < 0 || count > MaxStatesPerMessage || (count == 0 && isHost)) return;
-    uint8_t buffer[sizeof(StatesHeader) + MaxStatesPerMessage * sizeof(StateEntry)];
-    const StatesHeader header{MsgStates, kind, static_cast<uint8_t>(count)};
-    std::memcpy(buffer, &header, sizeof(header));
-    if (count) std::memcpy(buffer + sizeof(header), entries, count * sizeof(StateEntry));
-    const size_t size = sizeof(header) + count * sizeof(StateEntry);
-    SendBroadcast(buffer, size, ChannelReliable, true);
+    constexpr int Batch = (1168 - sizeof(StatesHeader)) / sizeof(StateEntry);
+    uint8_t buffer[sizeof(StatesHeader) + Batch * sizeof(StateEntry)];
+    for (int at = 0; at < count || (at == 0 && count == 0); at += Batch) {
+        const int chunk = (std::min)(Batch, count - at);
+        const StatesHeader header{MsgStates, kind, static_cast<uint8_t>(chunk)};
+        std::memcpy(buffer, &header, sizeof(header));
+        if (chunk) std::memcpy(buffer + sizeof(header), entries + at, chunk * sizeof(StateEntry));
+        const size_t size = sizeof(header) + chunk * sizeof(StateEntry);
+        if (to) SendToPeer(buffer, size, ChannelReliable, true, to);
+        else SendBroadcast(buffer, size, ChannelReliable, true);
+    }
 }
+}
+void SendStates(uint8_t kind, StateEntry const* entries, int count) { QueueStates(0, kind, entries, count); }
+void SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count) { QueueStates(to, kind, entries, count); }
 
 void SendMotionName(uint32_t hash, char const* name)
 {
@@ -2318,6 +2710,7 @@ void Stop()
 {
     // Tell the others right away; otherwise a closed game only shows up after the long peer timeout.
     if (host) {
+        CancelFileTransfers();
         if (isHost) {
             for (uint8_t i = 2; i < MaxPlayers; ++i)
                 if (peers[i]) enet_peer_disconnect_now(peers[i], 0);
@@ -2332,6 +2725,8 @@ void Stop()
     server = nullptr;
     haveQueued = false;
     lastServiceAt = 0;
+    haveCurrentLocal = false;
+    playerCadence = {};
     connected = inWorld = false;
     activitySent = false;
     lastActivitySend = 0;
@@ -2394,6 +2789,9 @@ bool StartFailed(char const* reason)
 bool Start(bool asHost)
 {
     isHost = asHost;
+    haveCurrentLocal = false;
+    currentLocal = {};
+    playerCadence = {};
     ResetNpcReplication();
     worldEpoch = npcPublication = npcSequence = 0;
     startupError[0] = '\0';
@@ -2415,6 +2813,8 @@ bool Start(bool asHost)
         enet_socket_set_option(host->socket, ENET_SOCKOPT_SNDBUF, PoseBurstBuffer) < 0)
         return StartFailed("cannot configure the owned ENet socket for canonical pose bursts");
     if (!steam::Start(isHost, isHost ? host->address.port : 0)) return StartFailed(steam::Error());
+    lastSteamTraffic = steam::Traffic();
+    relayEnvelopeBytes = lastSteamTraffic.envelopeBytes;
     strcpy_s(localName, steam::PlayerName());
     Logf("net: player name from Steam: %s", localName);
     if (isHost) {
@@ -2459,6 +2859,8 @@ void Service(PlayerState const& local, bool haveLocal)
             // A new connection has not said hello yet. ENet hands out the peer of a player who left before, and its old
             // player id made the hello guard refuse every rejoin (stageU1, 22.10.).
             event.peer->data = nullptr;
+            ResetBudget(event.peer);
+            if (!isHost) for (auto& sender : playerSenders[1]) sender = {};
             poseRoutes[event.peer - host->peers] = PoseRoute{};
             if (!isHost) {
                 everConnected = true;
@@ -2502,7 +2904,8 @@ void Service(PlayerState const& local, bool haveLocal)
         server = enet_host_connect(host, &target, ChannelCount, 0);
         Log(server ? "net: reconnecting" : "net: reconnect failed");
     }
-    if (!connected) return;
+    UpdateBudgets(now);
+    if (connected) {
     if (!activitySent || local.flags != lastActivityFlags || local.downedSequence != lastActivityDowned ||
         now - lastActivitySend >= 1000) {
         const ActivityMsg activity{MsgPlayerActivity, localId, local.flags, ++sequence,
@@ -2520,22 +2923,23 @@ void Service(PlayerState const& local, bool haveLocal)
         lastActivityFlags = local.flags;
         lastActivityDowned = local.downedSequence;
     }
-    if (!haveLocal || now - lastSend < std::max<uint32_t>(8, 1000u / static_cast<uint32_t>(sendRate) - 1)) return;
-    lastSend = now;
-    State message{MsgState, local};
-    message.state.id = localId;
-    message.state.sequence = ++sequence;
-    message.state.sent = now;
-    static uint8_t previousFlags = 0;
-    static uint32_t previousDowned = 0;
-    const bool reliable = message.state.flags != previousFlags || message.state.downedSequence != previousDowned;
-    previousFlags = message.state.flags;
-    previousDowned = message.state.downedSequence;
-    strncpy_s(message.state.name, localName, _TRUNCATE);
+    if (!haveLocal) return;
+    const bool due = playerCadence.Due(now, static_cast<uint32_t>(sendRate));
+    const bool immediate = !haveCurrentLocal || local.flags != currentLocal.flags ||
+        local.downedSequence != currentLocal.downedSequence || local.world != currentLocal.world ||
+        local.actionSeq != currentLocal.actionSeq;
+    if (!due && !immediate) return;
+    currentLocal = local;
+    currentLocal.id = localId;
+    currentLocal.sequence = ++sequence;
+    currentLocal.sent = now;
+    strncpy_s(currentLocal.name, localName, _TRUNCATE);
+    haveCurrentLocal = true;
     if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelState, reliable);
+        for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) SendPlayerState(peers[i], currentLocal);
     } else if (server) {
-        Send(server, &message, sizeof(message), ChannelState, reliable);
+        SendPlayerState(server, currentLocal);
+    }
     }
 }
 }
@@ -2543,6 +2947,7 @@ void Service(PlayerState const& local, bool haveLocal)
 void Flush()
 {
     if (!host || g3t::ai::ShuttingDown()) return;
+    PumpFileTransfers();
     if (haveQueued) {
         enqueueDelays.Add(enet_time_get() - queuedAt);
         haveQueued = false;
@@ -2604,20 +3009,64 @@ void BandwidthLog()
     const uint32_t sentData = host->totalSentData, sentPackets = host->totalSentPackets;
     const uint32_t receivedData = host->totalReceivedData, receivedPackets = host->totalReceivedPackets;
     const double perSecond = 1000.0 / elapsed;
+    const auto traffic = steam::Traffic();
+    const uint64_t steamPackets = traffic.txDatagrams - lastSteamTraffic.txDatagrams;
+    const uint64_t steamBytes = traffic.txBytes - lastSteamTraffic.txBytes;
+    const uint64_t framingBytes = traffic.txEnvelopeBytes - lastSteamTraffic.txEnvelopeBytes;
+    const uint64_t enetHeaderBytes = traffic.txEnetProtocolBytes - lastSteamTraffic.txEnetProtocolBytes;
+    const uint64_t enetAckBytes = traffic.txEnetAckBytes - lastSteamTraffic.txEnetAckBytes;
     Logf("net: bandwidth role=%s window_ms=%u enet_loopback_tx_packets_bytes=%u/%u enet_loopback_rx_packets_bytes=%u/%u "
-         "npc_per_s=considered:%.1f,sent:%.1f,unchanged:%.1f,far:%.1f,irrelevant:%.1f,send_failed:%.1f",
+         "npc_per_s=considered:%.1f,sent:%.1f,unchanged:%.1f,far:%.1f,irrelevant:%.1f,send_failed:%.1f,budget:%.1f",
          isHost ? "host" : "client", elapsed, sentPackets - lastSentPackets, sentData - lastSentData,
          receivedPackets - lastReceivedPackets, receivedData - lastReceivedData,
          bandwidth.considered * perSecond, bandwidth.sent * perSecond, bandwidth.skippedUnchanged * perSecond,
-         bandwidth.skippedFar * perSecond, bandwidth.skippedIrrelevant * perSecond, bandwidth.sendFailed * perSecond);
+         bandwidth.skippedFar * perSecond, bandwidth.skippedIrrelevant * perSecond, bandwidth.sendFailed * perSecond,
+         bandwidth.skippedBudget * perSecond);
+    const uint64_t updates = bandwidth.poseKeys + bandwidth.poseDeltas;
+    Logf("net: pose bandwidth tier_per_s=fast:%.1f,ordinary:%.1f,slow:%.1f tier_bytes_per_s=%.0f,%.0f,%.0f "
+         "bone_bytes_per_update=%.1f bones_per_update=%.1f keys=%llu deltas=%llu acks=%llu ack_misses=%llu "
+         "reference_misses=%llu decode_failures=%llu",
+         bandwidth.tierUpdates[0] * perSecond, bandwidth.tierUpdates[1] * perSecond, bandwidth.tierUpdates[2] * perSecond,
+         bandwidth.tierBytes[0] * perSecond, bandwidth.tierBytes[1] * perSecond, bandwidth.tierBytes[2] * perSecond,
+         updates ? double(bandwidth.poseBytes) / updates : 0.0, updates ? double(bandwidth.poseBones) / updates : 0.0,
+         static_cast<unsigned long long>(bandwidth.poseKeys), static_cast<unsigned long long>(bandwidth.poseDeltas),
+         static_cast<unsigned long long>(bandwidth.poseAcks), static_cast<unsigned long long>(bandwidth.poseAckMisses),
+         static_cast<unsigned long long>(bandwidth.poseReferenceMisses), static_cast<unsigned long long>(bandwidth.poseDecodeFailures));
+    detail::ForEachKindLine(bandwidth, [](char const* line) { Logf("%s", line); });
+    Logf("net: bandwidth rates enet_tx_datagrams_per_s=%.1f enet_tx_bytes_per_s=%.1f "
+         "steam_api_tx_datagrams_per_s=%.1f steam_api_tx_bytes_per_s=%.1f relay_header_bytes_per_s=%.1f relay_header_pct=%.2f",
+         (sentPackets - lastSentPackets) * perSecond, (sentData - lastSentData) * perSecond,
+         steamPackets * perSecond, steamBytes * perSecond, framingBytes * perSecond,
+         steamBytes ? 100.0 * framingBytes / steamBytes : 0.0);
+    Logf("net: bandwidth overhead enet_header_bytes_per_s=%.1f enet_ack_bytes_per_s=%.1f "
+         "protocol_overhead_pct=%.2f enet_parse_failures=%llu enet_unparsed_datagrams=%llu",
+         enetHeaderBytes * perSecond, enetAckBytes * perSecond,
+         steamBytes ? 100.0 * (framingBytes + enetHeaderBytes) / steamBytes : 0.0,
+         static_cast<unsigned long long>(traffic.txEnetParseFailures - lastSteamTraffic.txEnetParseFailures),
+         static_cast<unsigned long long>(traffic.txEnetUnparsedDatagrams - lastSteamTraffic.txEnetUnparsedDatagrams));
     // Each line is bounded below Logf's 900-byte buffer.
     detail::ForEachKindLine(bandwidth, [](char const* line) { Logf("%s", line); });
+    detail::ForEachKindRateLine(bandwidth, perSecond, [](char const* line) { Logf("%s", line); });
+    for (size_t i = 0; i < host->peerCount; ++i) {
+        ENetPeer const& peer = host->peers[i];
+        if (peer.state != ENET_PEER_STATE_CONNECTED) continue;
+        auto const snapshot = peerBudgets[i].Snapshot();
+        Logf("net: budget peer=%u cap_bytes_per_s=%u level=%u credit_bytes=%lld queue_bytes=%u "
+             "reliable_inflight=%u rtt_ms=%u throttle=%u deferred=%llu shed=%llu transitions=%u overflow_bytes=%llu",
+             isHost ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer.data)) : 1u, budgetRate,
+             static_cast<unsigned>(snapshot.pressure), static_cast<long long>(snapshot.creditBytes),
+             static_cast<unsigned>(snapshot.queueBytes), peer.reliableDataInTransit, peer.roundTripTime, peer.packetThrottle,
+             static_cast<unsigned long long>(snapshot.deferredCount),              static_cast<unsigned long long>(snapshot.shedCount),
+             snapshot.pressureTransitions,
+             static_cast<unsigned long long>(snapshot.overflowBytes));
+    }
     bandwidth = detail::BandwidthCounters{};
     bandwidthSince = now;
     lastSentPackets = sentPackets;
     lastSentData = sentData;
     lastReceivedPackets = receivedPackets;
     lastReceivedData = receivedData;
+    lastSteamTraffic = traffic;
 }
 
 void Tick(PlayerState const& local, bool haveLocal)
@@ -2628,7 +3077,7 @@ void Tick(PlayerState const& local, bool haveLocal)
     if (lastServiceAt) serviceGaps.Add(now - lastServiceAt);
     lastServiceAt = now;
     Service(local, haveLocal);
-    Flush();  // ACKs and non-state sends must also leave on a rate-limited/menu frame.
+    // FrameScope flushes ACKs and all gameplay together even on menu/rate-limited frames.
     RttLog();
     BandwidthLog();
 }

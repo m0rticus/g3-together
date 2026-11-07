@@ -12,13 +12,18 @@ namespace g3t::npcsend {
 // Distances are centimetres; the two bands prevent threshold chatter.
 constexpr float NearEnterCm = 2000.0f, NearExitCm = 2500.0f;
 constexpr float InterestEnterCm = 8000.0f, InterestExitCm = 10000.0f;
-constexpr float ContactSafetyCm = 300.0f; // cm; remote focus is not present in player state
+constexpr float ContactSafetyCm = 300.0f; // cm; conservative fallback when remote focus is missing/stale
 // Host movement detection, per capture; hold motion classification after the last movement.
 constexpr float MovementPositionCm = 0.02f; // cm displacement
 constexpr float MovementQuaternionComponent = 0.00025f; // quaternion component difference
 constexpr uint32_t MovementHoldMs = 500; // ms
 // Integer-millisecond intervals: 16/33 ms are at least 60/30 Hz at a sufficiently fast scan.
-constexpr uint32_t FastIntervalMs = 16, MovingFarIntervalMs = 33, IdleIntervalMs = 100;
+// User-selected 30 Hz ordinary locomotion; full capture rate is reserved for
+// interaction/contact. Distant/idle animation is 10 Hz, interpolated on mirrors.
+constexpr uint32_t FastIntervalMs = 16, OrdinaryIntervalMs = 33, MovingFarIntervalMs = 100, IdleIntervalMs = 100;
+// Exit holds let the monotonic display clock slew up to the slow tier's
+// 200 ms buffer before captures become sparse, including movement-to-idle.
+constexpr uint32_t UrgentHoldMs = 2000, OrdinaryHoldMs = 2000, InterestWarmupMs = 200;
 constexpr uint32_t KeyframeMs = 1000;
 constexpr uint32_t QuietCadenceMs = 250; // ms; intentional quiet heartbeat is not playback jitter
 constexpr uint32_t MirrorStaleMs = 10000; // ms without a snapshot before a mirror is stale
@@ -37,7 +42,12 @@ constexpr float RootDiscontinuityCm = 100.0f;
 constexpr double RotationDiscontinuityDegrees = 45.0;
 
 enum class Interest { Distance, Include, Exclude };
-enum class Tier { Fast, MovingFar, Idle };
+enum class Tier { Fast, Ordinary, MovingFar, Idle };
+inline uint32_t Interval(Tier tier)
+{
+    return tier == Tier::Fast ? FastIntervalMs : tier == Tier::Ordinary ? OrdinaryIntervalMs :
+           tier == Tier::MovingFar ? MovingFarIntervalMs : IdleIntervalMs;
+}
 enum class Decision { Ineligible, Invalid, Outside, Wait, Initial, Semantic, Changed, Keyframe, FinalAndRelease };
 
 struct Input {
@@ -59,6 +69,8 @@ struct State {
     bool live = false, nearTier = false;
     uint8_t urgent = 0; // independently acknowledged focus/combat/contact edges
     uint32_t sentAt = 0;
+    uint32_t enteredAt = 0, urgentUntil = 0, ordinaryUntil = 0;
+    bool haveUrgentHold = false, haveOrdinaryHold = false;
     net::NpcRecord record{};
     uint8_t poseFlags = 0;
     std::vector<pose::Bone> bones;
@@ -69,6 +81,24 @@ struct Result {
     Tier tier = Tier::Idle;
     bool essential = false; // queue the state reliably; computed against this recipient's last successful send
 };
+
+inline bool CanQueue(uint8_t to, Input const& in, Result const& result)
+{
+#ifdef G3T_REMOTE_NPC_FOCUS_SUPPORTED
+    if (!result.essential) {
+        const auto priority = result.tier == Tier::Fast || result.tier == Tier::Ordinary
+            ? net::BudgetClass::NpcActive : net::BudgetClass::NpcFarIdle;
+        // Bound the full-hash fallback, not just the compact case. Preview
+        // consumes no credit; successful common sends debit exactly once.
+        const uint32_t bytes = static_cast<uint32_t>(sizeof(net::NpcRecord) + 32 +
+            static_cast<size_t>(in.boneCount) * sizeof(pose::Bone));
+        return net::PreviewBandwidth(to, priority, bytes) == net::BudgetDecision::Allow;
+    }
+#else
+    (void)to; (void)in; (void)result;
+#endif
+    return true;
+}
 
 // Keep reliable transitions independent of global/last-captured bookkeeping.
 // The caller must compare against its own last successfully queued state.
@@ -191,9 +221,18 @@ inline bool PoseSemantic(State const& state, Input const& in)
         auto const& a = state.bones[i];
         auto const& b = in.bones[i];
         if (a.name != b.name) return true;
-        for (int k = 0; k < 12; ++k)
-            if (std::abs(int(a.values[k]) - int(b.values[k])) >=
-                (k < 9 ? BoneBasisDiscontinuity : BoneTranslationDiscontinuity)) return true;
+    }
+
+    return false;
+}
+
+inline bool MotionEdge(net::NpcRecord const& a, net::NpcRecord const& b)
+{
+    for (int i = 0; i < net::NpcMotionSlots; ++i) {
+        auto const& x = a.motions[i];
+        auto const& y = b.motions[i];
+        if (x.name != y.name || x.instance != y.instance || x.active != y.active ||
+            (x.weight == 0) != (y.weight == 0)) return true;
     }
     return false;
 }
@@ -232,17 +271,26 @@ inline Result Evaluate(State& state, Input const& in)
     if (state.live) state.nearTier = nearTier;
     const uint8_t urgent = detail::Urgency(in);
     if (state.live) state.urgent &= urgent;
-    const Tier tier = (urgent || (in.moving && (nearTier || in.nearby)))
-        ? Tier::Fast : in.moving ? Tier::MovingFar : Tier::Idle;
-    if (!state.live) return {Decision::Initial, tier, true};
-    if ((urgent & ~state.urgent) || in.force || detail::SemanticRecord(state.record, *in.record) || detail::PoseSemantic(state, in) ||
+    if (state.live && urgent) { state.urgentUntil = in.now + UrgentHoldMs; state.haveUrgentHold = true; }
+    const bool ordinaryWanted = (nearTier || in.nearby) && in.moving;
+    if (state.live && ordinaryWanted) { state.ordinaryUntil = in.now + OrdinaryHoldMs; state.haveOrdinaryHold = true; }
+    const bool fast = urgent || (state.live && in.now - state.enteredAt < InterestWarmupMs) ||
+        (state.haveUrgentHold && static_cast<int32_t>(state.urgentUntil - in.now) > 0);
+    const bool ordinary = ordinaryWanted ||
+        (state.haveOrdinaryHold && static_cast<int32_t>(state.ordinaryUntil - in.now) > 0);
+    const Tier tier = fast ? Tier::Fast : ordinary
+        ? Tier::Ordinary : in.moving ? Tier::MovingFar : Tier::Idle;
+    if (!state.live) return {Decision::Initial, Tier::Fast, true};
+    const bool essential = EssentialChanged(state.record, *in.record);
+    if ((urgent & ~state.urgent) || in.force || essential || detail::MotionEdge(state.record, *in.record) || detail::PoseSemantic(state, in) ||
         detail::DistanceSquared(state.record.position, in.record->position) >=
             double(RootDiscontinuityCm) * RootDiscontinuityCm ||
         detail::RotationChanged(state.record.rotation, in.record->rotation, RotationDiscontinuityDegrees))
-        return {Decision::Semantic, tier, EssentialChanged(state.record, *in.record)};
+        return {Decision::Semantic, tier, essential};
     const uint32_t elapsed = in.now - state.sentAt;
     if (elapsed >= KeyframeMs) return {Decision::Keyframe, tier};
-    const uint32_t interval = tier == Tier::Fast ? FastIntervalMs : tier == Tier::MovingFar ? MovingFarIntervalMs : IdleIntervalMs;
+    const uint32_t interval = Interval(tier);
+    if (elapsed >= interval && detail::SemanticRecord(state.record, *in.record)) return {Decision::Semantic, tier};
     if (elapsed >= interval && detail::DynamicChanged(state, in)) return {Decision::Changed, tier};
     return {Decision::Wait, tier};
 }
@@ -263,9 +311,17 @@ inline bool Commit(State& state, Input const& in, Decision decision)
     state.poseFlags = in.poseFlags;
     if (in.boneCount) state.bones.assign(in.bones, in.bones + in.boneCount);
     else state.bones.clear();
-    if (!wasLive) state.nearTier = in.distanceCm <= NearEnterCm;
+    if (!wasLive) { state.nearTier = in.distanceCm <= NearEnterCm; state.enteredAt = in.now; }
     state.urgent = detail::Urgency(in);
     state.live = true;
     return true;
+}
+
+inline uint32_t PresentationInterval(State const& state, Input const& in)
+{
+    if (detail::Urgency(in)) return FastIntervalMs;
+    const bool nearBand = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
+    return (nearBand || in.nearby) && in.moving ? OrdinaryIntervalMs :
+        in.moving ? MovingFarIntervalMs : IdleIntervalMs;
 }
 }

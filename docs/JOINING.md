@@ -42,6 +42,8 @@ letters, digits, underscores or hyphens. Use a different ID for each independent
 only to use the shared `default` group. The main menu and log show your ID. A Steam invite, `+connect_lobby`,
 `steam_lobby` or `steam_host` does not bypass this match. An invalid ID stops networking instead of falling back.
 IDs are public labels, not authentication secrets. Both players need the updated build; older relay builds cannot join.
+The compact relay header is 16 bytes for `default` and up to 72 bytes for a 63-character ID. The lobby number,
+session marker and exact session bytes must match before ENet data is forwarded.
 
 `language = auto` shows the mod's messages in the language of your Gothic 3 texts (German, Polish, otherwise
 English). To fix one, set `language = en`, `de` or `pl`; without the line the messages are English. Each player can
@@ -83,7 +85,7 @@ If Steam cannot start, a clear error is shown; fix Steam or the required DLL and
 - Either player can request a save. Wait for **"Co-op checkpoint saved for every participating player"**
   before leaving. A client never uploads its world to the host; both saves contain the host world
   and their respective account's character record. Back up the entire save folder, including `.g3t` and
-  `g3t-character-*.txt`, not only the native save pair. Both players need protocol 73.
+  `g3t-character-*.txt`, not only the native save pair. Both players need protocol 75.
 - See **Known issues** in the [full player guide](PLAYING.md) for problems and workarounds.
 
 ## If something goes wrong

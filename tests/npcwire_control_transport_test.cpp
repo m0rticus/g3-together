@@ -108,7 +108,7 @@ int main()
     SetNpcPoseHandler(GotPose);
     SetNpcReleaseHandler(CaptureReleases);
 
-    // An actual protocol-72 hello receives a refusal, never a welcome.
+    // Old wire versions receive a refusal, never a welcome.
     Hello oldHello{};
     oldHello.type = MsgHello;
     oldHello.version = 72;
@@ -123,7 +123,15 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     RefusedMsg refusal{};
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 72, host 73") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 72, host 75") != nullptr);
+    assert(!fakePeers[1].data && !peers[3]);
+    oldHello.version = 73;
+    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
+    transmissions.clear();
+    Deliver(&fakePeers[1], oldHandshake);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
+    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
+    assert(std::strstr(refusal.reason, "protocol 73, host 75") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     fakePeers[1].data = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
     transmissions.clear();
@@ -336,9 +344,14 @@ int main()
     SendPosedNpc(posed, poseBones, 80, pose::Facial);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlPose);
     const auto compactPose = transmissions[0];
+    std::vector<uint8_t> expectedPose;
+    bonewire::PoseCache keyEncoder;
+    bool isKey = false;
+    assert(keyEncoder.Encode(boneLayouts, 1, posed.incarnation, pose::Facial, poseBones, 80, fakeTime,
+                             expectedPose, isKey) == bonewire::Status::Ok && isKey);
     assert(compactPose.bytes.size() == sizeof(NpcsHeader) + 2 + sizeof(npcwire::WireBatchHeader) +
-           sizeof(npcwire::WireControl) + sizeof(npcwire::WireMotionTick) + sizeof(BonePosePrefix) + 80 * 24);
-    assert(fullPose.bytes.size() - compactPose.bytes.size() == 861);
+           sizeof(npcwire::WireControl) + sizeof(npcwire::WireMotionTick) + 2 + expectedPose.size());
+    assert(compactPose.bytes.size() < fullPose.bytes.size());
     hostBones = std::move(boneLayouts);
     boneLayouts = std::move(clientBones);
     isHost = false;
@@ -525,8 +538,7 @@ int main()
     const unsigned counts[] = {20, 50, 100};
     const size_t expectedControlBytes[] = {581, 1473, 2905};
     const size_t expectedLegacyControlBytes[] = {11990, 29975, 59950};
-    const size_t expectedLegacyPoseBytes[] = {57080, 142700, 285400};
-    const size_t expectedCompactPoseBytes[] = {39860, 99650, 199300};
+    const size_t expectedLegacyPoseBytes[] = {57100, 142750, 285500};
     for (unsigned c = 0; c < 3; ++c) {
         transmissions.clear();
         for (unsigned offset = 0; offset < counts[c]; offset += MaxNpcsPerMessage) {
@@ -542,7 +554,7 @@ int main()
         assert(bytes == expectedControlBytes[c]);
         assert((counts[c] / 2) * (sizeof(NpcsHeader) + 2 * sizeof(NpcRecord)) == expectedLegacyControlBytes[c]);
         assert(counts[c] * fullPose.bytes.size() == expectedLegacyPoseBytes[c]);
-        assert(counts[c] * compactPose.bytes.size() == expectedCompactPoseBytes[c]);
+        assert(counts[c] * compactPose.bytes.size() < counts[c] * fullPose.bytes.size());
     }
 
     // ENet otherwise promotes the snapshot itself to reliable at sequence
@@ -600,5 +612,98 @@ int main()
     transmissions.clear();
     SendNpcs(&exhausted, 1, false);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs && controlIdExhaustedLogged);
+
+    // Real pose handlers: ACK references survive a lost intermediate packet;
+    // resync requests force keys; essential records precede their own pose.
+    nextControlId = 0;
+    ResetNpcReplication();
+    NpcRecord streamRecord = Record(900);
+    pose::Bone streamBones[4]{};
+    for (int i = 0; i < 4; ++i) {
+        streamBones[i].name = static_cast<uint32_t>(i + 100);
+        streamBones[i].values[0] = streamBones[i].values[4] = streamBones[i].values[8] = 4096;
+        streamBones[i].values[1] = 123; // shear is not projected to a rotation
+    }
+    auto clientReceive = [&](std::vector<Transmission> const& packets) {
+        transmissions.clear();
+        isHost = false;
+        for (auto const& packet : packets) Deliver(&fakePeer, packet);
+        auto responses = transmissions;
+        transmissions.clear();
+        isHost = true;
+        for (auto const& response : responses) Deliver(&fakePeer, response);
+    };
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, false, 33));
+    auto streamBootstrap = transmissions;
+    clientReceive(streamBootstrap);
+    fakeTime += 33;
+    streamRecord.sent = fakeTime;
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, false, 33));
+    auto streamKey = transmissions;
+    clientReceive(streamKey);
+    assert(appliedInterval == 33);
+    fakeTime += 33; streamRecord.sent = fakeTime; ++streamBones[0].values[9];
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, false, 33));
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlPose);
+    const auto lostDelta = transmissions.front();
+    const size_t boneStart = sizeof(NpcsHeader) + 2 + BoneWire16(lostDelta.bytes.data() + sizeof(NpcsHeader)) + 2;
+    assert(bonewire::ReadPose32(lostDelta.bytes.data() + boneStart + 2) != 0);
+    fakeTime += 33; streamRecord.sent = fakeTime; ++streamBones[0].values[9];
+    transmissions.clear();
+    SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, false, 33);
+    auto survivingDelta = transmissions;
+    clientReceive(survivingDelta);
+    assert(appliedBones[0].values[9] == streamBones[0].values[9]);
+    const unsigned afterSurviving = applied;
+    isHost = false;
+    Deliver(&fakePeer, lostDelta);
+    assert(applied == afterSurviving);
+    decodedPoses.clear();
+    isHost = true;
+    fakeTime += 33; streamRecord.sent = fakeTime; ++streamBones[0].values[9];
+    transmissions.clear();
+    SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, false, 33);
+    auto missingReference = transmissions;
+    clientReceive(missingReference);
+    assert(bandwidth.poseReferenceMisses > 0 && applied == afterSurviving);
+    fakeTime += 33; streamRecord.sent = fakeTime;
+    transmissions.clear();
+    SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, false, 33);
+    auto recoveredKey = transmissions;
+    clientReceive(recoveredKey);
+    assert(applied == afterSurviving + 1 && appliedBones[0].values[9] == streamBones[0].values[9]);
+
+    ++streamRecord.incarnation; streamRecord.flags |= 1; streamRecord.hitPoints = 0;
+    fakeTime += 33; streamRecord.sent = fakeTime;
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, true, 16));
+    auto deathPackets = transmissions;
+    assert(deathPackets.front().bytes[0] == MsgNpcs);
+    NpcsHeader reliableHeader{}, posedHeader{};
+    std::memcpy(&reliableHeader, deathPackets.front().bytes.data(), sizeof(reliableHeader));
+    std::memcpy(&posedHeader, deathPackets.back().bytes.data(), sizeof(posedHeader));
+    assert(npcwire::Newer(posedHeader.publication, reliableHeader.publication));
+    clientReceive(deathPackets);
+    assert(applied == afterSurviving + 2);
+    failSend = true;
+    assert(!SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, true, 16));
+    failSend = false;
+
+    // Even a single identity bone has a valid tiny packed-key envelope.
+    NpcRecord one = Record(901);
+    streamBones[0].values[1] = streamBones[0].values[9] = 0;
+    transmissions.clear();
+    SendPosedNpcTo(2, one, streamBones, 1, 0, false, 100);
+    auto oneBootstrap = transmissions;
+    clientReceive(oneBootstrap);
+    transmissions.clear();
+    ++fakeTime; one.sent = fakeTime;
+    SendPosedNpcTo(2, one, streamBones, 1, 0, false, 100);
+    auto onePose = transmissions;
+    clientReceive(onePose);
+    assert(appliedBones.size() == 1 && appliedInterval == 100);
     return 0;
 }
