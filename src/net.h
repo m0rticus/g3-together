@@ -222,6 +222,16 @@ void SendNpcRelease(uint8_t const* guids, int count);  // host retires interest;
 bool SendNpcReleaseTo(uint8_t to, uint8_t const* guids, int count);
 using NpcReleaseHandler = int (*)(uint8_t owner, uint32_t generation, uint8_t* guids, int count);
 void SetNpcReleaseHandler(NpcReleaseHandler handler);
+#pragma pack(push, 1)
+struct NpcRemovalNote {
+    uint8_t guid[16] = {};
+    uint32_t epoch = 0, world = 0, incarnation = 0;
+};
+#pragma pack(pop)
+static_assert(sizeof(NpcRemovalNote) == 28, "NPC removal wire layout");
+bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note);
+using NpcRemovalHandler = void (*)(NpcRemovalNote const&);
+void SetNpcRemovalHandler(NpcRemovalHandler handler);
 void ResetNpcReplication();  // forget ordering/history fences on a world change, not the host publication clock
 void NpcReplicationCounts(unsigned& accepted, unsigned& rejected, unsigned& stale);
 void NpcPoseCounts(unsigned& sent, unsigned& received, unsigned& failed);

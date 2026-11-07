@@ -21,6 +21,8 @@ void LocalHit(eCEntity* entity);  // our hero hit this mirror: its stagger shows
 void LocalHit(eCEntity* entity, uint32_t sequence);
 void HostHit(eCEntity* entity, uint8_t player, uint32_t sequence);
 void Despawn(eCEntity* entity);  // host: publish removal of this NPC incarnation, without client death/respawn scripts
+void ForgetRemoved(uint8_t const guid[16]); // discard presentation/publication state without a death transition
+void ReleaseRemovedAim(eCEntity* entity);
 uint32_t Incarnation(uint8_t const guid[16]);
 void SetContext(eCEntity* entity, uint8_t player);
 uint8_t ContextPlayer(eCEntity* entity);

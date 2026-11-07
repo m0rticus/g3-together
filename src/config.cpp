@@ -59,6 +59,10 @@ Config const& LoadConfig()
         strncpy_s(value, equals + 1, _TRUNCATE);
         Trim(key);
         Trim(value);
+        if (!_stricmp(key, "ardea_remove_npcs") && std::strlen(equals + 1) >= sizeof(value)) {
+            Log("config: ardea_remove_npcs is too long; keeping previous setting");
+            continue;
+        }
         if (!_stricmp(key, "role")) config.host = _stricmp(value, "client") != 0;
         else if (!_stricmp(key, "session_id")) {
             config.sessionIdValid = ValidSessionId(value);
@@ -139,6 +143,10 @@ Config const& LoadConfig()
             const float roi = static_cast<float>(std::atof(value));
             if (roi >= 1000.0f && roi <= 20000.0f) config.hostRoi = roi;
             else Logf("config: host_roi %s out of 1000-20000; using %.0f", value, config.hostRoi);
+        }
+        else if (!_stricmp(key, "ardea_remove_npcs")) {
+            if (!npcremoval::policy::ParseNames(value, config.ardeaRemoveNpcs))
+                Logf("config: invalid ardea_remove_npcs '%s'; use Goblin,Ogre or an empty value; keeping previous setting", value);
         }
     }
     fclose(file);

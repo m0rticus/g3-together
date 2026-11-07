@@ -285,7 +285,7 @@ $lines.Add('language = auto')
 $productionKeys = @(
     'partner_key', 'look', 'puppet_template', 'reputation', 'host_roi', 'host_sim',
     'puppet_lead', 'motion_seek', 'listener_textbox', 'friendly_fire', 'npc_damage',
-    'npc_hp', 'steam_host'
+    'npc_hp', 'steam_host', 'ardea_remove_npcs'
 )
 $kept = @($old.Keys | Where-Object { $productionKeys -contains $_.ToString().ToLower() })
 if ($kept.Count -gt 0) {

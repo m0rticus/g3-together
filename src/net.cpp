@@ -43,6 +43,7 @@ enum : uint8_t { MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 4
                  MsgControlSignal = 48, MsgControlPose = 49 };
 enum : uint8_t { MsgPlayerActivity = 50 };
 enum : uint8_t { MsgPoseAck = 51 };
+enum : uint8_t { MsgNpcRemoval = 52 };
 constexpr uint8_t MsgPlayerResync = 60;
 
 #pragma pack(push, 1)
@@ -74,6 +75,7 @@ struct NpcReleaseHeader {
     uint32_t sequence, epoch, generation, publication;
     uint8_t count, owner;
 };
+struct NpcRemovalMsg { uint8_t type; NpcRemovalNote note; };
 struct MotionNameMsg { uint8_t type; uint32_t hash; char name[96]; };
 // to: the player who applies it (the NPC's owner, the hit player); from: who sent it (set by the host).
 struct HitNpcMsg { uint8_t type; uint8_t guid[16]; int32_t delta; uint8_t weapon[16]; uint8_t to; uint8_t from; uint8_t npc[16]; uint8_t outcome; uint32_t seen; uint8_t reaction; uint32_t epoch, sequence, incarnation; MeleeContact contact; };
@@ -204,6 +206,7 @@ NpcHandler npcHandler = nullptr;
 NpcPoseHandler npcPoseHandler = nullptr;
 PlayerStateHandler playerStateHandler = nullptr;
 NpcReleaseHandler npcReleaseHandler = nullptr;
+NpcRemovalHandler npcRemovalHandler = nullptr;
 MotionNameHandler motionNameHandler = nullptr;
 HitNpcHandler hitNpcHandler = nullptr;
 HitResultHandler hitResultHandler = nullptr;
@@ -1359,6 +1362,18 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             std::memcpy(batchRecords, packet->data + sizeof(header), header.count * sizeof(NpcRecord));
             finishRecords(batchRecords, processRecords(batchRecords, header.count));
         }
+    } else if (type == MsgNpcRemoval) {
+        if (isHost || peer != server || !(packet->flags & ENET_PACKET_FLAG_RELIABLE) ||
+            packet->dataLength != sizeof(NpcRemovalMsg)) {
+            ++npcRejected;
+            Log("net: invalid NPC removal sender or message");
+            return;
+        }
+        NpcRemovalMsg message{};
+        std::memcpy(&message, packet->data, sizeof(message));
+        if (message.note.epoch != worldEpoch || !message.note.incarnation) { ++npcStale; return; }
+        decodedPoses.erase(NpcKey(message.note.guid));
+        if (npcRemovalHandler) npcRemovalHandler(message.note);
     } else if (type == MsgNpcRelease && packet->dataLength >= sizeof(NpcReleaseHeader)) {
         if (isHost) { ++npcRejected; return; }
         NpcReleaseHeader header;
@@ -2252,6 +2267,17 @@ void SendNpcRelease(uint8_t const* guids, int count)
 
 void SetNpcReleaseHandler(NpcReleaseHandler handler) { npcReleaseHandler = handler; }
 
+bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note)
+{
+    if (!isHost || !host || to < 2 || to >= MaxPlayers || !peers[to] ||
+        !PeerJoined(to) || !InWorld(to) || !note.epoch ||
+        note.epoch != worldEpoch || !note.incarnation) return false;
+    const NpcRemovalMsg message{MsgNpcRemoval, note};
+    return Send(peers[to], &message, sizeof(message), ChannelNpcs, true);
+}
+
+void SetNpcRemovalHandler(NpcRemovalHandler handler) { npcRemovalHandler = handler; }
+
 void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player)
 {
     hitNpcHandler = npc;
@@ -2748,6 +2774,7 @@ void Stop()
     npcPoseHandler = nullptr;
     playerStateHandler = nullptr;
     npcReleaseHandler = nullptr;
+    npcRemovalHandler = nullptr;
     motionNameHandler = nullptr;
     hitNpcHandler = nullptr;
     hitResultHandler = nullptr;

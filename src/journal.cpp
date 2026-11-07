@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "journal.h"
+#include "npcremoval.h"
 
 #include "log.h"
 #include "net.h"
@@ -61,6 +62,7 @@ void CountQuest(Entity& npc)
 
 void OnDeath(uint8_t by, uint8_t const guid[16])
 {
+    if (npcremoval::Suppressed(guid)) return;
     ++received;
     if (net::IsHost()) net::SendDeath(guid, by, by);  // pass it on to everyone else
     const std::string key(reinterpret_cast<char const*>(guid), 16);
@@ -94,6 +96,7 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
 // too: the client's quest manager completed the raid quest again and paid its reward (stage 3c regression).
 void Apply(Entity& npc, Death& d)
 {
+    if (npcremoval::Suppressed(npc.GetInstance())) return;
     npc.NPC.DefeatedByPlayer = GETrue;
     npc.Routine.FullStop();
     npc.DamageReceiver.HitPoints = 0;
@@ -192,7 +195,7 @@ void Tick()
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity npc = all.GetAt(i);
         eCEntity* instance = npc.GetInstance();
-        if (!instance || instance == hero || remote::IsPuppet(instance)) continue;
+        if (!instance || instance == hero || remote::IsPuppet(instance) || npcremoval::Suppressed(instance)) continue;
         const std::string key = Key(instance);
         const bool dead = npc.IsDead();
         auto entry = deaths.find(key);

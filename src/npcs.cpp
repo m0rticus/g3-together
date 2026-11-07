@@ -16,6 +16,7 @@
 #include "talk.h"
 #include "world.h"
 #include "npcplayback.h"
+#include "npcremoval.h"
 #include "npcsend_policy.h"
 #include "replication.h"
 #include "ragdoll_force.h"
@@ -255,7 +256,7 @@ NpcOpponents IndexNpcOpponents()
     const bTObjArray<Entity> all = Entity::GetNPCs();
     for (int i = 0; i < all.GetCount(); ++i) {
         eCEntity* entity = all.GetAt(i).GetInstance();
-        if (!entity) continue;
+        if (!entity || npcremoval::Suppressed(entity)) continue;
         uint8_t bytes[16];
         guid::CopyEntity(entity, bytes);
         const auto inserted = result.emplace(net::HashGuid(bytes), entity);
@@ -536,6 +537,7 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
     if (!receiving) return 0;
     int accepted = 0;
     for (int i = 0; i < count; ++i) {
+        if (npcremoval::Suppressed(records[i].guid)) continue;
         const std::string key = Key(records[i].guid);
         const uint32_t captured = records[i].sent ? records[i].sent : sent;
         const auto existing = mirrors.find(key);
@@ -764,6 +766,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         eCEntity* instance = npc.GetInstance();
         if (!instance || instance == hero || remote::IsPuppet(instance)) continue;
         if (instance == controlled) continue;  // a transformed player's creature travels as its player state
+        if (npcremoval::Suppressed(instance)) continue;
         uint8_t guid[16];
         guid::CopyEntity(instance, guid);
         SendNote& note = sendNotes[Key(guid)];
@@ -1598,6 +1601,7 @@ void UpdateCorpsePresentation(Mirror& m, uint32_t now)
 
 void OnRagdollNote(net::RagdollNote const& note)
 {
+    if (npcremoval::Suppressed(note.guid)) return;
     const auto absent = absences.find(Key(note.guid));
     if (absent != absences.end() && static_cast<int32_t>(note.incarnation - absent->second.incarnation) <= 0) {
         ++ragdollForcesLate;
@@ -3254,6 +3258,7 @@ char const* MotionNameOf(uint32_t hash)
 
 eCEntity* NpcByGuid(uint8_t const guid[16])
 {
+    if (npcremoval::Suppressed(guid)) return nullptr;
     eCEntity* instance = Resolve(guid).GetInstance();
     return IsNpc(instance) ? instance : nullptr;
 }
@@ -3344,9 +3349,41 @@ void HostHit(eCEntity* entity, uint8_t player, uint32_t sequence)
     hostHits[Key(guid)] = {player, sequence};
 }
 
+void ReleaseRemovedAim(eCEntity* entity)
+{
+    if (!entity) return;
+    eCEntity* bodies[] = {gCSession::GetInstance().GetHero(), remote::ControlledBody()};
+    for (auto* body : bodies) {
+        if (!body) continue;
+        auto* animation = static_cast<eCVisualAnimation_PS*>(body->GetPropertySet(eEPropertySetType_Animation));
+        if (AutoAimTarget(animation) == entity)
+            Entity(body).EnableAutoAiming(GEFalse, Entity(), bCString());
+    }
+}
+
+void ForgetRemoved(uint8_t const guid[16])
+{
+    const std::string key = Key(guid);
+    mirrors.erase(key);
+    corpses.erase(key);
+    absences.erase(key);
+    pendingForces.erase(key);
+    forceHistory.erase(key);
+    hostHits.erase(key);
+    lastSent.erase(key);
+    sending.erase(key);
+    owned.erase(key);
+    sendNotes.erase(key);
+    deadOnHost.erase(key);
+    for (auto& recipient : recipientNpcs) recipient.erase(key);
+    for (auto it = forceSequences.begin(); it != forceSequences.end();)
+        if (it->first.compare(0, 16, key) == 0) it = forceSequences.erase(it);
+        else ++it;
+}
+
 void Despawn(eCEntity* entity)
 {
-    if (!net::IsHost() || !IsNpc(entity)) return;
+    if (!net::IsHost() || !IsNpc(entity) || npcremoval::Suppressed(entity)) return;
     uint8_t guid[16];
     Guid(entity, guid);
     const std::string key = Key(guid);
@@ -3411,6 +3448,7 @@ bool IsMirrored(eCEntity const* entity)
 
 bool Ready(eCEntity const* entity)
 {
+    if (npcremoval::Suppressed(entity)) return false;
     if (!IsMirrored(entity)) return true;
     for (auto const& entry : mirrors)
         if (entry.second.entity.GetInstance() == entity)
@@ -3802,6 +3840,7 @@ bool Follow(uint8_t const guid[16], uint8_t player, uint8_t memberType, bool wai
 
 void NewLife(uint8_t const guid[16])
 {
+    if (npcremoval::Suppressed(guid)) return;
     if (net::IsHost()) {
         uint32_t& incarnation = incarnations[Key(guid)];
         if (!incarnation) incarnation = 1;

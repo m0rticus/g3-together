@@ -3,6 +3,9 @@
 #include "npcwire_bones_transport_test.cpp"
 #undef main
 
+unsigned removalMessages = 0;
+NpcRemovalNote receivedRemoval{};
+
 int main()
 {
     ENetHost fakeHost{};
@@ -30,6 +33,58 @@ int main()
     server = &fakePeers[0];
     connected = inWorld = isHost = true;
     localId = 1;
+
+    const uint32_t previousEpoch = worldEpoch;
+    worldEpoch = 17;
+    SetNpcRemovalHandler([](NpcRemovalNote const& removal) {
+        ++removalMessages;
+        receivedRemoval = removal;
+    });
+    NpcRemovalNote removal{};
+    removal.guid[0] = 77;
+    removal.epoch = worldEpoch;
+    removal.world = 42;
+    removal.incarnation = 3;
+    clientInWorld[2] = false;
+    assert(!SendNpcRemovalTo(2, removal) && transmissions.empty());
+    clientInWorld[2] = true;
+    failSend = true;
+    assert(!SendNpcRemovalTo(2, removal) && transmissions.empty());
+    failSend = false;
+    assert(SendNpcRemovalTo(2, removal) && transmissions.size() == 1);
+    const auto terminal = transmissions[0];
+    assert(terminal.bytes.size() == 29 && terminal.bytes[0] == MsgNpcRemoval);
+    assert(terminal.channel == ChannelNpcs && (terminal.flags & ENET_PACKET_FLAG_RELIABLE));
+    transmissions.clear();
+    isHost = false;
+    localId = 2;
+    Deliver(server, terminal);
+    assert(removalMessages == 1 && receivedRemoval.guid[0] == 77 && receivedRemoval.incarnation == 3);
+    Deliver(&fakePeers[1], terminal);
+    assert(removalMessages == 1);
+    auto unreliableRemoval = terminal;
+    unreliableRemoval.flags = 0;
+    Deliver(server, unreliableRemoval);
+    assert(removalMessages == 1);
+    auto staleRemoval = terminal;
+    NpcRemovalMsg staleMessage{};
+    std::memcpy(&staleMessage, staleRemoval.bytes.data(), sizeof(staleMessage));
+    --staleMessage.note.epoch;
+    std::memcpy(staleRemoval.bytes.data(), &staleMessage, sizeof(staleMessage));
+    Deliver(server, staleRemoval);
+    assert(removalMessages == 1);
+    inWorld = false;
+    Deliver(server, terminal);
+    assert(removalMessages == 1);
+    inWorld = true;
+    auto oversizedRemoval = terminal;
+    oversizedRemoval.bytes.push_back(0);
+    Deliver(server, oversizedRemoval);
+    assert(removalMessages == 1);
+    isHost = true;
+    localId = 1;
+    worldEpoch = previousEpoch;
+    SetNpcRemovalHandler(nullptr);
 
     PlayerState local{};
     local.flags = 1;

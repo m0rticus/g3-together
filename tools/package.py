@@ -40,6 +40,9 @@ partner_key = PAGEDOWN
 # How far around the host its game runs the world, in cm (default 8000; the game itself uses 4000). Larger keeps the
 # NPCs near the other player on this PC longer, so they change hands less often.
 # host_roi = 8000
+# Suppress only the reviewed world-data Goblin/Ogre instances in Ardea; no kill/loot/XP.
+# An empty value disables this host-only rule. Quest creatures and other regions are unaffected.
+# ardea_remove_npcs = Goblin,Ogre
 # spheres (default): the host runs the world in a sphere of host_roi around each player, so the NPCs near the other player
 # stay on this PC (up to the host's view distance). elastic: one sphere around both players instead. off: each PC runs its
 # own surroundings (before 0.7.0).

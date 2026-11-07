@@ -9,6 +9,7 @@
 #include "config.h"
 #include "net.h"
 #include "npcs.h"
+#include "npcremoval.h"
 #include "processing.h"
 #include "remote.h"
 
@@ -502,10 +503,11 @@ float const* Field(eCEntityAdmin const* admin, int offset) { return reinterpret_
 bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, unsigned& expanded)
 {
     const bool native = admin->IntersectsProcessingRangeRegion(box);
-    if (native) return true;
     // Reached only from the validated LEA/PUSH/CALL sites of the engine's two dynamic-entity range paths.
     static_assert(offsetof(eCEntity, m_WorldNodeBoundary) == 0xe8, "native dynamic-collection box offset");
     auto const* entity = reinterpret_cast<eCEntity const*>(reinterpret_cast<char const*>(&box) - 0xe8);
+    if (npcremoval::ExcludeFromProcessing(entity)) return false;
+    if (native) return true;
     const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
     ++checks;
     const bool included = processing::IncludesNpc(native, npc, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount);

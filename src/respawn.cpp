@@ -6,6 +6,7 @@
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "npcremoval.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -54,6 +55,7 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 {
     if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     eCEntity* instance = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+    if (npcremoval::Suppressed(instance)) return 0;
     if (npcs::IsMirrored(instance)) { ++mirrorsSkipped; return 0; }
     if (!enabled || !instance) return original(spu, self, other, args);
     Entity npc(instance);

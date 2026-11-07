@@ -6,6 +6,15 @@ A first session for two players, one host and one joining player: joining, comba
 knock-outs, dialogs, quests, trading, looting, separate regions, saving, loading and rejoining.
 This checklist also covers recording bugs and collecting logs with `tools\collect_logs.py`.
 
+### Ardea creature removal (manual, not yet runtime-verified)
+
+- [ ] With the default host rule, start a new shared game in Ardea: no Goblins/Ogres on either screen;
+  slaves, orc raiders and citizens remain, with no leftover bodies or attacks against vanished targets.
+- [ ] Load an older Ardea save containing the creatures and repeat on both screens. Removal must not award
+  XP/loot, alter quest counters or manufacture a death; already-recorded effects in the old save are not undone.
+- [ ] Save/reload, leave/return, late-join/reconnect and shut down normally; removed mirrors must not return.
+- [ ] Confirm quest-specific Goblins/Ogres and creatures outside the Ardea box still exist.
+
 ## Before you start
 
 ### Players and installations

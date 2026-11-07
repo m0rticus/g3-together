@@ -54,4 +54,5 @@ bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> co
 bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now);
 void Tick();
 void OnWorldDeactivate();
+void ForgetRemoved(uint8_t const guid[16]);
 }

@@ -160,6 +160,14 @@ load distant simulation regions; the real camera, static-world culling and build
 `host_roi` controls NPC coverage, not rendering distance. The old `host_sim = off/elastic` choices no longer transfer
 simulation to a client.
 
+By default, the host suppresses 24 reviewed world-data Goblin/Ogre instances below/alongside Ardea
+that extended NPC coverage can bring into the starting village. This is non-death suppression:
+no bodies, loot, XP or quest callbacks. Other regions, summons and quest-specific creatures are unchanged.
+The host can select `ardea_remove_npcs = Goblin,Ogre`, `Goblin`, `Ogre`, or an empty value to disable
+the rule. Names are exact; invalid/duplicate names are logged and leave the previous setting unchanged.
+Clients follow the host's reliable removal records, including after rejoining/loading.
+Choose the setting before making the co-op save: disabled entity flags already written into a save are retained.
+
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
 30 Hz; combat, focus, contact and dialogue retain the high-rate stream. Changed idle poses and distant movers use

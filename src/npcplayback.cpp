@@ -11,6 +11,7 @@
 #include "remote.h"
 #include "config.h"
 #include "npcs.h"
+#include "npcremoval.h"
 #include "guards.h"
 #include "talk.h"
 
@@ -916,7 +917,7 @@ bool Start(bool client)
     clientMode = client;
     enabled = true;
     net::SetNpcPoseHandler([](net::NpcRecord const& record, pose::Bone const* bones, int count, uint8_t flags, bool, uint8_t interval) {
-        if (net::IsHost()) return;
+        if (net::IsHost() || npcremoval::Suppressed(record.guid)) return;
         auto& received = receivedPoses[std::string(reinterpret_cast<char const*>(record.guid), 16)];
         if (received.history.Push(record.incarnation, record.sent, bones, count, flags)) {
             received.arrived = net::Now();
@@ -934,6 +935,11 @@ bool Start(bool client)
 }
 
 bool Available() { return enabled; }
+
+void ForgetRemoved(uint8_t const guid[16])
+{
+    receivedPoses.erase(std::string(reinterpret_cast<char const*>(guid), 16));
+}
 
 uint32_t PoseInterval(net::NpcRecord const& record)
 {

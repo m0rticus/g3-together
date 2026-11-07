@@ -14,6 +14,7 @@
 #include "melee_policy.h"
 #include "net.h"
 #include "npcs.h"
+#include "npcremoval.h"
 #include "npcplayback.h"
 #include "remote.h"
 #include "ranged.h"
@@ -1410,6 +1411,7 @@ void QueueHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t co
 // Client: this player's hit killed a host NPC: the game's own reward (GiveXP computes it from the NPC's level).
 void OnKilled(uint8_t const guid[16], uint32_t incarnation)
 {
+    if (npcremoval::Suppressed(guid)) return;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     _GUID raw;
     std::memcpy(&raw, guid, 16);

@@ -5,6 +5,7 @@
 #include "ai.h"
 #include "combat.h"
 #include "net.h"
+#include "npcremoval.h"
 #include "story.h"
 #include "talk.h"
 #include "downed.h"
@@ -138,6 +139,7 @@ class Module : public eCEngineComponentBase
         ForgetStep("NPC playback cleanup / source-options mutex", &g3t::npcplayback::OnWorldDeactivate);
         ForgetStep("remote puppet cleanup", &g3t::remote::OnWorldDeactivate);
         ForgetStep("NPC cleanup / replication reset", &g3t::npcs::OnWorldDeactivate);
+        ForgetStep("Ardea removal cleanup", &g3t::npcremoval::OnWorldDeactivate);
         ForgetStep("combat cleanup", &g3t::combat::OnWorldChange);
         ForgetStep("shot cleanup", &g3t::shot::OnWorldChange);
         ForgetStep("summon cleanup", &g3t::summon::OnWorldChange);
@@ -237,6 +239,7 @@ class Module : public eCEngineComponentBase
         }
         g3t::crashlog::Tick();
         g3t::world::Tick();
+        g3t::npcremoval::Tick();
         g3t::npcplayback::Tick();
         {
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
@@ -306,6 +309,7 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
         g3t::Log("FAIL co-op disabled: this game build does not support authoritative NPC playback");
     }
     g3t::npcs::Start();
+    g3t::npcremoval::Start();
     g3t::combat::Start();
     g3t::summon::Start();
     g3t::shot::Start();
