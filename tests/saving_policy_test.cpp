@@ -36,6 +36,32 @@ int main()
     assert(!WorldMatches(8, 0, 8, false, false));
     assert(WorldMatches(8, 0, 0, false, true));
     assert(!WorldMatches(0, 0, 0, true, true));
+    assert(ChunkFits(0, 0, 100, 0, 10, 100));
+    assert(ChunkFits(100, 10, 100, 10, 90, 100));
+    assert(!ChunkFits(100, 10, 99, 10, 89, 100)); // Total cannot change between chunks.
+    assert(!ChunkFits(100, 10, 101, 10, 91, 100));
+    assert(!ChunkFits(0, 0, 101, 0, 10, 100));
+    assert(!ChunkFits(100, 10, 100, 9, 10, 100)); // Duplicate/out-of-order offset.
+    assert(!ChunkFits(100, 10, 100, 11, 10, 100));
+    assert(!ChunkFits(100, 10, 100, 10, 91, 100));
+    assert(!ChunkFits(0, 0, 0, 0, 0, 100));
+    assert(!ChunkFits(100, 100, 100, UINT32_MAX, 1, 100));
+    assert(PreparedMatches(alice, alice, 3, 3, 7, 7, "QuickSave", "QuickSave"));
+    assert(!PreparedMatches(alice, bob, 3, 3, 7, 7, "QuickSave", "QuickSave"));
+    assert(!PreparedMatches(alice, {previous, checkpoint, 123}, 3, 3, 7, 7, "QuickSave", "QuickSave"));
+    assert(!PreparedMatches(alice, alice, 2, 3, 7, 7, "QuickSave", "QuickSave"));
+    assert(!PreparedMatches(alice, alice, 3, 3, 6, 7, "QuickSave", "QuickSave"));
+    assert(!PreparedMatches(alice, alice, 3, 3, 7, 7, "QuickSave", "another"));
+    int savedDowned = 9;
+    assert(ParseRecordDowned("downed 0", 3, false, savedDowned) && savedDowned == 0);
+    assert(ParseRecordDowned("downed 1", 4, false, savedDowned) && savedDowned == 1);
+    for (auto line : {"downed", "downed 2", "downed -1", "downed 1 extra", "downed x", "downed 1x"}) {
+        assert(!ParseRecordDowned(line, 3, false, savedDowned) && savedDowned == 1);
+    }
+    assert(!ParseRecordDowned("downed 0", 4, true, savedDowned) && savedDowned == 1);
+    assert(!ParseRecordDowned("downed 0", 2, false, savedDowned) && savedDowned == 1);
+    assert(!ParseRecordDowned("downed 0", 5, false, savedDowned) && savedDowned == 1);
+    assert(!ParseRecordDowned(std::string("downed 0\0extra", 14), 4, false, savedDowned));
 
     const std::string identity = "identity " + world + " " + checkpoint + " 123";
     const std::string poseLine = "pose 12 -34 56 0 0 0 1";

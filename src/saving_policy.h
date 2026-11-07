@@ -67,6 +67,19 @@ inline uint64_t LegacyNativeOwner(std::string const& slot, uint64_t localAccount
 {
     return Prefix(slot, "G3T_host_") ? UINT64_MAX : localAccount;
 }
+inline bool ChunkFits(uint32_t declared, size_t received, uint32_t total, uint32_t offset,
+                      uint16_t length, uint32_t limit)
+{
+    return total && total <= limit && (!declared || declared == total) && length &&
+           offset <= total && length <= total - offset && received == offset;
+}
+inline bool PreparedMatches(Key const& captured, Key const& incoming, uint32_t welcome,
+                            uint32_t currentWelcome, uint32_t epoch, uint32_t currentEpoch,
+                            std::string const& slot, std::string const& incomingSlot)
+{
+    return Exact(captured, incoming) && welcome == currentWelcome && epoch == currentEpoch &&
+           SafeName(slot.c_str()) && slot == incomingSlot;
+}
 inline bool WorldMatches(uint32_t hostEpoch, uint32_t admittedEpoch, uint32_t loadedEpoch,
                          bool sameCheckpoint, bool freshNewWorld)
 {
@@ -144,6 +157,20 @@ inline std::vector<std::string> RecordWords(std::string const& line)
     while (input >> word) words.push_back(word);
     return words;
 }
+}
+
+inline bool ParseRecordDowned(std::string const& line, int version, bool alreadyPresent, int& downed)
+{
+    if (version < 3 || version > 4 || alreadyPresent || line.size() > 511 ||
+        line.find('\0') != std::string::npos) return false;
+    const auto words = detail::RecordWords(line);
+    if (words.size() != 2 || words[0] != "downed") return false;
+    int value = 0;
+    const auto parsed = std::from_chars(words[1].data(), words[1].data() + words[1].size(), value);
+    if (parsed.ec != std::errc() || parsed.ptr != words[1].data() + words[1].size() ||
+        (value != 0 && value != 1)) return false;
+    downed = value;
+    return true;
 }
 
 // Each argument is one complete line, without its line terminator. On failure neither output is changed.

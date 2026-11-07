@@ -178,6 +178,23 @@ bool CaptureAttributes(gCPlayerMemory_PS& memory, std::vector<saving::RecordAttr
     return true;
 }
 
+bool AttributesMatch(gCPlayerMemory_PS& memory, std::vector<saving::RecordAttribute> const& attrs, bool held)
+{
+    for (auto const& value : attrs) {
+        const bCString name(value.tag.c_str());
+        const int base = held && value.tag == "HP" ? 1 : value.base;
+        gCAttribute* attribute = memory.GetAttribute(name);
+        if (!attribute || memory.GetBaseValue(name) != base || memory.GetModifier(name) != value.modifier ||
+            memory.GetValue(name) != base + value.modifier) return false;
+        if (saving::StatTag(value.tag)) {
+            auto* stat = dynamic_cast<gCStat*>(attribute);
+            if (!stat || stat->GetBaseMaximum() != value.baseMaximum || stat->GetMaximumModifier() != value.maximumModifier ||
+                memory.GetMaximum(name) != value.baseMaximum + value.maximumModifier) return false;
+        } else if (memory.GetMaximum(name) != base + value.modifier) return false;
+    }
+    return true;
+}
+
 bool ApplyAttributes(gCPlayerMemory_PS& memory, std::vector<saving::RecordAttribute> const& attrs)
 {
     for (auto const& value : attrs) {
@@ -193,19 +210,7 @@ bool ApplyAttributes(gCPlayerMemory_PS& memory, std::vector<saving::RecordAttrib
         }
         if (memory.GetBaseValue(name) != value.base && !memory.SetBaseValue(name, value.base)) return false;
     }
-    for (auto const& value : attrs) {
-        const bCString name(value.tag.c_str());
-        gCAttribute* attribute = memory.GetAttribute(name);
-        if (!attribute || memory.GetBaseValue(name) != value.base || memory.GetModifier(name) != value.modifier ||
-            memory.GetValue(name) != value.base + value.modifier) return false;
-        if (saving::StatTag(value.tag)) {
-            auto* stat = dynamic_cast<gCStat*>(attribute);
-            if (!stat) return false;
-            if (stat->GetBaseMaximum() != value.baseMaximum || stat->GetMaximumModifier() != value.maximumModifier ||
-                memory.GetMaximum(name) != value.baseMaximum + value.maximumModifier) return false;
-        } else if (memory.GetMaximum(name) != value.base + value.modifier) return false;
-    }
-    return true;
+    return AttributesMatch(memory, attrs, false);
 }
 
 // A quick slot sits on its stack (gCInventoryStack::m_iQuickSlot), so a stack the record deletes and makes again comes
@@ -262,7 +267,7 @@ std::vector<Quick> QuickSlotsOf(Entity& self)
 }
 
 char const* ValidateContents(std::vector<Stack> const& stacks, std::vector<std::string> const& spells,
-                             std::vector<Quick> const& quick)
+                             std::vector<Quick> const& quick, bool templates = true)
 {
     std::unordered_set<std::string> skills, spellIds, foundSpells;
     std::map<std::pair<std::string, unsigned>, size_t> stackCounts, quickCounts;
@@ -273,24 +278,26 @@ char const* ValidateContents(std::vector<Stack> const& stacks, std::vector<std::
             s.slot < gESlot_None || s.slot > gESlot_Helmet || s.category < 0 || s.category >= gEItemCategory_Count ||
             (s.category == gEItemCategory_Skill ? (s.learned < 0 || s.learned > 1 || !skills.insert(s.id).second) : s.learned != -1))
             return "a stack out of range or a duplicate skill";
-        const Template item = FromHex(s.id);
-        if (!item.IsValid()) return "an invalid item template";
-        eCTemplateEntityProxy proxy;
-        proxy.SetEntity(static_cast<bCPropertyID const&>(item));
-        eCTemplateEntity* templateEntity = proxy.GetEntity();
-        if (!templateEntity || !templateEntity->GetPropertySet(eEPropertySetType_Item))
-            return "a stack whose item does not exist";
-        Entity templateItem(templateEntity);
-        if (static_cast<int>(templateItem.Item.GetCategory()) != s.category) return "a stack with the wrong item category";
-        if (s.category == gEItemCategory_Skill) {
-            Entity skill = templateItem.Item.GetSkill();
-            if (!skill.GetInstance() || !skill.GetTemplate().IsValid()) return "a skill whose template does not exist";
+        if (templates) {
+            const Template item = FromHex(s.id);
+            if (!item.IsValid()) return "an invalid item template";
+            eCTemplateEntityProxy proxy;
+            proxy.SetEntity(static_cast<bCPropertyID const&>(item));
+            eCTemplateEntity* templateEntity = proxy.GetEntity();
+            if (!templateEntity || !templateEntity->GetPropertySet(eEPropertySetType_Item))
+                return "a stack whose item does not exist";
+            Entity templateItem(templateEntity);
+            if (static_cast<int>(templateItem.Item.GetCategory()) != s.category) return "a stack with the wrong item category";
+            if (s.category == gEItemCategory_Skill) {
+                Entity skill = templateItem.Item.GetSkill();
+                if (!skill.GetInstance() || !skill.GetTemplate().IsValid()) return "a skill whose template does not exist";
+            }
+            if (s.category == gEItemCategory_Spellbook && spellIds.count(s.id)) {
+                Entity spell = templateItem.Item.GetSpell();
+                if (!spell.GetInstance() || !spell.GetTemplate().IsValid()) return "a spell whose template does not exist";
+            }
         }
-        if (s.category == gEItemCategory_Spellbook && spellIds.count(s.id)) {
-            Entity spell = templateItem.Item.GetSpell();
-            if (!spell.GetInstance() || !spell.GetTemplate().IsValid()) return "a spell whose template does not exist";
-            foundSpells.insert(s.id);
-        }
+        if (s.category == gEItemCategory_Spellbook && spellIds.count(s.id)) foundSpells.insert(s.id);
         ++stackCounts[{s.id, s.quality}];
     }
     if (foundSpells.size() != spellIds.size()) return "a missing spell item";
@@ -495,7 +502,7 @@ bool SaveRecordImpl(char const* path, saving::Key const* key)
         ok = ok && fprintf(file, "pose %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n", pose.position[0], pose.position[1], pose.position[2],
                            pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]) > 0;
     }
-    else ok = ok && fprintf(file, "downed %d\n", downed::Held() ? 1 : 0) > 0;
+    ok = ok && fprintf(file, "downed %d\n", downed::Held() ? 1 : 0) > 0;
     ok = ok && fprintf(file, "level %u %u\n", static_cast<unsigned>(self.NPC.Level), static_cast<unsigned>(self.NPC.LevelMax)) > 0;
     ok = ok && fprintf(file, "xp %d\nlp %d %d\n", static_cast<int>(self.PlayerMemory.XP), static_cast<int>(self.PlayerMemory.LPAttribs),
                        static_cast<int>(self.PlayerMemory.LPPerks)) > 0;
@@ -564,12 +571,12 @@ bool ReadRecordKey(char const* path, saving::Key& key)
     return ok;
 }
 
-bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLegacy)
+bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLegacy, bool validateOnly = false)
 {
     eCDynamicEntity* hero = Hero();
     FILE* file = nullptr;
     lastRefusal = nullptr;
-    if (!Ready(hero)) { lastRefusal = "hero not ready"; Logf("hero: record not applied (hero not ready)"); return false; }
+    if (!validateOnly && !Ready(hero)) { lastRefusal = "hero not ready"; Logf("hero: record not applied (hero not ready)"); return false; }
     if (!path || !*path || (expected && !saving::Valid(*expected))) {
         lastRefusal = "invalid path or identity";
         Logf("hero: record not applied (%s)", lastRefusal);
@@ -670,7 +677,8 @@ bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLe
                      (version != 4 || ((s.category == gEItemCategory_Skill) == (words.size() == 7)))) {
                 s.id = words[1];
                 wanted.push_back(s);
-            } else if (version >= 3 && words.size() == 2 && words[0] == "spell") inlineSpells.push_back(words[1]);
+            } else if (saving::ParseRecordDowned(text, version, haveDowned, savedDowned)) haveDowned = true;
+            else if (version >= 3 && words.size() == 2 && words[0] == "spell") inlineSpells.push_back(words[1]);
             else if (version >= 3 && words.size() == 4 && words[0] == "quick" &&
                      Integer(words[1], q.slot) && Integer(words[3], q.quality)) {
                 q.id = words[2];
@@ -767,7 +775,8 @@ bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLe
         }
         for (Stack const& s : wanted) {
             if (refused) break;
-            if (s.id.size() != 32 || s.id.find_first_not_of("0123456789abcdef") != std::string::npos || !FromHex(s.id).IsValid())
+            if (s.id.size() != 32 || s.id.find_first_not_of("0123456789abcdef") != std::string::npos ||
+                (!validateOnly && !FromHex(s.id).IsValid()))
                 refused = "a stack whose item does not exist";
             else if (s.amount < 1 || s.amount > 1000000 || s.quality >= 1024 || s.slot < gESlot_None || s.slot > gESlot_Helmet ||
                      s.category < 0 || s.category >= gEItemCategory_Count || s.learned < -1 || s.learned > 1 ||
@@ -781,8 +790,8 @@ bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLe
             if (!ReadQuick(path, inlineSpells, inlineQuick, &present)) refused = "legacy quick slots could not be read";
             else if (!present && !wanted.empty()) refused = "legacy spell and quick state was not recorded";
         }
-        if (!refused && (version == 4 || strictLegacy)) refused = ValidateContents(wanted, inlineSpells, inlineQuick);
-        if (!refused && (version == 4 || strictLegacy)) {
+        if (!refused && (version == 4 || strictLegacy)) refused = ValidateContents(wanted, inlineSpells, inlineQuick, !validateOnly);
+        if (!refused && !validateOnly && (version == 4 || strictLegacy)) {
             auto* memory = static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory));
             for (auto const& at : attrs) {
                 gCAttribute* attribute = memory->GetAttribute(bCString(at.tag.c_str()));
@@ -797,6 +806,11 @@ bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLe
         lastRefusal = refused;
         Logf("hero: record %s refused (%s); the hero stays as it is", path, refused);
         return false;
+    }
+    if (validateOnly) {
+        Logf("hero: record validated version=%d world=%s save=%s player=%llu stacks=%zu spells=%zu quick=%zu; native template checks deferred",
+             version, actual.world.c_str(), actual.save.c_str(), actual.player, wanted.size(), inlineSpells.size(), inlineQuick.size());
+        return true;
     }
     if (version < 2 && checking) Logf("hero: record %s is of version 1 (no end line); every field is there", path);
     downed::Restore(savedDowned != 0, "hero-record");
@@ -888,6 +902,11 @@ bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLe
               ? ApplySpellAndQuick(self, path, inlineSpells, inlineQuick, version == 4 || strictLegacy)
               : LoadQuick(self, path)))
         return fail("spells or quick slots could not be restored");
+    if ((version == 4 || strictLegacy) &&
+        (static_cast<unsigned>(self.NPC.Level) != level || static_cast<unsigned>(self.NPC.LevelMax) != levelMax ||
+         static_cast<int>(self.PlayerMemory.XP) != xp || static_cast<int>(self.PlayerMemory.LPAttribs) != lpa ||
+         static_cast<int>(self.PlayerMemory.LPPerks) != lpp || !AttributesMatch(*memory, attrs, downed::Held())))
+        return fail("restored character stats do not match the record");
     if (version == 4) {
         self.MoveTo(body::Pose(*hero, pose.position, pose.rotation));
         const bCVector& p = hero->GetWorldPosition();
@@ -914,6 +933,8 @@ bool LoadRecordImpl(char const* path, saving::Key const* expected, bool strictLe
 bool LoadRecord(char const* path) { return LoadRecordImpl(path, nullptr, false); }
 bool LoadLegacyRecordStrict(char const* path) { return LoadRecordImpl(path, nullptr, true); }
 bool LoadRecord(char const* path, saving::Key const& key) { return LoadRecordImpl(path, &key, false); }
+bool ValidateRecord(char const* path, saving::Key const& key) { return LoadRecordImpl(path, &key, false, true); }
+bool ValidateLegacyRecord(char const* path) { return LoadRecordImpl(path, nullptr, true, true); }
 
 void Dump(LogFn log)
 {

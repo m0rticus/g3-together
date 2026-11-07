@@ -16,6 +16,8 @@ bool LoadLegacyRecordStrict(char const* path);  // mandatory migration, never a 
 bool SaveRecord(char const* path, saving::Key const& key);
 bool LoadRecord(char const* path, saving::Key const& key);
 bool ReadRecordKey(char const* path, saving::Key& key);
+bool ValidateRecord(char const* path, saving::Key const& key);
+bool ValidateLegacyRecord(char const* path);
 char const* LastRefusal();              // why the last LoadRecord refused its record (damaged, unreadable), nullptr if it did not
 void Dump(LogFn log);                   // QA: HERODUMP line, a canonical summary of the local hero
 void SaveCommand(char const* name, LogFn log);  // QA: <save folder>/g3t-hero-<name>.txt

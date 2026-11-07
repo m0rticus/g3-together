@@ -74,7 +74,8 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("SafeName(name->GetText())", body)
         self.assertIn("net::SaveRequest", body)
         self.assertIn("net::SendSave(1, note)", body)
-        self.assertNotIn("originalSave(", body)
+        self.assertIn("if (!pairedEnabled) return originalSave && originalSave(self, name)", body)
+        self.assertEqual(body.count("originalSave("), 1)  # Only disabled/partial hooks pass through.
         self.assertIn("return false;", body)  # queued != native success
         timer = function_body(self.persist, r"\bvoid\s+CALLBACK\s+SaveNow\s*\(")
         self.assertIn("processDepth || nativeLoadDepth || nativeSaveDepth", timer)
@@ -104,7 +105,7 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn('path + ".tmp"', atomic)
         self.assertIn("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH", atomic)
         load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
-        self.assertLess(load.index("ReadBundle("), load.index("originalLoad("))
+        self.assertLess(load.index("ReadBundle("), load.index("const bool hudOk = originalLoad("))
         self.assertLess(load.index("SafeName("), load.index("Path(slot"))
 
     def test_commit_stores_same_world_without_loading_or_recapturing_character(self):
@@ -146,6 +147,8 @@ class SavingPolicyTests(unittest.TestCase):
         lower = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldLoadDetour\s*\(")
         self.assertIn("lowerLoadGood = lowerLoadGood && ok", lower)
         self.assertIn("nativeLoadDepth", lower)
+        self.assertLess(lower.index("if (pairedEnabled && !observed)"), lower.index("originalWorldLoad("))
+        self.assertIn("use HUD.LoadGame", lower)
         self.assertIn("ownCharacterReady = false", body)
 
     def test_reload_uses_world_incarnation_not_only_last_stored_checkpoint(self):
@@ -175,7 +178,7 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("ReadBundle(canonical, stored, canonicalData)", load)
         self.assertIn("saving::Exact(stored.key, manifest.key)", load)
         self.assertIn("canonicalData[2] == data[2]", load)
-        self.assertLess(load.index("StoreBundle(canonical, data)"), load.index("originalLoad("))
+        self.assertLess(load.index("StoreBundle(canonical, data)"), load.index("const bool hudOk = originalLoad("))
         self.assertIn('fopen_s(&journalFile, Path(slot, 2).c_str(), "r")', load)
 
     def test_transient_publication_retries_without_source_file_edit(self):
@@ -186,7 +189,9 @@ class SavingPolicyTests(unittest.TestCase):
 
     def test_all_supported_native_save_routes_use_coordinator(self):
         body = function_body(self.persist, r"\bbool\s+__fastcall\s+WorldSaveDetour\s*\(")
-        self.assertIn("if (nativeSaveDepth) return originalWorldSave", body)
+        self.assertIn("if (!pairedEnabled) return originalWorldSave", body)
+        self.assertIn("if (nativeSaveDepth)", body)
+        self.assertIn("originalWorldSave(self, name, image, metadata, size)", body)
         self.assertIn("SaveDetour(nullptr, &name)", body)
         ready = function_body(self.persist, r"\bbool\s+NativeSaveAllowed\s*\(")
         self.assertLess(ready.index("gCInfoManager_PS::GetInstance()"), ready.index("session.IsSaveAllowed()"))
@@ -222,6 +227,84 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("persist::CheckpointBusy()", function_body(trade, r"\bbool\s+BuildExchange\s*\("))
         self.assertIn("persist::CheckpointBusy()", function_body(offer, r"\bbool\s+Apply\s*\("))
         self.assertIn("persist::CheckpointBusy()", function_body(offer, r"\bbool\s+Reserve\s*\("))
+
+    def test_real_native_hooks_have_unique_named_resolution_and_safe_partial_fallback(self):
+        resolve = function_body(self.persist, r"\bbool\s+ResolveNative\s*\(")
+        install = function_body(self.persist, r"\bvoid\s+Install\s*\(")
+        self.assertIn("saving::native::FindUnique", resolve)
+        self.assertIn("matches == 1", resolve)
+        self.assertIn("GetProcAddress(game, fn.symbol)", resolve)
+        self.assertIn("saving::native::Links", resolve)
+        self.assertIn('persist: unresolved %s', resolve)
+        self.assertIn("pairedEnabled = originalSave && originalLoad && originalWorldSave && originalWorldLoad", install)
+        self.assertIn("partial hooks pass through, paired saves off", install)
+        self.assertIn("persist: save and load hooked", install)
+        native = (ROOT / "src" / "saving_native.h").read_text(encoding="utf-8")
+        self.assertIn("constexpr size_t Stolen = 6", native)
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("if (!pairedEnabled) return originalLoad", load)
+        self.assertLess(load.index("self != FileManager(true)"), load.index("const bool hudOk = originalLoad("))
+
+    def test_transfer_total_is_bound_and_import_lifetime_is_bounded(self):
+        chunk = function_body(self.persist, r"\bvoid\s+OnFileChunk\s*\(")
+        self.assertIn("saving::ChunkFits(incomingTotal[file]", chunk)
+        self.assertIn("if (incomingFailed) return", chunk)
+        done = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
+        self.assertIn("incomingTotal[f] != size[f]", done)
+        tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
+        self.assertIn("now - incomingAt > TransferLimit", tick)
+        self.assertIn("incomingWelcome != net::WelcomeSerial()", tick)
+
+    def test_successful_store_retains_prepare_until_final_result(self):
+        done = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
+        self.assertNotIn("prepared = Prepared{}", done)
+        save = function_body(self.persist, r"\bvoid\s+OnSave\s*\(")
+        self.assertIn("saving::PreparedMatches", save)
+        self.assertIn("note.op == net::SaveCancel || note.op == net::SaveResult", save)
+        self.assertIn("prepared = Prepared{}", save)
+
+    def test_host_overlay_is_gated_and_missing_host_record_does_not_schedule_client_import(self):
+        pending = function_body(self.persist, r"\bbool\s+HeroPending\s*\(")
+        self.assertNotIn("!net::IsHost()", pending)
+        self.assertIn("pairedEnabled", pending)
+        host = function_body(self.persist, r"\bvoid\s+HostTick\s*\(")
+        self.assertLess(host.index("!pendingRecord.empty()"), host.index("Tell(i)"))
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("if (!net::IsHost())", load)
+
+    def test_legacy_and_bound_records_preserve_downed_latch_and_verify_final_stats(self):
+        load = function_body(self.hero, r"\bbool\s+LoadRecordImpl\s*\(")
+        self.assertIn("saving::ParseRecordDowned(text, version, haveDowned, savedDowned)", load)
+        self.assertIn('downed::Restore(savedDowned != 0, "hero-record")', load)
+        self.assertIn("restored character stats do not match the record", load)
+        save = function_body(self.hero, r"\bbool\s+SaveRecordImpl\s*\(")
+        self.assertIn('fprintf(file, "downed %d\\n"', save)
+        self.assertNotIn('else ok = ok && fprintf(file, "downed', save)
+
+    def test_complete_character_preflight_precedes_native_load_and_never_mutates_hero(self):
+        choose = function_body(self.persist, r"\bbool\s+ChooseCharacter\s*\(")
+        self.assertIn("hero::ValidateRecord(pendingRecord.c_str(), pendingKey)", choose)
+        self.assertIn("hero::ValidateLegacyRecord(pendingRecord.c_str())", choose)
+        load = function_body(self.hero, r"\bbool\s+LoadRecordImpl\s*\(")
+        preflight = load.index("if (validateOnly) {")
+        self.assertLess(load.index("declared != wanted.size()"), preflight)
+        self.assertLess(load.index("ValidateContents(wanted, inlineSpells, inlineQuick, !validateOnly)"), preflight)
+        self.assertLess(preflight, load.index("downed::Restore("))
+        self.assertLess(preflight, load.index("DeleteStack("))
+        self.assertIn("if (!validateOnly && !Ready(hero))", load)
+
+    def test_final_character_comparison_is_read_only_and_downed_aware(self):
+        match = function_body(self.hero, r"\bbool\s+AttributesMatch\s*\(")
+        self.assertIn('held && value.tag == "HP" ? 1 : value.base', match)
+        self.assertNotIn("Set", match)
+        load = function_body(self.hero, r"\bbool\s+LoadRecordImpl\s*\(")
+        self.assertEqual(load.count("ApplyAttributes(*memory, attrs)"), 1)
+        self.assertLess(load.index("ApplySpellAndQuick("), load.index("AttributesMatch(*memory, attrs, downed::Held())"))
+
+    def test_prepare_capture_lifetime_covers_all_host_phases(self):
+        self.assertIn("PreparedLimit = PrepareLimit + WriteLimit + TransferLimit", self.persist)
+        tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
+        self.assertIn("now - prepared.since > PreparedLimit", tick)
 
 
 if __name__ == "__main__":

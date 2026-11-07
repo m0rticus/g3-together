@@ -175,6 +175,32 @@ Old visible-contact logs prove an attack was shown, not that damage was applied.
 
 ### Paired-save failure and migration checks (protocol 73)
 
+Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
+verified native entry points. `persist: unresolved <function> ... live=<bytes>; paired saves off`
+means no paired-save claim is valid; preserve that line and the preceding native module identity.
+The optional engine-free check `G3T_GAME_DLL` reads a selected CP 1.75 Game.dll and verifies unique
+signatures, named world exports, call edges and ASLR without loading or executing the DLL.
+
+For each host- and client-initiated save, follow `checkpoint requested`, each `character capture`
+(own player ID, record size/CRC), `native invoke=HUD.SaveGame`, successful HUD/world results,
+`host checkpoint published`, client `checkpoint stored`, both `checkpoint ack` phases, then
+`checkpoint paired`. Native three-file sizes/CRCs must agree on both copies; individual character
+CRCs need not agree. A client request must invoke native save only on the host. Wait for the final
+paired result, not the immediate queued call; the native menu may show its generic failure dialog
+because no synchronous save has completed yet.
+
+After loading, require `native load returned ... ok=1 hud_ok=1 lower_calls=1 lower_ok=1` and
+`character restore ... ok=1`/`own character restored` on the overlay recipient before world admission.
+The complete record is checked before native loading; template/attribute checks require the loaded
+world and run before hero mutation. An unsupported direct `World.LoadGameWorld` call is refused
+instead of bypassing own-character restoration; use the normal menu/quick-load HUD path.
+Check different stats, HP/MP, inventory/gold/equipment, learned spells, quick slots and positions,
+alongside the same quest/NPC/door state. Reload the latest checkpoint after playing further,
+then rejoin and check the first shared XP reward. Legacy V3 records include their downed latch;
+missing or damaged counterparts must remain refused or explicitly recover the same player's
+same-campaign record, never use the native host hero. These are still human acceptance checks:
+static bytes and a passing build do not establish that the running copies executed this path.
+
 Use only backed-up isolated profiles; never the protected user save folder.
 
 1. Rejoin without restarting, then after restarting from the menu. The same account keeps its own character.
