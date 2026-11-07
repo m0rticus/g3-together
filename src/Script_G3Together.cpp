@@ -79,7 +79,7 @@ struct FocusNpc {
 struct FocusObservation {
     bool known = false, focused = false, paused = false, watching = false;
     uint32_t frameAt = 0, lostAt = 0, resumedAt = 0, sampledAt = 0;
-    unsigned serial = 0, replacements = 0, details = 0;
+    unsigned serial = 0, replacements = 0, details = 0, resourceResets = 0, resourceRestores = 0;
     std::map<std::string, FocusNpc> npcs;
     std::set<std::string> weapons, modes, draws;
 } focusObservation;
@@ -103,10 +103,12 @@ void ObserveFocus()
         eCEntity* instance = session.GetHero();
         Entity hero(instance);
         const bool routine = instance && instance->GetPropertySet(eEPropertySetType_ScriptRoutine);
-        g3t::Logf("focus: %s role=%s serial=%u gap_ms=%u away_ms=%u paused=%d task=%.48s state=%.48s ai=%d ani=%d",
+        g3t::Logf("focus: %s role=%s serial=%u gap_ms=%u away_ms=%u native_dt_ms=%.1f paused=%d "
+                  "task=%.48s state=%.48s ai=%d ani=%d",
                   lost ? "lost" : regained ? "regained" : resumed ? "pause-resumed" : "frame-gap",
                   g3t::net::IsHost() ? "host" : "client", ++observation.serial, gap,
-                  regained ? now - observation.lostAt : 0, paused ? 1 : 0,
+                  regained ? now - observation.lostAt : 0,
+                  eCApplication::GetInstance().GetScaledFrameTimeInSeconds() * 1000.0f, paused ? 1 : 0,
                   routine ? hero.Routine.GetCurrentTask().GetText() : "-",
                   routine ? hero.Routine.GetCurrentState().GetText() : "-",
                   routine ? static_cast<int>(hero.Routine.AIMode) : -1,
@@ -376,8 +378,21 @@ class Module : public eCEngineComponentBase
         g3t::crashlog::Stage("shutdown called");
         return bEResult_Ok;
     }
-    bEResult ResetResources(GEBool) override { return bEResult_Ok; }
-    bEResult RestoreResources(GEBool) override { return bEResult_Ok; }
+    bEResult ResetResources(GEBool full) override
+    {
+        const unsigned count = ++focusObservation.resourceResets;
+        if (count <= 4 || count % 100 == 0)
+            g3t::Logf("focus: resource-reset count=%u full=%d focused=%d", count, full ? 1 : 0, g3t::partner::Focused());
+        return bEResult_Ok;
+    }
+    bEResult RestoreResources(GEBool full) override
+    {
+        const unsigned count = ++focusObservation.resourceRestores;
+        if (count <= 4 || count % 100 == 0)
+            g3t::Logf("focus: resource-restored count=%u full=%d focused=%d", count, full ? 1 : 0, g3t::partner::Focused());
+        g3t::downed::OnFrameResume();
+        return bEResult_Ok;
+    }
     // Also a frame the game runs inside its own load (Session::Start, C 22.10.): there nothing of the mod runs, from the
     // first line on (C 23.10.); the world is half made and the load has not returned.
     void Process() override

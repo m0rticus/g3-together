@@ -397,7 +397,7 @@ class DownedPolicyTests(unittest.TestCase):
 
     def test_focus_observation_does_not_mutate_npcs_or_input(self):
         observe = function_body(self.script_cpp, r"\bvoid\s+ObserveFocus\s*\(")
-        for field in ("focus: %s", "gap_ms=%u", "away_ms=%u", "task=%.48s", "state=%.48s",
+        for field in ("focus: %s", "gap_ms=%u", "away_ms=%u", "native_dt_ms=%.1f", "task=%.48s", "state=%.48s",
                       "weapon_changed=%zu", "ai_changed=%zu", "draw_motion=%zu", "actor_replacements=%u"):
             self.assertIn(field, observe)
         self.assertIn("g3t::partner::Focused()", observe)
@@ -407,6 +407,13 @@ class DownedPolicyTests(unittest.TestCase):
         for mutation in ("FullStop", "SetTask(", "SetAIMode", "EnableProcessing", "SetCombatMode", "SetForegroundWindow",
                          "SendInput", "SendWorldState", "SendNpc"):
             self.assertNotIn(mutation, observe)
+        for callback, log in (("ResetResources", "resource-reset"), ("RestoreResources", "resource-restored")):
+            body = function_body(self.script_cpp, rf"\bbEResult\s+{callback}\s*\(")
+            self.assertIn("focus: " + log, body)
+            self.assertNotIn("ForgetWorld", body)
+            self.assertNotIn("FullStop", body)
+        restore = function_body(self.script_cpp, r"\bbEResult\s+RestoreResources\s*\(")
+        self.assertIn("g3t::downed::OnFrameResume();", restore)
 
     def test_all_down_and_absence_grace_rules_are_preserved(self):
         all_down = function_body(

@@ -38,7 +38,10 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   payment, death and rejoin behavior must remain unchanged.
 
 `focus: lost/regained` records process-foreground transitions with `gap_ms`,
-`away_ms`, pause and local hero task/state/AI/animation. `pause-resumed` and
+`away_ms`, `native_dt_ms`, pause and local hero task/state/AI/animation.
+`resource-reset` / `resource-restored` record the existing module callbacks
+from native device recovery; these do not perform world cleanup.
+`pause-resumed` and
 `frame-gap` cover resumptions without an observed foreground transition (polling
 cannot see an away/back cycle entirely between module frames). `focus: npc`
 shows up to eight changed NPCs; `focus: settled` reports unique NPC GUIDs with
