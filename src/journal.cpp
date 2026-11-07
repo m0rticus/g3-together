@@ -130,6 +130,11 @@ bool LeaseDeath(eCEntity* entity, unsigned char owner)
     return true;
 }
 
+bool RecordedDeath(unsigned char const guid[16])
+{
+    return deaths.count(std::string(reinterpret_cast<char const*>(guid), 16)) != 0;
+}
+
 unsigned Write(FILE* file)
 {
     unsigned n = 0;

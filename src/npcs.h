@@ -21,6 +21,7 @@ void LeaseReleaseMirror(uint8_t const guid[16]);
 bool HostPresentationAvailable(eCEntity const* entity);
 uint32_t HostPresentationAge(eCEntity const* entity);
 bool HostCanPresent(uint8_t const guid[16]);
+bool HostKnows(uint8_t const guid[16]); // canonical history, independent of current capture freshness
 void OnWorldDeactivate();
 bool IsMirrored(eCEntity const* entity);  // a client NPC currently driven from host snapshots
 bool Ready(eCEntity const* entity);

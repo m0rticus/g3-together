@@ -54,7 +54,8 @@ choose independently; this does not change Gothic 3's own language.
 The host starts Gothic 3 and begins a new campaign or loads the co-op campaign. Start your game
 afterwards and choose **New Game**. The host sends your account's saved character and personal loot/merchant state, applied before
 admission. If no record exists for your account, you start fresh, never as a copy of the host.
-Only the host loads saved games; after a host load, choose New Game locally again to re-enter.
+Only the host loads saved games; after a host load the client re-enters automatically through its own `G3T_client_template` slot
+(saved once by your first New Game of each launch; if it is missing, restart Gothic 3 and choose New Game once).
 The host calendar, quest/status/timer/counter, dialog/event and nearby shared-door snapshots finish before admission.
 The client applies cutover changes and confirms entry before one-shot NPC/motion replays start.
 Restoration does not replay quest rewards. Native world files never travel over the network; gameplay acceptance remains manual.

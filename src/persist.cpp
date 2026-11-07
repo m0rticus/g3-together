@@ -87,8 +87,9 @@ using NewGameFn = bool(__stdcall*)(void*);
 NewGameCommandFn originalNewGameCommand = nullptr;
 NewGameFn originalNewGame = nullptr;
 void (*worldCleanup)() = nullptr;
-void* deferredNewGameMenu = nullptr;
 bool rejoinHooks = false, nativeNewGame = false, requestCharacterAgain = false;
+bool clientWorldEntered = false;
+rejoin::tmpl::Capture templateCapture;
 unsigned menuCommandDepth = 0;
 rejoin::Wait rejoinWait = rejoin::Wait::None;
 bool hostAdmissionAck = false;
@@ -785,7 +786,7 @@ void __fastcall NewGameCommandDetour(void* self, void*)
         return;
     }
     if (gCSession::GetInstance().GetPlayer() || clientRejoin.pending || captured.valid || requestPending) {
-        deferredNewGameMenu = self;
+        Logf("persist: client enter state=queued reason=new-game-command epoch=%08x", hostWorld.epoch);
         QueueClientReturn();
         Notice(i18n::ClientReturningToMenu);
         return; // The native player-present branch terminates Gothic 3.
@@ -797,6 +798,12 @@ void __fastcall NewGameCommandDetour(void* self, void*)
 bool __stdcall NewGameDetour(void* self)
 {
     if (ai::ShuttingDown() || net::IsHost() || !rejoinHooks) return originalNewGame(self);
+    if (!rejoin::NewGameAllowed(clientWorldEntered)) {
+        // The world is already loaded: native New Game would restart it in place (RestartWorld(false)), which never returned.
+        Log("persist: client New Game refused; this process already entered a world and the in-place native restart froze the game");
+        Notice(i18n::ClientRestartToRejoin, true);
+        return false;
+    }
     if (!worldCleanup || nativeLoadDepth || nativeSaveDepth || captured.valid || requestPending || clientRejoin.pending) {
         Log("persist: client New Game refused; transition or native operation still active");
         Notice(i18n::ClientRejoinFailed, true);
@@ -822,6 +829,8 @@ bool __stdcall NewGameDetour(void* self)
         Notice(i18n::ClientRejoinFailed, true);
     } else {
         restoreFailed = false;
+        clientWorldEntered = true;
+        templateCapture.Want(GetTickCount());
         requestCharacterAgain = receivedNote.epoch != hostWorld.epoch || !receivedWelcome;
         Log("persist: client native New Game returned; fresh local world ready for own account record");
     }
@@ -835,6 +844,67 @@ bool WriteAtomic(std::string const& path, Bytes const& bytes)
     }
     LogIo(lastIoFailure);
     return false;
+}
+uint64_t GameModuleBytes()
+{
+    char path[MAX_PATH]{};
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    HMODULE game = GetModuleHandleA("Game.dll");
+    if (!game || !GetModuleFileNameA(game, path, MAX_PATH) || !GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return 0;
+    return (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+}
+bool HasBytes(std::string const& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    return !path.empty() && GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data) && (data.nFileSizeHigh || data.nFileSizeLow);
+}
+bool TemplateValid()
+{
+    const std::string marker = Path(rejoin::tmpl::Slot, rejoin::tmpl::Sidecar);
+    const uint64_t game = GameModuleBytes();
+    if (!game || !HasBytes(Path(rejoin::tmpl::Slot, 0)) || !HasBytes(Path(rejoin::tmpl::Slot, 1)) || !Exists(marker)) return false;
+    Bytes bytes;
+    return ReadAll(marker, bytes) && rejoin::tmpl::MarkerMatches(bytes, game);
+}
+// Only our own three template files are ever removed; every other slot name belongs to the player.
+void RemoveTemplate()
+{
+    for (int file = 0; file < 3; ++file) {
+        const std::string path = Path(rejoin::tmpl::Slot, file);
+        if (!path.empty() && Exists(path)) DeleteFileA(path.c_str());
+    }
+}
+// One native save of the fresh starting world, before the account record replaces the New Game hero.
+void SaveClientTemplate()
+{
+    void* manager = FileManager(false);
+    const uint64_t game = GameModuleBytes();
+    if (!manager || !originalSave || !uiEntries[4] || !game || !rejoin::tmpl::OwnSlot(rejoin::tmpl::Slot)) {
+        Log("persist: client template save skipped; native hooks or game identity unavailable");
+        return;
+    }
+    RemoveTemplate(); // an interrupted save must never look valid
+    {
+        void* capture = uiEntries[4];
+        __asm {
+            push esi
+            mov esi, manager
+            call capture
+            pop esi
+        }
+    }
+    const bCString name(rejoin::tmpl::Slot);
+    lowerSaveCalls = 0; lowerSaveGood = true;
+    ++nativeSaveDepth;
+    const bool nativeOk = originalSave(manager, &name);
+    --nativeSaveDepth;
+    const std::string marker = rejoin::tmpl::Marker(game);
+    bool ok = nativeOk && lowerSaveCalls == 1 && lowerSaveGood &&
+              HasBytes(Path(rejoin::tmpl::Slot, 0)) && HasBytes(Path(rejoin::tmpl::Slot, 1));
+    ok = ok && WriteAtomic(Path(rejoin::tmpl::Slot, rejoin::tmpl::Sidecar), Bytes(marker.begin(), marker.end()));
+    if (!ok) RemoveTemplate();
+    Logf("persist: client template save slot=%s native_ok=%d lower_calls=%u lower_ok=%d ok=%d",
+         rejoin::tmpl::Slot, nativeOk ? 1 : 0, lowerSaveCalls, lowerSaveGood ? 1 : 0, ok ? 1 : 0);
 }
 std::string CharacterPath()
 {
@@ -1384,9 +1454,12 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
         needsNewHero = true;
         if (!containers::RestorePersonal({})) { restoreFailed = true; SaveFailure("personal-record"); return; }
         if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu)) {
-            needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
-            clientRejoin.Left();
-            synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+            // While the template save holds the fresh hero, Tick() admits it once the hold ends (newWorld stays set).
+            if (!templateCapture.Holding(GetTickCount())) {
+                needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
+                clientRejoin.Left();
+                synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+            }
         } else Notice(i18n::SaveCharacterMissing, true);
         Logf("persist: no saved character account=%llu epoch=%08x; fresh New Game required", key.player, note.epoch);
     } else {
@@ -1479,7 +1552,10 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
     if (note.epoch != hostWorld.epoch) {
         const bool replacing = rejoin::ReplacesWorld(hostWorld.epoch, note.epoch,
             hostWorld.kind != net::KindMenu, gCSession::GetInstance().GetPlayer() != nullptr, clientRejoin.pending);
-        if (replacing) { QueueClientReturn(); Notice(i18n::ClientHostWorldChanged, true); }
+        if (replacing) {
+            Logf("persist: client enter state=queued reason=host-world-changed epoch=%08x->%08x", hostWorld.epoch, note.epoch);
+            QueueClientReturn(); Notice(i18n::ClientHostWorldChanged, true);
+        }
         if (captured.valid || requestPending) Notice(i18n::ClientSaveCanceledByWorld, true);
         captured = {}; requestPending = false; receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
         needsNewHero = false; restoreFailed = false; synced = 0; ownCharacterReady = false; hostAdmissionAck = false;
@@ -1767,11 +1843,75 @@ void StatusHints()
 
 void SetWorldCleanup(void (*cleanup)()) { worldCleanup = cleanup; }
 bool ClientTransitionPending() { return !net::IsHost() && clientRejoin.pending; }
+bool HostWorldEntryAvailable()
+{
+    return !net::IsHost() && rejoinHooks && originalLoad && FileManager(true) != nullptr &&
+           rejoin::ChooseRoute(TemplateValid(), true) == rejoin::Route::Template;
+}
+EnterResult EnterHostWorld(char const* reason)
+{
+    if (net::IsHost()) return EnterResult::NotClient;
+    if (!HostWorldEntryAvailable()) {
+        Logf("persist: client enter state=unavailable reason=%s template=%d hooks=%d", reason ? reason : "-",
+             TemplateValid() ? 1 : 0, rejoinHooks ? 1 : 0);
+        Notice(i18n::ClientRestartToRejoin, true);
+        return EnterResult::Unavailable;
+    }
+    if (clientRejoin.pending) return EnterResult::AlreadyQueued;
+    Logf("persist: client enter state=queued reason=%s epoch=%08x", reason ? reason : "-", hostWorld.epoch);
+    QueueClientReturn();
+    return EnterResult::Queued;
+}
+// The engine's own LoadGame of the client template: the only supported way to replace a loaded world.
+static void EnterTemplateWorld(uint32_t queuedAt)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    void* files = FileManager(true);
+    const bCString name(rejoin::tmpl::Slot);
+    Logf("persist: client enter state=cleanup elapsed_ms=%u epoch=%08x player=%p running=%d",
+         GetTickCount() - queuedAt, hostWorld.epoch, game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
+    ++nativeLoadDepth;
+    nativeNewGame = true; // a native world change we started: OnWorldDeactivate must keep the client state
+    if (manager) manager->ClosePage();
+    worldCleanup(); // Every puppet/mirror/lease/camera reference is released while the old entities are valid.
+    ownCharacterReady = false; hostAdmissionAck = false; synced = 0;
+    localKind = net::KindMenu; freshLocalHero = false; newWorld = false; resetLocalWorld = false;
+    receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; receivedWelcome = 0;
+    needsNewHero = false; restoreFailed = false;
+    templateCapture.Done();
+    clientRejoin.Retired();
+    rejoinWait = rejoin::Wait::None;
+    net::SetInWorld(net::LocalId(), false);
+    lowerLoadCalls = 0; lowerLoadGood = true;
+    Logf("persist: client enter state=native-load slot=%s elapsed_ms=%u", rejoin::tmpl::Slot, GetTickCount() - queuedAt);
+    crashlog::WorldEntryWait("native client template load"); // gate for the 15 s main-thread stack sample
+    crashlog::WorldEntryScope scope("native client template HUD.LoadGame");
+    const bool hudOk = originalLoad(files, &name);
+    scope.Complete();
+    nativeNewGame = false;
+    --nativeLoadDepth;
+    const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
+    clientRejoin.Started(ok);
+    freshLocalHero = ok; newWorld = ok; resetLocalWorld = false;
+    requestCharacterAgain = true;
+    restoreFailed = !ok;
+    Logf("persist: client enter state=%s hud_ok=%d lower_calls=%u lower_ok=%d elapsed_ms=%u player=%p running=%d",
+         ok ? "returned" : "failed", hudOk ? 1 : 0, lowerLoadCalls, lowerLoadGood ? 1 : 0, GetTickCount() - queuedAt,
+         game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
+    if (ok) { clientWorldEntered = true; return; }
+    RemoveTemplate(); // regenerate on the next New Game rather than retry a template the engine refused
+    Notice(i18n::ClientRejoinFailed, true);
+}
 bool ProcessClientTransition()
 {
-    if (net::IsHost() || !rejoinHooks || !clientRejoin.pending || ai::ShuttingDown()) return false;
+    static uint32_t queuedAt = 0;
+    if (net::IsHost() || !rejoinHooks || ai::ShuttingDown()) return false;
+    if (!clientRejoin.pending && !templateCapture.wanted) { queuedAt = 0; return false; }
     // Never inspect a half-built native world, including frames nested in confirmation dialogs.
     if (nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth) return false;
+    const uint32_t now = GetTickCount();
+    if (clientRejoin.pending && !queuedAt) queuedAt = now ? now : 1;
     auto& game = gCSession::GetInstance();
     auto* manager = game.GetGUIManager();
     auto* infos = game.IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr;
@@ -1781,48 +1921,40 @@ bool ProcessClientTransition()
     const rejoin::Boundary boundary{nativeLoadDepth != 0 || nativeSaveDepth != 0 || nativeNewGame,
                                    processDepth != 0 || menuCommandDepth != 0,
                                    captured.valid || requestPending, interaction};
+    if (!clientRejoin.pending) {
+        // First native New Game of this launch: save the fresh starting world once, before the account record is applied.
+        if (templateCapture.Expired(now)) {
+            templateCapture.Done();
+            Log("persist: client template save abandoned; no quiet boundary within the hold window");
+            return false;
+        }
+        if (!templateCapture.Due(now) || !game.GetHero() || !game.IsGameRunning() ||
+            rejoin::State{}.Waiting(boundary) != rejoin::Wait::None) return false;
+        templateCapture.Done();
+        SaveClientTemplate();
+        return true;
+    }
     const auto wait = clientRejoin.Waiting(boundary);
     if (wait != rejoinWait) {
         rejoinWait = wait;
+        Logf("persist: client enter state=boundary-wait wait=%d elapsed_ms=%u", static_cast<int>(wait), now - queuedAt);
         Notice(wait == rejoin::Wait::Save ? i18n::ClientRejoinWaitSave :
                wait == rejoin::Wait::Interaction ? i18n::ClientRejoinWaitTrade :
                i18n::ClientReturningToMenu);
     }
     if (!worldCleanup || !clientRejoin.CanRetire(boundary)) return false;
-    if (!manager) {
+    const uint32_t startedAt = queuedAt;
+    queuedAt = 0;
+    if (rejoin::ChooseRoute(TemplateValid(), originalLoad != nullptr && FileManager(true) != nullptr) != rejoin::Route::Template) {
+        // No teardown without a way back in: the old world stays intact and outside admission.
+        clientRejoin.Retired();
         clientRejoin.failed = true;
-        Log("persist: client return-to-menu waiting; native GUI unavailable");
+        rejoinWait = rejoin::Wait::None;
+        Logf("persist: client enter state=failed reason=no-template elapsed_ms=%u", now - startedAt);
+        Notice(i18n::ClientRestartToRejoin, true);
         return false;
     }
-    ++nativeLoadDepth;
-    manager->ClosePage();
-    worldCleanup(); // Every puppet/mirror/lease/camera reference is released while the old entities are valid.
-    game.Stop();    // Native player/camera/control and running flags, not just the mod's admission flags.
-    manager->ClearAllEntities();
-    manager->CloseMenu();
-    const bool opened = manager->OpenMenu() != GEFalse;
-    --nativeLoadDepth;
-    ownCharacterReady = false; hostAdmissionAck = false; synced = 0;
-    localKind = net::KindMenu; freshLocalHero = false; newWorld = false; resetLocalWorld = false;
-    receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; receivedWelcome = 0;
-    needsNewHero = false; restoreFailed = false;
-    clientRejoin.Retired();
-    clientRejoin.failed = !opened || game.GetPlayer() != nullptr || game.IsGameRunning();
-    requestCharacterAgain = true;
-    rejoinWait = rejoin::Wait::None;
-    Logf("persist: client return-to-menu epoch=%08x ok=%d player=%p running=%d; own account record requested",
-         hostWorld.epoch, clientRejoin.failed ? 0 : 1, game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
-    hud::ClientNewGameEnabled(!clientRejoin.failed);
-    Notice(clientRejoin.failed ? i18n::ClientRejoinFailed : i18n::ClientChooseNewGame, clientRejoin.failed);
-    void* menu = deferredNewGameMenu;
-    deferredNewGameMenu = nullptr;
-    if (menu && !clientRejoin.failed) {
-        // Stop keeps the native menu alive. Reject a changed owner instead of calling a stale window.
-        void* vtable = nullptr;
-        if (Readable(menu, sizeof(vtable))) std::memcpy(&vtable, menu, sizeof(vtable));
-        if (vtable == nativeImage + 0x2d4c94) NewGameCommandDetour(menu, nullptr);
-        else { Log("persist: deferred New Game menu owner changed; choose New Game again"); Notice(i18n::ClientChooseNewGame); }
-    }
+    EnterTemplateWorld(startedAt);
     return true;
 }
 
@@ -1894,7 +2026,9 @@ void Tick()
     ObserveThumbnail();
     auto& game = gCSession::GetInstance();
     const bool running = game.GetHero() && game.IsGameRunning();
-    if (newWorld && running) {
+    // The one-shot fresh-hero authorization waits out the template save: consuming newWorld inside the hold lost it.
+    const bool templateHold = templateCapture.Holding(now);
+    if (newWorld && running && !templateHold) {
         newWorld = false; localKind = net::KindNew;
         resetLocalWorld = false;
         // Only a freshly initialized local hero is permitted when the host has no account record.
@@ -1962,7 +2096,7 @@ void Tick()
         if (net::SendWorld(answer, 1)) requestCharacterAgain = false;
     }
     if (!receivedRecord.empty() && !restoreFailed && !resetLocalWorld && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu) &&
-        receivedWelcome == net::WelcomeSerial() &&
+        !templateCapture.Holding(now) && receivedWelcome == net::WelcomeSerial() &&
         receivedNote.epoch == hostWorld.epoch && static_cast<int32_t>(now - restoreAt) >= 0) {
         if (!PersonalReadyForRestore(receivedPersonal)) {
             if (now - restoreAt > 10000) { restoreFailed = true; SaveFailure("personal-hooks"); }

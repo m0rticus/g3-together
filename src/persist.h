@@ -21,6 +21,14 @@ bool HeroPending();        // world/character restoration or fresh local New Gam
 void SetWorldCleanup(void (*cleanup)());
 bool ProcessClientTransition(); // outer module boundary only; true consumes this frame
 bool ClientTransitionPending();
+// Client: enter the host's current world NOW, through the engine's own LoadGame of the client template slot
+// (G3T_client_template, made once from the player's first New Game). Queue only: safe from ENet dispatch or any
+// frame; the native work runs at the next outer module boundary (ProcessClientTransition) once no native load/save,
+// trade or dialogue is active. Works from the title screen and in-world. The host's world replay and the client's own
+// account record are applied afterwards by the existing admission flow.
+enum class EnterResult { Queued, AlreadyQueued, Unavailable, NotClient };
+EnterResult EnterHostWorld(char const* reason);
+bool HostWorldEntryAvailable(); // template slot valid and the native load hooks verified (file check; not per frame)
 void OnWorldActivate();    // from the engine module's callbacks
 void OnWorldDeactivate();
 bool PrepareShutdown();    // cancel cooperative staging; false while native save/load still owns the stack

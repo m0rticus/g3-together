@@ -359,26 +359,29 @@ Friendly-fire protection applies before local hit feedback as well as before aut
 4. Wait for **"Co-op save complete"** before quitting. Dialog, downed/control, loading or an unsettled
    player exchange can refuse explicitly; combat alone is not a native refusal. Retry after the stated
    condition clears. A disconnected account retains its preceding saved character, not unseen progress.
-5. **Only the host loads** from the normal menu/quick-load controls. A new host world epoch returns
-   connected clients to the menu safely, without restarting Gothic 3. Clients choose **New Game**
-   again to reset their local world, then receive their account-exact saved character.
-   A connection-only rejoin in the same live world keeps that player's live character.
+5. **Only the host loads** from the normal menu/quick-load controls. A new host world epoch makes each
+   connected client re-enter the host's world automatically, without restarting Gothic 3: the client loads its
+   own **rejoin template** through the game's normal load path, then receives the host's world state and its
+   account-exact saved character. A connection-only rejoin in the same live world keeps that player's live character.
 
-**Client re-entry:** New Game is selectable in the client menu, including the menu opened during play.
-During play, **Back** continues the live session; choosing **New Game** stops that session before the
-native New Game confirmation, avoiding Gothic 3's original restart/exit branch. Canceling the confirmation
-leaves you in the menu, outside the campaign. Re-entry restores the account's last host-saved character;
-unsaved progress is discarded, not saved over that record. A campaign with no record for your account
-requires an explicit New Game and starts a fresh hero, never the host's hero.
+**Client rejoin template:** the first time you choose **New Game** after launching Gothic 3 (also the way to
+join the very first time), the game saves the fresh starting world once into your normal save folder as the
+slot `G3T_client_template` (three small files; nothing else is created, replaced or deleted, and it is never
+sent over the network). It is made on your own machine from your own New Game, so it matches your installed
+game; it is rebuilt automatically if the game files change. Later host loads/new campaigns use it to replace
+your world safely: Gothic 3's own New Game cannot restart a world that is already loaded (it froze the game),
+so a second New Game in the same launch is refused with a notice. Without the template (first launch, or the
+file was deleted) nothing is torn down: restart Gothic 3 once and choose New Game. Unsaved progress is
+discarded, not saved over your last host-saved record. A campaign with no record for your account starts a
+fresh hero from the template, never the host's hero.
 
-A host load/new campaign queues retirement outside network callbacks. Native loading must finish first;
-an outstanding save result or dialogue/trade can defer the return, with a notice. Finish the dialogue,
+A host load/new campaign queues the re-entry outside network callbacks. Native loading must finish first;
+an outstanding save result or dialogue/trade can defer it, with a notice. Finish the dialogue,
 close the trade window and let player exchanges settle. An unrecoverable exchange still blocks a manual
 re-entry rather than silently discarding an unresolved transaction. The host may remain in its menu
-or loading screen: client New Game remains available, but admission waits for a ready host world.
-Returning to the menu or re-entering never writes a new character checkpoint or loads native client
-save files. The native session is stopped and all mod world references are released; the native
-New Game loader owns the subsequent world restart and activation. No automatic fresh hero is created.
+or loading screen: admission waits for a ready host world.
+Re-entering never writes a new character checkpoint and never loads or receives the host's native save;
+only the client's own `G3T_client_template` is loaded, by the game itself.
 
 The host's `<menu-slot>.g3t` is a self-contained **G3TSAVE3** container: native header/world,
 shared journal/companions, individual G3THERO4 and bounded personal-state records, and versioned extension blocks. Whole-file

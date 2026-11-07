@@ -27,6 +27,9 @@ std::atomic<char const*> lastEndStep{nullptr};
 worldentry::Progress entryOperation, entryGate;
 std::atomic<uint32_t> entryEpoch{0}, entryWelcome{0};
 worldentry::Reports entryReports;
+std::atomic<DWORD> entryThread{0};
+std::atomic<uint32_t> sampledSince{0};
+constexpr uint32_t MainSampleMs = 15000;
 struct CacheSnapshot {
     std::atomic<uint32_t> count{0};
     std::atomic<void const*> first{nullptr};
@@ -762,7 +765,10 @@ void WorldEntryWait(char const* step)
 WorldEntryScope::WorldEntryScope(char const* operation)
 {
     active = !GetConfig().host && !ai::ShuttingDown() && entryGate.Read().name;
-    if (active) previous = entryOperation.Set(operation, GetTickCount());
+    if (active) {
+        entryThread.store(GetCurrentThreadId());
+        previous = entryOperation.Set(operation, GetTickCount());
+    }
 }
 
 WorldEntryScope::~WorldEntryScope()
@@ -777,11 +783,74 @@ void WorldEntryScope::Complete()
     active = false;
 }
 
+namespace {
+struct MainSample {
+    uintptr_t eip = 0, esp = 0, ebp = 0;
+    uintptr_t words[256] = {};
+    unsigned count = 0;
+    bool ok = false;
+};
+
+bool CopyStackWords(uintptr_t esp, MainSample& sample)
+{
+    __try {
+        auto const* source = reinterpret_cast<uintptr_t const*>(esp);
+        for (; sample.count < std::size(sample.words); ++sample.count) sample.words[sample.count] = source[sample.count];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return sample.count != 0;
+}
+
+// Suspended only long enough to copy registers and stack words: no allocation, lock or logging while it is stopped.
+void SampleThread(DWORD id, MainSample& sample)
+{
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id);
+    if (!thread) return;
+    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (GetThreadContext(thread, &context)) {
+            sample.eip = context.Eip;
+            sample.esp = context.Esp;
+            sample.ebp = context.Ebp;
+            sample.ok = CopyStackWords(context.Esp, sample);
+        }
+        ResumeThread(thread);
+    }
+    CloseHandle(thread);
+}
+
+// A native call that never returns leaves no dump (a hang is not a crash): say where the main thread is standing.
+void LogMainThread(char const* operation)
+{
+    const DWORD id = entryThread.load();
+    MainSample sample;
+    if (id) SampleThread(id, sample);
+    if (!sample.ok) {
+        Logf("world-entry: main thread stack unavailable operation=%s thread=%lu", operation ? operation : "-", id);
+        return;
+    }
+    char where[MAX_PATH + 200] = "(not in a known module)";
+    Where(sample.eip, where, sizeof(where));
+    Logf("world-entry: main thread stack operation=%s thread=%lu eip=%p %s esp=%p ebp=%p", operation ? operation : "-", id,
+         reinterpret_cast<void*>(sample.eip), where, reinterpret_cast<void*>(sample.esp), reinterpret_cast<void*>(sample.ebp));
+    // x86 engine code omits frame pointers: bounded return-address candidates, never labelled as unwound frames.
+    unsigned shown = 0;
+    for (unsigned i = 0; i < sample.count && shown < 32; ++i) {
+        if (!Where(sample.words[i], where, sizeof(where))) continue;
+        Logf("world-entry: main thread stack candidate_word=%u address=%p %s", i, reinterpret_cast<void*>(sample.words[i]), where);
+        ++shown;
+    }
+}
+}
+
 void PollWorldEntry()
 {
     worldentry::Step gate, operation;
     if (!entryGate.Read(gate) || !gate.name || !entryOperation.Read(operation)) return;
     const uint32_t now = GetTickCount();
+    if (operation.name && now - operation.since >= MainSampleMs && sampledSince.exchange(operation.since) != operation.since)
+        LogMainThread(operation.name);
     if (!entryReports.Due(now, operation, gate)) return;
     Logf("world-entry: still waiting for %s for %u s; operation=%s operation_ms=%u epoch=%08x welcome=%u",
          gate.name, (now - gate.since) / 1000, operation.name ? operation.name : "engine outside mod",

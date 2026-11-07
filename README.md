@@ -30,6 +30,18 @@ static culling or hero ROI membership. Native activation retires passive zero-sp
 restarting the routine. `npclease: readiness` at activation and once per second reports `e0` (range), `e8`
 (processable), `entity_enabled`, `disabled`, `native`, `collecting`, task/state, hero/camera distances and the
 remaining permit. Frozen/cut diagnostics retain the exact loss reason; expiry never restarts client AI.
+Idle and cosmetic hit clips use native rig/pose/direction resource resolution without running scripts or applying damage.
+The host can authorize client-discovered mortal humans, orcs and goblins with no host instance or canonical record,
+in addition to generic creatures and livestock. Ordinary actors require a complete native template, no authored
+quest/dialogue reference and no trader, teacher, party, summon or owned-entity role. Equipped ordinary actors are
+allowed only through this host-confirmed discovery path; a packet timeout alone never grants authority.
+These owners run native routines, movement and combat. Hand-back imports their latest accepted scalar state
+(position, health, life, attitude and routine), never replays Kill/XP and never creates another host instance.
+Inventory/equipment remain each machine's native/personal state: client equipment changes and executing
+task/crime stacks are not transferred. Existing story/dialogue/crime journals and personal loot remain separate.
+Quest/dialogue actors, companions, merchants and teachers stay host-owned; without host presentation they get
+script-free animated idle and cosmetic hit reactions, not native walking or local damage. Client-only NPC state
+is not saved. The census distinguishes native ownership, visual fallback and unresolved resource failures.
 NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.
 A client's successful hit plays an immediate presentation-only flinch and counts despite a host-side parry.
 Hit identities suppress the corresponding echoed reaction. Hero damage is judged against locally presented contacts,

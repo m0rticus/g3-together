@@ -4,6 +4,7 @@
 #include "npclease_save.h"
 #include "npclease_guards.h"
 #include "npclease_presentation.h"
+#include "npclease_admission.h"
 
 #include "ai.h"
 #include "body.h"
@@ -26,10 +27,12 @@
 #include <Windows.h>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace g3t::npclease {
 namespace {
@@ -72,6 +75,9 @@ gFScript originalKill = nullptr;
 using QuestFn = GEBool(__fastcall*)(gCQuestManager_PS*, void*, eCEntity const&);
 QuestFn originalQuest = nullptr;
 thread_local eCEntity* ownerDeath = nullptr;
+std::unordered_set<std::string> storyActors;
+bool storyCatalogReady = false;
+std::unordered_map<GuidKey, std::string, GuidHash> refusalReasons;
 
 GuidKey Key(uint8_t const guid[16])
 {
@@ -172,8 +178,66 @@ char const* SpeciesName(Entity& npc)
     case gESpecies_FireGolem: return "FireGolem";
     case gESpecies_IceGolem: return "IceGolem";
     case gESpecies_Stalker: return "Stalker";
+    case gESpecies_Chicken: return "Chicken";
+    case gESpecies_Pig: return "Pig";
+    case gESpecies_Cow: return "Cow";
     default: return nullptr;
     }
+}
+NativeClass ClassOf(Entity& npc)
+{
+    if (SpeciesName(npc)) return NativeClass::Creature;
+    const auto species = static_cast<gESpecies>(npc.NPC.Species);
+    return species == gESpecies_Human || species == gESpecies_Orc || species == gESpecies_Goblin
+        ? NativeClass::Ordinary : NativeClass::Unsupported;
+}
+
+std::string StoryKey(char const* name)
+{
+    std::string key(name);
+    std::transform(key.begin(), key.end(), key.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return key;
+}
+void AddStoryActor(bCString const& name)
+{
+    if (name.GetLength()) storyActors.insert(StoryKey(name.GetText()));
+}
+bool StoryCatalog()
+{
+    if (storyCatalogReady) return true;
+    auto* quests = gCQuestManager_PS::GetInstance();
+    auto* infos = gCInfoManager_PS::GetInstance();
+    if (!quests || !infos || !quests->GetQuests().GetCount() || !infos->GetInfos().GetCount()) return false;
+    storyActors.clear();
+    for (int i = 0; i < quests->GetQuests().GetCount(); ++i) {
+        auto* quest = quests->GetQuests().GetAt(i).operator->();
+        if (!quest) return false;
+        AddStoryActor(quest->GetDestinationEntity());
+        for (int j = 0; j < quest->GetDeliveryEntities().GetCount(); ++j)
+            AddStoryActor(quest->GetDeliveryEntities().GetAt(j));
+    }
+    for (int i = 0; i < infos->GetInfos().GetCount(); ++i) {
+        auto* info = infos->GetInfos().GetAt(i);
+        if (!info) return false;
+        AddStoryActor(info->GetOwner());
+        AddStoryActor(info->GetConditionOwnerNearEntity());
+        AddStoryActor(info->GetConditionItemContainer());
+        for (auto const* names : {&info->GetCondSecondaryNPC(), &info->GetCondPlayerPartyMember()})
+            for (int j = 0; j < names->GetCount(); ++j) AddStoryActor(names->GetAt(j));
+        auto* script = info->AccessInfoScript().GetObject();
+        if (!script) return false;
+        for (int j = 0; j < script->GetCommandCount(); ++j) {
+            auto* line = script->GetCommand(j);
+            if (!line) return false;
+            AddStoryActor(line->GetEntity1());
+            AddStoryActor(line->GetEntity2());
+        }
+    }
+    storyCatalogReady = true;
+    Logf("npclease: story admission catalog ready actors=%u quests=%d infos=%d",
+         static_cast<unsigned>(storyActors.size()), quests->GetQuests().GetCount(), infos->GetInfos().GetCount());
+    return true;
 }
 bool GenericName(char const* name, char const* species)
 {
@@ -186,6 +250,10 @@ bool GenericName(char const* name, char const* species)
 }
 bool ExcludedRole(eCEntity* entity)
 {
+    if (entity->GetPropertySet(eEPropertySetType_Magic) ||
+        entity->GetPropertySet(eEPropertySetType_Item)) return true;
+    if (entity->GetPropertySet(eEPropertySetType_Interaction) &&
+        Entity(entity).Interaction.GetOwner().GetInstance()) return true;
     auto* dialog = static_cast<gCDialog_PS*>(entity->GetPropertySet(eEPropertySetType_Dialog));
     if (dialog && (dialog->GetTradeEnabled() || dialog->GetTeachEnabled() || dialog->GetPartyEnabled()))
         return true;
@@ -224,38 +292,66 @@ char const* EquipmentReason(Entity& npc)
     return nullptr;
 }
 
-bool Eligible(eCEntity* entity)
+char const* EligibilityReason(eCEntity* entity, char const* name = nullptr, bool prototype = false)
 {
-    if (!entity || npcremoval::Suppressed(entity) || Player(entity) || !entity->GetPropertySet(eEPropertySetType_NPC) ||
+    if (!entity) return "native NPC instance unavailable";
+    if (npcremoval::Suppressed(entity)) return "authored removal";
+    if (!prototype && (Player(entity) || npcs::RedundantClientEntity(entity))) return "player or duplicate identity";
+    if (!entity->GetPropertySet(eEPropertySetType_NPC) ||
         !entity->GetPropertySet(eEPropertySetType_DamageReceiver) ||
         !entity->GetPropertySet(eEPropertySetType_ScriptRoutine) ||
         !entity->GetPropertySet(eEPropertySetType_CharacterMovement) ||
         !entity->GetPropertySet(eEPropertySetType_Inventory) ||
-        !entity->GetPropertySet(eEPropertySetType_Navigation)) return false;
+        !entity->GetPropertySet(eEPropertySetType_Navigation)) return "incomplete native NPC/template";
     Entity npc(entity);
+    Admission admission;
+    admission.type = ClassOf(npc);
+    admission.complete = prototype || entity->GetCreator() != nullptr;
+    admission.mortal = !npc.NPC.Immortal;
+    admission.independent = !ExcludedRole(entity);
     const char* species = SpeciesName(npc);
-    if (!species || !GenericName(npc.GetName().GetText(), species) || npc.NPC.Immortal || ExcludedRole(entity))
-        return false;
-    const auto* creator = entity->GetCreator();
-    if (!creator || std::strcmp(creator->GetName().GetText(), species)) return false;
-    if (talk::IsHeld(entity) || talk::TalkingWithHero(entity)) return false;
-    for (auto slot : {gESlot_RightHand, gESlot_LeftHand, gESlot_Body, gESlot_Helmet})
-        if (!PortableEquipment(npc, slot)) return false;
-    return true;
+    const bCString nativeName = npc.GetName();
+    const char* instanceName = name ? name : nativeName.GetText();
+    if (species) {
+        const auto* creator = prototype ? entity : entity->GetCreator();
+        admission.portableCreature = GenericName(instanceName, species) && creator &&
+            !std::strcmp(creator->GetName().GetText(), species) && (prototype || !EquipmentReason(npc));
+    } else if (admission.type == NativeClass::Ordinary) {
+        admission.storyCatalog = StoryCatalog();
+        admission.storyReferenced = storyActors.count(StoryKey(instanceName)) != 0 ||
+            storyActors.count(StoryKey(entity->GetName().GetText())) != 0;
+    }
+    return admission.Refusal();
 }
-bool ValidDiscovery(Checkpoint const& state)
+bool Eligible(eCEntity* entity)
 {
-    if (!Valid(state) || state.dead || state.status) return false;
+    return !EligibilityReason(entity);
+}
+char const* DiscoveryReason(Checkpoint const& state)
+{
+    if (!Valid(state) || state.dead || state.status) return "invalid/dead/status-bearing discovery checkpoint";
     _GUID raw;
     std::memcpy(&raw, state.templateId, sizeof(raw));
     eCTemplateEntityProxy proxy;
     proxy.SetEntity(guid::Property(raw));
     auto* prototype = proxy.GetEntity();
-    if (!prototype || !prototype->GetPropertySet(eEPropertySetType_NPC)) return false;
+    if (!prototype || !prototype->GetPropertySet(eEPropertySetType_NPC)) return "native discovery template unavailable";
+    return EligibilityReason(prototype, state.name, true);
+}
+bool ValidDiscovery(Checkpoint const& state)
+{
+    return !DiscoveryReason(state);
+}
+NativeClass ClassOf(Checkpoint const& state)
+{
+    _GUID raw;
+    std::memcpy(&raw, state.templateId, sizeof(raw));
+    eCTemplateEntityProxy proxy;
+    proxy.SetEntity(guid::Property(raw));
+    auto* prototype = proxy.GetEntity();
+    if (!prototype || !prototype->GetPropertySet(eEPropertySetType_NPC)) return NativeClass::Unsupported;
     Entity npc(prototype);
-    const auto* species = SpeciesName(npc);
-    return species && !npc.NPC.Immortal && !ExcludedRole(prototype) && GenericName(state.name, species) &&
-        !std::strcmp(prototype->GetName().GetText(), species);
+    return ClassOf(npc);
 }
 bool Processed(eCEntity const* entity)
 {
@@ -487,9 +583,22 @@ void Diagnostic(char const* action, GuidKey const& key, Entry const& entry, char
     char text[40];
     guid::Format(reinterpret_cast<uint8_t const*>(key.data()), text, sizeof(text));
     const uint32_t began = entry.recallAt ? entry.recallAt : entry.lease.started;
-    Logf("npclease: %s guid=%s name=%s class=generic_creature owner=%u epoch=%u life=%u revision=%u reason=%s duration_ms=%u",
-         action, text, entry.lease.state.name, entry.lease.owner, entry.lease.epoch, entry.lease.incarnation, entry.lease.revision,
+    Logf("npclease: %s guid=%s name=%s class=%s owner=%u epoch=%u life=%u revision=%u reason=%s duration_ms=%u",
+         action, text, entry.lease.state.name,
+         ClassOf(entry.lease.state) == NativeClass::Ordinary ? "ordinary_discovered" : "generic_creature",
+         entry.lease.owner, entry.lease.epoch, entry.lease.incarnation, entry.lease.revision,
          why, began ? net::Now() - began : 0);
+}
+void Refusal(GuidKey const& key, char const* name, char const* reason)
+{
+    ++refused;
+    auto found = refusalReasons.find(key);
+    if (found != refusalReasons.end() && found->second == reason) return;
+    if (found != refusalReasons.end()) found->second = reason;
+    else if (refusalReasons.size() < MaxLeases) refusalReasons.emplace(key, reason);
+    char text[40];
+    guid::Format(key.data(), text, sizeof(text));
+    Logf("npclease: admission-refused guid=%s name=%s reason=%s", text, name, reason);
 }
 void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& entry, eCEntity* entity,
                          ClientReadiness const& readiness, char const* why)
@@ -572,9 +681,15 @@ void ReceiveHost(uint8_t from, Message const& note)
         if (native && CaptureNative(native, baseline)) {
             if (entry.lease.state.dead) baseline = entry.lease.state;
             entry.hasBaseline = true;
+        } else if (native) {
+            Refusal(key, note.state.name, EligibilityReason(native) ? EligibilityReason(native) :
+                "host instance exists but canonical capture unavailable");
+            return;
         } else if (entry.hasBaseline && Valid(entry.lease.state)) baseline = entry.lease.state;
-        else if (note.incarnation == 1 && ValidDiscovery(note.state)) {
+        else if (HostUnknown(native != nullptr, npcs::HostKnows(note.guid), entry.hasBaseline) &&
+                 note.incarnation == 1 && ValidDiscovery(note.state)) {
             baseline = note.state;
+            entry.lease.state = baseline;
             entry.hasBaseline = true;
             if (!entry.adopted) {
                 entry.adopted = true;
@@ -582,25 +697,35 @@ void ReceiveHost(uint8_t from, Message const& note)
                 Diagnostic("discovered", key, entry, "verified native template; no host instance created");
             }
         } else {
-            ++refused;
-            if (!entry.lastRequest || now - entry.lastRequest >= 5000) {
-                Diagnostic("refused", key, entry, "no canonical baseline or safe native discovery template");
-                entry.lastRequest = now ? now : 1;
-            }
+            Refusal(key, note.state.name, npcs::HostKnows(note.guid) ?
+                "host-known GUID without canonical baseline; discovery refused" :
+                DiscoveryReason(note.state) ? DiscoveryReason(note.state) : "host canonical baseline unavailable");
             return;
         }
         if (std::memcmp(note.state.templateId, baseline.templateId, 16) ||
-            std::strcmp(note.state.name, baseline.name)) { ++refused; return; }
+            std::strcmp(note.state.name, baseline.name)) {
+            Refusal(key, note.state.name, "discovery identity does not match canonical template/name"); return;
+        }
         entry.lease.state = baseline;
+        if (!MayDelegate(ClassOf(baseline),
+                HostUnknown(native != nullptr, npcs::HostKnows(note.guid), false),
+                entry.adopted && !native)) {
+            Refusal(key, baseline.name, "ordinary NPC has a host instance/record; host-owned");
+            return;
+        }
         auto interest = InterestOf(baseline, from, native);
         interest.hostPresent = interest.hostPresent && npcs::HostCanPresent(note.guid);
         if (!entry.interest.Delegate(interest, now)) return;
-        if (baseline.status || baseline.dead) { ++refused; return; }
+        if (baseline.status || baseline.dead) {
+            Refusal(key, baseline.name, "canonical NPC life/status not transferable"); return;
+        }
         if (baseline.busy && interest.hostPresent) {
             if (!entry.recallAt) entry.recallAt = now ? now : 1;
             if (now - entry.recallAt < RecallWaitMs) return;
         }
-        if (native && !npcplayback::GuardForLease(native)) { ++refused; return; }
+        if (native && !npcplayback::GuardForLease(native)) {
+            Refusal(key, baseline.name, "native property authority fence unavailable"); return;
+        }
         if (authoritySerial == UINT32_MAX) { ++refused; Log("FAIL npclease: authority epoch exhausted"); return; }
         entry.world = note.world; entry.echo = note.echo;
         entry.recallAt = 0;
@@ -833,7 +958,7 @@ bool Install()
     ai::PatchPointer(reinterpret_cast<void**>(&script->m_funcScript), reinterpret_cast<void*>(&Kill), "npclease Kill script");
     net::SetNpcLeaseHandler(&Receive);
     installed = true;
-    Log("npclease: generic creature authority ready; discovery=on absence_dwell_ms=0 lease_ms=3000 state_hz=5");
+    Log("npclease: native authority ready; creature/discovered-ordinary admission=on absence_dwell_ms=0 lease_ms=3000 state_hz=5");
     return true;
 }
 void TickHost(uint32_t now)
@@ -990,13 +1115,19 @@ void TickClient(uint32_t now)
         }
     }
     if (!Running() || persist::CheckpointBusy() || !GetConfig().npcAuthorityFallback) return;
-    const auto all = Entity::GetNPCs();
+    const auto* all = world::ProcessedEntities();
     eCEntity* hero = remote::ControlledBody();
     const auto& p = hero->GetWorldPosition();
     const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
-    for (int i = 0; i < all.GetCount(); ++i) {
-        eCEntity* entity = all.GetAt(i).GetInstance();
-        if (!Eligible(entity) || !NativeReady(entity)) continue;
+    for (GEU16 i = 0; all && i < all->GetCount(); ++i) {
+        eCEntity* entity = all->GetAt(i);
+        if (!npcplayback::IsCharacter(entity) || Player(entity) || npcs::RedundantClientEntity(entity) ||
+            npcremoval::Suppressed(entity)) continue;
+        if (auto const* why = EligibilityReason(entity)) {
+            if (!npcs::HostPresentationAvailable(entity)) Refusal(Key(entity), entity->GetName().GetText(), why);
+            continue;
+        }
+        if (!NativeReady(entity)) continue;
         const auto key = Key(entity);
         const auto found = entries.find(key);
         if (npcs::HostPresentationAvailable(entity)) {
@@ -1054,15 +1185,12 @@ void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, i
 char const* UnavailabilityReason(eCEntity* entity)
 {
     if (!GetConfig().npcAuthorityFallback) return "fallback disabled; host-only presentation unavailable";
-    if (!installed || installFailed) return "native authority guards unavailable; host-owned";
-    if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return "native NPC instance unavailable";
-    Entity npc(entity);
-    if (!SpeciesName(npc)) return "unverified NPC class/scripts/equipment; host-owned";
-    if (npc.NPC.Immortal) return "immortal/story actor; host-owned";
-    if (ExcludedRole(entity) || talk::IsHeld(entity) || talk::TalkingWithHero(entity))
-        return "dialogue/trade/teacher/party/summon dependency; host-owned";
-    return Eligible(entity) ? "awaiting reliable host-authorized creature cut" :
-        "named/equipped or incomplete native template; host-owned";
+    if (installFailed) return "native authority guard installation failed; host-owned";
+    if (!installed) return "native authority guard initialization pending";
+    if (auto const* reason = EligibilityReason(entity)) return reason;
+    const auto refusedGuid = refusalReasons.find(Key(entity));
+    if (refusedGuid != refusalReasons.end()) return refusedGuid->second.c_str();
+    return "awaiting reliable host-authorized native cut";
 }
 bool Fenced(eCEntity const* entity)
 {
@@ -1146,6 +1274,9 @@ void RejectSnapshot(char const* reason)
 void OnWorldDeactivate()
 {
     entries.clear();
+    storyActors.clear();
+    storyCatalogReady = false;
+    refusalReasons.clear();
     guardStates.Clear();
     scanAt = 0;
     crashlog::CacheObjects(crashlog::CacheKind::Leases, 0, nullptr);
@@ -1192,7 +1323,7 @@ void Tick()
             dormant += item.second.lease.phase == Phase::Dormant;
         }
         const uint32_t elapsed = reportAt ? now - reportAt : 5000;
-        Logf("npclease: role=%s class=generic_creature leased=%u dormant=%u grants=%u recalls=%u recovered=%u refused=%u adopted=%u "
+        Logf("npclease: role=%s class=creature_or_discovered_ordinary leased=%u dormant=%u grants=%u recalls=%u recovered=%u refused=%u adopted=%u "
              "state_tx_per_s=%.1f state_rx_per_s=%.1f native_deaths=%u repeated_deaths=%u foreign_contacts=%u "
              "scan_avg_ms=%u scan_max_ms=%u",
              net::IsHost() ? "host" : "client", active, dormant, granted, recalled, recovered, refused, discovered,

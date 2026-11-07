@@ -3422,6 +3422,10 @@ void LocalHit(eCEntity* entity)
 
 void LocalHit(eCEntity* entity, uint32_t sequence)
 {
+    if (entity && sequence && !HostPresentationAvailable(entity)) {
+        npcplayback::CosmeticHit(entity, npcplayback::MotionInstance(remote::ControlledBody()));
+        return;
+    }
     if (!entity || !sequence || !Ready(entity)) return;
     for (auto& entry : mirrors) {
         Mirror& m = entry.second;
@@ -3620,6 +3624,14 @@ bool HostCanPresent(uint8_t const identity[16])
 {
     const auto found = lastSent.find(Key(identity));
     return found != lastSent.end() && net::Now() - found->second.at <= npclease::PresentationGraceMs;
+}
+
+bool HostKnows(uint8_t const identity[16])
+{
+    const auto key = Key(identity);
+    return lastSent.count(key) || incarnations.count(key) || owned.count(key) ||
+        claimedBy.count(key) || directedBy.count(key) || mirrors.count(key) || corpses.count(key) ||
+        absences.count(key) || deadOnHost.count(key) || journal::RecordedDeath(identity);
 }
 
 namespace {

@@ -110,6 +110,9 @@ struct Unavailable {
     eCEntity const* entity = nullptr;
     State state;
     uint32_t seen = 0, attempted = 0;
+    uint32_t hitSwing = 0;
+    std::string candidate;
+    std::string leaseReason;
     char const* reason = "no evaluated idle or held pose";
     bool noted = false, failed = false, retry = false;
 };
@@ -122,6 +125,7 @@ struct ProvenPose {
     uint32_t seen = 0;
     uint32_t idleStarted = 0;
     std::string idleMotion;
+    float reactionDuration = 0.0f;
 };
 std::unordered_map<std::string, ProvenPose> provenPoses;
 struct SourceSkeleton {
@@ -1289,7 +1293,7 @@ bool IdleResourceName(char const* name)
            lower.find("stumble") == std::string::npos;
 }
 
-bool EvaluateIdle(eCEntity* entity, eCVisualAnimation_PS& animation, uint32_t elapsed)
+bool EvaluateIdle(eCEntity* entity, eCVisualAnimation_PS& animation, uint32_t elapsed, bool loop = true)
 {
     auto* actor = animation.GetActor();
     const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
@@ -1300,7 +1304,7 @@ bool EvaluateIdle(eCEntity* entity, eCVisualAnimation_PS& animation, uint32_t el
     actor->SetTargetWeight(slot, 1.0f);
     actor->SetPlaySpeed(slot, 0.0f);
     actor->PauseMotion(GEFalse, slot);
-    actor->SetPlayTime(slot, npclease::IdleTime(elapsed, duration));
+    actor->SetPlayTime(slot, loop ? npclease::IdleTime(elapsed, duration) : npclease::ReactionTime(elapsed, duration));
     NativePose evaluation;
     evaluation.evaluateOnly = true;
     const auto rig = Rig(animation);
@@ -1321,37 +1325,35 @@ bool IdleFailure(eCEntity* entity, char const* reason)
     return false;
 }
 
-bool BootstrapIdle(eCEntity* entity, eCVisualAnimation_PS& animation)
+eCResourceDataEntity* NativeMotion(eCEntity* entity, gEAction action, gEPhase phase)
 {
-    using Resolver = void(__thiscall*)(gCScriptProcessingUnit*, bCString&, eCEntity*, gEAction,
-                                      bCString, bCString&, GEBool);
-    const auto module = GetModuleHandleA("Game.dll");
-    const auto resolve = module ? reinterpret_cast<Resolver>(GetProcAddress(module,
-        "?GetAniName@gCScriptProcessingUnit@@IAEXAAVbCString@@PAVeCEntity@@W4gEAction@@V2@0_N@Z")) : nullptr;
-    auto* routine = static_cast<gCScriptRoutine_PS*>(entity->GetPropertySet(eEPropertySetType_ScriptRoutine));
     auto* admin = dynamic_cast<eCAnimationAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCAnimationAdmin")));
-    auto* actor = animation.GetActor();
-    if (!resolve) return IdleFailure(entity, "native idle resolver unavailable");
-    if (!routine || !admin) return IdleFailure(entity, "native routine/animation administration unavailable");
-    if (!actor || !actor->GetInstance()) return IdleFailure(entity, "native animation actor unavailable");
+    if (!admin) { IdleFailure(entity, "native animation administration unavailable"); return nullptr; }
+    Entity npc(entity);
     bCString extension;
     eCResourceAnimationMotion_PS::GetNativeFileExt(extension);
-    eCResourceDataEntity* resource = nullptr;
-    bCString name;
-    for (char const* phase : {"Ambient", "Loop"}) {
-        bCString stem, direction("None");
-        resolve(&routine->GetSPU(), stem, entity, gEAction_Ambient, bCString(phase), direction, GEFalse);
-        if (!IdleResourceName(stem.GetText())) continue;
+    // GetAni fixes native direction/primary pose; GetAniName would insert the supplied direction verbatim.
+    for (auto const& stem : {npc.GetAni(action, phase),
+                            npc.GetAni(action, gEUseType_None, gEUseType_None, phase)}) {
+        if (!stem.GetLength()) continue;
         bCString varied(stem);
         admin->GetAniVariation(varied);
         for (auto const& candidate : {varied, stem}) {
-            name = candidate;
+            bCString name(candidate);
             name += extension;
-            resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate);
-            if (resource) break;
+            unavailable[EntityKey(entity)].candidate = name.GetText();
+            if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate))
+                return resource;
         }
-        if (resource) break;
     }
+    return nullptr;
+}
+
+bool BootstrapIdle(eCEntity* entity, eCVisualAnimation_PS& animation)
+{
+    auto* actor = animation.GetActor();
+    if (!actor || !actor->GetInstance()) return IdleFailure(entity, "native animation actor unavailable");
+    auto* resource = NativeMotion(entity, gEAction_Ambient, gEPhase_Loop);
     if (!resource) return IdleFailure(entity, "native ambient/loop resource unavailable");
     const bool idle = IdleResourceName(resource->GetFileName().GetText());
     if (!idle || !resource->SearchResourcePropertySet()) {
@@ -1402,6 +1404,55 @@ bool RememberNativePresentation(eCEntity* entity)
     originalActorProcess(actor, nullptr, entity->GetWorldMatrix(), GETrue, GEFalse, 0.0f);
     if (!(rig == Rig(*animation))) return false;
     return RememberPose(entity, npclease::PoseProvenance::Native);
+}
+
+bool CosmeticHit(eCEntity* entity, uint32_t swing)
+{
+    if (!entity || !swing || !clientMode || !Passive(entity) || npclease::Fenced(entity) ||
+        npcremoval::Suppressed(entity) || npcs::RedundantClientEntity(entity) ||
+        npcs::HostPresentationAvailable(entity)) return false;
+    Entity npc(entity);
+    if (npc.IsDead() || npc.IsDown() || talk::IsHeld(entity) || talk::TalkingWithHero(entity)) return false;
+    auto* animation = Animation(entity);
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    if (!actor || !actor->GetInstance()) return IdleFailure(entity, "cosmetic hit actor unavailable");
+    auto& waiting = unavailable[EntityKey(entity)];
+    if (waiting.entity == entity && waiting.hitSwing == swing) return true;
+    waiting.entity = entity;
+    waiting.seen = net::Now();
+    waiting.hitSwing = swing;
+    auto* resource = NativeMotion(entity, gEAction_QuickStumble, gEPhase_Hit);
+    if (!resource) resource = NativeMotion(entity, gEAction_StumbleR, gEPhase_Hit);
+    if (!resource) {
+        char id[40];
+        const auto key = EntityKey(entity);
+        guid::Format(reinterpret_cast<uint8_t const*>(key.data()), id, sizeof(id));
+        Logf("npcplayback: cosmetic-hit unavailable guid=%s name=%s candidate=%s damage=none",
+             id, npc.GetName().GetText(), waiting.candidate.c_str());
+        return false;
+    }
+    const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+    {
+        PresentationScope scope;
+        for (int i = 0; i < Slots; ++i) {
+            const auto old = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
+            if (actor->HasMotionInstance(old)) animation->StopMotion(old, 0.0f);
+        }
+        animation->SetMotion(slot, resource);
+        resource->ReleaseReference();
+        animation->PlayMotion(slot, nullptr);
+    }
+    if (!EvaluateIdle(entity, *animation, 1, false) ||
+        !RememberPose(entity, npclease::PoseProvenance::Reaction))
+        return IdleFailure(entity, "cosmetic hit skeletal evaluation failed");
+    auto& saved = provenPoses[EntityKey(entity)];
+    saved.idleStarted = net::Now();
+    saved.idleMotion = animation->GetMotionDesc(slot).GetMotionFilename().GetText();
+    saved.reactionDuration = static_cast<float>(actor->GetMaxTime(slot));
+    waiting.retry = false;
+    waiting.state.holding = false;
+    ++predictedHits;
+    return true;
 }
 
 bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now)
@@ -1615,6 +1666,12 @@ bool HoldUnavailable(eCEntity* entity, State& state)
         state.holding = false;
     }
     if (found == provenPoses.end()) state.holding = false;
+    if (found != provenPoses.end() && found->second.proof.provenance == npclease::PoseProvenance::Reaction &&
+        (net::Now() - found->second.idleStarted) * 0.001f >= found->second.reactionDuration) {
+        provenPoses.erase(found);
+        found = provenPoses.end();
+        state.holding = false;
+    }
     if (!state.holding) {
         const auto& p = entity->GetWorldPosition();
         const auto q = entity->GetWorldRotation();
@@ -1643,20 +1700,25 @@ bool HoldUnavailable(eCEntity* entity, State& state)
     }
     if (npcs::HostPresentationAvailable(entity) || found == provenPoses.end() ||
         !found->second.proof.Usable(Rig(*animation))) return false;
-    if (found->second.proof.provenance == npclease::PoseProvenance::Idle) {
+    if (found->second.proof.provenance == npclease::PoseProvenance::Idle ||
+        found->second.proof.provenance == npclease::PoseProvenance::Reaction) {
         const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+        const bool loop = found->second.proof.provenance == npclease::PoseProvenance::Idle;
         if (found->second.idleMotion != animation->GetMotionDesc(slot).GetMotionFilename().GetText() ||
-            !EvaluateIdle(entity, *animation, net::Now() - found->second.idleStarted)) {
+            !EvaluateIdle(entity, *animation, net::Now() - found->second.idleStarted, loop)) {
             provenPoses.erase(found);
             state.holding = false;
             return false;
         }
         const uint32_t began = found->second.idleStarted;
         const std::string motion = found->second.idleMotion;
-        if (!RememberPose(entity, npclease::PoseProvenance::Idle)) return false;
+        const auto provenance = found->second.proof.provenance;
+        const float duration = found->second.reactionDuration;
+        if (!RememberPose(entity, provenance)) return false;
         auto& saved = provenPoses[key];
         saved.idleStarted = began;
         saved.idleMotion = motion;
+        saved.reactionDuration = duration;
         state.holding = true;
         return true;
     }
@@ -1722,8 +1784,9 @@ void PresentationCensus(uint32_t now)
     static uint32_t last = 0;
     if (last && now - last < 5000) return;
     last = now ? now : 1;
-    unsigned host = 0, held = 0, idle = 0, native = 0, unproven = 0, hidden = 0, removed = 0, objects = 0;
+    unsigned host = 0, held = 0, idle = 0, native = 0, visual = 0, unproven = 0, hidden = 0, removed = 0, objects = 0;
     std::unordered_map<std::string, unsigned> reasons;
+    std::unordered_map<std::string, unsigned> refusals;
     std::string sample;
     char const* sampleName = "-";
     auto const* all = world::ProcessedEntities();
@@ -1736,12 +1799,14 @@ void PresentationCensus(uint32_t now)
         if (npclease::LocalAuthority(entity)) { ++native; continue; }
         if (!Passive(entity)) continue;
         if (npcs::HostPresentationAvailable(entity)) { ++host; continue; }
+        ++refusals[npclease::UnavailabilityReason(entity)];
         const auto key = EntityKey(entity);
         const auto proof = provenPoses.find(key);
         auto* animation = Animation(entity);
         if (proof != provenPoses.end() && proof->second.entity == entity && animation &&
             proof->second.proof.Usable(Rig(*animation))) {
-            if (proof->second.proof.provenance == npclease::PoseProvenance::Idle) ++idle;
+            if (proof->second.proof.provenance == npclease::PoseProvenance::Idle) { ++idle; ++visual; }
+            else if (proof->second.proof.provenance == npclease::PoseProvenance::Reaction) ++visual;
             else ++held;
         } else {
             ++unproven;
@@ -1754,11 +1819,16 @@ void PresentationCensus(uint32_t now)
     unsigned topCount = 0;
     for (auto const& reason : reasons)
         if (reason.second > topCount) { top = reason.first.c_str(); topCount = reason.second; }
+    char const* topRefusal = "-";
+    unsigned refusalCount = 0;
+    for (auto const& reason : refusals)
+        if (reason.second > refusalCount) { topRefusal = reason.first.c_str(); refusalCount = reason.second; }
     char id[40] = "-";
     if (!sample.empty()) guid::Format(reinterpret_cast<uint8_t const*>(sample.data()), id, sizeof(id));
-    Logf("npcplayback: census host=%u held=%u idle=%u native=%u unproven=%u hidden=%u removed=%u static=%u "
-         "top_reason=%s count=%u sample=%s guid=%s",
-         host, held, idle, native, unproven, hidden, removed, objects, top, topCount, sampleName, id);
+    Logf("npcplayback: census host=%u held=%u idle=%u native=%u visual=%u unproven=%u hidden=%u removed=%u static=%u "
+         "top_reason=%s count=%u sample=%s guid=%s top_refusal=%s refusal_count=%u",
+         host, held, idle, native, visual, unproven, hidden, removed, objects, top, topCount, sampleName, id,
+         topRefusal, refusalCount);
 }
 
 void Tick()
@@ -1803,9 +1873,13 @@ void Tick()
                 if (held.entity != npc.GetInstance()) held = Unavailable{};
                 held.entity = npc.GetInstance();
                 held.seen = cleanupNow;
-                if (!held.noted) {
-                    Logf("npclease: degraded name=%s reason=%s contacts=off",
-                         npc.GetName().GetText(), npclease::UnavailabilityReason(npc.GetInstance()));
+                const char* leaseReason = npclease::UnavailabilityReason(npc.GetInstance());
+                if (!held.noted || held.leaseReason != leaseReason) {
+                    char id[40];
+                    guid::Format(identity, id, sizeof(id));
+                    Logf("npclease: degraded guid=%s name=%s reason=%s contacts=off",
+                         id, npc.GetName().GetText(), leaseReason);
+                    held.leaseReason = leaseReason;
                     held.noted = true;
                 }
                 if (!HoldUnavailable(npc.GetInstance(), held.state)) {
@@ -1813,9 +1887,9 @@ void Tick()
                         char id[40];
                         guid::Format(identity, id, sizeof(id));
                         Logf("npcplayback: fallback guid=%s name=%s source=native-unproven host_age_ms=%u "
-                             "rendering=%u reason=%s; retaining visibility contacts=off",
+                             "rendering=%u reason=%s candidate=%s; retaining visibility contacts=off",
                              id, npc.GetName().GetText(), npcs::HostPresentationAge(entity),
-                             entity->IsRenderingEnabled() ? 1 : 0, held.reason);
+                             entity->IsRenderingEnabled() ? 1 : 0, held.reason, held.candidate.c_str());
                         held.failed = true;
                     }
                 } else {

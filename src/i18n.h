@@ -76,6 +76,7 @@ enum Message
     ClientSaveCanceledByWorld,
     ClientRejoinFailed,
     ClientMenuNewGame,
+    ClientRestartToRejoin,
     MessageCount
 };
 

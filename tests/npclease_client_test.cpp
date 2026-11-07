@@ -2,6 +2,7 @@
 #include "../src/npclease_client.h"
 #include "../src/npclease_save.h"
 #include "../src/npclease_guards.h"
+#include "../src/npclease_admission.h"
 
 #include <cassert>
 #include <cstdint>
@@ -142,8 +143,38 @@ static void TestInitialCollection()
     assert(!LeaseProcessingRange(true, NAN));
 }
 
+static void TestAdmission()
+{
+    Admission ordinary{NativeClass::Ordinary, true, true, true, false, true, false};
+    assert(!ordinary.Refusal());
+    const auto refused = [&](bool Admission::* field, bool value, char const* reason) {
+        auto changed = ordinary;
+        changed.*field = value;
+        assert(std::strcmp(changed.Refusal(), reason) == 0);
+    };
+    refused(&Admission::complete, false, "incomplete native NPC/template");
+    refused(&Admission::mortal, false, "immortal/story actor");
+    refused(&Admission::independent, false, "trader/teacher/party/summon/owned actor");
+    refused(&Admission::storyCatalog, false, "authoritative story catalog unavailable");
+    refused(&Admission::storyReferenced, true, "authored quest/dialogue reference; visual-only");
+    Admission creature{NativeClass::Creature, true, true, true, true, false, true};
+    assert(!creature.Refusal());
+    creature.portableCreature = false;
+    assert(creature.Refusal());
+    creature.type = NativeClass::Unsupported;
+    assert(std::strcmp(creature.Refusal(), "unsupported native species") == 0);
+    for (unsigned flags = 0; flags < 8; ++flags)
+        assert(HostUnknown(flags & 1, flags & 2, flags & 4) == (flags == 0));
+    assert(MayDelegate(NativeClass::Creature, false, false));
+    assert(MayDelegate(NativeClass::Ordinary, true, false));
+    assert(MayDelegate(NativeClass::Ordinary, false, true));
+    assert(!MayDelegate(NativeClass::Ordinary, false, false));
+    assert(!MayDelegate(NativeClass::Unsupported, true, true));
+}
+
 int main()
 {
+    TestAdmission();
     TestHitReadiness();
     TestInitialCollection();
     ClientWindow client;

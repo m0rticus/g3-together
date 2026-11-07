@@ -1,15 +1,75 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/client_rejoin.h"
+#include "../src/saving_policy.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 using namespace g3t::rejoin;
 
 namespace {
+void Template()
+{
+    // The slot is ours, safe for the engine's file layer, and distinct from every player slot and every host copy.
+    assert(std::string(tmpl::Slot).rfind("G3T_", 0) == 0);
+    assert(g3t::saving::SafeName(tmpl::Slot));
+    assert(!g3t::saving::Prefix(tmpl::Slot, "G3T_host_") && !g3t::saving::Prefix(tmpl::Slot, "G3T_pending_"));
+    assert(tmpl::OwnSlot(tmpl::Slot));
+    assert(!tmpl::OwnSlot(nullptr) && !tmpl::OwnSlot("") && !tmpl::OwnSlot("G3T_client_template2") &&
+           !tmpl::OwnSlot("G3T_client_templat") && !tmpl::OwnSlot("QuickSave") && !tmpl::OwnSlot("G3_World_01_0001"));
+    assert(tmpl::Sidecar == 2);
+
+    // The marker binds the template to the exact installed Game.dll and survives only unchanged.
+    const std::string marker = tmpl::Marker(4640768);
+    const std::vector<uint8_t> bytes(marker.begin(), marker.end());
+    assert(tmpl::MarkerMatches(bytes, 4640768));
+    assert(!tmpl::MarkerMatches(bytes, 4640769) && !tmpl::MarkerMatches(bytes, 0));
+    assert(!tmpl::MarkerMatches(std::vector<uint8_t>{}, 4640768));
+    std::vector<uint8_t> damaged = bytes;
+    damaged.back() ^= 1;
+    assert(!tmpl::MarkerMatches(damaged, 4640768));
+    damaged = bytes;
+    damaged.push_back('\n');
+    assert(!tmpl::MarkerMatches(damaged, 4640768));
+    damaged.assign(bytes.begin(), bytes.end() - 1);
+    assert(!tmpl::MarkerMatches(damaged, 4640768));
+    const std::string wide = tmpl::Marker(0x100000000ull);
+    assert(tmpl::MarkerMatches(std::vector<uint8_t>(wide.begin(), wide.end()), 0x100000000ull));
+    for (bool header : {false, true})
+        for (bool world : {false, true})
+            for (bool matches : {false, true})
+                assert(tmpl::Valid(header, world, matches) == (header && world && matches));
+
+    // One save per New Game; the account record is held from the New Game return until the save or the deadline.
+    tmpl::Capture capture;
+    assert(!capture.wanted && !capture.Holding(0) && !capture.Due(0) && !capture.Expired(0));
+    capture.Want(1000);
+    assert(capture.Holding(1000) && !capture.Due(1000) && !capture.Due(2999));
+    assert(capture.Due(1000 + tmpl::DelayMs) && capture.Holding(1000 + tmpl::DelayMs));
+    assert(capture.Holding(1000 + tmpl::DeadlineMs - 1) && !capture.Expired(1000 + tmpl::DeadlineMs - 1));
+    assert(capture.Expired(1000 + tmpl::DeadlineMs) && !capture.Holding(1000 + tmpl::DeadlineMs) && !capture.Due(1000 + tmpl::DeadlineMs));
+    assert(tmpl::DelayMs < tmpl::DeadlineMs);
+    capture.Done();
+    assert(!capture.wanted && !capture.Holding(2000) && !capture.Due(2000) && !capture.Expired(1000 + tmpl::DeadlineMs));
+    capture.Want(0xfffffff0u); // GetTickCount wraps: every comparison is signed-difference based
+    assert(capture.Holding(0xfffffff0u) && !capture.Due(0xfffffff0u));
+    assert(capture.Due(0xfffffff0u + tmpl::DelayMs) && capture.Holding(0xfffffff0u + tmpl::DeadlineMs - 1));
+    assert(capture.Expired(0xfffffff0u + tmpl::DeadlineMs));
+
+    // The template is the only way back into a loaded world; without it nothing is torn down.
+    for (bool valid : {false, true})
+        for (bool ready : {false, true})
+            assert((ChooseRoute(valid, ready) == Route::Template) == (valid && ready));
+    // The native New Game restarts an already loaded world in place and never returned: allowed only for the first world.
+    assert(NewGameAllowed(false) && !NewGameAllowed(true));
+}
+
 void Policy()
 {
     State state;
@@ -143,6 +203,7 @@ void RealGame(char const* path)
 int main(int argc, char** argv)
 {
     Policy();
+    Template();
     NativeFixtures();
     if (argc == 2) RealGame(argv[1]);
     return 0;

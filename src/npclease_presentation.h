@@ -27,7 +27,19 @@ inline float IdleTime(uint32_t elapsed, float duration)
         ? std::fmod(duration * 0.25f + elapsed * 0.001f, duration) : 0.0f;
 }
 
-enum class PoseProvenance { None, Canonical, Native, Idle };
+inline float ReactionTime(uint32_t elapsed, float duration)
+{
+    return duration > 0.0f && std::isfinite(duration)
+        ? std::min(elapsed * 0.001f, std::nextafter(duration, 0.0f)) : 0.0f;
+}
+
+inline bool CosmeticContact(bool client, bool passive, bool hostPresentation, bool localPlayer,
+                            bool fenced, bool protectedLife, uint32_t swing)
+{
+    return client && passive && !hostPresentation && localPlayer && !fenced && !protectedLife && swing != 0;
+}
+
+enum class PoseProvenance { None, Canonical, Native, Idle, Reaction };
 struct PresentationRig {
     void const* actor = nullptr;
     void const* instance = nullptr;

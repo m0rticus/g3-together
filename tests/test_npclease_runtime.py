@@ -16,16 +16,16 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         cls.runtime = (ROOT / "src" / "npclease_runtime.cpp").read_text(encoding="utf-8")
 
     def test_suppressed_npcs_cannot_be_leased_or_adopted(self):
-        eligible = section(self.runtime, "bool Eligible(", "bool ValidDiscovery(")
+        eligible = section(self.runtime, "char const* EligibilityReason(", "bool ValidDiscovery(")
         receive = section(self.runtime, "void Receive(uint8_t", "GEBool __fastcall Quest(")
         self.assertIn("npcremoval::Suppressed(entity)", eligible)
         self.assertIn("npcremoval::Suppressed(note.guid)", receive)
 
     def test_discovery_requires_native_template_and_host_epoch(self):
-        discovery = section(self.runtime, "bool ValidDiscovery(", "bool Processed(")
+        discovery = section(self.runtime, "char const* DiscoveryReason(", "bool Processed(")
         self.assertIn("proxy.GetEntity()", discovery)
         self.assertIn("eEPropertySetType_NPC", discovery)
-        self.assertIn("GenericName(state.name, species)", discovery)
+        self.assertIn("EligibilityReason(prototype, state.name, true)", discovery)
         host = section(self.runtime, "void ReceiveHost(", "void ReceiveClient(")
         self.assertIn("note.incarnation == 1 && ValidDiscovery(note.state)", host)
         self.assertIn("++authoritySerial", host)
@@ -218,13 +218,43 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn('Diagnostic("host-held"', frozen)
 
     def test_expansion_does_not_enable_unportable_roles(self):
-        species = section(self.runtime, "char const* SpeciesName(", "bool GenericName(")
+        species = section(self.runtime, "char const* SpeciesName(", "NativeClass ClassOf(Entity&")
         for covered in ("gESpecies_Troll", "gESpecies_Minecrawler", "gESpecies_Gargoyle", "gESpecies_Ogre"):
             self.assertIn(covered, species)
         for excluded in ("case gESpecies_Human:", "case gESpecies_Orc:", "case gESpecies_Goblin:",
-                         "case gESpecies_Cow:", "case gESpecies_Pig:"):
+                         ):
             self.assertNotIn(excluded, species)
+        for covered in ("gESpecies_Chicken", "gESpecies_Cow", "gESpecies_Pig"):
+            self.assertIn(covered, species)
         role = section(self.runtime, "bool ExcludedRole(", "bool Eligible(")
         for guard in ("GetTradeEnabled()", "GetTeachEnabled()", "GetPartyEnabled()",
                       "gEPartyMemberType_None", "GetMembers().GetCount()"):
             self.assertIn(guard, role)
+
+    def test_discovered_ordinary_requires_host_absence_and_story_catalog(self):
+        host = section(self.runtime, "void ReceiveHost(", "void ReceiveClient(")
+        self.assertLess(host.index("else if (native)"), host.index("ValidDiscovery(note.state)"))
+        self.assertIn("HostUnknown(native != nullptr, npcs::HostKnows(note.guid), entry.hasBaseline)", host)
+        self.assertIn("MayDelegate(ClassOf(baseline)", host)
+        self.assertIn("entry.adopted && !native", host)
+        catalog = section(self.runtime, "bool StoryCatalog()", "bool GenericName(")
+        for reference in ("GetQuests()", "GetInfos()", "GetDestinationEntity()", "GetDeliveryEntities()",
+                          "GetOwner()", "GetEntity1()", "GetEntity2()", "GetCondPlayerPartyMember()"):
+            self.assertIn(reference, catalog)
+        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
+        self.assertIn("const auto* all = world::ProcessedEntities()", client)
+        self.assertNotIn("Entity::GetNPCs()", client)
+        diagnostic = section(self.runtime, "char const* UnavailabilityReason(", "bool Fenced(")
+        self.assertIn("initialization pending", diagnostic)
+        self.assertIn("installation failed", diagnostic)
+        self.assertIn("npclease: admission-refused guid=%s name=%s reason=%s", self.runtime)
+        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        known = section(npcs, "bool HostKnows(", "namespace {")
+        for ledger in ("lastSent", "incarnations", "corpses", "absences", "deadOnHost",
+                       "journal::RecordedDeath(identity)"):
+            self.assertIn(ledger, known)
+        journal = (ROOT / "src" / "journal.cpp").read_text(encoding="utf-8")
+        deathQuery = section(journal, "bool RecordedDeath(", "unsigned Write(")
+        self.assertIn("deaths.count", deathQuery)
+        for mutation in ("deaths[", "Kill(", "CountQuest(", "SendDeath("):
+            self.assertNotIn(mutation, deathQuery)

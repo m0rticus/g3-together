@@ -134,7 +134,8 @@ choose independently; the setting changes only mod messages.
 - [ ] With matching `friendly_fire = 0` (the default), allied melee, projectiles and harmful spells must not cost victim
   HP or blocking stamina, stagger, knock down or apply statuses. Include followers and both attack directions.
   Healing and enemy hits must still work. Knock-out/revive checks below require an enemy, not your partner.
-- [ ] The client starts New Game locally on initial entry and after every host load. The host sends only
+- [ ] The client starts New Game locally on first entry of each launch and re-enters after every host load through its own
+  `G3T_client_template` slot. The host sends only
   that account's saved character before admission. A missing account starts fresh, never as the host's hero.
 
 ## A 90-minute session
@@ -375,8 +376,8 @@ test hooks, bots or automated engine launches. Static tests/builds do not establ
    Same-slot simultaneous requests should share one transaction; a different active slot refuses busy.
    Each completed save has one host `.g3t` plus recoverable native menu caches, not new client world files.
 4. Continue playing, then **host-load the earlier slot**. Require HUD and exactly one lower PUP-chained load success.
-   The client returns to its menu without relaunching and finds **New Game selectable**.
-   It chooses **New Game locally again**, waits for account-exact character/personal-state restoration
+   The client re-enters the host's world on its own through the `G3T_client_template` slot (the game's own LoadGame; no menu stop, no New Game).
+   It waits for account-exact character/personal-state restoration
    and the host calendar plus all story/runtime/nearby shared-door baselines, applied cutover and entry confirmation.
    Compare both distinct saved heroes and shared quest/NPC/door/loot state. Recheck the first shared XP reward.
    Check quest counters/timers and no repeated quest XP, gold, reputation or item rewards. Loot a chest/corpse
@@ -423,34 +424,29 @@ test hooks, bots or automated engine launches. Static tests/builds do not establ
     pause), `source=capture` for quicksaves and client requests, `source=retained page=1` with a window open, and
     `source=fallback` only when native holds no scene image. HUD.SaveGame is never preceded by a new capture.
 
-### Client rejoin without relaunch
+### Client rejoin through the template slot (replaces "without relaunch" New Game; builds 50+)
 
 After coordinator deployment, use the two already configured isolated host/client copies; these are human
-checks, not an automated engine/Steam test. Do not use the protected user save folder.
+checks, not an automated engine/Steam test. Do not use the protected user save folder. The client isolated profile's
+save folder gets one new slot, `G3T_client_template.*` (`.g3savcp`, `.g3savcpdat`, `.g3t`), nothing else.
 
-1. Host starts the test campaign; client chooses **New Game**, joins and receives only its own account record.
-   Make the heroes visibly different and host-save; wait for **Co-op save complete** on both.
-2. With the client playing, host-load that save. The client must return to the menu without closing Gothic 3.
-   **New Game** must be selectable. Choose it and confirm; the saved client inventory, stats, equipment and
-   position must return, not the host hero or a placeholder. Admission must complete again.
-3. Open the client menu during play. **Back** must continue unchanged. Choose **New Game** instead and cancel
-   its native confirmation: remain in the menu, unadmitted, with the saved account record unchanged.
-   Choose and confirm New Game again; rejoin the same epoch with the last host-saved character, not the discarded live hero.
-4. Host starts a different campaign while the client is playing, and repeat while the client is already in its menu.
-   The client must stay in the same process. If the account has no saved record there, show the fresh-hero notice;
-   only an explicitly confirmed New Game may admit a fresh local hero. Do not auto-save over the earlier account record.
-5. Host-load while the client is in a New Game loading screen or its confirmation dialog. Do not close either process:
-   native loading/confirmation must finish before any queued retirement, with no nested teardown or crash.
-   Repeat rapid host load/new-campaign changes: retire once when safe, then join the latest epoch only.
-6. Repeat with the client downed, with dialogue/NPC trade open, and while a client-requested save is awaiting its result.
-   Downed state must not force a process restart. Dialogue/trade must show a deferral; finish/close them and allow an exchange
-   to settle. An outstanding same-epoch save waits for success/refusal; a host epoch replacement explicitly cancels the old save.
-   Rejoining must restore the last completed host snapshot. Also start client New Game while the host is still loading/in menu:
-   New Game stays available, but no admission or placeholder capture occurs until the host world is ready.
-7. Review both logs manually: client retirement reports `player=00000000 running=0 ok=1`, full
-   `world-cache: ... before world cleanup` / `after world cleanup` inventory reports complete, and old puppets,
-   mirrors, leases and private camera slots do not survive the restart. Host admission must be confirmed for the new entry.
-   No client native save/world load or native world transfer is allowed. Static policy/native-byte tests and the Release build
+1. Fresh client launch: host starts the test campaign; client chooses **New Game** (the only manual step), joins and receives only its own
+   account record. Within ~2 s of the New Game return the client log must show `persist: client template save slot=G3T_client_template ... ok=1`
+   BEFORE `persist: character restore`. Make the heroes visibly different and host-save; wait for **Co-op save complete** on both.
+2. With the client playing, host-load that save. Expected client log: `client enter state=queued reason=host-world-changed`, `state=cleanup`,
+   `state=native-load`, `persist: native invoke=World.LoadGameWorld`, `state=returned ... lower_calls=1 lower_ok=1`, then the usual
+   `character restore` and admission. The client must land in the host's world with its own saved character, never closing Gothic 3 and
+   never showing "not responding". Repeat the host load 5+ times in a row (including loading the same slot again).
+3. Host loads while the client is in the menu opened during play, in a dialogue/trade (deferral notice, then entry after closing),
+   with a client save awaiting its result, and during the client's own loading screen: the entry waits for the boundary, no nested teardown, no crash.
+4. Choose **New Game** from the client's in-game menu: it queues the same template entry (no native process exit, no freeze). A **New Game**
+   from the title screen after a world was already entered in this launch is refused with the restart notice.
+5. Delete `G3T_client_template.*` in the isolated client profile (only those files), host-load: the client keeps its old world, shows the
+   "restart Gothic 3 and choose New Game once" notice and logs `state=failed reason=no-template`; after a restart + New Game the template is rebuilt.
+6. A campaign with no record for the client's account: the template's fresh hero is used, never the host's hero; nothing overwrites the earlier record.
+7. Review both logs and the engine log (`ge3log*.log` in the isolated profile): no `FATAL`/`still cached` lines, no `world-entry: main thread stack`
+   line (that line is printed only when a native world operation runs longer than 15 s and gives the main thread's module+RVA candidates).
+   No native world transfer to/from the host is allowed; only the client's own template is loaded. Static policy/native-byte tests and the Release build
    do not establish these visual/native acceptance results.
 
 ### Targeting after deaths

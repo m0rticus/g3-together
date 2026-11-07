@@ -160,12 +160,12 @@ constexpr Translation Messages[] = {
     {L"Only the host loads saved games. Start a new game here to re-enter with your saved character.",
      L"Nur der Host lädt Spielstände. Starte hier ein neues Spiel, um mit deinem gespeicherten Helden beizutreten.",
      L"Tylko host wczytuje zapisy. Rozpocznij tu nową grę, aby dołączyć ze swoim zapisanym bohaterem."},
-    {L"The host changed the campaign. Returning to the menu; your saved character is kept.",
-     L"Der Host hat die Kampagne gewechselt. Zurück zum Menü; dein gespeicherter Held bleibt erhalten.",
-     L"Host zmienił kampanię. Powrót do menu; twój zapisany bohater zostaje zachowany."},
-    {L"Returning to the menu safely. A running load must finish first.",
-     L"Sichere Rückkehr zum Menü. Ein laufender Ladevorgang muss zuerst enden.",
-     L"Bezpieczny powrót do menu. Trwające wczytywanie musi najpierw się zakończyć."},
+    {L"The host changed the campaign. Entering the host's new world; your saved character is kept.",
+     L"Der Host hat die Kampagne gewechselt. Du betrittst die neue Host-Welt; dein gespeicherter Held bleibt erhalten.",
+     L"Host zmienił kampanię. Wchodzisz do nowego świata hosta; twój zapisany bohater zostaje zachowany."},
+    {L"Entering the host's world safely. A running load must finish first.",
+     L"Sicherer Eintritt in die Host-Welt. Ein laufender Ladevorgang muss zuerst enden.",
+     L"Bezpieczne wejście do świata hosta. Trwające wczytywanie musi najpierw się zakończyć."},
     {L"Re-entry is waiting for the current co-op save result. Your character record is not overwritten.",
      L"Der Wiedereinstieg wartet auf das Ergebnis der Koop-Speicherung. Dein Heldeneintrag wird nicht überschrieben.",
      L"Ponowne dołączenie czeka na wynik zapisu kooperacji. Zapis twojego bohatera nie zostanie nadpisany."},
@@ -187,6 +187,9 @@ constexpr Translation Messages[] = {
     {L"New Game re-enters with your account's last host-saved character. Unsaved progress is discarded; Back continues this session.",
      L"Neues Spiel lädt deinen zuletzt beim Host gespeicherten Helden. Ungespeicherter Fortschritt geht verloren; Zurück setzt diese Sitzung fort.",
      L"Nowa gra przywraca ostatni zapis twojego bohatera u hosta. Niezapisany postęp zostaje odrzucony; Powrót kontynuuje tę sesję."},
+    {L"Rejoining needs one restart of Gothic 3: after it, choose New Game once so the game can save its rejoin template. Your saved character is not changed.",
+     L"Für den Wiedereinstieg muss Gothic 3 einmal neu gestartet werden: Wähle danach einmal Neues Spiel, damit die Vorlage gespeichert wird. Dein gespeicherter Held bleibt unverändert.",
+     L"Ponowne dołączenie wymaga jednego restartu Gothic 3: potem wybierz raz Nowa gra, aby zapisać szablon dołączenia. Twój zapisany bohater nie zostanie zmieniony."},
 };
 static_assert(sizeof(Messages) / sizeof(Messages[0]) == MessageCount, "Missing HUD translation");
 

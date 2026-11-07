@@ -16,6 +16,7 @@
 #include "npcs.h"
 #include "npcremoval.h"
 #include "npclease_runtime.h"
+#include "npclease_presentation.h"
 #include "npcplayback.h"
 #include "remote.h"
 #include "ranged.h"
@@ -752,6 +753,10 @@ bool SendHostJudgedMelee(eCEntity* victim, net::MeleeContact contact)
         return false;
     }
     if (IgnoreFriendlyHit(victim, remote::ControlledBody())) return false;
+    if (npclease::CosmeticContact(!net::IsHost(), npcplayback::IsPassive(victim),
+            npcs::HostPresentationAvailable(victim), true, npclease::Fenced(victim),
+            Entity(victim).IsDead() || Entity(victim).IsDown() || downed::HarmProtected(victim), contact.motion))
+        npcplayback::CosmeticHit(victim, contact.motion);
     const GEInt held = Entity(hero).Inventory.FindStackIndex(gESlot_RightHand);
     if (held >= 0) {
         const Template item = Entity(hero).Inventory.GetTemplate(held);

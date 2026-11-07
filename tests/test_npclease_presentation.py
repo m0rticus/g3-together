@@ -49,14 +49,15 @@ class NpcLeasePresentationTests(unittest.TestCase):
 
     def test_idle_bootstrap_is_evaluated_and_script_free(self):
         source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
-        idle = source[source.index("bool BootstrapIdle("):source.index("\n}\n\nbool LocalHit(")]
-        for required in ("GetAniName@gCScriptProcessingUnit", "GetAniVariation",
-                         "QueryMotionDataEntity", "IdleResourceName", "EvaluateIdle(",
-                         'for (char const* phase : {"Ambient", "Loop"})', "PoseProvenance::Idle"):
+        idle = source[source.index("eCResourceDataEntity* NativeMotion("):source.index("bool CosmeticHit(")]
+        for required in ("npc.GetAni(action, phase)", "GetAniVariation",
+                         "QueryMotionDataEntity", "gEUseType_None", "EvaluateIdle(",
+                         "gEAction_Ambient, gEPhase_Loop", "PoseProvenance::Idle"):
             self.assertIn(required, idle)
         for forbidden in ("ContinueRoutine", "sAIPlayAni", "SetTask", "Movement", "OnPreProcess",
                           "UpdatePresentation("):
             self.assertNotIn(forbidden, idle)
+        self.assertNotIn('direction("None")', idle)
         replay = source[source.index("bool Replay("):source.index("bool ReplayFrozenPose(")]
         self.assertIn("!hostPose.evaluated || !hostPose.applied || !hostPose.valid", replay)
         self.assertIn("PoseProvenance::Canonical", replay)
@@ -70,6 +71,24 @@ class NpcLeasePresentationTests(unittest.TestCase):
                          "evaluation.evaluated", "GETrue, GEFalse, 0.0f"):
             self.assertIn(required, evaluate)
         self.assertIn("EvaluateIdle(entity, *animation, net::Now()", hold)
+
+    def test_cosmetic_contact_is_script_free_finite_and_host_superseded(self):
+        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        hit = source[source.index("bool CosmeticHit("):source.index("bool LocalHit(")]
+        for required in ("HostPresentationAvailable", "npclease::Fenced", "RedundantClientEntity",
+                         "waiting.hitSwing == swing", "gEAction_QuickStumble, gEPhase_Hit",
+                         "PoseProvenance::Reaction", "EvaluateIdle(entity, *animation, 1, false)"):
+            self.assertIn(required, hit)
+        for forbidden in ("ContinueRoutine", "HitPoints =", "Kill(", "SendHitNpc", "SetTask"):
+            self.assertNotIn(forbidden, hit)
+        hold = source[source.index("bool HoldUnavailable("):source.index("void ReleaseUnavailable(")]
+        self.assertIn("reactionDuration", hold)
+        self.assertLess(hold.index("HostPresentationAvailable"), hold.index("PoseProvenance::Reaction"))
+        combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
+        contact = combat[combat.index("bool SendHostJudgedMelee("):combat.index("// Stufe 4.1:")]
+        self.assertLess(contact.index("CosmeticHit"), contact.index("net::SendHitNpc"))
+        self.assertIn("contact.motion", contact)
+        self.assertIn("visual=%u", source)
 
     def test_fallback_scans_processed_npcs_and_bounds_resource_retries(self):
         source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
