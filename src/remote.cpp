@@ -6,6 +6,7 @@
 #include "body.h"
 #include "combat.h"
 #include "config.h"
+#include "crashlog.h"
 #include "downed.h"
 #include "downed_policy.h"
 #include "guid.h"
@@ -790,6 +791,18 @@ void OnWorldDeactivate()
     for (auto& puppet : puppets) puppet = Puppet{};
     for (auto& set : contacts) set.clear();
     haveAnchor = false;
+}
+
+void CaptureCacheInventory()
+{
+    unsigned count = 0;
+    eCEntity* first = nullptr;
+    for (auto const& puppet : puppets)
+        if (auto* entity = puppet.entity.GetInstance()) {
+            ++count;
+            if (!first) first = entity;
+        }
+    crashlog::CacheObjects(crashlog::CacheKind::Puppets, count, first);
 }
 
 void NoteContact(eCEntity* npc, eCEntity* puppet)

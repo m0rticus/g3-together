@@ -7,6 +7,7 @@
 #pragma once
 
 #include "worldentry.h"
+#include <cstdint>
 
 namespace g3t::crashlog {
 using LogFn = void (*)(char const*);
@@ -32,4 +33,9 @@ void BeginShutdown();
 bool Shutdown();
 void StartWatchdog();
 void CancelWatchdog();
+enum class CacheKind { Cameras, Prefetchers, PrivateEntities, Spheres, Anchors, ProcessingRange, Puppets, Disabled, Summons, Count };
+// Engine thread publishes values only; reporting never follows a native pointer on a worker.
+void CacheObjects(CacheKind kind, uint32_t count, void const* first);
+void LogCacheInventory(char const* phase);
+void NativeStack(char const* reason);
 }

@@ -6,12 +6,14 @@
 
 #include "body.h"
 #include "ai.h"
+#include "crashlog.h"
 #include "config.h"
 #include "net.h"
 #include "npcs.h"
 #include "npcremoval.h"
 #include "processing.h"
 #include "remote.h"
+#include "world_retirement.h"
 
 #include <Engine.h>
 #include <Game.h>
@@ -39,6 +41,8 @@ struct RemoteRegionState {
     uint32_t retryAt = 0;
 };
 std::vector<RemoteRegionState> hostRegions;
+retirement::Gate retirementGate;
+std::atomic<unsigned> regionOwners{0};
 std::vector<std::array<float, 3>> simulationAnchors;
 uint32_t anchorsCheckedAt = 0;
 unsigned remoteRegionFailures = 0;
@@ -63,7 +67,7 @@ unsigned remoteEntityEvictions = 0;
 using ContextCacheOutFn = GEBool(__stdcall*)(eCGeometrySpatialContext*);
 using ContextCallbackGetter = ContextCacheOutFn(__thiscall*)(eCPVSPrefetcher3 const*);
 ContextCallbackGetter getContextCallback = nullptr;
-ContextCacheOutFn previousContextCallback = nullptr;
+std::atomic<ContextCacheOutFn> previousContextCallback{nullptr};
 eCPVSPrefetcher3* contextCacheOwner = nullptr;
 unsigned contextsRetained = 0;
 bool contextRefreshPending = false;
@@ -84,9 +88,9 @@ void RefreshContexts()
 
 bool NeedsContext(RemoteRegionState& region, bCBox const& context)
 {
-    if (!region.camera || !region.prefetcher || region.failed) return false;
+    if (!region.camera || !region.prefetcher) return false;
     bTSmallArray<eCPVSCellItem*> cells;
-    region.prefetcher->GetValidCells(region.camera->GetFrustumDatabase(), cells);
+    region.prefetcher->GetAllValidCells(cells);
     for (GEU16 i = 0; i < cells.GetCount(); ++i) {
         auto const& cell = cells.GetAt(i)->GetCellBox();
         // Execute expands context bounds by one grid cell before testing the active rectangle.
@@ -100,7 +104,12 @@ bool NeedsContext(RemoteRegionState& region, bCBox const& context)
 
 GEBool __stdcall MayReleaseContext(eCGeometrySpatialContext* context)
 {
-    if (ai::ShuttingDown()) return previousContextCallback ? previousContextCallback(context) : GETrue;
+    auto previous = previousContextCallback.load();
+    if (retirementGate.Paused() || ai::ShuttingDown()) {
+        // The main job can release a geometry graph while retirement is still draining its private cells.
+        if (regionOwners.load()) return GEFalse;
+        return previous ? previous(context) : GETrue;
+    }
     if (RemoteJobsPending()) {
         contextRefreshPending = true;
         ++contextsRetained;
@@ -108,7 +117,7 @@ GEBool __stdcall MayReleaseContext(eCGeometrySpatialContext* context)
     }
     for (auto& region : hostRegions)
         if (NeedsContext(region, context->GetContextBox())) { ++contextsRetained; return GEFalse; }
-    return previousContextCallback ? previousContextCallback(context) : GETrue;
+    return previous ? previous(context) : GETrue;
 }
 
 GEBool __stdcall KeepSharedContext(eCGeometrySpatialContext*)
@@ -142,7 +151,7 @@ void RestoreContextOwnership()
 {
     if (!contextCacheOwner) return;
     if (getContextCallback(contextCacheOwner) == &MayReleaseContext)
-        contextCacheOwner->SetContextCacheOutCallback(previousContextCallback);
+        contextCacheOwner->SetContextCacheOutCallback(previousContextCallback.load());
     else Log("WARN world: spatial-context callback changed externally; not overwriting it");
     contextCacheOwner = nullptr;
     previousContextCallback = nullptr;
@@ -173,7 +182,7 @@ void EvictRemoteEntity(RemoteRegionState& region, eCEntity* entity)
 
 GEBool __fastcall CacheOut(eCPVSPrefetcher3* self, void* edx, eCEntity* entity)
 {
-    if (ai::ShuttingDown()) return originalCacheOut ? originalCacheOut(self, edx, entity) : GETrue;
+    // Existing private ownership still needs eviction after BeginShutdown, until all regions have retired.
     auto* renderer = RenderAdmin();
     if (renderer && self == &renderer->GetPVSPrefetcher3()) {
         for (auto& region : hostRegions) EvictRemoteEntity(region, entity);
@@ -230,58 +239,132 @@ bool CompletePrefetcher(eCPVSPrefetcher3& prefetcher, char const* phase)
     return true;
 }
 
-void ReleaseRegion(RemoteRegionState& region)
+struct CellInventory {
+    unsigned cells = 0, statics = 0, dynamics = 0;
+    eCPVSCellItem* permanent = nullptr;
+    bool Empty() const { return !statics && !dynamics; }
+};
+
+CellInventory Inventory(eCPVSPrefetcher3* prefetcher)
 {
-    if (!region.camera) { region = RemoteRegionState{}; return; }
-    if (auto* renderer = RenderAdmin()) {
+    CellInventory result;
+    if (!prefetcher) return result;
+    struct CellLock {
+        bCCriticalSectionWin32& lock = eCPVSCellItem::GetCriticalSection();
+        CellLock() { lock.Acquire(); }
+        ~CellLock() { lock.Release(); }
+    } lock;
+    bTSmallArray<eCPVSCellItem*> cells;
+    prefetcher->GetAllValidCells(cells);
+    result.permanent = prefetcher->GetNonDeactivationCell();
+    auto add = [&](eCPVSCellItem* cell) {
+        if (!cell) return;
+        ++result.cells;
+        result.statics += cell->GetStaticEntities().GetCount();
+        result.dynamics += cell->GetDynamicEntities().GetCount();
+    };
+    for (GEU16 i = 0; i < cells.GetCount(); ++i)
+        if (cells.GetAt(i) != result.permanent) add(cells.GetAt(i));
+    add(result.permanent);
+    return result;
+}
+
+void LogRegion(RemoteRegionState const& region, char const* phase)
+{
+    auto cells = Inventory(region.prefetcher.get());
+    Logf("world-cache: %s camera=%p prefetcher=%p database=%u cells=%u static=%u dynamic=%u permanent=%p failed=%d",
+         phase, region.camera.get(), region.prefetcher.get(),
+         region.camera ? region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex() : 0xffffffffu,
+         cells.cells, cells.statics, cells.dynamics, cells.permanent, region.failed);
+}
+
+struct RegionRetirement {
+    RemoteRegionState& region;
+    eCRenderSystemAdmin& renderer;
+
+    bool CompleteJobs()
+    {
         if (region.prefetcher) {
             region.prefetcher->EnablePrefetcher(GEFalse);
-            if (!CompletePrefetcher(*region.prefetcher, "retired remote")) region.failed = true;
+            if (!CompletePrefetcher(*region.prefetcher, "retired remote")) return false;
         }
-        if (!CompletePrefetcher(renderer->GetPVSPrefetcher3(), "main renderer")) region.failed = true;
-        if (!renderer->FlushThreadQueues()) Log("world: remote region render queues did not flush before release");
+        return CompletePrefetcher(renderer.GetPVSPrefetcher3(), "main renderer");
+    }
+    bool FlushQueues()
+    {
+        if (renderer.FlushThreadQueues()) return true;
+        Log("FAIL world: remote retirement render queues did not flush; preserving owners");
+        return false;
+    }
+    bool ClearCells()
+    {
         auto& database = region.camera->GetFrustumDatabase();
         const uint32_t index = database.GetFrustumDatabaseIndex();
-        if (index != 0xffffffffu) {
-            // Retirement queues cell cache-out work; drain it while both native owners are still alive.
-            database.RefreshFrustumData();
-            if (region.prefetcher) {
-                region.prefetcher->ClearCells(database);
-                if (!CompletePrefetcher(*region.prefetcher, "retired remote cell clear")) region.failed = true;
-            }
-            if (!renderer->UnregisterDatabase(database))
-                Logf("FAIL world: remote camera database %u could not be unregistered", index);
-            if (!CompletePrefetcher(renderer->GetPVSPrefetcher3(), "main renderer database unregister"))
-                region.failed = true;
-            if (!renderer->FlushThreadQueues()) Log("FAIL world: remote cell cache-out queues did not flush");
-            const uint32_t after = database.GetFrustumDatabaseIndex();
-            if (after != 0xffffffffu) {
-                region.failed = true;
-                Logf("FAIL world: remote camera database %u remains registered (after=%u); preserving camera/prefetcher",
-                     index, after);
-            }
-            if (!region.failed)
-                Logf("world: retired remote camera database %u before destroying its camera", index);
+        if (index == 0xffffffffu) return true;
+        if (index >= 32) {
+            Logf("FAIL world: unsupported remote database index %u; preserving owners", index);
+            return false;
         }
-        if (!region.failed) {
-            region.camera.reset();
-            region.prefetcher.reset();
-            if (!renderer->FlushThreadQueues()) Log("FAIL world: remote camera destruction queues did not flush");
-            region = RemoteRegionState{};
-        } else {
-            region.retryAt = net::Now() + 5000;
-            Logf("FAIL world: retirement unsafe for database %u; no owner destroyed", index);
+        database.RefreshFrustumData();
+        if (region.prefetcher) {
+            bTSmallArray<eCPVSCellItem*> cells;
+            region.prefetcher->GetAllValidCells(cells);
+            // Native ClearCells only covers the current grid size. Release older grids BEFORE losing the slot index.
+            retirement::DrainSlots(cells.GetCount(), [&](size_t i) { return cells.GetAt(static_cast<GEU16>(i)); },
+                                   region.prefetcher->GetNonDeactivationCell(), index);
+            region.prefetcher->ClearCells(database);
         }
-    } else {
-        Log("FAIL world: remote camera retirement has no render system administration");
+        return true;
+    }
+    bool CellsEmpty()
+    {
+        LogRegion(region, "drained");
+        if (Inventory(region.prefetcher.get()).Empty()) return true;
+        Log("FAIL world: private PVS still owns entities; database/camera/prefetcher preserved");
+        return false;
+    }
+    bool Unregister()
+    {
+        auto& database = region.camera->GetFrustumDatabase();
+        const uint32_t index = database.GetFrustumDatabaseIndex();
+        if (index == 0xffffffffu) return true;
+        const bool unregistered = renderer.UnregisterDatabase(database);
+        const uint32_t after = database.GetFrustumDatabaseIndex();
+        if (unregistered && after == 0xffffffffu) return true;
+        Logf("FAIL world: remote database %u unregister result=%d after=%u; preserving owners", index, unregistered, after);
+        return false;
+    }
+    void DestroyOwners()
+    {
+        region.camera.reset();
+        region.prefetcher.reset();
+        if (!renderer.FlushThreadQueues()) Log("FAIL world: remote camera destruction queues did not flush");
+        regionOwners.fetch_sub(1);
+        region = RemoteRegionState{};
+    }
+};
+
+void ReleaseRegion(RemoteRegionState& region)
+{
+    if (!region.camera && !region.prefetcher) { region = RemoteRegionState{}; return; }
+    LogRegion(region, "retiring");
+    auto* renderer = RenderAdmin();
+    bool retired = false;
+    if (renderer && region.camera) {
+        RegionRetirement operations{region, *renderer};
+        retired = retirement::Retire(operations);
+    } else Log("FAIL world: remote retirement has no render administration or camera");
+    if (!retired) {
         region.failed = true;
         region.retryAt = net::Now() + 5000;
-    }
+        Log("FAIL world: retirement unsafe; no owner destroyed");
+    } else Log("world-cache: retired remote slot before destroying camera/prefetcher");
     contextRefreshPending = true;
 }
 
 bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
 {
+    if (retirementGate.Paused() || ai::ShuttingDown()) return false;
     if (region.failed) {
         if (static_cast<int32_t>(net::Now() - region.retryAt) < 0) return false;
         ReleaseRegion(region);
@@ -320,6 +403,7 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
         }
         region.camera = std::move(camera);
         region.prefetcher = std::move(prefetcher);
+        regionOwners.fetch_add(1);
         region.radius = 0.0f;
     }
     const bool moved = body::Distance(at, region.position) >= 500.0f || region.radius != radius;
@@ -517,13 +601,13 @@ bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, u
 
 bool __fastcall NpcIntersects(eCEntityAdmin* admin, void*, bCBox const& box)
 {
-    if (ai::ShuttingDown()) return admin ? admin->IntersectsProcessingRangeRegion(box) : GEFalse;
+    if (retirementGate.Paused() || ai::ShuttingDown()) return admin ? admin->IntersectsProcessingRangeRegion(box) : GEFalse;
     return NpcIntersectsAt(admin, box, npcRangeChecks, npcRangeExpanded);
 }
 
 bool __fastcall NpcIntersectsUpdate(eCEntityAdmin* admin, void*, bCBox const& box)
 {
-    if (ai::ShuttingDown()) return admin ? admin->IntersectsProcessingRangeRegion(box) : GEFalse;
+    if (retirementGate.Paused() || ai::ShuttingDown()) return admin ? admin->IntersectsProcessingRangeRegion(box) : GEFalse;
     return NpcIntersectsAt(admin, box, npcUpdateChecks, npcUpdateExpanded);
 }
 
@@ -633,7 +717,7 @@ void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
 
 void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
 {
-    if (ai::ShuttingDown()) {
+    if (retirementGate.Paused() || ai::ShuttingDown()) {
         if (originalProcess) originalProcess(admin);
         return;
     }
@@ -673,11 +757,11 @@ void HookElastic()
     Logf("world: eCEntityAdmin::Process %s", originalProcess ? "wrapped (NPC-only ranges)" : "could not be wrapped");
 }
 
-bool Extended() { return elasticActive || spheresActive; }
+bool Extended() { return !retirementGate.Paused() && (elasticActive || spheresActive); }
 
 bool HostProcesses(float const at[3], float margin)
 {
-    if (!spheresActive || !lastAdmin) return false;
+    if (retirementGate.Paused() || !spheresActive || !lastAdmin) return false;
     if (body::Distance(at, Field(lastAdmin, 0x24)) <= *Field(lastAdmin, 0x10) - margin) return true;  // the camera's own
     const float step = *Field(lastAdmin, 0x40);
     for (int i = 0; i < sphereCount; ++i)
@@ -687,6 +771,8 @@ bool HostProcesses(float const at[3], float margin)
 
 void Tick()
 {
+    Start();
+    if (retirementGate.Paused() || ai::ShuttingDown()) return;
     if (!net::IsHost()) return;
     HookElastic();
     if (spheresHooked && originalStopSession && gCSession::GetInstance().IsGameRunning()) {
@@ -713,6 +799,12 @@ void Tick()
 
 void OnWorldDeactivate()
 {
+    if (!retirementGate.Begin()) {
+        Log("world-cache: nested deactivation; retirement already in progress");
+        return;
+    }
+    struct FinishRetirement { ~FinishRetirement() { retirementGate.Finish(); } } finish;
+    CaptureCacheInventory();
     for (auto& region : hostRegions) ReleaseRegion(region);
     for (size_t i = 0; i < hostRegions.size();) {
         if (!hostRegions[i].camera && !hostRegions[i].prefetcher && !hostRegions[i].failed)
@@ -724,8 +816,73 @@ void OnWorldDeactivate()
     anchorsCheckedAt = 0;
     spheres.clear();
     sphereCount = 0;
+    spheresActive = false;
+    elasticActive = false;
     lastAdmin = nullptr;
-    RestoreContextOwnership();
+    if (hostRegions.empty()) RestoreContextOwnership();
+    CaptureCacheInventory();
+}
+
+void OnWorldActivate() { retirementGate.Activate(); }
+
+void CaptureCacheInventory()
+{
+    unsigned cameras = 0, prefetchers = 0, populated = 0;
+    for (auto const& region : hostRegions) {
+        cameras += region.camera != nullptr;
+        prefetchers += region.prefetcher != nullptr;
+        auto cells = Inventory(region.prefetcher.get());
+        populated += cells.statics + cells.dynamics;
+    }
+    crashlog::CacheObjects(crashlog::CacheKind::Cameras, cameras, hostRegions.empty() ? nullptr : hostRegions.front().camera.get());
+    crashlog::CacheObjects(crashlog::CacheKind::Prefetchers, prefetchers, hostRegions.empty() ? nullptr : hostRegions.front().prefetcher.get());
+    crashlog::CacheObjects(crashlog::CacheKind::PrivateEntities, populated, contextCacheOwner);
+    crashlog::CacheObjects(crashlog::CacheKind::Spheres, static_cast<unsigned>(spheres.size()), spheres.empty() ? nullptr : spheres.data());
+    crashlog::CacheObjects(crashlog::CacheKind::Anchors, static_cast<unsigned>(simulationAnchors.size()),
+                          simulationAnchors.empty() ? nullptr : simulationAnchors.data());
+    auto* range = Processed();
+    crashlog::CacheObjects(crashlog::CacheKind::ProcessingRange, range ? range->GetCount() : 0, range);
+}
+
+namespace {
+using DestroyEntityFn = void(__fastcall*)(eCEntity*, void*);
+DestroyEntityFn originalDestroyEntity = nullptr;
+bool destroyHookTried = false;
+thread_local bool reportingDestroy = false;
+
+void __fastcall DestroyEntity(eCEntity* entity, void* edx)
+{
+    if (entity->GetEntityFlags().m_CachedIn && !reportingDestroy) {
+        reportingDestroy = true;
+        static_assert(offsetof(eCEntity, m_EntityFlags) == 0x3c, "native entity flag offset");
+        uint32_t flags = 0, databases = 0;
+        std::memcpy(&flags, &entity->GetEntityFlags(), sizeof(flags));
+        // Actual Engine.dll Destroy/CacheOutInternal use this global PVS database bitset.
+        std::memcpy(&databases, reinterpret_cast<unsigned char const*>(entity) + 0x16c, sizeof(databases));
+        Logf("world-cache: destroy cached entity=%p flags=%08x databases=%08x paused=%d owners=%u shutdown=%d",
+             entity, flags, databases, retirementGate.Paused(), regionOwners.load(), ai::ShuttingDown());
+        crashlog::LogCacheInventory("cached entity destruction");
+        crashlog::NativeStack("eCEntity::Destroy cached-in invariant");
+        reportingDestroy = false;
+    }
+    originalDestroyEntity(entity, edx);
+}
+}
+
+void Start()
+{
+    if (destroyHookTried || ai::ShuttingDown()) return;
+    destroyHookTried = true;
+    auto engine = GetModuleHandleA("Engine.dll");
+    auto* code = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine, "?Destroy@eCEntity@@UAEXXZ")) : nullptr;
+    const unsigned char expected[] = {0x51, 0x56, 0x57, 0x8b, 0xf1};
+    if (!code || std::memcmp(code, expected, sizeof(expected))) {
+        Log("FAIL world-cache: unsupported eCEntity::Destroy entry; native invariant diagnostics unavailable");
+        return;
+    }
+    originalDestroyEntity = reinterpret_cast<DestroyEntityFn>(ai::JumpTo(code, reinterpret_cast<void*>(&DestroyEntity), sizeof(expected)));
+    Log(originalDestroyEntity ? "world-cache: native destruction diagnostics installed" :
+                                "FAIL world-cache: native destruction diagnostics hook could not be installed");
 }
 
 void ProcessingReport(LogFn log)

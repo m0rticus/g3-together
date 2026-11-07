@@ -122,7 +122,7 @@ class Module : public eCEngineComponentBase
         static const bCGuid id(raw);
         return id;
     }
-    bEResult Initialize() override { return bEResult_Ok; }
+    bEResult Initialize() override { g3t::world::Start(); return bEResult_Ok; }
     bEResult PostInitialize() override { return bEResult_Ok; }
     void OnAppInitialized() override {}
     // Forget every entity the mod holds. Loading a save (gCHUDFileManager::LoadGame) replaces the world's
@@ -135,6 +135,7 @@ class Module : public eCEngineComponentBase
     }
     static void ForgetWorld()
     {
+        CaptureCacheInventory("before world cleanup");
         ForgetStep("world cleanup / native prefetch queues", &g3t::world::OnWorldDeactivate);
         ForgetStep("NPC playback cleanup / source-options mutex", &g3t::npcplayback::OnWorldDeactivate);
         ForgetStep("remote puppet cleanup", &g3t::remote::OnWorldDeactivate);
@@ -165,6 +166,15 @@ class Module : public eCEngineComponentBase
         ForgetStep("ransack cleanup", &g3t::ransack::OnWorldChange);
         ForgetStep("trade cleanup", &g3t::trade::OnWorldChange);  // forget the old hero before retiring its automatic transactions
         ForgetStep("offer cleanup", &g3t::offer::OnWorldChange);
+        CaptureCacheInventory("after world cleanup");
+    }
+    static void CaptureCacheInventory(char const* phase)
+    {
+        g3t::world::CaptureCacheInventory();
+        g3t::remote::CaptureCacheInventory();
+        g3t::npcremoval::CaptureCacheInventory();
+        g3t::summon::CaptureCacheInventory();
+        g3t::crashlog::LogCacheInventory(phase);
     }
     bEResult WorldActivate() override
     {
@@ -175,6 +185,7 @@ class Module : public eCEngineComponentBase
         g3t::Log("world activated");
         ForgetWorld();
         g3t::persist::OnWorldActivate();
+        g3t::world::OnWorldActivate();
         g3t::Log("world-entry: activation cleanup returned");
         g3t::crashlog::WorldEntryWait("engine first in-world frame");
         return bEResult_Ok;

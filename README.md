@@ -10,6 +10,10 @@
 The current source speaks **protocol 75**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
 acceptance is still in progress; it is not a verified release. Both players need the same build; older protocol peers are refused.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
+World teardown finishes their PVS jobs and releases every private cell before unregistering the cameras.
+`world-cache:` inventories and `CRASH native-stack` diagnostics preserve any remaining cache ownership failure
+without suppressing the engine's error. Clean native exits, including the separately observed AMD/D3D9 shutdown hang,
+still require manual acceptance on both game copies.
 Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
 autonomous tasks or prediction. Final poses include native blend-out layers that motion slots alone do not describe.
 NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.

@@ -8,6 +8,7 @@ namespace g3t::remote {
 void Start();             // after LoadConfig
 void Tick();              // once per frame on the engine thread
 void OnWorldDeactivate(); // puppets belong to the old world; forget them
+void CaptureCacheInventory();  // engine thread only; does not dereference puppet entities
 unsigned CurrentWorld();  // hash of the active world's name, 0 if none
 bool IsPuppet(eCEntity const* entity);
 bool IsHeldPuppet(eCEntity const* entity); // accepted owner episode, independent of native animation/AIMode

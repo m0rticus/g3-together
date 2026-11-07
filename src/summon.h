@@ -8,6 +8,7 @@
 
 namespace g3t::summon {
 void OnWorldChange();
+void CaptureCacheInventory();  // engine thread only; counts records without resolving their GUIDs
 void Start();
 void Tick();  // once per frame: installs the wrappers, announces new summons, binds copies, notices summons ending
 using LogFn = void (*)(char const*);

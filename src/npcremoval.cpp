@@ -3,6 +3,7 @@
 #include "npcremoval_policy.h"
 
 #include "config.h"
+#include "crashlog.h"
 #include "guid.h"
 #include "log.h"
 #include "net.h"
@@ -182,6 +183,18 @@ void Start() { net::SetNpcRemovalHandler(&OnRemoval); }
 void OnWorldDeactivate()
 {
     for (auto& removal : removals) removal = Removal{};
+}
+
+void CaptureCacheInventory()
+{
+    unsigned count = 0;
+    eCEntity const* first = nullptr;
+    for (auto const& removal : removals)
+        if (removal.applied) {
+            ++count;
+            if (!first) first = removal.applied;
+        }
+    crashlog::CacheObjects(crashlog::CacheKind::Disabled, count, first);
 }
 
 void Tick()

@@ -13,6 +13,9 @@ using LogFn = void (*)(char const*);
 bTSmallArray<eCEntity*> const* ProcessedEntities();
 void Tick();  // host: NPC-only extra ranges; native camera, ROI and static culling stay unchanged
 void ProcessingReport(LogFn log);
+void Start();
+void OnWorldActivate();
+void CaptureCacheInventory();  // engine thread only; publishes counts/pointers for worker-safe crash reporting
 void OnWorldDeactivate();
 // host_sim = elastic or spheres: whether the host's game processes around the other players too in this frame, and whether
 // it processes this place (margin cm inside the edge of its sphere or of one of its spheres).

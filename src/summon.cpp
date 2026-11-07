@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "body.h"
+#include "crashlog.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -587,6 +588,17 @@ void OnWorldChange()
     creatureCopyList.clear();
     hostCreatures.clear();
     creatureJoins = 0;
+}
+
+void CaptureCacheInventory()
+{
+    const auto count = pending.size() + known.size() + lateCopies.size() + creatureCopyList.size() + hostCreatures.size();
+    void const* first = pending.empty() ? nullptr : pending.front().owner;
+    if (!first && !known.empty()) first = known.data();
+    if (!first && !lateCopies.empty()) first = lateCopies.data();
+    if (!first && !creatureCopyList.empty()) first = creatureCopyList.data();
+    if (!first && !hostCreatures.empty()) first = hostCreatures.data();
+    crashlog::CacheObjects(crashlog::CacheKind::Summons, static_cast<uint32_t>(count), first);
 }
 
 void WatchHits() { watchUntil = GetTickCount() + 4000; }

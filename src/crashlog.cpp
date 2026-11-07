@@ -9,6 +9,8 @@
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <TlHelp32.h>
+#include <intrin.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +26,14 @@ std::atomic<char const*> lastEndStep{nullptr};
 worldentry::Progress entryOperation, entryGate;
 std::atomic<uint32_t> entryEpoch{0}, entryWelcome{0};
 worldentry::Reports entryReports;
+struct CacheSnapshot {
+    std::atomic<uint32_t> count{0};
+    std::atomic<void const*> first{nullptr};
+};
+CacheSnapshot cacheSnapshots[static_cast<size_t>(CacheKind::Count)];
+char const* const cacheNames[] = {"cameras", "prefetchers", "private_entities", "spheres", "anchors",
+                                 "native_range", "puppets", "disabled", "summon_records"};
+static_assert(std::size(cacheNames) == std::size(cacheSnapshots), "cache inventory names");
 
 void LogEndStep()
 {
@@ -567,6 +577,7 @@ DWORD WINAPI WatchdogThread(LPVOID)
 {
     const DWORD result = WaitForSingleObject(watchdogCancel, 12000);
     if (result != WAIT_TIMEOUT) return 0;
+    LogCacheInventory("shutdown watchdog");
     DeriveDumpDir();
     if (!*dumpDir) {
         Log("shutdown watchdog: write failed (game directory unavailable)");
@@ -628,6 +639,72 @@ void PollWorldEntry()
 void EndStep(char const* step)
 {
     lastEndStep.store(step);
+}
+
+void CacheObjects(CacheKind kind, uint32_t count, void const* first)
+{
+    auto& snapshot = cacheSnapshots[static_cast<size_t>(kind)];
+    snapshot.first.store(first);
+    snapshot.count.store(count);
+}
+
+void LogCacheInventory(char const* phase)
+{
+    char line[800];
+    int length = Format(line, "world-cache: inventory %s", phase);
+    for (size_t i = 0; i < std::size(cacheSnapshots) && length > 0; ++i) {
+        const int written = Format(line + length, sizeof(line) - length, " %s=%u/%p", cacheNames[i],
+                                   cacheSnapshots[i].count.load(), cacheSnapshots[i].first.load());
+        if (written < 0 || static_cast<size_t>(length + written) >= sizeof(line)) {
+            Log("FAIL world-cache: inventory diagnostic exceeded its buffer");
+            return;
+        }
+        length += written;
+    }
+    Log(line);
+}
+
+void NativeStack(char const* reason)
+{
+    auto describe = [](void* frame, char* out, size_t size) {
+        MEMORY_BASIC_INFORMATION memory{};
+        char path[MAX_PATH] = {};
+        if (!VirtualQuery(frame, &memory, sizeof(memory)) || memory.Type != MEM_IMAGE ||
+            !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+            !GetModuleFileNameA(static_cast<HMODULE>(memory.AllocationBase), path, MAX_PATH)) return false;
+        char const* module = std::strrchr(path, '\\');
+        Format(out, size, "%s+%#x", module ? module + 1 : path,
+               static_cast<unsigned>(reinterpret_cast<uintptr_t>(frame) - reinterpret_cast<uintptr_t>(memory.AllocationBase)));
+        return true;
+    };
+    void* frames[24] = {};
+    const USHORT count = CaptureStackBackTrace(1, static_cast<DWORD>(std::size(frames)), frames, nullptr);
+    Logf("CRASH native-stack reason=%s pid=%lu thread=%lu frames=%u", reason,
+         GetCurrentProcessId(), GetCurrentThreadId(), static_cast<unsigned>(count));
+    for (USHORT i = 0; i < count; ++i) {
+        char where[MAX_PATH + 24];
+        if (!describe(frames[i], where, sizeof(where))) strcpy_s(where, "(module unavailable)");
+        Logf("CRASH native-stack frame=%u address=%p %s", static_cast<unsigned>(i), frames[i], where);
+    }
+    // x86 engine functions omit frame pointers. Keep bounded raw candidates separately, never label them unwound frames.
+    auto* stack = static_cast<uintptr_t const*>(_AddressOfReturnAddress());
+    auto const* tib = reinterpret_cast<NT_TIB const*>(NtCurrentTeb());
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(stack), top = reinterpret_cast<uintptr_t>(tib->StackBase);
+    if (begin < reinterpret_cast<uintptr_t>(tib->StackLimit) || begin >= top) {
+        Log("FAIL CRASH native-stack: current-thread stack bounds unavailable");
+        return;
+    }
+    const size_t words = std::min<size_t>((top - begin) / sizeof(uintptr_t), 1024);
+    uintptr_t candidates[32] = {};
+    unsigned retained = 0;
+    for (size_t i = 0; i < words && retained < std::size(candidates); ++i) {
+        if (!stack[i] || std::find(candidates, candidates + retained, stack[i]) != candidates + retained) continue;
+        char where[MAX_PATH + 24];
+        if (!describe(reinterpret_cast<void*>(stack[i]), where, sizeof(where))) continue;
+        candidates[retained++] = stack[i];
+        Logf("CRASH native-stack candidate_word=%u address=%p %s", static_cast<unsigned>(i),
+             reinterpret_cast<void*>(stack[i]), where);
+    }
 }
 
 void Tick()
