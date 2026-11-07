@@ -6,6 +6,7 @@
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "remote.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -58,6 +59,10 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 {
     if (ai::ShuttingDown()) return originalPick ? originalPick(spu, self, other, args) : 0;
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (remote::IsPuppet(victim)) {
+        remote::LogPuppetInteraction(victim, "pickpocket-refused", 0);
+        return 0;
+    }
     const bool before = Picked(victim);
     const GEInt result = originalPick(spu, self, other, args);
     ++tries;

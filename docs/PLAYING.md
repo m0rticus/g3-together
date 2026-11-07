@@ -360,6 +360,9 @@ Independent world-inventory persistence across saves/late joins is not implement
   loaded area does not end the run. Return to the same loaded world and stand beside the downed player's
   character and choose "I will help you." to help them up. The cheapest healing potion in the
   helper's inventory is consumed once for that knock-out.
+  With weapons away, the lying partner's focus is Talk, not Loot, on both PCs.
+  A player waiting for help cannot be looted, quick-looted, robbed or pickpocketed;
+  NPC combat exclusion does not make their remote body a corpse.
   Without a potion, both players see a notice and the downed player waits for their partner to
   return with one.
 - If everybody is known to be down or dead, the hero dies immediately as in single-player.

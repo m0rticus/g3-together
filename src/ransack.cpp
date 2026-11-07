@@ -130,6 +130,11 @@ GEBool __fastcall RobTransfer(PSInventory* self, void*, GEInt stack, GEInt amoun
     if (ai::ShuttingDown()) return self ? self->TransferAmountTo(stack, amount, to) : GEFalse;
     eCEntity* owner = nullptr;
     if (auto* set = reinterpret_cast<EntityPropertySet*>(self)->m_pEngineEntityPropertySet) owner = set->GetEntity();
+    if (remote::IsHeldPuppet(owner) || (downed::Held() && owner == gCSession::GetInstance().GetHero())) {
+        remote::LogPuppetInteraction(owner, "rob-transfer-refused", 0);
+        Log("ransack: transfer from a player waiting for help refused");
+        return GEFalse;
+    }
     const int id = remote::PuppetOwner(owner);
     const GEBool moved = self->TransferAmountTo(stack, amount, to);
     if (!id) return moved;
@@ -203,6 +208,11 @@ void Pay(uint8_t from, net::RansackNote const& note)
         Logf("ransack: robbery %u of player %d came again; paid already", note.seq, from);
         return;
     }
+    if (downed::Held()) {
+        net::SendRansack(from, reply);
+        Logf("ransack: robbery %u refused; this player is waiting for help", note.seq);
+        return;
+    }
     eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
     int paid = 0, before = 0;
     if (instance && note.amount > 0) {
@@ -269,15 +279,24 @@ void OnRansack(uint8_t from, net::RansackNote const& note)
 
 void Start() { net::SetRansackHandler(&OnRansack); }
 
-void OnRobbing(gCScriptProcessingUnit* spu)
+bool OnRobbing(gCScriptProcessingUnit* spu)
 {
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
     eCEntity* target = spu ? spu->GetTargetEntity() : nullptr;
+    if (self && (remote::IsHeldPuppet(target) ||
+                 (downed::Held() && target == gCSession::GetInstance().GetHero()))) {
+        remote::LogPuppetInteraction(target, "rob-state-refused", 0);
+        Logf("ransack: %s cannot rob a player waiting for help", Entity(self).GetName().GetText());
+        Entity robber(self);
+        robber.Routine.FullStop();
+        robber.Routine.ContinueRoutine();
+        return true;
+    }
     const int id = remote::PuppetOwner(target);
-    if (!id || !self) return;
+    if (!id || !self) return false;
     Victim& victim = victims[id];
     const uint32_t now = net::Now();
-    if (victim.lastHold && now - victim.lastHold < HoldEvery) return;
+    if (victim.lastHold && now - victim.lastHold < HoldEvery) return false;
     if (!victim.lastHold) Logf("ransack: %s robs player %d's puppet", Entity(self).GetName().GetText(), id);
     victim.lastHold = now ? now : 1;
     net::RansackNote note;
@@ -285,6 +304,7 @@ void OnRobbing(gCScriptProcessingUnit* spu)
     GuidOf(self, note.robber);
     net::SendRansack(static_cast<uint8_t>(id), note);
     ++holdsSent;
+    return false;
 }
 
 void Tick()
@@ -303,7 +323,7 @@ void Tick()
         if (!body) { victim = Victim{}; continue; }  // a new puppet starts as the game made it
         net::Remote const& r = remotes[id];
         const bool fresh = r.connected && r.latestTicks && now - r.latestTicks < 5000;
-        const bool down = fresh && (r.latest.flags & 16) && !(r.latest.flags & 4);
+        const bool down = fresh && (r.latest.flags & 16) && !(r.latest.flags & 4) && !remote::IsHeldPuppet(body);
         Entity puppet(body);
         if (down) {
             if (!victim.down) {

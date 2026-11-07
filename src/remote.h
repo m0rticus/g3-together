@@ -10,6 +10,8 @@ void Tick();              // once per frame on the engine thread
 void OnWorldDeactivate(); // puppets belong to the old world; forget them
 unsigned CurrentWorld();  // hash of the active world's name, 0 if none
 bool IsPuppet(eCEntity const* entity);
+bool IsHeldPuppet(eCEntity const* entity); // accepted owner episode, independent of native animation/AIMode
+void LogPuppetInteraction(eCEntity* entity, char const* action, int result);
 // The body the local player controls: its hero, or the creature it is turned into (a transformation spell or potion
 // makes Entity::GetPlayer() the creature while gCSession::GetHero() stays the hidden human body).
 eCEntity* ControlledBody();

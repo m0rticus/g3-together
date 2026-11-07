@@ -50,7 +50,7 @@ int main()
     assert(!life.Revive(episode + 1));
     assert(life.Revive(episode));
     assert(!CombatUnavailable(true, life.held, life.terminal, false, false, 0));
-    // Remote publication is an output, not an input: alive flags release the native Down puppet.
+    // Remote interaction mode is not an input to combat exclusion.
     assert(!CombatUnavailable(true, false, false, false, false, 1));
     life.Hold();
     life.End();
@@ -82,10 +82,9 @@ int main()
             self.assertNotIn(forbidden, remote)
         publication = function_body(self.ai, r"\bvoid\s+SyncDownedTargets\s*\(")
         self.assertIn("if (!net::IsHost()", publication)
-        self.assertIn("downed::CombatUnavailable(puppet)", publication)
-        self.assertIn("player.Routine.AIMode = gEAIMode_Down", publication)
-        self.assertIn("player.Routine.AIMode = gEAIMode_Abandoned", publication)
-        for forbidden in ("SetHitPoints", "gEAIMode_Dead", "SetTask", "SetPartyLeader"):
+        self.assertIn("downed::UnavailablePlayers()", publication)
+        self.assertIn("ReleaseDownedTargets", publication)
+        for forbidden in ("AIMode =", "SetHitPoints", "gEAIMode_Dead", "SetTask", "SetPartyLeader"):
             self.assertNotIn(forbidden, publication)
 
     def test_exact_references_are_released_after_instruction_stop(self):

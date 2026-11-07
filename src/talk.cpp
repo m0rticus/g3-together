@@ -102,7 +102,14 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* talker = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     Hold const* hold = net::IsHost() && !holdDisabled ? HoldOf(npc) : nullptr;
-    if (!hold || !talker || talker != gCSession::GetInstance().GetHero()) return originalAssessTalk(spu, self, other, args);
+    if (!hold || !talker || talker != gCSession::GetInstance().GetHero()) {
+        // AssessTalk accepts either player/NPC order; observe the real call, never assess speculatively at focus.
+        eCEntity* puppet = remote::IsPuppet(npc) ? npc : remote::IsPuppet(talker) ? talker : nullptr;
+        if (remote::IsHeldPuppet(puppet)) remote::LogPuppetInteraction(puppet, "talk-attempt", -1);
+        const GEInt result = originalAssessTalk(spu, self, other, args);
+        if (remote::IsHeldPuppet(puppet)) remote::LogPuppetInteraction(puppet, "talk-assessed", result);
+        return result;
+    }
     ++busyRefused;
     const DWORD now = GetTickCount();
     if (now - lastBusyMessage > 3000) {

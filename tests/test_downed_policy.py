@@ -405,7 +405,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("puppet.entity.Dialog.TradeEnabled", update)
         self.assertNotIn('CallScript(bCString("Kill")', update)
         pay = function_body(self.downed_cpp, r"\bvoid\s+PayAndHelp\s*\(")
-        self.assertIn("paidSequence[i] == r.latest.downedSequence && now - paidAt[i] < PaidCooldown", pay)
+        self.assertIn("!UnpaidEpisode(r.latest.downedSequence, paidSequence[i])", pay)
 
     def test_absence_boundaries_log_candidate_rejection_evidence(self):
         tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(")

@@ -99,9 +99,14 @@ Use the backed-up, isolated paired test save on both PCs and an enemy, not frien
 on both sides; these are manual checks, not a claim that the scenarios have passed.
 
 1. With the host able to help, knock down only the client. Wait more than five seconds and check the client
-   stays down despite native standing/healing animations or snapshots. The host chooses "I will help you.";
+   stays down despite native standing/healing animations or snapshots. Approach from the front, back and sides
+   with weapons away: the lying partner's focus hint must say Talk, never Loot. Use the normal interaction key
+   to open the dialog, not an inventory/robbery window. Also try quick loot: no window or items may be taken.
+   The host chooses "I will help you.";
    check the client stands up and exactly one host healing potion is consumed. Repeat with the host down and
    the client helping; exactly one client potion is consumed. Also check the no-potion notice and no revival.
+   Repeated interaction while the owner update settles must never consume another potion for that episode,
+   even after five seconds. A later knock-out is a new episode with its own single payment.
 2. Reload the paired test save between terminal attempts. Knock both players down nearly simultaneously;
    then repeat with the host down first and with the client down first. When each sees the other as present
    and down/dead, expect game over without a crash or a repeated death task. Check both screens and logs.
@@ -164,14 +169,30 @@ coordinated build. Do not automate game launches or encounters. Runtime acceptan
 The host startup should log `downed AssessTarget guard installed at native and script entries`.
 `SCRIPT ONLY` is an explicit unsupported-native-hook diagnostic, not full native-guard confirmation.
 Match `DOWNEDTARGET player/episode/flags` to the existing `downed: remote` and transition records.
-Expect `publish-down` (puppet AIMode 8), `frame-release` or `state-release`, then `released`;
+Expect `frame-release` or `state-release`, then `released`;
 `DOWNEDBIND` shows the five target pointers and active combat slot before/after cleanup.
-`excluded` is a player-id bitset, not a list of NPCs. On revival expect `publish-alive` (puppet mode 10).
+`excluded` is a player-id bitset, not a list of NPCs. Held puppets keep native AIMode 10 and the lying
+animation on both copies: mode 8 would make normal interaction choose loot before talk assessment.
+Combat exclusion still follows the owner's flags, so on revival the excluded player bit clears.
 `attitude-refused`, `perception-refused` and `assessment-refused` explain rejected acquisition.
 `DOWNEDHIT` records blocked in-flight judgement/status/HP/visible-contact paths before native effects.
 Repeated acquisition/hit refusals are limited to the first 40 records and one sample per five seconds;
 actual binding/life transitions are logged independently. No QA command or control is needed.
 Old visible-contact logs prove an attack was shown, not that damage was applied.
+
+Require `containers: player loot guard installed at native and script entries` on both copies.
+`SCRIPT ONLY` explicitly means direct native loot calls are not guarded on that binary.
+`DOWNEDINTERACT` records the actual puppet's role/player/episode/flags, held truth, native AIMode,
+Down/Dead predicates, HP, inventory presence, focus, action and result. `publish-talk` should show
+`held=1 ai=10 native_down=0 native_dead=0`; the owner still remains natively down on its own PC.
+Normal interaction should record `talk-attempt` followed by `talk-assessed result=1`, then the existing
+help-choice, potion-payment and accepted-revive lines for the same episode. `loot-rerouted-to-talk`
+identifies an older queued loot action safely diverted before opening HUD loot.
+`loot-refused`, `rob-state-refused`, `rob-transfer-refused` and `pickpocket-refused` identify protected paths.
+These diagnostics observe real calls, never invoke talk assessment during a focus scan, and are bounded
+to the first 40 records plus one sample per five seconds. Inventory presence is not permission to loot.
+While waiting, NPCs must ignore the body rather than rob it; ordinary nonlethal guard knock-outs still
+allow the existing native half-gold robbery. Check corpse/chest loot and partner trade remain normal.
 
 ### Paired-save failure and migration checks (protocol 75)
 

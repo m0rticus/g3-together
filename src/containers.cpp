@@ -8,6 +8,7 @@
 #include "remote.h"
 #include "trade.h"
 #include "ai.h"
+#include "downed.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -835,6 +836,7 @@ void ClientTick()
 // The game's own entry points for opening loot and trade: remember what this client's player opened.
 gFScript originalLoot = nullptr, originalTrade = nullptr;
 bool hooked = false;
+constexpr uintptr_t OpenLootRva = 0x6bfd0;
 DWORD lastHookTry = 0;
 
 void Opened(gCScriptProcessingUnit* spu, GELPVoid other, bool trade)
@@ -850,10 +852,17 @@ void Opened(gCScriptProcessingUnit* spu, GELPVoid other, bool trade)
 GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalLoot ? originalLoot(spu, self, other, args) : 0;
-    // A knocked-out partner's puppet lies down like a plunderable body and carries its gold for a robber (ransack.cpp):
-    // nobody plunders it; what it carries is the partner's.
     Entity partner = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     if (remote::PuppetOwner(partner.GetInstance())) {
+        eCEntity* actor = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+        if (remote::IsHeldPuppet(partner.GetInstance()) && actor &&
+            actor == gCSession::GetInstance().GetHero() && !downed::CombatUnavailable(actor)) {
+            // A loot action queued before the owner hold arrived still enters here directly from PS_GonnaLoot.
+            const GEInt result = GetScriptAdminExt().CallScript(bCString("AssessTalk"), actor, partner.GetInstance(), 0);
+            remote::LogPuppetInteraction(partner.GetInstance(), "loot-rerouted-to-talk", result);
+            return result;
+        }
+        remote::LogPuppetInteraction(partner.GetInstance(), "loot-refused", 0);
         Note("containers: loot of %s refused (another player)", NameOf(partner).c_str());
         return 0;
     }
@@ -1024,10 +1033,21 @@ void Tick()
         gSScript *loot = nullptr, *trade = nullptr;
         auto& scripts = GetScriptAdminExt().GetScripts();
         if (scripts.GetAt(bCString("PlayerOpenLoot"), loot) && loot && scripts.GetAt(bCString("PlayerOpenTrade"), trade) && trade) {
-            originalLoot = loot->m_funcScript;
+            const gFScript nativeLoot = loot->m_funcScript;
+            originalLoot = nativeLoot;
+            auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleA("Script_Game.dll"));
+            static const unsigned char head[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x54, 0x01, 0x00, 0x00};
+            bool nativeGuard = false;
+            if (base && reinterpret_cast<void*>(nativeLoot) == base + OpenLootRva &&
+                !std::memcmp(base + OpenLootRva, head, sizeof(head))) {
+                if (void* trampoline = ai::JumpTo(base + OpenLootRva, reinterpret_cast<void*>(&OpenLoot))) {
+                    originalLoot = reinterpret_cast<gFScript>(trampoline);
+                    nativeGuard = true;
+                }
+            }
             loot->m_funcScript = &OpenLoot;
             ai::TrackPointer(reinterpret_cast<void*>(&loot->m_funcScript),
-                             reinterpret_cast<void*>(originalLoot),
+                             reinterpret_cast<void*>(nativeLoot),
                              reinterpret_cast<void*>(&OpenLoot), "containers PlayerOpenLoot script");
             originalTrade = trade->m_funcScript;
             trade->m_funcScript = &OpenTrade;
@@ -1036,6 +1056,8 @@ void Tick()
                              reinterpret_cast<void*>(&OpenTrade), "containers PlayerOpenTrade script");
             hooked = true;
             Log("containers: loot and trade hooks installed");
+            Log(nativeGuard ? "containers: player loot guard installed at native and script entries"
+                            : "containers: player loot guard SCRIPT ONLY; native address/prologue or jump unavailable");
         }
     }
     if (!quickHooked && !quickHookFailed) HookQuickLoot();

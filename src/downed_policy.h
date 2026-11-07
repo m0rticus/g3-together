@@ -4,6 +4,16 @@
 #include <cstdint>
 
 namespace g3t::downed {
+inline bool HeldPuppet(uint8_t flags, uint32_t sequence)
+{
+    return (flags & 8) && !(flags & 4) && sequence != 0;
+}
+
+inline bool UnpaidEpisode(uint32_t sequence, uint32_t paidSequence)
+{
+    return sequence != 0 && sequence != paidSequence;
+}
+
 inline bool CombatUnavailable(bool player, bool held, bool terminal, bool nativeDown, bool nativeDead, uint8_t flags)
 {
     return player && (held || terminal || nativeDown || nativeDead || (flags & 14) != 0);

@@ -276,9 +276,9 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
     const bCVector& at = hero.GetInstance()->GetWorldPosition();
     const float here[3] = {at.GetX(), at.GetY(), at.GetZ()};
     if (life.held || life.terminal || hero.IsDown() || hero.IsDead() || i == net::LocalId() || !Present(r, now) ||
-        !(r.latest.flags & 8) || (r.latest.flags & 4) || !r.latest.downedSequence ||
+        !HeldPuppet(r.latest.flags, r.latest.downedSequence) ||
         body::Distance(r.latest.position, here) > ReviveRange ||
-        (paidSequence[i] == r.latest.downedSequence && now - paidAt[i] < PaidCooldown)) {
+        !UnpaidEpisode(r.latest.downedSequence, paidSequence[i])) {
         Logf("downed: help refused player=%u target=%d sequence=%u reason=not-eligible", net::LocalId(), i, r.latest.downedSequence);
         return;
     }
@@ -298,7 +298,11 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
         return;
     }
     if (stack >= 0) {
-        hero.Inventory.DeleteItems(stack, 1);
+        if (!hero.Inventory.DeleteItems(stack, 1)) {
+            Logf("downed: help refused player=%u target=%d sequence=%u reason=potion-removal-failed potion=%s",
+                 net::LocalId(), i, r.latest.downedSequence, potion);
+            return;
+        }
         ++potionsPaid;
     }
     paidAt[i] = now;
@@ -372,7 +376,8 @@ void OfferHelp(Entity& hero, net::Remote const* remotes, uint32_t now)
         if (!ours) helpStarted[i] = false;
         if (!scan) continue;
         net::Remote const& r = remotes[i];
-        const bool waiting = helpOption && Present(r, now) && (r.latest.flags & 8) && !(r.latest.flags & 4) && now - paidAt[i] >= PaidCooldown;
+        const bool waiting = helpOption && Present(r, now) && HeldPuppet(r.latest.flags, r.latest.downedSequence) &&
+                             UnpaidEpisode(r.latest.downedSequence, paidSequence[i]);
         gCInfo_PS* info = manager->GetInfo(bCString(infoName));
         if (!info && waiting) {
             info = manager->AddInfo(bCString(infoName));
@@ -774,8 +779,7 @@ bool CombatUnavailable(eCEntity* entity)
     const int id = remote::PuppetOwner(entity);
     if (!id) return false;
     net::Remote const& r = net::Remotes()[id];
-    // Latest accepted player state is authority. Native Down on the puppet is an output of this rule,
-    // not an input: otherwise publishing Down would latch it forever after the owner revives.
+    // Latest accepted player state is authority, not the talkable puppet's native mode or lying animation.
     return r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld() &&
            CombatUnavailable(true, false, false, false, false, r.latest.flags);
 }

@@ -172,19 +172,7 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
 void SyncDownedTargets()
 {
     if (!net::IsHost() || !gCSession::GetInstance().IsGameRunning()) return;
-    for (int id = 1; id < net::MaxPlayers; ++id) {
-        eCEntity* puppet = remote::PuppetOf(id);
-        if (!puppet || !puppet->GetPropertySet(eEPropertySetType_ScriptRoutine)) continue;
-        Entity player(puppet);
-        const bool unavailable = downed::CombatUnavailable(puppet);
-        if (unavailable && player.Routine.AIMode != gEAIMode_Down) {
-            player.Routine.AIMode = gEAIMode_Down;
-            downed::LogCombatDecision(puppet, puppet, "publish-down", true);
-        } else if (!unavailable && player.Routine.AIMode == gEAIMode_Down) {
-            player.Routine.AIMode = gEAIMode_Abandoned;
-            downed::LogCombatDecision(puppet, puppet, "publish-alive", true);
-        }
-    }
+    // Native Down selects loot before AssessTalk. Combat exclusion uses owner life truth, not puppet AIMode.
     if (!downed::UnavailablePlayers()) return;
     const bTObjArray<Entity> all = Entity::GetNPCs();
     for (int i = 0; i < all.GetCount(); ++i)
@@ -281,7 +269,7 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     }
     if (downed::RedirectDeath(self, name)) return GEFalse;  // the local hero is knocked out instead of dying
     if (strcmp(name, "IS_Running_ProcessInfo") == 0) infocmd::Observe(spu);  // a dialog script line runs
-    if (strcmp(name, "ZS_RansackBody") == 0) ransack::OnRobbing(spu);         // one of our NPCs robs a body (a puppet?)
+    if (strcmp(name, "ZS_RansackBody") == 0 && ransack::OnRobbing(spu)) return GEFalse;
     if (self && self == gCSession::GetInstance().GetHero() && strcmp(name, "_AI_TakeItem") == 0) {
         // The world item this hero takes vanishes into a stack (its GUID is gone afterwards): note it first.
         items::BeforeTake(spu);

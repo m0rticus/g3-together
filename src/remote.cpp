@@ -649,7 +649,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     // The player's swings replay as the game's combat moves too (owner's look: players' attacks hardly visible);
     // a body whose move faults goes back to motion names (body.cpp).
-    const bool held = (remote.latest.flags & 8) && !(remote.latest.flags & 4) && remote.latest.downedSequence;
+    const bool held = downed::HeldPuppet(remote.latest.flags, remote.latest.downedSequence);
+    const bool newHeldEpisode = held && puppet.downedSequence != remote.latest.downedSequence;
     if (held) {
         if (puppet.downedSequence != remote.latest.downedSequence) {
             puppet.body.actionUntil = 0;
@@ -688,8 +689,11 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     puppet.body.combatMoves = puppetCombat;
     body::Drive(puppet.entity, puppet.body, target, now);
     if (held) {
+        // Mode 8/9 takes PS_GonnaLoot before AssessTalk (Script_Game +0x81e72). Lie is presentation only.
+        puppet.entity.Routine.AIMode = gEAIMode_Abandoned;
         puppet.entity.CharacterMovement.StopMovement();
         puppet.entity.Routine.AniState = gEAniState_LieKnockDown;
+        if (newHeldEpisode) LogPuppetInteraction(puppet.entity.GetInstance(), "publish-talk", 1);
     }
 }
 }
@@ -727,6 +731,40 @@ int PuppetOwner(eCEntity const* entity)
     for (int id = 1; id < net::MaxPlayers; ++id)
         if (entity && puppets[id].spawned && puppets[id].entity.GetInstance() == entity) return id;
     return 0;
+}
+
+bool IsHeldPuppet(eCEntity const* entity)
+{
+    const int id = PuppetOwner(entity);
+    if (!id) return false;
+    net::Remote const& r = net::Remotes()[id];
+    return r.connected && r.latestTicks && r.latest.world == CurrentWorld() &&
+           downed::HeldPuppet(r.latest.flags, r.latest.downedSequence);
+}
+
+void LogPuppetInteraction(eCEntity* entity, char const* action, int result)
+{
+    const int id = PuppetOwner(entity);
+    if (!id) return;
+    static unsigned notes = 0;
+    static uint32_t lastNote = 0;
+    const uint32_t now = net::Now();
+    if (++notes > 40 && now - lastNote < 5000) return;
+    lastNote = now;
+    net::Remote const& r = net::Remotes()[id];
+    Entity player(entity);
+    const bool routine = entity->GetPropertySet(eEPropertySetType_ScriptRoutine) != nullptr;
+    const bool inventory = entity->GetPropertySet(eEPropertySetType_Inventory) != nullptr;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    const bool focused = hero && hero->GetPropertySet(eEPropertySetType_Focus) &&
+                         Entity(hero).Focus.GetFocusEntity().GetInstance() == entity;
+    Logf("DOWNEDINTERACT role=%s player=%d episode=%u flags=%u held=%d ai=%d native_down=%d native_dead=%d "
+         "hp=%d inventory=%d focused=%d action=%s result=%d",
+         net::IsHost() ? "host" : "client", id, r.latest.downedSequence, r.latest.flags,
+         IsHeldPuppet(entity) ? 1 : 0, routine ? static_cast<int>(player.Routine.AIMode) : -1,
+         routine && player.IsDown() ? 1 : 0, routine && player.IsDead() ? 1 : 0,
+         entity->GetPropertySet(eEPropertySetType_PlayerMemory) ? player.PlayerMemory.GetHitPoints() : -1,
+         inventory ? 1 : 0, focused ? 1 : 0, action, result);
 }
 
 eCEntity* PuppetOf(int playerId)

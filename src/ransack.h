@@ -12,7 +12,7 @@ void Start();
 void Tick();
 void OnWorldChange();
 // The AI wrapper (ai.cpp): one of this machine's NPCs runs ZS_RansackBody now.
-void OnRobbing(gCScriptProcessingUnit* spu);
+bool OnRobbing(gCScriptProcessingUnit* spu); // true when a held-player robbery was cancelled
 using LogFn = void (*)(char const*);
 void Report(LogFn log);  // QA: RANSACK line
 void Off(LogFn log);     // QA negative control (ransackoff): a robber takes the puppet's gold, the player pays nothing
