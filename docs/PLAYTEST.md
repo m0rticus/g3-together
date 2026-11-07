@@ -117,6 +117,12 @@ on both sides; these are manual checks, not a claim that the scenarios have pass
 5. Reload and repeat the above, including both helper directions. As a smoke check, perform a quick trade
    in each direction and verify inventories, then make and load a paired save and verify each player's own
    character and shared world.
+6. Knock out only the client, then walk the living host several hundred metres away and keep playing there
+   for several minutes. The client must stay down indefinitely. Walk back without teleporting: the client's
+   body must appear lying down even if its region streamed in only now, be focusable/talkable, and offer
+   "I will help you." Select it once: the client stands once and exactly one host potion is consumed.
+   Repeat with the host down and the client travelling; repeat across a zone/interior/region boundary.
+   If testing genuinely different loaded worlds, the helper must return to the target's world before helping.
 
 For each terminal life, inspect `g3together.log` manually for the decision reason `all-down` or `alone-grace`
 and one `downed: end step=kill-enter` followed by one `kill-return` when the native call returns. Reentry
@@ -125,6 +131,18 @@ the killer may be null, but the victim must be the local hero. If a crash occurs
 last step (`CRASH end-flow last_step=...`), both logs and any dump; `kill-return` will be absent. If the
 bundled dump writer rejects detailed flags, the log should report a `MiniDumpNormal` retry; record any dump
 write/rewind failure or empty dump. Do not trigger a crash just to check the diagnostic.
+
+The `downed: helpers` lines at `alone-start`, `alone-cancel`, `alone-expiry`, and terminal decisions report
+each candidate's connection/world gate, activity and pose ages, flags, world hashes, campaign epochs,
+last-known distance, and `reject` reason. `activity-stale` means five seconds without engine activity,
+not an out-of-range position. Explicit loading/hero restoration and no-running-hero/menu flags are reported;
+an engine blocked inside loading cannot send a fresh flag, so its last activity eventually becomes stale.
+Zones/interiors are not transmitted (`zone=not-sent`); a missing pose or a retiring/unavailable local hero
+reports distance -1 (`local_position_known=0` when the local hero cannot safely be inspected).
+An active distant helper must not cause `alone-start`/expiry merely because its pose is stale or its world differs.
+`downed: puppet action=hold/release` identifies the owner's episode used for arrival presentation.
+The 19-byte player activity message is bandwidth kind 50, sent reliably on the player-state channel once per
+second and on life/loading/menu transitions; player/NPC layouts and gameplay world gates are unchanged.
 
 ### Downed player target eligibility
 

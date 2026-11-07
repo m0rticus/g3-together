@@ -301,14 +301,19 @@ Independent world-inventory persistence across saves/late joins is not implement
   who waits jumps straight to 9 o'clock.
 - Animals that come back after some days (scavengers, deer, wolves and the like) come back on both PCs or on neither.
 - Helping up a downed player costs one healing potion. A player who would die stays down while a
-  connected partner in the same world, who is not downed, can help. Talk to the downed player's
+  connected, actively playing partner who is not downed or dead can help, regardless of distance,
+  region, interior, or world location. The partner can travel back; being outside the downed player's
+  loaded area does not end the run. Return to the same loaded world and stand beside the downed player's
   character and choose "I will help you." to help them up. The cheapest healing potion in the
-  helper's inventory is consumed.
+  helper's inventory is consumed once for that knock-out.
   Without a potion, both players see a notice and the downed player waits for their partner to
   return with one.
 - If everybody is known to be down or dead, the hero dies immediately as in single-player.
-  Missing, disconnected, loading, stale, or another-world partner state keeps the original
-  five-second grace instead. The host loads a
+  Missing, disconnected, loading, menu, or stale **player activity** keeps the original
+  five-second continuous grace instead. Activity has a separate reliable heartbeat at least once
+  per second, independent of NPC interest and world/presentation gates. Five seconds of silence
+  makes activity stale; the additional five-second grace then starts. A stale position or another
+  world alone does not make an active partner unavailable. The host loads a
   save; the other player is loaded into it automatically.
 - While either player is knocked out, host-controlled NPCs and creatures drop that player as a combat
   target and choose another eligible enemy or return to their routine. Further attacks cannot damage,

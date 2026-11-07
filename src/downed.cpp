@@ -52,7 +52,6 @@ char const* const PotionPrefix = "It_Potion_Health";  // healing potions (the ga
 constexpr float ReviveRange = 250.0f;  // cm: a partner standing next to the hero
 constexpr uint32_t ReviveTime = 3000;  // ms the partner has to stay there
 constexpr uint32_t StaleState = 5000;  // ms: a remote state older than this does not count
-constexpr uint32_t AloneGrace = 5000;  // ms unknown or unavailable partner state can keep the original grace
 constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still says "down" for a moment
 
 Life life;                     // authority is the paid revive, not the native body's current state
@@ -132,32 +131,38 @@ void KeepDown(Entity& hero, char const* source)
     if (hp != 1) hero.PlayerMemory.SetHitPoints(1);
 }
 
+void CancelAlone(char const* source);
+
 void Hold(char const* reason, char const* source)
 {
     if (life.held || life.terminal) return;
     life.Restore(true);
-    aloneSince = 0;
+    CancelAlone("new-held-life");
     revivedBy = 0;
     pendingReviveSequence = 0;
     Transition(reason, source);
     hud::Message(hud::Bad, potionNeeded ? i18n::Text(i18n::KnockedOutNeedsPotion) : i18n::Text(i18n::KnockedOut));
 }
 
-// A remote player who can help: in the same world, in game, recent, and not knocked out, dead, or waiting for help itself.
-bool Able(net::Remote const& r, uint32_t now)
+Availability HelperState(net::Remote const& r, uint32_t now)
 {
-    return r.connected && r.latestTicks && now - r.latestTicks < StaleState && (r.latest.flags & 1) && !(r.latest.flags & 14) &&
-           r.latest.world == remote::CurrentWorld();
+    return HelperAvailability(r.connected, r.activity.known, r.activity.ticks, r.activity.flags, now);
 }
 
+// Being able to travel back and help is independent of the loaded/presented body and world location.
+bool Able(net::Remote const& r, uint32_t now)
+{
+    return HelperState(r, now) == Availability::Able;
+}
+
+// Paying/interacting still needs a current nearby body in this ready gameplay world.
 bool Present(net::Remote const& r, uint32_t now)
 {
     return r.connected && r.latestTicks && now - r.latestTicks < StaleState && (r.latest.flags & 1) &&
-           r.latest.world == remote::CurrentWorld();
+           r.latest.world == remote::CurrentWorld() && net::InWorld(r.latest.id);
 }
 
-// Every connected partner is known to be down, knocked out, or dead. Missing, stale, loading, disconnected, or
-// another-world remotes are not authoritative and keep the grace path instead.
+// Every connected partner is playing and down, knocked out, or dead, wherever its body is.
 bool AllOthersDown(net::Remote const* remotes, uint32_t now)
 {
     bool present = false;
@@ -165,11 +170,62 @@ bool AllOthersDown(net::Remote const* remotes, uint32_t now)
         if (i == net::LocalId()) continue;
         net::Remote const& r = remotes[i];
         if (!r.connected) continue;
-        if (!Present(r, now)) return false;
+        if (!Playing(HelperState(r, now))) return false;
         present = true;
-        if (!(r.latest.flags & 14)) return false;
+        if (HelperState(r, now) != Availability::Down) return false;
     }
     return present;
+}
+
+char const* HelperReason(Availability state)
+{
+    switch (state) {
+    case Availability::Able: return "able";
+    case Availability::Down: return "down-or-dead";
+    case Availability::Disconnected: return "disconnected";
+    case Availability::Unknown: return "no-activity";
+    case Availability::Stale: return "activity-stale";
+    case Availability::NotPlaying: return "loading-or-menu";
+    }
+    return "invalid";
+}
+
+void LogHelpers(Entity* hero, char const* event, uint32_t now)
+{
+    float here[3] = {};
+    if (hero) {
+        const bCVector& at = hero->GetInstance()->GetWorldPosition();
+        here[0] = at.GetX(); here[1] = at.GetY(); here[2] = at.GetZ();
+    }
+    for (int i = 1; i < net::MaxPlayers; ++i) {
+        if (i == net::LocalId()) continue;
+        net::Remote const& r = net::Remotes()[i];
+        Logf("downed: helpers event=%s player=%u partner=%d name=%s connected=%d joined=%d gate=%d "
+             "activity_known=%d activity_age=%u activity_packet=%u flags=%u loading=%d menu=%d "
+             "pose_known=%d pose_age=%u pose_packet=%u pose_flags=%u sequence=%u "
+             "world=%08x partner_world=%08x pose_world=%08x epoch=%08x partner_epoch=%08x "
+             "distance_cm=%.0f local_position_known=%d zone=not-sent reject=%s",
+             event, net::LocalId(), i, *r.latest.name ? r.latest.name : "-", r.connected ? 1 : 0,
+             (net::IsHost() ? net::PeerJoined(static_cast<uint8_t>(i)) : net::Joined() && r.connected) ? 1 : 0,
+             net::InWorld(static_cast<uint8_t>(i)) ? 1 : 0, r.activity.known ? 1 : 0,
+             r.activity.known ? now - r.activity.ticks : 0, r.activity.sequence, r.activity.flags,
+             (r.activity.flags & 32) ? 1 : 0, (r.activity.flags & 64) ? 1 : 0,
+             r.latestTicks ? 1 : 0, r.latestTicks ? now - r.latestTicks : 0, r.latest.sequence,
+             r.latest.flags, r.activity.downedSequence, hero ? remote::CurrentWorld() : 0, r.activity.world,
+             r.latest.world, net::WorldEpoch(), r.activity.epoch,
+             hero && r.latestTicks ? body::Distance(r.latest.position, here) : -1.0f,
+             hero ? 1 : 0, HelperReason(HelperState(r, now)));
+    }
+}
+
+void CancelAlone(char const* source)
+{
+    if (!aloneSince) return;
+    const uint32_t now = net::Now();
+    // World retirement/restore must not inspect the old hero to report cancellation.
+    LogHelpers(nullptr, "alone-cancel", now);
+    Logf("downed: alone reset player=%u source=%s elapsed_ms=%u", net::LocalId(), source, now - aloneSince);
+    aloneSince = 0;
 }
 
 void Wide(char const* text, wchar_t* out, int size)
@@ -365,7 +421,7 @@ void WatchBlows(Entity& hero, uint32_t now)
 bool PartnerPresent(net::Remote const* remotes, uint32_t now)
 {
     for (int i = 1; i < net::MaxPlayers; ++i)
-        if (i != net::LocalId() && Present(remotes[i], now)) return true;
+        if (i != net::LocalId() && Playing(HelperState(remotes[i], now))) return true;
     return false;
 }
 
@@ -388,13 +444,7 @@ void Die(Entity& hero, char const* reason)
          reason, hero.GetInstance(), hero.PlayerMemory.GetHitPoints(), hero.Routine.GetCurrentTask().GetText(),
          hero.Routine.GetCurrentState().GetText(), static_cast<int>(hero.Routine.AIMode));
     const uint32_t now = net::Now();
-    for (int i = 1; i < net::MaxPlayers; ++i) {
-        if (i == net::LocalId() || !net::Remotes()[i].connected) continue;
-        net::Remote const& r = net::Remotes()[i];
-        Logf("downed: end partner=%d flags=%u sequence=%u packet=%u age=%u present=%d able=%d",
-             i, r.latest.flags, r.latest.downedSequence, r.latest.sequence, now - r.latestTicks,
-             Present(r, now) ? 1 : 0, Able(r, now) ? 1 : 0);
-    }
+    LogHelpers(&hero, reason, now);
     hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
     EndStep("set-hp");
     hero.PlayerMemory.SetHitPoints(0);
@@ -459,20 +509,20 @@ bool GuardState(eCEntity* self, char const* state)
 // heals +10 per second) until a partner chooses the help dialog and pays a healing potion; then it stands up
 // with a quarter of its hit points. Without a potion the partner is told so and the
 // hero stays down. When every known, connected partner is down or dead, the hero dies immediately. Unknown, stale,
-// loading, disconnected, or another-world partner state retains the original 5-second grace.
+// loading or disconnected partner activity retains the original 5-second grace; distance/world location does not.
 void Tick()
 {
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
     if (!instance) {
-        aloneSince = 0;
+        CancelAlone("no-local-hero");
         revivedBy = 0;
         lastHp = -1;
         lethalBlowAt = 0;
         return;
     }
     if (!session.IsGameRunning()) {
-        aloneSince = 0;
+        CancelAlone("local-not-playing");
         revivedBy = 0;
         return;
     }
@@ -485,9 +535,9 @@ void Tick()
     // Tell this player when someone else goes down or dies.
     for (int i = 1; i < net::MaxPlayers; ++i) {
         if (i == self) continue;
-        const bool present = Present(remotes[i], now);
-        const bool dead = present && (remotes[i].latest.flags & 4);
-        const bool down = present && (remotes[i].latest.flags & 8) && !dead;  // waiting for help
+        const bool present = Playing(HelperState(remotes[i], now));
+        const bool dead = present && (remotes[i].activity.flags & 4);
+        const bool down = present && (remotes[i].activity.flags & 8) && !dead;
         Wide(remotes[i].latest.name, name, 32);
         if (down && !told[i]) {
             swprintf_s(text, potionNeeded ? i18n::Text(i18n::PartnerDownNeedsPotion)
@@ -517,7 +567,7 @@ void Tick()
     if (hero.IsDead() && !life.held) { lethal = false; revivedBy = 0; return; }
     if (persist::HeroPending()) {
         if (life.held) KeepDown(hero, "hero-restore");
-        aloneSince = 0;
+        CancelAlone("hero-restore");
         return;
     }
     WatchBlows(hero, now);
@@ -540,7 +590,7 @@ void Tick()
         lethal = false;
         lethalSeenDown = false;
         nativeNoted = false;
-        aloneSince = 0;
+        CancelAlone("not-held");
         revivedBy = 0;
         if (autoHelp) Help(hero, remotes, now);
         else OfferHelp(hero, remotes, now);
@@ -586,7 +636,7 @@ void Tick()
         lethalSeenDown = false;
         lethalBlowAt = 0;
         nativeNoted = false;
-        aloneSince = 0;
+        CancelAlone("paid-revive");
         ++revives;
         Transition("paid-revive", "network");
         StandUp(hero);
@@ -600,13 +650,18 @@ void Tick()
     bool helpPossible = false;
     for (int i = 1; i < net::MaxPlayers; ++i)
         if (i != self && Able(remotes[i], now)) helpPossible = true;
-    if (helpPossible) { aloneSince = 0; return; }
-    if (AllOthersDown(remotes, now)) {
+    const uint32_t before = aloneSince;
+    const EndDecision decision = DecideEnd(helpPossible, AllOthersDown(remotes, now), now, aloneSince);
+    if (before && !aloneSince) LogHelpers(&hero, "alone-cancel", now);
+    if (!before && aloneSince) LogHelpers(&hero, "alone-start", now);
+    if (decision == EndDecision::AllDown) {
         Die(hero, "all-down");
         return;
     }
-    if (!aloneSince) aloneSince = now ? now : 1;
-    if (now - aloneSince >= AloneGrace) Die(hero, "alone-grace");
+    if (decision == EndDecision::AloneGrace) {
+        LogHelpers(&hero, "alone-expiry", now);
+        Die(hero, "alone-grace");
+    }
 }
 
 // A partner paid a potion for us (WorldState kind 8 to this player).
@@ -741,7 +796,7 @@ void OnWorldChange()
     crashlog::EndStep("world-change");
     Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
     wasDown = false;
-    aloneSince = 0;
+    CancelAlone("world-change");
     revivedBy = 0;
     pendingReviveSequence = 0;
     for (int i = 0; i < net::MaxPlayers; ++i) {

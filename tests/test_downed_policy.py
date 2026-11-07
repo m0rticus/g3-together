@@ -276,30 +276,98 @@ class DownedPolicyTests(unittest.TestCase):
             r"\bvoid\s+Tick\s*\(\s*\)",
         )
         self.assertIsNotNone(all_down)
-        self.assertIn("r.latest.flags & 14", all_down)
-        self.assertIn("Present(r, now)", all_down)
+        self.assertIn("Playing(HelperState(r, now))", all_down)
         self.assertIn("if (i == net::LocalId()) continue;", all_down)
         self.assertIn("if (!r.connected) continue;", all_down)
-        self.assertIn("if (!Present(r, now)) return false;", all_down)
-        self.assertIn("if (!(r.latest.flags & 14)) return false;", all_down)
+        self.assertIn("if (!Playing(HelperState(r, now))) return false;", all_down)
+        self.assertIn("if (HelperState(r, now) != Availability::Down) return false;", all_down)
         self.assertIn("return present;", all_down)
-        self.assertIn("constexpr uint32_t AloneGrace = 5000;", self.downed_cpp)
+        policy = (ROOT / "src" / "downed_policy.h").read_text(encoding="utf-8")
+        self.assertIn("constexpr uint32_t AbsenceGraceMs = 5000;", policy)
         self.assertIsNotNone(tick)
         self.assertIn("AllOthersDown(remotes, now)", tick)
-        self.assertIn("now - aloneSince >= AloneGrace", tick)
+        self.assertIn("DecideEnd(helpPossible, AllOthersDown(remotes, now), now, aloneSince)", tick)
         self.assertIn('Die(hero, "all-down")', tick)
         self.assertIn('Die(hero, "alone-grace")', tick)
-        self.assertIn("if (helpPossible) { aloneSince = 0; return; }", tick)
-        self.assertIn("if (!aloneSince) aloneSince = now ? now : 1;", tick)
-        self.assertLess(tick.index("if (helpPossible)"), tick.index("AllOthersDown(remotes, now)"))
-        self.assertLess(tick.index("AllOthersDown(remotes, now)"), tick.index("now - aloneSince >= AloneGrace"))
+        self.assertLess(tick.index("DecideEnd("), tick.index('Die(hero, "all-down")'))
+        self.assertLess(tick.index('Die(hero, "all-down")'), tick.index('Die(hero, "alone-grace")'))
         able = function_body(self.downed_cpp, r"\bbool\s+Able\s*\(")
         present = function_body(self.downed_cpp, r"\bbool\s+Present\s*\(")
-        for body in (able, present):
-            for requirement in ("r.connected", "r.latestTicks", "now - r.latestTicks < StaleState",
-                                "r.latest.flags & 1", "r.latest.world == remote::CurrentWorld()"):
-                self.assertIn(requirement, body)
-        self.assertIn("!(r.latest.flags & 14)", able)
+        self.assertIn("HelperState(r, now) == Availability::Able", able)
+        for requirement in ("r.connected", "r.latestTicks", "now - r.latestTicks < StaleState",
+                            "r.latest.flags & 1", "r.latest.world == remote::CurrentWorld()", "net::InWorld"):
+            self.assertIn(requirement, present)
+        helper = function_body(self.downed_cpp, r"\bAvailability\s+HelperState\s*\(")
+        for requirement in ("r.connected", "r.activity.known", "r.activity.ticks", "r.activity.flags"):
+            self.assertIn(requirement, helper)
+        self.assertNotIn("latest", helper)
+        self.assertNotIn("world", helper)
+
+    def test_activity_heartbeat_is_authenticated_reliable_and_gate_independent(self):
+        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        gate = function_body(net, r"\bbool\s+Gated\s*\(")
+        self.assertIn("case MsgPlayerActivity:", gate)
+        self.assertNotIn("case MsgState:", gate) # presentation/gameplay still gated
+        receive = function_body(net, r"\belse\s+if\s*\(\s*type\s*==\s*MsgPlayerActivity\b[^{}]*\)")
+        self.assertIn("ENET_PACKET_FLAG_RELIABLE", receive)
+        self.assertIn("peers[from] != peer", receive)
+        self.assertIn("message.id = static_cast<uint8_t>(from)", receive)
+        self.assertIn("peer != server || !connected", receive)
+        self.assertIn("r.activity.Accept", receive)
+        self.assertNotIn("Store(", receive)
+        self.assertNotIn("SetInWorld", receive)
+        # Forward valid heartbeat even if a newer pose already updated the host's activity.
+        self.assertNotIn("if (!r.activity.Accept", receive)
+        self.assertIn("ChannelState, true", receive) # independent of the bulk NPC/control reliable channel
+        service = function_body(net, r"\bvoid\s+Service\s*\(")
+        self.assertLess(service.index("MsgPlayerActivity"), service.index("if (!haveLocal"))
+        self.assertIn("now - lastActivitySend >= 1000", service)
+        self.assertIn("local.downedSequence != lastActivityDowned", service)
+        self.assertIn("message.state.downedSequence != previousDowned", service)
+
+    def test_world_gate_clears_only_presentation_disconnect_clears_activity(self):
+        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        clear = function_body(net, r"\bvoid\s+ClearPresentation\s*\(")
+        self.assertIn("cleared.activity = remotes[id].activity", clear)
+        self.assertIn("cleared.connected = remotes[id].connected", clear)
+        gate = function_body(net, r"\bvoid\s+SetInWorld\s*\(")
+        self.assertIn("ClearPresentation(i)", gate)
+        self.assertIn("ClearPresentation(id)", gate)
+        drop = function_body(net, r"\bvoid\s+Drop\s*\(")
+        self.assertIn("remotes[id] = Remote{}", drop)
+
+    def test_arriving_held_puppet_uses_owner_life_not_buffered_wake(self):
+        remote = (ROOT / "src" / "remote.cpp").read_text(encoding="utf-8")
+        update = function_body(remote, r"\bvoid\s+UpdatePuppet\s*\(")
+        held = function_body(update, r"\bif\s*\(\s*held\s*\)")
+        for requirement in ("target.position = remote.latest.position", "target.speed = 0.0f",
+                            "target.movementMode = gECharMovementMode_1",
+                            "target.aniState = gEAniState_LieKnockDown",
+                            "world::RequestProcessingUpdate()", 'std::strstr(target.motion, "GetUp")'):
+            self.assertIn(requirement, held)
+        self.assertIn("puppet.entity.Routine.AniState = gEAniState_LieKnockDown", update)
+        self.assertIn("|| heldOwner", update)
+        self.assertIn("remote.activity.downedSequence == remote.latest.downedSequence", update)
+        self.assertIn("puppet.entity.Dialog.TradeEnabled", update)
+        self.assertNotIn('CallScript(bCString("Kill")', update)
+        pay = function_body(self.downed_cpp, r"\bvoid\s+PayAndHelp\s*\(")
+        self.assertIn("paidSequence[i] == r.latest.downedSequence && now - paidAt[i] < PaidCooldown", pay)
+
+    def test_absence_boundaries_log_candidate_rejection_evidence(self):
+        tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(")
+        for event in ("alone-start", "alone-cancel", "alone-expiry"):
+            self.assertIn(f'LogHelpers(&hero, "{event}", now)', tick)
+        die = function_body(self.downed_cpp, r"\bvoid\s+Die\s*\(")
+        self.assertIn("LogHelpers(&hero, reason, now)", die)
+        cancel = function_body(self.downed_cpp, r"\bvoid\s+CancelAlone\s*\(\s*char\s+const\s*\*\s*source\s*\)\s*(?=\{)")
+        self.assertIn('LogHelpers(nullptr, "alone-cancel", now)', cancel)
+        self.assertNotIn("GetInstance", cancel)
+        world_change = function_body(self.downed_cpp, r"\bvoid\s+OnWorldChange\s*\(")
+        self.assertIn('CancelAlone("world-change")', world_change)
+        log = function_body(self.downed_cpp, r"\bvoid\s+LogHelpers\s*\(")
+        for field in ("connected=", "joined=", "gate=", "activity_age=", "pose_age=", "loading=", "menu=",
+                      "partner_world=", "partner_epoch=", "distance_cm=", "zone=not-sent", "reject="):
+            self.assertIn(field, log)
 
 
 if __name__ == "__main__":

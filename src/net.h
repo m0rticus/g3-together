@@ -90,6 +90,27 @@ struct NpcRecord
 static_assert(sizeof(NpcMotion) == 61, "NPC motion wire layout changed");
 static_assert(sizeof(NpcRecord) == 588, "NPC full-record fallback wire layout changed");
 
+struct PlayerActivity
+{
+    uint32_t sequence = 0, ticks = 0, world = 0, epoch = 0, downedSequence = 0;
+    uint8_t flags = 0; // player life flags; bit 5: hero restore/loading, bit 6: no running hero/menu
+    bool known = false;
+
+    bool Accept(uint32_t next, uint32_t arrived, uint32_t location, uint32_t generation,
+                uint8_t state, uint32_t downed)
+    {
+        if (known && static_cast<int32_t>(next - sequence) <= 0) return false;
+        sequence = next;
+        ticks = arrived;
+        world = location;
+        epoch = generation;
+        flags = state;
+        downedSequence = downed;
+        known = true;
+        return true;
+    }
+};
+
 struct Remote
 {
     PlayerState previous;
@@ -97,6 +118,7 @@ struct Remote
     uint32_t previousTicks = 0;  // net::Now() when previous/latest arrived
     uint32_t latestTicks = 0;
     bool connected = false;
+    PlayerActivity activity; // global helper evidence, independent of loaded/presented position
 };
 
 bool Start(bool host);
@@ -115,7 +137,7 @@ void SetSendRate(int hz);  // 20..60 Hz for player states; NPC captures have the
 uint8_t LocalId();
 // Host: always. Client: welcomed by the host and in the host's world (SetInWorld); gameplay pauses otherwise.
 bool Connected();
-Remote const* Remotes();  // indexed by player id, size MaxPlayers; a client outside the host's world is not connected here
+Remote const* Remotes();  // indexed by player id, size MaxPlayers; activity survives closed presentation/world gates
 constexpr int MaxPlayers = 8;
 uint32_t HashWorld(char const* name);
 uint32_t HashName(char const* name);
@@ -567,4 +589,5 @@ using OfferResultHandler = void (*)(OfferResultNote const& note);
 void SetOfferHandlers(OfferHandler offer, OfferResultHandler result);
 // The clock that stamps received states (ENet's). Compare stamps only against this clock.
 uint32_t Now();
+uint32_t WorldEpoch();
 }

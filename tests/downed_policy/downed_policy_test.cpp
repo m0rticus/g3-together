@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../../src/downed_policy.h"
 #include "../../src/replication.h"
+#include "../../src/net.h"
 #include <cassert>
+#include <initializer_list>
 
 using g3t::downed::Life;
 
@@ -162,11 +164,96 @@ void HelperEligibilityAroundPendingRevive()
     assert(!pending.Apply(true) && life.terminal && !life.held);
 }
 
+g3t::downed::Availability AvailabilityOf(g3t::net::Remote const& r, uint32_t now)
+{
+    return g3t::downed::HelperAvailability(r.connected, r.activity.known, r.activity.ticks, r.activity.flags, now);
+}
+
+void LocationAndPresentationDoNotDecideAvailability()
+{
+    using namespace g3t::downed;
+    g3t::net::Remote partner;
+    partner.connected = true;
+    partner.latestTicks = 1; // pose is stale, off-screen, and in another world
+    partner.latest.world = 42;
+    partner.latest.position[0] = 1000000.0f;
+    assert(partner.activity.Accept(100, 10000, 99, 17, 1, 0));
+    uint32_t alone = 0;
+    for (uint32_t now = 10000; now < 190000; now += 1000) {
+        assert(partner.activity.Accept(101 + (now - 10000) / 1000, now, 99, 17, 1, 0));
+        assert(AvailabilityOf(partner, now) == Availability::Able);
+        assert(DecideEnd(true, false, now, alone) == EndDecision::Wait && !alone);
+    }
+    // World/zone/interior and rendering are deliberately not inputs to helper classification.
+    partner.latest.world = 0;
+    partner.latestTicks = 0;
+    assert(AvailabilityOf(partner, 189000) == Availability::Able);
+    assert(AvailabilityOf(partner, 193999) == Availability::Able);
+    assert(AvailabilityOf(partner, 194000) == Availability::Stale);
+    assert(DecideEnd(false, false, 194000, alone) == EndDecision::Wait);
+    assert(DecideEnd(false, false, 198999, alone) == EndDecision::Wait);
+    assert(DecideEnd(false, false, 199000, alone) == EndDecision::AloneGrace);
+}
+
+void RealUnavailableAndAllDown()
+{
+    using namespace g3t::downed;
+    assert(HelperAvailability(false, true, 100, 1, 100) == Availability::Disconnected);
+    assert(HelperAvailability(true, false, 0, 1, 100) == Availability::Unknown);
+    assert(HelperAvailability(true, true, 100, 1, 5100) == Availability::Stale);
+    for (uint8_t flags : {uint8_t(0), uint8_t(32), uint8_t(64)}) {
+        const auto unavailable = HelperAvailability(true, true, 100, flags, 100);
+        assert(unavailable == Availability::NotPlaying && !Playing(unavailable));
+        uint32_t alone = 0;
+        assert(DecideEnd(false, false, 100, alone) == EndDecision::Wait && alone == 100);
+        assert(DecideEnd(false, false, 5099, alone) == EndDecision::Wait);
+        assert(DecideEnd(false, false, 5100, alone) == EndDecision::AloneGrace);
+    }
+    for (uint8_t flags : {uint8_t(3), uint8_t(5), uint8_t(9), uint8_t(11), uint8_t(19)}) {
+        const auto down = HelperAvailability(true, true, 100, flags, 100);
+        assert(down == Availability::Down && Playing(down));
+        uint32_t alone = 0;
+        assert(DecideEnd(false, true, 100, alone) == EndDecision::AllDown && !alone);
+        assert(DecideEnd(true, true, 100, alone) == EndDecision::Wait); // another alive candidate wins
+    }
+    uint32_t alone = 200;
+    assert(DecideEnd(false, true, 201, alone) == EndDecision::AllDown); // helper goes down during grace
+    assert(DecideEnd(true, false, 5199, alone) == EndDecision::Wait && alone == 0); // just before expiry
+    assert(DecideEnd(false, false, 5200, alone) == EndDecision::Wait && alone == 5200); // new continuous absence
+    assert(DecideEnd(false, false, 10199, alone) == EndDecision::Wait);
+    assert(DecideEnd(false, false, 10200, alone) == EndDecision::AloneGrace);
+}
+
+void ActivityOrderingAndTimerWrap()
+{
+    using namespace g3t::downed;
+    g3t::net::PlayerActivity activity;
+    assert(activity.Accept(100, 1000, 42, 7, 11, 3));
+    assert(!activity.Accept(99, 1001, 42, 7, 1, 0)); // delayed alive heartbeat cannot conceal downed state
+    assert(!activity.Accept(100, 1002, 42, 7, 1, 0));
+    assert(activity.flags == 11 && activity.ticks == 1000 && activity.downedSequence == 3);
+    assert(activity.Accept(101, 1003, 77, 8, 1, 0)); // alive in another world is still alive
+    activity = {};
+    assert(activity.Accept(UINT32_MAX, UINT32_MAX - 100, 42, 7, 1, 0));
+    assert(activity.Accept(0, 50, 42, 7, 11, 4));
+    assert(!activity.Accept(UINT32_MAX, 51, 42, 7, 1, 0));
+    assert(HelperAvailability(true, true, UINT32_MAX - 100, 1, 50) == Availability::Able);
+    uint32_t alone = 0;
+    assert(DecideEnd(false, false, UINT32_MAX - 100, alone) == EndDecision::Wait);
+    assert(DecideEnd(false, false, 4898, alone) == EndDecision::Wait);
+    assert(DecideEnd(false, false, 4899, alone) == EndDecision::AloneGrace);
+    alone = 0;
+    assert(DecideEnd(false, false, 0, alone) == EndDecision::Wait); // zero sentinel must not underflow into expiry
+}
+
 int main()
 {
     StickyAndRevive();
     TerminalAndWorldChanges();
     ReorderedSnapshotsAndRevives();
     HelperEligibilityAroundPendingRevive();
+    LocationAndPresentationDoNotDecideAvailability();
+    RealUnavailableAndAllDown();
+    ActivityOrderingAndTimerWrap();
     return 0;
 }

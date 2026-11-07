@@ -12,7 +12,8 @@ namespace g3t::downed {
 bool RedirectDeath(eCEntity* self, char const* state);
 bool GuardState(eCEntity* self, char const* state); // before native AI runs: only the down task/loop may run while held
 // Once per frame: a knocked-out hero stays down while a partner could help; a partner who talks to its puppet and
-// chooses "Ich werde dir helfen." pays a healing potion and stands it up (owner 23.10.). Nobody able to help for 5 s: the hero dies. Other players are told
+// chooses "Ich werde dir helfen." pays a healing potion and stands it up (owner 23.10.). Active, alive partners count
+// anywhere; nobody able to help for 5 s after genuine absence: the hero dies. Other players are told
 // when someone goes down or dies.
 void Tick();
 void OnWorldChange();                 // reset terminal death, but carry an unfinished downed life through loading

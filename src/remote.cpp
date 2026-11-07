@@ -7,11 +7,14 @@
 #include "combat.h"
 #include "config.h"
 #include "downed.h"
+#include "downed_policy.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
 #include "parity.h"
+#include "persist.h"
 #include "trade.h"
+#include "world.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -38,6 +41,7 @@ struct Puppet
     uint32_t wearChecked = 0;
     uint32_t world = 0;
     uint32_t truthSent = 0;
+    uint32_t downedSequence = 0;
     body::State body;
     std::string shape;        // the shape it stands for (the player's hero template, or its creature)
     std::unordered_map<uint32_t, std::string> presentationNames;
@@ -98,7 +102,9 @@ bool LocalState(net::PlayerState& state)
 {
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* own = session.GetHero();
-    if (!own || !session.IsGameRunning()) return false;
+    state.world = CurrentWorld();
+    if (!own || !session.IsGameRunning()) { state.flags = 64; return false; }
+    if (persist::HeroPending()) { state.flags = 32; return false; }
     if (badStates) {
         state.position[0] = std::nanf("");
         std::memset(state.name, 'X', sizeof(state.name));
@@ -355,7 +361,13 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     // so only a long silence removes the puppet. Stamps come from the network clock; GetTickCount() runs a few ms apart and made fresh states look
     // ancient after unsigned underflow (the puppet was removed and respawned hundreds of times).
     const uint32_t now = net::Now();
-    const bool fresh = remote.connected && remote.latestTicks && static_cast<int32_t>(now - remote.latestTicks) < 15000;
+    const bool heldOwner = remote.activity.known && now - remote.activity.ticks < downed::ActivityStaleMs &&
+                           (remote.activity.flags & 8) && (remote.latest.flags & 8) &&
+                           remote.activity.downedSequence &&
+                           remote.activity.downedSequence == remote.latest.downedSequence &&
+                           remote.activity.world == remote.latest.world;
+    const bool fresh = remote.connected && remote.latestTicks &&
+                       (static_cast<int32_t>(now - remote.latestTicks) < 15000 || heldOwner);
     const bool sameWorld = (remote.latest.flags & 1) && remote.latest.world == CurrentWorld();
     if (!fresh || !sameWorld) {
         Despawn(id, !fresh ? "no recent state" : "other world");
@@ -504,8 +516,48 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     // The player's swings replay as the game's combat moves too (owner's look: players' attacks hardly visible);
     // a body whose move faults goes back to motion names (body.cpp).
+    const bool held = (remote.latest.flags & 8) && !(remote.latest.flags & 4) && remote.latest.downedSequence;
+    if (held) {
+        if (puppet.downedSequence != remote.latest.downedSequence) {
+            puppet.body.actionUntil = 0;
+            puppet.body.localHitUntil = 0;
+            puppet.body.playing[0] = '\0';
+            puppet.entity.StopPlayAni();
+            world::RequestProcessingUpdate();
+            Logf("downed: puppet player=%d sequence=%u action=hold pose_packet=%u source=owner "
+                 "position=%.0f,%.0f,%.0f ani=%u",
+                 id, remote.latest.downedSequence, remote.latest.sequence,
+                 remote.latest.position[0], remote.latest.position[1], remote.latest.position[2], remote.latest.aniState);
+        }
+        // A newly streamed actor must not replay a buffered pre-knockout walk/get-up for an owner still held.
+        target.position = remote.latest.position;
+        target.rotation = remote.latest.rotation;
+        target.goal = nullptr;
+        target.speed = 0.0f;
+        target.movementMode = gECharMovementMode_1; // SDK's standing mode
+        target.aniState = gEAniState_LieKnockDown;
+        target.motion = remote.latest.animation;
+        if ((!std::strstr(target.motion, "_Lie") && !std::strstr(target.motion, "KnockDown")) ||
+            std::strstr(target.motion, "GetUp") || std::strstr(target.motion, "StandUp"))
+            target.motion = "";
+        target.smooth = false;
+        target.timeline = true;
+        target.presentationSerial = puppet.body.track.serial;
+        puppet.body.actionUntil = 0;
+        puppet.body.localHitUntil = 0;
+    } else if (puppet.downedSequence) {
+        puppet.body.actionUntil = 0;
+        puppet.body.playing[0] = '\0';
+        Logf("downed: puppet player=%d sequence=%u action=release pose_packet=%u source=owner flags=%u",
+             id, puppet.downedSequence, remote.latest.sequence, remote.latest.flags);
+    }
+    puppet.downedSequence = held ? remote.latest.downedSequence : 0;
     puppet.body.combatMoves = puppetCombat;
     body::Drive(puppet.entity, puppet.body, target, now);
+    if (held) {
+        puppet.entity.CharacterMovement.StopMovement();
+        puppet.entity.Routine.AniState = gEAniState_LieKnockDown;
+    }
 }
 }
 

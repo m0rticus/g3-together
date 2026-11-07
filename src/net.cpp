@@ -39,6 +39,7 @@ enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
 enum : uint8_t { MsgSave = 40, MsgBoneDictionary = 41, MsgBoneAck = 42, MsgBoneRequest = 43, MsgCompactPosedNpc = 44 };
 enum : uint8_t { MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 47,
                  MsgControlSignal = 48, MsgControlPose = 49 };
+enum : uint8_t { MsgPlayerActivity = 50 };
 
 #pragma pack(push, 1)
 struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };
@@ -50,6 +51,10 @@ struct FileChunkHeader { uint8_t type; uint8_t file; uint32_t total; uint32_t of
 struct FileDoneMsg { uint8_t type; char name[64]; uint32_t size[FileCount]; uint32_t crc[FileCount]; };
 struct Welcome { uint8_t type; uint8_t id; };
 struct State { uint8_t type; PlayerState state; };
+struct ActivityMsg {
+    uint8_t type, id, flags;
+    uint32_t sequence, world, epoch, downedSequence;
+};
 struct Leave { uint8_t type; uint8_t id; };
 struct NpcsHeader {
     uint8_t type;
@@ -101,6 +106,7 @@ struct SaveMsg { uint8_t type; SaveNote note; };
 #pragma pack(pop)
 static_assert(sizeof(NpcsHeader) == 23, "NPC datagram budget must match its wire header");
 static_assert(sizeof(SaveMsg) == 122, "save message wire layout changed");
+static_assert(sizeof(ActivityMsg) == 19, "player activity heartbeat wire layout changed");
 static_assert(sizeof(BoneRequestMsg) == 7, "Bone request wire layout changed");
 static_assert(sizeof(BonePosePrefix) == 3, "Compact pose overhead must match full pose");
 static_assert(offsetof(BoneRequestMsg, layoutId) == 5 && offsetof(BonePosePrefix, layoutId) == 1,
@@ -127,6 +133,10 @@ uint16_t helloVersion = 0;     // QA (stage W7): the next hello claims this prot
 char localName[24] = {};
 uint32_t sequence = 0;
 uint32_t lastSend = 0;
+uint32_t lastActivitySend = 0;
+uint8_t lastActivityFlags = 0;
+uint32_t lastActivityDowned = 0;
+bool activitySent = false;
 int sendRate = 60;  // Hz of the player state; npcs.cpp uses the same setting (config send_rate)
 Remote remotes[MaxPlayers] = {};
 uint32_t joins = 0;
@@ -229,7 +239,7 @@ bool Gated(uint8_t type)
 {
     switch (type) {
     case MsgHello: case MsgWelcome: case MsgRefused: case MsgLeave:
-    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld: case MsgSave:
+    case MsgCampaign: case MsgFileChunk: case MsgFileDone: case MsgWorld: case MsgSave: case MsgPlayerActivity:
         return false;
     default:
         return true;
@@ -415,6 +425,7 @@ void Store(PlayerState const& state)
 {
     if (state.id == 0 || state.id >= MaxPlayers || state.id == localId) return;
     Remote& r = remotes[state.id];
+    r.activity.Accept(state.sequence, enet_time_get(), state.world, worldEpoch, state.flags, state.downedSequence);
     if (r.latestTicks && static_cast<int32_t>(state.sequence - r.latest.sequence) <= 0) {
         if ((r.latest.flags & 14) != (state.flags & 14))
             Logf("downed: remote stale player=%u packet=%u current=%u flags=%u current_flags=%u source=player-state",
@@ -432,6 +443,15 @@ void Store(PlayerState const& state)
     r.latestTicks = enet_time_get();
     r.connected = true;
     if (playerStateHandler) playerStateHandler(state, r.latestTicks, reset);
+}
+
+void ClearPresentation(uint8_t id)
+{
+    Remote cleared{};
+    cleared.activity = remotes[id].activity;
+    cleared.connected = remotes[id].connected;
+    strncpy_s(cleared.latest.name, remotes[id].latest.name, _TRUNCATE);
+    remotes[id] = cleared;
 }
 
 void Drop(uint8_t id)
@@ -738,7 +758,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         peers[id] = peer;
         ++generations[id];
         peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
-        remotes[id].connected = false;  // until it is in the host's world (SetInWorld)
+        remotes[id].connected = true; // joined; activity and presentation have separate readiness
         clientInWorld[id] = false;
         strncpy_s(remotes[id].latest.name, hello.name, _TRUNCATE);
         const Welcome welcome{MsgWelcome, id};
@@ -758,9 +778,32 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         localId = welcome.id;
         connected = true;
         inWorld = false;  // until the host's world is known to be this one (persist.cpp)
+        activitySent = false;
         ++welcomes;
         ResetNpcReplication();  // a new host connection has a fresh publication stream, even in the same campaign
         Logf("net: welcomed as player %u (welcome %u)", localId, welcomes);
+    } else if (type == MsgPlayerActivity && packet->dataLength == sizeof(ActivityMsg)) {
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
+        ActivityMsg message;
+        std::memcpy(&message, packet->data, sizeof(message));
+        if (isHost) {
+            const uintptr_t from = reinterpret_cast<uintptr_t>(peer->data);
+            if (from < 2 || from >= MaxPlayers || peers[from] != peer) return;
+            message.id = static_cast<uint8_t>(from);
+        } else if (peer != server || !connected) {
+            return;
+        }
+        if (!message.id || message.id >= MaxPlayers || message.id == localId ||
+            (message.flags & 128) || ((message.flags & 1) && (message.flags & 96))) return;
+        Remote& r = remotes[message.id];
+        r.activity.Accept(message.sequence, enet_time_get(), message.world, message.epoch,
+                          message.flags, message.downedSequence);
+        r.connected = true;
+        if (isHost)
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i] && i != message.id &&
+                    !Send(peers[i], &message, sizeof(message), ChannelState, true))
+                    Logf("net: player activity relay to player %u failed", i);
     } else if (type == MsgState && packet->dataLength == sizeof(State)) {
         State message;
         std::memcpy(&message, packet->data, sizeof(message));
@@ -1477,6 +1520,7 @@ uint32_t HashWorld(char const* name)
 }
 
 uint32_t Now() { return enet_time_get(); }
+uint32_t WorldEpoch() { return worldEpoch; }
 uint8_t LocalId() { return localId; }
 bool IsHost() { return isHost; }
 uint32_t JoinCount() { return joins; }
@@ -1490,7 +1534,7 @@ void SetInWorld(uint8_t id, bool in)
         if (inWorld == in) return;
         inWorld = in;
         if (!in) {
-            for (uint8_t i = 0; i < MaxPlayers; ++i) remotes[i] = Remote{};  // the others' puppets are of that world
+            for (uint8_t i = 0; i < MaxPlayers; ++i) ClearPresentation(i);
             boneLayouts.Clear();
             receivedBoneGeneration = 0;
             requestedBoneEpoch = 0;
@@ -1520,9 +1564,7 @@ void SetInWorld(uint8_t id, bool in)
         goodsCache[id].clear();
         goodsReplay[id] = 0;
         for (auto& pending : goodsReplay) pending &= static_cast<uint8_t>(~(1u << id));
-        Remote cleared{};
-        strncpy_s(cleared.latest.name, remotes[id].latest.name, _TRUNCATE);
-        remotes[id] = cleared;  // its puppet goes; it comes back with the first state from the host's world
+        ClearPresentation(id); // the puppet leaves; connection-level activity still describes its owner
         npcOrigins[id].clear();
     }
     Logf("net: player %u (%s) is %s the host's world", id, remotes[id].latest.name, in ? "in" : "out of");
@@ -2291,6 +2333,8 @@ void Stop()
     haveQueued = false;
     lastServiceAt = 0;
     connected = inWorld = false;
+    activitySent = false;
+    lastActivitySend = 0;
     localId = 0;
     ResetNpcReplication();
     for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
@@ -2458,15 +2502,35 @@ void Service(PlayerState const& local, bool haveLocal)
         server = enet_host_connect(host, &target, ChannelCount, 0);
         Log(server ? "net: reconnecting" : "net: reconnect failed");
     }
-    if (!connected || !haveLocal || now - lastSend < std::max<uint32_t>(8, 1000u / static_cast<uint32_t>(sendRate) - 1)) return;
+    if (!connected) return;
+    if (!activitySent || local.flags != lastActivityFlags || local.downedSequence != lastActivityDowned ||
+        now - lastActivitySend >= 1000) {
+        const ActivityMsg activity{MsgPlayerActivity, localId, local.flags, ++sequence,
+                                   local.world, worldEpoch, local.downedSequence};
+        bool queued = true;
+        if (isHost) {
+            for (uint8_t i = 2; i < MaxPlayers; ++i)
+                if (peers[i] && !Send(peers[i], &activity, sizeof(activity), ChannelState, true)) queued = false;
+        } else if (server) {
+            queued = Send(server, &activity, sizeof(activity), ChannelState, true);
+        }
+        if (!queued) Log("net: player activity heartbeat queue failed; retrying at the next heartbeat");
+        activitySent = true;
+        lastActivitySend = now;
+        lastActivityFlags = local.flags;
+        lastActivityDowned = local.downedSequence;
+    }
+    if (!haveLocal || now - lastSend < std::max<uint32_t>(8, 1000u / static_cast<uint32_t>(sendRate) - 1)) return;
     lastSend = now;
     State message{MsgState, local};
     message.state.id = localId;
     message.state.sequence = ++sequence;
     message.state.sent = now;
     static uint8_t previousFlags = 0;
-    const bool reliable = message.state.flags != previousFlags;
+    static uint32_t previousDowned = 0;
+    const bool reliable = message.state.flags != previousFlags || message.state.downedSequence != previousDowned;
     previousFlags = message.state.flags;
+    previousDowned = message.state.downedSequence;
     strncpy_s(message.state.name, localName, _TRUNCATE);
     if (isHost) {
         for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) Send(peers[i], &message, sizeof(message), ChannelState, reliable);
