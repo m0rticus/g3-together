@@ -33,6 +33,7 @@ inline bool PerceptionBlocked(eCEntity* receiver, bool driven)
 }
 
 void Tick();             // installs the filter once the game's scripts have registered it
+bool RetargetDownedBeforeCancel(eCEntity* npc, void* spu);
 bool EnterTerminalDeath(eCEntity* hero); // synchronous native entry on an isolated runtime stack
 bool PerceptionFiltered();
 unsigned BlockedCount(); // perceptions refused for driven bodies so far

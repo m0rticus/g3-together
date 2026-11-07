@@ -301,7 +301,12 @@ static void TestReliableRetry()
     };
     b.record.flags ^= 1; reliable();
     b.record.flags ^= 2; reliable();
+    b.record.flags ^= 4; reliable();
+    b.record.flags ^= 8; reliable();
+    b.record.flags ^= 16; reliable();
+    b.record.flags ^= 32; reliable();
     b.record.flags ^= 128; reliable();
+    b.record.aiMode++; reliable();
     b.record.incarnation++; reliable();
     b.record.hitPoints++; reliable();
     b.record.hitPointsMax++; reliable();
@@ -322,6 +327,35 @@ static void TestReliableRetry()
     b.record = sent;
     b.in.distanceCm = InterestExitCm + 1;
     assert(b.Eval().decision == Decision::FinalAndRelease && b.Eval().essential);
+}
+
+static void TestRetargetBeforeNextCadence()
+{
+    Fixture f(1);
+    f.record.flags = 4 | (2 << 3);
+    f.record.aiMode = 3;
+    f.record.heldRight = 123;
+    f.Send(Decision::Initial);
+    f.in.combat = true;
+    f.in.now = 1;
+    f.record.flags = 4 | (1 << 3); // client -> host, with identical pose, weapon and motion
+    assert(f.Eval().decision == Decision::Semantic && f.Eval().essential);
+    assert(f.state.record.flags == (4 | (2 << 3))); // a failed queue cannot hide the opponent edge
+    f.Send(Decision::Semantic);
+    f.in.now = 2;
+    f.record.flags = 4;
+    f.record.combatTarget = 456; // player -> native NPC
+    assert(f.Eval().decision == Decision::Semantic && f.Eval().essential);
+    f.Send(Decision::Semantic);
+    f.in.now = 3;
+    f.record.combatTarget = 0;
+    assert(f.Eval().decision == Decision::Semantic && f.Eval().essential);
+    f.Send(Decision::Semantic);
+    f.in.now = 4;
+    f.record.aiMode = 1; // vanilla relax, not a new attack script on the receiver
+    f.record.flags = 0;
+    assert(f.Eval().decision == Decision::Semantic && f.Eval().essential);
+    assert(f.record.heldRight == 123 && f.record.motions[0].instance == 1);
 }
 
 static void TestDynamicAndSentBaseline()
@@ -748,6 +782,7 @@ int main()
     TestCadenceAndUrgency();
     TestDiscreteFields();
     TestReliableRetry();
+    TestRetargetBeforeNextCadence();
     TestDynamicAndSentBaseline();
     TestIndependentStatesAndWrap();
     TestLostSnapshotSelfHeals();

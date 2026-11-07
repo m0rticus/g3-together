@@ -8,6 +8,7 @@
 #include "items.h"
 #include "downed.h"
 #include "downed_policy.h"
+#include "npc_retarget_policy.h"
 #include "guards.h"
 #include "fightmem.h"
 #include "infocmd.h"
@@ -19,6 +20,7 @@
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -110,8 +112,95 @@ bool RejectDownedTarget(eCEntity* npc, eCEntity* target, char const* decision)
     return true;
 }
 
+using NextEnemy = Entity (GE_STDCALL *)(Entity);
+static_assert(sizeof(Entity) == 0xA8, "Native next-enemy ABI requires an SDK Entity by value");
+
+NextEnemy NativeNextEnemy()
+{
+    static bool checked = false;
+    static NextEnemy nextEnemy = nullptr;
+    if (checked) return nextEnemy;
+    HMODULE module = GetModuleHandleA("Script_Game.dll");
+    if (!module) return nullptr;
+    checked = true;
+    auto* base = reinterpret_cast<unsigned char*>(module);
+    static const unsigned char head[] = {0x81, 0xec, 0xe0, 0x08, 0x00, 0x00, 0x53, 0x55, 0x56,
+                                         0x8b, 0xb4, 0x24, 0xf0, 0x08, 0x00, 0x00, 0x57};
+    static const unsigned char tail[] = {0xc2, 0xac, 0x00};
+    // Script_Game+0xA070: hidden Entity return + by-value Entity, RET 0xAC.
+    if (!std::memcmp(base + 0xA070, head, sizeof(head)) && !std::memcmp(base + 0xAF1B, tail, sizeof(tail))) {
+        nextEnemy = reinterpret_cast<NextEnemy>(base + 0xA070);
+        Log("ai: native defeated-opponent selector verified");
+    } else {
+        Log("ai: native defeated-opponent selector UNAVAILABLE; signature/ABI mismatch, using visible fallback only");
+    }
+    return nextEnemy;
+}
+
+bool EligibleOpponent(eCEntity* npc, Entity const& target)
+{
+    eCEntity* instance = target.GetInstance();
+    const bool properties = instance && instance->GetPropertySet(eEPropertySetType_NPC) &&
+                            instance->GetPropertySet(eEPropertySetType_ScriptRoutine);
+    return retarget::EligibleTarget(properties, instance == npc, downed::CombatUnavailable(instance),
+                                    properties ? static_cast<int>(target.Routine.AIMode) : -1) &&
+           npclease::ContactAllowed(npc, instance);
+}
+
+bool ReplacementEnemy(eCEntity* npc, Entity const& target, bool visibleFallback)
+{
+    if (!EligibleOpponent(npc, target)) return false;
+    Entity self(npc);
+    if (visibleFallback && (!retarget::VisibleFallback(self.GetDistanceTo(target)) ||
+                            !self.IsFreeLOS(target, GETrue))) return false;
+    const int attitude = GetScriptAdminExt().CallScript(bCString("GetAttitude"), npc, target.GetInstance(), 0);
+    return retarget::EnemyAttitude(attitude);
+}
+
+Entity SelectReplacement(Entity const& npc, Entity const& current, Entity const& alternative,
+                         uint32_t bindings, retarget::Source& source)
+{
+    if (!(bindings & downed::Current) && EligibleOpponent(npc.GetInstance(), current)) {
+        source = retarget::Source::Current;
+        return current;
+    }
+    Entity native;
+    if (NextEnemy select = NativeNextEnemy()) native = select(npc);
+    const bool nativeValid = ReplacementEnemy(npc.GetInstance(), native, false);
+    const bool alternativeValid = !nativeValid && ReplacementEnemy(npc.GetInstance(), alternative, true);
+    std::array<Entity, net::MaxPlayers> actors;
+    std::array<retarget::PlayerCandidate, net::MaxPlayers> players{};
+    if (!nativeValid && !alternativeValid) {
+        for (unsigned id = 1; id < net::MaxPlayers; ++id) {
+            eCEntity* actor = id == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(id);
+            if (!actor) continue;
+            actors[id] = Entity(actor);
+            players[id].eligible = ReplacementEnemy(npc.GetInstance(), actors[id], true);
+            players[id].distanceCm = npc.GetDistanceTo(actors[id]);
+        }
+    }
+    const retarget::Selection selected = retarget::Select(bindings, false, nativeValid, alternativeValid,
+                                                         players.data(), players.size());
+    source = selected.source;
+    switch (source) {
+    case retarget::Source::Native: return native;
+    case retarget::Source::Alternative: return alternative;
+    case retarget::Source::Player: return actors[selected.player];
+    default: return Entity();
+    }
+}
+
+thread_local eCEntity* releasingDownedNpc = nullptr;
+
+struct DownedReleaseScope {
+    eCEntity* before;
+    explicit DownedReleaseScope(eCEntity* npc) : before(releasingDownedNpc) { releasingDownedNpc = npc; }
+    ~DownedReleaseScope() { releasingDownedNpc = before; }
+};
+
 bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProcessingUnit* spu = nullptr)
 {
+    if (instance && instance == releasingDownedNpc) return true;
     if (!HostNpc(instance) || !downed::UnavailablePlayers() ||
         !instance->GetPropertySet(eEPropertySetType_ScriptRoutine)) return false;
     Entity npc(instance);
@@ -137,12 +226,20 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
     check(alignment, downed::Alignment);
     check(inflictor, downed::Inflictor);
     if (!bindings) return false;
+    DownedReleaseScope scope(instance);
     downed::LogCombatDecision(instance, down, boundary, true);
     const bool stop = downed::StopTargetInstruction(bindings);
+    const bCString taskBefore = npc.Routine.GetCurrentTask(), stateBefore = npc.Routine.GetCurrentState();
+    const int modeBefore = npc.Routine.AIMode, weaponBefore = gCEntity::GetCombatMode(instance);
+    const unsigned combatBefore = npc.NPC.CombatState;
+    const bool fighting = modeBefore == gEAIMode_Combat || combatBefore == 1 ||
+        !std::strncmp(taskBefore.GetText(), "ZS_Attack", 9) ||
+        !std::strncmp(taskBefore.GetText(), "ZS_RevolutionAttack", 19);
     // A combat instruction owns saved target arguments. Retire it before changing its target proxies.
     if (stop) {
         npc.Routine.FullStop();
         npc.Routine.StopAICombatMove();
+        npc.Routine.StopAIGoto();
         npc.CharacterMovement.StopMovement();
     }
     Entity none;
@@ -156,18 +253,79 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
     if (stop) {
         if (!spu) spu = &static_cast<gCScriptRoutine_PS*>(instance->GetPropertySet(eEPropertySetType_ScriptRoutine))->GetSPU();
         if (downed::CombatUnavailable(spu->GetOtherEntity())) spu->SetOtherEntity(nullptr);
-        if ((bindings & downed::Current) || !current.GetInstance()) {
-            // Native participant lists derive from CombatState and CurrentTarget (+0x1880).
-            // Do not run ZS_Attack_End with the defeated player: its lethal branch may finish them.
-            npc.NPC.CombatState = 0;
-            npc.Routine.AIMode = gEAIMode_Reaction;
-            npc.Routine.ContinueRoutine();
-        } else {
-            npc.Routine.SetTask(bCString("ZS_Attack")); // stale spell, still a valid current opponent
+        retarget::Source source = retarget::Source::None;
+        Entity next = fighting ? SelectReplacement(npc, current, alternative, bindings, source) : Entity();
+        char const* reason = retarget::Reason(source);
+        if (next.GetInstance()) {
+            npc.SetAlignmentTarget(next);
+            if (source == retarget::Source::Current) {
+                npc.Routine.SetTask(bCString("ZS_Attack"));
+            } else {
+                // ZS_Attack_End+0x1A811 uses this same setter/assessment path before any weapon stow.
+                const int attitude = GetScriptAdminExt().CallScript(bCString("GetAttitude"), instance, next.GetInstance(), 0);
+                const gEAttackReason attackReason = npc.NPC.AttackReason == gEAttackReason_Revolution
+                    ? gEAttackReason_Revolution : attitude == gEAttitude_Hostile
+                    ? gEAttackReason_Enemy : attitude == gEAttitude_Predator ? gEAttackReason_Prey : gEAttackReason_ReactToDamage;
+                const int assessed = GetScriptAdminExt().CallScript(bCString("AssessTarget"), instance, next.GetInstance(), attackReason);
+                if (!assessed || npc.NPC.GetCurrentTarget().GetInstance() != next.GetInstance()) {
+                    Logf("ai: downed retarget assessment failed npc=%s target=%s result=%d",
+                         npc.GetName().GetText(), next.GetName().GetText(), assessed);
+                    npc.NPC.SetCurrentTarget(none);
+                    npc.SetAlignmentTarget(none);
+                    next = none;
+                    reason = "assessment-failed";
+                }
+            }
         }
+        if (!next.GetInstance()) {
+            if (fighting) {
+                // Empty target skips finishing/looting a revivable player; native End owns stow/wait/relax.
+                if (std::strcmp(npc.Routine.GetCurrentTask().GetText(), "ZS_Attack"))
+                    npc.Routine.SetTask(bCString("ZS_Attack"));
+                npc.Routine.SetState(bCString("ZS_Attack_End"));
+            } else {
+                npc.NPC.CombatState = 0;
+                npc.Routine.ContinueRoutine();
+            }
+        }
+        Logf("DOWNEDRETARGET npc=%.64s old=%.48s new=%.48s boundary=%s reason=%s task=%.40s->%.40s state=%.40s->%.40s ai=%d->%d combat=%u->%u weapon=%d->%d",
+             npc.GetName().GetText(), down ? Entity(down).GetName().GetText() : "-",
+             next.GetInstance() ? next.GetName().GetText() : "-", boundary, reason,
+             taskBefore.GetText(), npc.Routine.GetCurrentTask().GetText(),
+             stateBefore.GetText(), npc.Routine.GetCurrentState().GetText(), modeBefore, static_cast<int>(npc.Routine.AIMode),
+             combatBefore, static_cast<unsigned>(npc.NPC.CombatState), weaponBefore, static_cast<int>(gCEntity::GetCombatMode(instance)));
     }
     downed::LogCombatDecision(instance, down, "released", true);
     return stop;
+}
+
+gFScript originalRetargetAttack = nullptr;
+bool retargetAttackSearched = false;
+
+GEInt GE_STDCALL FilterRetargetAttack(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    if (!ShuttingDown() && ReleaseDownedTargets(Self(spu, self), "attack-release", spu)) return 1;
+    return originalRetargetAttack(spu, self, other, args);
+}
+
+void WrapRetargetAttack(gCScriptAdminExt& admin)
+{
+    auto* script = Find(admin.GetScripts(), "OnAttack");
+    HMODULE module = GetModuleHandleA("Script_Game.dll");
+    auto* code = module ? reinterpret_cast<unsigned char*>(module) + 0x147C0 : nullptr;
+    static const unsigned char head[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0x54, 0x03, 0x00, 0x00};
+    if (script && script->m_funcScript && reinterpret_cast<void*>(script->m_funcScript) == code &&
+        code && !std::memcmp(code, head, sizeof(head))) {
+        originalRetargetAttack = reinterpret_cast<gFScript>(JumpTo(code, reinterpret_cast<void*>(&FilterRetargetAttack)));
+        if (originalRetargetAttack) {
+            script->m_funcScript = &FilterRetargetAttack;
+            TrackPointer(&script->m_funcScript, reinterpret_cast<void*>(code),
+                         reinterpret_cast<void*>(&FilterRetargetAttack), "ai downed OnAttack script");
+            Log("ai: downed OnAttack retarget guard installed at native and script entries");
+            return;
+        }
+    }
+    Log("ai: downed OnAttack retarget guard UNAVAILABLE; native signature/entry or jump did not match");
 }
 
 void SyncDownedTargets()
@@ -814,13 +972,24 @@ void Describe(char const* name, void (*log)(char const*))
     }
 }
 
+bool RetargetDownedBeforeCancel(eCEntity* npc, void* spu)
+{
+    return ReleaseDownedTargets(npc, "cancel-release", static_cast<gCScriptProcessingUnit*>(spu));
+}
+
 void Tick()
 {
     SyncDownedTargets();
+    if (!retargetAttackSearched && gCSession::GetInstance().IsGameRunning()) {
+        retargetAttackSearched = true;
+        NativeNextEnemy();
+        WrapRetargetAttack(GetScriptAdminExt());
+    }
     if (!assessTargetSearched && gCSession::GetInstance().IsGameRunning()) {
         assessTargetSearched = true;
         WrapAssessTarget(GetScriptAdminExt());
     }
+
     if (!attitudeInstalled && gCSession::GetInstance().IsGameRunning()) {
         if (auto* script = Find(GetScriptAdminExt().GetScripts(), "GetAttitude")) {
             // The registered function is the native one 29 functions call directly (OnAttack, AssessTarget, damage

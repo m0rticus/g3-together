@@ -256,8 +256,8 @@ class Module : public eCEngineComponentBase
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
             g3t::remote::Tick();
         }
-        g3t::npcs::Tick();
         g3t::ai::Tick();
+        g3t::npcs::Tick();
         g3t::combat::Tick();
         g3t::summon::Tick();
         g3t::story::Tick();

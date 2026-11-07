@@ -110,7 +110,8 @@ struct Result {
 // The caller must compare against its own last successfully queued state.
 inline bool EssentialChanged(net::NpcRecord const& sent, net::NpcRecord const& current)
 {
-    return ((sent.flags ^ current.flags) & 0x83u) != 0 || // death, down, ragdoll
+    return ((sent.flags ^ current.flags) & 0xBFu) != 0 || // life, combat and player opponent (parry is a motion edge)
+        sent.aiMode != current.aiMode ||
         sent.incarnation != current.incarnation ||
         sent.hitPoints != current.hitPoints || sent.hitPointsMax != current.hitPointsMax ||
         sent.partyPlayer != current.partyPlayer || sent.partyType != current.partyType ||

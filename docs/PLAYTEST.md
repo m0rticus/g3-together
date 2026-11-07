@@ -172,7 +172,8 @@ Use the existing isolated host (`test-install`) and joining (`test-client`) copi
 coordinated build. Do not automate game launches or encounters. Runtime acceptance is still manual.
 
 1. Let an enemy group knock out the client while the host stays able to help. Wait more than five seconds.
-   The enemies must drop the client and attack another valid enemy or disengage. Check both screens:
+   The enemies must drop the client and immediately select another valid enemy with weapons still drawn,
+   without a put-away/redraw pause. Include several NPCs attacking the same player. Check both screens:
    no further HP/stamina loss, harmful statuses, hit reactions or attack knockback on the client.
 2. Repeat with the host knocked out and the client standing. Include creatures/animals, bow attacks,
    hostile magic and followers/summons. NPC-vs-NPC combat and attacks on the standing player must continue.
@@ -182,12 +183,24 @@ coordinated build. Do not automate game launches or encounters. Runtime acceptan
 4. Knock both down and verify immediate `all-down` game over with one native Kill per life. Repeat the
    unavailable-helper `alone-grace` check above. Smoke-check friendly melee protection, one hit per swing,
    partner trade and host save/load with client re-entry.
+5. In an isolated encounter, knock out one player while the helper stays alive but beyond enemy perception
+   range. With no other enemy near, the attacker should relax and stow its weapon the vanilla way, not
+   acquire the downed player again. Return and revive through talk, then confirm ordinary re-engagement.
 
 The host startup should log `downed AssessTarget guard installed at native and script entries`.
 `SCRIPT ONLY` is an explicit unsupported-native-hook diagnostic, not full native-guard confirmation.
 Match `DOWNEDTARGET player/episode/flags` to the existing `downed: remote` and transition records.
-Expect `frame-release` or `state-release`, then `released`;
-`DOWNEDBIND` shows the five target pointers and active combat slot before/after cleanup.
+Expect `frame-release`, `state-release`, `attack-release` or `cancel-release`, then `released`.
+`DOWNEDBIND` shows target/history/alignment/inflictor pointers and combat membership before/after cleanup.
+Startup also reports `native defeated-opponent selector verified` and the native/script `OnAttack retarget guard`.
+`UNAVAILABLE` means a selector/hook signature did not match and needs investigation.
+Each stopped-target transaction logs `DOWNEDRETARGET` with NPC, old/new targets, reason, task/state,
+AIMode, combat membership and weapon mode before/after. `native-enemy` uses vanilla's own selection;
+`alternative`/`visible-player` are eligible in-range/LOS fallbacks. A successful combat-to-combat retarget
+keeps weapon mode (2-4 when drawn) and combat membership; `no-enemy` enters `ZS_Attack_End`, whose
+native item-stow, combat release and wait run subsequently. An `assessment-failed` is an error, not success.
+Player opponent bits, NPC opponent hash and AIMode are reliable immediate control changes, captured
+after release; passive client mirrors replay their buffered opponent/motion, never an attack AI task.
 `excluded` is a player-id bitset, not a list of NPCs. Held puppets keep native AIMode 10 and the lying
 animation on both copies: mode 8 would make normal interaction choose loot before talk assessment.
 Combat exclusion still follows the owner's flags, so on revival the excluded player bit clears.

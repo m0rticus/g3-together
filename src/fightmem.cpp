@@ -195,6 +195,7 @@ GEInt GE_STDCALL Cancel(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 {
     if (ai::ShuttingDown()) return originalCancel ? originalCancel(spu, self, other, args) : 0;
     eCEntity* a = Of(spu, self, true);
+    if (ai::RetargetDownedBeforeCancel(a, spu)) return 1;
     eCEntity* puppet = PuppetFor(a, {Of(spu, other, false), TargetOf(a)});
     const Memory before = Read(a);
     const int reason = ReasonOf(a);
