@@ -342,7 +342,8 @@ join/rejoin. No QA command or negative-control switch is needed.
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified save/load entry points; `save UI hooked` also identifies the verified quicksave handler,
-menu-new call, native availability predicate and screenshot helper. World.DeleteSaveGame at RVA 19C0D0
+menu-new call, native availability predicate and screenshot helper (the scene thumbnail is chosen when the save
+is requested, never recaptured while the save page is drawn). World.DeleteSaveGame at RVA 19C0D0
 is also signature/export-checked so native slot deletion removes the container.
 `persist: unresolved <function> ...` means no save/load claim is valid; preserve that line and native identity.
 PUP owns the original world-load entry: the verified `E9 ... 90` entry and `87 0C 24 51 E9 ...`
@@ -411,6 +412,16 @@ test hooks, bots or automated engine launches. Static tests/builds do not establ
     injury/death/adoption. Also load intact old type-256 v1/v2 overlays and `npclease1 ` sidecars: no overlay
     error or stale authority. New saves must omit type 256. Corrupt container checksums must still refuse.
     Normally save with both players together; this far-apart case verifies the deliberate durability limit.
+11. Save thumbnails (host Load list). Make each of these saves on the host and open **Load**: every new entry
+    must show the 3D game scene like an older native save, never the menu, a page or a black frame:
+    a) in-game menu, **Save** (new slot) and overwrite of an existing slot; b) quicksave with no window open;
+    c) a client-requested menu-save (host walking in the scene, then repeat with the host's own menu open);
+    d) quicksave with the inventory/journal open, after any earlier menu or quicksave in the same world (shows that
+    scene, not the page; without one the log says `source=fallback` and the page may show); e) two saves back to back.
+    The host log shows one `persist: save thumbnail source=...` line per save, before `host save requested`:
+    `source=retained menu=1` for menu saves (the picture native took when the menu opened, scene frozen by the
+    pause), `source=capture` for quicksaves and client requests, `source=retained page=1` with a window open, and
+    `source=fallback` only when native holds no scene image. HUD.SaveGame is never preceded by a new capture.
 
 ### Client rejoin without relaunch
 

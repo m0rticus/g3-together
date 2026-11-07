@@ -517,6 +517,41 @@ void CheckNamedExports(std::vector<uint8_t> const& image, size_t optional,
     }
 }
 
+std::vector<size_t> CodeCalls(std::vector<uint8_t> const& image, PeImage const& pe, size_t target)
+{
+    std::vector<size_t> calls;
+    for (auto const& section : pe.sections) {
+        if (!(section.flags & 0x20000000) || !Range(image.size(), section.at, section.size)) continue;
+        for (size_t at = section.at; at + 5 <= section.at + section.size; ++at)
+            if (Calls(image.data(), image.size(), at, target)) calls.push_back(at);
+    }
+    return calls;
+}
+
+// HUD.SaveGame saves the file manager's retained image [manager+8]; only the menu-open handler and HUD.CaptureSaveImage
+// (the quicksave message) write it. The mod relies on that: it never recaptures while the menu is drawn.
+void CheckThumbnailOwners(std::vector<uint8_t> const& image, PeImage const& pe, size_t handleMessage)
+{
+    constexpr size_t CaptureSaveImage = 0xa9310, CreateImage = 0x19c500, SaveGame = 0xa9e90, SaveWorld = 0x19c6b0,
+                     QuicksaveCall = 0x7dc0f, MenuShowCall = 0x8c3bd, IsMenuOpen = 0x7c2c0;
+    constexpr char StoreRetained[] = "8b4e0885c98bf8740e8b018b5024ffd2c7460800000000897e08";
+    const auto capture = CodeCalls(image, pe, CaptureSaveImage);
+    if (capture.size() != 1 || capture[0] != QuicksaveCall || capture[0] <= handleMessage || capture[0] > handleMessage + 0x400)
+        throw std::runtime_error("HUD.CaptureSaveImage is no longer called only by the GUI.HandleMessage quicksave branch");
+    const auto create = CodeCalls(image, pe, CreateImage);
+    if (create.size() != 2 || create[0] != MenuShowCall || create[1] != CaptureSaveImage + 0xc)
+        throw std::runtime_error("the world scene image is no longer created only by menu show and the capture helper");
+    for (size_t call : create)
+        if (!Range(image.size(), call + 5, sizeof(StoreRetained)) ||
+            !Matches(image.data() + call + 5, image.size() - call - 5, StoreRetained))
+            throw std::runtime_error("scene image is no longer stored into [file manager+8] after creation");
+    if (!Matches(image.data() + SaveGame + 0xa5, image.size() - SaveGame - 0xa5, "8b4d088b5108") ||
+        !Calls(image.data(), image.size(), SaveGame + 0xb9, SaveWorld))
+        throw std::runtime_error("HUD.SaveGame no longer passes the retained image [manager+8] to World.SaveGameWorld");
+    if (!Matches(image.data() + IsMenuOpen, image.size() - IsMenuOpen, "8b410885c0740c33c9837848ff0f95c18ac1c332c0c3"))
+        throw std::runtime_error("gCGUIManager::IsMenuOpen no longer reports the menu window state");
+}
+
 void CheckRealPe(std::vector<uint8_t> const& image, PeImage const& pe, uint32_t base)
 {
     size_t sites[5]{};
@@ -607,6 +642,7 @@ void CheckRealPe(std::vector<uint8_t> const& image, PeImage const& pe, uint32_t 
         throw std::runtime_error("configured HUD/world/call edges or getter operands changed");
     if (owner != 0x403c20u || table != 0x2d9aa0u)
         throw std::runtime_error("configured singleton or vtable operand mismatch");
+    CheckThumbnailOwners(image, pe, ui[0]);
 }
 
 void CheckReal(char const* gamePath, char const* pupPath)

@@ -21,6 +21,7 @@
 #include "saving_native.h"
 #include "saving_policy.h"
 #include "saving_store.h"
+#include "savethumb.h"
 #include "steam.h"
 #include "story.h"
 #include "trade.h"
@@ -106,6 +107,7 @@ struct PendingCleanup { std::string path; uint32_t until = 0, nextTry = 0; };
 std::vector<PendingCleanup> pendingCleanup;
 saving::Key pendingKey;
 HWND saveWindow = nullptr;
+saving::thumb::Tracker thumbnail;
 
 saving::CaptureRound operation;
 struct Client {
@@ -1093,15 +1095,7 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         if (!CaptureJournal(state)) { CancelSave("journal-write"); return; }
         saving::store::Set(savingManifest, {saving::store::Journal, 1, 0, std::move(state)});
         if (!CaptureExtensions(savingManifest)) { CancelSave("extension"); return; }
-        {
-            void* capture = uiEntries[4];
-            __asm {
-                push esi
-                mov esi, manager
-                call capture
-                pop esi
-            }
-        }
+        // The thumbnail was fixed at request time (PrepareSaveThumbnail); the menu is still drawn now.
         // Save host-native NPCs as they stand; do not import or revoke live client authority.
         remote::DespawnAll("host-managed save");
         const bCString name(stagingSlot.c_str());
@@ -1160,6 +1154,50 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
          current.key.save.c_str(), requestedSlot.c_str(), encoded.size(), current.blocks.size(), 1);
     FinishSave(true, "durable host container");
 }
+void* RetainedImage(void* manager)
+{
+    void* image = nullptr;
+    std::memcpy(&image, static_cast<unsigned char*>(manager) + saving::thumb::ImageOffset, sizeof(image));
+    return image;
+}
+void CaptureSceneImage(void* manager)
+{
+    void* capture = uiEntries[4];
+    __asm {
+        push esi
+        mov esi, manager
+        call capture
+        pop esi
+    }
+}
+// Native captures the thumbnail when the menu opens or at the quicksave message, never when saving. The host-managed
+// save runs later, while the save page is still drawn, so choose the picture at the request and never recapture.
+void PrepareSaveThumbnail()
+{
+    void* manager = FileManager(false);
+    if (!manager) return;
+    auto* gui = gCSession::GetInstance().GetGUIManager();
+    const HWND window = eCApplication::GetInstance().GetHandle();
+    saving::thumb::View view;
+    view.menuOpen = gui && gui->IsMenuOpen();
+    view.pageOpen = gui && gui->IsAnyPageOpen();
+    view.minimized = window && IsIconic(window);
+    view.retained = RetainedImage(manager) != nullptr;
+    view.retainedCurrent = view.retained && thumbnail.Current(epoch);
+    const auto choice = saving::thumb::Choose(view);
+    if (choice != saving::thumb::Choice::KeepRetained) CaptureSceneImage(manager);
+    if (choice == saving::thumb::Choice::CaptureScene || (view.menuOpen && view.retained)) thumbnail.Stamp(epoch);
+    Logf("persist: save thumbnail source=%s menu=%d page=%d minimized=%d retained=%d current=%d image=%d",
+         saving::thumb::Name(choice), view.menuOpen ? 1 : 0, view.pageOpen ? 1 : 0, view.minimized ? 1 : 0,
+         view.retained ? 1 : 0, view.retainedCurrent ? 1 : 0, RetainedImage(manager) ? 1 : 0);
+}
+// With the menu open, native captured the image before showing it: remember that it belongs to this world.
+void ObserveThumbnail()
+{
+    auto& game = gCSession::GetInstance();
+    auto* gui = game.GetGUIManager();
+    if (net::IsHost() && game.IsGameRunning() && gui && gui->IsMenuOpen()) thumbnail.Stamp(epoch);
+}
 bool StartSave(char const* name)
 {
     if (!pairedEnabled || !NativeReady() || !writing) { SaveFailure("native-hooks"); return false; }
@@ -1204,6 +1242,7 @@ bool StartSave(char const* name)
     }
     saveWindow = eCApplication::GetInstance().GetHandle();
     if (!saveWindow || !SetTimer(saveWindow, SaveTimer, 30, &SaveNow)) { CancelSave("timer"); return false; }
+    PrepareSaveThumbnail();
     Logf("persist: host save requested world=%s save=%s slot=%s epoch=%08x", savingManifest.key.world.c_str(),
          savingManifest.key.save.c_str(), name, epoch);
     Notice(i18n::SaveQueued);
@@ -1852,6 +1891,7 @@ void Tick()
     const uint32_t now = GetTickCount();
     RetryCleanup(now);
     RetryReplies(now); StatusHints();
+    ObserveThumbnail();
     auto& game = gCSession::GetInstance();
     const bool running = game.GetHero() && game.IsGameRunning();
     if (newWorld && running) {
