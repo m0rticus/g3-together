@@ -5,6 +5,7 @@
 #include "ai.h"
 #include "config.h"
 #include "net.h"
+#include "shutdown_policy.h"
 #include <Game.h>
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -53,8 +54,123 @@ constexpr LONG MaxFirstChanceDumps = 2;
 LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
 PVOID vectoredHandler = nullptr;
 HANDLE watchdogCancel = nullptr, watchdogThreadHandle = nullptr;
+std::atomic<bool> preShutdownFinished{false}, fastExitReady{false};
+std::atomic<uint32_t> preShutdownAt{0};
+struct GraphicsSites {
+    DWORD thread = 0;
+    uintptr_t nativeWait = 0;
+    uint32_t conditionReturn = 0, driverReturn = 0, deviceReturn = 0;
+};
+GraphicsSites graphicsSites;
+shutdown::GraphicsWait lastGraphicsWait;
+bool lastGraphicsMatched = false;
+char const* lastGraphicsSample = "not sampled";
+DWORD lastGraphicsError = 0;
 bool stageWorld = false, stageForget = false, stageSteam = false, stageHooks = false;
 bool stageThreads = false, stagePreShutdown = false, stageShutdownCalled = false;
+
+bool ReadMemory(uintptr_t address, void* bytes, size_t size)
+{
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), bytes, size, &read) &&
+           read == size;
+}
+
+GraphicsSites FindGraphicsSites()
+{
+    GraphicsSites sites;
+    sites.thread = GetCurrentThreadId();
+    HMODULE engine = GetModuleHandleA("Engine.dll"), driver = GetModuleHandleA("AMDXN32.DLL");
+    HMODULE kernel = GetModuleHandleA("KERNELBASE.dll"), native = GetModuleHandleA("ntdll.dll");
+    const auto device = reinterpret_cast<uintptr_t>(GetProcAddress(engine, "??1eCDX9Device@@UAE@XZ"));
+    const auto condition = reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "SleepConditionVariableCS"));
+    const auto wait = reinterpret_cast<uintptr_t>(GetProcAddress(native, "NtWaitForAlertByThreadId"));
+    uint8_t deviceCode[15]{}, driverCode[18]{}, conditionCode[34]{}, waitCode[15]{};
+    const uintptr_t driverSite = reinterpret_cast<uintptr_t>(driver) + 0x2cad4;
+    uintptr_t conditionImport = 0;
+    if (!engine || !driver || !kernel || !native || !device || !condition || !wait ||
+        !ReadMemory(device + 0x317, deviceCode, sizeof(deviceCode)) ||
+        !shutdown::DeviceReleaseSite(deviceCode, sizeof(deviceCode)) ||
+        !ReadMemory(driverSite, driverCode, sizeof(driverCode)) ||
+        !shutdown::DriverWaitSite(driverCode, sizeof(driverCode)) ||
+        !ReadMemory(condition, conditionCode, sizeof(conditionCode)) ||
+        conditionCode[0x1a] != 0xff || conditionCode[0x1b] != 0x15 ||
+        conditionCode[0x20] != 0x8b || conditionCode[0x21] != 0xf0 ||
+        !ReadMemory(wait, waitCode, sizeof(waitCode)) ||
+        waitCode[0] != 0xb8 || waitCode[0xc] != 0xc2 || waitCode[0xd] != 8 || waitCode[0xe] != 0) {
+        Log("shutdown watchdog: native graphics signatures unsupported; diagnostic-only");
+        return sites;
+    }
+    uint32_t importSlot = 0;
+    std::memcpy(&importSlot, driverCode + 9, sizeof(importSlot));
+    if (!ReadMemory(importSlot, &conditionImport, sizeof(conditionImport)) || conditionImport != condition) {
+        Log("shutdown watchdog: AMD condition import differs; diagnostic-only");
+        return sites;
+    }
+    sites.nativeWait = wait;
+    sites.conditionReturn = static_cast<uint32_t>(condition + 0x20);
+    sites.driverReturn = static_cast<uint32_t>(driverSite + 13);
+    sites.deviceReturn = static_cast<uint32_t>(device + 0x322);
+    Logf("shutdown watchdog: native graphics wait verified thread=%lu device_return=%08x driver_return=%08x",
+         sites.thread, sites.deviceReturn, sites.driverReturn);
+    return sites;
+}
+
+bool SampleGraphicsWait(shutdown::GraphicsWait& wait)
+{
+    lastGraphicsError = 0;
+    lastGraphicsSample = "unsupported signatures";
+    if (!graphicsSites.nativeWait) return false;
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, graphicsSites.thread);
+    if (!thread) {
+        lastGraphicsSample = "OpenThread failed";
+        lastGraphicsError = GetLastError();
+        return false;
+    }
+    const DWORD suspended = SuspendThread(thread);
+    if (suspended == static_cast<DWORD>(-1)) {
+        lastGraphicsSample = "SuspendThread failed";
+        lastGraphicsError = GetLastError();
+        CloseHandle(thread);
+        return false;
+    }
+    CONTEXT context{};
+    context.ContextFlags = CONTEXT_FULL;
+    uint32_t stack[1024]{}, objectWords[22]{};
+    SIZE_T read = 0;
+    const bool captured = GetThreadContext(thread, &context) != FALSE;
+    lastGraphicsSample = captured ? "outside verified native wait" : "GetThreadContext failed";
+    if (!captured) lastGraphicsError = GetLastError();
+    bool matched = !suspended && captured && context.Eip == graphicsSites.nativeWait + 0xc;
+    if (suspended) lastGraphicsSample = "thread was already suspended";
+    if (matched) {
+        const BOOL stackRead = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
+                                                 stack, sizeof(stack), &read);
+        if (!stackRead) lastGraphicsError = GetLastError();
+        const uint32_t object = shutdown::WaitingObject(stack, read / sizeof(stack[0]),
+            graphicsSites.conditionReturn, graphicsSites.driverReturn, graphicsSites.deviceReturn);
+        lastGraphicsSample = object ? "driver counters unreadable" : "nested wait stack not matched";
+        matched = object && ReadMemory(object, objectWords, sizeof(objectWords));
+        if (matched) {
+            lastGraphicsSample = "verified native graphics wait";
+            wait = {object, objectWords[0x48 / 4], objectWords[0x50 / 4], objectWords[0x54 / 4]};
+        } else if (object) {
+            lastGraphicsError = GetLastError();
+        }
+    }
+    // No logging, allocation, engine access or termination while the main thread is suspended.
+    const DWORD resumed = ResumeThread(thread);
+    const DWORD error = resumed == static_cast<DWORD>(-1) ? GetLastError() : 0;
+    CloseHandle(thread);
+    if (resumed == static_cast<DWORD>(-1)) {
+        Logf("shutdown watchdog: main thread resume failed error=%lu; fast exit disabled", error);
+        lastGraphicsSample = "ResumeThread failed";
+        lastGraphicsError = error;
+        fastExitReady.store(false);
+        return false;
+    }
+    return matched;
+}
 
 void DeriveDumpDir()
 {
@@ -430,6 +546,16 @@ void WriteWatchdogText(char const* path)
            now.wHour, now.wMinute, now.wSecond, GetCurrentProcessId(), GetCurrentThreadId());
     WriteText(text, line);
 
+    Format(line, "SHUTDOWN_THREAD id=%lu cleanup_complete=%d fast_exit_eligible=%d graphics_supported=%d\n"
+                 "GRAPHICS_WAIT matched=%d object=%08x completed=%u produced=%u retired=%u\n"
+                 "GRAPHICS_SAMPLE status=%s error=%lu\n"
+                 "STACK_NOTE candidate_word entries are raw stack values, not unwound frames\n",
+           graphicsSites.thread, preShutdownFinished.load() ? 1 : 0, fastExitReady.load() ? 1 : 0,
+           graphicsSites.nativeWait ? 1 : 0, lastGraphicsMatched ? 1 : 0, lastGraphicsWait.object,
+           lastGraphicsWait.completed, lastGraphicsWait.produced, lastGraphicsWait.retired,
+           lastGraphicsSample, lastGraphicsError);
+    WriteText(text, line);
+
     WatchdogModule watchModules[128] = {};
     unsigned moduleCount = 0;
     HANDLE moduleSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -518,8 +644,9 @@ void WriteWatchdogText(char const* path)
                         std::memcpy(&address, stackBytes + i, sizeof(DWORD));
                         WatchdogWhere(watchModules, moduleCount, address, where, sizeof(where));
                         if (!std::strcmp(where, "unknown")) continue;
-                        Format(line, "THREAD id=%lu frame=%u address=%08IX module+offset=%s\n",
-                               tid, frame++, address, where);
+                        Format(line, "THREAD id=%lu candidate_word=%u address=%08IX module+offset=%s\n",
+                               tid, static_cast<unsigned>(i / sizeof(DWORD)), address, where);
+                        ++frame;
                         WriteText(text, line);
                     }
                 }
@@ -575,8 +702,33 @@ void WriteWatchdogDump(char const* path)
 
 DWORD WINAPI WatchdogThread(LPVOID)
 {
-    const DWORD result = WaitForSingleObject(watchdogCancel, 12000);
-    if (result != WAIT_TIMEOUT) return 0;
+    const uint32_t began = GetTickCount();
+    shutdown::ExitPolicy exit;
+    for (;;) {
+        const DWORD result = WaitForSingleObject(watchdogCancel, shutdown::PollMs);
+        if (result == WAIT_OBJECT_0) return 0;
+        if (result != WAIT_TIMEOUT) {
+            Logf("shutdown watchdog: wait failed error=%lu", GetLastError());
+            return 0;
+        }
+        const uint32_t now = GetTickCount();
+        const bool finished = preShutdownFinished.load();
+        const uint32_t finishedAt = preShutdownAt.load();
+        lastGraphicsMatched = finished && fastExitReady.load() && SampleGraphicsWait(lastGraphicsWait);
+        if (exit.Observe(now, finished && fastExitReady.load(), finishedAt, lastGraphicsMatched, lastGraphicsWait)) {
+            Logf("shutdown: native DX9/AMD Release stalled after cleanup thread=%lu object=%08x "
+                 "completed=%u target=%u; exiting process without DLL detach",
+                 graphicsSites.thread, lastGraphicsWait.object, lastGraphicsWait.completed,
+                 lastGraphicsWait.produced - lastGraphicsWait.retired);
+            // ExitProcess runs DLL detach, which can wait on a driver lock held by
+            // a terminated thread. Our world/save/transport cleanup already returned.
+            if (!TerminateProcess(GetCurrentProcess(), 0)) {
+                Logf("shutdown: native graphics fast exit failed error=%lu; retaining hang diagnostics", GetLastError());
+                fastExitReady.store(false);
+            }
+        }
+        if (now - (finished ? finishedAt : began) >= shutdown::DiagnosticMs) break;
+    }
     LogCacheInventory("shutdown watchdog");
     DeriveDumpDir();
     if (!*dumpDir) {
@@ -798,14 +950,14 @@ void BeginShutdown()
 
 bool Shutdown()
 {
-    CancelWatchdog();
     BeginShutdown();
     if (dumpStop) SetEvent(dumpStop);
     bool joined = true;
     if (dumpThreadHandle) {
         const DWORD waited = WaitForSingleObject(dumpThreadHandle, 2000);
-        if (waited == WAIT_TIMEOUT) {
-            Log("crashlog: dump worker stop timed out; continuing teardown");
+        if (waited != WAIT_OBJECT_0) {
+            Logf("crashlog: dump worker stop failed wait=%lu error=%lu; continuing teardown",
+                 waited, waited == WAIT_FAILED ? GetLastError() : 0);
             joined = false;
         }
         if (joined) {
@@ -826,6 +978,7 @@ void StartWatchdog()
 {
     if (watchdogThreadHandle) return;
     DeriveDumpDir();
+    graphicsSites = FindGraphicsSites();
     watchdogCancel = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     if (!watchdogCancel) {
         Log("shutdown watchdog: start failed (cancel event unavailable)");
@@ -838,5 +991,14 @@ void StartWatchdog()
         Log("shutdown watchdog: start failed (thread unavailable)");
         return;
     }
+}
+
+void CompletePreShutdown(bool safeToExit)
+{
+    preShutdownAt.store(GetTickCount());
+    fastExitReady.store(safeToExit);
+    preShutdownFinished.store(true);
+    Logf("shutdown watchdog: cleanup complete thread=%lu fast_exit_eligible=%d",
+         GetCurrentThreadId(), safeToExit ? 1 : 0);
 }
 }

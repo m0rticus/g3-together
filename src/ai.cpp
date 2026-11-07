@@ -16,6 +16,7 @@
 #include "npcplayback.h"
 #include "npclease_runtime.h"
 #include "net.h"
+#include "movement.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -385,6 +386,7 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
         return GEFalse;
     }
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
+    guards::LocalPlayer localPlayer(guards::IsLocalPlayer(self));
     if (downed::GuardState(self, name)) return GEFalse;
     if (npcplayback::IsPassive(self)) { ++skipped; return GEFalse; }
     if (ReleaseDownedTargets(self, "state-release", spu)) return GEFalse;
@@ -746,6 +748,7 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 GEInt GE_STDCALL FilterContinue(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ShuttingDown()) return originalContinue ? originalContinue(spu, self, other, args) : 0;
+    guards::LocalPlayer localPlayer(guards::IsLocalPlayer(Self(spu, self)));
     if (downed::GuardState(Self(spu, self), "ContinueRoutine")) return 0;
     if (continueBlock && remote::IsPuppet(Self(spu, self))) { ++continueBlocked; return 0; }
     ++continueRun;
@@ -755,6 +758,8 @@ GEInt GE_STDCALL FilterContinue(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 GEInt GE_STDCALL FilterPlayerKeys(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     // This is the local keyboard dispatcher; its script self can be unset.
+    guards::LocalPlayer localPlayer;
+    movement::KeyDispatch(args, downed::Held() || downed::Terminal());
     if (downed::Held() || downed::Terminal()) return 0;
     return originalPlayerKeys(spu, self, other, args);
 }
@@ -763,6 +768,7 @@ gFScriptAIRoutine originalPlayerRoutine = nullptr;
 
 GEBool GE_STDCALL FilterPlayerRoutine(gCScriptProcessingUnit* spu)
 {
+    guards::LocalPlayer localPlayer(guards::IsLocalPlayer(spu ? spu->GetSelfEntity() : nullptr));
     if (!ShuttingDown() && downed::GuardState(spu ? spu->GetSelfEntity() : nullptr, "Rtn_Player")) return GETrue;
     const GEBool result = originalPlayerRoutine(spu);
     downed::ObserveTerminal(spu ? spu->GetSelfEntity() : nullptr, "Rtn_Player");

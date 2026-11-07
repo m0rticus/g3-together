@@ -3,6 +3,7 @@
 
 #include "net.h"
 #include "combat_timing.h"
+#include "npclease_presentation.h"
 
 #include <cmath>
 #include <cstdint>
@@ -26,6 +27,10 @@ constexpr uint32_t FastIntervalMs = 16, OrdinaryIntervalMs = 33, MovingFarInterv
 // 200 ms buffer before captures become sparse, including movement-to-idle.
 constexpr uint32_t UrgentHoldMs = 2000, OrdinaryHoldMs = 2000, InterestWarmupMs = 200;
 constexpr uint32_t KeyframeMs = 1000;
+// Reserve 100 ms for capture-frame quantization before presentation grace expires.
+// Only unchanged snapshots use this congestion-independent keepalive.
+static_assert(npclease::PresentationGraceMs > 100, "presentation grace must leave room for capture jitter");
+constexpr uint32_t KeepaliveMs = npclease::PresentationGraceMs - 100;
 // A due update (not a quiet heartbeat) that leaves later than this counts as overdue in the diagnostics; one frame hitch
 // of ~60 ms fits every tier. Multiplied by the congestion stretch like every interval.
 constexpr uint32_t FastMaxStaleMs = 100, OrdinaryMaxStaleMs = 150, SlowMaxStaleMs = 300;
@@ -309,11 +314,14 @@ inline Result Evaluate(State& state, Input const& in)
         return {Decision::Semantic, tier, essential};
     const uint32_t elapsed = in.now - state.sentAt;
     const uint32_t stretch = in.stretchPermille;
-    if (elapsed >= Stretched(KeyframeMs, stretch)) return {Decision::Keyframe, tier};
     const uint32_t interval = Stretched(Interval(tier), stretch);
     const bool due = in.now - state.idealAt >= interval;
-    if (due && detail::SemanticRecord(state.record, *in.record)) return {Decision::Semantic, tier};
-    if (due && detail::DynamicChanged(state, in)) return {Decision::Changed, tier};
+    const bool semantic = detail::SemanticRecord(state.record, *in.record);
+    const bool changed = semantic || detail::DynamicChanged(state, in);
+    if (elapsed >= Stretched(KeyframeMs, stretch)) return {Decision::Keyframe, tier};
+    if (due && semantic) return {Decision::Semantic, tier};
+    if (due && changed) return {Decision::Changed, tier};
+    if (!changed && elapsed >= KeepaliveMs) return {Decision::Keyframe, tier};
     return {Decision::Wait, tier};
 }
 

@@ -194,13 +194,14 @@ before its three-second lease expires. The host retains the last accepted state 
 New takeover during a host stall is not implemented: that requires pre-issued standby permits.
 `npc_authority_fallback = off` keeps the pure host model and safe unavailable presentation.
 
-The existing paired-save extension type 256 now stores the adoption marker and canonical state/effect
-watermarks in overlay version 2; version 1 saves remain readable. Saves still refuse active, unimported or
-pending-effect leases with "NPC lease active: save would lose client-owned NPC state".
-The overlay is not a complete native inventory/task/reward transaction, so live-owner saves are not enabled.
-The restore epoch binding preserves dormant records through the first network publication.
-Both copies must use the same rebuilt DLL; the coordinator must reconcile these lease wire changes with
-the protocol version before deployment.
+Save with both players together. Client-owned NPC state never blocks a save: only the host's native world
+is saved, including any fenced/stale host copy; a client-only creature without a host instance contributes
+no instance. Client-only injury/death/adoption is deliberately lost on reload. Saving does not recall,
+import or reset leases, so the live encounter and normal hand-back continue unchanged.
+No lease overlay (extension type 256) is written or retained in new saves. Old v1/v2 overlays and
+`npclease1 ` text are ignored on load, never applied over the native world; container integrity checks remain.
+Knocked-out players still block saving: "A player is knocked out. Revive them first."
+Both copies must use the same rebuilt DLL. Protocol 77 and lease wire version 2 are unchanged.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
@@ -358,9 +359,26 @@ Friendly-fire protection applies before local hit feedback as well as before aut
 4. Wait for **"Co-op save complete"** before quitting. Dialog, downed/control, loading or an unsettled
    player exchange can refuse explicitly; combat alone is not a native refusal. Retry after the stated
    condition clears. A disconnected account retains its preceding saved character, not unseen progress.
-5. **Only the host loads** from the normal menu/quick-load controls. After the host loads, clients start
-   **New Game** again to reset their local world, then receive their account-exact saved character.
+5. **Only the host loads** from the normal menu/quick-load controls. A new host world epoch returns
+   connected clients to the menu safely, without restarting Gothic 3. Clients choose **New Game**
+   again to reset their local world, then receive their account-exact saved character.
    A connection-only rejoin in the same live world keeps that player's live character.
+
+**Client re-entry:** New Game is selectable in the client menu, including the menu opened during play.
+During play, **Back** continues the live session; choosing **New Game** stops that session before the
+native New Game confirmation, avoiding Gothic 3's original restart/exit branch. Canceling the confirmation
+leaves you in the menu, outside the campaign. Re-entry restores the account's last host-saved character;
+unsaved progress is discarded, not saved over that record. A campaign with no record for your account
+requires an explicit New Game and starts a fresh hero, never the host's hero.
+
+A host load/new campaign queues retirement outside network callbacks. Native loading must finish first;
+an outstanding save result or dialogue/trade can defer the return, with a notice. Finish the dialogue,
+close the trade window and let player exchanges settle. An unrecoverable exchange still blocks a manual
+re-entry rather than silently discarding an unresolved transaction. The host may remain in its menu
+or loading screen: client New Game remains available, but admission waits for a ready host world.
+Returning to the menu or re-entering never writes a new character checkpoint or loads native client
+save files. The native session is stopped and all mod world references are released; the native
+New Game loader owns the subsequent world restart and activation. No automatic fresh hero is created.
 
 The host's `<menu-slot>.g3t` is a self-contained **G3TSAVE3** container: native header/world,
 shared journal/companions, individual G3THERO4 and bounded personal-state records, and versioned extension blocks. Whole-file
@@ -472,6 +490,13 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   rather than inferring it from their talkable native mode.
   Ordinary knockdowns retain vanilla's exact Sit/Lie knockdown pose protection for melee contacts,
   not a new invulnerability timer for all stumbles, falls, spells or environmental damage.
+- Both players are immune while speaking with an NPC or using a merchant/partner trade window,
+  including the first-trade tutorial or a menu covering that window. Damage, harmful status effects,
+  hit reactions, knockdown and attack knockback are rejected on the player's own PC and their remote
+  puppet. Protection lasts another 1.5 seconds after all dialogue/trade windows and spoken dialogue
+  end, including Esc/abort. Enemies retain native hostility/targeting; this does not cancel the NPC's
+  talk routine or make enemies friendly. Loading/world changes clear interaction protection.
+  The existing player flags/heartbeat carry the state; protocol 77 and packet sizes are unchanged.
 - The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
   While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
   monsters, an intruder; not a duel, the arena, a guard's arrest or another player) counts as a death: you stay down until

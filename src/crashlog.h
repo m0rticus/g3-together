@@ -32,6 +32,7 @@ void Stage(char const* name);
 void BeginShutdown();
 bool Shutdown();
 void StartWatchdog();
+void CompletePreShutdown(bool safeToExit);
 void CancelWatchdog();
 enum class CacheKind { Cameras, Prefetchers, PrivateEntities, Spheres, Anchors, ProcessingRange, Puppets, Disabled, Summons, Leases, Count };
 // Engine thread publishes values only; reporting never follows a native pointer on a worker.

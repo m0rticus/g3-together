@@ -46,3 +46,30 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertNotIn("ContinueRoutine", hold)
         self.assertNotIn("HitPoints =", hold)
         self.assertNotIn("Kill", hold)
+
+    def test_idle_bootstrap_is_evaluated_and_script_free(self):
+        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        idle = source[source.index("bool BootstrapIdle("):source.index("\n}\n\nbool LocalHit(")]
+        for required in ("GetAniName@gCScriptProcessingUnit", "GetAniVariation",
+                         "QueryMotionDataEntity", "IdleResourceName", "SetPlayTime",
+                         "ActorProcess(", "evaluation.evaluated", "PoseProvenance::Idle"):
+            self.assertIn(required, idle)
+        for forbidden in ("ContinueRoutine", "sAIPlayAni", "SetTask", "Movement", "OnPreProcess",
+                          "UpdatePresentation("):
+            self.assertNotIn(forbidden, idle)
+        replay = source[source.index("bool Replay("):source.index("bool ReplayFrozenPose(")]
+        self.assertIn("!hostPose.evaluated || !hostPose.applied || !hostPose.valid", replay)
+        self.assertIn("PoseProvenance::Canonical", replay)
+        self.assertGreater(replay.index("PoseProvenance::Canonical"), replay.index("!hostPose.evaluated"))
+        hold = source[source.index("bool HoldUnavailable("):source.index("void ReleaseUnavailable(")]
+        self.assertIn("HostPresentationAvailable", hold)
+        self.assertIn("proof.Usable", hold)
+        self.assertNotIn("CapturePose(", hold)
+
+    def test_fallback_scans_processed_npcs_and_bounds_resource_retries(self):
+        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        tick = source[source.index("void Tick()"):]
+        self.assertIn("world::ProcessedEntities()", tick)
+        self.assertNotIn("Entity::GetNPCs()", tick)
+        self.assertLess(tick.index("eEPropertySetType_NPC"), tick.index("Entity npc(entity)"))
+        self.assertIn("held.failed && cleanupNow - held.attempted < 1000", tick)

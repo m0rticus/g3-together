@@ -39,13 +39,18 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertNotIn("GiveXP", activate)
         self.assertNotIn("CreateItems", activate)
 
-    def test_adopted_state_survives_overlay_restore(self):
+    def test_save_capture_is_empty_and_restore_discards_old_authority(self):
         capture = section(self.runtime, "SaveOverlay Capture()", "bool Restore(")
         restore = section(self.runtime, "bool Restore(", "bool WriteSnapshot(")
-        self.assertIn("saved.adopted = item.second.adopted", capture)
-        self.assertIn("entry.adopted = saved.adopted != 0", restore)
-        self.assertIn("entry.lease.phase = Phase::Dormant", restore)
-        self.assertIn("PublishGuard(", restore)
+        self.assertIn("return {};", capture)
+        self.assertNotIn("entries", capture)
+        self.assertIn("OnWorldDeactivate();", restore)
+        self.assertIn("return true;", restore)
+        for operation in ("EncodeOverlay", "Import(", "PublishGuard(", "entries[", "return false"):
+            self.assertNotIn(operation, restore)
+        write = section(self.runtime, "bool WriteSnapshot(", "bool ReadSnapshot(")
+        self.assertNotIn("fwrite", write)
+        self.assertNotIn("EncodeSaveText", write)
 
     def test_compact_state_uses_canonical_strings_not_client_identity(self):
         receive = section(self.runtime, "void Receive(uint8_t", "GEBool __fastcall Quest(")
@@ -56,11 +61,16 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         send = section(self.runtime, "bool Send(", "void Diagnostic(")
         self.assertIn("kind = Kind::StateFull", send)
 
-    def test_active_owner_save_gate_is_not_relaxed(self):
+    def test_live_dormant_pending_leases_never_refuse_or_mutate_on_save(self):
         persist = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
-        self.assertIn("if (npclease::ActiveLeases())", persist)
-        self.assertIn("NPC lease active: save would lose client-owned NPC state", persist)
-        self.assertIn('(savedVersion != 1 && savedVersion != 2)', persist)
+        i18n = (ROOT / "src" / "i18n.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("npclease::", persist)
+        self.assertNotIn("npc-lease-active", persist + i18n)
+        self.assertNotIn("NPC lease active", persist + i18n)
+        self.assertNotIn('Register("npclease"', persist)
+        self.assertIn("if (block.type == LegacyNpcLeaseExtension) continue;", persist)
+        self.assertIn("processDepth || nativeLoadDepth || nativeSaveDepth", persist)
+        self.assertIn('return "downed"', persist)
 
     def test_expired_owners_never_resume_without_authorization(self):
         client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")

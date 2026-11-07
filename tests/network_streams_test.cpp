@@ -388,5 +388,60 @@ int main()
     assert(RemoteFocusNpc(2) == 0 && RemoteTargetNpc(2) == 0);
     clientInWorld[2] = false;
     assert(RemoteStateAgeMs(2) == UINT32_MAX);
+
+    // Live authenticated heartbeat/relay paths reject protected players even without a loaded puppet.
+    clientInWorld[2] = clientInWorld[3] = true;
+    currentLocal.flags = 1;
+    currentLocal.world = 42;
+    auto activityFrame = [&](uint8_t player, uint8_t flags, uint32_t packetSequence) {
+        const ActivityMsg message{MsgPlayerActivity, player, flags, packetSequence, 42, worldEpoch, 0};
+        Transmission frame{{}, ENET_PACKET_FLAG_RELIABLE, ChannelState, peers[player]};
+        frame.bytes.resize(sizeof(message));
+        std::memcpy(frame.bytes.data(), &message, sizeof(message));
+        return frame;
+    };
+    remotes[3].activity = {};
+    const auto openTrade = activityFrame(3, 1 | downed::InTrade, 100);
+    Deliver(peers[3], openTrade);
+    assert(remotes[3].activity.flags == (1 | downed::InTrade));
+    assert(downed::PlayerInteractionFlags(3) == downed::InTrade);
+    transmissions.clear();
+    static unsigned receivedPlayerHits = 0;
+    SetHitHandlers(nullptr, [](int32_t, uint8_t const*, uint8_t, bool) { ++receivedPlayerHits; });
+    HitPlayerMsg hit{MsgHitPlayer, -10, {}, 2, 3, 0};
+    Transmission hitFrame{{}, ENET_PACKET_FLAG_RELIABLE, ChannelCombat, peers[2]};
+    hitFrame.bytes.resize(sizeof(hit));
+    std::memcpy(hitFrame.bytes.data(), &hit, sizeof(hit));
+    Deliver(peers[2], hitFrame);
+    assert(transmissions.empty() && !receivedPlayerHits);
+    SendHitPlayer(3, -10, hit.attacker, 1, false);
+    assert(transmissions.empty()); // host native/friendly hit is not sent either
+    const auto grace = activityFrame(3, 1 | downed::InteractionGrace, 101);
+    Deliver(peers[3], grace);
+    transmissions.clear();
+    Deliver(peers[2], hitFrame);
+    assert(transmissions.empty());
+    const auto closed = activityFrame(3, 1, 102);
+    Deliver(peers[3], closed);
+    Deliver(peers[3], openTrade);
+    assert(remotes[3].activity.sequence == 102 && !downed::PlayerInteractionFlags(3));
+    transmissions.clear();
+    Deliver(peers[2], hitFrame);
+    assert(transmissions.size() == 1 && transmissions[0].peer == peers[3]);
+    transmissions.clear();
+    SendHitPlayer(3, -10, hit.attacker, 1, false);
+    assert(transmissions.size() == 1);
+    transmissions.clear();
+
+    currentLocal.flags = 1 | downed::InDialogue;
+    hit.to = 1;
+    std::memcpy(hitFrame.bytes.data(), &hit, sizeof(hit));
+    Deliver(peers[2], hitFrame);
+    assert(!receivedPlayerHits && transmissions.empty()); // host hero's owning side is symmetric
+    currentLocal.flags = 1;
+    Deliver(peers[2], hitFrame);
+    assert(receivedPlayerHits == 1);
+    SetHitHandlers(nullptr, nullptr);
+    transmissions.clear();
     host = nullptr;
 }

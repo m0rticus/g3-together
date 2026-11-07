@@ -27,11 +27,23 @@ private:
     eCEntity* before;
 };
 
+// Local script entry points must not inherit a nested NPC's puppet identity.
+class LocalPlayer {
+public:
+    explicit LocalPlayer(bool local = true);
+    ~LocalPlayer();
+    LocalPlayer(LocalPlayer const&) = delete;
+    LocalPlayer& operator=(LocalPlayer const&) = delete;
+
+private:
+    eCEntity* before;
+};
+
 // The puppet that stands for the game's player right now, none for the local hero.
 eCEntity* CurrentActor();
 // This machine's own player body (its hero, or the creature it controls). Acting() makes the game's IsPlayer false for it, so a
 // script that runs with this body as self under an Acting scope treats the player as an NPC (it watched a fight, applauded and
-// walked around, 2 Nov. play session): no hook opens an Acting scope for a script whose self is this body.
+// walked around, 2 Nov. play session). Local script boundaries use LocalPlayer to clear even an inherited Acting scope.
 bool IsLocalPlayer(eCEntity const* entity);
 bool PlayerContextReady();  // both native GetPlayer/IsPlayer imports were redirected
 

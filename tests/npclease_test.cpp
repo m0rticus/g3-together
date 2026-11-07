@@ -2,6 +2,7 @@
 #define far SyntheticFarMacro
 #include "../src/npclease.h"
 #include "../src/npclease_client.h"
+#include "../src/npclease_save.h"
 #undef far
 #include <cassert>
 #include <cmath>
@@ -267,22 +268,6 @@ static void TestNativeDomainActions()
     assert(lease.AcceptState(2, 3, 1, 1, 1, c));
     assert(lease.Cut(2, 3, 1, 1, 1, c));
 
-    SaveOverlay overlay;
-    Saved saved{};
-    saved.guid[0] = 9;
-    saved.incarnation = 1;
-    saved.epoch = 1;
-    saved.revision = 1;
-    saved.state = c;
-    overlay.push_back(saved);
-    std::vector<uint8_t> encoded;
-    assert(EncodeOverlay(overlay, encoded));
-    SaveOverlay decoded;
-    assert(DecodeOverlay(encoded.data(), encoded.size(), decoded));
-    assert(decoded.size() == 1);
-    assert(decoded[0].state.action == 35);
-    assert(decoded[0].state.dead == 1);
-    assert(decoded[0].state.hp == 0);
 }
 
 static void TestEligibilityAndWrap()
@@ -728,21 +713,6 @@ static void TestTerminalRecoveryWatermark()
     resurrected.effects = NativeDeath;
     assert(!recovery.Offer(6, 12, 51, recoveryDeadline, resurrected));
 
-    SaveOverlay overlay;
-    Saved saved{};
-    saved.guid[0] = 66;
-    saved.incarnation = 1;
-    saved.epoch = 51;
-    saved.revision = recovery.revision;
-    saved.state = recovery.state;
-    overlay.push_back(saved);
-    std::vector<uint8_t> bytes;
-    assert(EncodeOverlay(overlay, bytes));
-    SaveOverlay restored;
-    assert(DecodeOverlay(bytes.data(), bytes.size(), restored));
-    assert(restored.size() == 1);
-    assert(restored[0].state.dead == 1);
-    assert((restored[0].state.effects & (NativeDeath | QuestDeath)) == (NativeDeath | QuestDeath));
 }
 
 static void TestDisconnectLedger()
@@ -779,7 +749,7 @@ static void RecalculateOverlayCrc(std::vector<uint8_t>& bytes)
     detail::Put32(bytes, 16, detail::Crc32(checked.data(), checked.size()));
 }
 
-static void TestOverlay()
+static void TestLegacyOverlayDiscard()
 {
     SaveOverlay overlay;
     for (uint32_t i = 0; i < 512; ++i) {
@@ -802,14 +772,6 @@ static void TestOverlay()
     assert(detail::Get32(encoded.data() + 12) == 512 * detail::SavedWireSize);
     assert(encoded.size() == 134164);
 
-    SaveOverlay decoded;
-    assert(DecodeOverlay(encoded.data(), encoded.size(), decoded));
-    assert(decoded.size() == 512);
-    assert(std::memcmp(decoded[511].guid, overlay[511].guid, 16) == 0);
-    assert(decoded[511].incarnation == overlay[511].incarnation);
-    assert(decoded[511].state.hp == overlay[511].state.hp);
-    assert(decoded[511].adopted == 1 && decoded[510].adopted == 0);
-
     static constexpr uint8_t crcSample[] = {'1','2','3','4','5','6','7','8','9'};
     assert(detail::Crc32(crcSample, sizeof(crcSample)) == 0xcbf43926u);
     std::vector<uint8_t> legacy(encoded.begin(), encoded.begin() + 20);
@@ -821,80 +783,22 @@ static void TestOverlay()
     detail::Put32(legacy, 12, static_cast<uint32_t>(overlay.size() * detail::LegacySavedWireSize));
     RecalculateOverlayCrc(legacy);
     assert(legacy.size() == 133652);
-    SaveOverlay legacyDecoded;
-    assert(DecodeOverlay(legacy.data(), legacy.size(), legacyDecoded));
-    assert(legacyDecoded.size() == overlay.size());
-    for (size_t i = 0; i < overlay.size(); ++i) {
-        assert(legacyDecoded[i].adopted == 0);
-        assert(legacyDecoded[i].epoch == overlay[i].epoch);
-        assert(detail::ExactState(legacyDecoded[i].state, overlay[i].state));
+    for (auto const& fixture : {legacy, encoded}) {
+        std::string text = SavePrefix;
+        constexpr char hex[] = "0123456789abcdef";
+        for (uint8_t byte : fixture) {
+            text += hex[byte >> 4];
+            text += hex[byte & 15];
+        }
+        text += '\n';
+        SaveOverlay discarded = overlay;
+        assert(DecodeSaveText(text, discarded) && discarded.empty());
+        text.pop_back(); // Invalid embedded legacy payloads cannot block restore either.
+        discarded = overlay;
+        assert(DecodeSaveText(text, discarded) && discarded.empty());
     }
-
-    std::vector<uint8_t> corrupt = encoded;
-    corrupt[corrupt.size() - 1] ^= 0x80;
-    SaveOverlay atomic = overlay;
-    assert(!DecodeOverlay(corrupt.data(), corrupt.size(), atomic));
-    assert(atomic.size() == overlay.size());
-    assert(atomic[0].incarnation == overlay[0].incarnation);
-
-    assert(!DecodeOverlay(encoded.data(), encoded.size() - 1, atomic));
-    corrupt = encoded;
-    corrupt.push_back(0);
-    assert(!DecodeOverlay(corrupt.data(), corrupt.size(), atomic));
-
-    corrupt = encoded;
-    for (size_t i = 20; i < 20 + detail::SavedWireSize; ++i) corrupt[i] ^= 0x11;
-    assert(!DecodeOverlay(corrupt.data(), corrupt.size(), atomic));
-
-    auto rejectValidCrc = [&](std::vector<uint8_t> bad) {
-        RecalculateOverlayCrc(bad);
-        SaveOverlay unchanged = atomic;
-        assert(!DecodeOverlay(bad.data(), bad.size(), atomic));
-        assert(atomic.size() == unchanged.size());
-        assert(atomic[0].epoch == unchanged[0].epoch &&
-               atomic[0].adopted == unchanged[0].adopted);
-    };
-    corrupt = encoded;
-    corrupt[20 + detail::SavedWireSize - 1] = 2;
-    rejectValidCrc(corrupt);
-    corrupt = encoded;
-    detail::Put32(corrupt, 20 + 20, 0); // epoch
-    rejectValidCrc(corrupt);
-    corrupt = legacy;
-    detail::Put32(corrupt, 20 + 20, 0);
-    rejectValidCrc(corrupt);
-    corrupt = encoded;
-    detail::Put32(corrupt, 20 + 16, 0); // incarnation
-    rejectValidCrc(corrupt);
-    corrupt = encoded;
-    std::memcpy(corrupt.data() + 20 + detail::SavedWireSize, corrupt.data() + 20, 16);
-    rejectValidCrc(corrupt);
-    corrupt = encoded;
-    detail::Put32(corrupt, 4, 3);
-    rejectValidCrc(corrupt);
-    corrupt = encoded;
-    detail::Put32(corrupt, 4, detail::LegacyOverlayVersion); // mismatched row size
-    rejectValidCrc(corrupt);
-
-    SaveOverlay duplicate = overlay;
-    duplicate[511].guid[0] = duplicate[0].guid[0];
-    duplicate[511].guid[15] = duplicate[0].guid[15];
-    std::vector<uint8_t> duplicateBytes;
-    assert(!EncodeOverlay(duplicate, duplicateBytes));
-    assert(duplicateBytes.empty());
-    duplicate = overlay;
-    duplicate[0].adopted = 2;
-    assert(!EncodeOverlay(duplicate, duplicateBytes));
-    duplicate = overlay;
-    duplicate[0].epoch = 0;
-    assert(!EncodeOverlay(duplicate, duplicateBytes));
-
-    SaveOverlay oversized;
-    oversized.resize(MaxLeases + 1);
-    assert(!EncodeOverlay(oversized, duplicateBytes));
-
-    SaveOverlay truncatedBytesOverlay;
-    assert(DecodeOverlay(nullptr, 0, truncatedBytesOverlay) == false);
+    std::string capture = "old content";
+    assert(EncodeSaveText(overlay, capture) && capture.empty());
 }
 
 int main()
@@ -911,11 +815,9 @@ int main()
     TestRecoverAndClientComposition();
     TestTerminalRecoveryWatermark();
     TestDisconnectLedger();
-    TestOverlay();
-    std::fprintf(stdout, "sizeof(Checkpoint)=%zu sizeof(Message)=%zu overlayHeader=%u maxPayload=%zu maxEncoded=%zu\n",
-                 sizeof(Checkpoint), sizeof(Message), 20u,
-                 size_t(MaxLeases) * detail::SavedWireSize,
-                 20u + size_t(MaxLeases) * detail::SavedWireSize);
+    TestLegacyOverlayDiscard();
+    std::fprintf(stdout, "sizeof(Checkpoint)=%zu sizeof(Message)=%zu\n",
+                 sizeof(Checkpoint), sizeof(Message));
     std::puts("npclease_test: PASS");
     return 0;
 }

@@ -24,7 +24,10 @@ void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us 
 bool Held();             // the local hero lies knocked out, waiting for help
 bool Terminal();         // the local hero's life is in the native terminal death presentation
 bool CombatUnavailable(eCEntity* entity); // player life truth, never the puppet's interpolated pose/native mode
-bool HarmProtected(eCEntity* entity); // co-op held or paid recovery; never blocks terminal death or loading
+bool HarmProtected(eCEntity* entity); // held, paid recovery or dialogue/trade; never blocks terminal death/loading
+uint8_t LocalInteractionFlags(); // live native windows/spoken dialogue plus bounded close grace
+uint8_t PlayerInteractionFlags(unsigned player); // ordered owner heartbeat; works without a loaded puppet
+void OnWorldDeactivate(); // suspend window observations until the next world activation/reset
 bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path);
 bool RejectReaction(eCEntity* victim, char const* state, char const* path);
 void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int before, int after, char const* decision);

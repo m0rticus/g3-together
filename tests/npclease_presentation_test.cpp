@@ -10,14 +10,47 @@ int main()
     using g3t::npclease::PresentationFresh;
     assert(PresentationFresh(true, false, 0, 100));
     assert(PresentationFresh(true, false, 400, 100));
-    assert(!PresentationFresh(true, false, 401, 100));
+    assert(PresentationFresh(true, false, 404, 100));
+    assert(PresentationFresh(true, false, 500, 100));
+    assert(!PresentationFresh(true, false, 501, 100));
     assert(!PresentationFresh(true, true, 0, 100));
     assert(!PresentationFresh(false, false, 0, 100));
     assert(!PresentationFresh(true, false, UINT32_MAX, 0));
     assert(PresentationFresh(true, false, 350, 16));
     assert(!PresentationFresh(true, false, 351, 16));
     assert(PresentationFresh(true, false, 1000, 250));
+    assert(PresentationFresh(true, false, 1100, 250));
+    assert(!PresentationFresh(true, false, 1101, 250));
     using namespace g3t::npclease;
+    int actor, instance, nodes, replacement;
+    PresentationRig rig{&actor, &instance, &nodes, 20, false};
+    PresentationProof proof;
+    assert(!proof.Usable(rig)); // Encodable bind bones and playback initialization are not proof.
+    bool initialized = true;
+    assert(initialized && !proof.Usable(rig));
+    proof.Record(rig, PoseProvenance::Canonical, false, true);
+    assert(!proof.Usable(rig));
+    proof.Record(rig, PoseProvenance::Canonical, true, false);
+    assert(!proof.Usable(rig));
+    proof.Record(rig, PoseProvenance::Canonical, true, true);
+    assert(proof.Usable(rig));
+    auto changed = rig;
+    changed.instance = &replacement;
+    assert(!proof.Usable(changed));
+    changed = rig; changed.nodes = &replacement;
+    assert(!proof.Usable(changed));
+    changed = rig; changed.actor = &replacement;
+    assert(!proof.Usable(changed));
+    changed = rig; ++changed.count;
+    assert(!proof.Usable(changed));
+    changed = rig; changed.facial = true;
+    assert(!proof.Usable(changed));
+    proof.Record(changed, PoseProvenance::Idle, true, true);
+    assert(proof.Usable(changed));
+    proof.Record(changed, PoseProvenance::Canonical, true, true);
+    assert(proof.Usable(changed) && proof.provenance == PoseProvenance::Canonical);
+    proof.Record(changed, PoseProvenance::Idle, true, false);
+    assert(!proof.Usable(changed));
     Checkpoint discovered;
     discovered.templateId[0] = 1;
     std::strcpy(discovered.name, "Wolf");
@@ -58,15 +91,6 @@ int main()
     assert(record.owner == 1 && record.state.position[0] == 1234 && record.state.dead);
     assert(!record.AcceptState(2, 7, 10, 1, 3, discovered));
 
-    Saved saved;
-    saved.guid[0] = 3; saved.epoch = record.epoch; saved.revision = record.revision;
-    saved.state = record.state; saved.adopted = 1;
-    SaveOverlay restored;
-    assert(EncodeOverlay({saved}, wire));
-    assert(DecodeOverlay(wire.data(), wire.size(), restored));
-    assert(restored[0].adopted && restored[0].state.dead && restored[0].state.hp == 0);
-    assert((restored[0].state.effects & (NativeDeath | QuestDeath)) == (NativeDeath | QuestDeath));
-
     Lease interrupted;
     ClientWindow lateClient;
     assert(interrupted.Offer(2, 7, 12, 200, discovered));
@@ -83,5 +107,5 @@ int main()
     assert(disconnected.phase == Phase::Dormant && disconnected.state.hp == 20);
     assert(!disconnected.AcceptState(2, 8, 13, 1, 2, discovered));
     std::cout << "Immediate release, stale presentation and missing-driver policy passed\n";
-    std::cout << "Discovered-record transfer, terminal cut, duplicate ledger, overlay and timeout model passed\n";
+    std::cout << "Discovered-record transfer, terminal cut, duplicate ledger and timeout model passed\n";
 }

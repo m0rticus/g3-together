@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/npcsend_policy.h"
+#include "../src/npcsend_candidates.h"
 #include "../src/net_metrics.h"
 #include <cassert>
 #include <cmath>
@@ -201,11 +202,11 @@ static void TestCadenceAndUrgency()
     f.in.force = true;
     f.Send(Decision::Semantic);
     f.in.force = false;
-    f.in.now += KeyframeMs - 1;
+    f.in.now += KeepaliveMs - 1;
     assert(f.Eval().decision == Decision::Wait);
     ++f.in.now;
     f.Send(Decision::Keyframe);
-    f.in.now += KeyframeMs;
+    f.in.now += KeepaliveMs;
     f.Send(Decision::Keyframe); // lost keyframe self-heals on next full keyframe
 }
 
@@ -604,6 +605,27 @@ static void TestNearbyIdleAndOrdinaryExit()
     f.Send(Decision::Changed);
 }
 
+static void TestSendOwnedCandidateUnion()
+{
+    using npcsend_candidates::Candidate;
+    const std::string actorA(16, 'A');
+    const std::string actorB(16, 'B');
+    const std::string player(16, 'P');
+    const std::string staticEntity(16, 'S');
+    const std::string zero(16, '\0');
+    std::vector<Candidate> candidates = {
+        {actorA, true, false, false, false, false},
+        {actorB, true, false, false, false, false},
+        {actorA, true, false, false, false, false},
+        {player, true, true, false, false, false},
+        {staticEntity, false, false, false, false, false},
+        {zero, true, false, false, false, true},
+    };
+    const std::vector<std::string> result = npcsend_candidates::Union(candidates);
+    assert(result.size() == 2);
+    assert(result[0] == actorA && result[1] == actorB);
+}
+
 static void TestPacedCounter()
 {
     net::detail::BandwidthCounters counters;
@@ -666,6 +688,101 @@ static void TestPhaseCarryingDeadlines()
     }
 }
 
+static void TestUnchangedPresentationFreshness()
+{
+    static_assert(npclease::PresentationGraceMs == 350);
+    for (uint32_t stretch : {StretchNormal, 2000u, StretchMax}) {
+        for (Tier tier : {Tier::Fast, Tier::Ordinary, Tier::MovingFar, Tier::Idle}) {
+            for (uint32_t frame : {1u, 16u, 22u, 33u, 66u, 100u}) {
+                Fixture f(1);
+                f.in.stretchPermille = stretch;
+                f.in.moving = tier == Tier::Fast || tier == Tier::Ordinary || tier == Tier::MovingFar;
+                f.in.distanceCm = tier == Tier::MovingFar ? 3000 : 1000;
+                f.in.focused = tier == Tier::Fast;
+                f.Send(Decision::Initial);
+
+                uint32_t lastSend = 0;
+                for (uint32_t now = 1; now <= 3000; ++now) {
+                    f.in.now = now;
+                    const uint32_t interval = PresentationInterval(f.state, f.in);
+                    assert(npclease::PresentationFresh(true, false, now - lastSend, interval));
+                    if (now % frame) continue;
+                    const Result result = f.Eval();
+                    if (result.decision == Decision::Keyframe) {
+                        const uint32_t gap = now - lastSend;
+                        assert(npclease::PresentationFresh(true, false, gap, interval));
+                        assert(gap <= npclease::PresentationGraceMs);
+                        assert(Commit(f.state, f.in, Decision::Keyframe));
+                        lastSend = now;
+                    } else {
+                        assert(result.decision == Decision::Wait);
+                    }
+                }
+                assert(lastSend >= 3000 - KeepaliveMs - frame);
+            }
+        }
+    }
+
+    Fixture boundary(1);
+    boundary.in.stretchPermille = StretchMax;
+    boundary.Send(Decision::Initial);
+    boundary.in.now = KeepaliveMs - 1;
+    assert(boundary.Eval().decision == Decision::Wait);
+    ++boundary.in.now;
+    assert(boundary.Eval().decision == Decision::Keyframe);
+}
+
+static void TestChangingSlowAtMaximumStretch()
+{
+    for (Tier tier : {Tier::MovingFar, Tier::Idle}) {
+        Fixture f(1);
+        f.in.distanceCm = 3000;
+        f.in.moving = tier == Tier::MovingFar;
+        f.in.stretchPermille = StretchMax;
+        f.Send(Decision::Initial);
+        assert(PresentationInterval(f.state, f.in) == 100);
+        assert(npclease::PresentationFresh(true, false, 400, PresentationInterval(f.state, f.in)));
+        assert(npclease::PresentationFresh(true, false, 500, PresentationInterval(f.state, f.in)));
+        assert(!npclease::PresentationFresh(true, false, 501, PresentationInterval(f.state, f.in)));
+        Stats stats;
+        uint32_t lastSend = 0;
+        for (uint32_t now = 22; now <= 5000; now += 22) {
+            f.in.now = now;
+            f.bones[0].values[9] += 1;
+            const Result result = f.Eval();
+            assert(result.tier == tier);
+            if (result.decision == Decision::Wait) continue;
+            assert(result.decision == Decision::Changed);
+            const bool due = now - f.state.idealAt >= Stretched(Interval(tier), StretchMax);
+            assert(due);
+            stats.Record(result.decision, tier, now - lastSend, StretchMax, due);
+            assert(Commit(f.state, f.in, result.decision));
+            lastSend = now;
+        }
+        assert(stats.tiers[2].count >= 12 && stats.heartbeats == 0 && stats.edges == 0);
+        assert(std::fabs(stats.tiers[2].AverageMs() - 400.0) <= 2.0);
+        assert(stats.tiers[2].overdue == 0);
+    }
+
+    Fixture pending(1);
+    pending.in.stretchPermille = StretchMax;
+    pending.Send(Decision::Initial);
+    pending.bones[0].values[9] += 1;
+    pending.in.now = KeepaliveMs;
+    assert(pending.Eval().decision == Decision::Wait);
+    pending.in.now = 400;
+    pending.Send(Decision::Changed);
+
+    Fixture semantic;
+    semantic.in.stretchPermille = StretchMax;
+    semantic.Send(Decision::Initial);
+    semantic.record.movementMode++;
+    semantic.in.now = KeepaliveMs;
+    assert(semantic.Eval().decision == Decision::Wait);
+    semantic.in.now = 400;
+    semantic.Send(Decision::Semantic);
+}
+
 static void TestStretchScaling()
 {
     for (Tier tier : {Tier::Ordinary, Tier::MovingFar, Tier::Idle}) {
@@ -684,7 +801,7 @@ static void TestStretchScaling()
     Fixture heartbeat;
     heartbeat.in.stretchPermille = 2000;
     heartbeat.Send(Decision::Initial);
-    heartbeat.in.now = 2 * KeyframeMs - 1;
+    heartbeat.in.now = KeepaliveMs - 1;
     assert(heartbeat.Eval().decision == Decision::Wait);
     ++heartbeat.in.now;
     heartbeat.Send(Decision::Keyframe);
@@ -821,6 +938,7 @@ static void TestImmediateCombatPublication()
 
 int main()
 {
+    TestSendOwnedCandidateUnion();
     static_assert(QuietCadenceMs == 250 && MirrorStaleMs == 10000 && PoseRetentionMs == 10000);
     static_assert(MovementPositionCm == 0.02f && MovementQuaternionComponent == 0.00025f && MovementHoldMs == 500);
     TestInitialAndHysteresis();
@@ -837,6 +955,8 @@ int main()
     TestNearbyIdleAndOrdinaryExit();
     TestPacedCounter();
     TestPhaseCarryingDeadlines();
+    TestUnchangedPresentationFreshness();
+    TestChangingSlowAtMaximumStretch();
     TestStretchScaling();
     TestMaxStaleAndStats();
     TestInitialPacer();

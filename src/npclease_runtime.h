@@ -22,9 +22,8 @@ uint8_t RemoteOwner(eCEntity const* entity);
 uint32_t Life(uint8_t const guid[16]);
 bool ContactAllowed(eCEntity const* victim, eCEntity const* source);
 bool ActiveLeases();
-// Canonical state only; no entity access, IO, native calls or live owner clocks.
+// Retired save API: capture is empty and restore discards legacy client checkpoints.
 SaveOverlay Capture();
-// Pass the saving world's epoch when restoring before its first network publication.
 bool Restore(SaveOverlay const& overlay, uint32_t expectedWorldEpoch = 0);
 bool WriteSnapshot(FILE* file);
 bool ReadSnapshot(FILE* file, SaveOverlay& overlay);

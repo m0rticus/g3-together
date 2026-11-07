@@ -17,6 +17,23 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ## Before you start
 
+### Quit-game teardown (manual acceptance)
+
+- [ ] On both isolated host/client copies, select **Quit game** from the main menu
+  disconnected, then connected in the lobby; repeat from the in-game menu solo,
+  connected, immediately after loading, and during a cooperative save transfer.
+- [ ] Returning to the main menu and rejoining must keep the process alive; only
+  process shutdown arms the exit watchdog. Load the last committed test save after
+  an interrupted transfer and confirm it remains intact.
+- [ ] Expect exit within a few seconds, no crash/hang dialog, no new Gothic3
+  AppHangB1/WER event, and no new `g3together-hang-*` files for a clean quit.
+  Normal native teardown is unchanged. If the verified AMD/DX9 final device
+  release stops progressing after successful world/save/transport cleanup, the
+  watchdog logs `native DX9/AMD Release stalled after cleanup` and ends the
+  process without DLL detach. This is a narrow teardown workaround, not a driver
+  repair; unsupported signatures or other hangs still produce 12-second diagnostics.
+  Use isolated copy saves only, never the protected user save folder.
+
 ### Players and installations
 
 - [ ] Assign exactly two roles: host and joining player. The host starts or loads the shared campaign; either player may request a host save.
@@ -222,6 +239,32 @@ The other PC reports `downed: puppet recovery begin` / `standing` from the owner
 conservative until standing is known; do not accept a test in which recovery never reaches `standing`.
 Repeated acquisition/hit refusals are limited to the first 40 records and one sample per five seconds;
 actual binding/life transitions are logged independently. No QA command or control is needed.
+
+### Dialogue and trade immunity (both PCs)
+
+Use coordinator-installed matching DLLs in the host `test-install` and client `test-client` copies.
+Do not treat policy tests/builds as native gameplay acceptance.
+
+1. Keep an attacking NPC near the host, then enter dialogue with a different NPC. Throughout spoken
+   lines and the option window, require unchanged HP and no stagger/knockdown/death on either screen.
+2. Put the client in a merchant's trade window while an orc attacks. Require the same immunity on
+   both screens. Repeat with direct partner trade, including its first tutorial and a covering menu.
+3. Close the window. Require 1.5 seconds of grace, then ordinary damage/reactions from eligible
+   attacks. Repeat with Esc, interrupted/aborted dialogue and dialogue-to-trade-to-dialogue transitions.
+4. Swap host/client roles and repeat. Include arrows, hostile targeted/area magic, creatures,
+   existing poison/burning, fall/touch damage, and the other player's attacks with friendly fire on.
+   Keep the other player far away too: immunity belongs to each hero, not a shared proximity bubble.
+5. Check world load, hero restore and peer disconnect/rejoin do not retain a closed window's
+   protection. Genuine open windows remain protected; no stale routine task should grant immunity.
+   Healing and dialog-triggered combat after grace must still work; enemies remain natively hostile.
+
+Startup must report `native interaction pages ready`; an `ANOMALY interaction page layout mismatch`
+means overlay/tutorial coverage is unavailable and is not acceptance. `PROTECTION` and
+`PROTECTEDHIT` name `in-dialogue`, `in-trade` or `interaction-close-grace`. `GROUNDHIT` includes the
+same `protection` reason and HP before/after. The owner sends bits5/6/7 in its existing playing flags
+for dialogue/trade/grace; absent-playing loading/menu bits are not immunity. Remote protection uses
+ordered kind50/pose activity, expires after five seconds without owner evidence and clears on
+disconnect or world mismatch. NPCs may finish visible swings; no counted hit or reaction may result.
 Old visible-contact logs prove an attack was shown, not that damage was applied.
 
 Require `containers: player loot guard installed at native and script entries` on both copies.
@@ -296,7 +339,8 @@ test hooks, bots or automated engine launches. Static tests/builds do not establ
    Same-slot simultaneous requests should share one transaction; a different active slot refuses busy.
    Each completed save has one host `.g3t` plus recoverable native menu caches, not new client world files.
 4. Continue playing, then **host-load the earlier slot**. Require HUD and exactly one lower PUP-chained load success.
-   The client chooses **New Game locally again**, waits for account-exact character/personal-state restoration
+   The client returns to its menu without relaunching and finds **New Game selectable**.
+   It chooses **New Game locally again**, waits for account-exact character/personal-state restoration
    and the host calendar plus all story/runtime/nearby shared-door baselines, applied cutover and entry confirmation.
    Compare both distinct saved heroes and shared quest/NPC/door/loot state. Recheck the first shared XP reward.
    Check quest counters/timers and no repeated quest XP, gold, reputation or item rewards. Loot a chest/corpse
@@ -306,9 +350,10 @@ test hooks, bots or automated engine launches. Static tests/builds do not establ
    no missing baseline, stale state, skipped motion mapping or reward-producing replay. Calendar/activation dates must agree.
    Clients receive no native serialized world; arbitrary dynamically created loose drops and temporary effects
    remain an acceptance boundary. Any mismatch blocks campaign acceptance.
-5. Disconnect/rejoin in the same live epoch: keep the live client character. Restart/rejoin after a host load:
+5. Disconnect/rejoin in the same live epoch: keep the live client character. Re-enter after a host load:
    restore the saved account record. A different account gets a fresh hero, never the previous slot occupant.
    A local backup is not imported automatically, even if it contains later progress.
+
 6. Host-load a plain native or intact G3T1/G3T2 save, including `G3T_Sandbox`. It must reach native load without
    a manifest-prefix error. Also load an earlier G3TSAVE3 container with no personal block; use native/fresh defaults.
    Old unbound client records are not silently migrated; absent accounts start fresh.
@@ -324,6 +369,43 @@ test hooks, bots or automated engine launches. Static tests/builds do not establ
 9. Verify equipment base/bonus splits and current HP/MP/SP, no doubled bonuses or host inheritance.
    Temporary-effect ownership/expiry and exact native inventory mutations remain manual acceptance.
    Check option parity, NPC mirroring, companion leases, trade, downed/revive/end, XP sharing and kill-once.
+10. Keep the host away while the client owns an actual wolf/scavenger lease (distance alone is not proof).
+    Host-save and client-request-save must complete with no lease warning, including live/dormant/pending
+    lease states. Continue moving/fighting, then hand back: no new freeze, duplicate body or repeated XP/Kill.
+    Host-load the slot and re-enter the client normally: only host-native NPC state returns, not client-only
+    injury/death/adoption. Also load intact old type-256 v1/v2 overlays and `npclease1 ` sidecars: no overlay
+    error or stale authority. New saves must omit type 256. Corrupt container checksums must still refuse.
+    Normally save with both players together; this far-apart case verifies the deliberate durability limit.
+
+### Client rejoin without relaunch
+
+After coordinator deployment, use the two already configured isolated host/client copies; these are human
+checks, not an automated engine/Steam test. Do not use the protected user save folder.
+
+1. Host starts the test campaign; client chooses **New Game**, joins and receives only its own account record.
+   Make the heroes visibly different and host-save; wait for **Co-op save complete** on both.
+2. With the client playing, host-load that save. The client must return to the menu without closing Gothic 3.
+   **New Game** must be selectable. Choose it and confirm; the saved client inventory, stats, equipment and
+   position must return, not the host hero or a placeholder. Admission must complete again.
+3. Open the client menu during play. **Back** must continue unchanged. Choose **New Game** instead and cancel
+   its native confirmation: remain in the menu, unadmitted, with the saved account record unchanged.
+   Choose and confirm New Game again; rejoin the same epoch with the last host-saved character, not the discarded live hero.
+4. Host starts a different campaign while the client is playing, and repeat while the client is already in its menu.
+   The client must stay in the same process. If the account has no saved record there, show the fresh-hero notice;
+   only an explicitly confirmed New Game may admit a fresh local hero. Do not auto-save over the earlier account record.
+5. Host-load while the client is in a New Game loading screen or its confirmation dialog. Do not close either process:
+   native loading/confirmation must finish before any queued retirement, with no nested teardown or crash.
+   Repeat rapid host load/new-campaign changes: retire once when safe, then join the latest epoch only.
+6. Repeat with the client downed, with dialogue/NPC trade open, and while a client-requested save is awaiting its result.
+   Downed state must not force a process restart. Dialogue/trade must show a deferral; finish/close them and allow an exchange
+   to settle. An outstanding same-epoch save waits for success/refusal; a host epoch replacement explicitly cancels the old save.
+   Rejoining must restore the last completed host snapshot. Also start client New Game while the host is still loading/in menu:
+   New Game stays available, but no admission or placeholder capture occurs until the host world is ready.
+7. Review both logs manually: client retirement reports `player=00000000 running=0 ok=1`, full
+   `world-cache: ... before world cleanup` / `after world cleanup` inventory reports complete, and old puppets,
+   mirrors, leases and private camera slots do not survive the restart. Host admission must be confirmed for the new entry.
+   No client native save/world load or native world transfer is allowed. Static policy/native-byte tests and the Release build
+   do not establish these visual/native acceptance results.
 
 ### Targeting after deaths
 
@@ -510,6 +592,7 @@ share unredacted INI files, saves, campaign sidecars or a complete Documents fol
   two bugs that need further human verification.
 - Only two players were tested.
 - Companions are restored after loading by player name. Changing your name loses that association.
-- If the host loads another save during a session, the other player is loaded into it automatically.
+- If the host loads another save during a session, the client returns to its menu when safe and chooses
+  New Game to re-enter with its own saved character; it does not load the host's native save automatically.
 - Untested: monsters attacking downed heroes, the actual bed dialog, and the
   mouse controls of the trade window (dragging items, its buttons).

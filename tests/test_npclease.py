@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NpcLeaseTests(unittest.TestCase):
-    def test_engine_free_npclease_policy_and_overlay(self):
+    def test_engine_free_npclease_policy_and_legacy_discard(self):
         compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
         self.assertIsNotNone(compiler, "C++17 compiler required")
         build = ROOT / "tests" / f".npclease-build-{os.getpid()}"

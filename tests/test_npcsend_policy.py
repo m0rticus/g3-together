@@ -9,6 +9,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NpcSendPolicyTests(unittest.TestCase):
+    def test_sendowned_candidate_inventory_contract(self):
+        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        sendowned = npcs[npcs.index("void SendOwned("):npcs.index("// A client simulates", npcs.index("void SendOwned("))]
+        self.assertIn("Entity::GetNPCs()", sendowned)
+        self.assertIn("world::ProcessedEntities()", sendowned)
+        self.assertIn("eEPropertySetType_NPC", sendowned)
+        self.assertIn("npcsend_candidates::Union(candidates)", sendowned)
+        self.assertIn("for (std::string const& candidateKey : candidateKeys)", sendowned)
+
     def test_engine_free_policy_and_75_npc_simulation(self):
         compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
         self.assertIsNotNone(compiler, "C++17 compiler required")

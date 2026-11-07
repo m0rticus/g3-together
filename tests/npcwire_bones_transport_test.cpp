@@ -89,6 +89,18 @@ int Format(char* out, size_t size, char const* format, ...)
     return result;
 }
 namespace ai { bool ShuttingDown() { return false; } }
+namespace downed {
+uint8_t PlayerInteractionFlags(unsigned player)
+{
+    if (!player || player >= net::MaxPlayers) return 0;
+    if (player == net::LocalId())
+        return (net::currentLocal.flags & 1) && !(net::currentLocal.flags & 14)
+            ? net::currentLocal.flags & InteractionMask : 0;
+    net::Remote const& remote = net::Remotes()[player];
+    return PeerInteraction(remote.connected, remote.activity.known, remote.activity.ticks,
+                           remote.activity.world, net::currentLocal.world, remote.activity.flags, net::Now());
+}
+}
 namespace steam {
 TrafficCounters Traffic() { return {}; }
 bool IsPeerRelay(unsigned short) { return true; }

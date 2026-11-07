@@ -152,52 +152,43 @@ int main()
     falling.action = 35;
     falling.busy = 1;
     assert(Valid(falling)); // a terminal life can still have an unsafe native ragdoll cut
-    SaveOverlay empty, restored;
-    std::string text;
-    assert(EncodeSaveText(empty, text));
-    assert(DecodeSaveText(text, restored));
-    assert(restored.empty());
-    assert(text.size() <= MaxOverlayText);
-    assert(!DecodeSaveText(text.substr(0, text.size() - 1), restored));
-    assert(!DecodeSaveText(text + text, restored));
-    auto corrupt = text;
-    corrupt[sizeof(SavePrefix) + 8] = corrupt[sizeof(SavePrefix) + 8] == '0' ? '1' : '0';
-    assert(!DecodeSaveText(corrupt, restored));
-    corrupt = text;
-    corrupt[sizeof(SavePrefix)] = '!';
-    assert(!DecodeSaveText(corrupt, restored));
-    assert(!DecodeSaveText(std::string(MaxOverlayText + 1, '0'), restored));
     Saved adopted;
     adopted.guid[0] = 4;
     adopted.epoch = 7;
     adopted.state = falling;
     adopted.adopted = 1;
     SaveOverlay withAdoption{adopted};
-    std::string adoptedText;
-    assert(EncodeSaveText(withAdoption, adoptedText));
-    assert(DecodeSaveText(adoptedText, restored));
-    assert(restored.size() == 1 && restored[0].adopted == 1 && restored[0].epoch == 7);
+    std::string text = "previous output";
+    assert(EncodeSaveText(withAdoption, text) && text.empty());
     auto invalidAdoption = withAdoption;
     invalidAdoption[0].adopted = 2;
-    const auto unchangedText = adoptedText;
-    assert(!EncodeSaveText(invalidAdoption, adoptedText));
-    assert(adoptedText == unchangedText);
+    assert(EncodeSaveText(invalidAdoption, text) && text.empty());
+    SaveOverlay restored = withAdoption;
+    for (auto const& ignored : {std::string(), std::string(SavePrefix) + "invalid\n",
+                               std::string(MaxOverlayText + 1, '0')}) {
+        restored = withAdoption;
+        assert(DecodeSaveText(ignored, restored) && restored.empty());
+    }
     auto stream = [&](std::string const& data, bool expected) {
         const char* path = "npclease-save-stream-test.txt";
         FILE* file = std::fopen(path, "w+b");
         assert(file);
         assert(fwrite(data.data(), 1, data.size(), file) == data.size());
         rewind(file);
+        restored = withAdoption;
         assert(ReadSaveStream(file, restored) == expected);
+        assert(restored.empty());
         assert(fclose(file) == 0);
         assert(std::remove(path) == 0);
     };
     stream("G3T 2\njournal data\n" + text + "downed 0\n", true);
-    stream(text + text, false);
-    stream("G3T 2\ndowned 0\n", false);
-    stream(text.substr(0, text.size() - 1), false);
-    stream(text + "npclease1 invalid\n", false);
+    stream(text + text, true);
+    stream("G3T 2\ndowned 0\n", true);
+    stream("npclease1 truncated", true);
+    stream(text + "npclease1 invalid\n", true);
     stream("ignored " + std::string(1024, 'a') + "\n" + text, true);
+    restored = withAdoption;
+    assert(!ReadSaveStream(nullptr, restored) && restored.empty());
     GuardRegistry guards;
     GuardKey key{};
     key[0] = 1;
@@ -227,18 +218,5 @@ int main()
         if (j % 7 == 0) guards.Clear();
     }
     for (auto& reader : readers) reader.join();
-    RestoreEpochBinding binding;
-    binding.Bind(10, 11);
-    assert(!binding.Consume(10));
-    assert(!binding.Consume(12)); // an unrelated world change must still discard the restore
-    assert(binding.expected == 11);
-    assert(binding.Consume(11));
-    assert(!binding.Consume(11));
-    assert(!binding.Consume(12));
-    binding.Bind(0, 42); // the first host publication may follow a solo native import
-    assert(!binding.Consume(0));
-    assert(binding.Consume(42));
-    binding.Bind(42, 42);
-    assert(!binding.Consume(42));
     std::cout << "npclease_client_test: PASS (200 transfers, conservative expiry, loss/reorder/duplicates)\n";
 }

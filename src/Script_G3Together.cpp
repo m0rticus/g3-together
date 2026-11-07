@@ -49,6 +49,7 @@
 #include "hud.h"
 #include "i18n.h"
 #include "xpshare.h"
+#include "movement.h"
 
 #include <Game.h>
 #include <Windows.h>
@@ -102,19 +103,37 @@ void Frame()
 
 // One frame of the module for persist (BeginFrame/EndFrame), closed on every way out of Process.
 struct FrameScope {
-    FrameScope() : run(g3t::persist::BeginFrame()) { if (run) ++moduleProcessDepth; }
+    FrameScope() : entered(g3t::movement::EntryTime()), run(g3t::persist::BeginFrame())
+    {
+        if (run) ++moduleProcessDepth;
+        if (run && moduleProcessDepth == 1) g3t::movement::Begin(entered);
+    }
     ~FrameScope()
     {
         if (run) {
-            g3t::net::Flush();
-            g3t::persist::EndFrame();
+            {
+                g3t::movement::Stage stage("net flush");
+                g3t::net::Flush();
+            }
+            {
+                g3t::movement::Stage stage("persist end");
+                g3t::persist::EndFrame();
+            }
             if (--moduleProcessDepth == 0) g3t::hud::Tick();
+            if (moduleProcessDepth == 0) g3t::movement::End();
         }
     }
     FrameScope(FrameScope const&) = delete;
     FrameScope& operator=(FrameScope const&) = delete;
+    const long long entered;
     const bool run;
 };
+
+void Step(char const* name, void (*tick)())
+{
+    g3t::movement::Stage stage(name);
+    tick();
+}
 
 // The engine's own extension point: a module registered with eCModuleAdmin gets Process()
 // every frame and world activation/shutdown callbacks.
@@ -131,7 +150,12 @@ class Module : public eCEngineComponentBase
         static const bCGuid id(raw);
         return id;
     }
-    bEResult Initialize() override { g3t::world::Start(); return bEResult_Ok; }
+    bEResult Initialize() override
+    {
+        g3t::persist::SetWorldCleanup(&ForgetWorld);
+        g3t::world::Start();
+        return bEResult_Ok;
+    }
     bEResult PostInitialize() override { return bEResult_Ok; }
     void OnAppInitialized() override {}
     // Forget every entity the mod holds. Loading a save (gCHUDFileManager::LoadGame) replaces the world's
@@ -163,6 +187,7 @@ class Module : public eCEngineComponentBase
         ForgetStep("arena cleanup", &g3t::arena::OnWorldChange);
         ForgetStep("ending cleanup", &g3t::ending::OnWorldChange);
         ForgetStep("HUD observation cleanup", &g3t::hud::OnWorldChange);
+        ForgetStep("movement observation cleanup", &g3t::movement::OnWorldChange);
         {
             g3t::crashlog::WorldEntryScope operation("downed cleanup");
             g3t::downed::OnWorldChange();
@@ -208,6 +233,7 @@ class Module : public eCEngineComponentBase
         g3t::crashlog::WorldEntryScope operation("WorldDeactivate callback");
         g3t::Log("world deactivated");
         ForgetWorld();
+        g3t::downed::OnWorldDeactivate();
         g3t::persist::OnWorldDeactivate();
         g3t::Log("world-entry: deactivation cleanup returned");
         return bEResult_Ok;
@@ -216,17 +242,20 @@ class Module : public eCEngineComponentBase
     {
         g3t::ai::BeginShutdown();
         g3t::crashlog::BeginShutdown();
+        g3t::crashlog::StartWatchdog();
+        const bool savesQuiescent = g3t::persist::PrepareShutdown();
         ForgetWorld();
         g3t::crashlog::Stage("world deactivated");
         g3t::crashlog::Stage("forget done");
         g3t::dialogaudio::OnWorldChange();  // no channel of ours outlives the audio system, whichever way the game ends
         g3t::net::Stop();
         g3t::crashlog::Stage("steam stopped");
-        g3t::ai::RestorePatches();
+        const auto patches = g3t::ai::RestorePatches();
         g3t::crashlog::Stage("hooks removed");
-        if (g3t::crashlog::Shutdown()) g3t::crashlog::Stage("threads joined");
-        g3t::crashlog::StartWatchdog();
+        const bool threadsJoined = g3t::crashlog::Shutdown();
+        if (threadsJoined) g3t::crashlog::Stage("threads joined");
         g3t::crashlog::Stage("pre-shutdown done");
+        g3t::crashlog::CompletePreShutdown(savesQuiescent && threadsJoined && !patches.failed);
         return bEResult_Ok;
     }
     bEResult Shutdown() override
@@ -244,12 +273,13 @@ class Module : public eCEngineComponentBase
     void Process() override
     {
         if (g3t::ai::ShuttingDown()) return;
+        if (g3t::persist::ProcessClientTransition()) return;
         g3t::crashlog::WorldEntryScope entryProcess("engine module Process");
         FrameScope frame;
         if (!frame.run) return;
         {
             g3t::crashlog::WorldEntryScope operation("frame report");
-            Frame();
+            Step("frame report", &Frame);
         }
         if (!g3t::npcplayback::Available()) {
             g3t::hud::MenuLine(g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
@@ -259,51 +289,60 @@ class Module : public eCEngineComponentBase
             }
             return;
         }
-        g3t::crashlog::Tick();
-        g3t::world::Tick();
-        g3t::npcremoval::Tick();
-        g3t::npcplayback::Tick();
+        { g3t::movement::Stage stage("crashlog"); g3t::crashlog::Tick(); }
+        { g3t::movement::Stage stage("world"); g3t::world::Tick(); }
+        { g3t::movement::Stage stage("NPC removal"); g3t::npcremoval::Tick(); }
+        { g3t::movement::Stage stage("NPC playback"); g3t::npcplayback::Tick(); }
         {
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
+            g3t::movement::Stage stage("remote / ENet service");
             g3t::remote::Tick();
         }
-        g3t::ai::Tick();
-        g3t::npcs::Tick();
-        g3t::combat::Tick();
-        g3t::summon::Tick();
-        g3t::story::Tick();
-        g3t::talk::Tick();
-        g3t::downed::Tick();
-        g3t::range::Tick();
-        g3t::partner::Tick();
-        g3t::doors::Tick();
-        g3t::enclaves::Tick();
-        g3t::journal::Tick();
+        if (g3t::persist::ClientTransitionPending()) {
+            g3t::persist::Tick();
+            g3t::talk::Tick();
+            g3t::trade::Tick();
+            g3t::offer::Tick();
+            return;
+        }
+        { g3t::movement::Stage stage("AI"); g3t::ai::Tick(); }
+        { g3t::movement::Stage stage("NPC / lease"); g3t::npcs::Tick(); }
+        { g3t::movement::Stage stage("combat"); g3t::combat::Tick(); }
+        { g3t::movement::Stage stage("summon"); g3t::summon::Tick(); }
+        { g3t::movement::Stage stage("story"); g3t::story::Tick(); }
+        { g3t::movement::Stage stage("talk"); g3t::talk::Tick(); }
+        { g3t::movement::Stage stage("downed"); g3t::downed::Tick(); }
+        { g3t::movement::Stage stage("range"); g3t::range::Tick(); }
+        { g3t::movement::Stage stage("partner jump"); g3t::partner::Tick(); }
+        { g3t::movement::Stage stage("doors"); g3t::doors::Tick(); }
+        { g3t::movement::Stage stage("enclaves"); g3t::enclaves::Tick(); }
+        { g3t::movement::Stage stage("journal"); g3t::journal::Tick(); }
         {
             g3t::crashlog::WorldEntryScope operation("persist tick");
+            g3t::movement::Stage stage("persist");
             g3t::persist::Tick();
         }
-        g3t::clock::Tick();
-        g3t::infocmd::Tick();
-        g3t::guide::Tick();
-        g3t::arena::Tick();
-        g3t::ending::Tick();
-        g3t::containers::Tick();
-        g3t::trade::Tick();
-        g3t::mapmarks::Tick();
-        g3t::ransack::Tick();
-        g3t::witness::Tick();
-        g3t::guards::Tick();
-        g3t::pickpocket::Tick();
-        g3t::respawn::Tick();
-        g3t::occupancy::Tick();
-        g3t::address::Tick();
-        g3t::fightmem::Tick();
-        g3t::xpshare::Tick();
-        g3t::dialogaudio::Tick();
-        g3t::offer::Tick();
-        g3t::shot::Tick();
-        g3t::spells::Tick();
+        { g3t::movement::Stage stage("clock"); g3t::clock::Tick(); }
+        { g3t::movement::Stage stage("info command"); g3t::infocmd::Tick(); }
+        { g3t::movement::Stage stage("guide"); g3t::guide::Tick(); }
+        { g3t::movement::Stage stage("arena"); g3t::arena::Tick(); }
+        { g3t::movement::Stage stage("ending"); g3t::ending::Tick(); }
+        { g3t::movement::Stage stage("containers"); g3t::containers::Tick(); }
+        { g3t::movement::Stage stage("trade"); g3t::trade::Tick(); }
+        { g3t::movement::Stage stage("map marks"); g3t::mapmarks::Tick(); }
+        { g3t::movement::Stage stage("ransack"); g3t::ransack::Tick(); }
+        { g3t::movement::Stage stage("witness"); g3t::witness::Tick(); }
+        { g3t::movement::Stage stage("guards"); g3t::guards::Tick(); }
+        { g3t::movement::Stage stage("pickpocket"); g3t::pickpocket::Tick(); }
+        { g3t::movement::Stage stage("respawn"); g3t::respawn::Tick(); }
+        { g3t::movement::Stage stage("occupancy"); g3t::occupancy::Tick(); }
+        { g3t::movement::Stage stage("address"); g3t::address::Tick(); }
+        { g3t::movement::Stage stage("fight memory"); g3t::fightmem::Tick(); }
+        { g3t::movement::Stage stage("XP share"); g3t::xpshare::Tick(); }
+        { g3t::movement::Stage stage("dialog audio"); g3t::dialogaudio::Tick(); }
+        { g3t::movement::Stage stage("offer"); g3t::offer::Tick(); }
+        { g3t::movement::Stage stage("shot"); g3t::shot::Tick(); }
+        { g3t::movement::Stage stage("spells"); g3t::spells::Tick(); }
     }
     void PostProcess() override {}
     void OnBeginRenderSolid() override {}
@@ -348,6 +387,7 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
     g3t::dialogaudio::Start();
     g3t::offer::Start();
     g3t::journal::Start();
+    g3t::persist::SetWorldCleanup(&Module::ForgetWorld);
     g3t::persist::Install();
     g3t::clock::Start();
     g3t::infocmd::Start();

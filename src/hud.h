@@ -14,6 +14,7 @@ bool InventoryOpen();  // the inventory page, not merely a cached active-page en
 // The main menu's top line (the Community Patch's version line) with a second line of the mod's under it, for a player
 // waiting there (the game's messages do not show in the main menu); nullptr puts it back. False: no such line here.
 bool MenuLine(wchar_t const* text);
+bool ClientNewGameEnabled(bool enabled); // paired with persist's guarded client command
 void MenuLineReport(LogFn log);          // QA: MENULINE, the line's text now (a line break as \n)
 void Probe(char const* way, LogFn log);  // QA: MENUTEXT, a test text by way of hud, gamemsg or subtitle
 }

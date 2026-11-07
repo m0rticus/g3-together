@@ -28,6 +28,64 @@ constexpr bool VanillaProne(int animation)
 }
 
 constexpr uint32_t ReviveGraceMs = 1500;
+constexpr uint32_t InteractionGraceMs = 1500;
+
+// High bits are interaction reasons only while the existing playing bit is set.
+// Without playing, 32/64 retain their loading/menu heartbeat meanings.
+enum InteractionFlag : uint8_t { InDialogue = 32, InTrade = 64, InteractionGrace = 128 };
+constexpr uint8_t InteractionMask = InDialogue | InTrade | InteractionGrace;
+
+constexpr int InteractionPage(int mainPage, int beforeTutorial)
+{
+    return mainPage == 15 ? beforeTutorial : mainPage;
+}
+
+inline bool DialogueObserved(int page, bool running, bool ending, bool heroPartner, bool livePartner)
+{
+    return page == 6 || (running && !ending && heroPartner && livePartner);
+}
+
+inline bool ValidActivityFlags(uint8_t flags)
+{
+    if (flags & 1) return !(flags & 14) || !(flags & InteractionMask);
+    return !(flags & InteractionGrace);
+}
+
+struct InteractionProtection
+{
+    uint8_t windows = 0;
+    bool grace = false;
+    uint32_t closedAt = 0;
+
+    void Clear() { windows = 0; grace = false; closedAt = 0; }
+    uint8_t Flags(uint32_t now) const
+    {
+        return windows ? windows : (grace && now - closedAt < InteractionGraceMs ? InteractionGrace : 0);
+    }
+    void Observe(bool eligible, bool dialogue, bool trade, uint32_t now)
+    {
+        if (!eligible) { Clear(); return; }
+        const uint8_t next = (dialogue ? InDialogue : 0) | (trade ? InTrade : 0);
+        if (next) grace = false;
+        else if (windows) { grace = true; closedAt = now; }
+        windows = next;
+        if (grace && now - closedAt >= InteractionGraceMs) grace = false;
+    }
+};
+
+inline uint8_t PeerInteraction(bool connected, bool known, uint32_t arrived, uint32_t peerWorld,
+                               uint32_t currentWorld, uint8_t flags, uint32_t now)
+{
+    return connected && known && now - arrived < 5000 && peerWorld == currentWorld &&
+           (flags & 1) && !(flags & 14) ? flags & InteractionMask : 0;
+}
+
+inline char const* InteractionReason(uint8_t flags)
+{
+    if (flags & InTrade) return "in-trade";
+    if (flags & InDialogue) return "in-dialogue";
+    return flags & InteractionGrace ? "interaction-close-grace" : "none";
+}
 
 struct Recovery
 {
@@ -70,9 +128,9 @@ struct PeerRecovery
     }
 };
 
-inline bool HarmImmune(bool player, bool held, bool terminal, uint8_t flags, bool recovering)
+inline bool HarmImmune(bool player, bool held, bool terminal, uint8_t flags, bool recovering, bool interacting = false)
 {
-    return player && !terminal && !(flags & 4) && (held || (flags & 8) || recovering);
+    return player && !terminal && !(flags & 4) && (held || (flags & 8) || recovering || interacting);
 }
 
 inline bool HarmfulReaction(char const* state)

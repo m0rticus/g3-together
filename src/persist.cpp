@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "config.h"
+#include "client_rejoin.h"
 #include "containers.h"
 #include "crashlog.h"
 #include "dialogaudio.h"
@@ -16,8 +17,6 @@
 #include "lobby.h"
 #include "net.h"
 #include "npcs.h"
-#include "npclease_runtime.h"
-#include "npclease_save.h"
 #include "remote.h"
 #include "saving_native.h"
 #include "saving_policy.h"
@@ -81,6 +80,16 @@ std::string lastSave, lastLoad, campaign, loading;
 uint8_t localKind = net::KindMenu;
 bool newWorld = false, ownCharacterReady = false, needsNewHero = false, restoreFailed = false;
 bool freshLocalHero = false, resetLocalWorld = false;
+rejoin::State clientRejoin;
+using NewGameCommandFn = void(__thiscall*)(void*);
+using NewGameFn = bool(__stdcall*)(void*);
+NewGameCommandFn originalNewGameCommand = nullptr;
+NewGameFn originalNewGame = nullptr;
+void (*worldCleanup)() = nullptr;
+void* deferredNewGameMenu = nullptr;
+bool rejoinHooks = false, nativeNewGame = false, requestCharacterAgain = false;
+unsigned menuCommandDepth = 0;
+rejoin::Wait rejoinWait = rejoin::Wait::None;
 bool hostAdmissionAck = false;
 uint32_t nextAdmissionTry = 0;
 uint32_t seenWelcome = 0;
@@ -652,11 +661,6 @@ char const* NativeSaveReason()
 {
     if (!eCApplication::IsInitialised()) return "not-running";
     if (nativeLoadDepth || nativeSaveDepth || !loading.empty()) return "loading";
-    if (npclease::ActiveLeases()) {
-        Log("save refusal reason=npc-lease-active");
-        hud::Message(hud::Warning, L"NPC lease active: save would lose client-owned NPC state");
-        return "npc-lease-active";
-    }
     gCSession& session = gCSession::GetInstance();
     if (!session.IsGameRunning() || !session.GetHero()) return "not-running";
     if (session.GetPlayer() != session.GetHero()) return "control";
@@ -677,11 +681,7 @@ char const* NativeSaveReason()
 }
 char const* SaveReadiness()
 {
-    if (npclease::ActiveLeases()) {
-        Log("save refusal reason=npc-lease-active");
-        hud::Message(hud::Warning, L"NPC lease active: save would lose client-owned NPC state");
-        return "npc-lease-active";
-    }
+    if (!net::IsHost() && clientRejoin.pending) return "peer-loading";
     if (char const* reason = NativeSaveReason()) return reason;
     if (!ownCharacterReady) return "own-character";
     if (!trade::ReadyForSave()) return "trade";
@@ -753,8 +753,10 @@ bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool
 
 void Notice(i18n::Message message, bool bad = false)
 {
-    if (gCSession::GetInstance().IsGameRunning()) hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
-    else hud::MenuLine(i18n::Text(message));
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(i18n::Text(message));
+    else hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
 }
 void SaveFailure(char const* code)
 {
@@ -765,6 +767,63 @@ void SaveFailure(char const* code)
     _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SaveFailureReason), i18n::SaveReason(code));
     if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
     else hud::MenuLine(text);
+}
+void QueueClientReturn()
+{
+    clientRejoin.Queue();
+    resetLocalWorld = true;
+    freshLocalHero = false;
+    hostAdmissionAck = false;
+    net::SetInWorld(net::LocalId(), false);
+}
+void __fastcall NewGameCommandDetour(void* self, void*)
+{
+    if (ai::ShuttingDown() || net::IsHost() || !rejoinHooks) {
+        originalNewGameCommand(self);
+        return;
+    }
+    if (gCSession::GetInstance().GetPlayer() || clientRejoin.pending || captured.valid || requestPending) {
+        deferredNewGameMenu = self;
+        QueueClientReturn();
+        Notice(i18n::ClientReturningToMenu);
+        return; // The native player-present branch terminates Gothic 3.
+    }
+    ++menuCommandDepth;
+    originalNewGameCommand(self);
+    --menuCommandDepth;
+}
+bool __stdcall NewGameDetour(void* self)
+{
+    if (ai::ShuttingDown() || net::IsHost() || !rejoinHooks) return originalNewGame(self);
+    if (!worldCleanup || nativeLoadDepth || nativeSaveDepth || captured.valid || requestPending || clientRejoin.pending) {
+        Log("persist: client New Game refused; transition or native operation still active");
+        Notice(i18n::ClientRejoinFailed, true);
+        return false;
+    }
+    ++nativeLoadDepth;
+    nativeNewGame = true;
+    ownCharacterReady = false; hostAdmissionAck = false; synced = 0;
+    freshLocalHero = false; newWorld = false;
+    net::SetInWorld(net::LocalId(), false);
+    worldCleanup();
+    crashlog::WorldEntryScope scope("native client HUD.NewGame");
+    const bool ok = originalNewGame(self);
+    scope.Complete();
+    nativeNewGame = false;
+    --nativeLoadDepth;
+    clientRejoin.Started(ok);
+    freshLocalHero = ok; newWorld = ok;
+    resetLocalWorld = false;
+    if (!ok) {
+        restoreFailed = true;
+        Log("persist: client native New Game failed; no character admission or save");
+        Notice(i18n::ClientRejoinFailed, true);
+    } else {
+        restoreFailed = false;
+        requestCharacterAgain = receivedNote.epoch != hostWorld.epoch || !receivedWelcome;
+        Log("persist: client native New Game returned; fresh local world ready for own account record");
+    }
+    return ok;
 }
 bool WriteAtomic(std::string const& path, Bytes const& bytes)
 {
@@ -966,26 +1025,7 @@ bool RestoreExtensions()
     }
     return true;
 }
-constexpr uint32_t NpcLeaseExtension = saving::store::Extension;
-bool CaptureNpcLease(Bytes& bytes)
-{
-    std::string text;
-    if (!npclease::EncodeSaveText(npclease::Capture(), text)) return false;
-    bytes.assign(text.begin(), text.end());
-    return bytes.size() <= saving::store::ExtensionLimit;
-}
-bool RestoreNpcLease(uint32_t savedVersion, Bytes const& bytes)
-{
-    if (!savedVersion) {
-        npclease::OnWorldDeactivate();
-        return true;
-    }
-    if ((savedVersion != 1 && savedVersion != 2) || bytes.size() > npclease::MaxOverlayText) return false;
-    std::string text(bytes.begin(), bytes.end());
-    npclease::SaveOverlay overlay;
-    if (!npclease::DecodeSaveText(text, overlay)) return false;
-    return npclease::Restore(overlay, epoch);
-}
+constexpr uint32_t LegacyNpcLeaseExtension = saving::store::Extension;
 bool Materialize(std::string const& slot, Save const& save)
 {
     const std::string paths[2] = {Path(slot, 0), Path(slot, 1)};
@@ -1032,10 +1072,6 @@ bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
 }
 void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
 {
-    if (npclease::ActiveLeases()) {
-        CancelSave("npc-lease-active");
-        return;
-    }
     if (processDepth || nativeLoadDepth || nativeSaveDepth || !operation.active || !AllReady()) return;
     if (operation.epoch != epoch) { CancelSave("world"); return; }
     if (operation.Expired(GetTickCount())) { CancelSave("world-state"); return; }
@@ -1066,6 +1102,7 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
                 pop esi
             }
         }
+        // Save host-native NPCs as they stand; do not import or revoke live client authority.
         remote::DespawnAll("host-managed save");
         const bCString name(stagingSlot.c_str());
         Logf("persist: native invoke=HUD.SaveGame save=%s slot=%s player=%llu",
@@ -1135,8 +1172,9 @@ bool StartSave(char const* name)
     savingManifest = {};
     savingManifest.key = {saving::Id(current.key.world) ? current.key.world : RandomId(), RandomId(), steam::PlayerId()};
     if (!saving::Valid(savingManifest.key)) { SaveFailure("identity"); return false; }
-    // Retain absent accounts and unknown extensions, but never data from another campaign.
+    // Retain absent accounts and unknown extensions, except the retired client-NPC overlay.
     for (auto block : current.blocks) {
+        if (block.type == LegacyNpcLeaseExtension) continue;
         if (block.type == saving::store::Character && block.account != steam::PlayerId()) {
             if (!saving::store::Rebind(block.bytes, {savingManifest.key.world, savingManifest.key.save, block.account})) {
                 SaveFailure("character-record"); return false;
@@ -1292,6 +1330,7 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
         return;
     }
     if (note.epoch != hostWorld.epoch || key.player != steam::PlayerId()) return;
+    requestCharacterAgain = false;
     if (synced == hostWorld.epoch && ownCharacterReady) {
         // Duplicate restoration after admission must never rewind a live character.
         Evaluate(); return;
@@ -1305,8 +1344,9 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
     if (bytes.empty()) {
         needsNewHero = true;
         if (!containers::RestorePersonal({})) { restoreFailed = true; SaveFailure("personal-record"); return; }
-        if (freshLocalHero && !resetLocalWorld && gCSession::GetInstance().IsGameRunning()) {
+        if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu)) {
             needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
+            clientRejoin.Left();
             synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
         } else Notice(i18n::SaveCharacterMissing, true);
         Logf("persist: no saved character account=%llu epoch=%08x; fresh New Game required", key.player, note.epoch);
@@ -1340,7 +1380,7 @@ void Evaluate()
 {
     if (net::IsHost() || !net::Joined() || !hostWorld.epoch || hostWorld.kind == net::KindMenu) return;
     if (seenWelcome != net::WelcomeSerial()) { net::SetInWorld(net::LocalId(), false); return; }
-    const bool ready = !nativeLoadDepth && loading.empty() && !newWorld && ownCharacterReady &&
+    const bool ready = !nativeLoadDepth && !clientRejoin.pending && loading.empty() && !newWorld && ownCharacterReady &&
                        !needsNewHero && !restoreFailed && synced == hostWorld.epoch &&
                        story::AdmissionReady() && doors::AdmissionReady();
     bool admitted = ready && hostAdmissionAck && net::InWorld(net::LocalId());
@@ -1380,7 +1420,13 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
             ack.op = net::WorldReady; ack.kind = localKind; ack.epoch = epoch;
             strncpy_s(ack.campaign, campaign.c_str(), _TRUNCATE);
             net::SendWorld(ack, from);
-        } else if (note.op == net::WorldWaiting || note.op == net::WorldOther) net::SetInWorld(from, false);
+        } else if (note.op == net::WorldWaiting || note.op == net::WorldOther) {
+            net::SetInWorld(from, false);
+            if (note.op == net::WorldOther) {
+                clients[from].ready = clients[from].recordSent = clients[from].cutover = 0;
+                clients[from].nextTry = 0;
+            }
+        }
         return;
     }
     if (note.op == net::WorldReady) {
@@ -1392,20 +1438,18 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
     }
     if (note.op != net::WorldHost) return;
     if (note.epoch != hostWorld.epoch) {
-        const bool replacing = hostWorld.epoch != 0 && hostWorld.kind != net::KindMenu;
-        resetLocalWorld = replacing && gCSession::GetInstance().IsGameRunning();
-        if (resetLocalWorld) {
-            freshLocalHero = false;
-            Notice(i18n::HostLoadsOnly, true);
-        }
+        const bool replacing = rejoin::ReplacesWorld(hostWorld.epoch, note.epoch,
+            hostWorld.kind != net::KindMenu, gCSession::GetInstance().GetPlayer() != nullptr, clientRejoin.pending);
+        if (replacing) { QueueClientReturn(); Notice(i18n::ClientHostWorldChanged, true); }
+        if (captured.valid || requestPending) Notice(i18n::ClientSaveCanceledByWorld, true);
         captured = {}; requestPending = false; receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
         needsNewHero = false; restoreFailed = false; synced = 0; ownCharacterReady = false; hostAdmissionAck = false;
         nextAdmissionTry = 0;
         net::SetInWorld(net::LocalId(), false);
-        remote::DespawnAll("host world replaced");
-        dialogaudio::OnWorldChange(); containers::OnWorldChange();
-        story::OnWorldChange(); doors::OnWorldChange();
-        journal::Clear();
+        // Live native objects are retired at the next outer module boundary, never in ENet dispatch.
+        if (!clientRejoin.pending) {
+            story::OnWorldChange(); doors::OnWorldChange();
+        }
     }
     hostWorld = note;
     Evaluate();
@@ -1630,12 +1674,28 @@ void StatusHints()
     if (now - menuAt < 1000) return;
     menuAt = now;
     const bool running = gCSession::GetInstance().IsGameRunning();
+    auto* manager = gCSession::GetInstance().GetGUIManager();
+    const bool inMenu = manager && manager->IsMenuOpen();
     const uint32_t trying = net::ConnectingFor();
-    if (!running) {
+    if (!config.host && rejoinHooks && !clientRejoin.pending)
+        hud::ClientNewGameEnabled(rejoin::MenuEnabled(true, rejoinHooks, nativeLoadDepth || nativeSaveDepth));
+    if (!running || inMenu) {
         if (!refusal.empty()) {
             if (hud::MenuLine(refusal.c_str())) menuSet = true;
+        } else if (!config.host && clientRejoin.pending) {
+            const auto hint = rejoinWait == rejoin::Wait::Save ? i18n::ClientRejoinWaitSave :
+                              rejoinWait == rejoin::Wait::Interaction ? i18n::ClientRejoinWaitTrade : i18n::ClientReturningToMenu;
+            if (hud::MenuLine(i18n::Text(hint))) menuSet = true;
+        } else if (!config.host && (clientRejoin.failed || restoreFailed)) {
+            if (hud::MenuLine(i18n::Text(i18n::ClientRejoinFailed))) menuSet = true;
+        } else if (joined && hostWorld.kind == net::KindMenu) {
+            if (hud::MenuLine(i18n::Text(i18n::ClientHostLoading))) menuSet = true;
         } else if (joined && needsNewHero) {
             if (hud::MenuLine(i18n::Text(i18n::SaveCharacterMissing))) menuSet = true;
+        } else if (joined && hostWorld.epoch && !ownCharacterReady) {
+            if (hud::MenuLine(i18n::Text(i18n::ClientChooseNewGame))) menuSet = true;
+        } else if (joined && ownCharacterReady) {
+            if (hud::MenuLine(i18n::Text(i18n::ClientMenuNewGame))) menuSet = true;
         } else {
             wchar_t text[700] = {};
             lobby::Format(lobby::Snapshot(), text, 700);
@@ -1666,6 +1726,67 @@ void StatusHints()
 
 }
 
+void SetWorldCleanup(void (*cleanup)()) { worldCleanup = cleanup; }
+bool ClientTransitionPending() { return !net::IsHost() && clientRejoin.pending; }
+bool ProcessClientTransition()
+{
+    if (net::IsHost() || !rejoinHooks || !clientRejoin.pending || ai::ShuttingDown()) return false;
+    // Never inspect a half-built native world, including frames nested in confirmation dialogs.
+    if (nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth) return false;
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    auto* infos = game.IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr;
+    const bool interaction = !trade::ReadyForSave() || (infos && infos->GetIsRunning()) ||
+        (manager && manager->IsAnyPageOpen() &&
+         (manager->GetActivePage() == gEGamePage_Trade || manager->GetActivePage() == gEGamePage_Dialog));
+    const rejoin::Boundary boundary{nativeLoadDepth != 0 || nativeSaveDepth != 0 || nativeNewGame,
+                                   processDepth != 0 || menuCommandDepth != 0,
+                                   captured.valid || requestPending, interaction};
+    const auto wait = clientRejoin.Waiting(boundary);
+    if (wait != rejoinWait) {
+        rejoinWait = wait;
+        Notice(wait == rejoin::Wait::Save ? i18n::ClientRejoinWaitSave :
+               wait == rejoin::Wait::Interaction ? i18n::ClientRejoinWaitTrade :
+               i18n::ClientReturningToMenu);
+    }
+    if (!worldCleanup || !clientRejoin.CanRetire(boundary)) return false;
+    if (!manager) {
+        clientRejoin.failed = true;
+        Log("persist: client return-to-menu waiting; native GUI unavailable");
+        return false;
+    }
+    ++nativeLoadDepth;
+    manager->ClosePage();
+    worldCleanup(); // Every puppet/mirror/lease/camera reference is released while the old entities are valid.
+    game.Stop();    // Native player/camera/control and running flags, not just the mod's admission flags.
+    manager->ClearAllEntities();
+    manager->CloseMenu();
+    const bool opened = manager->OpenMenu() != GEFalse;
+    --nativeLoadDepth;
+    ownCharacterReady = false; hostAdmissionAck = false; synced = 0;
+    localKind = net::KindMenu; freshLocalHero = false; newWorld = false; resetLocalWorld = false;
+    receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; receivedWelcome = 0;
+    needsNewHero = false; restoreFailed = false;
+    clientRejoin.Retired();
+    clientRejoin.failed = !opened || game.GetPlayer() != nullptr || game.IsGameRunning();
+    requestCharacterAgain = true;
+    rejoinWait = rejoin::Wait::None;
+    Logf("persist: client return-to-menu epoch=%08x ok=%d player=%p running=%d; own account record requested",
+         hostWorld.epoch, clientRejoin.failed ? 0 : 1, game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
+    hud::ClientNewGameEnabled(!clientRejoin.failed);
+    Notice(clientRejoin.failed ? i18n::ClientRejoinFailed : i18n::ClientChooseNewGame, clientRejoin.failed);
+    void* menu = deferredNewGameMenu;
+    deferredNewGameMenu = nullptr;
+    if (menu && !clientRejoin.failed) {
+        // Stop keeps the native menu alive. Reject a changed owner instead of calling a stale window.
+        void* vtable = nullptr;
+        if (Readable(menu, sizeof(vtable))) std::memcpy(&vtable, menu, sizeof(vtable));
+        if (vtable == nativeImage + 0x2d4c94) NewGameCommandDetour(menu, nullptr);
+        else { Log("persist: deferred New Game menu owner changed; choose New Game again"); Notice(i18n::ClientChooseNewGame); }
+    }
+    return true;
+}
+
 bool BeginFrame()
 {
     if (nativeLoadDepth || nativeSaveDepth) {
@@ -1677,15 +1798,35 @@ bool BeginFrame()
 }
 void EndFrame() { if (processDepth) --processDepth; }
 bool NativeLoading() { return nativeLoadDepth != 0; }
+bool PrepareShutdown()
+{
+    if (nativeLoadDepth || nativeSaveDepth) {
+        Logf("persist: shutdown still inside native operation load=%u save=%u; fast exit disabled",
+             nativeLoadDepth, nativeSaveDepth);
+        return false;
+    }
+    CancelSave("shutdown");
+    StopSaveTimer();
+    CleanupStaging();
+    RetryCleanup(GetTickCount() + 3001);
+    captured = {};
+    requestPending = false;
+    loading.clear();
+    receivedRecord.clear();
+    receivedPersonal.clear();
+    Log("persist: shutdown cooperative transfers cancelled; committed saves unchanged");
+    return true;
+}
 bool HeroPending()
 {
-    return pairedEnabled && (NativeLoading() || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
+    return pairedEnabled && (NativeLoading() || clientRejoin.pending || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
                              (!net::IsHost() && !net::InWorld(net::LocalId()) &&
                               (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady())));
 }
 void OnWorldActivate()
 {
     if (!loading.empty() || nativeSaveDepth) return;
+    if (!net::IsHost()) return; // Only successful HUD.NewGame authorizes a new client hero.
     newWorld = true;
     freshLocalHero = true;
     if (net::IsHost()) { current = {}; campaign.clear(); ownCharacterReady = false; localKind = net::KindMenu; NewEpoch(); }
@@ -1695,7 +1836,15 @@ void OnWorldDeactivate()
     if (!loading.empty() || nativeSaveDepth) return;
     ownCharacterReady = false; localKind = net::KindMenu;
     if (net::IsHost()) { current = {}; campaign.clear(); NewEpoch(); }
-    else net::SetInWorld(net::LocalId(), false);
+    else {
+        net::SetInWorld(net::LocalId(), false);
+        if (nativeNewGame || clientRejoin.pending) return;
+        freshLocalHero = false; newWorld = false; resetLocalWorld = false;
+        clientRejoin.Left();
+        receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; receivedWelcome = 0;
+        synced = 0; hostAdmissionAck = false; needsNewHero = false; restoreFailed = false;
+        requestCharacterAgain = true;
+    }
 }
 void Tick()
 {
@@ -1711,8 +1860,9 @@ void Tick()
         // Only a freshly initialized local hero is permitted when the host has no account record.
         if (net::IsHost()) {
             ownCharacterReady = true; current.key = {RandomId(), RandomId(), steam::PlayerId()}; NewEpoch();
-        } else if (needsNewHero) {
+        } else if (needsNewHero && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu)) {
             needsNewHero = false; freshLocalHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
+            clientRejoin.Left();
             story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
         }
     }
@@ -1765,7 +1915,14 @@ void Tick()
             captured.queued = SendRecord(1, net::CharacterCapture, {captured.note.world, captured.note.save, steam::PlayerId()}, captured.bytes);
         }
     }
-    if (!receivedRecord.empty() && !restoreFailed && !resetLocalWorld && running && receivedWelcome == net::WelcomeSerial() &&
+    if (clientRejoin.pending) return;
+    if (requestCharacterAgain && hostWorld.epoch && hostWorld.kind != net::KindMenu) {
+        net::WorldNote answer{};
+        answer.op = net::WorldOther; answer.kind = localKind; answer.epoch = hostWorld.epoch;
+        if (net::SendWorld(answer, 1)) requestCharacterAgain = false;
+    }
+    if (!receivedRecord.empty() && !restoreFailed && !resetLocalWorld && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu) &&
+        receivedWelcome == net::WelcomeSerial() &&
         receivedNote.epoch == hostWorld.epoch && static_cast<int32_t>(now - restoreAt) >= 0) {
         if (!PersonalReadyForRestore(receivedPersonal)) {
             if (now - restoreAt > 10000) { restoreFailed = true; SaveFailure("personal-hooks"); }
@@ -1778,6 +1935,7 @@ void Tick()
             restoreFailed = true; SaveFailure("personal-record"); return;
         }
         receivedRecord.clear(); receivedPersonal.clear(); ownCharacterReady = true; synced = hostWorld.epoch;
+        freshLocalHero = false; clientRejoin.Left();
         story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
     }
     if (ownCharacterReady && !net::InWorld(net::LocalId()) && synced == hostWorld.epoch &&
@@ -1804,8 +1962,6 @@ void Install()
     net::SetSaveHandler(&OnSave);
     net::SetCharacterHandler(&OnCharacter);
     net::SetWorldHandler(&OnWorld);
-    if (!SaveExtensions::Register("npclease", NpcLeaseExtension, 2, &CaptureNpcLease, &RestoreNpcLease))
-        Log("persist: NPC lease save overlay registration failed; lease gate remains active");
     unsigned char* resolved[5]{};
     if (!ResolveNative(resolved)) {
         Log("persist: save/load hooks not installed; host-managed saves off");
@@ -1829,6 +1985,17 @@ void Install()
     if (pairedEnabled) pairedEnabled = ReverifyNative();
     if (originalSave) saveTarget = resolved[0];
     if (originalLoad) loadTarget = resolved[1];
+    if (!net::IsHost() && rejoin::native::Matches(nativeImage, nativeImageSize)) {
+        originalNewGameCommand = reinterpret_cast<NewGameCommandFn>(ai::JumpTo(nativeImage + rejoin::native::Command.hint,
+            reinterpret_cast<void*>(&NewGameCommandDetour), rejoin::native::CommandStolen));
+        originalNewGame = reinterpret_cast<NewGameFn>(ai::JumpTo(nativeImage + rejoin::native::Loader.hint,
+            reinterpret_cast<void*>(&NewGameDetour), rejoin::native::LoaderStolen));
+        rejoinHooks = originalNewGameCommand && originalNewGame && pairedEnabled;
+        Logf("persist: client rejoin native hooks ready=%d; menu player gate and process-exit branch guarded", rejoinHooks ? 1 : 0);
+    } else if (!net::IsHost()) {
+        clientRejoin.failed = true;
+        Log("persist: client rejoin unavailable; native menu/loader ABI mismatch");
+    }
     installed = true;
     if (!pairedEnabled) {
         Logf("persist: save/load hook installation failed SaveGameFn=%d LoadGameFn=%d WorldSaveGameFn=%d WorldLoadGameFn=%d; partial hooks pass through, host-managed saves off",

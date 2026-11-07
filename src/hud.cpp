@@ -7,6 +7,7 @@
 #include "net.h"
 #include "persist.h"
 #include "remote.h"
+#include "movement.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -205,6 +206,7 @@ void Message(Kind kind, wchar_t const* text)
 void Tick()
 {
     if (ai::ShuttingDown() || persist::NativeLoading() || !gCSession::GetInstance().IsGameRunning()) return;
+    movement::Stage stage("passive HUD");
     SampleDue(GetTickCount());
     {
         std::lock_guard<std::mutex> lock(noticeMutex);
@@ -289,6 +291,17 @@ constexpr GEU32 VersionLine = 20812;
 std::wstring lineText;   // the version line as the game made it
 bCRect lineRect;
 bool lineSaved = false, lineChanged = false;
+}
+
+bool ClientNewGameEnabled(bool enabled)
+{
+    if (net::IsHost()) return false;
+    auto* manager = gCSession::GetInstance().GetGUIManager();
+    if (!manager || !manager->IsMenuOpen()) return false;
+    CFFGFCWnd* button = MenuElement(0x505b); // Verified CP New Game control, not Load or Save.
+    if (!button) return false;
+    button->EnableWindow(enabled);
+    return true;
 }
 
 // In the main menu the game's messages do not show (menutextdiag 24.10.: GUI2, the GUI manager's message and its subtitle

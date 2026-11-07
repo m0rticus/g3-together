@@ -16,6 +16,12 @@ without suppressing the engine's error. Clean native exits, including the separa
 still require manual acceptance on both game copies.
 Clients replay the host's final skeletal poses, facial-rig state and eight motion slots without NPC AI, navigation,
 autonomous tasks or prediction. Final poses include native blend-out layers that motion slots alone do not describe.
+Host capture includes the engine's processed NPC inventory around remote players, not just the host's interaction ROI.
+Unchanged streams refresh within the presentation grace window. When host presentation is genuinely unavailable,
+passive NPCs hold a successfully evaluated pose or a script-free native ambient pose; unevaluated bind poses are
+not accepted. Missing idle resources remain explicitly hidden until a real pose is available. This is not native
+routine walking or authority delegation for humans, merchants or story actors; those still require portable
+inventory/equipment and world-script transactions before safe client ownership and latest-state hand-back.
 NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.
 A client's successful hit plays an immediate presentation-only flinch and counts despite a host-side parry.
 Hit identities suppress the corresponding echoed reaction. Hero damage is judged against locally presented contacts,
@@ -148,6 +154,11 @@ handlers remain on the engine thread. `STEAMSTATUS`, `net: rtt` and `SYNCLATENCY
 send-to-flush residence and buffered NPC presentation. While playing, compact `SYNCBODY` and `SYNCNPC` counters report hard
 corrections, action corrections, stale mirrors and ownership takeover deferrals without per-entity scans.
 `SYNCCOMBAT` distinguishes locally judged hits, forwarded/applied claims and damage ignored while browsing inventory.
+Client `movement-frame:` lines separate engine gaps, persistence admission, module time and the slowest tick stage.
+`movement: event=held-key-stop` flags at least 150 ms without planar motion after movement while physical WASD/arrow
+keys remain held; it is a candidate, not proof of a bug (collisions and native tasks can stop movement). Nearby
+`movement-call:` lines identify recent local stop/task/mode calls by stage and native caller stack. Input bits are
+1=player can move, 2=session input, 4=device input, 8=GUI input; key masks sample WASD then arrows, not custom bindings.
 Share both players' ZIPs privately with the host first. User paths and IP addresses
 are redacted; Steam names/IDs can remain, so review before sharing further. Do not attach saves or unredacted INIs.
 [Without Python](docs/JOINING.md#if-something-goes-wrong), collect logs manually.

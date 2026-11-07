@@ -1390,6 +1390,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     reply.result.incarnation = npcs::Incarnation(guid);
     Entity target(npcs::NpcByGuid(guid));  // an NPC only: no chest, door, hero or puppet (Fable 1.7)
     if (!target.GetInstance() || target.IsDead()) return;
+    if (RejectDownedHit(target.GetInstance(), PlayerActor(from), "received-NPC-hit")) return;
     if (killOnce && killedHere.count(KillKey(guid))) {  // killed already, its death task not running yet (R9)
         ++killsRepeated;
         return;

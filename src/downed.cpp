@@ -12,6 +12,7 @@
 #include "net.h"
 #include "persist.h"
 #include "remote.h"
+#include "movement.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -59,6 +60,9 @@ constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still 
 Life life;                     // authority is the paid revive, not the native body's current state
 Recovery recovery;
 PeerRecovery puppetRecovery[net::MaxPlayers];
+InteractionProtection interaction;
+eCEntity* interactionHero = nullptr;
+bool interactionWorldActive = true;
 bool recoveryUnknownNoted = false;
 bool maintainingHp = false;
 bool lethal = false;            // the knock-out it lies in replaced its death (RedirectDeath)
@@ -89,6 +93,55 @@ uint32_t paidSequence[net::MaxPlayers] = {};
 uint32_t pendingReviveSequence = 0;
 unsigned transitions = 0, corrections = 0;
 uint32_t lastCorrection = 0;
+
+int NativeInteractionPage(gCGUIManager* manager)
+{
+    if (!manager) return -1;
+    static bool checked = false, supported = false;
+    if (!checked) {
+        HMODULE game = GetModuleHandleA("Game.dll");
+        if (!game) return -1;
+        checked = true;
+        auto* code = reinterpret_cast<unsigned char*>(game);
+        static unsigned char const pageBytes[] = {
+            0x8b, 0x41, 0x08, 0x85, 0xc0, 0x74, 0x11, 0x83, 0x78, 0x48, 0xff, 0x0f, 0x95, 0xc0,
+            0x84, 0xc0, 0x74, 0x06, 0xb8, 0x11, 0x00, 0x00, 0x00, 0xc3, 0x8b, 0x49, 0x04,
+            0x85, 0xc9, 0x74, 0x07, 0x8b, 0x81, 0x84, 0x00, 0x00, 0x00, 0xc3, 0x83, 0xc8, 0xff, 0xc3
+        };
+        static unsigned char const tutorialSelect[] = {0x83, 0xff, 0x0f};
+        static unsigned char const tutorialSave[] = {
+            0x8b, 0x85, 0x84, 0x00, 0x00, 0x00, 0x89, 0x85, 0x88, 0x00, 0x00, 0x00
+        };
+        supported = GetProcAddress(game, "?GetActivePage@gCGUIManager@@QBE?AW4gEGamePage@@XZ") ==
+                        reinterpret_cast<FARPROC>(code + 0x7b490) &&
+                    !std::memcmp(code + 0x7b490, pageBytes, sizeof(pageBytes)) &&
+                    !std::memcmp(code + 0x8b359, tutorialSelect, sizeof(tutorialSelect)) &&
+                    !std::memcmp(code + 0x8b384, tutorialSave, sizeof(tutorialSave));
+        Log(supported ? "downed: native interaction pages ready (dialog/trade beneath overlays and tutorial)"
+                      : "downed: ANOMALY interaction page layout mismatch; overlay protection unavailable");
+    }
+    if (!supported) return static_cast<int>(manager->GetActivePage());
+    // GetActivePage masks the main page with secondary overlays; tutorial saves it at +0x88.
+    void* root = nullptr;
+    std::memcpy(&root, reinterpret_cast<unsigned char*>(manager) + 4, sizeof(root));
+    if (!root) return -1;
+    int page = -1, beforeTutorial = -1;
+    std::memcpy(&page, static_cast<unsigned char*>(root) + 0x84, sizeof(page));
+    if (page == gEGamePage_Tutorial)
+        std::memcpy(&beforeTutorial, static_cast<unsigned char*>(root) + 0x88, sizeof(beforeTutorial));
+    return InteractionPage(page, beforeTutorial);
+}
+
+uint8_t InteractionOf(eCEntity* entity)
+{
+    if (!entity) return 0;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (hero && (entity == hero || entity == remote::ControlledBody())) return LocalInteractionFlags();
+    const int id = remote::PuppetOwner(entity);
+    if (id <= 0 || id >= net::MaxPlayers || !interactionWorldActive ||
+        persist::NativeLoading() || persist::HeroPending() || ai::ShuttingDown()) return 0;
+    return PlayerInteractionFlags(static_cast<unsigned>(id));
+}
 
 bool TrackPuppetRecovery(int id)
 {
@@ -190,6 +243,12 @@ bool RejectHp(eCEntity* entity, bCString const& tag, int value, bool additive, c
 void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer<gEAIMode> const& value)
 {
     eCEntity* entity = self ? self->GetEntity() : nullptr;
+    const int requested = static_cast<int>(value.GetValue());
+    if ((requested == gEAIMode_Down || requested == gEAIMode_Dead) && InteractionOf(entity) &&
+        RejectHarm(entity, nullptr, "SetAIMode")) return;
+    char modeText[24];
+    Format(modeText, sizeof(modeText), "%d", static_cast<int>(value.GetValue()));
+    movement::Touch(entity, "SetAIMode", modeText, _ReturnAddress());
     if (LocalTerminal(entity)) {
         const int mode = static_cast<int>(value.GetValue());
         const bool refused = !life.TerminalModeAllowed(mode);
@@ -260,6 +319,7 @@ GEBool __fastcall SetValue(gCPlayerMemory_PS* self, void* edx, bCString const& t
 void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, GEBool caught)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
+    movement::Touch(entity, "AISetTask", task.GetText(), _ReturnAddress());
     if (RejectReaction(entity, task.GetText(), "AISetTask")) return;
     if (LocalTerminal(entity)) {
         const bool refused = !life.TerminalTaskAllowed(task.GetText());
@@ -273,6 +333,7 @@ void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, 
 void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
+    movement::Touch(entity, "AISetState", state.GetText(), _ReturnAddress());
     if (RejectReaction(entity, state.GetText(), "AISetState")) return;
     if (LocalTerminal(entity)) {
         const bool refused = !life.TerminalStateAllowed(state.GetText());
@@ -439,7 +500,8 @@ void LogHelpers(Entity* hero, char const* event, uint32_t now)
              (net::IsHost() ? net::PeerJoined(static_cast<uint8_t>(i)) : net::Joined() && r.connected) ? 1 : 0,
              net::InWorld(static_cast<uint8_t>(i)) ? 1 : 0, r.activity.known ? 1 : 0,
              r.activity.known ? now - r.activity.ticks : 0, r.activity.sequence, r.activity.flags,
-             (r.activity.flags & 32) ? 1 : 0, (r.activity.flags & 64) ? 1 : 0,
+             (!(r.activity.flags & 1) && (r.activity.flags & 32)) ? 1 : 0,
+             (!(r.activity.flags & 1) && (r.activity.flags & 64)) ? 1 : 0,
              r.latestTicks ? 1 : 0, r.latestTicks ? now - r.latestTicks : 0, r.latest.sequence,
              r.latest.flags, r.activity.downedSequence, hero ? remote::CurrentWorld() : 0, r.activity.world,
              r.latest.world, net::WorldEpoch(), r.activity.epoch,
@@ -839,6 +901,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
 {
     if (!enabled || life.terminal || !self || self != gCSession::GetInstance().GetHero()) return false;
     if (std::strcmp(state, "ZS_Dead") != 0 && std::strcmp(state, "ZS_RagDollDead") != 0) return false;
+    if (RejectHarm(self, nullptr, "redirect-death")) return true;
     Entity hero(self);
     hero.Routine.FullStop();
     hero.Routine.SetTask(bCString(KnockOutTask));
@@ -890,6 +953,7 @@ bool GuardState(eCEntity* self, char const* state)
 // loading or disconnected partner activity retains the original 5-second grace; distance/world location does not.
 void Tick()
 {
+    LocalInteractionFlags();
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
     if (!instance) {
@@ -961,7 +1025,12 @@ void Tick()
         CancelAlone("hero-restore");
         return;
     }
-    WatchBlows(hero, now);
+    if (LocalInteractionFlags()) {
+        lastHp = hero.PlayerMemory.GetHitPoints();
+        lethalBlowAt = 0;
+    } else {
+        WatchBlows(hero, now);
+    }
     const bool down = hero.IsDown();
     if (!down && !life.held) {
         for (int i = 0; i < 2; ++i) {
@@ -1087,18 +1156,75 @@ void HelperHasNoPotion(int byPlayer)
 
 bool Held() { return life.held; }
 
+uint8_t LocalInteractionFlags()
+{
+    gCSession& session = gCSession::GetInstance();
+    eCEntity* hero = session.GetHero();
+    if (hero != interactionHero) {
+        interaction.Clear();
+        interactionHero = hero;
+    }
+    const uint32_t now = net::Now();
+    static uint8_t lastFlags = 0;
+    const uint8_t before = lastFlags;
+    const bool eligible = interactionWorldActive && hero && session.IsGameRunning() &&
+                          !ai::ShuttingDown() && !persist::NativeLoading() && !persist::HeroPending() &&
+                          !life.held && !life.terminal;
+    if (!eligible) {
+        interaction.Clear();
+    } else {
+        Entity player(hero);
+        const bool alive = !player.IsDead() && !player.IsDown();
+        const int page = alive ? NativeInteractionPage(session.GetGUIManager()) : -1;
+        gCInfoManager_PS* infos = alive ? gCInfoManager_PS::GetInstance() : nullptr;
+        eCEntity* partner = infos && infos->AccessIsRunning() && !infos->AccessEndRequested() &&
+                           infos->GetDialogPartner1() == hero ? infos->GetDialogPartnerNPC() : nullptr;
+        const bool spoken = partner && partner != hero &&
+                            partner->GetPropertySet(eEPropertySetType_NPC) && !Entity(partner).IsDead();
+        const bool dialogue = DialogueObserved(page, infos && infos->AccessIsRunning(),
+                                              infos && infos->AccessEndRequested(),
+                                              infos && infos->GetDialogPartner1() == hero, spoken);
+        interaction.Observe(alive, dialogue, page == gEGamePage_Trade, now);
+    }
+    const uint8_t flags = interaction.Flags(now);
+    if (before != flags)
+        Logf("PROTECTION role=%s player=%u reason=%s previous=%s flags=%u grace_ms=%u",
+             net::IsHost() ? "host" : "client", net::LocalId(), InteractionReason(flags),
+             InteractionReason(before), flags, (flags & InteractionGrace) ? InteractionGraceMs : 0);
+    lastFlags = flags;
+    return flags;
+}
+
+uint8_t PlayerInteractionFlags(unsigned player)
+{
+    if (!player || player >= net::MaxPlayers) return 0;
+    if (player == net::LocalId()) return LocalInteractionFlags();
+    if (!interactionWorldActive || ai::ShuttingDown() || persist::NativeLoading() ||
+        persist::HeroPending() || !gCSession::GetInstance().IsGameRunning()) return 0;
+    net::Remote const& r = net::Remotes()[player];
+    return PeerInteraction(r.connected, r.activity.known, r.activity.ticks, r.activity.world,
+                           remote::CurrentWorld(), r.activity.flags, net::Now());
+}
+
+void OnWorldDeactivate()
+{
+    interaction.Clear();
+    interactionHero = nullptr;
+    interactionWorldActive = false;
+}
+
 bool HarmProtected(eCEntity* entity)
 {
     if (!entity || ai::ShuttingDown() || persist::NativeLoading() || persist::HeroPending() ||
         !gCSession::GetInstance().IsGameRunning()) return false;
     eCEntity* hero = gCSession::GetInstance().GetHero();
     if (hero && (entity == hero || entity == remote::ControlledBody()))
-        return HarmImmune(true, life.held, life.terminal, 0, recovery.Protected(net::Now()));
+        return HarmImmune(true, life.held, life.terminal, 0, recovery.Protected(net::Now()), LocalInteractionFlags() != 0);
     const int id = remote::PuppetOwner(entity);
     if (id <= 0 || id >= net::MaxPlayers) return false;
     net::Remote const& r = net::Remotes()[id];
     const bool present = r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld();
-    return HarmImmune(present, false, false, r.latest.flags, TrackPuppetRecovery(id));
+    return HarmImmune(present, false, false, r.latest.flags, TrackPuppetRecovery(id)) || InteractionOf(entity) != 0;
 }
 
 bool SyntheticProne(eCEntity* victim)
@@ -1118,16 +1244,18 @@ void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int 
     const bCString task = player.Routine.GetCurrentTask(), state = player.Routine.GetCurrentState();
     const int pose = static_cast<int>(player.Routine.AniState);
     const uint32_t now = net::Now();
-    if (!life.held && !life.terminal && !recovery.Protected(now) && !(pose >= 15 && pose <= 21) &&
+    const uint8_t interactionFlags = LocalInteractionFlags();
+    if (!interactionFlags && !life.held && !life.terminal && !recovery.Protected(now) && !(pose >= 15 && pose <= 21) &&
         !HarmfulReaction(task.GetText()) && !HarmfulReaction(state.GetText()) &&
         !std::strstr(task.GetText(), "Fall") && !std::strstr(state.GetText(), "Fall")) return;
     Logf("GROUNDHIT role=%s player=%u episode=%u path=%s attacker=%s hp=%d->%d held=%d terminal=%d "
-         "rising=%d grace_ms=%u ai=%d ani=%d task=%s state=%s decision=%s",
+         "rising=%d grace_ms=%u ai=%d ani=%d task=%s state=%s decision=%s protection=%s",
          net::IsHost() ? "host" : "client", net::LocalId(), life.sequence, path,
          attacker ? Entity(attacker).GetName().GetText() : "-", before, after,
          life.held ? 1 : 0, life.terminal ? 1 : 0, recovery.rising ? 1 : 0,
          recovery.grace && now - recovery.stoodAt < ReviveGraceMs ? ReviveGraceMs - (now - recovery.stoodAt) : 0,
-         static_cast<int>(player.Routine.AIMode), pose, task.GetText(), state.GetText(), decision);
+         static_cast<int>(player.Routine.AIMode), pose, task.GetText(), state.GetText(), decision,
+         InteractionReason(interactionFlags));
 }
 
 bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path)
@@ -1137,6 +1265,18 @@ bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path)
     const int hp = victim->GetPropertySet(eEPropertySetType_PlayerMemory)
         ? player.PlayerMemory.GetHitPoints() : static_cast<int>(player.DamageReceiver.HitPoints);
     LogGroundEvent(victim, attacker, path, hp, hp, "reject-before-effects");
+    if (const uint8_t flags = InteractionOf(victim)) {
+        static unsigned refused = 0;
+        static uint32_t lastLog = 0;
+        const uint32_t now = net::Now();
+        if (++refused <= 40 || now - lastLog >= 5000) {
+            lastLog = now;
+            const int id = remote::PuppetOwner(victim);
+            Logf("PROTECTEDHIT role=%s player=%u path=%s reason=%s hp=%d decision=reject-before-effects",
+                 net::IsHost() ? "host" : "client", id ? static_cast<unsigned>(id) : net::LocalId(),
+                 path, InteractionReason(flags), hp);
+        }
+    }
     if (victim->GetPropertySet(eEPropertySetType_DamageReceiver)) player.DamageReceiver.DamageAmount = 0;
     return true;
 }
@@ -1229,6 +1369,7 @@ void Restore(bool waiting, char const* source)
 
 void NoteBlow()
 {
+    if (LocalInteractionFlags()) return;
     lethalBlowAt = net::Now() ? net::Now() : 1;
 }
 
@@ -1244,6 +1385,9 @@ bool NativeDown()
 
 void OnWorldChange()
 {
+    interaction.Clear();
+    interactionHero = nullptr;
+    interactionWorldActive = true;
     life.OnWorldChange(); // old-world paid revives must not apply after the load
     recovery.Clear();
     recoveryUnknownNoted = false;

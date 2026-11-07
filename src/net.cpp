@@ -4,6 +4,8 @@
 #include "net.h"
 
 #include "enet_policy.h"
+#include "downed.h"
+#include "downed_policy.h"
 #include "latency.h"
 #include "log.h"
 #include "npcwire_adapter.h"
@@ -985,7 +987,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             return;
         }
         if (!message.id || message.id >= MaxPlayers || message.id == localId ||
-            (message.flags & 128) || ((message.flags & 1) && (message.flags & 96))) return;
+            !downed::ValidActivityFlags(message.flags)) return;
         Remote& r = remotes[message.id];
         r.activity.Accept(message.sequence, enet_time_get(), message.world, message.epoch,
                           message.flags, message.downedSequence);
@@ -1531,6 +1533,11 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         if (message.delta < -1000000 || message.delta > 0) return;  // damage only, no overflow
         if (isHost && message.attackerPlayer) message.attackerPlayer = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        if (isHost && downed::PlayerInteractionFlags(message.to)) {
+            Logf("net: player hit refused target=%u reason=%s", message.to,
+                 downed::InteractionReason(downed::PlayerInteractionFlags(message.to)));
+            return;
+        }
         if (isHost && message.to > 1 && message.to < MaxPlayers) {  // for another client: never the host's hero, even if it just left
             if (peers[message.to]) Send(peers[message.to], &message, sizeof(message), ChannelCombat, true);
             return;
@@ -2466,6 +2473,11 @@ void SendHitResult(uint8_t to, HitResult const& result)
 void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill)
 {
     if (!host || playerId == localId || playerId >= MaxPlayers) return;
+    if (downed::PlayerInteractionFlags(playerId)) {
+        Logf("net: player hit not sent target=%u reason=%s", playerId,
+             downed::InteractionReason(downed::PlayerInteractionFlags(playerId)));
+        return;
+    }
     HitPlayerMsg message{MsgHitPlayer, delta, {}, attackerPlayer, playerId, static_cast<uint8_t>(meansToKill ? 1 : 0)};
     std::memcpy(message.attacker, attacker, 16);
     SendToPeer(&message, sizeof(message), ChannelCombat, true, playerId);

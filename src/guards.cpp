@@ -7,6 +7,7 @@
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "movement.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -347,6 +348,16 @@ Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor)
 }
 
 Acting::~Acting() { actor = before; }
+
+LocalPlayer::LocalPlayer(bool local) : before(actor)
+{
+    if (local) {
+        if (actor) movement::Touch(remote::ControlledBody(), "local-context", "puppet-context-cleared");
+        actor = nullptr;
+    }
+}
+
+LocalPlayer::~LocalPlayer() { actor = before; }
 
 eCEntity* CurrentActor() { return actor; }
 bool PlayerContextReady() { return originalGetPlayer && originalIsPlayer; }

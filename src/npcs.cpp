@@ -26,6 +26,7 @@
 #include "contact.h"
 #include "combat_timing.h"
 #include "guards.h"
+#include "npcsend_candidates.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -760,7 +761,28 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     lastPlayerCount = playerCount;
     for (int k = 0; k < playerCount; ++k) std::memcpy(lastPlayers[k], players[k], sizeof(float) * 3);
     eCEntity* controlled = remote::ControlledBody();
+    std::vector<npcsend_candidates::Candidate> candidates;
+    const auto addCandidate = [&](eCEntity* instance) {
+        if (!instance) {
+            candidates.push_back(npcsend_candidates::Candidate{std::string(), false, false, false, false, true});
+            return;
+        }
+        uint8_t guid[16];
+        guid::CopyEntity(instance, guid);
+        candidates.push_back(npcsend_candidates::Candidate{
+            std::string(reinterpret_cast<char const*>(guid), 16),
+            instance->GetPropertySet(eEPropertySetType_NPC) != nullptr,
+            instance->GetPropertySet(eEPropertySetType_PlayerMemory) != nullptr,
+            instance == hero || instance == controlled,
+            remote::IsPuppet(instance),
+            false
+        });
+    };
     const bTObjArray<Entity> all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i) addCandidate(all.GetAt(i).GetInstance());
+    auto const* processed = world::ProcessedEntities();
+    for (GEU16 i = 0; processed && i < processed->GetCount(); ++i) addCandidate(processed->GetAt(i));
+    const std::vector<std::string> candidateKeys = npcsend_candidates::Union(candidates);
     eCEntity* hostFocus = controlled && controlled->GetPropertySet(eEPropertySetType_Focus)
         ? Entity(controlled).Focus.GetFocusEntity().GetInstance() : nullptr;
     eCEntity* hostTarget = controlled && controlled->GetPropertySet(eEPropertySetType_NPC)
@@ -775,8 +797,8 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     uint32_t stretchOf[net::MaxPlayers];
     for (uint8_t id = 0; id < net::MaxPlayers; ++id)
         stretchOf[id] = id >= 2 ? net::NpcStretchPermille(id) : npcsend::StretchNormal;
-    for (int i = 0; i < all.GetCount(); ++i) {
-        Entity const& npc = all.GetAt(i);
+    for (std::string const& candidateKey : candidateKeys) {
+        Entity npc = guid::Resolve(reinterpret_cast<uint8_t const*>(candidateKey.data()));
         eCEntity* instance = npc.GetInstance();
         if (!instance || instance == hero || remote::IsPuppet(instance)) continue;
         if (instance == controlled) continue;  // a transformed player's creature travels as its player state

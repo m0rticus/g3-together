@@ -33,6 +33,7 @@ struct PlayerState
     uint8_t flags = 0;       // bit 0: in game (hero present, session running), bit 1: knocked out, bit 2: dead,
                              // bit 3: waiting for help (a death turned into a knock-out, downed.cpp), bit 4: knocked out
                              // by the game's own rules (a guard, not a death): the winner may rob it (ransack.cpp)
+                             // While playing: bits 5/6/7 = dialogue/trade/1500-ms interaction close grace.
     uint8_t movementMode = 0;  // gECharMovementMode of the hero: stand, sneak, walk, run, sprint, jump, swim
     uint8_t aniState = 0;      // gEAniState of the hero (stand 2, lying knocked out 16, ...): which motions fit
     char name[24] = {};
@@ -97,7 +98,7 @@ static_assert(sizeof(NpcRecord) == 588, "NPC full-record fallback wire layout ch
 struct PlayerActivity
 {
     uint32_t sequence = 0, ticks = 0, world = 0, epoch = 0, downedSequence = 0;
-    uint8_t flags = 0; // player life flags; bit 5: hero restore/loading, bit 6: no running hero/menu
+    uint8_t flags = 0; // same full player flags byte; when not playing, bit5=loading and bit6=no running hero/menu
     bool known = false;
 
     bool Accept(uint32_t next, uint32_t arrived, uint32_t location, uint32_t generation,

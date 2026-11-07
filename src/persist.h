@@ -18,8 +18,12 @@ bool BeginFrame();
 void EndFrame();
 bool NativeLoading();      // no native entity inspection until the synchronous loader returns
 bool HeroPending();        // world/character restoration or fresh local New Game is still required
+void SetWorldCleanup(void (*cleanup)());
+bool ProcessClientTransition(); // outer module boundary only; true consumes this frame
+bool ClientTransitionPending();
 void OnWorldActivate();    // from the engine module's callbacks
 void OnWorldDeactivate();
+bool PrepareShutdown();    // cancel cooperative staging; false while native save/load still owns the stack
 using LogFn = void (*)(char const*);
 void Off(LogFn log);     // QA negative control: write no sidecar
 // Retired compatibility commands; they only explain retirement, never alter saving/admission.

@@ -151,7 +151,7 @@ bool LocalState(net::PlayerState& state)
     const bool robbable = downed::NativeDown();
     state.flags = 1 | (Entity(own).IsDown() ? 2 : 0) |
                   ((Entity(own).IsDead() || downed::Terminal()) ? 4 : 0) |
-                  (downed::Held() ? 8 : 0) | (robbable ? 16 : 0);
+                  (downed::Held() ? 8 : 0) | (robbable ? 16 : 0) | downed::LocalInteractionFlags();
     state.downedSequence = downed::Sequence();
     state.gold = robbable ? Entity(own).Inventory.GetItemAmount(Template("It_Gold")) : 0;
     state.movementMode = static_cast<uint8_t>(Entity(hero).CharacterMovement.GetMovementMode());

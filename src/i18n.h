@@ -67,6 +67,15 @@ enum Message
     SaveCharacterMissing,
     SaveFailureReason,
     HostLoadsOnly,
+    ClientHostWorldChanged,
+    ClientReturningToMenu,
+    ClientRejoinWaitSave,
+    ClientRejoinWaitTrade,
+    ClientChooseNewGame,
+    ClientHostLoading,
+    ClientSaveCanceledByWorld,
+    ClientRejoinFailed,
+    ClientMenuNewGame,
     MessageCount
 };
 

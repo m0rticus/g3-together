@@ -37,6 +37,20 @@ int main(int argc, char** argv)
     assert(Find(decoded, Character, 12)->bytes == save.blocks[4].bytes);
     assert(!Find(decoded, Character, 13)); // Account identity, not display name/network slot.
     assert(Find(decoded, 256)->version == 7);
+    // Retired lease payloads are opaque: only container framing/CRC remain authoritative.
+    for (uint32_t version : {1u, 2u, 7u}) {
+        for (Bytes const& ignored : {Bytes{}, Bytes{'n','p','c','l','e','a','s','e','1',' ','!'},
+                                    Bytes(20 + 261, 1), Bytes(20 + 262, 2)}) {
+            Save old = save;
+            Set(old, {256, version, 0, ignored});
+            Bytes container;
+            Save loaded;
+            assert(Encode(old, container) && Decode(container, loaded));
+            assert(Find(loaded, 256)->bytes == ignored);
+            container.back() ^= 0x80;
+            assert(!Decode(container, loaded)); // Do not weaken outer checksums.
+        }
+    }
     assert(!Find(decoded, Personal, 12)); // Earlier G3TSAVE3 remains a valid native/default personal-state migration.
     Bytes personal, player;
     assert(g3t::saving::personal::Encode({}, personal));
