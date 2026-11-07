@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <cmath>
 
 int main()
 {
@@ -22,6 +23,24 @@ int main()
     assert(PresentationFresh(true, false, 1100, 250));
     assert(!PresentationFresh(true, false, 1101, 250));
     using namespace g3t::npclease;
+    assert(CharacterPresentation("Slave_04", true, true, true, true));
+    assert(CharacterPresentation("Wolf", true, true, true, true));
+    assert(!CharacterPresentation("G3_Object_Interact_Innos_Statue_01", true, true, true, true));
+    assert(!CharacterPresentation("Door", false, true, true, true));
+    assert(!CharacterPresentation("Statue", true, true, false, true));
+    assert(!CharacterPresentation("Item", true, false, true, true));
+    assert(!CharacterPresentation("Dummy", true, true, true, false));
+    assert(!CharacterPresentation(nullptr, true, true, true, true));
+    assert(std::fabs(IdleTime(0, 4.0f) - 1.0f) < 0.001f);
+    assert(std::fabs(IdleTime(500, 4.0f) - 1.5f) < 0.001f);
+    assert(std::fabs(IdleTime(4000, 4.0f) - 1.0f) < 0.001f);
+    assert(IdleTime(1, 0.0f) == 0.0f);
+    assert(IdleTime(1, INFINITY) == 0.0f);
+    assert(PortableCreatureSlot(false, false, false, false));
+    assert(PortableCreatureSlot(true, true, true, true));
+    assert(!PortableCreatureSlot(true, true, false, true));
+    assert(!PortableCreatureSlot(true, true, true, false));
+    assert(!PortableCreatureSlot(true, false, true, true));
     int actor, instance, nodes, replacement;
     PresentationRig rig{&actor, &instance, &nodes, 20, false};
     PresentationProof proof;
@@ -46,6 +65,8 @@ int main()
     changed = rig; changed.facial = true;
     assert(!proof.Usable(changed));
     proof.Record(changed, PoseProvenance::Idle, true, true);
+    assert(proof.Usable(changed));
+    proof.Record(changed, PoseProvenance::Native, true, true);
     assert(proof.Usable(changed));
     proof.Record(changed, PoseProvenance::Canonical, true, true);
     assert(proof.Usable(changed) && proof.provenance == PoseProvenance::Canonical);

@@ -27,6 +27,7 @@
 #include "combat_timing.h"
 #include "guards.h"
 #include "npcsend_candidates.h"
+#include "npcidentity_policy.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -51,6 +52,14 @@ struct LastSent { net::NpcRecord record; uint32_t at = 0, movingUntil = 0; };
 std::unordered_map<std::string, LastSent> lastSent;
 struct AwaitedHit { uint32_t sequence = 0, incarnation = 0; };
 std::unordered_map<std::string, AwaitedHit> awaitedHits;
+struct QuarantinedEntity {
+    npcidentity::Guid guid{};
+    npcidentity::Guid rootGuid{};
+    eCEntity const* root = nullptr;
+    bool rendering = false, picking = false, collision = false, processingDisabled = false;
+};
+std::unordered_map<eCEntity const*, QuarantinedEntity> quarantinedEntities;
+uint32_t identityCensusAt = 0, identityLogAt = 0;
 std::unordered_map<std::string, npcsend::State> recipientNpcs[net::MaxPlayers];
 uint32_t recipientGenerations[net::MaxPlayers] = {};
 npcsend::InitialPacer initialPacers[net::MaxPlayers];
@@ -479,7 +488,7 @@ void EnsureItem(Entity& npc, uint32_t hash)
 
 bool IsNpc(eCEntity* instance)
 {
-    return instance && instance->GetPropertySet(eEPropertySetType_NPC) && instance->GetPropertySet(eEPropertySetType_ScriptRoutine) &&
+    return npcplayback::IsCharacter(instance) && instance->GetPropertySet(eEPropertySetType_ScriptRoutine) &&
            instance->GetPropertySet(eEPropertySetType_DamageReceiver) && instance != gCSession::GetInstance().GetHero() &&
            instance != remote::ControlledBody() && !instance->GetPropertySet(eEPropertySetType_PlayerMemory) &&
            !remote::IsPuppet(instance);
@@ -771,7 +780,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         guid::CopyEntity(instance, guid);
         candidates.push_back(npcsend_candidates::Candidate{
             std::string(reinterpret_cast<char const*>(guid), 16),
-            instance->GetPropertySet(eEPropertySetType_NPC) != nullptr,
+            npcplayback::IsCharacter(instance),
             instance->GetPropertySet(eEPropertySetType_PlayerMemory) != nullptr,
             instance == hero || instance == controlled,
             remote::IsPuppet(instance),
@@ -3602,6 +3611,7 @@ bool HostPresentationAvailable(eCEntity const* entity)
     const auto found = mirrors.find(Key(identity));
     if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
     const auto& mirror = found->second;
+    if (mirror.entity.GetInstance() != entity) return false;
     return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
         npcplayback::PoseInterval(mirror.latest));
 }
@@ -3612,8 +3622,232 @@ bool HostCanPresent(uint8_t const identity[16])
     return found != lastSent.end() && net::Now() - found->second.at <= npclease::PresentationGraceMs;
 }
 
+namespace {
+npcidentity::Candidate IdentityCandidate(eCEntity* entity)
+{
+    npcidentity::Candidate candidate;
+    if (!entity) return candidate;
+    candidate.instance = reinterpret_cast<uintptr_t>(entity);
+    Guid(entity, candidate.guid.data());
+    std::memcpy(candidate.templateId.data(), &entity->GetTemplateID().GetCore(), 16);
+    candidate.name = entity->GetName().GetText();
+    if (!IsNpc(entity) || entity->GetPropertySet(eEPropertySetType_Item) ||
+        entity->GetPropertySet(eEPropertySetType_Magic) || npcremoval::Suppressed(entity)) return candidate;
+    Entity npc(entity);
+    if (entity->GetPropertySet(eEPropertySetType_Interaction) &&
+        npc.Interaction.GetOwner().GetInstance()) return candidate;
+    if (auto* party = static_cast<gCParty_PS*>(entity->GetPropertySet(eEPropertySetType_Party))) {
+        if (npc.Party.GetPartyLeader().GetInstance() || npc.Party.Waiting ||
+            static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) != gEPartyMemberType_None ||
+            party->GetMembers().GetCount()) return candidate;
+    }
+    const auto mirror = mirrors.find(Key(candidate.guid.data()));
+    if (mirror != mirrors.end() && (mirror->second.latest.partyPlayer || mirror->second.latest.guidePlayer))
+        return candidate;
+    if (claimedBy.count(Key(candidate.guid.data())) || directedBy.count(Key(candidate.guid.data())) ||
+        talk::TalkingWithHero(entity) || talk::IsHeld(entity)) return candidate;
+    candidate.protectedRole = false;
+    return candidate;
+}
+
+bool IndependentActor(eCEntity* entity)
+{
+    return entity && (entity->GetPropertySet(eEPropertySetType_NPC) ||
+        entity->GetPropertySet(eEPropertySetType_PlayerMemory) || remote::IsPuppet(entity) ||
+        entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody());
+}
+
+bool ActorDescendant(eCEntity* entity)
+{
+    for (int i = 0; i < entity->GetChildrenCount(); ++i)
+        if (auto* child = entity->GetChildAt(i); child && (IndependentActor(child) || ActorDescendant(child)))
+            return true;
+    return false;
+}
+
+void QuarantineTree(eCEntity* entity, eCEntity* root)
+{
+    auto [found, inserted] = quarantinedEntities.try_emplace(entity);
+    auto& saved = found->second;
+    npcidentity::Guid identity;
+    Guid(entity, identity.data());
+    if (inserted || saved.guid != identity) {
+        saved.guid = identity;
+        saved.root = root;
+        Guid(root, saved.rootGuid.data());
+        saved.rendering = entity->IsRenderingEnabled() != GEFalse;
+        saved.picking = entity->IsPickable() != GEFalse;
+        saved.collision = entity->GetEntityFlags().m_CollisionEnabled != 0;
+        saved.processingDisabled = entity->IsProcessingDisabled() != GEFalse;
+    }
+    entity->DisableProcessing(GETrue);
+    entity->EnableRendering(GEFalse);
+    entity->EnablePicking(GEFalse, GEFalse);
+    entity->EnableCollision(GEFalse);
+    for (int i = 0; i < entity->GetChildrenCount(); ++i)
+        if (auto* child = entity->GetChildAt(i); child && !IndependentActor(child)) QuarantineTree(child, root);
+}
+
+void LogIdentity(char const* kind, eCEntity* entity, eCEntity* keeper)
+{
+    const auto candidate = IdentityCandidate(entity);
+    const auto mirror = mirrors.find(Key(candidate.guid.data()));
+    char id[40], prototype[40];
+    guid::Format(candidate.guid.data(), id, sizeof(id));
+    guid::Format(candidate.templateId.data(), prototype, sizeof(prototype));
+    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+    const auto* creator = entity->GetCreator();
+    auto const& p = entity->GetWorldPosition();
+    Logf("npcs: %s guid=%s entity=%p keeper=%p name=%s template=%s template_guid=%s pos=%.1f,%.1f,%.1f "
+         "processing=%d rendering=%d bound=%d pose=%d host_age_ms=%u lease=%d fenced=%d protected=%d "
+         "actor=%p bodyparts=%d source=%s",
+         kind, id, entity, keeper, candidate.name.c_str(), creator ? creator->GetName().GetText() : "(unknown)",
+         prototype, p.GetX(), p.GetY(), p.GetZ(), !entity->IsProcessingDisabled(), entity->IsRenderingEnabled(),
+         mirror != mirrors.end() && mirror->second.entity.GetInstance() == entity,
+         mirror != mirrors.end() && mirror->second.entity.GetInstance() == entity && mirror->second.replayReady,
+         HostPresentationAge(entity), npclease::LocalAuthority(entity), npclease::Fenced(entity), candidate.protectedRole,
+         animation ? animation->GetActor() : nullptr,
+         animation ? animation->GetAnimationFactory().GetAdditionalBodyParts().GetCount() : 0,
+         RedundantClientEntity(entity) ? "identity-quarantine" : "native-or-unknown");
+    if (animation) {
+        auto& factory = animation->GetAnimationFactory();
+        Logf("npcs: NPCVISUAL guid=%s entity=%p main=%s facial=%d attachments=%u",
+             id, entity, factory.GetMainActorFileName().GetText(), factory.IsFacialAnimationStarted(),
+             animation->GetNumAttachments());
+        auto const& parts = factory.GetAdditionalBodyParts();
+        for (int i = 0; i < parts.GetCount(); ++i)
+            Logf("npcs: NPCBODYPART guid=%s entity=%p part=%s visible=%d", id, entity,
+                 parts[i].m_strName.GetText(), parts[i].m_bVisible);
+    }
+}
+}
+
+bool RedundantClientEntity(eCEntity const* entity)
+{
+    if (!entity || net::IsHost()) return false;
+    const auto found = quarantinedEntities.find(entity);
+    if (found == quarantinedEntities.end()) return false;
+    npcidentity::Guid identity;
+    Guid(const_cast<eCEntity*>(entity), identity.data());
+    return identity == found->second.guid;
+}
+
+void ReconcileClientEntities()
+{
+    if (net::IsHost() || !gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero()) return;
+    const uint32_t now = net::Now();
+    if (identityCensusAt && now - identityCensusAt < 250) return;
+    identityCensusAt = now ? now : 1;
+    const bool report = !identityLogAt || now - identityLogAt >= 5000;
+    if (report) identityLogAt = now ? now : 1;
+    std::vector<eCEntity*> live, npcs;
+    std::unordered_set<uintptr_t> seen;
+    auto add = [&](eCEntity* entity) {
+        if (npcidentity::AddPointer(seen, reinterpret_cast<uintptr_t>(entity))) live.push_back(entity);
+    };
+    const auto dynamic = Entity::GetEntities();
+    for (int i = 0; i < dynamic.GetCount(); ++i) add(dynamic[i].GetInstance());
+    const auto* processed = world::ProcessedEntities();
+    for (GEU16 i = 0; processed && i < processed->GetCount(); ++i) add((*processed)[i]);
+    for (size_t i = 0; i < live.size(); ++i)
+        for (int child = 0; child < live[i]->GetChildrenCount(); ++child) add(live[i]->GetChildAt(child));
+    std::unordered_map<std::string, std::vector<eCEntity*>> groups;
+    std::unordered_map<eCEntity*, npcidentity::Candidate> candidates;
+    std::unordered_map<std::string, std::vector<eCEntity*>> names;
+    for (auto* entity : live) {
+        if (!IsNpc(entity)) continue;
+        npcs.push_back(entity);
+        auto candidate = IdentityCandidate(entity);
+        groups[Key(candidate.guid.data())].push_back(entity);
+        if (report) names[candidate.name].push_back(entity);
+        candidates.emplace(entity, std::move(candidate));
+    }
+    std::unordered_set<eCEntity const*> redundant;
+    unsigned collisions = 0, unresolved = 0, duplicates = 0;
+    for (auto const& entry : groups) {
+        if (entry.second.size() < 2) continue;
+        ++collisions;
+        auto* keeper = Resolve(reinterpret_cast<uint8_t const*>(entry.first.data())).GetInstance();
+        const auto canonical = IdentityCandidate(keeper);
+        const auto mirror = mirrors.find(entry.first);
+        const uintptr_t bound = mirror != mirrors.end() && mirror->second.hostSession == net::WelcomeSerial()
+            ? reinterpret_cast<uintptr_t>(mirror->second.entity.GetInstance()) : 0;
+        for (auto* entity : entry.second) {
+            if (entity == keeper) continue;
+            if (npcidentity::Quarantine(candidates.at(entity), canonical, bound) &&
+                seen.count(canonical.instance) && !ActorDescendant(entity)) redundant.insert(entity);
+            else ++unresolved;
+        }
+    }
+    // Only inspect/restore pointers proved live by this census, never an old world's saved address.
+    for (auto* entity : live) {
+        auto saved = quarantinedEntities.find(entity);
+        if (saved == quarantinedEntities.end()) continue;
+        npcidentity::Guid identity;
+        Guid(entity, identity.data());
+        if (saved->second.guid != identity) { quarantinedEntities.erase(saved); continue; }
+        if (npcremoval::Suppressed(saved->second.rootGuid.data())) {
+            quarantinedEntities.erase(saved);
+            continue;
+        }
+        if (redundant.count(saved->second.root)) continue;
+        entity->DisableProcessing(saved->second.processingDisabled ? GETrue : GEFalse);
+        entity->EnableRendering(saved->second.rendering ? GETrue : GEFalse);
+        entity->EnablePicking(saved->second.picking ? GETrue : GEFalse, GEFalse);
+        entity->EnableCollision(saved->second.collision ? GETrue : GEFalse);
+        if (saved->second.root == entity) LogIdentity("NPCDUP_RESTORE", entity, entity);
+        quarantinedEntities.erase(saved);
+    }
+    for (auto it = quarantinedEntities.begin(); it != quarantinedEntities.end();)
+        if (!seen.count(reinterpret_cast<uintptr_t>(it->first))) it = quarantinedEntities.erase(it);
+        else ++it;
+    for (auto* entity : redundant) {
+        const bool first = !RedundantClientEntity(entity);
+        if (first) LogIdentity("NPCDUP_QUARANTINE", const_cast<eCEntity*>(entity),
+                              Resolve(IdentityCandidate(const_cast<eCEntity*>(entity)).guid.data()).GetInstance());
+        QuarantineTree(const_cast<eCEntity*>(entity), const_cast<eCEntity*>(entity));
+    }
+    for (auto const& entry : groups) {
+        if (entry.second.size() < 2) continue;
+        auto* keeper = Resolve(reinterpret_cast<uint8_t const*>(entry.first.data())).GetInstance();
+        for (auto* entity : entry.second) {
+            duplicates += entity != keeper && entity->IsRenderingEnabled();
+            if (report) LogIdentity("NPCDUP", entity, keeper);
+        }
+    }
+    if (!report) return;
+    unsigned nearbyPairs = 0, samples = 0;
+    for (auto const& name : names) {
+        auto const& entities = name.second;
+        for (size_t i = 0; i < entities.size(); ++i) {
+            for (size_t j = i + 1; j < entities.size(); ++j) {
+                auto const& a = candidates.at(entities[i]);
+                auto const& b = candidates.at(entities[j]);
+                if (a.guid == b.guid || a.templateId != b.templateId ||
+                    (entities[i]->GetWorldPosition() - entities[j]->GetWorldPosition()).GetMagnitude() > 100.0f) continue;
+                if (nearbyPairs++ < 8) {
+                    LogIdentity("NPCNEAR_DIFFERENT_GUID", entities[i], entities[j]);
+                    LogIdentity("NPCNEAR_DIFFERENT_GUID", entities[j], entities[i]);
+                }
+            }
+        }
+    }
+    for (auto* entity : npcs) {
+        if (samples < 16 && (entity->GetWorldPosition() -
+            gCSession::GetInstance().GetHero()->GetWorldPosition()).GetMagnitude() <= 1000.0f) {
+            LogIdentity("NPCMODEL", entity, nullptr);
+            ++samples;
+        }
+    }
+    Logf("npcs: NPCCENSUS npcs=%u guid_collisions=%u duplicates=%u quarantined=%u unresolved=%u "
+         "near_name_pairs=%u model_samples=%u",
+         static_cast<unsigned>(npcs.size()), collisions, duplicates, static_cast<unsigned>(redundant.size()),
+         unresolved, nearbyPairs, samples);
+}
+
 bool Ready(eCEntity const* entity)
 {
+    if (RedundantClientEntity(entity)) return false;
     if (npcremoval::Suppressed(entity)) return false;
     if (npclease::LocalAuthority(entity)) return true;
     if (npclease::Fenced(entity)) return false;
@@ -3631,6 +3865,7 @@ net::NpcRecord const* CombatRecord(eCEntity const* entity)
     Guid(const_cast<eCEntity*>(entity), identity);
     const auto found = mirrors.find(Key(identity));
     if (found == mirrors.end() || found->second.released || found->second.hostSession != net::WelcomeSerial() ||
+        found->second.entity.GetInstance() != entity ||
         found->second.latest.incarnation != Incarnation(identity) ||
         net::Now() - found->second.latestTicks > StaleAfter) return nullptr;
     return &found->second.latest;
@@ -3665,6 +3900,8 @@ void AwaitHit(eCEntity* entity, uint32_t sequence)
 
 void OnWorldDeactivate()
 {
+    quarantinedEntities.clear();
+    identityCensusAt = identityLogAt = 0;
     awaitedHits.clear();
     npclease::OnWorldDeactivate();
     targetingWatch = TargetingWatch{};

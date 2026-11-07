@@ -14,6 +14,8 @@
 #include "processing.h"
 #include "remote.h"
 #include "world_retirement.h"
+#include "world_processing_policy.h"
+#include "movement.h"
 
 #include <Engine.h>
 #include <Game.h>
@@ -28,6 +30,7 @@
 #include <algorithm>
 #include <vector>
 #include <Windows.h>
+#include <intrin.h>
 
 namespace g3t::world {
 namespace {
@@ -520,10 +523,31 @@ bTSmallArray<eCEntity*> const* Processed()
 
 bTSmallArray<eCEntity*> const* ProcessedEntities() { return Processed(); }
 
+namespace {
+bool MarkProcessingDirty(eCEntityAdmin* admin)
+{
+    auto* engine = GetModuleHandleA("Engine.dll");
+    auto* refresh = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
+        "?FourceFullROIUpdate@eCEntityAdmin@@QAEXXZ")) : nullptr;
+    if (refresh && refresh == reinterpret_cast<unsigned char*>(engine) + 0x231e00 &&
+        QueueProcessingRebuild(reinterpret_cast<unsigned char*>(admin), refresh)) return true;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        Log("FAIL world: unsupported incremental processing refresh; destructive full ROI clear refused");
+    }
+    return false;
+}
+}
+
 void RequestProcessingUpdate()
 {
+    if (retirementGate.Paused() || ai::ShuttingDown()) return;
     auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
-    if (scene) scene->GetAccessToEntityAdmin().FourceFullROIUpdate();
+    if (scene) {
+        if (MarkProcessingDirty(&scene->GetAccessToEntityAdmin()))
+            movement::Touch(remote::ControlledBody(), "ROI-dirty", "membership-preserved", _ReturnAddress());
+    }
     else Log("world: cannot refresh NPC processing range; scene administration is unavailable");
 }
 
@@ -705,11 +729,10 @@ void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
     bool changed = n != sphereCount;
     for (int i = 0; i < n && !changed; ++i)
         changed = body::Distance(wanted[i].at, spheres[i].at) > step || wanted[i].radius != spheres[i].radius;
-    auto* bytes = reinterpret_cast<unsigned char*>(admin);
     if (changed) {
+        if (!MarkProcessingDirty(admin)) return;
         spheres.assign(wanted.begin(), wanted.begin() + n);
         sphereCount = n;
-        bytes[0xfd] = 1;
         ++sphereRebuilds;
     }
     spheresActive = sphereCount > 0;

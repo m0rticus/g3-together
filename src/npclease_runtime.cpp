@@ -191,6 +191,34 @@ bool ExcludedRole(eCEntity* entity)
         static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) != gEPartyMemberType_None ||
         party->GetMembers().GetCount() != 0;
 }
+bool PortableEquipment(Entity& npc, gESlot slot)
+{
+    const Entity held = npc.Inventory.GetItemFromSlot(slot);
+    if (!held.GetInstance()) return true;
+    const bool hand = slot == gESlot_RightHand || slot == gESlot_LeftHand;
+    const bool natural = held.GetInstance() == npc.GetInstance() ||
+        (held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&
+         held.Interaction.GetUseType() == gEUseType_Fist);
+    const auto* creator = npc.GetInstance()->GetCreator();
+    if (!creator || !creator->GetPropertySet(eEPropertySetType_Inventory))
+        return PortableCreatureSlot(true, hand, natural, false);
+    Entity prototype(const_cast<eCTemplateEntity*>(creator));
+    const Entity expected = prototype.Inventory.GetDefaultItemFromSlot(slot);
+    const bool same = held.GetInstance() == npc.GetInstance() || (expected.GetInstance() &&
+        !std::memcmp(&held.GetInstance()->GetTemplateID().GetCore(),
+                     &expected.GetInstance()->GetTemplateID().GetCore(), 16));
+    return PortableCreatureSlot(true, hand, natural, same);
+}
+
+char const* EquipmentReason(Entity& npc)
+{
+    if (!PortableEquipment(npc, gESlot_RightHand)) return "unportable right-hand equipment";
+    if (!PortableEquipment(npc, gESlot_LeftHand)) return "unportable left-hand equipment";
+    if (!PortableEquipment(npc, gESlot_Body)) return "unportable body equipment";
+    if (!PortableEquipment(npc, gESlot_Helmet)) return "unportable helmet equipment";
+    return nullptr;
+}
+
 bool Eligible(eCEntity* entity)
 {
     if (!entity || npcremoval::Suppressed(entity) || Player(entity) || !entity->GetPropertySet(eEPropertySetType_NPC) ||
@@ -207,7 +235,7 @@ bool Eligible(eCEntity* entity)
     if (!creator || std::strcmp(creator->GetName().GetText(), species)) return false;
     if (talk::IsHeld(entity) || talk::TalkingWithHero(entity)) return false;
     for (auto slot : {gESlot_RightHand, gESlot_LeftHand, gESlot_Body, gESlot_Helmet})
-        if (npc.Inventory.GetItemFromSlot(slot).GetInstance()) return false;
+        if (!PortableEquipment(npc, slot)) return false;
     return true;
 }
 bool ValidDiscovery(Checkpoint const& state)
@@ -307,6 +335,7 @@ bool CaptureNative(eCEntity* entity, Checkpoint& state)
 void Stop(eCEntity* entity)
 {
     if (!entity || !entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;
+    npcplayback::RememberNativePresentation(entity);
     Entity npc(entity);
     npc.Routine.FullStop();
     npc.Routine.StopAICombatMove();
@@ -449,7 +478,8 @@ void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& en
     guid::Format(key.data(), text, sizeof(text));
     Entity npc(entity);
     Logf("npclease: readiness guid=%s epoch=%u revision=%u active=%u processed=%u actor=%u eligible=%u "
-         "running=%u enabled=%u checkpoint=%u remaining_ms=%d last_hit_age_ms=%u hp=%d ai=%d task=%s state=%s",
+         "running=%u enabled=%u checkpoint=%u remaining_ms=%d last_hit_age_ms=%u hp=%d ai=%d task=%s state=%s "
+         "disabled=%u right=%s left=%s body=%s helmet=%s eligibility_reason=%s",
          text, entry.lease.epoch, entry.lease.revision, entry.active ? 1 : 0,
          readiness.processed ? 1 : 0, readiness.actor ? 1 : 0, readiness.eligible ? 1 : 0,
          readiness.running ? 1 : 0, readiness.enabled ? 1 : 0, readiness.checkpointBusy ? 1 : 0,
@@ -458,7 +488,14 @@ void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& en
          entity ? static_cast<int>(npc.DamageReceiver.HitPoints) : entry.lease.state.hp,
          entity ? static_cast<int>(npc.Routine.AIMode) : -1,
          entity ? npc.Routine.GetCurrentTask().GetText() : "-",
-         entity ? npc.Routine.GetCurrentState().GetText() : "-");
+         entity ? npc.Routine.GetCurrentState().GetText() : "-",
+         entity && entity->IsProcessingDisabled() ? 1 : 0,
+         entity ? npc.Inventory.GetItemFromSlot(gESlot_RightHand).GetName().GetText() : "-",
+         entity ? npc.Inventory.GetItemFromSlot(gESlot_LeftHand).GetName().GetText() : "-",
+         entity ? npc.Inventory.GetItemFromSlot(gESlot_Body).GetName().GetText() : "-",
+         entity ? npc.Inventory.GetItemFromSlot(gESlot_Helmet).GetName().GetText() : "-",
+         readiness.eligible ? "eligible" : entity && EquipmentReason(npc) ? EquipmentReason(npc) :
+             UnavailabilityReason(entity));
 }
 void CommitDeath(GuidKey const& key, Entry& entry)
 {

@@ -50,11 +50,18 @@
 #include "i18n.h"
 #include "xpshare.h"
 #include "movement.h"
+#include "body.h"
+#include "guid.h"
 
 #include <Game.h>
 #include <Windows.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
+#include <utility>
 
 namespace {
 unsigned long long frames = 0;
@@ -62,6 +69,107 @@ DWORD lastReport = 0;
 bool faulted = false;
 bool playbackErrorShown = false;
 unsigned moduleProcessDepth = 0;
+
+struct FocusNpc {
+    uintptr_t instance = 0;
+    int weapon = 0, ai = 0;
+    uint16_t fraction = UINT16_MAX;
+    std::string motion;
+};
+struct FocusObservation {
+    bool known = false, focused = false, paused = false, watching = false;
+    uint32_t frameAt = 0, lostAt = 0, resumedAt = 0, sampledAt = 0;
+    unsigned serial = 0, replacements = 0, details = 0;
+    std::map<std::string, FocusNpc> npcs;
+    std::set<std::string> weapons, modes, draws;
+} focusObservation;
+
+void ResetFocusObservation() { focusObservation = FocusObservation{}; }
+
+void ObserveFocus()
+{
+    auto& observation = focusObservation;
+    const uint32_t now = GetTickCount();
+    const bool focused = g3t::partner::Focused();
+    auto& session = gCSession::GetInstance();
+    const bool paused = session.IsPaused();
+    const uint32_t gap = observation.known ? now - observation.frameAt : 0;
+    const bool lost = observation.known && observation.focused && !focused;
+    const bool regained = observation.known && !observation.focused && focused;
+    const bool resumed = observation.known && observation.paused && !paused;
+    const bool longGap = observation.known && gap >= 1000;
+    if (lost) observation.lostAt = now;
+    if (lost || regained || resumed || longGap) {
+        eCEntity* instance = session.GetHero();
+        Entity hero(instance);
+        const bool routine = instance && instance->GetPropertySet(eEPropertySetType_ScriptRoutine);
+        g3t::Logf("focus: %s role=%s serial=%u gap_ms=%u away_ms=%u paused=%d task=%.48s state=%.48s ai=%d ani=%d",
+                  lost ? "lost" : regained ? "regained" : resumed ? "pause-resumed" : "frame-gap",
+                  g3t::net::IsHost() ? "host" : "client", ++observation.serial, gap,
+                  regained ? now - observation.lostAt : 0, paused ? 1 : 0,
+                  routine ? hero.Routine.GetCurrentTask().GetText() : "-",
+                  routine ? hero.Routine.GetCurrentState().GetText() : "-",
+                  routine ? static_cast<int>(hero.Routine.AIMode) : -1,
+                  routine ? static_cast<int>(hero.Routine.AniState) : -1);
+        if (regained || resumed || longGap) {
+            g3t::downed::OnFrameResume();
+            observation.watching = true;
+            observation.resumedAt = now;
+            observation.weapons.clear();
+            observation.modes.clear();
+            observation.draws.clear();
+            observation.replacements = observation.details = 0;
+            observation.sampledAt = now - 250;
+        }
+    }
+    observation.known = true;
+    observation.focused = focused;
+    observation.paused = paused;
+    observation.frameAt = now;
+    if (!session.IsGameRunning() || g3t::persist::NativeLoading() || g3t::persist::HeroPending()) return;
+    // Preserve the last foreground sample while away. GUIDs/integers are observations, never cached live entities.
+    if (!focused || now - observation.sampledAt < 250) return;
+    observation.sampledAt = now;
+    std::map<std::string, FocusNpc> current;
+    const auto all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i) {
+        Entity npc = all.GetAt(i);
+        eCEntity* entity = npc.GetInstance();
+        if (!entity || entity == session.GetHero() || g3t::remote::IsPuppet(entity) ||
+            !entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) continue;
+        char identity[40] = {}, motion[256] = {};
+        g3t::guid::FormatEntity(entity, identity, sizeof(identity));
+        g3t::body::CurrentMotion(entity, motion, sizeof(motion));
+        FocusNpc sample{reinterpret_cast<uintptr_t>(entity), static_cast<int>(gCEntity::GetCombatMode(entity)),
+                        static_cast<int>(npc.Routine.AIMode), g3t::body::MotionFraction(entity), motion};
+        const auto before = observation.npcs.find(identity);
+        if (observation.watching && before != observation.npcs.end()) {
+            const auto& previous = before->second;
+            const bool weapon = sample.weapon != previous.weapon, mode = sample.ai != previous.ai;
+            const bool draw = (std::strstr(motion, "Draw") || std::strstr(motion, "Equip")) &&
+                (sample.motion != previous.motion || (sample.fraction != UINT16_MAX &&
+                 previous.fraction != UINT16_MAX && sample.fraction + 3276 < previous.fraction));
+            if (weapon) observation.weapons.insert(identity);
+            if (mode) observation.modes.insert(identity);
+            if (draw) observation.draws.insert(identity);
+            if (sample.instance != previous.instance) ++observation.replacements;
+            if ((weapon || mode || draw) && observation.details++ < 8)
+                g3t::Logf("focus: npc serial=%u guid=%s name=%.48s weapon=%d->%d ai=%d->%d draw=%d motion=%.96s",
+                          observation.serial, identity, npc.GetName().GetText(), previous.weapon, sample.weapon,
+                          previous.ai, sample.ai, draw ? 1 : 0, motion);
+        }
+        current.emplace(identity, std::move(sample));
+    }
+    observation.npcs.swap(current);
+    if (observation.watching && now - observation.resumedAt >= 2000) {
+        g3t::Logf("focus: settled serial=%u window_ms=%u sampled_npcs=%zu weapon_changed=%zu ai_changed=%zu "
+                  "draw_motion=%zu actor_replacements=%u held=%d",
+                  observation.serial, now - observation.resumedAt, observation.npcs.size(),
+                  observation.weapons.size(), observation.modes.size(), observation.draws.size(),
+                  observation.replacements, g3t::downed::Held() ? 1 : 0);
+        observation.watching = false;
+    }
+}
 
 // Yaw in degrees around the up axis (Y in Gothic 3).
 float Yaw(bCQuaternion const& q)
@@ -90,6 +198,7 @@ void Frame()
     if (faulted) return;
     __try {
         ++frames;
+        ObserveFocus();
         const DWORD now = GetTickCount();
         if (now - lastReport >= 1000) {
             lastReport = now;
@@ -168,6 +277,7 @@ class Module : public eCEngineComponentBase
     }
     static void ForgetWorld()
     {
+        ResetFocusObservation();
         CaptureCacheInventory("before world cleanup");
         ForgetStep("world cleanup / native prefetch queues", &g3t::world::OnWorldDeactivate);
         ForgetStep("NPC playback cleanup / source-options mutex", &g3t::npcplayback::OnWorldDeactivate);
@@ -292,6 +402,7 @@ class Module : public eCEngineComponentBase
         { g3t::movement::Stage stage("crashlog"); g3t::crashlog::Tick(); }
         { g3t::movement::Stage stage("world"); g3t::world::Tick(); }
         { g3t::movement::Stage stage("NPC removal"); g3t::npcremoval::Tick(); }
+        { g3t::movement::Stage stage("NPC identity"); g3t::npcs::ReconcileClientEntities(); }
         { g3t::movement::Stage stage("NPC playback"); g3t::npcplayback::Tick(); }
         {
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");

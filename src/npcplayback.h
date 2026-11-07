@@ -44,7 +44,9 @@ private:
 };
 bool Start(bool client);
 bool Available();
+bool IsCharacter(eCEntity const* entity);
 bool IsPassive(eCEntity const* entity);
+bool RememberNativePresentation(eCEntity* entity);
 void Silence(eCEntity* entity);  // stop and clear task/state restored directly by a native save or processing-range entry
 bool GuardForLease(eCEntity* entity); // register every native property fence before suspending either donor
 uint32_t MotionInstance(eCEntity* entity, int slot = 0);

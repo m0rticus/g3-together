@@ -299,6 +299,66 @@ void ActivityOrderingAndTimerWrap()
     assert(DecideEnd(false, false, 0, alone) == EndDecision::Wait); // zero sentinel must not underflow into expiry
 }
 
+void HeldEntryConvergence()
+{
+    using namespace g3t::downed;
+    HeldConvergence hold;
+    assert(!hold.Observe(false, 0, 0));
+    assert(!hold.Observe(false, 2000, 100));
+    assert(!hold.Observe(false, 4000, 200));
+    assert(!hold.Observe(true, 5000, 300)); // normal entry reached the native lying loop
+    for (uint32_t now = 400; now < 20000; now += 100) {
+        hold.Request(); // routine polling / focus resume must not restart a healthy held loop
+        assert(!hold.Observe(true, UINT16_MAX, now));
+    }
+    assert(hold.Observe(false, 0, 20000)); // once settled, a regressed pose repairs immediately
+    assert(!hold.Observe(true, 0, 20001));
+
+    hold.Clear();
+    assert(!hold.Observe(false, UINT16_MAX, 100));
+    assert(!hold.Observe(false, UINT16_MAX, 100 + HeldStallMs - 1));
+    assert(hold.Observe(false, UINT16_MAX, 100 + HeldStallMs)); // exact no-progress deadline
+    assert(!hold.Observe(true, 0, 100 + HeldStallMs + 1));
+
+    hold.Clear();
+    assert(!hold.Observe(false, 5000, 0));
+    for (uint32_t now = 100; now < HeldStallMs; now += 100)
+        assert(!hold.Observe(false, now % 200 ? 4000 : 5000, now)); // repeated knockdown restarts
+    assert(hold.Observe(false, 4000, HeldStallMs));
+
+    hold.Clear();
+    assert(!hold.Observe(false, 0, 10));
+    for (uint32_t elapsed = 100; elapsed < HeldEntryMaxMs; elapsed += 100)
+        assert(!hold.Observe(false, static_cast<uint16_t>(elapsed), elapsed + 10));
+    assert(hold.Observe(false, HeldEntryMaxMs, HeldEntryMaxMs + 10)); // bounded even with slow progress
+
+    hold.Clear();
+    assert(!hold.Observe(false, 0, UINT32_MAX - 100));
+    assert(hold.Observe(false, 0, UINT32_MAX - 100 + HeldStallMs)); // wall-clock wrap
+
+    hold.Clear();
+    assert(!hold.Observe(false, 0, 1));
+    hold.Request(); // refused stand or resume after a long frame gap
+    assert(hold.Observe(false, 1, 2));
+    for (uint32_t now = 3; now < HeldStallMs + 2; ++now) {
+        hold.Request();
+        assert(!hold.Observe(false, 0, now)); // asynchronous/failed repair cannot restart at 100-ms cadence
+    }
+    assert(hold.Observe(false, 0, HeldStallMs + 2));
+    assert(!hold.Observe(true, 0, HeldStallMs + 3));
+    hold.Clear(); // paid revive / next episode / world change
+    assert(!hold.settled && !hold.requested && !hold.observing);
+    assert(!hold.Observe(false, 0, 4)); // next life receives a new natural entry window
+
+    Life life;
+    life.Hold();
+    const uint32_t sequence = life.sequence;
+    hold.Request();
+    assert(hold.Observe(false, 0, 5));
+    assert(life.held && life.sequence == sequence);
+    assert(life.Revive(sequence)); // repair never changes the payment/episode authority
+}
+
 int main()
 {
     StickyAndRevive();
@@ -309,5 +369,6 @@ int main()
     LocationAndPresentationDoNotDecideAvailability();
     RealUnavailableAndAllDown();
     ActivityOrderingAndTimerWrap();
+    HeldEntryConvergence();
     return 0;
 }

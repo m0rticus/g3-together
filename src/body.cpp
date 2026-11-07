@@ -2,6 +2,7 @@
 #include "body.h"
 
 #include "config.h"
+#include "guards.h"
 #include "log.h"
 
 #include <Windows.h>
@@ -522,6 +523,7 @@ bCMatrix Pose(eCEntity const& base, float const position[3], float const rotatio
 
 bool PlayAniInstruction(eCEntity* instance, State& state, char const* name)
 {
+    if (guards::RejectRemoteWrite(instance, "body::PlayAniInstruction")) return false;
     return PlayScriptAni(instance, state, name);
 }
 
@@ -533,6 +535,7 @@ int AIModeOf(eCEntity* entity)
 
 void Pacify(Entity& entity, State& state)
 {
+    if (!entity.GetInstance() || guards::RejectRemoteWrite(entity.GetInstance(), "body::Pacify")) return;
     // Never touch combat targets here: clearing them while a scene script ran a combat state crashed the
     // game (gCScriptProcessingUnit::sAICombatMoveInstr). AI states of driven bodies are skipped in ai.cpp.
     entity.Routine.FullStop();
@@ -552,6 +555,7 @@ void Pacify(Entity& entity, State& state)
 
 void Release(Entity& entity, State& state)
 {
+    if (guards::RejectRemoteWrite(entity.GetInstance(), "body::Release")) { state = State{}; return; }
     if (!state.pacified || !entity.GetInstance()) { state = State{}; return; }
     entity.CharacterMovement.StopMovement();
     if (gCScriptRoutine_PS* routine = RoutineOf(entity.GetInstance())) {
@@ -647,7 +651,7 @@ void FollowSender(eCEntity* instance, State& state, Target const& target, uint32
 void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
 {
     eCEntity* instance = entity.GetInstance();
-    if (!instance) return;
+    if (!instance || guards::RejectRemoteWrite(instance, "body::Drive")) return;
     if (state.localHitUntil && static_cast<int32_t>(state.localHitUntil - now) > 0 &&
         (!target.timeline || state.presentationSerial == target.presentationSerial)) {
         entity.CharacterMovement.StopMovement();

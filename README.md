@@ -18,8 +18,9 @@ Clients replay the host's final skeletal poses, facial-rig state and eight motio
 autonomous tasks or prediction. Final poses include native blend-out layers that motion slots alone do not describe.
 Host capture includes the engine's processed NPC inventory around remote players, not just the host's interaction ROI.
 Unchanged streams refresh within the presentation grace window. When host presentation is genuinely unavailable,
-passive NPCs hold a successfully evaluated pose or a script-free native ambient pose; unevaluated bind poses are
-not accepted. Missing idle resources remain explicitly hidden until a real pose is available. This is not native
+passive NPCs hold a successfully evaluated host/creature pose or play a script-free native ambient clip at a fixed root.
+Missing idle resources retain native rendering with an explicit unproven-pose diagnostic, never hide the NPC.
+Statues and other non-character interaction entities are excluded from NPC presentation. This is not native
 routine walking or authority delegation for humans, merchants or story actors; those still require portable
 inventory/equipment and world-script transactions before safe client ownership and latest-state hand-back.
 NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.
@@ -153,12 +154,38 @@ relay counters and periodic Steam ping/status. Transport pumping is independent 
 handlers remain on the engine thread. `STEAMSTATUS`, `net: rtt` and `SYNCLATENCY` separate transport, engine servicing,
 send-to-flush residence and buffered NPC presentation. While playing, compact `SYNCBODY` and `SYNCNPC` counters report hard
 corrections, action corrections, stale mirrors and ownership takeover deferrals without per-entity scans.
+Client `NPCCENSUS` lines report a native NPC identity census every five seconds: `guid_collisions` counts
+distinct live pointers sharing a full GUID; `duplicates` counts still-renderable extra roots after reconciliation.
+`NPCDUP_QUARANTINE` identifies a safely hidden exact-GUID/name/template copy and its preserved `keeper`;
+`NPCDUP_RESTORE` restores its previous flags if native resolution later selects it. Players, puppets, summons,
+companions and independently owned actor children are never quarantined. `unresolved` counts protected or
+ambiguous copies left untouched. `NPCNEAR_DIFFERENT_GUID` reports same-name/template NPCs within one metre
+without treating them as duplicates. Nearby `NPCMODEL`, `NPCVISUAL` and `NPCBODYPART` lines distinguish NPC
+entities from legitimate assembled equipment/body-part renders. These diagnostics do not establish who
+created a native entity; `source=native-or-unknown` deliberately preserves that uncertainty.
 `SYNCCOMBAT` distinguishes locally judged hits, forwarded/applied claims and damage ignored while browsing inventory.
 Client `movement-frame:` lines separate engine gaps, persistence admission, module time and the slowest tick stage.
 `movement: event=held-key-stop` flags at least 150 ms without planar motion after movement while physical WASD/arrow
-keys remain held; it is a candidate, not proof of a bug (collisions and native tasks can stop movement). Nearby
-`movement-call:` lines identify recent local stop/task/mode calls by stage and native caller stack. Input bits are
+keys remain held; it is a candidate, not proof of a bug (collisions and native tasks can stop movement).
+Each event's `trail=` contains up to 16 recent local stop/task/mode/processing calls, their stages, caller module+RVA,
+captured stacks and call ordinals; `frame_native_stop/full_stop/exit` count the native observers' calls.
+`processing_exit=1` in the startup observer report confirms that range exits have caller attribution above property
+dispatch. Nested `ENet receive` and `remote puppet update` stages distinguish received NPC work from puppet work.
+`ROI-dirty value=membership-preserved` identifies a non-destructive processing refresh; it must not be followed by
+a hero `ExitProcessingRange`/`StopMovement` from that request. Processing refreshes preserve live membership while
+native recollection still enters relocated NPCs and removes entities genuinely outside the range. Input bits are
 1=player can move, 2=session input, 4=device input, 8=GUI input; key masks sample WASD then arrows, not custom bindings.
+Normal gameplay may have input mask 7; the GUI bit is reported but does not disarm held-key detection.
+`movement-position:` observes only the client's own hero/controlled body. A `transform-discontinuity` candidate names
+the native matrix/rigid-pose writer's module+RVA, tick stage, before/after position, velocity, movement mode and animation
+state. `position-discontinuity` frame/stage events include vertical motion. Thresholds are 30 cm unexplained travel or
+15 cm unexplained descent while jumping/falling, allowing velocity and gravity over elapsed time; gaps of 250 ms or more
+are not single-step evidence. Cumulative `transform_discontinuities`, `frame_discontinuities` and `dropped` counts reset
+on world change. These read-only observers never restore a pose; missing native signatures are logged explicitly.
+Remote playback/release cannot write the local hero or transformed body; `authority: local-body-write refused` reports
+an attempted alias. Admission/world-epoch cutover, save-load restore, New Game placement, downed/death/revive,
+dialogue/trade and deliberate script teleports retain their explicit paths. Intentional transitions and native collisions
+can produce candidates; `SYNCBODY kind=puppet` corrections describe remote presentation, not this client's hero.
 Share both players' ZIPs privately with the host first. User paths and IP addresses
 are redacted; Steam names/IDs can remain, so review before sharing further. Do not attach saves or unredacted INIs.
 [Without Python](docs/JOINING.md#if-something-goes-wrong), collect logs manually.

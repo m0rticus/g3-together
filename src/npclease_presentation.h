@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <cmath>
 
 namespace g3t::npclease {
 constexpr uint32_t PresentationGraceMs = 350;
@@ -14,7 +16,18 @@ inline bool PresentationFresh(bool connected, bool released, uint32_t age, uint3
         age <= std::max(PresentationGraceMs, interval * 4 + PresentationJitterMs);
 }
 
-enum class PoseProvenance { None, Canonical, Idle };
+inline bool CharacterPresentation(char const* name, bool npc, bool routine, bool movement, bool damage)
+{
+    return name && std::strncmp(name, "G3_Object_", 10) != 0 && npc && routine && movement && damage;
+}
+
+inline float IdleTime(uint32_t elapsed, float duration)
+{
+    return duration > 0.0f && std::isfinite(duration)
+        ? std::fmod(duration * 0.25f + elapsed * 0.001f, duration) : 0.0f;
+}
+
+enum class PoseProvenance { None, Canonical, Native, Idle };
 struct PresentationRig {
     void const* actor = nullptr;
     void const* instance = nullptr;

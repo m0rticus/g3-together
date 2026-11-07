@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/movement_policy.h"
+#include "../src/world_processing_policy.h"
+#include <array>
 #include <cassert>
 
 void TestMovementPolicy()
@@ -33,4 +35,25 @@ void TestMovementPolicy()
     assert(!stop.Observe(3000000, 0, true, true));
     stop.Reset();
     assert(!stop.armed && !stop.reported && stop.stillSince == 0);
+
+    const std::array<unsigned char, 17> refresh = {
+        0x56, 0x8b, 0xf1, 0xe8, 0xf8, 0xfb, 0xff, 0xff,
+        0xc6, 0x86, 0xfd, 0x00, 0x00, 0x00, 0x01, 0x5e, 0xc3
+    };
+    std::array<unsigned char, 512> admin;
+    admin.fill(0xa5);
+    const auto original = admin;
+    assert(!g3t::world::QueueProcessingRebuild(nullptr, refresh.data()));
+    assert(!g3t::world::QueueProcessingRebuild(admin.data(), nullptr));
+    for (size_t byte = 0; byte < refresh.size(); ++byte) {
+        auto unsupported = refresh;
+        unsupported[byte] ^= 1;
+        assert(!g3t::world::QueueProcessingRebuild(admin.data(), unsupported.data()));
+        assert(admin == original);
+    }
+    for (unsigned request = 0; request < 100; ++request) {
+        assert(g3t::world::QueueProcessingRebuild(admin.data(), refresh.data()));
+        for (size_t byte = 0; byte < admin.size(); ++byte)
+            assert(admin[byte] == (byte == 0xfd ? 1 : original[byte]));
+    }
 }

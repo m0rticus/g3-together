@@ -18,6 +18,7 @@ void ObserveTerminal(eCEntity* self, char const* source);
 // anywhere; nobody able to help for 5 s after genuine absence: the hero dies. Other players are told
 // when someone goes down or dies.
 void Tick();
+void OnFrameResume(); // defer any focus/pause/gap repair until a safe held-state module tick
 void OnWorldChange();                 // reset terminal death, but carry an unfinished downed life through loading
 void Revived(int byPlayer, uint32_t sequence); // a paid revive for this particular downed life
 void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us without one

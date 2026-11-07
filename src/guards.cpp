@@ -367,6 +367,19 @@ bool IsLocalPlayer(eCEntity const* entity)
     return entity && (entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody());
 }
 
+bool RejectRemoteWrite(eCEntity const* entity, char const* writer)
+{
+    if (!IsLocalPlayer(entity)) return false;
+    static uint32_t last = 0;
+    static unsigned rejected = 0;
+    const uint32_t now = GetTickCount();
+    if (++rejected == 1 || now - last >= 1000) {
+        last = now;
+        Logf("authority: local-body-write refused writer=%s count=%u entity=%p", writer, rejected, entity);
+    }
+    return true;
+}
+
 eCEntity* StateActor(eCEntity* self, char const* state)
 {
     if (!installed || !self || !state || !self->GetPropertySet(eEPropertySetType_NPC) || IsLocalPlayer(self)) return nullptr;

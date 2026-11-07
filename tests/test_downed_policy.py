@@ -345,6 +345,69 @@ class DownedPolicyTests(unittest.TestCase):
         result = subprocess.run([str(executable)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_refused_stand_defers_repair_without_replaying_entry(self):
+        guard = function_body(self.downed_cpp, r"\bbool\s+GuardState\s*\(")
+        self.assertNotIn("FullStop", guard)
+        self.assertNotIn(".SetTask(", guard)
+        self.assertIn("if (!StableHeld(hero)) convergence.Request();", guard)
+        self.assertIn("hero.Routine.SetTaskTime(0.0f);", guard)
+        self.assertIn("hero.Routine.AIMode = gEAIMode_Down;", guard)
+
+    def test_held_repair_rebuilds_loop_once_without_knockdown_entry(self):
+        keep = function_body(self.downed_cpp, r"\bvoid\s+KeepDown\s*\(")
+        self.assertIn("convergence.Observe(StableHeld(hero)", keep)
+        self.assertIn("body::MotionFraction(hero.GetInstance())", keep)
+        repair = function_body(keep, r"\bif\s*\(\s*repair\s*\)")
+        self.assertIn("hero.StopPlayAni();", repair)
+        self.assertIn("routine->AIStopPlayAnimation();", repair)
+        self.assertIn("routine->SetCurrentTask(bCString(KnockOutTask));", repair)
+        self.assertIn('routine->AISetState(bCString("ZS_Unconscious_Loop"));', repair)
+        self.assertIn("hero.Routine.AniState = gEAniState_LieKnockOut;", repair)
+        self.assertNotIn(".SetTask(", keep)
+        self.assertNotIn("AISetTask", keep)
+        self.assertLess(keep.index("convergence.Observe"), keep.index("hero.Routine.FullStop()"))
+
+    def test_stable_held_requires_loop_pose_and_no_rising_motion(self):
+        stable = function_body(self.downed_cpp, r"\bbool\s+StableHeld\s*\(")
+        for value in ("ZS_Unconscious_Loop", "gEAniState_LieKnockOut", "GetUp", "StandUp", "KnockDown", "_Ambient_"):
+            self.assertIn(value, stable)
+
+    def test_native_setters_refuse_wake_before_replacing_held_stack(self):
+        for function, native in (("SetTask", "originalSetTask"), ("SetState", "originalSetState")):
+            setter = function_body(self.downed_cpp, rf"\bvoid\s+__fastcall\s+{function}\s*\(")
+            self.assertIn("RejectHeldTransition", setter)
+            self.assertLess(setter.index("RejectHeldTransition"), setter.index(native))
+        guard = function_body(self.downed_cpp, r"\bbool\s+RejectHeldTransition\s*\(")
+        for condition in ("!life.held", "life.terminal", "GetHero()", "persist::NativeLoading()",
+                          "persist::HeroPending()", "ai::ShuttingDown()", "DownTask(state)", "ZS_Unconscious_Loop"):
+            self.assertIn(condition, guard)
+        for mutation in ("FullStop", "SetTask(", "AISetState(", "ContinueRoutine"):
+            self.assertNotIn(mutation, guard)
+
+    def test_convergence_reset_and_resume_are_local_life_only(self):
+        for signature in (r"\bvoid\s+Hold\s*\(", r"\bvoid\s+OnWorldChange\s*\("):
+            self.assertIn("convergence.Clear();", function_body(self.downed_cpp, signature))
+        tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(")
+        self.assertLess(tick.index("life.Revive("), tick.index("convergence.Clear();"))
+        resume = function_body(self.downed_cpp, r"\bvoid\s+OnFrameResume\s*\(")
+        self.assertIn("life.held && !life.terminal", resume)
+        self.assertIn("convergence.Request();", resume)
+        for mutation in ("FullStop", "SetTask", "SetHitPoints", "ContinueRoutine"):
+            self.assertNotIn(mutation, resume)
+
+    def test_focus_observation_does_not_mutate_npcs_or_input(self):
+        observe = function_body(self.script_cpp, r"\bvoid\s+ObserveFocus\s*\(")
+        for field in ("focus: %s", "gap_ms=%u", "away_ms=%u", "task=%.48s", "state=%.48s",
+                      "weapon_changed=%zu", "ai_changed=%zu", "draw_motion=%zu", "actor_replacements=%u"):
+            self.assertIn(field, observe)
+        self.assertIn("g3t::partner::Focused()", observe)
+        self.assertIn("g3t::downed::OnFrameResume();", observe)
+        self.assertIn("g3t::guid::FormatEntity", observe)
+        self.assertIn("ResetFocusObservation();", function_body(self.script_cpp, r"\bstatic\s+void\s+ForgetWorld\s*\("))
+        for mutation in ("FullStop", "SetTask(", "SetAIMode", "EnableProcessing", "SetCombatMode", "SetForegroundWindow",
+                         "SendInput", "SendWorldState", "SendNpc"):
+            self.assertNotIn(mutation, observe)
+
     def test_all_down_and_absence_grace_rules_are_preserved(self):
         all_down = function_body(
             self.downed_cpp,

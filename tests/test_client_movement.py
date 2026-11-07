@@ -115,7 +115,8 @@ int main() {{
                          ".StopMovement(", ".FullStop(", ".SetTask(", ".SetState(", "EnableInput("):
             self.assertNotIn(mutation, self.movement)
         for signature, original in ((r"\bvoid\s+__fastcall\s+NativeStop\s*\(", "originalStop(self, edx)"),
-                                    (r"\bvoid\s+__fastcall\s+NativeFullStop\s*\(", "originalFullStop(self, edx)")):
+                                    (r"\bvoid\s+__fastcall\s+NativeFullStop\s*\(", "originalFullStop(self, edx)"),
+                                    (r"\bvoid\s+__fastcall\s+NativeExit\s*\(", "originalExit(self, edx)")):
             body = function_body(self.movement, signature)
             self.assertIn(original, body)
             self.assertNotIn("return", body)
@@ -132,14 +133,60 @@ int main() {{
     def test_fixed_storage_and_bounded_log_trail(self):
         self.assertIn("std::array<Call, 16>", self.movement)
         trail = function_body(self.movement, r"\bvoid\s+Trail\s*\(")
-        self.assertIn("std::min(callCount, 4u)", trail)
+        self.assertIn("const unsigned count = callCount", trail)
         self.assertIn("now - call.at > 2000000", trail)
+        self.assertNotIn("Logf", trail)
+        self.assertIn("stage_call=%u stack=%s", trail)
         event = function_body(self.movement, r"\bvoid\s+Event\s*\(")
         self.assertIn('std::strcmp(kind, "held-key-stop")', event)
         self.assertIn("now - anomalyAt < 1000000", event)
+        self.assertIn("trail=%s", event)
+        self.assertIn("frame_native_exit=%u", event)
+        self.assertIn("(current.input & 7u) == 7u", self.movement)
+        self.assertEqual(event.count("Logf("), 1)
+        logger = (ROOT / "src" / "log.cpp").read_text(encoding="utf-8")
+        self.assertIn("char text[16384]", logger)
+        self.assertIn("char line[16448]", logger)
         reset = function_body(self.movement, r"\bvoid\s+OnWorldChange\s*\(")
         for clear in ("previous = {}", "boundary = {}", "calls = {}", "stop.Reset()"):
             self.assertIn(clear, reset)
+
+    def test_processing_refresh_never_clears_live_membership(self):
+        world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
+        request = function_body(world, r"\bvoid\s+RequestProcessingUpdate\s*\(")
+        self.assertIn("MarkProcessingDirty", request)
+        self.assertIn('"ROI-dirty"', request)
+        self.assertNotIn("FourceFullROIUpdate(", world)
+        mark = function_body(world, r"\bbool\s+MarkProcessingDirty\s*\(")
+        self.assertIn("QueueProcessingRebuild", mark)
+        self.assertIn("0x231e00", mark)
+        self.assertIn("destructive full ROI clear refused", mark)
+        place = function_body(world, r"\bvoid\s+PlaceSpheres\s*\(")
+        self.assertIn("if (!MarkProcessingDirty(admin)) return", place)
+
+    def test_native_counters_are_main_thread_and_substage_attributed(self):
+        touch = function_body(self.movement, r"\bvoid\s+Touch\s*\(")
+        self.assertLess(touch.index("GetCurrentThreadId() != observerThread"),
+                        touch.index("guards::IsLocalPlayer(entity)"))
+        self.assertIn("++nativeStops", touch)
+        self.assertIn("++nativeFullStops", touch)
+        self.assertIn("++nativeExits", touch)
+        self.assertIn("last.stage == phase", touch)
+        remote = (ROOT / "src" / "remote.cpp").read_text(encoding="utf-8")
+        for name in ("remote capture", "ENet service", "remote puppet update"):
+            self.assertIn(f'Stage stage("{name}")', remote)
+        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        self.assertIn('Stage stage("ENet receive")', net)
+
+    def test_read_only_engine_bytes_match_dirty_write_and_exit_observer(self):
+        game = os.environ.get("G3T_GAME_DLL")
+        if not game:
+            self.skipTest("Set G3T_GAME_DLL for sibling Engine.dll native signatures")
+        data = Path(game).with_name("Engine.dll").read_bytes()
+        self.assertEqual(read_rva(data, 0x231e00, 17),
+                         bytes.fromhex("56 8b f1 e8 f8 fb ff ff c6 86 fd 00 00 00 01 5e c3"))
+        self.assertEqual(read_rva(data, 0x223af0, 6), bytes.fromhex("56 8b f1 8b 46 3c"))
+        self.assertIn("exitEntry == engine + 0x223af0", self.movement)
 
     def test_frame_order_and_complete_tick_stage_coverage(self):
         process = function_body(self.module, r"\bvoid\s+Process\s*\(\s*\)\s+override")

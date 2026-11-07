@@ -54,7 +54,7 @@ void Log(const char* text)
     GetLocalTime(&now);
     // A long text is cut off: sprintf_s and vsprintf_s end the game when the buffer is too small (stage E2 22.10.: a
     // trader's contents in one container line closed the client with 0xC0000409, no line written).
-    char line[1024];
+    char line[16448];
     int length = Format(line, "%04u-%02u-%02u %02u:%02u:%02u.%03u ", now.wYear, now.wMonth, now.wDay,
                         now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
     if (length > 0) {
@@ -70,7 +70,7 @@ void Log(const char* text)
 
 void Logf(const char* format, ...)
 {
-    char text[900];
+    char text[16384];
     va_list args;
     va_start(args, format);
     // Truncate: vsprintf_s ends the process when the text does not fit (a trader's goods, Fable review 22.10.).

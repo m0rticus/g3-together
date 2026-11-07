@@ -51,8 +51,8 @@ class NpcLeasePresentationTests(unittest.TestCase):
         source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
         idle = source[source.index("bool BootstrapIdle("):source.index("\n}\n\nbool LocalHit(")]
         for required in ("GetAniName@gCScriptProcessingUnit", "GetAniVariation",
-                         "QueryMotionDataEntity", "IdleResourceName", "SetPlayTime",
-                         "ActorProcess(", "evaluation.evaluated", "PoseProvenance::Idle"):
+                         "QueryMotionDataEntity", "IdleResourceName", "EvaluateIdle(",
+                         'for (char const* phase : {"Ambient", "Loop"})', "PoseProvenance::Idle"):
             self.assertIn(required, idle)
         for forbidden in ("ContinueRoutine", "sAIPlayAni", "SetTask", "Movement", "OnPreProcess",
                           "UpdatePresentation("):
@@ -65,6 +65,11 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertIn("HostPresentationAvailable", hold)
         self.assertIn("proof.Usable", hold)
         self.assertNotIn("CapturePose(", hold)
+        evaluate = source[source.index("bool EvaluateIdle("):source.index("bool IdleFailure(")]
+        for required in ("SetPlayTime", "IdleTime(elapsed, duration)", "ActorProcess(",
+                         "evaluation.evaluated", "GETrue, GEFalse, 0.0f"):
+            self.assertIn(required, evaluate)
+        self.assertIn("EvaluateIdle(entity, *animation, net::Now()", hold)
 
     def test_fallback_scans_processed_npcs_and_bounds_resource_retries(self):
         source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
@@ -72,4 +77,35 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertIn("world::ProcessedEntities()", tick)
         self.assertNotIn("Entity::GetNPCs()", tick)
         self.assertLess(tick.index("eEPropertySetType_NPC"), tick.index("Entity npc(entity)"))
-        self.assertIn("held.failed && cleanupNow - held.attempted < 1000", tick)
+        hold = source[source.index("bool HoldUnavailable("):source.index("void ReleaseUnavailable(")]
+        self.assertIn("waiting.retry && now - waiting.attempted < 1000", hold)
+        self.assertLess(hold.index("waiting.retry &&"), hold.index("BootstrapIdle(entity"))
+        self.assertLess(hold.index("provenPoses.find(key)"), hold.index("BootstrapIdle(entity"))
+
+    def test_missing_pose_never_changes_rendering(self):
+        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("EnableRendering(", source)
+        self.assertIn("retaining visibility contacts=off", source)
+        self.assertIn("PresentationCensus(cleanupNow)", source)
+        for counter in ("host=%u", "held=%u", "idle=%u", "native=%u", "unproven=%u",
+                        "hidden=%u", "static=%u", "top_reason=%s"):
+            self.assertIn(counter, source)
+        tick = source[source.index("void Tick()"): ]
+        self.assertLess(tick.index("if (!IsCharacter(entity))"), tick.index("Entity npc(entity)"))
+        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        send = npcs[npcs.index("void SendOwned("):npcs.index("const bTObjArray<Entity> all", npcs.index("void SendOwned("))]
+        self.assertIn("npcplayback::IsCharacter(instance)", send)
+
+    def test_native_pose_is_preserved_before_creature_stop(self):
+        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        native = source[source.index("bool RememberNativePresentation("):source.index("bool LocalHit(")]
+        for required in ("GetTargetWeight", "GetPlayTime", "originalActorProcess(",
+                         "GETrue, GEFalse, 0.0f", "PoseProvenance::Native"):
+            self.assertIn(required, native)
+        runtime = (ROOT / "src" / "npclease_runtime.cpp").read_text(encoding="utf-8")
+        stop = runtime[runtime.index("void Stop("):runtime.index("bool Import(")]
+        self.assertLess(stop.index("RememberNativePresentation(entity)"), stop.index("npc.Routine.FullStop()"))
+        equipment = runtime[runtime.index("bool PortableEquipment("):runtime.index("bool Eligible(")]
+        for required in ("gEUseType_Fist", "GetDefaultItemFromSlot", "GetTemplateID().GetCore()",
+                         "PortableCreatureSlot"):
+            self.assertIn(required, equipment)

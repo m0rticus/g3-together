@@ -4,6 +4,11 @@
 #include "npclease.h"
 
 namespace g3t::npclease {
+inline bool PortableCreatureSlot(bool occupied, bool hand, bool natural, bool templateDefault)
+{
+    return !occupied || (hand && natural && templateDefault);
+}
+
 struct ClientReadiness {
     bool running = true, enabled = true, checkpointBusy = false;
     bool processed = true, actor = true, eligible = true, expired = false;

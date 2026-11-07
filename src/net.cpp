@@ -20,6 +20,7 @@
 #include "saving_store.h"
 #include "steam.h"
 #include "ai.h"
+#include "movement.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2980,7 +2981,10 @@ void Service(PlayerState const& local, bool haveLocal)
             }
             break;
         case ENET_EVENT_TYPE_RECEIVE:
-            OnReceive(event.peer, event.packet);
+            {
+                movement::Stage stage("ENet receive");
+                OnReceive(event.peer, event.packet);
+            }
             enet_packet_destroy(event.packet);
             break;
         case ENET_EVENT_TYPE_DISCONNECT:

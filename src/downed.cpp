@@ -59,6 +59,7 @@ constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still 
 
 Life life;                     // authority is the paid revive, not the native body's current state
 Recovery recovery;
+HeldConvergence convergence;
 PeerRecovery puppetRecovery[net::MaxPlayers];
 InteractionProtection interaction;
 eCEntity* interactionHero = nullptr;
@@ -93,6 +94,8 @@ uint32_t paidSequence[net::MaxPlayers] = {};
 uint32_t pendingReviveSequence = 0;
 unsigned transitions = 0, corrections = 0;
 uint32_t lastCorrection = 0;
+uint32_t lastStandRefusal = 0;
+unsigned standRefusals = 0;
 
 int NativeInteractionPage(gCGUIManager* manager)
 {
@@ -316,11 +319,35 @@ GEBool __fastcall SetValue(gCPlayerMemory_PS* self, void* edx, bCString const& t
     return result;
 }
 
+bool DownTask(char const* task);
+
+void StandRefused(char const* state, char const* source)
+{
+    const uint32_t now = net::Now();
+    if (++standRefusals == 1 || now - lastStandRefusal >= 5000) {
+        lastStandRefusal = now;
+        Logf("downed: stand refused player=%u sequence=%u source=%s state=%s count=%u repair=module-boundary",
+             net::LocalId(), life.sequence, source, state, standRefusals);
+    }
+}
+
+bool RejectHeldTransition(eCEntity* entity, char const* state, char const* source)
+{
+    if (!life.held || life.terminal || !entity || entity != gCSession::GetInstance().GetHero() ||
+        !gCSession::GetInstance().IsGameRunning() || persist::NativeLoading() ||
+        persist::HeroPending() || ai::ShuttingDown()) return false;
+    if (DownTask(state) || !std::strcmp(state, "ZS_Unconscious_Loop")) return false;
+    if (!convergence.settled) convergence.Request();
+    StandRefused(state, source);
+    return true;
+}
+
 void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, GEBool caught)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
     movement::Touch(entity, "AISetTask", task.GetText(), _ReturnAddress());
     if (RejectReaction(entity, task.GetText(), "AISetTask")) return;
+    if (RejectHeldTransition(entity, task.GetText(), "AISetTask")) return;
     if (LocalTerminal(entity)) {
         const bool refused = !life.TerminalTaskAllowed(task.GetText());
         Mutation("AISetTask", "task", task.GetText(), refused, _ReturnAddress());
@@ -335,6 +362,7 @@ void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
     movement::Touch(entity, "AISetState", state.GetText(), _ReturnAddress());
     if (RejectReaction(entity, state.GetText(), "AISetState")) return;
+    if (RejectHeldTransition(entity, state.GetText(), "AISetState")) return;
     if (LocalTerminal(entity)) {
         const bool refused = !life.TerminalStateAllowed(state.GetText());
         Mutation("AISetState", "state", state.GetText(), refused, _ReturnAddress());
@@ -386,19 +414,23 @@ bool DownTask(char const* task)
     return !std::strcmp(task, KnockOutTask) || !std::strcmp(task, "ZS_Unconscious") || !std::strcmp(task, "ZS_PiercedKO");
 }
 
-bool DownPose(Entity& hero)
+bool StableHeld(Entity& hero)
 {
-    const auto pose = static_cast<gEAniState>(hero.Routine.AniState);
-    return pose == gEAniState_LieKnockDown || pose == gEAniState_LieKnockOut || pose == gEAniState_LiePiercedKO;
+    if (!hero.IsDown() || hero.Routine.GetCurrentState() != "ZS_Unconscious_Loop" ||
+        static_cast<gEAniState>(hero.Routine.AniState) != gEAniState_LieKnockOut) return false;
+    char motion[256] = {};
+    body::CurrentMotion(hero.GetInstance(), motion, sizeof(motion));
+    return !std::strstr(motion, "GetUp") && !std::strstr(motion, "StandUp") &&
+           (!std::strstr(motion, "KnockDown") || std::strstr(motion, "_Ambient_"));
 }
 
 void KeepDown(Entity& hero, char const* source)
 {
     MaintainHp maintenance;
     const bCString task = hero.Routine.GetCurrentTask(), state = hero.Routine.GetCurrentState();
-    const bool repair = !hero.IsDown() || !DownTask(task.GetText()) ||
-                        (std::strcmp(state.GetText(), "ZS_Unconscious_Loop") && !DownTask(state.GetText())) ||
-                        (!std::strcmp(state.GetText(), "ZS_Unconscious_Loop") && !DownPose(hero));
+    const uint32_t now = net::Now();
+    const bool repair = convergence.Observe(StableHeld(hero) && DownTask(task.GetText()),
+                                            body::MotionFraction(hero.GetInstance()), now);
     const int hp = hero.PlayerMemory.GetHitPoints();
     if (repair || hp > 1) {
         ++corrections;
@@ -411,9 +443,17 @@ void KeepDown(Entity& hero, char const* source)
         }
     }
     if (repair) {
+        // Repair outside an executing script callback; never replay the knockdown entry.
         hero.Routine.FullStop();
         hero.CharacterMovement.StopMovement();
-        hero.Routine.SetTask(bCString(KnockOutTask));
+        hero.StopPlayAni();
+        auto* routine = static_cast<gCScriptRoutine_PS*>(hero.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
+        routine->AIStopPlayAnimation();
+        routine->SetCurrentTask(bCString(KnockOutTask));
+        hero.Routine.AniState = gEAniState_LieKnockOut;
+        routine->AISetState(bCString("ZS_Unconscious_Loop"));
+        Logf("downed: held settled player=%u sequence=%u source=%s refused=%u",
+             net::LocalId(), life.sequence, source, standRefusals);
     }
     // OnPlayerGameKeyPressed refuses AI mode Down (Script_Game.dll 0x10061640).
     hero.Routine.AIMode = gEAIMode_Down;
@@ -427,6 +467,7 @@ void Hold(char const* reason, char const* source)
 {
     if (life.held || life.terminal) return;
     recovery.Clear();
+    convergence.Clear();
     life.Restore(true);
     CancelAlone("new-held-life");
     revivedBy = 0;
@@ -929,6 +970,10 @@ bool GuardState(eCEntity* self, char const* state)
     // A module tick is not a script clock boundary: a long frame or another script can otherwise wake the hero first.
     if (DownTask(state) || !std::strcmp(state, "ZS_Unconscious_Loop")) {
         MaintainHp maintenance;
+        if (DownTask(state) && convergence.settled) {
+            convergence.Request();
+            return true;
+        }
         if (!std::strcmp(state, "ZS_Unconscious_Loop") && hero.Routine.GetTaskTime() > 5.0f)
             Logf("downed: stand refused player=%u sequence=%u source=native-wake timer=%.3f",
                  net::LocalId(), life.sequence, hero.Routine.GetTaskTime());
@@ -937,11 +982,12 @@ bool GuardState(eCEntity* self, char const* state)
         if (hero.PlayerMemory.GetHitPoints() != 1) hero.PlayerMemory.SetHitPoints(1);
         return false;
     }
-    Logf("downed: stand refused player=%u sequence=%u source=AI state=%s", net::LocalId(), life.sequence, state);
-    hero.Routine.FullStop();
-    hero.Routine.SetTask(bCString(KnockOutTask));
+    StandRefused(state, "AI");
+    if (!StableHeld(hero)) convergence.Request();
+    MaintainHp maintenance;
     hero.Routine.AIMode = gEAIMode_Down;
-    hero.CharacterMovement.StopMovement();
+    hero.Routine.SetTaskTime(0.0f);
+    if (hero.PlayerMemory.GetHitPoints() != 1) hero.PlayerMemory.SetHitPoints(1);
     return true;
 }
 
@@ -1091,6 +1137,7 @@ void Tick()
         const int by = revivedBy;
         revivedBy = 0;
         if (life.terminal || !life.Revive(pendingReviveSequence)) return;
+        convergence.Clear();
         recovery.Begin();
         recoveryUnknownNoted = false;
         pendingReviveSequence = 0;
@@ -1285,7 +1332,11 @@ bool RejectReaction(eCEntity* victim, char const* state, char const* path)
 {
     if (!victim || !HarmfulReaction(state) || !HarmProtected(victim)) return false;
     // The held task itself and its native loop must still establish/maintain the lying pose.
-    if (life.held && victim == gCSession::GetInstance().GetHero() && DownTask(state)) return false;
+    if (life.held && victim == gCSession::GetInstance().GetHero() && DownTask(state)) {
+        if (!convergence.settled) return false;
+        convergence.Request();
+        return true;
+    }
     eCEntity* attacker = Entity(victim).NPC.GetCurrentAttacker().GetInstance();
     if (!RejectHarm(victim, attacker, path)) return false;
     Logf("downed: ground reaction refused player=%u path=%s requested=%s", net::LocalId(), path, state);
@@ -1356,6 +1407,11 @@ void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bo
 uint32_t Sequence() { return life.held ? life.sequence : 0; }
 bool Terminal() { return life.terminal; }
 
+void OnFrameResume()
+{
+    if (life.held && !life.terminal) convergence.Request();
+}
+
 void Restore(bool waiting, char const* source)
 {
     if (life.terminal) return;
@@ -1390,6 +1446,9 @@ void OnWorldChange()
     interactionWorldActive = true;
     life.OnWorldChange(); // old-world paid revives must not apply after the load
     recovery.Clear();
+    convergence.Clear();
+    standRefusals = 0;
+    lastStandRefusal = 0;
     recoveryUnknownNoted = false;
     lethal = life.held;
     lethalSeenDown = false;

@@ -89,6 +89,10 @@ int Format(char* out, size_t size, char const* format, ...)
     return result;
 }
 namespace ai { bool ShuttingDown() { return false; } }
+namespace movement {
+Stage::Stage(char const*) : before(nullptr), started(0) {}
+Stage::~Stage() { assert(before == nullptr && started == 0 && beforeCalls == 0); }
+}
 namespace downed {
 uint8_t PlayerInteractionFlags(unsigned player)
 {

@@ -19,5 +19,6 @@ public:
 private:
     char const* before;
     long long started;
+    unsigned beforeCalls = 0;
 };
 }

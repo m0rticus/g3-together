@@ -10,6 +10,7 @@
 #include "downed.h"
 #include "downed_policy.h"
 #include "guid.h"
+#include "guards.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -19,6 +20,7 @@
 #include "world.h"
 #include "npcplayback.h"
 #include "pose.h"
+#include "movement.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -67,7 +69,7 @@ bCVector anchor;
 
 void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
 {
-    if (!state.id || state.id >= net::MaxPlayers) return;
+    if (!state.id || state.id >= net::MaxPlayers || state.id == net::LocalId()) return;
     Puppet& puppet = puppets[state.id];
     if (reset) {
         puppet.body.track = body::Track{};
@@ -230,6 +232,7 @@ void Forget(int id, eCEntity* entity)
     for (Entity& npc : candidates) {
         eCEntity* instance = npc.GetInstance();
         if (!instance || instance == entity || !instance->GetPropertySet(eEPropertySetType_NPC)) continue;
+        if (guards::RejectRemoteWrite(instance, "remote::Forget")) continue;
         bool after = false;
         if (npc.NPC.GetCurrentTarget().GetInstance() == entity) { npc.NPC.SetCurrentTarget(Entity()); after = true; }
         if (npc.NPC.GetAlternativeTarget().GetInstance() == entity) npc.NPC.SetAlternativeTarget(Entity());
@@ -363,6 +366,7 @@ void Despawn(int id, char const* reason)
     Puppet& puppet = puppets[id];
     if (!puppet.spawned) return;
     eCEntity* entity = puppet.entity.GetInstance();
+    if (guards::RejectRemoteWrite(entity, "remote::Despawn")) { puppet = Puppet{}; return; }
     gCWorld* current = gCWorld::GetCurrentWorld();
     if (entity && current && puppet.world == CurrentWorld()) {
         // Out of the local hero's party first, or the party keeps a member that no longer exists.
@@ -483,7 +487,9 @@ void StartPuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t 
 
 void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
 {
+    if (id <= 0 || id >= net::MaxPlayers || id == net::LocalId()) return;
     Puppet& puppet = puppets[id];
+    if (guards::RejectRemoteWrite(puppet.entity.GetInstance(), "remote::UpdatePuppet")) { puppet = Puppet{}; return; }
     // A client's loop stops during videos and loading (the intro once removed and respawned a puppet after 5 s),
     // so only a long silence removes the puppet. Stamps come from the network clock; GetTickCount() runs a few ms apart and made fresh states look
     // ancient after unsigned underflow (the puppet was removed and respawned hundreds of times).
@@ -524,6 +530,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         }
         puppet.entity = Entity::Spawn(shape, body::Pose(hero, remote.latest.position, remote.latest.rotation));
         if (!puppet.entity.GetInstance()) { Log("remote: spawn failed"); return; }
+        if (guards::RejectRemoteWrite(puppet.entity.GetInstance(), "remote::Spawn")) { puppet = Puppet{}; return; }
         // Collision stays on: with it off (stage 2, when puppets were snapped every frame) no weapon could touch a
         // puppet, so the host's NPCs attacked players without ever hitting them (aggrodiag: 0 hits in 20 s of
         // Topork's power attacks on a puppet).
@@ -834,12 +841,14 @@ void Tick()
 {
     if (!started) return;
     net::PlayerState local;
-    const bool haveLocal = LocalState(local);
-    net::Tick(local, haveLocal);
+    bool haveLocal = false;
+    { movement::Stage stage("remote capture"); haveLocal = LocalState(local); }
+    { movement::Stage stage("ENet service"); net::Tick(local, haveLocal); }
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     net::Remote const* remotes = net::Remotes();
     for (int id = 1; id < net::MaxPlayers; ++id) {
         if (id == net::LocalId()) continue;
+        movement::Stage stage("remote puppet update");
         if (haveLocal && hero) UpdatePuppet(id, remotes[id], *hero);
         else if (puppets[id].spawned) Despawn(id, "local game not running");
     }

@@ -45,6 +45,9 @@ eCEntity* CurrentActor();
 // script that runs with this body as self under an Acting scope treats the player as an NPC (it watched a fight, applauded and
 // walked around, 2 Nov. play session). Local script boundaries use LocalPlayer to clear even an inherited Acting scope.
 bool IsLocalPlayer(eCEntity const* entity);
+// Remote presentation never owns either local body. Admission/save restore, New Game placement,
+// downed/revive, dialogue/trade and deliberate script teleports use their explicit native paths.
+bool RejectRemoteWrite(eCEntity const* entity, char const* writer);
 bool PlayerContextReady();  // both native GetPlayer/IsPlayer imports were redirected
 
 // ai.cpp, before an AI state of `self` runs: the puppet it reacts to when that state follows the player, else none.

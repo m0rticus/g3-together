@@ -14,6 +14,8 @@ namespace g3t::net { struct NpcRecord; }
 namespace g3t::npcs {
 void Start();
 void Tick();
+void ReconcileClientEntities();
+bool RedundantClientEntity(eCEntity const* entity);
 void LeaseBaseline(eCEntity* entity, char* routine, size_t capacity, uint8_t& defeated);
 void LeaseReleaseMirror(uint8_t const guid[16]);
 bool HostPresentationAvailable(eCEntity const* entity);

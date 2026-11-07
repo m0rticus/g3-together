@@ -17,6 +17,38 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ## Before you start
 
+### Focus loss/regain and held knockout (manual acceptance)
+
+- [ ] With host standing near fighting NPCs, Alt-Tab away for 1 second, then 10
+  seconds, and return. Existing weapons must not all redraw; legitimate new
+  combat/target changes must still draw weapons. Repeat by Alt-Tabbing the client
+  and watching both screens. NPC redraw attribution remains unverified.
+- [ ] Knock out the host through an enemy lethal hit while the client remains
+  able to help. Alt-Tab away and back; the host must remain lying, not repeat
+  the knockdown entry. Have the client talk to its puppet, choose **I will help
+  you**, and confirm one healing potion pays for a successful revive.
+- [ ] Repeat with the client knocked out. Also check an already-stuck knockdown:
+  it should self-heal after 2500 ms without forward animation progress (5000 ms
+  maximum entry time), or at the next safe module tick after a refused stand.
+  Once lying correctly, no further task/motion repair should occur. If native
+  presentation does not settle, retries are at least 2500 ms apart, never every
+  native 100-ms routine poll.
+- [ ] Repeat during a held pause and host-managed save/load, during dialogue and
+  trade while standing, and with W held across Alt-Tab. Input, protection,
+  payment, death and rejoin behavior must remain unchanged.
+
+`focus: lost/regained` records process-foreground transitions with `gap_ms`,
+`away_ms`, pause and local hero task/state/AI/animation. `pause-resumed` and
+`frame-gap` cover resumptions without an observed foreground transition (polling
+cannot see an away/back cycle entirely between module frames). `focus: npc`
+shows up to eight changed NPCs; `focus: settled` reports unique NPC GUIDs with
+weapon/AI changes or sampled draw/equip motion starts/restarts over the next two
+foreground seconds, plus actor replacements. These are sampled observations,
+not proof that focus caused a draw; a short draw can fall between 250-ms samples.
+`downed: held settled` is a one-shot module-boundary repair; repeated
+`stand refused` is rate-limited and includes a cumulative count. None of these
+diagnostics restores weapon states, alters NPC authority or changes the protocol.
+
 ### Quit-game teardown (manual acceptance)
 
 - [ ] On both isolated host/client copies, select **Quit game** from the main menu

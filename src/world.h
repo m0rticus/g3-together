@@ -7,7 +7,7 @@
 #include <Engine.h>
 
 namespace g3t::world {
-void RequestProcessingUpdate();  // rebuild after relocating an authoritative NPC into an already-loaded region
+void RequestProcessingUpdate();  // queue recollection without exiting existing entities (including the local hero)
 using LogFn = void (*)(char const*);
 // Every entity the engine processes here, static ones included (doors, ore veins); null before the scene exists.
 bTSmallArray<eCEntity*> const* ProcessedEntities();

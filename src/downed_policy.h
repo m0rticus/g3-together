@@ -30,6 +30,45 @@ constexpr bool VanillaProne(int animation)
 constexpr uint32_t ReviveGraceMs = 1500;
 constexpr uint32_t InteractionGraceMs = 1500;
 
+constexpr uint32_t HeldStallMs = 2500;
+constexpr uint32_t HeldEntryMaxMs = 5000;
+
+struct HeldConvergence
+{
+    bool observing = false, settled = false, requested = false, awaitingRepair = false;
+    uint32_t enteredAt = 0, progressAt = 0, repairedAt = 0;
+    uint16_t furthest = 0;
+
+    void Clear() { *this = HeldConvergence{}; }
+    void Request() { requested = true; }
+    bool Observe(bool stable, uint16_t fraction, uint32_t now)
+    {
+        if (stable) {
+            settled = true;
+            observing = requested = awaitingRepair = false;
+            return false;
+        }
+        if (awaitingRepair && now - repairedAt < HeldStallMs) return false;
+        if (!observing) {
+            observing = true;
+            enteredAt = progressAt = now;
+            furthest = fraction == UINT16_MAX ? 0 : fraction;
+        } else if (fraction != UINT16_MAX && fraction > furthest) {
+            furthest = fraction;
+            progressAt = now;
+        }
+        // Repeated restarts cannot extend the deadline by replaying the same fraction.
+        if (!requested && !settled && now - progressAt < HeldStallMs && now - enteredAt < HeldEntryMaxMs)
+            return false;
+        requested = false;
+        observing = false;
+        settled = true;
+        awaitingRepair = true;
+        repairedAt = now;
+        return true;
+    }
+};
+
 // High bits are interaction reasons only while the existing playing bit is set.
 // Without playing, 32/64 retain their loading/menu heartbeat meanings.
 enum InteractionFlag : uint8_t { InDialogue = 32, InTrade = 64, InteractionGrace = 128 };
