@@ -36,7 +36,7 @@ class DownedPolicyTests(unittest.TestCase):
         cls.downed_cpp = DOWNED_CPP.read_text(encoding="utf-8")
         cls.script_cpp = SCRIPT_CPP.read_text(encoding="utf-8")
 
-    def test_die_is_idempotent_and_calls_native_kill_once(self):
+    def test_die_is_idempotent_and_queues_native_ragdoll_death_once(self):
         body = function_body(
             self.downed_cpp,
             r"\bvoid\s+Die\s*\(\s*Entity\s*&\s*hero\s*,\s*char\s+const\s*\*\s*reason\s*\)",
@@ -49,26 +49,37 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("return;", guard)
         for native in ("CallScript", "SetHitPoints", "FullStop", "GetInstance"):
             self.assertNotIn(native, guard)
-        kill = 'GetScriptAdminExt().CallScript(bCString("Kill"), nullptr, hero.GetInstance(), 0)'
-        self.assertEqual(body.count("CallScript("), 1)
-        self.assertEqual(body.count(kill), 1)
-        self.assertEqual(body.count("terminalKillSent = true;"), 1)
+        self.assertNotIn("CallScript", body)
+        self.assertNotIn('bCString("Kill")', body)
+        self.assertEqual(body.count('bCString("ZS_RagDollDead")'), 1)
+        self.assertEqual(body.count("hero.Routine.SetTask"), 1)
+        self.assertIn("hero.Routine.AIMode = gEAIMode_Reaction;", body)
+        self.assertIn("hero.CharacterMovement.StopMovement();", body)
+        self.assertIn("Entity clearAttacker;", body)
+        self.assertIn("Entity clearInflictor;", body)
+        self.assertIn("hero.NPC.SetCurrentAttacker(clearAttacker);", body)
+        self.assertIn("hero.DamageReceiver.SetLastInflictor(clearInflictor);", body)
+        self.assertIn("attacker_clear=%d inflictor_clear=%d", body)
+        self.assertIn("force=no-force", body)
+        self.assertLess(body.index("hero.CharacterMovement.StopMovement();"),
+                        body.index("hero.NPC.SetCurrentAttacker(clearAttacker);"))
+        self.assertLess(body.index("hero.DamageReceiver.SetLastInflictor(clearInflictor);"),
+                        body.index('hero.Routine.SetTask(bCString("ZS_RagDollDead"));'))
         ordered = (
             'EndStep("decision");',
             'EndStep("set-hp");',
             "hero.PlayerMemory.SetHitPoints(0);",
-            'EndStep("full-stop");',
+            'EndStep("death-full-stop");',
             "hero.Routine.FullStop();",
-            "terminalKillSent = true;",
-            'EndStep("kill-enter");',
-            kill,
-            'EndStep("kill-return");',
+            "hero.CharacterMovement.StopMovement();",
+            "hero.NPC.SetCurrentAttacker(clearAttacker);",
+            "hero.DamageReceiver.SetLastInflictor(clearInflictor);",
+            "hero.Routine.AIMode = gEAIMode_Reaction;",
+            'bCString("ZS_RagDollDead")',
+            'EndStep("death-state-queued");',
         )
         self.assertEqual([body.index(step) for step in ordered],
                          sorted(body.index(step) for step in ordered))
-        between = body[body.index("terminalKillSent = true;") + len("terminalKillSent = true;"):body.index(kill)]
-        self.assertRegex(between, r'^\s*EndStep\("kill-enter"\);\s*(?:const\s+\w+\s+\w+\s*=\s*)?$')
-        self.assertNotIn("SetTask", body)
 
     def test_terminal_tick_latch_never_restarts_a_death_task(self):
         tick = function_body(
@@ -103,7 +114,7 @@ class DownedPolicyTests(unittest.TestCase):
         guard = function_body(revived, r"\bif\s*\(\s*!helper\b[^{}]*\)")
         self.assertIsNotNone(guard)
         for condition in ("!life.held", "!sequence", "sequence != life.sequence", "life.terminal",
-                          "terminalKillSent", "!instance", "!session.IsGameRunning()", "persist::HeroPending()"):
+                          "!instance", "!session.IsGameRunning()", "persist::HeroPending()"):
             self.assertIn(condition, revived[:revived.index("{", revived.index("if (!helper"))])
         self.assertIn("return;", guard)
         for condition in ("byPlayer > 0", "byPlayer < net::MaxPlayers", "byPlayer != net::LocalId()"):
@@ -112,9 +123,12 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertLess(revived.index("if (!helper"), revived.index("pendingReviveSequence = sequence;"))
         self.assertIsNotNone(world_change)
         self.assertIn("life.OnWorldChange();", world_change)
-        self.assertIn("terminalKillSent = false;", world_change)
+        self.assertIn("nativeTerminalKills = 0;", world_change)
+        self.assertIn("nativeTerminalKillChecked = false;", world_change)
+        self.assertIn("terminalStateQueued = false;", world_change)
         self.assertIn("pendingReviveSequence = 0;", world_change)
         self.assertIn("void OnWorldChange();", self.downed_h)
+        self.assertIn("bool Terminal();", self.downed_h)
         self.assertIn("g3t::downed::OnWorldChange();", self.script_cpp)
 
     def test_native_state_and_loading_cannot_clear_the_downed_latch(self):
@@ -126,9 +140,30 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn('KeepDown(hero, "tick")', tick)
         before_terminal = tick[:tick.index("if (life.terminal)")]
         self.assertNotIn("life.held = false", before_terminal)
-        self.assertNotIn("terminalKillSent = false", before_terminal)
         ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
         self.assertLess(ai.index("downed::GuardState(self, name)"), ai.index("if (SpectatorState(name))"))
+        self.assertIn('std::strcmp(name, "ZS_RagDollDead") == 0', ai)
+        self.assertIn('downed::ObserveDeathState(self, true)', ai)
+        self.assertIn('downed::ObserveDeathState(self, false, result != GEFalse)', ai)
+        self.assertNotIn("ObserveNativeKill", ai)
+        self.assertNotIn('std::strcmp(name, "Kill")', ai)
+        self.assertNotIn("nativeTerminalKill", ai)
+        observe = function_body(
+            self.downed_cpp,
+            r"\bvoid\s+ObserveDeathState\s*\(\s*eCEntity\s*\*\s*self\s*,\s*bool\s+entered\s*,\s*bool\s+successful\s*\)",
+        )
+        self.assertIsNotNone(observe)
+        self.assertIn("if (successful && !nativeTerminalKillChecked)", observe)
+        self.assertIn("const bool dead = entity.IsDead();", observe)
+        self.assertIn("const bool deadMode = entity.Routine.AIMode == gEAIMode_Dead &&", observe)
+        self.assertIn("static_cast<int>(entity.Routine.AIMode) == 9;", observe)
+        self.assertIn("nativeTerminalKills = 1;", observe)
+        self.assertEqual(observe.count("nativeTerminalKills = 1"), 1)
+        self.assertIn("native Kill confirmed from ZS_RagDollDead", observe)
+        self.assertIn("ANOMALY native Kill not confirmed", observe)
+        self.assertIn("killer=null victim=hero", observe)
+        self.assertNotIn("ObserveNativeKill", self.downed_h)
+        self.assertNotIn("ObserveNativeKill", self.downed_cpp)
         keys = function_body(ai, r"\bGEInt\s+GE_STDCALL\s+FilterPlayerKeys\s*\(")
         self.assertIn("if (downed::Held()) return 0;", keys)
         self.assertIn("persist::NativeLoading()", self.downed_cpp)
@@ -156,7 +191,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("pendingReviveSequence = 0;", refused)
         self.assertLess(tick.index("revivedBy && !Able(remotes[revivedBy], now)"),
                         tick.index("life.Revive(pendingReviveSequence)"))
-        self.assertIn("life.terminal || terminalKillSent || !life.Revive(pendingReviveSequence)", tick)
+        self.assertIn("life.terminal || !life.Revive(pendingReviveSequence)", tick)
         net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
         self.assertIn("message.state.npcClass = from;", net)
         self.assertIn("constexpr uint16_t ProtocolVersion = saving::Protocol;", net)
@@ -341,11 +376,29 @@ class DownedPolicyTests(unittest.TestCase):
         remote = (ROOT / "src" / "remote.cpp").read_text(encoding="utf-8")
         update = function_body(remote, r"\bvoid\s+UpdatePuppet\s*\(")
         held = function_body(update, r"\bif\s*\(\s*held\s*\)")
+        local_state = function_body(remote, r"\bbool\s+LocalState\s*\(")
         for requirement in ("target.position = remote.latest.position", "target.speed = 0.0f",
                             "target.movementMode = gECharMovementMode_1",
                             "target.aniState = gEAniState_LieKnockDown",
                             "world::RequestProcessingUpdate()", 'std::strstr(target.motion, "GetUp")'):
             self.assertIn(requirement, held)
+        self.assertIn("Entity(own).IsDead() || downed::Terminal()", local_state)
+        self.assertIn("dead && !puppet.terminal", update)
+        self.assertIn("StartPuppetTerminal(puppet, id, hero, now)", update)
+        terminal = function_body(update, r"\bif\s*\(\s*puppet\.terminal\s*\)")
+        self.assertIsNotNone(terminal)
+        self.assertIn("UpdatePuppetTerminal(puppet, id, hero, now)", terminal)
+        self.assertIn("return;", terminal)
+        self.assertNotIn("body::Drive", terminal)
+        self.assertNotIn("AniState = gEAniState_LieKnockDown", terminal)
+        self.assertIn("bCString(\"DEAD\")", remote)
+        self.assertIn('puppet.entity.StartSaySVM(target, bCString("DEAD"), GEFalse);', remote)
+        self.assertNotIn('puppet.entity.StartSaySVM(target, bCString("DEAD"), GETrue);', remote)
+        self.assertIn("npcplayback::CapturePose", remote)
+        self.assertIn("npcplayback::ReplayFrozenPose", remote)
+        self.assertIn("SetRagDollEnabled(GETrue, 0.0f, GETrue)", remote)
+        self.assertIn("gECharMovementMode_RagDollDead", remote)
+        self.assertNotIn("AddForce", remote[remote.index("void StartPuppetTerminal"):remote.index("void UpdatePuppet", remote.index("void StartPuppetTerminal"))])
         self.assertIn("puppet.entity.Routine.AniState = gEAniState_LieKnockDown", update)
         self.assertIn("|| heldOwner", update)
         self.assertIn("remote.activity.downedSequence == remote.latest.downedSequence", update)

@@ -20,6 +20,7 @@ void OnWorldChange();                 // reset terminal death, but carry an unfi
 void Revived(int byPlayer, uint32_t sequence); // a paid revive for this particular downed life
 void HelperHasNoPotion(int byPlayer); // network: that partner stood next to us without one
 bool Held();             // the local hero lies knocked out, waiting for help
+bool Terminal();         // the local hero's life is in the native terminal death presentation
 bool CombatUnavailable(eCEntity* entity); // player life truth, never the puppet's interpolated pose/native mode
 uint32_t UnavailablePlayers(); // player-id bits; stale held packets do not make a player eligible again
 void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bool transition = false);
@@ -35,6 +36,7 @@ void LethalOnlyOff(LogFn log);  // QA negative control: every knock-out waits fo
 void GivePotion(char const* argument, LogFn log);  // QA: "Template[-Amount]" into the hero's inventory ("-0" takes all away)
 void Potions(LogFn log); // QA: POTION lines for the hero's potions
 void Report(LogFn log);  // QA: DOWNED line
+void ObserveDeathState(eCEntity* self, bool entered, bool successful = true);
 void AutoHelpOn(LogFn log);     // QA: standing next to a downed partner for 3 s helps it up again (as before 23.10.)
 void HelpOptionOff(LogFn log);  // QA negative control: a downed partner's puppet offers no help option
 void HelpLineSaid();  // infocmd.cpp: the line "Ich werde dir helfen." of the help option is being spoken

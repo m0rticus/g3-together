@@ -293,7 +293,12 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     eCEntity* actor = guards::StateActor(self, name);
     eCEntity* fighter = actor ? nullptr : fightmem::StateActor(self, name);
     guards::Acting player(actor ? actor : fighter);
+    eCEntity* localHero = gCSession::GetInstance().GetHero();
+    const bool localTerminalState = localHero && self == localHero && downed::Terminal() &&
+                                    std::strcmp(name, "ZS_RagDollDead") == 0;
+    if (localTerminalState) downed::ObserveDeathState(self, true);
     const GEBool result = it->second(stack, spu);
+    if (localTerminalState) downed::ObserveDeathState(self, false, result != GEFalse);
     if (fighter) fightmem::AfterState(self);
     return result;
 }

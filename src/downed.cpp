@@ -62,7 +62,10 @@ int lastHp = -1;                // the hero's hit points a frame ago
 uint32_t lethalBlowAt = 0;      // when a blow by someone who means to kill took hit points off the hero
 unsigned nativeLethal = 0;      // knock-outs of the game's own that were a lethal blow (promoted to the partner's help)
 bool nativeNoted = false;       // logged once per knock-out of the game's own
-bool terminalKillSent = false;  // the native Kill/game-over script was called once for this life
+bool terminalStateQueued = false;
+unsigned terminalStateEntries = 0, terminalStateReturns = 0;
+unsigned nativeTerminalKills = 0;
+bool nativeTerminalKillChecked = false;
 std::string inHand[2];         // the hero's right and left hand while standing (a knock-out drops them)
 bool wasDown = false;
 uint32_t aloneSince = 0;        // when the knocked-out hero last had nobody known able to help (0: someone can)
@@ -87,9 +90,9 @@ void Transition(char const* reason, char const* source)
 void EndStep(char const* step)
 {
     crashlog::EndStep(step);
-    Logf("downed: end step=%s player=%u role=%s held=%d terminal=%d kill_sent=%d sequence=%u",
+    Logf("downed: end step=%s player=%u role=%s held=%d terminal=%d native_kills=%u sequence=%u",
          step, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
-         life.terminal ? 1 : 0, terminalKillSent ? 1 : 0, life.sequence);
+         life.terminal ? 1 : 0, nativeTerminalKills, life.sequence);
 }
 
 bool DownTask(char const* task)
@@ -426,7 +429,7 @@ bool PartnerPresent(net::Remote const* remotes, uint32_t now)
 }
 
 // Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths end this life once.
-// The native Kill script shows game over immediately. Starting ZS_Dead as well would call Kill a second time.
+// ZS_RagDollDead is the sole native terminal entry; queue it once rather than starting any second kill path.
 void Die(Entity& hero, char const* reason)
 {
     if (!life.End()) {
@@ -448,16 +451,82 @@ void Die(Entity& hero, char const* reason)
     hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
     EndStep("set-hp");
     hero.PlayerMemory.SetHitPoints(0);
-    EndStep("full-stop");
+    EndStep("death-full-stop");
     hero.Routine.FullStop();
-    // Kill(killer, victim), unlike ResetAll(self): Script_Game.dll RVA 0x1bc30 resets OTHER before showing game over.
-    // No killer is needed here; a null victim crashes in ResetAll -> Entity::SetLookAtTarget.
-    terminalKillSent = true;
-    EndStep("kill-enter");
-    const GEInt killed = GetScriptAdminExt().CallScript(bCString("Kill"), nullptr, hero.GetInstance(), 0);
-    EndStep("kill-return");
-    Logf("downed: native Kill/game-over script called once (result=%d)", killed);
+    hero.CharacterMovement.StopMovement();
+    // ZS_RagDollDead obtains the native killer and lethal-hit force from these fields. Clear both
+    // before queuing the state so native Kill receives killer=null and no stale inflictor can AddForce.
+    Entity clearAttacker;
+    Entity clearInflictor;
+    hero.NPC.SetCurrentAttacker(clearAttacker);
+    hero.DamageReceiver.SetLastInflictor(clearInflictor);
+    const bool attackerClear = hero.NPC.GetCurrentAttacker().GetInstance() == nullptr;
+    const bool inflictorClear = hero.DamageReceiver.GetLastInflictor().GetInstance() == nullptr;
+    Logf("downed: terminal native inputs clear player=%u attacker_clear=%d inflictor_clear=%d "
+         "force=no-force killer=null victim=hero",
+         net::LocalId(), attackerClear ? 1 : 0, inflictorClear ? 1 : 0);
+    EndStep("death-native-inputs-cleared");
+    // ZS_RagDollDead is the native death-presentation entry: it requests DEAD, calls its direct
+    // native Kill, and enables ragdoll movement mode 14.
+    hero.Routine.AIMode = gEAIMode_Reaction;
+    if (!terminalStateQueued) {
+        terminalStateQueued = true;
+        hero.Routine.SetTask(bCString("ZS_RagDollDead"));
+        EndStep("death-state-queued");
+        Logf("downed: local death state queued once player=%u task=ZS_RagDollDead ai=%d hp=%d",
+             net::LocalId(), static_cast<int>(hero.Routine.AIMode),
+             hero.PlayerMemory.GetHitPoints());
+    } else {
+        Logf("downed: ANOMALY terminal state queue repeated player=%u", net::LocalId());
+    }
 }
+}
+
+void ObserveDeathState(eCEntity* self, bool entered, bool successful)
+{
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (!life.terminal || !self || self != hero) return;
+    Entity entity(hero);
+    if (entered) {
+        ++terminalStateEntries;
+        if (terminalStateEntries == 1) {
+            Logf("downed: local ZS_RagDollDead entry player=%u native_sound=DEAD owner=local "
+                 "task=%s hp=%d ai=%d",
+                 net::LocalId(), entity.Routine.GetCurrentTask().GetText(),
+                 entity.PlayerMemory.GetHitPoints(), static_cast<int>(entity.Routine.AIMode));
+        } else {
+            Logf("downed: ANOMALY repeated ZS_RagDollDead entry player=%u count=%u",
+                 net::LocalId(), terminalStateEntries);
+        }
+        return;
+    }
+    ++terminalStateReturns;
+    auto* animation = static_cast<eCVisualAnimation_PS*>(hero->GetPropertySet(eEPropertySetType_Animation));
+    const bool ragdoll = animation && animation->GetRagDollEnabled();
+    const bool controller = animation && animation->GetRagDollController();
+    Logf("downed: local ZS_RagDollDead return player=%u count=%u task=%s state=%s hp=%d ai=%d "
+         "movement=%d ragdoll=%d controller=%d dead=%d",
+         net::LocalId(), terminalStateReturns, entity.Routine.GetCurrentTask().GetText(),
+         entity.Routine.GetCurrentState().GetText(), entity.PlayerMemory.GetHitPoints(),
+         static_cast<int>(entity.Routine.AIMode),
+         static_cast<int>(entity.CharacterMovement.GetMovementMode()),
+         ragdoll ? 1 : 0, controller ? 1 : 0, entity.IsDead() ? 1 : 0);
+    if (successful && !nativeTerminalKillChecked) {
+        nativeTerminalKillChecked = true;
+        const bool dead = entity.IsDead();
+        const bool deadMode = entity.Routine.AIMode == gEAIMode_Dead &&
+                              static_cast<int>(entity.Routine.AIMode) == 9;
+        if (dead && deadMode) {
+            nativeTerminalKills = 1;
+            Logf("downed: native Kill confirmed from ZS_RagDollDead player=%u killer=null victim=hero "
+                 "dead=%d ai=%d",
+                 net::LocalId(), dead ? 1 : 0, static_cast<int>(entity.Routine.AIMode));
+        } else {
+            Logf("downed: ANOMALY native Kill not confirmed from ZS_RagDollDead player=%u killer=null victim=hero "
+                 "dead=%d ai=%d",
+                 net::LocalId(), dead ? 1 : 0, static_cast<int>(entity.Routine.AIMode));
+        }
+    }
 }
 
 // A hero's death runs through the tasks ZS_Dead or ZS_RagDollDead (the hit judgement and the kill cheat set
@@ -630,7 +699,7 @@ void Tick()
     if (revivedBy) {
         const int by = revivedBy;
         revivedBy = 0;
-        if (life.terminal || terminalKillSent || !life.Revive(pendingReviveSequence)) return;
+        if (life.terminal || !life.Revive(pendingReviveSequence)) return;
         pendingReviveSequence = 0;
         lethal = false;
         lethalSeenDown = false;
@@ -671,7 +740,7 @@ void Revived(int byPlayer, uint32_t sequence)
     eCDynamicEntity* instance = session.GetHero();
     const bool helper = byPlayer > 0 && byPlayer < net::MaxPlayers && byPlayer != net::LocalId() &&
                         Able(net::Remotes()[byPlayer], net::Now());
-    if (!helper || !life.held || !sequence || sequence != life.sequence || life.terminal || terminalKillSent ||
+    if (!helper || !life.held || !sequence || sequence != life.sequence || life.terminal ||
         !instance || !session.IsGameRunning() || persist::HeroPending()) {
         Logf("downed: revive refused player=%u helper=%d sequence=%u current=%u held=%d terminal=%d reason=stale-or-ineligible",
              net::LocalId(), byPlayer, sequence, life.sequence, life.held ? 1 : 0, life.terminal ? 1 : 0);
@@ -756,10 +825,11 @@ void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bo
 }
 
 uint32_t Sequence() { return life.held ? life.sequence : 0; }
+bool Terminal() { return life.terminal; }
 
 void Restore(bool waiting, char const* source)
 {
-    if (life.terminal || terminalKillSent) return;
+    if (life.terminal) return;
     if (waiting && !life.held) {
         Hold("saved-downed-life", source);
         lethal = true;
@@ -792,7 +862,11 @@ void OnWorldChange()
     lastHp = -1;
     lethalBlowAt = 0;
     nativeNoted = false;
-    terminalKillSent = false;
+    terminalStateQueued = false;
+    terminalStateEntries = 0;
+    terminalStateReturns = 0;
+    nativeTerminalKills = 0;
+    nativeTerminalKillChecked = false;
     crashlog::EndStep("world-change");
     Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
     wasDown = false;

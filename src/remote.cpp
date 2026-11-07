@@ -16,6 +16,8 @@
 #include "persist.h"
 #include "trade.h"
 #include "world.h"
+#include "npcplayback.h"
+#include "pose.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -46,6 +48,14 @@ struct Puppet
     body::State body;
     std::string shape;        // the shape it stands for (the player's hero template, or its creature)
     std::unordered_map<uint32_t, std::string> presentationNames;
+    bool terminal = false;
+    bool terminalInitialized = false;
+    bool terminalSound = false;
+    uint32_t terminalTryAt = 0;
+    uint32_t terminalFails = 0;
+    std::vector<pose::Bone> terminalPose;
+    uint8_t terminalPoseFlags = 0;
+    npcplayback::State terminalReplay;
 };
 Puppet puppets[net::MaxPlayers];
 bool started = false;
@@ -63,6 +73,14 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
         puppet.body.presentationSerial = 0;
         puppet.body.actionSeq = -1;
         puppet.presentationNames.clear();
+        puppet.terminal = false;
+        puppet.terminalInitialized = false;
+        puppet.terminalSound = false;
+        puppet.terminalTryAt = 0;
+        puppet.terminalFails = 0;
+        puppet.terminalPose.clear();
+        puppet.terminalPoseFlags = 0;
+        puppet.terminalReplay = npcplayback::State{};
     }
     auto remember = [&](char const* name) {
         if (!*name) return uint32_t(0);
@@ -130,7 +148,9 @@ bool LocalState(net::PlayerState& state)
     // bit 1: knocked out, bit 2: dead, bit 3: waiting for help (an intercepted death, downed.cpp), bit 4: knocked out by
     // the game's own rules, with the gold a robber would find (ransack.cpp)
     const bool robbable = downed::NativeDown();
-    state.flags = 1 | (Entity(own).IsDown() ? 2 : 0) | (Entity(own).IsDead() ? 4 : 0) | (downed::Held() ? 8 : 0) | (robbable ? 16 : 0);
+    state.flags = 1 | (Entity(own).IsDown() ? 2 : 0) |
+                  ((Entity(own).IsDead() || downed::Terminal()) ? 4 : 0) |
+                  (downed::Held() ? 8 : 0) | (robbable ? 16 : 0);
     state.downedSequence = downed::Sequence();
     state.gold = robbable ? Entity(own).Inventory.GetItemAmount(Template("It_Gold")) : 0;
     state.movementMode = static_cast<uint8_t>(Entity(hero).CharacterMovement.GetMovementMode());
@@ -365,6 +385,99 @@ void DespawnAll(char const* reason)
 }
 
 namespace {
+void UpdatePuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t now)
+{
+    if (!puppet.spawned || !puppet.entity.GetInstance()) return;
+    eCEntity* entity = puppet.entity.GetInstance();
+    if (!puppet.terminal) return;
+
+    puppet.entity.Routine.AIMode = gEAIMode_Dead;
+    puppet.entity.CharacterMovement.StopMovement();
+    puppet.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
+    puppet.downedSequence = 0;
+
+    if (puppet.terminalInitialized) return;
+    if (static_cast<int32_t>(now - puppet.terminalTryAt) < 0) return;
+
+    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    if (actor) {
+        using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
+        for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
+            const auto type = static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot);
+            actor->StopMotion(type, 0.0f);
+            actor->SetTargetWeight(type, 0.0f);
+            animation->SetMotionOwner(type, static_cast<Owner>(2));
+        }
+    }
+    if (animation && (!animation->GetRagDollEnabled() || !animation->GetRagDollController()))
+        animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
+
+    if (animation && animation->GetRagDollEnabled() && animation->GetRagDollController()) {
+        puppet.terminalInitialized = true;
+        Logf("downed: puppet player=%d action=ragdoll-ready ragdoll=1 controller=1 gravity_only=1",
+             id);
+        return;
+    }
+
+    ++puppet.terminalFails;
+    if (!puppet.terminalPose.empty())
+        npcplayback::ReplayFrozenPose(entity, puppet.terminalReplay, puppet.terminalPose, puppet.terminalPoseFlags);
+    world::RequestProcessingUpdate();
+    puppet.terminalTryAt = now + (puppet.terminalFails < 4 ? 1500 : 5000);
+    Logf("downed: puppet player=%d action=ragdoll-retry try=%u actor=%d animation=%d ready=0 gravity_only=1",
+         id, puppet.terminalFails, actor != nullptr ? 1 : 0, animation != nullptr ? 1 : 0);
+}
+
+void StartPuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t now)
+{
+    if (puppet.terminal) return;
+    puppet.terminal = true;
+    puppet.terminalInitialized = false;
+    puppet.terminalTryAt = now ? now + 250 : 251;
+    puppet.downedSequence = 0;
+    eCEntity* entity = puppet.entity.GetInstance();
+    if (!entity) return;
+
+    std::vector<pose::Bone> captured;
+    uint8_t capturedFlags = 0;
+    if (npcplayback::CapturePose(entity, captured, capturedFlags, nullptr)) {
+        puppet.terminalPose = std::move(captured);
+        puppet.terminalPoseFlags = capturedFlags;
+    }
+    body::Pacify(puppet.entity, puppet.body);
+    puppet.entity.CharacterMovement.StopMovement();
+    puppet.entity.Routine.AIMode = gEAIMode_Dead;
+    puppet.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
+    puppet.entity.StopPlayAni();
+
+    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    if (actor) {
+        using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
+        for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
+            const auto type = static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot);
+            actor->StopMotion(type, 0.0f);
+            actor->SetTargetWeight(type, 0.0f);
+            animation->SetMotionOwner(type, static_cast<Owner>(2));
+        }
+    }
+    if (animation) animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
+    world::RequestProcessingUpdate();
+
+    if (!puppet.terminalSound) {
+        puppet.terminalSound = true;
+        Entity target(const_cast<eCEntity*>(&hero));
+        puppet.entity.StartSaySVM(target, bCString("DEAD"), GEFalse);
+        Logf("downed: puppet player=%d action=sound svm=DEAD requested=1 source=puppet target=local-hero",
+             id);
+    }
+    Logf("downed: puppet player=%d action=death source=owner flags=4 ai=9 movement=14 "
+         "ragdoll=starting gravity_only=1 pose_captured=%d",
+         id, puppet.terminalPose.empty() ? 0 : 1);
+    UpdatePuppetTerminal(puppet, id, hero, now);
+}
+
 void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
 {
     Puppet& puppet = puppets[id];
@@ -439,6 +552,15 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     // Trading between players (owner 23.10.): addressed, a puppet offers the game's own trade option ("Zeig mir deine
     // Ware!"), which opens the trade window with it (trade.cpp, offer.cpp). Checked like the name.
     puppet.entity.Dialog.TradeEnabled = trade::Available() ? GETrue : GEFalse;
+    const bool dead = (remote.latest.flags & 4) != 0;
+    if (dead && !puppet.terminal) {
+        StartPuppetTerminal(puppet, id, hero, now);
+    }
+    if (puppet.terminal) {
+        puppet.downedSequence = 0;
+        UpdatePuppetTerminal(puppet, id, hero, now);
+        return;
+    }
     const float speed = body::Speed(remote.previous.position, remote.latest.position, remote.previous.sent, remote.latest.sent,
                                     remote.previousTicks, remote.latestTicks);
     // A changed shape can replace the puppet after its packets were serviced; seed that new presentation once.
