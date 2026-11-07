@@ -206,33 +206,9 @@ allow the existing native half-gold robbery. Check corpse/chest loot and partner
 ### Paired-save failure and migration checks (protocol 75)
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
-verified native entry points. `persist: unresolved <function> ... live=<bytes>; paired saves off`
-means no paired-save claim is valid; preserve that line and the preceding native module identity.
-The optional engine-free check `G3T_GAME_DLL` reads a selected CP 1.75 Game.dll and verifies unique
-signatures, named world exports, call edges and ASLR without loading or executing the DLL.
-
-For each host- and client-initiated save, follow `checkpoint requested`, each `character capture`
-(own player ID, record size/CRC), `native invoke=HUD.SaveGame`, successful HUD/world results,
-`host checkpoint published`, client `checkpoint stored`, both `checkpoint ack` phases, then
-`checkpoint paired`. Native three-file sizes/CRCs must agree on both copies; individual character
-CRCs need not agree. A client request must invoke native save only on the host. Wait for the final
-paired result, not the immediate queued call; the native menu may show its generic failure dialog
-because no synchronous save has completed yet.
-
-After loading, require `native load returned ... ok=1 hud_ok=1 lower_calls=1 lower_ok=1` and
-`character restore ... ok=1`/`own character restored` on the overlay recipient before world admission.
-The complete record is checked before native loading; template/attribute checks require the loaded
-world and run before hero mutation. An unsupported direct `World.LoadGameWorld` call is refused
-instead of bypassing own-character restoration; use the normal menu/quick-load HUD path.
-Check different stats, HP/MP, inventory/gold/equipment, learned spells, quick slots and positions,
-alongside the same quest/NPC/door state. Reload the latest checkpoint after playing further,
-then rejoin and check the first shared XP reward. Legacy V3 records include their downed latch;
-missing or damaged counterparts must remain refused or explicitly recover the same player's
-same-campaign record, never use the native host hero. These are still human acceptance checks:
-static bytes and a passing build do not establish that the running copies executed this path.
-
-Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
-verified native entry points. `persist: unresolved <function> ... live=<bytes>; paired saves off`
+verified save/load entry points; `paired save UI hooked` also identifies the verified quicksave handler,
+menu-new call, native availability predicate and screenshot helper.
+`persist: unresolved <function> ... live=<bytes>; paired saves off`
 means no paired-save claim is valid; preserve that line and the preceding native module identity.
 PUP owns the original world-load entry: the verified `E9 ... 90` entry and `87 0C 24 51 E9 ...`
 bridge lead to its `paru_s2.dll` companion. The mod leaves that entry untouched and observes the
@@ -255,11 +231,22 @@ For each host- and client-initiated save, follow `checkpoint requested`, each `c
 `host checkpoint published`, client `checkpoint stored`, both `checkpoint ack` phases, then
 `checkpoint paired`. Native three-file sizes/CRCs must agree on both copies; individual character
 CRCs need not agree. A client request must invoke native save only on the host. Wait for the final
-paired result, not the immediate queued call; the native menu may show its generic failure dialog
-because no synchronous save has completed yet.
+paired result, not the immediate queued call. Quicksave and menu-new events are handled without
+claiming synchronous native success or displaying its misleading generic failure.
+`net: checkpoint transfer paced` gives participant, bytes, chunk count and queue depth;
+`checkpoint bulk deferred` gives budget decision, pressure and credit (normal pacing is not failure);
+`outgoing packet could not be queued ... enet=...` reports the ENet return code; `checkpoint file queued` and
+`checkpoint transfer fully queued` show progress. A busy/transient admission is retried, not canceled.
+Repeat host and client menu saves and quicksaves immediately after each final paired result.
+Requesting another while one is active should identify `busy`, then work as soon as it completes.
+Every actual refusal logs `save refusal reason=...` and displays its localized specific reason.
+Leave dialog/downed/control/trade, retry immediately, and require no stale prepared-state delay.
+Native CP 1.75 `IsSaveAllowed` blocks dialog, controlled NPC, death or `DefeatedByPlayer`;
+combat, a drawn weapon, water or the save-menu pause alone are not independent native gates.
+Test combat and dialog separately rather than assuming both must refuse.
 
 After loading, require `native load returned ... ok=1 hud_ok=1 lower_calls=1 lower_ok=1` and
-`character restore ... ok=1`/`own character restored` on the overlay recipient before world admission.
+`character restore ... ok=1`/`own character restored` on both modern-checkpoint players before world admission.
 The complete record is checked before native loading; template/attribute checks require the loaded
 world and run before hero mutation. Use the normal menu/quick-load HUD path. Other mods calling
 the lower world-load export directly are not intercepted: preserving PUP's entry avoids taking

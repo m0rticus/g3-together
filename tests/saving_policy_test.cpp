@@ -36,6 +36,12 @@ int main()
     assert(!WorldMatches(8, 0, 8, false, false));
     assert(WorldMatches(8, 0, 0, false, true));
     assert(!WorldMatches(0, 0, 0, true, true));
+    assert(!NativeSaveRefusal(false, false, false, false)); // Combat/water/weapon/menu alone are not native save gates.
+    assert(std::string(NativeSaveRefusal(true, false, false, false)) == "dialog");
+    assert(std::string(NativeSaveRefusal(false, true, false, false)) == "control");
+    assert(std::string(NativeSaveRefusal(false, false, true, false)) == "dead");
+    assert(std::string(NativeSaveRefusal(false, false, false, true)) == "defeated");
+    assert(std::string(NativeSaveRefusal(true, true, true, true)) == "dialog");
     assert(ChunkFits(0, 0, 100, 0, 10, 100));
     assert(ChunkFits(100, 10, 100, 10, 90, 100));
     assert(!ChunkFits(100, 10, 99, 10, 89, 100)); // Total cannot change between chunks.

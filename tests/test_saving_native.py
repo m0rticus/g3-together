@@ -35,7 +35,8 @@ class SavingNativeTests(unittest.TestCase):
         pup = os.environ.get("G3T_PUP_DLL")
         if pup and Path(pup).is_file():
             args.extend(["--pup", pup])
-        subprocess.run(args, check=True, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_configured_pup_dll_receiver_owner_operands_and_relocations(self):
         path = os.environ.get("G3T_PUP_DLL")

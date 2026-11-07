@@ -224,6 +224,116 @@ int main()
     }
     assert(done && !FileTransferBusy(2));
 
+    // Build 20's old synchronous caller runs out of bulk credit after five full chunks.
+    const uint32_t checkpointSizes[FileCount]{65705, 2444033, 1381};
+    uint8_t payload[MaxChunk]{};
+    ResetBudget(peers[2]);
+    assert(peerBudgets[0].Snapshot().bulkCreditBytes == 6553);
+    unsigned burst = 0;
+    while (SendFileChunk(2, 0, checkpointSizes[0], burst * MaxChunk, payload, MaxChunk)) ++burst;
+    assert(burst == 5 && burst * MaxChunk < checkpointSizes[0]);
+    transmissions.clear();
+
+    // Repeated checkpoint-sized bundles survive exhausted credit, ENet refusal and real pressure.
+    for (unsigned round = 0; round < 3; ++round) {
+        std::memset(note.save, static_cast<int>('c' + round), 32);
+        const std::string checkpoint = saving::Slot(note.save);
+        std::vector<uint8_t> expected[FileCount], next[FileCount];
+        for (int f = 0; f < FileCount; ++f) {
+            expected[f].resize(checkpointSizes[f]);
+            for (uint32_t at = 0; at < checkpointSizes[f]; ++at)
+                expected[f][at] = static_cast<uint8_t>(at * 31u + f * 47u + round);
+            files[f] = expected[f];
+            next[f] = expected[f];
+        }
+        if (round == 2) {
+            fakePeers[0].packetThrottle = 16;
+            UpdateBudgets(fakeTime);
+            assert(peerBudgets[0].Pressure() == BudgetPressure::Critical);
+        }
+        assert(QueueFileTransfer(2, note, checkpoint.c_str(), files, checkpointSizes, crcs));
+        assert(!QueueFileTransfer(2, note, checkpoint.c_str(), next, checkpointSizes, crcs));
+        for (int f = 0; f < FileCount; ++f) {
+            assert(files[f].empty());             // Accepted atomically, even without available credit.
+            assert(next[f] == expected[f]);       // Busy admission preserves data for a later retry.
+        }
+        const auto before = peerBudgets[0].Snapshot();
+        failSend = true;
+        PumpFileTransfers();
+        assert(transmissions.empty() && !fileTransfers[2].prefixed && !fileTransfers[2].offset);
+        assert(peerBudgets[0].Snapshot().bulkCreditBytes == before.bulkCreditBytes);
+        failSend = false;
+        bool prefix = false, complete = false;
+        uint32_t offsets[FileCount]{};
+        unsigned steps = 0;
+        while (!complete && steps++ < 6000) {
+            if (round == 2 && steps == 20) fakePeers[0].packetThrottle = 30; // Resume constrained, not reset.
+            fakeTime += 34;
+            UpdateBudgets(fakeTime);
+            const auto cursor = fileTransfers[2].offset;
+            const auto credit = peerBudgets[0].Snapshot().bulkCreditBytes;
+            failSend = steps == 40; // A failure after prefix/data admission must not skip a chunk.
+            PumpFileTransfers();
+            if (failSend) {
+                assert(transmissions.empty() && fileTransfers[2].offset == cursor);
+                assert(peerBudgets[0].Snapshot().bulkCreditBytes == credit);
+            }
+            failSend = false;
+            unsigned chunks = 0;
+            for (auto const& transmission : transmissions) {
+                assert(transmission.channel == ChannelBulk);
+                assert(transmission.flags & ENET_PACKET_FLAG_RELIABLE);
+                assert(transmission.bytes.size() <= 1168);
+                if (transmission.bytes[0] == MsgSave) {
+                    assert(!prefix && !complete);
+                    prefix = true;
+                    SaveMsg prefixMessage{};
+                    std::memcpy(&prefixMessage, transmission.bytes.data(), sizeof(prefixMessage));
+                    assert(std::strcmp(prefixMessage.note.save, note.save) == 0);
+                } else if (transmission.bytes[0] == MsgFileChunk) {
+                    assert(prefix && !complete);
+                    ++chunks;
+                    FileChunkHeader chunk{};
+                    std::memcpy(&chunk, transmission.bytes.data(), sizeof(chunk));
+                    assert(chunk.file < FileCount && chunk.offset == offsets[chunk.file]);
+                    assert(chunk.total == checkpointSizes[chunk.file] && chunk.length <= MaxChunk);
+                    assert(transmission.bytes.size() == sizeof(chunk) + chunk.length);
+                    assert(std::memcmp(transmission.bytes.data() + sizeof(chunk),
+                                       expected[chunk.file].data() + chunk.offset, chunk.length) == 0);
+                    offsets[chunk.file] += chunk.length;
+                } else if (transmission.bytes[0] == MsgFileDone) {
+                    FileDoneMsg result{};
+                    std::memcpy(&result, transmission.bytes.data(), sizeof(result));
+                    assert(prefix && !complete && checkpoint == result.name);
+                    for (int f = 0; f < FileCount; ++f) {
+                        assert(offsets[f] == checkpointSizes[f]);
+                        assert(result.size[f] == checkpointSizes[f] && result.crc[f] == crcs[f]);
+                    }
+                    complete = true;
+                } else assert(false);
+            }
+            assert(chunks <= 4);
+            transmissions.clear();
+        }
+        assert(complete && !FileTransferBusy(2) && steps < 6000);
+        // Retry the refused queue admission immediately after the previous stream drained.
+        assert(QueueFileTransfer(2, note, checkpoint.c_str(), next, checkpointSizes, crcs));
+        SaveNote importing = note;
+        importing.op = SaveImport;
+        std::memset(importing.save, 'f', 32);
+        const std::string importSlot = saving::Slot(importing.save);
+        std::vector<uint8_t> importFiles[FileCount];
+        const uint32_t importSizes[FileCount]{1, 1, 1};
+        for (auto& file : importFiles) file.resize(1);
+        assert(QueueFileTransfer(3, importing, importSlot.c_str(), importFiles, importSizes, crcs));
+        CancelFileTransfers(note.save);
+        assert(!FileTransferBusy(2) && FileTransferBusy(3)); // A failed save must not cancel another peer's join import.
+        CancelFileTransfers();
+        assert(!FileTransferBusy(2) && !FileTransferBusy(3));
+        fakePeers[0].packetThrottle = ENET_PEER_DEFAULT_PACKET_THROTTLE;
+        ResetBudget(peers[2]);
+    }
+
     // Congestion pauses bulk, but never refuses a reliable hit/result.
     BudgetTelemetry congested;
     congested.throttle = 16;
@@ -241,6 +351,32 @@ int main()
     ++generations[2];
     PumpFileTransfers();
     assert(!FileTransferBusy(2) && transmissions.empty());
+
+    // A local load/timeout cancellation uses the existing opcode and must reach the host coordinator.
+    static unsigned cancellations = 0;
+    SetSaveHandler([](uint8_t from, SaveNote const& value) {
+        assert(from == 2 && value.op == SaveCancel && !value.ok && value.epoch == 42);
+        assert(std::strcmp(value.name, "canceled-load") == 0);
+        ++cancellations;
+    });
+    SaveNote cancel = note;
+    cancel.op = SaveCancel;
+    cancel.ok = 0;
+    std::memcpy(cancel.name, "canceled-load", sizeof("canceled-load"));
+    SaveMsg cancellation{MsgSave, cancel};
+    Transmission cancelPacket;
+    cancelPacket.bytes.resize(sizeof(cancellation));
+    std::memcpy(cancelPacket.bytes.data(), &cancellation, sizeof(cancellation));
+    cancelPacket.channel = ChannelReliable;
+    cancelPacket.flags = ENET_PACKET_FLAG_RELIABLE;
+    Deliver(peers[2], cancelPacket);
+    assert(cancellations == 1);
+    cancel.world[0] = 0; // The first new-game request has no world ID until host Prepare arrives.
+    cancellation.note = cancel;
+    std::memcpy(cancelPacket.bytes.data(), &cancellation, sizeof(cancellation));
+    Deliver(peers[2], cancelPacket);
+    assert(cancellations == 2);
+    SetSaveHandler(nullptr);
 
     remotes[2].connected = true;
     remotes[2].latestTicks = fakeTime;

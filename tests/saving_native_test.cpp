@@ -490,11 +490,12 @@ void ApplyRelocations(std::vector<uint8_t>& image, PeImage const& pe, uint32_t d
 }
 
 void CheckNamedExports(std::vector<uint8_t> const& image, size_t optional,
-                       size_t const (&entry)[5])
+                       size_t const (&entry)[5], Site const (&catalog)[5])
 {
     const size_t exports = Get(image, optional + 96);
     if (!exports) throw std::runtime_error("missing configured PE export directory");
-    for (size_t i = 2; i < 4; ++i) {
+    for (size_t i = 0; i < 5; ++i) {
+        if (!catalog[i].symbol) continue;
         unsigned found = 0;
         const uint32_t names = Get(image, exports + 32);
         const uint32_t ordinals = Get(image, exports + 36);
@@ -502,16 +503,16 @@ void CheckNamedExports(std::vector<uint8_t> const& image, size_t optional,
         const uint32_t nameCount = Get(image, exports + 24);
         for (unsigned n = 0; n < nameCount; ++n) {
             const size_t name = Get(image, names + n * 4);
-            const size_t length = std::strlen(Sites[i].symbol) + 1;
+            const size_t length = std::strlen(catalog[i].symbol) + 1;
             if (Range(image.size(), name, length) &&
-                !std::memcmp(image.data() + name, Sites[i].symbol, length)) {
+                !std::memcmp(image.data() + name, catalog[i].symbol, length)) {
                 const uint16_t ordinal = Short(image, ordinals + n * 2);
                 if (Get(image, functions + ordinal * 4) == entry[i])
                     ++found;
             }
         }
         if (found != 1)
-            throw std::runtime_error("configured world export mismatch");
+            throw std::runtime_error("configured native export mismatch");
     }
 }
 
@@ -548,7 +549,37 @@ void CheckRealPe(std::vector<uint8_t> const& image, PeImage const& pe, uint32_t 
             throw std::runtime_error("configured native signature resolved at the wrong RVA");
     }
 
-    CheckNamedExports(image, pe.optional, sites);
+    size_t ui[5]{};
+    for (size_t i = 0; i < 5; ++i) {
+        unsigned count = 0;
+        ui[i] = Missing;
+        for (auto const& section : pe.sections) {
+            if (!(section.flags & 0x20000000) || !Range(image.size(), section.at, section.size)) continue;
+            unsigned found = 0;
+            const size_t match = FindUnique(image.data() + section.at, section.size, UiSites[i].bytes, found);
+            if (match != Missing) ui[i] = section.at + match;
+            count += found;
+        }
+        if (count != 1 || ui[i] != UiSites[i].hint)
+            throw std::runtime_error("configured save UI/native availability signature mismatch");
+        auto corrupt = image;
+        const auto pattern = Decode(UiSites[i].bytes);
+        for (size_t at = 0; at < pattern.size(); ++at) {
+            if (pattern[at] < 0) continue;
+            corrupt[ui[i] + at] ^= 1;
+            assert(!Matches(corrupt.data() + ui[i], corrupt.size() - ui[i], UiSites[i].bytes));
+            corrupt[ui[i] + at] ^= 1;
+        }
+        assert(!Matches(image.data() + ui[i], pattern.size() - 1, UiSites[i].bytes));
+    }
+    if (!Calls(image.data(), image.size(), ui[2], sites[4]) ||
+        !Calls(image.data(), image.size(), ui[2] + 6, ui[1]) ||
+        !Calls(image.data(), image.size(), ui[1] + 0x27, sites[0]))
+        throw std::runtime_error("configured menu save call edge mismatch");
+    static_assert(GuiStolen == 7);
+    assert(Matches(image.data() + ui[0], GuiStolen, "8b44240483ec68"));
+    CheckNamedExports(image, pe.optional, sites, Sites);
+    CheckNamedExports(image, pe.optional, ui, UiSites);
 
     const std::vector<int> original = Decode(Sites[3].bytes);
     if (!Range(image.size(), sites[3], original.size()) ||

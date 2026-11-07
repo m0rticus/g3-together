@@ -265,6 +265,11 @@ struct FileTransfer {
     bool active = false, prefixed = false;
 };
 FileTransfer fileTransfers[MaxPlayers];
+struct BulkRefusal {
+    uint32_t at = 0;
+    int reason = -1;
+};
+BulkRefusal bulkRefusals[MaxPlayers];
 
 size_t PeerIndex(ENetPeer const* peer) { return static_cast<size_t>(peer - host->peers); }
 
@@ -369,7 +374,20 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
     if (priority == BudgetClass::BulkReliable) {
         const auto decision = budget.Preview(priority, charge);
         budget.RecordDecision(decision);
-        if (decision != BudgetDecision::Allow) return false;
+        if (decision != BudgetDecision::Allow) {
+            auto& refusal = bulkRefusals[PeerIndex(peer)];
+            const uint32_t now = enet_time_get();
+            if (!refusal.at || refusal.reason != static_cast<int>(decision) || now - refusal.at >= 5000) {
+                refusal = {now | 1u, static_cast<int>(decision)};
+                const auto snapshot = budget.Snapshot();
+                Logf("net: checkpoint bulk deferred player=%u kind=%u bytes=%zu charge=%llu decision=%s credit=%lld pressure=%u queue=%u in_flight=%u",
+                     static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer->data)), size ? static_cast<uint8_t const*>(data)[0] : 0,
+                     size, charge, decision == BudgetDecision::NeedsChunking ? "NeedsChunking" : "Defer",
+                     static_cast<long long>(snapshot.bulkCreditBytes), static_cast<unsigned>(snapshot.pressure),
+                     QueueBytes(peer->outgoingCommands) + QueueBytes(peer->outgoingSendReliableCommands), peer->reliableDataInTransit);
+            }
+            return false;
+        }
     }
     if (channel == ChannelPoses && !reliable) {
         PoseRoute& route = poseRoutes[peer - host->peers];
@@ -396,9 +414,24 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
     }
     ENetPacket* packet = enet_packet_create(data, size, PacketFlags(reliable));
     if (!packet) { Log("net: outgoing packet allocation failed"); return false; }
-    if (enet_peer_send(peer, channel, packet) < 0) {
+    const int queued = enet_peer_send(peer, channel, packet);
+    if (queued < 0) {
         enet_packet_destroy(packet);
-        Log("net: outgoing packet could not be queued");
+        if (priority != BudgetClass::BulkReliable) {
+            Log("net: outgoing packet could not be queued");
+            return false;
+        }
+        auto& refusal = bulkRefusals[PeerIndex(peer)];
+        const uint32_t now = enet_time_get();
+        if (!refusal.at || refusal.reason != -1 || now - refusal.at >= 5000) {
+            refusal = {now | 1u, -1};
+            const unsigned to = static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer->data));
+            const auto& transfer = fileTransfers[to < MaxPlayers ? to : 0];
+            Logf("net: outgoing packet could not be queued player=%u save=%s file=%u offset=%u channel=%u kind=%u bytes=%zu enet=%d queue=%u in_flight=%u",
+                 to, transfer.note.save, transfer.file, transfer.offset, channel,
+                 size ? static_cast<uint8_t const*>(data)[0] : 0, size, queued,
+                 QueueBytes(peer->outgoingCommands) + QueueBytes(peer->outgoingSendReliableCommands), peer->reliableDataInTransit);
+        }
         return false;
     }
     budget.CommitQueued(priority, charge);
@@ -1716,11 +1749,14 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         SaveNote const& note = message.note;
         if (note.world[32] || note.save[32] || note.name[48] || note.ok > 1) return;
-        const bool clientOp = note.op == SaveRequest || note.op == SaveReady || note.op == SaveStored;
+        const bool clientOp = note.op == SaveRequest || note.op == SaveReady || note.op == SaveStored || note.op == SaveCancel;
         const bool hostOp = note.op == SavePrepare || note.op == SaveCommit || note.op == SaveCancel ||
                             note.op == SaveResult || note.op == SaveImport;
         if ((isHost && !clientOp) || (!isHost && !hostOp)) return;
-        if (!note.epoch || (note.op != SaveRequest && (!saving::Id(note.world) || !saving::Id(note.save)))) return;
+        // A client may cancel its request before Prepare supplies the shared-world ID.
+        const bool pendingCancel = isHost && note.op == SaveCancel && !*note.world;
+        if (!note.epoch || (note.op != SaveRequest && ((!pendingCancel && !saving::Id(note.world)) ||
+            !saving::Id(note.save)))) return;
         if (saveHandler) saveHandler(from, note);
     } else if (type == MsgCampaign && !isHost && packet->dataLength == sizeof(CampaignMsg)) {
         CampaignMsg message;
@@ -2411,12 +2447,19 @@ bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
                        std::vector<uint8_t> (&files)[FileCount],
                        uint32_t const size[FileCount], uint32_t const crc[FileCount])
 {
-    if (!host || !isHost || to < 2 || to >= MaxPlayers || !peers[to] || fileTransfers[to].active ||
-        !name || !saving::SafeName(name) || (note.op != SaveCommit && note.op != SaveImport)) return false;
+    char const* rejected = !host || !isHost ? "not-host" : to < 2 || to >= MaxPlayers ? "recipient" :
+        !peers[to] || peers[to]->state != ENET_PEER_STATE_CONNECTED || !generations[to] ? "disconnected" :
+        fileTransfers[to].active ? "busy" : !name || !saving::SafeName(name) ? "name" :
+        (note.op != SaveCommit && note.op != SaveImport) ? "operation" : nullptr;
+    if (rejected) {
+        Logf("net: checkpoint queue refused player=%u reason=%s", to, rejected);
+        return false;
+    }
     constexpr uint32_t FileLimit = 64u * 1024 * 1024;
     for (int f = 0; f < FileCount; ++f) {
         if (!size[f] || size[f] > FileLimit || files[f].size() != size[f]) {
-            Logf("net: checkpoint transfer refused for player %u (file %d size)", to, f);
+            Logf("net: checkpoint queue refused player=%u reason=file-size file=%d declared=%u actual=%zu limit=%u",
+                 to, f, size[f], files[f].size(), FileLimit);
             return false;
         }
     }
@@ -2431,16 +2474,21 @@ bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
     transfer.progressedAt = enet_time_get();
     transfer.active = true;
     fileTransfers[to] = std::move(transfer);
-    Logf("net: checkpoint transfer paced player=%u bytes=%llu chunk=%u bulk_bytes_per_s=%u",
-         to, uint64_t(size[0]) + size[1] + size[2], MaxChunk, budgetRate / 4);
+    const uint32_t chunks = (size[0] + MaxChunk - 1) / MaxChunk + (size[1] + MaxChunk - 1) / MaxChunk +
+                            (size[2] + MaxChunk - 1) / MaxChunk;
+    Logf("net: checkpoint transfer paced player=%u save=%s bytes=%llu chunks=%u chunk=%u bulk_bytes_per_s=%u queue=%u in_flight=%u",
+         to, note.save, uint64_t(size[0]) + size[1] + size[2], chunks, MaxChunk, budgetRate / 4,
+         QueueBytes(peers[to]->outgoingCommands) + QueueBytes(peers[to]->outgoingSendReliableCommands),
+         peers[to]->reliableDataInTransit);
     return true;
 }
 
 bool FileTransferBusy(uint8_t to) { return to < MaxPlayers && fileTransfers[to].active; }
 
-void CancelFileTransfers()
+void CancelFileTransfers(char const* save)
 {
     for (uint8_t i = 2; i < MaxPlayers; ++i) {
+        if (save && std::strcmp(fileTransfers[i].note.save, save)) continue;
         if (fileTransfers[i].active) Logf("net: checkpoint transfer canceled for player %u", i);
         fileTransfers[i] = {};
     }
@@ -2455,7 +2503,10 @@ void PumpFileTransfers()
         FileTransfer& transfer = fileTransfers[to];
         if (!transfer.active) continue;
         if (!peers[to] || generations[to] != transfer.generation || now - transfer.progressedAt >= 180000) {
-            Logf("net: checkpoint transfer canceled player=%u (stale generation or no progress)", to);
+            Logf("net: checkpoint transfer canceled player=%u save=%s reason=%s file=%u offset=%u age_ms=%u",
+                 to, transfer.note.save, !peers[to] ? "disconnected" :
+                 generations[to] != transfer.generation ? "generation" : "no-progress",
+                 transfer.file, transfer.offset, now - transfer.progressedAt);
             transfer = {};
             continue;
         }
@@ -2464,6 +2515,7 @@ void PumpFileTransfers()
             if (!Send(peers[to], &prefix, sizeof(prefix), ChannelBulk, true)) continue;
             transfer.prefixed = true;
             transfer.progressedAt = now;
+            Logf("net: checkpoint prefix queued player=%u save=%s channel=%u", to, transfer.note.save, ChannelBulk);
         }
         for (unsigned chunks = 0; chunks < 4 && transfer.file < FileCount; ++chunks) {
             auto const& bytes = transfer.files[transfer.file];
@@ -2473,13 +2525,17 @@ void PumpFileTransfers()
             transfer.offset += length;
             transfer.progressedAt = now;
             if (transfer.offset == bytes.size()) {
+                Logf("net: checkpoint file queued player=%u save=%s file=%u bytes=%zu",
+                     to, transfer.note.save, transfer.file, bytes.size());
                 transfer.offset = 0;
                 ++transfer.file;
             }
         }
         if (transfer.file == FileCount &&
             Send(peers[to], &transfer.done, sizeof(transfer.done), ChannelBulk, true)) {
-            Logf("net: checkpoint transfer fully queued player=%u", to);
+            Logf("net: checkpoint transfer fully queued player=%u save=%s queue=%u in_flight=%u",
+                 to, transfer.note.save, QueueBytes(peers[to]->outgoingCommands) +
+                 QueueBytes(peers[to]->outgoingSendReliableCommands), peers[to]->reliableDataInTransit);
             transfer = {};
         }
     }

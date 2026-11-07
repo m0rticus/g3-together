@@ -160,6 +160,9 @@ constexpr Translation Messages[] = {
     {L"No exact character for this checkpoint. Recovering your latest character from this campaign.",
      L"Kein eigener Held für diesen Spielstand. Dein letzter Held aus dieser Kampagne wird wiederhergestellt.",
      L"Brak dokładnego bohatera dla tego zapisu. Przywracany jest twój ostatni bohater z tej kampanii."},
+    {L"Co-op save not completed: %s",
+     L"Koop-Spielstand nicht abgeschlossen: %s",
+     L"Zapis kooperacji nie został ukończony: %s"},
 };
 static_assert(sizeof(Messages) / sizeof(Messages[0]) == MessageCount, "Missing HUD translation");
 
@@ -197,5 +200,59 @@ wchar_t const* Text(Message message)
     if (!std::strcmp(language, "de")) return translation.german;
     if (!std::strcmp(language, "pl")) return translation.polish;
     return translation.english;
+}
+
+wchar_t const* SaveReason(char const* code)
+{
+    struct Reason { char const* code; Translation text; };
+    static constexpr Reason reasons[] = {
+        {"native-hooks", {L"Save/load hooks are unavailable. See the log.", L"Speicher-/Lade-Hooks fehlen. Siehe Log.", L"Brak obsługi zapisu/wczytywania. Zobacz log."}},
+        {"name", {L"Invalid or reserved save name.", L"Ungültiger oder reservierter Speichername.", L"Nieprawidłowa lub zastrzeżona nazwa zapisu."}},
+        {"busy", {L"Another checkpoint is still being saved. Wait for its result.", L"Ein Spielstand wird noch gespeichert. Warte auf das Ergebnis.", L"Inny zapis jest w toku. Poczekaj na wynik."}},
+        {"loading", {L"The world is loading or a native save is running.", L"Die Welt lädt oder wird gerade gespeichert.", L"Świat jest wczytywany lub zapisywany."}},
+        {"own-character", {L"Your own character has not finished restoring.", L"Dein eigener Held ist noch nicht wiederhergestellt.", L"Twój własny bohater nie został jeszcze przywrócony."}},
+        {"trade", {L"A player exchange is still synchronizing.", L"Ein Spieleraustausch wird noch synchronisiert.", L"Wymiana między graczami jest nadal synchronizowana."}},
+        {"not-running", {L"No playable hero is running.", L"Kein spielbarer Held ist aktiv.", L"Brak aktywnego grywalnego bohatera."}},
+        {"control", {L"Return to your own human hero before saving.", L"Kehre vor dem Speichern zu deinem menschlichen Helden zurück.", L"Przed zapisem wróć do swojego ludzkiego bohatera."}},
+        {"downed", {L"A player is knocked out. Revive them first.", L"Ein Spieler liegt am Boden. Hilf ihm zuerst auf.", L"Gracz jest powalony. Najpierw go podnieś."}},
+        {"dead", {L"The hero is dead. Load a checkpoint.", L"Der Held ist tot. Lade einen Spielstand.", L"Bohater nie żyje. Wczytaj zapis."}},
+        {"defeated", {L"The native hero is still marked defeated. Finish recovery first.", L"Der Held gilt noch als besiegt. Beende zuerst die Erholung.", L"Bohater nadal jest oznaczony jako pokonany. Najpierw zakończ odzyskiwanie."}},
+        {"dialog", {L"A dialog is running. Finish it and retry.", L"Ein Dialog läuft. Beende ihn und versuche es erneut.", L"Trwa rozmowa. Zakończ ją i spróbuj ponownie."}},
+        {"world", {L"The shared world is not ready or has changed.", L"Die gemeinsame Welt ist nicht bereit oder hat sich geändert.", L"Wspólny świat nie jest gotowy lub się zmienił."}},
+        {"folder", {L"The configured save folder is unavailable.", L"Der konfigurierte Speicherordner ist nicht verfügbar.", L"Skonfigurowany folder zapisów jest niedostępny."}},
+        {"identity", {L"Could not create the checkpoint identity.", L"Die Spielstandkennung konnte nicht erzeugt werden.", L"Nie można utworzyć identyfikatora zapisu."}},
+        {"character-write", {L"Could not store or validate your character record. See the log and retry.", L"Die Heldendatei konnte nicht gespeichert oder geprüft werden. Siehe Log.", L"Nie można zapisać lub sprawdzić pliku bohatera. Zobacz log."}},
+        {"journal-write", {L"Could not capture the shared world journal.", L"Das gemeinsame Weltjournal konnte nicht gespeichert werden.", L"Nie można zapisać wspólnego dziennika świata."}},
+        {"native-save", {L"The host's native world save failed. See the log and retry.", L"Der native Weltspielstand des Hosts ist fehlgeschlagen. Siehe Log.", L"Natywny zapis świata hosta nie powiódł się. Zobacz log."}},
+        {"disk-write", {L"Checkpoint files could not be published. Check disk space and retry.", L"Spielstanddateien konnten nicht geschrieben werden. Prüfe den Speicherplatz.", L"Nie można opublikować plików zapisu. Sprawdź wolne miejsce."}},
+        {"alias-write", {L"The requested menu/quick-save slot could not be written.", L"Der Menü-/Schnellspeicherplatz konnte nicht geschrieben werden.", L"Nie można zapisać wybranego zapisu menu/szybkiego zapisu."}},
+        {"peer-loading", {L"A connected partner is loading or outside this world.", L"Ein Mitspieler lädt oder ist in einer anderen Welt.", L"Połączony gracz wczytuje grę lub jest poza tym światem."}},
+        {"peer-left", {L"A participating partner disconnected or rejoined.", L"Ein beteiligter Mitspieler hat die Verbindung gewechselt.", L"Uczestniczący gracz rozłączył się lub połączył ponownie."}},
+        {"prepare-timeout", {L"A partner did not prepare its character within 15 seconds.", L"Ein Mitspieler hat seinen Helden nicht innerhalb von 15 Sekunden vorbereitet.", L"Gracz nie przygotował bohatera w ciągu 15 sekund."}},
+        {"write-timeout", {L"The host's save files did not finish within 60 seconds.", L"Die Host-Dateien waren nach 60 Sekunden nicht fertig.", L"Pliki zapisu hosta nie były gotowe w ciągu 60 sekund."}},
+        {"transfer-timeout", {L"A partner did not receive and confirm the checkpoint within 180 seconds.", L"Ein Mitspieler hat den Spielstand nach 180 Sekunden nicht bestätigt.", L"Gracz nie otrzymał i nie potwierdził zapisu w ciągu 180 sekund."}},
+        {"transfer-store", {L"The received checkpoint or own character record failed verification/storage.", L"Der empfangene Spielstand oder die Heldendatei konnte nicht geprüft/gespeichert werden.", L"Odebrany zapis lub plik bohatera nie przeszedł sprawdzania/zapisu."}},
+        {"transfer-chunk", {L"The checkpoint contains an invalid or out-of-order file chunk.", L"Der Spielstand enthält einen ungültigen oder falsch sortierten Dateiblock.", L"Zapis zawiera nieprawidłowy lub przesunięty fragment pliku."}},
+        {"transfer-length", {L"The checkpoint file lengths do not match.", L"Die Dateigrößen des Spielstands stimmen nicht überein.", L"Rozmiary plików zapisu nie zgadzają się."}},
+        {"transfer-crc", {L"The checkpoint file checksums do not match.", L"Die Prüfsummen des Spielstands stimmen nicht überein.", L"Sumy kontrolne plików zapisu nie zgadzają się."}},
+        {"transfer-manifest", {L"The checkpoint manifest or shared-world identity is invalid.", L"Das Spielstandmanifest oder die Weltkennung ist ungültig.", L"Manifest zapisu lub identyfikator wspólnego świata jest nieprawidłowy."}},
+        {"character-record", {L"Your prepared own-character record is missing or invalid.", L"Deine vorbereitete Heldendatei fehlt oder ist ungültig.", L"Przygotowany plik twojego bohatera nie istnieje lub jest nieprawidłowy."}},
+        {"host-offline", {L"No ready authoritative host is connected.", L"Kein bereiter autoritativer Host ist verbunden.", L"Brak połączenia z gotowym hostem świata."}},
+        {"control-send", {L"A checkpoint control message could not be queued. Retry.", L"Eine Spielstandnachricht konnte nicht eingereiht werden. Erneut versuchen.", L"Nie można wysłać wiadomości sterującej zapisem. Spróbuj ponownie."}},
+        {"request-timeout", {L"The host did not begin this request within 15 seconds.", L"Der Host hat die Anfrage nach 15 Sekunden nicht begonnen.", L"Host nie rozpoczął tego żądania w ciągu 15 sekund."}},
+        {"timer", {L"The native save timer could not be armed.", L"Der native Speicher-Timer konnte nicht gestartet werden.", L"Nie można uruchomić zegara natywnego zapisu."}},
+        {"native-load", {L"The native checkpoint load failed. See the log.", L"Der native Ladevorgang ist fehlgeschlagen. Siehe Log.", L"Natywne wczytywanie zapisu nie powiodło się. Zobacz log."}},
+        {"slot-allocation", {L"The game could not allocate a new menu save slot.", L"Das Spiel konnte keinen neuen Menü-Speicherplatz anlegen.", L"Gra nie może utworzyć nowego miejsca zapisu."}},
+        {"canceled-load", {L"A load replaced the pending save.", L"Ein Ladevorgang hat die Speicherung ersetzt.", L"Wczytywanie zastąpiło oczekujący zapis."}},
+    };
+    for (auto const& reason : reasons) {
+        if (!code || std::strcmp(code, reason.code)) continue;
+        char const* language = Language();
+        return !std::strcmp(language, "de") ? reason.text.german :
+               !std::strcmp(language, "pl") ? reason.text.polish : reason.text.english;
+    }
+    return !std::strcmp(Language(), "de") ? L"Der Mitspieler meldet einen unbekannten Speicherfehler. Siehe Log." :
+           !std::strcmp(Language(), "pl") ? L"Gracz zgłosił nieznany błąd zapisu. Zobacz log." :
+           L"The partner reported an unrecognized save failure. See the log.";
 }
 }

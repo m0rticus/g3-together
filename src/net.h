@@ -316,12 +316,13 @@ constexpr uint16_t MaxChunk = 1148; // 12-byte file header + data fits even the 
 bool SendFileChunk(uint8_t to, uint8_t file, uint32_t total, uint32_t offset, void const* data, uint16_t length);
 bool SendFileDone(uint8_t to, char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount]);
 // Takes the complete immutable bundle atomically; ordered prefix/chunks/done are
-// paced on a separate reliable channel. A busy recipient must finish or disconnect.
+// paced on a separate reliable channel. Refusal does not consume the files; retry a busy recipient.
 bool QueueFileTransfer(uint8_t to, SaveNote const& note, char const* name,
                        std::vector<uint8_t> (&files)[FileCount],
                        uint32_t const size[FileCount], uint32_t const crc[FileCount]);
 bool FileTransferBusy(uint8_t to);
-void CancelFileTransfers();
+// An ID cancels only that checkpoint; nullptr also cancels unrelated join imports on world changes.
+void CancelFileTransfers(char const* save = nullptr);
 using FileChunkHandler = void (*)(uint8_t file, uint32_t total, uint32_t offset, uint8_t const* data, uint16_t length);
 using FileDoneHandler = void (*)(char const* name, uint32_t const size[FileCount], uint32_t const crc[FileCount]);
 void SetFileHandlers(FileChunkHandler chunk, FileDoneHandler done);

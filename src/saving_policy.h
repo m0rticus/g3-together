@@ -85,6 +85,10 @@ inline bool WorldMatches(uint32_t hostEpoch, uint32_t admittedEpoch, uint32_t lo
 {
     return hostEpoch && (admittedEpoch == hostEpoch || (loadedEpoch == hostEpoch && sameCheckpoint) || freshNewWorld);
 }
+inline char const* NativeSaveRefusal(bool dialog, bool controlled, bool dead, bool defeated)
+{
+    return dialog ? "dialog" : controlled ? "control" : dead ? "dead" : defeated ? "defeated" : nullptr;
+}
 
 enum class Restore { Exact, Latest, Legacy, NewHero, Wait };
 inline Restore Select(bool exactExists, bool latestExists, bool legacyExists, bool cleanHero)
@@ -96,7 +100,7 @@ inline Restore Select(bool exactExists, bool latestExists, bool legacyExists, bo
 
 struct Barrier {
     enum Phase { Idle, Preparing, Writing, Committing };
-    struct Member { uint32_t generation = 0; bool ready = false, stored = false; };
+    struct Member { uint32_t generation = 0; bool ready = false, stored = false, queued = false; };
     std::array<Member, 8> members{};
     Phase phase = Idle;
     std::string save;

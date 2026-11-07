@@ -112,7 +112,8 @@ class SavingPolicyTests(unittest.TestCase):
         body = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
         self.assertIn("incomingWelcome != net::WelcomeSerial()", body)
         self.assertIn("incomingNote.epoch != hostWorld.epoch", body)
-        self.assertIn("prepared.welcome == net::WelcomeSerial()", body)
+        self.assertIn("prepared.welcome != net::WelcomeSerial()", body)
+        self.assertIn('reason = "character-record"', body)
         self.assertIn("saving::Exact(key, found)", body)
         self.assertIn("StoreBundle(name, incoming)", body)
         self.assertIn("const char* alias = prepared.note.name", body)
@@ -193,7 +194,7 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("if (nativeSaveDepth)", body)
         self.assertIn("originalWorldSave(self, name, image, metadata, size)", body)
         self.assertIn("SaveDetour(nullptr, &name)", body)
-        ready = function_body(self.persist, r"\bbool\s+NativeSaveAllowed\s*\(")
+        ready = function_body(self.persist, r"\bchar const\*\s+NativeSaveReason\s*\(")
         self.assertLess(ready.index("gCInfoManager_PS::GetInstance()"), ready.index("session.IsSaveAllowed()"))
         self.assertIn("session.GetPlayer() != session.GetHero()", ready)
         self.assertIn("downed::Held()", ready)
@@ -277,9 +278,11 @@ class SavingPolicyTests(unittest.TestCase):
     def test_native_entries_and_owned_call_are_reverified_before_use(self):
         verify = function_body(self.persist, r"\bbool\s+ReverifyNative\s*\(")
         self.assertIn("i < 5", verify)
-        self.assertIn("guard == reinterpret_cast<uintptr_t>(originals[i]) - 24", verify)
-        self.assertIn("target == reinterpret_cast<uintptr_t>(detours[i])", verify)
-        self.assertIn("target == reinterpret_cast<uintptr_t>(entry + Stolen)", verify)
+        self.assertIn("OwnedHook(entry, originals[i], detours[i], Stolen, fn.bytes)", verify)
+        guard = function_body(self.persist, r"\bbool\s+OwnedHook\s*\(")
+        self.assertIn("guard == reinterpret_cast<uintptr_t>(original) - 24", guard)
+        self.assertIn("target == reinterpret_cast<uintptr_t>(detour)", guard)
+        self.assertIn("target == reinterpret_cast<uintptr_t>(entry + stolen)", guard)
         self.assertIn("PupLoadEntry(entry, beforeUse)", verify)  # Allows the verified late PUP install only.
         self.assertIn("target != reinterpret_cast<uintptr_t>(&WorldLoadDetour)", verify)
         self.assertIn("saving::native::GetterLinks", verify)
@@ -295,7 +298,7 @@ class SavingPolicyTests(unittest.TestCase):
         ready = function_body(self.persist, r"\bbool\s+NativeReady\s*\(")
         self.assertIn("ReverifyNative(true)", ready)
         self.assertIn("pairedEnabled = false", ready)
-        self.assertIn('CancelSave("native hooks changed before use")', ready)
+        self.assertIn('CancelSave("native-hooks")', ready)
         self.assertIn('DropAutoload("native hooks changed before use")', ready)
         self.assertIn("prepared = Prepared{}", ready)
         self.assertIn("file.clear()", ready)
@@ -327,7 +330,9 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("live=%s; paired saves off", fail)
 
     def test_world_load_call_patch_is_checked_tracked_and_shutdown_safe(self):
-        hook = function_body(self.persist, r"\bbool\s+HookWorldLoadCall\s*\(")
+        wrapper = function_body(self.persist, r"\bbool\s+HookWorldLoadCall\s*\(")
+        self.assertIn("HookNativeCall(call, entry", wrapper)
+        hook = function_body(self.persist, r"\bbool\s+HookNativeCall\s*\(")
         self.assertLess(hook.index("target != reinterpret_cast<uintptr_t>(entry)"), hook.index("VirtualProtect("))
         self.assertIn("std::memcpy(call + 1, &relative", hook)
         self.assertIn("ai::TrackPatch(call, before, after", hook)
@@ -345,6 +350,75 @@ class SavingPolicyTests(unittest.TestCase):
         tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
         self.assertIn("now - incomingAt > TransferLimit", tick)
         self.assertIn("incomingWelcome != net::WelcomeSerial()", tick)
+
+    def test_campaign_uses_paced_queue_not_synchronous_bulk_burst(self):
+        send = function_body(self.persist, r"\bbool\s+SendCampaign\s*\(\s*uint8_t")
+        self.assertIn("net::QueueFileTransfer(", send)
+        self.assertIn("net::FileTransferBusy(to)", send)
+        self.assertNotIn("net::SendFileChunk(", send)
+        self.assertNotIn("net::SendFileDone(", send)
+        self.assertNotIn("net::SendSave(", send)  # Prefix belongs to the same ordered bulk stream.
+        poll = function_body(self.persist, r"\bvoid\s+PollSave\s*\(")
+        self.assertIn("if (!member.generation || member.queued) continue", poll)
+        self.assertIn("const bool queued = SendCampaign(i, true)", poll)
+        self.assertIn("member.queued = queued", poll)
+        self.assertLess(poll.index("if (barrier.phase != saving::Barrier::Committing) return;"),
+                        poll.index("if (barrier.AllStored())"))
+        self.assertNotIn('CancelSave("checkpoint transfer could not be queued")', poll)
+        finish = function_body(self.persist, r"\bvoid\s+FinishSave\s*\(")
+        self.assertIn("if (!ok) net::CancelFileTransfers(savingManifest.key.save.c_str())", finish)
+
+    def test_ui_handles_request_without_native_success_or_generic_failure(self):
+        quick = function_body(self.persist, r"\bbool\s+__fastcall\s+GuiMessageDetour\s*\(")
+        self.assertIn("message != 0x8001", quick)
+        self.assertIn('bCString slot("QuickSave")', quick)
+        self.assertIn("SaveDetour(nullptr, &slot)", quick)
+        self.assertNotIn("originalSave(", quick)
+        self.assertNotIn("SavePaired", quick)
+        menu = function_body(self.persist, r"\bbool\s+__stdcall\s+MenuNewSlot\s*\(")
+        self.assertIn("originalNewSlot(self)", menu)
+        self.assertIn("before == saveRequestsSeen", menu)
+        self.assertNotIn("SavePaired", menu)
+        native = function_body(self.persist, r"\bbool\s+__stdcall\s+SaveDetour\s*\(")
+        self.assertIn("return false;", native)
+
+    def test_reply_retry_and_new_prepare_release_stale_checkpoint(self):
+        tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
+        self.assertIn("RetryReplies(now)", tick)
+        retry = function_body(self.persist, r"\bvoid\s+RetryReplies\s*\(")
+        self.assertIn("reply.binding != net::PeerGeneration(to)", retry)
+        self.assertIn("reply.binding != net::WelcomeSerial()", retry)
+        self.assertIn("reply.note.epoch", retry)
+        self.assertIn("net::SendSave(to, reply.note)", retry)
+        receive = function_body(self.persist, r"\bvoid\s+OnSave\s*\(")
+        self.assertIn("prepared checkpoint superseded", receive)
+        self.assertIn("QueueReply(1, answer)", receive)
+        self.assertIn("strncpy_s(answer.name, reason", receive)
+
+    def test_modern_host_load_also_requires_own_exact_overlay(self):
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("manifest.legacy.empty() || !net::IsHost()", load)
+        self.assertLess(load.index("overlay && !ChooseCharacter("), load.rindex("originalLoad(self, name)"))
+        evaluate = function_body(self.persist, r"\bvoid\s+Evaluate\s*\(")
+        self.assertIn("if (net::IsHost()) return;", evaluate)
+
+    def test_specific_transfer_failures_are_replied_and_cleaned(self):
+        done = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
+        for code in ("transfer-chunk", "transfer-length", "transfer-crc", "transfer-manifest",
+                     "character-record", "disk-write", "alias-write"):
+            self.assertIn('"' + code + '"', done)
+        self.assertIn("strncpy_s(answer.name, reason", done)
+        self.assertIn("prepared = {}", done)
+        self.assertIn("ClearIncoming()", done)
+        cancel = function_body(self.persist, r"\bvoid\s+CancelClientSave\s*\(")
+        self.assertIn("note.op = net::SaveCancel", cancel)
+        self.assertIn("QueueReply(1, note)", cancel)
+        self.assertIn("prepared = {}", cancel)
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn('CancelClientSave("canceled-load")', load)
+        receive = function_body(self.persist, r"\bvoid\s+OnSave\s*\(")
+        self.assertIn("note.op == net::SaveCancel", receive)
+        self.assertIn("barrier.members[from].generation != net::PeerGeneration(from)", receive)
 
     def test_successful_store_retains_prepare_until_final_result(self):
         done = function_body(self.persist, r"\bvoid\s+OnFileDone\s*\(")
@@ -395,7 +469,10 @@ class SavingPolicyTests(unittest.TestCase):
     def test_prepare_capture_lifetime_covers_all_host_phases(self):
         self.assertIn("PreparedLimit = PrepareLimit + WriteLimit + TransferLimit", self.persist)
         tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
-        self.assertIn("now - prepared.since > PreparedLimit", tick)
+        self.assertIn("now - prepared.since > (prepared.committing ? TransferLimit : PreparedLimit)", tick)
+        self.assertIn("CancelClientSave(reason)", tick)
+        receive = function_body(self.persist, r"\bvoid\s+OnSave\s*\(")
+        self.assertIn("prepared.since = incomingAt; prepared.committing = true", receive)
 
 
 if __name__ == "__main__":
