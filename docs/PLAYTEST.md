@@ -212,7 +212,7 @@ to the first 40 records plus one sample per five seconds. Inventory presence is 
 While waiting, NPCs must ignore the body rather than rob it; ordinary nonlethal guard knock-outs still
 allow the existing native half-gold robbery. Check corpse/chest loot and partner trade remain normal.
 
-### Paired-save failure and migration checks (protocol 75)
+### Paired-save failure and migration checks (protocol 76)
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified save/load entry points; `paired save UI hooked` also identifies the verified quicksave handler,

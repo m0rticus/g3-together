@@ -28,6 +28,10 @@ struct BandwidthCounters {
     uint64_t tierUpdates[3] = {}, tierBytes[3] = {};
     uint64_t poseBytes = 0, poseBones = 0, poseKeys = 0, poseDeltas = 0;
     uint64_t poseAcks = 0, poseAckMisses = 0, poseReferenceMisses = 0, poseDecodeFailures = 0;
+    uint64_t poseHeaderBytes = 0, poseMaskBits = 0, poseRotationBits = 0, poseTranslationBits = 0;
+    uint64_t poseControlBytes = 0, poseOuterBytes = 0, poseIncludedDeltaBones = 0, posePredictiveUpdates = 0;
+    uint64_t poseRigidBones = 0, poseMaxBasisError = 0;
+    uint64_t posePaddingBits = 0;
 
     void Pose(uint32_t interval, size_t bytes, size_t bonesBytes, int bones, bool key)
     {
@@ -35,6 +39,20 @@ struct BandwidthCounters {
         ++tierUpdates[tier]; tierBytes[tier] += bytes;
         poseBytes += bonesBytes; poseBones += static_cast<uint64_t>(bones);
         if (key) ++poseKeys; else ++poseDeltas;
+    }
+
+    void PoseComponents(size_t headerBytes, size_t maskBits, size_t rotationBits, size_t translationBits,
+                        size_t includedBones, bool key, bool predictive, size_t controlBytes, size_t outerBytes,
+                        size_t rigidBones = 0, size_t maxBasisError = 0, size_t paddingBits = 0)
+    {
+        poseHeaderBytes += headerBytes; poseMaskBits += maskBits;
+        poseRotationBits += rotationBits; poseTranslationBits += translationBits;
+        poseControlBytes += controlBytes; poseOuterBytes += outerBytes;
+        if (!key) poseIncludedDeltaBones += includedBones;
+        if (predictive) ++posePredictiveUpdates;
+        poseRigidBones += rigidBones;
+        posePaddingBits += paddingBits;
+        if (maxBasisError > poseMaxBasisError) poseMaxBasisError = maxBasisError;
     }
 
     void Tx(uint8_t kind, size_t bytes) { ++kinds[kind].txPackets; kinds[kind].txBytes += bytes; }

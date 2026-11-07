@@ -15,10 +15,10 @@ namespace g3t::npcwire::bones {
 // count ordered u32 hashes; an ack has no payload. A request is only epoch:u32,
 // layout_id:u16 and may be sent without a known generation. A compact pose is
 // layout_id:u16 followed by count * 12 i16 values; count comes from the layout.
-// The live protocol 75 pose envelope additionally uses npcwire_pose.h's exact
+// The live protocol 76 pose envelope additionally uses npcwire_pose.h's guarded
 // acknowledged-reference/bitmask codec; this raw dictionary codec is its fallback.
 // Counts are 1..pose::MaxBones. These structs describe bytes, not native loads.
-constexpr uint8_t Version = 73;
+constexpr uint8_t Version = 74;
 #pragma pack(push, 1)
 struct DefinitionHeader {
     uint8_t version, kind;

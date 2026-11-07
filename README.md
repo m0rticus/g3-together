@@ -7,7 +7,7 @@
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
 
-The current source speaks **protocol 75**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
+The current source speaks **protocol 76**. Its host-authoritative NPC overhaul and paired saves are experimental and native gameplay
 acceptance is still in progress; it is not a verified release. Both players need the same build; older protocol peers are refused.
 The host simulates NPCs around every player, using independent non-rendered cameras to retain distant regions.
 World teardown finishes their PVS jobs and releases every private cell before unregistering the cameras.

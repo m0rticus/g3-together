@@ -19,7 +19,7 @@ struct Bone {
     int16_t values[12] = {};
 };
 #pragma pack(pop)
-static_assert(sizeof(Bone) == 28, "Bone poses use an affine matrix without discarding shear");
+static_assert(sizeof(Bone) == 28, "Bone poses retain affine storage and exact non-rigid fallback support");
 
 struct Transform {
     uint32_t name = 0;

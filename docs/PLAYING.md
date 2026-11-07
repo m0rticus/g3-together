@@ -151,7 +151,7 @@ uses unreliable fragments rather than silently becoming reliable; small packets 
 Compact NPC control batches are capped at 1172 bytes. Explicit reliable events and ENet's reliable sequence rollover
 retain their semantics.
 
-The current source uses **protocol 75**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
+The current source uses **protocol 76**. Its host-only NPC overhaul and paired saves are experimental; native gameplay acceptance is still
 in progress, so this source must not be treated as a verified release. Both players need the same build; older protocol peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
@@ -225,20 +225,38 @@ packet can neither hold back nor starve the live pose stream. ENet's RTT-jitter 
 fixed-rate pose frames. Native clip bookkeeping or a pending clip name cannot invalidate a successfully rendered host skeleton.
 
 The host sends final skeletal matrices because native blend-out layers survive outside the eight motion slots.
-Poses retain matrix shear and use sub-centimetre translation quantization. Ordinary poses travel on a separate lossy
+Poses use sub-centimetre translation quantization; compact rotations have a strict per-bone error guard and
+exact affine fallbacks for scale/shear. Ordinary poses travel on a separate lossy
 ENet channel; essential life/party/hit changes remain reliable on the NPC channel. Owned loopback sockets
 have burst capacity for crowded scenes. `NPCPOSE` and `PASSIVE` diagnostics distinguish queued/received poses,
 presentation waits and completed skeletal updates. This full-pose stream costs more bandwidth than clip-only replay;
 internet throughput and multi-player resource limits still need acceptance.
 
-The unchanged internal bone format 73 caches bone layouts and full NPC motion baselines per world. After each client acknowledges them, updates
+Internal bone format 74 caches bone layouts and full NPC motion baselines per world. After each client acknowledges them, updates
 send the existing bone values without repeated names and compact anchored control records. Ordinary nearby moving NPCs
 use a 33 ms (30 Hz) interval; distant movers and idle animation use 100 ms (10 Hz). Combat, focus, contact and dialogue
 stay at capture rate. Fast and ordinary tiers have 2 s exit holds, and new interest gets a 200 ms warm-up.
-Exact sparse pose residuals preserve scale/shear and Q12/Q2 integers. Loss, reordering, life/layout changes and missing
+Exact temporal/spatial residuals retain the Q12/Q2 affine fallback. Near-rigid bones may instead send a
+smallest-three quaternion only when host reconstruction changes no basis entry by more than two Q12 units.
+Every bone origin and facial/nonrigid translation retains its exact original Q2 values. Significant scale/shear
+always uses the exact affine path. For originally rigid rotations the conservative nearest-rotation
+bound is below 0.15 degrees (including existing basis quantization); a vertex within 200 cm
+of its influenced bone has at most 0.293 cm added displacement. Actual native skinning extents and visible
+acceptance remain unmeasured. Keys retain the original full-precision affine pose, and each update is encoded
+from the current original capture against explicitly ACKed decoded references, so error never accumulates.
+Loss, reordering, life/layout changes and missing
 references fall back to keys; periodic keys are due every 5 s within the 32-pose retention window. Full records remain the
 fallback for a missing dictionary, an unacknowledged baseline or values outside the compact range. The log reports layout
 sizes, resync requests, anchors and fallback failures.
+Scalar HP, action, target, equipment and relationship changes use exact sparse overrides against the named
+control baseline rather than repeatedly offering all eight unchanged motion descriptors. Essential reliable
+records preserve every original field bit-for-bit and the same reliable channel/publication ordering,
+but omit acknowledged immutable descriptors; original position/quaternion and active motion floats
+remain full precision. A descriptor, life or anchor change retains full-record baseline/key recovery.
+The codec chooses the smallest exact or guarded candidate, including Q14/Q12 quaternion grids and
+global/per-16-bone Rice parameters. It never reduces a selected update's rate or bone set.
+Kind 49 reuses its outer epoch/publication/count instead of repeating a 14-byte inner envelope;
+the explicit control generation and all baseline/life/sequence checks remain intact.
 Pose interval hints announce slower presentation tiers before the rate drops. The mirror buffers two advertised
 intervals plus bounded jitter, preserves the 34 ms fast floor, and slews its clock without rewinding.
 Hints do not mask a slower measured host cadence; the larger interval still increases the buffer.
@@ -251,6 +269,13 @@ no kind. The `npc_per_s` fields count scheduler decisions per second, not delive
 host's local UDP packet and byte counter delta, including protocol
 overhead, retransmissions and acknowledgements, but not IP headers or Steam traffic. ENet's transmit packet counter
 also includes a zero-byte socket-would-block attempt. None of these figures measures Steam's actual network usage.
+`net: pose components` separates codec header/model masks, rotation/translation residual bits normalized to
+bytes, control and outer headers. Bitstream padding can add less than one byte per update. Included-bone
+counts describe nonzero encoded corrections, not discarded bones. `rigid_bones_per_update` shows use of the
+bounded quaternion model; `host_observed_basis_error_q12` is the host's actual maximum (client `-1` means
+unavailable), with derived rotation and 200 cm lever-arm bounds. Bone-origin error is always zero.
+`tx_enet_relay_MB_per_s` reports decimal MB/s from ENet egress plus observed relay headers;
+`tx_total_bytes_per_s` also includes the small Steam-side control payloads. Neither is a bandwidth cap.
 `net: pose bandwidth` adds advertised-tier update/byte rates, bone payload bytes and bones per selected update,
 key/delta counts, ACK misses, missing references and decode failures. Bone payload counts include its compact
 flags/interval/reference/mask envelope. Kind 51 is the lossy generation/life-fenced pose ACK or key request.
@@ -434,7 +459,7 @@ Independent world-inventory persistence across saves/late joins is not implement
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
-  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 75 build.
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 76 build.
   To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
   one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
   outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.

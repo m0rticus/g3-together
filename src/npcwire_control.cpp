@@ -49,6 +49,65 @@ bool sameFloat(float a, float b) {
     std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4);
     return x == y;
 }
+template<class T> bool sameMetadataValue(T a, T b) { return a == b; }
+bool sameMetadataValue(float a, float b) { return sameFloat(a, b); }
+
+#define NPCWIRE_METADATA_FIELDS(X) \
+    X(0, movementMode, 1) X(1, hitPoints, 4) X(2, hitPointsMax, 4) \
+    X(3, motion, 4) X(4, aniState, 1) X(5, heldRight, 4) X(6, heldLeft, 4) \
+    X(7, partyPlayer, 1) X(8, partyType, 1) X(9, waiting, 1) X(10, guidePlayer, 1) \
+    X(11, aiMode, 1) X(12, action, 1) X(13, attackReason, 1) X(14, damageType, 1) \
+    X(15, damageAmount, 4) X(16, damageMultiplier, 4) X(17, hitPlayer, 1) \
+    X(18, hitSequence, 2) X(19, attitude, 1) X(20, combatTarget, 4)
+
+#define METADATA_WIDTH(bit, field, width) width,
+constexpr std::uint8_t MetadataWidths[] = { NPCWIRE_METADATA_FIELDS(METADATA_WIDTH) };
+#undef METADATA_WIDTH
+#define METADATA_ADD_WIDTH(bit, field, width) + width
+static_assert(MaxMetadataBytes == 3 NPCWIRE_METADATA_FIELDS(METADATA_ADD_WIDTH), "metadata maximum");
+#undef METADATA_ADD_WIDTH
+
+std::uint32_t metadataMask(const Control& v, const Control& base) {
+    std::uint32_t mask = 0;
+#define METADATA_COMPARE(bit, field, width) \
+    if (!sameMetadataValue(v.field, base.field)) mask |= std::uint32_t{1} << bit;
+    NPCWIRE_METADATA_FIELDS(METADATA_COMPARE)
+#undef METADATA_COMPARE
+    return mask;
+}
+void writeMetadataValue(Writer& w, std::uint8_t v) { w.u8(v); }
+void writeMetadataValue(Writer& w, std::uint16_t v) { w.u16(v); }
+void writeMetadataValue(Writer& w, std::uint32_t v) { w.u32(v); }
+void writeMetadataValue(Writer& w, std::int32_t v) { w.u32(static_cast<std::uint32_t>(v)); }
+void writeMetadataValue(Writer& w, float v) { w.f32(v); }
+bool readMetadataValue(Reader& r, std::uint8_t& v) { v = r.u8(); return r.ok; }
+bool readMetadataValue(Reader& r, std::uint16_t& v) { v = r.u16(); return r.ok; }
+bool readMetadataValue(Reader& r, std::uint32_t& v) { v = r.u32(); return r.ok; }
+bool readMetadataValue(Reader& r, std::int32_t& v) { v = signed32(r.u32()); return r.ok; }
+bool readMetadataValue(Reader& r, float& v) { v = r.f32(); return r.ok && std::isfinite(v); }
+void writeMetadata(Writer& w, const Control& v, std::uint32_t mask) {
+    w.u8(static_cast<std::uint8_t>(mask));
+    w.u8(static_cast<std::uint8_t>(mask >> 8));
+    w.u8(static_cast<std::uint8_t>(mask >> 16));
+#define METADATA_WRITE(bit, field, width) \
+    if (mask & (std::uint32_t{1} << bit)) writeMetadataValue(w, v.field);
+    NPCWIRE_METADATA_FIELDS(METADATA_WRITE)
+#undef METADATA_WRITE
+}
+bool readMetadata(Reader& r, Control& v, const Control& base) {
+    const auto a = r.u8(), b = r.u8(), c = r.u8();
+    const std::uint32_t mask = a | (static_cast<std::uint32_t>(b) << 8) |
+                               (static_cast<std::uint32_t>(c) << 16);
+#define METADATA_READ(bit, field, width) \
+    if (mask & (std::uint32_t{1} << bit)) { \
+        if (!readMetadataValue(r, v.field) || sameMetadataValue(v.field, base.field)) return false; \
+    }
+    NPCWIRE_METADATA_FIELDS(METADATA_READ)
+#undef METADATA_READ
+    return r.ok;
+}
+#undef NPCWIRE_METADATA_FIELDS
+
 bool sameDescriptor(const MotionDescriptor& a, const MotionDescriptor& b) {
     return a.name == b.name && a.instance == b.instance && sameFloat(a.speed, b.speed) &&
            sameFloat(a.intro, b.intro) && sameFloat(a.extro, b.extro) && a.blend == b.blend &&
@@ -60,16 +119,8 @@ std::uint8_t activeMask(const Control& v) {
         if (v.motions[i].active & 1u) result |= static_cast<std::uint8_t>(1u << i);
     return result;
 }
-bool sameMetadata(const Control& a, const Control& b) {
-    if (a.guid != b.guid || a.movementMode != b.movementMode || a.hitPoints != b.hitPoints ||
-        a.hitPointsMax != b.hitPointsMax || a.motion != b.motion || a.aniState != b.aniState ||
-        a.heldRight != b.heldRight || a.heldLeft != b.heldLeft || a.partyPlayer != b.partyPlayer ||
-        a.partyType != b.partyType || a.waiting != b.waiting || a.guidePlayer != b.guidePlayer ||
-        a.aiMode != b.aiMode || a.action != b.action || a.attackReason != b.attackReason ||
-        a.damageType != b.damageType || a.damageAmount != b.damageAmount ||
-        !sameFloat(a.damageMultiplier, b.damageMultiplier) || a.incarnation != b.incarnation ||
-        a.hitPlayer != b.hitPlayer || a.hitSequence != b.hitSequence || a.attitude != b.attitude ||
-        a.combatTarget != b.combatTarget) return false;
+bool sameImmutableMetadata(const Control& a, const Control& b) {
+    if (a.guid != b.guid || a.incarnation != b.incarnation) return false;
     for (unsigned i = 0; i < MotionSlots; ++i) {
         const auto& x = a.motions[i]; const auto& y = b.motions[i];
         if (!sameDescriptor(x.descriptor, y.descriptor) || x.active != y.active) return false;
@@ -160,6 +211,39 @@ bool EncodeYaw(double radians, std::uint16_t& result) {
     return true;
 }
 double DecodeYaw(std::uint16_t value) { return value * (Turn / 65536.0); }
+
+bool RecordBytes(const std::uint8_t* bytes, std::size_t available, std::size_t& length) {
+    if (!bytes || available < sizeof(WireControl)) return false;
+    const auto orientation = bytes[offsetof(WireControl, orientation)];
+    if (orientation & 0x3eu) return false;
+    const bool full = (orientation & 1u) != 0;
+    const bool exact = (orientation & 0x40u) != 0;
+    if (exact && !full) return false;
+    if (exact)
+        for (std::size_t i = 0; i < 6; ++i)
+            if (bytes[offsetof(WireControl, delta) + i]) return false;
+    if (full && (bytes[offsetof(WireControl, yaw)] || bytes[offsetof(WireControl, yaw) + 1])) return false;
+    const auto slots = bytes[offsetof(WireControl, slots)];
+    const auto ticks = sizeof(WireControl) + (full ? sizeof(WireQuaternion) : 0) + (exact ? 12 : 0);
+    std::size_t result = ticks + slotCount(slots) * (exact ? 8 : sizeof(WireMotionTick));
+    if (available < result) return false;
+    if (!exact)
+        for (std::size_t offset = ticks; offset < result; offset += sizeof(WireMotionTick))
+            if (bytes[offset + 2] & 0xf0u) return false;
+    if (orientation & 0x80u) {
+        if (available - result < 3) return false;
+        const auto mask = static_cast<std::uint32_t>(bytes[result]) |
+                          (static_cast<std::uint32_t>(bytes[result + 1]) << 8) |
+                          (static_cast<std::uint32_t>(bytes[result + 2]) << 16);
+        if (!mask || (mask & 0xe00000u)) return false;
+        result += 3;
+        for (std::size_t bit = 0; bit < sizeof(MetadataWidths); ++bit)
+            if (mask & (std::uint32_t{1} << bit)) result += MetadataWidths[bit];
+        if (available < result) return false;
+    }
+    length = result;
+    return true;
+}
 
 bool Context::Reset(std::uint32_t epoch, std::uint32_t generation) {
     if (!epoch || !generation) return false;
@@ -336,7 +420,7 @@ bool Context::InstallBaseline(Stream stream, std::uint16_t id, std::uint16_t tok
     return true;
 }
 
-bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>& output) {
+bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>& output, bool exact) {
     std::uint16_t id;
     if (!c.FindId(v.guid, id)) return false;
     const auto life = c.lives_.find(id);
@@ -345,9 +429,17 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
     if (life == c.lives_.end() || life->second != v.incarnation || anchor == c.anchors_.end() ||
         anchor->second.life != v.incarnation || baseline == c.baselines_.end() ||
         baseline->second.life != v.incarnation || baseline->second.anchor != v.anchor ||
-        !sameMetadata(v, baseline->second.value)) return false;
-    std::uint16_t deltas[3];
+        !sameImmutableMetadata(v, baseline->second.value)) return false;
+    const auto metadata = metadataMask(v, baseline->second.value);
+    if ((metadata & (std::uint32_t{1} << 16)) && !std::isfinite(v.damageMultiplier)) return false;
+    std::uint16_t deltas[3]{};
     for (unsigned i = 0; i < 3; ++i) {
+        if (exact) {
+            if (!std::isfinite(v.position[i]) ||
+                std::abs(v.position[i]) > static_cast<double>(std::numeric_limits<float>::max()) ||
+                static_cast<double>(static_cast<float>(v.position[i])) != v.position[i]) return false;
+            continue;
+        }
         const double delta = v.position[i] - static_cast<double>(anchor->second.value.position[i]);
         if (!std::isfinite(v.position[i]) || !std::isfinite(delta) || delta < -32768.0 || delta > 32767.0)
             return false;
@@ -368,6 +460,7 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
     }
     std::uint16_t yaw = 0;
     const bool full = std::holds_alternative<Quaternion>(v.rotation);
+    if (exact && !full) return false;
     if (full) {
         for (auto x : std::get<Quaternion>(v.rotation).components) if (!std::isfinite(x)) return false;
     } else if (!EncodeYaw(std::get<Yaw>(v.rotation).radians, yaw)) return false;
@@ -375,28 +468,33 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
     Writer w;
     w.u16(id); w.u32(v.anchor); w.u16(v.baseline);
     for (auto d : deltas) w.u16(d);
-    w.u16(yaw); w.u8(full ? 1 : 0);
+    w.u16(yaw); w.u8(static_cast<std::uint8_t>((full ? 1 : 0) | (metadata ? 0x80 : 0) | (exact ? 0x40 : 0)));
     w.u32(v.sent); w.u8(v.flags); w.u8(v.contact); w.u8(mask);
     if (full) for (auto x : std::get<Quaternion>(v.rotation).components) w.f32(x);
+    if (exact) for (auto x : v.position) w.f32(static_cast<float>(x));
     for (std::size_t i = 0; i < MotionSlots; ++i) if (mask & (1u << i)) {
-        w.u8(static_cast<std::uint8_t>(ticks[i]));
-        w.u8(static_cast<std::uint8_t>(ticks[i] >> 8));
-        w.u8(static_cast<std::uint8_t>(ticks[i] >> 16));
+        if (exact) {
+            w.f32(v.motions[i].phase); w.f32(v.motions[i].weight);
+        } else {
+            w.u8(static_cast<std::uint8_t>(ticks[i]));
+            w.u8(static_cast<std::uint8_t>(ticks[i] >> 8));
+            w.u8(static_cast<std::uint8_t>(ticks[i] >> 16));
+        }
     }
+    if (metadata) writeMetadata(w, v, metadata);
     if (w.data.size() > MaxBatchBytes) return false;
     output = std::move(w.data); return true;
 }
 
 bool DecodeRecord(const Context& c, const std::uint8_t* bytes, std::size_t size, Control& output) {
-    if (!bytes || size < sizeof(WireControl) || size > MaxBatchBytes) return false;
+    std::size_t length = 0;
+    if (size > MaxBatchBytes || !RecordBytes(bytes, size, length) || length != size) return false;
     Reader r{bytes, size};
     const auto id = r.u16(); const auto anchorToken = r.u32(); const auto baselineToken = r.u16();
     std::int32_t delta[3]; for (auto& d : delta) d = signed16(r.u16());
     const auto yaw = r.u16(); const auto orientation = r.u8();
     const auto sent = r.u32(); const auto flags = r.u8(), contact = r.u8(), slots = r.u8();
-    if (!r.ok || orientation > 1 || (orientation == 1 && yaw != 0) ||
-        size != sizeof(WireControl) + (orientation ? sizeof(WireQuaternion) : 0) +
-                    slotCount(slots) * sizeof(WireMotionTick)) return false;
+    if (!r.ok) return false;
     const auto life = c.lives_.find(id);
     const auto anchor = c.anchors_.find({id, anchorToken});
     const auto baseline = c.baselines_.find({id, baselineToken});
@@ -406,25 +504,39 @@ bool DecodeRecord(const Context& c, const std::uint8_t* bytes, std::size_t size,
     Control v = baseline->second.value;
     v.sent = sent; v.flags = flags; v.contact = contact; v.slots = slots;
     for (unsigned i = 0; i < 3; ++i) v.position[i] = static_cast<double>(anchor->second.value.position[i]) + delta[i];
-    if (orientation) {
+    if (orientation & 1u) {
         Quaternion q;
         for (auto& x : q.components) { x = r.f32(); if (!std::isfinite(x)) return false; }
         v.rotation = q;
     } else v.rotation = Yaw{DecodeYaw(yaw)};
+    const bool exact = (orientation & 0x40u) != 0;
+    if (exact) for (auto& x : v.position) {
+        x = r.f32();
+        if (!std::isfinite(x)) return false;
+    }
     for (std::size_t i = 0; i < MotionSlots; ++i) {
         if (!(slots & (1u << i))) continue;
+        if (exact) {
+            auto& motion = v.motions[i];
+            motion.phase = r.f32(); motion.weight = r.f32();
+            if (!std::isfinite(motion.phase) || !std::isfinite(motion.weight) ||
+                motion.phase < 0 || motion.phase > 1 || motion.weight < 0 || motion.weight > 1)
+                return false;
+            continue;
+        }
         const auto a = r.u8(), b = r.u8(), d = r.u8();
         if (d & 0xf0u) return false;
         const std::uint32_t packed = a | (static_cast<std::uint32_t>(b) << 8) | (static_cast<std::uint32_t>(d) << 16);
         v.motions[i].phase = static_cast<float>(packed & 0xfffu) / 4095.0f;
         v.motions[i].weight = static_cast<float>((packed >> 12) & 0xffu) / 255.0f;
     }
+    if ((orientation & 0x80u) && !readMetadata(r, v, baseline->second.value)) return false;
     if (!r.ok || r.offset != size) return false;
     output = v; return true;
 }
 
 bool EncodeBatch(const Context& c, std::uint32_t sequence, const std::vector<Control>& values,
-                 std::vector<std::uint8_t>& output) {
+                 std::vector<std::uint8_t>& output, bool exact) {
     if (!c.ready_ || values.empty() || values.size() > 0xffffu) return false;
     Writer w;
     w.u8('N'); w.u8('C'); w.u8(1); w.u8(0);
@@ -434,7 +546,7 @@ bool EncodeBatch(const Context& c, std::uint32_t sequence, const std::vector<Con
     for (const auto& value : values) {
         std::uint16_t id;
         std::vector<std::uint8_t> record;
-        if (!c.FindId(value.guid, id) || !seen.insert(id).second || !EncodeRecord(c, value, record) ||
+        if (!c.FindId(value.guid, id) || !seen.insert(id).second || !EncodeRecord(c, value, record, exact) ||
             record.size() > MaxBatchBytes - w.data.size()) return false;
         w.data.insert(w.data.end(), record.begin(), record.end());
     }
@@ -453,14 +565,9 @@ bool DecodeBatch(Context& c, const std::uint8_t* bytes, std::size_t size, std::v
     std::vector<Control> decoded;
     std::set<std::uint16_t> seen;
     for (unsigned i = 0; i < count; ++i) {
-        if (size - r.offset < sizeof(WireControl)) return false;
         const auto* start = bytes + r.offset;
-        const auto mode = start[offsetof(WireControl, orientation)];
-        const auto mask = start[offsetof(WireControl, slots)];
-        if (mode > 1) return false;
-        const auto length = sizeof(WireControl) + (mode ? sizeof(WireQuaternion) : 0) +
-                            slotCount(mask) * sizeof(WireMotionTick);
-        if (length > size - r.offset) return false;
+        std::size_t length = 0;
+        if (!RecordBytes(start, size - r.offset, length)) return false;
         Control v;
         std::uint16_t id;
         if (!DecodeRecord(c, start, length, v) || !c.FindId(v.guid, id) || !seen.insert(id).second) return false;

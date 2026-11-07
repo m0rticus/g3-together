@@ -123,7 +123,7 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     RefusedMsg refusal{};
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 72, host 75") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 72, host 76") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 73;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -131,7 +131,15 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 73, host 75") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 73, host 76") != nullptr);
+    assert(!fakePeers[1].data && !peers[3]);
+    oldHello.version = 75;
+    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
+    transmissions.clear();
+    Deliver(&fakePeers[1], oldHandshake);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
+    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
+    assert(std::strstr(refusal.reason, "protocol 75, host 76") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     fakePeers[1].data = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
     transmissions.clear();
@@ -213,10 +221,40 @@ int main()
     assert(receivedRecords[0].guid[0] == records[0].guid[0] &&
            receivedRecords[1].guid[0] == records[1].guid[0]);
 
-    // A changed immutable field starts a fresh baseline; fallback stays exact until its ACK.
+    // Scalar changes stay compact and exact against the named baseline.
     isHost = true;
     transmissions.clear();
     records[0].hitPoints = 60;
+    records[0].combatTarget = 0x87654321;
+    records[0].action = 8;
+    SendNpcs(records, 1, false);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+    const auto scalarPacket = transmissions[0];
+    transmissions.clear();
+    isHost = false;
+    Deliver(&fakePeer, scalarPacket);
+    assert(receivedRecords.back().hitPoints == 60 && receivedRecords.back().combatTarget == 0x87654321 &&
+           receivedRecords.back().action == 8);
+    isHost = true;
+    // Reliable publication is bit-exact without repeating descriptor tables.
+    records[0].position[0] += 0.123456f;
+    records[0].motions[0].phase = 0.123456f;
+    records[0].motions[0].weight = 0.654321f;
+    transmissions.clear();
+    SendNpcs(records, 1, true);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch &&
+           (transmissions[0].flags & ENET_PACKET_FLAG_RELIABLE));
+    const auto exactPacket = transmissions[0];
+    assert(exactPacket.channel == ChannelNpcs && exactPacket.bytes.size() < sizeof(NpcsHeader) + sizeof(NpcRecord));
+    transmissions.clear();
+    isHost = false;
+    Deliver(&fakePeer, exactPacket);
+    assert(std::memcmp(&receivedRecords.back(), &records[0], sizeof(NpcRecord)) == 0);
+    isHost = true;
+
+    // A changed immutable motion descriptor starts a fresh baseline.
+    transmissions.clear();
+    records[0].motions[0].speed = 1.6f;
     SendNpcs(records, 1, false);
     assert(transmissions.size() == 3 && transmissions[0].bytes[0] == MsgControlId &&
            transmissions[1].bytes[0] == MsgControlBaseline && transmissions[2].bytes[0] == MsgNpcs);
@@ -349,7 +387,7 @@ int main()
     bool isKey = false;
     assert(keyEncoder.Encode(boneLayouts, 1, posed.incarnation, pose::Facial, poseBones, 80, fakeTime,
                              expectedPose, isKey) == bonewire::Status::Ok && isKey);
-    assert(compactPose.bytes.size() == sizeof(NpcsHeader) + 2 + sizeof(npcwire::WireBatchHeader) +
+    assert(compactPose.bytes.size() == sizeof(NpcsHeader) + 2 + 4 +
            sizeof(npcwire::WireControl) + sizeof(npcwire::WireMotionTick) + 2 + expectedPose.size());
     assert(compactPose.bytes.size() < fullPose.bytes.size());
     hostBones = std::move(boneLayouts);
@@ -603,7 +641,7 @@ int main()
     // Exhaustion fails closed, without recycling a control ID or token.
     const auto stateKey = NpcKey(posed.guid);
     controlStates.at(stateKey).nextBaseline = UINT16_MAX;
-    posed.hitPoints--;
+    posed.motions[0].speed += 0.25f;
     transmissions.clear();
     SendNpcs(&posed, 1, false);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
@@ -705,5 +743,51 @@ int main()
     auto onePose = transmissions;
     clientReceive(onePose);
     assert(appliedBones.size() == 1 && appliedInterval == 100);
+
+    // The real sender/receiver uses mode 4 and canonical decoded ACK anchors.
+    NpcRecord rigidRecord = Record(902);
+    pose::Bone rigidBones[80]{};
+    unsigned rigidPackets = 0;
+    for (unsigned frame = 0; frame < 32; ++frame) {
+        fakeTime += 33; rigidRecord.sent = fakeTime;
+        for (int i = 0; i < 80; ++i) {
+            const double x = std::sin(frame * .21 + i * .43) * .8;
+            const double y = std::sin(frame * .31 + i * .27) * .7;
+            const double z = std::sin(frame * .17 + i * .19) * .6;
+            const double cx = std::cos(x), sx = std::sin(x), cy = std::cos(y), sy = std::sin(y);
+            const double cz = std::cos(z), sz = std::sin(z);
+            pose::Transform transform{};
+            transform.name = static_cast<uint32_t>(1000 + i);
+            const double matrix[9] = {cz*cy, sz*cy, -sy, cz*sy*sx-sz*cx, sz*sy*sx+cz*cx,
+                cy*sx, cz*sy*cx+sz*sx, sz*sy*cx-cz*sx, cy*cx};
+            for (int k = 0; k < 9; ++k) transform.values[k] = static_cast<float>(matrix[k]);
+            transform.values[10] = static_cast<float>(i * 1.25);
+            assert(pose::Encode(transform, rigidBones[i]));
+        }
+        transmissions.clear();
+        assert(SendPosedNpcTo(2, rigidRecord, rigidBones, 80, 0, false, 33));
+        auto packets = transmissions;
+        for (auto const& packet : packets) if (packet.bytes[0] == MsgControlPose) {
+            const size_t start = sizeof(NpcsHeader) + 2 +
+                BoneWire16(packet.bytes.data() + sizeof(NpcsHeader)) + 2;
+            if (packet.bytes[start + 6] == 4) ++rigidPackets;
+            if (frame == 2) {
+                auto invalidInterval = packet;
+                invalidInterval.bytes[start - 1] = 0;
+                const unsigned before = applied;
+                isHost = false;
+                Deliver(&fakePeer, invalidInterval);
+                assert(applied == before);
+                isHost = true;
+            }
+        }
+        if (frame % 7 == 6) continue;
+        clientReceive(packets);
+        assert(appliedBones.size() == 80);
+        for (int i = 0; i < 80; ++i)
+            for (int k = 0; k < 12; ++k)
+                assert(std::abs(int(appliedBones[i].values[k]) - rigidBones[i].values[k]) <= (k < 9 ? 2 : 0));
+    }
+    assert(rigidPackets);
     return 0;
 }

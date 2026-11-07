@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Engine-independent codec for one player state (protocol 75 state v1).
+// Engine-independent codec for one player state (state v1, unchanged since protocol 75).
 #pragma once
 
 #include <cmath>

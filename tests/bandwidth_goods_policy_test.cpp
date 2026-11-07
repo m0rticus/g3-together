@@ -46,6 +46,17 @@ int main()
     counters.Npc(static_cast<NpcSendDecision>(99), 7);
     assert(counters.considered == 20 && counters.sent == 2 && counters.skippedUnchanged == 3 &&
            counters.skippedFar == 4 && counters.skippedIrrelevant == 5 && counters.sendFailed == 6);
+    counters.Pose(16, 500, 420, 76, false);
+    counters.PoseComponents(13, 76, 2500, 500, 70, false, true, 45, 23, 60, 2);
+    counters.Pose(100, 1900, 1831, 76, true);
+    counters.PoseComponents(7, 0, 76 * 144, 76 * 48, 76, true, false, 45, 23);
+    assert(counters.poseDeltas == 1 && counters.poseKeys == 1 && counters.poseBones == 152);
+    assert(counters.tierUpdates[0] == 1 && counters.tierUpdates[2] == 1 && counters.tierBytes[0] == 500);
+    assert(counters.poseHeaderBytes == 20 && counters.poseMaskBits == 76);
+    assert(counters.poseRotationBits == 2500 + 76 * 144 && counters.poseTranslationBits == 500 + 76 * 48);
+    assert(counters.poseIncludedDeltaBones == 70 && counters.posePredictiveUpdates == 1);
+    assert(counters.poseControlBytes == 90 && counters.poseOuterBytes == 46);
+    assert(counters.poseRigidBones == 60 && counters.poseMaxBasisError == 2);
 
     std::vector<std::string> lines;
     g3t::net::detail::ForEachKindLine(counters, [&](char const* line) { lines.emplace_back(line); });

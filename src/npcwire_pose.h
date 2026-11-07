@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "npcwire_bonepack.h"
 #include "npcwire_bones.h"
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <deque>
 #include <cstring>
+#include <limits>
+#include <vector>
 
 namespace g3t::npcwire::bones {
 // An independent key is only a periodic safety net: every delta already references a frame the client acknowledged, and a
@@ -14,6 +20,14 @@ constexpr size_t DeltaHeaderBytes = 6; // layout:u16, acknowledged reference:u32
 // A mode byte follows: 0 = raw 24-byte affine key per bone; 1 = twelve
 // one-byte residual widths (0..17), bone presence bits, packed 12-bit component
 // masks and zigzag residual bits. A packed key predicts identity, not bind pose.
+// Modes 2/3: flags:u8=0, older ACK:u32, ratio:Q8 u16 (0..1024),
+// twelve Rice k nibbles, padded bone presence bits, exact component residuals.
+// Mode 3 predicts the adjacent bone's temporal residual as well.
+// Mode 4 adds a rigid-bone bitmap and packed 2-bit quaternion omitted indices.
+// Rigid bones carry three Q14 quaternion coordinates and exact translations;
+// other bones retain all twelve affine integers. Every Rice escape is bounded.
+// Mode-4 flags: bit 0 selects separate Rice parameters per 16 bones; bit 1
+// selects a Q12 grid (multiples of four Q14 units) for rigid coordinates only.
 
 inline uint32_t ReadPose32(uint8_t const* p)
 {
@@ -25,193 +39,896 @@ inline void WritePose32(std::vector<uint8_t>& out, uint32_t value)
 }
 inline bool PoseNewer(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) > 0; }
 
-// Every residual is lossless relative to the existing Q12/Q2 affine integers.
-// No quaternion projection, cumulative quantization, bind-pose assumption or
-// unacknowledged predecessor is involved; arbitrary scale/shear survives.
+// Encode is exact; EncodeCompact also considers guarded near-rigid rotations
+// (at most two Q12 units per basis entry). Both use explicitly ACKed canonical
+// references. Store the returned reconstruction, never an untransmitted source.
 class PoseCache {
     struct Frame {
         uint32_t token, incarnation;
         uint16_t layout;
         uint8_t flags;
+        uint32_t now;
         std::vector<pose::Bone> bones;
     };
     std::deque<Frame> frames_;
-    uint32_t ack_ = 0, keyAt_ = 0;
+    std::deque<uint32_t> ackRefs_;
+    uint32_t keyAt_ = 0;
     bool haveKey_ = false;
 
     Frame const* Find(uint32_t token, uint32_t incarnation, uint16_t layout, uint8_t flags) const
     {
         for (auto const& f : frames_)
-            if (f.token == token && f.incarnation == incarnation && f.layout == layout && f.flags == flags) return &f;
+            if (f.token == token && f.incarnation == incarnation &&
+                f.layout == layout && f.flags == flags) return &f;
         return nullptr;
+    }
+
+    static int32_t TemporalPrediction(Frame const& recent, Frame const* older,
+                                      unsigned ratio, size_t bone, int component)
+    {
+        const int32_t base = recent.bones[bone].values[component];
+        if (!older) return base;
+        const int64_t difference = int64_t(base) - older->bones[bone].values[component];
+        return PoseSaturateInt16(int64_t(base) + PoseRoundQ8(difference * ratio));
+    }
+
+    static unsigned Ratio(Frame const& recent, Frame const* older, uint32_t now)
+    {
+        if (!older || !PoseNewer(recent.now, older->now) || !PoseNewer(now, recent.now)) return 0;
+        const uint32_t span = recent.now - older->now;
+        const uint32_t elapsed = now - recent.now;
+        if (!span) return 0;
+        const uint64_t ratio = (uint64_t(elapsed) * 256u + span / 2u) / span;
+        return static_cast<unsigned>((std::min)(uint64_t(1024), ratio));
+    }
+
+    static bool QuaternionPrediction(Frame const& recent, Frame const* older, unsigned ratio,
+                                     size_t bone, uint8_t omitted, PoseQuat& prediction)
+    {
+        if (!PoseExtractQuat(recent.bones[bone], prediction)) return false;
+        if (prediction.values[omitted] < 0)
+            for (auto& value : prediction.values) value = -value;
+        if (!older) return true;
+        PoseQuat previous;
+        if (!PoseExtractQuat(older->bones[bone], previous)) return false;
+        if (previous.values[omitted] < 0)
+            for (auto& value : previous.values) value = -value;
+        for (int k = 0; k < 4; ++k)
+            prediction.values[k] = PoseSaturateInt16(int64_t(prediction.values[k]) +
+                PoseRoundQ8((int64_t(prediction.values[k]) - previous.values[k]) * ratio));
+        return true;
     }
 
 public:
     size_t Retained() const { return frames_.size(); }
+
     bool Ack(uint32_t token, uint32_t incarnation)
     {
         if (!token) {
             if (frames_.empty() || frames_.back().incarnation != incarnation) return false;
-            ack_ = 0; return true;
+            ackRefs_.clear();
+            return true;
         }
-        for (auto const& f : frames_)
-            if (f.token == token && f.incarnation == incarnation) {
-                if (!ack_ || PoseNewer(token, ack_)) ack_ = token;
+        for (auto const& f : frames_) {
+            if (f.token != token || f.incarnation != incarnation) continue;
+            if (ackRefs_.empty()) {
+                ackRefs_.push_back(token);
+            } else if (PoseNewer(token, ackRefs_.front())) {
+                ackRefs_.push_front(token);
+            } else {
                 return true;
             }
+            while (ackRefs_.size() > 4) ackRefs_.pop_back();
+            return true;
+        }
         return false;
     }
 
     bool Store(uint32_t token, uint32_t incarnation, uint16_t layout, uint8_t flags,
                pose::Bone const* bones, size_t count, uint32_t now, bool key)
     {
-        if (!token || !incarnation || !layout || !bones || !count || count > pose::MaxBones) return false;
+        if (!token || !incarnation || !layout || !bones || !count || count > pose::MaxBones ||
+            (flags & ~pose::Facial)) return false;
         if (!frames_.empty()) {
             auto const& last = frames_.back();
             if (PoseNewer(last.incarnation, incarnation) ||
                 (last.incarnation == incarnation && !PoseNewer(token, last.token))) return false;
             if (last.incarnation != incarnation || last.layout != layout || last.flags != flags) {
                 frames_.clear();
-                ack_ = 0;
+                ackRefs_.clear();
+                keyAt_ = 0;
+                haveKey_ = false;
             }
         }
         if (frames_.size() == PoseWindow) frames_.pop_front();
-        frames_.push_back({token, incarnation, layout, flags, {bones, bones + count}});
+        frames_.push_back({token, incarnation, layout, flags, now,
+                           std::vector<pose::Bone>(bones, bones + count)});
         if (key) { keyAt_ = now; haveKey_ = true; }
         return true;
     }
 
-    Status Encode(Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
-                  pose::Bone const* bones, size_t count, uint32_t now, std::vector<uint8_t>& out, bool& key) const
+    Status EncodeCompactImpl(Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
+                             pose::Bone const* bones, size_t count, uint32_t now,
+                             std::vector<uint8_t>& out, bool& key,
+                             std::vector<pose::Bone>& decodedOutput, PoseStats* stats,
+                             bool allowMode4) const
     {
+        if (!dictionary.HasLayout(layout) || !incarnation || !layout || !bones ||
+            !count || count > pose::MaxBones || (flags & ~pose::Facial))
+            return Status::InvalidArgument;
+
         std::vector<uint8_t> full;
-        auto status = dictionary.EncodePose(layout, bones, count, full);
+        Status status = dictionary.EncodePose(layout, bones, count, full);
         if (status != Status::Ok) return status;
+        std::vector<pose::Bone> reconstructed(bones, bones + count);
         full.insert(full.begin() + 2, 4, 0);
-        auto const* base = Find(ack_, incarnation, layout, flags);
-        Frame identity{0, incarnation, layout, flags, {}};
-        if (!base || base->bones.size() != count || !haveKey_ || now - keyAt_ >= PoseKeyMs) {
+        full.insert(full.begin() + DeltaHeaderBytes, 0);
+
+        std::vector<uint8_t> result = full;
+        bool resultKey = true;
+        PoseStats resultStats;
+        resultStats.headerBytes = 7;
+        resultStats.rotationBits = count * 144;
+        resultStats.translationBits = count * 48;
+        resultStats.includedBones = 0;
+        resultStats.predictive = false;
+
+        bool keyDue = !haveKey_ || now - keyAt_ >= PoseKeyMs;
+        const Frame* base = nullptr;
+        if (!keyDue && !ackRefs_.empty())
+            base = Find(ackRefs_.front(), incarnation, layout, flags);
+        if (!base || base->bones.size() != count) {
+            base = nullptr;
+            keyDue = true;
+        }
+
+        Frame identity{0, incarnation, layout, flags, now, {}};
+        if (keyDue) {
             status = dictionary.IdentityPose(layout, identity.bones);
             if (status != Status::Ok) return status;
-            base = &identity;
+        } else {
+            identity = *base;
         }
-        std::vector<uint8_t> delta{static_cast<uint8_t>(layout), static_cast<uint8_t>(layout >> 8)};
-        WritePose32(delta, base->token);
-        delta.push_back(1); // bitpacked residuals; zero is the full affine key
-        full.insert(full.begin() + DeltaHeaderBytes, 0);
+        base = &identity;
+        if (!base->bones.empty() && base->bones.size() != count) return Status::Malformed;
+
+        std::vector<uint8_t> sparse{static_cast<uint8_t>(layout), static_cast<uint8_t>(layout >> 8)};
+        WritePose32(sparse, base->token);
+        sparse.push_back(1);
         uint8_t widths[12] = {};
         std::vector<uint16_t> components(count, 0);
-        for (size_t i = 0; i < count; ++i) {
+        std::size_t includedSparse = 0;
+        for (std::size_t i = 0; i < count; ++i) {
             for (int k = 0; k < 12; ++k) {
-                const int32_t d = int32_t(bones[i].values[k]) - base->bones[i].values[k];
-                uint32_t value = d < 0 ? uint32_t(-d) * 2 - 1 : uint32_t(d) * 2;
-                if (!value) continue;
+                const int32_t difference = int32_t(bones[i].values[k]) - base->bones[i].values[k];
+                if (!difference) continue;
+                uint32_t value = difference < 0
+                    ? uint32_t(-int64_t(difference) * 2 - 1)
+                    : uint32_t(int64_t(difference) * 2);
                 components[i] |= uint16_t(1u << k);
                 uint8_t width = 0;
                 do { ++width; value >>= 1; } while (value);
                 widths[k] = (std::max)(widths[k], width);
             }
+            if (components[i]) ++includedSparse;
         }
-        delta.insert(delta.end(), widths, widths + 12);
-        const size_t maskAt = delta.size(), maskBytes = (count + 7) / 8;
-        delta.resize(maskAt + maskBytes, 0);
+        sparse.insert(sparse.end(), widths, widths + 12);
+        const std::size_t maskAt = sparse.size();
+        const std::size_t maskBytes = (count + 7) / 8;
+        sparse.resize(maskAt + maskBytes, 0);
         unsigned bit = 0;
         auto put = [&](uint32_t value, unsigned width) {
             for (unsigned n = 0; n < width; ++n) {
-                if (!bit) delta.push_back(0);
-                delta.back() |= static_cast<uint8_t>((value & 1u) << bit);
+                if (!bit) sparse.push_back(0);
+                sparse.back() |= static_cast<uint8_t>((value & 1u) << bit);
                 value >>= 1;
                 bit = (bit + 1) % 8;
             }
         };
-        for (size_t i = 0; i < count; ++i) {
-            const uint16_t mask = components[i];
-            if (!mask) continue;
-            delta[maskAt + i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-            put(mask, 12);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!components[i]) continue;
+            sparse[maskAt + i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+            put(static_cast<uint32_t>(components[i]), 12);
         }
-        for (size_t i = 0; i < count; ++i) {
+        for (std::size_t i = 0; i < count; ++i) {
             for (int k = 0; k < 12; ++k) {
                 if (!(components[i] & (1u << k))) continue;
                 const int32_t difference = int32_t(bones[i].values[k]) - base->bones[i].values[k];
-                uint32_t value = difference < 0 ? uint32_t(-difference) * 2 - 1 : uint32_t(difference) * 2;
+                uint32_t value = difference < 0
+                    ? uint32_t(-int64_t(difference) * 2 - 1)
+                    : uint32_t(int64_t(difference) * 2);
                 put(value, widths[k]);
             }
         }
-        key = !base->token || delta.size() >= full.size();
-        out = delta.size() >= full.size() ? std::move(full) : std::move(delta);
+        if (sparse.size() < result.size()) {
+            result = sparse;
+            resultKey = base->token == 0;
+            resultStats = {};
+            resultStats.headerBytes = 19;
+            resultStats.maskBits = maskBytes * 8 + includedSparse * 12;
+            resultStats.includedBones = includedSparse;
+            std::size_t residualRotation = 0, residualTranslation = 0;
+            for (std::size_t i = 0; i < count; ++i) for (int k = 0; k < 12; ++k)
+                if (components[i] & (1u << k))
+                    (k < 9 ? residualRotation : residualTranslation) += widths[k];
+            resultStats.rotationBits = residualRotation;
+            resultStats.translationBits = residualTranslation;
+        }
+
+        if (!keyDue && ackRefs_.size() >= 2) {
+            const Frame* recent = Find(ackRefs_[0], incarnation, layout, flags);
+            const Frame* older = Find(ackRefs_[1], incarnation, layout, flags);
+            if (recent && older && recent->bones.size() == count &&
+                older->bones.size() == count && PoseNewer(recent->token, older->token)) {
+                const unsigned ratio = Ratio(*recent, older, now);
+                for (uint8_t predictiveMode = 2; predictiveMode <= 3; ++predictiveMode) {
+                    std::array<unsigned, 12> kval{};
+                    std::vector<uint32_t> residual(count * 12, 0);
+                    std::vector<uint8_t> present(count, 0);
+                    std::array<int32_t, 12> prior{};
+                    for (std::size_t i = 0; i < count; ++i) {
+                        for (int k = 0; k < 12; ++k) {
+                            const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                            int32_t residualValue = int32_t(bones[i].values[k]) - prediction;
+                            if (predictiveMode == 3) {
+                                residualValue -= i ? prior[k] : 0;
+                            }
+                            uint32_t zig = PoseZigZag(residualValue);
+                            residual[i * 12 + k] = zig;
+                            if (zig) present[i] = 1;
+                            if (predictiveMode == 3)
+                                prior[k] = int32_t(bones[i].values[k]) - prediction;
+                        }
+                    }
+                    for (int k = 0; k < 12; ++k) {
+                        PoseRiceParameters parameters;
+                        for (std::size_t i = 0; i < count; ++i)
+                            if (present[i]) parameters.Add(residual[i * 12 + k]);
+                        kval[k] = parameters.Best();
+                    }
+                    const std::size_t presenceBytes = (count + 7) / 8;
+                    PoseRiceWriter writer;
+                    writer.Put(layout, 16);
+                    writer.Put(recent->token, 32);
+                    writer.Put(predictiveMode, 8);
+                    writer.Put(0, 8);
+                    writer.Put(older->token, 32);
+                    writer.Put(ratio, 16);
+                    for (unsigned k : kval) writer.Put(k, 4);
+                    for (std::size_t i = 0; i < count; ++i)
+                        writer.Put(present[i] ? 1u : 0u, 1);
+                    while (writer.bits & 7) writer.Put(0, 1);
+                    std::size_t included = 0, residualRotation = 0, residualTranslation = 0;
+                    for (std::size_t i = 0; i < count; ++i) if (present[i]) ++included;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        if (!present[i]) continue;
+                        for (int k = 0; k < 12; ++k) {
+                            const std::size_t before = writer.bits;
+                            writer.Rice(residual[i * 12 + k], kval[k], 21);
+                            (k < 9 ? residualRotation : residualTranslation) += writer.bits - before;
+                        }
+                    }
+                    writer.Align();
+
+                    if (writer.bytes.size() < result.size()) {
+                        result = std::move(writer.bytes);
+                        resultKey = false;
+                        resultStats = {};
+                        resultStats.headerBytes = 20;
+                        resultStats.maskBits = presenceBytes * 8;
+                        resultStats.rotationBits = residualRotation;
+                        resultStats.translationBits = residualTranslation;
+                        resultStats.includedBones = included;
+                        resultStats.predictive = true;
+                    }
+                }
+            }
+        }
+
+        if (allowMode4 && !keyDue && ackRefs_.size() >= 1) {
+            const Frame *recent = Find(ackRefs_.front(), incarnation, layout, flags);
+            const Frame *older =
+                ackRefs_.size() >= 2 ? Find(ackRefs_[1], incarnation, layout, flags) : nullptr;
+            if (recent && recent->bones.size() == count &&
+                (!older || (older->bones.size() == count && PoseNewer(recent->token, older->token)))) {
+                const unsigned ratio = older ? Ratio(*recent, older, now) : 0;
+                std::array<PoseQuat, pose::MaxBones> sourceQuaternions{}, predictedQuaternions{};
+                std::array<bool, pose::MaxBones> quaternionReady{};
+                for (size_t i = 0; i < count; ++i)
+                    quaternionReady[i] = PoseExtractQuat(bones[i], sourceQuaternions[i]) &&
+                        QuaternionPrediction(*recent, older, ratio, i, sourceQuaternions[i].omitted,
+                                             predictedQuaternions[i]);
+                for (bool coarse : {false, true}) {
+                    std::array<uint8_t, pose::MaxBones> boneType{};
+                    std::array<uint8_t, pose::MaxBones> omitted{};
+                    std::vector<uint32_t> residual(count * 12, 0);
+                    std::size_t rigidCount = 0;
+                    std::size_t included = 0;
+                    size_t maxBasisError = 0;
+                    int32_t prior[pose::MaxBones][12] = {};
+                    uint8_t previousTypesForBone[pose::MaxBones] = {};
+                    std::vector<pose::Bone> rigidReconstruction(bones, bones + count);
+
+                    for (std::size_t i = 0; i < count; ++i) {
+                        PoseQuat targetQuat = sourceQuaternions[i], recentQuat = predictedQuaternions[i];
+                        bool rigid = quaternionReady[i];
+                        pose::Bone rigidMatrix{};
+                        size_t boneError = 0;
+                        if (rigid) {
+                            auto accepts = [&](PoseQuat const &quaternion) {
+                                if (!PoseQuatToBone(quaternion, bones[i], rigidMatrix))
+                                    return false;
+                                boneError = 0;
+                                for (int k = 0; k < 9; ++k) {
+                                    const size_t error = size_t(std::abs(int32_t(rigidMatrix.values[k]) -
+                                                                         int32_t(bones[i].values[k])));
+                                    if (error > boneError)
+                                        boneError = error;
+                                    if (error > 2)
+                                        return false;
+                                }
+                                return true;
+                            };
+                            if (coarse) {
+                                const PoseQuat original = targetQuat;
+                                for (auto &value : recentQuat.values)
+                                    value = PoseRoundSignedDivide(value, 4) * 4;
+                                for (int k = 0; k < 4; ++k)
+                                    if (k != targetQuat.omitted)
+                                        targetQuat.values[k] =
+                                            PoseRoundSignedDivide(targetQuat.values[k], 4) * 4;
+                                rigid = PoseCompleteQuat(targetQuat) && accepts(targetQuat);
+                                for (unsigned choice = 0; !rigid && choice < 8; ++choice) {
+                                    targetQuat = original;
+                                    unsigned rank = 0;
+                                    for (int k = 0; k < 4; ++k)
+                                        if (k != targetQuat.omitted) {
+                                            const int value = original.values[k];
+                                            const int floor = value - ((value % 4 + 4) % 4);
+                                            targetQuat.values[k] =
+                                                floor + static_cast<int>((choice >> rank++) & 1u) * 4;
+                                        }
+                                    rigid = PoseCompleteQuat(targetQuat) && accepts(targetQuat);
+                                }
+                            } else
+                                rigid = accepts(targetQuat);
+                        }
+
+                        if (rigid) {
+                            maxBasisError = (std::max)(maxBasisError, boneError);
+                            rigidReconstruction[i] = rigidMatrix;
+                            boneType[i] = 2;
+                            omitted[i] = targetQuat.omitted;
+                            for (int k = 0; k < 12; ++k)
+                                residual[i * 12 + k] = 0;
+                            for (int k = 0; k < 12; ++k)
+                                prior[i][k] = 0;
+                            bool useSpatial =
+                                i > 0 && previousTypesForBone[i - 1] == 2 && omitted[i - 1] == omitted[i];
+                            for (int k = 0; k < 4; ++k) {
+                                if (k == targetQuat.omitted)
+                                    continue;
+                                int32_t difference = targetQuat.values[k] - recentQuat.values[k];
+                                prior[i][k] = targetQuat.values[k] - recentQuat.values[k];
+                                if (useSpatial)
+                                    difference -= prior[i - 1][k];
+                                residual[i * 12 + k] = PoseZigZag(coarse ? difference / 4 : difference);
+                            }
+                            for (int k = 9; k < 12; ++k) {
+                                int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                                int32_t difference = int32_t(bones[i].values[k]) - prediction;
+                                if (useSpatial)
+                                    difference -= prior[i - 1][k];
+                                prior[i][k] = int32_t(bones[i].values[k]) - prediction;
+                                residual[i * 12 + k] = PoseZigZag(difference);
+                            }
+                            ++rigidCount;
+                            ++included;
+                            previousTypesForBone[i] = boneType[i];
+                            continue;
+                        }
+
+                        const bool changedAffine = [&]() {
+                            bool changed = false;
+                            for (int k = 0; k < 12; ++k) {
+                                int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                                int32_t difference = int32_t(bones[i].values[k]) - prediction;
+                                const bool useSpatial = i > 0 && previousTypesForBone[i - 1] == 1;
+                                if (useSpatial)
+                                    difference -= prior[i - 1][k];
+                                prior[i][k] = int32_t(bones[i].values[k]) - prediction;
+                                residual[i * 12 + k] = PoseZigZag(difference);
+                                if (difference)
+                                    changed = true;
+                            }
+                            return changed;
+                        }();
+                        if (changedAffine) {
+                            boneType[i] = 1;
+                            ++included;
+                        }
+                        previousTypesForBone[i] = boneType[i];
+                    }
+
+                    if (included) {
+                        for (bool grouped : {false, true}) {
+                            const size_t groupBones = grouped ? 16 : count;
+                            const size_t groups = (count + groupBones - 1) / groupBones;
+                            std::vector<std::array<unsigned, 12>> parameters(groups);
+                            for (size_t group = 0; group < groups; ++group) {
+                                for (int k = 0; k < 12; ++k) {
+                                    PoseRiceParameters costs;
+                                    for (std::size_t i = group * groupBones;
+                                         i < (std::min)(count, (group + 1) * groupBones); ++i)
+                                        if (boneType[i] == 1 ||
+                                            (boneType[i] == 2 && ((k < 4 && k != omitted[i]) || k >= 9)))
+                                            costs.Add(residual[i * 12 + k]);
+                                    parameters[group][k] = costs.Best();
+                                }
+                            }
+                            const std::size_t presenceBytes = (count + 7) / 8;
+                            const std::size_t rigidBytes = (count + 7) / 8;
+                            std::size_t omittedBytes = (rigidCount + 3) / 4;
+                            PoseRiceWriter writer;
+                            writer.Put(layout, 16);
+                            writer.Put(recent->token, 32);
+                            writer.Put(4, 8);
+                            writer.Put((grouped ? 1 : 0) | (coarse ? 2 : 0), 8);
+                            writer.Put(older ? older->token : 0, 32);
+                            writer.Put(ratio, 16);
+                            for (auto const &values : parameters)
+                                for (unsigned k : values)
+                                    writer.Put(k, 4);
+                            writer.Align();
+                            for (std::size_t i = 0; i < count; ++i)
+                                writer.Put(boneType[i] ? 1u : 0u, 1);
+                            writer.Align();
+                            for (std::size_t i = 0; i < count; ++i)
+                                writer.Put(boneType[i] == 2 ? 1u : 0u, 1);
+                            writer.Align();
+                            for (std::size_t i = 0; i < count; ++i)
+                                if (boneType[i] == 2) {
+                                    writer.Put(omitted[i], 2);
+                                }
+                            writer.Align();
+                            std::size_t residualRotation = 0, residualTranslation = 0;
+                            for (std::size_t i = 0; i < count; ++i)
+                                if (boneType[i]) {
+                                    auto const &kval = parameters[i / groupBones];
+                                    if (boneType[i] == 2) {
+                                        for (int k = 0; k < 4; ++k) {
+                                            if (k == omitted[i])
+                                                continue;
+                                            const std::size_t before = writer.bits;
+                                            writer.Rice(residual[i * 12 + k], kval[k], 21);
+                                            residualRotation += writer.bits - before;
+                                        }
+                                        for (int k = 9; k < 12; ++k) {
+                                            const std::size_t before = writer.bits;
+                                            writer.Rice(residual[i * 12 + k], kval[k], 21);
+                                            residualTranslation += writer.bits - before;
+                                        }
+                                    } else {
+                                        for (int k = 0; k < 12; ++k) {
+                                            const std::size_t before = writer.bits;
+                                            writer.Rice(residual[i * 12 + k], kval[k], 21);
+                                            (k < 9 ? residualRotation : residualTranslation) +=
+                                                writer.bits - before;
+                                        }
+                                    }
+                                }
+                            writer.Align();
+
+                            if (writer.bytes.size() < result.size()) {
+                                result = std::move(writer.bytes);
+                                resultKey = false;
+                                resultStats = {};
+                                resultStats.headerBytes = 14 + groups * 6;
+                                resultStats.maskBits = (presenceBytes + rigidBytes + omittedBytes) * 8;
+                                resultStats.rotationBits = residualRotation;
+                                resultStats.translationBits = residualTranslation;
+                                resultStats.includedBones = included;
+                                resultStats.predictive = true;
+                                resultStats.maxBasisErrorUnits = maxBasisError;
+                                resultStats.rigidBones = rigidCount;
+
+                                reconstructed = rigidReconstruction;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        out = std::move(result);
+        key = resultKey;
+        decodedOutput = std::move(reconstructed);
+        if (stats)
+            *stats = resultStats;
         return Status::Ok;
     }
 
-    Status Decode(Dictionary const& dictionary, uint8_t const* data, size_t size,
-                  uint32_t incarnation, uint8_t flags, std::vector<pose::Bone>& out, uint16_t& layout) const
+    Status Encode(Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
+                  pose::Bone const* bones, size_t count, uint32_t now,
+                  std::vector<uint8_t>& out, bool& key, PoseStats* stats = nullptr) const
     {
-        if (!data || size <= DeltaHeaderBytes || !incarnation || (flags & ~pose::Facial)) return Status::Malformed;
+        std::vector<pose::Bone> reconstructed;
+        return EncodeCompactImpl(dictionary, layout, incarnation, flags, bones, count, now,
+                                 out, key, reconstructed, stats, false);
+    }
+
+    Status EncodeCompact(Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
+                         pose::Bone const* bones, size_t count, uint32_t now,
+                         std::vector<uint8_t>& out, bool& key,
+                         std::vector<pose::Bone>& reconstructed, PoseStats* stats = nullptr) const
+    {
+        return EncodeCompactImpl(dictionary, layout, incarnation, flags, bones, count, now,
+                                 out, key, reconstructed, stats, true);
+    }
+
+    Status Decode(Dictionary const& dictionary, uint8_t const* data, size_t size,
+                  uint32_t incarnation, uint8_t flags,
+                  std::vector<pose::Bone>& out, uint16_t& layout,
+                  PoseStats* stats = nullptr) const
+    {
+        PoseStats decodedStats;
+        PoseStats* callerStats = stats;
+        stats = &decodedStats;
+        if (!data || size <= DeltaHeaderBytes || !incarnation || (flags & ~pose::Facial))
+            return Status::Malformed;
         const uint16_t id = uint16_t(data[0]) | uint16_t(uint16_t(data[1]) << 8);
         if (!id) return Status::Malformed;
         if (!dictionary.HasLayout(id)) { layout = id; return Status::UnknownLayout; }
-        if (!frames_.empty() && PoseNewer(frames_.back().incarnation, incarnation)) return Status::WrongGeneration;
+        if (!frames_.empty() && PoseNewer(frames_.back().incarnation, incarnation))
+            return Status::WrongGeneration;
+
         const uint32_t ref = ReadPose32(data + 2);
         const uint8_t mode = data[DeltaHeaderBytes];
-        if (mode > 1) return Status::Malformed;
         if (!mode) {
             if (ref) return Status::Malformed;
             std::vector<uint8_t> full(data, data + 2);
             full.insert(full.end(), data + DeltaHeaderBytes + 1, data + size);
-            return dictionary.DecodePose(full.data(), full.size(), out, layout);
-        }
-        auto const* base = Find(ref, incarnation, id, flags);
-        Frame identity{0, incarnation, id, flags, {}};
-        if (!ref) {
-            auto status = dictionary.IdentityPose(id, identity.bones);
-            if (status != Status::Ok) return status;
-            base = &identity;
-        }
-        if (!base) { layout = id; return Status::UnknownPose; }
-        const size_t count = base->bones.size(), maskBytes = (count + 7) / 8, maskAt = DeltaHeaderBytes + 1 + 12;
-        if (size < maskAt + maskBytes ||
-            (count % 8 && (data[maskAt + maskBytes - 1] >> (count % 8)))) return Status::Malformed;
-        auto const* widths = data + DeltaHeaderBytes + 1;
-        for (int k = 0; k < 12; ++k) if (widths[k] > 17) return Status::Malformed;
-        auto result = base->bones;
-        size_t offset = maskAt + maskBytes;
-        std::vector<uint16_t> masks(count, 0);
-        unsigned bit = 0;
-        auto get = [&](unsigned width, uint32_t& value) {
-            value = 0;
-            for (unsigned n = 0; n < width; ++n) {
-                if (offset == size) return false;
-                value |= uint32_t((data[offset] >> bit) & 1u) << n;
-                if (++bit == 8) { bit = 0; ++offset; }
+            const Status status = dictionary.DecodePose(full.data(), full.size(), out, layout);
+            if (status == Status::Ok && stats) {
+                stats->headerBytes = 7;
+                stats->rotationBits = out.size() * 144;
+                stats->translationBits = out.size() * 48;
+                stats->includedBones = 0;
+                stats->predictive = false;
             }
-            return true;
-        };
-        for (size_t i = 0; i < count; ++i) {
-            if (!(data[maskAt + i / 8] & (1u << (i % 8)))) continue;
-            uint32_t mask;
-            if (!get(12, mask) || !mask) return Status::Malformed;
-            masks[i] = static_cast<uint16_t>(mask);
+            if (status == Status::Ok && callerStats) *callerStats = decodedStats;
+            return status;
         }
+        if (mode == 1) {
+            auto const* base = Find(ref, incarnation, id, flags);
+            Frame identity{0, incarnation, id, flags, 0, {}};
+            if (!ref) {
+                const Status status = dictionary.IdentityPose(id, identity.bones);
+                if (status != Status::Ok) return status;
+                base = &identity;
+            }
+            if (!base) { layout = id; return Status::UnknownPose; }
+            const size_t count = base->bones.size();
+            const size_t maskBytes = (count + 7) / 8;
+            const size_t maskAt = DeltaHeaderBytes + 1 + 12;
+            if (size < maskAt + maskBytes ||
+                (count % 8 && (data[maskAt + maskBytes - 1] >> (count % 8))))
+                return Status::Malformed;
+            auto const* widths = data + DeltaHeaderBytes + 1;
+            for (int k = 0; k < 12; ++k) if (widths[k] > 17) return Status::Malformed;
+
+            std::vector<uint16_t> masks(count, 0);
+            std::size_t offset = maskAt + maskBytes;
+            unsigned bit = 0;
+            auto get = [&](unsigned width, uint32_t& value) {
+                value = 0;
+                for (unsigned n = 0; n < width; ++n) {
+                    if (offset == size) return false;
+                    value |= uint32_t((data[offset] >> bit) & 1u) << n;
+                    if (++bit == 8) { bit = 0; ++offset; }
+                }
+                return true;
+            };
+            for (size_t i = 0; i < count; ++i) {
+                if (!(data[maskAt + i / 8] & (1u << (i % 8)))) continue;
+                uint32_t mask;
+                if (!get(12, mask) || !mask) return Status::Malformed;
+                masks[i] = static_cast<uint16_t>(mask);
+            }
+            auto result = base->bones;
+            std::size_t included = 0;
+            std::size_t residualRotation = 0, residualTranslation = 0;
+            for (size_t i = 0; i < count; ++i) {
+                if (masks[i]) ++included;
+                for (int k = 0; k < 12; ++k) {
+                    if (!(masks[i] & (1u << k))) continue;
+                    if (!widths[k]) return Status::Malformed;
+                    uint32_t value = 0;
+                    if (!get(widths[k], value)) return Status::Malformed;
+                    if (value > 131070 || !value) return Status::Malformed;
+                    const int32_t difference = value & 1
+                        ? -int32_t((value + 1) / 2)
+                        : int32_t(value / 2);
+                    const int64_t decoded = int64_t(base->bones[i].values[k]) + difference;
+                    if (decoded < -32768 || decoded > 32767) return Status::Malformed;
+                    result[i].values[k] = static_cast<int16_t>(decoded);
+                    (k < 9 ? residualRotation : residualTranslation) += widths[k];
+                }
+            }
+            if (bit) {
+                if (offset >= size || (data[offset] >> bit)) return Status::Malformed;
+                ++offset;
+            }
+            if (offset != size) return Status::Malformed;
+            out = std::move(result);
+            layout = id;
+            if (stats) {
+                stats->headerBytes = 19;
+                stats->maskBits = maskBytes * 8 + included * 12;
+                stats->rotationBits = residualRotation;
+                stats->translationBits = residualTranslation;
+                stats->includedBones = included;
+                stats->predictive = false;
+            }
+            if (callerStats) *callerStats = decodedStats;
+            return Status::Ok;
+        }
+
+        if (mode == 4) {
+            if (size < 20) return Status::Malformed;
+            if (data[7] & ~3u) return Status::Malformed;
+            const uint32_t secondary = ReadPose32(data + 8);
+            const unsigned ratio = uint16_t(data[12]) | uint16_t(uint16_t(data[13]) << 8);
+            if (ratio > 1024) return Status::Malformed;
+            const Frame* recent = Find(ref, incarnation, id, flags);
+            if (!recent) { layout = id; return Status::UnknownPose; }
+            const size_t count = recent->bones.size();
+            if (!count || count > pose::MaxBones) return Status::Malformed;
+            const size_t groupBones = (data[7] & 1) ? 16 : count;
+            const size_t groups = (count + groupBones - 1) / groupBones;
+            const size_t parameterEnd = 14 + groups * 6;
+            if (size < parameterEnd) return Status::Malformed;
+            std::vector<std::array<unsigned, 12>> parameters(groups);
+            for (size_t group = 0; group < groups; ++group)
+                for (int k = 0; k < 12; ++k)
+                    parameters[group][k] = (data[14 + group * 6 + k / 2] >> ((k & 1) * 4)) & 15u;
+            const size_t presenceBytes = (count + 7) / 8;
+            const size_t rigidBytes = presenceBytes;
+            if (size < parameterEnd + presenceBytes + rigidBytes) return Status::Malformed;
+            if (count % 8 && (data[parameterEnd + presenceBytes - 1] >> (count % 8))) return Status::Malformed;
+            std::size_t rigidCount = 0;
+            for (std::size_t i = 0; i < count; ++i)
+                if (data[parameterEnd + presenceBytes + i / 8] & (1u << (i % 8))) ++rigidCount;
+            if (count % 8 &&
+                (data[parameterEnd + presenceBytes + rigidBytes - 1] >> (count % 8)))
+                return Status::Malformed;
+            const std::size_t omittedBytes = (rigidCount + 3) / 4;
+            const std::size_t headerBytes = parameterEnd + presenceBytes + rigidBytes + omittedBytes;
+            if (size < headerBytes) return Status::Malformed;
+
+            Frame const* older = nullptr;
+            if (secondary) {
+                older = Find(secondary, incarnation, id, flags);
+                if (!older) { layout = id; return Status::UnknownPose; }
+                if (older->bones.size() != count || !PoseNewer(ref, secondary))
+                    return Status::Malformed;
+            } else if (ratio != 0) {
+                return Status::Malformed;
+            }
+
+            unsigned rigidRank = 0;
+            std::array<uint8_t, pose::MaxBones> omitted{};
+            for (std::size_t i = 0; i < count; ++i) {
+                const bool present = data[parameterEnd + i / 8] & (1u << (i % 8));
+                const bool rigid = data[parameterEnd + presenceBytes + i / 8] & (1u << (i % 8));
+                if (rigid && !present) return Status::Malformed;
+                if (rigid) {
+                    const std::size_t byte = parameterEnd + presenceBytes + rigidBytes + rigidRank / 4;
+                    omitted[i] = static_cast<uint8_t>((data[byte] >> ((rigidRank & 3) * 2)) & 3u);
+                    ++rigidRank;
+                }
+            }
+            if (rigidRank != rigidCount) return Status::Malformed;
+            if (rigidCount &&
+                (rigidCount % 4 &&
+                 (data[parameterEnd + presenceBytes + rigidBytes + omittedBytes - 1] >>
+                  ((rigidCount % 4) * 2))))
+                return Status::Malformed;
+
+            std::vector<uint8_t> payload(data, data + size);
+            PoseRiceReader reader{payload};
+            reader.bits = headerBytes * 8;
+            auto result = recent->bones;
+            int32_t priorPrev[12] = {};
+            uint8_t prevType = 0, prevOmitted = 0;
+            std::size_t included = 0, rigidBones = 0;
+            std::size_t residualRotation = 0, residualTranslation = 0;
+            for (size_t i = 0; i < count; ++i) {
+                auto const& kval = parameters[i / groupBones];
+                const bool present = payload[parameterEnd + i / 8] & (1u << (i % 8));
+                const bool rigid = payload[parameterEnd + presenceBytes + i / 8] & (1u << (i % 8));
+                if (!present) {
+                    int32_t priorCur[12] = {};
+                    for (int k = 0; k < 12; ++k) {
+                        const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                        int64_t decoded = prediction;
+                        if (i && prevType == 1) decoded += priorPrev[k];
+                        if (decoded < -32768 || decoded > 32767) return Status::Malformed;
+                        result[i].values[k] = static_cast<int16_t>(decoded);
+                        priorCur[k] = static_cast<int32_t>(decoded) - prediction;
+                    }
+                    for (int k = 0; k < 12; ++k) priorPrev[k] = priorCur[k];
+                    prevType = 0;
+                    continue;
+                }
+                ++included;
+                int32_t priorCur[12] = {};
+                bool boneChanged = false;
+                if (!rigid) {
+                    for (int k = 0; k < 12; ++k) {
+                        const std::size_t before = reader.bits;
+                        uint32_t zig = 0;
+                        if (!reader.Rice(zig, kval[k], 21)) return Status::Malformed;
+                        if (zig > 262140u) return Status::Malformed;
+                        if (zig) boneChanged = true;
+                        const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                        int64_t decoded = int64_t(prediction) + PoseUnzigZag(zig);
+                        if (i && prevType == 1) decoded += priorPrev[k];
+                        if (decoded < -32768 || decoded > 32767) return Status::Malformed;
+                        result[i].values[k] = static_cast<int16_t>(decoded);
+                        priorCur[k] = static_cast<int32_t>(decoded) - prediction;
+                        (k < 9 ? residualRotation : residualTranslation) += reader.bits - before;
+                    }
+                    prevType = 1;
+                } else {
+                    ++rigidBones;
+                    PoseQuat predicted;
+                    if (!QuaternionPrediction(*recent, older, ratio, i, omitted[i], predicted))
+                        return Status::Malformed;
+                    if (data[7] & 2)
+                        for (auto& value : predicted.values)
+                            value = PoseRoundSignedDivide(value, 4) * 4;
+
+                    PoseQuat target = predicted;
+                    for (int k = 0; k < 4; ++k) {
+                        if (k == omitted[i]) continue;
+                        const std::size_t before = reader.bits;
+                        uint32_t zig = 0;
+                        if (!reader.Rice(zig, kval[k], 21)) return Status::Malformed;
+                        if (zig > 262140u) return Status::Malformed;
+                        if (zig) boneChanged = true;
+                        target.values[k] = predicted.values[k] +
+                            PoseUnzigZag(zig) * ((data[7] & 2) ? 4 : 1);
+                        if (i && prevType == 2 && prevOmitted == omitted[i])
+                            target.values[k] += priorPrev[k];
+                        if (target.values[k] < -32768 || target.values[k] > 32767)
+                            return Status::Malformed;
+                        priorCur[k] = target.values[k] - predicted.values[k];
+                        residualRotation += reader.bits - before;
+                    }
+                    target.omitted = omitted[i];
+                    if (!PoseCompleteQuat(target)) return Status::Malformed;
+                    pose::Bone rigidMatrix;
+                    if (!PoseQuatToBone(target, result[i], rigidMatrix)) return Status::Malformed;
+                    result[i] = rigidMatrix;
+
+                    for (int k = 9; k < 12; ++k) {
+                        const std::size_t before = reader.bits;
+                        uint32_t zig = 0;
+                        if (!reader.Rice(zig, kval[k], 21)) return Status::Malformed;
+                        if (zig > 262140u) return Status::Malformed;
+                        if (zig) boneChanged = true;
+                        const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                        int64_t decoded = int64_t(prediction) + PoseUnzigZag(zig);
+                        if (i && prevType == 2 && prevOmitted == omitted[i])
+                            decoded += priorPrev[k];
+                        if (decoded < -32768 || decoded > 32767) return Status::Malformed;
+                        result[i].values[k] = static_cast<int16_t>(decoded);
+                        priorCur[k] = static_cast<int32_t>(decoded) - prediction;
+                        residualTranslation += reader.bits - before;
+                    }
+                    prevType = 2;
+                    prevOmitted = omitted[i];
+                }
+                if (!rigid && !boneChanged) return Status::Malformed;
+                for (int k = 0; k < 12; ++k) priorPrev[k] = priorCur[k];
+            }
+            if (!reader.AlignAndFinish()) return Status::Malformed;
+            out = std::move(result);
+            layout = id;
+            if (stats) {
+                stats->headerBytes = parameterEnd;
+                stats->maskBits = (presenceBytes + rigidBytes + omittedBytes) * 8;
+                stats->rotationBits = residualRotation;
+                stats->translationBits = residualTranslation;
+                stats->includedBones = included;
+                stats->predictive = true;
+                stats->rigidBones = rigidBones;
+            }
+            if (callerStats) *callerStats = decodedStats;
+            return Status::Ok;
+        }
+
+        if (mode != 2 && mode != 3) return Status::Malformed;
+        if (size < 20) return Status::Malformed;
+        if (data[7] != 0) return Status::Malformed;
+        const uint32_t secondary = ReadPose32(data + 8);
+        const unsigned ratio = uint16_t(data[12]) | uint16_t(uint16_t(data[13]) << 8);
+        if (ratio > 1024) return Status::Malformed;
+
+        std::array<unsigned, 12> kval{};
+        for (int k = 0; k < 12; ++k)
+            kval[k] = (data[14 + k / 2] >> ((k & 1) * 4)) & 15u;
+
+        const Frame* recent = Find(ref, incarnation, id, flags);
+        if (!recent) { layout = id; return Status::UnknownPose; }
+        const size_t count = recent->bones.size();
+        if (!count || count > pose::MaxBones) return Status::Malformed;
+        const size_t presenceBytes = (count + 7) / 8;
+        const size_t headerBytes = 20 + presenceBytes;
+        if (size < headerBytes) return Status::Malformed;
+        if (count % 8 && (data[headerBytes - 1] >> (count % 8))) return Status::Malformed;
+
+        Frame const* older = nullptr;
+        if (secondary) {
+            older = Find(secondary, incarnation, id, flags);
+            if (!older) { layout = id; return Status::UnknownPose; }
+            if (older->bones.size() != count || !PoseNewer(ref, secondary))
+                return Status::Malformed;
+        } else if (ratio != 0) {
+            return Status::Malformed;
+        }
+
+        std::vector<uint8_t> payload(data, data + size);
+        PoseRiceReader reader{payload};
+        reader.bits = headerBytes * 8;
+        auto result = recent->bones;
+        std::array<int32_t, 12> prior{};
+        std::size_t included = 0, residualRotation = 0, residualTranslation = 0;
         for (size_t i = 0; i < count; ++i) {
+            const bool present = (payload[20 + i / 8] & (1u << (i % 8))) != 0;
+            if (!present) {
+                for (int k = 0; k < 12; ++k) {
+                    const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                    const int64_t decoded = mode == 3 ? int64_t(prediction) + (i ? prior[k] : 0)
+                                                       : int64_t(prediction);
+                    if (decoded < -32768 || decoded > 32767) return Status::Malformed;
+                    result[i].values[k] = static_cast<int16_t>(decoded);
+                    if (mode == 3) prior[k] = static_cast<int32_t>(decoded) - prediction;
+                }
+                continue;
+            }
+            ++included;
+            bool boneChanged = false;
             for (int k = 0; k < 12; ++k) {
-                if (!(masks[i] & (1u << k))) continue;
-                if (!widths[k]) return Status::Malformed;
-                uint32_t value = 0;
-                if (!get(widths[k], value)) return Status::Malformed;
-                if (value > 131070 || !value) return Status::Malformed;
-                const int32_t difference = value & 1 ? -int32_t((value + 1) / 2) : int32_t(value / 2);
-                const int32_t decoded = base->bones[i].values[k] + difference;
+                const std::size_t before = reader.bits;
+                uint32_t zig = 0;
+                if (!reader.Rice(zig, kval[k], 21)) return Status::Malformed;
+                if (zig > (mode == 3 ? 262140u : 131070u)) return Status::Malformed;
+                if (zig) boneChanged = true;
+                const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                int64_t decoded = int64_t(prediction) + PoseUnzigZag(zig);
+                if (mode == 3) decoded += i ? prior[k] : 0;
                 if (decoded < -32768 || decoded > 32767) return Status::Malformed;
                 result[i].values[k] = static_cast<int16_t>(decoded);
+                if (mode == 3)
+                    prior[k] = static_cast<int32_t>(decoded) - prediction;
+                (k < 9 ? residualRotation : residualTranslation) += reader.bits - before;
             }
+            if (!boneChanged) return Status::Malformed;
         }
-        if (bit) {
-            if (data[offset] >> bit) return Status::Malformed;
-            ++offset;
-        }
-        if (offset != size) return Status::Malformed;
+        if (!reader.AlignAndFinish()) return Status::Malformed;
         out = std::move(result);
         layout = id;
+        if (stats) {
+            stats->headerBytes = 20;
+            stats->maskBits = presenceBytes * 8;
+            stats->rotationBits = residualRotation;
+            stats->translationBits = residualTranslation;
+            stats->includedBones = included;
+            stats->predictive = true;
+        }
+        if (callerStats) *callerStats = decodedStats;
         return Status::Ok;
     }
 };

@@ -55,7 +55,7 @@ void Golden()
         input[0].values[i] = values[i];
         input[1].values[i] = values[11 - i];
     }
-    const Bytes header = {73, 1, 0, 0, 1, 2, 3, 4,
+    const Bytes header = {74, 1, 0, 0, 1, 2, 3, 4,
                           0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x12, 0x34};
     Bytes dictionary;
     assert(sender.EncodeDictionary(0x3412u, dictionary) == Status::Ok);

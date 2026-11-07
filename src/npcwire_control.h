@@ -15,6 +15,7 @@ namespace g3t::npcwire {
 
 constexpr std::size_t MaxBatchBytes = 1172;
 constexpr std::size_t MotionSlots = 8;
+constexpr std::size_t MaxMetadataBytes = 49; // 3-byte mask + 46 bytes of values.
 constexpr std::size_t MaxBaselinesPerNpc = 16;
 constexpr std::size_t AnchorReorderWindow = 64;
 using Guid = std::array<std::uint8_t, 16>;
@@ -160,10 +161,10 @@ private:
     std::map<std::uint16_t, History> history_;
     std::map<std::uint16_t, std::uint32_t> sequences_;
 
-    friend bool EncodeRecord(const Context&, const Control&, std::vector<std::uint8_t>&);
+    friend bool EncodeRecord(const Context&, const Control&, std::vector<std::uint8_t>&, bool);
     friend bool DecodeRecord(const Context&, const std::uint8_t*, std::size_t, Control&);
     friend bool EncodeBatch(const Context&, std::uint32_t, const std::vector<Control>&,
-                            std::vector<std::uint8_t>&);
+                            std::vector<std::uint8_t>&, bool);
     friend bool DecodeBatch(Context&, const std::uint8_t*, std::size_t, std::vector<Control>&);
     friend bool EncodeFullFallback(const Context&, std::uint32_t, const Control&, std::vector<std::uint8_t>&);
     friend bool DecodeFullFallback(Context&, const std::uint8_t*, std::size_t, Control&);
@@ -175,16 +176,41 @@ private:
     friend bool DecodeSignal(const Context&, const std::uint8_t*, std::size_t, struct Signal&);
 };
 
+// The 24-byte WireControl is followed by the optional full quaternion, then
+// three bytes per active slot. Orientation bit 0 selects yaw (0) or full
+// quaternion (1); bit 7 announces metadata. Bit 6 selects exact binary32
+// positions (12 bytes after the quaternion) and phase/weight (8 bytes/slot),
+// requires full quaternion and zero delta/yaw fields. Other bits are reserved.
+// Without metadata this is the original fixed format. With metadata, append a
+// 3-byte little-endian, nonzero 21-bit mask and the selected original-width
+// little-endian values, in this order (bit 0 first):
+// movementMode:u8, hitPoints:i32, hitPointsMax:i32, motion:u32, aniState:u8,
+// heldRight:u32, heldLeft:u32, partyPlayer:u8, partyType:u8, waiting:u8,
+// guidePlayer:u8, aiMode:u8, action:u8, attackReason:u8, damageType:u8,
+// damageAmount:i32, damageMultiplier:f32, hitPlayer:u8, hitSequence:u16,
+// attitude:u8, combatTarget:u32. Mask bits 21-23 are reserved. Overrides must
+// differ from the named baseline (binary32 bit equality for damageMultiplier);
+// an overridden multiplier must be finite. Omitted values always come from
+// that immutable baseline, never a previous update.
+//
+// RecordBytes validates the structural prefix of one record in `available`
+// bytes without a Context, leaving length unchanged on failure. It accepts
+// subsequent records/trailing bytes; DecodeRecord requires an exact size and
+// additionally validates values and canonical overrides against the baseline.
+bool RecordBytes(const std::uint8_t* bytes, std::size_t available, std::size_t& length);
+
 // All outputs and Context ordering remain unchanged on failure. EncodeRecord
-// fails on any changed baseline field, non-finite/out-of-[0,1] active phase or
-// weight, or position overflow: send a new baseline or full fallback instead.
-// Slots contain phase rounded to 12 bits and weight rounded to 8 bits, with
-// the top four bits zero. Inactive slot values come unchanged from baseline.
-// Standalone records lack sequence/stream fences: use DecodeBatch on the network.
-bool EncodeRecord(const Context& context, const Control& value, std::vector<std::uint8_t>& output);
+// fails on changes to GUID, incarnation, motion descriptors, active bits or
+// inactive phase/weight, on non-finite/out-of-[0,1] active phase or weight, or
+// on position overflow: send a new baseline or full fallback instead. Slots
+// contain phase rounded to 12 bits and weight rounded to 8 bits, with the top
+// four bits zero. Standalone records lack sequence/stream fences: use
+// DecodeBatch on the network.
+bool EncodeRecord(const Context& context, const Control& value, std::vector<std::uint8_t>& output,
+                  bool exact = false);
 bool DecodeRecord(const Context& context, const std::uint8_t* bytes, std::size_t size, Control& output);
 bool EncodeBatch(const Context& context, std::uint32_t sequence, const std::vector<Control>& values,
-                 std::vector<std::uint8_t>& output);
+                 std::vector<std::uint8_t>& output, bool exact = false);
 bool DecodeBatch(Context& context, const std::uint8_t* bytes, std::size_t size, std::vector<Control>& output);
 
 // Lossless 588-byte legacy-field keyframe, in an 18-byte fenced envelope.

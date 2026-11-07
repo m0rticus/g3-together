@@ -263,33 +263,41 @@ int main() {
     bad = bytes; bad[offsetof(WireControl, yaw)] = 1;
     assert(!DecodeRecord(receiver, bad.data(), bad.size(), decoded));
 
-    // Every non-dynamic group must reject instead of silently using the baseline.
+    // Scalar metadata changes are reconstructed from the named baseline.
     auto reject = [&](const Control& x) {
         std::vector<std::uint8_t> unchanged{9};
         assert(!EncodeRecord(sender, x, unchanged) && unchanged == std::vector<std::uint8_t>{9});
     };
-    auto changed = update; changed.hitPoints++; reject(changed);
-    changed = update; changed.hitPointsMax--; reject(changed);
-    changed = update; changed.movementMode++; reject(changed);
-    changed = update; changed.motion++; reject(changed);
-    changed = update; changed.aniState++; reject(changed);
-    changed = update; changed.heldRight++; reject(changed);
-    changed = update; changed.heldLeft++; reject(changed);
-    changed = update; changed.partyPlayer++; reject(changed);
-    changed = update; changed.partyType++; reject(changed);
-    changed = update; changed.waiting++; reject(changed);
-    changed = update; changed.guidePlayer++; reject(changed);
-    changed = update; changed.aiMode++; reject(changed);
-    changed = update; changed.action++; reject(changed);
-    changed = update; changed.attackReason++; reject(changed);
-    changed = update; changed.damageType++; reject(changed);
-    changed = update; changed.damageAmount++; reject(changed);
-    changed = update; changed.damageMultiplier += 1; reject(changed);
+    auto accept = [&](const Control& x) {
+        std::vector<std::uint8_t> wire;
+        Control result;
+        assert(EncodeRecord(sender, x, wire));
+        assert(DecodeRecord(receiver, wire.data(), wire.size(), result));
+        checkStatic(x, result);
+    };
+    auto changed = update; changed.hitPoints++; accept(changed);
+    changed = update; changed.hitPointsMax--; accept(changed);
+    changed = update; changed.movementMode++; accept(changed);
+    changed = update; changed.motion++; accept(changed);
+    changed = update; changed.aniState++; accept(changed);
+    changed = update; changed.heldRight++; accept(changed);
+    changed = update; changed.heldLeft++; accept(changed);
+    changed = update; changed.partyPlayer++; accept(changed);
+    changed = update; changed.partyType++; accept(changed);
+    changed = update; changed.waiting++; accept(changed);
+    changed = update; changed.guidePlayer++; accept(changed);
+    changed = update; changed.aiMode++; accept(changed);
+    changed = update; changed.action++; accept(changed);
+    changed = update; changed.attackReason++; accept(changed);
+    changed = update; changed.damageType++; accept(changed);
+    changed = update; changed.damageAmount++; accept(changed);
+    changed = update; changed.damageMultiplier += 1; accept(changed);
+    changed = update; changed.hitPlayer++; accept(changed);
+    changed = update; changed.hitSequence++; accept(changed);
+    changed = update; changed.attitude++; accept(changed);
+    changed = update; changed.combatTarget--; accept(changed);
+    // Immutable descriptors, life and inactive slot data still require a baseline.
     changed = update; changed.incarnation++; reject(changed);
-    changed = update; changed.hitPlayer++; reject(changed);
-    changed = update; changed.hitSequence++; reject(changed);
-    changed = update; changed.attitude++; reject(changed);
-    changed = update; changed.combatTarget--; reject(changed);
     changed = update; changed.motions[0].descriptor.instance++; reject(changed);
     changed = update; changed.motions[1].descriptor.options[6]++; reject(changed);
     changed = update; changed.motions[0].active = 2; reject(changed);

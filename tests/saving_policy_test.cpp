@@ -7,8 +7,8 @@
 int main()
 {
     using namespace g3t::saving;
-    static_assert(Protocol == 75, "compact players and bulk-channel peers must use protocol 75");
-    static_assert(g3t::npcwire::bones::Version == 73, "unchanged bone codec retains its internal format version");
+    static_assert(Protocol == 76, "predictive bone and sparse control peers must use protocol 76");
+    static_assert(g3t::npcwire::bones::Version == 74, "bone dictionary format version advances separately");
     const std::string world(32, 'a'), checkpoint(32, 'b'), previous(32, 'c');
     const Key alice{world, checkpoint, 123}, bob{world, checkpoint, 456};
     assert(Valid(alice) && !Valid({world, checkpoint, 0}));
