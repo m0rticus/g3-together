@@ -315,23 +315,111 @@ class DownedPolicyTests(unittest.TestCase):
         for flag in ("MiniDumpWithThreadInfo", "MiniDumpWithHandleData", "MiniDumpWithUnloadedModules",
                      "MiniDumpWithDataSegs", "MiniDumpWithIndirectlyReferencedMemory"):
             self.assertIn(flag, dump)
-        self.assertEqual(dump.count("writeDump("), 2)
-        self.assertLess(dump.index("file, type, exception"), dump.index("DWORD error = GetLastError();"))
-        retry = function_body(
-            dump,
-            r"\bif\s*\(\s*error\s*==\s*ERROR_INVALID_PARAMETER\s*\|\|\s*"
-            r"error\s*==\s*static_cast<DWORD>\(E_INVALIDARG\)\s*\)",
-        )
-        self.assertIsNotNone(retry)
-        self.assertLess(retry.index("SetFilePointerEx(file, start, nullptr, FILE_BEGIN)"),
-                        retry.index("SetEndOfFile(file)"))
-        self.assertLess(retry.index("SetEndOfFile(file)"), retry.index("file, MiniDumpNormal, exception"))
-        self.assertIn("crash dump rewind failed", retry)
-        self.assertIn("return false;", retry[:retry.index("file, MiniDumpNormal, exception")])
-        self.assertIn("error = GetLastError();", retry[retry.index("file, MiniDumpNormal, exception"):])
+        self.assertEqual(dump.count("writeDump("), 1)
+        self.assertIn("MiniDumpWithFullMemoryInfo", dump)
+        self.assertNotIn("#ifdef MiniDumpWithFullMemoryInfo", dump)
+        self.assertIn("const Profile profiles[]", dump)
+        self.assertIn('"detailed"', dump)
+        self.assertIn('"legacy-rich"', dump)
+        self.assertIn('"normal"', dump)
+        legacy = dump[dump.index("const auto legacyRich"):dump.index("struct Profile")]
+        self.assertIn("MiniDumpWithHandleData", legacy)
+        self.assertIn("MiniDumpWithUnloadedModules", legacy)
+        self.assertIn("MiniDumpWithDataSegs", legacy)
+        self.assertIn("MiniDumpWithIndirectlyReferencedMemory", legacy)
+        self.assertNotIn("MiniDumpWithThreadInfo", legacy)
+        self.assertNotIn("MiniDumpWithFullMemoryInfo", legacy)
+        self.assertIn("rewind()", dump)
+        self.assertIn("if (i && !rewind())", dump)
+        self.assertIn("ERROR_INVALID_PARAMETER", dump)
+        self.assertIn("static_cast<DWORD>(E_INVALIDARG)", dump)
+        self.assertNotIn("== static_cast<DWORD>(E_FAIL)", dump)
+        self.assertIn("crash dump success profile=%s", dump)
+        self.assertIn("crash dump write failed profile=%s", dump)
         self.assertIn("crash dump write failed", dump)
-        self.assertIn("WriteDump(file, dumpInfo ? &exception : nullptr);", crash)
+        self.assertIn("WriteDump(file, dumpExceptionCopied ? &exception : nullptr);", crash)
         self.assertIn("WriteDump(file, nullptr);", crash)
+
+    def test_dump_worker_owns_exception_context_and_busy_admission(self):
+        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        self.assertIn("EXCEPTION_RECORD dumpExceptionRecord{};", crash)
+        self.assertIn("CONTEXT dumpContext{};", crash)
+        self.assertIn("EXCEPTION_POINTERS dumpExceptionPointers{};", crash)
+        self.assertIn("bool dumpExceptionCopied = false;", crash)
+        self.assertIn("LONG dumpBusy = 0;", crash)
+
+        admit = function_body(crash, r"\bvoid\s+Dump\s*\(")
+        self.assertIsNotNone(admit)
+        self.assertIn("InterlockedCompareExchange(&dumpBusy, 1, 0)", admit)
+        self.assertIn("guard: crashlog dump busy", admit)
+        self.assertIn("ResetEvent(dumpDone)", admit)
+        self.assertIn("dumpExceptionRecord = *info->ExceptionRecord;", admit)
+        self.assertIn("dumpExceptionRecord.ExceptionRecord = nullptr;", admit)
+        self.assertIn("dumpContext = *info->ContextRecord;", admit)
+        self.assertIn("dumpExceptionPointers.ExceptionRecord = &dumpExceptionRecord;", admit)
+        self.assertIn("dumpExceptionPointers.ContextRecord = &dumpContext;", admit)
+        self.assertIn("dumpExceptionCopied = true;", admit)
+        self.assertLess(admit.index("dumpExceptionRecord ="), admit.index("SetEvent(dumpRequest)"))
+        self.assertIn("if (!SetEvent(dumpRequest))", admit)
+        self.assertIn("const DWORD waited = WaitForSingleObject(dumpDone, wait);", admit)
+        self.assertIn("WAIT_TIMEOUT", admit)
+        self.assertIn("crash dump wait timeout", admit)
+        self.assertIn("WAIT_FAILED", admit)
+        self.assertIn("crash dump wait failed", admit)
+
+        worker = function_body(crash, r"\bDWORD\s+WINAPI\s+DumpThread\s*\(")
+        self.assertIsNotNone(worker)
+        self.assertIn("dumpExceptionCopied ? &dumpExceptionPointers : nullptr", worker)
+        self.assertIn("dumpExceptionCopied ? &exception : nullptr", worker)
+        self.assertLess(worker.index("SetEvent(dumpDone);"),
+                        worker.index("InterlockedExchange(&dumpBusy, 0);"))
+        self.assertIn("InterlockedExchange(&dumpBusy, 0);", worker)
+        handler = function_body(crash, r"\bLONG\s+CALLBACK\s+OnException\s*\(")
+        self.assertIn("!info || !info->ExceptionRecord || !info->ContextRecord", handler)
+        self.assertIn("guard: crashlog missing exception record/context", handler)
+
+    def test_known_crash_symbols_use_actual_enet_entries_and_executable_rva_bounds(self):
+        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        self.assertLess(crash.index("#include <enet/enet.h>"), crash.index("#include <Game.h>"))
+        known = function_body(crash, r"\bvoid\s+FindKnownSymbols\s*\(")
+        self.assertIsNotNone(known)
+        for symbol in (
+            "enet_range_coder_compress",
+            "enet_range_coder_decompress",
+            "enet_host_flush",
+            "enet_host_service",
+        ):
+            self.assertIn(symbol, known)
+            self.assertIn("&" + symbol, known)
+        lookup = function_body(crash, r"\bchar\s+const\*\s+NearestKnownSymbol\s*\(")
+        self.assertIsNotNone(lookup)
+        self.assertLess(crash.index("bool Executable(Module const& m, uintptr_t rva);"),
+                        crash.index("char const* NearestKnownSymbol"))
+        self.assertIn("Executable(m, rva)", lookup)
+        self.assertIn("Executable(m, at)", lookup)
+        self.assertIn("at <= rva", lookup)
+        self.assertIn("at > *start", lookup)
+        self.assertIn("m.base + m.size", lookup)
+        where = function_body(crash, r"\bbool\s+Where\s*\(")
+        self.assertIsNotNone(where)
+        self.assertNotIn("if (!name && m.game)", where)
+        self.assertIn("NearestKnownSymbol(m, rva, &start)", where)
+        self.assertIn("NearestExport(m, rva, &exportStart)", where)
+        self.assertIn("exportStart > start", where)
+        self.assertIn("scriptStart > start", where)
+        self.assertIn("nearest known symbol", where)
+        self.assertIn("nearest export symbol", where)
+        self.assertIn("Executable(m, rva)", where)
+        executable = crash.split("bool Executable(Module const& m, uintptr_t rva)\n", 1)[1].split(
+            "// The exported function", 1)[0]
+        self.assertIn("RvaRange(m, rva, 1)", executable)
+        self.assertIn("Headers(m)", executable)
+        export_lookup = function_body(crash, r"\bchar\s+const\*\s+NearestExport\s*\(")
+        self.assertIsNotNone(export_lookup)
+        self.assertIn("Headers(m)", export_lookup)
+        self.assertIn("RvaRange(m, nameRvas[i], 1)", export_lookup)
+        self.assertIn("NumberOfFunctions", export_lookup)
+        self.assertIn("NumberOfNames", export_lookup)
 
     def test_engine_free_transition_and_ordering_rules(self):
         build = ROOT / "build" / "downed-policy-tests"

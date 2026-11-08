@@ -3198,6 +3198,38 @@ void Stop()
 char const* StartupError() { return startupError; }
 
 namespace {
+size_t ENET_CALLBACK CompressDatagram(void* context, ENetBuffer const* buffers, size_t count,
+                                     size_t inputBytes, enet_uint8* output, size_t outputBytes)
+{
+    if (!context || !buffers || !count || !inputBytes || !output || !outputBytes) {
+        Log("guard: ENet compression missing context/input/output; codec refused");
+        return 0;
+    }
+    size_t empty = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!buffers[i].dataLength) ++empty;
+        else if (!buffers[i].data) {
+            Logf("guard: ENet compression null payload buffer=%zu bytes=%zu; codec refused",
+                 i, buffers[i].dataLength);
+            return 0;
+        }
+    }
+    if (empty)
+        Logf("guard: ENet compression empty_buffers=%zu input_bytes=%zu action=skip-empty-preserve-checkpoint",
+             empty, inputBytes);
+    return enet_range_coder_compress(context, buffers, count, inputBytes, output, outputBytes);
+}
+
+size_t ENET_CALLBACK DecompressDatagram(void* context, enet_uint8 const* input, size_t inputBytes,
+                                       enet_uint8* output, size_t outputBytes)
+{
+    if (!context || !input || !inputBytes || !output || !outputBytes) {
+        Log("guard: ENet decompression missing context/input/output; codec refused");
+        return 0;
+    }
+    return enet_range_coder_decompress(context, input, inputBytes, output, outputBytes);
+}
+
 bool StartFailed(char const* reason)
 {
     strncpy_s(startupError, reason, _TRUNCATE);
@@ -3228,8 +3260,11 @@ bool Start(bool asHost)
     char const* createError = nullptr;
     host = CreateTransportHost(&target, isHost ? MaxPlayers - 1 : 1, createError);
     if (!host) return StartFailed(createError);
+    host->compressor.compress = &CompressDatagram;
+    host->compressor.decompress = &DecompressDatagram;
     Logf("enet: host created role=%s channels=%u compress=on mtu=%u port=%u",
          isHost ? "host" : "client", ChannelCount, host->mtu, host->address.port);
+    Log("enet: range coder guards active empty_buffers=skip checkpoint_payload=unchanged");
     bandwidth = detail::BandwidthCounters{};
     bandwidthSince = enet_time_get();
     lastSentData = host->totalSentData;

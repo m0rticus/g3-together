@@ -72,6 +72,16 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   `npc-control: ackaccepted` reports `created`, `pending`, `fallback` and `partial`;
   `npc-control: resync` includes the recovery reason and whether the token was evicted.
   Check late join, normal departure/rejoin and host save/load in the same session.
+- [ ] Keep both players connected past the pose channel's 16-bit sequence rollover.
+  Startup must show `enet: range coder guards active empty_buffers=skip`.
+  After `net: pose sequence checkpoint queued`, expect
+  `guard: ENet compression empty_buffers=... action=skip-empty-preserve-checkpoint`;
+  the connection and pose stream must continue on the alternate channel, including
+  later rollovers and rejoin/save/load. Build 66 crashed in
+  `enet_range_coder_compress+0xac` on the checkpoint's null, zero-length payload,
+  not in world cleanup (`last_step=world-change` was an older downed-flow marker).
+  If another crash occurs, retain the matching DLL/PDB/map and dump; expect
+  the selected minidump profile/flags and nearest known function beside module+RVA.
 - [ ] Repeat in the isolated copies with the optional finite-buffer fake Steam
   build: 262144 queued bytes and 262144 bytes/s, first without artificial lag, then
   with the existing 10-ms lag. The original unlimited fake DLL cannot reproduce

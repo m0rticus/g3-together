@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstdarg>
+#include <cstdlib>
 #include <vector>
 
 struct Transmission {
@@ -69,7 +70,10 @@ int enet_peer_send(ENetPeer* peer, enet_uint8 channel, ENetPacket* packet)
     return 0;
 }
 ENetHost* enet_host_create(const ENetAddress*, size_t, size_t, enet_uint32, enet_uint32) { return nullptr; }
-int enet_host_compress_with_range_coder(ENetHost*) { return 0; }
+void* enet_malloc(size_t size) { return std::malloc(size); }
+void enet_free(void* memory) { std::free(memory); }
+void enet_host_compress(ENetHost* host, ENetCompressor const* compressor) { host->compressor = *compressor; }
+#include "../thirdparty/enet/compress.c"
 void enet_host_destroy(ENetHost*) {}
 ENetPeer* enet_host_connect(ENetHost*, const ENetAddress*, size_t, enet_uint32) { return nullptr; }
 int enet_host_service(ENetHost*, ENetEvent*, enet_uint32) { return 0; }
@@ -224,6 +228,31 @@ void Deliver(ENetPeer* peer, Transmission const& transmission)
 
 int main()
 {
+    {
+        void* context = enet_range_coder_create();
+        assert(context);
+        uint8_t input[64]{}, encoded[100]{}, flatEncoded[100]{}, restored[64]{};
+        ENetBuffer flat{}, segmented[4]{};
+        flat.data = input;
+        flat.dataLength = sizeof(input);
+        segmented[0].data = input;
+        segmented[0].dataLength = 32;
+        segmented[2].data = input + 32;
+        segmented[2].dataLength = 32;
+        const auto size = CompressDatagram(context, segmented, 4, sizeof(input), encoded, sizeof(encoded));
+        const auto flatSize = enet_range_coder_compress(context, &flat, 1, sizeof(input), flatEncoded, sizeof(flatEncoded));
+        assert(size && size == flatSize && !std::memcmp(encoded, flatEncoded, size));
+        assert(logs.size() == 1 && logs.back().find("action=skip-empty-preserve-checkpoint") != std::string::npos);
+        assert(DecompressDatagram(context, encoded, size, restored, sizeof(restored)) == sizeof(input));
+        assert(!std::memcmp(input, restored, sizeof(input)));
+        segmented[0].data = nullptr;
+        assert(CompressDatagram(context, segmented, 4, sizeof(input), encoded, sizeof(encoded)) == 0);
+        assert(logs.back().find("guard: ENet compression null payload") != std::string::npos);
+        assert(DecompressDatagram(context, nullptr, 1, restored, sizeof(restored)) == 0);
+        assert(logs.back().find("guard: ENet decompression missing") != std::string::npos);
+        enet_range_coder_destroy(context);
+        logs.clear();
+    }
     ENetHost fakeHost{};
     ENetPeer fakePeers[2]{};
     ENetPeer& fakePeer = fakePeers[0];

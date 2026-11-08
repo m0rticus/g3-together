@@ -247,24 +247,22 @@ size_t ENET_CALLBACK
 enet_range_coder_compress (void * context, const ENetBuffer * inBuffers, size_t inBufferCount, size_t inLimit, enet_uint8 * outData, size_t outLimit)
 {
     ENetRangeCoder * rangeCoder = (ENetRangeCoder *) context;
-    enet_uint8 * outStart = outData, * outEnd = & outData [outLimit];
-    const enet_uint8 * inData, * inEnd;
+    enet_uint8 * outStart = outData, * outEnd;
+    const enet_uint8 * inData = NULL, * inEnd = NULL;
     enet_uint32 encodeLow = 0, encodeRange = ~0;
     ENetSymbol * root;
     enet_uint16 predicted = 0;
     size_t order = 0, nextSymbol = 0;
 
-    if (rangeCoder == NULL || inBufferCount <= 0 || inLimit <= 0)
+    if (rangeCoder == NULL || inBuffers == NULL || inBufferCount <= 0 || inLimit <= 0 ||
+        outData == NULL || outLimit <= 0)
       return 0;
 
-    inData = (const enet_uint8 *) inBuffers -> data;
-    inEnd = & inData [inBuffers -> dataLength];
-    inBuffers ++;
-    inBufferCount --;
+    outEnd = & outData [outLimit];
 
     ENET_CONTEXT_CREATE (root, ENET_CONTEXT_ESCAPE_MINIMUM, ENET_CONTEXT_SYMBOL_MINIMUM);
 
-    for (;;)
+    while (inLimit > 0)
     {
         ENetSymbol * subcontext, * symbol;
 #ifdef ENET_CONTEXT_EXCLUSION
@@ -272,16 +270,29 @@ enet_range_coder_compress (void * context, const ENetBuffer * inBuffers, size_t 
 #endif
         enet_uint8 value;
         enet_uint16 count, under, * parent = & predicted, total;
-        if (inData >= inEnd)
+        /* Reliable sequence checkpoints have an empty payload, including at the end of a datagram. */
+        while (inData == inEnd)
         {
+            size_t length;
             if (inBufferCount <= 0)
-              break;
+              goto inputDone;
+            length = inBuffers -> dataLength;
             inData = (const enet_uint8 *) inBuffers -> data;
-            inEnd = & inData [inBuffers -> dataLength];
             inBuffers ++;
             inBufferCount --;
+            if (length == 0)
+            {
+                inEnd = inData;
+                continue;
+            }
+            if (inData == NULL)
+              return 0;
+            if (length > inLimit)
+              length = inLimit;
+            inEnd = & inData [length];
         }
         value = * inData ++;
+        -- inLimit;
     
         for (subcontext = & rangeCoder -> symbols [predicted]; 
              subcontext != root; 
@@ -336,6 +347,7 @@ enet_range_coder_compress (void * context, const ENetBuffer * inBuffers, size_t 
         ENET_RANGE_CODER_FREE_SYMBOLS;
     }
 
+inputDone:
     ENET_RANGE_CODER_FLUSH;
 
     return (size_t) (outData - outStart);
@@ -499,8 +511,8 @@ size_t ENET_CALLBACK
 enet_range_coder_decompress (void * context, const enet_uint8 * inData, size_t inLimit, enet_uint8 * outData, size_t outLimit)
 {
     ENetRangeCoder * rangeCoder = (ENetRangeCoder *) context;
-    enet_uint8 * outStart = outData, * outEnd = & outData [outLimit];
-    const enet_uint8 * inEnd = & inData [inLimit];
+    enet_uint8 * outStart = outData, * outEnd;
+    const enet_uint8 * inEnd;
     enet_uint32 decodeLow = 0, decodeCode = 0, decodeRange = ~0;
     ENetSymbol * root;
     enet_uint16 predicted = 0;
@@ -510,9 +522,11 @@ enet_range_coder_decompress (void * context, const enet_uint8 * inData, size_t i
     ENetExclude * nextExclude = excludes;
 #endif
   
-    if (rangeCoder == NULL || inLimit <= 0)
+    if (rangeCoder == NULL || inData == NULL || inLimit <= 0 || outData == NULL || outLimit <= 0)
       return 0;
 
+    outEnd = & outData [outLimit];
+    inEnd = & inData [inLimit];
     ENET_CONTEXT_CREATE (root, ENET_CONTEXT_ESCAPE_MINIMUM, ENET_CONTEXT_SYMBOL_MINIMUM);
 
     ENET_RANGE_CODER_SEED;

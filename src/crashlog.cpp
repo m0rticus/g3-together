@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <enet/enet.h>
 #include "crashlog.h"
 
 #include "log.h"
@@ -49,7 +50,11 @@ using DumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXC
                              PMINIDUMP_CALLBACK_INFORMATION);
 DumpFn writeDump = nullptr;
 HANDLE dumpRequest = nullptr, dumpDone = nullptr, dumpStop = nullptr, dumpThreadHandle = nullptr;
-EXCEPTION_POINTERS* dumpInfo = nullptr;
+EXCEPTION_RECORD dumpExceptionRecord{};
+CONTEXT dumpContext{};
+EXCEPTION_POINTERS dumpExceptionPointers{};
+bool dumpExceptionCopied = false;
+LONG dumpBusy = 0;
 DWORD dumpThreadId = 0, dumpWorkerThreadId = 0;
 char dumpDir[MAX_PATH] = {};
 LONG dumps = 0;
@@ -203,23 +208,47 @@ void DeriveDumpDir()
 bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception)
 {
     if (!writeDump) { Log("crashlog: crash dump writer unavailable"); return false; }
-    const auto type = static_cast<MINIDUMP_TYPE>(
-        MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
-        MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
-    if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type, exception, nullptr, nullptr)) return true;
-    DWORD error = GetLastError();
-    // The game ships dbghelp 5.2, which rejects newer flags with HRESULT E_INVALIDARG and leaves an empty dump.
-    if (error == ERROR_INVALID_PARAMETER || error == static_cast<DWORD>(E_INVALIDARG)) {
-        Logf("crashlog: detailed minidump unsupported error=%lu; retrying MiniDumpNormal", error);
-        const LARGE_INTEGER start{};
+    const LARGE_INTEGER start{};
+    auto rewind = [&]() {
         if (!SetFilePointerEx(file, start, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) {
             Logf("crashlog: crash dump rewind failed error=%lu", GetLastError());
             return false;
         }
-        if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, exception, nullptr, nullptr)) return true;
-        error = GetLastError();
+        return true;
+    };
+    const auto detailed = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+        MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithFullMemoryInfo);
+    const auto legacyRich = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+        MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory);
+    struct Profile {
+        MINIDUMP_TYPE type;
+        char const* name;
+    };
+    const Profile profiles[] = {{detailed, "detailed"}, {legacyRich, "legacy-rich"}, {MiniDumpNormal, "normal"}};
+    // The game ships dbghelp 5.2: only unsupported flags permit a more compatible profile.
+    for (size_t i = 0; i != std::size(profiles); ++i) {
+        if (i && !rewind()) return false;
+        if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, profiles[i].type, exception, nullptr, nullptr)) {
+            Logf("crashlog: crash dump success profile=%s type=%lu", profiles[i].name,
+                 static_cast<unsigned long>(profiles[i].type));
+            return true;
+        }
+        DWORD error = GetLastError();
+        if (error == ERROR_INVALID_PARAMETER || error == static_cast<DWORD>(E_INVALIDARG)) {
+            if (i + 1 == std::size(profiles)) {
+                Logf("crashlog: crash dump profile=%s unsupported error=%lu", profiles[i].name, error);
+                break;
+            }
+            Logf("crashlog: crash dump profile=%s unsupported error=%lu; retrying %s",
+                 profiles[i].name, error, profiles[i + 1].name);
+            continue;
+        }
+        Logf("crashlog: crash dump write failed profile=%s error=%lu", profiles[i].name, error);
+        return false;
     }
-    Logf("crashlog: crash dump write failed error=%lu", error);
+    Log("crashlog: crash dump write failed");
     return false;
 }
 
@@ -228,10 +257,21 @@ DWORD WINAPI DumpThread(LPVOID)
     for (;;) {
         HANDLE waits[2] = {dumpStop, dumpRequest};
         const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-        if (result == WAIT_OBJECT_0) return 0;
-        if (result != WAIT_OBJECT_0 + 1) return 0;
+        if (result == WAIT_OBJECT_0) {
+            SetEvent(dumpDone);
+            InterlockedExchange(&dumpBusy, 0);
+            return 0;
+        }
+        if (result != WAIT_OBJECT_0 + 1) {
+            Logf("crashlog: crash dump worker wait failed result=%lu error=%lu",
+                 result, result == WAIT_FAILED ? GetLastError() : 0);
+            SetEvent(dumpDone);
+            InterlockedExchange(&dumpBusy, 0);
+            return 0;
+        }
         if (ai::ShuttingDown()) {
             SetEvent(dumpDone);
+            InterlockedExchange(&dumpBusy, 0);
             return 0;
         }
         SYSTEMTIME now;
@@ -240,13 +280,15 @@ DWORD WINAPI DumpThread(LPVOID)
         Format(path, "%sg3together-crash-%02u%02u%02u-%ld.dmp", dumpDir, now.wHour, now.wMinute, now.wSecond, dumps);
         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file != INVALID_HANDLE_VALUE) {
-            MINIDUMP_EXCEPTION_INFORMATION exception{dumpThreadId, dumpInfo, FALSE};
-            WriteDump(file, dumpInfo ? &exception : nullptr);
+            MINIDUMP_EXCEPTION_INFORMATION exception{dumpThreadId,
+                                                     dumpExceptionCopied ? &dumpExceptionPointers : nullptr, FALSE};
+            WriteDump(file, dumpExceptionCopied ? &exception : nullptr);
             CloseHandle(file);
         } else {
             Logf("crashlog: crash dump create failed error=%lu", GetLastError());
         }
         SetEvent(dumpDone);
+        InterlockedExchange(&dumpBusy, 0);
     }
 }
 
@@ -254,11 +296,42 @@ void Dump(EXCEPTION_POINTERS* info)
 {
     if (!writeDump || !dumpRequest || ai::ShuttingDown()) return;
     if (InterlockedCompareExchange(&dumps, 0, 0) < 0) return;
-    dumpInfo = info;
+    if (InterlockedCompareExchange(&dumpBusy, 1, 0) != 0) {
+        Log("guard: crashlog dump busy; skipping overlapping request");
+        return;
+    }
+    if (!ResetEvent(dumpDone)) {
+        Logf("guard: crashlog ResetEvent(dumpDone) failed error=%lu", GetLastError());
+        InterlockedExchange(&dumpBusy, 0);
+        return;
+    }
+    dumpExceptionCopied = false;
+    dumpExceptionRecord = {};
+    dumpContext = {};
+    dumpExceptionPointers = {};
+    if (info && info->ExceptionRecord && info->ContextRecord) {
+        dumpExceptionRecord = *info->ExceptionRecord;
+        dumpExceptionRecord.ExceptionRecord = nullptr;
+        dumpContext = *info->ContextRecord;
+        dumpExceptionPointers.ExceptionRecord = &dumpExceptionRecord;
+        dumpExceptionPointers.ContextRecord = &dumpContext;
+        dumpExceptionCopied = true;
+    } else {
+        Log("guard: crashlog missing exception record/context; dumping without exception");
+    }
     dumpThreadId = GetCurrentThreadId();
-    SetEvent(dumpRequest);
+    if (!SetEvent(dumpRequest)) {
+        Logf("guard: crashlog dump request failed error=%lu", GetLastError());
+        InterlockedExchange(&dumpBusy, 0);
+        return;
+    }
     const DWORD wait = ai::ShuttingDown() ? 1000 : 30000;
-    WaitForSingleObject(dumpDone, wait);
+    const DWORD waited = WaitForSingleObject(dumpDone, wait);
+    if (waited == WAIT_TIMEOUT) {
+        Logf("crashlog: crash dump wait timeout ms=%lu guard=busy", wait);
+    } else if (waited == WAIT_FAILED) {
+        Logf("crashlog: crash dump wait failed error=%lu guard=busy", GetLastError());
+    }
 }
 
 LONG WINAPI LastChance(EXCEPTION_POINTERS* info)
@@ -291,10 +364,9 @@ void InstallDumps()
 struct Module {
     char const* name;
     uintptr_t base = 0, size = 0;
-    bool game = true;  // crash lines name its functions
 };
 Module modules[] = {{"Gothic3.exe"}, {"Engine.dll"}, {"Game.dll"}, {"Script.dll"}, {"Script_Game.dll"}, {"SharedBase.dll"},
-                    {"Script_G3Together.dll", 0, 0, false}, {"Script_paru.dll", 0, 0, false}};
+                    {"Script_G3Together.dll"}, {"Script_paru.dll"}};
 
 // Function names in crash lines (29.10.): the nearest export at or below the address, for Script_Game.dll also the scripts
 // the game registered (most of them are not exported). Mangled names are undecorated by dbghelp, loaded at install time.
@@ -312,15 +384,78 @@ Script scripts[4096];
 volatile LONG scriptCount = 0;
 bool scriptsTaken = false;
 
+bool RvaRange(Module const& m, uintptr_t rva, size_t size)
+{
+    return rva <= m.size && size <= m.size - rva;
+}
+
+struct KnownSymbol {
+    uintptr_t at = 0;
+    char const* name = nullptr;
+};
+KnownSymbol knownSymbols[4];
+size_t knownSymbolCount = 0;
+bool Executable(Module const& m, uintptr_t rva);
+
+void FindKnownSymbols()
+{
+    knownSymbolCount = 0;
+    uintptr_t addresses[] = {
+        reinterpret_cast<uintptr_t>(&enet_range_coder_compress),
+        reinterpret_cast<uintptr_t>(&enet_range_coder_decompress),
+        reinterpret_cast<uintptr_t>(&enet_host_flush),
+        reinterpret_cast<uintptr_t>(&enet_host_service),
+    };
+    char const* symbolNames[] = {
+        "enet_range_coder_compress",
+        "enet_range_coder_decompress",
+        "enet_host_flush",
+        "enet_host_service",
+    };
+    for (size_t i = 0; i != std::size(addresses); ++i) {
+        knownSymbols[knownSymbolCount].at = addresses[i];
+        knownSymbols[knownSymbolCount].name = symbolNames[i];
+        ++knownSymbolCount;
+    }
+}
+
+char const* NearestKnownSymbol(Module const& m, uintptr_t rva, uintptr_t* start)
+{
+    if (!Executable(m, rva)) return nullptr;
+    char const* best = nullptr;
+    for (size_t i = 0; i != knownSymbolCount; ++i) {
+        if (!knownSymbols[i].at || knownSymbols[i].at < m.base ||
+            knownSymbols[i].at >= m.base + m.size)
+            continue;
+        uintptr_t at = knownSymbols[i].at - m.base;
+        if (!Executable(m, at)) continue;
+        if (at <= rva && (!best || at > *start)) {
+            best = knownSymbols[i].name;
+            *start = at;
+        }
+    }
+    return best;
+}
+
 IMAGE_NT_HEADERS const* Headers(Module const& m)
 {
+    if (!m.base || m.size < sizeof(IMAGE_DOS_HEADER)) return nullptr;
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(m.base);
-    return reinterpret_cast<IMAGE_NT_HEADERS const*>(m.base + dos->e_lfanew);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        !RvaRange(m, static_cast<uintptr_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS)))
+        return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS const*>(m.base + dos->e_lfanew);
+    return nt->Signature == IMAGE_NT_SIGNATURE ? nt : nullptr;
 }
 
 bool Executable(Module const& m, uintptr_t rva)
 {
+    if (!RvaRange(m, rva, 1)) return false;
     IMAGE_NT_HEADERS const* nt = Headers(m);
+    if (!nt) return false;
+    if (!RvaRange(m, static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(IMAGE_FIRST_SECTION(nt)) - m.base),
+                  nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER)))
+        return false;
     IMAGE_SECTION_HEADER const* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i != nt->FileHeader.NumberOfSections; ++i, ++section) {
         const uintptr_t size = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
@@ -333,10 +468,21 @@ bool Executable(Module const& m, uintptr_t rva)
 // The exported function that starts nearest at or below rva (forwarders and data skipped, a jmp thunk followed).
 char const* NearestExport(Module const& m, uintptr_t rva, uintptr_t* start)
 {
+    IMAGE_NT_HEADERS const* nt = Headers(m);
+    if (!nt) return nullptr;
     auto const* base = reinterpret_cast<unsigned char const*>(m.base);
-    IMAGE_DATA_DIRECTORY const& dir = Headers(m)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    IMAGE_DATA_DIRECTORY const& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.VirtualAddress || !dir.Size) return nullptr;
+    if (!RvaRange(m, dir.VirtualAddress, dir.Size) ||
+        !RvaRange(m, dir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY)))
+        return nullptr;
     auto const* exports = reinterpret_cast<IMAGE_EXPORT_DIRECTORY const*>(base + dir.VirtualAddress);
+    if (exports->NumberOfFunctions > m.size / sizeof(DWORD) ||
+        exports->NumberOfNames > m.size / sizeof(DWORD) ||
+        !RvaRange(m, exports->AddressOfFunctions, static_cast<size_t>(exports->NumberOfFunctions) * sizeof(DWORD)) ||
+        !RvaRange(m, exports->AddressOfNames, static_cast<size_t>(exports->NumberOfNames) * sizeof(DWORD)) ||
+        !RvaRange(m, exports->AddressOfNameOrdinals, static_cast<size_t>(exports->NumberOfNames) * sizeof(WORD)))
+        return nullptr;
     auto const* functions = reinterpret_cast<DWORD const*>(base + exports->AddressOfFunctions);
     auto const* nameRvas = reinterpret_cast<DWORD const*>(base + exports->AddressOfNames);
     auto const* ordinals = reinterpret_cast<WORD const*>(base + exports->AddressOfNameOrdinals);
@@ -347,13 +493,20 @@ char const* NearestExport(Module const& m, uintptr_t rva, uintptr_t* start)
         if (at >= dir.VirtualAddress && at < dir.VirtualAddress + dir.Size) continue;  // forwarder
         if (!Executable(m, at)) continue;
         if (base[at] == 0xE9) {  // incremental-link thunk: jmp rel32
+            if (!RvaRange(m, at, 5)) continue;
             int32_t relative;
             std::memcpy(&relative, base + at + 1, sizeof(relative));
             at += 5 + relative;
             if (at >= m.size || !Executable(m, at)) continue;
         }
         if (at <= rva && (!best || at > *start)) {
-            best = reinterpret_cast<char const*>(base + nameRvas[i]);
+            if (!RvaRange(m, nameRvas[i], 1)) continue;
+            char const* name = reinterpret_cast<char const*>(base + nameRvas[i]);
+            const size_t remaining = m.size - nameRvas[i];
+            size_t length = 0;
+            while (length != remaining && name[length]) ++length;
+            if (length == remaining) continue;
+            best = name;
             *start = at;
         }
     }
@@ -367,6 +520,7 @@ char const* NearestScript(Module const& m, uintptr_t address, uintptr_t* start)
     for (LONG i = 0; i != count; ++i) {
         const uintptr_t at = scripts[i].at;
         if (at < m.base || at > address || (best && at - m.base <= *start)) continue;
+        if (at >= m.base + m.size || !Executable(m, at - m.base)) continue;
         best = scripts[i].name;
         *start = at - m.base;
     }
@@ -408,6 +562,7 @@ void FindModules()
         m.base = reinterpret_cast<uintptr_t>(h);
         m.size = nt->OptionalHeader.SizeOfImage;
     }
+    FindKnownSymbols();
 }
 
 // "Module+rva" for an address in one of the modules, else nothing; for the game's modules with " (Function+offset)".
@@ -417,17 +572,25 @@ bool Where(uintptr_t address, char* out, size_t size)
         if (m.base && address >= m.base && address < m.base + m.size) {
             const uintptr_t rva = address - m.base;
             int length = Format(out, size, "%s+%#x", m.name, static_cast<unsigned>(rva));
-            if (!names || !m.game) return true;
-            uintptr_t start = 0, scriptStart = 0;
-            char const* name = NearestExport(m, rva, &start);
-            if (char const* script = NearestScript(m, address, &scriptStart); script && (!name || scriptStart > start)) {
+            if (!names || !Executable(m, rva)) return true;
+            uintptr_t start = 0, exportStart = 0, scriptStart = 0;
+            char const* name = NearestKnownSymbol(m, rva, &start);
+            char const* kind = name ? "nearest known symbol" : nullptr;
+            if (char const* exportName = NearestExport(m, rva, &exportStart);
+                exportName && exportStart > start) {
+                name = exportName;
+                start = exportStart;
+                kind = "nearest export symbol";
+            }
+            if (char const* script = NearestScript(m, address, &scriptStart); script && scriptStart > start) {
                 name = script;
                 start = scriptStart;
+                kind = "nearest registered script";
             }
             if (!name) return true;
             char plain[160];
             if (*name == '?' && undecorate && undecorate(name, plain, sizeof(plain), UndnameNameOnly)) name = plain;
-            Format(out + length, size - length, " (%s+%#x)", name, static_cast<unsigned>(rva - start));
+            Format(out + length, size - length, " (%s %s+%#x)", kind, name, static_cast<unsigned>(rva - start));
             ++named;
             return true;
         }
@@ -437,7 +600,11 @@ bool Where(uintptr_t address, char* out, size_t size)
 LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
 {
     if (ai::ShuttingDown()) return EXCEPTION_CONTINUE_SEARCH;
-    if (!info || info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    if (!info || !info->ExceptionRecord || !info->ContextRecord) {
+        Log("guard: crashlog missing exception record/context; cannot describe fault");
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
     bool gameFault = false;
     for (Module const& module : modules)
