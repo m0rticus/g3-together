@@ -16,7 +16,8 @@ struct ProcessingMembership {
     bool range = false, processable = false;
 };
 ProcessingMembership ProcessingOf(eCEntity const* entity);
-bool QueueEntityProcessing(eCEntity* entity);
+// Registration is an optimization (engine range/processable lists); `why` names the exact reason when it returns false.
+bool QueueEntityProcessing(eCEntity* entity, char const** why = nullptr);
 void Tick();  // host: NPC-only extra ranges; native camera, ROI and static culling stay unchanged
 void ProcessingReport(LogFn log);
 void Start();

@@ -5,6 +5,7 @@
 #include "npclease_guards.h"
 #include "npclease_presentation.h"
 #include "npclease_admission.h"
+#include "npcown_policy.h"
 
 #include "ai.h"
 #include "body.h"
@@ -50,13 +51,22 @@ struct Entry {
     uint32_t activationAt = 0, ownerReportAt = 0, rangeChangedAt = 0, processableChangedAt = 0;
     eCEntity* observedEntity = nullptr;
     bool observedRange = false, observedProcessable = false;
-    bool nativeActivated = false, processingQueued = false;
+    bool nativeActivated = false;
     bool hasPresentationFloor = false;
     uint8_t previousOwner = 0;
     eCEntity* applied = nullptr;
     bool active = false, prepared = false, cut = false, committed = false, hasBaseline = false;
     bool captureFailed = false;
     bool adopted = false;
+    // Client-first ownership: `local` = this client drives the NPC natively right now (host handshake independent);
+    // `confirmed` = the host granted an epoch for it (Commit seen).
+    bool local = false, confirmed = false;
+    uint32_t ownedAt = 0, yieldedAt = 0, cutAt = 0, hostSeenAt = 0, requestEvery = 500, retryAt = 0;
+    char const* cutReason = nullptr;
+    eCEntity* ownedEntity = nullptr;
+    bool silentLogged = false;
+    char lastTask[48]{};
+    uint32_t reactionAt = 0;
     char sentRoutine[64]{};
 };
 using GuidKey = std::array<uint8_t, 16>;
@@ -75,9 +85,11 @@ gFScript originalKill = nullptr;
 using QuestFn = GEBool(__fastcall*)(gCQuestManager_PS*, void*, eCEntity const&);
 QuestFn originalQuest = nullptr;
 thread_local eCEntity* ownerDeath = nullptr;
-std::unordered_set<std::string> storyActors;
-bool storyCatalogReady = false;
-std::unordered_map<GuidKey, std::string, GuidHash> refusalReasons;
+// Per-GUID refusal/waiting reasons: logged once per GUID and reason, counted once; the 10 Hz scan only re-asserts them.
+npcown::RefusalLedger refusals, waiting;
+npcown::TransitionLog transitions;
+npcown::OwnStats ownTotals;
+uint32_t sessionReadyAt = 0, ownReportAt = 0;
 
 GuidKey Key(uint8_t const guid[16])
 {
@@ -122,15 +134,17 @@ bool Running()
 }
 void PublishGuard(GuidKey const& key, Entry const& entry)
 {
-    if (!entry.lease.epoch || entry.lease.phase == Phase::Host) {
+    if (!entry.local && (!entry.lease.epoch || entry.lease.phase == Phase::Host)) {
         guardStates.Erase(key);
         return;
     }
     AuthorityGuard guard;
     guard.leased = true;
-    guard.processingAllowed = !net::IsHost() && entry.active && entry.world == net::WorldEpoch() &&
-        entry.welcome == net::WelcomeSerial() && Running() && !persist::CheckpointBusy() &&
-        entry.window.Active(entry.lease.epoch, net::Now());
+    // A client-first owner is independent of the host round trip, the lease window, pauses and checkpoints: only the world
+    // identity matters. Pausing or saving must never make an owned NPC passive (the passive path clears its task).
+    guard.processingAllowed = !net::IsHost() && entry.local && entry.active && entry.world == net::WorldEpoch() &&
+        entry.welcome == net::WelcomeSerial() && !ai::ShuttingDown();
+    guard.persistent = entry.local;
     guard.locallyDriven = guard.processingAllowed && entry.nativeActivated;
     guard.deadline = entry.window.deadline;
     guard.owner = net::IsHost() && entry.lease.ActiveLeases() ? entry.lease.owner : 0;
@@ -186,77 +200,15 @@ char const* SpeciesName(Entity& npc)
 }
 NativeClass ClassOf(Entity& npc)
 {
-    if (SpeciesName(npc)) return NativeClass::Creature;
-    const auto species = static_cast<gESpecies>(npc.NPC.Species);
-    return species == gESpecies_Human || species == gESpecies_Orc || species == gESpecies_Goblin
-        ? NativeClass::Ordinary : NativeClass::Unsupported;
+    return SpeciesName(npc) ? NativeClass::Creature : NativeClass::Ordinary;
 }
 
-std::string StoryKey(char const* name)
+// Summons, party members and owned actors follow a player and stay with that player's machine; trade/teach/dialogue/quest
+// actors, immortals, named actors and equipped NPCs are ordinary client citizens.
+bool FollowerRole(eCEntity* entity)
 {
-    std::string key(name);
-    std::transform(key.begin(), key.end(), key.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return key;
-}
-void AddStoryActor(bCString const& name)
-{
-    if (name.GetLength()) storyActors.insert(StoryKey(name.GetText()));
-}
-bool StoryCatalog()
-{
-    if (storyCatalogReady) return true;
-    auto* quests = gCQuestManager_PS::GetInstance();
-    auto* infos = gCInfoManager_PS::GetInstance();
-    if (!quests || !infos || !quests->GetQuests().GetCount() || !infos->GetInfos().GetCount()) return false;
-    storyActors.clear();
-    for (int i = 0; i < quests->GetQuests().GetCount(); ++i) {
-        auto* quest = quests->GetQuests().GetAt(i).operator->();
-        if (!quest) return false;
-        AddStoryActor(quest->GetDestinationEntity());
-        for (int j = 0; j < quest->GetDeliveryEntities().GetCount(); ++j)
-            AddStoryActor(quest->GetDeliveryEntities().GetAt(j));
-    }
-    for (int i = 0; i < infos->GetInfos().GetCount(); ++i) {
-        auto* info = infos->GetInfos().GetAt(i);
-        if (!info) return false;
-        AddStoryActor(info->GetOwner());
-        AddStoryActor(info->GetConditionOwnerNearEntity());
-        AddStoryActor(info->GetConditionItemContainer());
-        for (auto const* names : {&info->GetCondSecondaryNPC(), &info->GetCondPlayerPartyMember()})
-            for (int j = 0; j < names->GetCount(); ++j) AddStoryActor(names->GetAt(j));
-        auto* script = info->AccessInfoScript().GetObject();
-        if (!script) return false;
-        for (int j = 0; j < script->GetCommandCount(); ++j) {
-            auto* line = script->GetCommand(j);
-            if (!line) return false;
-            AddStoryActor(line->GetEntity1());
-            AddStoryActor(line->GetEntity2());
-        }
-    }
-    storyCatalogReady = true;
-    Logf("npclease: story admission catalog ready actors=%u quests=%d infos=%d",
-         static_cast<unsigned>(storyActors.size()), quests->GetQuests().GetCount(), infos->GetInfos().GetCount());
-    return true;
-}
-bool GenericName(char const* name, char const* species)
-{
-    size_t length = std::strlen(species);
-    if (std::strncmp(name, species, length)) return false;
-    if (!name[length]) return true;
-    if (name[length++] != '_') return false;
-    for (size_t i = length; name[i]; ++i) if (name[i] < '0' || name[i] > '9') return false;
-    return name[length] != '\0';
-}
-bool ExcludedRole(eCEntity* entity)
-{
-    if (entity->GetPropertySet(eEPropertySetType_Magic) ||
-        entity->GetPropertySet(eEPropertySetType_Item)) return true;
     if (entity->GetPropertySet(eEPropertySetType_Interaction) &&
         Entity(entity).Interaction.GetOwner().GetInstance()) return true;
-    auto* dialog = static_cast<gCDialog_PS*>(entity->GetPropertySet(eEPropertySetType_Dialog));
-    if (dialog && (dialog->GetTradeEnabled() || dialog->GetTeachEnabled() || dialog->GetPartyEnabled()))
-        return true;
     auto* party = static_cast<gCParty_PS*>(entity->GetPropertySet(eEPropertySetType_Party));
     if (!party) return false;
     Entity npc(entity);
@@ -264,64 +216,32 @@ bool ExcludedRole(eCEntity* entity)
         static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) != gEPartyMemberType_None ||
         party->GetMembers().GetCount() != 0;
 }
-bool PortableEquipment(Entity& npc, gESlot slot)
+
+npcown::RoleFacts RoleOf(eCEntity* entity, bool prototype)
 {
-    const Entity held = npc.Inventory.GetItemFromSlot(slot);
-    if (!held.GetInstance()) return true;
-    const bool hand = slot == gESlot_RightHand || slot == gESlot_LeftHand;
-    const bool natural = held.GetInstance() == npc.GetInstance() ||
-        (held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&
-         held.Interaction.GetUseType() == gEUseType_Fist);
-    const auto* creator = npc.GetInstance()->GetCreator();
-    if (!creator || !creator->GetPropertySet(eEPropertySetType_Inventory))
-        return PortableCreatureSlot(true, hand, natural, false);
-    Entity prototype(const_cast<eCTemplateEntity*>(creator));
-    const Entity expected = prototype.Inventory.GetDefaultItemFromSlot(slot);
-    const bool same = held.GetInstance() == npc.GetInstance() || (expected.GetInstance() &&
-        !std::memcmp(&held.GetInstance()->GetTemplateID().GetCore(),
-                     &expected.GetInstance()->GetTemplateID().GetCore(), 16));
-    return PortableCreatureSlot(true, hand, natural, same);
+    npcown::RoleFacts role;
+    role.removed = npcremoval::Suppressed(entity);
+    if (!prototype) {
+        role.hero = entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody() ||
+            entity->GetPropertySet(eEPropertySetType_PlayerMemory);
+        role.remotePuppet = remote::IsPuppet(entity);
+        role.duplicateIdentity = npcs::RedundantClientEntity(entity);
+    }
+    role.complete = entity->GetPropertySet(eEPropertySetType_NPC) &&
+        entity->GetPropertySet(eEPropertySetType_DamageReceiver) &&
+        entity->GetPropertySet(eEPropertySetType_ScriptRoutine) &&
+        entity->GetPropertySet(eEPropertySetType_CharacterMovement) &&
+        entity->GetPropertySet(eEPropertySetType_Inventory) &&
+        entity->GetPropertySet(eEPropertySetType_Navigation) && (prototype || entity->GetCreator() != nullptr);
+    role.itemOrSpell = entity->GetPropertySet(eEPropertySetType_Magic) || entity->GetPropertySet(eEPropertySetType_Item);
+    role.summonOrFollower = role.complete && FollowerRole(entity);
+    return role;
 }
 
-char const* EquipmentReason(Entity& npc)
-{
-    if (!PortableEquipment(npc, gESlot_RightHand)) return "unportable right-hand equipment";
-    if (!PortableEquipment(npc, gESlot_LeftHand)) return "unportable left-hand equipment";
-    if (!PortableEquipment(npc, gESlot_Body)) return "unportable body equipment";
-    if (!PortableEquipment(npc, gESlot_Helmet)) return "unportable helmet equipment";
-    return nullptr;
-}
-
-char const* EligibilityReason(eCEntity* entity, char const* name = nullptr, bool prototype = false)
+char const* EligibilityReason(eCEntity* entity, char const* = nullptr, bool prototype = false)
 {
     if (!entity) return "native NPC instance unavailable";
-    if (npcremoval::Suppressed(entity)) return "authored removal";
-    if (!prototype && (Player(entity) || npcs::RedundantClientEntity(entity))) return "player or duplicate identity";
-    if (!entity->GetPropertySet(eEPropertySetType_NPC) ||
-        !entity->GetPropertySet(eEPropertySetType_DamageReceiver) ||
-        !entity->GetPropertySet(eEPropertySetType_ScriptRoutine) ||
-        !entity->GetPropertySet(eEPropertySetType_CharacterMovement) ||
-        !entity->GetPropertySet(eEPropertySetType_Inventory) ||
-        !entity->GetPropertySet(eEPropertySetType_Navigation)) return "incomplete native NPC/template";
-    Entity npc(entity);
-    Admission admission;
-    admission.type = ClassOf(npc);
-    admission.complete = prototype || entity->GetCreator() != nullptr;
-    admission.mortal = !npc.NPC.Immortal;
-    admission.independent = !ExcludedRole(entity);
-    const char* species = SpeciesName(npc);
-    const bCString nativeName = npc.GetName();
-    const char* instanceName = name ? name : nativeName.GetText();
-    if (species) {
-        const auto* creator = prototype ? entity : entity->GetCreator();
-        admission.portableCreature = GenericName(instanceName, species) && creator &&
-            !std::strcmp(creator->GetName().GetText(), species) && (prototype || !EquipmentReason(npc));
-    } else if (admission.type == NativeClass::Ordinary) {
-        admission.storyCatalog = StoryCatalog();
-        admission.storyReferenced = storyActors.count(StoryKey(instanceName)) != 0 ||
-            storyActors.count(StoryKey(entity->GetName().GetText())) != 0;
-    }
-    return admission.Refusal();
+    return npcown::Exclusion(RoleOf(entity, prototype));
 }
 bool Eligible(eCEntity* entity)
 {
@@ -329,7 +249,7 @@ bool Eligible(eCEntity* entity)
 }
 char const* DiscoveryReason(Checkpoint const& state)
 {
-    if (!Valid(state) || state.dead || state.status) return "invalid/dead/status-bearing discovery checkpoint";
+    if (!Valid(state)) return "invalid discovery checkpoint";
     _GUID raw;
     std::memcpy(&raw, state.templateId, sizeof(raw));
     eCTemplateEntityProxy proxy;
@@ -367,12 +287,11 @@ bool NativeReady(eCEntity* entity)
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
     return Processed(entity) && world::ProcessingOf(entity).processable && animation && animation->GetActor();
 }
-ClientReadiness Readiness(eCEntity* entity, Entry const& entry, uint32_t now)
+ClientReadiness Readiness(eCEntity* entity, Entry const&, uint32_t)
 {
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
     ClientReadiness result{Running(), GetConfig().npcAuthorityFallback, persist::CheckpointBusy(),
-        Processed(entity), animation && animation->GetActor(), Eligible(entity),
-        Reached(now, entry.localDeadline)};
+        Processed(entity), animation && animation->GetActor(), Eligible(entity)};
     result.processingEnabled = entity && entity->IsEnabled() && !entity->IsProcessingDisabled();
     result.processable = world::ProcessingOf(entity).processable;
     auto* hero = remote::ControlledBody();
@@ -380,8 +299,6 @@ ClientReadiness Readiness(eCEntity* entity, Entry const& entry, uint32_t now)
         result.insideRange = entity && hero &&
             LeaseProcessingRange(true, (entity->GetWorldPosition() - hero->GetWorldPosition()).GetMagnitude());
     }
-    result.collecting = entry.processingQueued &&
-        AwaitingInitialCollection(entry.nativeActivated, entry.activationAt, now);
     return result;
 }
 bool CanResumePresentation(eCEntity* entity)
@@ -434,8 +351,8 @@ bool CaptureNative(eCEntity* entity, Checkpoint& state)
     for (size_t i = 0; i < 5; ++i) state.statusAge[i] = seconds - stamps[i];
     eCEntity* target = npc.NPC.GetCurrentTarget().GetInstance();
     state.busy = static_cast<uint8_t>(npc.IsDown() || npc.Routine.AIMode == gEAIMode_Combat ||
-        body::LocallyAttacking(entity) || (target && !TargetPlayer(target)) || talk::IsHeld(entity) ||
-        state.status != 0);
+        npc.Routine.AIMode == gEAIMode_Talk || body::LocallyAttacking(entity) ||
+        (target && !TargetPlayer(target)) || talk::IsHeld(entity) || state.status != 0);
     if (state.dead) {
         state.hp = 0;
         auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
@@ -445,7 +362,7 @@ bool CaptureNative(eCEntity* entity, Checkpoint& state)
 }
 void Stop(eCEntity* entity)
 {
-    if (!entity || !entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;
+    if (!entity || Player(entity) || !entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;
     npcplayback::RememberNativePresentation(entity);
     Entity npc(entity);
     npc.Routine.FullStop();
@@ -551,9 +468,14 @@ Interest InterestOf(Checkpoint const& state, uint8_t client, eCEntity* hostNpc)
     const float atCamera[3] = {camera.GetX(), camera.GetY(), camera.GetZ()};
     value.hostDistance = std::min(body::Distance(state.position, atHero), body::Distance(state.position, atCamera));
     value.clientDistance = value.sameWorld ? body::Distance(state.position, net::Remotes()[client].latest.position) : 1e30f;
-    unsigned clients = 0;
-    for (uint8_t i = 2; i < net::MaxPlayers; ++i) clients += net::InWorld(i) && net::Remotes()[i].connected;
-    value.conflict = clients != 1;
+    // One owner per NPC: refuse only when a LOWER-numbered client is also within reach of this NPC (it owns it).
+    unsigned others = 0;
+    for (uint8_t i = 2; i < client; ++i) {
+        if (!net::InWorld(i) || !net::Remotes()[i].connected) continue;
+        auto const& other = net::Remotes()[i].latest;
+        if (other.world == remote::CurrentWorld() && body::Distance(state.position, other.position) <= ClientRadiusCm) ++others;
+    }
+    value.conflict = others != 0;
     return value;
 }
 Message Control(GuidKey const& key, Entry const& entry, Kind kind)
@@ -591,14 +513,27 @@ void Diagnostic(char const* action, GuidKey const& key, Entry const& entry, char
 }
 void Refusal(GuidKey const& key, char const* name, char const* reason)
 {
+    // Counted and logged once per GUID and reason; a re-assertion by a periodic scan is silent.
+    if (!refusals.Note(key, reason)) return;
     ++refused;
-    auto found = refusalReasons.find(key);
-    if (found != refusalReasons.end() && found->second == reason) return;
-    if (found != refusalReasons.end()) found->second = reason;
-    else if (refusalReasons.size() < MaxLeases) refusalReasons.emplace(key, reason);
     char text[40];
     guid::Format(key.data(), text, sizeof(text));
     Logf("npclease: admission-refused guid=%s name=%s reason=%s", text, name, reason);
+}
+void OwnEvent(GuidKey const& key, char const* name, npcown::Event event, char const* detail)
+{
+    if (!transitions.Changed(key, event)) return;
+    char text[40], line[420];
+    guid::Format(key.data(), text, sizeof(text));
+    npcown::FormatEvent(line, sizeof(line), text, name, event, detail);
+    Log(line);
+}
+void OwnEventAlways(GuidKey const& key, char const* name, npcown::Event event, char const* detail)
+{
+    char text[40], line[420];
+    guid::Format(key.data(), text, sizeof(text));
+    npcown::FormatEvent(line, sizeof(line), text, name, event, detail);
+    Log(line);
 }
 void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& entry, eCEntity* entity,
                          ClientReadiness const& readiness, char const* why)
@@ -607,30 +542,24 @@ void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& en
     char text[40];
     guid::Format(key.data(), text, sizeof(text));
     Entity npc(entity);
-    Logf("npclease: readiness guid=%s epoch=%u revision=%u active=%u processed=%u actor=%u eligible=%u "
-         "running=%u enabled=%u checkpoint=%u remaining_ms=%d last_hit_age_ms=%u hp=%d ai=%d task=%s state=%s "
-         "disabled=%u right=%s left=%s body=%s helmet=%s eligibility_reason=%s "
-         "reason=%s ptr=%p e0=%u e8=%u entity_enabled=%u native=%u collecting=%u "
+    Logf("npclease: readiness guid=%s epoch=%u revision=%u active=%u local=%u confirmed=%u processed=%u actor=%u eligible=%u "
+         "running=%u enabled=%u checkpoint=%u last_hit_age_ms=%u hp=%d ai=%d task=%s state=%s "
+         "disabled=%u eligibility_reason=%s suspension=%s reason=%s ptr=%p e0=%u e8=%u entity_enabled=%u native=%u "
          "e0_changed_age_ms=%u e8_changed_age_ms=%u hero_cm=%.0f camera_cm=%.0f",
-         text, entry.lease.epoch, entry.lease.revision, entry.active ? 1 : 0,
+         text, entry.lease.epoch, entry.lease.revision, entry.active ? 1 : 0, entry.local ? 1 : 0, entry.confirmed ? 1 : 0,
          readiness.processed ? 1 : 0, readiness.actor ? 1 : 0, readiness.eligible ? 1 : 0,
          readiness.running ? 1 : 0, readiness.enabled ? 1 : 0, readiness.checkpointBusy ? 1 : 0,
-         static_cast<int32_t>(entry.localDeadline - net::Now()),
          entry.lastHit ? net::Now() - entry.lastHit : UINT32_MAX,
          entity ? static_cast<int>(npc.DamageReceiver.HitPoints) : entry.lease.state.hp,
          entity ? static_cast<int>(npc.Routine.AIMode) : -1,
          entity ? npc.Routine.GetCurrentTask().GetText() : "-",
          entity ? npc.Routine.GetCurrentState().GetText() : "-",
          entity && entity->IsProcessingDisabled() ? 1 : 0,
-         entity ? npc.Inventory.GetItemFromSlot(gESlot_RightHand).GetName().GetText() : "-",
-         entity ? npc.Inventory.GetItemFromSlot(gESlot_LeftHand).GetName().GetText() : "-",
-         entity ? npc.Inventory.GetItemFromSlot(gESlot_Body).GetName().GetText() : "-",
-         entity ? npc.Inventory.GetItemFromSlot(gESlot_Helmet).GetName().GetText() : "-",
-         readiness.eligible ? "eligible" : entity && EquipmentReason(npc) ? EquipmentReason(npc) :
-             UnavailabilityReason(entity),
+         readiness.eligible ? "eligible" : UnavailabilityReason(entity),
+         readiness.Suspension() ? readiness.Suspension() : "-",
          why, entity, world::ProcessingOf(entity).range ? 1 : 0,
          readiness.processable ? 1 : 0, entity && entity->IsEnabled() ? 1 : 0,
-         entry.nativeActivated ? 1 : 0, readiness.collecting ? 1 : 0,
+         entry.nativeActivated ? 1 : 0,
          net::Now() - entry.rangeChangedAt, net::Now() - entry.processableChangedAt,
          entity && remote::ControlledBody() ?
              (entity->GetWorldPosition() - remote::ControlledBody()->GetWorldPosition()).GetMagnitude() : -1.0f,
@@ -675,64 +604,46 @@ void ReceiveHost(uint8_t from, Message const& note)
             from < 2 || from >= net::MaxPlayers || !note.echo) return;
         if (found == entries.end() && !CapacityAvailable()) return;
         Entry& entry = entries[key];
-        if (entry.lease.ActiveLeases()) return;
+        if (entry.lease.ActiveLeases()) {
+            // The client reclaimed an NPC it had cut but the host never took over: re-offer from its latest checkpoint.
+            if (entry.lease.phase != Phase::Frozen || entry.lease.owner != from) return;
+            entry.lease.phase = Phase::Dormant;
+        }
         eCEntity* native = npcs::NpcByGuid(note.guid);
-        Checkpoint baseline;
-        if (native && CaptureNative(native, baseline)) {
-            if (entry.lease.state.dead) baseline = entry.lease.state;
-            entry.hasBaseline = true;
-        } else if (native) {
-            Refusal(key, note.state.name, EligibilityReason(native) ? EligibilityReason(native) :
-                "host instance exists but canonical capture unavailable");
-            return;
-        } else if (entry.hasBaseline && Valid(entry.lease.state)) baseline = entry.lease.state;
-        else if (HostUnknown(native != nullptr, npcs::HostKnows(note.guid), entry.hasBaseline) &&
-                 note.incarnation == 1 && ValidDiscovery(note.state)) {
-            baseline = note.state;
-            entry.lease.state = baseline;
-            entry.hasBaseline = true;
-            if (!entry.adopted) {
-                entry.adopted = true;
-                ++discovered;
-                Diagnostic("discovered", key, entry, "verified native template; no host instance created");
+        // Client-first: the client already runs this NPC; its latest checkpoint is the baseline for every class.
+        const Checkpoint baseline = note.state;
+        if (native) {
+            if (auto const* why = EligibilityReason(native)) { Refusal(key, note.state.name, why); return; }
+            if (std::memcmp(&native->GetTemplateID().GetCore(), baseline.templateId, 16)) {
+                Refusal(key, note.state.name, "client checkpoint does not match the host instance template"); return;
             }
-        } else {
-            Refusal(key, note.state.name, npcs::HostKnows(note.guid) ?
-                "host-known GUID without canonical baseline; discovery refused" :
-                DiscoveryReason(note.state) ? DiscoveryReason(note.state) : "host canonical baseline unavailable");
-            return;
-        }
-        if (std::memcmp(note.state.templateId, baseline.templateId, 16) ||
-            std::strcmp(note.state.name, baseline.name)) {
-            Refusal(key, note.state.name, "discovery identity does not match canonical template/name"); return;
-        }
-        entry.lease.state = baseline;
-        if (!MayDelegate(ClassOf(baseline),
-                HostUnknown(native != nullptr, npcs::HostKnows(note.guid), false),
-                entry.adopted && !native)) {
-            Refusal(key, baseline.name, "ordinary NPC has a host instance/record; host-owned");
-            return;
+            if (!baseline.dead && Entity(native).IsDead()) {
+                Refusal(key, note.state.name, "host instance is already dead"); return;
+            }
+        } else if (auto const* why = DiscoveryReason(baseline)) { Refusal(key, note.state.name, why); return; }
+        if (!baseline.dead && journal::RecordedDeath(note.guid)) {
+            Refusal(key, note.state.name, "host journal recorded this NPC's death"); return;
         }
         auto interest = InterestOf(baseline, from, native);
         interest.hostPresent = interest.hostPresent && npcs::HostCanPresent(note.guid);
-        if (!entry.interest.Delegate(interest, now)) return;
-        if (baseline.status || baseline.dead) {
-            Refusal(key, baseline.name, "canonical NPC life/status not transferable"); return;
-        }
-        if (baseline.busy && interest.hostPresent) {
-            if (!entry.recallAt) entry.recallAt = now ? now : 1;
-            if (now - entry.recallAt < RecallWaitMs) return;
-        }
+        if (!entry.interest.Delegate(interest, now)) { Refusal(key, note.state.name, DelegateRefusal(interest)); return; }
         if (native && !npcplayback::GuardForLease(native)) {
             Refusal(key, baseline.name, "native property authority fence unavailable"); return;
         }
         if (authoritySerial == UINT32_MAX) { ++refused; Log("FAIL npclease: authority epoch exhausted"); return; }
         entry.world = note.world; entry.echo = note.echo;
         entry.recallAt = 0;
-        entry.lease.incarnation = entry.adopted ? note.incarnation : npcs::Incarnation(note.guid);
+        entry.hasBaseline = true;
+        if (!native && !entry.adopted) {
+            entry.adopted = true;
+            ++discovered;
+            Diagnostic("discovered", key, entry, "verified native template; no host instance created");
+        }
+        entry.lease.incarnation = native ? npcs::Incarnation(note.guid) : note.incarnation;
         entry.previousOwner = from;
         entry.previousGeneration = net::PeerGeneration(from);
         if (!entry.lease.Offer(from, net::PeerGeneration(from), ++authoritySerial, now, baseline)) { ++refused; return; }
+        refusals.Forget(key);
         PublishGuard(key, entry);
         Stop(native);
         Send(key, entry, Kind::Offer);
@@ -756,7 +667,7 @@ void ReceiveHost(uint8_t from, Message const& note)
             entry.echo = note.echo;
             Send(key, entry, Kind::Commit);
             ++granted;
-            Diagnostic("grant", key, entry, "client imported inert baseline");
+            Diagnostic("grant", key, entry, "client-first owner accepted; epoch attached");
         } else if (entry.lease.phase == Phase::Client && !entry.committed) Send(key, entry, Kind::Commit);
     } else if (note.kind == Kind::Ack) {
         entry.committed = true;
@@ -769,9 +680,10 @@ void ReceiveHost(uint8_t from, Message const& note)
             CommitDeath(key, entry);
             const bool renewRecall = entry.lease.phase == Phase::Recalling && entry.recallAt &&
                 now - entry.recallAt < RecallWaitMs;
-            if ((entry.lease.phase == Phase::Client || renewRecall) && Running() && !persist::CheckpointBusy()) {
+            if (entry.lease.phase == Phase::Client || renewRecall) {
+                // A live client keeps its epoch through host pauses and checkpoints; only a silent client is recovered.
                 entry.lease.deadline = now + LeaseMs + LeaseSafetyMs;
-                Send(key, entry, Kind::Renew);
+                if (Running() && !persist::CheckpointBusy()) Send(key, entry, Kind::Renew);
             }
         }
     } else if (note.kind == Kind::Cut) {
@@ -784,33 +696,44 @@ void ReceiveHost(uint8_t from, Message const& note)
         }
     }
 }
+// A client-owned NPC stops natively running: the host presents it again, took it over, or recalled it. Local state is discarded
+// by the host's stream; nothing is frozen.
+void ReleaseLocal(GuidKey const& key, Entry& entry, eCEntity* entity, bool stop)
+{
+    const bool wasLocal = entry.local;
+    entry.local = false; entry.confirmed = false; entry.active = false; entry.prepared = false;
+    entry.nativeActivated = false; entry.cut = false; entry.recallAt = 0;
+    entry.lease.phase = Phase::Host;
+    entry.window.Reset(entry.lease.epoch);
+    entry.ownedEntity = nullptr;
+    PublishGuard(key, entry);
+    if (wasLocal && stop) Stop(entity);
+}
 void ReceiveClient(Message const& note)
 {
     const auto key = Key(note.guid);
     const uint32_t now = net::Now();
     if (note.kind == Kind::Offer) {
-        if (!GetConfig().npcAuthorityFallback || !Running() || note.owner != net::LocalId() ||
+        // Client-first: the NPC already runs natively here; an Offer only attaches the host epoch. Never Import or Stop.
+        if (!GetConfig().npcAuthorityFallback || note.owner != net::LocalId() ||
             Reached(now + LeaseSafetyMs, note.echo + note.duration)) { ++refused; return; }
         auto it = entries.find(key);
-        if (it == entries.end() || (it->second.lease.epoch && !Newer(note.epoch, it->second.lease.epoch))) {
+        if (it == entries.end() || !it->second.local || it->second.cut ||
+            (it->second.lease.epoch && !Newer(note.epoch, it->second.lease.epoch))) {
             ++refused; return;
         }
         Entry& entry = it->second;
         eCEntity* entity = npcs::NpcByGuid(note.guid);
-        if (!NativeReady(entity) || !Eligible(entity) || !npcplayback::GuardForLease(entity)) { ++refused; return; }
+        if (!entity || !Eligible(entity)) { ++refused; return; }
         if (!entry.window.Prepare(note.epoch, note.echo, note.duration, now)) { ++refused; return; }
-        entry.active = false; entry.prepared = true; entry.cut = false; entry.committed = false;
-        entry.world = note.world; entry.welcome = net::WelcomeSerial();
+        entry.prepared = true; entry.committed = false; entry.confirmed = false;
         entry.lease.owner = note.owner; entry.lease.generation = note.generation;
         entry.lease.incarnation = note.incarnation; entry.lease.epoch = note.epoch;
-        entry.lease.started = entry.unavailableAt ? entry.unavailableAt : now;
-        entry.lease.revision = note.revision; entry.lease.state = note.state; entry.lease.phase = Phase::Offering;
+        entry.lease.revision = note.revision; entry.lease.phase = Phase::Client;
         entry.hasBaseline = true;
-        std::memcpy(entry.sentRoutine, note.state.routine, sizeof(entry.sentRoutine));
         entry.localDeadline = note.echo + note.duration - LeaseSafetyMs;
-        entry.echo = now;
+        entry.echo = now; entry.hostSeenAt = now;
         PublishGuard(key, entry);
-        if (!Import(entity, note.state)) { ++refused; entry.prepared = false; return; }
         Send(key, entry, Kind::Prepared);
         return;
     }
@@ -818,61 +741,58 @@ void ReceiveClient(Message const& note)
     if (found == entries.end()) { ++refused; return; }
     Entry& entry = found->second;
     if (note.kind == Kind::Commit && note.owner == 1 && note.world == entry.world &&
-        note.incarnation == entry.lease.incarnation && Newer(note.epoch, entry.lease.epoch) && entry.cut) {
-        entry.active = false;
+        note.incarnation == entry.lease.incarnation && Newer(note.epoch, entry.lease.epoch) &&
+        (entry.cut || entry.local || entry.lease.phase == Phase::Host)) {
+        const bool wasCut = entry.cut;
+        eCEntity* entity = npcs::NpcByGuid(note.guid);
+        ReleaseLocal(key, entry, entity, !wasCut);
         entry.lease.epoch = note.epoch; entry.lease.owner = 1; entry.lease.phase = Phase::Host;
         entry.lease.generation = note.generation;
         entry.lease.state = note.state; entry.lease.revision = note.revision;
         entry.presentationFloor = note.echo;
         entry.hasPresentationFloor = true;
-        entry.prepared = false; entry.cut = false; entry.recallAt = 0;
+        entry.yieldedAt = now ? now : 1;
         entry.unavailableAt = 0;
         entry.window.Reset(note.epoch);
         entry.echo = now;
         PublishGuard(key, entry);
         Send(key, entry, Kind::Ack);
-        Diagnostic("hand-back", key, entry, "host committed donor cut");
+        ++ownTotals.handBacks;
+        Diagnostic("hand-back", key, entry, wasCut ? "host committed donor cut" : "host took over a client-owned NPC");
+        OwnEventAlways(key, note.state.name, npcown::Event::HandBack,
+            wasCut ? "reason=host committed donor cut state=latest" : "reason=host took over");
         return;
     }
     if (!Exact(note, entry)) { ++refused; return; }
     if (note.kind == Kind::Commit) {
         if (entry.lease.phase == Phase::Host && note.owner == 1) { Send(key, entry, Kind::Ack); return; }
-        if (entry.active) {
-            if (entry.window.Active(note.epoch, now)) Send(key, entry, Kind::Ack);
-            else ++refused;
-            return;
+        if (!entry.local || entry.cut) { ++refused; return; }
+        if (!entry.confirmed) {
+            entry.window.Commit(note.epoch, now); // telemetry only; ownership never depends on the window
+            entry.confirmed = true; entry.prepared = false;
+            entry.hostSeenAt = now;
+            char detail[80];
+            std::snprintf(detail, sizeof(detail), "epoch=%u life=%u", entry.lease.epoch, entry.lease.incarnation);
+            OwnEvent(key, entry.lease.state.name, npcown::Event::Confirmed, detail);
         }
-        if (!entry.prepared || entry.cut || !Running() || !entry.window.Commit(note.epoch, now)) { ++refused; return; }
-        entry.lease.phase = Phase::Client;
-        entry.active = true; entry.prepared = false; entry.echo = now;
-        entry.nativeActivated = false; entry.activationAt = now; entry.ownerReportAt = 0;
-        auto* entity = npcs::NpcByGuid(note.guid);
-        PublishGuard(key, entry);
-        entry.processingQueued = false;
-        if (entity && !entity->IsProcessingDisabled() && Eligible(entity) &&
-            ProcessingAuthority(entity) && npcplayback::GuardForLease(entity)) {
-            Entity(entity).EnableProcessing(GETrue);
-            entry.processingQueued = world::QueueEntityProcessing(entity);
-        }
+        entry.echo = now;
         Send(key, entry, Kind::Ack);
-        ObserveProcessing(entry, entity, now);
-        ReadinessDiagnostic("activation-queued", key, entry, entity, Readiness(entity, entry, now),
-            entry.processingQueued ? "committed permit; awaiting native e0/e8 collection" :
-                                     "native processing registration unavailable; donor fenced");
     } else if (note.kind == Kind::Renew) {
-        if (!entry.active || entry.cut || !entry.window.Renew(note.epoch, note.echo, note.duration, now)) { ++refused; return; }
-        entry.localDeadline = entry.window.deadline;
+        if (!entry.local || entry.cut || !entry.confirmed) { ++refused; return; }
+        entry.window.Renew(note.epoch, note.echo, note.duration, now);
+        entry.hostSeenAt = now;
+        entry.silentLogged = false;
         entry.lease.state.effects |= note.state.effects;
-        PublishGuard(key, entry);
     } else if (note.kind == Kind::Recall) {
         if (!entry.recallAt) entry.recallAt = now ? now : 1;
     } else if (note.kind == Kind::Abort) {
-        entry.active = false; entry.prepared = false; entry.lease.phase = Phase::Host;
-        entry.cut = false; entry.recallAt = 0;
-        entry.window.Reset(note.epoch);
-        PublishGuard(key, entry);
-        Stop(npcs::NpcByGuid(note.guid));
+        // The host could not keep its side of the offer: keep running natively and retry the handshake later.
         Send(key, entry, Kind::Ack);
+        entry.prepared = false; entry.confirmed = false; entry.recallAt = 0;
+        entry.window.Reset(0);
+        entry.lease.epoch = 0;
+        entry.lastRequest = now;
+        PublishGuard(key, entry);
     }
 }
 void Receive(uint8_t from, Message const& note)
@@ -929,8 +849,13 @@ GEInt GE_STDCALL Kill(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
     final.dead = 1; final.hp = 0; final.busy = 0; final.effects |= NativeDeath;
     entry->lease.state = final;
     ++entry->lease.revision; entry->echo = net::Now();
-    if (Send(Key(victim), *entry, Kind::State)) ++stateSent;
+    // Unconfirmed owners carry the death in their next Adopt/Offer baseline; the host journals it exactly once (QuestDeath bit).
+    if (entry->confirmed && Send(Key(victim), *entry, Kind::State)) ++stateSent;
     ++nativeDeaths;
+    ++ownTotals.deaths;
+    OwnEventAlways(Key(victim), final.name, npcown::Event::Death,
+        entry->confirmed ? "native death xp/loot=native quest=host-journal confirmed=1" :
+                           "native death xp/loot=native quest=host-journal confirmed=0 (reported on confirmation)");
     return result;
 }
 bool Install()
@@ -958,7 +883,7 @@ bool Install()
     ai::PatchPointer(reinterpret_cast<void**>(&script->m_funcScript), reinterpret_cast<void*>(&Kill), "npclease Kill script");
     net::SetNpcLeaseHandler(&Receive);
     installed = true;
-    Log("npclease: native authority ready; creature/discovered-ordinary admission=on absence_dwell_ms=0 lease_ms=3000 state_hz=5");
+    Log("npclease: native authority ready; client-first ownership for all NPC classes absence_dwell_ms=0 lease_ms=3000 state_hz=5");
     return true;
 }
 void TickHost(uint32_t now)
@@ -1046,110 +971,390 @@ void TickHost(uint32_t now)
         PublishGuard(key, entry);
     }
 }
-void TickClient(uint32_t now)
+// Which native path put the NPC into the engine's processing lists. Informational only: ownership never depends on it,
+// so a failed registration can never freeze, fence or cut a client-owned NPC.
+void RegisterProcessing(GuidKey const& key, Entry& entry, eCEntity* entity)
+{
+    const bool processedBefore = Processed(entity), processableBefore = world::ProcessingOf(entity).processable;
+    bool queued = false, enabled = false;
+    char const* queueWhy = "not needed";
+    if (!(processedBefore && processableBefore)) {
+        if (!entity->IsEnabled()) { Entity(entity).EnableProcessing(GETrue); enabled = true; }
+        if (entity->IsProcessingDisabled() && !npcs::RedundantClientEntity(entity)) {
+            entity->DisableProcessing(GEFalse);
+            enabled = true;
+        }
+        queued = world::QueueEntityProcessing(entity, &queueWhy);
+    }
+    const auto path = npcown::Classify(processedBefore, processableBefore, queued, enabled);
+    switch (path) {
+    case npcown::Registration::AlreadyProcessed: ++ownTotals.registrationAlready; break;
+    case npcown::Registration::Queued: ++ownTotals.registrationQueued; break;
+    case npcown::Registration::Enabled: ++ownTotals.registrationEnabled; break;
+    default: ++ownTotals.registrationFailed; break;
+    }
+    static bool seen[4] = {};
+    const auto index = static_cast<size_t>(path);
+    if (path == npcown::Registration::AlreadyProcessed && seen[index]) return;
+    if (seen[index] && path != npcown::Registration::Unavailable) return;
+    seen[index] = true;
+    char detail[300];
+    std::snprintf(detail, sizeof(detail),
+        "path=%s processed=%u processable=%u enabled=%u processing_disabled=%u authority=%u queue=%s ownership=kept",
+        npcown::Name(path), processedBefore ? 1 : 0, processableBefore ? 1 : 0, entity->IsEnabled() ? 1 : 0,
+        entity->IsProcessingDisabled() ? 1 : 0, ProcessingAuthority(entity) ? 1 : 0, queueWhy);
+    OwnEventAlways(key, entry.lease.state.name, npcown::Event::Registration, detail);
+}
+
+// Immediate client-first ownership of an NPC the host does not present. Returns nullptr on success, else the reason.
+char const* TakeOver(eCEntity* entity, GuidKey const& key, uint32_t now)
+{
+    Entry& entry = entries[key];
+    Checkpoint state;
+    if (!CaptureNative(entity, state)) return "native checkpoint invalid";
+    entry.world = net::WorldEpoch(); entry.welcome = net::WelcomeSerial();
+    entry.lease.state = state; entry.lease.owner = net::LocalId();
+    entry.lease.incarnation = npcs::Incarnation(key.data());
+    if (!entry.lease.incarnation) entry.lease.incarnation = 1;
+    entry.lease.epoch = 0; entry.lease.revision = 0; entry.lease.generation = 0;
+    entry.lease.phase = Phase::Client;
+    entry.lease.started = now;
+    entry.window.Reset(0);
+    entry.hasBaseline = true;
+    entry.local = true; entry.active = true; entry.confirmed = false; entry.prepared = false;
+    entry.cut = false; entry.recallAt = 0; entry.captureFailed = false;
+    entry.ownedAt = now ? now : 1;
+    entry.ownedEntity = entity;
+    entry.lastRequest = 0; entry.requestEvery = 500; entry.hostSeenAt = 0; entry.silentLogged = false;
+    entry.cutReason = nullptr;
+    entry.retryAt = 0;
+    std::memcpy(entry.sentRoutine, state.routine, sizeof(entry.sentRoutine));
+    if (!Activate(entity, entry, key.data())) {
+        entry.local = false; entry.active = false; entry.nativeActivated = false; entry.ownedEntity = nullptr;
+        entry.lease.phase = Phase::Host;
+        PublishGuard(key, entry);
+        return "native fence/import/restart unavailable";
+    }
+    refusals.Forget(key);
+    waiting.Forget(key);
+    ++ownTotals.takeovers;
+    RegisterProcessing(key, entry, entity);
+    Entity npc(entity);
+    std::snprintf(entry.lastTask, sizeof(entry.lastTask), "%s", npc.Routine.GetCurrentTask().GetText());
+    char detail[300];
+    std::snprintf(detail, sizeof(detail), "reason=host not presenting class=%s hp=%d/%d routine=%s task=%s mode=%d dist_hero_cm=%.0f",
+        ClassOf(npc) == NativeClass::Creature ? "creature" : "ordinary", state.hp, state.maxHp, state.routine,
+        entry.lastTask, static_cast<int>(npc.Routine.AIMode),
+        (entity->GetWorldPosition() - remote::ControlledBody()->GetWorldPosition()).GetMagnitude());
+    OwnEventAlways(key, state.name, npcown::Event::Owned, detail);
+    transitions.Changed(key, npcown::Event::Owned);
+    return nullptr;
+}
+
+// Hand the NPC to the host from its latest state (host recall, role change). The host imports it and presents it; if it does
+// not commit in time the client reclaims the NPC instead of leaving it frozen.
+void CutToHost(GuidKey const& key, Entry& entry, eCEntity* entity, Checkpoint const* state, char const* why, uint32_t now)
+{
+    entry.local = false; entry.active = false; entry.cut = true; entry.cutAt = now ? now : 1;
+    entry.cutReason = why;
+    entry.lease.phase = Phase::Frozen;
+    entry.window.Freeze();
+    if (state) entry.lease.state = *state;
+    ++entry.lease.revision; entry.echo = now;
+    entry.nativeActivated = false; entry.confirmed = false; entry.ownedEntity = nullptr;
+    PublishGuard(key, entry);
+    Diagnostic("frozen", key, entry, why);
+    char detail[200];
+    std::snprintf(detail, sizeof(detail), "reason=%s awaiting host hand-back from latest state hp=%d", why, entry.lease.state.hp);
+    OwnEventAlways(key, entry.lease.state.name, npcown::Event::Frozen, detail);
+    Stop(entity);
+    Send(key, entry, Kind::Cut);
+}
+
+bool SharedWithOtherClient(eCEntity* entity)
+{
+    // One owner per NPC: the lowest connected client id within reach owns it, the others stay host/visual driven.
+    const auto& at = entity->GetWorldPosition();
+    const float here[3] = {at.GetX(), at.GetY(), at.GetZ()};
+    for (uint8_t i = 2; i < net::LocalId(); ++i) {
+        auto const& other = net::Remotes()[i];
+        if (other.connected && (other.latest.flags & 1) && other.latest.world == remote::CurrentWorld() &&
+            body::Distance(here, other.latest.position) <= ClientRadiusCm) return true;
+    }
+    return false;
+}
+
+// Reaction logging: the first task change after a native hit is the hit reaction the NPC plays.
+void ObserveReaction(GuidKey const& key, Entry& entry, Entity& npc, uint32_t now)
+{
+    const char* task = npc.Routine.GetCurrentTask().GetText();
+    if (std::strcmp(task, entry.lastTask)) {
+        if (entry.lastHit && entry.reactionAt != entry.lastHit && now - entry.lastHit < 2500) {
+            entry.reactionAt = entry.lastHit;
+            char detail[200];
+            std::snprintf(detail, sizeof(detail), "task=%s->%s state=%s hit_age_ms=%u", entry.lastTask[0] ? entry.lastTask : "-",
+                task[0] ? task : "-", npc.Routine.GetCurrentState().GetText(), now - entry.lastHit);
+            OwnEventAlways(key, entry.lease.state.name, npcown::Event::Reaction, detail);
+        }
+        std::snprintf(entry.lastTask, sizeof(entry.lastTask), "%s", task);
+    }
+}
+
+void MaintainOwners(uint32_t now)
 {
     for (auto& item : entries) {
         Entry& entry = item.second;
-        if (entry.prepared && Reached(now, entry.localDeadline)) {
-            entry.prepared = false; entry.lease.phase = Phase::Host; entry.window.Freeze();
-            PublishGuard(item.first, entry);
-            Stop(npcs::NpcByGuid(reinterpret_cast<uint8_t const*>(item.first.data())));
-            Diagnostic("prepare-expired", item.first, entry, "late commit cannot activate donor");
-        }
-        if (!entry.active) continue;
-        auto* entity = npcs::NpcByGuid(reinterpret_cast<uint8_t const*>(item.first.data()));
-        ObserveProcessing(entry, entity, now);
-        auto readiness = Readiness(entity, entry, now);
-        const char* lost = readiness.LossReason();
-        if (!entry.nativeActivated && !lost) {
-            if (!entry.processingQueued) lost = "native processing registration unavailable";
-            else if (readiness.processed && readiness.processable) {
-                if (Activate(entity, entry, item.first.data())) {
-                    readiness = Readiness(entity, entry, now);
-                    lost = readiness.LossReason();
-                    ReadinessDiagnostic("active", item.first, entry, entity, readiness,
-                        lost ? lost : "native client AI; collected baseline imported and playback retired");
-                    entry.ownerReportAt = now;
+        const GuidKey& key = item.first;
+        auto* entity = npcs::NpcByGuid(key.data());
+        if (entry.cut && !entry.local) {
+            // Hand-back pending: the host commits from the cut state; if it cannot (not loaded near the host) the NPC lives on.
+            if (entity && now - entry.cutAt >= npcown::CutReclaimMs && !npcs::HostStreamFresh(key.data()) &&
+                !persist::CheckpointBusy()) {
+                entry.cut = false; entry.lease.epoch = 0; entry.lease.phase = Phase::Host; entry.window.Reset(0);
+                if (const char* why = TakeOver(entity, key, now)) {
+                    OwnEventAlways(key, entry.lease.state.name, npcown::Event::Refused, why);
                 } else {
-                    entry.active = true;
-                    lost = "native guard/import/restart unavailable";
+                    ++ownTotals.reclaims;
+                    OwnEventAlways(key, entry.lease.state.name, npcown::Event::Reclaimed,
+                        "reason=host did not commit the cut in time; client keeps the NPC natively");
                 }
-            } else continue;
-        }
-        Checkpoint state = entry.lease.state;
-        const bool captured = entry.nativeActivated && CaptureNative(entity, state);
-        if (!captured && !entry.captureFailed)
-            ReadinessDiagnostic("state-unavailable", item.first, entry, entity, readiness,
-                lost ? lost : "native checkpoint invalid; renewal cannot advance");
-        entry.captureFailed = !captured;
-        if (entry.nativeActivated && (!entry.ownerReportAt || now - entry.ownerReportAt >= 1000)) {
-            ReadinessDiagnostic("owner", item.first, entry, entity, readiness, lost ? lost : "native owner retained");
-            entry.ownerReportAt = now;
-        }
-        if (lost || (entry.recallAt && captured && (!state.busy || now - entry.recallAt >= RecallWaitMs))) {
-            // Status tasks cannot be restarted from a scalar duration; defer their cut while the lease remains healthy.
-            if (!lost && !TransferableStatus(state)) continue;
-            entry.active = false; entry.cut = true; entry.lease.phase = Phase::Frozen;
-            entry.window.Freeze();
-            if (captured) entry.lease.state = state;
-            ++entry.lease.revision; entry.echo = now;
-            PublishGuard(item.first, entry);
-            ReadinessDiagnostic("frozen", item.first, entry, entity, readiness, lost ? lost : "safe recall cut");
-            entry.nativeActivated = false;
-            Stop(entity);
-            Send(item.first, entry, Kind::Cut);
+            }
             continue;
         }
+        if (!entry.local) continue;
+        if (!entity) continue; // unloaded by the engine: suspended, state kept for its return
+        if (entry.ownedEntity != entity) {
+            // The engine reloaded the entity under a new instance: restore the latest local state into it once it is
+            // processable (ownership and the checkpoint are retained meanwhile).
+            if (!NativeReady(entity)) continue;
+            if (!Activate(entity, entry, key.data())) {
+                ReleaseLocal(key, entry, entity, false);
+                OwnEventAlways(key, entry.lease.state.name, npcown::Event::Yielded, "reason=reloaded instance could not be restored");
+                continue;
+            }
+            entry.ownedEntity = entity;
+            OwnEventAlways(key, entry.lease.state.name, npcown::Event::Owned, "reason=reloaded instance restored from latest state");
+        }
+        ObserveProcessing(entry, entity, now);
+        const auto readiness = Readiness(entity, entry, now);
+        Entity npc(entity);
+        Checkpoint state = entry.lease.state;
+        const bool captured = CaptureNative(entity, state);
+        if (captured) state.effects |= entry.lease.state.effects;
+        if (!captured && !entry.captureFailed)
+            ReadinessDiagnostic("state-unavailable", key, entry, entity, readiness,
+                readiness.LossReason() ? readiness.LossReason() : "native checkpoint invalid; state sends pause, NPC keeps running");
+        entry.captureFailed = !captured;
+
+        npcown::OwnerFacts facts;
+        facts.role = RoleOf(entity, false);
+        // A terminally dead owner keeps its corpse (XP/loot already paid natively; the host is told on confirmation); a
+        // single stray in-flight host record never counts as presentation (two accepted records are required).
+        const bool terminalDeath = entry.lease.state.dead && (entry.lease.state.effects & NativeDeath);
+        facts.hostPresenting = !terminalDeath && npcs::HostStreamFresh(key.data()) &&
+            npcs::HostStreamRecords(key.data()) >= 2;
+        facts.hostRecallDue = entry.recallAt && entry.confirmed && captured &&
+            npc.Routine.AIMode != gEAIMode_Talk &&
+            (!state.busy || now - entry.recallAt >= RecallWaitMs) && TransferableStatus(state);
+        facts.leaseExpired = entry.confirmed && Reached(now, entry.window.deadline);
+        facts.hostSilent = entry.confirmed && entry.hostSeenAt && now - entry.hostSeenAt > LeaseMs + LeaseSafetyMs;
+        facts.checkpointBusy = readiness.checkpointBusy;
+        facts.paused = !readiness.running;
+        facts.registrationFailed = false;
+        facts.processingListsMissing = !readiness.processed || !readiness.processable;
+        facts.outsideRing = !readiness.insideRange;
+        facts.disconnected = !net::Connected();
+        if (facts.hostSilent && !entry.silentLogged) {
+            entry.silentLogged = true;
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), "silent_ms=%u owner keeps running natively; state sends continue",
+                now - entry.hostSeenAt);
+            OwnEventAlways(key, entry.lease.state.name, npcown::Event::HostSilent, detail);
+        }
+        if (char const* release = npcown::Release(facts)) {
+            if (facts.hostPresenting || !entry.confirmed || !captured) {
+                const uint32_t age = npcs::HostPresentationAge(entity);
+                ReleaseLocal(key, entry, entity, true);
+                entry.yieldedAt = now ? now : 1;
+                ++ownTotals.yields;
+                char detail[200];
+                std::snprintf(detail, sizeof(detail), "reason=%s stream_age_ms=%u local state discarded; host stream applies",
+                    release, age == UINT32_MAX ? 0u : age);
+                OwnEventAlways(key, entry.lease.state.name, npcown::Event::Yielded, detail);
+            } else CutToHost(key, entry, entity, &state, release, now);
+            continue;
+        }
+        ObserveReaction(key, entry, npc, now);
         const bool event = captured && (state.hp != entry.lease.state.hp || state.dead != entry.lease.state.dead ||
             state.attitude != entry.lease.state.attitude || state.status != entry.lease.state.status ||
             state.defeated != entry.lease.state.defeated);
-        if (captured && (event || now - entry.lastState >= StateMs)) {
+        const bool settledDead = state.dead && (entry.lease.state.effects & QuestDeath);
+        if (captured && (event || (!settledDead && now - entry.lastState >= StateMs))) {
             entry.lease.state = state;
             if (++entry.lease.revision == 0) {
-                entry.active = false; PublishGuard(item.first, entry); Stop(entity);
-                Log("FAIL npclease: revision exhausted"); continue;
+                ReleaseLocal(key, entry, entity, false);
+                Log("FAIL npclease: revision exhausted; NPC released to the host stream");
+                continue;
             }
             entry.echo = now;
-            if (event) Diagnostic("state-event", item.first, entry, "native HP/life/attitude/status changed; owner unchanged");
-            if (Send(item.first, entry, Kind::State)) { entry.lastState = now; ++stateSent; }
+            if (event && entry.confirmed)
+                Diagnostic("state-event", key, entry, "native HP/life/attitude/status changed; owner unchanged");
+            if (entry.confirmed) { if (Send(key, entry, Kind::State)) { entry.lastState = now; ++stateSent; } }
+            else entry.lastState = now;
+        }
+        // Handshake with the host: asynchronous, backed off, never a precondition for animating or reacting.
+        if (!entry.confirmed && !entry.prepared && now - entry.lastRequest >= entry.requestEvery) {
+            entry.echo = now;
+            if (Send(key, entry, Kind::Adopt)) {
+                entry.lastRequest = now;
+                entry.requestEvery = std::min<uint32_t>(entry.requestEvery * 2, 8000);
+            }
+        }
+        if (entry.prepared && Reached(now, entry.localDeadline) && !entry.confirmed) {
+            entry.prepared = false;
+            entry.lease.epoch = 0; entry.window.Reset(0);
+            entry.lastRequest = 0;
+            Diagnostic("prepare-expired", key, entry, "late commit; client keeps running natively and retries the handshake");
         }
     }
-    if (!Running() || persist::CheckpointBusy() || !GetConfig().npcAuthorityFallback) return;
+    if (entries.size() + 64 >= MaxLeases) {
+        // Forget GUIDs that are unloaded, host-driven and carry no handshake state.
+        for (auto it = entries.begin(); it != entries.end();) {
+            Entry const& idle = it->second;
+            if (!idle.local && !idle.cut && !idle.prepared && idle.lease.phase == Phase::Host &&
+                !npcs::NpcByGuid(it->first.data())) {
+                guardStates.Erase(it->first);
+                it = entries.erase(it);
+            } else ++it;
+        }
+    }
+}
+
+void ScanClient(uint32_t now)
+{
+    if (ai::ShuttingDown() || persist::NativeLoading() || persist::HeroPending() ||
+        !gCSession::GetInstance().IsGameRunning() || !remote::ControlledBody() || installFailed) return;
+    if (!sessionReadyAt) sessionReadyAt = now ? now : 1;
+    const bool settled = npcown::StreamSettled(now, sessionReadyAt, npcs::HostStreamSeen());
+    const bool census = !ownReportAt || now - ownReportAt >= 5000;
+    npcown::OwnStats snap;
+    std::unordered_map<std::string, unsigned> visual, waits, refusedNow;
     const auto* all = world::ProcessedEntities();
-    eCEntity* hero = remote::ControlledBody();
-    const auto& p = hero->GetWorldPosition();
-    const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
+    unsigned takeovers = 0;
     for (GEU16 i = 0; all && i < all->GetCount(); ++i) {
         eCEntity* entity = all->GetAt(i);
-        if (!npcplayback::IsCharacter(entity) || Player(entity) || npcs::RedundantClientEntity(entity) ||
-            npcremoval::Suppressed(entity)) continue;
-        if (auto const* why = EligibilityReason(entity)) {
-            if (!npcs::HostPresentationAvailable(entity)) Refusal(Key(entity), entity->GetName().GetText(), why);
-            continue;
-        }
-        if (!NativeReady(entity)) continue;
+        if (!npcplayback::IsCharacter(entity) || Player(entity)) continue;
         const auto key = Key(entity);
         const auto found = entries.find(key);
-        if (npcs::HostPresentationAvailable(entity)) {
-            if (found != entries.end() && found->second.lease.phase == Phase::Host)
-                found->second.unavailableAt = 0;
+        const char* name = entity->GetName().GetText();
+        if (found != entries.end() && found->second.cut && !found->second.local) {
+            ++snap.frozen;
+            if (census) ++waits[found->second.cutReason ? found->second.cutReason : "hand-back pending"];
             continue;
         }
-        if (found == entries.end() && !CapacityAvailable()) continue;
-        Entry& entry = entries[key];
-        if (!entry.unavailableAt) entry.unavailableAt = now ? now : 1;
-        if (entry.active || entry.prepared || entry.cut || now - entry.lastRequest < 500) continue;
-        Checkpoint state;
-        if (!CaptureNative(entity, state) || state.dead || state.status ||
-            body::Distance(here, state.position) > ClientRadiusCm) continue;
-        entry.world = net::WorldEpoch(); entry.lease.state = state; entry.lease.owner = net::LocalId();
-        entry.hasBaseline = true;
-        entry.lease.incarnation = npcs::Incarnation(reinterpret_cast<uint8_t const*>(key.data()));
-        if (!entry.lease.incarnation) entry.lease.incarnation = 1;
-        entry.echo = now;
-        const auto kind = npcs::HostPresentationAge(entity) == UINT32_MAX ? Kind::Adopt : Kind::Request;
-        if (Send(key, entry, kind)) entry.lastRequest = now;
+        npcown::Facts facts;
+        facts.role = RoleOf(entity, false);
+        facts.installed = installed;
+        facts.configEnabled = GetConfig().npcAuthorityFallback;
+        facts.nativeReady = NativeReady(entity);
+        facts.hostPresenting = npcs::HostPresentationAvailable(entity) || npcs::HostStreamFresh(key.data());
+        facts.settled = settled;
+        facts.cooldownHeld = found != entries.end() && npcown::CooldownHeld(now, found->second.yieldedAt);
+        facts.alreadyOwned = found != entries.end() && found->second.local && found->second.ownedEntity == entity;
+        const auto decision = npcown::Decide(facts);
+        switch (decision.verdict) {
+        case npcown::Verdict::Excluded:
+            Refusal(key, name, decision.reason);
+            ++snap.refused;
+            if (census) ++refusedNow[decision.reason];
+            continue;
+        case npcown::Verdict::HostStreamed:
+            ++snap.hostStreamed;
+            refusals.Forget(key);
+            waiting.Forget(key);
+            if (found != entries.end() && found->second.lease.phase == Phase::Host) found->second.unavailableAt = 0;
+            continue;
+        case npcown::Verdict::Wait:
+            ++snap.waiting;
+            if (census) ++waits[decision.reason];
+            if (waiting.Note(key, decision.reason) && std::strncmp(decision.reason, "host stream settling", 20) &&
+                std::strncmp(decision.reason, "native authority guards", 23)) {
+                char detail[160];
+                std::snprintf(detail, sizeof(detail), "reason=%s", decision.reason);
+                OwnEvent(key, name, npcown::Event::Waiting, detail);
+            }
+            continue;
+        case npcown::Verdict::ClientNative:
+            break;
+        }
+        if (facts.alreadyOwned) { ++snap.nativeOwned; continue; }
+        if (found == entries.end() && !CapacityAvailable()) {
+            ++snap.waiting; if (census) ++waits["canonical cache full"]; continue;
+        }
+        Entity npc(entity);
+        char const* hold = nullptr;
+        if (npc.IsDead() || npc.IsDown()) hold = "dead or downed; keeps its native state";
+        else if (SharedWithOtherClient(entity)) hold = "another client shares this NPC (single owner)";
+        else if (found != entries.end() && found->second.retryAt && !Reached(now, found->second.retryAt))
+            hold = "takeover retry back-off";
+        else if (takeovers >= 8) hold = "takeover rate limit";
+        if (hold) {
+            ++snap.waiting;
+            if (census) ++waits[hold];
+            if (waiting.Note(key, hold) && std::strcmp(hold, "takeover rate limit") &&
+                std::strcmp(hold, "takeover retry back-off")) {
+                char detail[160];
+                std::snprintf(detail, sizeof(detail), "reason=%s", hold);
+                OwnEvent(key, name, npcown::Event::Waiting, detail);
+            }
+            continue;
+        }
+        if (found == entries.end()) {
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), "verdict=client-native class=%s", ClassOf(npc) == NativeClass::Creature ? "creature" : "ordinary");
+            OwnEvent(key, name, npcown::Event::Loaded, detail);
+        }
+        ++takeovers;
+        if (const char* why = TakeOver(entity, key, now)) {
+            ++snap.refused;
+            if (census) ++refusedNow[why];
+            Refusal(key, name, why);
+            entries[key].retryAt = (now ? now : 1) + 2000;
+        } else ++snap.nativeOwned;
     }
+    if (!census) return;
+    for (auto const& item : entries) {
+        if (item.second.local) { if (item.second.confirmed) ++snap.confirmed; }
+    }
+    const auto pick = [&](std::unordered_map<std::string, unsigned> const& values, char const*& label, unsigned& amount) {
+        label = "-"; amount = 0;
+        for (auto const& value : values) if (value.second > amount) { label = value.first.c_str(); amount = value.second; }
+    };
+    static std::string refusedTop, waitingTop, visualTop;
+    unsigned refusedCount = 0, waitCount = 0;
+    char const* label = "-";
+    pick(refusedNow, label, refusedCount); refusedTop = label;
+    pick(waits, label, waitCount); waitingTop = label;
+    snap.refusedTop = refusedTop.c_str(); snap.refusedTopCount = refusedCount;
+    snap.waitingTop = waitingTop.c_str(); snap.waitingTopCount = waitCount;
+    snap.frozenTop = waitingTop.c_str(); snap.frozenTopCount = snap.frozen ? waitCount : 0;
+    snap.visualOnly = snap.refused + snap.waiting;
+    visualTop = refusedCount >= waitCount ? refusedTop : waitingTop;
+    snap.visualTop = visualTop.c_str(); snap.visualTopCount = std::max(refusedCount, waitCount);
+    snap.hitsApplied = ownTotals.hitsApplied; snap.deaths = ownTotals.deaths; snap.handBacks = ownTotals.handBacks;
+    snap.yields = ownTotals.yields; snap.takeovers = ownTotals.takeovers; snap.reclaims = ownTotals.reclaims;
+    snap.registrationAlready = ownTotals.registrationAlready; snap.registrationQueued = ownTotals.registrationQueued;
+    snap.registrationEnabled = ownTotals.registrationEnabled; snap.registrationFailed = ownTotals.registrationFailed;
+    char line[700];
+    npcown::FormatSummary(line, sizeof(line), snap);
+    Log(line);
+    ownReportAt = now ? now : 1;
+}
+
+void TickClient(uint32_t now)
+{
+    MaintainOwners(now);
+    ScanClient(now);
 }
 }
 
@@ -1170,27 +1375,27 @@ void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, i
     if (!entry || net::IsHost() || !entry->active || entry->lease.owner != net::LocalId()) return;
     const uint32_t now = net::Now();
     entry->lastHit = now ? now : 1;
-    const auto readiness = Readiness(victim, *entry, now);
-    char text[40];
-    guid::Format(Key(victim).data(), text, sizeof(text));
+    if (after < before) ++ownTotals.hitsApplied;
     Entity npc(victim);
-    Logf("npclease: hit guid=%s epoch=%u revision=%u path=%s attacker=%s hp=%d->%d local=%u "
-         "processed=%u actor=%u remaining_ms=%d ai=%d task=%s state=%s reason=%s",
-         text, entry->lease.epoch, entry->lease.revision, path, source ? Entity(source).GetName().GetText() : "-",
-         before, after, LocalAuthority(victim) ? 1 : 0, readiness.processed ? 1 : 0, readiness.actor ? 1 : 0,
-         static_cast<int32_t>(entry->localDeadline - now), static_cast<int>(npc.Routine.AIMode),
-         npc.Routine.GetCurrentTask().GetText(), npc.Routine.GetCurrentState().GetText(),
-         readiness.LossReason() ? readiness.LossReason() : "native owner retained");
+    char detail[300];
+    std::snprintf(detail, sizeof(detail),
+        "path=%s attacker=%s hp=%d->%d native=%u confirmed=%u ai=%d task=%s state=%s", path,
+        source ? Entity(source).GetName().GetText() : "-", before, after, LocalAuthority(victim) ? 1 : 0,
+        entry->confirmed ? 1 : 0, static_cast<int>(npc.Routine.AIMode), npc.Routine.GetCurrentTask().GetText(),
+        npc.Routine.GetCurrentState().GetText());
+    OwnEventAlways(Key(victim), entry->lease.state.name, npcown::Event::Hit, detail);
 }
 char const* UnavailabilityReason(eCEntity* entity)
 {
-    if (!GetConfig().npcAuthorityFallback) return "fallback disabled; host-only presentation unavailable";
-    if (installFailed) return "native authority guard installation failed; host-owned";
-    if (!installed) return "native authority guard initialization pending";
+    if (!GetConfig().npcAuthorityFallback) return "npc_authority_fallback off";
+    if (installFailed) return "native authority guard installation failed";
+    if (!installed) return "native authority guards initializing";
+    if (!entity) return "native NPC instance unavailable";
     if (auto const* reason = EligibilityReason(entity)) return reason;
-    const auto refusedGuid = refusalReasons.find(Key(entity));
-    if (refusedGuid != refusalReasons.end()) return refusedGuid->second.c_str();
-    return "awaiting reliable host-authorized native cut";
+    const auto key = Key(entity);
+    if (auto const* reason = refusals.Reason(key)) return reason;
+    if (auto const* reason = waiting.Reason(key)) return reason;
+    return "awaiting client-first scan";
 }
 bool Fenced(eCEntity const* entity)
 {
@@ -1207,12 +1412,20 @@ bool IgnoreHostSnapshot(uint8_t const identity[16], uint32_t captured)
     const auto found = entries.find(Key(identity));
     if (found == entries.end()) return false;
     const auto& entry = found->second;
-    return (entry.lease.epoch && entry.lease.phase != Phase::Host) ||
-        (entry.hasPresentationFloor && !Newer(captured, entry.presentationFloor));
+    if (entry.hasPresentationFloor && !Newer(captured, entry.presentationFloor)) return true;
+    // A client owner keeps receiving the stream: a fresh host stream is how it learns to yield.
+    if (entry.local) return false;
+    return entry.lease.epoch && entry.lease.phase != Phase::Host;
 }
 bool IgnoreHostSnapshot(uint8_t const identity[16])
 {
-    return !net::IsHost() && SuppressHostPublication(identity);
+    return !net::IsHost() && SuppressHostPublication(identity) && !LocalOwner(identity);
+}
+bool LocalOwner(uint8_t const identity[16])
+{
+    if (net::IsHost()) return false;
+    const auto found = entries.find(Key(identity));
+    return found != entries.end() && found->second.local && found->second.active;
 }
 uint8_t RemoteOwner(eCEntity const* entity)
 {
@@ -1274,9 +1487,11 @@ void RejectSnapshot(char const* reason)
 void OnWorldDeactivate()
 {
     entries.clear();
-    storyActors.clear();
-    storyCatalogReady = false;
-    refusalReasons.clear();
+    refusals.Clear();
+    waiting.Clear();
+    transitions.Clear();
+    ownTotals = npcown::OwnStats{};
+    sessionReadyAt = 0; ownReportAt = 0;
     guardStates.Clear();
     scanAt = 0;
     crashlog::CacheObjects(crashlog::CacheKind::Leases, 0, nullptr);
@@ -1317,16 +1532,17 @@ void Tick()
     const auto elapsedScan = GetTickCount() - began;
     ++scanSamples; scanTotalMs += elapsedScan; scanMaxMs = std::max(scanMaxMs, static_cast<unsigned>(elapsedScan));
     if (!reportAt || now - reportAt >= 5000) {
-        unsigned active = 0, dormant = 0;
+        unsigned active = 0, dormant = 0, local = 0;
         for (auto const& item : entries) {
             active += item.second.lease.ActiveLeases();
             dormant += item.second.lease.phase == Phase::Dormant;
+            local += item.second.local;
         }
         const uint32_t elapsed = reportAt ? now - reportAt : 5000;
-        Logf("npclease: role=%s class=creature_or_discovered_ordinary leased=%u dormant=%u grants=%u recalls=%u recovered=%u refused=%u adopted=%u "
+        Logf("npclease: role=%s class=all_npc_classes leased=%u client_owned=%u dormant=%u grants=%u recalls=%u recovered=%u refused=%u adopted=%u "
              "state_tx_per_s=%.1f state_rx_per_s=%.1f native_deaths=%u repeated_deaths=%u foreign_contacts=%u "
              "scan_avg_ms=%u scan_max_ms=%u",
-             net::IsHost() ? "host" : "client", active, dormant, granted, recalled, recovered, refused, discovered,
+             net::IsHost() ? "host" : "client", active, local, dormant, granted, recalled, recovered, refused, discovered,
              stateSent * 1000.0 / elapsed, stateReceived * 1000.0 / elapsed, nativeDeaths, repeatedDeaths, contactsRefused,
              scanSamples ? scanTotalMs / scanSamples : 0, scanMaxMs);
         scanSamples = scanTotalMs = scanMaxMs = 0;

@@ -550,13 +550,14 @@ ProcessingMembership ProcessingOf(eCEntity const* entity)
 }
 
 namespace {
-bool MarkProcessingDirty(eCEntityAdmin* admin)
+bool MarkProcessingDirty(eCEntityAdmin* admin, char const** why = nullptr)
 {
     auto* engine = GetModuleHandleA("Engine.dll");
     auto* refresh = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(engine,
         "?FourceFullROIUpdate@eCEntityAdmin@@QAEXXZ")) : nullptr;
     if (refresh && refresh == reinterpret_cast<unsigned char*>(engine) + 0x231e00 &&
         QueueProcessingRebuild(reinterpret_cast<unsigned char*>(admin), refresh)) return true;
+    if (why) *why = "engine ROI refresh signature mismatch";
     static bool warned = false;
     if (!warned) {
         warned = true;
@@ -577,16 +578,20 @@ void RequestProcessingUpdate()
     else Log("world: cannot refresh NPC processing range; scene administration is unavailable");
 }
 
-bool QueueEntityProcessing(eCEntity* entity)
+bool QueueEntityProcessing(eCEntity* entity, char const** why)
 {
-    if (!entity || retirementGate.Paused() || ai::ShuttingDown()) return false;
+    if (why) *why = "queued";
+    if (!entity) { if (why) *why = "no entity"; return false; }
+    if (retirementGate.Paused()) { if (why) *why = "retirement gate paused"; return false; }
+    if (ai::ShuttingDown()) { if (why) *why = "shutting down"; return false; }
     auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
     if (!scene) {
+        if (why) *why = "scene administration unavailable";
         Log("FAIL world: cannot queue native entity processing; scene administration unavailable");
         return false;
     }
     auto& admin = scene->GetAccessToEntityAdmin();
-    if (!MarkProcessingDirty(&admin)) return false;
+    if (!MarkProcessingDirty(&admin, why)) return false;
     admin.AddDirtyProcessingRangeEntity(entity, GETrue);
     return true;
 }

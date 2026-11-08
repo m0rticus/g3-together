@@ -12,6 +12,8 @@ void OnWorldDeactivate();
 void CaptureCacheInventory();
 bool NewLife(uint8_t const guid[16]);
 bool LocalAuthority(eCEntity const* entity);
+// The client drives this NPC natively right now (provisional or host-confirmed). Safe to call with any GUID.
+bool LocalOwner(uint8_t const guid[16]);
 bool ProcessingAuthority(eCEntity const* entity);
 void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, int after);
 char const* UnavailabilityReason(eCEntity* entity);

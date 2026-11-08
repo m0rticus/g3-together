@@ -29,6 +29,8 @@
 #include "npcsend_candidates.h"
 #include "npcstream_diag.h"
 #include "npcidentity_policy.h"
+#include "relation.h"
+#include "relation_policy.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -211,6 +213,7 @@ struct Mirror
     net::NpcRecord latest;
     uint32_t previousTicks = 0;
     uint32_t latestTicks = 0;
+    uint32_t records = 0;  // accepted host records since this mirror was created (debounce for a client owner yielding)
     uint32_t previousSent = 0, latestSent = 0;  // the sender's clock (body::Speed)
     uint32_t heldRight = 0, heldLeft = 0;  // what this mirror holds now (hashes)
     uint32_t holdChecked = 0;
@@ -236,6 +239,9 @@ struct Mirror
     bool released = false, staleHeld = false;
     uint32_t shownSent = 0, truthSent = 0;
     bool havePresentation = false;
+    uint8_t attitudeWritten = 0xFF;  // relation::Unset: the last AttitudeToPlayer2 this machine wrote into the bound entity
+    uint8_t attitudeShown = 0xFF;    // the attitude of the presentation sample in use
+    unsigned attitudeDrifts = 0;     // times a native script changed the written value before it was applied again
     // Our blows shove a mirror here before its owner's snapshots show the same: the displacement (where it stood minus where the
     // owner's buffered pose had it) is kept for a moment once the local stagger ends and then fades, so it blends back to the
     // owner's pose instead of jumping there.
@@ -548,11 +554,14 @@ bool Contested(std::string const& key, uint8_t owner)
 }
 
 bool receiving = true;  // QA (invariant self-test): RecvOff drops all NPC snapshots, so both machines simulate
+bool hostStreamSeen = false;
+uint32_t hostStreamSession = 0;
 
 int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint8_t owner, uint32_t generation)
 {
     if (net::IsHost() || owner != 1) return 0;
     if (!receiving) return 0;
+    if (count > 0) { hostStreamSeen = true; hostStreamSession = net::WelcomeSerial(); }
     int accepted = 0;
     for (int i = 0; i < count; ++i) {
         if (npcremoval::Suppressed(records[i].guid)) continue;
@@ -676,7 +685,7 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         m.latest = records[i];
         m.latestTicks = now;
         m.latestSent = captured;
-        m.released = false;
+        ++m.records;
         m.staleHeld = false;
         body::MotionState motion;
         motion.motion = records[i].motion;
@@ -919,7 +928,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         r.hitPoints = self.DamageReceiver.HitPoints;
         r.hitPointsMax = self.DamageReceiver.HitPointsMax;
         r.aniState = static_cast<uint8_t>(static_cast<int>(self.Routine.AniState));
-        r.attitude = static_cast<uint8_t>(static_cast<int>(static_cast<gEAttitude>(self.NPC.AttitudeToPlayer2)));
+        r.attitude = relation::Outgoing(instance, !self.IsDead());
         eCEntity* combatTarget = self.NPC.GetCurrentTarget().GetInstance();
         if (combatTarget && !remote::IsPuppet(combatTarget) && combatTarget != remote::ControlledBody() &&
             combatTarget != gCSession::GetInstance().GetHero())
@@ -2915,6 +2924,35 @@ void TickTargetingWatch(uint32_t now)
 }
 }
 
+namespace {
+unsigned attitudeRepairs = 0;
+
+// The host's relation is the final state of a mirror's AttitudeToPlayer2, which the name tag reads every frame. It is written
+// whenever the entity does not hold it (also while the presentation is unavailable, before the first sample and right after a
+// rebind), and a change this machine's own scripts made after our write is repaired and counted.
+void KeepHostAttitude(Mirror& m, uint8_t wanted, char const* via)
+{
+    eCEntity* instance = m.entity.GetInstance();
+    auto* properties = instance ? static_cast<gCNPC_PS*>(instance->GetPropertySet(eEPropertySetType_NPC)) : nullptr;
+    if (!properties) return;
+    const int stored = static_cast<int>(static_cast<gEAttitude>(m.entity.NPC.AttitudeToPlayer2));
+    const relation::Apply apply = relation::ApplyHost(stored, wanted, m.attitudeWritten);
+    if (apply == relation::Apply::Ignore) return;
+    if (apply == relation::Apply::Keep) {
+        m.attitudeWritten = wanted;
+        return;
+    }
+    if (apply == relation::Apply::Repair) {
+        ++m.attitudeDrifts;
+        if (++attitudeRepairs <= 40 || m.attitudeDrifts == 1)
+            Logf("relation: mismatch kind=native-drift npc=%s stored=%d written=%u host=%u via=%s; repaired",
+                 m.entity.GetName().GetText(), stored, static_cast<unsigned>(m.attitudeWritten), static_cast<unsigned>(wanted), via);
+    }
+    properties->AccessAttitudeToPlayer2().AccessValue() = static_cast<gEAttitude>(wanted);
+    m.attitudeWritten = wanted;
+}
+}
+
 void PassiveMirrorTick()
 {
     if (net::IsHost()) return;
@@ -2946,7 +2984,7 @@ void PassiveMirrorTick()
     lastFrameAt = now;
     for (auto it = mirrors.begin(); it != mirrors.end();) {
         Mirror& m = it->second;
-        if (npclease::IgnoreHostSnapshot(m.latest.guid)) { ++it; continue; }
+        if (npclease::IgnoreHostSnapshot(m.latest.guid) || npclease::LocalOwner(m.latest.guid)) { ++it; continue; }
         eCEntity* previous = m.entity.GetInstance();
         Entity live = Resolve(m.latest.guid);
         if (live.GetInstance() != m.entity.GetInstance() || (m.resolved && !IsNpc(live.GetInstance()))) {
@@ -2977,6 +3015,7 @@ void PassiveMirrorTick()
             m.localHitAt = m.fallbackGraceUntil = 0;
             std::strcpy(m.presentationSource, RagdollSource(m));
             m.guarded = false;
+            m.attitudeWritten = relation::Unset;  // a new instance holds its own default: that is not a native change to repair
         }
         if (!m.resolved || !m.entity.GetInstance()) {
             if (m.resolvedAt && now - m.resolvedAt < RetryLookup) { ++it; continue; }
@@ -3004,6 +3043,7 @@ void PassiveMirrorTick()
         TickDeathFocusWatch(m, now);
         m.replayReady = false;
         if (!HostPresentationAvailable(m.entity.GetInstance())) {
+            KeepHostAttitude(m, m.latest.attitude, "held");
             if (!m.staleHeld) {
                 m.staleHeld = true;
                 ++staleMirrorReleases;
@@ -3033,6 +3073,7 @@ void PassiveMirrorTick()
         net::NpcRecord shown = m.latest;
         m.body.track.predictive = false;
         if (!body::Sample(m.body.track, now, shown.position, shown.rotation, -body::PlaybackDelay(m.body.track), true, &presentation)) {
+            KeepHostAttitude(m, m.latest.attitude, "unsampled");
             ++it;
             continue;
         }
@@ -3115,8 +3156,9 @@ void PassiveMirrorTick()
         routine->AccessAction().AccessValue() = static_cast<gEAction>(shown.action);
         auto* npcProperties = static_cast<gCNPC_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC));
         npcProperties->AccessAttackReason().AccessValue() = static_cast<gEAttackReason>(shown.attackReason);
-        // The game colours the name tag (green friendly, white neutral, orange angry, red hostile) from this property.
-        npcProperties->AccessAttitudeToPlayer2().AccessValue() = static_cast<gEAttitude>(shown.attitude);
+        // The game colours the name tag (green friendly, white neutral, orange angry, red hostile) from this property, read every frame.
+        m.attitudeShown = shown.attitude;
+        KeepHostAttitude(m, shown.attitude, "shown");
         m.shownCombatTarget = shown.combatTarget;
         const uint8_t target = (shown.flags >> 3) & 7;
         // Melee priority rejects equal current targets, including null == null (Script_Game+0xAA67C).
@@ -3668,10 +3710,73 @@ bool HostPresentationAvailable(eCEntity const* entity)
         npcplayback::PoseInterval(mirror.latest));
 }
 
+bool HostStreamFresh(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial() || !found->second.latestTicks) return false;
+    auto const& mirror = found->second;
+    return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
+        npcplayback::PoseInterval(mirror.latest));
+}
+
+bool HostStreamSeen() { return hostStreamSeen && hostStreamSession == net::WelcomeSerial(); }
+
+uint32_t HostStreamRecords(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    return found == mirrors.end() || found->second.hostSession != net::WelcomeSerial() ? 0 : found->second.records;
+}
+
 bool HostCanPresent(uint8_t const identity[16])
 {
     const auto found = lastSent.find(Key(identity));
     return found != lastSent.end() && net::Now() - found->second.at <= npclease::PresentationGraceMs;
+}
+
+bool HostAttitude(eCEntity const* entity, int& attitude)
+{
+    if (!entity) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end()) return false;
+    const Mirror& m = found->second;
+    const uint8_t value = m.attitudeWritten != relation::Unset ? m.attitudeWritten : m.latest.attitude;
+    if (!relation::MirrorAnswersFromHost(m.entity.GetInstance() == entity, m.hostSession == net::WelcomeSerial(),
+                                         m.latestTicks != 0, value)) return false;
+    attitude = value;
+    return true;
+}
+
+bool RelationOf(eCEntity const* entity, RelationInfo& info)
+{
+    info = RelationInfo{};
+    if (!entity) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const std::string key = Key(identity);
+    const auto mirror = mirrors.find(key);
+    if (mirror != mirrors.end() && mirror->second.entity.GetInstance() == entity) {
+        const Mirror& m = mirror->second;
+        info.mirrored = true;
+        info.bound = m.resolved && m.hostSession == net::WelcomeSerial();
+        info.presenting = HostPresentationAvailable(entity);
+        info.released = m.released;
+        info.hostAttitude = m.latest.attitude;
+        info.shown = m.attitudeShown;
+        info.written = m.attitudeWritten;
+        info.partyPlayer = m.latest.partyPlayer;
+        info.aiMode = m.latest.aiMode;
+        info.ageMs = m.latestTicks ? net::Now() - m.latestTicks : UINT32_MAX;
+        info.drifts = m.attitudeDrifts;
+    }
+    const auto sent = lastSent.find(key);
+    if (sent != lastSent.end()) {
+        info.hasSent = true;
+        info.sentAttitude = sent->second.record.attitude;
+        info.sentAgeMs = net::Now() - sent->second.at;
+    }
+    return true;
 }
 
 bool HostKnows(uint8_t const identity[16])

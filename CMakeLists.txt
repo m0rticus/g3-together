@@ -28,6 +28,7 @@ add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/g
             src/remote.cpp src/body.cpp src/npcs.cpp src/ai.cpp src/combat.cpp src/story.cpp src/talk.cpp src/items.cpp src/containers.cpp src/explore.cpp src/parity.cpp src/downed.cpp src/hud.cpp src/range.cpp src/journal.cpp src/persist.cpp src/hero.cpp src/clock.cpp src/infocmd.cpp src/transform.cpp src/ranged.cpp src/partner.cpp src/summon.cpp src/shot.cpp src/spells.cpp src/crashlog.cpp src/trace.cpp src/world.cpp src/social.cpp src/enclaves.cpp src/doors.cpp src/dialogaudio.cpp src/offer.cpp src/trade.cpp src/tradeview.cpp src/mapmarks.cpp src/ransack.cpp src/witness.cpp src/guards.cpp src/pickpocket.cpp src/respawn.cpp src/occupancy.cpp src/address.cpp src/fightmem.cpp src/guide.cpp src/arena.cpp src/ending.cpp src/xpshare.cpp src/i18n.cpp src/exports.def)
 target_gothic_script_options(Script_G3Together)
 target_sources(Script_G3Together PRIVATE src/npcremoval.cpp)
+target_sources(Script_G3Together PRIVATE src/relation.cpp)
 target_sources(Script_G3Together PRIVATE src/movement.cpp)
 # The standalone codec rolls back partially installed baselines on allocation failure.
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/npcwire_control.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)

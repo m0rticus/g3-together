@@ -37,6 +37,7 @@
 #include "enclaves.h"
 #include "log.h"
 #include "npcs.h"
+#include "relation.h"
 #include "npcplayback.h"
 #include "npclease_runtime.h"
 #include "offer.h"
@@ -464,6 +465,7 @@ class Module : public eCEngineComponentBase
         { g3t::movement::Stage stage("occupancy"); g3t::occupancy::Tick(); }
         { g3t::movement::Stage stage("address"); g3t::address::Tick(); }
         { g3t::movement::Stage stage("fight memory"); g3t::fightmem::Tick(); }
+        { g3t::movement::Stage stage("relation"); g3t::relation::Tick(); }
         { g3t::movement::Stage stage("XP share"); g3t::xpshare::Tick(); }
         { g3t::movement::Stage stage("dialog audio"); g3t::dialogaudio::Tick(); }
         { g3t::movement::Stage stage("offer"); g3t::offer::Tick(); }

@@ -2,7 +2,6 @@
 #include "../src/npclease_client.h"
 #include "../src/npclease_save.h"
 #include "../src/npclease_guards.h"
-#include "../src/npclease_admission.h"
 
 #include <cassert>
 #include <cstdint>
@@ -20,21 +19,17 @@ static void TestHitReadiness()
 {
     ClientReadiness ready;
     assert(!ready.LossReason());
+    assert(!ready.Suspension());
     const auto check = [&](bool ClientReadiness::* field, bool value, char const* reason) {
         auto changed = ready;
         changed.*field = value;
         assert(std::strcmp(changed.LossReason(), reason) == 0);
     };
-    check(&ClientReadiness::running, false, "session/world unavailable");
     check(&ClientReadiness::enabled, false, "authority fallback disabled");
-    check(&ClientReadiness::checkpointBusy, true, "checkpoint barrier");
-    check(&ClientReadiness::processed, false, "native processing unavailable");
-    check(&ClientReadiness::actor, false, "native animation actor unavailable");
     check(&ClientReadiness::eligible, false, "native eligibility changed");
-    check(&ClientReadiness::expired, true, "conservative lease expired");
-    check(&ClientReadiness::processingEnabled, false, "native entity disabled");
-    check(&ClientReadiness::processable, false, "native processable membership unavailable");
-    check(&ClientReadiness::insideRange, false, "client processing range lost");
+    auto both = ready;
+    both.enabled = both.eligible = false;
+    assert(std::strcmp(both.LossReason(), "authority fallback disabled") == 0);
 
     Checkpoint state;
     state.templateId[0] = 1;
@@ -46,7 +41,7 @@ static void TestHitReadiness()
     assert(client.Prepare(1, 100, LeaseMs, 120));
     assert(host.Prepared(1, 130));
     assert(client.Commit(1, 150));
-    AuthorityGuard guard{true, true, 0, client.deadline};
+    AuthorityGuard guard{true, true, 0, client.deadline, true, true};
     for (uint32_t revision = 1; revision <= 32; ++revision) {
         const uint32_t now = 150 + revision * 50;
         state.hp -= 10;
@@ -73,10 +68,11 @@ static void TestHitReadiness()
     const auto accepted = host.state;
     Checkpoint lostState = state;
     lostState.hp -= 10;
-    // A dropped state/renew leaves the current owner live only until its existing permit.
+    // A dropped state/renew leaves the telemetry window at its existing deadline.
     assert(host.state.hp == accepted.hp && host.state.hp != lostState.hp);
     assert(client.Active(1, client.deadline - 1) && guard.Local(client.deadline - 1));
-    assert(!client.Active(1, client.deadline) && guard.Fenced(client.deadline));
+    assert(!client.Active(1, client.deadline) && guard.Local(client.deadline));
+    assert(guard.Processing(client.deadline) && !guard.Fenced(client.deadline));
     assert(!client.Renew(1, client.deadline, LeaseMs, client.deadline));
     assert(!host.AcceptState(2, 7, 1, 2, 33, lostState));
     // A later accepted checkpoint can skip a lost revision without changing authority.
@@ -95,46 +91,75 @@ static void TestHitReadiness()
     assert(host.owner == 1 && host.state.dead && host.state.hp == 0);
     assert(host.state.effects == NativeDeath);
     assert(!host.AcceptState(2, 7, 1, 1, 37, accepted));
-    ClientReadiness expired = ready;
-    expired.expired = true;
-    assert(expired.LossReason());
     assert(!client.Active(1, client.deadline));
 }
 
-static void TestInitialCollection()
+static void TestSuspension()
 {
-    ClientReadiness pending;
-    pending.processed = pending.processable = false;
-    pending.collecting = AwaitingInitialCollection(false, 100, 100);
-    assert(pending.collecting && !pending.LossReason());
-    pending.collecting = AwaitingInitialCollection(false, 100, 599);
-    assert(pending.collecting && !pending.LossReason());
-    pending.collecting = AwaitingInitialCollection(false, 100, 600);
-    assert(!pending.collecting && pending.LossReason());
-    pending.collecting = AwaitingInitialCollection(true, 100, 101);
-    assert(!pending.collecting && pending.LossReason()); // no grace after native activation
-    pending.collecting = AwaitingInitialCollection(false, UINT32_MAX - 100, 398);
-    assert(pending.collecting);
-    assert(!AwaitingInitialCollection(false, UINT32_MAX - 100, 399));
-    for (auto field : {&ClientReadiness::expired, &ClientReadiness::checkpointBusy}) {
-        auto lost = pending;
-        lost.*field = true;
-        assert(lost.LossReason());
+    struct Condition {
+        bool ClientReadiness::* field;
+        bool suspendedValue;
+        char const* reason;
+    };
+    const Condition conditions[] = {
+        {&ClientReadiness::running, false, "session/world paused"},
+        {&ClientReadiness::checkpointBusy, true, "checkpoint in progress"},
+        {&ClientReadiness::processingEnabled, false, "native entity disabled"},
+        {&ClientReadiness::insideRange, false, "outside client processing ring"},
+        {&ClientReadiness::processed, false, "not in native range list"},
+        {&ClientReadiness::processable, false, "not in native processable list"},
+        {&ClientReadiness::actor, false, "native animation actor unavailable"},
+    };
+    ClientReadiness all;
+    for (auto const& condition : conditions) {
+        ClientReadiness one;
+        one.*condition.field = condition.suspendedValue;
+        assert(!one.LossReason());
+        assert(std::strcmp(one.Suspension(), condition.reason) == 0);
+        all.*condition.field = condition.suspendedValue;
     }
-    for (auto field : {&ClientReadiness::actor, &ClientReadiness::processingEnabled,
-                       &ClientReadiness::running, &ClientReadiness::enabled,
-                       &ClientReadiness::eligible, &ClientReadiness::insideRange}) {
-        auto lost = pending;
-        lost.*field = false;
-        assert(lost.LossReason()); // collection cannot bypass other fences
+    // Clear the conditions in priority order, checking every combined state.
+    for (auto const& condition : conditions) {
+        assert(!all.LossReason());
+        assert(std::strcmp(all.Suspension(), condition.reason) == 0);
+        all.*condition.field = !condition.suspendedValue;
     }
+    assert(!all.LossReason() && !all.Suspension());
+    for (unsigned mask = 0; mask < (1u << 7); ++mask) {
+        ClientReadiness combination;
+        for (unsigned i = 0; i < 7; ++i) {
+            if (mask & (1u << i))
+                combination.*conditions[i].field = conditions[i].suspendedValue;
+        }
+        assert(!combination.LossReason());
+        assert((combination.Suspension() != nullptr) == (mask != 0));
+    }
+}
+
+static void TestAuthorityGuard()
+{
     AuthorityGuard guard{true, false, 0, 1000, true};
     assert(guard.Processing(999) && !guard.Local(999) && guard.Fenced(999));
     assert(!guard.Processing(1000));
     guard.locallyDriven = true;
     assert(guard.Local(999) && !guard.Local(1000));
+    assert(guard.Processing(999) && !guard.Processing(1000));
+    assert(!guard.Fenced(999) && guard.Fenced(1000));
+    guard.persistent = true;
+    assert(guard.Local(1000) && guard.Processing(1000) && !guard.Fenced(1000));
+    assert(guard.Local(2000) && guard.Processing(2000) && !guard.Fenced(2000));
     guard.processingAllowed = false;
     assert(!guard.Processing(999));
+    assert(!guard.Processing(2000) && guard.Local(2000) && !guard.Fenced(2000));
+    guard.locallyDriven = false;
+    guard.processingAllowed = true;
+    assert(guard.Processing(2000));
+    assert(!guard.Local(2000) && guard.Fenced(2000));
+    guard.leased = false;
+    assert(!guard.Local(2000) && !guard.Fenced(2000));
+    guard.locallyDriven = true;
+    assert(guard.Local(2000) && !guard.Fenced(2000));
+
     assert(LeaseProcessingRange(true, ClientRadiusCm));
     assert(!LeaseProcessingRange(true, ClientRadiusCm + 1));
     assert(!LeaseProcessingRange(false, 0));
@@ -143,40 +168,11 @@ static void TestInitialCollection()
     assert(!LeaseProcessingRange(true, NAN));
 }
 
-static void TestAdmission()
-{
-    Admission ordinary{NativeClass::Ordinary, true, true, true, false, true, false};
-    assert(!ordinary.Refusal());
-    const auto refused = [&](bool Admission::* field, bool value, char const* reason) {
-        auto changed = ordinary;
-        changed.*field = value;
-        assert(std::strcmp(changed.Refusal(), reason) == 0);
-    };
-    refused(&Admission::complete, false, "incomplete native NPC/template");
-    refused(&Admission::mortal, false, "immortal/story actor");
-    refused(&Admission::independent, false, "trader/teacher/party/summon/owned actor");
-    refused(&Admission::storyCatalog, false, "authoritative story catalog unavailable");
-    refused(&Admission::storyReferenced, true, "authored quest/dialogue reference; visual-only");
-    Admission creature{NativeClass::Creature, true, true, true, true, false, true};
-    assert(!creature.Refusal());
-    creature.portableCreature = false;
-    assert(creature.Refusal());
-    creature.type = NativeClass::Unsupported;
-    assert(std::strcmp(creature.Refusal(), "unsupported native species") == 0);
-    for (unsigned flags = 0; flags < 8; ++flags)
-        assert(HostUnknown(flags & 1, flags & 2, flags & 4) == (flags == 0));
-    assert(MayDelegate(NativeClass::Creature, false, false));
-    assert(MayDelegate(NativeClass::Ordinary, true, false));
-    assert(MayDelegate(NativeClass::Ordinary, false, true));
-    assert(!MayDelegate(NativeClass::Ordinary, false, false));
-    assert(!MayDelegate(NativeClass::Unsupported, true, true));
-}
-
 int main()
 {
-    TestAdmission();
     TestHitReadiness();
-    TestInitialCollection();
+    TestSuspension();
+    TestAuthorityGuard();
     ClientWindow client;
     assert(!client.Commit(1, 10));
     assert(!client.Prepare(1, 0, LeaseMs, LeaseMs));
@@ -295,5 +291,5 @@ int main()
         if (j % 7 == 0) guards.Clear();
     }
     for (auto& reader : readers) reader.join();
-    std::cout << "npclease_client_test: PASS (200 transfers, conservative expiry, loss/reorder/duplicates)\n";
+    std::cout << "npclease_client_test: PASS (200 transfers, telemetry expiry, loss/reorder/duplicates)\n";
 }

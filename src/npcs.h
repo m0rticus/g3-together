@@ -19,8 +19,24 @@ bool RedundantClientEntity(eCEntity const* entity);
 void LeaseBaseline(eCEntity* entity, char* routine, size_t capacity, uint8_t& defeated);
 void LeaseReleaseMirror(uint8_t const guid[16]);
 bool HostPresentationAvailable(eCEntity const* entity);
+// Freshness of the host's stream for this GUID, independent of whether a mirror is bound to a live entity. A client-owned NPC
+// is never bound to a mirror, so this is how it learns that the host is presenting it (the host wins; the client yields).
+bool HostStreamFresh(uint8_t const guid[16]);
+// Records received from the host in this welcome session (the host's first stream batch has arrived).
+bool HostStreamSeen();
+// Accepted host records since this GUID's mirror was created: one stray in-flight record must not make an owner yield.
+uint32_t HostStreamRecords(uint8_t const guid[16]);
 uint32_t HostPresentationAge(eCEntity const* entity);
 bool HostCanPresent(uint8_t const guid[16]);
+// The relation (AttitudeToPlayer2) this client's mirror of the NPC must show: what this machine wrote last, else the host's latest.
+bool HostAttitude(eCEntity const* entity, int& attitude);
+struct RelationInfo {
+    bool mirrored = false, bound = false, presenting = false, released = false, hasSent = false;
+    uint8_t hostAttitude = 0xFF, shown = 0xFF, written = 0xFF, sentAttitude = 0xFF, partyPlayer = 0, aiMode = 0;
+    uint32_t ageMs = 0, sentAgeMs = 0;
+    unsigned drifts = 0;
+};
+bool RelationOf(eCEntity const* entity, RelationInfo& info);  // relation.cpp diagnostics: mirror and last-sent state
 bool HostKnows(uint8_t const guid[16]); // canonical history, independent of current capture freshness
 void OnWorldDeactivate();
 bool IsMirrored(eCEntity const* entity);  // a client NPC currently driven from host snapshots

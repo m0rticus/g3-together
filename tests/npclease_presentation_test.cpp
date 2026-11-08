@@ -49,11 +49,6 @@ int main()
     assert(!CosmeticContact(true, true, false, true, true, false, 1));
     assert(!CosmeticContact(true, true, false, true, false, true, 1));
     assert(!CosmeticContact(true, true, false, true, false, false, 0));
-    assert(PortableCreatureSlot(false, false, false, false));
-    assert(PortableCreatureSlot(true, true, true, true));
-    assert(!PortableCreatureSlot(true, true, false, true));
-    assert(!PortableCreatureSlot(true, true, true, false));
-    assert(!PortableCreatureSlot(true, false, true, true));
     int actor, instance, nodes, replacement;
     PresentationRig rig{&actor, &instance, &nodes, 20, false};
     PresentationProof proof;

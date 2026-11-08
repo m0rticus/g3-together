@@ -117,14 +117,13 @@ class NpcLeasePresentationTests(unittest.TestCase):
 
     def test_native_pose_is_preserved_before_creature_stop(self):
         source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
-        native = source[source.index("bool RememberNativePresentation("):source.index("bool LocalHit(")]
+        native = source[source.index("bool RememberNativePresentation("):source.index("bool CosmeticHit(")]
         for required in ("GetTargetWeight", "GetPlayTime", "originalActorProcess(",
                          "GETrue, GEFalse, 0.0f", "PoseProvenance::Native"):
             self.assertIn(required, native)
         runtime = (ROOT / "src" / "npclease_runtime.cpp").read_text(encoding="utf-8")
         stop = runtime[runtime.index("void Stop("):runtime.index("bool Import(")]
+        self.assertIn("if (!entity || Player(entity) || !entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;", stop)
         self.assertLess(stop.index("RememberNativePresentation(entity)"), stop.index("npc.Routine.FullStop()"))
-        equipment = runtime[runtime.index("bool PortableEquipment("):runtime.index("bool Eligible(")]
-        for required in ("gEUseType_Fist", "GetDefaultItemFromSlot", "GetTemplateID().GetCore()",
-                         "PortableCreatureSlot"):
-            self.assertIn(required, equipment)
+        imported = runtime[runtime.index("bool Import("):runtime.index("bool Activate(")]
+        self.assertLess(imported.index("Stop(entity)"), imported.index("entity->SetToWorldMatrix(pose)"))

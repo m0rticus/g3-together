@@ -10,7 +10,7 @@
 namespace g3t::npclease {
 
 constexpr uint8_t WireVersion = 2;
-constexpr uint32_t LeaseMs = 3000, LeaseSafetyMs = 300, FarDwellMs = 3000;
+constexpr uint32_t LeaseMs = 3000, LeaseSafetyMs = 300, FarDwellMs = 0;
 constexpr uint32_t RecallWaitMs = 10000, PrepareMs = 3000, StateMs = 200;
 constexpr float ClientRadiusCm = 10000.0f;
 constexpr size_t MaxLeases = 512;
@@ -247,6 +247,17 @@ struct Eligibility {
         return interest.hostDistance <= farRadius - 2000.0f;
     }
 };
+
+// Why Eligibility::Delegate refused (diagnostics only; the order mirrors Delegate).
+inline char const* DelegateRefusal(Interest const& interest)
+{
+    if (!interest.sameWorld) return "client not in the host's world";
+    if (!interest.ready) return "client state stale or checkpoint busy";
+    if (!interest.eligible) return "host authority guards unavailable";
+    if (interest.conflict) return "another client shares this NPC";
+    if (interest.clientDistance > ClientRadiusCm) return "NPC outside the client ring";
+    return "host presents it within its own reach";
+}
 
 struct Lease {
     Phase phase = Phase::Host;

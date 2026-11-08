@@ -5,44 +5,38 @@
 #include <cmath>
 
 namespace g3t::npclease {
-constexpr uint32_t ActivationCollectMs = 500;
-
 inline bool LeaseProcessingRange(bool permit, float distance)
 {
     return permit && std::isfinite(distance) && distance >= 0.0f && distance <= ClientRadiusCm;
 }
 
-inline bool AwaitingInitialCollection(bool activated, uint32_t began, uint32_t now)
-{
-    return !activated && now - began < ActivationCollectMs;
-}
-
-inline bool PortableCreatureSlot(bool occupied, bool hand, bool natural, bool templateDefault)
-{
-    return !occupied || (hand && natural && templateDefault);
-}
-
+// Observations about a client-owned NPC. Only the first two can end ownership (LossReason); every other field merely
+// explains why native processing is suspended right now (Suspension) and never freezes, fences or cuts the NPC.
 struct ClientReadiness {
     bool running = true, enabled = true, checkpointBusy = false;
-    bool processed = true, actor = true, eligible = true, expired = false;
-    bool processingEnabled = true, processable = true, insideRange = true, collecting = false;
+    bool processed = true, actor = true, eligible = true;
+    bool processingEnabled = true, processable = true, insideRange = true;
 
     char const* LossReason() const
     {
-        if (!running) return "session/world unavailable";
         if (!enabled) return "authority fallback disabled";
-        if (checkpointBusy) return "checkpoint barrier";
-        if (!processingEnabled) return "native entity disabled";
-        if (!insideRange) return "client processing range lost";
-        if (!processed && !collecting) return "native processing unavailable";
-        if (!processable && !collecting) return "native processable membership unavailable";
-        if (!actor) return "native animation actor unavailable";
         if (!eligible) return "native eligibility changed";
-        if (expired) return "conservative lease expired";
+        return nullptr;
+    }
+    char const* Suspension() const
+    {
+        if (!running) return "session/world paused";
+        if (checkpointBusy) return "checkpoint in progress";
+        if (!processingEnabled) return "native entity disabled";
+        if (!insideRange) return "outside client processing ring";
+        if (!processed) return "not in native range list";
+        if (!processable) return "not in native processable list";
+        if (!actor) return "native animation actor unavailable";
         return nullptr;
     }
 };
 
+// The host handshake window is telemetry for a client-owned NPC: it never expires ownership.
 struct ClientWindow {
     enum class Mode { Idle, Prepared, Active, Frozen };
     Mode mode = Mode::Idle;

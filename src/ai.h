@@ -72,6 +72,10 @@ bool AttitudeNative();          // jump in the native function (all callers), no
 int PlainAttitude(eCEntity* self, eCEntity* other);  // QA: GetAttitude without the puppet -> hero redirect (as attitudeoff)
 // Native relation query for this exact player, without the wrapper's NoteContact or puppet -> hero redirect.
 bool TryPlayerAttitude(eCEntity* self, eCEntity* player, int& attitude);
+// The NPC's relation to this machine's player as the name-colour scripts compute it: no puppet scope, no downed refusal.
+bool LocalAttitude(eCEntity* self, int& attitude);
+void RelationStats(unsigned& queries, unsigned& scopeCleared, unsigned& downedAllowed, unsigned& mirrorAnswered);
+bool RelationHooked();  // the name-colour writers' GetAttitude call site was verified and is filtered
 eCEntity* RedirectedFor();  // QA: the puppet a running GetAttitude answers for as the local hero (else null)
 unsigned AttitudeAsked();       // GetAttitude calls with a puppet as the judged entity
 unsigned AttitudeRedirected();  // of these, answered as for the local hero

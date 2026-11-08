@@ -276,6 +276,27 @@ conservative until standing is known; do not accept a test in which recovery nev
 Repeated acquisition/hit refusals are limited to the first 40 records and one sample per five seconds;
 actual binding/life transitions are logged independently. No QA command or control is needed.
 
+### NPC relation / name colour (both PCs)
+
+The tag colour is read every frame from the NPC's `AttitudeToPlayer2` (red 4/5, orange 3/6, green 1, tan 2, pale cream 0, dead
+tan). Only the game's scripts store it, as the NPC's relation to this machine's player; knocked-down state, a puppet standing in for
+the player and a client mirror's own scripts must not change it. The host sends it in the NPC record; the client writes it into the
+mirror every frame (also while a mirror is held or unsampled) and answers the scripts' own question with the host's value.
+`relation:` lines are written by both PCs, no QA command: `summary` (reason, down bits, per-attitude counts of live NPCs within
+60 m, fix counters: `writer_queries`, `scope_cleared`, `downed_not_refused`, `mirror_answered`, `healed`), `npc` (the six nearest:
+state `host`/`native`/`lease`/`mirror`/`mirror-held`/`mirror-released`, `stored`, `colour`, `hostile` = red, `truth` = the relation
+the scripts would store now, `host`/`shown`/`written` on a client, `sent` on a host), `transition kind=knocked-down|revive`
+(followed by summaries 1 s and 4 s later), `change` (a tracked NPC's stored value or state moved), `heal` (stored 0 on a live NPC
+replaced by its truth) and `mismatch kinds=...` (`native-drift` the client's own script changed a mirror and it was repaired,
+`unapplied`, `stale-none`, `unsent`, `truth-differs` informational). Startup must report `ai: name-colour writers (GetFocusNameAttitude
+call site) verified`.
+
+1. Stand near hostile orcs and creatures on both PCs; note red names on both screens. Knock the host down (all the time it lies
+   there), then revive it: names stay red/white exactly as before on both screens. Repeat knocking the client down.
+2. Walk the client out of the host's range and back in: hostile NPCs keep red names; none turns white while it is presented.
+3. In both logs, `relation: npc` lines of one NPC keep the same `stored`/`colour` through `transition` lines; no `mismatch` with
+   `stale-none`/`native-drift` after the revive summaries. A `stored=0` NPC with `truth>0` must be `heal`ed within 2 s.
+
 ### Dialogue and trade immunity (both PCs)
 
 Use coordinator-installed matching DLLs in the host `test-install` and client `test-client` copies.

@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import re
 import unittest
 
 from test_hud_notices import read_rva
@@ -14,11 +15,16 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.runtime = (ROOT / "src" / "npclease_runtime.cpp").read_text(encoding="utf-8")
+        cls.policy = (ROOT / "src" / "npcown_policy.h").read_text(encoding="utf-8")
 
     def test_suppressed_npcs_cannot_be_leased_or_adopted(self):
-        eligible = section(self.runtime, "char const* EligibilityReason(", "bool ValidDiscovery(")
+        role = section(self.runtime, "npcown::RoleFacts RoleOf(", "char const* EligibilityReason(")
+        eligible = section(self.runtime, "char const* EligibilityReason(", "bool Eligible(")
+        exclusion = section(self.policy, "inline char const* Exclusion(", "// ---- the decision")
         receive = section(self.runtime, "void Receive(uint8_t", "GEBool __fastcall Quest(")
-        self.assertIn("npcremoval::Suppressed(entity)", eligible)
+        self.assertIn("role.removed = npcremoval::Suppressed(entity)", role)
+        self.assertIn("npcown::Exclusion(RoleOf(entity, prototype))", eligible)
+        self.assertIn('if (role.removed) return "authored removal"', exclusion)
         self.assertIn("npcremoval::Suppressed(note.guid)", receive)
 
     def test_discovery_requires_native_template_and_host_epoch(self):
@@ -26,12 +32,15 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("proxy.GetEntity()", discovery)
         self.assertIn("eEPropertySetType_NPC", discovery)
         self.assertIn("EligibilityReason(prototype, state.name, true)", discovery)
-        host = section(self.runtime, "void ReceiveHost(", "void ReceiveClient(")
-        self.assertIn("note.incarnation == 1 && ValidDiscovery(note.state)", host)
-        self.assertIn("++authoritySerial", host)
+        host = section(self.runtime, "void ReceiveHost(", "void ReleaseLocal(")
+        adopt = section(host, "if (note.kind == Kind::Request || note.kind == Kind::Adopt)", "if (found == entries.end())")
+        self.assertIn("DiscoveryReason(baseline)", adopt)
+        self.assertIn("native ? npcs::Incarnation(note.guid) : note.incarnation", adopt)
+        self.assertIn("++authoritySerial, now, baseline", adopt)
+        self.assertNotIn("note.incarnation == 1", adopt)
         self.assertNotIn("CreateEntity", host)
-        self.assertLess(host.index("PublishGuard(key, entry)"), host.index("Stop(native)"))
-        self.assertLess(host.index("Stop(native)"), host.index("Send(key, entry, Kind::Offer)"))
+        self.assertLess(adopt.index("PublishGuard(key, entry)"), adopt.index("Stop(native)"))
+        self.assertLess(adopt.index("Stop(native)"), adopt.index("Send(key, entry, Kind::Offer)"))
 
     def test_activation_imports_before_native_restart(self):
         activate = section(self.runtime, "bool Activate(", "Interest InterestOf(")
@@ -76,13 +85,41 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("processDepth || nativeLoadDepth || nativeSaveDepth", persist)
         self.assertIn('return "downed"', persist)
 
-    def test_expired_owners_never_resume_without_authorization(self):
+    def test_ownership_does_not_expire_or_depend_on_processing(self):
         client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
-        readiness = section(self.runtime, "ClientReadiness Readiness(", "bool CanResumePresentation(")
-        self.assertIn("Reached(now, entry.localDeadline)", readiness)
-        self.assertIn("readiness.LossReason()", client)
-        self.assertLess(client.index("entry.window.Freeze()"), client.index("Send(item.first, entry, Kind::Cut)"))
-        self.assertNotIn("Kind::Commit", client)
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        self.assertIn("MaintainOwners(now)", client)
+        for body in (client, maintain):
+            self.assertNotIn("conservative lease expired", body)
+            self.assertNotIn("processingQueued", body)
+        release_policy = section(self.policy, "inline char const* Release(", "// ---- processing registration")
+        for allowed in ("Exclusion(facts.role)", "facts.hostPresenting", "facts.hostCommit", "facts.hostRecallDue"):
+            self.assertIn(allowed, release_policy)
+        for ignored in ("leaseExpired", "hostSilent", "checkpointBusy", "paused", "registrationFailed",
+                        "processingListsMissing", "outsideRing", "disconnected"):
+            self.assertNotIn(ignored, release_policy)
+        self.assertIn("npcs::HostStreamFresh(key.data())", maintain)
+        self.assertIn("npcs::HostStreamRecords(key.data()) >= 2", maintain)
+        self.assertIn("!terminalDeath", maintain)
+        self.assertIn("npcown::Release(facts)", maintain)
+        self.assertIn("if (facts.hostPresenting || !entry.confirmed || !captured)", maintain)
+        self.assertIn("ReleaseLocal(key, entry, entity, true)", maintain)
+        self.assertIn("CutToHost(key, entry, entity, &state, release, now)", maintain)
+        release = section(self.runtime, "void ReleaseLocal(", "void ReceiveClient(")
+        takeover = section(self.runtime, "char const* TakeOver(", "void CutToHost(")
+        cut = section(self.runtime, "void CutToHost(", "bool SharedWithOtherClient(")
+        clear = r"\bentry\.local\s*=\s*false\b"
+        for body in (release, takeover, cut):
+            self.assertEqual(len(re.findall(clear, body)), 1)
+        self.assertEqual(len(re.findall(clear, self.runtime)), 3)
+        release_branch = section(maintain, "if (char const* release = npcown::Release(facts))", "ObserveReaction(")
+        # Besides the policy release, ownership ends only when the engine's reloaded instance cannot be restored or the
+        # revision counter is exhausted (both fall back to the host stream; nothing is frozen).
+        self.assertEqual(maintain.count("ReleaseLocal(key, entry, entity,"),
+                         release_branch.count("ReleaseLocal(key, entry, entity,") + 2,
+                         "MaintainOwners releases outside npcown::Release and the two documented fallbacks")
+        self.assertIn("reloaded instance could not be restored", maintain)
+        self.assertIn("revision exhausted", maintain)
 
     def test_owner_readiness_uses_native_processing_not_interaction_roi(self):
         processed = section(self.runtime, "bool Processed(", "bool NativeReady(")
@@ -98,29 +135,55 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
         self.assertIn("GetEntitiesInProcessingRange()", section(world, "bTSmallArray<eCEntity*> const* Processed()", "\n}\n\nbTSmallArray"))
 
-    def test_committed_collection_is_fenced_and_never_restarts_expired_owner(self):
+    def test_takeover_is_fenced_before_registration_and_handshake(self):
+        takeover = section(self.runtime, "char const* TakeOver(", "void CutToHost(")
+        activate = section(self.runtime, "bool Activate(", "Interest InterestOf(")
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        self.assertLess(takeover.index("Activate(entity, entry, key.data())"),
+                        takeover.index("RegisterProcessing(key, entry, entity)"))
+        self.assertNotRegex(takeover, r"\bif\s*\([^;{}]*RegisterProcessing\(")
+        self.assertLess(activate.index("PublishGuard("), activate.index("npcs::LeaseReleaseMirror("))
+        self.assertLess(activate.index("npcs::LeaseReleaseMirror("), activate.index("Import(entity"))
+        self.assertLess(activate.index("Import(entity"), activate.index("ReleaseNativePresentation"))
+        self.assertLess(activate.index("ReleaseNativePresentation"), activate.index("ContinueRoutine()"))
+        self.assertNotIn("Send(", takeover)
+        self.assertIn("Send(key, entry, Kind::Adopt)", maintain)
+        registration = section(self.runtime, "void RegisterProcessing(", "char const* TakeOver(")
+        self.assertIn("queued = world::QueueEntityProcessing(entity, &queueWhy)", registration)
+        self.assertIn("npcown::Classify(processedBefore, processableBefore, queued, enabled)", registration)
+        for operation in ("entry.local = false", "Stop(", "Kind::Cut"):
+            self.assertNotIn(operation, registration)
         receive = section(self.runtime, "void ReceiveClient(", "void Receive(uint8_t")
+        offer = section(receive, "if (note.kind == Kind::Offer)", "const auto found = entries.find(key)")
+        self.assertIn("!it->second.local", offer)
+        self.assertIn("entry.lease.epoch = note.epoch", offer)
+        self.assertIn("Send(key, entry, Kind::Prepared)", offer)
+        self.assertNotIn("Import(", offer)
+        self.assertNotIn("Stop(", offer)
+        host_commit = section(receive, "if (note.kind == Kind::Commit && note.owner == 1", "if (!Exact(note, entry))")
+        self.assertIn("Newer(note.epoch, entry.lease.epoch)", host_commit)
+        self.assertIn("ReleaseLocal(key, entry, entity, !wasCut)", host_commit)
         commit = section(receive, "if (note.kind == Kind::Commit) {", "} else if (note.kind == Kind::Renew)")
-        self.assertLess(commit.index("entry.window.Commit"), commit.index("EnableProcessing(GETrue)"))
-        self.assertLess(commit.index("PublishGuard(key, entry)"), commit.index("EnableProcessing(GETrue)"))
-        self.assertIn("world::QueueEntityProcessing(entity)", commit)
-        self.assertIn("entry.nativeActivated = false", commit)
+        self.assertIn("entry.confirmed = true", commit)
+        self.assertIn("Send(key, entry, Kind::Ack)", commit)
         guard = section(self.runtime, "void PublishGuard(", "AuthorityGuard ReadGuard(")
-        self.assertIn("entry.window.Active(entry.lease.epoch", guard)
+        self.assertIn("entry.local && entry.active", guard)
+        self.assertIn("guard.persistent = entry.local", guard)
         self.assertIn("guard.processingAllowed && entry.nativeActivated", guard)
-        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
-        self.assertLess(client.index("readiness.LossReason()"), client.index("Activate(entity"))
-        self.assertIn("readiness.processed && readiness.processable", client)
-        self.assertIn("entry.nativeActivated && CaptureNative", client)
-        readiness = section(self.runtime, "ClientReadiness Readiness(", "bool CanResumePresentation(")
-        self.assertIn("AwaitingInitialCollection(entry.nativeActivated", readiness)
-        self.assertIn("LeaseProcessingRange", readiness)
+        self.assertNotIn("entry.window.Active(", guard)
+        self.assertNotIn("Reached(", guard)
 
     def test_entity_queue_and_client_range_preserve_native_hero_membership(self):
         world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
         queue = section(world, "bool QueueEntityProcessing(", "// Extra ranges")
         self.assertIn("admin.AddDirtyProcessingRangeEntity(entity, GETrue)", queue)
-        self.assertIn("MarkProcessingDirty(&admin)", queue)
+        self.assertLess(queue.index("MarkProcessingDirty(&admin, why)"),
+                        queue.index("admin.AddDirtyProcessingRangeEntity(entity, GETrue)"))
+        self.assertIn('if (why) *why = "queued"', queue)
+        for reason in ("no entity", "retirement gate paused", "shutting down", "scene administration unavailable"):
+            self.assertIn(f'*why = "{reason}"', queue)
+        dirty = section(world, "bool MarkProcessingDirty(", "void RequestProcessingUpdate(")
+        self.assertIn('*why = "engine ROI refresh signature mismatch"', dirty)
         for destructive in ("ClearProcessingRangeList", "FourceFullROIUpdate()", "EnterProcessingRange(",
                             "ExitProcessingRange(", "GetEntitiesInProcessingRange"):
             self.assertNotIn(destructive, queue)
@@ -162,39 +225,63 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
                          bytes.fromhex("8d4c240c518d8ed8000000e818040000"))
         self.assertEqual(read_rva(data, 0x230c14, 9), bytes.fromhex("80bdfd000000017462"))
 
-    def test_hits_only_observe_owner_and_publish_reliable_state(self):
+    def test_hits_only_observe_owner_and_death_state_requires_confirmation(self):
         note = section(self.runtime, "void NoteHit(", "char const* UnavailabilityReason(")
         for mutation in ("entry->active =", "entry->lease.phase =", "entry->window.Freeze",
-                         "Stop(", "Kind::Cut", "Import("):
+                         "Stop(", "Kind::Cut", "Import(", "HitPoints", "entry->lease.state.hp =",
+                         "SetHitPoints"):
             self.assertNotIn(mutation, note)
         self.assertIn("entry->lastHit = ", note)
-        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
-        event = section(client, "const bool event =", "if (captured && (event")
+        self.assertIn("if (after < before) ++ownTotals.hitsApplied", note)
+        self.assertIn("npcown::Event::Hit", note)
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        event = section(maintain, "const bool event =", "if (captured && (event")
         self.assertIn("state.hp != entry.lease.state.hp", event)
-        self.assertIn('Diagnostic("state-event"', client)
+        self.assertIn('Diagnostic("state-event"', maintain)
+        kill = section(self.runtime, "GEInt GE_STDCALL Kill(", "bool Install()")
+        self.assertIn("if (entry->confirmed && Send(Key(victim), *entry, Kind::State))", kill)
+        self.assertIn("Send(key, entry, Kind::Adopt)", maintain)
+        control = section(self.runtime, "Message Control(", "bool Send(")
+        self.assertIn("note.state = entry.lease.state", control)
         combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
         self.assertIn('npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints"', combat)
         self.assertIn("npclease::NoteHit(victim.GetInstance(), attacker, Judgements[which]", combat)
 
-    def test_failure_diagnostics_precede_stop_and_distinguish_causes(self):
-        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
-        cut = section(client, "if (lost ||", "const bool event =")
-        self.assertLess(cut.index('ReadinessDiagnostic("frozen"'), cut.index("Stop(entity)"))
-        self.assertIn('ReadinessDiagnostic("state-unavailable"', client)
+    def test_release_diagnostics_precede_stop_and_distinguish_causes(self):
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        cut = section(self.runtime, "void CutToHost(", "bool SharedWithOtherClient(")
+        self.assertIn("npcown::Release(facts)", maintain)
+        self.assertIn("CutToHost(key, entry, entity, &state, release, now)", maintain)
+        self.assertLess(cut.index('Diagnostic("frozen", key, entry, why)'), cut.index("Stop(entity)"))
+        self.assertLess(cut.index("OwnEventAlways("), cut.index("Stop(entity)"))
+        self.assertIn('"reason=%s awaiting host hand-back', cut)
+        self.assertIn('ReadinessDiagnostic("state-unavailable"', maintain)
         diagnostic = section(self.runtime, "void ReadinessDiagnostic(", "void CommitDeath(")
-        for field in ("guid=%s", "epoch=%u", "processed=%u", "actor=%u", "remaining_ms=%d",
+        for field in ("guid=%s", "epoch=%u", "processed=%u", "actor=%u", "local=%u", "confirmed=%u",
                       "last_hit_age_ms=%u", "task=%s", "state=%s", "e0=%u", "e8=%u",
-                      "entity_enabled=%u", "collecting=%u", "hero_cm=%.0f", "camera_cm=%.0f"):
+                      "entity_enabled=%u", "suspension=%s", "hero_cm=%.0f", "camera_cm=%.0f"):
             self.assertIn(field, diagnostic)
-        self.assertIn('ReadinessDiagnostic("owner"', client)
-        self.assertIn("now - entry.ownerReportAt >= 1000", client)
 
     def test_kill_ledger_precedes_native_effects(self):
         kill = section(self.runtime, "GEInt GE_STDCALL Kill(", "bool Install()")
         self.assertLess(kill.index("CommitEffect(entry->lease.state, NativeDeath)"),
                         kill.index("const GEInt result = originalKill("))
+        self.assertLess(kill.index("ownerDeath = victim"), kill.index("const GEInt result = originalKill("))
+        self.assertLess(kill.index("const GEInt result = originalKill("), kill.index("ownerDeath = before"))
+        self.assertIn("entry->lease.state.effects & NativeDeath", kill)
+        self.assertIn("++repeatedDeaths", kill)
         self.assertIn("final.dead = 1; final.hp = 0", kill)
-        self.assertIn("Kind::State", kill)
+        self.assertIn("final.effects |= NativeDeath", kill)
+        self.assertIn("if (entry->confirmed && Send(Key(victim), *entry, Kind::State))", kill)
+        quest = section(self.runtime, "GEBool __fastcall Quest(", "GEInt GE_STDCALL Kill(")
+        self.assertIn("ownerDeath == &victim) return GEFalse", quest)
+        death = section(self.runtime, "void CommitDeath(", "bool Exact(")
+        self.assertIn("entry.lease.state.effects & NativeDeath", death)
+        self.assertIn("entry.lease.state.effects & QuestDeath", death)
+        self.assertIn("journal::LeaseDeath(entity, entry.lease.owner)", death)
+        self.assertIn("CommitEffect(entry.lease.state, QuestDeath)", death)
+        host = section(self.runtime, "void ReceiveHost(", "void ReleaseLocal(")
+        self.assertIn("CommitDeath(key, entry)", host)
 
     def test_late_pre_handoff_samples_cannot_roll_back_the_cut(self):
         receive = section(self.runtime, "void ReceiveClient(", "void Receive(uint8_t")
@@ -205,6 +292,9 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("note.echo = net::Now()", controls)
         floor = section(self.runtime, "bool IgnoreHostSnapshot(uint8_t const identity[16],", "uint8_t RemoteOwner(")
         self.assertIn("entry.hasPresentationFloor && !Newer(captured, entry.presentationFloor)", floor)
+        self.assertIn("if (entry.local) return false", floor)
+        self.assertIn("!LocalOwner(identity)", floor)
+        self.assertIn("found->second.local && found->second.active", floor)
         npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
         playback = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
         self.assertIn("npclease::IgnoreHostSnapshot(records[i].guid, captured)", npcs)
@@ -217,44 +307,103 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertLess(frozen.index("if (Activate(entity"), frozen.index("Kind::Commit"))
         self.assertIn('Diagnostic("host-held"', frozen)
 
-    def test_expansion_does_not_enable_unportable_roles(self):
-        species = section(self.runtime, "char const* SpeciesName(", "NativeClass ClassOf(Entity&")
-        for covered in ("gESpecies_Troll", "gESpecies_Minecrawler", "gESpecies_Gargoyle", "gESpecies_Ogre"):
-            self.assertIn(covered, species)
-        for excluded in ("case gESpecies_Human:", "case gESpecies_Orc:", "case gESpecies_Goblin:",
-                         ):
-            self.assertNotIn(excluded, species)
-        for covered in ("gESpecies_Chicken", "gESpecies_Cow", "gESpecies_Pig"):
-            self.assertIn(covered, species)
-        role = section(self.runtime, "bool ExcludedRole(", "bool Eligible(")
-        for guard in ("GetTradeEnabled()", "GetTeachEnabled()", "GetPartyEnabled()",
-                      "gEPartyMemberType_None", "GetMembers().GetCount()"):
+    def test_role_admission_excludes_only_unsupported_roles(self):
+        exclusion = section(self.policy, "inline char const* Exclusion(", "// ---- the decision")
+        self.assertEqual(set(re.findall(r"\brole\.(\w+)", exclusion)),
+                         {"hero", "remotePuppet", "summonOrFollower", "itemOrSpell",
+                          "duplicateIdentity", "removed", "complete"})
+        self.assertIn("return nullptr", exclusion)
+        role = section(self.runtime, "npcown::RoleFacts RoleOf(", "char const* EligibilityReason(")
+        for guard in ("GetHero()", "remote::ControlledBody()", "eEPropertySetType_PlayerMemory",
+                      "remote::IsPuppet(entity)", "npcs::RedundantClientEntity(entity)",
+                      "npcremoval::Suppressed(entity)", "role.complete =", "GetCreator()",
+                      "eEPropertySetType_Magic", "eEPropertySetType_Item", "FollowerRole(entity)"):
             self.assertIn(guard, role)
+        follower = section(self.runtime, "bool FollowerRole(", "npcown::RoleFacts RoleOf(")
+        for guard in ("GetOwner().GetInstance()", "GetPartyLeader().GetInstance()", "npc.Party.Waiting",
+                      "gEPartyMemberType_None", "GetMembers().GetCount()"):
+            self.assertIn(guard, follower)
+        for obsolete in ("SpeciesName", "ClassOf(", "StoryCatalog", "GetTradeEnabled()", "GetTeachEnabled()"):
+            self.assertNotIn(obsolete, role + follower)
 
-    def test_discovered_ordinary_requires_host_absence_and_story_catalog(self):
-        host = section(self.runtime, "void ReceiveHost(", "void ReceiveClient(")
-        self.assertLess(host.index("else if (native)"), host.index("ValidDiscovery(note.state)"))
-        self.assertIn("HostUnknown(native != nullptr, npcs::HostKnows(note.guid), entry.hasBaseline)", host)
-        self.assertIn("MayDelegate(ClassOf(baseline)", host)
-        self.assertIn("entry.adopted && !native", host)
-        catalog = section(self.runtime, "bool StoryCatalog()", "bool GenericName(")
-        for reference in ("GetQuests()", "GetInfos()", "GetDestinationEntity()", "GetDeliveryEntities()",
-                          "GetOwner()", "GetEntity1()", "GetEntity2()", "GetCondPlayerPartyMember()"):
-            self.assertIn(reference, catalog)
-        client = section(self.runtime, "void TickClient(", "\n}\n\nbool LocalAuthority(")
-        self.assertIn("const auto* all = world::ProcessedEntities()", client)
-        self.assertNotIn("Entity::GetNPCs()", client)
+    def test_adopt_uses_client_baseline_for_all_classes(self):
+        host = section(self.runtime, "void ReceiveHost(", "void ReleaseLocal(")
+        adopt = section(host, "if (note.kind == Kind::Request || note.kind == Kind::Adopt)", "if (found == entries.end())")
+        self.assertIn("const Checkpoint baseline = note.state", adopt)
+        self.assertIn("EligibilityReason(native)", adopt)
+        self.assertIn("std::memcmp(&native->GetTemplateID().GetCore(), baseline.templateId, 16)", adopt)
+        self.assertIn("else if (auto const* why = DiscoveryReason(baseline))", adopt)
+        self.assertIn("!baseline.dead && Entity(native).IsDead()", adopt)
+        self.assertIn("!baseline.dead && journal::RecordedDeath(note.guid)", adopt)
+        self.assertIn("entry.interest.Delegate(interest, now)", adopt)
+        self.assertIn("!native && !entry.adopted", adopt)
+        for obsolete in ("StoryCatalog", "HostUnknown", "MayDelegate", "HostKnows", "ClassOf(", "SpeciesName"):
+            self.assertNotIn(obsolete, adopt)
+        scan = section(self.runtime, "void ScanClient(", "void TickClient(")
+        self.assertIn("const auto* all = world::ProcessedEntities()", scan)
+        self.assertNotIn("Entity::GetNPCs()", scan)
         diagnostic = section(self.runtime, "char const* UnavailabilityReason(", "bool Fenced(")
-        self.assertIn("initialization pending", diagnostic)
+        self.assertIn("initializing", diagnostic)
         self.assertIn("installation failed", diagnostic)
+        self.assertIn("EligibilityReason(entity)", diagnostic)
         self.assertIn("npclease: admission-refused guid=%s name=%s reason=%s", self.runtime)
-        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        known = section(npcs, "bool HostKnows(", "namespace {")
-        for ledger in ("lastSent", "incarnations", "corpses", "absences", "deadOnHost",
-                       "journal::RecordedDeath(identity)"):
-            self.assertIn(ledger, known)
         journal = (ROOT / "src" / "journal.cpp").read_text(encoding="utf-8")
         deathQuery = section(journal, "bool RecordedDeath(", "unsigned Write(")
         self.assertIn("deaths.count", deathQuery)
         for mutation in ("deaths[", "Kill(", "CountQuest(", "SendDeath("):
             self.assertNotIn(mutation, deathQuery)
+
+    def test_client_first_takeover_is_immediate_and_independent_of_handshake(self):
+        scan = section(self.runtime, "void ScanClient(", "void TickClient(")
+        takeover = section(self.runtime, "char const* TakeOver(", "void CutToHost(")
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        decision = section(self.policy, "inline Decision Decide(", "// ---- acquisition timing")
+        self.assertIn("npcown::StreamSettled(now, sessionReadyAt, npcs::HostStreamSeen())", scan)
+        self.assertIn("facts.settled = settled", scan)
+        self.assertIn("facts.cooldownHeld = found != entries.end() && npcown::CooldownHeld(", scan)
+        self.assertIn("if (!facts.settled)", decision)
+        self.assertIn("if (facts.cooldownHeld)", decision)
+        self.assertLess(scan.index("npcown::Decide(facts)"), scan.index("TakeOver(entity, key, now)"))
+        self.assertLess(scan.index("takeovers >= 8"), scan.index("++takeovers"))
+        self.assertLess(scan.index("++takeovers"), scan.index("TakeOver(entity, key, now)"))
+        for obsolete in ("dwell", "lastRequest", "Kind::Adopt", "Send("):
+            self.assertFalse(obsolete in scan, f"ScanClient unexpectedly contains {obsolete}")
+        # The only timer in the scan is the back-off after a FAILED takeover (a permanent fence failure must not retry at 10 Hz).
+        self.assertIn("entries[key].retryAt = (now ? now : 1) + 2000", scan)
+        self.assertLess(scan.index("TakeOver(entity, key, now)"), scan.index("entries[key].retryAt ="))
+        self.assertEqual(scan.count("Reached("), 1)
+        self.assertNotRegex(scan, r"\bif\s*\([^)]*\b(?:now\s*-|unavailableAt)")
+        for operation in ("QueueEntityProcessing(", "RegisterProcessing("):
+            self.assertNotIn(operation, scan)
+            self.assertNotRegex(scan, rf"\bif\s*\([^;{{}}]*{re.escape(operation)}")
+        self.assertNotIn("Send(", takeover)
+        self.assertLess(maintain.index("entry.lease.state = state"), maintain.index("Send(key, entry, Kind::Adopt)"))
+
+    def test_review_hardening_keeps_owners_alive_and_hand_back_loss_free(self):
+        host = section(self.runtime, "void ReceiveHost(", "void ReceiveClient(")
+        client = section(self.runtime, "void ReceiveClient(", "void Receive(uint8_t")
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        interest = section(self.runtime, "Interest InterestOf(", "Message Control(")
+        capture = section(self.runtime, "bool CaptureNative(", "void Stop(")
+        shared = section(self.runtime, "bool SharedWithOtherClient(", "// Reaction logging")
+        # A live client keeps its epoch through host pauses/checkpoints: the deadline renews regardless of Running().
+        renew = section(host, "entry.lease.AcceptState(", "} else if (note.kind == Kind::Cut)")
+        self.assertLess(renew.index("entry.lease.deadline = now + LeaseMs + LeaseSafetyMs"),
+                        renew.index("if (Running() && !persist::CheckpointBusy()) Send(key, entry, Kind::Renew)"))
+        # The host re-offers a cut NPC the same client reclaimed (no obsolete-checkpoint hand-back).
+        self.assertIn("entry.lease.phase != Phase::Frozen || entry.lease.owner != from", host)
+        self.assertIn("entry.lease.phase = Phase::Dormant", host)
+        # A Commit(owner=1) is accepted even after the client already yielded to the host stream (no endless retransmits).
+        self.assertIn("(entry.cut || entry.local || entry.lease.phase == Phase::Host)", client)
+        # Terminal death never yields; one stray host record never counts as presentation.
+        self.assertIn("const bool terminalDeath", maintain)
+        self.assertIn("npcs::HostStreamRecords(key.data()) >= 2", maintain)
+        # Native dialogue is busy and blocks a forced recall cut.
+        self.assertIn("gEAIMode_Talk", capture)
+        self.assertIn("npc.Routine.AIMode != gEAIMode_Talk", maintain)
+        # A reloaded instance waits for native readiness without dropping ownership.
+        reload = section(maintain, "if (entry.ownedEntity != entity)", "ObserveProcessing(")
+        self.assertLess(reload.index("if (!NativeReady(entity)) continue;"), reload.index("Activate(entity, entry, key.data())"))
+        # One owner per NPC: only LOWER-numbered clients within reach take precedence, on both machines.
+        self.assertIn("i < net::LocalId()", shared)
+        self.assertIn("i < client", interest)

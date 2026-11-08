@@ -17,10 +17,12 @@
 #include "npclease_runtime.h"
 #include "net.h"
 #include "movement.h"
+#include "relation_policy.h"
 
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
+#include <intrin.h>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -503,6 +505,11 @@ bool fleeKeep = true;    // QA negative control: fleekeepoff
 unsigned attitudeAsked = 0, attitudeRedirected = 0, attitudeFleeKept = 0;
 
 bool attitudeNative = false;
+// The name-colour writers (ContinueRoutine, AssessTarget, AssessActivePerception) store GetFocusNameAttitude (Script_Game.dll
+// 0xF340) = GetAttitude(self, Entity::GetPlayer()) into gCNPC_PS.AttitudeToPlayer2 through one direct call at 0xF3D7: its
+// return address tells the name-colour query from every targeting query. 0: call site not verified in this build.
+uintptr_t focusNameReturn = 0;
+unsigned relationQueries = 0, relationScopeCleared = 0, relationDownedAllowed = 0, relationMirrorAnswered = 0;
 eCEntity* redirectedFor = nullptr;  // the puppet whose GetAttitude runs as the local hero's right now
 bool plainAsk = false;              // QA attchain: one question answered without the redirect (as attitudeoff would)
 thread_local unsigned playerAttitudeQueries = 0;
@@ -516,6 +523,22 @@ unsigned char* NativeAttitude()
     if (!module) return nullptr;
     auto* code = reinterpret_cast<unsigned char*>(module) + 0xE3B0;
     return std::memcmp(code, expected, sizeof(expected)) == 0 ? code : nullptr;
+}
+
+// GetFocusNameAttitude (0xF340: push ebp; mov ebp,esp; and esp,-8; sub esp,0x1fc) calls GetAttitude at 0xF3D7 (E8 rel32 to
+// 0xE3B0; the return address is 0xF3DC). Checked against the function start, which is not patched yet or already jumps.
+uintptr_t VerifiedFocusNameReturn()
+{
+    static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0xfc, 0x01, 0x00, 0x00};
+    HMODULE module = GetModuleHandleA("Script_Game.dll");
+    if (!module) return 0;
+    auto* base = reinterpret_cast<unsigned char*>(module);
+    unsigned char const* call = base + 0xF3D7;
+    int32_t relative = 0;
+    std::memcpy(&relative, call + 1, sizeof(relative));
+    if (std::memcmp(base + 0xF340, prologue, sizeof(prologue)) != 0 || call[0] != 0xE8 ||
+        call + 5 + relative != base + 0xE3B0) return 0;
+    return reinterpret_cast<uintptr_t>(call + 5);
 }
 
 }
@@ -711,11 +734,44 @@ void* JumpTo(unsigned char* target, void* detour, size_t stolen)
 
 namespace {
 
+bool LedByRemotePlayer(eCEntity* npc)
+{
+    const uint8_t owner = npcs::CompanionOwner(npc);
+    return owner && owner != net::LocalId();
+}
+
+// The relation the game shows in the name tag and every later script reads. It is the NPC's relation to this machine's
+// player: a downed player is no reason to forget it, a puppet standing in for the player (Acting scope) is not whom the tag
+// is for, and a passive mirror has the host's relation, never this machine's own script's.
+GEInt FocusNameAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    ++relationQueries;
+    eCEntity* judge = Self(spu, self);
+    int hostAttitude = 0;
+    if (judge && npcs::IsMirrored(judge) && npcs::HostAttitude(judge, hostAttitude)) {
+        ++relationMirrorAnswered;
+        return hostAttitude;
+    }
+    eCEntity* actor = guards::CurrentActor();
+    if (judge && relation::FocusNameContext(actor != nullptr, actor && LedByRemotePlayer(judge)) == relation::Context::LocalPlayer) {
+        ++relationScopeCleared;
+        guards::LocalPlayer local(true);
+        Entity player(remote::ControlledBody());
+        if (player.GetInstance() && player.GetInstance() != judge)
+            return originalAttitude(spu, self, &player, args);
+    }
+    eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (HostNpc(judge) && downed::CombatUnavailable(target)) ++relationDownedAllowed;
+    return originalAttitude(spu, self, other, args);
+}
+
 GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ShuttingDown()) return originalAttitude ? originalAttitude(spu, self, other, args) : 0;
+    if (focusNameReturn && reinterpret_cast<uintptr_t>(_ReturnAddress()) == focusNameReturn)
+        return FocusNameAttitude(spu, self, other, args);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
-    if (RejectDownedTarget(Self(spu, self), target, "attitude-refused")) return gEAttitude_None;
+    if (relation::RefuseDownedAttitude(false, true) && RejectDownedTarget(Self(spu, self), target, "attitude-refused")) return gEAttitude_None;
     if (playerAttitudeQueries) return originalAttitude(spu, self, other, args);
     if (target && remote::IsPuppet(target)) {
         ++attitudeAsked;
@@ -860,6 +916,28 @@ bool TryPlayerAttitude(eCEntity* self, eCEntity* player, int& attitude)
     return true;
 }
 unsigned AttitudeAsked() { return attitudeAsked; }
+bool LocalAttitude(eCEntity* self, int& attitude)
+{
+    if (!self || !originalAttitude || ShuttingDown() || !guards::PlayerContextReady()) return false;
+    guards::LocalPlayer local(true);
+    Entity player(remote::ControlledBody());
+    if (!player.GetInstance() || player.GetInstance() == self) return false;
+    struct Query {
+        Query() { ++playerAttitudeQueries; }
+        ~Query() { --playerAttitudeQueries; }
+    } query;
+    Entity npc(self);
+    attitude = static_cast<int>(originalAttitude(nullptr, &npc, &player, 0));
+    return true;
+}
+void RelationStats(unsigned& queries, unsigned& scopeCleared, unsigned& downedAllowed, unsigned& mirrorAnswered)
+{
+    queries = relationQueries;
+    scopeCleared = relationScopeCleared;
+    downedAllowed = relationDownedAllowed;
+    mirrorAnswered = relationMirrorAnswered;
+}
+bool RelationHooked() { return focusNameReturn != 0; }
 unsigned AttitudeRedirected() { return attitudeRedirected; }
 unsigned AttitudeFleeKept() { return attitudeFleeKept; }
 void AttitudeOff(void (*log)(char const*))
@@ -1012,7 +1090,11 @@ void Tick()
                              reinterpret_cast<void*>(&FilterAttitude), "ai GetAttitude script");
             }
             attitudeInstalled = true;
+            if (attitudeNative) focusNameReturn = VerifiedFocusNameReturn();
             Logf("ai: GetAttitude wrapped (%s; puppets count as the local hero)", attitudeNative ? "native jump" : "script table only");
+            Logf("ai: name-colour writers (GetFocusNameAttitude call site) %s",
+                 focusNameReturn ? "verified: the local relation is stored, never None for a downed player, never a puppet's"
+                                 : "NOT verified in this build; relation fixes inactive");
         }
     }
     if (gCSession::GetInstance().IsGameRunning()) downed::InstallTerminalGuards();

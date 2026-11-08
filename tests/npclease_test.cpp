@@ -275,19 +275,25 @@ static void TestEligibilityAndWrap()
     Eligibility eligibility{};
     Interest interest{};
     interest.hostRoi = 8000;
-    interest.hostDistance = 12000;
+    interest.hostDistance = 11999;
     interest.clientDistance = ClientRadiusCm;
     assert(!eligibility.Delegate(interest, 100));
-    assert(!eligibility.Delegate(interest, 3099));
-    assert(eligibility.Delegate(interest, 3100));
-    assert(eligibility.farHeld);
+    assert(!eligibility.farHeld && !eligibility.dwellActive);
+    interest.hostDistance = 12000;
+    assert(eligibility.Delegate(interest, 101));
+    assert(eligibility.farHeld && !eligibility.dwellActive);
 
     interest.hostDistance = 11000;
     assert(eligibility.Delegate(interest, 3200));
     assert(eligibility.farHeld);
-    interest.hostDistance = 9999;
+    assert(!eligibility.Recall(interest));
+    interest.hostDistance = 10000;
     assert(!eligibility.Delegate(interest, 3300));
     assert(!eligibility.farHeld);
+    assert(eligibility.Recall(interest));
+    interest.hostDistance = 12000;
+    assert(eligibility.Delegate(interest, 3301));
+    assert(eligibility.farHeld);
 
     eligibility.farHeld = true;
     eligibility.farSince = 100;
@@ -310,6 +316,36 @@ static void TestEligibilityAndWrap()
     farAway.hostDistance = 12000;
     farAway.clientDistance = 4000;
     assert(!eligibility.Recall(farAway));
+
+    Eligibility largerRoi{};
+    Interest wider = farAway;
+    wider.hostRoi = 15000;
+    wider.hostDistance = 16999;
+    assert(!largerRoi.Delegate(wider, UINT32_MAX));
+    wider.hostDistance = 17000;
+    assert(largerRoi.Delegate(wider, UINT32_MAX));
+    wider.hostDistance = 15001;
+    assert(largerRoi.Delegate(wider, 0) && !largerRoi.Recall(wider));
+    wider.hostDistance = 15000;
+    assert(largerRoi.Recall(wider) && !largerRoi.Delegate(wider, 1));
+
+    Interest refusal{};
+    refusal.sameWorld = false;
+    refusal.ready = false;
+    refusal.eligible = false;
+    refusal.conflict = true;
+    refusal.clientDistance = ClientRadiusCm + 1;
+    assert(std::strcmp(DelegateRefusal(refusal), "client not in the host's world") == 0);
+    refusal.sameWorld = true;
+    assert(std::strcmp(DelegateRefusal(refusal), "client state stale or checkpoint busy") == 0);
+    refusal.ready = true;
+    assert(std::strcmp(DelegateRefusal(refusal), "host authority guards unavailable") == 0);
+    refusal.eligible = true;
+    assert(std::strcmp(DelegateRefusal(refusal), "another client shares this NPC") == 0);
+    refusal.conflict = false;
+    assert(std::strcmp(DelegateRefusal(refusal), "NPC outside the client ring") == 0);
+    refusal.clientDistance = ClientRadiusCm;
+    assert(std::strcmp(DelegateRefusal(refusal), "host presents it within its own reach") == 0);
 
     assert(Reached(0, 0xffffffffu));
     assert(!Reached(0, 1));
@@ -381,16 +417,23 @@ static void TestHostPresenceEligibility()
     assert(range.Delegate(interest, 101));
     interest.clientDistance = ClientRadiusCm + 1;
     assert(!range.Delegate(interest, 102));
+    assert(range.farHeld && !range.dwellActive);
+    interest.clientDistance = ClientRadiusCm;
+    assert(range.Delegate(interest, 103));
 
     Eligibility bypass{};
     interest.hostPresent = true;
-    interest.hostDistance = 12000;
+    interest.hostDistance = 11999;
     interest.clientDistance = ClientRadiusCm;
     assert(!bypass.Delegate(interest, 100));
-    assert(bypass.dwellActive);
+    assert(!bypass.farHeld && !bypass.dwellActive);
     interest.hostPresent = false;
     assert(bypass.Delegate(interest, 101));
-    assert(!bypass.dwellActive);
+    assert(bypass.farHeld && !bypass.dwellActive);
+    interest.hostPresent = true;
+    assert(bypass.Delegate(interest, 102));
+    interest.hostDistance = 10000;
+    assert(!bypass.Delegate(interest, 103) && !bypass.farHeld);
 }
 
 static void TestLeaseGrantAndExpiry()

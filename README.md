@@ -23,25 +23,20 @@ Missing idle resources retain native rendering with an explicit unproven-pose di
 Statues and other non-character interaction entities are excluded from NPC presentation. This is not native
 routine walking or authority delegation for humans, merchants or story actors; those still require portable
 inventory/equipment and world-script transactions before safe client ownership and latest-state hand-back.
-Host-authorized generic creature leases explicitly queue native entity processing before starting AI. Initial
-collection remains script-fenced for at most 500 ms; running owners have no processing-loss grace. Only a valid
-client lease within 10000 cm of its controlled hero extends creature processing, without changing the camera,
-static culling or hero ROI membership. Native activation retires passive zero-speed animation slots before
-restarting the routine. `npclease: readiness` at activation and once per second reports `e0` (range), `e8`
-(processable), `entity_enabled`, `disabled`, `native`, `collecting`, task/state, hero/camera distances and the
-remaining permit. Frozen/cut diagnostics retain the exact loss reason; expiry never restarts client AI.
-Idle and cosmetic hit clips use native rig/pose/direction resource resolution without running scripts or applying damage.
-The host can authorize client-discovered mortal humans, orcs and goblins with no host instance or canonical record,
-in addition to generic creatures and livestock. Ordinary actors require a complete native template, no authored
-quest/dialogue reference and no trader, teacher, party, summon or owned-entity role. Equipped ordinary actors are
-allowed only through this host-confirmed discovery path; a packet timeout alone never grants authority.
-These owners run native routines, movement and combat. Hand-back imports their latest accepted scalar state
-(position, health, life, attitude and routine), never replays Kill/XP and never creates another host instance.
-Inventory/equipment remain each machine's native/personal state: client equipment changes and executing
-task/crime stacks are not transferred. Existing story/dialogue/crime journals and personal loot remain separate.
-Quest/dialogue actors, companions, merchants and teachers stay host-owned; without host presentation they get
-script-free animated idle and cosmetic hit reactions, not native walking or local damage. Client-only NPC state
-is not saved. The census distinguishes native ownership, visual fallback and unresolved resource failures.
+Client-first NPC ownership: an NPC the client has loaded and the host is not presenting (no fresh host stream) is taken
+over by the client immediately and runs natively (routine, movement, animation, combat AI, hit reactions, damage,
+death, dialogue, trade) for every ordinary NPC class, including humans, orcs, goblins, slaves, guards, merchants,
+named/quest/dialogue actors and all creatures; only the hero, remote puppets, replicated summons/party/owned actors,
+item/spell actors, duplicate identities, authored removals and host-streamed NPCs stay host-driven (`src/npcown_policy.h`
+is the engine-free decision table). The host handshake (`Adopt` with the client's latest checkpoint, then
+`Offer`/`Prepared`/`Commit`) runs asynchronously and never gates animating or reacting; a failed registration, lease
+expiry, silent host, pause or checkpoint never freezes a client-owned NPC. Native processing registration is an
+optimization only (`npc-own: event=registration` names the path: already-processed / queued / enabled). A fresh host stream
+for an owned NPC wins and the client yields; hand-back imports the latest accepted scalar state (position, health,
+life, attitude and routine), never replays Kill/XP and never creates another host instance. Inventory/equipment remain
+each machine's native/personal state. Client-only NPC state is not saved.
+`npc-own: summary` (every 5 s) and `npc-own: event=...` (per NPC transition) lines in `g3together.log` explain exactly
+where any NPC stopped working. The census distinguishes native ownership, visual fallback and unresolved resource failures.
 NPC captures use a fixed 60 Hz deadline; diagnostics report missed captures when the host is slower.
 A client's successful hit plays an immediate presentation-only flinch and counts despite a host-side parry.
 Hit identities suppress the corresponding echoed reaction. Hero damage is judged against locally presented contacts,

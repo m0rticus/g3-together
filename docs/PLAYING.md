@@ -179,27 +179,32 @@ The host can select `ardea_remove_npcs = Goblin,Ogre`, `Goblin`, `Ogre`, or an e
 the rule. Names are exact; invalid/duplicate names are logged and leave the previous setting unchanged.
 Clients follow the host's reliable removal records, including after rejoining/loading.
 Choose the setting before making the co-op save: disabled entity flags already written into a save are retained.
-`npc_authority_fallback = on` (the default on both copies) enables host-authorized client AI for generic,
-mortal, unequipped creatures, including the original wildlife plus trolls, minecrawlers, lurkers, golems,
-gargoyles and other explicitly supported creature species. Instance and creator names must match the generic
-species template; named variants, humans/humanoids, livestock, equipped, dialogue/merchant/teacher/party/summon
-actors remain host-owned. Exactly one connected client is supported, within 100 m of the NPC.
+`npc_authority_fallback = on` (the default on both copies) makes a client-loaded NPC live natively on the client
+whenever the host is not presenting it (no fresh host stream): humans, orcs, goblins, slaves, guards, merchants and
+other named/quest/dialogue actors, immortals, equipped actors and every creature class run their routine, movement,
+animation, combat AI, hit reactions, damage, death, dialogue and trade natively. Only the hero, remote player puppets,
+replicated summons/party/owned actors, item/spell actors, duplicate identities, authored removals and NPCs the host is
+currently streaming stay host-driven. There is no per-NPC dwell: ownership starts at once, after one stream-settle grace
+(at most 2 s, or the host's first NPC batch) per session. A host stream that arrives for an owned NPC wins: the client
+yields (local state is discarded, nothing freezes) and a 1.5 s cool-down prevents flapping.
 
-Missing host processing or presentation no longer has a three-second admission delay. A reliable
-Offer/Prepared/Commit cut still precedes native client driving; packet loss or an unavailable host never
-authorizes speculative double simulation. Client-streamed creatures without a host instance can be adopted
-after native-template validation, without spawning a duplicate host entity. Released or late live mirrors
-hold their last valid skeletal pose with contacts disabled; an entity without a valid pose is temporarily
-hidden, not made dead. Excluded actors use this same harmless degraded presentation.
+The host handshake runs asynchronously: the client sends its latest checkpoint (`Adopt`), the host grants an epoch
+(`Offer`/`Prepared`/`Commit`) when it is not presenting that NPC, and from then on receives 5 Hz state. A refused, late
+or lost handshake, a silent or paused host, a checkpoint, a save, a failed processing registration or an expired lease
+window never stops a client-owned NPC. Processing registration (`RegisterProcessing`) only reports which native path
+(already processed / queued / enabled) put the NPC in the engine lists. One owner per NPC: if a lower-numbered client is
+also within 100 m of it, that client owns it and this one keeps it visual-only.
 
-Hand-back requires a usable host instance in the primary host ROI, inside the distance hysteresis band.
-The client cuts a calm state, the host imports latest accepted transform/HP/life/routine/status and restarts
-before committing a newer authority epoch. Late pre-handoff poses cannot overwrite the cut. Combat can defer
-the cut for at most ten seconds; no executing AI stack, equipment inventory or PhysX state is copied.
-Personal loot stays personal; import never reruns Kill, XP or treasure generation.
-Disconnects, loading, a paused/unresponsive host, lost native readiness or disabled fallback freeze client AI
-before its three-second lease expires. The host retains the last accepted state until it can import it.
-New takeover during a host stall is not implemented: that requires pre-issued standby permits.
+Hand-back: when the host walks into range the host recalls the NPC; the client cuts from its latest state (combat can
+defer the cut for at most ten seconds), the host imports the latest accepted transform/HP/life/attitude/routine,
+restarts natively and commits a newer epoch, and the client yields to the host stream. If the host cannot commit within
+2.5 s the client reclaims the NPC instead of leaving it frozen. The host keeps its own inventory/equipment; personal loot
+stays personal; import never reruns Kill, XP or treasure generation (the native death on the client runs once, the host
+journals the quest effect once).
+Read `npc-own:` lines in the log: every 5 s `npc-own: summary` (host_streamed / native_owned / confirmed / visual_only /
+waiting / refused / frozen with top reasons, hits_applied, deaths, hand_backs, yields, takeovers, reclaims, registration
+paths) and one `npc-own: event=...` line per transition per NPC (loaded, owned, confirmed, waiting, refused, hit,
+reaction, death, frozen, yielded, handback, reclaimed, host-silent, registration).
 `npc_authority_fallback = off` keeps the pure host model and safe unavailable presentation.
 
 Save with both players together. Client-owned NPC state never blocks a save: only the host's native world
@@ -231,7 +236,8 @@ Player-puppet smoothing remains separate.
 one-way timing**; `arrival_age` is time since the newest local receive. `underruns` counts buffer recovery events in the
 currently tracked NPCs; age/lag maxima can include a deliberately held terminal pose. Do not add these estimates to an
 RTT as if all components were disjoint.
-The host also sends each NPC's attitude to the player, so name-tag colours (green, white, orange, red) match on both PCs. While
+The host also sends each NPC's attitude to the player, so name-tag colours (green, white, orange, red) match on both PCs, also
+while either player lies knocked out and after the revive (the colour is the NPC's relation, never changed by a knock-out). While
 you talk to an NPC on the client, that one NPC's script routine runs locally so its voiced lines play; the host still holds
 and animates it. Both are built for manual testing and not yet verified live.
 
