@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/steam_send.h"
+#include "../src/steam_config.h"
 #include "../src/net.h"
 #include <cassert>
 #include <cmath>
@@ -47,19 +48,21 @@ static void RetentionAndPriority()
     assert(queue.Push(codec, baseline.data(), baseline.size(), 150));
     assert(queue.Push(codec, player.data(), player.size(), 160));
     assert(queue.Drain([](Item const&) { return Ignored; }) == Ignored);
-    assert(queue.Depth() == 3 && queue.counters.retries == 2);
+    assert(queue.Depth() == 3 && queue.counters.retries == 4);
     std::vector<unsigned> order;
     assert(queue.Drain([&](Item const& item) {
         order.push_back(Channel(codec, item));
         assert(item.Flags() & AutoRestart);
-        assert(item.reliable ? !(item.Flags() & NoDelay) : (item.Flags() & NoDelay));
+        assert(item.Flags() & NoDelay);
+        assert(!(item.Flags() & Reliable)); // even ENet reliable: only one retransmission layer
         return Ok;
     }) == Ok);
     assert((order == std::vector<unsigned>{0,7,4}));
     assert(queue.Depth() == 0 && queue.Bytes() == 0);
     assert(queue.counters.reliableAccepted == 1 && queue.counters.unreliableAccepted == 2);
     assert(queue.counters.playerStates == 1);
-    assert(queue.counters.failed[25] == 1 && queue.counters.failed[16] == 1);
+    assert(queue.counters.failed[25] == 1 && queue.counters.failed[41] == 3);
+    assert(!Retryable(Timeout)); // EResult 16 is not Ignored/NoDelay
 
     assert(queue.Push(codec, pose.data(), pose.size(), UINT32_MAX - 20));
     assert(queue.Push(codec, pose.data(), pose.size(), UINT32_MAX - 10));
@@ -79,6 +82,36 @@ static void RetentionAndPriority()
         return Ignored;
     }) == Ignored);
     assert(submissions == 2 && queue.Depth() == 1); // delayed motion cannot block reliable activity/ACKs
+}
+
+static void CapacityConfiguration()
+{
+    using namespace g3t::steam::config;
+    std::array<int32_t, 4> values{512 * 1024, 256 * 1024, 256 * 1024, 5000};
+    unsigned writes = 0;
+    auto get = [&](int id) { return Read{2, Int32, values[id - SendBufferSize]}; };
+    auto set = [&](int id, int32_t value) {
+        ++writes;
+        values[id - SendBufferSize] = value;
+        return true;
+    };
+    for (auto const& setting : Settings) {
+        auto result = Apply(setting, get, set);
+        assert(result.Verified());
+    }
+    assert(writes == 2);
+    assert((values == std::array<int32_t, 4>{Capacity, 256 * 1024, Capacity, 5000}));
+    values[0] = Capacity * 2;
+    assert(Apply(Settings[0], get, set).Verified() && writes == 2);
+    values[0] = 1024;
+    auto rejected = Apply(Settings[0], get, [](int, int32_t) { return false; });
+    assert(!rejected.Verified() && rejected.after.value == 1024);
+    auto unreadable = Apply(Settings[0], [](int) { return Read{-1, 0, 0}; }, set);
+    assert(!unreadable.Verified() && writes == 2);
+    auto wrongType = Apply(Settings[0], [](int) { return Read{1, 3, 1024}; }, set);
+    assert(!wrongType.Verified() && writes == 2);
+    auto unverified = Apply(Settings[0], get, [](int, int32_t) { return true; });
+    assert(!unverified.Verified()); // accepted write alone is not an effective-value check
 }
 
 static void SplittingAndRetransmissions()
@@ -156,7 +189,7 @@ static void UnclassifiedRetention()
         assert(queue.Depth() == 5 && queue.Bytes() == bytes);
     }
     assert(queue.counters.retries == 2 && queue.counters.failed[25] == 1 &&
-           queue.counters.failed[16] == 1 && queue.counters.unreliableFailed == 2);
+           queue.counters.failed[41] == 1 && queue.counters.unreliableFailed == 2);
     size_t index = 0;
     assert(queue.Drain([&](Item const& item) {
         assert(!item.reliable && item.bytes == unknown[index < 4 ? index : 1]);
@@ -167,6 +200,57 @@ static void UnclassifiedRetention()
     assert(queue.counters.accepted[static_cast<unsigned>(Priority::Bulk)] == 5);
     assert(queue.counters.unreliableAccepted == 5 &&
            queue.counters.bytes[static_cast<unsigned>(Priority::Bulk)] == bytes);
+}
+
+static void RepackedRetransmissions()
+{
+    Codec codec;
+    Queue queue;
+    auto first = Command(1, 7, true, {6,8,9});
+    auto second = Command(1, 8, true, {6,1,2});
+    assert(queue.Push(codec, first.data(), first.size(), 10));
+    auto repacked = first;
+    repacked[3] = 30; // ENet's retransmit timestamp is not part of command identity
+    repacked.insert(repacked.end(), second.begin() + 4, second.end());
+    assert(queue.Push(codec, repacked.data(), repacked.size(), 20));
+    assert(queue.Depth() == 2 && queue.counters.duplicates == 1);
+    std::vector<std::vector<uint8_t>> decoded;
+    assert(queue.Drain([&](Item const& item) {
+        std::vector<uint8_t> plain;
+        assert(codec.Decode(item.bytes.data(), item.bytes.size(), plain));
+        decoded.push_back(plain);
+        return Ok;
+    }) == Ok);
+    auto expectedSecond = second;
+    expectedSecond[3] = 30;
+    assert((decoded == std::vector<std::vector<uint8_t>>{first, expectedSecond}));
+    assert(queue.Push(codec, repacked.data(), repacked.size(), 30));
+    assert(queue.Depth() == 1); // accepted commands may be retransmitted after real network loss
+}
+
+static void IndependentRefusals()
+{
+    Codec codec;
+    Queue queue;
+    auto save = Command(6, 1, true, {40,0});
+    auto definition = Command(7, 1, true, {47,0});
+    auto player = Command(0, 1, false, {3,0});
+    auto action = Command(1, 1, true, {6,0});
+    for (auto const& packet : {save, definition, player, action})
+        assert(queue.Push(codec, packet.data(), packet.size(), 100));
+    std::vector<unsigned> accepted;
+    assert(queue.Drain([&](Item const& item) {
+        const unsigned channel = Channel(codec, item);
+        if (channel == 1) return LimitExceeded;
+        if (channel == 7) return Ignored;
+        accepted.push_back(channel);
+        return Ok;
+    }) == LimitExceeded);
+    assert((accepted == std::vector<unsigned>{0,6}));
+    assert(queue.Depth() == 2 && queue.counters.playerStates == 1);
+    assert(queue.counters.peakDepth == 4 && queue.counters.peakBytes >= queue.Bytes());
+    assert(queue.Drain([](Item const&) { return Ok; }) == Ok);
+    assert(queue.Depth() == 0);
 }
 
 static void FragmentRoundtrip()
@@ -282,10 +366,13 @@ static void SaturatedNpcStream()
 int ENET_CALLBACK main()
 {
     RetentionAndPriority();
+    CapacityConfiguration();
     SplittingAndRetransmissions();
     UnclassifiedRetention();
+    RepackedRetransmissions();
+    IndependentRefusals();
     FragmentRoundtrip();
     PayloadSavings();
     SaturatedNpcStream();
-    std::puts("Steam queue: retained 25/16, priority isolation, exact compression, fragments and retransmission dedup passed");
+    std::puts("Steam queue: retained 25/41 (16=Timeout), independent priority, single reliability, exact compression, fragments and command retransmission dedup passed");
 }

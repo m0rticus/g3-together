@@ -429,11 +429,32 @@ datagrams/bytes per second and exact relay framing share. `valve` reports the NP
 queue, offered rate and the bulk pacing credit. Steam API counts still exclude encryption, SDR, UDP/IP and other physical-network overhead.
 ENet's existing lossless range coder is enabled at both endpoints. The Steam worker separates
 critical, definition, NPC pose and save commands, recompresses each group only when smaller,
-and retains result-25/16 submissions for priority-first retry. Reliable ENet commands remain
-reliable at Steam; unreliable samples use NoDelay without discarding refused samples locally.
+and retains result-25/41 submissions for priority-first retry (EResult 16 is Timeout,
+not Ignored). All ENet datagrams use
+Steam unreliable/NoNagle/NoDelay: ENet alone owns data ACKs and retransmission, avoiding
+a second reliable queue and its cross-channel head-of-line blocking. Native Steam
+negotiation and reliable hello/welcome/bye controls keep their existing flags.
+Pending reliable ENet commands are deduplicated even when retries are packed differently;
+unreliable samples are never deduplicated. A refused queue does not block attempts from
+other priority/reliability queues.
 NPC definitions use a separate ordered ENet channel so they cannot block player metadata.
 The engine-free structured 588-byte NPC record/80-affine-bone fixture saves over 40%;
-`steam-send:` reports actual live savings, accepted player commands, failures and queue age.
+`steam-send:` reports actual live savings, accepted player commands, failures by result
+and queue age/peaks. `enet_reliable_ok` describes the inner commands; `steam_reliable_ok`
+describes actual Steam reliable submissions, normally only the small native controls.
+At initialization the optional Steam Utils config API raises `SendBufferSize` and
+`SendRateMax` capacity ceilings to at least 4 MiB and 4 MiB/s, preserving larger existing
+values. The maximum is a transport pacing ceiling, not newly created physical capacity
+or a guarantee that Steam's estimator will increase throughput. There is
+no NPC cap or forced minimum throughput. `SendRateMin` and `NagleTime` are preserved;
+NoNagle is selected per message. Config logs record before/requested/effective values
+and verification; an older stand-in without the config exports is explicitly reported.
+`steam-send: session` reads Steam's own send-rate estimate, pending unreliable/reliable
+bytes, sent-unacknowledged reliable bytes and estimated queue delay, rather than
+equating API acceptance with delivery. `available=0` means that telemetry is unavailable.
+Steam Messages channels are receive demultiplexing, not priority lanes, so an inadequate
+physical link can still accumulate retained data. Absolute bounded delivery latency
+requires real-Steam acceptance, not a successful API submission.
 High-entropy payloads remain exact and do not grow. Both endpoints require the same rebuilt
 DLL; application protocol 77 and NPC wire layouts are unchanged. Real-Steam throughput and
 CPU cost still require manual acceptance; there is no new NPC cap or send-rate limit.

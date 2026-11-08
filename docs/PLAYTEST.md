@@ -47,10 +47,17 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 - [ ] Inspect the five-second `steam-send:` windows. `player_state_commands` must
   advance in both directions; `critical`, `definition` and `npc_pose` report accepted
   datagrams/bytes. `plain_bytes` versus `wire_bytes` measures actual lossless savings.
-  Result 25 (LimitExceeded) and result 16 (Ignored/NoDelay) must say
-  `action=retained-for-retry`; `queue_bytes`/`oldest_ms` must recover after a burst,
+  Result 25 (LimitExceeded) and result 41 (Ignored/NoDelay; 16 is Timeout) must say
+  `data_action=retained-for-retry`; `queue_bytes`/`oldest_ms` and their peak fields must recover after a burst,
   not grow continuously. `npc_updates_dropped=0` describes our local queue policy,
   not a guarantee against ordinary network loss.
+- [ ] Check startup `steam-send: config` for verified effective `SendBufferSize`
+  and `SendRateMax` capacity headroom, with `SendRateMin`/`NagleTime` unchanged.
+  Data must report `data_reliability=ENet-only`, `data_flags=37`; actual
+  `steam_reliable_ok` should contain native controls, not the NPC/save stream.
+  Correlate `steam-send: enet` throttle, reliable queues and RTT with the same
+  window's result codes and `steam-send: session` actual Steam pending bytes,
+  send-rate estimate and `queue_us`. A continuously growing queue is not acceptance.
 - [ ] Confirm `net: pose bandwidth` gains ACKs/deltas after entry, compact kind 49
   is used when its definition is acknowledged, and reliable queues/RTT do not climb
   indefinitely. Pending definitions must not repeatedly invalidate their own ACKs.

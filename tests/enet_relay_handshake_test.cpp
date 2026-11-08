@@ -118,6 +118,7 @@ struct Relay {
     ENetSocket clientSide = ENET_SOCKET_NULL, serverSide = ENET_SOCKET_NULL;
     ENetAddress clientSideAddress{}, serverSideAddress{}, clientAddress{}, serverAddress{};
     bool haveClient = false, holdUnknown = false, criticalBeforeUnknown = false;
+    bool impaired = false, refusedConnect = false, lostConnect = false, lostVerify = false;
     const std::vector<uint8_t> unknown{0, 0, 0x0d, 0, 0, 0};
     Codec codecs[2];
     Queue queues[2];
@@ -156,9 +157,32 @@ static void PumpSide(Relay& relay, unsigned direction)
         assert(queue.Push(codec, bytes, static_cast<size_t>(length), enet_time_get(), &pushed));
         assert(pushed.valid && pushed.firstCommand == decoded.firstCommand &&
                pushed.command == decoded.command && pushed.commandBytes == decoded.commandBytes);
+        if (relay.impaired && direction == 0 && !relay.refusedConnect) {
+            assert(capture.receivedDatagrams == 1 && capture.connect == 1 && compressed);
+            assert(decoded.firstCommand == ENET_PROTOCOL_COMMAND_CONNECT);
+            assert(queue.Depth() == 1 && queue.Bytes() > 0);
+            std::vector<uint8_t> refused;
+            assert(queue.Drain([&](Item const& item) {
+                assert(item.Flags() == 37 && item.reliable && (item.bytes[0] & 0x40u));
+                refused = item.bytes;
+                return LimitExceeded;
+            }) == LimitExceeded);
+            assert(!refused.empty() && queue.Depth() == 1 && queue.Bytes() == refused.size());
+            assert(queue.counters.failed[25] == 1 && queue.counters.retries == 1);
+            relay.refusedConnect = true;
+            assert(queue.Drain([&](Item const& item) {
+                assert(item.Flags() == 37 && item.reliable && item.bytes == refused);
+                relay.lostConnect = true;
+                ++capture.submittedDatagrams;
+                return Ok; // Accepted by Steam, then lost before the host receives it.
+            }) == Ok);
+            assert(relay.lostConnect && queue.Depth() == 0 && queue.Bytes() == 0);
+            continue;
+        }
         if (relay.holdUnknown && direction == 0 && !critical) continue;
 
         assert(queue.Drain([&](Item const& item) {
+            assert(item.Flags() == 37);
             if (item.bytes == relay.unknown) {
                 assert(relay.holdUnknown && relay.criticalBeforeUnknown && !item.reliable);
                 relay.holdUnknown = false;
@@ -170,6 +194,13 @@ static void PumpSide(Relay& relay, unsigned direction)
                 if (Observe(output, (item.bytes[0] & 0x40u) != 0, outputCapture))
                     relay.criticalBeforeUnknown = true;
                 capture.outboundCompressed += (item.bytes[0] & 0x40u) != 0;
+                if (relay.impaired && direction == 1 && outputCapture.verify && !relay.lostVerify) {
+                    assert(relay.lostConnect && relay.captures[0].connect >= 2 &&
+                           capture.verify == 1 && outputCapture.compressedVerify == 1 && item.reliable);
+                    relay.lostVerify = true;
+                    ++capture.submittedDatagrams;
+                    return Ok; // Also lose the first accepted VERIFY_CONNECT.
+                }
             }
             auto const& to = direction == 0 ? relay.serverAddress : relay.clientAddress;
             ENetBuffer out{item.bytes.size(), const_cast<uint8_t*>(item.bytes.data())};
@@ -210,6 +241,8 @@ static void Service(ENetHost* host, State& state)
             ++state.disconnected;
         } else if (event.type == ENET_EVENT_TYPE_RECEIVE) {
             assert(event.channelID < g3t::net::ChannelCount);
+            if (event.channelID == g3t::net::ChannelReliable)
+                assert(event.packet->flags & ENET_PACKET_FLAG_RELIABLE);
             auto const expected = Payload(state.round, state.other, event.channelID);
             assert(event.packet->dataLength == expected.size());
             assert(std::memcmp(event.packet->data, expected.data(), expected.size()) == 0);
@@ -232,9 +265,10 @@ static void Tick(ENetHost* client, State& cs, ENetHost* server, State& ss, Relay
 }
 
 template<class Predicate>
-static void Until(Predicate done, ENetHost* client, State& cs, ENetHost* server, State& ss, Relay& relay)
+static void Until(Predicate done, ENetHost* client, State& cs, ENetHost* server, State& ss, Relay& relay,
+                  int seconds = 3)
 {
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     while (!done() && std::chrono::steady_clock::now() < deadline)
         Tick(client, cs, server, ss, relay);
     assert(done());
@@ -258,6 +292,46 @@ static ENetSocket BindRelay(ENetAddress const& bind, ENetAddress& address)
     return socket;
 }
 
+static void ImpairedHandshake(ENetHost* client, ENetHost* server, Relay& relay)
+{
+    relay.impaired = true;
+    State cs{}, ss{};
+    cs.round = ss.round = 1;
+    cs.other = 1;
+    ss.other = 0;
+    ENetPeer* peer = g3t::net::ConnectTransportHost(client, &relay.clientSideAddress);
+    assert(peer);
+    Until([&] { return cs.connected == 1 && ss.connected == 1; }, client, cs, server, ss, relay, 10);
+    assert(relay.refusedConnect && relay.lostConnect && relay.lostVerify);
+    assert(relay.captures[0].connect >= 2 && relay.captures[0].compressedConnect >= 2);
+    assert(relay.captures[1].verify >= 2 && relay.captures[1].compressedVerify >= 2);
+    assert(peer == cs.peer && ss.peer && ss.connectData == 0);
+
+    SendChannel(client, cs.peer, 1, 0, g3t::net::ChannelReliable);
+    SendChannel(server, ss.peer, 1, 1, g3t::net::ChannelReliable);
+    Until([&] {
+        return cs.received == 1 && ss.received == 1 &&
+               !cs.peer->reliableDataInTransit && !ss.peer->reliableDataInTransit &&
+               !relay.queues[0].Depth() && !relay.queues[1].Depth();
+    }, client, cs, server, ss, relay, 10);
+    assert(cs.channelMask == (1u << g3t::net::ChannelReliable) &&
+           ss.channelMask == (1u << g3t::net::ChannelReliable));
+    assert(cs.connected == 1 && ss.connected == 1 && !cs.disconnected && !ss.disconnected);
+    assert(cs.peer->state == ENET_PEER_STATE_CONNECTED && ss.peer->state == ENET_PEER_STATE_CONNECTED);
+    for (unsigned direction = 0; direction < 2; ++direction) {
+        auto const& queue = relay.queues[direction];
+        assert(queue.Depth() == 0 && queue.Bytes() == 0 && queue.counters.unclassified == 0);
+        assert(queue.counters.failed[25] == (direction == 0 ? 1u : 0u));
+        assert(queue.counters.failed[16] == 0 && queue.counters.failed[41] == 0);
+        assert(queue.counters.retries == (direction == 0 ? 1u : 0u));
+    }
+    std::printf("impaired connected=2 exact_reliable_payloads=2 connect=%u compressed_connect=%u "
+                "verify=%u compressed_verify=%u result25=1 lost_connect=1 lost_verify=1 "
+                "flags=37 unclassified=0 queues_empty=2\n",
+                relay.captures[0].connect, relay.captures[0].compressedConnect,
+                relay.captures[1].verify, relay.captures[1].compressedVerify);
+}
+
 int ENET_CALLBACK main(int argc, char** argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "sizes") == 0) {
@@ -265,7 +339,9 @@ int ENET_CALLBACK main(int argc, char** argv)
         std::puts("all 13 native command sizes match");
         return 0;
     }
-    assert(argc == 1);
+    const bool impaired = argc == 2 && std::strcmp(argv[1], "impaired") == 0;
+    assert(argc == 1 || impaired);
+    static_assert(Ignored == 41 && Timeout == 16 && LimitExceeded == 25, "Steam EResult values");
     assert(enet_initialize() == 0);
     ENetAddress bind{ENET_HOST_ANY, 0};
     assert(enet_address_set_host_ip(&bind, "127.0.0.1") == 0);
@@ -284,6 +360,15 @@ int ENET_CALLBACK main(int argc, char** argv)
     relay.clientSide = BindRelay(bind, relay.clientSideAddress);
     relay.serverSide = BindRelay(bind, relay.serverSideAddress);
     assert(!Same(relay.clientSideAddress, relay.serverSideAddress));
+    if (impaired) {
+        ImpairedHandshake(client, server, relay);
+        enet_socket_destroy(relay.clientSide);
+        enet_socket_destroy(relay.serverSide);
+        enet_host_destroy(client);
+        enet_host_destroy(server);
+        enet_deinitialize();
+        return 0;
+    }
     for (unsigned round = 1; round <= 3; ++round) {
         State cs{}, ss{};
         cs.round = ss.round = round;
@@ -311,7 +396,7 @@ int ENET_CALLBACK main(int argc, char** argv)
             assert(queue.Push(relay.codecs[0], relay.unknown.data(), relay.unknown.size(), 1));
             for (int result : {LimitExceeded, Ignored}) {
                 assert(queue.Drain([&](Item const& item) {
-                    assert(item.bytes == relay.unknown && !item.reliable);
+                    assert(item.Flags() == 37 && item.bytes == relay.unknown && !item.reliable);
                     return result;
                 }) == result);
                 assert(queue.Depth() == 1 && queue.Bytes() == relay.unknown.size());
@@ -347,7 +432,8 @@ int ENET_CALLBACK main(int argc, char** argv)
                     direction, c.receivedDatagrams, c.submittedDatagrams, c.connect, c.compressedConnect,
                     c.verify, c.compressedVerify, c.ackOnly, c.reliable, c.unreliable, c.definitions, c.throttle);
     }
-    assert(relay.queues[0].counters.failed[25] == 1 && relay.queues[0].counters.failed[16] == 1);
+    assert(relay.queues[0].counters.failed[25] == 1 && relay.queues[0].counters.failed[41] == 1);
+    assert(relay.queues[0].counters.failed[16] == 0);
     assert(relay.queues[0].counters.accepted[static_cast<unsigned>(Priority::Bulk)] >= 1);
     enet_socket_destroy(relay.clientSide);
     enet_socket_destroy(relay.serverSide);

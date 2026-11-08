@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/enet_policy.h"
 #include "../src/net.h"
+#include "../src/steam_send.h"
 
 #include <cassert>
 #include <cstring>
@@ -8,15 +9,120 @@
 #include <vector>
 
 std::vector<size_t> datagramSizes;
-extern "C" int g3t_test_socket_send(ENetSocket, ENetAddress const*, ENetBuffer const* buffers, size_t count)
+namespace {
+bool relayActive = false;
+bool directSockets = false;
+ENetSocket senderSocket = ENET_SOCKET_NULL;
+g3t::steam::send::Codec relayCodec;
+g3t::steam::send::Queue toReceiver, toSender;
+}
+extern "C" int g3t_test_socket_send(ENetSocket socket, ENetAddress const* address, ENetBuffer const* buffers, size_t count)
 {
     size_t bytes = 0;
     for (size_t i = 0; i < count; ++i) bytes += buffers[i].dataLength;
     datagramSizes.push_back(bytes);
+    if (relayActive) {
+        std::vector<uint8_t> packet;
+        for (size_t i = 0; i < count; ++i) {
+            auto const* data = static_cast<uint8_t const*>(buffers[i].data);
+            packet.insert(packet.end(), data, data + buffers[i].dataLength);
+        }
+        auto& queue = socket == senderSocket ? toReceiver : toSender;
+        assert(queue.Push(relayCodec, packet.data(), packet.size(), enet_time_get()));
+    } else if (directSockets) {
+        return enet_socket_send(socket, address, buffers, count);
+    }
     return static_cast<int>(bytes);
 }
 
 namespace {
+void ReliableSteamRelay()
+{
+    using namespace g3t::steam::send;
+    ENetAddress address{ENET_HOST_ANY, 0};
+    assert(enet_initialize() == 0);
+    directSockets = true;
+    auto* sender = enet_host_create(&address, 1, 8, 0, 0);
+    auto* receiver = enet_host_create(&address, 1, 8, 0, 0);
+    assert(sender && receiver);
+    sender->mtu = receiver->mtu = 1200;
+    assert(enet_host_compress_with_range_coder(sender) == 0);
+    assert(enet_host_compress_with_range_coder(receiver) == 0);
+    address.port = receiver->address.port;
+    assert(enet_address_set_host_ip(&address, "127.0.0.1") == 0);
+    auto* peer = enet_host_connect(sender, &address, 8, 0);
+    assert(peer);
+    ENetEvent event{};
+    const auto deadline = enet_time_get() + 5000;
+    // Establish directly: the separate CONNECT-classifier regression owns that path.
+    while (peer->state != ENET_PEER_STATE_CONNECTED &&
+           static_cast<int32_t>(deadline - enet_time_get()) > 0) {
+        enet_host_service(receiver, &event, 1);
+        enet_host_service(sender, &event, 1);
+    }
+    assert(peer->state == ENET_PEER_STATE_CONNECTED);
+    enet_host_flush(receiver);
+    enet_host_service(sender, &event, 1);
+    senderSocket = sender->socket;
+    relayActive = true;
+    const std::vector<uint8_t> action(120, 0x5a), save(4000, 0x36);
+    auto* packet = enet_packet_create(action.data(), action.size(), ENET_PACKET_FLAG_RELIABLE);
+    assert(packet && enet_peer_send(peer, 1, packet) == 0);
+    packet = enet_packet_create(save.data(), save.size(), ENET_PACKET_FLAG_RELIABLE);
+    assert(packet && enet_peer_send(peer, 6, packet) == 0);
+    bool lostAction = false, refused = false;
+    unsigned actions = 0, saves = 0, steamReliable = 0;
+    while ((actions != 1 || saves != 1 || peer->reliableDataInTransit) &&
+           static_cast<int32_t>(deadline - enet_time_get()) > 0) {
+        enet_host_service(sender, &event, 1);
+        toReceiver.Drain([&](Item const& item) {
+            if (!refused) { refused = true; return LimitExceeded; }
+            assert(!(item.Flags() & Reliable));
+            steamReliable += (item.Flags() & Reliable) != 0;
+            std::vector<uint8_t> plain;
+            assert(relayCodec.Decode(item.bytes.data(), item.bytes.size(), plain));
+            const size_t header = plain[0] & 0x80u ? 4 : 2;
+            if (!lostAction && plain[header + 1] == 1) {
+                lostAction = true;
+                return Ok; // Steam accepted it; ordinary unreliable network loss follows.
+            }
+            ENetBuffer buffer{item.bytes.size(), const_cast<uint8_t*>(item.bytes.data())};
+            assert(enet_socket_send(sender->socket, &address, &buffer, 1) == static_cast<int>(buffer.dataLength));
+            return Ok;
+        });
+        while (enet_host_service(receiver, &event, 0) > 0) {
+            if (event.type != ENET_EVENT_TYPE_RECEIVE) continue;
+            assert(event.packet->flags & ENET_PACKET_FLAG_RELIABLE);
+            if (event.channelID == 1) {
+                assert(event.packet->dataLength == action.size());
+                assert(!std::memcmp(event.packet->data, action.data(), action.size()));
+                ++actions;
+            } else {
+                assert(event.channelID == 6 && event.packet->dataLength == save.size());
+                assert(!std::memcmp(event.packet->data, save.data(), save.size()));
+                ++saves;
+            }
+            enet_packet_destroy(event.packet);
+        }
+        enet_host_flush(receiver);
+        toSender.Drain([&](Item const& item) {
+            assert(!(item.Flags() & Reliable));
+            ENetBuffer buffer{item.bytes.size(), const_cast<uint8_t*>(item.bytes.data())};
+            ENetAddress target{peer->address.host, sender->address.port};
+            assert(enet_socket_send(receiver->socket, &target, &buffer, 1) == static_cast<int>(buffer.dataLength));
+            return Ok;
+        });
+    }
+    assert(refused && lostAction && actions == 1 && saves == 1 && steamReliable == 0);
+    assert(!peer->reliableDataInTransit);
+    assert(toReceiver.Depth() == 0 && toSender.Depth() == 0);
+    relayActive = false;
+    directSockets = false;
+    enet_host_destroy(sender);
+    enet_host_destroy(receiver);
+    enet_deinitialize();
+}
+
 void Queue(size_t size, enet_uint32 flags, enet_uint8 command, bool reliable, unsigned fragments,
            enet_uint32 mtu = 1200, bool checksum = false, enet_uint16 epoch = 0)
 {
@@ -116,6 +222,8 @@ int main(int argc, char** argv)
         assert(datagramSizes.size() == 2);
         for (size_t bytes : datagramSizes) assert(bytes >= 916 && bytes <= 1200);
         assert(host.totalSentPackets == 2);
+    } else if (!std::strcmp(argv[1], "steam")) {
+        ReliableSteamRelay();
     } else {
         assert(false);
     }

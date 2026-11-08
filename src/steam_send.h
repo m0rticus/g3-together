@@ -11,7 +11,7 @@
 #include <vector>
 
 namespace g3t::steam::send {
-constexpr int Ok = 1, Ignored = 16, LimitExceeded = 25;
+constexpr int Ok = 1, Timeout = 16, LimitExceeded = 25, Ignored = 41;
 constexpr int Reliable = 8, NoNagle = 1, NoDelay = 4, AutoRestart = 32;
 enum class Priority : unsigned { Critical, Definition, Pose, Bulk, Count };
 constexpr unsigned Classes = static_cast<unsigned>(Priority::Count);
@@ -68,15 +68,16 @@ public:
 
 struct Item {
     std::vector<uint8_t> bytes;
-    std::string retransmission;
+    std::vector<std::string> retransmissions;
     uint32_t at = 0;
     bool reliable = false;
     unsigned playerStates = 0;
     int Flags() const
     {
-        // NoDelay refuses a busy Steam queue; the application retains the exact
-        // datagram and retries it, rather than letting bulk fill that queue.
-        return AutoRestart | (reliable ? Reliable | NoNagle : NoDelay | NoNagle);
+        // ENet already owns ACKs/retransmission. Steam reliable would queue a
+        // second copy and impose ordering across ENet's independent channels.
+        // Retain NoDelay refusals here so priority stays under our control.
+        return AutoRestart | NoDelay | NoNagle;
     }
 };
 
@@ -88,6 +89,8 @@ struct Counters {
     uint64_t retries = 0, duplicates = 0, plainBytes = 0, wireBytes = 0;
     uint64_t playerStates = 0;
     uint64_t unclassified = 0;
+    size_t peakDepth = 0, peakBytes = 0;
+    uint32_t peakAge = 0;
 };
 
 class Queue {
@@ -124,10 +127,14 @@ public:
             ++counters.unclassified;
             counters.plainBytes += size;
             counters.wireBytes += size;
+            counters.peakDepth = (std::max)(counters.peakDepth, depth_);
+            counters.peakBytes = (std::max)(counters.peakBytes, bytes_);
+            counters.peakAge = (std::max)(counters.peakAge, OldestAge(now));
             return true;
         }
         const size_t header = plain[0] & 0x80u ? 4 : 2;
         std::array<std::vector<uint8_t>, Classes * 2> groups;
+        std::array<std::vector<std::string>, Classes * 2> retransmissions;
         std::array<unsigned, Classes * 2> playerStates{};
         for (size_t at = header; at < plain.size();) {
             const unsigned command = plain[at] & 15u;
@@ -145,6 +152,18 @@ public:
             else if (channel == 7 && command >= 6)
                 priority = Priority::Definition;
             const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
+            if (reliable) {
+                // An ENet retry may be packed beside different commands.
+                // Match the command, not that incidental datagram grouping.
+                std::string key(reinterpret_cast<char const*>(plain.data()), 2);
+                key.append(reinterpret_cast<char const*>(plain.data() + at), length);
+                if (!pendingReliable_.insert(key).second) {
+                    ++counters.duplicates;
+                    at += length;
+                    continue;
+                }
+                retransmissions[groupId].push_back(std::move(key));
+            }
             auto& group = groups[groupId];
             if ((command == 6 || command == 7) && channel == 0 &&
                 length > commandHeader && plain[at + commandHeader] == 3)
@@ -158,27 +177,23 @@ public:
             if (group.empty()) continue;
             const bool reliable = (i & 1u) == 0;
             auto& queue = queues_[i];
-            // Only duplicate ENet retransmissions are redundant. Never replace
-            // an unreliable NPC sample, including one with the same pose.
-            std::string retransmission;
-            if (reliable) {
-                retransmission.assign(reinterpret_cast<char const*>(group.data()), group.size());
-                if (header == 4) retransmission[2] = retransmission[3] = 0;
-                if (!pendingReliable_.insert(retransmission).second) { ++counters.duplicates; continue; }
-            }
             counters.plainBytes += group.size();
             codec.Encode(group);
             counters.wireBytes += group.size();
             bytes_ += group.size();
             ++depth_;
-            queue.push_back({std::move(group), std::move(retransmission), now, reliable, playerStates[i]});
+            queue.push_back({std::move(group), std::move(retransmissions[i]), now, reliable, playerStates[i]});
         }
+        counters.peakDepth = (std::max)(counters.peakDepth, depth_);
+        counters.peakBytes = (std::max)(counters.peakBytes, bytes_);
+        counters.peakAge = (std::max)(counters.peakAge, OldestAge(now));
         return true;
     }
 
     template<class Submit>
     int Drain(Submit submit)
     {
+        int blocked = Ok;
         for (unsigned i = 0; i < queues_.size(); ++i) {
             auto& queue = queues_[i];
             while (!queue.empty()) {
@@ -187,8 +202,12 @@ public:
                 if (result != Ok) {
                     ++counters.failed[result >= 0 && result < 128 ? result : 0];
                     ++(item.reliable ? counters.reliableFailed : counters.unreliableFailed);
-                    if (Retryable(result)) ++counters.retries;
-                    return result;
+                    if (!Retryable(result)) return result;
+                    ++counters.retries;
+                    if (blocked == Ok) blocked = result;
+                    // A refused large packet must not prevent a small ACK,
+                    // player state or independent channel from fitting.
+                    break;
                 }
                 ++counters.accepted[i / 2];
                 counters.bytes[i / 2] += item.bytes.size();
@@ -196,11 +215,11 @@ public:
                 ++(item.reliable ? counters.reliableAccepted : counters.unreliableAccepted);
                 bytes_ -= item.bytes.size();
                 --depth_;
-                if (item.reliable) pendingReliable_.erase(item.retransmission);
+                for (auto const& key : item.retransmissions) pendingReliable_.erase(key);
                 queue.pop_front();
             }
         }
-        return Ok;
+        return blocked;
     }
 };
 }

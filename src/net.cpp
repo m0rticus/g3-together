@@ -3604,7 +3604,7 @@ void BandwidthLog()
     detail::ForEachKindLine(bandwidth, [](char const* line) { Logf("%s", line); });
     detail::ForEachKindRateLine(bandwidth, perSecond, [](char const* line) { Logf("%s", line); });
     for (size_t i = 0; i < host->peerCount; ++i) {
-        ENetPeer const& peer = host->peers[i];
+        ENetPeer& peer = host->peers[i];
         if (peer.state != ENET_PEER_STATE_CONNECTED) continue;
         auto const snapshot = peerBudgets[i].Snapshot();
         Logf("net: valve peer=%u npc_stretch_permille=%u level=%u signals=%u queue_bytes=%u offered_bytes_per_s=%llu "
@@ -3616,6 +3616,14 @@ void BandwidthLog()
              peer.reliableDataInTransit, peer.roundTripTime, snapshot.baseRttMs, peer.packetThrottle,
              snapshot.pressureTransitions, budgetRate / 4, static_cast<long long>(snapshot.bulkCreditBytes),
              static_cast<unsigned long long>(snapshot.deferredCount));
+        Logf("steam-send: enet peer=%u throttle=%u/%u rtt_ms=%u reliable_inflight_bytes=%u "
+             "queued_commands=%u reliable_queued_commands=%u reliable_sent_commands=%u "
+             "reliability_owner=ENet steam_channels_are_not_lanes=1",
+             isHost ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer.data)) : 1u,
+             peer.packetThrottle, ENET_PEER_PACKET_THROTTLE_SCALE, peer.roundTripTime, peer.reliableDataInTransit,
+             static_cast<unsigned>(enet_list_size(&peer.outgoingCommands)),
+             static_cast<unsigned>(enet_list_size(&peer.outgoingSendReliableCommands)),
+             static_cast<unsigned>(enet_list_size(&peer.sentReliableCommands)));
     }
     bandwidth = detail::BandwidthCounters{};
     bandwidthSince = now;

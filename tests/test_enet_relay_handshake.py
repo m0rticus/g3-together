@@ -45,49 +45,59 @@ def win32_tool_environment(build):
 
 
 class EnetRelayHandshakeTests(unittest.TestCase):
-    def test_native_win32_compressed_handshake_through_both_queues(self):
+    @classmethod
+    def setUpClass(cls):
         if os.name != "nt":
-            self.skipTest("production /Gz Win32 ENet ABI requires Windows")
+            raise unittest.SkipTest("production /Gz Win32 ENet ABI requires Windows")
         build = ROOT / "build" / f"enet-relay-handshake-{os.getpid()}"
         build.mkdir(parents=True)
-        try:
-            env = win32_tool_environment(build)
-            compiler = shutil.which("cl.exe", path=env.get("PATH") or env.get("Path"))
-            self.assertIsNotNone(compiler, "Win32 compiler not found after vcvars32")
-            enet = ROOT / "thirdparty" / "enet"
-            include = enet / "include"
-            sources = sorted(enet.glob("*.c"))
-            objects = [build / (source.stem + ".obj") for source in sources]
-            commands = [
-                [compiler, "/nologo", "/TC", "/c", "/Gz", "/O2", "/W3",
-                 "/D_WINSOCK_DEPRECATED_NO_WARNINGS", f"/I{include}",
-                 *(str(source) for source in sources), f"/Fo{build}\\"],
-                [compiler, "/nologo", "/std:c++17", "/EHsc", "/Gz", "/O2", "/W4", "/WX",
-                 f"/I{include}", str(ROOT / "tests" / "enet_relay_handshake_test.cpp"),
-                 *(str(obj) for obj in objects), f"/Fo{build / 'test.obj'}",
-                 f"/Fe{build / 'test.exe'}", "/link", "ws2_32.lib", "winmm.lib"],
-            ]
-            warnings = []
-            for command in commands:
-                result = subprocess.run(command, cwd=build, env=env, capture_output=True,
-                                        text=True, timeout=120)
-                output = result.stdout + result.stderr
-                warnings.extend(line for line in output.splitlines()
-                                if re.search(r"\bwarning [A-Z]+\d+:", line, re.IGNORECASE))
-                self.assertEqual(result.returncode, 0, output)
-            result = subprocess.run([str(build / "test.exe")], cwd=build, env=env,
-                                    capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            print(f"Win32 /Gz compiler warnings: {len(warnings)}")
-            for warning in warnings:
-                print(warning)
-            print(result.stdout, end="")
-            result = subprocess.run([str(build / "test.exe"), "sizes"], cwd=build, env=env,
-                                    capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            print(result.stdout, end="")
-        finally:
-            shutil.rmtree(build)
+        cls.addClassCleanup(shutil.rmtree, build)
+        cls.build = build
+        cls.env = win32_tool_environment(build)
+        cls.executable = build / "test.exe"
+        compiler = shutil.which("cl.exe", path=cls.env.get("PATH") or cls.env.get("Path"))
+        if not compiler:
+            raise RuntimeError("Win32 compiler not found after vcvars32")
+        enet = ROOT / "thirdparty" / "enet"
+        include = enet / "include"
+        sources = sorted(enet.glob("*.c"))
+        objects = [build / (source.stem + ".obj") for source in sources]
+        commands = [
+            [compiler, "/nologo", "/TC", "/c", "/Gz", "/O2", "/W3",
+             "/D_WINSOCK_DEPRECATED_NO_WARNINGS", f"/I{include}",
+             *(str(source) for source in sources), f"/Fo{build}\\"],
+            [compiler, "/nologo", "/std:c++17", "/EHsc", "/Gz", "/O2", "/W4", "/WX",
+             f"/I{include}", str(ROOT / "tests" / "enet_relay_handshake_test.cpp"),
+             *(str(obj) for obj in objects), f"/Fo{build / 'test.obj'}",
+             f"/Fe{cls.executable}", "/link", "ws2_32.lib", "winmm.lib"],
+        ]
+        warnings = []
+        for command in commands:
+            result = subprocess.run(command, cwd=build, env=cls.env, capture_output=True,
+                                    text=True, timeout=120)
+            output = result.stdout + result.stderr
+            warnings.extend(line for line in output.splitlines()
+                            if re.search(r"\bwarning [A-Z]+\d+:", line, re.IGNORECASE))
+            if result.returncode:
+                raise RuntimeError(output)
+        print(f"Win32 /Gz compiler warnings: {len(warnings)}")
+        for warning in warnings:
+            print(warning)
+
+    def run_case(self, *args):
+        result = subprocess.run([str(self.executable), *args], cwd=self.build, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        print(result.stdout, end="")
+        return result.stdout
+
+    def test_native_win32_compressed_handshake_through_both_queues(self):
+        self.assertIn("native ENet two-relay queued handshake/data/reconnect passed", self.run_case())
+        self.assertIn("all 13 native command sizes match", self.run_case("sizes"))
+
+    def test_native_win32_impaired_first_handshake_through_unreliable_queues(self):
+        self.assertIn("impaired connected=2 exact_reliable_payloads=2",
+                      self.run_case("impaired"))
 
 
 if __name__ == "__main__":

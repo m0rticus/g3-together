@@ -86,6 +86,9 @@ class EnetFragmentTests(unittest.TestCase):
     def test_compact_poses_share_real_enet_datagrams(self):
         self.run_case("packing")
 
+    def test_enet_recovers_reliable_actions_and_saves_over_unreliable_steam_relay(self):
+        self.run_case("steam")
+
 
 if __name__ == "__main__":
     unittest.main()

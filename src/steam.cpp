@@ -11,7 +11,7 @@
 //   channel 1 (control): 'H' hello (client -> lobby owner until welcomed), 'W' welcome, 'P'+time ping and 'Q'+time pong
 //            every second (round trip for the status), 'B' bye. Before a lobby exists (invite-driven connection, see
 //            steam_connect.h) the same channel carries the plain ASCII join request/offer/decline frames "G3T1J/L/N".
-//   channel 0 (data): ENet commands grouped by priority, losslessly compressed. Reliable commands stay reliable;
+//   channel 0 (data): ENet commands grouped by priority, losslessly compressed. ENet alone owns data reliability;
 //            busy Steam submissions are retained by our queue, never mistaken for completed loopback sends.
 // Nothing connects by itself (connection = invite, the default): the host publishes Join Game rich presence and opens its
 // friends-only lobby only for a friend's join request; the client connects only after its player accepts a Steam invite.
@@ -30,6 +30,7 @@
 #include "steam_connect.h"
 #include "steam_send.h"
 #include "enet_policy.h"
+#include "steam_config.h"
 
 #include "config.h"
 #include "crashlog.h"
@@ -133,6 +134,9 @@ struct Api
     void(__cdecl* MessageRelease)(void* message);
     void*(__cdecl* Utils)();
     void(__cdecl* InitRelayNetworkAccess)(void*);
+    sbool(__cdecl* SetConfigValue)(void*, int value, int scope, intptr_t object, int type, void const* data);
+    int(__cdecl* GetConfigValue)(void*, int value, int scope, intptr_t object, int* type, void* data, size_t* size);
+    int(__cdecl* GetSessionConnectionInfo)(void*, void const* identity, void* info, void* status);
 } api;
 
 struct Export { void** slot; char const* name; };
@@ -179,6 +183,9 @@ Export const Exports[] = {
 };
 Export const OptionalExports[] = {
     {reinterpret_cast<void**>(&api.FriendRelationship), "SteamAPI_ISteamFriends_GetFriendRelationship"},
+    {reinterpret_cast<void**>(&api.SetConfigValue), "SteamAPI_ISteamNetworkingUtils_SetConfigValue"},
+    {reinterpret_cast<void**>(&api.GetConfigValue), "SteamAPI_ISteamNetworkingUtils_GetConfigValue"},
+    {reinterpret_cast<void**>(&api.GetSessionConnectionInfo), "SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo"},
 };
 
 // Callback ids and the 32-bit layouts (playbook, "Struct layouts"): read with memcpy at these offsets.
@@ -225,6 +232,7 @@ struct Remote
     unsigned short relayPort = 0;
     unsigned toEnet = 0, toSteam = 0;
     send::Queue pending;
+    uint64_t steamReliableOk = 0, steamUnreliableOk = 0, steamFailed[128] = {};
 };
 
 struct Skipped { u64 lobby; uint32_t until; };  // until 0: for good (not a G3 Together lobby)
@@ -237,6 +245,20 @@ u64 me = 0;
 char persona[64] = "";
 char playerName[24] = "";
 unsigned sendFailures = 0;
+config::Applied networkingConfig[4];
+bool networkingConfigured = false;
+#pragma pack(push, 8)
+struct SessionStatus {
+    int32_t state = 0, ping = 0;
+    float qualityLocal = 0, qualityRemote = 0;
+    float outPackets = 0, outBytes = 0, inPackets = 0, inBytes = 0;
+    int32_t sendRate = 0, pendingUnreliable = 0, pendingReliable = 0, sentUnackedReliable = 0;
+    int64_t queueMicros = 0;
+    int32_t maxJitterMicros = 0, reserved[15] = {};
+};
+#pragma pack(pop)
+static_assert(sizeof(SessionStatus) == 120 && offsetof(SessionStatus, queueMicros) == 48,
+              "Steamworks.NET 2025.164.1 realtime status ABI");
 unsigned isolatedDrops = 0;
 uint32_t lastSendFailure = 0, lastDiagnostics = 0;
 
@@ -418,6 +440,12 @@ int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
     Identity(identity, to);
     const int result = api.SendToUser(messages, identity, packet, static_cast<unsigned>(encodedSize),
                                       flags | (channel == ChannelControl ? SendNoNagle : 0) | SendAutoRestart, channel);
+    for (auto& r : remotes) {
+        if (r.id != to) continue;
+        if (result == ResultOk) ++(flags & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
+        else ++r.steamFailed[result >= 0 && result < 128 ? result : 0];
+        break;
+    }
     if (result != ResultOk) {
         ++sendFailures;
         const uint32_t now = Now();
@@ -1540,6 +1568,7 @@ bool QueueDatagram(Remote& r, void const* data, unsigned size)
 void DrainDatagrams(Remote& r)
 {
     try {
+        r.pending.counters.peakAge = (std::max)(r.pending.counters.peakAge, r.pending.OldestAge(Now()));
         const int result = r.pending.Drain([&](send::Item const& item) {
             const int sent = RawSend(r.id, item.Flags(), ChannelData, item.bytes.data(),
                                      static_cast<unsigned>(item.bytes.size()));
@@ -1566,20 +1595,52 @@ void SendDiagnostics(uint32_t now)
         auto const& c = r.pending.counters;
         Logf("steam-send: peer=%llu accepted_datagrams=%llu accepted_bytes=%llu "
              "critical=%llu/%llu definition=%llu/%llu npc_pose=%llu/%llu bulk=%llu/%llu "
-             "reliable_ok=%llu unreliable_ok=%llu player_state_commands=%llu reliable_failed=%llu unreliable_failed=%llu "
-             "retained_retries=%llu dedup_retransmits=%llu queue_datagrams=%zu queue_bytes=%zu oldest_ms=%u "
-             "plain_bytes=%llu wire_bytes=%llu unclassified=%llu action=retry-retained-priority-first npc_updates_dropped=0",
+             "enet_reliable_ok=%llu enet_unreliable_ok=%llu player_state_commands=%llu reliable_failed=%llu unreliable_failed=%llu "
+             "retained_retries=%llu dedup_retransmit_commands=%llu",
              r.id, c.reliableAccepted + c.unreliableAccepted, c.bytes[0] + c.bytes[1] + c.bytes[2] + c.bytes[3],
              c.accepted[0], c.bytes[0], c.accepted[1], c.bytes[1], c.accepted[2], c.bytes[2], c.accepted[3], c.bytes[3],
              c.reliableAccepted, c.unreliableAccepted, c.playerStates, c.reliableFailed, c.unreliableFailed,
-             c.retries, c.duplicates, r.pending.Depth(), r.pending.Bytes(), r.pending.OldestAge(now),
+             c.retries, c.duplicates);
+        Logf("steam-send: peer=%llu queue_datagrams=%zu queue_bytes=%zu oldest_ms=%u "
+             "peak_datagrams=%zu peak_bytes=%zu peak_oldest_ms=%u plain_bytes=%llu wire_bytes=%llu "
+             "unclassified=%llu action=retry-retained-independent-priority npc_updates_dropped=0",
+             r.id, r.pending.Depth(), r.pending.Bytes(), r.pending.OldestAge(now),
+             c.peakDepth, c.peakBytes, (std::max)(c.peakAge, r.pending.OldestAge(now)),
              c.plainBytes, c.wireBytes, c.unclassified);
+        Logf("steam-send: peer=%llu steam_reliable_ok=%llu steam_unreliable_ok=%llu "
+             "data_flags=%d data_reliability=ENet-only config_verified=%u send_buffer=%d send_rate_min=%d "
+             "send_rate_max=%d nagle_us=%d channels=data:0,control:1 channel_priority_lanes=0",
+             r.id, r.steamReliableOk, r.steamUnreliableOk, send::AutoRestart | send::NoDelay | send::NoNagle,
+             networkingConfigured ? 1u : 0u, networkingConfig[0].after.value, networkingConfig[1].after.value,
+             networkingConfig[2].after.value, networkingConfig[3].after.value);
+        if (api.GetSessionConnectionInfo) {
+            char identity[160];
+            Identity(identity, r.id);
+            SessionStatus status;
+            const int state = api.GetSessionConnectionInfo(messages, identity, nullptr, &status);
+            Logf("steam-send: session peer=%llu available=%u state=%d ping_ms=%d "
+                 "send_rate_bytes_per_s=%d pending_unreliable_bytes=%d pending_reliable_bytes=%d "
+                 "sent_unacked_reliable_bytes=%d queue_us=%lld out_packets_per_s=%.1f out_bytes_per_s=%.1f "
+                 "quality_local=%.3f quality_remote=%.3f",
+                 r.id, state == 3 ? 1u : 0u, state, status.ping, status.sendRate,
+                 status.pendingUnreliable, status.pendingReliable, status.sentUnackedReliable,
+                 static_cast<long long>(status.queueMicros), status.outPackets, status.outBytes,
+                 status.qualityLocal, status.qualityRemote);
+        } else {
+            Logf("steam-send: session peer=%llu available=0 reason=status-export-unavailable", r.id);
+        }
         for (unsigned result = 0; result < 128; ++result)
-            if (c.failed[result])
-                Logf("steam-send: peer=%llu result=%u failed_datagrams=%llu action=%s",
-                     r.id, result, c.failed[result],
+            if (r.steamFailed[result])
+                Logf("steam-send: peer=%llu result=%u failed_datagrams=%llu data_failed=%llu control_failed=%llu "
+                     "data_action=%s control_action=control-flow-retry",
+                     r.id, result, r.steamFailed[result], c.failed[result], r.steamFailed[result] - c.failed[result],
                      send::Retryable(static_cast<int>(result)) ? "retained-for-retry" : "close-session");
         r.pending.counters = {};
+        r.pending.counters.peakDepth = r.pending.Depth();
+        r.pending.counters.peakBytes = r.pending.Bytes();
+        r.pending.counters.peakAge = r.pending.OldestAge(now);
+        r.steamReliableOk = r.steamUnreliableOk = 0;
+        std::memset(r.steamFailed, 0, sizeof(r.steamFailed));
     }
 }
 
@@ -1763,10 +1824,42 @@ bool Load()
     for (auto const& e : OptionalExports) {
         FARPROC function = GetProcAddress(dll, e.name);
         *e.slot = reinterpret_cast<void*>(function);
-        if (!function) Logf("steam: optional %s not exported by this steam_api.dll; friendship is checked through the friends list instead", e.name);
+        if (!function) Logf("steam: optional %s not exported by this steam_api.dll", e.name);
     }
     Logf("steam: loaded %s", path);
     return true;
+}
+
+bool ConfigureNetworking(void* utils)
+{
+    if (!utils || !api.SetConfigValue || !api.GetConfigValue) {
+        Log("steam-send: config unavailable action=keep-Steam-defaults; capacity not verified (older stand-in/API)");
+        return true;
+    }
+    auto get = [&](int id) {
+        config::Read read;
+        size_t size = sizeof(read.value);
+        read.result = api.GetConfigValue(utils, id, config::GlobalScope, 0, &read.type, &read.value, &size);
+        if (size != sizeof(read.value)) read.type = 0;
+        return read;
+    };
+    bool verified = true;
+    for (unsigned i = 0; i < 4; ++i) {
+        auto const& setting = config::Settings[i];
+        auto& applied = networkingConfig[i];
+        applied = config::Apply(setting, get, [&](int id, int32_t value) {
+            return api.SetConfigValue(utils, id, config::GlobalScope, 0, config::Int32, &value) != 0;
+        });
+        Logf("steam-send: config scope=global name=%s before=%d requested=%d effective=%d "
+             "read_result=%d/%d set=%s verified=%u action=%s",
+             setting.name, applied.before.value, applied.requested, applied.after.value,
+             applied.before.result, applied.after.result,
+             !applied.attempted ? "unchanged" : applied.accepted ? "accepted" : "rejected",
+             applied.Verified() ? 1u : 0u, setting.capacity ? "capacity-headroom" : "preserve-default");
+        verified = verified && applied.Verified();
+    }
+    networkingConfigured = verified;
+    return verified;
 }
 }
 
@@ -1804,7 +1897,9 @@ bool Start(bool host, unsigned short port)
     friends = api.Friends();
     messages = api.Messages();
     if (!user || !matchmaking || !friends || !messages) return Fail("Steam interfaces missing");
-    if (void* utils = api.Utils()) api.InitRelayNetworkAccess(utils);  // the relay network is ready by the first message
+    void* utils = api.Utils();
+    if (!ConfigureNetworking(utils)) return Fail("Steam networking capacity configuration failed; see steam-send config");
+    if (utils) api.InitRelayNetworkAccess(utils);  // the relay network is ready by the first message
     me = api.UserSteamId(user);
     if (!me) return Fail("Steam did not provide a SteamID64");
     char const* steamName = api.PersonaName(friends);
