@@ -128,4 +128,86 @@ int main()
     gate.Finish();
     gate.Activate();
     assert(!gate.Paused());
+
+    {
+        Gate stopped;
+        assert(stopped.Begin(true));
+        stopped.Finish();
+        assert(stopped.Paused() && stopped.Resumable());
+        assert(!stopped.ResumeAfterStop(false));
+        assert(stopped.Paused() && stopped.Resumable());
+        assert(stopped.ResumeAfterStop(true));
+        assert(!stopped.Paused() && !stopped.Resumable());
+        assert(!stopped.ResumeAfterStop(true));
+        assert(!stopped.Paused() && !stopped.Resumable());
+    }
+
+    {
+        Gate callback;
+        assert(callback.Begin());
+        callback.Finish();
+        assert(callback.Paused() && !callback.Resumable());
+        assert(!callback.ResumeAfterStop(true));
+        assert(callback.Paused() && !callback.Resumable());
+        callback.Activate();
+        assert(!callback.Paused() && !callback.Resumable());
+    }
+
+    {
+        Gate cleaning;
+        assert(cleaning.Begin(true));
+        assert(cleaning.Paused() && cleaning.Resumable());
+        assert(!cleaning.ResumeAfterStop(true));
+        assert(cleaning.Paused() && cleaning.Resumable());
+        assert(!cleaning.Begin(true));
+        assert(cleaning.Resumable());
+        cleaning.Finish();
+        assert(cleaning.ResumeAfterStop(true));
+
+        assert(cleaning.Begin(false));
+        assert(cleaning.Paused() && !cleaning.Resumable());
+        assert(!cleaning.Begin(true));
+        assert(cleaning.Paused() && !cleaning.Resumable());
+        cleaning.Finish();
+        assert(!cleaning.ResumeAfterStop(true));
+        assert(cleaning.Paused() && !cleaning.Resumable());
+        cleaning.Activate();
+        assert(!cleaning.Paused());
+    }
+
+    {
+        Gate newGame;
+        assert(newGame.Begin(false));
+        newGame.Finish();
+        newGame.Activate();
+        assert(!newGame.Paused() && !newGame.Resumable());
+        assert(newGame.Begin(true));
+        newGame.Finish();
+        assert(newGame.Paused() && newGame.Resumable());
+        assert(newGame.ResumeAfterStop(true));
+        assert(!newGame.Paused() && !newGame.Resumable());
+    }
+
+    {
+        Gate callbackAfterStop;
+        assert(callbackAfterStop.Begin(true));
+        callbackAfterStop.Finish();
+        assert(callbackAfterStop.Paused() && callbackAfterStop.Resumable());
+        assert(callbackAfterStop.Begin(false));
+        callbackAfterStop.Finish();
+        assert(callbackAfterStop.Paused() && !callbackAfterStop.Resumable());
+        assert(!callbackAfterStop.ResumeAfterStop(true));
+        callbackAfterStop.Activate();
+        assert(!callbackAfterStop.Paused() && !callbackAfterStop.Resumable());
+    }
+
+    {
+        Gate activate;
+        assert(activate.Begin(true));
+        activate.Finish();
+        assert(activate.Resumable());
+        activate.Activate();
+        assert(!activate.Paused() && !activate.Resumable());
+        assert(!activate.ResumeAfterStop(true));
+    }
 }

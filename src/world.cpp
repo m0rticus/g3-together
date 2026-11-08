@@ -46,6 +46,9 @@ struct RemoteRegionState {
 };
 std::vector<RemoteRegionState> hostRegions;
 retirement::Gate retirementGate;
+unsigned nativeStops = 0, gateResumes = 0;
+uint32_t gateStoppedAt = 0, suspendedLogged = 0;
+unsigned regionLogs = 0;
 std::atomic<unsigned> regionOwners{0};
 std::vector<std::array<float, 3>> simulationAnchors;
 uint32_t anchorsCheckedAt = 0;
@@ -409,9 +412,16 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
         region.prefetcher = std::move(prefetcher);
         regionOwners.fetch_add(1);
         region.radius = 0.0f;
+        Logf("world: remote simulation region created (database %u) for a player %.0f,%.0f,%.0f radius %.0f cm",
+             region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex(), at[0], at[1], at[2], radius);
     }
     const bool moved = body::Distance(at, region.position) >= 500.0f || region.radius != radius;
     if (moved) {
+        if (region.frames && regionLogs < 24) {
+            ++regionLogs;
+            Logf("world: remote simulation region moved to %.0f,%.0f,%.0f radius %.0f cm (%u frames)", at[0], at[1], at[2], radius,
+                 region.frames);
+        }
         contextRefreshPending = true;
         region.camera->SetClipDepth(bCVector2(1.0f, radius));
         region.camera->SetPosition(bCVector(at[0], at[1], at[2]));
@@ -786,9 +796,18 @@ void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
     originalProcess(admin);
 }
 
+void RetireWorld(bool bySession);
+
 void __fastcall StopSession(gCSession* session, void* edx)
 {
-    if (!ai::ShuttingDown()) OnWorldDeactivate();
+    if (!ai::ShuttingDown()) {
+        const bool running = session && session->IsGameRunning();
+        RetireWorld(true);
+        gateStoppedAt = net::Now();
+        if (++nativeStops <= 24)
+            Logf("world: native gCSession::Stop #%u (session running=%d): host simulation suspended until the session runs again",
+                 nativeStops, running ? 1 : 0);
+    }
     if (originalStopSession) originalStopSession(session, edx);
 }
 
@@ -828,10 +847,53 @@ bool HostProcesses(float const at[3], float margin)
     return false;
 }
 
+// The native Stop that follows the world activation callback of a New Game leaves the gate paused for the whole world
+// (no callback arrives afterwards): lift that one pause once the native session runs again, as in a loaded world.
+void ResumeAfterNativeStop()
+{
+    auto& session = gCSession::GetInstance();
+    if (!session.IsGameRunning() || !session.GetHero() || !retirementGate.ResumeAfterStop(true)) return;
+    ++gateResumes;
+    Logf("world: host simulation resumed after native session stop #%u (suspended %u ms)", nativeStops, net::Now() - gateStoppedAt);
+}
+
+HostSimStatus HostSimulationStatus()
+{
+    HostSimStatus status;
+    status.hooked = spheresHooked;
+    status.paused = retirementGate.Paused();
+    status.resumable = retirementGate.Resumable();
+    status.spheresActive = spheresActive;
+    status.spheres = static_cast<unsigned>(sphereCount);
+    status.anchors = static_cast<unsigned>(simulationAnchors.size());
+    status.stops = nativeStops;
+    status.resumes = gateResumes;
+    if (lastAdmin) status.nativeRoiCm = *Field(lastAdmin, 0x10);
+    if (auto const* range = Processed()) status.processed = range->GetCount();
+    for (auto const& region : hostRegions) {
+        if (region.failed) ++status.regionsFailed;
+        else if (region.camera) ++status.regions;
+        const CellInventory cells = Inventory(region.prefetcher.get());
+        status.regionCells += cells.cells;
+        status.regionStatics += cells.statics;
+        status.regionDynamics += cells.dynamics;
+    }
+    return status;
+}
+
 void Tick()
 {
     Start();
-    if (retirementGate.Paused() || ai::ShuttingDown()) return;
+    if (ai::ShuttingDown()) return;
+    if (retirementGate.Paused()) ResumeAfterNativeStop();
+    if (retirementGate.Paused()) {
+        if (net::IsHost() && GetConfig().hostSimSpheres && spheresHooked && net::Now() - suspendedLogged >= 5000) {
+            suspendedLogged = net::Now();
+            Logf("world: spheres suspended (native Stop #%u, resumable=%d, session running=%d)", nativeStops,
+                 retirementGate.Resumable() ? 1 : 0, gCSession::GetInstance().IsGameRunning() ? 1 : 0);
+        }
+        return;
+    }
     HookElastic();
     if (!net::IsHost()) return;
     if (spheresHooked && originalStopSession && gCSession::GetInstance().IsGameRunning()) {
@@ -841,8 +903,9 @@ void Tick()
     if (GetConfig().hostSimSpheres && net::Now() - elasticLogged >= 5000) {
         elasticLogged = net::Now();
         if (spheresActive)
-            Logf("world: spheres %d around players (first %.0f,%.0f,%.0f radius %.0f cm), %u rebuilds, %u times too far", sphereCount,
-                 spheres[0].at[0], spheres[0].at[1], spheres[0].at[2], spheres[0].radius, sphereRebuilds, sphereTooFar);
+            Logf("world: spheres %d around players (first %.0f,%.0f,%.0f radius %.0f cm), %u rebuilds, %u times too far, regions=%zu anchors=%zu",
+                 sphereCount, spheres[0].at[0], spheres[0].at[1], spheres[0].at[2], spheres[0].radius, sphereRebuilds, sphereTooFar,
+                 hostRegions.size(), simulationAnchors.size());
         else if (spheresHooked)
             Logf("world: spheres none now (%u times too far)", sphereTooFar);
     }
@@ -856,9 +919,9 @@ void Tick()
     }
 }
 
-void OnWorldDeactivate()
+void RetireWorld(bool bySession)
 {
-    if (!retirementGate.Begin()) {
+    if (!retirementGate.Begin(bySession)) {
         Log("world-cache: nested deactivation; retirement already in progress");
         return;
     }
@@ -881,6 +944,8 @@ void OnWorldDeactivate()
     if (hostRegions.empty()) RestoreContextOwnership();
     CaptureCacheInventory();
 }
+
+void OnWorldDeactivate() { RetireWorld(false); }
 
 void OnWorldActivate() { retirementGate.Activate(); }
 

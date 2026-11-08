@@ -5,6 +5,7 @@
 #pragma once
 
 #include <Engine.h>
+#include "hostsim_status.h"
 
 namespace g3t::world {
 void RequestProcessingUpdate();  // incremental range refresh; never exit the local hero to force recollection
@@ -26,6 +27,8 @@ void OnWorldDeactivate();
 // it processes this place (margin cm inside the edge of its sphere or of one of its spheres).
 bool Extended();
 bool HostProcesses(float const at[3], float margin);
+// Compact state of the host's simulation around the other players for the 5-second `npc-stream:` line. Engine thread only.
+HostSimStatus HostSimulationStatus();
 void Usables(char const* radius, LogFn log);  // USABLE lines within radius cm (default 3000) of the hero, then USABLE end
 void Face(char const* name, LogFn log);       // FACE line: stand in front of the nearest entity of that name (or GUID)
 void Use(char const* name, LogFn log);        // USE line: the hero uses the nearest entity of that name

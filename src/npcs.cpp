@@ -27,6 +27,7 @@
 #include "combat_timing.h"
 #include "guards.h"
 #include "npcsend_candidates.h"
+#include "npcstream_diag.h"
 #include "npcidentity_policy.h"
 
 #include <Game.h>
@@ -497,6 +498,7 @@ bool IsNpc(eCEntity* instance)
 // QA (NPCSEND): why SendOwned last left an NPC out, or "sent", and when (net::Now()).
 struct SendNote { char const* reason = "never"; uint32_t at = 0; };
 std::unordered_map<std::string, SendNote> sendNotes;
+npcstream_diag::Window streamDiag;  // host: the 5-second `npc-stream:` accounting (local measurements only)
 // Fewer changes of hands around the edge (owner 27.10.: NPCs changed hands three times as often when the players stood
 // some 40 m apart, every change can jerk). What this machine sends it keeps up to KeepRadius from the nearest player as
 // long as it processes it, not just to InterestRadius; for MinHold after it began, and while it fights, up to HoldRadius.
@@ -789,14 +791,32 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     };
     const bTObjArray<Entity> all = Entity::GetNPCs();
     for (int i = 0; i < all.GetCount(); ++i) addCandidate(all.GetAt(i).GetInstance());
+    const size_t firstProcessed = candidates.size();
     auto const* processed = world::ProcessedEntities();
     for (GEU16 i = 0; processed && i < processed->GetCount(); ++i) addCandidate(processed->GetAt(i));
     const std::vector<std::string> candidateKeys = npcsend_candidates::Union(candidates);
+    using npcstream_diag::Drop;
+    streamDiag.BeginTick(net::Now());
+    std::unordered_set<std::string> processedKeys;
+    unsigned interactionNpcs = 0, processedNpcs = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (!npcsend_candidates::Eligible(candidates[i])) continue;
+        if (i < firstProcessed) ++interactionNpcs;
+        else { ++processedNpcs; processedKeys.insert(candidates[i].key); }
+    }
+    streamDiag.Candidates(interactionNpcs, processedNpcs, static_cast<unsigned>(candidateKeys.size()),
+                          processed ? processed->GetCount() : 0u);
     eCEntity* hostFocus = controlled && controlled->GetPropertySet(eEPropertySetType_Focus)
         ? Entity(controlled).Focus.GetFocusEntity().GetInstance() : nullptr;
     eCEntity* hostTarget = controlled && controlled->GetPropertySet(eEPropertySetType_NPC)
         ? Entity(controlled).NPC.GetCurrentTarget().GetInstance() : nullptr;
     net::Remote const* remotes = net::Remotes();
+    bool recipientHere[net::MaxPlayers] = {};
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+        if (!remotes[id].connected) continue;
+        recipientHere[id] = net::InWorld(id) && (remotes[id].latest.flags & 1) && remotes[id].latest.world == remote::CurrentWorld();
+        streamDiag.Player(id, net::InWorld(id), recipientHere[id], net::RemoteStateAgeMs(id), remotes[id].latest.position);
+    }
     const auto countSkipped = [&](std::string const& key, net::NpcSendDecision decision) {
         for (uint8_t id = 2; id < net::MaxPlayers; ++id)
             if (net::InWorld(id) && remotes[id].connected && !recipientNpcs[id].count(key))
@@ -809,19 +829,29 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     for (std::string const& candidateKey : candidateKeys) {
         Entity npc = guid::Resolve(reinterpret_cast<uint8_t const*>(candidateKey.data()));
         eCEntity* instance = npc.GetInstance();
-        if (!instance || instance == hero || remote::IsPuppet(instance)) continue;
-        if (instance == controlled) continue;  // a transformed player's creature travels as its player state
-        if (npcremoval::Suppressed(instance)) continue;
+        if (!instance) { streamDiag.Candidate(Drop::Unresolved); continue; }
+        if (instance == hero || remote::IsPuppet(instance)) { streamDiag.Candidate(Drop::Hero); continue; }
+        if (instance == controlled) { streamDiag.Candidate(Drop::Hero); continue; }  // a transformed player's creature travels as its player state
+        if (npcremoval::Suppressed(instance)) { streamDiag.Candidate(Drop::Removed); continue; }
         uint8_t guid[16];
         guid::CopyEntity(instance, guid);
-        if (npclease::SuppressHostPublication(guid)) continue;
+        if (npclease::SuppressHostPublication(guid)) { streamDiag.Candidate(Drop::Lease); continue; }
+        {
+            const bCVector& w = instance->GetWorldPosition();
+            const float where[3] = {w.GetX(), w.GetY(), w.GetZ()};
+            const bool fromProcessing = processedKeys.count(candidateKey) != 0;
+            for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+                if (recipientHere[id])
+                    streamDiag.Reach(id, body::Distance(where, remotes[id].latest.position), fromProcessing, GetConfig().hostRoi,
+                                     npcsend::InterestEnterCm);
+        }
         SendNote& note = sendNotes[Key(guid)];
         note.at = net::Now();
         if (journal::Pending(instance)) {
-            note.reason = "pending"; countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
+            note.reason = "pending"; streamDiag.Candidate(Drop::Pending); countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
         }  // a recorded death not applied yet: never show it alive
         if (mirrors.count(Key(guid))) {
-            note.reason = "mirror"; countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
+            note.reason = "mirror"; streamDiag.Candidate(Drop::Mirror); countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
         }
         if (deadStays && !net::IsHost() && deadOnHost.count(Key(guid))) {
             Entity corpse(instance);
@@ -831,7 +861,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         }
         const auto back = givenBack.find(Key(guid));
         if (back != givenBack.end() && static_cast<int32_t>(net::Now() - back->second) < 0) {
-            note.reason = "givenback"; countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
+            note.reason = "givenback"; streamDiag.Candidate(Drop::GivenBack); countSkipped(Key(guid), net::NpcSendDecision::SkippedIrrelevant); continue;
         }
         const bCVector& p = instance->GetWorldPosition();
         const float at[3] = {p.GetX(), p.GetY(), p.GetZ()};
@@ -856,7 +886,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                 if (nearest <= retain || ((young || fighting) && nearest <= retain + 2000.0f)) { inRange = true; ++heldBand; }
             }
         }
-        if (!inRange) { note.reason = "range"; countSkipped(Key(guid), net::NpcSendDecision::SkippedFar); continue; }
+        if (!inRange) { note.reason = "range"; streamDiag.Candidate(Drop::Range); countSkipped(Key(guid), net::NpcSendDecision::SkippedFar); continue; }
         note.reason = "sent";
         {
             Held& held = sending[Key(guid)];
@@ -988,6 +1018,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                 remotes[id].latest.world != remote::CurrentWorld()) {
                 if (net::InWorld(id) && net::PeerJoined(id))
                     net::RecordNpcSendDecision(net::NpcSendDecision::SkippedIrrelevant);
+                if (remotes[id].connected) streamDiag.Result(id, Drop::Away);
                 continue;
             }
             const float distance = body::Distance(at, remotes[id].latest.position);
@@ -1017,19 +1048,23 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
             const npcsend::Result result = npcsend::Evaluate(state, input);
             if (result.decision == npcsend::Decision::Outside) {
                 net::RecordNpcSendDecision(net::NpcSendDecision::SkippedFar);
+                streamDiag.Result(id, Drop::Outside);
             } else if (result.decision == npcsend::Decision::Wait) {
                 net::RecordNpcSendDecision(net::NpcSendDecision::SkippedUnchanged);
+                streamDiag.Result(id, Drop::Unchanged);
             } else if (result.decision == npcsend::Decision::Invalid || result.decision == npcsend::Decision::Ineligible) {
                 static unsigned invalid = 0;
                 if (invalid++ < 20) Logf("npcs: invalid send policy input for recipient %u", id);
                 net::RecordNpcSendDecision(net::NpcSendDecision::SkippedIrrelevant);
+                streamDiag.Result(id, Drop::Invalid);
             } else if (result.decision == npcsend::Decision::FinalAndRelease) {
                 const bool finalQueued = net::SendNpcsTo(id, &r, 1, true);
                 const bool releaseQueued = finalQueued && net::SendNpcReleaseTo(id, guid, 1);
                 if (releaseQueued && npcsend::Commit(state, input, result.decision)) {
                     states.erase(key);
                     net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
-                } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
+                    streamDiag.Released(id);
+                } else { net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed); streamDiag.Result(id, Drop::Failed); }
             } else {
                 // No bandwidth gate: every due update is sent. Only a first update (a join or world-entry burst) is spread over
                 // time, and only for NPCs this recipient has never had.
@@ -1037,6 +1072,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                     !initialPacers[id].Admit(r.sent, stretchOf[id])) {
                     ++sendStats.paced;
                     net::RecordNpcSendDecision(net::NpcSendDecision::SkippedPaced);
+                    streamDiag.Result(id, Drop::Paced);
                     continue;
                 }
                 const bool queued = posed
@@ -1056,7 +1092,8 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                     sendStats.Record(result.decision, result.tier, r.sent - previousSentAt, stretchOf[id], onSchedule);
                     if (existing == states.end()) states.emplace(key, std::move(fresh));
                     net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
-                } else net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
+                    streamDiag.Sent(id);
+                } else { net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed); streamDiag.Result(id, Drop::Failed); }
             }
         }
     }
@@ -1073,12 +1110,23 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                 reinterpret_cast<uint8_t const*>(it->first.data()), 1);
             if (released) {
                 net::RecordNpcSendDecision(net::NpcSendDecision::Sent);
+                streamDiag.Released(id);
                 it = states.erase(it);
             } else {
                 net::RecordNpcSendDecision(net::NpcSendDecision::SendFailed);
+                streamDiag.Result(id, Drop::Failed);
                 ++it;
             }
         }
+    }
+    if (streamDiag.Due(net::Now())) {
+        npcstream_diag::Context context;
+        context.hostValid = hero != nullptr && playerCount > 0;
+        if (context.hostValid) std::memcpy(context.hostAt, players[0], sizeof(context.hostAt));
+        context.mode = GetConfig().hostSimSpheres ? "spheres" : GetConfig().hostSimElastic ? "elastic" : "off";
+        context.roiCm = GetConfig().hostRoi;
+        context.sim = world::HostSimulationStatus();
+        streamDiag.Flush(net::Now(), context, [](char const* line) { Log(line); });
     }
 }
 

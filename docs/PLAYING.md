@@ -164,6 +164,14 @@ load distant simulation regions; the real camera, static-world culling and build
 `host_roi` controls NPC coverage, not rendering distance. The old `host_sim = off/elastic` choices no longer transfer
 simulation to a client.
 
+The host logs one `npc-stream:` line per remote player every 5 s: both positions and their distance, whether the host's
+simulation is `gate=open` or `paused`, how many distant regions/spheres it keeps (`regions=`, `region_dynamic=` = entities
+loaded for that player), the host NPCs it has within `host_roi` of that player (`near_roi=`, `nearest_cm=`), how many came
+from the interaction list or the engine's processing list, and per second what was considered, sent and released, with the
+rule that kept the rest back (`top_drop=`: `outside` = farther than the 80 m interest radius from that player, `range`,
+`hero`, `lease`, `pending`, `mirror`, `givenback`, `away`, `unchanged`, `paced`, `invalid`, `failed`). `world: spheres
+suspended` means the host's own native session stop paused host simulation; it resumes when the session runs again.
+
 By default, the host suppresses 24 reviewed world-data Goblin/Ogre instances below/alongside Ardea
 that extended NPC coverage can bring into the starting village. This is non-death suppression:
 no bodies, loot, XP or quest callbacks. Other regions, summons and quest-specific creatures are unchanged.

@@ -7,16 +7,34 @@
 
 namespace g3t::world::retirement {
 class Gate {
-    std::atomic<bool> paused{false}, cleaning{false};
+    std::atomic<bool> paused{false}, cleaning{false}, resumable{false};
   public:
-    bool Begin()
+    // bySession: the pause comes from the native gCSession::Stop. A world (de)activation callback is always followed by
+    // Activate; a Stop is not (HUD.NewGame stops the session after the activation callback and starts it again without a
+    // second one), so only that kind of pause may be lifted again once the session runs.
+    bool Begin(bool bySession = false)
     {
         paused.store(true);
-        return !cleaning.exchange(true);
+        const bool entered = !cleaning.exchange(true);
+        if (entered) resumable.store(bySession);
+        return entered;
     }
     void Finish() { cleaning.store(false); }
-    void Activate() { if (!cleaning.load()) paused.store(false); }
+    void Activate()
+    {
+        if (cleaning.load()) return;
+        paused.store(false);
+        resumable.store(false);
+    }
+    bool ResumeAfterStop(bool sessionRunning)
+    {
+        if (!sessionRunning || cleaning.load() || !paused.load() || !resumable.load()) return false;
+        resumable.store(false);
+        paused.store(false);
+        return true;
+    }
     bool Paused() const { return paused.load(); }
+    bool Resumable() const { return resumable.load(); }
 };
 
 template<class Cell, class CellAt>
