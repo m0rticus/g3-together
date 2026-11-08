@@ -58,6 +58,7 @@ int enet_peer_send(ENetPeer* peer, enet_uint8 channel, ENetPacket* packet)
     return 0;
 }
 ENetHost* enet_host_create(const ENetAddress*, size_t, size_t, enet_uint32, enet_uint32) { return nullptr; }
+int enet_host_compress_with_range_coder(ENetHost*) { return 0; }
 void enet_host_destroy(ENetHost*) {}
 ENetPeer* enet_host_connect(ENetHost*, const ENetAddress*, size_t, enet_uint32) { return nullptr; }
 int enet_host_service(ENetHost*, ENetEvent*, enet_uint32) { return 0; }

@@ -17,6 +17,41 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ## Before you start
 
+### Real Steam world synchronization (manual acceptance)
+
+- [ ] Use the same rebuilt DLL on both real Steam accounts. Invite/accept normally,
+  enter Ardea together and confirm `admission: ... in the host's world` on the host.
+  Walk, turn, draw weapons, attack and cast on each machine; both screens must show
+  the other player, including the host on the client.
+- [ ] Watch the same named NPCs fighting, moving, taking damage and dying on both
+  screens for at least three minutes. Then separate into different regions and
+  return. Shared NPCs must follow host state; client-only processing must still work
+  outside host presentation. `admission-refused ... host presents it within its own
+  reach` is expected for shared NPCs, not a failed world-entry handshake.
+- [ ] Inspect the five-second `steam-send:` windows. `player_state_commands` must
+  advance in both directions; `critical`, `definition` and `npc_pose` report accepted
+  datagrams/bytes. `plain_bytes` versus `wire_bytes` measures actual lossless savings.
+  Result 25 (LimitExceeded) and result 16 (Ignored/NoDelay) must say
+  `action=retained-for-retry`; `queue_bytes`/`oldest_ms` must recover after a burst,
+  not grow continuously. `npc_updates_dropped=0` describes our local queue policy,
+  not a guarantee against ordinary network loss.
+- [ ] Confirm `net: pose bandwidth` gains ACKs/deltas after entry, compact kind 49
+  is used when its definition is acknowledged, and reliable queues/RTT do not climb
+  indefinitely. Pending definitions must not repeatedly invalidate their own ACKs.
+  `npc-control: ackaccepted` reports `created`, `pending`, `fallback` and `partial`;
+  `npc-control: resync` includes the recovery reason and whether the token was evicted.
+  Check late join, normal departure/rejoin and host save/load in the same session.
+- [ ] Repeat in the isolated copies with the optional finite-buffer fake Steam
+  build: 262144 queued bytes and 262144 bytes/s, first without artificial lag, then
+  with the existing 10-ms lag. The original unlimited fake DLL cannot reproduce
+  Steam's send-buffer failure. Install test tooling only in authorized copies.
+
+Application protocol remains **77**; both players need the matching build because
+the standard ENet compressor and dedicated definition channel must be enabled at
+both endpoints. No NPC cadence, coverage or precision limit is added. A sustained
+queue-growth result still requires the new real Steam logs; a successful loopback
+test alone is not real-Steam acceptance.
+
 ### SteamID identity (manual acceptance; no game/Steam automation)
 
 - [ ] In the two isolated copies, record each `identity: join` SteamID and slot. Save a distinct client inventory,

@@ -640,12 +640,65 @@ int main()
     isHost = true;
     fakeTime += 1001;
     SendNpcs(&posed, 1, false);
-    assert(transmissions.size() == 3);
-    assert(transmissions[0].bytes == slowId.bytes && transmissions[1].bytes == slowBaseline.bytes);
+    // A successful ID/baseline queue is retained independently; ordinary
+    // sample retries do not enqueue either definition again while ACK is withheld.
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
     transmissions.clear();
     Deliver(&fakePeer, slowAck);
     SendNpcs(&posed, 1, false);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+
+    // Withhold a baseline ACK for more than the old 1 s retry interval while
+    // changing the immutable descriptor on every sample. The reference and
+    // serial stay pinned, and every changing sample uses exact full fallback.
+    const auto descriptorKey = NpcKey(posed.guid);
+    const uint16_t descriptorToken = controlStates.at(descriptorKey).nextBaseline;
+    NpcRecord changing = posed;
+    changing.motions[0].speed = 1.6f;
+    changing.sent++;
+    transmissions.clear();
+    SendNpcs(&changing, 1, false);
+    assert(transmissions.size() == 3);
+    assert(transmissions[0].bytes[0] == MsgControlId &&
+           transmissions[1].bytes[0] == MsgControlBaseline &&
+           transmissions[2].bytes[0] == MsgNpcs);
+    assert(controlStates.at(descriptorKey).nextBaseline == descriptorToken + 1);
+    const auto descriptorId = transmissions[0], descriptorBaseline = transmissions[1];
+    transmissions.clear();
+    fakeTime += 2100;
+    for (unsigned i = 0; i < 4; ++i) {
+        changing.motions[0].speed = 1.61f + i * 0.01f;
+        changing.sent++;
+        changing.position[0] += 1.0f;
+        SendNpcs(&changing, 1, false);
+        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
+        assert(controlStates.at(descriptorKey).nextBaseline == descriptorToken + 1);
+        transmissions.clear();
+    }
+    isHost = false;
+    Deliver(&fakePeer, descriptorId);
+    Deliver(&fakePeer, descriptorBaseline);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
+    const auto descriptorAck = transmissions[0];
+    transmissions.clear();
+    isHost = true;
+    Deliver(&fakePeer, descriptorAck);
+    assert(controlAcknowledged[2].count(controlStates.at(descriptorKey).id));
+
+    // A failed reliable enqueue leaves the whole transaction retryable. Once
+    // successful, later samples enqueue neither definition again.
+    NpcRecord partial = Record(102);
+    failSend = true;
+    transmissions.clear();
+    SendNpcs(&partial, 1, false);
+    assert(transmissions.empty());
+    failSend = false;
+    transmissions.clear();
+    SendNpcs(&partial, 1, false);
+    assert(transmissions.size() == 3);
+    transmissions.clear();
+    SendNpcs(&partial, 1, false);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
 
     // Exhaustion fails closed, without recycling a control ID or token.
     const auto stateKey = NpcKey(posed.guid);

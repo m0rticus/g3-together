@@ -427,9 +427,16 @@ Story join snapshots are sent only to the joining peer and split into unfragment
 The five-second `kind_bps` lines show application bytes/s; `rates` shows ENet and successful Steam API
 datagrams/bytes per second and exact relay framing share. `valve` reports the NPC stretch, the congestion signals that raised it,
 queue, offered rate and the bulk pacing credit. Steam API counts still exclude encryption, SDR, UDP/IP and other physical-network overhead.
-Range-coder compression remains disabled: the engine-free benchmark shows benefits for compact players and
-structured control data, but no saving for high-entropy data. Representative pose traffic and its CPU cost
-must be measured before enabling compression globally.
+ENet's existing lossless range coder is enabled at both endpoints. The Steam worker separates
+critical, definition, NPC pose and save commands, recompresses each group only when smaller,
+and retains result-25/16 submissions for priority-first retry. Reliable ENet commands remain
+reliable at Steam; unreliable samples use NoDelay without discarding refused samples locally.
+NPC definitions use a separate ordered ENet channel so they cannot block player metadata.
+The engine-free structured 588-byte NPC record/80-affine-bone fixture saves over 40%;
+`steam-send:` reports actual live savings, accepted player commands, failures and queue age.
+High-entropy payloads remain exact and do not grow. Both endpoints require the same rebuilt
+DLL; application protocol 77 and NPC wire layouts are unchanged. Real-Steam throughput and
+CPU cost still require manual acceptance; there is no new NPC cap or send-rate limit.
 
 Your own successful hit shows its local flinch immediately and is claimed reliably from the host. A host-side parry
 does not cancel that landed hit. Hit identities, acknowledgements and NPC incarnations prevent duplicate claims and

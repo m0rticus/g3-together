@@ -11,7 +11,8 @@
 //   channel 1 (control): 'H' hello (client -> lobby owner until welcomed), 'W' welcome, 'P'+time ping and 'Q'+time pong
 //            every second (round trip for the status), 'B' bye. Before a lobby exists (invite-driven connection, see
 //            steam_connect.h) the same channel carries the plain ASCII join request/offer/decline frames "G3T1J/L/N".
-//   channel 0 (data): one ENet datagram per message, sent unreliable (ENet does its own reliability).
+//   channel 0 (data): ENet commands grouped by priority, losslessly compressed. Reliable commands stay reliable;
+//            busy Steam submissions are retained by our queue, never mistaken for completed loopback sends.
 // Nothing connects by itself (connection = invite, the default): the host publishes Join Game rich presence and opens its
 // friends-only lobby only for a friend's join request; the client connects only after its player accepts a Steam invite.
 // Every step is logged as "connect: ..." (connection = auto keeps the old automatic discovery for the stand-in/tests).
@@ -27,6 +28,7 @@
 #include "relaywire.h"
 #include "saving_policy.h"
 #include "steam_connect.h"
+#include "steam_send.h"
 
 #include "config.h"
 #include "crashlog.h"
@@ -41,6 +43,8 @@
 #include <cstring>
 #include <float.h>
 #include <mutex>
+#include <memory>
+#include <new>
 #include <process.h>
 #include <xmmintrin.h>
 
@@ -216,6 +220,7 @@ struct Remote
     SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
     unsigned short relayPort = 0;
     unsigned toEnet = 0, toSteam = 0;
+    send::Queue pending;
 };
 
 struct Skipped { u64 lobby; uint32_t until; };  // until 0: for good (not a G3 Together lobby)
@@ -293,6 +298,7 @@ latency::Samples pollGaps, pumpWork;
 unsigned receiveCaps = 0, forwardCaps = 0, socketFailures = 0, receiveFailures = 0, invalidPongs = 0;
 int socketError = 0;
 TrafficCounters traffic;
+std::unique_ptr<send::Codec> sendCodec;
 
 double PingSeconds()
 {
@@ -398,7 +404,7 @@ int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
     char identity[160];
     Identity(identity, to);
     const int result = api.SendToUser(messages, identity, packet, static_cast<unsigned>(encodedSize),
-                                      flags | SendNoNagle | SendAutoRestart, channel);
+                                      flags | (channel == ChannelControl ? SendNoNagle : 0) | SendAutoRestart, channel);
     if (result != ResultOk) {
         ++sendFailures;
         const uint32_t now = Now();
@@ -414,10 +420,10 @@ int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
             ++traffic.txDataDatagrams;
             traffic.txDataBytes += size;
             EnetPacketParse enet;
-            if (!ParseEnetDataPacket(data, size, &enet))
+            std::vector<uint8_t> plain;
+            const bool decoded = sendCodec && sendCodec->Decode(data, size, plain);
+            if (!decoded || !ParseEnetDataPacket(plain.data(), plain.size(), &enet))
                 ++traffic.txEnetParseFailures;
-            else if (enet.compressed)
-                ++traffic.txEnetUnparsedDatagrams;
             else {
                 traffic.txEnetProtocolBytes += enet.protocolBytes;
                 traffic.txEnetAckBytes += enet.ackBytes;
@@ -515,6 +521,9 @@ void Drop(Remote* r, char const* why)
 {
     if (!r || !r->id) return;
     const u64 id = r->id;
+    if (r->pending.Depth())
+        Logf("steam-send: peer=%llu action=close-session pending_datagrams=%zu pending_bytes=%zu reason=%s",
+             id, r->pending.Depth(), r->pending.Bytes(), why);
     Logf("steam: %llu dropped (%s; %u datagrams to ENet, %u to Steam)", r->id, why, r->toEnet, r->toSteam);
     if ((isHost && r->relayPort) || (!isHost && r->id == owner && r->linked)) {
         RelayDrop drop;
@@ -1355,7 +1364,64 @@ void Receive(int channel)
     ++receiveCaps;
 }
 
-// ENet -> Steam: what ENet sent to the relay sockets since the last Pump.
+bool QueueDatagram(Remote& r, void const* data, unsigned size)
+{
+    try {
+        if (sendCodec && r.pending.Push(*sendCodec, data, size, Now())) return true;
+        Logf("steam-send: peer=%llu action=close-session malformed_enet_bytes=%u", r.id, size);
+        Drop(&r, "invalid outbound ENet datagram");
+    } catch (std::bad_alloc const&) {
+        Logf("steam-send: peer=%llu action=close-session allocation-failed pending_bytes=%zu", r.id, r.pending.Bytes());
+        Drop(&r, "Steam send queue allocation failed");
+    }
+    return false;
+}
+
+void DrainDatagrams(Remote& r)
+{
+    try {
+        const int result = r.pending.Drain([&](send::Item const& item) {
+            const int sent = RawSend(r.id, item.Flags(), ChannelData, item.bytes.data(),
+                                     static_cast<unsigned>(item.bytes.size()));
+            if (sent == ResultOk) ++r.toSteam;
+            return sent;
+        });
+        if (result != ResultOk && !send::Retryable(result)) {
+            Logf("steam-send: peer=%llu action=close-session fatal_result=%d pending_datagrams=%zu pending_bytes=%zu",
+                 r.id, result, r.pending.Depth(), r.pending.Bytes());
+            Drop(&r, "Steam data submission failed");
+        }
+    } catch (std::bad_alloc const&) {
+        Logf("steam-send: peer=%llu action=close-session allocation-failed pending_bytes=%zu", r.id, r.pending.Bytes());
+        Drop(&r, "Steam send queue allocation failed");
+    }
+}
+
+void SendDiagnostics(uint32_t now)
+{
+    for (auto& r : remotes) {
+        if (!r.linked) continue;
+        auto const& c = r.pending.counters;
+        Logf("steam-send: peer=%llu accepted_datagrams=%llu accepted_bytes=%llu "
+             "critical=%llu/%llu definition=%llu/%llu npc_pose=%llu/%llu bulk=%llu/%llu "
+             "reliable_ok=%llu unreliable_ok=%llu player_state_commands=%llu reliable_failed=%llu unreliable_failed=%llu "
+             "retained_retries=%llu dedup_retransmits=%llu queue_datagrams=%zu queue_bytes=%zu oldest_ms=%u "
+             "plain_bytes=%llu wire_bytes=%llu action=retry-retained-priority-first npc_updates_dropped=0",
+             r.id, c.reliableAccepted + c.unreliableAccepted, c.bytes[0] + c.bytes[1] + c.bytes[2] + c.bytes[3],
+             c.accepted[0], c.bytes[0], c.accepted[1], c.bytes[1], c.accepted[2], c.bytes[2], c.accepted[3], c.bytes[3],
+             c.reliableAccepted, c.unreliableAccepted, c.playerStates, c.reliableFailed, c.unreliableFailed,
+             c.retries, c.duplicates, r.pending.Depth(), r.pending.Bytes(), r.pending.OldestAge(now),
+             c.plainBytes, c.wireBytes);
+        for (unsigned result = 0; result < 128; ++result)
+            if (c.failed[result])
+                Logf("steam-send: peer=%llu result=%u failed_datagrams=%llu action=%s",
+                     r.id, result, c.failed[result],
+                     send::Retryable(static_cast<int>(result)) ? "retained-for-retry" : "close-session");
+        r.pending.counters = {};
+    }
+}
+
+// ENet -> Steam: gather before draining so player/critical traffic bypasses queued NPC poses.
 void Forward()
 {
     char datagram[4096];
@@ -1375,10 +1441,10 @@ void Forward()
                     break;
                 }
                 if (ntohs(from.sin_port) != enetPort) continue;
-                RawSend(r.id, SendUnreliable, ChannelData, datagram, static_cast<unsigned>(size));
-                ++r.toSteam;
+                if (!QueueDatagram(r, datagram, static_cast<unsigned>(size))) break;
                 if (n == 255) ++forwardCaps;
             }
+            if (r.linked) DrainDatagrams(r);
         }
         return;
     }
@@ -1397,10 +1463,10 @@ void Forward()
         enetAddress = from;
         haveEnetAddress = true;
         if (!host || !host->linked) continue;  // no host yet: ENet keeps trying to connect until there is one
-        RawSend(owner, SendUnreliable, ChannelData, datagram, static_cast<unsigned>(size));
-        ++host->toSteam;
+        if (!QueueDatagram(*host, datagram, static_cast<unsigned>(size))) break;
         if (n == 255) ++forwardCaps;
     }
+    if (host && host->linked) DrainDatagrams(*host);
 }
 
 // Client without a lobby: an accepted invite, the INI's lobby, else the first friend hosting a G3 Together game.
@@ -1562,6 +1628,8 @@ bool Start(bool host, unsigned short port)
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return Fail("winsock not started");
     winsockStarted = true;
+    sendCodec = std::make_unique<send::Codec>();
+    if (!sendCodec->Ready()) return Fail("Steam send compression context allocation failed");
     if (!Load()) return false;
     char text[1024] = "";
     const int result = api.InitFlat(text);
@@ -1797,6 +1865,7 @@ void PumpOnce()
     }
     if (!lastDiagnostics || now - lastDiagnostics >= 5000) {
         lastDiagnostics = now ? now : 1;
+        SendDiagnostics(now);
         Publish();
         Status(&Log);
         pollGaps = {};
@@ -1838,6 +1907,7 @@ void Stop()
     }
     if (relay != INVALID_SOCKET) closesocket(relay);
     relay = INVALID_SOCKET;
+    sendCodec.reset();
     ready = false;
     if (apiInitialized) {
         api.Shutdown();

@@ -572,7 +572,7 @@ ENET_API int        enet_host_service (ENetHost *, ENetEvent *, enet_uint32);
 ENET_API void       enet_host_flush (ENetHost *);
 ENET_API void       enet_host_broadcast (ENetHost *, enet_uint8, ENetPacket *);
 ENET_API void       enet_host_compress (ENetHost *, const ENetCompressor *);
-ENET_API int        enet_host_compress_with_range_coder (ENetHost * host);
+ENET_API int ENET_CALLBACK enet_host_compress_with_range_coder (ENetHost * host);
 ENET_API void       enet_host_channel_limit (ENetHost *, size_t);
 ENET_API void       enet_host_bandwidth_limit (ENetHost *, enet_uint32, enet_uint32);
 extern   void       enet_host_bandwidth_throttle (ENetHost *);
@@ -601,10 +601,10 @@ extern void                  enet_peer_dispatch_incoming_reliable_commands (ENet
 extern void                  enet_peer_on_connect (ENetPeer *);
 extern void                  enet_peer_on_disconnect (ENetPeer *);
 
-ENET_API void * enet_range_coder_create (void);
-ENET_API void   enet_range_coder_destroy (void *);
-ENET_API size_t enet_range_coder_compress (void *, const ENetBuffer *, size_t, size_t, enet_uint8 *, size_t);
-ENET_API size_t enet_range_coder_decompress (void *, const enet_uint8 *, size_t, enet_uint8 *, size_t);
+ENET_API void * ENET_CALLBACK enet_range_coder_create (void);
+ENET_API void ENET_CALLBACK enet_range_coder_destroy (void *);
+ENET_API size_t ENET_CALLBACK enet_range_coder_compress (void *, const ENetBuffer *, size_t, size_t, enet_uint8 *, size_t);
+ENET_API size_t ENET_CALLBACK enet_range_coder_decompress (void *, const enet_uint8 *, size_t, enet_uint8 *, size_t);
    
 extern size_t enet_protocol_command_size (enet_uint8);
 
@@ -613,4 +613,3 @@ extern size_t enet_protocol_command_size (enet_uint8);
 #endif
 
 #endif /* __ENET_ENET_H__ */
-

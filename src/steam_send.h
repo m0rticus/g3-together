@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "relaywire.h"
+#include <enet/enet.h>
+#include <algorithm>
+#include <array>
+#include <deque>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace g3t::steam::send {
+constexpr int Ok = 1, Ignored = 16, LimitExceeded = 25;
+constexpr int Reliable = 8, NoNagle = 1, NoDelay = 4, AutoRestart = 32;
+enum class Priority : unsigned { Critical, Definition, Pose, Bulk, Count };
+constexpr unsigned Classes = static_cast<unsigned>(Priority::Count);
+
+inline bool Retryable(int result) { return result == LimitExceeded || result == Ignored; }
+
+class Codec {
+    void* context_ = enet_range_coder_create();
+public:
+    Codec() = default;
+    ~Codec() { if (context_) enet_range_coder_destroy(context_); }
+    Codec(Codec const&) = delete;
+    Codec& operator=(Codec const&) = delete;
+    bool Ready() const { return context_ != nullptr; }
+
+    bool Decode(void const* packet, size_t size, std::vector<uint8_t>& plain)
+    {
+        if (!context_ || !packet || size < 2 || size > RelayPayloadLimit) return false;
+        auto const* bytes = static_cast<uint8_t const*>(packet);
+        const size_t header = bytes[0] & 0x80u ? 4 : 2;
+        if (size <= header) return false;
+        plain.assign(bytes, bytes + header);
+        if (bytes[0] & 0x40u) {
+            plain.resize(RelayPayloadLimit);
+            const size_t decoded = enet_range_coder_decompress(context_, bytes + header, size - header,
+                                                               plain.data() + header, plain.size() - header);
+            if (!decoded) return false;
+            plain.resize(header + decoded);
+            plain[0] &= ~0x40u;
+        } else {
+            plain.insert(plain.end(), bytes + header, bytes + size);
+        }
+        EnetPacketParse parsed;
+        return ParseEnetDataPacket(plain.data(), plain.size(), &parsed) && !parsed.compressed;
+    }
+
+    void Encode(std::vector<uint8_t>& packet)
+    {
+        const size_t header = packet[0] & 0x80u ? 4 : 2;
+        std::vector<uint8_t> packed(packet.size());
+        ENetBuffer buffer{packet.size() - header, packet.data() + header};
+        const size_t size = enet_range_coder_compress(context_, &buffer, 1, buffer.dataLength,
+                                                     packed.data() + header, buffer.dataLength);
+        if (!size || size >= buffer.dataLength) return;
+        std::memcpy(packed.data(), packet.data(), header);
+        packed[0] |= 0x40u;
+        packed.resize(header + size);
+        packet.swap(packed);
+    }
+};
+
+struct Item {
+    std::vector<uint8_t> bytes;
+    std::string retransmission;
+    uint32_t at = 0;
+    bool reliable = false;
+    unsigned playerStates = 0;
+    int Flags() const
+    {
+        // NoDelay refuses a busy Steam queue; the application retains the exact
+        // datagram and retries it, rather than letting bulk fill that queue.
+        return AutoRestart | (reliable ? Reliable | NoNagle : NoDelay | NoNagle);
+    }
+};
+
+struct Counters {
+    uint64_t accepted[Classes] = {}, bytes[Classes] = {};
+    uint64_t failed[128] = {};
+    uint64_t reliableAccepted = 0, unreliableAccepted = 0;
+    uint64_t reliableFailed = 0, unreliableFailed = 0;
+    uint64_t retries = 0, duplicates = 0, plainBytes = 0, wireBytes = 0;
+    uint64_t playerStates = 0;
+};
+
+class Queue {
+    std::array<std::deque<Item>, Classes * 2> queues_;
+    std::unordered_set<std::string> pendingReliable_;
+    size_t bytes_ = 0, depth_ = 0;
+public:
+    Counters counters;
+    size_t Bytes() const { return bytes_; }
+    size_t Depth() const { return depth_; }
+    uint32_t OldestAge(uint32_t now) const
+    {
+        uint32_t age = 0;
+        for (auto const& q : queues_)
+            if (!q.empty()) age = (std::max)(age, now - q.front().at);
+        return age;
+    }
+
+    bool Push(Codec& codec, void const* packet, size_t size, uint32_t now)
+    {
+        std::vector<uint8_t> plain;
+        if (!codec.Decode(packet, size, plain)) return false;
+        const size_t header = plain[0] & 0x80u ? 4 : 2;
+        std::array<std::vector<uint8_t>, Classes * 2> groups;
+        std::array<unsigned, Classes * 2> playerStates{};
+        for (size_t at = header; at < plain.size();) {
+            const unsigned command = plain[at] & 15u;
+            const unsigned channel = plain[at + 1];
+            static constexpr size_t lengths[] = {0,8,44,44,8,4,6,8,24,8,12,12,24};
+            size_t length = lengths[command];
+            if (command == 6) length += RelayReadUint16(plain.data() + at + 4);
+            if (command == 7 || command == 8 || command == 9 || command == 12)
+                length += RelayReadUint16(plain.data() + at + 6);
+            const bool reliable = (plain[at] & 0x80u) != 0 || command == 1;
+            Priority priority = Priority::Critical;
+            if (channel == 6 && command >= 6) priority = Priority::Bulk;
+            else if (command >= 6 && (channel == 4 || channel == 5 || (channel == 2 && !reliable)))
+                priority = Priority::Pose;
+            else if (channel == 7 && command >= 6)
+                priority = Priority::Definition;
+            const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
+            auto& group = groups[groupId];
+            if ((command == 6 || command == 7) && channel == 0 &&
+                length > lengths[command] && plain[at + lengths[command]] == 3)
+                ++playerStates[groupId];
+            if (group.empty()) group.assign(plain.begin(), plain.begin() + header);
+            group.insert(group.end(), plain.begin() + at, plain.begin() + at + length);
+            at += length;
+        }
+        for (unsigned i = 0; i < groups.size(); ++i) {
+            auto& group = groups[i];
+            if (group.empty()) continue;
+            const bool reliable = (i & 1u) == 0;
+            auto& queue = queues_[i];
+            // Only duplicate ENet retransmissions are redundant. Never replace
+            // an unreliable NPC sample, including one with the same pose.
+            std::string retransmission;
+            if (reliable) {
+                retransmission.assign(reinterpret_cast<char const*>(group.data()), group.size());
+                if (header == 4) retransmission[2] = retransmission[3] = 0;
+                if (!pendingReliable_.insert(retransmission).second) { ++counters.duplicates; continue; }
+            }
+            counters.plainBytes += group.size();
+            codec.Encode(group);
+            counters.wireBytes += group.size();
+            bytes_ += group.size();
+            ++depth_;
+            queue.push_back({std::move(group), std::move(retransmission), now, reliable, playerStates[i]});
+        }
+        return true;
+    }
+
+    template<class Submit>
+    int Drain(Submit submit)
+    {
+        for (unsigned i = 0; i < queues_.size(); ++i) {
+            auto& queue = queues_[i];
+            while (!queue.empty()) {
+                auto const& item = queue.front();
+                const int result = submit(item);
+                if (result != Ok) {
+                    ++counters.failed[result >= 0 && result < 128 ? result : 0];
+                    ++(item.reliable ? counters.reliableFailed : counters.unreliableFailed);
+                    if (Retryable(result)) ++counters.retries;
+                    return result;
+                }
+                ++counters.accepted[i / 2];
+                counters.bytes[i / 2] += item.bytes.size();
+                counters.playerStates += item.playerStates;
+                ++(item.reliable ? counters.reliableAccepted : counters.unreliableAccepted);
+                bytes_ -= item.bytes.size();
+                --depth_;
+                if (item.reliable) pendingReliable_.erase(item.retransmission);
+                queue.pop_front();
+            }
+        }
+        return Ok;
+    }
+};
+}

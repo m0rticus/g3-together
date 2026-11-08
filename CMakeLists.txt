@@ -19,9 +19,7 @@ target_include_directories(enet PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/e
 target_compile_definitions(enet PRIVATE _WINSOCK_DEPRECATED_NO_WARNINGS)
 # Gothic script targets default to __stdcall (/Gz); ENet must match so the import names agree.
 target_compile_options(enet PRIVATE /Gz)
-# compress.c only defines the range coder, whose functions are stored in ENET_CALLBACK (__cdecl) pointers;
-# under /Gz they would be __stdcall and fail to compile. The mod never calls the range coder directly.
-set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/enet/compress.c" PROPERTIES COMPILE_OPTIONS /Gd)
+# Codec entry points explicitly use ENET_CALLBACK (__cdecl); its allocator/host calls still match ENet's /Gz ABI.
 target_link_libraries(enet PUBLIC ws2_32 winmm)
 
 add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/guid_text.cpp src/guid.cpp src/config.cpp src/net.cpp src/npclease_runtime.cpp src/npcwire_bones.cpp src/npcwire_control.cpp src/npcwire_adapter.cpp src/steam.cpp src/lobby.cpp src/snapshot.cpp src/npcplayback.cpp
@@ -34,6 +32,7 @@ target_sources(Script_G3Together PRIVATE src/options.cpp)
 # The standalone codec rolls back partially installed baselines on allocation failure.
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/npcwire_control.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 # Sources are UTF-8: without /utf-8 MSVC reads them as Windows-1252 and HUD texts show "lÃ¤uft" (plan 3.5).
 target_compile_options(Script_G3Together PRIVATE /utf-8 /wd4530)
 # A map file, to turn crash addresses from the engine's report into functions.

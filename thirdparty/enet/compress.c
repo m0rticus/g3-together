@@ -45,7 +45,7 @@ typedef struct _ENetRangeCoder
     ENetSymbol symbols[4096];
 } ENetRangeCoder;
 
-void *
+void * ENET_CALLBACK
 enet_range_coder_create (void)
 {
     ENetRangeCoder * rangeCoder = (ENetRangeCoder *) enet_malloc (sizeof (ENetRangeCoder));
@@ -55,7 +55,7 @@ enet_range_coder_create (void)
     return rangeCoder;
 }
 
-void
+void ENET_CALLBACK
 enet_range_coder_destroy (void * context)
 {
     ENetRangeCoder * rangeCoder = (ENetRangeCoder *) context;
@@ -243,7 +243,7 @@ ENET_CONTEXT_WALK(context, { \
 })
 #endif
 
-size_t
+size_t ENET_CALLBACK
 enet_range_coder_compress (void * context, const ENetBuffer * inBuffers, size_t inBufferCount, size_t inLimit, enet_uint8 * outData, size_t outLimit)
 {
     ENetRangeCoder * rangeCoder = (ENetRangeCoder *) context;
@@ -495,7 +495,7 @@ typedef struct _ENetExclude
 
 #define ENET_CONTEXT_NOT_EXCLUDED(value_, after, before)
 
-size_t
+size_t ENET_CALLBACK
 enet_range_coder_decompress (void * context, const enet_uint8 * inData, size_t inLimit, enet_uint8 * outData, size_t outLimit)
 {
     ENetRangeCoder * rangeCoder = (ENetRangeCoder *) context;
@@ -634,7 +634,7 @@ enet_range_coder_decompress (void * context, const enet_uint8 * inData, size_t i
     @param host host to enable the range coder for
     @returns 0 on success, < 0 on failure
 */
-int
+int ENET_CALLBACK
 enet_host_compress_with_range_coder (ENetHost * host)
 {
     ENetCompressor compressor;
