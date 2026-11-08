@@ -35,6 +35,7 @@
 #include "net.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -196,8 +197,8 @@ constexpr int FriendFlagImmediate = 4;
 constexpr uint32_t GothicAppId = 39500;
 char const LobbyTag[] = "g3together";
 char const LobbyVersion[] = "3";  // compact LE lobby + marker/length + exact ASCII session relay framing
-// No silence timeout below ENet's own: a world load stops the game loop (and so Pump) for many seconds, and net.cpp gives
-// ENet peers up to 180 s for it. A friend who quits leaves the lobby, which ends the link at once.
+// The transport worker continues during native loads; allow ENet's shorter bounded timeout to decide network loss.
+// A friend who quits leaves the lobby, which ends the link at once.
 constexpr uint32_t SilenceMs = 180000;
 constexpr uint32_t ScanMs = 3000;       // client: how often the friends list is searched for a host
 constexpr uint32_t JoinWaitMs = 15000;  // client: a lobby that does not answer the join in this time is skipped for a while
@@ -206,6 +207,7 @@ constexpr int MaxRemotes = net::MaxPlayers;
 struct Remote
 {
     u64 id = 0;
+    uint64_t generation = 0;
     char name[24] = {};
     bool linked = false;   // host: said hello while in the lobby; client: the host welcomed us
     bool leaving = false;
@@ -234,6 +236,7 @@ unsigned short enetPort = 0;
 u64 lobby = 0, owner = 0;
 uint32_t lastCreate = 0;
 Remote remotes[MaxRemotes];
+uint64_t nextRelayGeneration = 0;
 int senderOffset = 0;  // where a message's sender identity sits: 12 in the real 32-bit DLL, 16 by the headers; 0: unknown
 
 // Client
@@ -268,17 +271,22 @@ std::atomic<bool> disconnectRequested{false};  // engine thread -> worker: the E
 struct Published
 {
     bool ready = false, hostLinked = false;
+    uint64_t hostGeneration = 0;
     u64 lobby = 0;
     int linked = 0, ping = -1;
     uint32_t pingSampleAt = 0;
     unsigned short ports[MaxRemotes] = {};
     u64 accounts[MaxRemotes] = {};
+    uint64_t generations[MaxRemotes] = {};
     char names[MaxRemotes][24] = {}, playerName[24] = {};
     char hostName[64] = {}, error[256] = {}, status[900] = {};
     Connection connection;
     TrafficCounters traffic;
 } published;
 std::mutex publishedMutex;
+std::vector<RelayDrop> relayDrops;
+struct RelayClose { uint64_t account, generation; };
+std::vector<RelayClose> relayCloses;
 HANDLE worker = nullptr, stopEvent = nullptr, wakeEvent = nullptr, pollTimer = nullptr;
 uint32_t lastPump = 0;
 latency::Samples pollGaps, pumpWork;
@@ -339,10 +347,13 @@ void Publish()
         auto const& r = remotes[i];
         if (!r.id) continue;
         if (r.linked) {
-            next.ports[i] = r.relayPort; next.accounts[i] = r.id;
+            next.ports[i] = r.relayPort; next.accounts[i] = r.id; next.generations[i] = r.generation;
             strcpy_s(next.names[i], r.name);
         }
-        if (!isHost && r.id == owner) next.hostLinked = r.linked;
+        if (!isHost && r.id == owner) {
+            next.hostLinked = r.linked;
+            if (r.linked) next.hostGeneration = r.generation;
+        }
         n += Format(next.status + n, sizeof(next.status) - n, " peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
                     r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
                     r.ping.milliseconds < 0 ? 0u : now - r.ping.sampledAt);
@@ -465,6 +476,7 @@ Remote* Get(u64 id)
         if (!r.id) {
             r = Remote{};
             r.id = id;
+            r.generation = ++nextRelayGeneration;
             r.heard = Now();
             return &r;
         }
@@ -483,18 +495,44 @@ void LeaveLobby();
 void OnClientLinkLost(u64 id, char const* why);
 void OnHostLinkLost(u64 id, char const* why);
 
+// publishedMutex must be held: an engine reader must not authenticate an already-closing relay.
+void InvalidatePublished(u64 account, uint64_t generation)
+{
+    for (int i = 0; i < MaxRemotes; ++i) {
+        if (published.accounts[i] != account || published.generations[i] != generation) continue;
+        published.ports[i] = 0;
+        published.accounts[i] = published.generations[i] = 0;
+        published.names[i][0] = '\0';
+        if (isHost && published.linked > 0) --published.linked;
+    }
+    if (!isHost && published.hostGeneration == generation) {
+        published.hostLinked = false;
+        published.hostGeneration = 0;
+    }
+}
+
 void Drop(Remote* r, char const* why)
 {
     if (!r || !r->id) return;
     const u64 id = r->id;
     Logf("steam: %llu dropped (%s; %u datagrams to ENet, %u to Steam)", r->id, why, r->toEnet, r->toSteam);
+    if ((isHost && r->relayPort) || (!isHost && r->id == owner && r->linked)) {
+        RelayDrop drop;
+        drop.account = id;
+        drop.generation = r->generation;
+        drop.port = r->relayPort;
+        strncpy_s(drop.reason, why, _TRUNCATE);
+        std::lock_guard<std::mutex> lock(publishedMutex);
+        InvalidatePublished(drop.account, drop.generation);
+        relayDrops.push_back(drop);
+    }
     char identity[160];
     Identity(identity, r->id);
     api.CloseSession(messages, identity);
     if (r->socket != INVALID_SOCKET) closesocket(r->socket);
     const bool wasHost = !isHost && r->id == owner;
     *r = Remote{};
-    if (wasHost) LeaveLobby();  // its ENet notices the loss by its own timeout (net.cpp also closes it when the link ends)
+    if (wasHost) LeaveLobby();  // the engine thread consumes the queued relay drop
     if (connectionMode != connect::Mode::Invite) return;
     if (wasHost) OnClientLinkLost(id, why);
     else if (isHost) OnHostLinkLost(id, why);
@@ -581,6 +619,16 @@ void LeaveLobby()
     if (!lobby) return;
     for (auto& r : remotes)
         if (r.id && (isHost || r.id == owner)) {
+            if ((isHost && r.relayPort) || (!isHost && r.id == owner && r.linked)) {
+                RelayDrop drop;
+                drop.account = r.id;
+                drop.generation = r.generation;
+                drop.port = r.relayPort;
+                strcpy_s(drop.reason, "lobby closed");
+                std::lock_guard<std::mutex> lock(publishedMutex);
+                InvalidatePublished(drop.account, drop.generation);
+                relayDrops.push_back(drop);
+            }
             Control(r.id, 'B', true);
             char identity[160];
             Identity(identity, r.id);
@@ -1613,15 +1661,55 @@ uint64_t PeerId(unsigned short port)
 }
 bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
+    uint64_t generation = 0;
+    return PeerIdentity(port, account, name, generation);
+}
+namespace {
+bool ReadPeerIdentityLocked(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
     if (!published.ready || !isHost || !port) return false;
     for (int i = 0; i < MaxRemotes; ++i)
         if (published.ports[i] == port && published.accounts[i]) {
             account = published.accounts[i];
+            generation = published.generations[i];
             strcpy_s(name, published.names[i]);
             return true;
         }
     return false;
+}
+}
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return ReadPeerIdentityLocked(port, account, name, generation);
+}
+bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    if (!ReadPeerIdentityLocked(port, account, name, generation) || account == me) return false;
+    relayCloses.erase(std::remove_if(relayCloses.begin(), relayCloses.end(),
+        [account, generation](RelayClose const& request) {
+            return request.account == account && request.generation == generation;
+        }), relayCloses.end());
+    return true;
+}
+
+std::vector<RelayDrop> TakeRelayDrops()
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    std::vector<RelayDrop> result;
+    result.swap(relayDrops);
+    return result;
+}
+
+void RequestHostRelayClose(uint64_t account, uint64_t generation)
+{
+    if (!account || !generation) return;
+    {
+        std::lock_guard<std::mutex> lock(publishedMutex);
+        relayCloses.push_back({account, generation});
+    }
+    if (wakeEvent) SetEvent(wakeEvent);
 }
 
 namespace {
@@ -1651,6 +1739,16 @@ void PumpOnce()
         }
         api.DispatchFree(pipe);
     }
+    std::vector<RelayClose> closes;
+    {
+        std::lock_guard<std::mutex> lock(publishedMutex);
+        closes.swap(relayCloses);
+        for (auto const& close : closes)
+            InvalidatePublished(close.account, close.generation);
+    }
+    if (isHost) for (auto const& close : closes)
+        if (Remote* r = Find(close.account); r && r->generation == close.generation)
+            Drop(r, "ENet connection ended");
     if (isHost && !lobby && connectionMode == connect::Mode::Auto && Now() - lastCreate > 15000)
         CreateLobbyAuto();  // the first try failed: again every 15 s (legacy mode only)
     if (disconnectRequested.exchange(false) && !isHost && connectionMode == connect::Mode::Invite && clientFlow.Active())
@@ -1749,6 +1847,10 @@ void Stop()
         WSACleanup();
         winsockStarted = false;
     }
+    {
+        std::lock_guard<std::mutex> lock(publishedMutex);
+        relayCloses.clear();
+    }
     Publish();
 }
 
@@ -1786,6 +1888,12 @@ bool HostLinked()
 {
     std::lock_guard<std::mutex> lock(publishedMutex);
     return published.hostLinked;
+}
+
+uint64_t HostRelayGeneration()
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return published.hostGeneration;
 }
 
 bool RequestClientDisconnect()

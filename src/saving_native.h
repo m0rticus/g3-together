@@ -38,7 +38,10 @@ inline constexpr Site DeleteSite = {
 };
 constexpr size_t Missing = static_cast<size_t>(-1);
 constexpr size_t Stolen = 6; // push ebp / mov ebp,esp / and esp,-8; no relative operand
-constexpr uint32_t PupReceiverRva = 0x157f0, PupImageSize = 0xa8000;
+constexpr uint32_t PupKnownRva = 0x157f0, PupKnownImageSize = 0xa8000;
+constexpr uint32_t PupKnownSemaphore = 0x99510, PupKnownWaitImport = 0x677a0,
+                   PupKnownReleaseImport = 0x677a4, PupKnownAdapter = 0x97578;
+struct PupLayout { uint32_t semaphore, waitImport, releaseImport, adapter; };
 inline constexpr char PupReceiverBytes[] =
     "558bec6affff35????????ff15????????6a006a01ff35????????ff15????????a1????????5dffe0";
 
@@ -103,17 +106,26 @@ inline bool PupShimTarget(uint8_t const* data, size_t size, uint32_t address, ui
 {
     return Matches(data, size, "870c2451e9????????") && BranchTarget(data + 4, size - 4, address + 4, 0xe9, target);
 }
-inline bool PupReceiver(uint8_t const* data, size_t size, uint32_t base)
+inline bool PupReceiverLayoutAt(uint8_t const* data, size_t size, uint32_t address,
+                                uint32_t base, uint32_t imageSize, PupLayout& layout)
 {
-    return Matches(data, size, PupReceiverBytes) &&
-           Word(data, 7) == base + 0x99510 && Word(data, 13) == base + 0x677a0 &&
-           Word(data, 23) == base + 0x99510 && Word(data, 29) == base + 0x677a4 &&
-           Word(data, 34) == base + 0x97578;
+    if (!Matches(data, size, PupReceiverBytes) || address < base || address - base >= imageSize)
+        return false;
+    const uint32_t semaphore = Word(data, 7), waitImport = Word(data, 13),
+                   releaseImport = Word(data, 29), adapter = Word(data, 34);
+    if (semaphore != Word(data, 23) || waitImport == releaseImport ||
+        adapter == semaphore || adapter == waitImport || adapter == releaseImport)
+        return false;
+    for (uint32_t operand : {semaphore, waitImport, releaseImport, adapter})
+        if ((operand & 3u) || operand < base || operand - base >= imageSize) return false;
+    layout = {semaphore - base, waitImport - base, releaseImport - base, adapter - base};
+    return true;
 }
-inline bool PupReceiverAt(uint8_t const* data, size_t size, uint32_t address, uint32_t base, uint32_t imageSize)
+inline bool PupLayoutIsPinned(uint32_t receiverRva, uint32_t imageSize, PupLayout const& layout)
 {
-    return base && imageSize == PupImageSize && address >= base && address - base == PupReceiverRva &&
-           PupReceiver(data, size, base);
+    return receiverRva == PupKnownRva && imageSize == PupKnownImageSize &&
+           layout.semaphore == PupKnownSemaphore && layout.waitImport == PupKnownWaitImport &&
+           layout.releaseImport == PupKnownReleaseImport && layout.adapter == PupKnownAdapter;
 }
 inline bool Calls(uint8_t const* image, size_t size, size_t at, size_t target)
 {

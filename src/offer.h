@@ -9,6 +9,7 @@ using ResultFn = bool (*)(net::OfferNote const&, bool accepted);
 void Start();
 void Tick();
 void OnWorldChange();
+void OnPeerLeft(uint8_t player);
 void SetResultHandler(ResultFn handler);
 bool Send(net::OfferNote note);
 bool Reserve(net::OfferNote const& note);

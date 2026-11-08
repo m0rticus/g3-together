@@ -30,6 +30,7 @@ enum Message
     RecordBack,
     ConnectionLost,
     Reconnected,
+    PlayerLeft,
     RefusedVersion,
     RefusedInstall,
     RefusedOther,
@@ -117,6 +118,19 @@ enum Message
     OptionsOn,
     OptionsOff,
     ClientTemplateUnavailable,
+    AdmissionUnsupportedPup,
+    AdmissionUnsupportedGame,
+    AdmissionJoining,
+    AdmissionMismatch,
+    AdmissionMismatchCountdown,
+    AdmissionManual,
+    AdmissionHeld,
+    AdmissionNoRoute,
+    AdmissionGaveUp,
+    AdmissionStalled,
+    AdmissionInWorld,
+    HostClientWaiting,
+    HostClientInWorld,
     MessageCount
 };
 

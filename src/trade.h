@@ -12,6 +12,7 @@ bool TradableStack(Entity& self, int stack);
 void Start();
 void Tick();
 void OnWorldChange();
+void OnPeerLeft(uint8_t player);
 bool OnOpen(eCEntity* partner);
 bool Available();
 bool ReadyForSave();

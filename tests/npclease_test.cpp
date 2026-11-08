@@ -50,6 +50,10 @@ static_assert(FullMessageWireSize == 278 && StateMessageWireSize == 150 &&
 static_assert(static_cast<uint8_t>(Kind::Reject) == 11 && static_cast<uint8_t>(Kind::Adopt) == 12 &&
               static_cast<uint8_t>(Kind::StateFull) == 13,
               "Existing operation numbers must remain stable");
+static_assert(PeerCurrent(true, 3, 3), "A live lease owner must receive its controls");
+static_assert(!PeerCurrent(false, 3, 3), "A departed lease owner must not receive controls");
+static_assert(!PeerCurrent(true, 4, 3), "A replacement must not receive the old owner's controls");
+static_assert(!PeerCurrent(true, 0, 0), "An unassigned generation is not a lease owner");
 
 static void TestValidityAndWire()
 {

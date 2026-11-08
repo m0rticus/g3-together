@@ -43,17 +43,22 @@ class SavingNativeTests(unittest.TestCase):
         if not path or not Path(path).is_file():
             self.skipTest("Set G3T_PUP_DLL to the read-only PUP companion paru_s2.dll")
         fixture = Path(path)
-        digest = hashlib.sha256(fixture.read_bytes()).hexdigest().upper()
-        self.assertIn(
-            digest,
-            {
-                "97760FFCD3EEF09B7DBCD8EF925B9995A198CB8BBA96951298969C48A84CD8F0",  # genuine CP 1.75 Steam install
-                "60FCCBA5E27CA544FC1E72FE5BA4CBC33AAD107C1CBC90845B275F81B58C349C",  # QA copy (g3qa32.dll import)
-            },
-            "G3T_PUP_DLL identity differs from the captured paru_s2.dll",
-        )
-        subprocess.run([str(self.executable), "--pup", path], check=True,
-                       capture_output=True, text=True)
+        digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        result = subprocess.run([str(self.executable), "--pup", path], check=True,
+                                capture_output=True, text=True)
+        self.assertIn(result.stdout.strip(), {
+            f"pup digest={digest} verified=structural",
+            f"pup digest={digest} verified=pinned",
+        })
+
+    def test_pup_identity_is_informational(self):
+        source = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+        self.assertNotRegex(source, r'if\s*\(\s*!\s*(?:KnownPup|LogPupIdentity)\s*\(')
+        self.assertNotRegex(source, r'PupRefused\s*\(\s*"companion-identity"')
+        self.assertIn("persist: PUP identity digest=", source)
+        self.assertIn("verified=", source)
+        for offset in ("0x677a0", "0x97578", "0x99510"):
+            self.assertNotIn(offset, source.lower())
 
 
 if __name__ == "__main__":

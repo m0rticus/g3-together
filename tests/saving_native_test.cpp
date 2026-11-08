@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <stdexcept>
@@ -28,6 +29,56 @@ uint32_t Get(std::vector<uint8_t> const& image, size_t at)
 {
     if (!Range(image.size(), at, 4)) throw std::runtime_error("truncated PE dword");
     return Word(image.data(), at);
+}
+
+std::string Sha256(std::vector<uint8_t> const& input)
+{
+    static constexpr uint32_t constants[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    auto rotate = [](uint32_t value, unsigned count) { return (value >> count) | (value << (32 - count)); };
+    uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    std::vector<uint8_t> padded = input;
+    const uint64_t bits = static_cast<uint64_t>(input.size()) * 8;
+    padded.push_back(0x80);
+    while (padded.size() % 64 != 56) padded.push_back(0);
+    for (int shift = 56; shift >= 0; shift -= 8) padded.push_back(static_cast<uint8_t>(bits >> shift));
+    for (size_t block = 0; block < padded.size(); block += 64) {
+        uint32_t words[64]{};
+        for (size_t i = 0; i < 16; ++i) {
+            for (size_t b = 0; b < 4; ++b) words[i] = (words[i] << 8) | padded[block + i * 4 + b];
+        }
+        for (size_t i = 16; i < 64; ++i) {
+            const uint32_t a = words[i - 15], b = words[i - 2];
+            words[i] = words[i - 16] + (rotate(a, 7) ^ rotate(a, 18) ^ (a >> 3)) +
+                       words[i - 7] + (rotate(b, 17) ^ rotate(b, 19) ^ (b >> 10));
+        }
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3],
+                 e = state[4], f = state[5], g = state[6], h = state[7];
+        for (size_t i = 0; i < 64; ++i) {
+            const uint32_t t1 = h + (rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25)) +
+                                ((e & f) ^ (~e & g)) + constants[i] + words[i];
+            const uint32_t t2 = (rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22)) +
+                                ((a & b) ^ (a & c) ^ (b & c));
+            h = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+    }
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    for (uint32_t word : state)
+        for (int shift = 28; shift >= 0; shift -= 4) result += hex[(word >> shift) & 15];
+    return result;
 }
 
 class AddressReader {
@@ -88,13 +139,85 @@ std::vector<uint8_t> SyntheticReceiver(uint32_t pupBase)
     std::vector<uint8_t> callback(41);
     for (size_t i = 0; i < receiver.size(); ++i)
         callback[i] = receiver[i] < 0 ? 0 : static_cast<uint8_t>(receiver[i]);
-    Put(callback, 7, pupBase + 0x99510);
-    Put(callback, 13, pupBase + 0x677a0);
-    Put(callback, 23, pupBase + 0x99510);
-    Put(callback, 29, pupBase + 0x677a4);
-    Put(callback, 34, pupBase + 0x97578);
-    assert(PupReceiver(callback.data(), callback.size(), pupBase));
+    Put(callback, 7, pupBase + PupKnownSemaphore);
+    Put(callback, 13, pupBase + PupKnownWaitImport);
+    Put(callback, 23, pupBase + PupKnownSemaphore);
+    Put(callback, 29, pupBase + PupKnownReleaseImport);
+    Put(callback, 34, pupBase + PupKnownAdapter);
+    PupLayout layout{};
+    assert(PupReceiverLayoutAt(callback.data(), callback.size(), pupBase + PupKnownRva,
+                               pupBase, PupKnownImageSize, layout));
+    assert(PupLayoutIsPinned(PupKnownRva, PupKnownImageSize, layout));
     return callback;
+}
+
+bool KnownReceiver(uint8_t const* data, size_t size, uint32_t base)
+{
+    PupLayout layout{};
+    return PupReceiverLayoutAt(data, size, base + PupKnownRva, base, PupKnownImageSize, layout) &&
+           PupLayoutIsPinned(PupKnownRva, PupKnownImageSize, layout);
+}
+
+void StructuralReceiverFixtures()
+{
+    const uint32_t base = 0x41000000u, imageSize = 0x50000u, rva = 0x1200u;
+    auto callback = SyntheticReceiver(base);
+    Put(callback, 7, base + 0x31000);
+    Put(callback, 13, base + 0x32000);
+    Put(callback, 23, base + 0x31000);
+    Put(callback, 29, base + 0x33000);
+    Put(callback, 34, base + 0x34000);
+    PupLayout layout{};
+    const auto accepted = [&](std::vector<uint8_t> const& bytes) {
+        return PupReceiverLayoutAt(bytes.data(), bytes.size(), base + rva, base, imageSize, layout);
+    };
+    assert(accepted(callback));
+    assert(layout.semaphore == 0x31000 && layout.waitImport == 0x32000 &&
+           layout.releaseImport == 0x33000 && layout.adapter == 0x34000);
+    assert(!PupLayoutIsPinned(rva, imageSize, layout));
+    assert(!PupReceiverLayoutAt(callback.data(), callback.size(), base - 1, base, imageSize, layout));
+    assert(!PupReceiverLayoutAt(callback.data(), callback.size(), base + imageSize, base, imageSize, layout));
+
+    for (size_t operand : {7u, 13u, 29u, 34u}) {
+        for (uint32_t bad : {base - 4, base + imageSize, Get(callback, operand) + 1}) {
+            auto corrupt = callback;
+            Put(corrupt, operand, bad);
+            if (operand == 7) Put(corrupt, 23, bad);
+            assert(!accepted(corrupt));
+        }
+    }
+    auto corrupt = callback;
+    Put(corrupt, 23, base + 0x31004);
+    assert(!accepted(corrupt));
+    corrupt = callback;
+    Put(corrupt, 29, Get(corrupt, 13));
+    assert(!accepted(corrupt));
+    for (size_t operand : {7u, 13u, 29u}) {
+        corrupt = callback;
+        Put(corrupt, 34, Get(corrupt, operand));
+        assert(!accepted(corrupt));
+    }
+    corrupt = callback;
+    corrupt[12] ^= 1;
+    assert(!accepted(corrupt));
+    assert(!PupReceiverLayoutAt(callback.data(), 40, base + rva, base, imageSize, layout));
+
+    const auto known = SyntheticReceiver(base);
+    assert(PupReceiverLayoutAt(known.data(), known.size(), base + PupKnownRva,
+                               base, PupKnownImageSize, layout));
+    assert(PupLayoutIsPinned(PupKnownRva, PupKnownImageSize, layout));
+    assert(!PupLayoutIsPinned(PupKnownRva + 4, PupKnownImageSize, layout));
+    assert(!PupLayoutIsPinned(PupKnownRva, PupKnownImageSize + 4, layout));
+    for (unsigned field = 0; field < 4; ++field) {
+        auto different = layout;
+        switch (field) {
+        case 0: different.semaphore += 4; break;
+        case 1: different.waitImport += 4; break;
+        case 2: different.releaseImport += 4; break;
+        default: different.adapter += 4; break;
+        }
+        assert(!PupLayoutIsPinned(PupKnownRva, PupKnownImageSize, different));
+    }
 }
 
 void CheckPairedSaveFixture(PairedSaveFixture const& fixture)
@@ -124,7 +247,7 @@ void CheckPairedSaveFixture(PairedSaveFixture const& fixture)
 
     std::vector<uint8_t> shim(9);
     shim = {0x87, 0x0c, 0x24, 0x51, 0xe9, 0, 0, 0, 0};
-    const uint32_t callbackAddress = fixture.pupBase + PupReceiverRva;
+    const uint32_t callbackAddress = fixture.pupBase + PupKnownRva;
     const uint32_t shimNext = fixture.shimAddress + 9;
     Put(shim, 5, callbackAddress - shimNext);
     if (!fixture.syntheticPup) {
@@ -144,18 +267,20 @@ void CheckPairedSaveFixture(PairedSaveFixture const& fixture)
     assert(runtime.Put(callbackAddress, receiver));
     std::vector<uint8_t> callbackBytes;
     assert(runtime.Read(callbackAddress, receiver.size(), callbackBytes));
-    assert(PupReceiver(callbackBytes.data(), callbackBytes.size(), fixture.pupBase));
-    assert(PupReceiverAt(callbackBytes.data(), callbackBytes.size(),
-                         callbackAddress, fixture.pupBase, PupImageSize));
-    assert(!PupReceiverAt(callbackBytes.data(), callbackBytes.size(),
-                          0x720c57f0u, fixture.pupBase, PupImageSize));
-    assert(!PupReceiverAt(callbackBytes.data(), callbackBytes.size(),
-                          callbackAddress, fixture.pupBase + 1, PupImageSize));
-    assert(!PupReceiverAt(callbackBytes.data(), callbackBytes.size(),
-                          callbackAddress, fixture.pupBase, PupImageSize - 4));
+    PupLayout layout{};
+    assert(PupReceiverLayoutAt(callbackBytes.data(), callbackBytes.size(),
+                               callbackAddress, fixture.pupBase, PupKnownImageSize, layout));
+    assert(PupLayoutIsPinned(PupKnownRva, PupKnownImageSize, layout));
+    assert(!PupReceiverLayoutAt(callbackBytes.data(), callbackBytes.size(),
+                                fixture.pupBase - 1, fixture.pupBase, PupKnownImageSize, layout));
+    assert(!PupReceiverLayoutAt(callbackBytes.data(), callbackBytes.size(),
+                                callbackAddress, fixture.pupBase + PupKnownRva + 4, PupKnownImageSize, layout));
+    assert(!PupReceiverLayoutAt(callbackBytes.data(), callbackBytes.size(),
+                                callbackAddress, fixture.pupBase, PupKnownRva, layout));
 
     auto foreign = receiver;
-    assert(!PupReceiver(foreign.data(), foreign.size(), fixture.pupBase + 1));
+    assert(!PupReceiverLayoutAt(foreign.data(), foreign.size(), callbackAddress,
+                                fixture.pupBase + PupKnownImageSize, PupKnownImageSize, layout));
 
     auto truncatedEntry = fixture.entry;
     AddressReader truncatedEntryReader;
@@ -228,7 +353,7 @@ void CheckPairedSaveFixture(PairedSaveFixture const& fixture)
     assert(!runtime.Read(negativeCallbackAddress, 41, staleCallback));
 
     auto truncatedReceiver = callbackBytes;
-    assert(!PupReceiver(truncatedReceiver.data(), 40, fixture.pupBase));
+    assert(!KnownReceiver(truncatedReceiver.data(), 40, fixture.pupBase));
     AddressReader truncatedReceiverReader;
     truncatedReceiver.pop_back();
     assert(truncatedReceiverReader.Put(callbackAddress, truncatedReceiver));
@@ -237,12 +362,12 @@ void CheckPairedSaveFixture(PairedSaveFixture const& fixture)
     for (size_t at : {0u, 6u, 12u, 22u, 28u, 33u, 40u}) {
         auto corruptFixed = callbackBytes;
         corruptFixed[at] ^= 1;
-        assert(!PupReceiver(corruptFixed.data(), corruptFixed.size(), fixture.pupBase));
+        assert(!KnownReceiver(corruptFixed.data(), corruptFixed.size(), fixture.pupBase));
     }
     for (size_t operand : {7u, 13u, 23u, 29u, 34u}) {
         auto corruptOperand = callbackBytes;
         Put(corruptOperand, operand, Get(corruptOperand, operand) + 1);
-        assert(!PupReceiver(corruptOperand.data(), corruptOperand.size(), fixture.pupBase));
+        assert(!KnownReceiver(corruptOperand.data(), corruptOperand.size(), fixture.pupBase));
     }
 }
 
@@ -266,6 +391,13 @@ void PairedSaveFixtures()
 void Fixture()
 {
     static_assert(Stolen == 6);
+    assert(Sha256({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    const std::string abc = "abc";
+    assert(Sha256({abc.begin(), abc.end()}) ==
+           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const std::string longMessage = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    assert(Sha256({longMessage.begin(), longMessage.end()}) ==
+           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
     const std::vector<int> prologue{0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
     for (size_t i = 0; i < 4; ++i) {
         const auto bytes = Decode(Sites[i].bytes);
@@ -321,32 +453,32 @@ void Fixture()
     assert(!BranchTarget(branch.data(), branch.size(), 0x100u, 0xe8, target));
 
     const uint32_t pupBase = 0x724b0000u;
-    std::vector<uint8_t> callback(PupImageSize, 0xcc);
-    const size_t callbackRva = PupReceiverRva;
+    std::vector<uint8_t> callback(PupKnownImageSize, 0xcc);
+    const size_t callbackRva = PupKnownRva;
     const auto receiver = Decode(PupReceiverBytes);
     assert(receiver.size() == 41);
     for (size_t i = 0; i < receiver.size(); ++i)
         callback[callbackRva + i] = receiver[i] < 0 ? 0 : static_cast<uint8_t>(receiver[i]);
-    Put(callback, callbackRva + 7, pupBase + 0x99510);
-    Put(callback, callbackRva + 13, pupBase + 0x677a0);
-    Put(callback, callbackRva + 23, pupBase + 0x99510);
-    Put(callback, callbackRva + 29, pupBase + 0x677a4);
-    Put(callback, callbackRva + 34, pupBase + 0x97578);
-    assert(PupReceiver(callback.data() + callbackRva, callback.size() - callbackRva, pupBase));
-    assert(!PupReceiver(callback.data() + callbackRva, 40, pupBase));
+    Put(callback, callbackRva + 7, pupBase + PupKnownSemaphore);
+    Put(callback, callbackRva + 13, pupBase + PupKnownWaitImport);
+    Put(callback, callbackRva + 23, pupBase + PupKnownSemaphore);
+    Put(callback, callbackRva + 29, pupBase + PupKnownReleaseImport);
+    Put(callback, callbackRva + 34, pupBase + PupKnownAdapter);
+    assert(KnownReceiver(callback.data() + callbackRva, callback.size() - callbackRva, pupBase));
+    assert(!KnownReceiver(callback.data() + callbackRva, 40, pupBase));
     for (size_t at : {callbackRva, callbackRva + 6, callbackRva + 12,
                       callbackRva + 22, callbackRva + 28, callbackRva + 33, callbackRva + 40}) {
         auto corrupt = callback;
         corrupt[at] ^= 1;
-        assert(!PupReceiver(corrupt.data() + callbackRva, corrupt.size() - callbackRva, pupBase));
+        assert(!KnownReceiver(corrupt.data() + callbackRva, corrupt.size() - callbackRva, pupBase));
     }
     for (size_t operand : {7u, 13u, 23u, 29u, 34u}) {
         auto corrupt = callback;
         Put(corrupt, callbackRva + operand, Get(corrupt, callbackRva + operand) + 1);
-        assert(!PupReceiver(corrupt.data() + callbackRva, corrupt.size() - callbackRva, pupBase));
+        assert(!KnownReceiver(corrupt.data() + callbackRva, corrupt.size() - callbackRva, pupBase));
     }
-    assert(!PupReceiver(callback.data() + callbackRva,
-                        callback.size() - callbackRva, pupBase + 1));
+    assert(!KnownReceiver(callback.data() + callbackRva,
+                          callback.size() - callbackRva, pupBase + 1));
     const uint32_t base = 0x31000000;
     std::vector<uint8_t> image(4096, 0xcc);
     size_t sites[5]{0x100, 0x300, 0x700, 0x740, 0x800};
@@ -369,8 +501,8 @@ void Fixture()
                 modifiedEntry.begin() + 0xd00);
     assert(FindUnique(modifiedEntry.data(), modifiedEntry.size(), WorldLoadBody, bodyMatches) ==
            Missing && bodyMatches == 2);
-    assert(PupReceiver(callback.data() + callbackRva,
-                       callback.size() - callbackRva, pupBase));
+    assert(KnownReceiver(callback.data() + callbackRva,
+                         callback.size() - callbackRva, pupBase));
     assert(pupBase + 0x157f0 != 0x720c57f0u);
     for (auto pattern : {"", "5", "zz", "?5", "55?"}) {
         unsigned count = 1;
@@ -661,15 +793,16 @@ void CheckReal(char const* gamePath, char const* pupPath)
     (void)pupPath;
 }
 
-uint32_t CheckPup(char const* pupPath)
+void CheckPup(char const* pupPath)
 {
     PeImage pe = LoadPe(pupPath);
-    if (pe.imageSize != PupImageSize)
-        throw std::runtime_error("configured PUP image size mismatch");
-
+    size_t initialCallback = Missing;
+    PupLayout initialLayout{};
     for (uint32_t actual : {pe.base, 0x724b0000u,
                             0x724b0000u + 0x21000000u,
                             0x724b0000u - 0x21000000u}) {
+        if (actual > UINT32_MAX - pe.imageSize)
+            throw std::runtime_error("configured PUP image address overflows");
         std::vector<uint8_t> relocated = pe.image;
         ApplyRelocations(relocated, pe, actual - pe.base);
         unsigned callbackMatches = 0;
@@ -683,29 +816,30 @@ uint32_t CheckPup(char const* pupPath)
             if (match != Missing) callback = section.at + match;
             callbackMatches += found;
         }
-        if (callbackMatches != 1 || callback != PupReceiverRva)
+        if (callbackMatches != 1)
             throw std::runtime_error("configured PUP callback is missing or ambiguous");
-        if (!PupReceiver(relocated.data() + PupReceiverRva,
-                         relocated.size() - PupReceiverRva, actual))
-            throw std::runtime_error("configured PUP callback operands mismatch");
-        if (!PupReceiverAt(relocated.data() + PupReceiverRva,
-                           relocated.size() - PupReceiverRva,
-                           actual + PupReceiverRva, actual, PupImageSize))
+        PupLayout layout{};
+        if (!PupReceiverLayoutAt(relocated.data() + callback, relocated.size() - callback,
+                                 actual + static_cast<uint32_t>(callback), actual, pe.imageSize, layout))
             throw std::runtime_error("configured PUP callback owner/address validation mismatch");
-        if (PupReceiverAt(relocated.data() + PupReceiverRva,
-                          relocated.size() - PupReceiverRva,
-                          actual + PupReceiverRva + 1, actual, PupImageSize))
-            throw std::runtime_error("configured PUP callback accepted a wrong RVA");
-        if (PupReceiverAt(relocated.data() + PupReceiverRva,
-                          relocated.size() - PupReceiverRva,
-                          actual + PupReceiverRva, actual + 1, PupImageSize))
+        if (PupReceiverLayoutAt(relocated.data() + callback, relocated.size() - callback,
+                                actual + pe.imageSize, actual, pe.imageSize, layout))
+            throw std::runtime_error("configured PUP callback accepted an outside address");
+        if (PupReceiverLayoutAt(relocated.data() + callback, relocated.size() - callback,
+                                actual + static_cast<uint32_t>(callback), actual + pe.imageSize, pe.imageSize, layout))
             throw std::runtime_error("configured PUP callback accepted a foreign owner");
-        if (PupReceiverAt(relocated.data() + PupReceiverRva,
-                          relocated.size() - PupReceiverRva,
-                          actual + PupReceiverRva, actual, PupImageSize - 4))
-            throw std::runtime_error("configured PUP callback accepted the wrong module image size");
+        if (initialCallback == Missing) {
+            initialCallback = callback;
+            initialLayout = layout;
+        } else if (callback != initialCallback || layout.semaphore != initialLayout.semaphore ||
+                   layout.waitImport != initialLayout.waitImport || layout.releaseImport != initialLayout.releaseImport ||
+                   layout.adapter != initialLayout.adapter) {
+            throw std::runtime_error("configured PUP callback relocations changed its layout");
+        }
     }
-    return 0x724b0000u;
+    std::cout << "pup digest=" << Sha256(pe.disk) << " verified="
+              << (PupLayoutIsPinned(static_cast<uint32_t>(initialCallback), pe.imageSize, initialLayout)
+                      ? "pinned" : "structural") << '\n';
 }
 }
 
@@ -713,6 +847,7 @@ int main(int argc, char** argv)
 {
     Fixture();
     PairedSaveFixtures();
+    StructuralReceiverFixtures();
     char const* game = nullptr;
     char const* pup = nullptr;
     for (int i = 1; i + 1 < argc; i += 2) {

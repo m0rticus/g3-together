@@ -510,6 +510,18 @@ void OnWorldChange()
     dialogOverSince = 0;
 }
 
+void OnPeerLeft(uint8_t player)
+{
+    if (!player || player >= net::MaxPlayers) return;
+    offer::OnPeerLeft(player);
+    received[player] = Wares{};
+    filledGold[player] = 0;
+    if (partner == player) {
+        partner = 0;
+        windowOpen = false;
+    }
+}
+
 void RestoreGold(eCEntity* body, int player)
 {
     if (!body || player <= 0 || player >= net::MaxPlayers) return;

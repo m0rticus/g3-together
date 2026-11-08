@@ -116,7 +116,7 @@ class SteamConnectTests(unittest.TestCase):
         service = self.between(net, "void Service(", "void Flush()")
         self.assertIn("steamLinked", service)
         self.assertIn("!isHost && !server && !refused && steamLinked", service)
-        self.assertIn("steam::HostLinked()", service)
+        self.assertIn("steam::HostRelayGeneration()", service)
         # Nothing reconnects by itself: once ENet was up, losing it ends the Steam link (the player accepts again).
         self.assertIn("steam::RequestClientDisconnect()", service)
         self.assertIn("everConnected && steam::RequestClientDisconnect()", service)

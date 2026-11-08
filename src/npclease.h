@@ -33,6 +33,11 @@ enum class Kind : uint8_t {
 
 enum class Phase : uint8_t { Host, Offering, Client, Recalling, Frozen, Dormant };
 
+constexpr bool PeerCurrent(bool joined, uint32_t generation, uint32_t expected)
+{
+    return joined && expected && generation == expected;
+}
+
 enum Effect : uint8_t { NativeDeath = 1, QuestDeath = 2 };
 
 #pragma pack(push, 1)

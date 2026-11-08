@@ -252,6 +252,8 @@ using MotionNameHandler = void (*)(uint32_t hash, char const* name);
 void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names);
 using PlayerStateHandler = void (*)(PlayerState const& state, uint32_t arrived, bool reset);
 void SetPlayerStateHandler(PlayerStateHandler handler);  // each accepted network state, before the next render frame
+using PeerLeftHandler = void (*)(uint8_t id, char const* name);
+void SetPeerLeftHandler(PeerLeftHandler handler);
 
 // Damage, reliable. Client -> host: this client hit an NPC (by GUID) for delta (negative) hit points.
 // Host -> one client: an NPC hit that player's puppet for delta.

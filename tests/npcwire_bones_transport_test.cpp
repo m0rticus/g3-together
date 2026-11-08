@@ -17,6 +17,9 @@ std::vector<std::string> logs;
 enet_uint32 fakeTime = 5000;
 bool failSend = false;
 uint64_t transportAccounts[2] = {12, 13};
+uint64_t transportGenerations[2] = {};
+std::vector<g3t::steam::RelayDrop> relayDrops;
+std::vector<std::pair<uint64_t, uint64_t>> relayCloses;
 uint64_t localSteamAccount = 12;
 
 extern "C" {
@@ -118,6 +121,29 @@ bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
     strcpy_s(name, port == 12 ? "Steam Player One" : "Steam Player Two");
     return true;
 }
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    if (!PeerIdentity(port, account, name)) return false;
+    generation = port == 12 ? transportGenerations[0] : transportGenerations[1];
+    return true;
+}
+bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    if (!PeerIdentity(port, account, name, generation) || account == localSteamAccount) return false;
+    relayCloses.erase(std::remove(relayCloses.begin(), relayCloses.end(), std::make_pair(account, generation)),
+                      relayCloses.end());
+    return true;
+}
+std::vector<RelayDrop> TakeRelayDrops()
+{
+    std::vector<RelayDrop> result;
+    result.swap(relayDrops);
+    return result;
+}
+void RequestHostRelayClose(uint64_t account, uint64_t generation)
+{
+    if (account && generation) relayCloses.emplace_back(account, generation);
+}
 uint64_t PlayerId() { return localSteamAccount; }
 bool Start(bool, unsigned short) { return false; }
 unsigned short RelayPort() { return 0; }
@@ -125,6 +151,7 @@ void Pump() {}
 void Stop() {}
 int Ping() { return -1; }
 bool HostLinked() { return false; }
+uint64_t HostRelayGeneration() { return 0; }
 bool RequestClientDisconnect() { return false; }
 char const* PlayerName() { return ""; }
 char const* Error() { return ""; }

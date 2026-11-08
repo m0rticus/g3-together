@@ -74,6 +74,17 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         send = section(self.runtime, "bool Send(", "void Diagnostic(")
         self.assertIn("kind = Kind::StateFull", send)
 
+    def test_departed_owner_controls_do_not_reach_reused_slot(self):
+        current = section(self.runtime, "bool CurrentPeer(", "bool Send(")
+        self.assertIn("PeerCurrent(net::PeerJoined(player), net::PeerGeneration(player), generation)", current)
+        send = section(self.runtime, "bool Send(", "void Diagnostic(")
+        self.assertIn("net::IsHost() && !CurrentPeer(entry.lease.owner, entry.lease.generation)", send)
+        host = section(self.runtime, "void TickHost(", "void RegisterProcessing(")
+        self.assertIn("const bool ownerGone = !CurrentPeer(entry.lease.owner, entry.lease.generation)", host)
+        self.assertIn("if (CurrentPeer(client, generation))", host)
+        self.assertIn("if (CurrentPeer(previousOwner, previousGeneration))", host)
+        self.assertIn("CurrentPeer(client, entry.previousGeneration)", host)
+
     def test_live_dormant_pending_leases_never_refuse_or_mutate_on_save(self):
         persist = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
         i18n = (ROOT / "src" / "i18n.cpp").read_text(encoding="utf-8")

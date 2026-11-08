@@ -81,6 +81,7 @@ unsigned processDepth = 0, nativeLoadDepth = 0, nativeSaveDepth = 0;
 unsigned saves = 0, loads = 0;
 unsigned recordsWritten = 0, recordsApplied = 0, loadFrames = 0, epochs = 0;
 std::string lastSave, lastLoad, campaign, loading;
+std::string hookFailure, pupDigestHex; // first native-hook refusal (stage), and the informational digest of the PUP companion
 uint8_t localKind = net::KindMenu;
 bool newWorld = false, ownCharacterReady = false, needsNewHero = false, restoreFailed = false;
 bool freshLocalHero = false, resetLocalWorld = false;
@@ -129,6 +130,8 @@ saving::thumb::Tracker thumbnail;
 saving::CaptureRound operation;
 struct Client {
     uint32_t generation = 0, ready = 0, recordSent = 0, nextTry = 0, cutover = 0;
+    uint32_t waitingSince = 0; // host: since this client has been connected but not in the host's current world
+    bool told = false;         // host: the "still waiting" diagnostic for that wait was logged
 };
 Client clients[net::MaxPlayers]{};
 struct Captured {
@@ -222,6 +225,7 @@ size_t FindCode(unsigned char* image, size_t size, IMAGE_SECTION_HEADER const* s
 }
 void Unresolved(char const* name, unsigned char* entry, char const* phase)
 {
+    if (hookFailure.empty()) hookFailure = name;
     char bytes[25] = "unreadable";
     if (Readable(entry, 12))
         for (size_t b = 0; b < 12; ++b) Format(bytes + b * 2, 3, "%02x", entry[b]);
@@ -390,45 +394,47 @@ bool ReadAll(std::string const& path, std::vector<uint8_t>& out)
     return false;
 }
 
-bool KnownPup(HMODULE module)
+void LogPupIdentity(HMODULE module, bool pinned, bool emit = true)
 {
-    static HMODULE verified = nullptr;
-    if (module == verified && module) return true;
-    char path[MAX_PATH]{};
-    std::vector<uint8_t> bytes;
-    const DWORD length = module ? GetModuleFileNameA(module, path, MAX_PATH) : 0;
-    if (!length || length >= MAX_PATH || !ReadAll(path, bytes) || bytes.empty()) {
-        Logf("persist: unresolved WorldLoadGameFn PUP identity read path=%s error=%lu; host-managed saves off", path, GetLastError());
-        return false;
+    struct Identity { HMODULE module; std::string digest; bool logged; };
+    static std::vector<Identity> identities;
+    size_t index = 0;
+    while (index < identities.size() && identities[index].module != module) ++index;
+    if (index == identities.size()) {
+        Identity identity{module, {}, false};
+        char path[MAX_PATH]{};
+        std::vector<uint8_t> bytes;
+        const DWORD length = module ? GetModuleFileNameA(module, path, MAX_PATH) : 0;
+        if (length && length < MAX_PATH && ReadAll(path, bytes) && bytes.size() <= UINT32_MAX) {
+            BCRYPT_ALG_HANDLE algorithm = nullptr;
+            BCRYPT_HASH_HANDLE hash = nullptr;
+            uint8_t digest[32]{};
+            NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+            if (status >= 0) status = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0);
+            if (status >= 0 && !bytes.empty()) status = BCryptHashData(hash, bytes.data(), static_cast<ULONG>(bytes.size()), 0);
+            if (status >= 0) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+            if (hash) BCryptDestroyHash(hash);
+            if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+            if (status >= 0) {
+                char hex[65]{};
+                for (size_t i = 0; i < sizeof(digest); ++i) Format(hex + i * 2, 3, "%02x", digest[i]);
+                identity.digest = hex;
+            }
+        }
+        identities.push_back(identity);
     }
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    uint8_t digest[32]{};
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (status >= 0) status = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0);
-    if (status >= 0) status = BCryptHashData(hash, bytes.data(), static_cast<ULONG>(bytes.size()), 0);
-    if (status >= 0) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
-    if (hash) BCryptDestroyHash(hash);
-    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    // The genuine CP 1.75 Steam paru_s2.dll, and the QA copy whose only difference is the 10-byte import module name
-    // (SHELL32.dll -> g3qa32.dll at file offset 0x90dcc). Pinning only the QA copy switched every genuine install's hooks off.
-    static constexpr char const* const known[] = {
-        "97760ffcd3eef09b7dbcd8ef925b9995a198cb8bba96951298969c48a84cd8f0",
-        "60fccba5e27ca544fc1e72fe5ba4cbc33aad107c1cbc90845b275f81b58c349c",
-    };
-    bool recognized = false;
-    if (status >= 0)
-        for (char const* expected : known) recognized = recognized || saving::native::Matches(digest, sizeof(digest), expected);
-    if (status < 0 || !recognized) {
-        Logf("persist: unresolved WorldLoadGameFn PUP identity path=%s status=%08lx; host-managed saves off", path, status);
-        return false;
+    auto& identity = identities[index];
+    pupDigestHex = identity.digest;
+    if (emit && !identity.logged) {
+        Logf("persist: PUP identity digest=%s verified=%s",
+             identity.digest.empty() ? "unavailable" : identity.digest.c_str(), pinned ? "pinned" : "structural");
+        identity.logged = true;
     }
-    verified = module;
-    return true;
 }
 
 bool PupRefused(char const* stage, unsigned char* entry, uint32_t bridge, uint32_t receiver, bool beforeUse)
 {
+    if (hookFailure.empty()) hookFailure = std::string("pup:") + stage;
     const uintptr_t observed = receiver ? receiver : bridge ? bridge : reinterpret_cast<uintptr_t>(entry);
     auto* at = reinterpret_cast<unsigned char const*>(observed);
     char bytes[19] = "unreadable";
@@ -454,32 +460,40 @@ bool PupLoadEntry(unsigned char* entry, bool beforeUse)
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCSTR>(receiver), &pup) || !pup)
         return PupRefused("receiver-module", entry, bridge, receiver, beforeUse);
+    LogPupIdentity(pup, false, false);
+    const auto refuse = [&](char const* stage) {
+        LogPupIdentity(pup, false);
+        return PupRefused(stage, entry, bridge, receiver, beforeUse);
+    };
     auto* image = reinterpret_cast<unsigned char*>(pup);
-    if (receiver < reinterpret_cast<uintptr_t>(image) || receiver - reinterpret_cast<uintptr_t>(image) != saving::native::PupReceiverRva)
-        return PupRefused("receiver-rva", entry, bridge, receiver, beforeUse);
-    if (!KnownPup(pup)) return PupRefused("companion-identity", entry, bridge, receiver, beforeUse);
     if (!Readable(image, sizeof(IMAGE_DOS_HEADER)))
-        return PupRefused("companion-memory", entry, bridge, receiver, beforeUse);
+        return refuse("companion-memory");
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
         !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32)))
-        return PupRefused("companion-header", entry, bridge, receiver, beforeUse);
+        return refuse("companion-header");
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
     auto* sections = IMAGE_FIRST_SECTION(nt);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
-        nt->OptionalHeader.SizeOfImage != saving::native::PupImageSize ||
         !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
         !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections)))
-        return PupRefused("companion-layout", entry, bridge, receiver, beforeUse);
+        return refuse("companion-layout");
+    const uintptr_t imageBase = reinterpret_cast<uintptr_t>(image);
+    const uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
+    if (receiver < imageBase || receiver - imageBase >= imageSize)
+        return refuse("receiver-rva");
+    const uint32_t receiverRva = static_cast<uint32_t>(receiver - imageBase);
     unsigned matches = 0;
-    if (FindCode(image, saving::native::PupImageSize, sections, nt->FileHeader.NumberOfSections,
-                 saving::native::PupReceiverBytes, matches) != saving::native::PupReceiverRva)
-        return PupRefused("receiver-pattern", entry, bridge, receiver, beforeUse);
+    if (FindCode(image, imageSize, sections, nt->FileHeader.NumberOfSections,
+                 saving::native::PupReceiverBytes, matches) != receiverRva)
+        return refuse("receiver-pattern");
     auto const* code = reinterpret_cast<uint8_t const*>(receiver);
+    saving::native::PupLayout layout{};
     if (!Readable(code, 41) || !Executable(code) ||
-        !saving::native::PupReceiverAt(code, 41, receiver, reinterpret_cast<uintptr_t>(image), nt->OptionalHeader.SizeOfImage))
-        return PupRefused("receiver-operands", entry, bridge, receiver, beforeUse);
+        !saving::native::PupReceiverLayoutAt(code, 41, receiver, static_cast<uint32_t>(imageBase), imageSize, layout))
+        return refuse("receiver-operands");
+    LogPupIdentity(pup, saving::native::PupLayoutIsPinned(receiverRva, imageSize, layout));
     // Mutable imports/adapter/semaphore are readiness, not the identity of an installed PUP hook.
     static unsigned char* reportedEntry = nullptr;
     static uint32_t reportedBridge = 0, reportedReceiver = 0;
@@ -494,18 +508,23 @@ bool PupLoadEntry(unsigned char* entry, bool beforeUse)
         }
         return true;
     }
-    if (!Readable(image + 0x677a0, 8) || !Readable(image + 0x97578, 4) || !Readable(image + 0x99510, 4))
+    if (!saving::native::Range(imageSize, layout.waitImport, 4) ||
+        !saving::native::Range(imageSize, layout.releaseImport, 4) ||
+        !saving::native::Range(imageSize, layout.adapter, 4) ||
+        !saving::native::Range(imageSize, layout.semaphore, 4) ||
+        !Readable(image + layout.waitImport, 4) || !Readable(image + layout.releaseImport, 4) ||
+        !Readable(image + layout.adapter, 4) || !Readable(image + layout.semaphore, 4))
         return PupRefused("runtime-memory", entry, bridge, receiver, beforeUse);
     HMODULE kernel = GetModuleHandleA("kernel32.dll");
-    if (saving::native::Word(image, 0x677a0) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "WaitForSingleObject")) ||
-        saving::native::Word(image, 0x677a4) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "ReleaseSemaphore")))
+    if (saving::native::Word(image, layout.waitImport) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "WaitForSingleObject")) ||
+        saving::native::Word(image, layout.releaseImport) != reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "ReleaseSemaphore")))
         return PupRefused("runtime-imports", entry, bridge, receiver, beforeUse);
-    const uintptr_t original = saving::native::Word(image, 0x97578);
+    const uintptr_t original = saving::native::Word(image, layout.adapter);
     if (!original || original == reinterpret_cast<uintptr_t>(entry) || original == bridge || original == receiver ||
         !Executable(reinterpret_cast<void const*>(original)))
         return PupRefused("runtime-adapter", entry, bridge, receiver, beforeUse);
     DWORD flags = 0;
-    if (!GetHandleInformation(reinterpret_cast<HANDLE>(saving::native::Word(image, 0x99510)), &flags))
+    if (!GetHandleInformation(reinterpret_cast<HANDLE>(saving::native::Word(image, layout.semaphore)), &flags))
         return PupRefused("runtime-semaphore", entry, bridge, receiver, beforeUse);
     if (readyBridge != bridge || readyReceiver != receiver) {
         readyBridge = bridge;
@@ -785,6 +804,13 @@ void Notice(i18n::Message message, bool bad = false)
     if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(i18n::Text(message));
     else hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
 }
+void NoticeText(wchar_t const* text, hud::Kind kind)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
+    else hud::Message(kind, text);
+}
 void SaveFailure(char const* code)
 {
     lastSaveFailure = code;
@@ -798,6 +824,30 @@ void SaveFailure(char const* code)
 bool AutoloadAvailable()
 {
     return !net::IsHost() && GetConfig().clientAutoload && rejoinHooks && !ai::ShuttingDown();
+}
+// The native hooks failed to verify, for either role: host-managed worlds are off and this install can never be admitted.
+bool HooksUnsupported()
+{
+    return installed && (!pairedEnabled || (!net::IsHost() && !rejoinHooks));
+}
+void HostNameWide(wchar_t (&out)[80])
+{
+    out[0] = 0;
+    MultiByteToWideChar(CP_UTF8, 0, steam::HostName(), -1, out, 79);
+    if (!*out) wcscpy_s(out, L"the host");
+}
+// Loud, on both machines, whenever co-op cannot work: names the unsupported PUP build when that is the cause.
+wchar_t const* UnsupportedText(wchar_t* buffer, size_t size)
+{
+    wchar_t detail[96] = {};
+    if (hookFailure.compare(0, 4, "pup:") == 0) {
+        MultiByteToWideChar(CP_UTF8, 0, pupDigestHex.empty() ? "unknown" : pupDigestHex.substr(0, 16).c_str(), -1, detail, 95);
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::AdmissionUnsupportedPup), detail);
+    } else {
+        MultiByteToWideChar(CP_UTF8, 0, hookFailure.empty() ? "native hooks" : hookFailure.c_str(), -1, detail, 95);
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::AdmissionUnsupportedGame), detail);
+    }
+    return buffer;
 }
 void AutoloadCancel(char const* by, bool notify = false)
 {
@@ -875,6 +925,7 @@ bool __stdcall NewGameDetour(void* self)
         restoreFailed = false;
         clientWorldEntered = true;
         templateHeroFresh = true;
+        autoloadState.Adopted(GetTickCount()); // the player's (or the first automatic) entry: its admission is awaited and bounded
         templateCapture.Want(GetTickCount());
         requestCharacterAgain = receivedNote.epoch != hostWorld.epoch || !receivedWelcome;
         Log("persist: client native New Game returned; fresh local world ready for own account record");
@@ -1740,6 +1791,14 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
         }
     }
 }
+void HostNotice(i18n::Message message, uint8_t peer, hud::Kind kind)
+{
+    wchar_t name[80] = {}, text[300] = {};
+    MultiByteToWideChar(CP_UTF8, 0, net::PeerName(peer), -1, name, 79);
+    if (!*name) wcscpy_s(name, L"Player");
+    _snwprintf_s(text, _TRUNCATE, i18n::Text(message), name);
+    NoticeText(text, kind);
+}
 void NewEpoch()
 {
     CancelSave("world");
@@ -1748,6 +1807,8 @@ void NewEpoch()
     if (!epoch) epoch = ++epochs;
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
         clients[i].ready = clients[i].recordSent = clients[i].cutover = 0;
+        clients[i].waitingSince = GetTickCount();
+        clients[i].told = false;
         net::SetInWorld(i, false);
         if (!net::PeerJoined(i)) continue;
         net::WorldNote notice{};
@@ -1788,8 +1849,12 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
                 const bool first = clients[from].ready != epoch;
                 clients[from].ready = epoch;
                 net::SetInWorld(from, true); // One-shot NPC/motion replays are now behind the client's applied cutover.
-                if (first) Logf("persist: admission confirmed peer=%u account=%llu epoch=%08x baselines=1",
-                                from, net::PeerAccount(from), epoch);
+                if (first) {
+                    Logf("persist: admission confirmed peer=%u account=%llu epoch=%08x baselines=1", from, net::PeerAccount(from), epoch);
+                    Logf("admission: client peer=%u account=%llu in the host's world epoch=%08x kind=%u after_ms=%u", from,
+                         net::PeerAccount(from), epoch, localKind, GetTickCount() - clients[from].waitingSince);
+                    HostNotice(i18n::HostClientInWorld, from, hud::Good);
+                }
                 return;
             }
             if (!story::FinishAdmission(from) || !doors::FinishAdmission(from)) return;
@@ -1848,8 +1913,21 @@ void HostTick(uint32_t now)
         auto& client = clients[i];
         if (!net::PeerJoined(i)) { client = {}; continue; }
         const uint32_t generation = net::PeerGeneration(i);
-        if (client.generation != generation) { client = {}; client.generation = generation; }
+        if (client.generation != generation) {
+            client = {};
+            client.generation = generation;
+            client.waitingSince = now ? now : 1;
+            Logf("admission: client peer=%u account=%llu connected, waiting to enter the host's world epoch=%08x kind=%u", i,
+                 net::PeerAccount(i), epoch, ownCharacterReady && loading.empty() && !restoreFailed ? localKind : net::KindMenu);
+            HostNotice(i18n::HostClientWaiting, i, hud::Info);
+        }
         if (client.ready == epoch) continue;
+        if (!client.told && now - client.waitingSince >= 20000) {
+            client.told = true;
+            Logf("admission: client peer=%u waiting %u s, not in the host's world: epoch=%08x host_kind=%u record_sent=%d cutover=%d in_world=%d",
+                 i, (now - client.waitingSince) / 1000, epoch, localKind, client.recordSent == epoch ? 1 : 0,
+                 client.cutover == epoch ? 1 : 0, net::InWorld(i) ? 1 : 0);
+        }
         if (static_cast<int32_t>(now - client.nextTry) < 0) continue;
         client.nextTry = now + 1000;
         net::WorldNote note{};
@@ -2020,28 +2098,22 @@ bool ApplyCharacter(Bytes const& bytes, saving::Key const& key)
     if (ok) ++recordsApplied;
     return ok;
 }
-char const* AutoloadName(autoload::Status status)
+char const* AdmissionCause(autoload::Status status)
 {
     using S = autoload::Status;
     switch (status) {
-    case S::Off: return "off";
-    case S::NotJoined: return "not-joined";
+    case S::Unsupported: return hookFailure.empty() ? "hooks-off" : hookFailure.c_str();
     case S::Refused: return "refused";
-    case S::HostLoading: return "host-loading";
-    case S::WaitRecord: return "wait-record";
-    case S::Busy: return "busy";
-    case S::NoRoute: return "no-route";
-    case S::InWorld: return "in-world";
-    case S::Countdown: return "countdown";
-    case S::Retry: return "retry";
-    case S::Entering: return "entering";
-    case S::Admitting: return "admitting";
-    case S::Stalled: return "stalled";
-    case S::Idle: return "idle";
-    case S::Held: return "held";
-    case S::GaveUp: return "gave-up";
+    case S::HostLoading: return "host-has-no-world";
+    case S::ManualOnly: return "autoload-off";
+    case S::NoRoute: return "no-template";
+    case S::Held: return "canceled";
+    case S::GaveUp: return "entry-failed";
+    case S::Stalled: return "admission-timeout";
+    case S::Mismatch: return "not-host-world";
+    case S::JoiningSlow: return "slow-admission";
+    default: return "-";
     }
-    return "?";
 }
 bool RecordKnown()
 {
@@ -2108,6 +2180,8 @@ autoload::Snapshot AutoloadSnapshot(uint32_t now)
     auto& game = gCSession::GetInstance();
     auto* manager = game.GetGUIManager();
     autoload::Snapshot s;
+    s.client = !net::IsHost();
+    s.hooks = rejoinHooks && !ai::ShuttingDown();
     s.enabled = AutoloadAvailable();
     s.joined = net::Joined();
     s.refused = *net::RefusalReason() != 0;
@@ -2116,6 +2190,10 @@ autoload::Snapshot AutoloadSnapshot(uint32_t now)
     s.localWorld = game.GetPlayer() != nullptr || game.IsGameRunning();
     s.queued = clientRejoin.pending && !entryManual && !entryApproved;
     s.admitted = hostWorld.epoch && ownCharacterReady && synced == hostWorld.epoch && net::InWorld(net::LocalId());
+    // A world the normal flow can still admit by itself: the fresh start world of a New Game/template entry (the account record
+    // replaces its hero), or one whose character for this epoch is applied and whose replay/ACK is in flight.
+    s.adoptable = s.localWorld && hostWorld.epoch && !restoreFailed && !clientRejoin.failed && !clientRejoin.pending &&
+                  (clientRejoin.fresh || (ownCharacterReady && synced == hostWorld.epoch));
     s.busy = nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth || captured.valid || requestPending;
     s.recordKnown = RecordKnown();
     if (s.enabled && s.joined && s.epoch && s.hostPlayable && !s.admitted) {
@@ -2135,23 +2213,130 @@ void CountdownText(wchar_t* buffer, size_t size, unsigned seconds)
     _snwprintf_s(buffer, size, _TRUNCATE,
                  i18n::Text(needsNewHero ? i18n::ClientAutoloadCountdownFresh : i18n::ClientAutoloadCountdown), seconds);
 }
-void NoteAutoload(autoload::Decision const& decision)
+// What the player is told for a status: the main-menu line and the HUD use the same words. `world` = a local world exists.
+wchar_t const* AdmissionText(autoload::Status status, bool world, wchar_t* buffer, size_t size)
 {
-    autoloadRemainingMs = decision.remainingMs;
-    if (decision.status == autoloadStatus) return;
-    autoloadStatus = decision.status;
-    Logf("persist: client autoload status=%s epoch=%08x kind=%u entries=%u queued=%d record=%d", AutoloadName(decision.status),
-         hostWorld.epoch, hostWorld.kind, autoloadState.Entries(), clientRejoin.pending ? 1 : 0, RecordKnown() ? 1 : 0);
     using S = autoload::Status;
-    if (decision.status == S::Stalled) Notice(i18n::ClientAutoloadStalled, true);
-    else if (decision.status == S::GaveUp) Notice(i18n::ClientAutoloadGaveUp, true);
-    else if (decision.status == S::HostLoading && clientRejoin.pending && gCSession::GetInstance().IsGameRunning())
-        hud::Message(hud::Info, i18n::Text(i18n::ClientAutoloadWaitHost)); // frozen stale world: the menu line is not visible
-    else if (decision.status == S::Countdown && gCSession::GetInstance().IsGameRunning()) {
-        // The stale world is frozen (queued entry): the menu line is not visible, so say it once on the HUD.
-        wchar_t text[500] = {};
-        CountdownText(text, 500, autoload::CountdownMs / 1000);
-        hud::Message(hud::Info, text);
+    wchar_t host[80];
+    HostNameWide(host);
+    const unsigned seconds = (autoloadRemainingMs + 999) / 1000;
+    auto with = [&](i18n::Message message) {
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(message), host);
+        return buffer;
+    };
+    switch (status) {
+    case S::Unsupported: return UnsupportedText(buffer, size);
+    case S::HostLoading:
+    case S::WaitRecord: return i18n::Text(AutoloadAvailable() ? i18n::ClientAutoloadWaitHost : i18n::ClientHostLoading);
+    case S::ManualOnly: return with(i18n::AdmissionManual);
+    case S::Held: return world ? with(i18n::AdmissionHeld) : i18n::Text(i18n::ClientAutoloadCanceled);
+    case S::GaveUp: return world ? with(i18n::AdmissionGaveUp) : i18n::Text(i18n::ClientAutoloadGaveUp);
+    case S::NoRoute: {
+        const char* code = templateImpossibleCode.empty() ? "template-unavailable" : templateImpossibleCode.c_str();
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::ClientTemplateUnavailable), i18n::SaveReason(code),
+                     static_cast<unsigned long>(templateFailError));
+        return buffer;
+    }
+    case S::Joining:
+    case S::JoiningSlow:
+    case S::Admitting: return with(i18n::AdmissionJoining);
+    case S::Mismatch: return with(i18n::AdmissionMismatch);
+    case S::Stalled: return with(i18n::AdmissionStalled);
+    case S::Countdown:
+        if (world && !clientRejoin.pending) { // a live world that is not the host's: the entry returns to the menu first
+            _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::AdmissionMismatchCountdown), seconds);
+            return buffer;
+        }
+        CountdownText(buffer, size, seconds);
+        return buffer;
+    case S::Retry:
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::ClientAutoloadRetry), seconds);
+        return buffer;
+    default: return nullptr;
+    }
+}
+// admission: one compact line per transition (connected, host epoch, local world, mismatch, correction, admitted), so the next
+// real run shows exactly what happened. Edges only; never per frame.
+void AdmissionObserve(autoload::Snapshot const& s, uint32_t now)
+{
+    static bool joined = false, world = false, admitted = false, fresh = false;
+    static uint32_t epoch = 0, waitingSince = 0;
+    static uint8_t kind = 0xff;
+    if (s.joined != joined) {
+        joined = s.joined;
+        if (joined)
+            Logf("admission: connected host=%s hooks=%d autoload=%d protocol=%u welcome=%u", steam::HostName(), s.hooks ? 1 : 0,
+                 s.enabled ? 1 : 0, saving::Protocol, net::WelcomeSerial());
+        else
+            Logf("admission: disconnected host=%s hooks=%d autoload=%d", steam::HostName(), s.hooks ? 1 : 0, s.enabled ? 1 : 0);
+    }
+    if (hostWorld.epoch != epoch || hostWorld.kind != kind) {
+        Logf("admission: host epoch=%08x kind=%u (was %08x/%u) client_world=%s admitted=%d", hostWorld.epoch, hostWorld.kind, epoch,
+             kind == 0xff ? 0u : kind, s.localWorld ? (s.adoptable ? "fresh" : "used") : "none", s.admitted ? 1 : 0);
+        epoch = hostWorld.epoch;
+        kind = hostWorld.kind;
+    }
+    if (s.localWorld != world || (s.localWorld && s.adoptable != fresh)) {
+        world = s.localWorld;
+        fresh = s.adoptable;
+        Logf("admission: client world=%s host_epoch=%08x admitted=%d queued=%d fresh=%d", world ? (fresh ? "fresh" : "used") : "none",
+             hostWorld.epoch, s.admitted ? 1 : 0, s.queued ? 1 : 0, clientRejoin.fresh ? 1 : 0);
+    }
+    if (s.joined && s.epoch && s.hostPlayable && !s.admitted && !waitingSince) waitingSince = now ? now : 1;
+    if (s.admitted != admitted) {
+        admitted = s.admitted;
+        if (admitted) {
+            Logf("admission: admitted epoch=%08x after_ms=%u world=%s", hostWorld.epoch, waitingSince ? now - waitingSince : 0,
+                 fresh ? "fresh" : "used");
+            waitingSince = 0;
+            if (s.client && s.localWorld) {
+                wchar_t host[80], text[200];
+                HostNameWide(host);
+                _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::AdmissionInWorld), host);
+                NoticeText(text, hud::Good);
+            }
+        } else Logf("admission: left host world epoch=%08x joined=%d", hostWorld.epoch, s.joined ? 1 : 0);
+    }
+}
+void NoteAutoload(autoload::Decision const& decision, autoload::Snapshot const& snapshot, uint32_t now)
+{
+    using S = autoload::Status;
+    static uint32_t remindedAt = 0;
+    autoloadRemainingMs = decision.remainingMs;
+    AdmissionObserve(snapshot, now);
+    wchar_t text[700] = {};
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    const bool hudVisible = game.IsGameRunning() && !(manager && manager->IsMenuOpen());
+    if (decision.status == autoloadStatus) {
+        // The HUD fades after a few seconds: a player in a world that is not the host's hears it again until it is resolved.
+        const bool slow = decision.status == S::JoiningSlow || autoload::Blocked(decision.status);
+        if (hudVisible && snapshot.localWorld && !snapshot.admitted && slow && decision.status != S::Unsupported &&
+            now - remindedAt >= 20000 && AdmissionText(decision.status, true, text, 700)) {
+            remindedAt = now;
+            hud::Message(hud::Warning, text);
+        }
+        return;
+    }
+    autoloadStatus = decision.status;
+    remindedAt = now;
+    Logf("persist: client autoload status=%s epoch=%08x kind=%u entries=%u queued=%d record=%d", autoload::Name(decision.status),
+         hostWorld.epoch, hostWorld.kind, autoloadState.Entries(), clientRejoin.pending ? 1 : 0, RecordKnown() ? 1 : 0);
+    Logf("admission: phase=%s cause=%s host_epoch=%08x host_kind=%u world=%s admitted=%d queued=%d entries=%u route=%d autoload=%d hooks=%d",
+         autoload::Name(decision.status), AdmissionCause(decision.status), hostWorld.epoch, hostWorld.kind,
+         snapshot.localWorld ? (snapshot.adoptable ? "fresh" : "used") : "none", snapshot.admitted ? 1 : 0, snapshot.queued ? 1 : 0,
+         autoloadState.Entries(), snapshot.routeAvailable ? 1 : 0, snapshot.enabled ? 1 : 0, snapshot.hooks ? 1 : 0);
+    if (decision.status == S::Mismatch)
+        Logf("admission: mismatch detected host_epoch=%08x kind=%u: this client's world is not the host's world and cannot be admitted by itself",
+             hostWorld.epoch, hostWorld.kind);
+    if (decision.status == S::Unsupported || !hudVisible) return; // the menu line shows the text; the unsupported banner has its own timer
+    if (decision.status == S::Held && !snapshot.localWorld) return;
+    if (decision.status == S::ManualOnly && snapshot.adoptable) return; // the player's own New Game is being admitted: the 20 s reminder covers a world that never is
+    if (!snapshot.localWorld && decision.status != S::Countdown) return;
+    if (decision.status == S::Joining || decision.status == S::Admitting) return; // normal admission takes a few seconds: only a slow one is said
+    if (AdmissionText(decision.status, snapshot.localWorld, text, 700)) {
+        const bool bad = decision.status != S::Countdown && decision.status != S::HostLoading;
+        hud::Message(bad ? hud::Warning : hud::Info, text);
     }
 }
 // The first native New Game of this launch (no template yet): synchronous, through NewGameDetour's guard.
@@ -2170,6 +2355,8 @@ bool FirstEntryNow(uint32_t now)
     const bool ok = clientRejoin.fresh && !clientRejoin.failed;
     autoloadState.Entered(ok, GetTickCount());
     Logf("persist: client autoload first entry %s epoch=%08x entries=%u", ok ? "started" : "failed", hostWorld.epoch, autoloadState.Entries());
+    Logf("admission: correction finished ok=%d via=first-new-game host_epoch=%08x entries=%u", ok ? 1 : 0, hostWorld.epoch,
+         autoloadState.Entries());
     if (ok) Notice(i18n::ClientAutoloadEntered);
     return true;
 }
@@ -2184,13 +2371,16 @@ bool ProcessAutoload()
         const bool ok = clientRejoin.fresh && !clientRejoin.failed;
         autoloadState.Entered(ok, now);
         Logf("persist: client autoload entry %s epoch=%08x entries=%u", ok ? "started" : "failed", hostWorld.epoch, autoloadState.Entries());
+        Logf("admission: correction finished ok=%d via=template host_epoch=%08x entries=%u", ok ? 1 : 0, hostWorld.epoch,
+             autoloadState.Entries());
         if (ok) Notice(i18n::ClientAutoloadEntered);
     }
     const bool escDown = partner::Focused() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     if (escDown && !escWasDown && autoload::Cancelable(autoloadStatus)) AutoloadCancel("Esc", true);
     escWasDown = escDown;
-    const auto decision = autoloadState.Step(AutoloadSnapshot(now), now);
-    NoteAutoload(decision);
+    const auto snapshot = AutoloadSnapshot(now);
+    const auto decision = autoloadState.Step(snapshot, now);
+    NoteAutoload(decision, snapshot, now);
     if (decision.status == autoload::Status::NoRoute && clientRejoin.pending && !entryManual && !entryApproved &&
         !HostWorldEntryAvailable()) {
         // No way back in: let the transition report it and release the frozen world instead of waiting forever.
@@ -2198,6 +2388,9 @@ bool ProcessAutoload()
         return false;
     }
     if (decision.action != autoload::Action::Enter) return false;
+    Logf("admission: correction started via=%s reason=%s host_epoch=%08x attempt=%u", HostWorldEntryAvailable() ? "template" : "first-new-game",
+         snapshot.queued ? "host-world-changed" : snapshot.localWorld ? "mismatch" : "first-entry", hostWorld.epoch,
+         autoloadState.Entries() + 1);
     if (HostWorldEntryAvailable()) {
         if (!clientRejoin.pending) {
             const auto queued = EnterHostWorld("autoload");
@@ -2215,26 +2408,9 @@ bool ProcessAutoload()
 }
 wchar_t const* AutoloadMenuText(wchar_t* buffer, size_t size)
 {
-    using S = autoload::Status;
-    if (!AutoloadAvailable()) return nullptr;
-    const unsigned seconds = (autoloadRemainingMs + 999) / 1000;
-    switch (autoloadStatus) {
-    case S::HostLoading:
-    case S::WaitRecord: return i18n::Text(i18n::ClientAutoloadWaitHost);
-    case S::Countdown: CountdownText(buffer, size, seconds); return buffer;
-    case S::Retry:
-        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::ClientAutoloadRetry), seconds);
-        return buffer;
-    case S::Held: return i18n::Text(i18n::ClientAutoloadCanceled);
-    case S::GaveUp: return i18n::Text(i18n::ClientAutoloadGaveUp);
-    case S::NoRoute: {
-        const char* code = templateImpossibleCode.empty() ? "template-unavailable" : templateImpossibleCode.c_str();
-        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::ClientTemplateUnavailable), i18n::SaveReason(code),
-                     static_cast<unsigned long>(templateFailError));
-        return buffer;
-    }
-    default: return nullptr;
-    }
+    if (net::IsHost()) return nullptr;
+    auto& game = gCSession::GetInstance();
+    return AdmissionText(autoloadStatus, game.GetPlayer() != nullptr || game.IsGameRunning(), buffer, size);
 }
 void StatusHints()
 {
@@ -2295,8 +2471,27 @@ void StatusHints()
     }
     wchar_t autoloadBuffer[700] = {};
     wchar_t const* autoloadText = nullptr;
+    // Native hooks off (either role): said loudly in the menu line and on the HUD, never as a plain "connected".
+    static bool unsupportedLogged = false;
+    static uint32_t unsupportedAt = 0;
+    const bool unsupported = HooksUnsupported();
+    if (unsupported) {
+        if (!unsupportedLogged) {
+            unsupportedLogged = true;
+            Logf("admission: unsupported install role=%s cause=%s pup_digest=%s; host-managed saves OFF, a client can never be admitted",
+                 config.host ? "host" : "client", hookFailure.empty() ? "hooks" : hookFailure.c_str(),
+                 pupDigestHex.empty() ? "-" : pupDigestHex.c_str());
+        }
+        if (running && (!unsupportedAt || now - unsupportedAt >= 30000)) {
+            unsupportedAt = now ? now : 1;
+            wchar_t text[700] = {};
+            hud::Message(hud::Bad, UnsupportedText(text, 700));
+        }
+    }
     if (!running || inMenu) {
-        if (!refusal.empty()) {
+        if (unsupported) {
+            if (hud::MenuLine(UnsupportedText(autoloadBuffer, 700))) menuSet = true;
+        } else if (!refusal.empty()) {
             if (hud::MenuLine(refusal.c_str())) menuSet = true;
         } else if (!config.host && !(clientRejoin.pending && (entryManual || entryApproved)) &&
                    (autoloadText = AutoloadMenuText(autoloadBuffer, 700)) != nullptr) {
@@ -2314,7 +2509,12 @@ void StatusHints()
         } else if (joined && hostWorld.epoch && !ownCharacterReady) {
             if (hud::MenuLine(i18n::Text(i18n::ClientChooseNewGame))) menuSet = true;
         } else if (joined && ownCharacterReady) {
-            if (hud::MenuLine(i18n::Text(i18n::ClientMenuNewGame))) menuSet = true;
+            // Honest about the world: "connected" alone never says the player is in the host's world.
+            wchar_t host[80], head[240], text[700];
+            HostNameWide(host);
+            _snwprintf_s(head, _TRUNCATE, i18n::Text(net::Connected() ? i18n::AdmissionInWorld : i18n::AdmissionJoining), host);
+            _snwprintf_s(text, _TRUNCATE, L"%s %s", head, i18n::Text(i18n::ClientMenuNewGame));
+            if (hud::MenuLine(text)) menuSet = true;
         } else {
             wchar_t text[700] = {};
             lobby::Format(lobby::Snapshot(), text, 700);
@@ -2417,7 +2617,14 @@ static void EnterTemplateWorld(uint32_t queuedAt)
 bool ProcessClientTransition()
 {
     static uint32_t queuedAt = 0, createWaitSince = 0;
-    if (net::IsHost() || !rejoinHooks || ai::ShuttingDown()) return false;
+    if (net::IsHost() || ai::ShuttingDown()) return false;
+    if (!rejoinHooks) {
+        if (installed) {
+            const uint32_t at = GetTickCount();
+            AdmissionObserve(AutoloadSnapshot(at), at);
+        }
+        return false;
+    }
     static bool startupLogged = false;
     if (!startupLogged && !Folder().empty()) {
         startupLogged = true; // one line at the first frame: what the template looks like on this machine, before any decision
@@ -2513,10 +2720,12 @@ bool ProcessClientTransition()
             RemoveTemplate("deep-check-failed"); // the files changed under us: the next frame creates a new one or refuses
             return false;
         }
+        const bool manualEntry = entryManual;
         entryManual = entryApproved = false;
         queuedAt = 0;
         recordWaitSince = 0; recordWaitGaveUp = false;
         EnterTemplateWorld(startedAt);
+        if (manualEntry && clientRejoin.fresh) autoloadState.Adopted(GetTickCount());
         return true;
     }
     // No way back in from here: the old world stays intact and outside admission, nothing is torn down.
@@ -2572,7 +2781,9 @@ bool PrepareShutdown()
 }
 bool HeroPending()
 {
-    return pairedEnabled && (NativeLoading() || clientRejoin.pending || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
+    // A client whose hooks are off can never be admitted: it is pending forever, never "playing as if admitted".
+    return (pairedEnabled || !net::IsHost()) &&
+           (NativeLoading() || clientRejoin.pending || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
                              (!net::IsHost() && !net::InWorld(net::LocalId()) &&
                               (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady())));
 }
@@ -2720,6 +2931,7 @@ void Install()
     net::SetWorldHandler(&OnWorld);
     unsigned char* resolved[5]{};
     if (!ResolveNative(resolved)) {
+        if (hookFailure.empty()) hookFailure = "Game.dll layout";
         Log("persist: save/load hooks not installed; host-managed saves off");
         installed = true;
         return;
@@ -2753,10 +2965,12 @@ void Install()
              rejoinHooks && GetConfig().clientAutoload ? "on" : "off");
     } else if (!net::IsHost()) {
         clientRejoin.failed = true;
+        if (hookFailure.empty()) hookFailure = "menu/loader layout";
         Log("persist: client rejoin unavailable; native menu/loader ABI mismatch");
     }
     installed = true;
     if (!pairedEnabled) {
+        if (hookFailure.empty()) hookFailure = "hook install";
         Logf("persist: save/load hook installation failed SaveGameFn=%d LoadGameFn=%d WorldSaveGameFn=%d WorldLoadGameFn=%d; partial hooks pass through, host-managed saves off",
              originalSave != nullptr, originalLoad != nullptr, originalWorldSave != nullptr, loadCallInstalled ? 1 : 0);
         return;

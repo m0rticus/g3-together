@@ -488,9 +488,31 @@ already loaded; while the host is in its menu or loading the client waits. **Esc
 disables it, then **New Game** (also in the in-game menu) enters on demand. Before the rejoin template exists (first
 launch of Gothic 3) the automatic entry is the same first New Game you would choose; it also saves the template (a few
 seconds later, with no action from you).
-A failed start is retried after 3 s and 8 s, then reported; 60 seconds without the host's admission shows a notice and
-never leaves the world. A client already playing in the host's world (initial startup, same-epoch reconnect) is
-never restarted, and a protocol/install mismatch never enters.
+A failed start is retried after 3 s and 8 s, then reported. A protocol/install mismatch never enters.
+
+**A connected client is never left playing silently in another game.** "Connected" only means the transport is up; the
+mod tells you separately whether you are in the host's world ("In <host>'s world." / "Connected to <host>, but not in
+the host's world yet: ..."). A client that is in a world the host does not run (a New Game it started by hand while
+connected, a world played before the connection, or one the host's admission never completed for) is detected within
+about 2 s ("different game than the host"), then returned to the menu and entered into the host's world after the same
+4 second Esc-cancelable countdown; a world that may still be admitted gets 30 s, or 60 s after an entry (a notice after
+8 s), before it is corrected the same way, at most 3 times per host world. While not admitted, no gameplay state is sent or applied. If the
+correction is impossible the cause is shown in the menu line and repeated on the HUD: `client_autoload` off or canceled
+(choose New Game), no available template route (with its reason), refused (version/install), or an
+unsupported install (below). The log records each step as a compact `admission:` line (`connected`, `host epoch`,
+`client world`, `phase`, `mismatch detected`, `correction started/finished`, `admitted`); the host logs
+`admission: client peer=N ... connected, waiting` and `... in the host's world`, and shows "<name> connected, waiting to
+enter your world." and "<name> is in your world.".
+
+**Unsupported installs are loud.** If the game's native save/load hooks cannot be verified (for example an unsupported
+Parallel Universe Patch build or a different Game.dll), both machines show "Host-managed saves OFF: ... co-op will not
+work correctly" in the main-menu top line and on the HUD, a client never plays as if admitted, and the log names the
+stage (`persist: unresolved ...`, `persist: PUP identity digest=... verified=structural|pinned`). The PUP companion is
+verified by the byte layout of the world-load chain; its file digest is only logged.
+
+**Interrupted trades:** if a peer disconnects before an exchange's outcome is known, the exchange is retained and can
+block saving to prevent item loss or duplication. Retries target the original seller's authenticated account. If a
+replacement connection arrives after its old Steam relay has already been retired, accept a fresh invite to rejoin.
 
 **Client rejoin template:** the first time you enter a host world after launching Gothic 3 (the automatic first
 **New Game**, or the one you choose; the very first join works the same), the game saves that fresh starting world

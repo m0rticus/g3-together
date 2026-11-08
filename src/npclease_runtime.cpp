@@ -489,8 +489,13 @@ Message Control(GuidKey const& key, Entry const& entry, Kind kind)
     std::memcpy(note.guid, key.data(), 16);
     return note;
 }
+bool CurrentPeer(uint8_t player, uint32_t generation)
+{
+    return PeerCurrent(net::PeerJoined(player), net::PeerGeneration(player), generation);
+}
 bool Send(GuidKey const& key, Entry& entry, Kind kind)
 {
+    if (net::IsHost() && !CurrentPeer(entry.lease.owner, entry.lease.generation)) return false;
     if (kind == Kind::State && std::strcmp(entry.sentRoutine, entry.lease.state.routine))
         kind = Kind::StateFull;
     const auto note = Control(key, entry, kind);
@@ -912,7 +917,8 @@ void TickHost(uint32_t now)
             auto value = InterestOf(entry.lease.state, entry.lease.owner, entity);
             value.hostPresent = value.hostPresent && value.hostDistance <= value.hostRoi &&
                 CanResumePresentation(entity);
-            if (entry.interest.Recall(value) || !Running() || entry.lease.state.dead) {
+            const bool ownerGone = !CurrentPeer(entry.lease.owner, entry.lease.generation);
+            if (ownerGone || entry.interest.Recall(value) || !Running() || entry.lease.state.dead) {
                 if (entry.lease.Recall(now)) {
                     ++recalled; entry.recallAt = now ? now : 1;
                     Send(key, entry, Kind::Recall);
@@ -934,10 +940,12 @@ void TickHost(uint32_t now)
             if (entity && NativeReady(entity) && TransferableStatus(entry.lease.state) && Import(entity, entry.lease.state) &&
                 authoritySerial != UINT32_MAX) {
                 const uint8_t client = entry.lease.owner;
+                const uint32_t generation = entry.lease.generation;
                 if (entry.lease.HandBack(++authoritySerial, now)) {
                     entry.committed = false;
                     if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data()))) {
-                        net::SendNpcLease(client, Control(key, entry, Kind::Commit));
+                        if (CurrentPeer(client, generation))
+                            net::SendNpcLease(client, Control(key, entry, Kind::Commit));
                         Diagnostic("host-active", key, entry, "imported frozen client cut");
                     } else Diagnostic("host-held", key, entry, "native restart unavailable");
                 }
@@ -952,7 +960,8 @@ void TickHost(uint32_t now)
                 auto abort = Control(key, entry, Kind::Abort);
                 abort.owner = previousOwner;
                 abort.generation = previousGeneration;
-                net::SendNpcLease(previousOwner, abort);
+                if (CurrentPeer(previousOwner, previousGeneration))
+                    net::SendNpcLease(previousOwner, abort);
                 if (entity) Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data()));
             } else {
                 if (authoritySerial != UINT32_MAX) entry.lease.epoch = ++authoritySerial;
@@ -965,7 +974,8 @@ void TickHost(uint32_t now)
             const uint8_t client = entry.previousOwner;
             entry.lease.phase = Phase::Host; entry.lease.owner = 1;
             entry.lease.generation = 0; entry.committed = false;
-            if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data())) && client > 1)
+            if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data())) &&
+                CurrentPeer(client, entry.previousGeneration))
                 net::SendNpcLease(client, Control(key, entry, Kind::Commit));
         }
         PublishGuard(key, entry);

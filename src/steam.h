@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "steam_connect.h"
 
@@ -39,6 +40,16 @@ unsigned short RelayPort();
 bool IsPeerRelay(unsigned short port);  // host: this loopback sender belongs to a linked Steam lobby member
 uint64_t PeerId(unsigned short port);  // account authenticated by the relay; 0 if not linked
 bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24]); // one authenticated worker snapshot
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& relayGeneration);
+bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& relayGeneration);
+struct RelayDrop {
+    uint64_t account = 0;
+    uint64_t generation = 0;
+    unsigned short port = 0;
+    char reason[48] = {};
+};
+std::vector<RelayDrop> TakeRelayDrops(); // engine thread: drain worker notifications
+void RequestHostRelayClose(uint64_t account, uint64_t generation);
 // Wake the independent transport worker after ENet flushes. Does not run engine or ENet handlers.
 void Pump();
 // Join the transport worker, forward ENet's goodbye, then leave/close Steam. Called on the engine thread.
@@ -53,6 +64,7 @@ char const* Error();        // why Steam is not used, "" while it is (or before 
 // Client: the Steam name of the host whose lobby it is in ("" while it looks for one) and whether that host answered.
 char const* HostName();
 bool HostLinked();  // client: the relay link to the host is up (net.cpp connects ENet while it is and closes it when it ends)
+uint64_t HostRelayGeneration(); // client: generation of the published linked relay, or zero
 // Client, invite mode: the ENet connection to the host ended (and was up before). The Steam link ends with it (lobby left, session
 // closed, flow Lost) so that nothing reconnects by itself: the player accepts the invite again. Safe from the engine thread (the
 // worker does the work). False in connection = auto, which keeps its legacy automatic ENet reconnect.

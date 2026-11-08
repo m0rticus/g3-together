@@ -6,6 +6,7 @@
 #include "log.h"
 #include "persist.h"
 #include "trade.h"
+#include "trade_replay.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -24,7 +25,12 @@ constexpr int MaxAmount = 1000000, MaxGold = 10000000;
 constexpr unsigned AnyQuality = ~0u;
 ResultFn resultHandler = nullptr;
 uint32_t nextSerial = 0;
-struct Sent { net::OfferNote note; uint32_t at; bool delivered = false; };
+struct Sent {
+    net::OfferNote note;
+    uint32_t at;
+    uint64_t sellerAccount = 0;
+    bool delivered = false, retryPaused = false;
+};
 std::vector<Sent> sent;
 using Identity = std::tuple<uint8_t, uint64_t, uint32_t>;
 struct Outcome { net::OfferResultNote result; uint64_t fingerprint; bool finalized = false; };
@@ -145,6 +151,10 @@ uint64_t Fingerprint(net::OfferNote note)
 void OnOffer(net::OfferNote const& note)
 {
     if (note.count > net::MaxOfferEntries || note.acknowledge > 1 || note.buyer == note.seller) return;
+    if (!trade::replay::SellerEpoch(note.sellerEpoch, trade::Epoch())) {
+        Logf("trade: ignored exchange %u for an earlier seller session player=%u", note.serial, note.buyer);
+        return;
+    }
     const Identity key{note.buyer, note.buyerEpoch, note.serial};
     auto cached = outcomes.find(key);
     const uint64_t hash = Fingerprint(note);
@@ -187,6 +197,10 @@ void OnResult(net::OfferResultNote const& result)
         auto const& note = pending.note;
         if (note.serial != result.serial || note.seller != result.seller || note.buyerEpoch != result.buyerEpoch ||
             note.sellerEpoch != result.sellerEpoch) continue;
+        if (!trade::replay::SellerAccount(net::IsHost(), pending.sellerAccount, net::PeerAccount(note.seller))) {
+            Logf("trade: ignored exchange result %u from a different seller account", note.serial);
+            return;
+        }
         if (result.result == net::OfferFinalized) {
             if (pending.delivered) sent.erase(it);
             return;
@@ -215,11 +229,16 @@ void SetResultHandler(ResultFn handler) { resultHandler = handler; }
 bool Send(net::OfferNote note)
 {
     if (!sent.empty() || !net::Connected() || !note.sellerEpoch) return false;
+    const uint64_t sellerAccount = net::IsHost() ? net::PeerAccount(note.seller) : 0;
+    if (!trade::replay::SellerAccount(net::IsHost(), sellerAccount, sellerAccount)) {
+        Logf("trade: cannot send exchange to player=%u without an authenticated account", note.seller);
+        return false;
+    }
     note.buyer = net::LocalId();
     note.buyerEpoch = trade::Epoch();
     note.serial = ++nextSerial;
     if (!net::SendOffer(note)) return false;
-    sent.push_back({note, GetTickCount(), false});
+    sent.push_back({note, GetTickCount(), sellerAccount, false});
     ++sentCount;
     return true;
 }
@@ -287,7 +306,17 @@ void Tick()
     for (auto& pending : sent) {
         if (now - pending.at < 1000) continue;
         // No timeout refund: the owner may have applied the exchange while its answer was lost.
-        if (net::Connected() && net::SendOffer(pending.note)) ++retries;
+        const bool sameSeller = trade::replay::SellerAccount(
+            net::IsHost(), pending.sellerAccount, net::PeerAccount(pending.note.seller));
+        if (net::Connected() && !sameSeller && !pending.retryPaused) {
+            Logf("trade: exchange %u retry paused; original seller account is not in slot %u",
+                 pending.note.serial, pending.note.seller);
+            pending.retryPaused = true;
+        }
+        if (net::Connected() && sameSeller) {
+            pending.retryPaused = false;
+            if (net::SendOffer(pending.note)) ++retries;
+        }
         pending.at = now;
     }
 }
@@ -298,6 +327,18 @@ void OnWorldChange()
     sent.clear();
     outcomes.clear();
     inventoryHealthy = true;
+}
+
+void OnPeerLeft(uint8_t player)
+{
+    bool uncertain = false;
+    for (auto const& pending : sent)
+        if (pending.note.seller == player) uncertain = true;
+    for (auto const& entry : outcomes)
+        if (std::get<0>(entry.first) == player && !entry.second.finalized) uncertain = true;
+    if (uncertain)
+        Logf("trade: unsettled exchange player=%u; saving remains blocked until the exchange is resolved or the last save is restored",
+             player);
 }
 
 void Report(LogFn log)

@@ -98,6 +98,14 @@ The host calendar, quest/status/timer/counter, dialog/event and nearby shared-do
 The client applies cutover changes and confirms entry before one-shot NPC/motion replays start.
 Restoration does not replay quest rewards. Native world files never travel over the network; gameplay acceptance remains manual.
 
+"Connected" is only the transport. The main-menu top line and the HUD say whether you are **in the host's world**
+("In <host>'s world.") or **not yet** ("Connected to <host>, but not in the host's world yet: ..."). If you ever end up in a
+different game than the host (you started a New Game yourself, played before connecting, or the host's admission never finished),
+the mod detects a mismatch and returns you to the menu and into the host's world after the countdown (Esc cancels);
+if it cannot, it tells you why (autoload off or canceled: choose New Game; template unavailable: see the reported reason;
+refused: compare versions; unsupported install: the "Host-managed saves OFF" line, on both machines). The log lines to send
+with a bug report are the `admission:` lines in `g3together.log` (client and host).
+
 If joining is refused, compare versions and game options with the host. Game compatibility refusals appear in
 `g3together.log` in the Gothic 3 folder on a line containing `REFUSED by host`. Steam-level refusals appear in the
 menu's top line and in `connect:` lines in the log; the reason stays until the next accept.

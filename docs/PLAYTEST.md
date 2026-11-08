@@ -30,12 +30,21 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   legacy rows and no reassignment. Set `legacy_companion_owner = <actual SteamID64> <old name>` on the host,
   restart/load/join/save and confirm exactly the selected account receives the companion.
 - [ ] Rejoin in a different slot and confirm companions and newly saved summons follow the same SteamID,
-  not whoever occupies the former slot. A second connection under one SteamID must be refused cleanly.
+  not whoever occupies the former slot. A newer authenticated connection under one SteamID must replace
+  the old connection, with a `peer: replace` log entry.
 
 The stand-in Steam DLL's IDs 11/12 are stable test account IDs, not real SteamIDs.
 Changing a real Steam profile does not rename those stand-ins; their persona input must be changed by the
 test-copy maintainer between runs. Engine-free tests cover real-looking full 64-bit IDs, but do not verify
 native restoration. Do not overwrite original saves when checking migration.
+
+### Peer departure and rejoin (manual acceptance)
+
+- [ ] With matching builds in the isolated host and client copies, join as player 2. Close the client and
+  confirm the host shows `Clients: 0` and a `peer: leave` line. Rejoin and confirm player 2 is reused,
+  the count is one, and a normal save succeeds. Repeat with a real Steam invite.
+- [ ] Simulate a nonresponsive client without leaving its Steam lobby; confirm the host eventually logs
+  `timeout-or-disconnect` and removes the client. A normal 30–60-second load must not disconnect it.
 
 ### Focus loss/regain and held knockout (manual acceptance)
 
@@ -528,7 +537,16 @@ decision policy and source/native-byte wiring). Never use the protected user sav
    install/protocol must refuse and never start an entry.
 8. Failure: delete the template files while a world was already entered: the client makes the template from its current world (`template: route=create`)
    and enters; only when no world exists to make it from (title screen after an entered launch) the message names the reason (`template: route=impossible why=no-world-to-save`).
-   An entered client the host never admits shows *"The host has not admitted you yet..."* once after 60 s and stays where it is.
+   An entered client the host never admits shows *"Connected to <host>, but not in the host's world yet..."* after 8 s, then is corrected (countdown, return to
+   the menu, template entry after 60 s; at most 3 times per host world, then *"automatic entry failed repeatedly"*).
+9. Never silent (log lines `admission: ...`; see PLAYING.md): (a) connect the client first, host later; (b) host first, client later; (c) while connected,
+   choose New Game by hand in the client (admitted within seconds, `admission: admitted`); (d) make the client play a world while the host is in its
+   menu, then let the host start a world: `admission: mismatch detected`, the 4 s countdown *"You are in a different game than the host..."*, then
+   `correction started/finished` and `admitted`; (e) `client_autoload = off`: *"Connected to <host>, but not in the host's world (client_autoload is off)..."*
+   in the menu and repeated on the HUD every 20 s, no automatic entry; (f) Esc during the countdown: the *"automatic entry canceled"* text stays; (g) host
+   in its menu: *"The host is in the menu or still loading..."* and the host's lobby line shows `Connected: n | in your world: m`; the host's HUD shows
+   *"<name> connected, waiting to enter your world."* then *"<name> is in your world."*; (h) an install whose native hooks fail shows *"Host-managed
+   saves OFF: ..."* on both machines.
 
 ### Targeting after deaths
 

@@ -11,6 +11,8 @@
 #include "downed_policy.h"
 #include "guid.h"
 #include "guards.h"
+#include "hud.h"
+#include "i18n.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -61,11 +63,23 @@ struct Puppet
     npcplayback::State terminalReplay;
 };
 Puppet puppets[net::MaxPlayers];
+bool departed[net::MaxPlayers] = {};
 bool started = false;
 uint32_t lastSyncReport = 0;
 bool templateWarned = false;
 bool haveAnchor = false;
 bCVector anchor;
+
+void PeerLeft(uint8_t id, char const* label)
+{
+    departed[id] = true;
+    trade::OnPeerLeft(id);
+    if (!label || !*label) return;
+    wchar_t name[64] = {}, text[160];
+    MultiByteToWideChar(CP_UTF8, 0, label, -1, name, 64);
+    swprintf_s(text, i18n::Text(i18n::PlayerLeft), name[0] ? name : L"?");
+    hud::Message(hud::Info, text);
+}
 
 void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
 {
@@ -788,6 +802,7 @@ void Start()
     Config const& config = GetConfig();
     parity::Compute();
     net::SetPlayerStateHandler(&FeedPlayer);
+    net::SetPeerLeftHandler(&PeerLeft);
     net::SetSendRate(config.sendRate);
     net::SetBandwidthBudget(static_cast<uint32_t>(config.networkBudgetKib) * 1024);
     started = net::Start(config.host);
@@ -796,6 +811,7 @@ void Start()
 void OnWorldDeactivate()
 {
     for (auto& puppet : puppets) puppet = Puppet{};
+    for (auto& pending : departed) pending = false;
     for (auto& set : contacts) set.clear();
     haveAnchor = false;
 }
@@ -849,6 +865,7 @@ void Tick()
     for (int id = 1; id < net::MaxPlayers; ++id) {
         if (id == net::LocalId()) continue;
         movement::Stage stage("remote puppet update");
+        if (departed[id]) { Despawn(id, "peer left"); departed[id] = false; }
         if (haveLocal && hero) UpdatePuppet(id, remotes[id], *hero);
         else if (puppets[id].spawned) Despawn(id, "local game not running");
     }

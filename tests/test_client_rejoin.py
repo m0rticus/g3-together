@@ -131,8 +131,10 @@ class ClientRejoinTests(unittest.TestCase):
         # Every other refusal names its reason through the one notice function.
         self.assertEqual(source.count("TemplateImpossible(plan);"), 2)
         self.assertEqual(source.count("TemplateNotify("), 4)  # definition, failed save, impossible route, save-refused timeout
-        text = source.split("wchar_t const* AutoloadMenuText(", 1)[1].split("void StatusHints()", 1)[0]
+        text = source.split("wchar_t const* AdmissionText(", 1)[1].split("void AdmissionObserve(", 1)[0]
         self.assertIn("i18n::ClientTemplateUnavailable", text.split("case S::NoRoute", 1)[1])
+        menu = source.split("wchar_t const* AutoloadMenuText(", 1)[1].split("void StatusHints()", 1)[0]
+        self.assertIn("AdmissionText(autoloadStatus", menu)
         policy = (ROOT / "src" / "client_template.h").read_text()
         decide = policy.split("inline Plan Decide(Situation const& s)", 1)[1].split("// Silent regeneration", 1)[0]
         self.assertEqual(decide.count("Route::Impossible"), 5)

@@ -3,6 +3,7 @@
 
 #include "net.h"
 #include "player_identity.h"
+#include "peer_timeout.h"
 
 #include "enet_policy.h"
 #include "downed.h"
@@ -139,6 +140,7 @@ ENetAddress target{};        // client side: where to (re)connect
 uint32_t lastConnectAttempt = 0;
 uint32_t startedAt = 0;      // client: when the Steam link to the host came up and ENet began to connect (enet_time_get)
 bool steamLinked = false;    // client: the Steam relay link to the host is up; ENet connects only while it is (invite-driven connection)
+uint64_t hostRelayGeneration = 0;
 bool linkEnding = false;     // client: the Steam link was asked to end (ENet lost); its still-published "up" state is not a new link
 bool connectLogged = false;  // client: the first ENet attempt of this Steam link was logged
 bool everConnected = false;  // client: an ENet connection to the host came up once (owner 24.10.: "host not reachable")
@@ -221,6 +223,7 @@ NpcHandler npcHandler = nullptr;
 NpcLeaseHandler npcLeaseHandler = nullptr;
 NpcPoseHandler npcPoseHandler = nullptr;
 PlayerStateHandler playerStateHandler = nullptr;
+PeerLeftHandler peerLeftHandler = nullptr;
 NpcReleaseHandler npcReleaseHandler = nullptr;
 NpcRemovalHandler npcRemovalHandler = nullptr;
 MotionNameHandler motionNameHandler = nullptr;
@@ -243,6 +246,8 @@ ClockHandler clockHandler = nullptr;
 WorldStateHandler worldStateHandler = nullptr;
 ENetPeer* peers[MaxPlayers] = {};  // host side: peer for each client id
 uint64_t peerAccounts[MaxPlayers] = {}; // pinned authenticated account for this connection generation
+uint64_t peerRelayGenerations[MaxPlayers] = {};
+std::unordered_map<uint64_t, uint8_t> rememberedSlots;
 SummonHandler summonHandler = nullptr;
 ShotHandler shotHandler = nullptr;
 RagdollHandler ragdollHandler = nullptr;
@@ -650,12 +655,43 @@ void Drop(uint8_t id)
     for (auto& forced : forcePlayerFull) forced[id] = false;
     peers[id] = nullptr;
     peerAccounts[id] = 0;
+    peerRelayGenerations[id] = 0;
     clientInWorld[id] = false;
     goodsCache[id].clear();
     goodsReplay[id] = 0;
     for (auto& pending : goodsReplay) pending &= static_cast<uint8_t>(~(1u << id));
     npcOrigins[id].clear();
     hitClaims[id] = replication::Sequence{};
+}
+
+unsigned ClientCount()
+{
+    unsigned count = 0;
+    for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) ++count;
+    return count;
+}
+
+void LeavePeer(ENetPeer* peer, char const* reason, bool disconnect)
+{
+    if (!peer) return;
+    const uintptr_t slot = reinterpret_cast<uintptr_t>(peer->data);
+    if (slot < 2 || slot >= MaxPlayers || peers[slot] != peer) return;
+    const auto id = static_cast<uint8_t>(slot);
+    const uint64_t account = peerAccounts[id];
+    const uint64_t relayGeneration = peerRelayGenerations[id];
+    const unsigned before = ClientCount();
+    char name[24];
+    strncpy_s(name, remotes[id].latest.name, _TRUNCATE);
+    peer->data = nullptr;
+    if (disconnect) enet_peer_disconnect_now(peer, 0);
+    Drop(id);
+    if (!disconnect) steam::RequestHostRelayClose(account, relayGeneration);
+    const Leave leave{MsgLeave, id};
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i]) Send(peers[i], &leave, sizeof(leave), ChannelReliable, true);
+    Logf("peer: leave slot=%u steamid=%llu reason=%s clients=%u->%u",
+         id, account, reason, before, ClientCount());
+    if (peerLeftHandler) peerLeftHandler(id, name);
 }
 
 bool Sane(NpcRecord const& record)
@@ -905,8 +941,12 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     if (isHost && (peer->address.host != target.host || !steam::IsPeerRelay(peer->address.port))) return;
     if (isHost && peer->data) {
         const uintptr_t slot = reinterpret_cast<uintptr_t>(peer->data);
+        uint64_t account = 0, relayGeneration = 0;
+        char name[24] = {};
         if (slot < 2 || slot >= MaxPlayers || peers[slot] != peer ||
-            !peerAccounts[slot] || peerAccounts[slot] != steam::PeerId(peer->address.port)) {
+            !steam::PeerIdentity(peer->address.port, account, name, relayGeneration) ||
+            !peerAccounts[slot] || peerAccounts[slot] != account ||
+            peerRelayGenerations[slot] != relayGeneration) {
             Log("identity: refused relay/account mismatch");
             enet_peer_disconnect_later(peer, 1);
             return;
@@ -962,22 +1002,32 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         uint8_t id = 0;
         uint64_t account = 0;
+        uint64_t relayGeneration = 0;
         char displayName[24] = {};
-        std::set<uint64_t> joinedAccounts;
-        for (uint8_t i = 2; i < MaxPlayers; ++i)
-            if (peers[i]) joinedAccounts.insert(peerAccounts[i]);
-        if (!steam::PeerIdentity(peer->address.port, account, displayName) ||
-            !identity::Admit(account, steam::PlayerId(), joinedAccounts)) {
-            Logf("identity: refused duplicate/invalid steamid=%llu source=transport-authenticated", account);
-            strcpy_s(refusal.reason, "SteamID already joined or authenticated identity unavailable");
+        if (!steam::ClaimPeerIdentity(peer->address.port, account, displayName, relayGeneration) ||
+            !account || account == steam::PlayerId()) {
+            Logf("identity: refused invalid steamid=%llu source=transport-authenticated", account);
+            strcpy_s(refusal.reason, "authenticated Steam identity unavailable");
             Send(peer, &refusal, sizeof(refusal), ChannelReliable, true);
             enet_peer_disconnect_later(peer, 1);
             return;
         }
+        for (uint8_t i = 2; i < MaxPlayers; ++i)
+            if (peers[i] && peerAccounts[i] == account) {
+                const unsigned count = ClientCount();
+                Logf("peer: replace slot=%u steamid=%llu reason=new-authenticated-connection clients=%u->%u",
+                     i, account, count, count - 1);
+                LeavePeer(peers[i], "replaced", true);
+            }
+        const auto remembered = rememberedSlots.find(account);
+        if (remembered != rememberedSlots.end() && !peers[remembered->second]) id = remembered->second;
         for (uint8_t i = 2; i < MaxPlayers && !id; ++i) if (!peers[i]) id = i;
         if (!id) { enet_peer_disconnect(peer, 2); return; }
+        const unsigned before = ClientCount();
         peers[id] = peer;
         peerAccounts[id] = account;
+        peerRelayGenerations[id] = relayGeneration;
+        rememberedSlots[account] = id;
         for (auto& sender : playerSenders[id]) sender = {};
         for (auto& forced : forcePlayerFull[id]) forced = false;
         ++generations[id];
@@ -989,6 +1039,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         Send(peer, &welcome, sizeof(welcome), ChannelReliable, true);
         Logf("net: %s joined as player %u", hello.name, id);
         Logf("identity: join steamid=%llu display=%s source=transport-authenticated slot=%u", account, displayName, id);
+        Logf("peer: join slot=%u steamid=%llu reason=authenticated clients=%u->%u", id, account, before, ClientCount());
     } else if (type == MsgRefused && !isHost && packet->dataLength == sizeof(RefusedMsg)) {
         RefusedMsg refusal;
         std::memcpy(&refusal, packet->data, sizeof(refusal));
@@ -1891,6 +1942,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         Leave leave;
         std::memcpy(&leave, packet->data, sizeof(leave));
         Logf("net: player %u left", leave.id);
+        if (leave.id && leave.id < MaxPlayers && remotes[leave.id].connected && peerLeftHandler)
+            peerLeftHandler(leave.id, remotes[leave.id].latest.name);
         Drop(leave.id);
     } else if (type == MsgWorld && (packet->dataLength == sizeof(WorldMsg) || packet->dataLength == sizeof(HostWorldMsg))) {
         WorldMsg message;
@@ -2073,6 +2126,7 @@ void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names)
 void SetNpcPoseHandler(NpcPoseHandler handler) { npcPoseHandler = handler; }
 
 void SetPlayerStateHandler(PlayerStateHandler handler) { playerStateHandler = handler; }
+void SetPeerLeftHandler(PeerLeftHandler handler) { peerLeftHandler = handler; }
 #ifndef G3T_REMOTE_NPC_FOCUS_SUPPORTED
 // Standalone pose branch: the player-state branch supplies these on integration.
 uint32_t RemoteFocusNpc(uint8_t) { return 0; }
@@ -2573,8 +2627,11 @@ void SetSaveHandler(SaveHandler handler) { saveHandler = handler; }
 void SetCharacterHandler(CharacterHandler handler) { characterHandler = handler; }
 uint64_t PeerAccount(uint8_t id)
 {
-    return isHost && id >= 2 && id < MaxPlayers && peers[id] &&
-        steam::PeerId(peers[id]->address.port) == peerAccounts[id] ? peerAccounts[id] : 0;
+    if (!isHost || id < 2 || id >= MaxPlayers || !peers[id]) return 0;
+    uint64_t account = 0, generation = 0;
+    char name[24] = {};
+    return steam::PeerIdentity(peers[id]->address.port, account, name, generation) &&
+        account == peerAccounts[id] && generation == peerRelayGenerations[id] ? account : 0;
 }
 bool SendCharacter(uint8_t to, CharacterNote const& note, std::vector<uint8_t> const& bytes)
 {
@@ -2908,12 +2965,14 @@ void Stop()
         enet_host_flush(host);
     }
     steam::Stop();  // passes the goodbyes on before closing ENet
+    steam::TakeRelayDrops();
     if (host) enet_host_destroy(host);
     host = nullptr;
     server = nullptr;
     haveQueued = false;
     lastServiceAt = 0;
     steamLinked = false;
+    hostRelayGeneration = 0;
     connectLogged = false;
     haveCurrentLocal = false;
     playerCadence = {};
@@ -2930,6 +2989,7 @@ void Stop()
     npcHandler = nullptr;
     npcPoseHandler = nullptr;
     playerStateHandler = nullptr;
+    peerLeftHandler = nullptr;
     npcReleaseHandler = nullptr;
     npcRemovalHandler = nullptr;
     motionNameHandler = nullptr;
@@ -3025,13 +3085,58 @@ bool Start(bool asHost)
 }
 
 namespace {
+void DropClientRemotes()
+{
+    for (uint8_t i = 1; i < MaxPlayers; ++i) {
+        if (i != localId && remotes[i].connected && peerLeftHandler)
+            peerLeftHandler(i, remotes[i].latest.name);
+        Drop(i);
+    }
+}
+
+void CloseClientLink()
+{
+    steamLinked = false;
+    hostRelayGeneration = 0;
+    startedAt = 0;
+    if (server) {
+        enet_peer_disconnect_now(server, 0);
+        enet_host_flush(host);
+        server = nullptr;
+    }
+    connected = false;
+    inWorld = false;
+    options::Restore();
+    DropClientRemotes();
+}
+
+void ProcessRelayDrops()
+{
+    for (auto const& drop : steam::TakeRelayDrops()) {
+        if (!isHost) {
+            if (hostRelayGeneration && hostRelayGeneration == drop.generation) {
+                Logf("peer: leave slot=1 steamid=%llu reason=%s clients=%u->0",
+                     drop.account, drop.reason, connected ? 1u : 0u);
+                CloseClientLink();
+            }
+            continue;
+        }
+        for (uint8_t id = 2; id < MaxPlayers; ++id)
+            if (peers[id] && peerAccounts[id] == drop.account && peerRelayGenerations[id] == drop.generation &&
+                peers[id]->address.port == drop.port)
+                LeavePeer(peers[id], drop.reason, true);
+    }
+}
+
 void Service(PlayerState const& local, bool haveLocal)
 {
     strncpy_s(localName, steam::PlayerName(), _TRUNCATE);
+    ProcessRelayDrops();
     if (isHost) for (uint8_t id = 2; id < MaxPlayers; ++id) {
-        uint64_t account = 0;
+        uint64_t account = 0, generation = 0;
         char name[24] = {};
-        if (peers[id] && steam::PeerIdentity(peers[id]->address.port, account, name) && account == peerAccounts[id])
+        if (peers[id] && steam::PeerIdentity(peers[id]->address.port, account, name, generation) &&
+            account == peerAccounts[id] && generation == peerRelayGenerations[id])
             strncpy_s(remotes[id].latest.name, name, _TRUNCATE);
     }
     ENetEvent event;
@@ -3050,7 +3155,8 @@ void Service(PlayerState const& local, bool haveLocal)
             }
             // World loads and the intro video stop the engine loop (and so this service call) for
             // many seconds; the default ENet timeouts dropped a loading player after about 9 s.
-            enet_peer_timeout(event.peer, 0, 60000, 180000);
+            enet_peer_timeout(event.peer, G3T_PEER_TIMEOUT_LIMIT,
+                              G3T_PEER_TIMEOUT_MINIMUM_MS, G3T_PEER_TIMEOUT_MAXIMUM_MS);
             // The pose stream is fixed-rate and already tolerates loss; ENet's RTT-jitter throttle only drops more
             // frames and shrinks the reliable window, so keep it at full rate (deceleration 0).
             enet_peer_throttle_configure(event.peer, 5000, 0, 0);
@@ -3078,12 +3184,7 @@ void Service(PlayerState const& local, bool haveLocal)
             break;
         case ENET_EVENT_TYPE_DISCONNECT:
             if (isHost) {
-                const uint8_t id = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(event.peer->data));
-                Logf("net: player %u disconnected", id);
-                Drop(id);
-                event.peer->data = nullptr;
-                const Leave leave{MsgLeave, id};
-                for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) Send(peers[i], &leave, sizeof(leave), ChannelReliable, true);
+                LeavePeer(event.peer, event.data ? "disconnect" : "timeout-or-disconnect", false);
             } else {
                 // The Steam link is the connection (invite-driven): once ENet was up, losing it ends the link too, and the player
                 // accepts the invite again. connection = auto keeps the legacy automatic reconnect over the live link.
@@ -3094,7 +3195,7 @@ void Service(PlayerState const& local, bool haveLocal)
                 inWorld = false;
                 options::Restore();
                 server = nullptr;
-                for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
+                DropClientRemotes();
                 if (endLink) linkEnding = true;
             }
             break;
@@ -3108,11 +3209,13 @@ void Service(PlayerState const& local, bool haveLocal)
     const uint32_t now = enet_time_get();
     if (!isHost) {
         // The Steam link (steam.cpp) is the connection: ENet connects when it comes up and is closed when it ends.
-        const bool published = steam::HostLinked();
+        const uint64_t publishedGeneration = steam::HostRelayGeneration();
+        const bool published = publishedGeneration != 0;
         if (!published) linkEnding = false;
         const bool linked = published && !linkEnding;
         if (linked && !steamLinked) {
             steamLinked = true;
+            hostRelayGeneration = publishedGeneration;
             connectLogged = false;
             refused = false;  // a new invite is a new attempt
             refusalReason[0] = '\0';
@@ -3121,17 +3224,8 @@ void Service(PlayerState const& local, bool haveLocal)
             lastConnectAttempt = now - 3001;
             Log("net: the Steam link to the host is up; ENet connects through the relay");
         } else if (!linked && steamLinked) {
-            steamLinked = false;
-            startedAt = 0;
             Log("net: the Steam link to the host ended; ENet connection closed (accept the invite again to reconnect)");
-            if (server) {
-                enet_peer_disconnect_now(server, 0);
-                enet_host_flush(host);
-                server = nullptr;
-            }
-            connected = false;
-            inWorld = false;
-            for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
+            CloseClientLink();
         }
     }
     if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {

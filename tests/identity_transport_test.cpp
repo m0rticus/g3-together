@@ -2,9 +2,17 @@
 #define main bone_transport_fixture_main
 #include "npcwire_bones_transport_test.cpp"
 #undef main
+#include "../src/trade_replay.h"
 
 int main()
 {
+    assert(trade::replay::SellerEpoch(77, 77));
+    assert(!trade::replay::SellerEpoch(77, 78));
+    assert(!trade::replay::SellerEpoch(0, 0));
+    assert(trade::replay::SellerAccount(true, 12, 12));
+    assert(!trade::replay::SellerAccount(true, 12, 13));
+    assert(!trade::replay::SellerAccount(true, 12, 0));
+    assert(trade::replay::SellerAccount(false, 0, 0));
     ENetHost fixture{};
     ENetPeer connections[3]{};
     ENetChannel channels[3][ChannelCount]{};
@@ -40,8 +48,31 @@ int main()
     assert(std::string(PeerName(2)) == "Steam Player One"); // Hello cannot authorize a label/migration.
     assert(transmissions.size() == 1 && transmissions.back().bytes[0] == MsgWelcome);
     Deliver(&connections[1], join); // Same authenticated SteamID on a second connection.
-    assert(!connections[1].data && !peers[3]);
-    assert(transmissions.size() == 2 && transmissions.back().bytes[0] == MsgRefused);
+    assert(!connections[0].data && connections[1].data && peers[2] == &connections[1] && !peers[3]);
+    assert(transmissions.size() == 2 && transmissions.back().bytes[0] == MsgWelcome);
+    assert(PeerGeneration(2) == 2);
+    LeavePeer(&connections[0], "late-event", false);
+    assert(peers[2] == &connections[1]);
+    clientInWorld[2] = true;
+    goodsCache[2] = {1, 2};
+    npcOrigins[2]["old"] = {};
+    steam::RelayDrop drop;
+    drop.account = transportAccounts[0];
+    drop.port = 13;
+    drop.generation = transportGenerations[1];
+    strcpy_s(drop.reason, "left the lobby");
+    relayDrops.push_back(drop);
+    ProcessRelayDrops();
+    assert(!PeerJoined(2) && !clientInWorld[2] && goodsCache[2].empty() && npcOrigins[2].empty());
+    assert(ClientCount() == 0 && !remotes[2].connected);
+    transportGenerations[0] = 1;
+    Deliver(&connections[0], join); // Same account returns to its free slot.
+    assert(peers[2] == &connections[0] && PeerGeneration(2) == 3 && ClientCount() == 1);
+    drop.port = 12; // A delayed drop for the old relay must not evict the replacement.
+    drop.generation = 0;
+    relayDrops.push_back(drop);
+    ProcessRelayDrops();
+    assert(peers[2] == &connections[0]);
     transportAccounts[1] = 18446744073709551615ULL;
     Deliver(&connections[2], join);
     assert(PeerAccount(3) == transportAccounts[1] && connections[2].data);
@@ -76,4 +107,26 @@ int main()
     assert(!PeerAccount(2));
     Deliver(&connections[0], upload);
     assert(receivedCharacters == captures);
+
+    LeavePeer(&connections[0], "timeout-or-disconnect", false);
+    assert(!PeerJoined(2) && relayCloses.size() == 1 && relayCloses[0].second == 1);
+    transportAccounts[0] = record.note.account;
+    Deliver(&connections[0], join);
+    assert(PeerJoined(2) && relayCloses.empty()); // An already-authenticated rejoin supersedes the queued close.
+
+    isHost = false;
+    connected = inWorld = steamLinked = true;
+    hostRelayGeneration = 77;
+    server = &connections[0];
+    remotes[1].connected = true;
+    const unsigned restoresBefore = options::restores;
+    drop.generation = 76;
+    relayDrops.push_back(drop);
+    ProcessRelayDrops();
+    assert(connected && server);
+    drop.generation = 77;
+    relayDrops.push_back(drop);
+    ProcessRelayDrops();
+    assert(!connected && !inWorld && !steamLinked && !server && !remotes[1].connected);
+    assert(options::restores == restoresBefore + 1);
 }
