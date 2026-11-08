@@ -30,6 +30,7 @@ target_gothic_script_options(Script_G3Together)
 target_sources(Script_G3Together PRIVATE src/npcremoval.cpp)
 target_sources(Script_G3Together PRIVATE src/relation.cpp)
 target_sources(Script_G3Together PRIVATE src/movement.cpp)
+target_sources(Script_G3Together PRIVATE src/options.cpp)
 # The standalone codec rolls back partially installed baselines on allocation failure.
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/npcwire_control.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)

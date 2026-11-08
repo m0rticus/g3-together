@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "combat.h"
+#include "options.h"
 
 #include "ai.h"
 #include "body.h"
@@ -826,6 +827,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     eCEntity* hero = gCSession::GetInstance().GetHero();
     Entity damageSource = sourceArg ? *static_cast<Entity*>(sourceArg)
         : Entity(spu ? (which == 0 ? spu->GetSelfEntity() : spu->GetOtherEntity()) : nullptr);
+    options::NpcJudgement difficulty(!net::IsHost() && npcs::OwnerOf(victim.GetInstance()) == 1);
     eCEntity* attacker = Attacker(nullptr, &damageSource);
     GroundProbe ground(victim.GetInstance(), attacker, Judgements[which]);
     eCEntity* source = damageSource.GetInstance();

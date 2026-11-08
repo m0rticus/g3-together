@@ -3,6 +3,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "options_policy.h"
 
 #include <Engine.h>
 #include <Windows.h>
@@ -84,35 +85,38 @@ char optionsText[128] = "";
 uint64_t HashOptions(std::string const& dir)
 {
     Fnv fnv;
+    fnv.AddValue(options::policy::Capability);
     eSSetupEngine const& setup = eCApplication::GetInstance().GetEngineSetup();
     char const* difficulty = setup.Difficulty.GetText();
-    fnv.Add(difficulty ? difficulty : "");
-    fnv.AddValue(setup.AlternativeBalancing);
-    fnv.AddValue(setup.AlternativeAI);
-    fnv.AddValue(setup.MinHitDuration);
-    fnv.AddValue(setup.XPModifier);
-    fnv.AddValue(setup.QuickLoot);
-    // Owner 28.10.: the co-op's own balance (config.h) counts like the game's options, so both play by the host's.
-    fnv.AddValue(GetConfig().friendlyFire);
-    fnv.AddValue(static_cast<int>(GetConfig().npcDamage * 100.0f + 0.5f));
-    fnv.AddValue(static_cast<int>(GetConfig().npcHp * 100.0f + 0.5f));
     Logf("PARITY options difficulty=%s alternative_balancing=%d alternative_ai=%d min_hit_duration=%d xp_modifier=%d quick_loot=%d "
          "friendly_fire=%d npc_damage=%.2f npc_hp=%.2f",
          difficulty ? difficulty : "", setup.AlternativeBalancing, setup.AlternativeAI, setup.MinHitDuration, setup.XPModifier,
          setup.QuickLoot, GetConfig().friendlyFire, GetConfig().npcDamage, GetConfig().npcHp);
-    // Short labels: the refusal carries at most 160 characters, its own words and these values (npc_hp last) included.
-    Format(optionsText, "difficulty %s, bal. %d, AI %d, min. hit %d, XP %d%%, loot %d, friendly_fire %d, npc_damage %g, npc_hp %g",
-           difficulty ? difficulty : "?", setup.AlternativeBalancing ? 1 : 0, setup.AlternativeAI ? 1 : 0,
-           static_cast<int>(setup.MinHitDuration), static_cast<int>(setup.XPModifier), setup.QuickLoot ? 1 : 0, GetConfig().friendlyFire,
-           static_cast<double>(GetConfig().npcDamage), static_cast<double>(GetConfig().npcHp));
-    // The [Game] section of ge3.ini also holds options the setup struct does not show (ExtendedContent).
+    strcpy_s(optionsText, "delegation capability / unsupported [Game] keys");
     static char section[8192];
     const DWORD n = GetPrivateProfileSectionA("Game", section, sizeof(section), (dir + "\\Ini\\ge3.ini").c_str());
     std::vector<std::string> lines;
-    for (char const* line = section; line < section + n && *line; line += std::strlen(line) + 1) lines.push_back(Lower(line));
+    if (n == sizeof(section) - 2) {
+        fnv.Add("<Game section truncated>");
+        Log("PARITY [Game] section too large; install identity includes an invalid-section marker");
+    }
+    unsigned shared = 0, local = 0;
+    for (char const* line = section; line < section + n && *line; line += std::strlen(line) + 1) {
+        std::string text(line);
+        const auto equals = text.find('=');
+        const std::string key = options::policy::LowerTrim(text.substr(0, equals));
+        const auto kind = options::policy::Classify(key);
+        if (kind == options::policy::Class::Host) { ++shared; continue; }
+        if (kind == options::policy::Class::Local) { ++local; continue; }
+        const std::string value = equals == std::string::npos ? "" : options::policy::LowerTrim(text.substr(equals + 1));
+        lines.push_back(key + "=" + value);
+        Logf("PARITY unsupported [Game] key=%s value=%s (identity; not delegated)", key.c_str(), value.c_str());
+    }
     std::sort(lines.begin(), lines.end());
     for (auto const& line : lines) fnv.Add(line.c_str());
-    Logf("PARITY ini_game_lines=%u", static_cast<unsigned>(lines.size()));
+    Logf("PARITY ini_game_lines=%u shared=%u local=%u identity=%u difficulty=per-player balancing=host",
+         shared + local + static_cast<unsigned>(lines.size()), shared, local, static_cast<unsigned>(lines.size()));
+    if (!n) Log("PARITY no [Game] entries; using native effective defaults, not refusing local preferences");
     return fnv.value;
 }
 }
@@ -141,7 +145,7 @@ void Compute()
     Fnv rules, other;
     for (auto const& f : FilesIn(dir + "\\Data", "*")) {
         if (IsRulesArchive(f.name)) { rules.Add(f.name.c_str()); AddFile(rules, dir + "\\Data\\" + f.name); }
-        else { other.Add(f.name.c_str()); other.AddValue(f.size); }  // big archives: name and size only
+        else { other.Add(f.name.c_str()); AddFile(other, dir + "\\Data\\" + f.name); }
     }
     items[DataRules] = rules.value;
     items[DataOther] = other.value;

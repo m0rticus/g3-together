@@ -8,6 +8,7 @@
 #include "persist.h"
 #include "remote.h"
 #include "movement.h"
+#include "options.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -323,7 +324,12 @@ bool MenuLine(wchar_t const* text)
         lineChanged = false;
         return true;
     }
-    const std::wstring shown = lineText + L"\n" + text;
+    std::wstring content(text);
+    if (auto* adopted = options::Hint()) {
+        content += L"\n";
+        content += adopted;
+    }
+    const std::wstring shown = lineText + L"\n" + content;
     if (line->GetWindowTextA().GetText() != shown) {
         line->SetWindowTextA(bCUnicodeString(shown.c_str()));
         char utf8[900] = {};
@@ -331,7 +337,8 @@ bool MenuLine(wchar_t const* text)
         Logf("menu: %s", utf8);
     }
     // Room for the version and two lines of text: a refusal that lists differing files, or German, runs longer.
-    if (!lineChanged) line->MoveWindow(bCRect(0, lineRect.GetTop(), 1024, lineRect.GetTop() + 3 * lineRect.GetHeight() + 4));
+    line->MoveWindow(bCRect(0, lineRect.GetTop(), 1024,
+        lineRect.GetTop() + (options::Hint() ? 5 : 3) * lineRect.GetHeight() + 4));
     lineChanged = true;
     return true;
 }

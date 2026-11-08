@@ -16,6 +16,7 @@
 #include "net_metrics.h"
 #include "playerwire.h"
 #include "parity.h"
+#include "options.h"
 #include "replication.h"
 #include "saving_policy.h"
 #include "saving_store.h"
@@ -59,7 +60,7 @@ struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[pa
 struct RefusedMsg { uint8_t type; char reason[160]; };
 struct ClockMsg { uint8_t type; ClockState state; };
 struct WorldStateMsg { uint8_t type; WorldState state; };
-struct Welcome { uint8_t type; uint8_t id; };
+struct Welcome { uint8_t type; uint8_t id; options::policy::Snapshot options; };
 struct State { uint8_t type; PlayerState state; };
 struct ActivityMsg {
     uint8_t type, id, flags;
@@ -115,6 +116,7 @@ struct WitnessMsg { uint8_t type; uint8_t from; uint8_t to; WitnessNote note; };
 struct NpcSpellMsg { uint8_t type; uint8_t from; uint8_t to; char script[32]; uint8_t target[16]; int32_t args; };
 struct EnclaveMsg { uint8_t type; EnclaveNote note; };
 struct WorldMsg { uint8_t type; WorldNote note; };
+struct HostWorldMsg { uint8_t type; WorldNote note; options::policy::Snapshot options; };
 struct SaveMsg { uint8_t type; SaveNote note; };
 struct CharacterMsg { uint8_t type; CharacterNote note; };
 #pragma pack(pop)
@@ -253,6 +255,7 @@ WorldHandler worldHandler = nullptr;
 SaveHandler saveHandler = nullptr;
 CharacterHandler characterHandler = nullptr;
 bool inWorld = false;                  // client side: this machine is in the host's world (persist.cpp)
+options::policy::Snapshot hostOptions;
 bool clientInWorld[MaxPlayers] = {};   // host side: that client is in the host's world
 uint32_t generations[MaxPlayers] = {}; // host side: counts the connections a slot was given (PeerGeneration)
 uint32_t worldEntries = 0;             // client side: local world gate openings
@@ -939,16 +942,14 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             uint64_t const* ours = parity::Local();
             for (int i = 0; i != parity::ItemCount; ++i)
                 if (hello.parity[i] != ours[i]) {
-                    strcat_s(refusal.reason, refusal.reason[0] ? ", " : "install differs from the host: ");
-                    strcat_s(refusal.reason, parity::ItemName(i));
-                    // Which option, the client cannot tell from a hash: the host's values (the host on Hard, the client on Medium,
-                    // playtest 27.10.); the reason is cut at its 160 characters.
-                    if (i == parity::Options) {
-                        strncat_s(refusal.reason, " (host: ", _TRUNCATE);
-                        strncat_s(refusal.reason, parity::OptionsText(), _TRUNCATE);
-                        strncat_s(refusal.reason, ")", _TRUNCATE);
-                    }
+                    Format(refusal.reason, "install differs from the host: %s; install the host's %s",
+                           parity::ItemName(i), i == parity::Options ? "G3 Together build and unsupported [Game] values" :
+                           i == parity::ScriptsFolder ? "script DLLs/mod package" :
+                           i == parity::DataRules || i == parity::DataOther ? "data archives/mods" : "game version/patches");
+                    break; // Never overflow the fixed refusal when several items differ.
                 }
+            if (!refusal.reason[0] && !options::policy::Valid(hostOptions))
+                strcpy_s(refusal.reason, "host balancing is invalid; host must repair its game/mod options and restart");
         }
         if (refusal.reason[0]) {
             Logf("net: refused %s: %s", hello.name, refusal.reason);
@@ -981,7 +982,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         remotes[id].connected = true; // joined; activity and presentation have separate readiness
         clientInWorld[id] = false;
         strncpy_s(remotes[id].latest.name, displayName, _TRUNCATE);
-        const Welcome welcome{MsgWelcome, id};
+        const Welcome welcome{MsgWelcome, id, hostOptions};
         Send(peer, &welcome, sizeof(welcome), ChannelReliable, true);
         Logf("net: %s joined as player %u", hello.name, id);
         Logf("identity: join steamid=%llu display=%s source=transport-authenticated slot=%u", account, displayName, id);
@@ -990,12 +991,22 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&refusal, packet->data, sizeof(refusal));
         refusal.reason[sizeof(refusal.reason) - 1] = '\0';
         refused = true;
+        options::Restore();
         strncpy_s(refusalReason, refusal.reason, _TRUNCATE);
         Logf("net: REFUSED by host: %s", refusal.reason);
     } else if (type == MsgWelcome && !isHost && packet->dataLength == sizeof(Welcome)) {
         Welcome welcome;
         std::memcpy(&welcome, packet->data, sizeof(welcome));
         if (welcome.id < 2 || welcome.id >= MaxPlayers) { Logf("net: welcome with player id %u; ignored", welcome.id); return; }
+        if (peer != server || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
+        if (!options::Adopt(welcome.options, 0)) {
+            refused = true;
+            strcpy_s(refusalReason, "invalid host balancing or unavailable native option readers; install the same supported patches/build");
+            options::Restore();
+            Logf("net: REFUSED host options: %s", refusalReason);
+            enet_peer_disconnect_later(peer, 1);
+            return;
+        }
         localId = welcome.id;
         connected = true;
         inWorld = false;  // until the host's world is known to be this one (persist.cpp)
@@ -1878,7 +1889,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&leave, packet->data, sizeof(leave));
         Logf("net: player %u left", leave.id);
         Drop(leave.id);
-    } else if (type == MsgWorld && packet->dataLength == sizeof(WorldMsg)) {
+    } else if (type == MsgWorld && (packet->dataLength == sizeof(WorldMsg) || packet->dataLength == sizeof(HostWorldMsg))) {
         WorldMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         message.note.campaign[sizeof(message.note.campaign) - 1] = 0;
@@ -1887,11 +1898,32 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             (isHost ? from < 2 || from >= MaxPlayers || peers[from] != peer ||
                       (message.note.op != WorldReady && message.note.op != WorldWaiting && message.note.op != WorldOther)
                     : peer != server || !connected || (message.note.op != WorldHost && message.note.op != WorldReady))) return;
+        if (!isHost && message.note.op == WorldHost) {
+            HostWorldMsg announced{};
+            if (packet->dataLength == sizeof(announced)) std::memcpy(&announced, packet->data, sizeof(announced));
+            if (packet->dataLength != sizeof(announced) || !options::Adopt(announced.options, message.note.epoch)) {
+                refused = true;
+                connected = inWorld = false;
+                strcpy_s(refusalReason, "invalid/missing host world balancing; install the same G3 Together build");
+                options::Restore();
+                Logf("net: REFUSED host options: %s", refusalReason);
+                enet_peer_disconnect_later(peer, 1);
+                return;
+            }
+        } else if (packet->dataLength != sizeof(WorldMsg)) return;
         if (!isHost && message.note.op == WorldHost && worldEpoch != message.note.epoch) {
             ResetNpcReplication();
             worldEpoch = message.note.epoch;
         }
         if (worldHandler && from) worldHandler(from, message.note);
+        if (!isHost && message.note.op == WorldHost && !options::WorldAnnounced()) {
+            refused = true;
+            connected = inWorld = false;
+            strcpy_s(refusalReason, "host balancing needs a fresh world entry; restart Gothic 3 and create the client rejoin template");
+            options::Restore();
+            Logf("net: REFUSED host entry: %s", refusalReason);
+            enet_peer_disconnect_later(peer, 1);
+        }
     }
 }
 }
@@ -1995,11 +2027,17 @@ bool SendWorld(WorldNote const& note, uint8_t to)
     if (isHost && note.op == WorldHost && worldEpoch != note.epoch) {
         ResetNpcReplication();
         worldEpoch = note.epoch;
+        hostOptions = options::Capture(); // Options are frozen within one host world epoch.
     }
     const WorldMsg message{MsgWorld, note};
     if (isHost) {
-        if (to > 1 && to < MaxPlayers && peers[to])
+        if (to > 1 && to < MaxPlayers && peers[to]) {
+            if (note.op == WorldHost) {
+                const HostWorldMsg announcement{MsgWorld, note, hostOptions};
+                return Send(peers[to], &announcement, sizeof(announcement), ChannelReliable, true);
+            }
             return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
+        }
     } else if (server && connected)
         return Send(server, &message, sizeof(message), ChannelReliable, true);
     return false;
@@ -2855,6 +2893,7 @@ Remote const* Remotes() { return remotes; }
 
 void Stop()
 {
+    options::Restore();
     // Tell the others right away; otherwise a closed game only shows up after the long peer timeout.
     if (host) {
         if (isHost) {
@@ -2933,6 +2972,8 @@ bool StartFailed(char const* reason)
 bool Start(bool asHost)
 {
     isHost = asHost;
+    if (!options::Install()) return StartFailed("Game.dll/Engine.dll balancing readers unsupported; install the same CP 1.75.14 patches/build");
+    hostOptions = options::Capture();
     haveCurrentLocal = false;
     currentLocal = {};
     playerCadence = {};
@@ -3042,6 +3083,7 @@ void Service(PlayerState const& local, bool haveLocal)
                 Log("net: disconnected from host; will reconnect");
                 connected = false;
                 inWorld = false;
+                options::Restore();
                 server = nullptr;
                 for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
             }

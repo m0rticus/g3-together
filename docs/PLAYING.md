@@ -14,15 +14,74 @@ This is a test version. See the known issues and limitations below.
 - **Parallel Universe Patch 1.1.1**. Steam, CP 1.75.14 and PUP 1.1.1 are the tested baseline;
   compatibility without PUP has not been established.
 - The same G3 Together version (the same `Script_G3Together.dll`) and the same game files.
-- Matching difficulty, alternative balancing, alternative AI, XP factor, minimum hit duration, Quick Loot,
-  and the entire `[Game]` section of `Ini\ge3.ini`. The mod checks these when a player joins and refuses
-  mismatched installations. The joining player's `<Gothic 3>\g3together.log` records the reason on a line
-  containing `REFUSED by host`. Loose files in Data subfolders are not checked.
+- Difficulty and Quick Loot can differ. Shared balancing follows the host in memory for the session,
+  not by editing the client's files (see below). DLL/script/archive differences still refuse,
+  naming the differing item and what to install. Unrecognized `[Game]` keys remain a conservative
+  identity check; known gameplay/input/UI keys are classified rather than hashing the whole section.
+  The joining player's `<Gothic 3>\g3together.log` records refusals; loose files in Data subfolders
+  are not checked. Root Data files/archives are compared by content, not just filename/size.
 - No other co-op mods in `scripts`, such as Myrtana Accord's `Script_G3Coop.dll`.
 - Prefer a separate **copy** of the Gothic 3 installation for co-op.
 - Steam running and logged in on both PCs, with both players on each other's friends list.
 
 ## Installation
+
+### Difficulty and session balancing
+
+| Option | Class | Where its effective value applies |
+|---|---|---|
+| Difficulty | Per player | Each real hero's native difficulty; NPC simulation/judgement uses the NPC owner's difficulty |
+| Alternative balancing / `ExtendedContent` | Host wins | Native gameplay/setup readers and AB-dependent templates/skills |
+| Alternative AI / `AIMode` | Host wins | Native AI/script readers |
+| `MinHitDuration`, `XPModifier` | Host wins | Native hit timing and kill XP readers |
+| `PlayerStart` | Host wins | Native starting-hero read, before world entry |
+| `friendly_fire`, `npc_damage`, `npc_hp` | Host wins | Mod combat scaling on both machines |
+| Quick Loot / `QuickLoot`, `TestMode`, `NoMenu` | Local | Input/debug/menu preferences; not delegated |
+| DLLs, scripts, Data archives, protocol, unknown `[Game]` extensions | Hard refusal | Installation/capability identity |
+
+The client can play **Easy while the host plays Hard**. Hits on the real client hero are
+judged defender-local against its own armour, native difficulty and HP; the host cannot
+replace those HP decisions. A locally simulated host NPC uses the host's difficulty.
+Client claims against host-presented NPCs run the native judgement with that NPC owner's
+difficulty, then the host applies the claim and shared `npc_hp`/friendly-fire scaling.
+This preserves the client's visible contact/block decision rather than rerunning every hit
+against a different host animation. NPCs actually simulated by the client use the client's
+difficulty, not a global host difficulty. Consequently a change of NPC simulation owner can
+change difficulty-sensitive future AI/damage decisions; existing HP is not rerolled.
+Mirrored NPC presentation never owns HP.
+
+Do not interpret per-player difficulty as one global NPC HP/damage multiplier. Static analysis
+of the supported CP scripts found difficulty-sensitive combat/AI branches (including an
+alternative-balancing Hard damage branch); not a blanket difficulty multiplier on all damage
+or NPC maximum HP. The inspected `GiveXP` path uses alternative balancing and `XPModifier`
+for victim-derived XP, not `GetCurrentDifficulty`. Quest/raw shared XP and level-up learning
+points retain their existing native/mod paths; no new XP/LP rescaling is introduced.
+`npc_damage` still multiplies NPC damage to party members, and `npc_hp` still divides damage
+taken by non-party NPCs; neither factor modifies native maximum HP or resets existing stats.
+
+Different shared balancing is adopted before admission with one localized "Using the host's
+balancing..." notice listing changed values and confirming your difficulty is kept.
+`options:` log lines expose host/original/effective/source, including unchanged values.
+The same summary appears beside the existing main-menu hint. When values already match,
+there is no balancing notice. Host values are getter overlays, not edits to `ge3.ini`,
+`UserOptions.ini` or `g3together.ini`; disconnect removes the overlays.
+Missing client `[Game]` values use native defaults, then the host's shared values.
+Invalid host values or an unsupported native reader block admission explicitly.
+
+Balancing is frozen within each host world epoch. Change startup balancing on the host,
+restart it as required by Gothic 3, then start/load the campaign: the existing re-entry path
+adopts the new set. A pre-existing client world with incompatible startup settings must
+re-enter through its template; if the template is missing, restart the client and create it
+with its first New Game. Never overwrite the user's native world/save to accomplish adoption.
+
+**Verification boundary:** native getter/read/serialization paths were verified statically
+against the installed CP DLL bytes; this is not an observed running-engine test. The join
+`options:` diagnostics are intended for the next two-player run to confirm actual behaviour.
+Protocol remains **77**, with a delegation capability marker in the existing Hello options
+slot and a versioned balancing snapshot appended only to Welcome and host world announcements.
+Old builds are distinguishable and refuse rather than silently ignoring delegation.
+
+### Installing the package
 
 **Setup:** once Gothic 3 and both patches are installed, unpack the whole package anywhere and double-click
 `Setup.cmd`. It does the copying and the INI for you: it finds Gothic 3 (Steam, GOG or the

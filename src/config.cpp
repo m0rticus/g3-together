@@ -3,6 +3,7 @@
 
 #include "log.h"
 #include "player_identity.h"
+#include "options.h"
 
 #include <Windows.h>
 #include <cstdio>
@@ -28,7 +29,14 @@ void Trim(char* text)
 }
 }
 
-Config const& GetConfig() { return config; }
+Config const& GetLocalConfig() { return config; }
+Config const& GetConfig()
+{
+    static Config effective;
+    effective = config;
+    options::ApplyMod(effective);
+    return effective;
+}
 
 Config const& LoadConfig()
 {

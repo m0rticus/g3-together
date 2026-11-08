@@ -129,8 +129,22 @@ char const* Error() { return ""; }
 }
 namespace parity {
 uint64_t const* Local() { static uint64_t values[ItemCount] = {}; return values; }
-char const* ItemName(int) { return ""; }
+char const* ItemName(int item) {
+    static char const* names[] = {"Game.dll", "Script.dll", "Engine.dll", "scripts folder",
+                                 "rules archives", "other archives", "options"};
+    return names[item];
+}
 char const* OptionsText() { return ""; }
+}
+namespace options {
+policy::Session observed;
+policy::Snapshot localOptions;
+unsigned adoptions = 0, restores = 0;
+bool Install() { return true; }
+policy::Snapshot Capture() { return localOptions; }
+bool Adopt(policy::Snapshot const& s, uint32_t epoch) { ++adoptions; return observed.Adopt(localOptions, s, epoch); }
+void Restore() { ++restores; observed.Restore(); }
+bool WorldAnnounced() { return true; }
 }
 }
 

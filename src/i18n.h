@@ -87,6 +87,17 @@ enum Message
     ClientAutoloadEntered,
     ClientAutoloadStalled,
     IdentityMigrationPending,
+    OptionsAdopted,
+    OptionsBalancing,
+    OptionsAI,
+    OptionsMinHit,
+    OptionsXP,
+    OptionsFriendlyFire,
+    OptionsNpcDamage,
+    OptionsNpcHp,
+    OptionsPlayerStart,
+    OptionsOn,
+    OptionsOff,
     MessageCount
 };
 

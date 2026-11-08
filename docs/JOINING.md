@@ -5,8 +5,26 @@
 - Both PCs should use the tested baseline: Gothic 3 from Steam, **Community Patch 1.75.14** and
   **Parallel Universe Patch 1.1.1**. Use the same G3 Together DLL and the same game files.
   Compatibility without PUP has not been established.
-- Difficulty, alternative balancing, alternative AI, XP factor, minimum hit duration, Quick Loot
-  and the `[Game]` section in `Ini\ge3.ini` must match the host.
+- **Difficulty is per player**: client Easy and host Hard can join; neither difficulty is overwritten.
+  Quick Loot, test mode and menu preferences also stay local.
+- **Balancing follows the host for the session**: alternative balancing (`ExtendedContent`),
+  alternative AI (`AIMode`), `XPModifier`, `MinHitDuration`, `PlayerStart`, and the mod's
+  `friendly_fire`, `npc_damage`, `npc_hp`. Different local values no longer refuse a join.
+  The client adopts them through in-memory readers, before world entry, and restores its own
+  readers on disconnect. No host values are written to `ge3.ini` or the client's other settings files.
+  A differing set produces one "Using the host's balancing..." notice and a main-menu hint;
+  `options:` log lines record host, original, effective and source for every setting.
+- DLLs, script DLLs, rules archives and other Data archives still must match.
+  A refusal names the first differing item and the game patches/mod files to install.
+  Unknown `[Game]` keys conservatively remain installation identity: align those values rather
+  than guessing whether an unrecognized extension changes gameplay. Whitespace/case is normalized;
+  the known local/shared keys above are not hashed. Graphics, audio and key sections are not adopted.
+- Host balancing is frozen within a world epoch. Restart the host when changing startup/INI
+  balancing, then load/start the campaign; the client follows the new epoch through the existing
+  automatic or manual re-entry path. Invalid host balancing refuses explicitly.
+  Missing client `[Game]` entries use native defaults until adoption; they alone do not refuse.
+  A client already in a world with conflicting startup balancing must re-enter through its
+  client template. If that template is unavailable, a clear restart/template notice blocks admission.
 - There must be no other co-op mod in the `scripts` folder.
 - Steam must be running and logged in on both PCs; both players must be Steam friends.
 

@@ -220,6 +220,19 @@ constexpr Translation Messages[] = {
     {L"Legacy companion owner unresolved; saved ownership retained. See identity: in g3together.log and legacy_companion_owner.",
      L"Alter Begleiterbesitzer unbekannt; gespeicherter Besitz bleibt erhalten. Siehe identity: in g3together.log und legacy_companion_owner.",
      L"Nieznany właściciel dawnego towarzysza; zapisane przypisanie zachowano. Zobacz identity: w g3together.log i legacy_companion_owner."},
+    {L"Using the host's balancing: %s; your difficulty (%s) is kept.",
+     L"Balancing des Hosts übernommen: %s; dein Schwierigkeitsgrad (%s) bleibt.",
+     L"Używam balansu hosta: %s; twój poziom trudności (%s) pozostaje."},
+    {L"alternative balancing %s", L"Alternatives Balancing %s", L"alternatywny balans %s"},
+    {L"alternative AI %s", L"alternative KI %s", L"alternatywna SI %s"},
+    {L"min hit duration %d", L"min. Trefferdauer %d", L"min. czas trafienia %d"},
+    {L"XP %d%%", L"EP %d%%", L"PD %d%%"},
+    {L"friendly fire %d%%", L"Verbündetenschaden %d%%", L"ogień sojuszniczy %d%%"},
+    {L"NPC damage %.3g", L"NPC-Schaden %.3g", L"obrażenia NPC %.3g"},
+    {L"NPC HP %.3g", L"NPC-LP %.3g", L"PŻ NPC %.3g"},
+    {L"starting hero %s", L"Startheld %s", L"początkowy bohater %s"},
+    {L"ON", L"AN", L"WŁ."},
+    {L"OFF", L"AUS", L"WYŁ."},
 };
 static_assert(sizeof(Messages) / sizeof(Messages[0]) == MessageCount, "Missing HUD translation");
 

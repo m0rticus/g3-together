@@ -55,7 +55,10 @@ partner_key = PAGEDOWN
 # motion_seek = off
 # While you listen to the other player's dialog you see the spoken lines as subtitles; on also shows their answers in a box.
 # listener_textbox = on
-# Balance (both players need the same values, the join compares them): friendly_fire = percent of the damage players and
+# Balance: the host's values apply to both players for the session (client files stay unchanged).
+# Difficulty and Quick Loot stay per player; native balancing/AI/XP/min-hit settings follow the host.
+# Different DLLs, scripts and data archives still refuse; install the same game patches/mod package.
+# friendly_fire = percent of the damage players and
 # their companions deal to each other (0-100, default 0). Zero also prevents allied hit reactions and harmful effects.
 # npc_damage and npc_hp = factors on the damage NPCs deal and on
 # how much NPCs endure (0.1-10, default 1.0; companions excepted).
@@ -92,7 +95,10 @@ partner_key = PAGEDOWN
 # motion_seek = off
 # While you listen to the other player's dialog you see the spoken lines as subtitles; on also shows their answers in a box.
 # listener_textbox = on
-# Balance (both players need the same values, the join compares them): friendly_fire = percent of the damage players and
+# Balance: the host's values override these client preferences only in memory until disconnect.
+# Difficulty and Quick Loot stay per player; native balancing/AI/XP/min-hit settings follow the host.
+# Different DLLs, scripts and data archives still refuse; install the same game patches/mod package.
+# friendly_fire = percent of the damage players and
 # their companions deal to each other (0-100, default 0). Zero also prevents allied hit reactions and harmful effects.
 # npc_damage and npc_hp = factors on the damage NPCs deal and on
 # how much NPCs endure (0.1-10, default 1.0; companions excepted).

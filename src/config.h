@@ -50,8 +50,8 @@ struct Config
     // subtitles) a player who only listens to the other's dialog sees its lines as subtitles, as the game shows the talk of
     // others, but not the speaker's menu of answers in a box; on: the menu too, as before.
     bool listenerTextbox = false;
-    // Owner 28.10., as in single player but adjustable (combat.cpp; each player's INI, compared at the join like the game's
-    // options): friendly_fire = percent of cross-player party damage. Zero (default) blocks harmful contacts between
+    // Session balance follows the host in memory; each player's INI stays untouched.
+    // friendly_fire = percent of cross-player party damage. Zero (default) blocks harmful contacts between
     // all co-op party members before damage or reactions; positive values retain damage scaling. npc_damage = factor on
     // the damage NPCs deal to players and companions, npc_hp = factor on how
     // much NPCs endure (the damage they take is divided by it), both default 1.0, companions excepted.
@@ -66,4 +66,5 @@ struct Config
 // Reads <game dir>\g3together.ini (key = value lines, # comments). Missing file: defaults, host role.
 Config const& LoadConfig();
 Config const& GetConfig();
+Config const& GetLocalConfig(); // stored local preferences, without session overlays
 }
