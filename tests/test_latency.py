@@ -32,7 +32,8 @@ class LatencyTests(unittest.TestCase):
             raise RuntimeError(f"Latency test compilation failed:\n{result.stdout}{result.stderr}")
 
     def run_case(self, case):
-        subprocess.run([str(self.executable), case], check=True, capture_output=True, text=True)
+        result = subprocess.run([str(self.executable), case], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, f"{case} failed:\n{result.stdout}{result.stderr}")
 
     def test_clean_link_uses_34_ms_npc_floor_without_changing_player_delay(self):
         self.run_case("floor")
@@ -48,6 +49,21 @@ class LatencyTests(unittest.TestCase):
 
     def test_life_transitions_wrap_and_discontinuity_keep_one_nonpredictive_timeline(self):
         self.run_case("timeline")
+
+    def test_transit_baseline_and_five_second_stall_recover_within_eight_seconds(self):
+        self.run_case("transit")
+
+    def test_moderate_transit_jitter_and_time_based_decay(self):
+        self.run_case("moderate-jitter")
+
+    def test_burst_preserves_every_action_hit_and_life_boundary_across_wrap(self):
+        self.run_case("events")
+
+    def test_player_prediction_is_locomotion_only_speed_and_time_bounded(self):
+        self.run_case("prediction")
+
+    def test_incoming_combat_backlog_never_accelerates_or_runs_past_latest(self):
+        self.run_case("protected-backlog")
 
     def test_precise_ping_rejects_bad_replies_and_expires_across_clock_wrap(self):
         self.run_case("ping")

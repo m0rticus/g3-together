@@ -183,6 +183,26 @@ void checkWire(const Context& sender, const Context& receiver, const Control& va
     checkFields(value, decoded);
     assert(decoded.flags == value.flags && decoded.contact == value.contact);
 }
+void checkMotion(const Control& expected, const Control& actual) {
+    assert(expected.slots == actual.slots);
+    for (unsigned i = 0; i < MotionSlots; ++i) {
+        const auto& a = expected.motions[i];
+        const auto& b = actual.motions[i];
+        assert(a.descriptor.name == b.descriptor.name &&
+               a.descriptor.instance == b.descriptor.instance &&
+               bits(a.descriptor.speed) == bits(b.descriptor.speed) &&
+               bits(a.descriptor.intro) == bits(b.descriptor.intro) &&
+               bits(a.descriptor.extro) == bits(b.descriptor.extro) &&
+               a.descriptor.blend == b.descriptor.blend &&
+               a.descriptor.options == b.descriptor.options &&
+               a.active == b.active);
+        if (a.active & 1u)
+            assert(std::fabs(a.phase - b.phase) <= 0.5f / 4095 + 1e-7 &&
+                   std::fabs(a.weight - b.weight) <= 0.5f / 255 + 1e-7);
+        else
+            assert(bits(a.phase) == bits(b.phase) && bits(a.weight) == bits(b.weight));
+    }
+}
 void checkTruncations(const Context& receiver, const std::vector<std::uint8_t>& wire) {
     for (std::size_t n = 0; n < wire.size(); ++n) {
         std::size_t length = 123456;
@@ -261,6 +281,114 @@ int main() {
         checkWire(sender, receiver, v, mask);
     }
 
+    // Three named motion overrides change descriptors and active/inactive state
+    // without replacing or re-keying the immutable baseline.
+    auto dynamic = base;
+    dynamic.rotation = Yaw{0};
+    dynamic.motions[0].descriptor.name++;
+    dynamic.motions[0].descriptor.instance++;
+    dynamic.motions[0].descriptor.speed = 2.25f;
+    dynamic.motions[3].active = 2;
+    dynamic.motions[3].phase = 2.5f;
+    dynamic.motions[3].weight = 3.0f;
+    dynamic.motions[7].descriptor.options[6]++;
+    dynamic.motions[7].weight = 0.9f;
+    dynamic.slots = ActiveSlots(dynamic);
+    std::vector<std::uint8_t> dynamicWire;
+    assert(EncodeRecord(sender, dynamic, dynamicWire));
+    assert((dynamicWire[offsetof(WireControl, orientation)] & 0x20u) != 0);
+    assert(dynamicWire.size() == 24 + 7 * 3 + 1 + 14 + 11 + 6);
+    const std::size_t dynamicOverride = 24 + 7 * 3;
+    assert(dynamicWire[dynamicOverride] == 0x89);
+    std::size_t dynamicLength = 0;
+    assert(RecordBytes(dynamicWire.data(), dynamicWire.size(), dynamicLength) &&
+           dynamicLength == dynamicWire.size());
+    Control dynamicDecoded;
+    assert(DecodeRecord(receiver, dynamicWire.data(), dynamicWire.size(), dynamicDecoded));
+    checkMotion(dynamic, dynamicDecoded);
+    checkTruncations(receiver, dynamicWire);
+
+    // Active slots in the control record come from the current value. A baseline
+    // with no slots can gain two slots and each gained slot is full-encoded.
+    auto noSlots = snapshot(1, 0);
+    noSlots.baseline = 23;
+    assert(sender.AddBaseline(S, 1, 23, noSlots.anchor, noSlots));
+    assert(receiver.AddBaseline(S, 1, 23, noSlots.anchor, noSlots));
+    auto appeared = noSlots;
+    appeared.rotation = Yaw{0};
+    appeared.motions[0].active = 3;
+    appeared.motions[7].active = 1;
+    appeared.motions[0].phase = 0.25f;
+    appeared.motions[0].weight = 0.75f;
+    appeared.motions[7].phase = 0.125f;
+    appeared.motions[7].weight = 0.75f;
+    appeared.slots = ActiveSlots(appeared);
+    std::vector<std::uint8_t> appearedWire;
+    assert(EncodeRecord(sender, appeared, appearedWire));
+    assert(appearedWire[offsetof(WireControl, slots)] == 0x81);
+    assert((appearedWire[offsetof(WireControl, orientation)] & 0x20u) != 0);
+    assert(appearedWire.size() == 24 + 2 * 3 + 1 + 2 * 3);
+    std::size_t appearedLength = 0;
+    assert(RecordBytes(appearedWire.data(), appearedWire.size(), appearedLength) &&
+           appearedLength == appearedWire.size());
+    Control appearedDecoded;
+    assert(DecodeRecord(receiver, appearedWire.data(), appearedWire.size(), appearedDecoded));
+    checkMotion(appeared, appearedDecoded);
+
+    // All eight slots are losslessly overridden together; exact mode also
+    // preserves the full fields and exact position/motion float bits.
+    auto allDynamic = base;
+    allDynamic.rotation = Yaw{0};
+    for (unsigned i = 0; i < MotionSlots; ++i) {
+        allDynamic.motions[i].descriptor.name += 1000;
+        allDynamic.motions[i].descriptor.instance += 1000;
+        allDynamic.motions[i].descriptor.speed = static_cast<float>(i) + 0.25f;
+        allDynamic.motions[i].descriptor.intro = -static_cast<float>(i);
+        allDynamic.motions[i].descriptor.extro = static_cast<float>(i) + 0.5f;
+        allDynamic.motions[i].descriptor.blend = static_cast<std::int32_t>(i) - 4;
+        allDynamic.motions[i].descriptor.options[0] = 0x10000u + i;
+    }
+    std::vector<std::uint8_t> allDynamicWire;
+    assert(EncodeRecord(sender, allDynamic, allDynamicWire));
+    assert((allDynamicWire[offsetof(WireControl, orientation)] & 0x20u) != 0);
+    assert(allDynamicWire[24 + 8 * 3] == 0xff);
+    Control allDynamicDecoded;
+    assert(DecodeRecord(receiver, allDynamicWire.data(), allDynamicWire.size(), allDynamicDecoded));
+    checkMotion(allDynamic, allDynamicDecoded);
+
+    auto exactDynamic = allDynamic;
+    exactDynamic.position = {{-0.0, static_cast<double>(0.123456f), static_cast<double>(12345.678f)}};
+    exactDynamic.rotation = Quaternion{{{0.125f, -0.25f, 0.5f, 0.875f}}};
+    for (unsigned i = 0; i < MotionSlots; ++i) {
+        exactDynamic.motions[i].phase = 0.123456f + 0.01f * i;
+        exactDynamic.motions[i].weight = 0.654321f + i;
+    }
+    std::vector<std::uint8_t> exactDynamicWire;
+    assert(EncodeRecord(sender, exactDynamic, exactDynamicWire, true));
+    assert((exactDynamicWire[offsetof(WireControl, orientation)] & 0x20u) != 0);
+    std::size_t exactDynamicLength = 0;
+    assert(RecordBytes(exactDynamicWire.data(), exactDynamicWire.size(), exactDynamicLength) &&
+           exactDynamicLength == exactDynamicWire.size());
+    Control exactDynamicDecoded;
+    assert(DecodeRecord(receiver, exactDynamicWire.data(), exactDynamicWire.size(), exactDynamicDecoded));
+    checkMotion(exactDynamic, exactDynamicDecoded);
+    assert(exactDynamicDecoded.position == exactDynamic.position &&
+           std::signbit(exactDynamicDecoded.position[0]));
+    for (unsigned i = 0; i < MotionSlots; ++i) {
+        assert(bits(exactDynamicDecoded.motions[i].phase) == bits(exactDynamic.motions[i].phase));
+        assert(bits(exactDynamicDecoded.motions[i].weight) == bits(exactDynamic.motions[i].weight));
+    }
+    exactDynamic.motions[0].weight = 2.0f;
+    exactDynamic.motions[7].weight = 10.0f;
+    assert(EncodeRecord(sender, exactDynamic, exactDynamicWire, true));
+    assert(DecodeRecord(receiver, exactDynamicWire.data(), exactDynamicWire.size(), exactDynamicDecoded));
+    assert(exactDynamicDecoded.motions[0].weight == 2.0f &&
+           exactDynamicDecoded.motions[7].weight == 10.0f);
+    exactDynamic.motions[0].weight = 10.0001f;
+    std::vector<std::uint8_t> rejected{9};
+    assert(!EncodeRecord(sender, exactDynamic, rejected, true) &&
+           rejected == std::vector<std::uint8_t>{9});
+
     // Independent updates restore every omitted value, even after reordering.
     auto a = base, b = base;
     a.rotation = b.rotation = Yaw{0};
@@ -302,7 +430,7 @@ int main() {
     assert(!DecodeRecord(receiver, trailing.data(), trailing.size(), decoded) && decoded.sent == 0x12345678);
     const auto ext = extensionOffset(all);
     auto bad = maxWire;
-    for (unsigned bit = 1; bit <= 5; ++bit) {
+    for (unsigned bit = 1; bit <= 4; ++bit) {
         bad = maxWire; bad[offsetof(WireControl, orientation)] |= static_cast<std::uint8_t>(1u << bit);
         length = 123456;
         assert(!RecordBytes(bad.data(), bad.size(), length) && length == 123456);
@@ -347,6 +475,48 @@ int main() {
         bad[offset + extraBit / 8] |= static_cast<std::uint8_t>(1u << (extraBit % 8));
         assert(!RecordBytes(bad.data(), bad.size(), length));
     }
+
+    // Motion override masks and payloads are canonical and fail atomically.
+    bad = dynamicWire;
+    bad[dynamicOverride] = 0;
+    assert(!RecordBytes(bad.data(), bad.size(), length));
+    decoded.sent = 0x12345678;
+    assert(!DecodeRecord(receiver, bad.data(), bad.size(), decoded) &&
+           decoded.sent == 0x12345678);
+
+    bad = dynamicWire;
+    bad[dynamicOverride] = 0x80;
+    assert(RecordBytes(bad.data(), bad.size(), length));
+    assert(!DecodeRecord(receiver, bad.data(), bad.size(), decoded));
+
+    bad = dynamicWire;
+    const std::size_t slot0Payload = dynamicOverride + 1;
+    bad[slot0Payload] = 0x07;
+    bad[slot0Payload + 1] = 0;
+    const std::uint32_t baselineName = 100;
+    for (unsigned i = 0; i < 4; ++i)
+        bad[slot0Payload + 2 + i] = static_cast<std::uint8_t>(baselineName >> (8 * i));
+    const std::uint32_t baselineInstance = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        bad[slot0Payload + 6 + i] = static_cast<std::uint8_t>(baselineInstance >> (8 * i));
+    const std::uint32_t baselineSpeed = 0x3f800000u;
+    for (unsigned i = 0; i < 4; ++i)
+        bad[slot0Payload + 10 + i] = static_cast<std::uint8_t>(baselineSpeed >> (8 * i));
+    assert(RecordBytes(bad.data(), bad.size(), length) && length == bad.size());
+    assert(!DecodeRecord(receiver, bad.data(), bad.size(), decoded));
+
+    bad = dynamicWire;
+    bad[slot0Payload] = 0;
+    bad[slot0Payload + 1] = 0;
+    assert(!RecordBytes(bad.data(), bad.size(), length));
+    assert(!DecodeRecord(receiver, bad.data(), bad.size(), decoded));
+
+    bad = dynamicWire;
+    const std::size_t slot3Payload = slot0Payload + 14;
+    bad[slot3Payload] = 0xe0;
+    bad[slot3Payload + 1] = 0xe0;
+    bad[slot3Payload + 2] = 1;
+    assert(!DecodeRecord(receiver, bad.data(), bad.size(), decoded));
 
     // Changed NaN/infinity values are invalid, while both signs of zero differ.
     for (const auto raw : {0x7f800000u, 0xff800000u, 0x7fc01234u}) {

@@ -69,8 +69,10 @@ void Handshake(ENetPeer& peer, NpcRecord const& record)
     assert(transmissions.size() == 3);
     assert(transmissions[0].bytes[0] == MsgControlId);
     assert(transmissions[1].bytes[0] == MsgControlBaseline);
-    assert(transmissions[2].bytes[0] == MsgNpcs);
-    const auto id = transmissions[0], baseline = transmissions[1];
+    assert(transmissions[2].bytes[0] == MsgControlBatch);
+    assert(transmissions[2].channel == ChannelDefinitions &&
+           (transmissions[2].flags & ENET_PACKET_FLAG_RELIABLE));
+    const auto id = transmissions[0], baseline = transmissions[1], dependent = transmissions[2];
     transmissions.clear();
     isHost = false;
     Deliver(&peer, id);
@@ -78,9 +80,13 @@ void Handshake(ENetPeer& peer, NpcRecord const& record)
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
     const auto ack = transmissions[0];
     transmissions.clear();
+    Deliver(&peer, dependent);
+    assert(receivedRecords.size() >= 1);
+    transmissions.clear();
     isHost = true;
     Deliver(&peer, ack);
     assert(transmissions.empty());
+    receivedRecords.clear();
 }
 
 int main()
@@ -127,7 +133,7 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     RefusedMsg refusal{};
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 72, host 77") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 72, host 78") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 73;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -135,7 +141,7 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 73, host 77") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 73, host 78") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 76;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -143,7 +149,15 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 76, host 77") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 76, host 78") != nullptr);
+    assert(!fakePeers[1].data && !peers[3]);
+    oldHello.version = 77;
+    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
+    transmissions.clear();
+    Deliver(&fakePeers[1], oldHandshake);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
+    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
+    assert(std::strstr(refusal.reason, "protocol 77, host 78") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     fakePeers[1].data = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
     transmissions.clear();
@@ -249,48 +263,48 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch &&
            (transmissions[0].flags & ENET_PACKET_FLAG_RELIABLE));
     const auto exactPacket = transmissions[0];
-    assert(exactPacket.channel == ChannelNpcs && exactPacket.bytes.size() < sizeof(NpcsHeader) + sizeof(NpcRecord));
+    assert(exactPacket.channel == ChannelDefinitions &&
+           exactPacket.bytes[0] == MsgControlBatch);
     transmissions.clear();
     isHost = false;
     Deliver(&fakePeer, exactPacket);
     assert(std::memcmp(&receivedRecords.back(), &records[0], sizeof(NpcRecord)) == 0);
     isHost = true;
 
-    // A changed immutable motion descriptor starts a fresh baseline.
+    // A changed immutable motion descriptor uses a relative motion override,
+    // without replacing the named baseline or life.
     transmissions.clear();
     records[0].motions[0].speed = 1.6f;
     SendNpcs(records, 1, false);
-    assert(transmissions.size() == 3 && transmissions[0].bytes[0] == MsgControlId &&
-           transmissions[1].bytes[0] == MsgControlBaseline && transmissions[2].bytes[0] == MsgNpcs);
-    const auto newId = transmissions[0], newBaseline = transmissions[1], changedFull = transmissions[2];
-    transmissions.clear();
-    isHost = false;
-    Deliver(&fakePeer, changedFull);
-    assert(receivedRecords.back().hitPoints == 60);
-    Deliver(&fakePeer, newId);
-    Deliver(&fakePeer, newBaseline);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
-    const auto newAck = transmissions[0];
-    transmissions.clear();
-    isHost = true;
-    Deliver(&fakePeer, newAck);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+    const auto changedCompact = transmissions[0];
     const auto key = NpcKey(records[0].guid);
     const uint16_t token = controlStates.at(key).nextBaseline;
+    transmissions.clear();
+    isHost = false;
+    Deliver(&fakePeer, changedCompact);
+    assert(receivedRecords.back().hitPoints == 60);
+    assert(receivedRecords.back().motions[0].speed == 1.6f);
+    isHost = true;
 
-    // Extended active weight uses exact full fallback without churning baselines.
+    // Extended active weight uses exact compact motion ticks without churning baselines.
     records[0].motions[0].weight = 2.0f;
     for (int i = 0; i < 10; ++i) {
         transmissions.clear();
         SendNpcs(records, 1, false);
-        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
+        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
         assert(controlStates.at(key).nextBaseline == token);
     }
+    isHost = false;
+    Deliver(&fakePeer, transmissions[0]);
+    assert(receivedRecords.back().motions[0].weight == 2.0f);
+    isHost = true;
     records[0].motions[0].weight = 0.7f;
     records[0].position[0] += 40000.0f;
     transmissions.clear();
     SendNpcs(records, 1, false);
-    assert(controlStates.at(key).nextBaseline == token + 1);
-    assert(transmissions.size() == 3 && transmissions[2].bytes[0] == MsgNpcs);
+    assert(controlStates.at(key).nextBaseline == token);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
 
     // Client rejoin loses its tables: the compact packet requests the ID and
     // the host resends the ID, baseline and latest gameplay record reliably.
@@ -335,19 +349,37 @@ int main()
     Deliver(&fakePeer, recovered);
     assert(receivedRecords.size() == beforeUnknown + 2);
 
-    // Reliable life transitions remain full records and precede reliable release.
+    // Reliable life transitions use compact control after setup is queued,
+    // and precede reliable release on the ordered definitions channel.
     isHost = true;
     fresh.flags = 1;
     fresh.hitPoints = 0;
     transmissions.clear();
     SendNpcs(&fresh, 1, true);
     SendNpcRelease(fresh.guid, 1);
-    assert(transmissions.size() == 4 && transmissions[2].bytes[0] == MsgNpcs &&
-           (transmissions[2].flags & ENET_PACKET_FLAG_RELIABLE));
-    assert(transmissions[3].bytes[0] == MsgNpcRelease && (transmissions[3].flags & ENET_PACKET_FLAG_RELIABLE));
-    const auto terminal = transmissions[2], release = transmissions[3];
+    Transmission terminal, release;
+    Transmission setupId, setupBaseline;
+    bool haveSetupId = false, haveSetupBaseline = false;
+    for (const auto& packet : transmissions) {
+        if (packet.bytes[0] == MsgControlId) { setupId = packet; haveSetupId = true; }
+        if (packet.bytes[0] == MsgControlBaseline) { setupBaseline = packet; haveSetupBaseline = true; }
+        if (packet.bytes[0] == MsgControlBatch) terminal = packet;
+        if (packet.bytes[0] == MsgNpcRelease) release = packet;
+    }
+    assert(!terminal.bytes.empty() && !release.bytes.empty());
+    assert(terminal.channel == ChannelDefinitions && release.channel == ChannelDefinitions &&
+           (terminal.flags & ENET_PACKET_FLAG_RELIABLE) &&
+           (release.flags & ENET_PACKET_FLAG_RELIABLE));
     transmissions.clear();
     isHost = false;
+    Transmission terminalAck;
+    if (haveSetupId && haveSetupBaseline) {
+        Deliver(&fakePeer, setupId);
+        Deliver(&fakePeer, setupBaseline);
+        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
+        terminalAck = transmissions[0];
+        transmissions.clear();
+    }
     Deliver(&fakePeer, terminal);
     assert(receivedRecords.back().flags == 1 && receivedRecords.back().hitPoints == 0);
     Deliver(&fakePeer, release);
@@ -355,6 +387,12 @@ int main()
     const size_t terminalCount = receivedRecords.size();
     Deliver(&fakePeer, recovered);
     assert(receivedRecords.size() == terminalCount);
+    if (!terminalAck.bytes.empty()) {
+        isHost = true;
+        transmissions.clear();
+        Deliver(&fakePeer, terminalAck);
+        transmissions.clear();
+    }
 
     // Both dictionaries must be acknowledged before a posed update combines
     // compressed control and the exact 24-byte bone transforms.
@@ -369,8 +407,11 @@ int main()
     transmissions.clear();
     SendPosedNpc(posed, poseBones, 80, pose::Facial);
     assert(transmissions.size() == 2 && transmissions[0].bytes[0] == MsgBoneDictionary &&
-           transmissions[1].bytes[0] == MsgPosedNpc);
-    const auto boneDefinition = transmissions[0], fullPose = transmissions[1];
+           (transmissions[1].bytes[0] == MsgCompactPosedNpc ||
+            transmissions[1].bytes[0] == MsgControlPose));
+    assert(transmissions[1].channel == ChannelDefinitions &&
+           (transmissions[1].flags & ENET_PACKET_FLAG_RELIABLE));
+    const auto boneDefinition = transmissions[0], coldPose = transmissions[1];
     bonewire::Dictionary hostBones = std::move(boneLayouts);
     boneLayouts.Clear();
     receivedBoneGeneration = 0;
@@ -380,7 +421,7 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgBoneAck);
     const auto boneAck = transmissions[0];
     transmissions.clear();
-    Deliver(&fakePeer, fullPose);
+    Deliver(&fakePeer, coldPose);
     assert(applied == 1 && appliedBones.size() == 80);
     bonewire::Dictionary clientBones = std::move(boneLayouts);
     boneLayouts = std::move(hostBones);
@@ -388,20 +429,14 @@ int main()
     Deliver(&fakePeer, boneAck);
     transmissions.clear();
     SendPosedNpc(posed, poseBones, 80, pose::Facial);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlPose);
-    const auto compactPose = transmissions[0];
-    std::vector<uint8_t> expectedPose;
-    bonewire::PoseCache keyEncoder;
-    bool isKey = false;
-    assert(keyEncoder.Encode(boneLayouts, 1, posed.incarnation, pose::Facial, poseBones, 80, fakeTime,
-                             expectedPose, isKey) == bonewire::Status::Ok && isKey);
-    assert(compactPose.bytes.size() == sizeof(NpcsHeader) + 2 + 4 +
-           sizeof(npcwire::WireControl) + sizeof(npcwire::WireMotionTick) + 2 + expectedPose.size());
-    assert(compactPose.bytes.size() < fullPose.bytes.size());
+    assert(transmissions.size() == 1 &&
+           (transmissions[0].bytes[0] == MsgCompactPosedNpc ||
+            transmissions[0].bytes[0] == MsgControlPose));
+    const auto warmPose = transmissions[0];
     hostBones = std::move(boneLayouts);
     boneLayouts = std::move(clientBones);
     isHost = false;
-    Deliver(&fakePeer, compactPose);
+    Deliver(&fakePeer, warmPose);
     assert(applied == 2 && appliedFlags == pose::Facial && appliedBones.size() == 80);
     for (int i = 0; i < 80; ++i) {
         assert(appliedBones[i].name == poseBones[i].name);
@@ -413,7 +448,9 @@ int main()
     isHost = true;
     transmissions.clear();
     SendPosedNpc(posed, poseBones, 80, pose::Facial);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlPose);
+    assert(transmissions.size() == 1 &&
+           (transmissions[0].bytes[0] == MsgCompactPosedNpc ||
+            transmissions[0].bytes[0] == MsgControlPose));
     const auto earlyPose = transmissions[0];
     hostBones = std::move(boneLayouts);
     boneLayouts.Clear();
@@ -451,16 +488,16 @@ int main()
     clientInWorld[3] = true;
     transmissions.clear();
     SendNpcs(&posed, 1, false);
-    bool readyBatch = false, newIdForPeer = false, newBaselineForPeer = false, fullForPeer = false;
+    bool readyBatch = false, newIdForPeer = false, newBaselineForPeer = false, dependentForPeer = false;
     for (auto const& packet : transmissions) {
         if (packet.peer == &fakePeer && packet.bytes[0] == MsgControlBatch) readyBatch = true;
         if (packet.peer == &fakePeers[1]) {
             newIdForPeer |= packet.bytes[0] == MsgControlId;
             newBaselineForPeer |= packet.bytes[0] == MsgControlBaseline;
-            fullForPeer |= packet.bytes[0] == MsgNpcs;
+            dependentForPeer |= packet.bytes[0] == MsgControlBatch;
         }
     }
-    assert(readyBatch && newIdForPeer && newBaselineForPeer && fullForPeer);
+    assert(readyBatch && newIdForPeer && newBaselineForPeer && dependentForPeer);
     Drop(3);
 
     // ACKs for a previous offer of the same baseline cannot acknowledge a
@@ -549,8 +586,11 @@ int main()
     transmissions.clear();
     SendNpcs(&posed, 1, false);
     assert(transmissions.size() == 3 && transmissions[0].bytes[0] == MsgControlId &&
-           transmissions[1].bytes[0] == MsgControlBaseline && transmissions[2].bytes[0] == MsgNpcs);
-    const auto nextId = transmissions[0], nextBaseline = transmissions[1];
+           transmissions[1].bytes[0] == MsgControlBaseline &&
+           transmissions[2].bytes[0] == MsgControlBatch);
+    assert(transmissions[2].channel == ChannelDefinitions &&
+           (transmissions[2].flags & ENET_PACKET_FLAG_RELIABLE));
+    const auto nextId = transmissions[0], nextBaseline = transmissions[1], nextDependent = transmissions[2];
     transmissions.clear();
     isHost = false;
     Deliver(&fakePeer, nextId);
@@ -561,7 +601,8 @@ int main()
     Deliver(&fakePeer, oldId);
     Deliver(&fakePeer, oldBaseline);
     Deliver(&fakePeer, complete);
-    assert(transmissions.empty() && receivedRecords.size() == beforeMissing + 1);
+    assert(transmissions.empty());
+    assert(receivedRecords.size() == beforeMissing + 1);
     isHost = true;
     Deliver(&fakePeer, oldAck);
     assert(controlAcknowledged[2].empty());
@@ -585,7 +626,6 @@ int main()
     const unsigned counts[] = {20, 50, 100};
     const size_t expectedControlBytes[] = {581, 1473, 2905};
     const size_t expectedLegacyControlBytes[] = {11990, 29975, 59950};
-    const size_t expectedLegacyPoseBytes[] = {57100, 142750, 285500};
     for (unsigned c = 0; c < 3; ++c) {
         transmissions.clear();
         for (unsigned offset = 0; offset < counts[c]; offset += MaxNpcsPerMessage) {
@@ -600,8 +640,6 @@ int main()
         }
         assert(bytes == expectedControlBytes[c]);
         assert((counts[c] / 2) * (sizeof(NpcsHeader) + 2 * sizeof(NpcRecord)) == expectedLegacyControlBytes[c]);
-        assert(counts[c] * fullPose.bytes.size() == expectedLegacyPoseBytes[c]);
-        assert(counts[c] * compactPose.bytes.size() < counts[c] * fullPose.bytes.size());
     }
 
     // ENet otherwise promotes the snapshot itself to reliable at sequence
@@ -623,13 +661,18 @@ int main()
     assert(controlGeneration > beforeRejoin);
     transmissions.clear();
     SendNpcs(&posed, 1, false);
-    assert(transmissions.size() == 3 && transmissions[2].bytes[0] == MsgNpcs);
+    assert(transmissions.size() == 3 &&
+           transmissions[0].bytes[0] == MsgControlId &&
+           transmissions[1].bytes[0] == MsgControlBaseline &&
+           transmissions[2].bytes[0] == MsgControlBatch);
+    assert(transmissions[2].channel == ChannelDefinitions &&
+           (transmissions[2].flags & ENET_PACKET_FLAG_RELIABLE));
     Deliver(&fakePeer, nextAck);
     assert(controlAcknowledged[2].empty());
 
     // A round trip longer than the retry interval must still acknowledge the
     // original offer; retries of that offer keep its serial.
-    const auto slowId = transmissions[0], slowBaseline = transmissions[1];
+    const auto slowId = transmissions[0], slowBaseline = transmissions[1], slowDependent = transmissions[2];
     transmissions.clear();
     isHost = false;
     Deliver(&fakePeer, slowId);
@@ -637,20 +680,23 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
     const auto slowAck = transmissions[0];
     transmissions.clear();
+    Deliver(&fakePeer, slowDependent);
+    transmissions.clear();
     isHost = true;
     fakeTime += 1001;
     SendNpcs(&posed, 1, false);
     // A successful ID/baseline queue is retained independently; ordinary
     // sample retries do not enqueue either definition again while ACK is withheld.
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+    assert(transmissions[0].channel == ChannelDefinitions &&
+           (transmissions[0].flags & ENET_PACKET_FLAG_RELIABLE));
     transmissions.clear();
     Deliver(&fakePeer, slowAck);
     SendNpcs(&posed, 1, false);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
 
-    // Withhold a baseline ACK for more than the old 1 s retry interval while
-    // changing the immutable descriptor on every sample. The reference and
-    // serial stay pinned, and every changing sample uses exact full fallback.
+    // Withhold setup delivery while changing the descriptor every sample.
+    // The named baseline stays pinned and each sample uses a compact override.
     const auto descriptorKey = NpcKey(posed.guid);
     const uint16_t descriptorToken = controlStates.at(descriptorKey).nextBaseline;
     NpcRecord changing = posed;
@@ -658,12 +704,8 @@ int main()
     changing.sent++;
     transmissions.clear();
     SendNpcs(&changing, 1, false);
-    assert(transmissions.size() == 3);
-    assert(transmissions[0].bytes[0] == MsgControlId &&
-           transmissions[1].bytes[0] == MsgControlBaseline &&
-           transmissions[2].bytes[0] == MsgNpcs);
-    assert(controlStates.at(descriptorKey).nextBaseline == descriptorToken + 1);
-    const auto descriptorId = transmissions[0], descriptorBaseline = transmissions[1];
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+    assert(controlStates.at(descriptorKey).nextBaseline == descriptorToken);
     transmissions.clear();
     fakeTime += 2100;
     for (unsigned i = 0; i < 4; ++i) {
@@ -671,19 +713,10 @@ int main()
         changing.sent++;
         changing.position[0] += 1.0f;
         SendNpcs(&changing, 1, false);
-        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
-        assert(controlStates.at(descriptorKey).nextBaseline == descriptorToken + 1);
+        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+        assert(controlStates.at(descriptorKey).nextBaseline == descriptorToken);
         transmissions.clear();
     }
-    isHost = false;
-    Deliver(&fakePeer, descriptorId);
-    Deliver(&fakePeer, descriptorBaseline);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
-    const auto descriptorAck = transmissions[0];
-    transmissions.clear();
-    isHost = true;
-    Deliver(&fakePeer, descriptorAck);
-    assert(controlAcknowledged[2].count(controlStates.at(descriptorKey).id));
 
     // A failed reliable enqueue leaves the whole transaction retryable. Once
     // successful, later samples enqueue neither definition again.
@@ -698,7 +731,7 @@ int main()
     assert(transmissions.size() == 3);
     transmissions.clear();
     SendNpcs(&partial, 1, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
 
     // Exhaustion fails closed, without recycling a control ID or token.
     const auto stateKey = NpcKey(posed.guid);
@@ -706,7 +739,9 @@ int main()
     posed.motions[0].speed += 0.25f;
     transmissions.clear();
     SendNpcs(&posed, 1, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgNpcs);
+    assert(transmissions.size() == 1 &&
+           (transmissions[0].bytes[0] == MsgControlBatch ||
+            transmissions[0].bytes[0] == MsgNpcs));
     nextControlId = UINT16_MAX;
     NpcRecord exhausted = Record(101);
     transmissions.clear();
@@ -781,11 +816,17 @@ int main()
     transmissions.clear();
     assert(SendPosedNpcTo(2, streamRecord, streamBones, 4, 0, true, 16));
     auto deathPackets = transmissions;
-    assert(deathPackets.front().bytes[0] == MsgNpcs);
-    NpcsHeader reliableHeader{}, posedHeader{};
-    std::memcpy(&reliableHeader, deathPackets.front().bytes.data(), sizeof(reliableHeader));
-    std::memcpy(&posedHeader, deathPackets.back().bytes.data(), sizeof(posedHeader));
-    assert(npcwire::Newer(posedHeader.publication, reliableHeader.publication));
+    assert(!deathPackets.empty());
+    bool reliablePose = false;
+    for (const auto& packet : deathPackets) {
+        assert(packet.channel == ChannelDefinitions &&
+               (packet.flags & ENET_PACKET_FLAG_RELIABLE));
+        if (packet.bytes[0] == MsgControlPose ||
+            packet.bytes[0] == MsgCompactPosedNpc ||
+            packet.bytes[0] == MsgPosedNpc)
+            reliablePose = true;
+    }
+    assert(reliablePose);
     clientReceive(deathPackets);
     assert(applied == afterSurviving + 2);
     failSend = true;

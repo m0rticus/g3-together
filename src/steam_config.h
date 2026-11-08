@@ -16,7 +16,7 @@ struct Setting {
 };
 constexpr Setting Settings[] = {
     {SendBufferSize, "SendBufferSize", Capacity},
-    {SendRateMin, "SendRateMin", 0},
+    {SendRateMin, "SendRateMin", Capacity},
     {SendRateMax, "SendRateMax", Capacity},
     {NagleTime, "NagleTime", 0},
 };
@@ -44,8 +44,8 @@ Applied Apply(Setting const& setting, Get get, Set set)
     applied.before = get(setting.id);
     if (!applied.before.Valid()) return applied;
     applied.requested = (std::max)(applied.before.value, setting.capacity);
-    // Capacity ceilings are not a new rate limit. Keep larger existing values
-    // and the measured-congestion rate floor; NoNagle is selected per message.
+    // Keep larger existing values. Valve's public sender has no bandwidth probe
+    // cycle: raising only the maximum can leave its initial rate at the minimum.
     if (applied.requested != applied.before.value) {
         applied.attempted = true;
         applied.accepted = set(setting.id, applied.requested);

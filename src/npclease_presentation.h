@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -9,6 +10,22 @@
 namespace g3t::npclease {
 constexpr uint32_t PresentationGraceMs = 350;
 constexpr uint32_t PresentationJitterMs = 100;
+
+inline bool HostClaim(bool connected, bool currentSession, bool released, uint32_t records)
+{
+    return connected && currentSession && !released && records != 0;
+}
+
+inline bool ReleasePending(bool released, int count, bool presented, uint32_t shown, uint32_t latest,
+                           std::size_t events)
+{
+    return released && count > 0 && (events != 0 || !presented || static_cast<int32_t>(latest - shown) > 0);
+}
+
+inline bool ReconcileLife(bool locallyDead, bool recordedDead, bool hostDead)
+{
+    return !hostDead && (locallyDead || recordedDead);
+}
 
 inline bool PresentationFresh(bool connected, bool released, uint32_t age, uint32_t interval)
 {

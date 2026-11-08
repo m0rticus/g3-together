@@ -47,11 +47,32 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   enter Ardea together and confirm `admission: ... in the host's world` on the host.
   Walk, turn, draw weapons, attack and cast on each machine; both screens must show
   the other player, including the host on the client.
+- [ ] Check `PLAYERSTREAM player=1` on the client: `accepted` must keep advancing,
+  `world_gate=1`, `same_world=1` and `puppet=1`. A
+  `player-stream: ... action=cache-before-entry` line is expected if the host's
+  keyframe beats the world-entry ACK; opening admission must not lose that metadata.
+  `PUPPETLATENCY` distinguishes state age from displayed lag and reports the actual
+  motion name. Puppet creation alone does not prove that the host is visible.
+- [ ] Compare a healthy link with a brief transport stall, then restore delivery.
+  `SYNCLATENCY`, per-NPC `SYNCTRACK` and `PUPPETLATENCY` must distinguish network
+  transit excess from retained presentation backlog. Noncombat catch-up should drain
+  a five-second delivered backlog within eight seconds, without rewinds or lost
+  attack/hit/death transitions. Incoming attacks on the local hero retain normal
+  contact timing; NPC roots and bones must hold, not predict through missing data.
+  The adaptive buffer is capped at 500 ms, not enlarged to hide a multi-second
+  transport queue. Confirm running, turning and stopping remain smooth afterward.
 - [ ] Watch the same named NPCs fighting, moving, taking damage and dying on both
   screens for at least three minutes. Then separate into different regions and
   return. Shared NPCs must follow host state; client-only processing must still work
   outside host presentation. `admission-refused ... host presents it within its own
   reach` is expected for shared NPCs, not a failed world-entry handshake.
+- [ ] Repeat with a healthy 30-60 ms RTT and a two-second stall. Unreleased shared
+  NPCs must not cycle through `owned`/`yielded` or die from stale local combat.
+  `NPCOWNSTREAM uncertain=1` delays new acquisition/reclaim, not established
+  client-only simulation. Explicit release on a healthy link still permits native
+  client ownership. If host-alive state contradicts a local corpse, expect a yield
+  and `NPCRECONCILE`; life/HP/pose must return to host state without death/reward
+  scripts. A two-second delivered noncombat backlog should drain within four seconds.
 - [ ] Inspect the five-second `steam-send:` windows. `player_state_commands` must
   advance in both directions; `critical`, `definition` and `npc_pose` report accepted
   datagrams/bytes. `plain_bytes` versus `wire_bytes` measures actual lossless savings.
@@ -60,14 +81,34 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   not grow continuously. `npc_updates_dropped=0` describes our local queue policy,
   not a guarantee against ordinary network loss.
 - [ ] Check startup `steam-send: config` for verified effective `SendBufferSize`
-  and `SendRateMax` capacity headroom, with `SendRateMin`/`NagleTime` unchanged.
+  and both `SendRateMin`/`SendRateMax` at least 4194304, with `NagleTime` unchanged.
+  `rate_policy=manual-headroom` means no adaptive bandwidth probe is assumed:
+  only queued data is sent, but a slow upload can still be overloaded.
   Data must report `data_reliability=ENet-only`, `data_flags=37`; actual
   `steam_reliable_ok` should contain native controls, not the NPC/save stream.
   Correlate `steam-send: enet` throttle, reliable queues and RTT with the same
   window's result codes and `steam-send: session` actual Steam pending bytes,
   send-rate estimate and `queue_us`. A continuously growing queue is not acceptance.
-- [ ] Confirm `net: pose bandwidth` gains ACKs/deltas after entry, compact kind 49
-  is used when its definition is acknowledged, and reliable queues/RTT do not climb
+- [ ] In the same real-account windows, collect `steam: path peer=... transport=...`.
+  `relay-sdr` requires Steam's relayed flag and a relay POP; `direct-ice` requires
+  a connected, nonrelayed SteamID peer with an address. `unknown` is not evidence
+  of either route (including old stand-ins that do not fill connection info).
+  Record `available=1`, `flags`, `pop_relay`, `ping_ms`, `est_bandwidth_bytes_per_s`,
+  pending bytes and `queue_us` before and after NPC entry. Addresses in the
+  description are redacted; the send-rate estimate is not measured upload capacity.
+  `steam-send: config-current scope=global verified=1` must still show at least
+  4194304 for buffer/min/max rate. This verifies global values, not a hidden connection
+  override. `steam: transport-config` reads ICE/route penalties without changing
+  them; `ice_enable=-1` means Steam's user policy, not proof ICE was attempted.
+  A STUN size query returning `stun_type=4 stun_read_result=-3` reports the required
+  string size: `stun_list_bytes=1` means empty; greater than 1 means configured.
+  Server names/addresses are not logged and no STUN dependency is added.
+  The second transport-config line reports unchanged MTU, native timeouts and
+  encryption policy; changing those is not a fix for sustained send-rate pressure.
+  Do not add raw UDP fallback until the reduced offered load and raised config
+  have been tested and the remaining bottleneck is proven to be Steam-specific.
+- [ ] Confirm `net: pose bandwidth` gains anchor ACKs/deltas after entry, compact kind 49
+  is used from cold start on the reliable definition channel, and reliable queues/RTT do not climb
   indefinitely. Pending definitions must not repeatedly invalidate their own ACKs.
   `npc-control: ackaccepted` reports `created`, `pending`, `fallback` and `partial`;
   `npc-control: resync` includes the recovery reason and whether the token was evicted.
@@ -82,14 +123,27 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   not in world cleanup (`last_step=world-change` was an older downed-flow marker).
   If another crash occurs, retain the matching DLL/PDB/map and dump; expect
   the selected minidump profile/flags and nearest known function beside module+RVA.
+- [ ] Require `npc-converge:` with `baseline_policy=life-only` and
+  `pose_ack_policy=anchor-only`. About one control baseline per NPC life is expected;
+  changing animation descriptors must not repeatedly offer 615-byte baselines.
+  `anchor queued` marks independent reliable keys, normally five seconds apart per NPC.
+  The startup `ordered_setup_poses`/`ordered_setup_controls` counts should stop
+  growing once control/dictionary ACKs arrive; `reliable_anchors` and client
+  `received_anchors` continue advancing.
+  Pose ACKs should succeed even with multi-second RTT, with small control components
+  and predominantly deltas instead of repeated 588-byte controls/raw bone keys.
+  Compare the same GUIDs, HP, appearance and animation on both screens; investigate
+  repeated unconfirmed `npc-own: takeover`/`yield` cycles separately from GUID collisions.
 - [ ] Repeat in the isolated copies with the optional finite-buffer fake Steam
   build: 262144 queued bytes and 262144 bytes/s, first without artificial lag, then
   with the existing 10-ms lag. The original unlimited fake DLL cannot reproduce
   Steam's send-buffer failure. Install test tooling only in authorized copies.
 
-Application protocol remains **77**; both players need the matching build because
-the standard ENet compressor and dedicated definition channel must be enabled at
-both endpoints. No NPC cadence, coverage or precision limit is added. A sustained
+Application protocol is **78**; both players need the matching build. Reserved control
+and pose flags now describe motion overrides and reliable pinned anchors, and independent
+Rice keys permit zero references. Bone packing also selects reversible second-order
+spatial prediction when smaller. Baseline/ID envelopes retain their layouts.
+No NPC cadence, coverage or new precision limit is added. A sustained
 queue-growth result still requires the new real Steam logs; a successful loopback
 test alone is not real-Steam acceptance.
 
@@ -443,7 +497,7 @@ to the first 40 records plus one sample per five seconds. Inventory presence is 
 While waiting, NPCs must ignore the body rather than rob it; ordinary nonlethal guard knock-outs still
 allow the existing native half-gold robbery. Check corpse/chest loot and partner trade remain normal.
 
-### Host-managed save/load acceptance (protocol 77)
+### Host-managed save/load acceptance (protocol 78)
 
 ### HUD notices without movement interruption
 
@@ -747,7 +801,7 @@ Both use Steam and are Steam friends; see [PLAYING.md](PLAYING.md#over-steam-exp
 | Invite and connect | The host starts first and stays silent: its menu says to invite the partner from the Steam friends list. The joining player's menu says it waits for an invite and nothing connects by itself (check `g3together.log`: no `joining lobby`, no lobby created on the host). The host right-clicks the friend > **Invite to Game** (or the joining player right-clicks the host > **Join Game**) and the joining player accepts: the host opens a lobby, the client joins (note how long); player names match their Steam names; the menu shows lobby status and ping. The `connect:` log lines on both sides show each step. |
 | Latency breakdown | With the coordinator's two isolated copies and no artificial relay, confirm the client's menu says transport RTT and normally reads low single digits, not 15/16/31/32 ms clock steps or a fixed 110 ms. Compare `STEAMSTATUS ping` with the separate ENet RTT after at least 60 seconds in-world. Transport should keep responding while one game loads; ENet may retain frame/ACK delay. Check worker poll gaps, socket/send failures, batch/service caps and send-to-flush maxima. Do not interpret smoothed ENet loss alone as continuing physical loss. |
 | Burst/fragment queues | Record `queued_commands`, `reliable_queued`, `reliable_inflight` and `reliable_bytes` in the same quiet and NPC-heavy windows. Two-record batches remain 1199 bytes and still fragment; best-effort near-MTU snapshots must no longer introduce reliable ACK dependencies. Large full poses were already unreliable-fragmented, so high traffic can remain. Queue snapshots can miss short bursts; do not claim throughput or gameplay acceptance from the queue-only ENet tests. |
-| Buffered presentation | On a clean 60 Hz link, `SYNCLATENCY buffer_avg_ms` should settle near 34 ms; actual `shown_lag` should settle without rewinds. Jitter/slower captures may increase the buffer up to 250 ms. Check NPC running/turning/stopping, melee/parries/hit reactions, targeting after kills, ragdolls, downed/revive, trade and host save/load with client re-entry. Policy tests and builds do not establish native visual/gameplay acceptance. |
+| Buffered presentation | On a clean 60 Hz link, `SYNCLATENCY buffer_avg_ms` should settle near 34 ms; actual `shown_lag` should settle without rewinds. Jitter/transit variation may increase the buffer up to 500 ms. Inspect backlog/catch-up and per-entity oldest sample ages after a stall; received actions and life transitions must survive catch-up. Check NPC running/turning/stopping, melee/parries/hit reactions, targeting after kills, ragdolls, downed/revive, trade and host save/load with client re-entry. Policy tests and builds do not establish native visual/gameplay acceptance. |
 | Different networks | Play from two different homes without a VPN or port forwarding: check joining, character-record save requests and an hour of play. Record latency and stutters. |
 | Join game | Run once with the joining player's game already running and once with it closed (Steam must start Gothic 3 with the host's connect string): **Join Game** on the host in the Steam friends list, or accept the invite notification: it joins. Also accept while already connected (ignored), accept a stale invite after the host quit (clear message), and accept an invite with a different `session_id` (clear refusal). |
 | Leaving | The joining player quits: the host sees it gone at once and is joinable again. It starts again, accepts the invite again and rejoins; nothing reconnects by itself. |

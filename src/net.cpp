@@ -40,7 +40,7 @@
 
 namespace g3t::net {
 namespace {
-constexpr uint16_t ProtocolVersion = saving::Protocol;  // 77: host-managed saves and guarded bone packing
+constexpr uint16_t ProtocolVersion = saving::Protocol;  // 78: convergent NPC setup and independent packed keys
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
 enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
 enum : uint8_t { MsgSave = 40, MsgBoneDictionary = 41, MsgBoneAck = 42, MsgBoneRequest = 43, MsgCompactPosedNpc = 44 };
@@ -126,9 +126,12 @@ static_assert(sizeof(BoneRequestMsg) == 7, "Bone request wire layout changed");
 static_assert(sizeof(BonePosePrefix) == 4 && sizeof(PoseAckMsg) == 37, "Pose interval/ack wire layout changed");
 static_assert(offsetof(BoneRequestMsg, layoutId) == 5 && offsetof(BonePosePrefix, layoutId) == 2,
               "Bone request or pose field offsets changed");
+constexpr uint8_t PoseAnchorFlag = 0x80; // Reliable independent key, pinned across delayed ACKs.
+constexpr uint8_t PoseEssentialFlag = 0x40; // Gameplay edge, not transport-only setup/anchor reliability.
 static_assert(sizeof(NpcsHeader) + sizeof(npcwire::WireBatchHeader) + sizeof(npcwire::WireControl) +
               12 + npcwire::MotionSlots * 8 + sizeof(npcwire::WireQuaternion) +
-              npcwire::MaxMetadataBytes <= NpcDatagramBudget,
+              npcwire::MaxMetadataBytes + 1 + npcwire::MotionSlots * (sizeof(uint16_t) + sizeof(npcwire::WireFullMotion))
+                  <= NpcDatagramBudget,
               "largest compact NPC record must fit the unfragmented budget");
 
 ENetHost* host = nullptr;
@@ -224,6 +227,7 @@ npcwire::ResyncReason requestedControlReason = npcwire::ResyncReason::None;
 unsigned controlBaselineLogs = 0, controlRequestLogs = 0, controlBatchLogs = 0, controlErrors = 0;
 unsigned npcControlPending = 0, npcControlCreated = 0, npcControlAckAccepted = 0;
 unsigned npcControlStale = 0, npcControlResync = 0, npcControlFallback = 0, npcControlPartial = 0;
+uint64_t npcOrderedSetupPoses = 0, npcOrderedSetupControls = 0, npcAnchorsSent = 0, npcAnchorsReceived = 0;
 bool SendFullNpc(ENetPeer* peer, NpcRecord const& record, bool reliable);
 detail::BandwidthCounters bandwidth;
 uint32_t bandwidthSince = 0, lastSentData = 0, lastSentPackets = 0, lastReceivedData = 0, lastReceivedPackets = 0;
@@ -751,7 +755,7 @@ bool ControlStream(uint8_t const* data, size_t size, uint8_t kind, npcwire::Stre
 struct PreparedControl {
     npcwire::Control value{};
     npcwire::BaselineRef ref{};
-    bool available = false, encodable = false;
+    bool available = false, encodable = false, exact = false;
 };
 
 PreparedControl PrepareControl(NpcRecord const& record, bool forceBaseline = false)
@@ -793,11 +797,8 @@ PreparedControl PrepareControl(NpcRecord const& record, bool forceBaseline = fal
                              state.lifeFlags != lifeFlags;
     npcwire::Control dynamic;
     if (!npcwire::FromNpcRecord(record, state.current.anchor, state.current.baseline, false, dynamic)) return result;
-    auto probe = dynamic;
-    for (auto& motion : probe.motions)
-        if (motion.active & 1u) { motion.phase = 0.0f; motion.weight = 0.0f; }
-    std::vector<uint8_t> ignored;
-    const bool baselineRetained = npcwire::EncodeRecord(controlSender, probe, ignored);
+    npcwire::Anchor retainedAnchor;
+    const bool baselineRetained = controlSender.GetAnchor(state.id, state.current.anchor, retainedAnchor);
     bool pendingSameLife = false;
     for (uint8_t peerId = 2; peerId < MaxPlayers; ++peerId) {
         const auto offered = controlOffered[peerId].find(state.id);
@@ -852,6 +853,11 @@ PreparedControl PrepareControl(NpcRecord const& record, bool forceBaseline = fal
     result.value = std::move(dynamic);
     std::vector<uint8_t> encoded;
     result.encodable = npcwire::EncodeRecord(controlSender, result.value, encoded);
+    if (!result.encodable &&
+        npcwire::FromNpcRecord(record, state.current.anchor, state.current.baseline, true, result.value)) {
+        result.exact = true;
+        result.encodable = npcwire::EncodeRecord(controlSender, result.value, encoded, true);
+    }
     return result;
 }
 
@@ -860,6 +866,14 @@ bool ControlReady(uint8_t peerId, PreparedControl const& prepared)
     const auto ack = controlAcknowledged[peerId].find(prepared.ref.id);
     return prepared.available && prepared.encodable && ack != controlAcknowledged[peerId].end() &&
            SameControlRef(ack->second, prepared.ref);
+}
+
+bool ControlQueued(uint8_t peerId, PreparedControl const& prepared)
+{
+    const auto offer = controlOffered[peerId].find(prepared.ref.id);
+    return prepared.available && prepared.encodable && offer != controlOffered[peerId].end() &&
+           SameControlRef(offer->second.ref, prepared.ref) &&
+           offer->second.idQueued && offer->second.baselineQueued;
 }
 
 void OfferControl(uint8_t peerId, PreparedControl const& prepared, bool force = false)
@@ -912,7 +926,7 @@ void OfferControl(uint8_t peerId, PreparedControl const& prepared, bool force = 
         : true;
     bool idQueued = sendId && npcwire::EncodeId(controlSender, serial, prepared.ref.id, id) &&
                 SendBoneControl(peers[peerId], MsgControlId, id);
-    bool baselineQueued = sendBaseline &&
+    bool baselineQueued = sendBaseline && (transaction.idQueued || idQueued) &&
                       npcwire::EncodeBaseline(controlSender, serial, prepared.ref.id,
                                               prepared.ref.baseline, baseline) &&
                       SendBoneControl(peers[peerId], MsgControlBaseline, baseline);
@@ -967,7 +981,8 @@ void RequestControl(ENetPeer* peer, npcwire::Stream stream, uint16_t id, uint32_
 }
 
 bool DecodeControls(ENetPeer* peer, NpcsHeader const& header, uint8_t const* data, size_t size,
-                    std::vector<NpcRecord>& records, std::vector<uint8_t>& acceptedBatch)
+                    std::vector<NpcRecord>& records, std::vector<uint8_t>& acceptedBatch,
+                    bool retainStaleAnchor = false)
 {
     npcwire::Stream stream;
     if (!ControlStream(data, size, 'C', stream) || stream.generation < receivedControlGeneration ||
@@ -992,7 +1007,7 @@ bool DecodeControls(ENetPeer* peer, NpcsHeader const& header, uint8_t const* dat
             return false;
         }
         const auto previous = npcPublications.find(NpcKey(guid.data()));
-        if (previous != npcPublications.end() && previous->second.publication.initialized &&
+        if (!retainStaleAnchor && previous != npcPublications.end() && previous->second.publication.initialized &&
             !npcwire::Newer(header.publication, previous->second.publication.latest)) {
             ++npcStale;
             ++npcControlStale;
@@ -1044,7 +1059,10 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     const bool xpHandshake = XpHandshake(packet->data, packet->dataLength);
     const bool storyHandshake = (packet->flags & ENET_PACKET_FLAG_RELIABLE) &&
                                (StoryHandshake(packet->data, packet->dataLength) || DoorHandshake(packet->data, packet->dataLength));
-    if (Gated(type) && !xpHandshake && !storyHandshake && !Open(peer)) { ++gatedIn; return; }
+    // Channel 0 can deliver the player's keyframe before channel 1 finishes entry.
+    // Cache authenticated state now; puppet/world writes still wait for admission.
+    const bool playerEntryCache = type == MsgState && !isHost && connected && peer == server;
+    if (Gated(type) && !xpHandshake && !storyHandshake && !playerEntryCache && !Open(peer)) { ++gatedIn; return; }
     if (type == MsgNpcLease) {
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
         if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) ||
@@ -1179,7 +1197,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                     !Send(peers[i], &message, sizeof(message), ChannelState, true))
                     Logf("net: player activity relay to player %u failed", i);
     } else if (type == MsgState) {
-        if (!isHost && peer != server) return;
+        if (!isHost && (!connected || peer != server)) return;
         if (packet->dataLength >= 1 + playerwire::FixedBytes &&
             (packet->data[2] || BoneWire16(packet->data + 1 + playerwire::FixedBytes - 2)) &&
             !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) {
@@ -1196,6 +1214,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         PlayerState state;
         const auto status = playerReceivers[player].Decode(packet->data + 1, packet->dataLength - 1, state, player);
         if (status == playerwire::Status::NeedKeyframe) {
+            ++remotes[player].metadataWaits;
             const uint32_t now = enet_time_get();
             if (!playerRequestAt[player] || now - playerRequestAt[player] >= 1000) {
                 const PlayerResyncMsg request{MsgPlayerResync, player};
@@ -1206,12 +1225,16 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             }
             return;
         }
-        if (status == playerwire::Status::Stale) return;
+        if (status == playerwire::Status::Stale) { ++remotes[player].staleStates; return; }
         if (status != playerwire::Status::Ok || !Sane(state)) {
             Logf("net: invalid compact player state player=%u", player);
             return;
         }
         if (isHost) strncpy_s(state.name, remotes[player].latest.name, _TRUNCATE);
+        ++remotes[player].acceptedStates;
+        if (!isHost && !inWorld && ++remotes[player].preEntryStates == 1)
+            Logf("player-stream: player=%u action=cache-before-entry packet=%u world=%08X metadata_revision=%u",
+                 player, state.sequence, state.world, playerReceivers[player].Revision());
         Store(state);
         if (isHost) {
             for (uint8_t i = 2; i < MaxPlayers; ++i)
@@ -1481,6 +1504,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         uint16_t boneCount = 0;
         uint8_t poseFlags = 0;
+        bool poseAnchor = false;
+        bool poseEssential = (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0;
         uint8_t intervalMs = 16;
         uint16_t poseLayout = 0;
         size_t receivedPoseBytes = 0;
@@ -1507,6 +1532,11 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             controlData = packet->data + offset;
             std::vector<uint8_t> expandedControl;
             if (type == MsgControlPose) {
+                if (packet->dataLength < offset + controlSize + 2 + bonewire::DeltaHeaderBytes + 1) {
+                    ++npcRejected; return;
+                }
+                poseAnchor = (packet->data[offset + controlSize] & PoseAnchorFlag) != 0;
+                if (poseAnchor && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
                 if (controlSize < 4 + sizeof(npcwire::WireControl)) { ++npcRejected; return; }
                 expandedControl.resize(sizeof(npcwire::WireBatchHeader));
                 std::memcpy(expandedControl.data(), "NC\1\0", 4);
@@ -1519,7 +1549,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             if (!DecodeControls(peer, header,
                                 expandedControl.empty() ? controlData : expandedControl.data(),
                                 expandedControl.empty() ? controlSize : expandedControl.size(),
-                                controlRecords, acceptedBatch)) {
+                                controlRecords, acceptedBatch, poseAnchor)) {
                 ++npcRejected;
                 if (BoneLog(controlErrors)) Log("net: compact NPC control decode failed");
                 return;
@@ -1530,7 +1560,10 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                     ++npcRejected;
                     return;
                 }
-                poseFlags = packet->data[offset++];
+                const uint8_t wireFlags = packet->data[offset++];
+                poseEssential = (wireFlags & PoseEssentialFlag) != 0;
+                if (poseEssential && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
+                poseFlags = wireFlags & ~(PoseAnchorFlag | PoseEssentialFlag);
                 intervalMs = packet->data[offset++];
                 if ((poseFlags & ~pose::Facial) || intervalMs < 16 || intervalMs > 100) {
                     ++npcRejected; return;
@@ -1549,7 +1582,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                         const PoseAckMsg request{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, record.incarnation, 0};
                         auto message = request;
                         std::memcpy(message.guid, record.guid, 16);
-                        if (!Send(peer, &message, sizeof(message), ChannelState, false)) ++bandwidth.poseAckMisses;
+                        if (!Send(peer, &message, sizeof(message), ChannelState, true)) ++bandwidth.poseAckMisses;
                         ++bandwidth.poseReferenceMisses;
                     } else ++bandwidth.poseDecodeFailures;
                     ++npcRejected; return;
@@ -1557,11 +1590,13 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 poseLayout = layoutId;
                 receivedPoseBytes = packet->dataLength - sizeof(header) - 2 - controlSize;
                 receivedPoseKey = bonewire::ReadPose32(packet->data + offset + 2) == 0;
+                if (poseAnchor && !receivedPoseKey) { ++npcRejected; return; }
                 bones = decodedBones.data();
                 boneCount = static_cast<uint16_t>(decodedBones.size());
             }
             std::vector<npcwire::Control> acceptedControls;
-            if (!npcwire::DecodeBatch(controlReceiver, acceptedBatch.data(), acceptedBatch.size(), acceptedControls)) {
+            if (!poseAnchor &&
+                !npcwire::DecodeBatch(controlReceiver, acceptedBatch.data(), acceptedBatch.size(), acceptedControls)) {
                 ++npcRejected;
                 return;
             }
@@ -1590,7 +1625,11 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 if (BoneLog(boneInvalidLogs)) Log("net: rejected truncated or invalid compact pose");
                 return;
             }
-            poseFlags = packet->data[recordsSize];
+            poseAnchor = (packet->data[recordsSize] & PoseAnchorFlag) != 0;
+            if (poseAnchor && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
+            poseEssential = (packet->data[recordsSize] & PoseEssentialFlag) != 0;
+            if (poseEssential && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
+            poseFlags = packet->data[recordsSize] & ~(PoseAnchorFlag | PoseEssentialFlag);
             intervalMs = packet->data[recordsSize + 1];
             if (poseFlags & ~pose::Facial) {
                 ++npcRejected;
@@ -1614,7 +1653,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 if (status == bonewire::Status::UnknownPose) {
                     PoseAckMsg request{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, posedRecord.incarnation, 0};
                     std::memcpy(request.guid, posedRecord.guid, 16);
-                    if (!Send(peer, &request, sizeof(request), ChannelState, false)) ++bandwidth.poseAckMisses;
+                    if (!Send(peer, &request, sizeof(request), ChannelState, true)) ++bandwidth.poseAckMisses;
                     ++bandwidth.poseReferenceMisses;
                 } else ++bandwidth.poseDecodeFailures;
                 ++npcRejected;
@@ -1626,6 +1665,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             poseLayout = layoutId;
             receivedPoseBytes = packet->dataLength - recordsSize;
             receivedPoseKey = bonewire::ReadPose32(data + 2) == 0;
+            if (poseAnchor && !receivedPoseKey) { ++npcRejected; return; }
             boneCount = static_cast<uint16_t>(decodedBones.size());
         } else if (packet->dataLength != recordsSize) { ++npcRejected; return; }
         if (bones && (intervalMs < 16 || intervalMs > 100)) { ++npcRejected; return; }
@@ -1643,16 +1683,27 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 NpcRecord const& record = records[i];
                 if (!Sane(record)) { ++npcRejected; continue; }
                 const std::string key = NpcKey(record.guid);
+                // Reliable anchor delivery can trail a newer displayed sample.
+                // Retain its canonical pose without rolling presentation back.
+                if (bones && poseLayout && poseAnchor) {
+                    if (!decodedPoses[key].Store(header.publication, record.incarnation, poseLayout, poseFlags,
+                                                bones, boneCount, enet_time_get(), true, true)) {
+                        ++bandwidth.poseDecodeFailures;
+                        ++npcRejected;
+                        continue;
+                    }
+                    ++npcAnchorsReceived;
+                    PoseAckMsg ack{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, record.incarnation, header.publication};
+                    std::memcpy(ack.guid, record.guid, 16);
+                    if (!Send(peer, &ack, sizeof(ack), ChannelState, true)) ++bandwidth.poseAckMisses;
+                    else ++bandwidth.poseAcks;
+                }
                 const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
                                          : npcPublications[key].Snapshot(header.owner, header.publication);
                 if (!newer) { ++npcStale; continue; }
-                if (bones && poseLayout) {
+                if (bones && poseLayout && !poseAnchor) {
                     decodedPoses[key].Store(header.publication, record.incarnation, poseLayout, poseFlags,
                                            bones, boneCount, enet_time_get(), false);
-                    PoseAckMsg ack{MsgPoseAck, worldEpoch, receivedBoneGeneration, {}, record.incarnation, header.publication};
-                    std::memcpy(ack.guid, record.guid, 16);
-                    if (!Send(peer, &ack, sizeof(ack), ChannelState, false)) ++bandwidth.poseAckMisses;
-                    else ++bandwidth.poseAcks;
                 }
                 if (bones) {
                     bandwidth.Pose(intervalMs, packet->dataLength, receivedPoseBytes, boneCount, receivedPoseKey);
@@ -1668,7 +1719,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                         sizeof(header), receivedPoseStats.rigidBones, 0, receivedPoseStats.PaddingBits());
                 }
                 if (bones && npcPoseHandler)
-                    npcPoseHandler(record, bones, boneCount, poseFlags, (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0, intervalMs);
+                    npcPoseHandler(record, bones, boneCount, poseFlags, poseEssential, intervalMs);
                 records[count++] = record;
             }
             return count;
@@ -2179,7 +2230,7 @@ void SetInWorld(uint8_t id, bool in)
     if (!isHost) {
         if (inWorld == in) return;
         inWorld = in;
-        for (auto& receiver : playerReceivers) receiver = {};
+        if (!in) for (auto& receiver : playerReceivers) receiver = {};
         for (auto& senders : playerSenders) for (auto& sender : senders) sender = {};
         if (!in) {
             for (uint8_t i = 0; i < MaxPlayers; ++i) ClearPresentation(i);
@@ -2367,6 +2418,7 @@ void ResetNpcReplication()
     controlIdExhaustedLogged = false;
     npcControlPending = npcControlCreated = npcControlAckAccepted = 0;
     npcControlStale = npcControlResync = npcControlFallback = npcControlPartial = 0;
+    npcOrderedSetupPoses = npcOrderedSetupControls = npcAnchorsSent = npcAnchorsReceived = 0;
     for (uint8_t i = 0; i < MaxPlayers; ++i) {
         ForgetBonePeer(i);
         ForgetControlPeer(i);
@@ -2419,7 +2471,7 @@ bool SendFullNpc(ENetPeer* peer, NpcRecord const& record, bool reliable)
     const NpcsHeader header{MsgNpcs, ++npcSequence, enet_time_get(), worldEpoch, 1, ++npcPublication, 1, 1};
     std::memcpy(buffer, &header, sizeof(header));
     std::memcpy(buffer + sizeof(header), &record, sizeof(record));
-    const bool sent = reliable ? Send(peer, buffer, sizeof(buffer), ChannelNpcs, true)
+    const bool sent = reliable ? Send(peer, buffer, sizeof(buffer), ChannelDefinitions, true)
                                : SendUnreliableNpc(peer, buffer, sizeof(buffer));
     if (!sent && BoneLog(controlErrors))
         Log("net: full-record NPC fallback could not be sent");
@@ -2428,7 +2480,7 @@ bool SendFullNpc(ENetPeer* peer, NpcRecord const& record, bool reliable)
 
 bool SendEssentialNpc(uint8_t peerId, NpcRecord const& record, PreparedControl const& prepared)
 {
-    if (ControlReady(peerId, prepared)) {
+    if (ControlQueued(peerId, prepared)) {
         npcwire::Control exact;
         std::vector<uint8_t> batch;
         const NpcsHeader header{MsgControlBatch, ++npcSequence, enet_time_get(), worldEpoch,
@@ -2438,7 +2490,7 @@ bool SendEssentialNpc(uint8_t peerId, NpcRecord const& record, PreparedControl c
             std::vector<uint8_t> message(sizeof(header));
             std::memcpy(message.data(), &header, sizeof(header));
             message.insert(message.end(), batch.begin(), batch.end());
-            if (Send(peers[peerId], message.data(), message.size(), ChannelNpcs, true)) return true;
+            if (Send(peers[peerId], message.data(), message.size(), ChannelDefinitions, true)) return true;
             if (BoneLog(controlErrors)) Log("net: exact reliable NPC control send failed; using full record");
         } else if (BoneLog(controlErrors)) {
             Log("net: exact reliable NPC control encode failed; using full record");
@@ -2452,6 +2504,7 @@ struct PendingControls {
     std::vector<NpcRecord> originals;
     std::vector<uint16_t> ids;
     size_t bytes = sizeof(NpcsHeader) + sizeof(npcwire::WireBatchHeader);
+    bool exact = false;
 };
 
 bool FlushControls(uint8_t id, PendingControls& pending)
@@ -2461,7 +2514,7 @@ bool FlushControls(uint8_t id, PendingControls& pending)
                             static_cast<uint8_t>(pending.values.size()), 1};
     bool queued = false;
     std::vector<uint8_t> batch;
-    if (npcwire::EncodeBatch(controlSender, header.publication, pending.values, batch) &&
+    if (npcwire::EncodeBatch(controlSender, header.publication, pending.values, batch, pending.exact) &&
         sizeof(header) + batch.size() <= NpcDatagramBudget) {
         std::vector<uint8_t> message(sizeof(header));
         std::memcpy(message.data(), &header, sizeof(header));
@@ -2494,7 +2547,8 @@ bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable)
         if (!record.sent) record.sent = enet_time_get();
         const auto prepared = PrepareControl(record);
         std::vector<uint8_t> encoded;
-        const bool encodable = prepared.encodable && npcwire::EncodeRecord(controlSender, prepared.value, encoded) &&
+        const bool encodable = prepared.encodable &&
+            npcwire::EncodeRecord(controlSender, prepared.value, encoded, prepared.exact) &&
             sizeof(NpcsHeader) + sizeof(npcwire::WireBatchHeader) + encoded.size() <= NpcDatagramBudget;
         for (uint8_t peerId = 2; peerId < MaxPlayers; ++peerId) {
             if (to && peerId != to) continue;
@@ -2503,13 +2557,19 @@ bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable)
             auto& batch = pending[peerId];
             if (reliable || !encodable || !ControlReady(peerId, prepared)) {
                 FlushControls(peerId, batch);
-                queued = (reliable ? SendEssentialNpc(peerId, record, prepared)
-                                   : SendFullNpc(peers[peerId], record, false)) || queued;
+                const bool orderedSetup = encodable && ControlQueued(peerId, prepared) && !ControlReady(peerId, prepared);
+                const bool sent = (reliable || orderedSetup)
+                                   ? SendEssentialNpc(peerId, record, prepared)
+                                   : SendFullNpc(peers[peerId], record, false);
+                if (sent && orderedSetup) ++npcOrderedSetupControls;
+                queued = sent || queued;
                 continue;
             }
             if (batch.bytes + encoded.size() > NpcDatagramBudget ||
+                (!batch.values.empty() && batch.exact != prepared.exact) ||
                 std::find(batch.ids.begin(), batch.ids.end(), prepared.ref.id) != batch.ids.end())
                 queued = FlushControls(peerId, batch) || queued;
+            batch.exact = prepared.exact;
             batch.bytes += encoded.size();
             batch.values.push_back(prepared.value);
             batch.originals.push_back(record);
@@ -2585,9 +2645,6 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
     for (uint8_t i = 2; i < MaxPlayers; ++i) {
         if (to && i != to) continue;
         if (!peers[i] || !clientInWorld[i]) continue;
-        if (reliable && !SendEssentialNpc(i, record, preparedControl)) return false;
-        // Essential state is an earlier publication, never a fence that makes
-        // its own accompanying pose stale when reliable traffic arrives first.
         header.sequence = ++npcSequence;
         header.publication = ++npcPublication;
         if (!header.publication) header.publication = ++npcPublication;
@@ -2596,7 +2653,7 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         if (layoutId && !boneAcknowledged[i].count(layoutId)) {
             const auto sent = boneOffered[i].find(layoutId);
             const uint32_t now = enet_time_get();
-            if (sent == boneOffered[i].end() || static_cast<uint32_t>(now - sent->second) >= 1000) {
+            if (sent == boneOffered[i].end()) {
                 if (!definitionAttempted) {
                     definitionAttempted = true;
                     definitionReady = boneLayouts.EncodeDictionary(layoutId, definition) == bonewire::Status::Ok;
@@ -2609,24 +2666,32 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                 }
             }
         }
-        bool compactReady = layoutId && boneAcknowledged[i].count(layoutId);
+        // Before setup ACKs, dependent samples share the definitions' reliable
+        // channel. They cannot overtake their prerequisites, and no sample is
+        // withheld or replaced while waiting for the return trip.
+        const bool dictionaryReady = layoutId && boneAcknowledged[i].count(layoutId);
+        bool compactReady = layoutId && (dictionaryReady || boneOffered[i].count(layoutId));
         bool poseKey = true;
         bonewire::PoseStats poseStats;
         std::vector<pose::Bone> reconstructed;
         compactMessage.clear();
         controlPoseMessage.clear();
         auto& poseCache = sentPoses[i][NpcKey(record.guid)];
+        const bool anchor = compactReady &&
+            poseCache.AnchorDue(record.sent, record.incarnation, layoutId, poseFlags);
         if (compactReady) {
             std::vector<uint8_t> compact;
             const auto status = poseCache.EncodeCompact(boneLayouts, layoutId, record.incarnation, poseFlags, bones, count,
-                                                       record.sent, compact, poseKey, reconstructed, &poseStats);
+                                                       record.sent, compact, poseKey, reconstructed, &poseStats, anchor);
             if (status == bonewire::Status::Ok) {
                 compactMessage.resize(sizeof(header) + sizeof(record) + 2 + compact.size());
                 NpcsHeader compactHeader = header;
                 compactHeader.type = MsgCompactPosedNpc;
                 std::memcpy(compactMessage.data(), &compactHeader, sizeof(compactHeader));
                 std::memcpy(compactMessage.data() + sizeof(header), &record, sizeof(record));
-                compactMessage[sizeof(header) + sizeof(record)] = poseFlags;
+                compactMessage[sizeof(header) + sizeof(record)] =
+                    static_cast<uint8_t>(poseFlags | (anchor ? PoseAnchorFlag : 0) |
+                                         (reliable ? PoseEssentialFlag : 0));
                 compactMessage[sizeof(header) + sizeof(record) + 1] = intervalMs;
                 std::memcpy(compactMessage.data() + sizeof(header) + sizeof(record) + 2, compact.data(), compact.size());
             } else if (BoneLog(boneInvalidLogs)) {
@@ -2635,10 +2700,15 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
             }
         }
         compactReady = compactReady && !compactMessage.empty();
-        if (compactReady && ControlReady(i, preparedControl)) {
+        if (compactReady && ControlQueued(i, preparedControl)) {
             std::vector<uint8_t> batch;
-            const std::vector<npcwire::Control> values{preparedControl.value};
-            if (npcwire::EncodeBatch(controlSender, header.publication, values, batch) && batch.size() <= UINT16_MAX) {
+            auto value = preparedControl.value;
+            const bool exact = reliable || preparedControl.exact;
+            const bool converted = !exact ||
+                npcwire::FromNpcRecord(record, preparedControl.ref.anchor, preparedControl.ref.baseline, true, value);
+            const std::vector<npcwire::Control> values{value};
+            if (converted && npcwire::EncodeBatch(controlSender, header.publication, values, batch, exact) &&
+                batch.size() <= UINT16_MAX) {
                 NpcsHeader controlHeader = header;
                 controlHeader.type = MsgControlPose;
                 controlPoseMessage.resize(sizeof(header) + 2);
@@ -2650,9 +2720,14 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                 controlPoseMessage.insert(controlPoseMessage.end(), batch.begin() + sizeof(npcwire::WireBatchHeader), batch.end());
                 controlPoseMessage.insert(controlPoseMessage.end(),
                     compactMessage.begin() + sizeof(header) + sizeof(record), compactMessage.end());
+            } else if (BoneLog(controlErrors)) {
+                Log("npc-converge: compact posed control encode failed; retaining full control with the pose");
             }
         }
-        const bool controlReady = compactReady && ControlReady(i, preparedControl) && !controlPoseMessage.empty();
+        const bool controlReady = compactReady && !controlPoseMessage.empty();
+        const bool orderedSetup = compactReady &&
+            (!dictionaryReady || (controlReady && !ControlReady(i, preparedControl)));
+        const bool sendReliable = reliable || anchor || orderedSetup;
         if (!controlReady) ++npcControlFallback;
         const void* data = controlReady ? static_cast<void const*>(controlPoseMessage.data())
             : compactReady ? static_cast<void const*>(compactMessage.data()) : buffer;
@@ -2663,11 +2738,19 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
             Logf("net: player %u pose=%s bones=%d pose_bytes=%u datagram_bytes=%u", static_cast<unsigned>(i),
                  compactReady ? "compact" : "full", count, static_cast<unsigned>(poseBytes),
                  static_cast<unsigned>(bytes));
-        if (Send(peers[i], data, bytes, ChannelPoses, false)) {
+        if (Send(peers[i], data, bytes, sendReliable ? ChannelDefinitions : ChannelPoses, sendReliable)) {
             ++poseSent; queued = true;
             if (compactReady)
                 poseCache.Store(header.publication, record.incarnation, layoutId, poseFlags, reconstructed.data(), count,
-                                record.sent, poseKey);
+                                record.sent, poseKey, anchor);
+            if (orderedSetup) ++npcOrderedSetupPoses;
+            if (anchor) {
+                ++npcAnchorsSent;
+                if (BoneLog(boneAckLogs))
+                    Logf("npc-converge: anchor queued player=%u layout=%u token=%u bones=%d bytes=%zu setup_ordered=%u",
+                         static_cast<unsigned>(i), static_cast<unsigned>(layoutId), header.publication, count, bytes,
+                         orderedSetup ? 1u : 0u);
+            }
             bandwidth.Pose(intervalMs, bytes, poseBytes, count, poseKey || !compactReady);
             if (!compactReady) {
                 poseStats.headerBytes = 2 + count * sizeof(uint32_t);
@@ -2708,7 +2791,9 @@ bool SendNpcReleaseTo(uint8_t to, uint8_t const* guids, int count)
     bool queued = false;
     for (uint8_t id = 2; id < MaxPlayers; ++id) {
         if ((to && id != to) || !peers[id]) continue;
-        if (Send(peers[id], buffer, size, ChannelNpcs, true)) {
+        // Final gameplay state, setup, anchors and release share one ordered
+        // lane; release must not overtake a final reliable posed update.
+        if (Send(peers[id], buffer, size, ChannelDefinitions, true)) {
             queued = true;
             for (int i = 0; i < count; ++i) sentPoses[id].erase(NpcKey(guids + i * 16));
         }
@@ -2729,7 +2814,7 @@ bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note)
         !PeerJoined(to) || !InWorld(to) || !note.epoch ||
         note.epoch != worldEpoch || !note.incarnation) return false;
     const NpcRemovalMsg message{MsgNpcRemoval, note};
-    return Send(peers[to], &message, sizeof(message), ChannelNpcs, true);
+    return Send(peers[to], &message, sizeof(message), ChannelDefinitions, true);
 }
 
 void SetNpcRemovalHandler(NpcRemovalHandler handler) { npcRemovalHandler = handler; }
@@ -3597,6 +3682,16 @@ void BandwidthLog()
          bandwidth.skippedFar * perSecond, bandwidth.skippedIrrelevant * perSecond, bandwidth.sendFailed * perSecond,
          bandwidth.skippedPaced * perSecond);
     const uint64_t updates = bandwidth.poseKeys + bandwidth.poseDeltas;
+    if (isHost)
+        Logf("npc-converge: ordered_setup_poses=%llu ordered_setup_controls=%llu reliable_anchors=%llu "
+             "control_baselines=%u control_acks=%u "
+             "baseline_policy=life-only pose_ack_policy=anchor-only",
+             static_cast<unsigned long long>(npcOrderedSetupPoses),
+             static_cast<unsigned long long>(npcOrderedSetupControls),
+             static_cast<unsigned long long>(npcAnchorsSent), npcControlCreated, npcControlAckAccepted);
+    else
+        Logf("npc-converge: received_anchors=%llu pose_ack_policy=anchor-only",
+             static_cast<unsigned long long>(npcAnchorsReceived));
     Logf("net: pose bandwidth tier_per_s=fast:%.1f,ordinary:%.1f,slow:%.1f tier_bytes_per_s=%.0f,%.0f,%.0f "
          "bone_bytes_per_update=%.1f bones_per_update=%.1f keys=%llu deltas=%llu acks=%llu ack_misses=%llu "
          "reference_misses=%llu decode_failures=%llu",

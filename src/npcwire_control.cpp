@@ -113,20 +113,89 @@ bool sameDescriptor(const MotionDescriptor& a, const MotionDescriptor& b) {
            sameFloat(a.intro, b.intro) && sameFloat(a.extro, b.extro) && a.blend == b.blend &&
            a.options == b.options;
 }
+constexpr std::uint8_t MotionFieldWidths[] = {
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 1, 4, 4
+};
+std::uint16_t motionFieldMask(const Motion& current, const Motion& baseline) {
+    std::uint16_t mask = 0;
+    if (current.descriptor.name != baseline.descriptor.name) mask |= std::uint16_t{1} << 0;
+    if (current.descriptor.instance != baseline.descriptor.instance) mask |= std::uint16_t{1} << 1;
+    if (!sameFloat(current.descriptor.speed, baseline.descriptor.speed)) mask |= std::uint16_t{1} << 2;
+    if (!sameFloat(current.descriptor.intro, baseline.descriptor.intro)) mask |= std::uint16_t{1} << 3;
+    if (!sameFloat(current.descriptor.extro, baseline.descriptor.extro)) mask |= std::uint16_t{1} << 4;
+    if (current.descriptor.blend != baseline.descriptor.blend) mask |= std::uint16_t{1} << 5;
+    for (unsigned i = 0; i < 7; ++i)
+        if (current.descriptor.options[i] != baseline.descriptor.options[i])
+            mask |= std::uint16_t{1} << (6 + i);
+    if (current.active != baseline.active) mask |= std::uint16_t{1} << 13;
+    if (!(current.active & 1u)) {
+        if (!sameFloat(current.phase, baseline.phase)) mask |= std::uint16_t{1} << 14;
+        if (!sameFloat(current.weight, baseline.weight)) mask |= std::uint16_t{1} << 15;
+    }
+    return mask;
+}
+std::uint8_t motionOverrideMask(const Control& current, const Control& baseline) {
+    std::uint8_t result = 0;
+    for (unsigned i = 0; i < MotionSlots; ++i)
+        if (motionFieldMask(current.motions[i], baseline.motions[i]))
+            result |= static_cast<std::uint8_t>(1u << i);
+    return result;
+}
+bool validFullMotion(const Motion& m, std::uint8_t slots, unsigned slot) {
+    if (!std::isfinite(m.phase) || !std::isfinite(m.weight) ||
+        !std::isfinite(m.descriptor.speed) || !std::isfinite(m.descriptor.intro) ||
+        !std::isfinite(m.descriptor.extro) ||
+        m.weight < 0.0f || m.weight > 10.0f)
+        return false;
+    if ((m.active & 1u) != ((slots >> slot) & 1u)) return false;
+    if (m.active & 1u) {
+        if (m.phase < 0.0f || m.phase > 1.0f) return false;
+    }
+    return true;
+}
+void writeMotionFields(Writer& w, const Motion& m, std::uint16_t mask) {
+    if (mask & (std::uint16_t{1} << 0)) w.u32(m.descriptor.name);
+    if (mask & (std::uint16_t{1} << 1)) w.u32(m.descriptor.instance);
+    if (mask & (std::uint16_t{1} << 2)) w.f32(m.descriptor.speed);
+    if (mask & (std::uint16_t{1} << 3)) w.f32(m.descriptor.intro);
+    if (mask & (std::uint16_t{1} << 4)) w.f32(m.descriptor.extro);
+    if (mask & (std::uint16_t{1} << 5)) w.u32(static_cast<std::uint32_t>(m.descriptor.blend));
+    for (unsigned i = 0; i < 7; ++i)
+        if (mask & (std::uint16_t{1} << (6 + i))) w.u32(m.descriptor.options[i]);
+    if (mask & (std::uint16_t{1} << 13)) w.u8(m.active);
+    if (mask & (std::uint16_t{1} << 14)) w.f32(m.phase);
+    if (mask & (std::uint16_t{1} << 15)) w.f32(m.weight);
+}
+bool readMotionFields(Reader& r, Motion& m, std::uint16_t mask) {
+    if (mask & (std::uint16_t{1} << 0)) m.descriptor.name = r.u32();
+    if (mask & (std::uint16_t{1} << 1)) m.descriptor.instance = r.u32();
+    if (mask & (std::uint16_t{1} << 2)) m.descriptor.speed = r.f32();
+    if (mask & (std::uint16_t{1} << 3)) m.descriptor.intro = r.f32();
+    if (mask & (std::uint16_t{1} << 4)) m.descriptor.extro = r.f32();
+    if (mask & (std::uint16_t{1} << 5)) m.descriptor.blend = signed32(r.u32());
+    for (unsigned i = 0; i < 7; ++i)
+        if (mask & (std::uint16_t{1} << (6 + i))) m.descriptor.options[i] = r.u32();
+    if (mask & (std::uint16_t{1} << 13)) m.active = r.u8();
+    if (mask & (std::uint16_t{1} << 14)) m.phase = r.f32();
+    if (mask & (std::uint16_t{1} << 15)) m.weight = r.f32();
+    if (!r.ok) return false;
+    if (mask & (std::uint16_t{1} << 2))
+        if (!std::isfinite(m.descriptor.speed)) return false;
+    if (mask & (std::uint16_t{1} << 3))
+        if (!std::isfinite(m.descriptor.intro)) return false;
+    if (mask & (std::uint16_t{1} << 4))
+        if (!std::isfinite(m.descriptor.extro)) return false;
+    if (mask & (std::uint16_t{1} << 14))
+        if (!std::isfinite(m.phase)) return false;
+    if (mask & (std::uint16_t{1} << 15))
+        if (!std::isfinite(m.weight) || m.weight < 0.0f || m.weight > 10.0f) return false;
+    return true;
+}
 std::uint8_t activeMask(const Control& v) {
     std::uint8_t result = 0;
     for (unsigned i = 0; i < MotionSlots; ++i)
         if (v.motions[i].active & 1u) result |= static_cast<std::uint8_t>(1u << i);
     return result;
-}
-bool sameImmutableMetadata(const Control& a, const Control& b) {
-    if (a.guid != b.guid || a.incarnation != b.incarnation) return false;
-    for (unsigned i = 0; i < MotionSlots; ++i) {
-        const auto& x = a.motions[i]; const auto& y = b.motions[i];
-        if (!sameDescriptor(x.descriptor, y.descriptor) || x.active != y.active) return false;
-        if (!(x.active & 1u) && (!sameFloat(x.phase, y.phase) || !sameFloat(x.weight, y.weight))) return false;
-    }
-    return true;
 }
 std::size_t slotCount(std::uint8_t mask) {
     std::size_t count = 0;
@@ -215,9 +284,10 @@ double DecodeYaw(std::uint16_t value) { return value * (Turn / 65536.0); }
 bool RecordBytes(const std::uint8_t* bytes, std::size_t available, std::size_t& length) {
     if (!bytes || available < sizeof(WireControl)) return false;
     const auto orientation = bytes[offsetof(WireControl, orientation)];
-    if (orientation & 0x3eu) return false;
+    if (orientation & 0x1eu) return false;
     const bool full = (orientation & 1u) != 0;
     const bool exact = (orientation & 0x40u) != 0;
+    const bool motionOverrides = (orientation & 0x20u) != 0;
     if (exact && !full) return false;
     if (exact)
         for (std::size_t i = 0; i < 6; ++i)
@@ -240,6 +310,24 @@ bool RecordBytes(const std::uint8_t* bytes, std::size_t available, std::size_t& 
         for (std::size_t bit = 0; bit < sizeof(MetadataWidths); ++bit)
             if (mask & (std::uint32_t{1} << bit)) result += MetadataWidths[bit];
         if (available < result) return false;
+    }
+    if (motionOverrides) {
+        if (available <= result) return false;
+        const std::uint8_t overrideMask = bytes[result++];
+        if (!overrideMask) return false;
+        for (unsigned slot = 0; slot < MotionSlots; ++slot) {
+            if (!(overrideMask & (1u << slot))) continue;
+            if (available - result < 2) return false;
+            const std::uint16_t fieldMask =
+                static_cast<std::uint16_t>(bytes[result]) |
+                (static_cast<std::uint16_t>(bytes[result + 1]) << 8);
+            if (!fieldMask) return false;
+            result += 2;
+            for (unsigned bit = 0; bit < 16; ++bit)
+                if (fieldMask & (std::uint16_t{1} << bit))
+                    result += MotionFieldWidths[bit];
+            if (available < result) return false;
+        }
     }
     length = result;
     return true;
@@ -429,9 +517,12 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
     if (life == c.lives_.end() || life->second != v.incarnation || anchor == c.anchors_.end() ||
         anchor->second.life != v.incarnation || baseline == c.baselines_.end() ||
         baseline->second.life != v.incarnation || baseline->second.anchor != v.anchor ||
-        !sameImmutableMetadata(v, baseline->second.value)) return false;
+        baseline->second.value.guid != v.guid ||
+        baseline->second.value.incarnation != v.incarnation) return false;
     const auto metadata = metadataMask(v, baseline->second.value);
     if ((metadata & (std::uint32_t{1} << 16)) && !std::isfinite(v.damageMultiplier)) return false;
+    const std::uint8_t overrides = motionOverrideMask(v, baseline->second.value);
+    const std::uint8_t slots = activeMask(v);
     std::uint16_t deltas[3]{};
     for (unsigned i = 0; i < 3; ++i) {
         if (exact) {
@@ -446,17 +537,21 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
         const auto rounded = static_cast<std::int32_t>(std::round(delta));
         deltas[i] = static_cast<std::uint16_t>(rounded);
     }
-    const std::uint8_t mask = activeMask(baseline->second.value);
-    if (mask != v.slots) return false;
     std::uint32_t ticks[MotionSlots]{};
     for (std::size_t i = 0; i < MotionSlots; ++i) {
-        if (!(mask & (1u << i))) continue;
+        if (!(slots & (1u << i))) continue;
         const auto phase = v.motions[i].phase, weight = v.motions[i].weight;
-        if (!std::isfinite(phase) || !std::isfinite(weight) ||
-            phase < 0 || phase > 1 || weight < 0 || weight > 1) return false;
+        if (!std::isfinite(phase) || !std::isfinite(weight) || phase < 0 || phase > 1 ||
+            weight < 0 || weight > (exact ? 10.0f : 1.0f))
+            return false;
         const auto p = static_cast<std::uint32_t>(std::floor(static_cast<double>(phase) * 4095 + 0.5));
         const auto w = static_cast<std::uint32_t>(std::floor(static_cast<double>(weight) * 255 + 0.5));
         ticks[i] = p | (w << 12);
+    }
+    for (std::size_t i = 0; i < MotionSlots; ++i) {
+        if (overrides & (1u << i)) {
+            if (!validFullMotion(v.motions[i], slots, i)) return false;
+        }
     }
     std::uint16_t yaw = 0;
     const bool full = std::holds_alternative<Quaternion>(v.rotation);
@@ -468,11 +563,12 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
     Writer w;
     w.u16(id); w.u32(v.anchor); w.u16(v.baseline);
     for (auto d : deltas) w.u16(d);
-    w.u16(yaw); w.u8(static_cast<std::uint8_t>((full ? 1 : 0) | (metadata ? 0x80 : 0) | (exact ? 0x40 : 0)));
-    w.u32(v.sent); w.u8(v.flags); w.u8(v.contact); w.u8(mask);
+    w.u16(yaw); w.u8(static_cast<std::uint8_t>((full ? 1 : 0) | (metadata ? 0x80 : 0) |
+                                               (exact ? 0x40 : 0) | (overrides ? 0x20 : 0)));
+    w.u32(v.sent); w.u8(v.flags); w.u8(v.contact); w.u8(slots);
     if (full) for (auto x : std::get<Quaternion>(v.rotation).components) w.f32(x);
     if (exact) for (auto x : v.position) w.f32(static_cast<float>(x));
-    for (std::size_t i = 0; i < MotionSlots; ++i) if (mask & (1u << i)) {
+    for (std::size_t i = 0; i < MotionSlots; ++i) if (slots & (1u << i)) {
         if (exact) {
             w.f32(v.motions[i].phase); w.f32(v.motions[i].weight);
         } else {
@@ -482,6 +578,16 @@ bool EncodeRecord(const Context& c, const Control& v, std::vector<std::uint8_t>&
         }
     }
     if (metadata) writeMetadata(w, v, metadata);
+    if (overrides) {
+        w.u8(overrides);
+        for (std::size_t i = 0; i < MotionSlots; ++i) {
+            if (!(overrides & (1u << i))) continue;
+            const std::uint16_t fieldMask =
+                motionFieldMask(v.motions[i], baseline->second.value.motions[i]);
+            w.u16(fieldMask);
+            writeMotionFields(w, v.motions[i], fieldMask);
+        }
+    }
     if (w.data.size() > MaxBatchBytes) return false;
     output = std::move(w.data); return true;
 }
@@ -498,9 +604,13 @@ bool DecodeRecord(const Context& c, const std::uint8_t* bytes, std::size_t size,
     const auto life = c.lives_.find(id);
     const auto anchor = c.anchors_.find({id, anchorToken});
     const auto baseline = c.baselines_.find({id, baselineToken});
-    if (life == c.lives_.end() || anchor == c.anchors_.end() || baseline == c.baselines_.end() ||
+    const auto idEntry = c.ids_.find(id);
+    if (life == c.lives_.end() || idEntry == c.ids_.end() ||
+        anchor == c.anchors_.end() || baseline == c.baselines_.end() ||
         anchor->second.life != life->second || baseline->second.life != life->second ||
-        baseline->second.anchor != anchorToken || slots != activeMask(baseline->second.value)) return false;
+        baseline->second.anchor != anchorToken ||
+        baseline->second.value.guid != idEntry->second ||
+        baseline->second.value.incarnation != life->second) return false;
     Control v = baseline->second.value;
     v.sent = sent; v.flags = flags; v.contact = contact; v.slots = slots;
     for (unsigned i = 0; i < 3; ++i) v.position[i] = static_cast<double>(anchor->second.value.position[i]) + delta[i];
@@ -520,7 +630,7 @@ bool DecodeRecord(const Context& c, const std::uint8_t* bytes, std::size_t size,
             auto& motion = v.motions[i];
             motion.phase = r.f32(); motion.weight = r.f32();
             if (!std::isfinite(motion.phase) || !std::isfinite(motion.weight) ||
-                motion.phase < 0 || motion.phase > 1 || motion.weight < 0 || motion.weight > 1)
+                motion.phase < 0 || motion.phase > 1 || motion.weight < 0 || motion.weight > 10)
                 return false;
             continue;
         }
@@ -531,6 +641,37 @@ bool DecodeRecord(const Context& c, const std::uint8_t* bytes, std::size_t size,
         v.motions[i].weight = static_cast<float>((packed >> 12) & 0xffu) / 255.0f;
     }
     if ((orientation & 0x80u) && !readMetadata(r, v, baseline->second.value)) return false;
+    if (orientation & 0x20u) {
+        const std::uint8_t overrideMask = r.u8();
+        if (!overrideMask) return false;
+        for (std::size_t i = 0; i < MotionSlots; ++i) {
+            if (!(overrideMask & (1u << i))) continue;
+            const std::uint16_t fieldMask = r.u16();
+            if (!fieldMask) return false;
+            Motion& motion = v.motions[i];
+            if (!readMotionFields(r, motion, fieldMask) ||
+                !validFullMotion(motion, slots, i) ||
+                motionFieldMask(motion, baseline->second.value.motions[i]) != fieldMask)
+                return false;
+        }
+        for (std::size_t i = 0; i < MotionSlots; ++i) {
+            if (overrideMask & (1u << i)) continue;
+            const Motion& omitted = v.motions[i];
+            const Motion& immutable = baseline->second.value.motions[i];
+            if (!sameDescriptor(omitted.descriptor, immutable.descriptor) ||
+                omitted.active != immutable.active)
+                return false;
+            if (motionFieldMask(omitted, immutable) != 0) return false;
+        }
+        if (activeMask(v) != slots) return false;
+        std::uint8_t canonicalMask = 0;
+        for (std::size_t i = 0; i < MotionSlots; ++i)
+            if (motionFieldMask(v.motions[i], baseline->second.value.motions[i]))
+                canonicalMask |= static_cast<std::uint8_t>(1u << i);
+        if (canonicalMask != overrideMask) return false;
+    } else if (activeMask(v) != slots) {
+        return false;
+    }
     if (!r.ok || r.offset != size) return false;
     output = v; return true;
 }

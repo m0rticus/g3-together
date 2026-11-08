@@ -114,6 +114,7 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
     motion.actionSeq = state.actionSeq;
     motion.motionFrac = state.motionFrac;
     motion.flags = state.flags;
+    motion.locomotion = body::IsLocomotionMotion(state.animation);
     body::Feed(puppet.body.track, state.position, state.rotation, state.sent, arrived, state.movementMode, motion);
 }
 
@@ -502,6 +503,10 @@ void StartPuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t 
 void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
 {
     if (id <= 0 || id >= net::MaxPlayers || id == net::LocalId()) return;
+    if (!net::IsHost() && !net::InWorld(net::LocalId())) {
+        Despawn(id, "awaiting world admission");
+        return;
+    }
     Puppet& puppet = puppets[id];
     if (guards::RejectRemoteWrite(puppet.entity.GetInstance(), "remote::UpdatePuppet")) { puppet = Puppet{}; return; }
     // A client's loop stops during videos and loading (the intro once removed and respawned a puppet after 5 s),
@@ -720,6 +725,38 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         if (newHeldEpisode) LogPuppetInteraction(puppet.entity.GetInstance(), "publish-talk", 1);
     }
 }
+
+void LogPlayerStreams(uint32_t now)
+{
+    auto const* remotes = net::Remotes();
+    for (int id = 1; id < net::MaxPlayers; ++id) {
+        auto const& r = remotes[id];
+        if (id == net::LocalId() || !r.connected) continue;
+        auto const& puppet = puppets[id];
+        auto const& track = puppet.body.track;
+        auto age = [&](uint32_t sent) {
+            return static_cast<unsigned>(std::max(static_cast<int32_t>(now - static_cast<uint32_t>(track.offset) - sent), 0));
+        };
+        Logf("PLAYERSTREAM role=%s player=%d connected=%d world_gate=%d same_world=%d accepted=%u "
+             "metadata_waits=%u stale=%u cached_entry=%u packet=%u arrival_age_ms=%u puppet=%d",
+             net::IsHost() ? "host" : "client", id, r.connected ? 1 : 0,
+             net::InWorld(net::IsHost() ? static_cast<uint8_t>(id) : net::LocalId()) ? 1 : 0,
+             r.latest.world == CurrentWorld() ? 1 : 0, r.acceptedStates, r.metadataWaits, r.staleStates,
+             r.preEntryStates, r.latest.sequence, r.latestTicks ? now - r.latestTicks : 0u,
+             puppet.spawned && puppet.entity.GetInstance() ? 1 : 0);
+        if (!track.count) continue;
+        char shows[128] = {};
+        if (puppet.spawned && puppet.entity.GetInstance())
+            body::CurrentMotion(puppet.entity.GetInstance(), shows, sizeof(shows));
+        Logf("PUPPETLATENCY player=%d samples=%d buffer_ms=%d shown_lag_ms=%u newest_sample_age_ms=%u "
+             "oldest_sample_age_ms=%u transit_excess_ms=%d backlog_ms=%d catchup=%d catchup_frames=%u "
+             "pending_events=%zu requested_motion=%s shown_motion=%s",
+             id, track.count, body::PlaybackDelay(track), track.haveRenderTime ? age(track.renderSent) : 0u,
+             age(track.snaps[track.count - 1].sent), age(body::OldestRetainedSent(track)), track.transitExcessMs,
+             track.backlogMs, track.catchUp ? 1 : 0, track.catchUpFrames, body::PendingEvents(track),
+             *r.latest.animation ? r.latest.animation : "-", *shows ? shows : "-");
+    }
+}
 }
 
 unsigned CurrentWorld()
@@ -872,6 +909,7 @@ void Tick()
     const uint32_t now = GetTickCount();
     if (haveLocal && (!lastSyncReport || now - lastSyncReport >= 5000)) {
         lastSyncReport = now ? now : 1;
+        LogPlayerStreams(net::Now());
         body::SyncReport(&Log);
         npcs::SyncReport(&Log);
         combat::SyncReport(&Log);

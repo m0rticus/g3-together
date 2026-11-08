@@ -99,19 +99,33 @@ static void CapacityConfiguration()
         auto result = Apply(setting, get, set);
         assert(result.Verified());
     }
-    assert(writes == 2);
-    assert((values == std::array<int32_t, 4>{Capacity, 256 * 1024, Capacity, 5000}));
+    assert(writes == 3);
+    assert((values == std::array<int32_t, 4>{Capacity, Capacity, Capacity, 5000}));
     values[0] = Capacity * 2;
-    assert(Apply(Settings[0], get, set).Verified() && writes == 2);
+    assert(Apply(Settings[0], get, set).Verified() && writes == 3);
     values[0] = 1024;
     auto rejected = Apply(Settings[0], get, [](int, int32_t) { return false; });
     assert(!rejected.Verified() && rejected.after.value == 1024);
     auto unreadable = Apply(Settings[0], [](int) { return Read{-1, 0, 0}; }, set);
-    assert(!unreadable.Verified() && writes == 2);
+    assert(!unreadable.Verified() && writes == 3);
     auto wrongType = Apply(Settings[0], [](int) { return Read{1, 3, 1024}; }, set);
-    assert(!wrongType.Verified() && writes == 2);
+    assert(!wrongType.Verified() && writes == 3);
     auto unverified = Apply(Settings[0], get, [](int, int32_t) { return true; });
     assert(!unverified.Verified()); // accepted write alone is not an effective-value check
+    values[1] = Capacity * 2;
+    assert(Apply(Settings[1], get, set).Verified() && writes == 3);
+
+    // Pinned Valve SNP_ClampSendRate, d534c19: the BBR probe cycle is a FIXME.
+    auto valveClamp = [](int estimate, int minimum, int maximum) {
+        minimum = std::clamp(minimum, 1024, 100 * 1024 * 1024);
+        maximum = std::clamp(maximum, minimum, 100 * 1024 * 1024);
+        return std::clamp(estimate, minimum, maximum);
+    };
+    int rate = 4380 * 1000 / 40; // Initial rate at 40 ms RTT, not a bandwidth measurement.
+    for (int i = 0; i < 100; ++i) rate = valveClamp(rate, 256 * 1024, Capacity);
+    assert(rate == 256 * 1024); // Raising only max cannot make this sender probe upwards.
+    rate = valveClamp(rate, Capacity, Capacity);
+    assert(rate == Capacity);
 }
 
 static void SplittingAndRetransmissions()

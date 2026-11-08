@@ -16,6 +16,7 @@ namespace g3t::npcwire {
 constexpr std::size_t MaxBatchBytes = 1172;
 constexpr std::size_t MotionSlots = 8;
 constexpr std::size_t MaxMetadataBytes = 49; // 3-byte mask + 46 bytes of values.
+constexpr std::size_t MaxMotionOverrideBytes = 505; // 1-byte slot mask + eight 63-byte field-mask payloads.
 constexpr std::size_t MaxBaselinesPerNpc = 16;
 constexpr std::size_t AnchorReorderWindow = 64;
 using Guid = std::array<std::uint8_t, 16>;
@@ -61,6 +62,9 @@ static_assert(sizeof(WireFullMotion) == 61, "full motion layout");
 static_assert(sizeof(WireFullRecord) == 588, "full NPC layout");
 static_assert(offsetof(WireFullRecord, motions) == 100, "full motion offset");
 static_assert(offsetof(WireControl, slots) == 23, "slot mask offset");
+static_assert(sizeof(WireControl) + sizeof(WireQuaternion) + 12 + 8 * 8 +
+              MaxMetadataBytes + MaxMotionOverrideBytes <= MaxBatchBytes,
+              "maximum exact motion override record fits one batch");
 
 struct MotionDescriptor {
     std::uint32_t name = 0, instance = 0;
@@ -101,7 +105,7 @@ struct Control {
     std::uint16_t hitSequence = 0;
     std::uint8_t contact = 0, attitude = 0;
     std::uint32_t combatTarget = 0; // Exact net::NpcRecord hash, not a short ID.
-    std::uint8_t slots = 0; // Baseline slots whose active bit 0 is set.
+    std::uint8_t slots = 0; // Current slots whose active bit 0 is set.
     std::array<Motion, MotionSlots> motions{};
 };
 
@@ -177,10 +181,12 @@ private:
 };
 
 // The 24-byte WireControl is followed by the optional full quaternion, then
-// three bytes per active slot. Orientation bit 0 selects yaw (0) or full
-// quaternion (1); bit 7 announces metadata. Bit 6 selects exact binary32
-// positions (12 bytes after the quaternion) and phase/weight (8 bytes/slot),
-// requires full quaternion and zero delta/yaw fields. Other bits are reserved.
+// three bytes per active slot (or eight exact bytes/slot). Orientation bit 0
+// selects yaw (0) or full quaternion (1); bit 7 announces metadata; bit 5
+// announces relative field-mask motion overrides. Bit 6 selects exact binary32
+// positions (12 bytes after the quaternion) and exact phase/weight
+// (8 bytes/slot), requires full quaternion and zero delta/yaw fields. Other
+// bits are reserved.
 // Without metadata this is the original fixed format. With metadata, append a
 // 3-byte little-endian, nonzero 21-bit mask and the selected original-width
 // little-endian values, in this order (bit 0 first):
@@ -192,6 +198,12 @@ private:
 // differ from the named baseline (binary32 bit equality for damageMultiplier);
 // an overridden multiplier must be finite. Omitted values always come from
 // that immutable baseline, never a previous update.
+// Motion overrides follow metadata and contain a nonzero 8-bit slot mask.
+// Each set slot has a nonzero 16-bit little-endian field mask followed only
+// by changed fields in ascending field order: name, instance, speed, intro,
+// extro, blend, options[0..6], active, inactive phase, inactive weight.
+// Normal active phase/weight ticks still precede metadata and are not repeated
+// by the override field payload. Omitted slot state is the immutable baseline.
 //
 // RecordBytes validates the structural prefix of one record in `available`
 // bytes without a Context, leaving length unchanged on failure. It accepts
@@ -200,9 +212,11 @@ private:
 bool RecordBytes(const std::uint8_t* bytes, std::size_t available, std::size_t& length);
 
 // All outputs and Context ordering remain unchanged on failure. EncodeRecord
-// fails on changes to GUID, incarnation, motion descriptors, active bits or
-// inactive phase/weight, on non-finite/out-of-[0,1] active phase or weight, or
-// on position overflow: send a new baseline or full fallback instead. Slots
+// fails on changes to GUID or incarnation, non-finite motion/active values,
+// active phase outside [0,1], live native weight outside [0,10], or position
+// overflow: send a new baseline or full fallback instead. Dynamic descriptors,
+// active flags and inactive phase/weight use relative field-mask motion overrides.
+// Slots
 // contain phase rounded to 12 bits and weight rounded to 8 bits, with the top
 // four bits zero. Standalone records lack sequence/stream fences: use
 // DecodeBatch on the network.

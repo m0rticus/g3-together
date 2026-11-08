@@ -296,13 +296,13 @@ int main() {
     changed = update; changed.hitSequence++; accept(changed);
     changed = update; changed.attitude++; accept(changed);
     changed = update; changed.combatTarget--; accept(changed);
-    // Immutable descriptors, life and inactive slot data still require a baseline.
+    // Life and GUID are immutable; descriptors and motion state use full overrides.
     changed = update; changed.incarnation++; reject(changed);
-    changed = update; changed.motions[0].descriptor.instance++; reject(changed);
-    changed = update; changed.motions[1].descriptor.options[6]++; reject(changed);
-    changed = update; changed.motions[0].active = 2; reject(changed);
-    changed = update; changed.motions[1].phase++; reject(changed);
-    changed = update; changed.motions[1].weight++; reject(changed);
+    changed = update; changed.motions[0].descriptor.instance++; accept(changed);
+    changed = update; changed.motions[1].descriptor.options[6]++; accept(changed);
+    changed = update; changed.motions[0].active = 2; accept(changed);
+    changed = update; changed.motions[1].phase++; accept(changed);
+    changed = update; changed.motions[1].weight = 9.0f; accept(changed);
     changed = update; changed.motions[0].weight = 10.0f; reject(changed);
     changed = update; changed.motions[0].phase = 1.00001f; reject(changed);
     changed = update; changed.motions[0].weight = std::numeric_limits<float>::quiet_NaN(); reject(changed);
@@ -322,6 +322,17 @@ int main() {
     checkStatic(extended, decoded);
     assert(decoded.motions[0].weight == 10 && decoded.motions[1].weight == 10 && decoded.slots == 0x81);
     assert(!DecodeFullFallback(receiver, full.data(), full.size(), decoded));
+    auto exactExtended = v;
+    exactExtended.motions[0].weight = 2.0f;
+    assert(EncodeRecord(sender, exactExtended, bytes, true));
+    assert(DecodeRecord(receiver, bytes.data(), bytes.size(), decoded));
+    assert(decoded.motions[0].weight == 2.0f);
+    exactExtended.motions[0].weight = 10.0f;
+    assert(EncodeRecord(sender, exactExtended, bytes, true));
+    assert(DecodeRecord(receiver, bytes.data(), bytes.size(), decoded));
+    assert(decoded.motions[0].weight == 10.0f);
+    exactExtended.motions[0].weight = 10.0001f;
+    assert(!EncodeRecord(sender, exactExtended, bytes, true));
     auto overflow = v; overflow.position[0] = static_cast<double>(1244.125f + 40000.0f);
     assert(!EncodeRecord(sender, overflow, bytes));
     assert(EncodeFullFallback(sender, 2, overflow, bytes));

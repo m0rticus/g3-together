@@ -77,7 +77,7 @@ with its first New Game. Never overwrite the user's native world/save to accompl
 **Verification boundary:** native getter/read/serialization paths were verified statically
 against the installed CP DLL bytes; this is not an observed running-engine test. The join
 `options:` diagnostics are intended for the next two-player run to confirm actual behaviour.
-Protocol remains **77**, with a delegation capability marker in the existing Hello options
+Protocol is **78**, with a delegation capability marker in the existing Hello options
 slot and a versioned balancing snapshot appended only to Welcome and host world announcements.
 Old builds are distinguishable and refuse rather than silently ignoring delegation.
 
@@ -164,13 +164,25 @@ opens a lobby on its own.
 - Session IDs are visible grouping labels, not passwords or access controls. Steam friendship/lobby membership
   still applies. The host publishes a status text and the ID in its Steam Rich Presence connect string,
   `+g3t_connect <host SteamID64> <session_id>`. Both players need this build: older builds cannot invite or be invited
-  by it, even though protocol 77 and the relay envelope are unchanged. The Steam control channel has new join requests.
+  by it, even though the relay envelope is unchanged. The current build uses protocol 78; the Steam control channel has new join requests.
   The session-scoped relay format is also incompatible with older pre-session relay builds, even in the default group.
 - Each concurrently running real-Steam instance needs a distinct Steam identity. Running six processes under
   one Steam account is not supported by this identity-addressed transport. Multiple copies on one PC also need
   isolated installations, profiles and saves; a Session ID isolates network traffic, not filesystem writes.
 - Without Steam or the required `steam_api.dll`, co-op startup fails with a message in the menu and game.
   There is no fallback. ENet's UDP sockets bind only to localhost and accept linked Steam relays, not direct-IP players.
+- "Steam transport" does not necessarily mean a relayed route: NetworkingMessages
+  uses the same underlying P2P transport as NetworkingSockets, including direct
+  ICE connectivity when Steam's privacy policy allows it. Five-second `steam: path`
+  lines distinguish direct/SDR/unknown without logging peer IP addresses.
+  The documented 262144 B/s send-rate default is configurable, not a universal
+  Steam bandwidth limit. We request at least 4 MiB for the buffer and 4 MiB/s
+  for both rate bounds, preserving larger existing values. Valve's public sender
+  does not implement bandwidth probing; raising only the maximum can leave the
+  rate at 256 KiB/s. This manual headroom sends queued data, not padding, but can
+  overload a slow upload: 4 MiB/s is 33.6 Mbit/s, not promised Internet capacity.
+  Global values and live send rate are logged for the real-account test.
+  No direct-IP fallback, privacy override, NPC cap or shedding is added.
 - The Steam overlay may not open in Gothic 3. It is not needed: use the friends list in the Steam desktop client
   for **Join Game** or **Invite to Game**.
 
@@ -266,7 +278,7 @@ uses unreliable fragments rather than silently becoming reliable; small packets 
 Compact NPC control batches are capped at 1172 bytes. Explicit reliable events and ENet's reliable sequence rollover
 retain their semantics.
 
-The current source uses **protocol 77**. Its host-only NPC overhaul and host-managed saves are experimental; native gameplay acceptance is still
+The current source uses **protocol 78**. Its host-only NPC overhaul and host-managed saves are experimental; native gameplay acceptance is still
 in progress, so this source must not be treated as a verified release. Both players need the same build; older protocol peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
@@ -296,8 +308,13 @@ other named/quest/dialogue actors, immortals, equipped actors and every creature
 animation, combat AI, hit reactions, damage, death, dialogue and trade natively. Only the hero, remote player puppets,
 replicated summons/party/owned actors, item/spell actors, duplicate identities, authored removals and NPCs the host is
 currently streaming stay host-driven. There is no per-NPC dwell: ownership starts at once, after one stream-settle grace
-(at most 2 s, or the host's first NPC batch) per session. A host stream that arrives for an owned NPC wins: the client
-yields (local state is discarded, nothing freezes) and a 1.5 s cool-down prevents flapping.
+(2 s, or the host's first NPC batch) per session. An unreleased host stream keeps authority through packet gaps;
+stale state never permits a takeover. New acquisition/reclaim waits if the freshest live NPC state or RTT exceeds
+1.5 s; established client-only owners keep running. Two accepted host records revoke an established local owner,
+including a locally dead one: passive host property/pose replay reconciles it without rerunning death or reward scripts.
+A 1.5 s cool-down applies after yielding.
+An explicit release drains its received final state and events before native acquisition; it cannot import an older
+buffered transform or HP simply because the release message arrived.
 
 The host handshake runs asynchronously: the client sends its latest checkpoint (`Adopt`), the host grants an epoch
 (`Offer`/`Prepared`/`Commit`) when it is not presenting that NPC, and from then on receives 5 Hz state. A refused, late
@@ -309,13 +326,15 @@ also within 100 m of it, that client owns it and this one keeps it visual-only.
 Hand-back: when the host walks into range the host recalls the NPC; the client cuts from its latest state (combat can
 defer the cut for at most ten seconds), the host imports the latest accepted transform/HP/life/attitude/routine,
 restarts natively and commits a newer epoch, and the client yields to the host stream. If the host cannot commit within
-2.5 s the client reclaims the NPC instead of leaving it frozen. The host keeps its own inventory/equipment; personal loot
+2.5 s, has no unreleased claim and delivery is timely, the client reclaims the NPC. The host keeps its own inventory/equipment; personal loot
 stays personal; import never reruns Kill, XP or treasure generation (the native death on the client runs once, the host
 journals the quest effect once).
 Read `npc-own:` lines in the log: every 5 s `npc-own: summary` (host_streamed / native_owned / confirmed / visual_only /
 waiting / refused / frozen with top reasons, hits_applied, deaths, hand_backs, yields, takeovers, reclaims, registration
 paths) and one `npc-own: event=...` line per transition per NPC (loaded, owned, confirmed, waiting, refused, hit,
 reaction, death, frozen, yielded, handback, reclaimed, host-silent, registration).
+`NPCOWNSTREAM` reports observed state age, RTT and acquisition uncertainty; `NPCRECONCILE` reports a local corpse
+contradicted by the displayed host-alive state. Native death is refused while proven host authority is present.
 `npc_authority_fallback = off` keeps the pure host model and safe unavailable presentation.
 
 Save with both players together. Client-owned NPC state never blocks a save: only the host's native world
@@ -325,7 +344,7 @@ import or reset leases, so the live encounter and normal hand-back continue unch
 No lease overlay (extension type 256) is written or retained in new saves. Old v1/v2 overlays and
 `npclease1 ` text are ignored on load, never applied over the native world; container integrity checks remain.
 Knocked-out players still block saving: "A player is knocked out. Revive them first."
-Both copies must use the same rebuilt DLL. Protocol 77 and lease wire version 2 are unchanged.
+Both copies must use the same rebuilt DLL. Protocol is 78; lease wire version 2 is unchanged.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
@@ -342,11 +361,19 @@ latency adaptation then smooths the buffer without predicting future NPC movemen
 life transitions follow that same presentation timeline. Missing or stale presentation cannot authorize an incoming hit.
 Player-puppet smoothing remains separate.
 `SYNCLATENCY` reports desired buffer and actual `shown_lag` separately: slew/holds can make them differ.
-`jitter_avg_ms`/`jitter_max_ms` expose the arrival/capture-interval variation driving adaptation.
+`jitter_avg_ms`/`jitter_max_ms` expose arrival/capture-interval variation. Adaptive buffering also accounts
+for transit excess, but is capped at 500 ms: it cannot conceal or fix a multi-second transport queue.
+Delivered noncombat backlog is played faster to return to the target delay, preserving received action,
+hit and life boundaries; attacks directed at the local hero keep their normal presentation/contact clock.
+Unpresented canonical bones remain available until the corresponding root/action timeline consumes them.
+NPCs never extrapolate; player position prediction is limited to 100 ms of valid locomotion.
 `shown_lag` and `transit_excess` use the track's minimum arrival-minus-send clock-offset estimate, **not synchronized
 one-way timing**; `arrival_age` is time since the newest local receive. `underruns` counts buffer recovery events in the
 currently tracked NPCs; age/lag maxima can include a deliberately held terminal pose. Do not add these estimates to an
 RTT as if all components were disjoint.
+`SYNCTRACK` and `PUPPETLATENCY` expose per-entity retained age and catch-up; `PLAYERSTREAM` reports
+accepted player states, metadata waits and whether a puppet exists. Authenticated host-player metadata can
+be cached before the world-entry ACK, but spawning/world writes remain gated until admission.
 The host also sends each NPC's attitude to the player, so name-tag colours (green, white, orange, red) match on both PCs, also
 while either player lies knocked out and after the revive (the colour is the NPC's relation, never changed by a knock-out). While
 you talk to an NPC on the client, that one NPC's script routine runs locally so its voiced lines play; the host still holds
@@ -362,13 +389,16 @@ fixed-rate pose frames. Native clip bookkeeping or a pending clip name cannot in
 The host sends final skeletal matrices because native blend-out layers survive outside the eight motion slots.
 Poses use sub-centimetre translation quantization; compact rotations have a strict per-bone error guard and
 exact affine fallbacks for scale/shear. Ordinary poses travel on a separate lossy
-ENet channel; essential life/party/hit changes remain reliable on the NPC channel. Owned loopback sockets
+ENet channel; essential life/party/hit changes, setup and independent bone anchors share the ordered reliable
+definition channel. Compact pose flag `0x40` marks a logical essential update; `0x80` marks a reliable anchor.
+Transport-only setup or anchor reliability does not create a gameplay snap or event. Owned loopback sockets
 have burst capacity for crowded scenes. `NPCPOSE` and `PASSIVE` diagnostics distinguish queued/received poses,
 presentation waits and completed skeletal updates. This full-pose stream costs more bandwidth than clip-only replay;
 internet throughput and multi-player resource limits still need acceptance.
 
-Internal bone format 74 caches bone layouts and full NPC motion baselines per world. After each client acknowledges them, updates
-send the existing bone values without repeated names and compact anchored control records. Ordinary nearby moving NPCs
+Protocol 78 caches bone layouts and full NPC motion baselines per world. Once their definitions are queued, cold updates
+send bone values without repeated names and compact anchored controls on the same ordered reliable channel.
+Acknowledgements let ordinary updates use the lossy pose channel without waiting for setup on every frame. Nearby moving NPCs
 use a 33 ms (30 Hz) interval; distant movers and idle animation use 100 ms (10 Hz). Combat, focus, contact and dialogue
 stay at capture rate. Fast and ordinary tiers have 2 s exit holds, and new interest gets a 200 ms warm-up.
 Exact temporal/spatial residuals retain the Q12/Q2 affine fallback. Near-rigid bones may instead send a
@@ -380,14 +410,17 @@ of its influenced bone has at most 0.293 cm added displacement. Actual native sk
 acceptance remain unmeasured. Keys retain the original full-precision affine pose, and each update is encoded
 from the current original capture against explicitly ACKed decoded references, so error never accumulates.
 Loss, reordering, life/layout changes and missing
-references fall back to keys; periodic keys are due every 5 s within the 32-pose retention window. Full records remain the
-fallback for a missing dictionary, an unacknowledged baseline or values outside the compact range. The log reports layout
+references fall back to keys; independent reliable anchors are normally due every 5 s. Alongside 32 transient frames,
+the first anchor and four recent anchors remain pinned across delayed feedback. Full records remain the
+fallback when a definition cannot be queued or a record cannot be encoded; pending acknowledgements alone do not
+force full records. The log reports layout
 sizes, resync requests, anchors and fallback failures.
-Scalar HP, action, target, equipment and relationship changes use exact sparse overrides against the named
+Scalar HP, action, target, equipment, relationship and motion-descriptor changes use sparse overrides against the named
 control baseline rather than repeatedly offering all eight unchanged motion descriptors. Essential reliable
 records preserve every original field bit-for-bit and the same reliable channel/publication ordering,
-but omit acknowledged immutable descriptors; original position/quaternion and active motion floats
-remain full precision. A descriptor, life or anchor change retains full-record baseline/key recovery.
+but omit unchanged immutable descriptors; original position/quaternion and active motion floats
+remain full precision. Life changes or loss of a retained control anchor trigger baseline recovery,
+not ordinary animation descriptor changes. Exact compact escapes cover out-of-range roots and native blend weights.
 The codec chooses the smallest exact or guarded candidate, including Q14/Q12 quaternion grids and
 global/per-16-bone Rice parameters. It never reduces a selected update's rate or bone set.
 Kind 49 reuses its outer epoch/publication/count instead of repeating a 14-byte inner envelope;
@@ -471,7 +504,8 @@ Steam Messages channels are receive demultiplexing, not priority lanes, so an in
 physical link can still accumulate retained data. Absolute bounded delivery latency
 requires real-Steam acceptance, not a successful API submission.
 High-entropy payloads remain exact and do not grow. Both endpoints require the same rebuilt
-DLL; application protocol 77 and NPC wire layouts are unchanged. Real-Steam throughput and
+DLL. The transport-only repair preserved the application wire; the subsequent NPC convergence
+repair requires protocol 78. Real-Steam throughput and
 CPU cost still require manual acceptance; there is no new NPC cap or send-rate limit.
 
 Your own successful hit shows its local flinch immediately and is claimed reliably from the host. A host-side parry
@@ -711,7 +745,7 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   puppet. Protection lasts another 1.5 seconds after all dialogue/trade windows and spoken dialogue
   end, including Esc/abort. Enemies retain native hostility/targeting; this does not cancel the NPC's
   talk routine or make enemies friendly. Loading/world changes clear interaction protection.
-  The existing player flags/heartbeat carry the state; protocol 77 and packet sizes are unchanged.
+  The existing player flags/heartbeat carry the state; protocol 78 leaves those packet sizes unchanged.
 - The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
   While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
   monsters, an intruder; not a duel, the arena, a guard's arrest or another player) counts as a death: you stay down until
@@ -733,7 +767,7 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
-  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 77 build.
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 78 build.
   To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
   one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
   outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.

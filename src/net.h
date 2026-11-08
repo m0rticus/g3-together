@@ -124,6 +124,7 @@ struct Remote
     uint32_t latestTicks = 0;
     bool connected = false;
     PlayerActivity activity; // global helper evidence, independent of loaded/presented position
+    uint32_t acceptedStates = 0, metadataWaits = 0, staleStates = 0, preEntryStates = 0;
 };
 
 bool Start(bool host);
@@ -220,7 +221,8 @@ void SendPosedNpc(NpcRecord const& record, pose::Bone const* bones, int count, u
 bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable = false);
 bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones, int count,
                     uint8_t poseFlags = 0, bool reliable = false, uint8_t intervalMs = 16);
-using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool reliable, uint8_t intervalMs);
+// Essential describes the source update, not setup/anchor transport reliability.
+using NpcPoseHandler = void (*)(NpcRecord const&, pose::Bone const*, int, uint8_t poseFlags, bool essential, uint8_t intervalMs);
 void SetNpcPoseHandler(NpcPoseHandler handler);
 uint32_t RemoteFocusNpc(uint8_t player);
 uint32_t RemoteTargetNpc(uint8_t player);

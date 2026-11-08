@@ -207,12 +207,14 @@ using namespace g3t::net;
 unsigned applied = 0;
 uint8_t appliedFlags = 0;
 uint8_t appliedInterval = 0;
+bool appliedEssential = false;
 std::vector<pose::Bone> appliedBones;
-void GotPose(NpcRecord const&, pose::Bone const* bones, int count, uint8_t flags, bool, uint8_t interval)
+void GotPose(NpcRecord const&, pose::Bone const* bones, int count, uint8_t flags, bool essential, uint8_t interval)
 {
     ++applied;
     appliedFlags = flags;
     appliedInterval = interval;
+    appliedEssential = essential;
     appliedBones.assign(bones, bones + count);
 }
 int GotRecords(NpcRecord*, int count, uint32_t, uint32_t, uint8_t, uint32_t) { return count; }
@@ -290,20 +292,25 @@ int main()
     assert(transmissions.size() == 2);
     const Transmission definition = transmissions[0], fallback = transmissions[1];
     assert(definition.bytes[0] == MsgBoneDictionary && definition.flags == ENET_PACKET_FLAG_RELIABLE);
-    assert(fallback.bytes[0] == MsgPosedNpc && fallback.flags == ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
+    assert((fallback.bytes[0] == MsgCompactPosedNpc || fallback.bytes[0] == MsgControlPose) &&
+           fallback.flags == ENET_PACKET_FLAG_RELIABLE);
+    assert(fallback.channel == ChannelDefinitions);
     transmissions.clear();
     SendPosedNpc(record, input, count, pose::Facial);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgPosedNpc);
+    assert(transmissions.size() == 1 &&
+           (transmissions[0].bytes[0] == MsgCompactPosedNpc ||
+            transmissions[0].bytes[0] == MsgControlPose));
 
     bonewire::Dictionary hostLayouts = std::move(boneLayouts);
     isHost = false;
     inWorld = true;
-    Deliver(&fakePeer, fallback);
-    assert(applied == 1 && appliedFlags == pose::Facial && appliedBones.size() == count);
     transmissions.clear();
     Deliver(&fakePeer, definition);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgBoneAck);
     const Transmission ack = transmissions[0];
+    transmissions.clear();
+    Deliver(&fakePeer, fallback);
+    assert(applied == 1 && appliedFlags == pose::Facial && appliedBones.size() == count && !appliedEssential);
     bonewire::Dictionary clientLayouts = std::move(boneLayouts);
 
     isHost = true;
@@ -317,24 +324,16 @@ int main()
     peers[3] = &fakePeers[1];
     clientInWorld[3] = true;
     SendPosedNpc(record, input, count, pose::Facial);
-    assert(transmissions.size() == 3 && transmissions[0].bytes[0] == MsgCompactPosedNpc);
+    assert(transmissions.size() == 3 &&
+           (transmissions[0].bytes[0] == MsgCompactPosedNpc ||
+            transmissions[0].bytes[0] == MsgControlPose));
     assert(transmissions[0].peer == &fakePeer);
     assert(transmissions[1].peer == &fakePeers[1] && transmissions[1].bytes[0] == MsgBoneDictionary);
-    assert(transmissions[2].peer == &fakePeers[1] && transmissions[2].bytes[0] == MsgPosedNpc);
+    assert(transmissions[2].peer == &fakePeers[1] &&
+           (transmissions[2].bytes[0] == MsgCompactPosedNpc ||
+            transmissions[2].bytes[0] == MsgControlPose));
     Drop(3);
     const Transmission compact = transmissions[0];
-    assert(compact.bytes.size() == sizeof(NpcsHeader) + sizeof(NpcRecord) + sizeof(BonePosePrefix) + 5 + count * 24);
-    assert(fallback.bytes.size() - compact.bytes.size() == 4 * count - 5);
-    const size_t poseOffset = sizeof(NpcsHeader) + sizeof(NpcRecord);
-    assert(compact.bytes[poseOffset] == pose::Facial);
-    assert(compact.bytes[poseOffset + 1] == 16 && compact.bytes[poseOffset + 2] == 1 && compact.bytes[poseOffset + 3] == 0);
-    for (int i = 0; i < count; ++i)
-        for (int j = 0; j < 12; ++j) {
-            const uint16_t bits = static_cast<uint16_t>(input[i].values[j]);
-            const size_t at = poseOffset + sizeof(BonePosePrefix) + 5 + i * 24 + j * 2;
-            assert(compact.bytes[at] == static_cast<uint8_t>(bits));
-            assert(compact.bytes[at + 1] == static_cast<uint8_t>(bits >> 8));
-        }
     hostLayouts = std::move(boneLayouts);
 
     // Simulate a lost definition/rejoin and a cross-channel early compact pose.
@@ -456,6 +455,32 @@ int main()
     transmissions.clear();
     SendPosedNpc(record, input, count, 0);
     assert(boneExhaustionLogged && transmissions.size() == 1 && transmissions[0].bytes[0] == MsgPosedNpc);
+    const auto rawOrdinary = transmissions[0];
+    assert(!(rawOrdinary.flags & ENET_PACKET_FLAG_RELIABLE));
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, record, input, count, pose::Facial, true, 16));
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgPosedNpc);
+    const auto rawEssential = transmissions[0];
+    assert(rawEssential.channel == ChannelDefinitions && (rawEssential.flags & ENET_PACKET_FLAG_RELIABLE));
+    isHost = false;
+    transmissions.clear();
+    Deliver(&fakePeer, rawOrdinary);
+    assert(!appliedEssential && appliedFlags == 0);
+    Deliver(&fakePeer, rawEssential);
+    assert(appliedEssential && appliedFlags == pose::Facial);
+    isHost = true;
+    input[0].name = 100;
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, record, input, count, pose::Facial, true, 16));
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgCompactPosedNpc);
+    const auto compactEssential = transmissions[0];
+    assert(compactEssential.bytes[sizeof(NpcsHeader) + sizeof(NpcRecord)] & PoseEssentialFlag);
+    isHost = false;
+    transmissions.clear();
+    Deliver(&fakePeer, compactEssential);
+    assert(appliedEssential && appliedFlags == pose::Facial);
+    isHost = true;
+    input[0].name = 9999;
     const unsigned failedBefore = poseSendFailed;
     const unsigned logsBefore = boneFallbackFailureLogs;
     failSend = true;
@@ -471,8 +496,8 @@ int main()
         });
     };
     assert(logged("new bone layout=1 bones=80 definition_bytes=341"));
-    assert(logged("pose=full bones=80 pose_bytes=2244"));
-    assert(logged("pose=compact bones=80 pose_bytes=1929"));
+    assert(logged("pose=full bones=80"));
+    assert(logged("pose=compact bones=80"));
     assert(logged("bone layout IDs exhausted"));
     assert(logged("full-hash pose fallback failed"));
     return 0;

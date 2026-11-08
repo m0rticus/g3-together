@@ -3,6 +3,8 @@
 #include "../src/npclease.h"
 #include "../src/npclease_client.h"
 #include "../src/npclease_admission.h"
+#include "../src/npclease_presentation.h"
+#include "../src/replication.h"
 
 #include <cassert>
 #include <cstdint>
@@ -101,7 +103,7 @@ static void TestDecisions()
     }
 
     // Exhaust the readiness flags and both overriding states, including their priority.
-    for (unsigned bits = 0; bits < 128; ++bits) {
+    for (unsigned bits = 0; bits < 512; ++bits) {
         own::Facts facts;
         facts.installed = (bits & 1u) != 0;
         facts.nativeReady = (bits & 2u) != 0;
@@ -110,6 +112,8 @@ static void TestDecisions()
         facts.alreadyOwned = (bits & 16u) != 0;
         facts.hostPresenting = (bits & 32u) != 0;
         facts.configEnabled = (bits & 64u) != 0;
+        facts.hostStreamUncertain = (bits & 128u) != 0;
+        facts.hostReleasePending = (bits & 256u) != 0;
         own::Verdict verdict;
         char const* reason;
         if (!facts.configEnabled) {
@@ -124,6 +128,10 @@ static void TestDecisions()
             verdict = own::Verdict::Wait; reason = "native processing/actor not ready";
         } else if (!facts.settled) {
             verdict = own::Verdict::Wait; reason = "host stream settling";
+        } else if (facts.hostReleasePending) {
+            verdict = own::Verdict::Wait; reason = "final host state awaiting presentation";
+        } else if (facts.hostStreamUncertain) {
+            verdict = own::Verdict::Wait; reason = "host stream stale; authority unknown";
         } else if (facts.cooldownHeld) {
             verdict = own::Verdict::Wait; reason = "host yield cool-down";
         } else {
@@ -376,6 +384,64 @@ static lease::Checkpoint Baseline()
     return state;
 }
 
+static void TestStaleAuthority()
+{
+    for (uint32_t rtt : {30u, 60u}) {
+        for (uint32_t gap : {0u, 2000u, 5000u}) {
+            own::Facts candidate;
+            candidate.hostPresenting = lease::HostClaim(true, true, false, 2);
+            candidate.hostStreamUncertain = !own::AcquisitionTimely(gap, rtt);
+            assert(own::Decide(candidate).verdict == own::Verdict::HostStreamed);
+            if (gap) assert(!lease::PresentationFresh(true, false, gap, 34));
+        }
+        assert(own::AcquisitionTimely(1000, rtt)); // unchanged idle heartbeat
+    }
+    assert(own::AcquisitionTimely(own::AuthorityObservationMs, own::AuthorityObservationMs));
+    assert(!own::AcquisitionTimely(own::AuthorityObservationMs + 1, 30));
+    assert(!own::AcquisitionTimely(0, 2000));
+    assert(!lease::HostClaim(false, true, false, 2));
+    assert(!lease::HostClaim(true, false, false, 2));
+    assert(!lease::HostClaim(true, true, true, 2));
+    assert(!lease::HostClaim(true, true, false, 0));
+
+    own::Facts candidate;
+    candidate.hostStreamUncertain = true;
+    assert(own::Decide(candidate).verdict == own::Verdict::Wait);
+    candidate.alreadyOwned = true;
+    assert(own::Decide(candidate).verdict == own::Verdict::ClientNative);
+    candidate.alreadyOwned = false;
+    candidate.hostStreamUncertain = false;
+    candidate.hostPresenting = lease::HostClaim(true, true, true, 2);
+    assert(own::Decide(candidate).verdict == own::Verdict::ClientNative); // explicit release, healthy link
+    candidate.hostReleasePending = lease::ReleasePending(true, 32, true, 1000, 3000, 0);
+    assert(own::Decide(candidate).verdict == own::Verdict::Wait);
+    assert(lease::ReleasePending(true, 32, true, 3000, 3000, 1)); // do not skip a final event
+    assert(lease::ReleasePending(true, 1, false, 0, 0, 0));
+    assert(lease::ReleasePending(true, 32, true, UINT32_MAX - 1, 2, 0));
+    assert(!lease::ReleasePending(false, 32, true, 1000, 3000, 1));
+    assert(!lease::ReleasePending(true, 0, false, 0, 3000, 0));
+    candidate.hostReleasePending = lease::ReleasePending(true, 32, true, 3000, 3000, 0);
+    assert(own::Decide(candidate).verdict == own::Verdict::ClientNative);
+
+    auto local = Baseline();
+    local.dead = 1; local.hp = 0; local.effects = lease::NativeDeath;
+    own::OwnerFacts owner;
+    owner.hostSilent = owner.leaseExpired = true;
+    assert(own::Release(owner) == nullptr); // genuinely client-only death is kept
+    owner.hostPresenting = lease::HostClaim(true, true, false, 2);
+    SameReason(own::Release(owner), "host presenting"); // local terminal outcome has no veto
+    g3t::replication::TerminalLife hostLife;
+    assert(hostLife.Observe(1, false));
+    assert(lease::ReconcileLife(local.dead != 0, false, hostLife.dead));
+    assert(hostLife.Observe(1, false)); // a local death did not latch canonical death
+    assert(hostLife.Observe(1, true));
+    assert(!lease::ReconcileLife(local.dead != 0, false, hostLife.dead));
+    assert(!hostLife.Observe(1, false)); // canonical terminal life still cannot resurrect
+    assert(hostLife.Observe(2, false));
+    assert(lease::ReconcileLife(true, true, hostLife.dead));
+    assert(!lease::ReconcileLife(false, false, false));
+}
+
 static void TestLatestHandBack()
 {
     lease::Lease host;
@@ -517,5 +583,6 @@ int main()
     TestDuplicateOffers();
     TestClientWindow();
     TestLeaseAdmission();
-    std::cout << "npcown_policy_test: OK (13 groups)\n";
+    TestStaleAuthority();
+    std::cout << "npcown_policy_test: OK (14 groups)\n";
 }

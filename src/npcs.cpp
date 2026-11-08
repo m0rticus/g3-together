@@ -3152,7 +3152,8 @@ void PassiveMirrorTick()
             auto* animation = static_cast<eCVisualAnimation_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
             if (animation && animation->GetRagDollEnabled()) animation->StopRagDoll();
         }
-        if (m.killed && !(shown.flags & 1)) {
+        const bool localDeath = m.entity.IsDead();
+        if (npclease::ReconcileLife(localDeath, m.killed, (shown.flags & 1) != 0)) {
             m.ragdollStarted = m.laid = false;
             m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
             m.deathImpulse = {};
@@ -3166,6 +3167,9 @@ void PassiveMirrorTick()
             std::strcpy(m.presentationSource, "gravity");
             std::strcpy(m.killerAttribution, "host_or_npc_unknown");
             deadOnHost.erase(it->first);
+            if (localDeath)
+                Logf("NPCRECONCILE name=%s incarnation=%u local_dead=1 host_alive=1 host_hp=%d receive_age_ms=%u",
+                    m.entity.GetName().GetText(), shown.incarnation, shown.hitPoints, now - m.latestTicks);
         }
         const bool firstDeath = !m.killed;
         m.killed = (shown.flags & 1) != 0;
@@ -3749,6 +3753,7 @@ bool HostPresentationAvailable(eCEntity const* entity)
     if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
     const auto& mirror = found->second;
     if (mirror.entity.GetInstance() != entity) return false;
+    if (mirror.released) return net::Connected() && HostReleasePending(identity);
     return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
         npcplayback::PoseInterval(mirror.latest));
 }
@@ -3760,6 +3765,41 @@ bool HostStreamFresh(uint8_t const identity[16])
     auto const& mirror = found->second;
     return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
         npcplayback::PoseInterval(mirror.latest));
+}
+
+bool HostStreamClaimed(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    return found != mirrors.end() && npclease::HostClaim(net::Connected(),
+        found->second.hostSession == net::WelcomeSerial(), found->second.released, found->second.records);
+}
+
+bool HostReleasePending(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
+    auto const& mirror = found->second;
+    auto const& track = mirror.body.track;
+    return npclease::ReleasePending(mirror.released, track.count, track.haveRenderTime,
+        track.renderSent, mirror.latest.sent, body::PendingEvents(track));
+}
+
+uint32_t HostStreamDelay()
+{
+    uint32_t youngest = UINT32_MAX;
+    const uint32_t now = net::Now();
+    for (auto const& item : mirrors) {
+        auto const& mirror = item.second;
+        if (!npclease::HostClaim(net::Connected(), mirror.hostSession == net::WelcomeSerial(),
+                mirror.released, mirror.records) || (mirror.latest.flags & 1)) continue;
+        auto const& track = mirror.body.track;
+        const uint32_t age = track.haveOffset
+            ? static_cast<uint32_t>(std::max(static_cast<int32_t>(
+                now - static_cast<uint32_t>(track.offset) - mirror.latest.sent), 0))
+            : now - mirror.latestTicks;
+        youngest = std::min(youngest, age);
+    }
+    return youngest == UINT32_MAX ? 0 : youngest;
 }
 
 bool HostStreamSeen() { return hostStreamSeen && hostStreamSession == net::WelcomeSerial(); }
@@ -4866,6 +4906,9 @@ void SyncReport(LogFn log)
     log(line);
     unsigned tracked = 0, delaySum = 0, delayMax = 0;
     unsigned arrivalAgeMax = 0, transitExcessMax = 0, shownLagMax = 0, shownTracks = 0, underruns = 0;
+    unsigned backlogMax = 0, oldestAgeMax = 0, catchUpTracks = 0, catchUpFrames = 0;
+    size_t pendingEvents = 0;
+    uint64_t backlogSum = 0;
     uint64_t shownLagSum = 0;
     double jitterSum = 0.0, jitterMax = 0.0;
     const uint32_t now = net::Now();
@@ -4874,6 +4917,21 @@ void SyncReport(LogFn log)
         if (!track.count) continue;
         const unsigned d = static_cast<unsigned>(body::PlaybackDelay(track));
         ++tracked, delaySum += d, delayMax = std::max(delayMax, d);
+        const unsigned backlog = static_cast<unsigned>(std::max(track.backlogMs, 0));
+        const unsigned oldestAge = static_cast<unsigned>(std::max(static_cast<int32_t>(
+            now - static_cast<uint32_t>(track.offset) - body::OldestRetainedSent(track)), 0));
+        backlogSum += backlog;
+        backlogMax = std::max(backlogMax, backlog);
+        oldestAgeMax = std::max(oldestAgeMax, oldestAge);
+        catchUpTracks += track.catchUp ? 1u : 0u;
+        catchUpFrames += track.catchUpFrames;
+        pendingEvents += body::PendingEvents(track);
+        Format(line, "SYNCTRACK npc_hash=%08X owner=%u samples=%d buffer_ms=%u oldest_sample_age_ms=%u "
+                     "arrival_age_ms=%u transit_excess_ms=%d backlog_ms=%u catchup=%d protected=%d pending_events=%zu",
+               net::HashGuid(reinterpret_cast<uint8_t const*>(entry.first.data())), entry.second.owner,
+               track.count, d, oldestAge, now - track.lastArrived, track.transitExcessMs, backlog,
+               track.catchUp ? 1 : 0, track.combatClockProtected ? 1 : 0, body::PendingEvents(track));
+        log(line);
         jitterSum += track.jitterMs;
         jitterMax = std::max(jitterMax, static_cast<double>(track.jitterMs));
         arrivalAgeMax = std::max(arrivalAgeMax, now - track.lastArrived);
@@ -4894,10 +4952,13 @@ void SyncReport(LogFn log)
            tracked ? delaySum / tracked : 0u, delayMax, localBlowsJudged, localBlowsOutOfReach);
     log(line);
     Format(line, "SYNCLATENCY tracked=%u shown=%u buffer_avg_ms=%u buffer_max_ms=%u shown_lag_avg_ms=%u shown_lag_max_ms=%u "
-                 "arrival_age_max_ms=%u transit_excess_max_ms=%u jitter_avg_ms=%.1f jitter_max_ms=%.1f underruns=%u",
+                 "arrival_age_max_ms=%u transit_excess_max_ms=%u jitter_avg_ms=%.1f jitter_max_ms=%.1f underruns=%u "
+                 "backlog_avg_ms=%u backlog_max_ms=%u oldest_sample_age_max_ms=%u catchup_tracks=%u catchup_frames=%u pending_events=%zu",
            tracked, shownTracks, tracked ? delaySum / tracked : 0u, delayMax,
            shownTracks ? static_cast<unsigned>(shownLagSum / shownTracks) : 0u, shownLagMax,
-           arrivalAgeMax, transitExcessMax, tracked ? jitterSum / tracked : 0.0, jitterMax, underruns);
+           arrivalAgeMax, transitExcessMax, tracked ? jitterSum / tracked : 0.0, jitterMax, underruns,
+           tracked ? static_cast<unsigned>(backlogSum / tracked) : 0u, backlogMax, oldestAgeMax,
+           catchUpTracks, catchUpFrames, pendingEvents);
     log(line);
     if (net::IsHost()) {
         // Achieved update interval per scheduling tier since the previous report (interval-paced updates only), and how many

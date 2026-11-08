@@ -114,6 +114,10 @@ bool Player(eCEntity const* entity)
     return entity && (entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody() ||
                       remote::IsPuppet(entity) || entity->GetPropertySet(eEPropertySetType_PlayerMemory));
 }
+bool HostWins(GuidKey const& key)
+{
+    return npcs::HostStreamClaimed(key.data()) && npcs::HostStreamRecords(key.data()) >= 2;
+}
 bool CapacityAvailable()
 {
     if (entries.size() < MaxLeases) return true;
@@ -832,6 +836,12 @@ GEInt GE_STDCALL Kill(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
 {
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     Entry* entry = Find(victim);
+    if (!ai::ShuttingDown() && !net::IsHost() && victim && !Player(victim) && HostWins(Key(victim))) {
+        ++repeatedDeaths;
+        OwnEvent(Key(victim), victim->GetName().GetText(), npcown::Event::Refused,
+            "path=Kill reason=unreleased host authority; native death refused");
+        return 1;
+    }
     if (!ai::ShuttingDown() && entry && entry->lease.epoch &&
         (Fenced(victim) || (entry->lease.state.effects & NativeDeath))) {
         ++repeatedDeaths;
@@ -1019,6 +1029,10 @@ void RegisterProcessing(GuidKey const& key, Entry& entry, eCEntity* entity)
 // Immediate client-first ownership of an NPC the host does not present. Returns nullptr on success, else the reason.
 char const* TakeOver(eCEntity* entity, GuidKey const& key, uint32_t now)
 {
+    if (npcs::HostStreamClaimed(key.data())) return "unreleased host authority";
+    if (npcs::HostReleasePending(key.data())) return "final host state awaiting presentation";
+    if (!npcown::AcquisitionTimely(npcs::HostStreamDelay(), net::RoundTrip(1)))
+        return "host stream stale; authority unknown";
     Entry& entry = entries[key];
     Checkpoint state;
     if (!CaptureNative(entity, state)) return "native checkpoint invalid";
@@ -1118,7 +1132,8 @@ void MaintainOwners(uint32_t now)
         auto* entity = npcs::NpcByGuid(key.data());
         if (entry.cut && !entry.local) {
             // Hand-back pending: the host commits from the cut state; if it cannot (not loaded near the host) the NPC lives on.
-            if (entity && now - entry.cutAt >= npcown::CutReclaimMs && !npcs::HostStreamFresh(key.data()) &&
+            if (entity && now - entry.cutAt >= npcown::CutReclaimMs && !npcs::HostStreamClaimed(key.data()) &&
+                npcown::AcquisitionTimely(npcs::HostStreamDelay(), net::RoundTrip(1)) &&
                 !persist::CheckpointBusy()) {
                 entry.cut = false; entry.lease.epoch = 0; entry.lease.phase = Phase::Host; entry.window.Reset(0);
                 if (const char* why = TakeOver(entity, key, now)) {
@@ -1133,7 +1148,7 @@ void MaintainOwners(uint32_t now)
         }
         if (!entry.local) continue;
         if (!entity) continue; // unloaded by the engine: suspended, state kept for its return
-        if (entry.ownedEntity != entity) {
+        if (entry.ownedEntity != entity && !HostWins(key)) {
             // The engine reloaded the entity under a new instance: restore the latest local state into it once it is
             // processable (ownership and the checkpoint are retained meanwhile).
             if (!NativeReady(entity)) continue;
@@ -1158,11 +1173,8 @@ void MaintainOwners(uint32_t now)
 
         npcown::OwnerFacts facts;
         facts.role = RoleOf(entity, false);
-        // A terminally dead owner keeps its corpse (XP/loot already paid natively; the host is told on confirmation); a
-        // single stray in-flight host record never counts as presentation (two accepted records are required).
-        const bool terminalDeath = entry.lease.state.dead && (entry.lease.state.effects & NativeDeath);
-        facts.hostPresenting = !terminalDeath && npcs::HostStreamFresh(key.data()) &&
-            npcs::HostStreamRecords(key.data()) >= 2;
+        // A single in-flight record does not revoke an established owner. Proven host authority wins even over a local death.
+        facts.hostPresenting = HostWins(key);
         facts.hostRecallDue = entry.recallAt && entry.confirmed && captured &&
             npc.Routine.AIMode != gEAIMode_Talk &&
             (!state.busy || now - entry.recallAt >= RecallWaitMs) && TransferableStatus(state);
@@ -1247,6 +1259,11 @@ void ScanClient(uint32_t now)
     if (!sessionReadyAt) sessionReadyAt = now ? now : 1;
     const bool settled = npcown::StreamSettled(now, sessionReadyAt, npcs::HostStreamSeen());
     const bool census = !ownReportAt || now - ownReportAt >= 5000;
+    const uint32_t streamDelay = npcs::HostStreamDelay(), roundTrip = net::RoundTrip(1);
+    const bool streamUncertain = !npcown::AcquisitionTimely(streamDelay, roundTrip);
+    if (census)
+        Logf("NPCOWNSTREAM state_age_ms=%u rtt_ms=%u uncertain=%u claim_policy=unreleased owner_gap_policy=keep",
+            streamDelay, roundTrip, streamUncertain ? 1u : 0u);
     npcown::OwnStats snap;
     std::unordered_map<std::string, unsigned> visual, waits, refusedNow;
     const auto* all = world::ProcessedEntities();
@@ -1267,7 +1284,9 @@ void ScanClient(uint32_t now)
         facts.installed = installed;
         facts.configEnabled = GetConfig().npcAuthorityFallback;
         facts.nativeReady = NativeReady(entity);
-        facts.hostPresenting = npcs::HostPresentationAvailable(entity) || npcs::HostStreamFresh(key.data());
+        facts.hostPresenting = npcs::HostStreamClaimed(key.data());
+        facts.hostStreamUncertain = streamUncertain;
+        facts.hostReleasePending = npcs::HostReleasePending(key.data());
         facts.settled = settled;
         facts.cooldownHeld = found != entries.end() && npcown::CooldownHeld(now, found->second.yieldedAt);
         facts.alreadyOwned = found != entries.end() && found->second.local && found->second.ownedEntity == entity;
@@ -1370,13 +1389,14 @@ void TickClient(uint32_t now)
 
 bool LocalAuthority(eCEntity const* entity)
 {
-    return ReadGuard(entity).Local(net::Now());
+    return ReadGuard(entity).Local(net::Now()) && !HostWins(Key(entity));
 }
 bool ProcessingAuthority(eCEntity const* entity)
 {
     auto* hero = remote::ControlledBody();
     return entity && hero && !net::IsHost() && !npcs::RedundantClientEntity(entity) &&
-        !npcremoval::Suppressed(entity) && LeaseProcessingRange(ReadGuard(entity).Processing(net::Now()),
+        !npcremoval::Suppressed(entity) && !HostWins(Key(entity)) &&
+        LeaseProcessingRange(ReadGuard(entity).Processing(net::Now()),
         (entity->GetWorldPosition() - hero->GetWorldPosition()).GetMagnitude());
 }
 void NoteHit(eCEntity* victim, eCEntity* source, char const* path, int before, int after)

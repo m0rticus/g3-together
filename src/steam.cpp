@@ -31,6 +31,7 @@
 #include "steam_send.h"
 #include "enet_policy.h"
 #include "steam_config.h"
+#include "steam_diagnostics.h"
 
 #include "config.h"
 #include "crashlog.h"
@@ -241,24 +242,13 @@ bool ready = false, tried = false, winsockStarted = false, apiInitialized = fals
 char error[256] = "";
 HSteamPipe pipe = 0;
 void *user = nullptr, *matchmaking = nullptr, *friends = nullptr, *messages = nullptr;
+void* networkingUtils = nullptr;
 u64 me = 0;
 char persona[64] = "";
 char playerName[24] = "";
 unsigned sendFailures = 0;
 config::Applied networkingConfig[4];
 bool networkingConfigured = false;
-#pragma pack(push, 8)
-struct SessionStatus {
-    int32_t state = 0, ping = 0;
-    float qualityLocal = 0, qualityRemote = 0;
-    float outPackets = 0, outBytes = 0, inPackets = 0, inBytes = 0;
-    int32_t sendRate = 0, pendingUnreliable = 0, pendingReliable = 0, sentUnackedReliable = 0;
-    int64_t queueMicros = 0;
-    int32_t maxJitterMicros = 0, reserved[15] = {};
-};
-#pragma pack(pop)
-static_assert(sizeof(SessionStatus) == 120 && offsetof(SessionStatus, queueMicros) == 48,
-              "Steamworks.NET 2025.164.1 realtime status ABI");
 unsigned isolatedDrops = 0;
 uint32_t lastSendFailure = 0, lastDiagnostics = 0;
 
@@ -1588,8 +1578,60 @@ void DrainDatagrams(Remote& r)
     }
 }
 
+config::Read ReadNetworkingConfig(int id)
+{
+    config::Read read;
+    if (!networkingUtils || !api.GetConfigValue) return read;
+    size_t size = sizeof(read.value);
+    read.result = api.GetConfigValue(networkingUtils, id, config::GlobalScope, 0, &read.type, &read.value, &size);
+    if (size != sizeof(read.value)) read.type = 0;
+    return read;
+}
+
+void TransportConfigDiagnostics()
+{
+    const auto ice = ReadNetworkingConfig(diagnostics::IceEnable);
+    const auto icePenalty = ReadNetworkingConfig(diagnostics::IcePenalty);
+    const auto sdrPenalty = ReadNetworkingConfig(diagnostics::SdrPenalty);
+    size_t stunBytes = 0;
+    int stunType = 0, stunResult = 0;
+    if (networkingUtils && api.GetConfigValue)
+        stunResult = api.GetConfigValue(networkingUtils, diagnostics::StunServerList,
+                                       config::GlobalScope, 0, &stunType, nullptr, &stunBytes);
+    Logf("steam: transport-config scope=global action=read-only ice_enable=%d ice_valid=%u ice_read_result=%d "
+         "ice_penalty_ms=%d ice_penalty_valid=%u sdr_penalty_ms=%d sdr_penalty_valid=%u "
+         "stun_list_bytes=%zu stun_type=%d stun_read_result=%d "
+         "ice_default_minus_one=Steam-user-policy peer_resolved_config_available=0",
+         ice.value, ice.Valid() ? 1u : 0u, ice.result, icePenalty.value, icePenalty.Valid() ? 1u : 0u,
+         sdrPenalty.value, sdrPenalty.Valid() ? 1u : 0u, stunBytes, stunType, stunResult);
+    const auto initial = ReadNetworkingConfig(diagnostics::TimeoutInitial);
+    const auto connected = ReadNetworkingConfig(diagnostics::TimeoutConnected);
+    const auto mtu = ReadNetworkingConfig(diagnostics::MtuPacketSize);
+    const auto unencrypted = ReadNetworkingConfig(diagnostics::Unencrypted);
+    Logf("steam: transport-config scope=global action=read-only timeout_initial_ms=%d timeout_initial_valid=%u "
+         "timeout_connected_ms=%d timeout_connected_valid=%u mtu_packet_bytes=%d mtu_valid=%u "
+         "unencrypted=%d unencrypted_valid=%u",
+         initial.value, initial.Valid() ? 1u : 0u, connected.value, connected.Valid() ? 1u : 0u,
+         mtu.value, mtu.Valid() ? 1u : 0u, unencrypted.value, unencrypted.Valid() ? 1u : 0u);
+}
+
 void SendDiagnostics(uint32_t now)
 {
+    if (CountLinked()) {
+        config::Read current[4];
+        bool verified = networkingConfigured;
+        for (unsigned i = 0; i < 4; ++i) {
+            current[i] = ReadNetworkingConfig(config::Settings[i].id);
+            verified = verified && current[i].Valid() && current[i].value >= networkingConfig[i].requested;
+        }
+        Logf("steam-send: config-current scope=global verified=%u connection_config_verified=0 "
+             "send_buffer=%d send_buffer_valid=%u send_rate_min=%d send_rate_min_valid=%u "
+             "send_rate_max=%d send_rate_max_valid=%u nagle_us=%d nagle_valid=%u action=read-only",
+             verified ? 1u : 0u, current[0].value, current[0].Valid() ? 1u : 0u,
+             current[1].value, current[1].Valid() ? 1u : 0u, current[2].value, current[2].Valid() ? 1u : 0u,
+             current[3].value, current[3].Valid() ? 1u : 0u);
+        TransportConfigDiagnostics();
+    }
     for (auto& r : remotes) {
         if (!r.linked) continue;
         auto const& c = r.pending.counters;
@@ -1616,17 +1658,31 @@ void SendDiagnostics(uint32_t now)
         if (api.GetSessionConnectionInfo) {
             char identity[160];
             Identity(identity, r.id);
-            SessionStatus status;
-            const int state = api.GetSessionConnectionInfo(messages, identity, nullptr, &status);
+            diagnostics::ConnectionInfo info;
+            diagnostics::SessionStatus status;
+            const int state = api.GetSessionConnectionInfo(messages, identity, &info, &status);
+            const bool current = diagnostics::Current(state, info, status);
+            const auto description = diagnostics::Description(info);
+            Logf("steam: path peer=%llu transport=%s evidence=%s available=%u state=%d info_state=%d status_state=%d "
+                 "flags=0x%x pop_relay=0x%08x pop_remote=0x%08x peer_address_present=%u "
+                 "ping_ms=%d est_bandwidth_bytes_per_s=%d estimate_kind=Steam-send-rate-not-link-speed "
+                 "pending_unreliable_bytes=%d pending_reliable_bytes=%d queue_us=%lld "
+                 "description=\"%s\" address_tokens=redacted",
+                 r.id, diagnostics::Transport(state, info, status), diagnostics::Evidence(state, info, status),
+                 current ? 1u : 0u, state, info.state, status.state, static_cast<unsigned>(info.flags),
+                 info.popRelay, info.popRemote, diagnostics::HasRemoteAddress(info) ? 1u : 0u,
+                 status.ping, status.sendRate, status.pendingUnreliable, status.pendingReliable,
+                 static_cast<long long>(status.queueMicros), description.data());
             Logf("steam-send: session peer=%llu available=%u state=%d ping_ms=%d "
                  "send_rate_bytes_per_s=%d pending_unreliable_bytes=%d pending_reliable_bytes=%d "
                  "sent_unacked_reliable_bytes=%d queue_us=%lld out_packets_per_s=%.1f out_bytes_per_s=%.1f "
                  "quality_local=%.3f quality_remote=%.3f",
-                 r.id, state == 3 ? 1u : 0u, state, status.ping, status.sendRate,
+                 r.id, current ? 1u : 0u, state, status.ping, status.sendRate,
                  status.pendingUnreliable, status.pendingReliable, status.sentUnackedReliable,
                  static_cast<long long>(status.queueMicros), status.outPackets, status.outBytes,
                  status.qualityLocal, status.qualityRemote);
         } else {
+            Logf("steam: path peer=%llu transport=unknown available=0 reason=status-export-unavailable", r.id);
             Logf("steam-send: session peer=%llu available=0 reason=status-export-unavailable", r.id);
         }
         for (unsigned result = 0; result < 128; ++result)
@@ -1830,35 +1886,31 @@ bool Load()
     return true;
 }
 
-bool ConfigureNetworking(void* utils)
+bool ConfigureNetworking()
 {
-    if (!utils || !api.SetConfigValue || !api.GetConfigValue) {
+    if (!networkingUtils || !api.SetConfigValue || !api.GetConfigValue) {
         Log("steam-send: config unavailable action=keep-Steam-defaults; capacity not verified (older stand-in/API)");
         return true;
     }
-    auto get = [&](int id) {
-        config::Read read;
-        size_t size = sizeof(read.value);
-        read.result = api.GetConfigValue(utils, id, config::GlobalScope, 0, &read.type, &read.value, &size);
-        if (size != sizeof(read.value)) read.type = 0;
-        return read;
-    };
     bool verified = true;
     for (unsigned i = 0; i < 4; ++i) {
         auto const& setting = config::Settings[i];
         auto& applied = networkingConfig[i];
-        applied = config::Apply(setting, get, [&](int id, int32_t value) {
-            return api.SetConfigValue(utils, id, config::GlobalScope, 0, config::Int32, &value) != 0;
+        applied = config::Apply(setting, ReadNetworkingConfig, [&](int id, int32_t value) {
+            return api.SetConfigValue(networkingUtils, id, config::GlobalScope, 0, config::Int32, &value) != 0;
         });
         Logf("steam-send: config scope=global name=%s before=%d requested=%d effective=%d "
              "read_result=%d/%d set=%s verified=%u action=%s",
              setting.name, applied.before.value, applied.requested, applied.after.value,
              applied.before.result, applied.after.result,
              !applied.attempted ? "unchanged" : applied.accepted ? "accepted" : "rejected",
-             applied.Verified() ? 1u : 0u, setting.capacity ? "capacity-headroom" : "preserve-default");
+             applied.Verified() ? 1u : 0u, setting.id == config::SendRateMin ? "manual-send-rate-floor" :
+                 setting.capacity ? "capacity-headroom" : "preserve-default");
         verified = verified && applied.Verified();
     }
     networkingConfigured = verified;
+    Log("steam-send: rate_policy=manual-headroom adaptive_bandwidth_probe=not-assumed "
+        "queued-data-only=1 warning=offered-traffic-must-fit-real-upload; no-NPC-cap-or-shedding");
     return verified;
 }
 }
@@ -1895,11 +1947,13 @@ bool Start(bool host, unsigned short port)
     user = api.User();
     matchmaking = api.Matchmaking();
     friends = api.Friends();
+    networkingUtils = api.Utils();
+    if (!ConfigureNetworking()) return Fail("Steam networking capacity configuration failed; see steam-send config");
+    TransportConfigDiagnostics();
+    // Messages creates an implicit P2P listener; install capacity defaults before it can inherit them.
     messages = api.Messages();
     if (!user || !matchmaking || !friends || !messages) return Fail("Steam interfaces missing");
-    void* utils = api.Utils();
-    if (!ConfigureNetworking(utils)) return Fail("Steam networking capacity configuration failed; see steam-send config");
-    if (utils) api.InitRelayNetworkAccess(utils);  // the relay network is ready by the first message
+    if (networkingUtils) api.InitRelayNetworkAccess(networkingUtils);  // ready by the first message
     me = api.UserSteamId(user);
     if (!me) return Fail("Steam did not provide a SteamID64");
     char const* steamName = api.PersonaName(friends);

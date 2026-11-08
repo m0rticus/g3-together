@@ -22,7 +22,7 @@ using HS = H::State;
 using M = LobbyMetadata;
 constexpr uint64_t Self = 7, Host = 101, Other = 202, Lobby = 1001, OtherLobby = 2002;
 constexpr uint32_t Start = 1000;
-constexpr unsigned Protocol = 77;
+constexpr unsigned Protocol = 78;
 
 Target HostTarget(uint64_t id = Host, char const* session = "default")
 {
@@ -568,12 +568,12 @@ void Frames()
     frame = Decode(std::string(buffer, n));
     assert(frame.type == 'L' && frame.lobby == 109775243837622925ULL && std::strcmp(frame.session, "default") == 0);
     for (auto why : {Why::WrongSession, Why::WrongProtocol, Why::Busy, Why::NotFriends, Why::HostError}) {
-        n = EncodeDecline(buffer, sizeof(buffer), why, "other", 77);
+        n = EncodeDecline(buffer, sizeof(buffer), why, "other", Protocol);
         assert(n);
         frame = Decode(std::string(buffer, n));
         assert(frame.type == 'N' && DeclineWhy(frame.code) == why && DeclineCode(why) == frame.code);
         if (why == Why::WrongSession) assert(std::strcmp(frame.session, "other") == 0);
-        if (why == Why::WrongProtocol || why == Why::HostError) assert(frame.number == 77);
+        if (why == Why::WrongProtocol || why == Why::HostError) assert(frame.number == Protocol);
     }
     n = EncodeDecline(buffer, sizeof(buffer), Why::HostError, nullptr, 0);
     assert(Decode(std::string(buffer, n)).number == 0);
@@ -582,20 +582,20 @@ void Frames()
     assert(!EncodeOffer(buffer, sizeof(buffer), 0, "default"));
     assert(!EncodeJoin(buffer, sizeof(buffer), "bad!", Protocol));
     const std::vector<std::string> bad = {
-        "XXT1J default 77", "G3T1X default 77", "G3T1J default 77 extra",
-        "G3T1J default 77 ", "G3T1J  default 77", "G3T1J default  77",
+        "XXT1J default 78", "G3T1X default 78", "G3T1J default 78 extra",
+        "G3T1J default 78 ", "G3T1J  default 78", "G3T1J default  78",
         std::string("G3T1J default ") + char(1), std::string(129, 'x').replace(0, 5, "G3T1J"),
         "G3T1J default 0", "G3T1J default -1", "G3T1J default 65536",
         "G3T1J default 18446744073709551616", "G3T1L 0 default",
         "G3T1L 18446744073709551616 default", "G3T1N X -",
         "G3T1N B 1", "G3T1N F 0", "G3T1N P abc", "G3T1N E -1",
-        "G3T1N S bad!", "G3T1J default 77\n"
+        "G3T1N S bad!", "G3T1J default 78\n"
     };
     for (auto const& text : bad) assert(!DecodeFrame(text.data(), text.size(), &frame));
     assert(!IsFrame(nullptr, 0));
     unsigned char packet[g3t::steam::RelayMaxEnvelopeSize] = {};
     std::size_t packetSize = 0;
-    const char payload[] = "G3T1J default 77";
+    const char payload[] = "G3T1J default 78";
     constexpr uint64_t lobby = 109775243837622925ULL;
     assert(g3t::steam::RelayEncode(lobby, "default", payload, sizeof(payload) - 1,
                                    packet, sizeof(packet), &packetSize));

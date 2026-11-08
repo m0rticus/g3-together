@@ -109,9 +109,8 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         for ignored in ("leaseExpired", "hostSilent", "checkpointBusy", "paused", "registrationFailed",
                         "processingListsMissing", "outsideRing", "disconnected"):
             self.assertNotIn(ignored, release_policy)
-        self.assertIn("npcs::HostStreamFresh(key.data())", maintain)
-        self.assertIn("npcs::HostStreamRecords(key.data()) >= 2", maintain)
-        self.assertIn("!terminalDeath", maintain)
+        self.assertIn("facts.hostPresenting = HostWins(key)", maintain)
+        self.assertNotIn("terminalDeath", maintain)
         self.assertIn("npcown::Release(facts)", maintain)
         self.assertIn("if (facts.hostPresenting || !entry.confirmed || !captured)", maintain)
         self.assertIn("ReleaseLocal(key, entry, entity, true)", maintain)
@@ -406,15 +405,38 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("entry.lease.phase = Phase::Dormant", host)
         # A Commit(owner=1) is accepted even after the client already yielded to the host stream (no endless retransmits).
         self.assertIn("(entry.cut || entry.local || entry.lease.phase == Phase::Host)", client)
-        # Terminal death never yields; one stray host record never counts as presentation.
-        self.assertIn("const bool terminalDeath", maintain)
-        self.assertIn("npcs::HostStreamRecords(key.data()) >= 2", maintain)
+        # Local terminal death cannot overrule host authority; one stray record still cannot revoke an established owner.
+        self.assertNotIn("terminalDeath", maintain)
+        self.assertIn("facts.hostPresenting = HostWins(key)", maintain)
+        wins = section(self.runtime, "bool HostWins(", "bool CapacityAvailable(")
+        self.assertIn("npcs::HostStreamRecords(key.data()) >= 2", wins)
         # Native dialogue is busy and blocks a forced recall cut.
         self.assertIn("gEAIMode_Talk", capture)
         self.assertIn("npc.Routine.AIMode != gEAIMode_Talk", maintain)
         # A reloaded instance waits for native readiness without dropping ownership.
-        reload = section(maintain, "if (entry.ownedEntity != entity)", "ObserveProcessing(")
+        reload = section(maintain, "if (entry.ownedEntity != entity && !HostWins(key))", "ObserveProcessing(")
         self.assertLess(reload.index("if (!NativeReady(entity)) continue;"), reload.index("Activate(entity, entry, key.data())"))
         # One owner per NPC: only LOWER-numbered clients within reach take precedence, on both machines.
         self.assertIn("i < net::LocalId()", shared)
         self.assertIn("i < client", interest)
+
+    def test_stale_host_state_cannot_authorize_takeover_or_native_death(self):
+        takeover = section(self.runtime, "char const* TakeOver(", "void CutToHost(")
+        scan = section(self.runtime, "void ScanClient(", "void TickClient(")
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        kill = section(self.runtime, "GEInt GE_STDCALL Kill(", "bool Install(")
+        self.assertLess(takeover.index("HostStreamClaimed"), takeover.index("CaptureNative"))
+        self.assertLess(takeover.index("AcquisitionTimely"), takeover.index("Activate("))
+        self.assertIn("facts.hostPresenting = npcs::HostStreamClaimed(key.data())", scan)
+        self.assertIn("facts.hostStreamUncertain = streamUncertain", scan)
+        self.assertIn("facts.hostReleasePending = npcs::HostReleasePending(key.data())", scan)
+        self.assertIn("!npcs::HostStreamClaimed(key.data())", maintain)
+        self.assertIn("entry.ownedEntity != entity && !HostWins(key)", maintain)
+        self.assertLess(kill.index("HostWins(Key(victim))"), kill.index("return originalKill"))
+        self.assertIn("native death refused", kill)
+        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        claim = section(npcs, "bool HostStreamClaimed(", "uint32_t HostStreamDelay(")
+        self.assertNotIn("PresentationFresh", claim)
+        self.assertNotIn("latestTicks", claim)
+        self.assertIn("npclease::ReconcileLife(localDeath, m.killed, (shown.flags & 1) != 0)", npcs)
+        self.assertIn("NPCRECONCILE", npcs)

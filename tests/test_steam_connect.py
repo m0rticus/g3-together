@@ -28,7 +28,7 @@ class SteamConnectTests(unittest.TestCase):
             executable.unlink(missing_ok=True)
 
     def test_wire_and_header_dependencies(self):
-        self.assertIn("Protocol = 77", (ROOT / "src" / "saving_policy.h").read_text(encoding="utf-8"))
+        self.assertIn("Protocol = 78", (ROOT / "src" / "saving_policy.h").read_text(encoding="utf-8"))
         header = (ROOT / "src" / "steam_connect.h").read_text(encoding="utf-8")
         includes = re.findall(r'^\s*#\s*include\s*([<"][^>"]+[>"])', header, re.MULTILINE)
         self.assertEqual([name for name in includes if name.startswith('"')], ['"relaywire.h"'])

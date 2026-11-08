@@ -3,7 +3,8 @@
 
 // Engine-free decision table for client-processed NPCs.
 //
-// Principle: a client-loaded NPC is driven by the client exactly when the host is not presenting it (no fresh host stream).
+// Principle: an unreleased host stream retains authority even when its presentation is stale. New client ownership requires
+// a timely observation of host absence; already-owned client-only NPCs keep running through gaps.
 // The host handshake (npclease) is bookkeeping that runs asynchronously; it is never a precondition for animating or reacting
 // and a failed registration/lease/round trip never freezes a client-owned NPC.
 
@@ -49,7 +50,9 @@ struct Facts {
     bool installed = true;        // native authority guards (Kill/quest hooks) ready
     bool configEnabled = true;    // npc_authority_fallback
     bool nativeReady = true;      // processed + processable + animation actor
-    bool hostPresenting = false;  // fresh, unreleased host stream for this entity
+    bool hostPresenting = false;  // known, unreleased host stream for this entity, even when stale
+    bool hostStreamUncertain = false; // stale delivery cannot establish host absence
+    bool hostReleasePending = false; // play the final received host state before native acquisition
     bool settled = true;          // host stream settle grace elapsed (once per host session)
     bool cooldownHeld = false;    // just yielded to a host stream (anti-flap)
     bool alreadyOwned = false;
@@ -69,6 +72,8 @@ inline Decision Decide(Facts const& facts)
     if (!facts.installed) return {Verdict::Wait, "native authority guards initializing"};
     if (!facts.nativeReady) return {Verdict::Wait, "native processing/actor not ready"};
     if (!facts.settled) return {Verdict::Wait, "host stream settling"};
+    if (facts.hostReleasePending) return {Verdict::Wait, "final host state awaiting presentation"};
+    if (facts.hostStreamUncertain) return {Verdict::Wait, "host stream stale; authority unknown"};
     if (facts.cooldownHeld) return {Verdict::Wait, "host yield cool-down"};
     return {Verdict::ClientNative, "host not presenting"};
 }
@@ -79,6 +84,12 @@ inline Decision Decide(Facts const& facts)
 constexpr uint32_t StreamSettleMs = 2000;
 constexpr uint32_t YieldCooldownMs = 1500;
 constexpr uint32_t CutReclaimMs = 2500;
+constexpr uint32_t AuthorityObservationMs = 1500; // covers the idle heartbeat; a two-second backlog is not absence
+
+inline bool AcquisitionTimely(uint32_t stateAge, uint32_t roundTrip)
+{
+    return stateAge <= AuthorityObservationMs && roundTrip <= AuthorityObservationMs;
+}
 
 inline bool StreamSettled(uint32_t now, uint32_t sessionReadyAt, bool hostStreamSeen)
 {
@@ -94,7 +105,7 @@ inline bool CooldownHeld(uint32_t now, uint32_t yieldedAt)
 // game, a checkpoint, a failed registration, leaving the processing lists or the 100 m ring) only suspends diagnostics.
 struct OwnerFacts {
     RoleFacts role;
-    bool hostPresenting = false;     // fresh host stream: the host drives, the client discards its local state
+    bool hostPresenting = false;     // proven unreleased host stream: discard local state, including local death
     bool hostCommit = false;         // host announced it took the NPC (Commit owner=1 / Abort)
     bool hostRecallDue = false;      // host recalled it and a safe cut point was reached
     bool leaseExpired = false;

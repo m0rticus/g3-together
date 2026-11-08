@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include "net.h"
 
 namespace g3t::body {
@@ -10,6 +12,8 @@ constexpr int32_t BufferDelay = 100;
 constexpr int32_t MaxAhead = 100;
 constexpr int32_t NpcBufferFloor = 34;  // two 60 Hz intervals rounded up; no NPC extrapolation
 constexpr int32_t PlayerBufferFloor = 50;  // preserve the existing predictive puppet policy
+constexpr int32_t MaximumBufferDelay = 500;
+constexpr float MaximumTravelSpeed = 3000.0f;  // cm/s
 
 struct MotionState
 {
@@ -30,6 +34,7 @@ struct MotionState
     float damageMultiplier = 0.0f;
     uint8_t contact = 0;
     uint8_t attitude = 0;
+    bool locomotion = false;  // player animation name was classified as locomotion by the receiver
     net::NpcMotion motions[net::NpcMotionSlots];
 };
 
@@ -45,6 +50,11 @@ struct Track
         MotionState motion;
     };
     Snap snaps[SnapshotCount];
+    std::deque<Snap> pendingEvents;
+    Snap retained;
+    bool haveRetained = false;
+    MotionState presentedMotion;
+    bool havePresentedMotion = false;
     int count = 0;
     int32_t offset = 0;
     bool haveOffset = false;
@@ -62,7 +72,17 @@ struct Track
     uint32_t poseIntervalMs = 0;
     float jitterMs = 0.0f;
     int32_t delayMs = BufferDelay;
+    int32_t transitExcessMs = 0, backlogMs = 0;
+    float recentTransitMs = 0.0f;
+    double delayDecayCredit = 0.0;
+    uint32_t adaptiveAt = 0;
+    bool haveAdaptiveTime = false;
+    bool catchUp = false;
+    unsigned catchUpFrames = 0;
     bool combatClockProtected = false;
+    float lastPlayerPosition[3] = {};
+    uint32_t lastPlayerNow = 0;
+    bool havePlayerPosition = false, playerWasPredicted = false, playerReconciling = false;
     // Diagnostics only: spacing of received updates since the last SYNCSTREAM report (arrival clock).
     uint32_t gapCount = 0, gapMinMs = UINT32_MAX, gapMaxMs = 0;
     uint64_t gapSumMs = 0;
@@ -82,6 +102,8 @@ extern bool arrivalSpeed;
 extern unsigned sampledBetween, sampledAhead, sampledHeld, sampledOldest;
 float Distance(float const a[3], float const b[3]);
 int32_t PlaybackDelay(Track const& track);
+std::size_t PendingEvents(Track const& track);
+uint32_t OldestRetainedSent(Track const& track);
 void SetPoseInterval(Track& track, uint32_t interval);
 bool IsLocomotionMotion(char const* motion);
 void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived, int movementMode = -1,

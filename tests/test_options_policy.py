@@ -54,7 +54,7 @@ class OptionsPolicyTests(unittest.TestCase):
 
     def test_wire_adopts_before_admission_and_preserves_protocol(self):
         net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
-        self.assertIn("Protocol = 77", (ROOT / "src" / "saving_policy.h").read_text())
+        self.assertIn("Protocol = 78", (ROOT / "src" / "saving_policy.h").read_text())
         self.assertIn("struct Hello { uint8_t type; uint16_t version; char name[24]; uint64_t parity[parity::ItemCount]; };", net)
         welcome = net.split("} else if (type == MsgWelcome", 1)[1].split("} else if", 1)[0]
         self.assertLess(welcome.index("options::Adopt"), welcome.index("connected = true"))

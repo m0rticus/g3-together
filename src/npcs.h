@@ -22,6 +22,12 @@ bool HostPresentationAvailable(eCEntity const* entity);
 // Freshness of the host's stream for this GUID, independent of whether a mirror is bound to a live entity. A client-owned NPC
 // is never bound to a mirror, so this is how it learns that the host is presenting it (the host wins; the client yields).
 bool HostStreamFresh(uint8_t const guid[16]);
+// Stale presentation is not an authority release. This does not require a bound native instance or recent delivery.
+bool HostStreamClaimed(uint8_t const guid[16]);
+// A reliable release does not discard buffered final state/events or authorize takeover from an older displayed state.
+bool HostReleasePending(uint8_t const guid[16]);
+// Age of the newest live host NPC state against its minimum-transit reference; zero when no live stream is claimed.
+uint32_t HostStreamDelay();
 // Records received from the host in this welcome session (the host's first stream batch has arrived).
 bool HostStreamSeen();
 // Accepted host records since this GUID's mirror was created: one stray in-flight record must not make an owner yield.

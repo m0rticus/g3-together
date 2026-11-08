@@ -143,7 +143,7 @@ static void QuaternionFidelity()
     bytes.push_back(0);
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, id) == Status::Malformed);
     bytes = valid;
-    bytes[7] = 4;
+    bytes[7] = 8;
     decoded = canonical;
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, id) == Status::Malformed);
 }

@@ -55,8 +55,21 @@ class History {
         std::vector<Bone> bones;
     };
     std::vector<Frame> frames;
+    uint32_t sampledSent = 0;
+    bool haveSampled = false;
+
+    void Prune()
+    {
+        size_t consumed = 0;
+        while (frames.size() - consumed > HistorySize && haveSampled &&
+               static_cast<int32_t>(sampledSent - frames[consumed + 1].sent) >= 0)
+            ++consumed;
+        if (consumed) frames.erase(frames.begin(), frames.begin() + consumed);
+    }
 
 public:
+    size_t Size() const { return frames.size(); }
+
     bool Push(uint32_t incarnation, uint32_t sent, Bone const* bones, int count, uint8_t flags = 0)
     {
         if (!incarnation || !bones || count <= 0 || count > MaxBones || (flags & ~Facial)) return false;
@@ -64,14 +77,18 @@ public:
             const auto& last = frames.back();
             if (static_cast<int32_t>(incarnation - last.incarnation) < 0 ||
                 (incarnation == last.incarnation && static_cast<int32_t>(sent - last.sent) <= 0)) return false;
-            if (incarnation != last.incarnation) frames.clear();
+            if (incarnation != last.incarnation) {
+                frames.clear();
+                haveSampled = false;
+            }
         }
-        if (frames.size() == HistorySize) frames.erase(frames.begin());
         frames.push_back({incarnation, sent, flags, std::vector<Bone>(bones, bones + count)});
+        // Unpresented bones must outlive the matching queued action/root samples.
+        Prune();
         return true;
     }
 
-    bool Sample(uint32_t incarnation, uint32_t sent, std::vector<Transform>& result, uint8_t* flags = nullptr) const
+    bool Sample(uint32_t incarnation, uint32_t sent, std::vector<Transform>& result, uint8_t* flags = nullptr)
     {
         if (frames.empty() || frames.front().incarnation != incarnation ||
             static_cast<int32_t>(sent - frames.front().sent) < 0 ||
@@ -99,6 +116,9 @@ public:
             for (int k = 0; k < 12; ++k)
                 result[i].values[k] += (end.values[k] - result[i].values[k]) * fraction;
         }
+        if (!haveSampled || static_cast<int32_t>(sent - sampledSent) > 0) sampledSent = sent;
+        haveSampled = true;
+        Prune();
         return true;
     }
 };
