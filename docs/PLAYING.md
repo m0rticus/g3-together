@@ -174,6 +174,21 @@ opens a lobby on its own.
 - The Steam overlay may not open in Gothic 3. It is not needed: use the friends list in the Steam desktop client
   for **Join Game** or **Invite to Game**.
 
+#### If Shift+Tab does not open the Steam overlay
+
+Check **Steam > Settings > In-game > Enable the Steam Overlay while in-game**, then
+**Library > Gothic 3 > Properties > General > Enable the Steam Overlay while in-game**.
+Check the overlay shortcut in Steam's In-game settings; Shift+Tab is only the default.
+Apply any changes for your next normal Steam launch, not by interrupting a co-op session.
+
+The actual rendering process is `Gothic3Final.exe`; `Gothic3.exe` is the launcher.
+A loaded `gameoverlayrenderer.dll` or successful Steam initialization does not prove the overlay works.
+The supported CP script-DLL loader runs after graphics creation, so moving Steam initialization
+earlier within this mod cannot meet Valve's [pre-device initialization requirement](https://partner.steamgames.com/doc/features/overlay).
+Late attachment is a possible cause, not a verified explanation for every installation.
+Do not copy or manually inject Steam's overlay DLL into the game. If the checks do not help,
+use the desktop Steam friends list; accepting its invite preserves the normal invite-driven connection.
+
 #### Connecting step by step
 
 1. Both players set the same `session_id` and start Steam. The host starts Gothic 3 and begins or loads the campaign.

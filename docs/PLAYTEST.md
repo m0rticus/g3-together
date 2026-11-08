@@ -17,6 +17,14 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ## Before you start
 
+### Steam overlay (manual acceptance; no repair claimed)
+
+- [ ] Before the next normal Steam launch, check both global and Gothic 3 overlay settings and the configured shortcut.
+- [ ] Test that shortcut in the main menu and in the campaign. Record whether the overlay actually opens;
+  a renderer-DLL attach log alone is not a successful test. Steam's renderer log names `Gothic3Final.exe`, not the launcher.
+- [ ] If unavailable, send and accept an invite using the desktop Steam friends list and confirm normal co-op joining.
+  Do not inject an overlay DLL, change patches or restart a live session just to collect diagnostics.
+
 ### Real Steam world synchronization (manual acceptance)
 
 - [ ] On both endpoints expect `enet: host created ... channels=8 compress=on`.
