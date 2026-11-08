@@ -19,6 +19,18 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ### Real Steam world synchronization (manual acceptance)
 
+- [ ] On both endpoints expect `enet: host created ... channels=8 compress=on`.
+  After invite/hello, the client's `steam-send: first ENet datagram` must show
+  `command=2 command_header_bytes=48 action=classified-and-queued`; the host's
+  first command is VERIFY_CONNECT (3, 44 bytes). Both logs must then show
+  `enet: event ... type=connect(1)` and progressing data counters. Repeat departure/rejoin.
+  Unknown classifications must say `unclassified_enet_bytes=... first_bytes=...
+  action=sent-as-bulk`, not close the link. If it ends, collect the client's
+  `connect: client link ended: reason=... steam_state=... enet_state=... elapsed_ms=...`
+  and the host's `connect: host link ended` plus ENet event data/lobby callback flags.
+  The menu names the reason and distinguishes a link lost within five seconds.
+  The isolated build-65 copies would hit the same native CONNECT rejection;
+  earlier hand-built packet tests and pre-build-64 game runs did not exercise it.
 - [ ] Repeatedly accept the host's Steam invite, including immediately after the lobby opens.
   The client must connect without a false session/version mismatch. If metadata is delayed,
   its log should show `metadata pending` followed by `metadata arrived after ...: ok`;

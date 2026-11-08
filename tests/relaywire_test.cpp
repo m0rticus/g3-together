@@ -119,6 +119,18 @@ int main()
     assert(ParseEnetDataPacket(ack, sizeof(ack), &enet));
     assert(!enet.compressed && enet.protocolBytes == 10 && enet.ackBytes == 8);
 
+    unsigned char connect[4 + 48] = {};
+    connect[0] = 0x80;
+    connect[4] = 0x82;
+    connect[5] = 0xff;
+    connect[48] = 0x12; connect[49] = 0x34; connect[50] = 0xab; connect[51] = 0xcd;
+    assert(!ParseEnetDataPacket(connect, 4 + 44, &enet));
+    assert(!enet.valid && enet.firstCommand == 2 && enet.command == 2 &&
+           enet.commandOffset == 4 && enet.commandBytes == 48 && enet.remainingBytes == 44);
+    assert(ParseEnetDataPacket(connect, sizeof(connect), &enet));
+    assert(enet.valid && enet.firstCommand == 2 && enet.command == 2 &&
+           enet.commandOffset == 4 && enet.commandBytes == 48 && enet.protocolBytes == sizeof(connect));
+
     unsigned char reliable[19];
     std::memset(reliable, 0, sizeof(reliable));
     reliable[0] = 0x80; // sent-time ENet header

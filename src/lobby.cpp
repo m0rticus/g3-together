@@ -110,6 +110,8 @@ State Snapshot()
             case connect::ClientFlow::State::Lost:
                 state.phase = Phase::Lost;
                 strncpy_s(state.name, flow.name, _TRUNCATE);
+                strncpy_s(state.reason, flow.endReason, _TRUNCATE);
+                state.endedImmediately = flow.endedImmediately;
                 break;
             }
         }
@@ -175,7 +177,8 @@ void Format(State const& state, wchar_t* out, size_t size)
         _snwprintf_s(out, size, _TRUNCATE, i18n::Text(i18n::LobbyRequesting), name);
         break;
     case Phase::Lost:
-        _snwprintf_s(out, size, _TRUNCATE, i18n::Text(i18n::LobbyLost), name);
+        _snwprintf_s(out, size, _TRUNCATE,
+                     i18n::Text(state.endedImmediately ? i18n::LobbyLostImmediate : i18n::LobbyLost), name, reason);
         break;
     case Phase::Declined: {
         wchar_t hostSession[64] = {};

@@ -42,10 +42,6 @@ namespace g3t::net {
 namespace {
 constexpr uint16_t ProtocolVersion = saving::Protocol;  // 77: host-managed saves and guarded bone packing
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
-// UDP payload per datagram (ENet default 1392 = up to 1420-byte IP packets): VPNs such as Hamachi carry about 1400, so
-// stay well below (C, re/findings/hamachi-net-c.md, 21.10.). ENet splits larger messages into fragments of this size.
-constexpr enet_uint32 Mtu = 1200;
-enum : uint8_t { ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3, ChannelPoses = 4, ChannelPosesAlt = 5, ChannelBulk = 6, ChannelDefinitions = 7, ChannelCount = 8 };
 enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
 enum : uint8_t { MsgSave = 40, MsgBoneDictionary = 41, MsgBoneAck = 42, MsgBoneRequest = 43, MsgCompactPosedNpc = 44 };
 enum : uint8_t { MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 47,
@@ -697,7 +693,7 @@ void LeavePeer(ENetPeer* peer, char const* reason, bool disconnect)
     peer->data = nullptr;
     if (disconnect) enet_peer_disconnect_now(peer, 0);
     Drop(id);
-    if (!disconnect) steam::RequestHostRelayClose(account, relayGeneration);
+    if (!disconnect) steam::RequestHostRelayClose(account, relayGeneration, reason);
     const Leave leave{MsgLeave, id};
     for (uint8_t i = 2; i < MaxPlayers; ++i)
         if (peers[i]) Send(peers[i], &leave, sizeof(leave), ChannelReliable, true);
@@ -3206,6 +3202,9 @@ bool StartFailed(char const* reason)
 {
     strncpy_s(startupError, reason, _TRUNCATE);
     Logf("net: Steam-only connection failed: %s", startupError);
+    if (!isHost)
+        Logf("connect: client link ended: reason=%s stage=startup enet_state=%s elapsed_ms=0",
+             startupError, EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED));
     Stop();
     return false;
 }
@@ -3226,21 +3225,17 @@ bool Start(bool asHost)
     enetInitialized = true;
     target = ENetAddress{};
     if (enet_address_set_host_ip(&target, "127.0.0.1") != 0) return StartFailed("loopback address unavailable");
-    host = enet_host_create(&target, isHost ? MaxPlayers - 1 : 1, ChannelCount, 0, 0);
-    if (!host) return StartFailed("loopback ENet socket could not be created");
-    if (enet_host_compress_with_range_coder(host) != 0)
-        return StartFailed("ENet lossless compression context allocation failed");
+    char const* createError = nullptr;
+    host = CreateTransportHost(&target, isHost ? MaxPlayers - 1 : 1, createError);
+    if (!host) return StartFailed(createError);
+    Logf("enet: host created role=%s channels=%u compress=on mtu=%u port=%u",
+         isHost ? "host" : "client", ChannelCount, host->mtu, host->address.port);
     bandwidth = detail::BandwidthCounters{};
     bandwidthSince = enet_time_get();
     lastSentData = host->totalSentData;
     lastSentPackets = host->totalSentPackets;
     lastReceivedData = host->totalReceivedData;
     lastReceivedPackets = host->totalReceivedPackets;
-    host->mtu = Mtu;
-    constexpr int PoseBurstBuffer = 4 * 1024 * 1024;
-    if (enet_socket_set_option(host->socket, ENET_SOCKOPT_RCVBUF, PoseBurstBuffer) < 0 ||
-        enet_socket_set_option(host->socket, ENET_SOCKOPT_SNDBUF, PoseBurstBuffer) < 0)
-        return StartFailed("cannot configure the owned ENet socket for canonical pose bursts");
     if (!steam::Start(isHost, isHost ? host->address.port : 0)) return StartFailed(steam::Error());
     lastSteamTraffic = steam::Traffic();
     relayEnvelopeBytes = lastSteamTraffic.envelopeBytes;
@@ -3296,6 +3291,9 @@ void ProcessRelayDrops()
             if (hostRelayGeneration && hostRelayGeneration == drop.generation) {
                 Logf("peer: leave slot=1 steamid=%llu reason=%s clients=%u->0",
                      drop.account, drop.reason, connected ? 1u : 0u);
+                Logf("enet: relay closed role=client reason=%s state=%s elapsed_ms=%u",
+                     drop.reason, EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED),
+                     startedAt ? enet_time_get() - startedAt : 0);
                 CloseClientLink();
             }
             continue;
@@ -3327,6 +3325,13 @@ void Service(PlayerState const& local, bool haveLocal)
         if (result <= 0) break;
         switch (event.type) {
         case ENET_EVENT_TYPE_CONNECT:
+            Logf("enet: event role=%s type=connect(%u) data=%u state=%s(%u) channels=%zu elapsed_ms=%u",
+                 isHost ? "host" : "client", static_cast<unsigned>(event.type), event.data,
+                 EnetPeerStateName(event.peer->state), static_cast<unsigned>(event.peer->state), event.peer->channelCount,
+                 !isHost && startedAt ? enet_time_get() - startedAt : 0);
+            if (!isHost)
+                steam::NoteClientEnetState(event.peer->state, event.type, event.data,
+                                          startedAt ? enet_time_get() - startedAt : 0, "");
             if (isHost && (event.peer->address.host != target.host || !steam::IsPeerRelay(event.peer->address.port))) {
                 Log("net: rejected an ENet connection outside the linked Steam relays");
                 enet_peer_reset(event.peer);
@@ -3362,9 +3367,23 @@ void Service(PlayerState const& local, bool haveLocal)
             enet_packet_destroy(event.packet);
             break;
         case ENET_EVENT_TYPE_DISCONNECT:
+            Logf("enet: event role=%s type=disconnect(%u) data=%u state=%s(%u) channels=%zu elapsed_ms=%u",
+                 isHost ? "host" : "client", static_cast<unsigned>(event.type), event.data,
+                 EnetPeerStateName(event.peer->state), static_cast<unsigned>(event.peer->state), event.peer->channelCount,
+                 !isHost && startedAt ? enet_time_get() - startedAt : 0);
             if (isHost) {
-                LeavePeer(event.peer, event.data ? "disconnect" : "timeout-or-disconnect", false);
+                char reason[160];
+                Format(reason, "%s event_data=%u", event.data ? "disconnect" : "timeout-or-disconnect", event.data);
+                LeavePeer(event.peer, reason, false);
             } else {
+                char reason[160];
+                if (refused)
+                    Format(reason, "ENet connect refused: %.110s (disconnect event data=%u)", refusalReason, event.data);
+                else
+                    Format(reason, event.data ? "ENet disconnect event data=%u" : "ENet timeout or disconnect event data=%u",
+                           event.data);
+                steam::NoteClientEnetState(event.peer->state, event.type, event.data,
+                                          startedAt ? enet_time_get() - startedAt : 0, reason);
                 // The Steam link is the connection (invite-driven): once ENet was up, losing it ends the link too, and the player
                 // accepts the invite again. connection = auto keeps the legacy automatic reconnect over the live link.
                 const bool endLink = everConnected && steam::RequestClientDisconnect();
@@ -3383,7 +3402,10 @@ void Service(PlayerState const& local, bool haveLocal)
         }
     }
     if (events == 512) ++serviceCaps;
-    if (result < 0 && ++serviceErrors == 1) Log("net: ENet service failed; subsequent failures counted in RTT diagnostics");
+    if (result < 0 && ++serviceErrors == 1)
+        Logf("enet: service failed role=%s result=%d state=%s elapsed_ms=%u; subsequent failures counted in RTT diagnostics",
+             isHost ? "host" : "client", result, EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED),
+             !isHost && startedAt ? enet_time_get() - startedAt : 0);
     FlushGoodsReplays();
     const uint32_t now = enet_time_get();
     if (!isHost) {
@@ -3403,13 +3425,21 @@ void Service(PlayerState const& local, bool haveLocal)
             lastConnectAttempt = now - 3001;
             Log("net: the Steam link to the host is up; ENet connects through the relay");
         } else if (!linked && steamLinked) {
-            Log("net: the Steam link to the host ended; ENet connection closed (accept the invite again to reconnect)");
+            const auto flow = steam::Flow();
+            Logf("enet: relay closed role=client reason=%s state=%s elapsed_ms=%u",
+                 flow.endReason[0] ? flow.endReason : "relay no longer published",
+                 EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED), now - startedAt);
             CloseClientLink();
         }
     }
     if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {
         lastConnectAttempt = now;
-        server = enet_host_connect(host, &target, ChannelCount, 0);
+        server = ConnectTransportHost(host, &target);
+        steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
+                                  now - startedAt, server ? "" : "ENet connect refused (no free peer)");
+        Logf("enet: connect request role=client channels=%u compress=on relay_port=%u result=%s state=%s elapsed_ms=%u",
+             ChannelCount, target.port, server ? "pending" : "refused",
+             EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED), now - startedAt);
         if (!connectLogged) Logf("net: connecting over Steam (relay 127.0.0.1:%u): %s", target.port, server ? "pending" : "failed");
         else Log(server ? "net: reconnecting" : "net: reconnect failed");
         connectLogged = true;
@@ -3641,8 +3671,12 @@ void Reconnect(void (*log)(char const*))
     connected = false;
     inWorld = false;
     for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
-    server = enet_host_connect(host, &target, ChannelCount, 0);
+    server = ConnectTransportHost(host, &target);
     lastConnectAttempt = enet_time_get();
+    steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
+                              startedAt ? lastConnectAttempt - startedAt : 0, server ? "" : "ENet QA reconnect refused");
+    Logf("enet: connect request role=client channels=%u compress=on relay_port=%u result=%s source=QA-reconnect",
+         ChannelCount, target.port, server ? "pending" : "refused");
     Log("net: QA reconnect: left the host and connecting again");
     log(server ? "RECONNECT ok=1" : "RECONNECT ok=0");
 }

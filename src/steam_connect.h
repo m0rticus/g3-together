@@ -27,6 +27,11 @@ constexpr uint32_t RequestWaitMs = 20000;   // client: no answer to the join req
 constexpr uint32_t RequestResendMs = 4000;  // client: the request is sent again (idempotent on the host) until answered
 constexpr uint32_t LobbyWaitMs = 15000;     // client: lobby metadata / JoinLobby answer
 constexpr uint32_t LobbyMetadataWaitMs = 8000;  // client: Steam has not delivered both lobby data keys
+constexpr uint32_t ImmediateLinkEndMs = 5000;
+inline bool LinkEndedImmediately(bool hadLink, uint32_t elapsedMs)
+{
+    return hadLink && elapsedMs < ImmediateLinkEndMs;
+}
 constexpr uint32_t HelloWaitMs = 20000;     // client: lobby entered, the host has not welcomed us
 constexpr uint32_t CreateWaitMs = 15000;    // host: CreateLobby has not answered
 constexpr uint32_t OfferWaitMs = 60000;     // host: the invited partner has not said hello

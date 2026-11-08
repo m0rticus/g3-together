@@ -889,6 +889,13 @@ void SupersessionAndWrap()
 
 int main()
 {
+    assert(!LinkEndedImmediately(false, 0));
+    assert(!LinkEndedImmediately(false, ImmediateLinkEndMs - 1));
+    assert(LinkEndedImmediately(true, 0));
+    assert(LinkEndedImmediately(true, ImmediateLinkEndMs - 1));
+    assert(!LinkEndedImmediately(true, ImmediateLinkEndMs));
+    assert(!LinkEndedImmediately(true, ImmediateLinkEndMs + 1));
+    assert(ImmediateLinkEndMs == 5000);
     ClientTable();
     HostTable();
     ConnectStrings();

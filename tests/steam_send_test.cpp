@@ -113,9 +113,60 @@ static void SplittingAndRetransmissions()
     assert(queue.Depth() == 1);
     auto invalid = pose;
     invalid.pop_back();
-    assert(!queue.Push(codec, invalid.data(), invalid.size(), 40));
-    assert(queue.Depth() == 1);
+    assert(queue.Push(codec, invalid.data(), invalid.size(), 40));
+    assert(queue.Depth() == 2 && queue.counters.unclassified == 1);
     assert(!queue.Push(codec, nullptr, 0, 40));
+}
+
+static void UnclassifiedRetention()
+{
+    Codec codec;
+    Queue queue;
+    const std::vector<std::vector<uint8_t>> unknown = {
+        {0x40, 0, 0xff},                    // compressed, invalid range coder stream
+        {0, 0, 0x0d, 0, 0, 0},             // unsupported command
+        {0x80, 0, 0, 1, 0x86, 0, 0, 1},   // truncated command
+        {0x40}                              // too short even to decode
+    };
+    std::vector<uint8_t> plain;
+    size_t bytes = 0;
+    for (auto const& packet : unknown) {
+        EnetPacketParse parse{};
+        assert(!codec.Decode(packet.data(), packet.size(), plain, &parse));
+        assert(queue.Push(codec, packet.data(), packet.size(), 10, &parse));
+        assert(!parse.valid);
+        bytes += packet.size();
+    }
+    assert(queue.Push(codec, unknown[1].data(), unknown[1].size(), 11)); // unknowns are never deduplicated
+    bytes += unknown[1].size();
+    assert(queue.Depth() == 5 && queue.Bytes() == bytes);
+    assert(queue.counters.unclassified == 5 && queue.counters.duplicates == 0);
+    assert(queue.counters.plainBytes == bytes && queue.counters.wireBytes == bytes);
+    assert(!queue.Push(codec, nullptr, 1, 10));
+    assert(!queue.Push(codec, unknown[0].data(), 0, 10));
+    std::vector<uint8_t> oversized(RelayPayloadLimit + 1);
+    assert(!queue.Push(codec, oversized.data(), oversized.size(), 10));
+    assert(queue.Depth() == 5 && queue.counters.unclassified == 5);
+
+    for (int result : {LimitExceeded, Ignored}) {
+        assert(queue.Drain([&](Item const& item) {
+            assert(!item.reliable && item.bytes == unknown[0]);
+            return result;
+        }) == result);
+        assert(queue.Depth() == 5 && queue.Bytes() == bytes);
+    }
+    assert(queue.counters.retries == 2 && queue.counters.failed[25] == 1 &&
+           queue.counters.failed[16] == 1 && queue.counters.unreliableFailed == 2);
+    size_t index = 0;
+    assert(queue.Drain([&](Item const& item) {
+        assert(!item.reliable && item.bytes == unknown[index < 4 ? index : 1]);
+        ++index;
+        return Ok;
+    }) == Ok);
+    assert(index == 5 && queue.Depth() == 0 && queue.Bytes() == 0);
+    assert(queue.counters.accepted[static_cast<unsigned>(Priority::Bulk)] == 5);
+    assert(queue.counters.unreliableAccepted == 5 &&
+           queue.counters.bytes[static_cast<unsigned>(Priority::Bulk)] == bytes);
 }
 
 static void FragmentRoundtrip()
@@ -232,6 +283,7 @@ int ENET_CALLBACK main()
 {
     RetentionAndPriority();
     SplittingAndRetransmissions();
+    UnclassifiedRetention();
     FragmentRoundtrip();
     PayloadSavings();
     SaturatedNpcStream();

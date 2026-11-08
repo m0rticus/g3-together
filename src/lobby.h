@@ -24,6 +24,7 @@ struct State
     steam::connect::Why why = steam::connect::Why::None;
     uint64_t arg = 0;
     char hostSession[64] = {};
+    bool endedImmediately = false;
 };
 
 State Snapshot();

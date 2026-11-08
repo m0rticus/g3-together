@@ -161,6 +161,71 @@ class SteamConnectTests(unittest.TestCase):
         self.assertIn("Steam did not deliver the lobby's data in time", self.source("src/i18n.cpp"))
         self.assertIn("Why::MetadataTimeout", self.source("src/lobby.cpp"))
 
+    def test_transport_factory_and_link_loss_diagnostics(self):
+        net = self.source("src/net.cpp")
+        steam = self.source("src/steam.cpp")
+        start = self.between(net, "bool Start(bool asHost)", "void Service(")
+        service = self.between(net, "void Service(", "void Flush()")
+        reconnect = self.between(net, "void Reconnect(void (*log)(char const*))", "\n}")
+        self.assertIn("CreateTransportHost(&target, isHost ? MaxPlayers - 1 : 1, createError)", start)
+        self.assertIn("ConnectTransportHost(host, &target)", service)
+        self.assertIn("ConnectTransportHost(host, &target)", reconnect)
+        self.assertNotIn("enet_host_create(", net)
+        self.assertNotIn("enet_host_connect(", net)
+        policy = self.source("src/enet_policy.h")
+        for required in ("ChannelDefinitions = 7", "ChannelCount = 8", "Mtu = 1200",
+                         "enet_host_create(address, peers, ChannelCount, 0, 0)",
+                         "enet_host_compress_with_range_coder(host)", "ENET_SOCKOPT_RCVBUF",
+                         "ENET_SOCKOPT_SNDBUF", "enet_host_connect(host, address, ChannelCount, 0)"):
+            self.assertIn(required, policy)
+
+        queued = self.between(steam, "bool QueueDatagram(", "void DrainDatagrams(")
+        classify = queued.split("catch (std::bad_alloc", 1)[0]
+        self.assertIn("r.pending.Push(*sendCodec, data, size, Now(), &parsed)", classify)
+        self.assertNotIn("Drop(", classify)
+        self.assertIn("if (!parsed.valid)", classify)
+        self.assertIn("return true;", classify)
+        self.assertIn("(compressed ? 16u : 0u) | (parsed.command & 15u)", classify)
+        self.assertIn("if (!r.unclassifiedLogged[kind])", classify)
+        self.assertIn("r.unclassifiedLogged[kind] = true", classify)
+        for required in ("unclassified_enet_bytes=%u", "first_bytes=%s", "action=sent-as-bulk",
+                         "first ENet datagram role=%s", "parsed.firstCommand",
+                         "EnetCommandHeaderSize(parsed.firstCommand)"):
+            self.assertIn(required, classify)
+        self.assertIn("unclassifiedLogged[32] = {}", steam)
+        self.assertIn("r = Remote{};", self.between(steam, "Remote* Get(", "bool InLobby("))
+
+        for required in ("type=connect(%u) data=%u state=%s(%u) channels=%zu elapsed_ms=%u",
+                         "type=disconnect(%u) data=%u state=%s(%u) channels=%zu elapsed_ms=%u",
+                         "steam::NoteClientEnetState(event.peer->state, event.type, event.data",
+                         "steam::RequestHostRelayClose(account, relayGeneration, reason)"):
+            self.assertIn(required, net)
+        for required in ("connect: client link ended: reason=%s steam_state=%s enet_state=%s(%u)",
+                         "elapsed_ms=%u enet_elapsed_ms=%u immediate=%d",
+                         "connect: host link ended: peer=%llu reason=%s steam_state=%s elapsed_ms=%u",
+                         "stage=%s lobby_callback=%u lobby_flags=0x%x",
+                         "r->lobbyChange = state", "CbLobbyChatUpdate = 506",
+                         "Drop(r, close.reason)", "connect::LinkEndedImmediately(clientHadLink, elapsed)"):
+            self.assertIn(required, steam)
+
+        reset = self.between(steam, "void ResetClientEnd()", "void RecordClientEnd(")
+        self.assertIn("clientHadLink = clientEndRecorded = clientEndedImmediately = false", reset)
+        self.assertIn("clientEndReason[0] = '\\0'", reset)
+        after = self.between(steam, "void AfterClient(", "void PollLobbyMetadata()\n{")
+        self.assertIn('if (!std::strcmp(event, "accept") && (fx & (F::SendRequest | F::InspectLobby))) ResetClientEnd();', after)
+        self.assertIn("clientLinkedAt = Now()", steam)
+        lobby = self.source("src/lobby.cpp")
+        self.assertIn("state.endedImmediately ? i18n::LobbyLostImmediate : i18n::LobbyLost", lobby)
+        self.assertIn("i18n::LobbyLost), name, reason", lobby)
+        i18n = self.source("src/i18n.cpp")
+        for prefix in ("the connection to %s ended (%s).", "the connection to %s ended immediately after forming (%s)."):
+            row = re.search(r'\{L"G3 Together: ' + re.escape(prefix) + r'.*?\},', i18n, re.DOTALL)
+            self.assertIsNotNone(row, prefix)
+            languages = re.findall(r'L"([^"]*)"', row.group())
+            self.assertEqual(len(languages), 3)
+            for text in languages:
+                self.assertEqual(text.count("%s"), 2, text)
+
 
 if __name__ == "__main__":
     unittest.main()

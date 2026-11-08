@@ -110,6 +110,8 @@ int main()
 
     LeavePeer(&connections[0], "timeout-or-disconnect", false);
     assert(!PeerJoined(2) && relayCloses.size() == 1 && relayCloses[0].second == 1);
+    assert(relayCloses[0].first == record.note.account &&
+           relayCloses[0].reason == "timeout-or-disconnect");
     transportAccounts[0] = record.note.account;
     Deliver(&connections[0], join);
     assert(PeerJoined(2) && relayCloses.empty()); // An already-authenticated rejoin supersedes the queued close.
@@ -129,4 +131,27 @@ int main()
     ProcessRelayDrops();
     assert(!connected && !inWorld && !steamLinked && !server && !remotes[1].connected);
     assert(options::restores == restoresBefore + 1);
+
+    assert(flowSnapshot.endReason[0] == '\0' && !flowSnapshot.endedImmediately);
+    std::strcpy(flowSnapshot.endReason, "mock link ended");
+    steamLinked = connected = inWorld = true;
+    hostRelayGeneration = 78;
+    server = &connections[0];
+    startedAt = fakeTime - 37;
+    Service(PlayerState{}, false);
+    assert(!connected && !inWorld && !steamLinked && !server);
+    assert(std::any_of(logs.begin(), logs.end(), [](std::string const& line) {
+        return line.find("reason=mock link ended") != std::string::npos &&
+               line.find("elapsed_ms=37") != std::string::npos;
+    }));
+
+    server = &connections[0];
+    connected = true;
+    startedAt = fakeTime - 123;
+    clientEnetSnapshots.clear();
+    Reconnect([](char const* text) { logs.emplace_back(text); });
+    assert(!server && clientEnetSnapshots.size() == 1);
+    auto const& snapshot = clientEnetSnapshots[0];
+    assert(snapshot.state == ENET_PEER_STATE_DISCONNECTED && snapshot.event == ENET_EVENT_TYPE_NONE &&
+           snapshot.data == 0 && snapshot.elapsedMs == 123 && snapshot.reason == "ENet QA reconnect refused");
 }

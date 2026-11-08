@@ -1,5 +1,6 @@
 build/
 /build-steamsync/
+/build-linkdrop/
 __pycache__/
 /g3together.ini
 /g3together.log

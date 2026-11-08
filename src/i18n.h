@@ -63,6 +63,7 @@ enum Message
     LobbyLobbyInvited,
     LobbyRequesting,
     LobbyLost,
+    LobbyLostImmediate,
     LobbyDeclined,
     DeclineNotInvite,
     DeclineSelf,

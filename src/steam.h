@@ -46,10 +46,10 @@ struct RelayDrop {
     uint64_t account = 0;
     uint64_t generation = 0;
     unsigned short port = 0;
-    char reason[48] = {};
+    char reason[160] = {};
 };
 std::vector<RelayDrop> TakeRelayDrops(); // engine thread: drain worker notifications
-void RequestHostRelayClose(uint64_t account, uint64_t generation);
+void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason);
 // Wake the independent transport worker after ENet flushes. Does not run engine or ENet handlers.
 void Pump();
 // Join the transport worker, forward ENet's goodbye, then leave/close Steam. Called on the engine thread.
@@ -69,6 +69,8 @@ uint64_t HostRelayGeneration(); // client: generation of the published linked re
 // closed, flow Lost) so that nothing reconnects by itself: the player accepts the invite again. Safe from the engine thread (the
 // worker does the work). False in connection = auto, which keeps its legacy automatic ENet reconnect.
 bool RequestClientDisconnect();
+// Engine-thread snapshot for worker-side link-end diagnostics; never inspect an ENet peer on the worker.
+void NoteClientEnetState(unsigned state, unsigned event, uint32_t data, uint32_t elapsedMs, char const* reason);
 // Host: friends whose relay is linked to this game.
 int LinkedCount();
 TrafficCounters Traffic(); // successful Steam API submissions and accepted relay datagrams, copied by the existing published mutex
@@ -84,6 +86,8 @@ struct Connection
     char name[64] = {};         // display label only: client = the friend whose invite is followed (or whose lobby invite waits), host = the invited partner
     char hostSession[64] = {};  // WrongSession: the other side's session_id
     bool lobbyInvitePending = false;  // client, idle: a lobby invite arrived that the player has not accepted in Steam yet (name = inviter)
+    char endReason[160] = {};
+    bool endedImmediately = false;
 };
 Connection Flow();
 

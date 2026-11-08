@@ -27,8 +27,9 @@ public:
     Codec& operator=(Codec const&) = delete;
     bool Ready() const { return context_ != nullptr; }
 
-    bool Decode(void const* packet, size_t size, std::vector<uint8_t>& plain)
+    bool Decode(void const* packet, size_t size, std::vector<uint8_t>& plain, EnetPacketParse* result = nullptr)
     {
+        if (result) *result = {};
         if (!context_ || !packet || size < 2 || size > RelayPayloadLimit) return false;
         auto const* bytes = static_cast<uint8_t const*>(packet);
         const size_t header = bytes[0] & 0x80u ? 4 : 2;
@@ -45,7 +46,9 @@ public:
             plain.insert(plain.end(), bytes + header, bytes + size);
         }
         EnetPacketParse parsed;
-        return ParseEnetDataPacket(plain.data(), plain.size(), &parsed) && !parsed.compressed;
+        const bool valid = ParseEnetDataPacket(plain.data(), plain.size(), &parsed) && !parsed.compressed;
+        if (result) *result = parsed;
+        return valid;
     }
 
     void Encode(std::vector<uint8_t>& packet)
@@ -84,6 +87,7 @@ struct Counters {
     uint64_t reliableFailed = 0, unreliableFailed = 0;
     uint64_t retries = 0, duplicates = 0, plainBytes = 0, wireBytes = 0;
     uint64_t playerStates = 0;
+    uint64_t unclassified = 0;
 };
 
 class Queue {
@@ -102,18 +106,34 @@ public:
         return age;
     }
 
-    bool Push(Codec& codec, void const* packet, size_t size, uint32_t now)
+    bool Push(Codec& codec, void const* packet, size_t size, uint32_t now, EnetPacketParse* result = nullptr)
     {
+        if (result) *result = {};
+        if (!packet || !size || size > RelayPayloadLimit) return false;
         std::vector<uint8_t> plain;
-        if (!codec.Decode(packet, size, plain)) return false;
+        if (!codec.Decode(packet, size, plain, result)) {
+            // Classification is not transport validation. Keep unknown datagrams
+            // intact and let the receiving ENet endpoint validate them.
+            auto const* bytes = static_cast<uint8_t const*>(packet);
+            Item item;
+            item.bytes.assign(bytes, bytes + size);
+            item.at = now;
+            queues_[static_cast<unsigned>(Priority::Bulk) * 2 + 1].push_back(std::move(item));
+            bytes_ += size;
+            ++depth_;
+            ++counters.unclassified;
+            counters.plainBytes += size;
+            counters.wireBytes += size;
+            return true;
+        }
         const size_t header = plain[0] & 0x80u ? 4 : 2;
         std::array<std::vector<uint8_t>, Classes * 2> groups;
         std::array<unsigned, Classes * 2> playerStates{};
         for (size_t at = header; at < plain.size();) {
             const unsigned command = plain[at] & 15u;
             const unsigned channel = plain[at + 1];
-            static constexpr size_t lengths[] = {0,8,44,44,8,4,6,8,24,8,12,12,24};
-            size_t length = lengths[command];
+            const size_t commandHeader = EnetCommandHeaderSize(command);
+            size_t length = commandHeader;
             if (command == 6) length += RelayReadUint16(plain.data() + at + 4);
             if (command == 7 || command == 8 || command == 9 || command == 12)
                 length += RelayReadUint16(plain.data() + at + 6);
@@ -127,7 +147,7 @@ public:
             const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
             auto& group = groups[groupId];
             if ((command == 6 || command == 7) && channel == 0 &&
-                length > lengths[command] && plain[at + lengths[command]] == 3)
+                length > commandHeader && plain[at + commandHeader] == 3)
                 ++playerStates[groupId];
             if (group.empty()) group.assign(plain.begin(), plain.begin() + header);
             group.insert(group.end(), plain.begin() + at, plain.begin() + at + length);

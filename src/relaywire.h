@@ -108,7 +108,16 @@ struct EnetPacketParse
     bool compressed = false;
     std::size_t protocolBytes = 0;
     std::size_t ackBytes = 0;
+    std::size_t packetBytes = 0, commandOffset = 0, commandBytes = 0, remainingBytes = 0;
+    unsigned firstCommand = 0, command = 0;
 };
+
+inline constexpr std::size_t EnetCommandHeaderSize(unsigned command)
+{
+    // CONNECT includes its final application-data word; VERIFY_CONNECT does not.
+    constexpr std::size_t sizes[] = {0, 8, 48, 44, 8, 4, 6, 8, 24, 8, 12, 16, 24};
+    return command < sizeof(sizes) / sizeof(sizes[0]) ? sizes[command] : 0;
+}
 
 inline std::uint16_t RelayReadUint16(void const* bytes)
 {
@@ -122,6 +131,7 @@ inline bool ParseEnetDataPacket(void const* packet, std::size_t packetSize,
 {
     if (!result) return false;
     *result = EnetPacketParse{};
+    result->packetBytes = packetSize;
     if (!packet || packetSize < 2) return false;
 
     auto const* data = static_cast<unsigned char const*>(packet);
@@ -140,24 +150,16 @@ inline bool ParseEnetDataPacket(void const* packet, std::size_t packetSize,
     result->protocolBytes = headerSize;
     std::size_t offset = headerSize;
     while (offset < packetSize) {
-        if (packetSize - offset < 4) return false;
+        result->commandOffset = offset;
+        result->remainingBytes = packetSize - offset;
+        result->commandBytes = 4;
+        if (result->remainingBytes < 4) return false;
         unsigned command = data[offset] & 0x0fu;
-        std::size_t commandSize = 0;
-        switch (command) {
-        case 1: commandSize = 8; break;   // acknowledge
-        case 2: commandSize = 44; break;  // connect
-        case 3: commandSize = 44; break;  // verify connect
-        case 4: commandSize = 8; break;   // disconnect
-        case 5: commandSize = 4; break;   // ping
-        case 6: commandSize = 6; break;   // send reliable
-        case 7: commandSize = 8; break;   // send unreliable
-        case 8: commandSize = 24; break;  // send fragment
-        case 9: commandSize = 8; break;   // send unsequenced
-        case 10: commandSize = 12; break; // bandwidth limit
-        case 11: commandSize = 12; break; // throttle configure
-        case 12: commandSize = 24; break; // send unreliable fragment
-        default: return false;
-        }
+        result->command = command;
+        if (offset == headerSize) result->firstCommand = command;
+        std::size_t commandSize = EnetCommandHeaderSize(command);
+        result->commandBytes = commandSize;
+        if (!commandSize) return false;
         if (packetSize - offset < commandSize) return false;
 
         std::size_t payloadSize = 0;
@@ -171,6 +173,7 @@ inline bool ParseEnetDataPacket(void const* packet, std::size_t packetSize,
             payloadSize = RelayReadUint16(data + offset + 6);
             commandSize += payloadSize;
         }
+        result->commandBytes = commandSize;
         if (packetSize - offset < commandSize) return false;
 
         result->protocolBytes += commandSize - payloadSize;

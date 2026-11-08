@@ -19,7 +19,18 @@ bool failSend = false;
 uint64_t transportAccounts[2] = {12, 13};
 uint64_t transportGenerations[2] = {};
 std::vector<g3t::steam::RelayDrop> relayDrops;
-std::vector<std::pair<uint64_t, uint64_t>> relayCloses;
+struct RelayClose {
+    uint64_t first, second;
+    std::string reason;
+};
+std::vector<RelayClose> relayCloses;
+struct ClientEnetSnapshot {
+    unsigned state, event;
+    uint32_t data, elapsedMs;
+    std::string reason;
+};
+std::vector<ClientEnetSnapshot> clientEnetSnapshots;
+g3t::steam::Connection flowSnapshot;
 uint64_t localSteamAccount = 12;
 
 extern "C" {
@@ -131,7 +142,10 @@ bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint
 bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
 {
     if (!PeerIdentity(port, account, name, generation) || account == localSteamAccount) return false;
-    relayCloses.erase(std::remove(relayCloses.begin(), relayCloses.end(), std::make_pair(account, generation)),
+    relayCloses.erase(std::remove_if(relayCloses.begin(), relayCloses.end(),
+                                    [=](RelayClose const& close) {
+                                        return close.first == account && close.second == generation;
+                                    }),
                       relayCloses.end());
     return true;
 }
@@ -141,9 +155,9 @@ std::vector<RelayDrop> TakeRelayDrops()
     result.swap(relayDrops);
     return result;
 }
-void RequestHostRelayClose(uint64_t account, uint64_t generation)
+void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason)
 {
-    if (account && generation) relayCloses.emplace_back(account, generation);
+    if (account && generation) relayCloses.push_back({account, generation, reason ? reason : ""});
 }
 uint64_t PlayerId() { return localSteamAccount; }
 bool Start(bool, unsigned short) { return false; }
@@ -154,6 +168,11 @@ int Ping() { return -1; }
 bool HostLinked() { return false; }
 uint64_t HostRelayGeneration() { return 0; }
 bool RequestClientDisconnect() { return false; }
+void NoteClientEnetState(unsigned state, unsigned event, uint32_t data, uint32_t elapsedMs, char const* reason)
+{
+    clientEnetSnapshots.push_back({state, event, data, elapsedMs, reason ? reason : ""});
+}
+Connection Flow() { return flowSnapshot; }
 char const* PlayerName() { return ""; }
 char const* Error() { return ""; }
 }

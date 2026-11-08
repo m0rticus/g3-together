@@ -29,6 +29,7 @@
 #include "saving_policy.h"
 #include "steam_connect.h"
 #include "steam_send.h"
+#include "enet_policy.h"
 
 #include "config.h"
 #include "crashlog.h"
@@ -216,6 +217,8 @@ struct Remote
     char name[24] = {};
     bool linked = false;   // host: said hello while in the lobby; client: the host welcomed us
     bool leaving = false;
+    uint32_t createdAt = 0, linkedAt = 0, lobbyChange = 0;
+    bool firstEnetLogged = false, unclassifiedLogged[32] = {};
     uint32_t heard = 0, lastPing = 0;
     latency::Ping ping;
     SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
@@ -272,6 +275,14 @@ bool connectPublished = false;  // host: the Join Game rich presence (connect) w
 uint32_t lastPresence = 0;
 u64 requestedHost = 0;          // client: the host a join request went to (its session is closed when the attempt ends)
 std::atomic<bool> disconnectRequested{false};  // engine thread -> worker: the ENet connection ended, end the link too
+struct ClientEnet {
+    unsigned state = 0, event = 0;
+    uint32_t data = 0, elapsedMs = 0, sampledAt = 0;
+    char reason[160] = {};
+} clientEnet;
+uint32_t clientAttemptAt = 0, clientLinkedAt = 0;
+bool clientHadLink = false, clientEndRecorded = false, clientEndedImmediately = false;
+char clientEndReason[160] = {};
 
 // Only the transport worker owns the API, sockets and remotes after startup.
 // Engine-thread readers copy published state, never wait on a Steam call or inspect its mutable buffers.
@@ -292,7 +303,7 @@ struct Published
 } published;
 std::mutex publishedMutex;
 std::vector<RelayDrop> relayDrops;
-struct RelayClose { uint64_t account, generation; };
+struct RelayClose { uint64_t account, generation; char reason[160]; };
 std::vector<RelayClose> relayCloses;
 HANDLE worker = nullptr, stopEvent = nullptr, wakeEvent = nullptr, pollTimer = nullptr;
 uint32_t lastPump = 0;
@@ -485,7 +496,7 @@ Remote* Get(u64 id)
             r = Remote{};
             r.id = id;
             r.generation = ++nextRelayGeneration;
-            r.heard = Now();
+            r.createdAt = r.heard = Now();
             return &r;
         }
     return nullptr;
@@ -502,6 +513,38 @@ bool InLobby(u64 id)
 void LeaveLobby();
 void OnClientLinkLost(u64 id, char const* why);
 void OnHostLinkLost(u64 id, char const* why);
+
+void ResetClientEnd()
+{
+    clientAttemptAt = Now();
+    clientLinkedAt = 0;
+    clientHadLink = clientEndRecorded = clientEndedImmediately = false;
+    clientEndReason[0] = '\0';
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    clientEnet = {};
+}
+
+void RecordClientEnd(char const* why, connect::ClientFlow::State before)
+{
+    if (isHost || clientEndRecorded) return;
+    clientEndRecorded = true;
+    CopyName(clientEndReason, sizeof(clientEndReason), why);
+    const uint32_t now = Now();
+    const uint32_t elapsed = now - (clientHadLink ? clientLinkedAt : clientAttemptAt);
+    clientEndedImmediately = connect::LinkEndedImmediately(clientHadLink, elapsed);
+    ClientEnet enet;
+    {
+        std::lock_guard<std::mutex> lock(publishedMutex);
+        enet = clientEnet;
+    }
+    const Remote* r = Find(owner ? owner : requestedHost);
+    Logf("connect: client link ended: reason=%s steam_state=%s enet_state=%s(%u) enet_event=%u event_data=%u "
+         "elapsed_ms=%u enet_elapsed_ms=%u immediate=%d arg=%llu lobby=%llu relay_port=%u generation=%llu "
+         "to_enet=%u to_steam=%u",
+         clientEndReason, connect::StateName(before), net::EnetPeerStateName(enet.state), enet.state, enet.event, enet.data,
+         elapsed, enet.elapsedMs + (enet.sampledAt ? now - enet.sampledAt : 0), clientEndedImmediately ? 1 : 0,
+         clientFlow.arg(), lobby, relayPort, r ? r->generation : 0, r ? r->toEnet : 0, r ? r->toSteam : 0);
+}
 
 // publishedMutex must be held: an engine reader must not authenticate an already-closing relay.
 void InvalidatePublished(u64 account, uint64_t generation)
@@ -523,6 +566,13 @@ void Drop(Remote* r, char const* why)
 {
     if (!r || !r->id) return;
     const u64 id = r->id;
+    if (!isHost && id == owner) RecordClientEnd(why, clientFlow.state());
+    if (isHost)
+        Logf("connect: host link ended: peer=%llu reason=%s steam_state=%s elapsed_ms=%u "
+             "stage=%s lobby_callback=%u lobby_flags=0x%x enet_port=%u relay_port=%u to_enet=%u to_steam=%u",
+             id, why, connect::StateName(hostFlow.state()), Now() - (r->linked ? r->linkedAt : r->createdAt),
+             r->toEnet || r->toSteam ? "enet-traffic" : "before-enet", r->lobbyChange ? CbLobbyChatUpdate : 0,
+             r->lobbyChange, enetPort, r->relayPort, r->toEnet, r->toSteam);
     if (r->pending.Depth())
         Logf("steam-send: peer=%llu action=close-session pending_datagrams=%zu pending_bytes=%zu reason=%s",
              id, r->pending.Depth(), r->pending.Bytes(), why);
@@ -596,6 +646,7 @@ void CreateLobbyAuto()
 void Join(u64 id, char const* why)
 {
     LeaveLobby();
+    if (connectionMode == connect::Mode::Auto) ResetClientEnd();
     lobby = id;
     owner = 0;
     joinedAt = Now();
@@ -624,6 +675,7 @@ connect::LobbyMetadata ReadLobbyMetadata(u64 id)
 void LeaveLobby()
 {
     if (!lobby) return;
+    if (!isHost && owner) RecordClientEnd("local lobby closed", clientFlow.state());
     for (auto& r : remotes)
         if (r.id && (isHost || r.id == owner)) {
             if ((isHost && r.relayPort) || (!isHost && r.id == owner && r.linked)) {
@@ -790,6 +842,7 @@ void FinishLobbyEntry(u64 id, u64 lobbyOwner)
     if (!lobbyOwner) {
         Logf("connect: lobby %llu has no owner after entry", id);
         strcpy_s(error, "the Steam lobby has no owner");
+        RecordClientEnd("the Steam lobby has no owner", clientFlow.state());
         LeaveLobby();
         Skip(id, 30000);
         return;
@@ -806,7 +859,12 @@ void AfterClient(char const* event, connect::ClientFlow::State before, unsigned 
 {
     using F = connect::ClientFlow;
     LogClientChange(event, before, fx, quiet);
-    if (fx & F::Teardown) TearDownClient();
+    if (fx & F::Teardown) {
+        RecordClientEnd(clientFlow.state() == F::State::Declined ? connect::WhyName(clientFlow.why()) :
+                        !std::strcmp(event, "accept") ? "another Steam invite accepted" : event, before);
+        TearDownClient();
+    }
+    if (!std::strcmp(event, "accept") && (fx & (F::SendRequest | F::InspectLobby))) ResetClientEnd();
     if (fx & F::SendRequest) SendJoinRequest(false);
     if (fx & F::InspectLobby) {
         InspectLobby(clientFlow.lobby(), "lobby invite");
@@ -832,6 +890,7 @@ void PollLobbyMetadata()
     if (connectionMode == connect::Mode::Auto && candidatePendingLogged &&
         now - candidateAt >= connect::LobbyMetadataWaitMs) {
         Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", id, now - candidateAt);
+        RecordClientEnd("Steam lobby metadata timed out", clientFlow.state());
         candidateLobby = 0;
         if (candidateJoined && lobby == id) LeaveLobby();
         Skip(id, 30000);
@@ -1016,6 +1075,7 @@ void OnClientLinkLost(u64 id, char const* why)
 {
     const connect::ClientFlow::State before = clientFlow.state();
     const unsigned fx = clientFlow.LinkLost(id);
+    if (fx & connect::ClientFlow::Teardown) RecordClientEnd(why, before);
     if (clientFlow.state() == connect::ClientFlow::State::Lost)
         Logf("connect: connection to %llu (%s) ended (%s); nothing reconnects by itself: accept their invite again", id, NameOf(id), why);
     AfterClient("link lost", before, fx);
@@ -1097,6 +1157,8 @@ void FillConnection(Connection& out)
     out.arg = clientFlow.arg();
     strcpy_s(out.hostSession, clientFlow.hostSession());
     out.lobbyInvitePending = !isHost && clientFlow.Idle() && clientFlow.lobbyInvitedBy() != 0;
+    strcpy_s(out.endReason, clientEndReason);
+    out.endedImmediately = clientEndedImmediately;
     const u64 who = isHost ? hostFlow.partner() : out.lobbyInvitePending ? clientFlow.lobbyInvitedBy() : clientFlow.inviter();
     CopyName(out.name, sizeof(out.name), NameOf(who));
 }
@@ -1182,6 +1244,7 @@ void OnLobbyEnter(char const* p)
     if (!joined || metadata == connect::LobbyMetadata::Different) {
         Logf("steam: lobby %llu refused (response %u, incompatible session ID or transport)", id, response);
         Format(error, response != 1 ? "the Steam lobby is full or closed" : "different session_id or incompatible G3 Together transport");
+        RecordClientEnd(error, clientFlow.state());
         LeaveLobby();
         Skip(id, 30000);
         return;
@@ -1225,7 +1288,10 @@ void OnCallback(int callback, char const* p, int size)
         std::memcpy(&b, p + 8, 8);
         std::memcpy(&state, p + 24, 4);
         if (a == lobby && (state & 0x1e)) {
-            if (Remote* r = Find(b)) r->leaving = true;
+            if (Remote* r = Find(b)) {
+                r->leaving = true;
+                r->lobbyChange = state;
+            }
             else if (isHost && connectionMode == connect::Mode::Invite && b == hostFlow.partner())
                 OnHostLinkLost(b, "left the lobby before saying hello");  // no relay exists yet to drop
         }
@@ -1271,10 +1337,13 @@ void OnCallback(int callback, char const* p, int size)
     }
     case CbSessionFailed:
         a = api.IdentityGetSteamId(p);
-        Logf("connect: session with %llu (%s) failed; dropping its relay", a, NameOf(a));
+        Logf("connect: session with %llu (%s) failed; dropping its relay (Steam callback=%d bytes=%d)",
+             a, NameOf(a), CbSessionFailed, size);
         if (!isHost && connectionMode == connect::Mode::Invite) {
             const connect::ClientFlow::State before = clientFlow.state();
-            AfterClient("session failed", before, clientFlow.SessionFailed(a));
+            const unsigned fx = clientFlow.SessionFailed(a);
+            if (fx & connect::ClientFlow::Teardown) RecordClientEnd("Steam session failed (callback 1252)", before);
+            AfterClient("session failed", before, fx);
         }
         Drop(Find(a), "session failed");
         break;
@@ -1306,6 +1375,7 @@ void OnControl(Remote& r, char const* data, int size)
                 break;
             }
             r.linked = true;
+            r.linkedAt = Now();
             CopyName(r.name, sizeof(r.name), api.FriendPersonaName(friends, r.id));
             Logf("steam: %s (%llu) linked to this game", Text(api.FriendPersonaName(friends, r.id)), r.id);
             if (connectionMode == connect::Mode::Invite) {
@@ -1320,6 +1390,8 @@ void OnControl(Remote& r, char const* data, int size)
         if (size != 1) break;
         if (!isHost && r.id == owner && !r.linked) {
             r.linked = true;
+            r.linkedAt = clientLinkedAt = Now();
+            clientHadLink = true;
             Logf("steam: welcomed by the host %s; ENet goes over Steam now", hostName);
             if (connectionMode == connect::Mode::Invite) {
                 const connect::ClientFlow::State before = clientFlow.state();
@@ -1429,9 +1501,35 @@ void Receive(int channel)
 bool QueueDatagram(Remote& r, void const* data, unsigned size)
 {
     try {
-        if (sendCodec && r.pending.Push(*sendCodec, data, size, Now())) return true;
-        Logf("steam-send: peer=%llu action=close-session malformed_enet_bytes=%u", r.id, size);
-        Drop(&r, "invalid outbound ENet datagram");
+        EnetPacketParse parsed;
+        if (sendCodec && r.pending.Push(*sendCodec, data, size, Now(), &parsed)) {
+            auto const* bytes = static_cast<unsigned char const*>(data);
+            const bool compressed = (bytes[0] & 0x40u) != 0;
+            if (!r.firstEnetLogged) {
+                r.firstEnetLogged = true;
+                Logf("steam-send: first ENet datagram role=%s peer=%llu wire_bytes=%u decoded_bytes=%zu "
+                     "compressed=%d command=%u command_header_bytes=%zu action=%s",
+                     isHost ? "host" : "client", r.id, size, parsed.packetBytes, compressed ? 1 : 0,
+                     parsed.firstCommand, EnetCommandHeaderSize(parsed.firstCommand),
+                     parsed.valid ? "classified-and-queued" : "queued-as-unclassified-bulk");
+            }
+            if (!parsed.valid) {
+                const unsigned kind = (compressed ? 16u : 0u) | (parsed.command & 15u);
+                if (!r.unclassifiedLogged[kind]) {
+                    r.unclassifiedLogged[kind] = true;
+                    char hex[33] = {};
+                    for (unsigned i = 0; i < (std::min)(size, 16u); ++i)
+                        std::snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", bytes[i]);
+                    Logf("steam-send: peer=%llu unclassified_enet_bytes=%u first_bytes=%s decoded_bytes=%zu "
+                         "command=%u offset=%zu required=%zu remaining=%zu action=sent-as-bulk",
+                         r.id, size, hex, parsed.packetBytes, parsed.command, parsed.commandOffset,
+                         parsed.commandBytes, parsed.remainingBytes);
+                }
+            }
+            return true;
+        }
+        Logf("steam-send: peer=%llu invalid_local_datagram_bytes=%u codec_ready=%d action=not-queued",
+             r.id, size, sendCodec && sendCodec->Ready() ? 1 : 0);
     } catch (std::bad_alloc const&) {
         Logf("steam-send: peer=%llu action=close-session allocation-failed pending_bytes=%zu", r.id, r.pending.Bytes());
         Drop(&r, "Steam send queue allocation failed");
@@ -1451,7 +1549,9 @@ void DrainDatagrams(Remote& r)
         if (result != ResultOk && !send::Retryable(result)) {
             Logf("steam-send: peer=%llu action=close-session fatal_result=%d pending_datagrams=%zu pending_bytes=%zu",
                  r.id, result, r.pending.Depth(), r.pending.Bytes());
-            Drop(&r, "Steam data submission failed");
+            char why[160];
+            Format(why, "Steam data submission failed (result=%d)", result);
+            Drop(&r, why);
         }
     } catch (std::bad_alloc const&) {
         Logf("steam-send: peer=%llu action=close-session allocation-failed pending_bytes=%zu", r.id, r.pending.Bytes());
@@ -1468,12 +1568,12 @@ void SendDiagnostics(uint32_t now)
              "critical=%llu/%llu definition=%llu/%llu npc_pose=%llu/%llu bulk=%llu/%llu "
              "reliable_ok=%llu unreliable_ok=%llu player_state_commands=%llu reliable_failed=%llu unreliable_failed=%llu "
              "retained_retries=%llu dedup_retransmits=%llu queue_datagrams=%zu queue_bytes=%zu oldest_ms=%u "
-             "plain_bytes=%llu wire_bytes=%llu action=retry-retained-priority-first npc_updates_dropped=0",
+             "plain_bytes=%llu wire_bytes=%llu unclassified=%llu action=retry-retained-priority-first npc_updates_dropped=0",
              r.id, c.reliableAccepted + c.unreliableAccepted, c.bytes[0] + c.bytes[1] + c.bytes[2] + c.bytes[3],
              c.accepted[0], c.bytes[0], c.accepted[1], c.bytes[1], c.accepted[2], c.bytes[2], c.accepted[3], c.bytes[3],
              c.reliableAccepted, c.unreliableAccepted, c.playerStates, c.reliableFailed, c.unreliableFailed,
              c.retries, c.duplicates, r.pending.Depth(), r.pending.Bytes(), r.pending.OldestAge(now),
-             c.plainBytes, c.wireBytes);
+             c.plainBytes, c.wireBytes, c.unclassified);
         for (unsigned result = 0; result < 128; ++result)
             if (c.failed[result])
                 Logf("steam-send: peer=%llu result=%u failed_datagrams=%llu action=%s",
@@ -1538,6 +1638,7 @@ void Search()
     if (lobby) {
         if (!owner && Now() - joinedAt > JoinWaitMs) {
             Logf("steam: lobby %llu did not answer the join; trying others", lobby);
+            RecordClientEnd("Steam lobby did not answer JoinLobby", clientFlow.state());
             Skip(lobby, 30000);
             api.LeaveLobby(matchmaking, lobby);
             lobby = 0;
@@ -1587,6 +1688,7 @@ bool Fail(char const* text)
 {
     strncpy_s(error, text, _TRUNCATE);
     Logf("steam: not used: %s", error);
+    if (!isHost && clientFlow.Active()) OnClientLinkLost(clientFlow.host(), text);
     Publish();
     return false;
 }
@@ -1824,12 +1926,14 @@ std::vector<RelayDrop> TakeRelayDrops()
     return result;
 }
 
-void RequestHostRelayClose(uint64_t account, uint64_t generation)
+void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason)
 {
     if (!account || !generation) return;
     {
         std::lock_guard<std::mutex> lock(publishedMutex);
-        relayCloses.push_back({account, generation});
+        RelayClose close{account, generation, {}};
+        strncpy_s(close.reason, reason, _TRUNCATE);
+        relayCloses.push_back(close);
     }
     if (wakeEvent) SetEvent(wakeEvent);
 }
@@ -1870,11 +1974,17 @@ void PumpOnce()
     }
     if (isHost) for (auto const& close : closes)
         if (Remote* r = Find(close.account); r && r->generation == close.generation)
-            Drop(r, "ENet connection ended");
+            Drop(r, close.reason);
     if (isHost && !lobby && connectionMode == connect::Mode::Auto && Now() - lastCreate > 15000)
         CreateLobbyAuto();  // the first try failed: again every 15 s (legacy mode only)
-    if (disconnectRequested.exchange(false) && !isHost && connectionMode == connect::Mode::Invite && clientFlow.Active())
-        OnClientLinkLost(clientFlow.host(), "the ENet connection ended");
+    if (disconnectRequested.exchange(false) && !isHost && connectionMode == connect::Mode::Invite && clientFlow.Active()) {
+        ClientEnet enet;
+        {
+            std::lock_guard<std::mutex> lock(publishedMutex);
+            enet = clientEnet;
+        }
+        OnClientLinkLost(clientFlow.host(), enet.reason[0] ? enet.reason : "ENet connection ended (no event reason)");
+    }
     if (!isHost) {
         PollLobbyMetadata();
         if (connectionMode == connect::Mode::Auto) Search();
@@ -1887,7 +1997,11 @@ void PumpOnce()
     Receive(ChannelControl);
     // Lobby departure callbacks can precede a queued ENet goodbye. Drain it before closing that peer's relay.
     for (auto& r : remotes)
-        if (r.leaving) Drop(&r, "left the lobby");
+        if (r.leaving) {
+            char why[160];
+            Format(why, "left the Steam lobby (callback %d flags=0x%x)", CbLobbyChatUpdate, r.lobbyChange);
+            Drop(&r, why);
+        }
     Forward();
     const uint32_t now = Now();
     static uint32_t lastNames = 0;
@@ -1952,6 +2066,7 @@ void Stop()
     wakeEvent = stopEvent = pollTimer = nullptr;
     SteamFpScope floatingPoint("shutdown");
     if (apiInitialized) {
+        if (!isHost && (owner || clientFlow.Active())) RecordClientEnd("local transport shutdown", clientFlow.state());
         if (isHost) {  // not joinable any more once the game is closed
             SetPresence("connect", "");
             SetPresence("status", "");
@@ -2027,6 +2142,17 @@ bool RequestClientDisconnect()
     disconnectRequested.store(true);
     if (wakeEvent) SetEvent(wakeEvent);
     return true;
+}
+
+void NoteClientEnetState(unsigned state, unsigned event, uint32_t data, uint32_t elapsedMs, char const* reason)
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    clientEnet.state = state;
+    clientEnet.event = event;
+    clientEnet.data = data;
+    clientEnet.elapsedMs = elapsedMs;
+    clientEnet.sampledAt = Now();
+    strncpy_s(clientEnet.reason, reason, _TRUNCATE);
 }
 
 Connection Flow()
