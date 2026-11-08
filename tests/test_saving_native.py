@@ -44,9 +44,12 @@ class SavingNativeTests(unittest.TestCase):
             self.skipTest("Set G3T_PUP_DLL to the read-only PUP companion paru_s2.dll")
         fixture = Path(path)
         digest = hashlib.sha256(fixture.read_bytes()).hexdigest().upper()
-        self.assertEqual(
+        self.assertIn(
             digest,
-            "60FCCBA5E27CA544FC1E72FE5BA4CBC33AAD107C1CBC90845B275F81B58C349C",
+            {
+                "97760FFCD3EEF09B7DBCD8EF925B9995A198CB8BBA96951298969C48A84CD8F0",  # genuine CP 1.75 Steam install
+                "60FCCBA5E27CA544FC1E72FE5BA4CBC33AAD107C1CBC90845B275F81B58C349C",  # QA copy (g3qa32.dll import)
+            },
             "G3T_PUP_DLL identity differs from the captured paru_s2.dll",
         )
         subprocess.run([str(self.executable), "--pup", path], check=True,

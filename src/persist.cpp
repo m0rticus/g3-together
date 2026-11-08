@@ -404,8 +404,16 @@ bool KnownPup(HMODULE module)
     if (status >= 0) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
     if (hash) BCryptDestroyHash(hash);
     if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (status < 0 || !saving::native::Matches(digest, sizeof(digest),
-        "60fccba5e27ca544fc1e72fe5ba4cbc33aad107c1cbc90845b275f81b58c349c")) {
+    // The genuine CP 1.75 Steam paru_s2.dll, and the QA copy whose only difference is the 10-byte import module name
+    // (SHELL32.dll -> g3qa32.dll at file offset 0x90dcc). Pinning only the QA copy switched every genuine install's hooks off.
+    static constexpr char const* const known[] = {
+        "97760ffcd3eef09b7dbcd8ef925b9995a198cb8bba96951298969c48a84cd8f0",
+        "60fccba5e27ca544fc1e72fe5ba4cbc33aad107c1cbc90845b275f81b58c349c",
+    };
+    bool recognized = false;
+    if (status >= 0)
+        for (char const* expected : known) recognized = recognized || saving::native::Matches(digest, sizeof(digest), expected);
+    if (status < 0 || !recognized) {
         Logf("persist: unresolved WorldLoadGameFn PUP identity path=%s status=%08lx; host-managed saves off", path, status);
         return false;
     }
