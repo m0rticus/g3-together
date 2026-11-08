@@ -9,8 +9,12 @@
 //
 // On top of NetworkingMessages:
 //   channel 1 (control): 'H' hello (client -> lobby owner until welcomed), 'W' welcome, 'P'+time ping and 'Q'+time pong
-//            every second (round trip for the status), 'B' bye.
+//            every second (round trip for the status), 'B' bye. Before a lobby exists (invite-driven connection, see
+//            steam_connect.h) the same channel carries the plain ASCII join request/offer/decline frames "G3T1J/L/N".
 //   channel 0 (data): one ENet datagram per message, sent unreliable (ENet does its own reliability).
+// Nothing connects by itself (connection = invite, the default): the host publishes Join Game rich presence and opens its
+// friends-only lobby only for a friend's join request; the client connects only after its player accepts a Steam invite.
+// Every step is logged as "connect: ..." (connection = auto keeps the old automatic discovery for the stand-in/tests).
 // The relay: a client's ENet connects to a 127.0.0.1 socket of this file, which passes each datagram to the host's
 // SteamID. On the host each linked friend gets its own 127.0.0.1 socket that talks to the host's ENet port, so ENet sees
 // every friend as a separate local peer (coop-anything's HXCoop pattern) and needs no change. The host's ENet still
@@ -21,6 +25,8 @@
 #include "steam.h"
 #include "player_identity.h"
 #include "relaywire.h"
+#include "saving_policy.h"
+#include "steam_connect.h"
 
 #include "config.h"
 #include "crashlog.h"
@@ -29,6 +35,7 @@
 #include "net.h"
 
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <float.h>
@@ -109,6 +116,7 @@ struct Api
     sbool(__cdecl* FriendGamePlayed)(void*, u64 user, void* info);
     char const*(__cdecl* FriendPersonaName)(void*, u64 user);
     sbool(__cdecl* SetRichPresence)(void*, char const* key, char const* value);
+    int(__cdecl* FriendRelationship)(void*, u64 user);  // optional: older stand-ins lack it; 3 = friend
     void*(__cdecl* Messages)();
     int(__cdecl* SendToUser)(void*, void const* identity, void const* data, unsigned size, int flags, int channel);
     int(__cdecl* ReceiveOnChannel)(void*, int channel, void** messages, int max);
@@ -163,11 +171,15 @@ Export const Exports[] = {
     {reinterpret_cast<void**>(&api.Utils), "SteamAPI_SteamNetworkingUtils_SteamAPI_v004"},
     {reinterpret_cast<void**>(&api.InitRelayNetworkAccess), "SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess"},
 };
+Export const OptionalExports[] = {
+    {reinterpret_cast<void**>(&api.FriendRelationship), "SteamAPI_ISteamFriends_GetFriendRelationship"},
+};
 
 // Callback ids and the 32-bit layouts (playbook, "Struct layouts"): read with memcpy at these offsets.
 enum : int {
     CbLobbyJoinRequested = 333,  // GameLobbyJoinRequested_t { u64 lobby; u64 friend; }: an invite accepted in the game
     CbRichJoinRequested = 337,   // GameRichPresenceJoinRequested_t { u64 friend; char connect[256]; }: "Join game"
+    CbLobbyInvite = 503,         // LobbyInvite_t { u64 inviter; u64 lobby; u64 game; }: an invite arrived, not accepted yet
     CbLobbyEnter = 504,          // LobbyEnter_t { u64 lobby; u32 perms; bool locked; u32 response at 16; } 1 = success
     CbLobbyDataUpdate = 505,     // LobbyDataUpdate_t { u64 lobby; u64 member; bool success; }
     CbLobbyChatUpdate = 506,     // LobbyChatUpdate_t { u64 lobby; u64 changed; u64 by; u32 state at 24; }
@@ -240,6 +252,17 @@ char hostName[64] = "";
 Skipped skipped[16] = {};
 bool searchLogged = false;
 
+// The invite-driven connection (steam_connect.h): both flows live on the transport worker like everything below.
+connect::Mode connectionMode = connect::Mode::Invite;
+connect::ClientFlow clientFlow;
+connect::HostFlow hostFlow;
+struct Label { u64 id = 0; uint32_t at = 0; char text[64] = ""; } labels[3];  // display names of the people the flows name
+char presenceStatus[96] = "", presenceConnect[256] = "";
+bool connectPublished = false;  // host: the Join Game rich presence (connect) was accepted by Steam
+uint32_t lastPresence = 0;
+u64 requestedHost = 0;          // client: the host a join request went to (its session is closed when the attempt ends)
+std::atomic<bool> disconnectRequested{false};  // engine thread -> worker: the ENet connection ended, end the link too
+
 // Only the transport worker owns the API, sockets and remotes after startup.
 // Engine-thread readers copy published state, never wait on a Steam call or inspect its mutable buffers.
 struct Published
@@ -252,6 +275,7 @@ struct Published
     u64 accounts[MaxRemotes] = {};
     char names[MaxRemotes][24] = {}, playerName[24] = {};
     char hostName[64] = {}, error[256] = {}, status[900] = {};
+    Connection connection;
     TrafficCounters traffic;
 } published;
 std::mutex publishedMutex;
@@ -271,6 +295,8 @@ double PingSeconds()
 }
 // Keep relay intervals/ages on QPC too, independent of an occluded game's millisecond timer resolution.
 uint32_t Now() { return static_cast<uint32_t>(static_cast<uint64_t>(PingSeconds() * 1000.0)); }
+
+void FillConnection(Connection& out);  // after the Steam helpers below
 
 int CountLinked()
 {
@@ -296,6 +322,7 @@ void Publish()
         }
     strcpy_s(next.hostName, hostName);
     strcpy_s(next.error, error);
+    FillConnection(next.connection);
     int n = Format(next.status, "STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d "
                    "send_failures=%u offset=%d error=%s session_id=%s isolated_drops=%u "
                    "poll_timer=%s poll_gap_avg_ms=%.2f poll_gap_max_ms=%u pump_work_max_ms=%u receive_caps=%u forward_caps=%u "
@@ -304,6 +331,10 @@ void Publish()
                    sendFailures, senderOffset, *error ? error : "-", GetConfig().sessionId, isolatedDrops,
                    pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum, receiveCaps, forwardCaps,
                    socketFailures, socketError, receiveFailures, invalidPongs);
+    n += Format(next.status + n, sizeof(next.status) - n, " connect_mode=%s connect_state=%s why=%s",
+                connectionMode == connect::Mode::Auto ? "auto" : "invite",
+                isHost ? connect::StateName(hostFlow.state()) : connect::StateName(clientFlow.state()),
+                isHost ? "-" : connect::WhyName(clientFlow.why()));
     for (int i = 0; i < MaxRemotes; ++i) {
         auto const& r = remotes[i];
         if (!r.id) continue;
@@ -449,10 +480,13 @@ bool InLobby(u64 id)
 }
 
 void LeaveLobby();
+void OnClientLinkLost(u64 id, char const* why);
+void OnHostLinkLost(u64 id, char const* why);
 
 void Drop(Remote* r, char const* why)
 {
     if (!r || !r->id) return;
+    const u64 id = r->id;
     Logf("steam: %llu dropped (%s; %u datagrams to ENet, %u to Steam)", r->id, why, r->toEnet, r->toSteam);
     char identity[160];
     Identity(identity, r->id);
@@ -460,7 +494,10 @@ void Drop(Remote* r, char const* why)
     if (r->socket != INVALID_SOCKET) closesocket(r->socket);
     const bool wasHost = !isHost && r->id == owner;
     *r = Remote{};
-    if (wasHost) LeaveLobby();  // the client looks for a host again; its ENet notices the loss by its own timeout
+    if (wasHost) LeaveLobby();  // its ENet notices the loss by its own timeout (net.cpp also closes it when the link ends)
+    if (connectionMode != connect::Mode::Invite) return;
+    if (wasHost) OnClientLinkLost(id, why);
+    else if (isHost) OnHostLinkLost(id, why);
 }
 
 void Skip(u64 id, uint32_t forMs)
@@ -483,11 +520,23 @@ bool IsSkipped(u64 id)
 
 // ---- lobby ----
 
-void CreateLobby()
+bool CreateLobby()
 {
     lastCreate = Now();
-    const u64 call = api.CreateLobby(matchmaking, LobbyFriendsOnly, net::MaxPlayers);
+    const int members = connectionMode == connect::Mode::Invite ? static_cast<int>(connect::MaxPartners) + 1 : net::MaxPlayers;
+    const u64 call = api.CreateLobby(matchmaking, LobbyFriendsOnly, members);
     if (!call) {
+        Logf("connect: Steam rejected the CreateLobby request");
+        return false;
+    }
+    Logf("connect: CreateLobby called (friends-only, %d members); waiting for Steam's answer", members);
+    return true;
+}
+
+// connection = auto (legacy): the lobby exists from the start and is retried every 15 s.
+void CreateLobbyAuto()
+{
+    if (!CreateLobby()) {
         strcpy_s(error, "Steam rejected the lobby creation request");
         Logf("steam: %s", error);
         return;
@@ -505,17 +554,20 @@ void Join(u64 id, char const* why)
     Logf("steam: joining lobby %llu (%s)", id, why);
 }
 
-void InspectLobby(u64 id, char const* why)
+bool InspectLobby(u64 id, char const* why)
 {
     candidateLobby = id;
     candidateAt = Now();
     strncpy_s(candidateReason, why, _TRUNCATE);
+    Logf("connect: reading the metadata of lobby %llu (%s)", id, why);
     if (!api.RequestLobbyData(matchmaking, id)) {
         Logf("steam: could not request lobby %llu metadata", id);
         candidateLobby = 0;
         Skip(id, 30000);
-        strcpy_s(error, "Steam could not read the lobby's session ID");
+        if (connectionMode == connect::Mode::Auto) strcpy_s(error, "Steam could not read the lobby's session ID");
+        return false;
     }
+    return true;
 }
 
 bool MatchesSession(u64 id)
@@ -537,7 +589,7 @@ void LeaveLobby()
             r = Remote{};
         }
     api.LeaveLobby(matchmaking, lobby);
-    if (isHost) {
+    if (isHost && connectionMode == connect::Mode::Auto) {  // legacy: its Join Game string names this lobby (invite mode keeps its own)
         api.SetRichPresence(friends, "connect", "");
         api.SetRichPresence(friends, "status", "");
     }
@@ -547,6 +599,363 @@ void LeaveLobby()
     searchLogged = false;
 }
 
+// ---- invite-driven connection (steam_connect.h) ----
+
+// Display label only (the persona name Steam knows); nobody is ever identified by it.
+char const* NameOf(u64 id)
+{
+    if (!id || !friends) return "";
+    Label* slot = &labels[0];
+    for (auto& l : labels) {
+        if (l.id == id) { slot = &l; break; }
+        if (l.at < slot->at) slot = &l;
+    }
+    const uint32_t now = Now();
+    if (slot->id != id) {
+        *slot = Label{};
+        slot->id = id;
+    }
+    if (!slot->text[0] && (!slot->at || now - slot->at > 2000)) {  // Steam may not know the name yet; ask again later
+        slot->at = now ? now : 1;
+        CopyName(slot->text, sizeof(slot->text), api.FriendPersonaName(friends, id));
+    }
+    return slot->text[0] ? slot->text : "a friend";
+}
+
+bool IsFriend(u64 id)
+{
+    if (!id || id == me) return false;
+    if (api.FriendRelationship) return api.FriendRelationship(friends, id) == 3;  // k_EFriendRelationshipFriend
+    const int count = api.FriendCount(friends, FriendFlagImmediate);
+    for (int i = 0; i < count; ++i)
+        if (api.FriendByIndex(friends, i, FriendFlagImmediate) == id) return true;
+    return false;
+}
+
+u64 FriendByName(char const* name)
+{
+    const int count = api.FriendCount(friends, FriendFlagImmediate);
+    for (int i = 0; i < count; ++i) {
+        const u64 id = api.FriendByIndex(friends, i, FriendFlagImmediate);
+        if (!_stricmp(Text(api.FriendPersonaName(friends, id)), name)) return id;
+    }
+    return 0;
+}
+
+// A negotiation frame (steam_connect.h): plain ASCII on the control channel, reliable, before any lobby exists.
+int SendFrame(u64 to, char const* what, char const* frame, size_t size)
+{
+    char identity[160];
+    Identity(identity, to);
+    const int result = api.SendToUser(messages, identity, frame, static_cast<unsigned>(size),
+                                      SendReliable | SendNoNagle | SendAutoRestart, ChannelControl);
+    Logf("connect: sent %s to %llu (%s) result=%d%s", what, to, NameOf(to), result, result == ResultOk ? "" : " (Steam did not accept the message)");
+    return result;
+}
+
+bool SetPresence(char const* key, char const* value)
+{
+    if (!friends) return false;
+    const bool ok = api.SetRichPresence(friends, key, value) != 0;
+    Logf("connect: rich presence %s=\"%s\" ok=%d", key, value, ok ? 1 : 0);
+    return ok;
+}
+
+// Host: the Join Game rich presence stays published for the whole run (also while a partner is connected, so the same friend can
+// accept again after a drop); only the status text follows the flow.
+void PublishPresence()
+{
+    if (!isHost || connectionMode != connect::Mode::Invite || !apiInitialized) return;
+    lastPresence = Now();
+    if (!connectPublished) {
+        if (!connect::FormatConnect(presenceConnect, sizeof(presenceConnect), me, GetConfig().sessionId)) {
+            strcpy_s(error, "cannot build the Join Game connect string");
+            Logf("connect: %s (host %llu, session %s)", error, me, GetConfig().sessionId);
+            return;
+        }
+        if (SetPresence("connect", presenceConnect)) {
+            connectPublished = true;
+            error[0] = '\0';
+        } else {
+            strcpy_s(error, "Steam did not accept the Join Game rich presence");
+            Logf("connect: %s; trying again in 5 s", error);
+        }
+    }
+    using S = connect::HostFlow::State;
+    const S state = hostFlow.state();
+    char const* status = state == S::Linked ? "G3 Together: playing with a partner"
+        : state == S::Opening || state == S::Offered ? "G3 Together: a partner is connecting"
+        : "G3 Together: open for a partner (Join Game)";
+    if (std::strcmp(status, presenceStatus) != 0 && SetPresence("status", status)) strcpy_s(presenceStatus, status);
+}
+
+void SendJoinRequest(bool resend)
+{
+    const u64 host = clientFlow.host();
+    char frame[connect::FrameMax + 1];
+    const size_t size = connect::EncodeJoin(frame, sizeof(frame), GetConfig().sessionId, saving::Protocol);
+    if (!host || !size) {
+        Logf("connect: cannot send a join request (host=%llu)", host);
+        return;
+    }
+    requestedHost = host;
+    SendFrame(host, resend ? "join request (again, no answer yet)" : "join request", frame, size);
+}
+
+void TearDownClient()
+{
+    candidateLobby = 0;
+    if (lobby) LeaveLobby();
+    if (requestedHost) {
+        char identity[160];
+        Identity(identity, requestedHost);
+        api.CloseSession(messages, identity);
+        requestedHost = 0;
+    }
+    owner = 0;
+}
+
+void LogClientChange(char const* event, connect::ClientFlow::State before, unsigned fx, bool quiet)
+{
+    using F = connect::ClientFlow;
+    const F::State after = clientFlow.state();
+    if (after == F::State::Declined && before != after)
+        Logf("connect: client %s -> %s on %s: %s (arg=%llu%s%s)", connect::StateName(before), connect::StateName(after), event,
+             connect::WhyName(clientFlow.why()), clientFlow.arg(), *clientFlow.hostSession() ? ", host session " : "", clientFlow.hostSession());
+    else if (after != before)
+        Logf("connect: client %s -> %s on %s", connect::StateName(before), connect::StateName(after), event);
+    else if ((fx & F::Ignored) && !quiet)
+        Logf("connect: client %s: %s ignored (nothing changes)", connect::StateName(before), event);
+}
+
+void AfterClient(char const* event, connect::ClientFlow::State before, unsigned fx, bool quiet = false)
+{
+    using F = connect::ClientFlow;
+    LogClientChange(event, before, fx, quiet);
+    if (fx & F::Teardown) TearDownClient();
+    if (fx & F::SendRequest) SendJoinRequest(false);
+    if (fx & F::InspectLobby) {
+        const u64 inspected = clientFlow.lobby();
+        if (!InspectLobby(inspected, "lobby invite")) {
+            const F::State pending = clientFlow.state();
+            AfterClient("lobby metadata request failed", pending, clientFlow.LobbyChecked(inspected, false, Now()));
+        }
+    }
+    if (fx & F::JoinLobby) {
+        Logf("connect: JoinLobby(%llu)", clientFlow.lobby());
+        Join(clientFlow.lobby(), "accepted invite");
+    }
+}
+
+void SendOffer(u64 partner)
+{
+    char frame[connect::FrameMax + 1];
+    const size_t size = connect::EncodeOffer(frame, sizeof(frame), lobby, GetConfig().sessionId);
+    if (!lobby || !size) {
+        Logf("connect: cannot send the lobby offer (lobby=%llu)", lobby);
+        return;
+    }
+    SendFrame(partner, "lobby offer", frame, size);
+}
+
+void SendDecline(u64 to, connect::Why why, u64 arg)
+{
+    char frame[connect::FrameMax + 1];
+    const size_t size = connect::EncodeDecline(frame, sizeof(frame), why, GetConfig().sessionId, arg);
+    Logf("connect: declining %llu (%s): %s", to, NameOf(to), connect::WhyName(why));
+    if (!to || !size) return;
+    SendFrame(to, "decline", frame, size);
+}
+
+void AfterHost(char const* event, connect::HostFlow::State before, unsigned fx, bool quiet = false)
+{
+    using H = connect::HostFlow;
+    const H::State after = hostFlow.state();
+    if (after != before)
+        Logf("connect: host %s -> %s on %s", connect::StateName(before), connect::StateName(after), event);
+    else if ((fx & H::Ignored) && !quiet)
+        Logf("connect: host %s: %s ignored (nothing changes)", connect::StateName(before), event);
+    if (fx & H::SendDecline) SendDecline(hostFlow.declineTo(), hostFlow.declineWhy(), hostFlow.declineArg());
+    if (fx & H::Teardown) LeaveLobby();
+    if (fx & H::CreateLobby) {
+        if (connectionMode == connect::Mode::Auto) {
+            CreateLobbyAuto();
+        } else if (!CreateLobby()) {
+            const H::State rejected = hostFlow.state();
+            AfterHost("CreateLobby rejected", rejected, hostFlow.LobbyCreated(false, 2, Now()));
+        }
+    }
+    if (fx & H::SendOffer) SendOffer(hostFlow.partner());
+    PublishPresence();
+}
+
+void DescribeTarget(connect::Target const& target, char (&out)[160])
+{
+    if (target.kind == connect::Target::Kind::Host) Format(out, "host %llu, session %s", target.id, target.session);
+    else if (target.kind == connect::Target::Kind::Lobby) Format(out, "lobby %llu", target.id);
+    else Format(out, "%s", target.malformed ? "malformed G3 Together connect string" : "not a G3 Together connect string");
+}
+
+// The player accepted something in Steam (or the INI/command line says so): the only way a client starts connecting.
+void OnAccepted(connect::ClientFlow::Source source, char const* what, u64 friendId, char const* raw)
+{
+    const connect::Target target = connect::ParseConnect(raw);
+    char described[160];
+    DescribeTarget(target, described);
+    Logf("connect: %s: friend=%llu (%s) connect=\"%.200s\" -> %s", what, friendId, NameOf(friendId), raw ? raw : "", described);
+    if (isHost) {
+        Log("connect: ignored: this copy is the host (invites are for the client)");
+        return;
+    }
+    if (connectionMode == connect::Mode::Auto) {
+        if (target.kind == connect::Target::Kind::Lobby) pendingLobby = target.id;
+        else Log("connect: connection=auto only follows +connect_lobby; the friends-list search goes on");
+        return;
+    }
+    const connect::ClientFlow::State before = clientFlow.state();
+    AfterClient("accept", before, clientFlow.Accept(source, friendId, target, Now()));
+}
+
+void OnLobbyInvite(u64 inviter, u64 lobbyId)
+{
+    Logf("connect: lobby invite from %llu (%s) lobby=%llu: not joining by itself, the player has to accept it in Steam",
+         inviter, NameOf(inviter), lobbyId);
+    if (isHost || connectionMode != connect::Mode::Invite) return;
+    const connect::ClientFlow::State before = clientFlow.state();
+    AfterClient("lobby invite", before, clientFlow.LobbyInvite(inviter, lobbyId));
+}
+
+void OnJoinRequest(u64 from, connect::Frame const& frame)
+{
+    connect::HostFlow::Join join;
+    join.from = from;
+    join.friendOk = IsFriend(from);
+    join.sessionOk = !std::strcmp(frame.session, GetConfig().sessionId);
+    join.protocol = frame.protocol;
+    Logf("connect: join request from %llu (%s): session=%s protocol=%u friend=%d", from, NameOf(from), frame.session, frame.protocol,
+         join.friendOk ? 1 : 0);
+    const connect::HostFlow::State before = hostFlow.state();
+    AfterHost("join request", before, hostFlow.Request(join, saving::Protocol, Now()));
+}
+
+void OnNegotiation(u64 from, char const* data, int size)
+{
+    connect::Frame frame;
+    if (!from || size <= 0 || !connect::DecodeFrame(data, static_cast<size_t>(size), &frame)) {
+        Logf("connect: malformed negotiation frame from %llu (%d bytes) dropped", from, size);
+        return;
+    }
+    if (isHost) {
+        if (frame.type == 'J') OnJoinRequest(from, frame);
+        else Logf("connect: frame '%c' from %llu ignored: the host only answers join requests", frame.type, from);
+        return;
+    }
+    if (connectionMode != connect::Mode::Invite) {
+        Logf("connect: frame '%c' from %llu ignored: connection=auto", frame.type, from);
+        return;
+    }
+    const connect::ClientFlow::State before = clientFlow.state();
+    if (frame.type == 'L') {
+        if (std::strcmp(frame.session, GetConfig().sessionId)) {
+            Logf("connect: offer from %llu names session %s, not ours (%s); ignored", from, frame.session, GetConfig().sessionId);
+            return;
+        }
+        Logf("connect: lobby offer from %llu (%s): lobby=%llu", from, NameOf(from), frame.lobby);
+        AfterClient("lobby offer", before, clientFlow.Offer(from, frame.lobby, Now()));
+    } else if (frame.type == 'N') {
+        const connect::Why why = connect::DeclineWhy(frame.code);
+        Logf("connect: host %llu (%s) declined the join request: %s (code %c)", from, NameOf(from), connect::WhyName(why), frame.code);
+        AfterClient("host declined", before, clientFlow.HostDeclined(from, why, frame.number, frame.code == 'S' ? frame.session : nullptr));
+    } else {
+        Logf("connect: frame '%c' from %llu ignored: a client only expects offers and declines", frame.type, from);
+    }
+}
+
+void OnClientLinkLost(u64 id, char const* why)
+{
+    const connect::ClientFlow::State before = clientFlow.state();
+    const unsigned fx = clientFlow.LinkLost(id);
+    if (clientFlow.state() == connect::ClientFlow::State::Lost)
+        Logf("connect: connection to %llu (%s) ended (%s); nothing reconnects by itself: accept their invite again", id, NameOf(id), why);
+    AfterClient("link lost", before, fx);
+}
+
+void OnHostLinkLost(u64 id, char const* why)
+{
+    const connect::HostFlow::State before = hostFlow.state();
+    const unsigned fx = hostFlow.LinkLost(id);
+    if (fx & connect::HostFlow::Teardown)
+        Logf("connect: partner %llu (%s) is gone (%s); lobby closed, waiting for the next invite", id, NameOf(id), why);
+    AfterHost("link lost", before, fx);
+}
+
+void ClientTick()
+{
+    const uint32_t now = Now();
+    if (clientFlow.ResendDue(now)) SendJoinRequest(true);
+    const connect::ClientFlow::State before = clientFlow.state();
+    AfterClient("timer", before, clientFlow.Tick(now), true);
+}
+
+void HostTick()
+{
+    const uint32_t now = Now();
+    const connect::HostFlow::State before = hostFlow.state();
+    AfterHost("timer", before, hostFlow.Tick(now), true);
+    if (!connectPublished && now - lastPresence > 5000) PublishPresence();
+}
+
+void ParseLegacyConnect(char const* text);
+
+// Client, once Steam is ready. Steam may have started the game with the host's connect string on the command line (Join Game /
+// an invite accepted while the game was closed); the INI's steam_lobby / steam_host are explicit manual joins. One attempt.
+void StartupAccept()
+{
+    char const* line = GetCommandLineA();
+    Logf("connect: command line: %.300s", line ? line : "");
+    if (connectionMode == connect::Mode::Auto) {
+        ParseLegacyConnect(line);
+        return;
+    }
+    const connect::Target target = connect::ParseConnect(line);
+    if (target.kind != connect::Target::Kind::None || target.malformed) {
+        OnAccepted(connect::ClientFlow::Source::CommandLine, "Steam started the game with a connect string",
+                   target.kind == connect::Target::Kind::Host ? target.id : 0, line);
+        return;
+    }
+    Log("connect: no G3 Together connect string on the command line");
+    if (wantedLobby) {
+        char text[64];
+        Format(text, "+connect_lobby %llu", wantedLobby);
+        OnAccepted(connect::ClientFlow::Source::Manual, "steam_lobby in g3together.ini (manual join, one attempt)", 0, text);
+        return;
+    }
+    if (*GetConfig().steamHost) {
+        const u64 id = FriendByName(GetConfig().steamHost);
+        char text[96];
+        if (id && connect::FormatConnect(text, sizeof(text), id, GetConfig().sessionId)) {
+            OnAccepted(connect::ClientFlow::Source::Manual, "steam_host in g3together.ini (manual join, one attempt)", id, text);
+            return;
+        }
+        Logf("connect: steam_host '%s' is not on your Steam friends list", GetConfig().steamHost);
+    }
+    Log("connect: waiting for an invite (accept a Steam invite or Join Game on the host; nothing connects by itself)");
+}
+
+void FillConnection(Connection& out)
+{
+    out.automatic = connectionMode == connect::Mode::Auto;
+    out.host = isHost;
+    out.hostState = hostFlow.state();
+    out.clientState = clientFlow.state();
+    out.why = clientFlow.why();
+    out.arg = clientFlow.arg();
+    strcpy_s(out.hostSession, clientFlow.hostSession());
+    out.lobbyInvitePending = !isHost && clientFlow.Idle() && clientFlow.lobbyInvitedBy() != 0;
+    const u64 who = isHost ? hostFlow.partner() : out.lobbyInvitePending ? clientFlow.lobbyInvitedBy() : clientFlow.inviter();
+    CopyName(out.name, sizeof(out.name), NameOf(who));
+}
+
 void OnLobbyCreated(char const* p)
 {
     int result = 0;
@@ -554,7 +963,22 @@ void OnLobbyCreated(char const* p)
     std::memcpy(&result, p, 4);
     std::memcpy(&id, p + 8, 8);
     if (!isHost || (lobby && lobby == id)) return;  // arrives twice on real Steam: as the call result and as a broadcast
+    Logf("connect: lobby create result=%d lobby=%llu", result, id);
+    const bool invite = connectionMode == connect::Mode::Invite;
+    if (invite && hostFlow.state() != connect::HostFlow::State::Opening) {
+        // Nobody is waiting for it (the request timed out or was withdrawn): close it again.
+        if (result == ResultOk) {
+            api.LeaveLobby(matchmaking, id);
+            Logf("connect: lobby %llu closed again: no join request is waiting for it", id);
+        }
+        return;
+    }
     if (result != ResultOk) {
+        if (invite) {
+            const connect::HostFlow::State before = hostFlow.state();
+            AfterHost("lobby create failed", before, hostFlow.LobbyCreated(false, result, Now()));
+            return;
+        }
         Format(error, "Steam lobby not created (result %d)", result);
         Logf("steam: %s; trying again in 15 s", error);
         return;
@@ -562,20 +986,31 @@ void OnLobbyCreated(char const* p)
     error[0] = '\0';
     lobby = id;
     owner = me;
-    char connect[64];
-    Format(connect, "+connect_lobby %llu", id);
     if (!api.SetLobbyData(matchmaking, id, "session_id", GetConfig().sessionId) ||
         !api.SetLobbyData(matchmaking, id, LobbyTag, LobbyVersion)) {
-        strcpy_s(error, "Steam did not publish the co-op session ID and lobby tag");
-        Logf("steam: %s", error);
+        Log("connect: Steam did not publish the co-op session ID and lobby tag");
         LeaveLobby();
+        if (invite) {
+            const connect::HostFlow::State before = hostFlow.state();
+            AfterHost("lobby data not published", before, hostFlow.LobbyCreated(false, 2, Now()));
+        } else {
+            strcpy_s(error, "Steam did not publish the co-op session ID and lobby tag");
+            Logf("steam: %s", error);
+        }
         return;
     }
     if (!api.SetLobbyData(matchmaking, id, "name", persona)) Log("steam: could not publish the lobby's player name");
-    if (!api.SetRichPresence(friends, "status", "G3 Together")) Log("steam: could not publish rich-presence status");
-    if (!api.SetRichPresence(friends, "connect", connect)) Log("steam: could not publish Join game rich presence");
+    Logf("connect: lobby %llu open (friends-only); session_id=%s (case-sensitive; only matching sessions can connect)", id,
+         GetConfig().sessionId);
+    if (invite) {
+        const connect::HostFlow::State before = hostFlow.state();
+        AfterHost("lobby created", before, hostFlow.LobbyCreated(true, result, Now()));
+        return;
+    }
+    char text[64];
+    Format(text, "+connect_lobby %llu", id);
+    if (!SetPresence("status", "G3 Together") || !SetPresence("connect", text)) Log("steam: could not publish Join game rich presence");
     Logf("steam: lobby %llu open; friends join over Steam (friends list: Join game, or steam_lobby = %llu)", id, id);
-    Logf("steam: session_id=%s (case-sensitive; only matching sessions can connect)", GetConfig().sessionId);
 }
 
 void OnLobbyEnter(char const* p)
@@ -585,7 +1020,28 @@ void OnLobbyEnter(char const* p)
     std::memcpy(&id, p, 8);
     std::memcpy(&response, p + 16, 4);
     if (isHost || id != lobby || owner) return;
-    if (response != 1 || !MatchesSession(id)) {
+    const bool joined = response == 1;
+    const bool matches = joined && MatchesSession(id);
+    Logf("connect: LobbyEnter lobby=%llu response=%u metadata=%s", id, response, !joined ? "-" : matches ? "ok" : "different session_id or transport");
+    if (connectionMode == connect::Mode::Invite) {
+        const u64 lobbyOwner = joined ? api.GetLobbyOwner(matchmaking, id) : 0;
+        const connect::ClientFlow::State before = clientFlow.state();
+        const unsigned fx = clientFlow.LobbyEntered(id, joined, matches, lobbyOwner, Now());
+        if (fx & connect::ClientFlow::Ignored) {  // not the lobby the flow is joining any more
+            api.LeaveLobby(matchmaking, id);
+            lobby = 0;
+        } else if (!(fx & connect::ClientFlow::Teardown)) {
+            error[0] = '\0';
+            owner = lobbyOwner;
+            CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
+            if (Remote* r = Get(owner)) r->heard = Now();
+            lastHello = 0;
+            Logf("connect: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
+        }
+        AfterClient("lobby entered", before, fx);
+        return;
+    }
+    if (!joined || !matches) {
         Logf("steam: lobby %llu refused (response %u, incompatible session ID or transport)", id, response);
         Format(error, response != 1 ? "the Steam lobby is full or closed" : "different session_id or incompatible G3 Together transport");
         api.LeaveLobby(matchmaking, id);
@@ -601,7 +1057,8 @@ void OnLobbyEnter(char const* p)
     Logf("steam: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
 }
 
-void ParseConnect(char const* text)
+// connection = auto: only the legacy "+connect_lobby <id>" is followed, by the friends-list search.
+void ParseLegacyConnect(char const* text)
 {
     char const* key = text ? std::strstr(text, "+connect_lobby ") : nullptr;
     if (key) pendingLobby = _strtoui64(key + 15, nullptr, 10);
@@ -624,6 +1081,15 @@ void OnCallback(int callback, char const* p, int size)
         std::memcpy(&b, p + 8, 8);
         if (a != candidateLobby || a != b) break;
         candidateLobby = 0;
+        if (connectionMode == connect::Mode::Invite) {
+            const bool matches = p[16] && MatchesSession(a);
+            Logf("connect: lobby %llu metadata: success=%d g3together=%s session_id=%s (ours %s) -> %s", a, p[16] ? 1 : 0,
+                 Text(api.GetLobbyData(matchmaking, a, LobbyTag)), Text(api.GetLobbyData(matchmaking, a, "session_id")),
+                 GetConfig().sessionId, matches ? "a G3 Together lobby of this session" : "refused");
+            const connect::ClientFlow::State before = clientFlow.state();
+            AfterClient("lobby metadata", before, clientFlow.LobbyChecked(a, matches, Now()));
+            break;
+        }
         if (p[16] && MatchesSession(a)) {
             error[0] = '\0';
             Join(a, candidateReason);
@@ -641,29 +1107,57 @@ void OnCallback(int callback, char const* p, int size)
         std::memcpy(&state, p + 24, 4);
         if (a == lobby && (state & 0x1e)) {
             if (Remote* r = Find(b)) r->leaving = true;
+            else if (isHost && connectionMode == connect::Mode::Invite && b == hostFlow.partner())
+                OnHostLinkLost(b, "left the lobby before saying hello");  // no relay exists yet to drop
         }
         break;
-    case CbLobbyJoinRequested:
-        std::memcpy(&pendingLobby, p, 8);
-        Logf("steam: invite accepted for lobby %llu", pendingLobby);
+    case CbLobbyJoinRequested: {  // the player accepted a lobby invite
+        char text[64];
+        std::memcpy(&a, p, 8);
+        if (size >= 16) std::memcpy(&b, p + 8, 8);
+        Format(text, "+connect_lobby %llu", a);
+        OnAccepted(connect::ClientFlow::Source::LobbyJoin, "invite accepted (GameLobbyJoinRequested_t 333)", b, text);
         break;
-    case CbRichJoinRequested:
-        if (size >= 8 + 16) ParseConnect(p + 8);
-        Logf("steam: Join game -> lobby %llu", pendingLobby);
+    }
+    case CbRichJoinRequested: {  // the player pressed Join Game / accepted an invite while the game runs
+        char text[257] = {};
+        if (size < 8) break;
+        std::memcpy(&a, p, 8);
+        std::memcpy(text, p + 8, size - 8 < 256 ? static_cast<size_t>(size - 8) : 256);
+        OnAccepted(connect::ClientFlow::Source::RichJoin, "Join Game accepted (GameRichPresenceJoinRequested_t 337)", a, text);
         break;
-    case CbSessionRequest:
+    }
+    case CbLobbyInvite:
+        if (size < 16) break;
+        std::memcpy(&a, p, 8);
+        std::memcpy(&b, p + 8, 8);
+        OnLobbyInvite(a, b);
+        break;
+    case CbSessionRequest: {
         a = api.IdentityGetSteamId(p);
-        // Host: members of its lobby only (code review 28.10. P2: anyone's session was accepted and took one of the slots).
-        if ((isHost && lobby && InLobby(a)) || (!isHost && owner && a == owner)) {
+        // Host: members of its lobby, and (invite mode) Steam friends, who may only ask to join. Strangers never get a session
+        // (code review 28.10. P2: anyone's session was accepted and took one of the slots).
+        char const* accepted = nullptr;
+        if (isHost && lobby && InLobby(a)) accepted = "lobby member";
+        else if (!isHost && owner && a == owner) accepted = "the host";
+        else if (!isHost && connectionMode == connect::Mode::Invite && clientFlow.host() == a && clientFlow.Active()) accepted = "the host we asked to join";
+        else if (isHost && connectionMode == connect::Mode::Invite && IsFriend(a)) accepted = "Steam friend";
+        if (accepted) {
             api.AcceptSession(messages, p);
-            Logf("steam: session with %llu accepted", a);
+            Logf("connect: session with %llu (%s) accepted: %s", a, NameOf(a), accepted);
         } else {
-            Logf("steam: session from %llu ignored", a);
+            Logf("connect: session from %llu ignored (neither a lobby member nor a Steam friend asking to join)", a);
         }
         break;
+    }
     case CbSessionFailed:
-        Logf("steam: session with %llu failed; dropping its relay", api.IdentityGetSteamId(p));
-        Drop(Find(api.IdentityGetSteamId(p)), "session failed");
+        a = api.IdentityGetSteamId(p);
+        Logf("connect: session with %llu (%s) failed; dropping its relay", a, NameOf(a));
+        if (!isHost && connectionMode == connect::Mode::Invite) {
+            const connect::ClientFlow::State before = clientFlow.state();
+            AfterClient("session failed", before, clientFlow.SessionFailed(a));
+        }
+        Drop(Find(a), "session failed");
         break;
     default:
         break;
@@ -679,6 +1173,10 @@ void OnControl(Remote& r, char const* data, int size)
     case 'H':
         if (size != 1) break;
         if (isHost && lobby && !r.linked && InLobby(r.id)) {
+            if (connectionMode == connect::Mode::Invite && !hostFlow.Admit(r.id)) {
+                Logf("connect: hello from %llu (%s) refused: not the invited partner", r.id, NameOf(r.id));
+                break;
+            }
             if (CountLinked() + 1 >= net::MaxPlayers) {
                 Logf("steam: %llu refused, the game is full", r.id);
                 break;
@@ -691,6 +1189,11 @@ void OnControl(Remote& r, char const* data, int size)
             r.linked = true;
             CopyName(r.name, sizeof(r.name), api.FriendPersonaName(friends, r.id));
             Logf("steam: %s (%llu) linked to this game", Text(api.FriendPersonaName(friends, r.id)), r.id);
+            if (connectionMode == connect::Mode::Invite) {
+                const connect::HostFlow::State before = hostFlow.state();
+                AfterHost("hello", before, hostFlow.Linked(r.id));
+                Logf("connect: connected: partner %llu (%s) is linked to this game", r.id, NameOf(r.id));
+            }
         }
         if (r.linked) Control(r.id, 'W', true);
         break;
@@ -699,6 +1202,11 @@ void OnControl(Remote& r, char const* data, int size)
         if (!isHost && r.id == owner && !r.linked) {
             r.linked = true;
             Logf("steam: welcomed by the host %s; ENet goes over Steam now", hostName);
+            if (connectionMode == connect::Mode::Invite) {
+                const connect::ClientFlow::State before = clientFlow.state();
+                AfterClient("welcomed", before, clientFlow.Welcomed(r.id));
+                Logf("connect: connected: welcomed by host %llu (%s)", r.id, hostName);
+            }
         }
         break;
     case 'P':
@@ -769,8 +1277,14 @@ void Receive(int channel)
             const u64 from = Sender(m);
             void const* payload = nullptr;
             std::size_t payloadSize = 0;
-            if (!lobby || size < 0 || !RelayDecode(data, static_cast<std::size_t>(size), lobby,
-                                                     GetConfig().sessionId, &payload, &payloadSize)) {
+            const bool relayFrame = lobby && size >= 0 && RelayDecode(data, static_cast<std::size_t>(size), lobby,
+                                                                      GetConfig().sessionId, &payload, &payloadSize);
+            if (!relayFrame && channel == ChannelControl && connect::IsFrame(data, size < 0 ? 0 : static_cast<std::size_t>(size))) {
+                OnNegotiation(from, data, size);  // join request / offer / decline: no lobby (or a different one) yet
+                api.MessageRelease(batch[i]);
+                continue;
+            }
+            if (!relayFrame) {
                 ++isolatedDrops;
                 api.MessageRelease(batch[i]);
                 continue;
@@ -976,6 +1490,11 @@ bool Load()
         }
         *e.slot = reinterpret_cast<void*>(function);
     }
+    for (auto const& e : OptionalExports) {
+        FARPROC function = GetProcAddress(dll, e.name);
+        *e.slot = reinterpret_cast<void*>(function);
+        if (!function) Logf("steam: optional %s not exported by this steam_api.dll; friendship is checked through the friends list instead", e.name);
+    }
     Logf("steam: loaded %s", path);
     return true;
 }
@@ -1023,8 +1542,18 @@ bool Start(bool host, unsigned short port)
     if (!*playerName) return Fail("Steam player name does not fit the network protocol");
     ready = true;
     Logf("steam: ready as Gothic 3 (%u), %s (%llu), %s", GothicAppId, persona, me, isHost ? "host" : "client");
+    connectionMode = GetConfig().connectionAuto ? connect::Mode::Auto : connect::Mode::Invite;
+    if (connectionMode == connect::Mode::Invite)
+        Log("connect: mode=invite: nothing connects, searches the friends list or opens a lobby by itself; it all starts when a Steam invite / Join Game is accepted");
+    else
+        Log("connect: mode=auto (legacy): the host opens a lobby at startup and the client searches its friends list by itself");
     if (isHost) {
-        CreateLobby();
+        const connect::HostFlow::State before = hostFlow.state();
+        const unsigned fx = hostFlow.Ready(connectionMode, Now());
+        if (connectionMode == connect::Mode::Invite)
+            Logf("connect: host ready: no lobby until a friend accepts the invite and its join request arrives; session_id=%s protocol=%u",
+                 GetConfig().sessionId, static_cast<unsigned>(saving::Protocol));
+        AfterHost("steam ready", before, fx);
     } else {
         relay = LoopbackSocket(&relayPort);
         if (relay == INVALID_SOCKET) {
@@ -1032,8 +1561,10 @@ bool Start(bool host, unsigned short port)
             return Fail("no local relay socket");
         }
         wantedLobby = _strtoui64(GetConfig().steamLobby, nullptr, 10);
-        ParseConnect(GetCommandLineA());
         Logf("steam: relay on 127.0.0.1:%u%s", relayPort, wantedLobby ? " (steam_lobby set)" : "");
+        clientFlow.Configure(me, GetConfig().sessionId);
+        clientFlow.Ready();
+        StartupAccept();
     }
     stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     wakeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -1120,8 +1651,16 @@ void PumpOnce()
         }
         api.DispatchFree(pipe);
     }
-    if (isHost && !lobby && Now() - lastCreate > 15000) CreateLobby();  // the first try failed: again every 15 s
-    if (!isHost) Search();
+    if (isHost && !lobby && connectionMode == connect::Mode::Auto && Now() - lastCreate > 15000)
+        CreateLobbyAuto();  // the first try failed: again every 15 s (legacy mode only)
+    if (disconnectRequested.exchange(false) && !isHost && connectionMode == connect::Mode::Invite && clientFlow.Active())
+        OnClientLinkLost(clientFlow.host(), "the ENet connection ended");
+    if (!isHost) {
+        if (connectionMode == connect::Mode::Auto) Search();
+        else ClientTick();
+    } else if (connectionMode == connect::Mode::Invite) {
+        HostTick();
+    }
     // Data before control: a friend who quits sends ENet's goodbye and then 'B'; the other order closed its socket first.
     Receive(ChannelData);
     Receive(ChannelControl);
@@ -1191,6 +1730,10 @@ void Stop()
     wakeEvent = stopEvent = pollTimer = nullptr;
     SteamFpScope floatingPoint("shutdown");
     if (apiInitialized) {
+        if (isHost) {  // not joinable any more once the game is closed
+            SetPresence("connect", "");
+            SetPresence("status", "");
+        }
         Forward();  // ENet's goodbye to the others
         LeaveLobby();
         Log("steam: stopped");
@@ -1243,6 +1786,20 @@ bool HostLinked()
 {
     std::lock_guard<std::mutex> lock(publishedMutex);
     return published.hostLinked;
+}
+
+bool RequestClientDisconnect()
+{
+    if (isHost || connectionMode != connect::Mode::Invite) return false;
+    disconnectRequested.store(true);
+    if (wakeEvent) SetEvent(wakeEvent);
+    return true;
+}
+
+Connection Flow()
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return published.connection;
 }
 
 int LinkedCount()

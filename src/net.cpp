@@ -137,7 +137,10 @@ ENetHost* host = nullptr;
 ENetPeer* server = nullptr;  // client side: the connection to the host
 ENetAddress target{};        // client side: where to (re)connect
 uint32_t lastConnectAttempt = 0;
-uint32_t startedAt = 0;      // client: when it began to connect (enet_time_get)
+uint32_t startedAt = 0;      // client: when the Steam link to the host came up and ENet began to connect (enet_time_get)
+bool steamLinked = false;    // client: the Steam relay link to the host is up; ENet connects only while it is (invite-driven connection)
+bool linkEnding = false;     // client: the Steam link was asked to end (ENet lost); its still-published "up" state is not a new link
+bool connectLogged = false;  // client: the first ENet attempt of this Steam link was logged
 bool everConnected = false;  // client: an ENet connection to the host came up once (owner 24.10.: "host not reachable")
 bool isHost = false;
 bool enetInitialized = false;
@@ -2005,7 +2008,7 @@ void SetInWorld(uint8_t id, bool in)
 bool InWorld(uint8_t id) { return isHost ? (id == 1 || (id < MaxPlayers && clientInWorld[id])) : inWorld; }
 bool Joined() { return connected; }
 char const* RefusalReason() { return refusalReason; }
-uint32_t ConnectingFor() { return isHost || everConnected || !host ? 0 : enet_time_get() - startedAt; }
+uint32_t ConnectingFor() { return isHost || everConnected || !host || !steamLinked ? 0 : enet_time_get() - startedAt; }
 void ClaimVersionForTest(uint16_t version) { helloVersion = version; }
 void PrimePoseWrapForTest()
 {
@@ -2910,6 +2913,8 @@ void Stop()
     server = nullptr;
     haveQueued = false;
     lastServiceAt = 0;
+    steamLinked = false;
+    connectLogged = false;
     haveCurrentLocal = false;
     playerCadence = {};
     connected = inWorld = false;
@@ -3010,11 +3015,11 @@ bool Start(bool asHost)
     } else {
         target.port = steam::RelayPort();
         if (!target.port) return StartFailed("Steam relay socket is unavailable");
-        server = enet_host_connect(host, &target, ChannelCount, 0);
-        if (!server) return StartFailed("connection to the Steam relay could not be created");
-        lastConnectAttempt = enet_time_get();
-        startedAt = enet_time_get();
-        Logf("net: connecting over Steam (relay 127.0.0.1:%u): pending", target.port);
+        // Nothing connects by itself: ENet reaches for the relay only once the Steam link to the host is up (Service).
+        steamLinked = false;
+        connectLogged = false;
+        startedAt = 0;
+        Logf("net: waiting for a Steam invite (ENet connects through the relay 127.0.0.1:%u once the Steam link to the host is up)", target.port);
     }
     return true;
 }
@@ -3080,12 +3085,17 @@ void Service(PlayerState const& local, bool haveLocal)
                 const Leave leave{MsgLeave, id};
                 for (uint8_t i = 2; i < MaxPlayers; ++i) if (peers[i]) Send(peers[i], &leave, sizeof(leave), ChannelReliable, true);
             } else {
-                Log("net: disconnected from host; will reconnect");
+                // The Steam link is the connection (invite-driven): once ENet was up, losing it ends the link too, and the player
+                // accepts the invite again. connection = auto keeps the legacy automatic reconnect over the live link.
+                const bool endLink = everConnected && steam::RequestClientDisconnect();
+                Log(endLink ? "net: disconnected from host; closing the Steam link (accept the invite again to reconnect)"
+                            : "net: disconnected from host; will reconnect");
                 connected = false;
                 inWorld = false;
                 options::Restore();
                 server = nullptr;
                 for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
+                if (endLink) linkEnding = true;
             }
             break;
         default:
@@ -3096,10 +3106,40 @@ void Service(PlayerState const& local, bool haveLocal)
     if (result < 0 && ++serviceErrors == 1) Log("net: ENet service failed; subsequent failures counted in RTT diagnostics");
     FlushGoodsReplays();
     const uint32_t now = enet_time_get();
-    if (!isHost && !server && !refused && now - lastConnectAttempt > 3000) {
+    if (!isHost) {
+        // The Steam link (steam.cpp) is the connection: ENet connects when it comes up and is closed when it ends.
+        const bool published = steam::HostLinked();
+        if (!published) linkEnding = false;
+        const bool linked = published && !linkEnding;
+        if (linked && !steamLinked) {
+            steamLinked = true;
+            connectLogged = false;
+            refused = false;  // a new invite is a new attempt
+            refusalReason[0] = '\0';
+            everConnected = false;
+            startedAt = now;
+            lastConnectAttempt = now - 3001;
+            Log("net: the Steam link to the host is up; ENet connects through the relay");
+        } else if (!linked && steamLinked) {
+            steamLinked = false;
+            startedAt = 0;
+            Log("net: the Steam link to the host ended; ENet connection closed (accept the invite again to reconnect)");
+            if (server) {
+                enet_peer_disconnect_now(server, 0);
+                enet_host_flush(host);
+                server = nullptr;
+            }
+            connected = false;
+            inWorld = false;
+            for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
+        }
+    }
+    if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {
         lastConnectAttempt = now;
         server = enet_host_connect(host, &target, ChannelCount, 0);
-        Log(server ? "net: reconnecting" : "net: reconnect failed");
+        if (!connectLogged) Logf("net: connecting over Steam (relay 127.0.0.1:%u): %s", target.port, server ? "pending" : "failed");
+        else Log(server ? "net: reconnecting" : "net: reconnect failed");
+        connectLogged = true;
     }
     UpdateBudgets(now);
     if (connected) {

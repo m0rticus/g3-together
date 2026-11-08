@@ -4,8 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "steam_connect.h"
+
 namespace g3t::lobby {
-enum class Phase { Starting, Creating, Hosting, Searching, Connecting, WaitingCampaign, Joined, Failed, Refused };
+enum class Phase {
+    Starting, Creating, Hosting, Searching, Connecting, WaitingCampaign, Joined, Failed, Refused,
+    InviteWait, PartnerOpening, PartnerOffered, WaitingInvite, LobbyInvited, Requesting, Declined, Lost
+};
 struct State
 {
     Phase phase = Phase::Starting;
@@ -16,6 +21,9 @@ struct State
     char name[64] = {};
     char sessionId[64] = "default";
     char reason[256] = {};
+    steam::connect::Why why = steam::connect::Why::None;
+    uint64_t arg = 0;
+    char hostSession[64] = {};
 };
 
 State Snapshot();

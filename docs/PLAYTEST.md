@@ -591,7 +591,7 @@ still requires the manual encounter; builds and replay tests alone cannot establ
 
 | Stage | Steps and observations |
 |---|---|
-| Host not reachable | Before the session, start the joining player while the host is offline: the top menu line reports that it is searching Steam friends. No address or port is requested. |
+| Host not reachable | Before the session, accept the host's invite (or Join Game) while the host is offline or its game is closed: the top menu line says the host is not reachable or did not answer, and nothing keeps trying by itself. Accepting again once the host is ready connects. No address or port is requested. |
 | Overheard dialog | One player talks to an NPC, the other stands within 20 m with the game's subtitles on: they hear the lines and read them at the top of the screen, in their own game language. |
 | Theft in front of a witness | The joining player takes an item that belongs to a town while a guard or citizen of the host's region watches: that NPC goes after the joining player, as it would after the host. |
 | Robbed when knocked out | Let a guard knock the joining player out (not kill): they stand up by themselves after a while, the guard takes half their gold, and they see "<Name> robbed you of N gold.". The host cannot loot them meanwhile. |
@@ -650,13 +650,13 @@ Both use Steam and are Steam friends; see [PLAYING.md](PLAYING.md#over-steam-exp
 
 | Stage | Steps and observations |
 |---|---|
-| Finding the host | The host starts first, then the joining player without an address: within a few seconds it joins (note how long). Steam shows Gothic 3 and player names match their Steam names. The menu shows lobby status and ping. |
+| Invite and connect | The host starts first and stays silent: its menu says to invite the partner from the Steam friends list. The joining player's menu says it waits for an invite and nothing connects by itself (check `g3together.log`: no `joining lobby`, no lobby created on the host). The host right-clicks the friend > **Invite to Game** (or the joining player right-clicks the host > **Join Game**) and the joining player accepts: the host opens a lobby, the client joins (note how long); player names match their Steam names; the menu shows lobby status and ping. The `connect:` log lines on both sides show each step. |
 | Latency breakdown | With the coordinator's two isolated copies and no artificial relay, confirm the client's menu says transport RTT and normally reads low single digits, not 15/16/31/32 ms clock steps or a fixed 110 ms. Compare `STEAMSTATUS ping` with the separate ENet RTT after at least 60 seconds in-world. Transport should keep responding while one game loads; ENet may retain frame/ACK delay. Check worker poll gaps, socket/send failures, batch/service caps and send-to-flush maxima. Do not interpret smoothed ENet loss alone as continuing physical loss. |
 | Burst/fragment queues | Record `queued_commands`, `reliable_queued`, `reliable_inflight` and `reliable_bytes` in the same quiet and NPC-heavy windows. Two-record batches remain 1199 bytes and still fragment; best-effort near-MTU snapshots must no longer introduce reliable ACK dependencies. Large full poses were already unreliable-fragmented, so high traffic can remain. Queue snapshots can miss short bursts; do not claim throughput or gameplay acceptance from the queue-only ENet tests. |
 | Buffered presentation | On a clean 60 Hz link, `SYNCLATENCY buffer_avg_ms` should settle near 34 ms; actual `shown_lag` should settle without rewinds. Jitter/slower captures may increase the buffer up to 250 ms. Check NPC running/turning/stopping, melee/parries/hit reactions, targeting after kills, ragdolls, downed/revive, trade and host save/load with client re-entry. Policy tests and builds do not establish native visual/gameplay acceptance. |
 | Different networks | Play from two different homes without a VPN or port forwarding: check joining, character-record save requests and an hour of play. Record latency and stutters. |
-| Join game | The joining player's game runs first; then "Join game" on the host in the Steam friends list: it joins. |
-| Leaving | The joining player quits: the host sees it gone at once. It starts again and rejoins. |
+| Join game | Run once with the joining player's game already running and once with it closed (Steam must start Gothic 3 with the host's connect string): **Join Game** on the host in the Steam friends list, or accept the invite notification: it joins. Also accept while already connected (ignored), accept a stale invite after the host quit (clear message), and accept an invite with a different `session_id` (clear refusal). |
+| Leaving | The joining player quits: the host sees it gone at once and is joinable again. It starts again, accepts the invite again and rejoins; nothing reconnects by itself. |
 | Without Steam | Close Steam and start the game: co-op startup must fail with a clear message and no alternative connection. Repeat on the host. |
 
 ## Recording a bug

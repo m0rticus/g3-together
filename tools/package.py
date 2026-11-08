@@ -20,8 +20,10 @@ HOST_INI = """# G3 Together: this player hosts the campaign.
 # This package speaks protocol 77 with host-managed saves and guarded bone packing: both players need this same package.
 role = host
 # Player name is taken from Steam automatically.
-# Steam friends find this game. Steam and G3Together/steam_api.dll are required; there is no direct-IP fallback.
+# Invite a Steam friend, or they can choose Join Game. Steam and G3Together/steam_api.dll are required; no direct-IP fallback.
 transport = steam
+# invite (default): open a lobby only for an accepted request; auto: open one at startup for automatic discovery.
+# connection = invite
 # Match this case-sensitive ID on both players; use a different ID for each independent group.
 # 1-63 ASCII letters, digits, underscores or hyphens. This is not a password or a Steam lobby number.
 session_id = default
@@ -72,9 +74,14 @@ friendly_fire = 0
 CLIENT_INI = """# G3 Together: this player joins the host.
 # This package speaks protocol 77 with host-managed saves and guarded bone packing: both players need this same package.
 role = client
-# Finds the host among Steam friends; Steam is required. With several hosts: steam_host = <SteamID64 or Steam name>.
-# Saved characters, personal state and companion ownership use SteamID64; display names may change.
+# Wait for the host's Steam invite or choose Join Game on the host; Steam is required.
+# Finds the host in invite mode only after you accept the request. Saved characters, personal state and companion ownership
+# use authenticated SteamID64; display names may change.
 transport = steam
+# invite (default): wait for an invite; auto: scan friends and join automatically (for test setups).
+# connection = invite
+# Optional manual joins at startup in invite mode: steam_host = <host's Steam name> or steam_lobby = <lobby number>.
+# In auto mode these restrict discovery. Neither overrides session_id.
 # Must match the host; different IDs never connect, even through invites or steam_lobby.
 session_id = default
 # Player name is taken from Steam automatically.

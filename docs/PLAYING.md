@@ -133,15 +133,17 @@ Steam is the only connection path. No host address, VPN or router port forwardin
 
 ### Over Steam (experimental)
 
-With `transport = steam` in both INIs, the joining player's game finds the host among their Steam friends, and all traffic
-goes through Steam, relayed by Valve where needed.
+With `transport = steam` in both INIs, the players connect through a Steam invite or **Join Game**.
+All traffic goes through Steam, relayed by Valve where needed. By default neither game searches for a partner or
+opens a lobby on its own.
 
 - Both players need to own Gothic 3 on Steam, with Steam running and logged in, and must be Steam friends.
   The automatic player name is the current Steam display name; manual INI names are ignored.
 - The mod needs Valve's 32-bit `steam_api.dll` in `<Gothic 3>\G3Together\`. The setup puts it there (from the package, or
   downloaded from the Steamworks.NET release 2025.164.1 after asking, checked by its SHA-256).
 - The mod initializes as Gothic 3 (AppID 39500), so Steam activity uses Gothic 3 instead of Spacewar.
-  Local real-Steam initialization and lobby creation were checked; two-account gameplay remains a separate check.
+  Real-Steam initialization and lobby creation were checked previously; invite-driven gameplay still needs a
+  two-account check.
 - Set the same `session_id` in both players' `g3together.ini`, or choose it in setup. It is a case-sensitive label
   of 1-63 ASCII letters, digits, underscores or hyphens, shown in the menu and log. Missing settings use `default`;
   empty or invalid values stop networking. Different IDs are rejected before joining a Steam lobby, and every
@@ -151,32 +153,59 @@ goes through Steam, relayed by Valve where needed.
   maximum; a different case or an ID prefix is never an exact match. Truncated, legacy, marker-invalid and lobby/session
   mismatch packets are dropped before a Steam peer is reserved.
 - For three independent pairs, set `session_id = pair-red`, `pair-green` or `pair-blue` on each pair's host and client.
-  These IDs do not change the existing per-lobby player limit or impose a two-player cap. Use one host per ID;
-  if multiple hosts deliberately share an ID, automatic search still selects the first matching friend.
-- `steam_host = <the host's SteamID64 or Steam name>` additionally restricts friend search. Prefer SteamID64
-  so renaming the host does not affect search. The host's `g3together.log` names
-  its Steam lobby number; `steam_lobby = <number>` restricts joining to that lobby. These selectors, command-line
-  `+connect_lobby`, and Steam invites **never override session_id**.
+  Use one host per ID. In invite mode a host accepts one partner at a time.
+- `connection = invite` is the default: wait for a Steam invite or Join Game. `connection = auto` keeps the old
+  behavior for test setups: the host opens a friends-only lobby at startup and the client scans friends and joins
+  on its own. If multiple hosts share an ID, automatic search selects the first matching friend.
+- In invite mode, `steam_host = <the host's Steam name>` asks that friend's game once at startup and
+  `steam_lobby = <lobby number>` joins that lobby once at startup. These are optional manual overrides for testing.
+  In auto mode they restrict discovery as before. They, command-line `+connect_lobby`, and Steam invites
+  **never override session_id**.
 - Session IDs are visible grouping labels, not passwords or access controls. Steam friendship/lobby membership
-  still applies. The session-scoped relay format is incompatible with older builds, even in the default group;
-  update every player. The gameplay protocol itself is unchanged.
+  still applies. The host publishes a status text and the ID in its Steam Rich Presence connect string,
+  `+g3t_connect <host SteamID64> <session_id>`. Both players need this build: older builds cannot invite or be invited
+  by it, even though protocol 77 and the relay envelope are unchanged. The Steam control channel has new join requests.
+  The session-scoped relay format is also incompatible with older pre-session relay builds, even in the default group.
 - Each concurrently running real-Steam instance needs a distinct Steam identity. Running six processes under
   one Steam account is not supported by this identity-addressed transport. Multiple copies on one PC also need
   isolated installations, profiles and saves; a Session ID isolates network traffic, not filesystem writes.
 - Without Steam or the required `steam_api.dll`, co-op startup fails with a message in the menu and game.
   There is no fallback. ENet's UDP sockets bind only to localhost and accept linked Steam relays, not direct-IP players.
+- The Steam overlay may not open in Gothic 3. It is not needed: use the friends list in the Steam desktop client
+  for **Join Game** or **Invite to Game**.
 
-Saved character and personal inventory records, companion/follower/guide ownership and newly recorded summons
-are keyed by authenticated SteamID64. Display names refresh independently; reconnecting into a different player
-slot or renaming a Steam profile does not transfer ownership. Old name-keyed companions migrate only on an
-unambiguous match; unresolved records are retained with a host warning. See [Joining](JOINING.md) for the explicit
-`legacy_companion_owner` setting. Older saves did not record remote summon SteamIDs, so missing historical
-ownership cannot be inferred safely. World quests/events remain shared world state, not player-name records.
-- The Steam overlay's invite may not open in Gothic 3. It is not needed: the joining player's game finds the host by
-  itself, and "Join game" in the Steam friends list works as well while their game is running.
+#### Connecting step by step
 
-The main menu reports creating/hosting/searching/joined states, accepted and ready clients, linked Steam peers and
-measured **transport RTT**. It is the most recent high-resolution Steam control echo, rounded to integer milliseconds,
+1. Both players set the same `session_id` and start Steam. The host starts Gothic 3 and begins or loads the campaign.
+   The host stays joinable without opening a lobby and can right-click the partner in the Steam friends list and
+   choose **Invite to Game**.
+2. The joining player accepts the invite in Steam's notification or overlay, or right-clicks the host in the Steam
+   friends list and chooses **Join Game**. If Gothic 3 is already running, Steam delivers the request to that game.
+   If it is closed, Steam starts it with the host's `+g3t_connect <id> <session>` connect string; a Steam lobby
+   invite can instead supply `+connect_lobby <id>`.
+3. After a valid request from a friend with the same session ID and protocol, the host opens a friends-only lobby
+   and the client joins. The host accepts one partner at a time; a second friend is told the host is busy.
+   When the partner leaves, or fails to finish connecting within 60 seconds, the host closes the lobby and becomes
+   joinable again.
+
+#### Connection states and what the menu says
+
+- The host's top line says **"Invite your partner from the Steam friends list (right-click -> Invite to Game / Join Game)."**
+  while waiting. The client starts at **"waiting for an invite"**.
+- After accepting, the client can show **"invited by <friend name>"**, then connecting and connected. The friend
+  name is a display label. An invite accepted while already connected is ignored; a different invite accepted
+  while connecting switches to the newest one.
+- A refusal stays in the menu until the next accept. Reasons include a different `session_id`, a different G3 Together
+  version, a busy host, not being on the host's friends list, an unreachable host or one not running G3 Together,
+  and a stale invite whose lobby is closed.
+- After a lost connection, the client does not reconnect on its own. Accept the invite again or use **Join Game**.
+
+`g3together.log` lines beginning with `connect:` record the exact published Rich Presence value, received invite or
+Join Game friend ID and connect string, parsed command line, join request, lobby creation/join results and Steam result
+codes, handshake and refusals. `tools\collect_logs.py` includes this log. Review names and Steam IDs before sharing logs.
+
+The main menu also reports accepted and ready clients, linked Steam peers and measured **transport RTT**.
+It is the most recent high-resolution Steam control echo, rounded to integer milliseconds,
 not NPC buffering or input-to-photon latency; the host shows the maximum fresh linked-peer sample.
 `pending` means no valid sample exists yet or none arrived for five seconds. Control echoes are sent once per second,
 but a still-outstanding echo is not overwritten; genuinely slow replies up to five seconds remain measurable.
@@ -185,8 +214,8 @@ waitable timer and an immediate wake after ENet flushes. This avoids Windows 11'
 for an occluded game. Older Windows versions without high-resolution timers explicitly log the legacy timed-wait path.
 This is a scheduling target, not a hard OS deadline. ENet and gameplay handlers
 stay on the engine thread, so loading/render stalls can still raise **ENet RTT** without raising transport RTT.
-Errors and compatibility refusals take priority. `g3together.log` appends startup/session, lobby, peer, send-failure and
-periodic connection diagnostics automatically. Review names and Steam IDs before sharing logs.
+Errors and compatibility refusals take priority. `g3together.log` also appends startup/session, lobby, peer,
+send-failure and periodic connection diagnostics automatically.
 
 `STEAMSTATUS ping=` is the displayed transport RTT; `ping_age_ms` is the sample's age. `poll_timer` identifies the
 high-resolution or legacy wait path. `poll_gap_avg_ms`,
@@ -431,7 +460,8 @@ Friendly-fire protection applies before local hit feedback as well as before aut
 ## Starting and saving
 
 1. The host starts Gothic 3 and begins a new game or loads the co-op campaign.
-2. The other player starts **New Game** locally. Before admission, the host restores that Steam account's
+2. The other player accepts the host's invite or **Join Game**, then starts **New Game** locally (or enters
+   automatically with `client_autoload`, below). Before admission, the host restores that Steam account's
    saved character and personal loot/merchant state if present. The host calendar, authoritative story/quest-runtime
    and nearby shared-door snapshots finish before admission. The applied cutover is confirmed before NPC/motion
    entry replays. A new account gets a fresh character, never the host's hero.
@@ -674,7 +704,7 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
 
 | What can happen | What to do |
 |---|---|
-| The game may crash during combat or shortly after an enemy dies. The known orc-raid crash has a guard, but other crashes remain possible. | The host should save before difficult fights. Record the time and enemy, and preserve both players' logs before restarting. The host loads the last good save; the other player is loaded into it automatically (if their own game crashed, they restart it and wait in the main menu). |
+| The game may crash during combat or shortly after an enemy dies. The known orc-raid crash has a guard, but other crashes remain possible. | The host should save before difficult fights. Record the time and enemy, and preserve both players' logs before restarting. The host loads the last good save; with `client_autoload` on, the other player is loaded into it automatically once connected. If the connection was lost, accept the invite or Join Game again. |
 | The other player's character briefly lags behind while being hit, or shows a movement inaccurately. | Regroup and wait briefly; use **Page Down** if needed. If enemies, health or positions remain clearly different, stop the fight and record the problem. |
 | Enemies or companions behave differently on the two PCs after joining. | Check that both players see the same characters and movements near the host. If the difference persists, preserve the logs and restart together from the last good save. |
 | "<Name> is using this." when you want to sit down or use a campfire, anvil or other place | Your partner uses it right now; wait until they get up. If someone gets stuck at such a place, record the bug and reload together. |

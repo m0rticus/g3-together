@@ -124,6 +124,8 @@ unsigned short RelayPort() { return 0; }
 void Pump() {}
 void Stop() {}
 int Ping() { return -1; }
+bool HostLinked() { return false; }
+bool RequestClientDisconnect() { return false; }
 char const* PlayerName() { return ""; }
 char const* Error() { return ""; }
 }

@@ -50,7 +50,7 @@ $t = @{
     SteamDllFail = 'steam_api.dll could not be downloaded ({0}).'
     SteamDllNone = 'Steam is required. Setup cannot install the mod without the verified steam_api.dll.'
     SteamHost    = 'Over Steam: both players must own Gothic 3 on Steam and be Steam friends. Steam must be running. Names come from Steam automatically; activity shows Gothic 3.'
-    SteamClient  = 'Over Steam: the host must be on your Steam friends list and have Steam running; your game finds theirs by itself.'
+    SteamClient  = 'Over Steam: the host must be on your Steam friends list and have Steam running; accept its invite (or Join Game) to connect.'
     IniBackup    = 'Your previous g3together.ini is kept in {0}.'
     IniDone      = 'g3together.ini written: {0}'
     DoneHost     = 'Done. Start Gothic 3 and begin a new game or load your co-op campaign; then your partner starts.'
@@ -285,7 +285,7 @@ $lines.Add('language = auto')
 $productionKeys = @(
     'partner_key', 'look', 'puppet_template', 'reputation', 'host_roi', 'host_sim',
     'puppet_lead', 'motion_seek', 'listener_textbox', 'friendly_fire', 'npc_damage',
-    'npc_hp', 'steam_host', 'ardea_remove_npcs'
+    'npc_hp', 'steam_host', 'connection', 'ardea_remove_npcs'
 )
 $kept = @($old.Keys | Where-Object { $productionKeys -contains $_.ToString().ToLower() })
 if ($kept.Count -gt 0) {

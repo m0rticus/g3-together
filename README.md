@@ -88,8 +88,10 @@ Replaced files go into `G3Together-backup`. See also [manual installation](docs/
 
 ### 3. Connect and play
 
-Both players must own Gothic 3 on Steam, have Steam running and be Steam friends. The joining player's game finds the host through Steam:
-no host address, VPN or router port forwarding is needed. Steam failures are reported without opening another connection.
+Both players must own Gothic 3 on Steam, have Steam running and be Steam friends. Nothing connects by itself: the host
+stays silent (menu: invite your partner from the Steam friends list), and the joining player connects only after accepting
+the host's Steam invite or choosing **Join Game** on the host in the Steam friends list, whether Gothic 3 is already running or not.
+No host address, VPN or router port forwarding is needed. Steam failures are reported without opening another connection.
 ENet's internal UDP sockets bind only to localhost. See [over Steam](docs/PLAYING.md#over-steam-experimental).
 
 Choose the same **Session ID** in setup on both players, or set `session_id = pair-red` in both

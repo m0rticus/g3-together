@@ -13,8 +13,12 @@ struct Config
     char sessionId[SessionIdSize] = "default";  // shared, case-sensitive session_id; not the native Steam lobby number
     bool sessionIdValid = true;
     // Steam is the only transport. ENet's sockets are private loopback bridges, not direct-IP endpoints.
-    char steamLobby[24] = "";             // client, steam: join this lobby (its number from the host's log) instead of searching
-    char steamHost[64] = "";              // client: this friend's SteamID64 or display name
+    // connection = invite | auto (steam.cpp, steam_connect.h). invite (default): nothing connects, searches or creates a lobby on
+    // its own; the host publishes Join Game rich presence and the client connects only after its player accepts a Steam invite /
+    // Join Game. auto: the legacy behaviour (host opens a lobby at startup, client scans the friends list), kept for the stand-in/tests.
+    bool connectionAuto = false;
+    char steamLobby[24] = "";             // client, steam: join this lobby (its number from the host's log) instead of searching; invite mode: manual join at startup
+    char steamHost[64] = "";              // client, steam: only this friend's game (its Steam name); invite mode: manual join of that friend at startup
     std::map<std::string, uint64_t> legacyCompanionOwners; // host-authorized one-time migration, old label -> SteamID64
     char language[5] = "en";       // local HUD language: en | de | pl | auto (the game's text language); not a network setting
     char puppetTemplate[64] = "PC_Hero";  // template used to show other players (the hero himself) who chose no look

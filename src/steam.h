@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+#include "steam_connect.h"
+
 namespace g3t::steam {
 struct TrafficCounters
 {
@@ -26,8 +28,11 @@ struct TrafficCounters
     uint64_t txEnetUnparsedDatagrams = 0;
 };
 
-// Loads required steam_api.dll, starts the Steam API as Gothic 3 and, for a host, opens a friends-only lobby. enetPort: the host's
-// ENet port (each friend's datagrams go there over 127.0.0.1). False if Steam cannot be used; Error() says why.
+// Loads required steam_api.dll and starts the Steam API as Gothic 3. connection = invite (default): the host publishes Join Game
+// rich presence and opens its friends-only lobby only for a friend's join request; the client connects only after its player
+// accepts a Steam invite / Join Game (steam_connect.h). connection = auto: the host opens a lobby at once, the client searches
+// its friends list. enetPort: the host's ENet port (each friend's datagrams go there over 127.0.0.1). False if Steam cannot be
+// used; Error() says why.
 bool Start(bool host, unsigned short enetPort);
 // Client: the 127.0.0.1 port ENet connects to; the relay passes it on to the host found over Steam. 0 before Start.
 unsigned short RelayPort();
@@ -47,10 +52,29 @@ uint64_t PlayerId();       // authenticated local account, stable across names a
 char const* Error();        // why Steam is not used, "" while it is (or before Start)
 // Client: the Steam name of the host whose lobby it is in ("" while it looks for one) and whether that host answered.
 char const* HostName();
-bool HostLinked();
+bool HostLinked();  // client: the relay link to the host is up (net.cpp connects ENet while it is and closes it when it ends)
+// Client, invite mode: the ENet connection to the host ended (and was up before). The Steam link ends with it (lobby left, session
+// closed, flow Lost) so that nothing reconnects by itself: the player accepts the invite again. Safe from the engine thread (the
+// worker does the work). False in connection = auto, which keeps its legacy automatic ENet reconnect.
+bool RequestClientDisconnect();
 // Host: friends whose relay is linked to this game.
 int LinkedCount();
 TrafficCounters Traffic(); // successful Steam API submissions and accepted relay datagrams, copied by the existing published mutex
+// The invite-driven connection as the menu shows it (steam_connect.h has the state machines; steam.cpp publishes a copy).
+struct Connection
+{
+    bool automatic = false;  // connection = auto (legacy friends-list discovery): the states below are not used
+    bool host = false;
+    connect::HostFlow::State hostState = connect::HostFlow::State::Starting;
+    connect::ClientFlow::State clientState = connect::ClientFlow::State::Starting;
+    connect::Why why = connect::Why::None;  // client, Declined: why the attempt ended
+    uint64_t arg = 0;                       // WrongProtocol: the host's protocol; HostError: the Steam EResult
+    char name[64] = {};         // display label only: client = the friend whose invite is followed (or whose lobby invite waits), host = the invited partner
+    char hostSession[64] = {};  // WrongSession: the other side's session_id
+    bool lobbyInvitePending = false;  // client, idle: a lobby invite arrived that the player has not accepted in Steam yet (name = inviter)
+};
+Connection Flow();
+
 // QA (steamstatus): one line with role, lobby, peers, relay counters.
 void Status(void (*log)(char const*));
 }

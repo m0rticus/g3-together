@@ -2265,6 +2265,10 @@ void StatusHints()
     everJoined = everJoined || joined;
     wasJoined = joined;
     char const* reason = net::RefusalReason();
+    if (!*reason && !refusal.empty()) {  // a new invite is a new attempt: the old refusal no longer applies
+        refusal.clear();
+        shown.clear();
+    }
     if (*reason && shown != reason) {
         shown = reason;
         static char const install[] = "install differs from the host: ";

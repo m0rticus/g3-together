@@ -87,8 +87,9 @@ choose independently; this does not change Gothic 3's own language.
 
 ## Joining
 
-The host starts Gothic 3 and begins a new campaign or loads the co-op campaign. Start your game
-afterwards: with `client_autoload = on` (default) it joins and enters the host's world by itself after a 4 second countdown in the
+The host starts Gothic 3 and begins a new campaign or loads the co-op campaign. Accept the host's invite in Steam,
+or use **Join Game** on the host in the Steam friends list. This works whether your game is running or Steam starts
+it for you. Once connected, with `client_autoload = on` (default) you enter the host's world after a 4 second countdown in the
 menu (Esc cancels it), or choose **New Game** yourself. The host sends your account's saved character and personal loot/merchant state, applied before
 admission. If no record exists for your account, you start fresh, never as a copy of the host.
 Only the host loads saved games; after a host load the client re-enters automatically (same countdown) through its own `G3T_client_template` slot
@@ -97,12 +98,14 @@ The host calendar, quest/status/timer/counter, dialog/event and nearby shared-do
 The client applies cutover changes and confirms entry before one-shot NPC/motion replays start.
 Restoration does not replay quest rewards. Native world files never travel over the network; gameplay acceptance remains manual.
 
-If joining is refused, open `g3together.log` in the Gothic 3 folder and find the line containing
-`REFUSED by host`. Compare versions and game options with the host. The reason also stays in the top line of the main menu.
+If joining is refused, compare versions and game options with the host. Game compatibility refusals appear in
+`g3together.log` in the Gothic 3 folder on a line containing `REFUSED by host`. Steam-level refusals appear in the
+menu's top line and in `connect:` lines in the log; the reason stays until the next accept.
 
-**Steam is the only connection path** (see [PLAYING.md](PLAYING.md#over-steam-experimental)). Your game looks for the host
-among your Steam friends; until it finds one, the top line of the main menu says so
-after about 15 seconds. The host must be on your Steam friends list and have Steam and its game running.
+**Steam is the only connection path** (see [PLAYING.md](PLAYING.md#over-steam-experimental)). By default your game waits
+for an invite; accept one or choose **Join Game** on the host. The host must be on your Steam friends list and have Steam
+and its game running. The Steam desktop friends list works even if the overlay cannot open inside Gothic 3.
+After a lost connection, accept again; the client does not reconnect by itself.
 If Steam cannot start, a clear error is shown; fix Steam or the required DLL and restart the game. There is no IP fallback.
 
 ## While playing

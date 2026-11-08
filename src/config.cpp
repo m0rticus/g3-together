@@ -92,6 +92,13 @@ Config const& LoadConfig()
             if (_stricmp(value, "steam")) Logf("config: transport '%s' is no longer supported; connections require Steam", value);
         }
         else if (!_stricmp(key, "steam_lobby")) strncpy_s(config.steamLobby, value, _TRUNCATE);
+        else if (!_stricmp(key, "connection")) {
+            if (!_stricmp(value, "auto")) config.connectionAuto = true;
+            else {
+                config.connectionAuto = false;
+                if (_stricmp(value, "invite")) Logf("config: unknown connection '%s', using invite", value);
+            }
+        }
         else if (!_stricmp(key, "steam_host")) strncpy_s(config.steamHost, value, _TRUNCATE);
         else if (!_stricmp(key, "legacy_companion_owner")) {
             const std::string mapping(value);
@@ -199,8 +206,9 @@ Config const& LoadConfig()
          config.puppetLead ? "auto" : "off", config.motionSeek ? "on" : "off", config.listenerTextbox ? "on" : "off", config.friendlyFire, config.npcDamage, config.npcHp);
     Logf("config: movement_smoothing=%s (100 ms replica display buffer; local controls remain native)",
          config.movementSmoothing ? "on" : "off");
-    Logf("config: transport=steam session_id=%s steam_lobby=%s steam_host=%s", config.sessionIdValid ? config.sessionId : "(invalid)", *config.steamLobby ? config.steamLobby : "-",
-         *config.steamHost ? config.steamHost : "-");
+    Logf("config: transport=steam connection=%s session_id=%s steam_lobby=%s steam_host=%s",
+         config.connectionAuto ? "auto" : "invite", config.sessionIdValid ? config.sessionId : "(invalid)",
+         *config.steamLobby ? config.steamLobby : "-", *config.steamHost ? config.steamHost : "-");
     Logf("config: send_rate=%d Hz (compact player states; reliable gameplay immediate; NPC policy independent) network_budget_kib=%d per peer (bulk save pacing base; never caps NPC/gameplay traffic)",
          config.sendRate, config.networkBudgetKib);
     return config;
