@@ -74,6 +74,7 @@ enum Message
     DeclineUnreachable,
     DeclineLobbyGone,
     DeclineNotG3T,
+    DeclineMetadataTimeout,
     TradeUnavailable,
     TradeRestoreFailed,
     TradeNativeUnavailable,

@@ -134,6 +134,33 @@ class SteamConnectTests(unittest.TestCase):
         self.assertIn("connection", playing)
         self.assertIn("+g3t_connect", playing)
 
+    def test_metadata_replication_paths(self):
+        steam = self.source("src/steam.cpp")
+        entry = self.between(steam, "void OnLobbyEnter(", "// connection = auto: only")
+        self.assertIn("ReadLobbyMetadata(id)", entry)
+        self.assertIn("clientFlow.LobbyEntered(id, joined, metadata", entry)
+        self.assertIn('InspectLobby(id, "joined lobby", true)', entry)
+        self.assertIn("connect::LobbyMetadata::Pending", entry)
+        poll = self.between(steam, "void PollLobbyMetadata()\n{", "void SendOffer(")
+        self.assertIn("ReadLobbyMetadata(id)", poll)
+        self.assertIn("clientFlow.LobbyChecked(id, metadata, now)", poll)
+        self.assertIn("LobbyMetadataWaitMs", poll)
+        self.assertIn("RequestLobbyData(matchmaking, id)", poll)
+        self.assertIn("metadata pending", poll)
+        self.assertIn("metadata arrived after", poll)
+        callback = self.between(steam, "case CbLobbyDataUpdate:", "case CbLobbyChatUpdate:")
+        self.assertIn("a != candidateLobby || a != b", callback)
+        self.assertIn("PollLobbyMetadata();", callback)
+        pump = self.between(steam, "void PumpOnce()\n{\n    if (!ready) return;", "void Pump() {")
+        self.assertIn("PollLobbyMetadata();", pump)
+        after = self.between(steam, "void AfterClient(", "void PollLobbyMetadata()\n{")
+        self.assertIn("F::AwaitMetadata", after)
+        self.assertIn("F::HelloReady", after)
+        self.assertIn("FinishLobbyEntry", after)
+        self.assertIn("DeclineMetadataTimeout", self.source("src/i18n.h"))
+        self.assertIn("Steam did not deliver the lobby's data in time", self.source("src/i18n.cpp"))
+        self.assertIn("Why::MetadataTimeout", self.source("src/lobby.cpp"))
+
 
 if __name__ == "__main__":
     unittest.main()

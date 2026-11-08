@@ -19,6 +19,10 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ### Real Steam world synchronization (manual acceptance)
 
+- [ ] Repeatedly accept the host's Steam invite, including immediately after the lobby opens.
+  The client must connect without a false session/version mismatch. If metadata is delayed,
+  its log should show `metadata pending` followed by `metadata arrived after ...: ok`;
+  a timeout should explicitly mention missing Steam lobby data and allow another invite.
 - [ ] Use the same rebuilt DLL on both real Steam accounts. Invite/accept normally,
   enter Ardea together and confirm `admission: ... in the host's world` on the host.
   Walk, turn, draw weapons, attack and cast on each machine; both screens must show

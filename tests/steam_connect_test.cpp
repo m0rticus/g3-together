@@ -19,6 +19,7 @@ using C = ClientFlow;
 using H = HostFlow;
 using CS = C::State;
 using HS = H::State;
+using M = LobbyMetadata;
 constexpr uint64_t Self = 7, Host = 101, Other = 202, Lobby = 1001, OtherLobby = 2002;
 constexpr uint32_t Start = 1000;
 constexpr unsigned Protocol = 77;
@@ -79,7 +80,7 @@ C MakeClient(ClientFixture fixture)
     }
     if (fixture == ClientFixture::Invited || fixture == ClientFixture::Checked) {
         assert(c.Accept(C::Source::LobbyJoin, Host, LobbyTarget(), Start) == C::InspectLobby);
-        if (fixture == ClientFixture::Checked) assert(c.LobbyChecked(Lobby, true, Start) == C::JoinLobby);
+        if (fixture == ClientFixture::Checked) assert(c.LobbyChecked(Lobby, M::Match, Start) == C::JoinLobby);
         return c;
     }
     assert(c.Accept(C::Source::RichJoin, Host, HostTarget(), Start) == C::SendRequest);
@@ -90,7 +91,7 @@ C MakeClient(ClientFixture fixture)
     }
     assert(c.Offer(Host, Lobby, Start) == C::JoinLobby);
     if (fixture == ClientFixture::Offered) return c;
-    assert(c.LobbyEntered(Lobby, true, true, Host, Start) == C::None);
+    assert(c.LobbyEntered(Lobby, true, M::Match, Host, Start) == C::HelloReady);
     if (fixture == ClientFixture::Entered) return c;
     assert(c.Welcomed(Host) == C::None);
     if (fixture == ClientFixture::Lost) assert(c.LinkLost(Host) == C::Teardown);
@@ -131,14 +132,14 @@ unsigned Apply(C& c, ClientEvent e, ClientFixture f)
     case CE::DeclineHost: return c.HostDeclined(Host, Why::Busy, 12, "remote");
     case CE::DeclineOther: return c.HostDeclined(Other, Why::Busy, 12, "remote");
     case CE::DeclineNone: return c.HostDeclined(Host, Why::None, 12, "remote");
-    case CE::CheckGood: return c.LobbyChecked(Lobby, true, Start);
-    case CE::CheckBad: return c.LobbyChecked(Lobby, false, Start);
-    case CE::CheckOther: return c.LobbyChecked(OtherLobby, true, Start);
-    case CE::EnterGood: return c.LobbyEntered(Lobby, true, true, Host, Start);
-    case CE::EnterFailed: return c.LobbyEntered(Lobby, false, true, Host, Start);
-    case CE::EnterMismatch: return c.LobbyEntered(Lobby, true, false, Host, Start);
-    case CE::EnterNoOwner: return c.LobbyEntered(Lobby, true, true, 0, Start);
-    case CE::EnterOther: return c.LobbyEntered(OtherLobby, true, true, Host, Start);
+    case CE::CheckGood: return c.LobbyChecked(Lobby, M::Match, Start);
+    case CE::CheckBad: return c.LobbyChecked(Lobby, M::Different, Start);
+    case CE::CheckOther: return c.LobbyChecked(OtherLobby, M::Match, Start);
+    case CE::EnterGood: return c.LobbyEntered(Lobby, true, M::Match, Host, Start);
+    case CE::EnterFailed: return c.LobbyEntered(Lobby, false, M::Match, Host, Start);
+    case CE::EnterMismatch: return c.LobbyEntered(Lobby, true, M::Different, Host, Start);
+    case CE::EnterNoOwner: return c.LobbyEntered(Lobby, true, M::Match, 0, Start);
+    case CE::EnterOther: return c.LobbyEntered(OtherLobby, true, M::Match, Host, Start);
     case CE::WelcomeHost: return c.Welcomed(Host);
     case CE::WelcomeOther: return c.Welcomed(Other);
     case CE::LostHost: return c.LinkLost(Host);
@@ -181,8 +182,7 @@ ClientExpected Expected(ClientSnapshot s, ClientFixture f, ClientEvent e)
     const bool underway = f == ClientFixture::Requesting || f == ClientFixture::Offered ||
                           f == ClientFixture::Invited || f == ClientFixture::Checked ||
                           f == ClientFixture::Entered;
-    const bool awaitingEntry = f == ClientFixture::Offered || f == ClientFixture::Checked ||
-                               f == ClientFixture::Entered;
+    const bool awaitingEntry = f == ClientFixture::Offered || f == ClientFixture::Checked;
     const bool isAccept = e.kind >= CE::HostSame && e.kind <= CE::Malformed;
     if (isAccept && f != ClientFixture::Starting && f != ClientFixture::Linked) {
         const bool invalid = e.kind == CE::Foreign || e.kind == CE::Malformed ||
@@ -229,7 +229,7 @@ ClientExpected Expected(ClientSnapshot s, ClientFixture f, ClientEvent e)
         if (e.kind == CE::CheckGood) fx = C::JoinLobby;
         else { ClientFail(s, Why::NotG3T); fx = C::Teardown; }
     } else if (e.kind >= CE::EnterGood && e.kind <= CE::EnterNoOwner && awaitingEntry) {
-        if (e.kind == CE::EnterGood) { s.host = Host; fx = C::None; }
+        if (e.kind == CE::EnterGood) { s.host = Host; fx = C::HelloReady; }
         else {
             ClientFail(s, e.kind == CE::EnterMismatch ? Why::NotG3T : Why::LobbyGone);
             fx = C::Teardown;
@@ -685,7 +685,7 @@ void Simulation()
     assert(host.partner() == Self);
     assert(host.LobbyCreated(true, 1, Start) == H::SendOffer);
     DeliverOffer(host, client, Start);
-    assert(client.LobbyEntered(Lobby, true, true, Host, Start) == C::None);
+    assert(client.LobbyEntered(Lobby, true, M::Match, Host, Start) == C::HelloReady);
     assert(host.Admit(Self) && !host.Admit(Other));
     assert(host.Linked(Self) == H::None);
     assert(client.Welcomed(Host) == C::None);
@@ -736,7 +736,7 @@ void Simulation()
     assert(SendJoin(waitingHello, noHello, Self, true, "default", Protocol, Protocol, Start) == H::CreateLobby);
     assert(noHello.LobbyCreated(true, 1, Start) == H::SendOffer);
     DeliverOffer(noHello, waitingHello, Start);
-    assert(waitingHello.LobbyEntered(Lobby, true, true, Host, Start) == C::None);
+    assert(waitingHello.LobbyEntered(Lobby, true, M::Match, Host, Start) == C::HelloReady);
     assert(waitingHello.Tick(Start + HelloWaitMs - 1) == C::None);
     assert(waitingHello.Tick(Start + HelloWaitMs) == C::Teardown && waitingHello.why() == Why::NoAnswer);
     assert(noHello.Tick(Start + OfferWaitMs - 1) == H::None);
@@ -746,11 +746,11 @@ void Simulation()
         C stale = ReadyClient();
         assert(stale.Accept(C::Source::LobbyJoin, Host, LobbyTarget(), Start) == C::InspectLobby);
         if (check) {
-            assert(stale.LobbyChecked(Lobby, true, Start) == C::JoinLobby);
-            assert(stale.LobbyEntered(Lobby, false, true, Host, Start) == C::Teardown);
+            assert(stale.LobbyChecked(Lobby, M::Match, Start) == C::JoinLobby);
+            assert(stale.LobbyEntered(Lobby, false, M::Match, Host, Start) == C::Teardown);
             assert(stale.why() == Why::LobbyGone);
         } else {
-            assert(stale.LobbyChecked(Lobby, false, Start) == C::Teardown);
+            assert(stale.LobbyChecked(Lobby, M::Different, Start) == C::Teardown);
             assert(stale.why() == Why::NotG3T);
         }
         assert(stale.state() == CS::Declined);
@@ -767,6 +767,82 @@ void Simulation()
     assert(unanswered.Tick(Start + RequestWaitMs) == C::Teardown);
     assert(unanswered.state() == CS::Declined && unanswered.why() == Why::NoAnswer);
     assert(!unanswered.ResendDue(Start + RequestWaitMs + RequestResendMs));
+}
+
+void MetadataReplication()
+{
+    assert(CheckLobbyMetadata("", "3", "", "default") == M::Pending);
+    assert(CheckLobbyMetadata("3", "3", "", "default") == M::Pending);
+    assert(CheckLobbyMetadata("", "3", "default", "default") == M::Pending);
+    assert(CheckLobbyMetadata("4", "3", "", "default") == M::Pending);
+    assert(CheckLobbyMetadata(nullptr, "3", "default", "default") == M::Pending);
+    assert(CheckLobbyMetadata("3", "3", "default", "default") == M::Match);
+    assert(CheckLobbyMetadata("4", "3", "default", "default") == M::Different);
+    assert(CheckLobbyMetadata("3", "3", "Default", "default") == M::Different);
+
+    // The host's offer arrives before its SetLobbyData has replicated to this client.
+    C offered = ReadyClient();
+    assert(offered.Accept(C::Source::RichJoin, Host, HostTarget(), Start) == C::SendRequest);
+    assert(offered.Offer(Host, Lobby, Start + 1) == C::JoinLobby);
+    assert(offered.LobbyEntered(Lobby, true, M::Pending, Host, Start + 2) == C::AwaitMetadata);
+    assert(offered.state() == CS::Joining && offered.host() == Host);
+    assert(offered.Welcomed(Host) == C::Ignored);
+    assert(offered.LobbyEntered(Lobby, true, M::Match, Host, Start + 3) == C::Ignored);
+    assert(offered.LobbyChecked(OtherLobby, M::Different, Start + 3) == C::Ignored);
+    assert(offered.LobbyChecked(Lobby, M::Pending, Start + 4) == C::None);
+    assert(offered.LobbyChecked(Lobby, M::Match, Start + 1000) == C::HelloReady);
+    assert(offered.LobbyChecked(Lobby, M::Different, Start + 1001) == C::Ignored);
+    assert(offered.Welcomed(Host) == C::None && offered.state() == CS::Linked);
+
+    C mismatch = ReadyClient();
+    assert(mismatch.Accept(C::Source::RichJoin, Host, HostTarget(), Start) == C::SendRequest);
+    assert(mismatch.Offer(Host, Lobby, Start) == C::JoinLobby);
+    assert(mismatch.LobbyEntered(Lobby, true, M::Pending, Host, Start) == C::AwaitMetadata);
+    assert(mismatch.LobbyChecked(Lobby, M::Different, Start + 1) == C::Teardown);
+    assert(mismatch.state() == CS::Declined && mismatch.why() == Why::NotG3T);
+
+    // Pre-join lobby invites, command lines and manual joins use the same pending policy.
+    for (auto source : {C::Source::LobbyJoin, C::Source::CommandLine, C::Source::Manual}) {
+        C direct = ReadyClient();
+        assert(direct.Accept(source, Host, LobbyTarget(), Start) == C::InspectLobby);
+        assert(direct.LobbyChecked(Lobby, M::Pending, Start) == C::None);
+        assert(direct.LobbyChecked(OtherLobby, M::Match, Start + 1) == C::Ignored);
+        assert(direct.Tick(Start + LobbyMetadataWaitMs - 2) == C::None);
+        assert(direct.LobbyChecked(Lobby, M::Match, Start + LobbyMetadataWaitMs - 1) == C::JoinLobby);
+        assert(direct.LobbyEntered(Lobby, true, M::Pending, Host, Start + LobbyMetadataWaitMs) == C::AwaitMetadata);
+        assert(direct.LobbyChecked(Lobby, M::Match, Start + LobbyMetadataWaitMs + 1) == C::HelloReady);
+        assert(direct.Welcomed(Host) == C::None);
+    }
+
+    C expired = ReadyClient();
+    assert(expired.Accept(C::Source::RichJoin, Host, HostTarget(), Start) == C::SendRequest);
+    assert(expired.Offer(Host, Lobby, Start) == C::JoinLobby);
+    assert(expired.LobbyEntered(Lobby, true, M::Pending, Host, Start) == C::AwaitMetadata);
+    assert(expired.LobbyChecked(Lobby, M::Pending, Start + LobbyMetadataWaitMs - 1) == C::None);
+    assert(expired.Tick(Start + LobbyMetadataWaitMs - 1) == C::None);
+    assert(expired.Tick(Start + LobbyMetadataWaitMs) == C::Teardown);
+    assert(expired.state() == CS::Declined && expired.why() == Why::MetadataTimeout);
+    assert(!expired.host() && !expired.lobby());
+    assert(expired.LobbyChecked(Lobby, M::Match, Start + LobbyMetadataWaitMs + 1) == C::Ignored);
+    assert(expired.Accept(C::Source::RichJoin, Host, HostTarget(), Start + LobbyMetadataWaitMs + 2) == C::SendRequest);
+    assert(expired.Offer(Host, OtherLobby, Start + LobbyMetadataWaitMs + 3) == C::JoinLobby);
+    assert(expired.LobbyChecked(Lobby, M::Match, Start + LobbyMetadataWaitMs + 4) == C::Ignored);
+    assert(expired.LobbyEntered(Lobby, true, M::Match, Host, Start + LobbyMetadataWaitMs + 4) == C::Ignored);
+    assert(expired.LobbyEntered(OtherLobby, true, M::Match, Host, Start + LobbyMetadataWaitMs + 4) == C::HelloReady);
+
+    C late = ReadyClient();
+    assert(late.Accept(C::Source::LobbyJoin, Host, LobbyTarget(), Start) == C::InspectLobby);
+    assert(late.LobbyChecked(Lobby, M::Pending, Start) == C::None);
+    assert(late.LobbyChecked(Lobby, M::Match, Start + LobbyMetadataWaitMs) == C::Teardown);
+    assert(late.why() == Why::MetadataTimeout);
+
+    constexpr uint32_t wrapStart = UINT32_MAX - 1000;
+    C wrap = ReadyClient();
+    assert(wrap.Accept(C::Source::LobbyJoin, Host, LobbyTarget(), wrapStart) == C::InspectLobby);
+    assert(wrap.LobbyChecked(Lobby, M::Pending, wrapStart) == C::None);
+    assert(wrap.Tick(wrapStart + LobbyMetadataWaitMs - 1) == C::None);
+    assert(wrap.Tick(wrapStart + LobbyMetadataWaitMs) == C::Teardown);
+    assert(wrap.why() == Why::MetadataTimeout);
 }
 
 void SupersessionAndWrap()
@@ -819,6 +895,7 @@ int main()
     Frames();
     RelayPrefixCollision();
     Simulation();
+    MetadataReplication();
     SupersessionAndWrap();
 #ifdef TEST_KNOWN_TRUNCATED_TOKEN
     TruncatedToken();

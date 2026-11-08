@@ -215,6 +215,9 @@ void Format(State const& state, wchar_t* out, size_t size)
         case connect::Why::NotG3T:
             _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineNotG3T), name);
             break;
+        case connect::Why::MetadataTimeout:
+            _snwprintf_s(reason, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineMetadataTimeout));
+            break;
         case connect::Why::None:
             _snwprintf_s(reason, _TRUNCATE, L"?");
             break;

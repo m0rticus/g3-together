@@ -206,6 +206,7 @@ char const LobbyVersion[] = "3";  // compact LE lobby + marker/length + exact AS
 constexpr uint32_t SilenceMs = 180000;
 constexpr uint32_t ScanMs = 3000;       // client: how often the friends list is searched for a host
 constexpr uint32_t JoinWaitMs = 15000;  // client: a lobby that does not answer the join in this time is skipped for a while
+constexpr uint32_t MetadataRequestRetryMs = 1000;
 constexpr int MaxRemotes = net::MaxPlayers;
 
 struct Remote
@@ -252,8 +253,9 @@ bool haveEnetAddress = false;
 u64 wantedLobby = 0;             // from steam_lobby in the INI or +connect_lobby on the command line
 bool wantedWaitLogged = false;
 u64 pendingLobby = 0;            // an invite or "Join game" accepted through Steam
-u64 candidateLobby = 0;          // metadata must match before calling JoinLobby, including invites and explicit numbers
-uint32_t candidateAt = 0;
+u64 candidateLobby = 0;          // metadata being checked before or after JoinLobby
+uint32_t candidateAt = 0, candidateRequestAt = 0;
+bool candidateJoined = false, candidatePendingLogged = false;
 char candidateReason[64] = "";
 uint32_t joinedAt = 0, lastScan = 0, lastHello = 0;
 char hostName[64] = "";
@@ -601,26 +603,22 @@ void Join(u64 id, char const* why)
     Logf("steam: joining lobby %llu (%s)", id, why);
 }
 
-bool InspectLobby(u64 id, char const* why)
+void InspectLobby(u64 id, char const* why, bool joined = false)
 {
     candidateLobby = id;
-    candidateAt = Now();
+    candidateAt = candidateRequestAt = Now();
+    candidateJoined = joined;
+    candidatePendingLogged = false;
     strncpy_s(candidateReason, why, _TRUNCATE);
     Logf("connect: reading the metadata of lobby %llu (%s)", id, why);
-    if (!api.RequestLobbyData(matchmaking, id)) {
+    if (!api.RequestLobbyData(matchmaking, id))
         Logf("steam: could not request lobby %llu metadata", id);
-        candidateLobby = 0;
-        Skip(id, 30000);
-        if (connectionMode == connect::Mode::Auto) strcpy_s(error, "Steam could not read the lobby's session ID");
-        return false;
-    }
-    return true;
 }
 
-bool MatchesSession(u64 id)
+connect::LobbyMetadata ReadLobbyMetadata(u64 id)
 {
-    if (std::strcmp(Text(api.GetLobbyData(matchmaking, id, LobbyTag)), LobbyVersion)) return false;
-    return !std::strcmp(Text(api.GetLobbyData(matchmaking, id, "session_id")), GetConfig().sessionId);
+    return connect::CheckLobbyMetadata(Text(api.GetLobbyData(matchmaking, id, LobbyTag)), LobbyVersion,
+                                       Text(api.GetLobbyData(matchmaking, id, "session_id")), GetConfig().sessionId);
 }
 
 void LeaveLobby()
@@ -785,6 +783,25 @@ void LogClientChange(char const* event, connect::ClientFlow::State before, unsig
         Logf("connect: client %s: %s ignored (nothing changes)", connect::StateName(before), event);
 }
 
+void PollLobbyMetadata();
+
+void FinishLobbyEntry(u64 id, u64 lobbyOwner)
+{
+    if (!lobbyOwner) {
+        Logf("connect: lobby %llu has no owner after entry", id);
+        strcpy_s(error, "the Steam lobby has no owner");
+        LeaveLobby();
+        Skip(id, 30000);
+        return;
+    }
+    error[0] = '\0';
+    owner = lobbyOwner;
+    CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
+    if (Remote* r = Get(owner)) r->heard = Now();
+    lastHello = 0;
+    Logf("connect: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
+}
+
 void AfterClient(char const* event, connect::ClientFlow::State before, unsigned fx, bool quiet = false)
 {
     using F = connect::ClientFlow;
@@ -792,15 +809,82 @@ void AfterClient(char const* event, connect::ClientFlow::State before, unsigned 
     if (fx & F::Teardown) TearDownClient();
     if (fx & F::SendRequest) SendJoinRequest(false);
     if (fx & F::InspectLobby) {
-        const u64 inspected = clientFlow.lobby();
-        if (!InspectLobby(inspected, "lobby invite")) {
-            const F::State pending = clientFlow.state();
-            AfterClient("lobby metadata request failed", pending, clientFlow.LobbyChecked(inspected, false, Now()));
-        }
+        InspectLobby(clientFlow.lobby(), "lobby invite");
+        PollLobbyMetadata();
     }
     if (fx & F::JoinLobby) {
         Logf("connect: JoinLobby(%llu)", clientFlow.lobby());
         Join(clientFlow.lobby(), "accepted invite");
+    }
+    if (fx & F::AwaitMetadata) {
+        InspectLobby(clientFlow.lobby(), "joined lobby", true);
+        PollLobbyMetadata();
+    }
+    if (fx & F::HelloReady) FinishLobbyEntry(clientFlow.lobby(), clientFlow.host());
+}
+
+void PollLobbyMetadata()
+{
+    if (!candidateLobby) return;
+    const u64 id = candidateLobby;
+    const uint32_t now = Now();
+    const auto metadata = ReadLobbyMetadata(id);
+    if (connectionMode == connect::Mode::Auto && candidatePendingLogged &&
+        now - candidateAt >= connect::LobbyMetadataWaitMs) {
+        Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", id, now - candidateAt);
+        candidateLobby = 0;
+        if (candidateJoined && lobby == id) LeaveLobby();
+        Skip(id, 30000);
+        strcpy_s(error, "Steam did not deliver the lobby's data in time; accept the invite again");
+        lastScan = now - ScanMs;
+        return;
+    }
+    if (metadata == connect::LobbyMetadata::Pending) {
+        if (!candidatePendingLogged) {
+            Logf("connect: lobby %llu metadata pending (g3together=\"%s\" session_id=\"%s\"), waiting up to %u ms", id,
+                 Text(api.GetLobbyData(matchmaking, id, LobbyTag)), Text(api.GetLobbyData(matchmaking, id, "session_id")),
+                 connect::LobbyMetadataWaitMs);
+            candidatePendingLogged = true;
+        }
+        if (connectionMode == connect::Mode::Invite) {
+            const auto before = clientFlow.state();
+            const unsigned fx = clientFlow.LobbyChecked(id, metadata, now);
+            if ((fx & connect::ClientFlow::Teardown) && clientFlow.why() == connect::Why::MetadataTimeout)
+                Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", id, now - candidateAt);
+            AfterClient("lobby metadata pending", before, fx, true);
+            if (fx & connect::ClientFlow::Teardown) return;
+        }
+        if (now - candidateRequestAt >= MetadataRequestRetryMs) {
+            candidateRequestAt = now;
+            if (!api.RequestLobbyData(matchmaking, id))
+                Logf("steam: could not refresh lobby %llu metadata", id);
+        }
+        return;
+    }
+
+    if (candidatePendingLogged)
+        Logf("connect: lobby %llu metadata arrived after %u ms: %s", id, now - candidateAt,
+             metadata == connect::LobbyMetadata::Match ? "ok" : "different");
+    else
+        Logf("connect: lobby %llu metadata: %s", id, metadata == connect::LobbyMetadata::Match ? "ok" : "different");
+    const bool joined = candidateJoined;
+    candidateLobby = 0;
+    if (connectionMode == connect::Mode::Invite) {
+        const auto before = clientFlow.state();
+        const unsigned fx = clientFlow.LobbyChecked(id, metadata, now);
+        if ((fx & connect::ClientFlow::Teardown) && clientFlow.why() == connect::Why::MetadataTimeout)
+            Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys in time", id, now - candidateAt);
+        AfterClient("lobby metadata", before, fx);
+    } else if (metadata == connect::LobbyMetadata::Match) {
+        if (joined) FinishLobbyEntry(id, api.GetLobbyOwner(matchmaking, id));
+        else Join(id, candidateReason);
+    } else {
+        Logf("steam: skipping lobby %llu: different session_id or incompatible transport (wanted %s)", id, GetConfig().sessionId);
+        if (joined && lobby == id) LeaveLobby();
+        Skip(id, 30000);
+        if (wantedLobby == id || !std::strcmp(candidateReason, "accepted through Steam"))
+            strcpy_s(error, "different session_id or incompatible G3 Together transport");
+        lastScan = now - ScanMs;
     }
 }
 
@@ -951,7 +1035,11 @@ void ClientTick()
     const uint32_t now = Now();
     if (clientFlow.ResendDue(now)) SendJoinRequest(true);
     const connect::ClientFlow::State before = clientFlow.state();
-    AfterClient("timer", before, clientFlow.Tick(now), true);
+    const u64 waitingLobby = clientFlow.lobby();
+    const unsigned fx = clientFlow.Tick(now);
+    if ((fx & connect::ClientFlow::Teardown) && clientFlow.why() == connect::Why::MetadataTimeout)
+        Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", waitingLobby, now - candidateAt);
+    AfterClient("timer", before, fx, true);
 }
 
 void HostTick()
@@ -1057,6 +1145,7 @@ void OnLobbyCreated(char const* p)
         return;
     }
     if (!api.SetLobbyData(matchmaking, id, "name", persona)) Log("steam: could not publish the lobby's player name");
+    Logf("connect: lobby %llu session metadata accepted by Steam; remote propagation may still be pending", id);
     Logf("connect: lobby %llu open (friends-only); session_id=%s (case-sensitive; only matching sessions can connect)", id,
          GetConfig().sessionId);
     if (invite) {
@@ -1077,41 +1166,32 @@ void OnLobbyEnter(char const* p)
     std::memcpy(&id, p, 8);
     std::memcpy(&response, p + 16, 4);
     if (isHost || id != lobby || owner) return;
+    if (connectionMode == connect::Mode::Auto && candidateJoined && candidateLobby == id) return;
     const bool joined = response == 1;
-    const bool matches = joined && MatchesSession(id);
-    Logf("connect: LobbyEnter lobby=%llu response=%u metadata=%s", id, response, !joined ? "-" : matches ? "ok" : "different session_id or transport");
+    const auto metadata = joined ? ReadLobbyMetadata(id) : connect::LobbyMetadata::Pending;
+    Logf("connect: LobbyEnter lobby=%llu response=%u metadata=%s", id, response, !joined ? "-" :
+         metadata == connect::LobbyMetadata::Pending ? "pending" :
+         metadata == connect::LobbyMetadata::Match ? "ok" : "different session_id or transport");
     if (connectionMode == connect::Mode::Invite) {
         const u64 lobbyOwner = joined ? api.GetLobbyOwner(matchmaking, id) : 0;
         const connect::ClientFlow::State before = clientFlow.state();
-        const unsigned fx = clientFlow.LobbyEntered(id, joined, matches, lobbyOwner, Now());
-        if (fx & connect::ClientFlow::Ignored) {  // not the lobby the flow is joining any more
-            api.LeaveLobby(matchmaking, id);
-            lobby = 0;
-        } else if (!(fx & connect::ClientFlow::Teardown)) {
-            error[0] = '\0';
-            owner = lobbyOwner;
-            CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
-            if (Remote* r = Get(owner)) r->heard = Now();
-            lastHello = 0;
-            Logf("connect: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
-        }
+        const unsigned fx = clientFlow.LobbyEntered(id, joined, metadata, lobbyOwner, Now());
         AfterClient("lobby entered", before, fx);
         return;
     }
-    if (!joined || !matches) {
+    if (!joined || metadata == connect::LobbyMetadata::Different) {
         Logf("steam: lobby %llu refused (response %u, incompatible session ID or transport)", id, response);
         Format(error, response != 1 ? "the Steam lobby is full or closed" : "different session_id or incompatible G3 Together transport");
-        api.LeaveLobby(matchmaking, id);
-        lobby = 0;
+        LeaveLobby();
         Skip(id, 30000);
         return;
     }
-    error[0] = '\0';
-    owner = api.GetLobbyOwner(matchmaking, id);
-    CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
-    if (Remote* r = Get(owner)) r->heard = Now();
-    lastHello = 0;
-    Logf("steam: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
+    if (metadata == connect::LobbyMetadata::Pending) {
+        InspectLobby(id, "joined lobby", true);
+        PollLobbyMetadata();
+        return;
+    }
+    FinishLobbyEntry(id, api.GetLobbyOwner(matchmaking, id));
 }
 
 // connection = auto: only the legacy "+connect_lobby <id>" is followed, by the friends-list search.
@@ -1137,26 +1217,8 @@ void OnCallback(int callback, char const* p, int size)
         std::memcpy(&a, p, 8);
         std::memcpy(&b, p + 8, 8);
         if (a != candidateLobby || a != b) break;
-        candidateLobby = 0;
-        if (connectionMode == connect::Mode::Invite) {
-            const bool matches = p[16] && MatchesSession(a);
-            Logf("connect: lobby %llu metadata: success=%d g3together=%s session_id=%s (ours %s) -> %s", a, p[16] ? 1 : 0,
-                 Text(api.GetLobbyData(matchmaking, a, LobbyTag)), Text(api.GetLobbyData(matchmaking, a, "session_id")),
-                 GetConfig().sessionId, matches ? "a G3 Together lobby of this session" : "refused");
-            const connect::ClientFlow::State before = clientFlow.state();
-            AfterClient("lobby metadata", before, clientFlow.LobbyChecked(a, matches, Now()));
-            break;
-        }
-        if (p[16] && MatchesSession(a)) {
-            error[0] = '\0';
-            Join(a, candidateReason);
-        } else {
-            Logf("steam: skipping lobby %llu: different session_id or incompatible transport (wanted %s)", a, GetConfig().sessionId);
-            Skip(a, 30000);
-            if (wantedLobby == a || !std::strcmp(candidateReason, "accepted through Steam"))
-                strcpy_s(error, "different session_id or incompatible G3 Together transport");
-            lastScan = Now() - ScanMs;
-        }
+        if (!p[16]) Logf("connect: lobby %llu metadata update failed; still waiting for Steam", a);
+        PollLobbyMetadata();
         break;
     case CbLobbyChatUpdate:
         std::memcpy(&a, p, 8);
@@ -1472,21 +1534,13 @@ void Forward()
 // Client without a lobby: an accepted invite, the INI's lobby, else the first friend hosting a G3 Together game.
 void Search()
 {
+    if (candidateLobby) return;
     if (lobby) {
         if (!owner && Now() - joinedAt > JoinWaitMs) {
             Logf("steam: lobby %llu did not answer the join; trying others", lobby);
             Skip(lobby, 30000);
             api.LeaveLobby(matchmaking, lobby);
             lobby = 0;
-        }
-        return;
-    }
-    if (candidateLobby) {
-        if (Now() - candidateAt > JoinWaitMs) {
-            Logf("steam: lobby %llu did not answer the metadata request", candidateLobby);
-            Skip(candidateLobby, 30000);
-            candidateLobby = 0;
-            strcpy_s(error, "Steam did not answer the lobby session ID request");
         }
         return;
     }
@@ -1822,6 +1876,7 @@ void PumpOnce()
     if (disconnectRequested.exchange(false) && !isHost && connectionMode == connect::Mode::Invite && clientFlow.Active())
         OnClientLinkLost(clientFlow.host(), "the ENet connection ended");
     if (!isHost) {
+        PollLobbyMetadata();
         if (connectionMode == connect::Mode::Auto) Search();
         else ClientTick();
     } else if (connectionMode == connect::Mode::Invite) {

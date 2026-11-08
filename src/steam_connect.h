@@ -26,6 +26,7 @@ namespace g3t::steam::connect {
 constexpr uint32_t RequestWaitMs = 20000;   // client: no answer to the join request
 constexpr uint32_t RequestResendMs = 4000;  // client: the request is sent again (idempotent on the host) until answered
 constexpr uint32_t LobbyWaitMs = 15000;     // client: lobby metadata / JoinLobby answer
+constexpr uint32_t LobbyMetadataWaitMs = 8000;  // client: Steam has not delivered both lobby data keys
 constexpr uint32_t HelloWaitMs = 20000;     // client: lobby entered, the host has not welcomed us
 constexpr uint32_t CreateWaitMs = 15000;    // host: CreateLobby has not answered
 constexpr uint32_t OfferWaitMs = 60000;     // host: the invited partner has not said hello
@@ -154,6 +155,7 @@ enum class Why : uint8_t {
     Unreachable,    // Steam could not reach the host (offline / game not running)
     LobbyGone,      // the lobby is closed or full
     NotG3T,         // the lobby is not a G3 Together game of this session/version
+    MetadataTimeout, // Steam did not deliver the lobby data in time
 };
 inline char const* WhyName(Why why)
 {
@@ -170,6 +172,7 @@ inline char const* WhyName(Why why)
     case Why::Unreachable: return "host unreachable over Steam";
     case Why::LobbyGone: return "lobby closed or full";
     case Why::NotG3T: return "lobby is not this G3 Together session";
+    case Why::MetadataTimeout: return "Steam did not deliver lobby data in time";
     }
     return "?";
 }
@@ -303,6 +306,15 @@ inline bool DecodeFrame(void const* data, size_t size, Frame* out)
 
 // ---- the client ----
 
+enum class LobbyMetadata : uint8_t { Pending, Match, Different };
+
+inline LobbyMetadata CheckLobbyMetadata(char const* tag, char const* version, char const* session, char const* ours)
+{
+    if (!tag || !*tag || !session || !*session) return LobbyMetadata::Pending;
+    return std::strcmp(tag, version) == 0 && std::strcmp(session, ours) == 0
+        ? LobbyMetadata::Match : LobbyMetadata::Different;
+}
+
 class ClientFlow
 {
   public:
@@ -323,6 +335,8 @@ class ClientFlow
         JoinLobby = 4,     // JoinLobby(lobby())
         Teardown = 8,      // leave the lobby, close the session with the abandoned host, forget half-open state
         Ignored = 16,      // the event changed nothing
+        AwaitMetadata = 32, // joined, but Steam has not delivered both lobby data keys
+        HelloReady = 64,   // lobby entered and metadata verified; start the relay hello
     };
 
     void Configure(uint64_t self, char const* session)
@@ -392,34 +406,57 @@ class ClientFlow
         Fail(why, arg);
         return Teardown;
     }
-    // The metadata of an invited lobby was read; ok: it is a G3 Together lobby of this session and version.
-    unsigned LobbyChecked(uint64_t lobby, bool ok, uint32_t now)
+    // Both pre-join and post-join checks may have to wait for Steam to deliver metadata.
+    unsigned LobbyChecked(uint64_t lobby, LobbyMetadata metadata, uint32_t now)
     {
-        if (state_ != State::Joining || verified_ || lobby != lobby_) return Ignored;
-        if (!ok) {
+        if (state_ != State::Joining || lobby != lobby_ || entered_ || (verified_ && !joinAnswered_)) return Ignored;
+        if (metadataPending_ && detail::Reached(now, deadline_)) {
+            Fail(Why::MetadataTimeout, 0);
+            return Teardown;
+        }
+        if (metadata == LobbyMetadata::Pending) {
+            if (!metadataPending_) {
+                metadataPending_ = true;
+                deadline_ = now + LobbyMetadataWaitMs;
+            }
+            return None;
+        }
+        metadataPending_ = false;
+        if (metadata == LobbyMetadata::Different) {
             Fail(Why::NotG3T, 0);
             return Teardown;
+        }
+        if (joinAnswered_) {
+            entered_ = true;
+            deadline_ = now + HelloWaitMs;
+            return HelloReady;
         }
         verified_ = true;
         deadline_ = now + LobbyWaitMs;
         return JoinLobby;
     }
-    // Steam answered JoinLobby. joined: response was success; matches: the lobby data are ours; owner: the lobby's owner (the host).
-    unsigned LobbyEntered(uint64_t lobby, bool joined, bool matches, uint64_t owner, uint32_t now)
+    // Steam answered JoinLobby. Do not send hello until both metadata keys match.
+    unsigned LobbyEntered(uint64_t lobby, bool joined, LobbyMetadata metadata, uint64_t owner, uint32_t now)
     {
-        if (state_ != State::Joining || !verified_ || lobby != lobby_) return Ignored;
+        if (state_ != State::Joining || !verified_ || joinAnswered_ || lobby != lobby_) return Ignored;
         if (!joined || !owner) {
             Fail(Why::LobbyGone, 0);
             return Teardown;
         }
-        if (!matches) {
+        if (metadata == LobbyMetadata::Different) {
             Fail(Why::NotG3T, 0);
             return Teardown;
         }
-        entered_ = true;
         host_ = owner;
+        joinAnswered_ = true;
+        if (metadata == LobbyMetadata::Pending) {
+            metadataPending_ = true;
+            deadline_ = now + LobbyMetadataWaitMs;
+            return AwaitMetadata;
+        }
+        entered_ = true;
         deadline_ = now + HelloWaitMs;
-        return None;
+        return HelloReady;
     }
     unsigned Welcomed(uint64_t from)
     {
@@ -466,7 +503,7 @@ class ClientFlow
     unsigned Tick(uint32_t now)
     {
         if ((state_ != State::Requesting && state_ != State::Joining) || !detail::Reached(now, deadline_)) return None;
-        Fail(state_ == State::Requesting || entered_ ? Why::NoAnswer : Why::LobbyGone, 0);
+        Fail(metadataPending_ ? Why::MetadataTimeout : state_ == State::Requesting || entered_ ? Why::NoAnswer : Why::LobbyGone, 0);
         return Teardown;
     }
     bool ResendDue(uint32_t now)
@@ -491,7 +528,7 @@ class ClientFlow
         why_ = why;
         arg_ = arg;
         host_ = lobby_ = 0;
-        verified_ = entered_ = false;
+        verified_ = entered_ = joinAnswered_ = metadataPending_ = false;
     }
     unsigned Begin(uint64_t friendId, Target const& target, uint32_t now)
     {
@@ -500,7 +537,7 @@ class ClientFlow
         why_ = Why::None;
         arg_ = 0;
         hostSession_[0] = '\0';
-        entered_ = false;
+        entered_ = joinAnswered_ = metadataPending_ = false;
         if (target.kind == Target::Kind::Host) {
             host_ = target.id;
             lobby_ = 0;
@@ -521,7 +558,7 @@ class ClientFlow
     State state_ = State::Starting;
     Why why_ = Why::None;
     uint64_t arg_ = 0, self_ = 0, host_ = 0, lobby_ = 0, inviter_ = 0, invitedBy_ = 0, invitedLobby_ = 0;
-    bool verified_ = false, entered_ = false;
+    bool verified_ = false, entered_ = false, joinAnswered_ = false, metadataPending_ = false;
     uint32_t deadline_ = 0, resendAt_ = 0;
     char session_[RelayMaxSessionSize + 1] = {};
     char hostSession_[RelayMaxSessionSize + 1] = {};
