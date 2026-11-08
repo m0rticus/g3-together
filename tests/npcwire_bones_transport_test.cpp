@@ -16,6 +16,8 @@ std::vector<Transmission> transmissions;
 std::vector<std::string> logs;
 enet_uint32 fakeTime = 5000;
 bool failSend = false;
+uint64_t transportAccounts[2] = {12, 13};
+uint64_t localSteamAccount = 12;
 
 extern "C" {
 int enet_initialize() { return 0; }
@@ -108,8 +110,15 @@ uint8_t PlayerInteractionFlags(unsigned player)
 namespace steam {
 TrafficCounters Traffic() { return {}; }
 bool IsPeerRelay(unsigned short) { return true; }
-uint64_t PeerId(unsigned short port) { return port == 12 ? 12 : port == 13 ? 13 : 0; }
-uint64_t PlayerId() { return 12; }
+uint64_t PeerId(unsigned short port) { return port == 12 ? transportAccounts[0] : port == 13 ? transportAccounts[1] : 0; }
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
+{
+    account = PeerId(port);
+    if (!account) return false;
+    strcpy_s(name, port == 12 ? "Steam Player One" : "Steam Player Two");
+    return true;
+}
+uint64_t PlayerId() { return localSteamAccount; }
 bool Start(bool, unsigned short) { return false; }
 unsigned short RelayPort() { return 0; }
 void Pump() {}
@@ -163,6 +172,10 @@ int main()
     fakeHost.peers = fakePeers;
     host = &fakeHost;
     peers[2] = &fakePeer;
+    fakePeer.address.port = 12;
+    fakePeers[1].address.port = 13;
+    peerAccounts[2] = 12;
+    peerAccounts[3] = 13;
     server = &fakePeer;
     worldEpoch = 0x1234;
     target.host = fakePeer.address.host;

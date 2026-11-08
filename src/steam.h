@@ -33,6 +33,7 @@ bool Start(bool host, unsigned short enetPort);
 unsigned short RelayPort();
 bool IsPeerRelay(unsigned short port);  // host: this loopback sender belongs to a linked Steam lobby member
 uint64_t PeerId(unsigned short port);  // account authenticated by the relay; 0 if not linked
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24]); // one authenticated worker snapshot
 // Wake the independent transport worker after ENet flushes. Does not run engine or ENet handlers.
 void Pump();
 // Join the transport worker, forward ENet's goodbye, then leave/close Steam. Called on the engine thread.

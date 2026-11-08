@@ -31,6 +31,10 @@
 #include "npcidentity_policy.h"
 #include "relation.h"
 #include "relation_policy.h"
+#include "player_identity.h"
+#include "steam.h"
+#include "hud.h"
+#include "i18n.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -173,10 +177,12 @@ unsigned fightSent = 0, fightSeenAny = 0, fightSeenUs = 0, fightSeenNear = 0;  /
 constexpr uint32_t RevokeAfter = 15000;   // ms: a claim whose owner sends nothing goes back to the host
 constexpr uint32_t GiveBackFor = 5000;    // ms: a handed-back NPC is not sent while the host takes it over
 unsigned claimsDenied = 0, claimsRevoked = 0;
-// Host: whose companion each NPC is, by player name. Unlike claimedBy it outlives a disconnect and goes into the
+// Host: whose companion each NPC is, by authenticated SteamID. Unlike claimedBy it outlives a disconnect and goes into the
 // save's sidecar: the recruiting (JoinPlayerSlavery: leader, type Slave, not waiting) ran only on that player's
 // machine, so in the host's save the NPC is nobody's companion.
-std::unordered_map<std::string, std::string> companions;
+identity::Companions companionIdentity;
+auto& companions = companionIdentity.owners;
+std::set<std::string> identityWarnings;
 std::unordered_map<std::string, uint32_t> offered;  // host: when a saved companion was last handed to its player
 constexpr uint32_t OfferEvery = 20000;  // ms
 bool offering = true;  // QA negative control: CompanionsOff
@@ -1300,16 +1306,49 @@ void SendRevoke(std::string const& key, uint8_t player)
 
 // Host: claims whose player left, or that stay silent (the player no longer processes the NPC, or left before its
 // first snapshot), go back to the host; a silent but connected player is told so.
+void RefreshCompanionIdentity()
+{
+    if (!net::IsHost()) return;
+    companionIdentity.host = steam::PlayerId();
+    auto observe = [](uint64_t account, char const* name) {
+        if (!account || !identity::Label(name)) return;
+        companionIdentity.candidates.insert(account);
+        auto found = companionIdentity.labels.find(account);
+        if (found != companionIdentity.labels.end() && found->second != name)
+            Logf("identity: name changed steamid=%llu old=%s new=%s", account, found->second.c_str(), name);
+        companionIdentity.labels[account] = name;
+    };
+    observe(steam::PlayerId(), steam::PlayerName());
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+        if (net::PeerJoined(id)) observe(net::PeerAccount(id), net::PeerName(id));
+    for (auto& [key, owner] : companions) {
+        if (owner.account) continue;
+        const std::string oldName = owner.legacyName;
+        const auto decision = companionIdentity.Migrate(key, GetConfig().legacyCompanionOwners);
+        if (decision == identity::Decision::Bound || decision == identity::Decision::Explicit) {
+            Logf("identity: migrated companion=%s old=%s steamid=%llu source=%s", identity::Hex(key).c_str(),
+                 oldName.c_str(), owner.account, decision == identity::Decision::Explicit ? "host-config" : "unique-Steam-name");
+        } else if (identityWarnings.insert(owner.legacyName).second) {
+            Logf("identity: migration pending old=%s reason=%s; retained; host config: legacy_companion_owner = <SteamID64> %s",
+                 owner.legacyName.c_str(), decision == identity::Decision::Ambiguous ? "ambiguous" : "unknown-or-offline",
+                 owner.legacyName.c_str());
+            hud::Message(hud::Warning, i18n::Text(i18n::IdentityMigrationPending));
+        }
+    }
+}
 void OfferCompanions(uint32_t now)
 {
+    RefreshCompanionIdentity();
     if (!offering) return;
-    for (auto const& [key, name] : companions) {
+    for (auto const& [key, owner] : companions) {
+        if (!owner.account || owner.summoned) continue;
         if (claimedBy.count(key)) continue;
         auto last = offered.find(key);
         if (last != offered.end() && static_cast<int32_t>(now - last->second) < static_cast<int32_t>(OfferEvery)) continue;
         for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
             net::Remote const& r = net::Remotes()[id];
-            if (!r.connected || !(r.latest.flags & 1) || r.latest.world != remote::CurrentWorld() || name != r.latest.name) continue;
+            if (!r.connected || !(r.latest.flags & 1) || r.latest.world != remote::CurrentWorld() ||
+                owner.account != net::PeerAccount(id)) continue;
             Entity npc = Resolve(reinterpret_cast<uint8_t const*>(key.data()));
             if (!npc.GetInstance()) break;
             // Only near its player: one far away is not processed there and never sent, the claim ran out for want of
@@ -1336,7 +1375,8 @@ void OfferCompanions(uint32_t now)
             }
             offered[key] = now;
             ++companionsOffered;
-            Logf("npcs: %s is %s's companion (saved); handed over", Resolve(reinterpret_cast<uint8_t const*>(key.data())).GetName().GetText(), name.c_str());
+            Logf("npcs: %s is %s's companion (saved steamid=%llu); handed over",
+                 Resolve(reinterpret_cast<uint8_t const*>(key.data())).GetName().GetText(), net::PeerName(id), owner.account);
             break;
         }
     }
@@ -1347,7 +1387,10 @@ void ClaimTick(uint32_t now)
     OfferCompanions(now);
     for (auto it = claimedBy.begin(); it != claimedBy.end();) {
         const uint8_t player = it->second;
-        const bool gone = !net::Remotes()[player].connected || !net::InWorld(player);
+        const auto savedOwner = companions.find(it->first);
+        const bool sameAccount = savedOwner == companions.end() ||
+            (savedOwner->second.account && savedOwner->second.account == net::PeerAccount(player));
+        const bool gone = !sameAccount || !net::Remotes()[player].connected || !net::InWorld(player);
         Entity npc = Resolve(reinterpret_cast<uint8_t const*>(it->first.data()));
         if (!gone) {
             eCEntity* actor = remote::PuppetOf(player);
@@ -4232,6 +4275,16 @@ bool OnClaim(uint8_t const guid[16], uint8_t player, bool take)
 {
     if (!net::IsHost() || player < 2 || player >= net::MaxPlayers || !net::PeerJoined(player)) return false;
     const std::string key = Key(guid);
+    const uint64_t account = net::PeerAccount(player);
+    if (!account) { Log("identity: companion claim refused without authenticated SteamID"); return false; }
+    RefreshCompanionIdentity();
+    auto saved = companions.find(key);
+    if (take && saved != companions.end() && saved->second.account != account) {
+        SendRevoke(key, player);
+        Logf("identity: companion claim refused steamid=%llu saved=%llu legacy=%s", account,
+             saved->second.account, saved->second.legacyName.c_str());
+        return false;
+    }
     const auto current = claimedBy.find(key);
     if (take && current != claimedBy.end() && current->second != player && net::Remotes()[current->second].connected) {
         // Two players recruited it at once: the first keeps it, the second mirrors it again.
@@ -4247,7 +4300,7 @@ bool OnClaim(uint8_t const guid[16], uint8_t player, bool take)
         // The player's first snapshot creates the mirror; until then the host just stops sending it.
         claimedBy[key] = player;
         claimSeen[key] = net::Now();
-        companions[key] = net::Remotes()[player].latest.name;
+        companions[key] = {account, {}, saved != companions.end() && saved->second.summoned};
         DropMirror(key);  // an older mirror from another owner
     } else {
         claimedBy.erase(key);
@@ -4326,6 +4379,16 @@ bool DeadStays() { return deadStays; }
 uint8_t CompanionOwner(eCEntity* entity)
 {
     if (!entity) return 0;
+    if (net::IsHost()) {
+        uint8_t guid[16]; Guid(entity, guid);
+        auto saved = companions.find(Key(guid));
+        if (saved != companions.end()) {
+            if (saved->second.account == steam::PlayerId()) return 1;
+            for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+                if (saved->second.account && saved->second.account == net::PeerAccount(id)) return id;
+            return 0; // Never reinterpret an absent saved owner's old slot as a new player.
+        }
+    }
     if (!net::IsHost()) {
         uint8_t guid[16]; Guid(entity, guid);
         if (auto mirror = mirrors.find(Key(guid)); mirror != mirrors.end()) return mirror->second.latest.partyPlayer;
@@ -4703,46 +4766,48 @@ void Adopt(uint8_t const guid[16])
 
 unsigned WriteCompanions(FILE* file)
 {
-    unsigned n = 0;
-    for (auto const& [key, name] : companions) {
-        fprintf(file, "companion ");
-        for (unsigned char c : key) fprintf(file, "%02x", c);
-        fprintf(file, " %s\n", name.c_str());
-        ++n;
-    }
-    return n;
+    RefreshCompanionIdentity();
+    const std::string text = companionIdentity.Write();
+    if (fwrite(text.data(), 1, text.size(), file) != text.size()) Log("identity: companion journal write failed");
+    return static_cast<unsigned>(companions.size());
 }
 
-unsigned ReadCompanions(FILE* file)
+bool ReadCompanions(FILE* file)
 {
-    companions.clear();
+    identity::Companions restored;
     offered.clear();
     char line[256];
-    unsigned n = 0;
     while (fgets(line, sizeof(line), file)) {
-        // The player's name is the rest of the line (names may contain spaces).
-        char hex[33] = {};
-        int consumed = 0;
-        if (sscanf_s(line, "companion %32s %n", hex, 33u, &consumed) != 1 || !consumed) continue;
-        std::string name = line + consumed;
-        while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
-        if (name.empty()) continue;
-        std::string key(16, '\0');
-        for (int i = 0; i < 16; ++i) {
-            unsigned v = 0;
-            sscanf_s(hex + 2 * i, "%2x", &v);
-            key[i] = static_cast<char>(v);
+        if (restored.Read(line) == identity::Row::Invalid) {
+            Log("identity: invalid/duplicate companion journal row; load refused");
+            return false;
         }
-        companions[key] = name;
-        ++n;
     }
-    return n;
+    if (ferror(file)) { Log("identity: companion journal read failed"); return false; }
+    companionIdentity = std::move(restored);
+    identityWarnings.clear();
+    return true;
 }
 
 void ClearCompanions()
 {
-    companions.clear();
+    companionIdentity = {};
+    identityWarnings.clear();
     offered.clear();
+}
+void CompanionAccounts(std::vector<uint64_t> const& accounts)
+{
+    companionIdentity.candidates.insert(accounts.begin(), accounts.end());
+    RefreshCompanionIdentity();
+}
+void RememberSummon(uint8_t const guid[16], uint8_t player)
+{
+    if (!net::IsHost()) return;
+    const uint64_t account = player == 1 ? steam::PlayerId() : net::PeerAccount(player);
+    if (!account) { Log("identity: summon owner unresolved; retained without reassignment"); return; }
+    const std::string key = Key(guid);
+    auto existing = companions.find(key);
+    if (existing == companions.end()) companions[key] = {account, {}, true};
 }
 }
 

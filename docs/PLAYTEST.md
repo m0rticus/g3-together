@@ -17,6 +17,26 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
 
 ## Before you start
 
+### SteamID identity (manual acceptance; no game/Steam automation)
+
+- [ ] In the two isolated copies, record each `identity: join` SteamID and slot. Save a distinct client inventory,
+  a looted personal chest/merchant purchase and a recruited companion; note a summon if one remains alive.
+  Shut down normally yourself, rename the Steam display name, then restart and load that host save.
+  The same SteamID must restore the character, personal state and companion; expect `identity: name changed`.
+  Stand near the companion so the existing proximity rule allows restoration.
+- [ ] Load an untouched build-57 save while using the old name. Expect `identity: migrated` for legacy
+  companions, then save and reload: there must be no second migration for those GUIDs.
+- [ ] Rename before first legacy migration, or use two identical names. Expect a host warning, retained
+  legacy rows and no reassignment. Set `legacy_companion_owner = <actual SteamID64> <old name>` on the host,
+  restart/load/join/save and confirm exactly the selected account receives the companion.
+- [ ] Rejoin in a different slot and confirm companions and newly saved summons follow the same SteamID,
+  not whoever occupies the former slot. A second connection under one SteamID must be refused cleanly.
+
+The stand-in Steam DLL's IDs 11/12 are stable test account IDs, not real SteamIDs.
+Changing a real Steam profile does not rename those stand-ins; their persona input must be changed by the
+test-copy maintainer between runs. Engine-free tests cover real-looking full 64-bit IDs, but do not verify
+native restoration. Do not overwrite original saves when checking migration.
+
 ### Focus loss/regain and held knockout (manual acceptance)
 
 - [ ] With host standing near fighting NPCs, Alt-Tab away for 1 second, then 10

@@ -76,9 +76,11 @@ void Revoked(uint8_t const guid[16]);  // client: the host refused or ended our 
 void Rebind(uint8_t const guid[16]);   // look this mirror's GUID up again (its copy was just given that GUID: summon.cpp)
 void Foreign(uint8_t const guid[16]);  // an NPC here that another machine simulates: never send it as ours (a copy)
 void Adopt(uint8_t const guid[16]);    // client: a companion from the host's save is ours again
-// Host: companions by player name, kept in the save's sidecar (lines "companion <guid hex> <player name>").
+// Host: SteamID64 ownership; legacy name rows are preserved until safely migrated.
 unsigned WriteCompanions(FILE* file);
-unsigned ReadCompanions(FILE* file);
+bool ReadCompanions(FILE* file);
+void CompanionAccounts(std::vector<uint64_t> const& accounts);
+void RememberSummon(uint8_t const guid[16], uint8_t player);
 void ClearCompanions();
 void CompanionsOff(LogFn log);  // QA negative control: saved companions are not handed over
 void StyleOff(LogFn log);  // QA negative control: mirrors hold no weapons and keep their stance

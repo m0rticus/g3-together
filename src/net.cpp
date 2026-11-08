@@ -2,6 +2,7 @@
 #include <enet/enet.h>
 
 #include "net.h"
+#include "player_identity.h"
 
 #include "enet_policy.h"
 #include "downed.h"
@@ -236,6 +237,7 @@ DeathHandler deathHandler = nullptr;
 ClockHandler clockHandler = nullptr;
 WorldStateHandler worldStateHandler = nullptr;
 ENetPeer* peers[MaxPlayers] = {};  // host side: peer for each client id
+uint64_t peerAccounts[MaxPlayers] = {}; // pinned authenticated account for this connection generation
 SummonHandler summonHandler = nullptr;
 ShotHandler shotHandler = nullptr;
 RagdollHandler ragdollHandler = nullptr;
@@ -641,6 +643,7 @@ void Drop(uint8_t id)
     for (auto& forced : forcePlayerFull[id]) forced = false;
     for (auto& forced : forcePlayerFull) forced[id] = false;
     peers[id] = nullptr;
+    peerAccounts[id] = 0;
     clientInWorld[id] = false;
     goodsCache[id].clear();
     goodsReplay[id] = 0;
@@ -894,6 +897,15 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
 {
     if (packet->dataLength) bandwidth.Rx(packet->data[0], packet->dataLength);
     if (isHost && (peer->address.host != target.host || !steam::IsPeerRelay(peer->address.port))) return;
+    if (isHost && peer->data) {
+        const uintptr_t slot = reinterpret_cast<uintptr_t>(peer->data);
+        if (slot < 2 || slot >= MaxPlayers || peers[slot] != peer ||
+            !peerAccounts[slot] || peerAccounts[slot] != steam::PeerId(peer->address.port)) {
+            Log("identity: refused relay/account mismatch");
+            enet_peer_disconnect_later(peer, 1);
+            return;
+        }
+    }
     if (packet->dataLength < 1) return;
     const uint8_t type = packet->data[0];
     if (type == MsgPosedNpc || type == MsgCompactPosedNpc || type == MsgControlPose) ++poseReceived;
@@ -945,19 +957,34 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             return;
         }
         uint8_t id = 0;
+        uint64_t account = 0;
+        char displayName[24] = {};
+        std::set<uint64_t> joinedAccounts;
+        for (uint8_t i = 2; i < MaxPlayers; ++i)
+            if (peers[i]) joinedAccounts.insert(peerAccounts[i]);
+        if (!steam::PeerIdentity(peer->address.port, account, displayName) ||
+            !identity::Admit(account, steam::PlayerId(), joinedAccounts)) {
+            Logf("identity: refused duplicate/invalid steamid=%llu source=transport-authenticated", account);
+            strcpy_s(refusal.reason, "SteamID already joined or authenticated identity unavailable");
+            Send(peer, &refusal, sizeof(refusal), ChannelReliable, true);
+            enet_peer_disconnect_later(peer, 1);
+            return;
+        }
         for (uint8_t i = 2; i < MaxPlayers && !id; ++i) if (!peers[i]) id = i;
         if (!id) { enet_peer_disconnect(peer, 2); return; }
         peers[id] = peer;
+        peerAccounts[id] = account;
         for (auto& sender : playerSenders[id]) sender = {};
         for (auto& forced : forcePlayerFull[id]) forced = false;
         ++generations[id];
         peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
         remotes[id].connected = true; // joined; activity and presentation have separate readiness
         clientInWorld[id] = false;
-        strncpy_s(remotes[id].latest.name, hello.name, _TRUNCATE);
+        strncpy_s(remotes[id].latest.name, displayName, _TRUNCATE);
         const Welcome welcome{MsgWelcome, id};
         Send(peer, &welcome, sizeof(welcome), ChannelReliable, true);
         Logf("net: %s joined as player %u", hello.name, id);
+        Logf("identity: join steamid=%llu display=%s source=transport-authenticated slot=%u", account, displayName, id);
     } else if (type == MsgRefused && !isHost && packet->dataLength == sizeof(RefusedMsg)) {
         RefusedMsg refusal;
         std::memcpy(&refusal, packet->data, sizeof(refusal));
@@ -976,6 +1003,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         ++welcomes;
         ResetNpcReplication();  // a new host connection has a fresh publication stream, even in the same campaign
         Logf("net: welcomed as player %u (welcome %u)", localId, welcomes);
+        Logf("identity: join steamid=%llu display=%s source=transport-authenticated slot=%u",
+             steam::PlayerId(), steam::PlayerName(), localId);
     } else if (type == MsgPlayerActivity && packet->dataLength == sizeof(ActivityMsg)) {
         if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         ActivityMsg message;
@@ -1031,6 +1060,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             Logf("net: invalid compact player state player=%u", player);
             return;
         }
+        if (isHost) strncpy_s(state.name, remotes[player].latest.name, _TRUNCATE);
         Store(state);
         if (isHost) {
             for (uint8_t i = 2; i < MaxPlayers; ++i)
@@ -1803,11 +1833,15 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         CharacterMsg message{};
         std::memcpy(&message, packet->data, sizeof(message));
         auto const& note = message.note;
+        const uint64_t authenticated = isHost ? PeerAccount(from) : steam::PlayerId();
+        if (!authenticated || note.account != authenticated) {
+            Logf("identity: character refused claimed=%llu authenticated=%llu slot=%u", note.account, authenticated, from);
+            return;
+        }
         if (note.world[32] || note.save[32] || !saving::Id(note.world) || !saving::Id(note.save) ||
             !note.epoch || !note.account || note.length > saving::store::PlayerLimit ||
             packet->dataLength - sizeof(message) != note.length ||
-            (isHost ? note.purpose != CharacterCapture || note.account != steam::PeerId(peer->address.port)
-                    : note.purpose != CharacterRestore || note.account != steam::PlayerId())) return;
+            (isHost ? note.purpose != CharacterCapture : note.purpose != CharacterRestore)) return;
         std::vector<uint8_t> bytes(packet->data + sizeof(message), packet->data + packet->dataLength);
         if (note.crc != saving::store::Crc(bytes)) {
             Logf("net: character record CRC refused player=%u save=%s bytes=%u", from, note.save, note.length);
@@ -2498,7 +2532,8 @@ void SetSaveHandler(SaveHandler handler) { saveHandler = handler; }
 void SetCharacterHandler(CharacterHandler handler) { characterHandler = handler; }
 uint64_t PeerAccount(uint8_t id)
 {
-    return isHost && id >= 2 && id < MaxPlayers && peers[id] ? steam::PeerId(peers[id]->address.port) : 0;
+    return isHost && id >= 2 && id < MaxPlayers && peers[id] &&
+        steam::PeerId(peers[id]->address.port) == peerAccounts[id] ? peerAccounts[id] : 0;
 }
 bool SendCharacter(uint8_t to, CharacterNote const& note, std::vector<uint8_t> const& bytes)
 {
@@ -2928,6 +2963,7 @@ bool Start(bool asHost)
     Logf("net: player name from Steam: %s", localName);
     if (isHost) {
         localId = 1;
+        Logf("identity: join steamid=%llu display=%s source=transport-authenticated slot=1", steam::PlayerId(), localName);
         connected = true;
         Logf("net: Steam-only host relay on 127.0.0.1:%u", host->address.port);
     } else {
@@ -2945,6 +2981,13 @@ bool Start(bool asHost)
 namespace {
 void Service(PlayerState const& local, bool haveLocal)
 {
+    strncpy_s(localName, steam::PlayerName(), _TRUNCATE);
+    if (isHost) for (uint8_t id = 2; id < MaxPlayers; ++id) {
+        uint64_t account = 0;
+        char name[24] = {};
+        if (peers[id] && steam::PeerIdentity(peers[id]->address.port, account, name) && account == peerAccounts[id])
+            strncpy_s(remotes[id].latest.name, name, _TRUNCATE);
+    }
     ENetEvent event;
     // At most 512 events a frame: a flood must not stall the game (Fable's review 22.10. 1.9); the rest waits for the next.
     int events = 0;

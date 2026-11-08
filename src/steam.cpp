@@ -19,6 +19,7 @@
 #include <windows.h>
 
 #include "steam.h"
+#include "player_identity.h"
 #include "relaywire.h"
 
 #include "config.h"
@@ -193,6 +194,7 @@ constexpr int MaxRemotes = net::MaxPlayers;
 struct Remote
 {
     u64 id = 0;
+    char name[24] = {};
     bool linked = false;   // host: said hello while in the lobby; client: the host welcomed us
     bool leaving = false;
     uint32_t heard = 0, lastPing = 0;
@@ -248,6 +250,7 @@ struct Published
     uint32_t pingSampleAt = 0;
     unsigned short ports[MaxRemotes] = {};
     u64 accounts[MaxRemotes] = {};
+    char names[MaxRemotes][24] = {}, playerName[24] = {};
     char hostName[64] = {}, error[256] = {}, status[900] = {};
     TrafficCounters traffic;
 } published;
@@ -284,6 +287,7 @@ void Publish()
     next.lobby = lobby;
     next.linked = CountLinked();
     next.traffic = traffic;
+    strcpy_s(next.playerName, playerName);
     next.traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetConfig().sessionId));
     for (auto const& r : remotes)
         if (r.linked && r.ping.Value(now) > next.ping) {
@@ -303,7 +307,10 @@ void Publish()
     for (int i = 0; i < MaxRemotes; ++i) {
         auto const& r = remotes[i];
         if (!r.id) continue;
-        if (r.linked) { next.ports[i] = r.relayPort; next.accounts[i] = r.id; }
+        if (r.linked) {
+            next.ports[i] = r.relayPort; next.accounts[i] = r.id;
+            strcpy_s(next.names[i], r.name);
+        }
         if (!isHost && r.id == owner) next.hostLinked = r.linked;
         n += Format(next.status + n, sizeof(next.status) - n, " peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
                     r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
@@ -323,6 +330,8 @@ void CopyName(char* out, size_t size, char const* source)
         while (length && (static_cast<unsigned char>(source[length]) & 0xc0) == 0x80) --length;
     }
     std::memcpy(out, Text(source), length);
+    for (size_t i = 0; i < length; ++i)
+        if (static_cast<unsigned char>(out[i]) < 32 || out[i] == 127) out[i] = '_';
     out[length] = '\0';
 }
 
@@ -680,6 +689,7 @@ void OnControl(Remote& r, char const* data, int size)
                 break;
             }
             r.linked = true;
+            CopyName(r.name, sizeof(r.name), api.FriendPersonaName(friends, r.id));
             Logf("steam: %s (%llu) linked to this game", Text(api.FriendPersonaName(friends, r.id)), r.id);
         }
         if (r.linked) Control(r.id, 'W', true);
@@ -879,7 +889,8 @@ void Search()
         if (!api.FriendGamePlayed(friends, id, &info) || (info.game & 0xffffff) != GothicAppId || !info.lobby) continue;
         if (IsSkipped(info.lobby)) continue;
         char const* name = Text(api.FriendPersonaName(friends, id));
-        if (*wantedHost && _stricmp(name, wantedHost)) continue;
+        uint64_t wantedId = 0;
+        if (*wantedHost && (identity::SteamId(wantedHost, wantedId) ? id != wantedId : _stricmp(name, wantedHost) != 0)) continue;
         InspectLobby(info.lobby, *name ? name : "a friend");
         return;
     }
@@ -1004,6 +1015,7 @@ bool Start(bool host, unsigned short port)
     if (!user || !matchmaking || !friends || !messages) return Fail("Steam interfaces missing");
     if (void* utils = api.Utils()) api.InitRelayNetworkAccess(utils);  // the relay network is ready by the first message
     me = api.UserSteamId(user);
+    if (!me) return Fail("Steam did not provide a SteamID64");
     char const* steamName = api.PersonaName(friends);
     if (!steamName || !*steamName) return Fail("Steam did not provide a player name");
     CopyName(persona, sizeof(persona), steamName);
@@ -1068,6 +1080,18 @@ uint64_t PeerId(unsigned short port)
         if (published.ports[i] == port) return published.accounts[i];
     return 0;
 }
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    if (!published.ready || !isHost || !port) return false;
+    for (int i = 0; i < MaxRemotes; ++i)
+        if (published.ports[i] == port && published.accounts[i]) {
+            account = published.accounts[i];
+            strcpy_s(name, published.names[i]);
+            return true;
+        }
+    return false;
+}
 
 namespace {
 void PumpOnce()
@@ -1106,6 +1130,15 @@ void PumpOnce()
         if (r.leaving) Drop(&r, "left the lobby");
     Forward();
     const uint32_t now = Now();
+    static uint32_t lastNames = 0;
+    if (now - lastNames >= 1000) {
+        lastNames = now;
+        CopyName(playerName, sizeof(playerName), api.PersonaName(friends));
+        CopyName(persona, sizeof(persona), api.PersonaName(friends));
+        for (auto& r : remotes)
+            if (r.linked) CopyName(r.name, sizeof(r.name), api.FriendPersonaName(friends, r.id));
+        if (!isHost && owner) CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
+    }
     if (!isHost && owner) {
         Remote* host = Find(owner);
         if (host && !host->linked && now - lastHello > 1000) {
@@ -1178,7 +1211,13 @@ void Stop()
 
 bool Ready() { std::lock_guard<std::mutex> lock(publishedMutex); return published.ready; }
 uint64_t LobbyId() { std::lock_guard<std::mutex> lock(publishedMutex); return published.lobby; }
-char const* PlayerName() { return playerName; }
+char const* PlayerName()
+{
+    thread_local char copy[24];
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    strcpy_s(copy, published.playerName);
+    return copy;
+}
 uint64_t PlayerId() { return me; }
 int Ping()
 {

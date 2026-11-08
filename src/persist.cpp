@@ -1670,7 +1670,13 @@ bool RestoreJournal()
     if (!WriteAtomic(path, block->bytes)) return false;
     FILE* file = nullptr;
     if (fopen_s(&file, path.c_str(), "rb") || !file) { DeleteFileA(path.c_str()); return false; }
-    journal::Read(file); rewind(file); npcs::ReadCompanions(file); rewind(file);
+    journal::Read(file); rewind(file);
+    if (!npcs::ReadCompanions(file)) { fclose(file); DeleteFileA(path.c_str()); return false; }
+    std::vector<uint64_t> accounts;
+    for (auto const& entry : current.blocks)
+        if (entry.type == saving::store::Character) accounts.push_back(entry.account);
+    npcs::CompanionAccounts(accounts);
+    rewind(file);
     bool held = false;
     char line[256]{};
     while (fgets(line, sizeof(line), file)) {

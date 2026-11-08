@@ -69,7 +69,8 @@ friendly_fire = 0
 CLIENT_INI = """# G3 Together: this player joins the host.
 # This package speaks protocol 77 with host-managed saves and guarded bone packing: both players need this same package.
 role = client
-# Finds the host among your Steam friends; Steam is required. With several friends hosting: steam_host = <their Steam name>.
+# Finds the host among Steam friends; Steam is required. With several hosts: steam_host = <SteamID64 or Steam name>.
+# Saved characters, personal state and companion ownership use SteamID64; display names may change.
 transport = steam
 # Must match the host; different IDs never connect, even through invites or steam_lobby.
 session_id = default

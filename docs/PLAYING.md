@@ -94,7 +94,8 @@ goes through Steam, relayed by Valve where needed.
 - For three independent pairs, set `session_id = pair-red`, `pair-green` or `pair-blue` on each pair's host and client.
   These IDs do not change the existing per-lobby player limit or impose a two-player cap. Use one host per ID;
   if multiple hosts deliberately share an ID, automatic search still selects the first matching friend.
-- `steam_host = <the host's Steam name>` additionally restricts friend search. The host's `g3together.log` names
+- `steam_host = <the host's SteamID64 or Steam name>` additionally restricts friend search. Prefer SteamID64
+  so renaming the host does not affect search. The host's `g3together.log` names
   its Steam lobby number; `steam_lobby = <number>` restricts joining to that lobby. These selectors, command-line
   `+connect_lobby`, and Steam invites **never override session_id**.
 - Session IDs are visible grouping labels, not passwords or access controls. Steam friendship/lobby membership
@@ -105,6 +106,13 @@ goes through Steam, relayed by Valve where needed.
   isolated installations, profiles and saves; a Session ID isolates network traffic, not filesystem writes.
 - Without Steam or the required `steam_api.dll`, co-op startup fails with a message in the menu and game.
   There is no fallback. ENet's UDP sockets bind only to localhost and accept linked Steam relays, not direct-IP players.
+
+Saved character and personal inventory records, companion/follower/guide ownership and newly recorded summons
+are keyed by authenticated SteamID64. Display names refresh independently; reconnecting into a different player
+slot or renaming a Steam profile does not transfer ownership. Old name-keyed companions migrate only on an
+unambiguous match; unresolved records are retained with a host warning. See [Joining](JOINING.md) for the explicit
+`legacy_companion_owner` setting. Older saves did not record remote summon SteamIDs, so missing historical
+ownership cannot be inferred safely. World quests/events remain shared world state, not player-name records.
 - The Steam overlay's invite may not open in Gothic 3. It is not needed: the joining player's game finds the host by
   itself, and "Join game" in the Steam friends list works as well while their game is running.
 

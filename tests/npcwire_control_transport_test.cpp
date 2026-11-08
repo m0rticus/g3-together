@@ -96,6 +96,10 @@ int main()
     fakeHost.peers = &fakePeer;
     host = &fakeHost;
     peers[2] = &fakePeer;
+    fakePeer.address.port = 12;
+    fakePeers[1].address.port = 13;
+    peerAccounts[2] = 12;
+    peerAccounts[3] = 13;
     server = &fakePeer;
     target.host = fakePeer.address.host;
     worldEpoch = 0x1234;

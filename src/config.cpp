@@ -2,6 +2,7 @@
 #include "config.h"
 
 #include "log.h"
+#include "player_identity.h"
 
 #include <Windows.h>
 #include <cstdio>
@@ -49,8 +50,12 @@ Config const& LoadConfig()
     }
     char line[256];
     while (fgets(line, sizeof(line), file)) {
+        char const* setting = line;
+        while (*setting == ' ' || *setting == '\t') ++setting;
+        const bool identityMapping = !_strnicmp(setting, "legacy_companion_owner", 22) &&
+            (setting[22] == ' ' || setting[22] == '\t' || setting[22] == '=');
         char* hash = std::strchr(line, '#');
-        if (hash) *hash = '\0';
+        if (hash && !identityMapping) *hash = '\0'; // Migration labels may themselves contain '#'.
         char* equals = std::strchr(line, '=');
         if (!equals) continue;
         *equals = '\0';
@@ -80,6 +85,21 @@ Config const& LoadConfig()
         }
         else if (!_stricmp(key, "steam_lobby")) strncpy_s(config.steamLobby, value, _TRUNCATE);
         else if (!_stricmp(key, "steam_host")) strncpy_s(config.steamHost, value, _TRUNCATE);
+        else if (!_stricmp(key, "legacy_companion_owner")) {
+            const std::string mapping(value);
+            const size_t space = mapping.find(' ');
+            uint64_t account = 0;
+            if (space == std::string::npos || !identity::SteamId(mapping.substr(0, space), account) ||
+                !identity::Label(mapping.substr(space + 1)) || std::strlen(equals + 1) >= sizeof(value)) {
+                Log("identity: invalid legacy_companion_owner; use <SteamID64> <old display name>");
+            } else {
+                auto [entry, inserted] = config.legacyCompanionOwners.emplace(mapping.substr(space + 1), account);
+                if (!inserted && entry->second != account) {
+                    entry->second = 0;
+                    Log("identity: conflicting legacy_companion_owner mappings; migration refused");
+                }
+            }
+        }
         else if (!_stricmp(key, "language")) {
             if (!_stricmp(value, "de")) strcpy_s(config.language, "de");
             else if (!_stricmp(value, "pl")) strcpy_s(config.language, "pl");

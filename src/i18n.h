@@ -86,6 +86,7 @@ enum Message
     ClientAutoloadGaveUp,
     ClientAutoloadEntered,
     ClientAutoloadStalled,
+    IdentityMigrationPending,
     MessageCount
 };
 

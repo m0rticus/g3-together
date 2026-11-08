@@ -26,6 +26,8 @@ int main()
         fakePeers[i].outgoingSendReliableCommands.sentinel.next = &fakePeers[i].outgoingSendReliableCommands.sentinel;
         fakePeers[i].outgoingSendReliableCommands.sentinel.previous = &fakePeers[i].outgoingSendReliableCommands.sentinel;
         peers[i + 2] = &fakePeers[i];
+        fakePeers[i].address.port = static_cast<unsigned short>(i + 12);
+        peerAccounts[i + 2] = i + 12;
         clientInWorld[i + 2] = true;
         generations[i + 2] = 1;
         ResetBudget(&fakePeers[i]);

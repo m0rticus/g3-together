@@ -217,6 +217,9 @@ constexpr Translation Messages[] = {
     {L"The host has not admitted you yet. Check the host's game; open the menu and choose New Game to try again.",
      L"Der Host hat dich noch nicht aufgenommen. Prüfe das Spiel des Hosts; öffne das Menü und wähle Neues Spiel für einen neuen Versuch.",
      L"Host jeszcze cię nie przyjął. Sprawdź grę hosta; otwórz menu i wybierz Nowa gra, aby spróbować ponownie."},
+    {L"Legacy companion owner unresolved; saved ownership retained. See identity: in g3together.log and legacy_companion_owner.",
+     L"Alter Begleiterbesitzer unbekannt; gespeicherter Besitz bleibt erhalten. Siehe identity: in g3together.log und legacy_companion_owner.",
+     L"Nieznany właściciel dawnego towarzysza; zapisane przypisanie zachowano. Zobacz identity: w g3together.log i legacy_companion_owner."},
 };
 static_assert(sizeof(Messages) / sizeof(Messages[0]) == MessageCount, "Missing HUD translation");
 

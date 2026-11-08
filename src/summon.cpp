@@ -208,6 +208,8 @@ void AnnounceCreature(eCEntity* creature, uint8_t owner = 1)
     net::SummonNote note;
     note.op = net::SummonCreature;
     Guid(creature, note.guid);
+    if (!owner) return; // An absent SteamID owner cannot be addressed by a current wire slot.
+    npcs::RememberSummon(note.guid, owner);
     for (auto const& existing : hostCreatures) if (!std::memcmp(existing.guid, note.guid, 16)) return;
     note.netId = (static_cast<uint32_t>(net::LocalId()) << 24) | (++counter & 0xFFFFFF);
     note.ownerPlayer = owner;
@@ -260,13 +262,26 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
 {
     _GUID raw;
     std::memcpy(&raw, note.guid, 16);
+    auto setOwner = [&](Entity& copy) {
+        if (copy.GetInstance() && copy.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
+            eCEntity* owner = note.ownerPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(note.ownerPlayer);
+            copy.Party.SetPartyLeader(Entity(owner));
+            copy.Party.PartyMemberType = gEPartyMemberType_Summoned;
+        }
+    };
     for (auto const& existing : creatureCopyList)
-        if (!std::memcmp(existing.guid, note.guid, 16) && existing.netId == note.netId) { npcs::Rebind(note.guid); return; }
+        if (!std::memcmp(existing.guid, note.guid, 16) && existing.netId == note.netId) {
+            Entity copy(npcs::NpcByGuid(note.guid));
+            setOwner(copy);
+            npcs::Rebind(note.guid);
+            return;
+        }
     creatureCopyList.erase(std::remove_if(creatureCopyList.begin(), creatureCopyList.end(), [&](CreatureCopy const& previous) {
         return !std::memcmp(previous.guid, note.guid, 16);
     }), creatureCopyList.end());
     Entity copy(npcs::NpcByGuid(note.guid));
     if (copy.GetInstance()) {
+        setOwner(copy);
         CreatureCopy tracked;
         std::memcpy(tracked.guid, note.guid, 16);
         tracked.netId = note.netId;
@@ -294,11 +309,7 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
         copy.Kill();
         return;
     }
-    if (copy.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
-        eCEntity* owner = note.ownerPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(note.ownerPlayer);
-        copy.Party.SetPartyLeader(Entity(owner));
-        copy.Party.PartyMemberType = gEPartyMemberType_Summoned;
-    }
+    setOwner(copy);
     npcs::Foreign(note.guid);  // before its first snapshot arrives it must not go out as one of ours
     if (!lateCopyMs) npcs::Rebind(note.guid);
     CreatureCopy c;
@@ -649,7 +660,15 @@ void Tick()
                 net::SendSummon(gone);
                 it = hostCreatures.erase(it);
             } else {
-                if (joined) net::SendSummon(*it);
+                const uint8_t owner = npcs::CompanionOwner(ByGuid(it->guid).GetInstance());
+                const bool changed = owner != it->ownerPlayer;
+                it->ownerPlayer = owner;
+                Entity creature = ByGuid(it->guid);
+                eCEntity* leader = owner == 1 ? remote::ControlledBody() : remote::PuppetOf(owner);
+                if (creature.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
+                    creature.Party.GetPartyLeader().GetInstance() != leader)
+                    creature.Party.SetPartyLeader(Entity(leader));
+                if (owner && (joined || changed)) net::SendSummon(*it);
                 ++it;
             }
         }

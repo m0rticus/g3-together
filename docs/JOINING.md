@@ -34,8 +34,26 @@ The steps below also let you install by hand.
    language = auto
    ```
 
-Your PC must use `role = client`. Your player name comes from Steam; keep that Steam display name unchanged: the host uses it to
-restore your companions after loading a save.
+Your PC must use `role = client`. Your display name comes from Steam and is only a label.
+Saved characters, personal loot/merchant state and companion ownership use your authenticated **SteamID64**,
+not your display name or connection slot. Changing your Steam name does not change these records.
+One SteamID can occupy only one joined player slot.
+
+Older account-bound characters and personal records load unchanged. Old name-keyed companion entries migrate
+once when their old name uniquely matches a known Steam account and no saved remote account is unidentified.
+Unmatched or ambiguous entries stay in the save; the host sees a warning and `identity: migration pending` in the log.
+If a name changed before migration, the host can explicitly select its owner in the host's `g3together.ini`:
+
+```ini
+legacy_companion_owner = 76561198012345678 Old Steam Name
+```
+
+Use the actual owner's SteamID64 from `identity: join`, not a player slot or lobby number. Restart the host after
+editing, load the old save and let that account join; then save normally. The log records `identity: migrated`;
+the next save writes SteamID-keyed ownership, without changing or replacing any character. Different old names
+can have separate setting lines; conflicting assignments for the same old name are refused.
+On `legacy_companion_owner` lines, `#` is part of the old name, not an inline comment.
+Quote the whole value if the old name ends with spaces.
 
 Set `session_id` to exactly the host's ID (setup asks for it too). IDs are case-sensitive and contain 1-63 ASCII
 letters, digits, underscores or hyphens. Use a different ID for each independent host/client pair; leave it out

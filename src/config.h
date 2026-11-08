@@ -3,6 +3,8 @@
 
 #include "session.h"
 #include "npcremoval_policy.h"
+#include <map>
+#include <string>
 
 namespace g3t {
 struct Config
@@ -12,7 +14,8 @@ struct Config
     bool sessionIdValid = true;
     // Steam is the only transport. ENet's sockets are private loopback bridges, not direct-IP endpoints.
     char steamLobby[24] = "";             // client, steam: join this lobby (its number from the host's log) instead of searching
-    char steamHost[64] = "";              // client, steam: only this friend's game (its Steam name), when several friends host
+    char steamHost[64] = "";              // client: this friend's SteamID64 or display name
+    std::map<std::string, uint64_t> legacyCompanionOwners; // host-authorized one-time migration, old label -> SteamID64
     char language[5] = "en";       // local HUD language: en | de | pl | auto (the game's text language); not a network setting
     char puppetTemplate[64] = "PC_Hero";  // template used to show other players (the hero himself) who chose no look
     char look[32] = "";                  // this player's own look: the template the others show it as (empty: theirs)
