@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/client_rejoin.h"
+#include "../src/client_template.h"
 #include "../src/saving_policy.h"
 
 #include <algorithm>
@@ -25,47 +26,60 @@ void Template()
            !tmpl::OwnSlot("G3T_client_templat") && !tmpl::OwnSlot("QuickSave") && !tmpl::OwnSlot("G3_World_01_0001"));
     assert(tmpl::Sidecar == 2);
 
-    // The marker binds the template to the exact installed Game.dll and survives only unchanged.
-    const std::string marker = tmpl::Marker(4640768);
-    const std::vector<uint8_t> bytes(marker.begin(), marker.end());
-    assert(tmpl::MarkerMatches(bytes, 4640768));
-    assert(!tmpl::MarkerMatches(bytes, 4640769) && !tmpl::MarkerMatches(bytes, 0));
-    assert(!tmpl::MarkerMatches(std::vector<uint8_t>{}, 4640768));
-    std::vector<uint8_t> damaged = bytes;
-    damaged.back() ^= 1;
-    assert(!tmpl::MarkerMatches(damaged, 4640768));
-    damaged = bytes;
-    damaged.push_back('\n');
-    assert(!tmpl::MarkerMatches(damaged, 4640768));
-    damaged.assign(bytes.begin(), bytes.end() - 1);
-    assert(!tmpl::MarkerMatches(damaged, 4640768));
-    const std::string wide = tmpl::Marker(0x100000000ull);
-    assert(tmpl::MarkerMatches(std::vector<uint8_t>(wide.begin(), wide.end()), 0x100000000ull));
-    for (bool header : {false, true})
-        for (bool world : {false, true})
-            for (bool matches : {false, true})
-                assert(tmpl::Valid(header, world, matches) == (header && world && matches));
-
-    // One save per New Game; the account record is held from the New Game return until the save or the deadline.
+    // Hold the account record through native save, asynchronous publication and one delayed retry.
+    static_assert(tmpl::DelayMs == 2000 && tmpl::DeadlineMs == 25000 && tmpl::MaxTries == 2);
     tmpl::Capture capture;
     assert(!capture.wanted && !capture.Holding(0) && !capture.Due(0) && !capture.Expired(0));
     capture.Want(1000);
     assert(capture.Holding(1000) && !capture.Due(1000) && !capture.Due(2999));
     assert(capture.Due(1000 + tmpl::DelayMs) && capture.Holding(1000 + tmpl::DelayMs));
+    capture.Began();
+    assert(capture.busy && !capture.Due(1000 + tmpl::DelayMs) && capture.Holding(1000 + tmpl::DelayMs));
+    tmpl::Publish publish;
+    publish.Begin(tmpl::Origin::NewGame, 3000);
+    publish.NativeReturned(true, 1, true, 3000);
+    tmpl::Facts facts;
+    facts.header.exists = true;
+    facts.header.size = tmpl::MinHeaderBytes;
+    facts.worldTmp.exists = facts.worldTmp.locked = true;
+    assert(publish.Poll(facts, 3300) == tmpl::Step::Wait && capture.Holding(3300));
+    facts.worldTmp = {};
+    facts.world.exists = true;
+    facts.world.size = tmpl::MinWorldBytes;
+    assert(publish.Poll(facts, 3350) == tmpl::Step::Seal && capture.Holding(3350));
+    publish.Finish(true);
+    capture.Done();
+    assert(!capture.wanted && !capture.busy && !capture.Holding(3350));
+    capture.Want(1000);
+    capture.Began();
+    publish.Begin(tmpl::Origin::NewGame, 3000);
+    publish.NativeReturned(false, 0, false, 4000);
+    assert(!publish.Active() && publish.failure() == tmpl::Fail::NativeRefused);
+    capture.Failed(4000);
+    assert(capture.wanted && !capture.busy && capture.tries == 1 && capture.Holding(4000));
+    assert(!capture.Due(4000 + tmpl::RetryDelayMs - 1) && capture.Due(4000 + tmpl::RetryDelayMs));
+    capture.Began();
+    assert(!capture.Due(4000 + tmpl::RetryDelayMs) && capture.Holding(4000 + tmpl::RetryDelayMs));
+    publish.Begin(tmpl::Origin::NewGame, 5500);
+    publish.NativeReturned(true, 1, true, 5500);
+    publish.Finish(false, tmpl::Fail::Seal);
+    assert(!publish.Active() && publish.failure() == tmpl::Fail::Seal);
+    capture.Failed(6000);
+    assert(capture.tries == 2 && !capture.wanted && !capture.busy && !capture.Holding(6000) && !capture.Due(9000));
+    capture.Want(1000);
+    capture.Began();
     assert(capture.Holding(1000 + tmpl::DeadlineMs - 1) && !capture.Expired(1000 + tmpl::DeadlineMs - 1));
     assert(capture.Expired(1000 + tmpl::DeadlineMs) && !capture.Holding(1000 + tmpl::DeadlineMs) && !capture.Due(1000 + tmpl::DeadlineMs));
-    assert(tmpl::DelayMs < tmpl::DeadlineMs);
     capture.Done();
     assert(!capture.wanted && !capture.Holding(2000) && !capture.Due(2000) && !capture.Expired(1000 + tmpl::DeadlineMs));
     capture.Want(0xfffffff0u); // GetTickCount wraps: every comparison is signed-difference based
     assert(capture.Holding(0xfffffff0u) && !capture.Due(0xfffffff0u));
+    assert(!capture.Due(0xfffffff0u + tmpl::DelayMs - 1));
     assert(capture.Due(0xfffffff0u + tmpl::DelayMs) && capture.Holding(0xfffffff0u + tmpl::DeadlineMs - 1));
+    capture.Began();
+    capture.Failed(0xfffffff0u + tmpl::DeadlineMs - 1);
+    assert(!capture.Due(0xfffffff0u + tmpl::DeadlineMs) && !capture.Holding(0xfffffff0u + tmpl::DeadlineMs));
     assert(capture.Expired(0xfffffff0u + tmpl::DeadlineMs));
-
-    // The template is the only way back into a loaded world; without it nothing is torn down.
-    for (bool valid : {false, true})
-        for (bool ready : {false, true})
-            assert((ChooseRoute(valid, ready) == Route::Template) == (valid && ready));
     // The native New Game restarts an already loaded world in place and never returned: allowed only for the first world.
     assert(NewGameAllowed(false) && !NewGameAllowed(true));
 }

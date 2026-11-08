@@ -51,10 +51,10 @@ class ClientRejoinTests(unittest.TestCase):
         self.assertNotIn("CaptureCharacter", transition)
         self.assertNotIn("SaveRecord", transition)
         self.assertNotIn("worldCleanup();", transition)  # cleanup only inside the guarded template entry
-        self.assertLess(transition.index("rejoin::ChooseRoute("), transition.index("EnterTemplateWorld(startedAt)"))
-        refusal = transition.split("rejoin::ChooseRoute(", 1)[1].split("EnterTemplateWorld(startedAt)", 1)[0]
+        self.assertLess(transition.index("EntryPlan(quiet)"), transition.index("EnterTemplateWorld(startedAt)"))
+        refusal = transition.split("EnterTemplateWorld(startedAt);", 1)[1]
         self.assertIn("clientRejoin.failed = true", refusal)
-        self.assertIn("ClientRestartToRejoin", refusal)
+        self.assertIn("TemplateImpossible(plan)", refusal)  # the exact reason, never a generic restart message
         self.assertIn("note.op == net::WorldOther", on_world)
         self.assertIn("clients[from].ready = clients[from].recordSent = clients[from].cutover = 0", on_world)
 
@@ -69,7 +69,7 @@ class ClientRejoinTests(unittest.TestCase):
         self.assertIn("lowerLoadCalls == 1 && lowerLoadGood", enter)
         self.assertIn("clientRejoin.Started(ok)", enter)
         self.assertIn("requestCharacterAgain = true", enter)
-        self.assertIn("RemoveTemplate();", enter.split("if (ok)", 1)[1])
+        self.assertIn('RemoveTemplate("native-load-failed")', enter.split("if (ok)", 1)[1])
         self.assertNotIn("originalNewGame", enter)
         self.assertNotIn("Stop()", enter)
         self.assertNotIn("CapturePlayer", enter)
@@ -83,30 +83,66 @@ class ClientRejoinTests(unittest.TestCase):
 
     def test_template_slot_is_ours_and_saved_once_before_the_account_record(self):
         source = (ROOT / "src" / "persist.cpp").read_text()
-        remove = source.split("void RemoveTemplate()", 1)[1].split("// One native save", 1)[0]
-        self.assertIn("rejoin::tmpl::Slot", remove)
+        remove = source.split("bool RemoveTemplate(char const* reason)", 1)[1].split("// ---- one template save", 1)[0]
+        self.assertIn("rejoin::tmpl::OwnSlot(rejoin::tmpl::Slot)", remove)
+        self.assertIn("RemoveOwn(TemplatePaths()", remove)  # only the slot's own files and their .tmp staging files
         self.assertNotIn("lastSave", remove)
         self.assertNotIn("current", remove)
-        save = source.split("void SaveClientTemplate()", 1)[1].split("std::string CharacterPath()", 1)[0]
-        self.assertIn("rejoin::tmpl::OwnSlot(rejoin::tmpl::Slot)", save)
-        self.assertLess(save.index("RemoveTemplate();"), save.index("originalSave(manager, &name)"))
-        self.assertIn("lowerSaveCalls == 1", save)
-        self.assertLess(save.index("lowerSaveCalls == 1"), save.index("WriteAtomic("))
-        self.assertIn("if (!ok) RemoveTemplate();", save)
-        self.assertNotIn("SaveDetour", save)
+        start = source.split("bool TemplateStart(rejoin::tmpl::Origin origin, TemplateJob job)", 1)[1].split("// Each frame while a save settles", 1)[0]
+        self.assertIn("tpl::OwnSlot(tpl::Slot)", start)
+        self.assertLess(start.index("RemoveOwn(paths"), start.index("originalSave(manager, &name)"))
+        self.assertEqual(start.count("originalSave(manager, &name)"), 1)  # exactly one native save per attempt
+        self.assertIn("templatePublish.NativeReturned(nativeOk, lowerSaveCalls, lowerSaveGood", start)
+        # The root cause: the files were judged right after the native call. The call only starts the settle phase now.
+        for forbidden in ("SealFiles", "Observe(", "HasBytes", "Sleep(", "WriteAtomic("):
+            self.assertNotIn(forbidden, start)
+        poll = source.split("void TemplatePoll(uint32_t now)", 1)[1].split("// Silent regeneration", 1)[0]
+        self.assertIn("templatePublish.Poll(facts, now)", poll)
+        self.assertLess(poll.index("Observe(paths, true)"), poll.index("SealFiles("))
+        self.assertNotIn("Sleep(", source.split("// ---- one template save", 1)[1].split("std::string CharacterPath()", 1)[0])
+        ended = source.split("void TemplateEnded(uint32_t now)", 1)[1].split("// Native save of the running world", 1)[0]
+        self.assertIn('RemoveTemplate("rollback")', ended)  # a failed save never leaves a half template
+        self.assertNotIn("SaveDetour", start)
         loader = source.split("bool __stdcall NewGameDetour", 1)[1].split("bool WriteAtomic", 1)[0]
         native_call = loader.index("const bool ok = originalNewGame(self);")
         self.assertLess(loader.index("rejoin::NewGameAllowed(clientWorldEntered)"), native_call)
         self.assertIn("templateCapture.Want(GetTickCount())", loader[native_call:])
-        self.assertEqual(source.count("SaveClientTemplate();"), 1)
+        self.assertIn("templateHeroFresh = true;", loader[native_call:])
+        self.assertNotIn("SaveClientTemplate", source)
+        transition = source.split("bool ProcessClientTransition()", 1)[1].split("bool BeginFrame()", 1)[0]
+        self.assertEqual(transition.count("TemplateStart("), 3)  # background, first entry, host-load
+        self.assertLess(transition.index("TemplatePoll(now)"), transition.index("if (!clientRejoin.pending) {"))
         tick = source.split("void Tick()\n{", 1)[1].split("namespace SaveExtensions", 1)[0]
         self.assertIn("const bool templateHold = templateCapture.Holding(now);", tick)
         self.assertLess(tick.index("const bool templateHold"), tick.index("if (newWorld && running && !templateHold) {"))
         self.assertEqual(tick.count("!templateCapture.Holding(now)"), 1)  # account-record restore waits for the save
         on_character = source.split("void OnCharacter(", 1)[1].split("void Evaluate()", 1)[0]
         self.assertIn("!templateCapture.Holding(GetTickCount())", on_character)
-        for guarded in ("needsNewHero && clientRejoin.CanUseFresh", "!receivedRecord.empty() && !restoreFailed"):
+        self.assertIn("templateHeroFresh", on_character)  # a carried hero never starts a new account
+        for guarded in ("needsNewHero && templateHeroFresh && clientRejoin.CanUseFresh", "!receivedRecord.empty() && !restoreFailed"):
             self.assertIn(guarded, tick)
+
+    def test_restart_message_only_when_the_route_is_impossible(self):
+        source = (ROOT / "src" / "persist.cpp").read_text()
+        # The generic "restart Gothic 3" text survives only as the refusal of the hanging in-place New Game.
+        self.assertEqual(source.count("i18n::ClientRestartToRejoin"), 1)
+        new_game = source.split("bool __stdcall NewGameDetour", 1)[1].split("bool WriteAtomic", 1)[0]
+        self.assertIn("i18n::ClientRestartToRejoin", new_game)
+        # Every other refusal names its reason through the one notice function.
+        self.assertEqual(source.count("TemplateImpossible(plan);"), 2)
+        self.assertEqual(source.count("TemplateNotify("), 4)  # definition, failed save, impossible route, save-refused timeout
+        text = source.split("wchar_t const* AutoloadMenuText(", 1)[1].split("void StatusHints()", 1)[0]
+        self.assertIn("i18n::ClientTemplateUnavailable", text.split("case S::NoRoute", 1)[1])
+        policy = (ROOT / "src" / "client_template.h").read_text()
+        decide = policy.split("inline Plan Decide(Situation const& s)", 1)[1].split("// Silent regeneration", 1)[0]
+        self.assertEqual(decide.count("Route::Impossible"), 5)
+
+    def test_template_publish_waits_for_the_engines_world_write_in_the_log_contract(self):
+        source = (ROOT / "src" / "persist.cpp").read_text()
+        for line in ("template: state=", "template: save start", "template: native HUD.SaveGame", "template: settle +",
+                     "template: ready slot=", "template: failed reason=", "template: file operation=", "template: remove reason=",
+                     "template: refused reason=", "template: notice reason=", "template: startup slot="):
+            self.assertIn(line, source)
 
     def test_native_new_game_is_not_the_world_replacement(self):
         # RestartWorld(false) on an active world is the in-place restart that never returned (build 42 freeze).

@@ -471,25 +471,37 @@ After coordinator deployment, use the two already configured isolated host/clien
 checks, not an automated engine/Steam test. Do not use the protected user save folder. The client isolated profile's
 save folder gets one new slot, `G3T_client_template.*` (`.g3savcp`, `.g3savcpdat`, `.g3t`), nothing else.
 
-1. Fresh client launch: host starts the test campaign; client chooses **New Game** (the only manual step), joins and receives only its own
-   account record. Within ~2 s of the New Game return the client log must show `persist: client template save slot=G3T_client_template ... ok=1`
-   BEFORE `persist: character restore`. Make the heroes visibly different and host-save; wait for **Co-op save complete** on both.
-2. With the client playing, host-load that save. Expected client log: `client enter state=queued reason=host-world-changed`, `state=cleanup`,
-   `state=native-load`, `persist: native invoke=World.LoadGameWorld`, `state=returned ... lower_calls=1 lower_ok=1`, then the usual
+1. Fresh client launch: host starts the test campaign; client chooses **New Game** (the only manual step; with autoload on it starts by itself), joins and receives only its own
+   account record. About 2-4 s after the New Game return the client log must show, in this order: `template: save start job=first-entry origin=new-game`,
+   `template: native HUD.SaveGame slot=G3T_client_template ok=1 lower_calls=1 lower_ok=1 ms=...`, one or more `template: settle +NNNms header=... world=missing(2) ... world_tmp=...`
+   lines (the engine writes the world half ~0.3 s later), `template: ready slot=G3T_client_template origin=new-game header=... crc=... world=... crc=...` and
+   `template: state=valid why=- origin=new-game ...`, all BEFORE `persist: character restore`. The isolated client profile must now hold
+   `G3T_client_template.g3savcp`, `.g3savcpdat` and `.g3t` (no `.tmp`). Make the heroes visibly different and host-save; wait for **Co-op save complete** on both.
+2. With the client playing, host-load that save. Expected client log: `client enter state=queued reason=host-world-changed`, `template: route=template ...`,
+   `state=cleanup ... template=valid origin=new-game`, `state=native-load`, `persist: native invoke=World.LoadGameWorld`, `state=returned ... lower_calls=1 lower_ok=1`, then the usual
    `character restore` and admission. The client must land in the host's world with its own saved character, never closing Gothic 3 and
-   never showing "not responding". Repeat the host load 5+ times in a row (including loading the same slot again).
+   never showing "not responding". Repeat the host load 5+ times in a row (including loading the same slot again): **no restart of Gothic 3 at any point.**
 3. Host loads while the client is in the menu opened during play, in a dialogue/trade (deferral notice, then entry after closing),
    with a client save awaiting its result, and during the client's own loading screen: the entry waits for the boundary, no nested teardown, no crash.
 4. Choose **New Game** from the client's in-game menu: it queues the same template entry (no native process exit, no freeze). A **New Game**
-   from the title screen after a world was already entered in this launch enters through the template too (or shows the restart notice when no
-   template exists); the native New Game is never run twice in a launch.
-5. Delete `G3T_client_template.*` in the isolated client profile (only those files), host-load: the client keeps its old world, shows the
-   "restart Gothic 3 and choose New Game once" notice and logs `state=failed reason=no-template`; after a restart + New Game the template is rebuilt.
+   from the title screen after a world was already entered in this launch enters through the template too (or shows the exact reason when no
+   template exists and there is no world to make one from); the native New Game is never run twice in a launch.
+5. Delete `G3T_client_template.*` in the isolated client profile (only those files; the client must be in the world, hero standing idle): within
+   ~15 s the log shows `template: state=missing why=no-files`, `template: save start job=background origin=world attempt=...`, `settle`, `ready ... origin=world`; then host-load:
+   the client enters through the new template with no restart. Repeat the deletion and host-load before the 15 s are over: the log shows
+   `template: route=create ...`, `template: save start job=host-load origin=world`, `ready`, then `state=native-load ... returned`; no restart.
+   (A carried-hero template only starts accounts that the host has a record for; for a new account see 6.)
 6. A campaign with no record for the client's account: the template's fresh hero is used, never the host's hero; nothing overwrites the earlier record.
+   With an `origin=world` template and a host save without a record for the client the log shows `template: route=... why=carried-hero-new-account`
+   and one message with the reason; after a restart the first New Game rebuilds a fresh-hero template.
 7. Review both logs and the engine log (`ge3log*.log` in the isolated profile): no `FATAL`/`still cached` lines, no `world-entry: main thread stack`
    line (that line is printed only when a native world operation runs longer than 15 s and gives the main thread's module+RVA candidates).
    No native world transfer to/from the host is allowed; only the client's own template is loaded. Static policy/native-byte tests and the Release build
    do not establish these visual/native acceptance results.
+8. Template failures name their reason: make the template fail on purpose (isolated client profile only, e.g. hold `G3T_client_template.g3savcpdat.tmp`
+   open from another program or make the folder read-only) and the log shows `template: failed reason=template-busy|save-access-denied|template-no-world ...`,
+   `template: remove reason=rollback clean=1` and one HUD/menu message `Rejoin template: <reason> (system error N)`; the slot is clean afterwards and the
+   next attempt starts from scratch.
 
 ### Client autoload on host load (`client_autoload`)
 
@@ -514,7 +526,8 @@ decision policy and source/native-byte wiring). Never use the protected user sav
 7. Edge states: host load while the client is in dialogue/trade (countdown, then the deferral notice until it closes), downed or dead (no delay),
    awaiting a co-op save result, or inside its own New Game loading screen (finishes first, then the newer epoch is followed). A mismatched
    install/protocol must refuse and never start an entry.
-8. Failure: delete the template files while a world was already entered (no route): *"restart Gothic 3 ..."* and the old world is released, not frozen.
+8. Failure: delete the template files while a world was already entered: the client makes the template from its current world (`template: route=create`)
+   and enters; only when no world exists to make it from (title screen after an entered launch) the message names the reason (`template: route=impossible why=no-world-to-save`).
    An entered client the host never admits shows *"The host has not admitted you yet..."* once after 60 s and stays where it is.
 
 ### Targeting after deaths

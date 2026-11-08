@@ -28,7 +28,7 @@ bool ClientTransitionPending();
 // account record are applied afterwards by the existing admission flow.
 enum class EnterResult { Queued, AlreadyQueued, Unavailable, NotClient };
 EnterResult EnterHostWorld(char const* reason);
-bool HostWorldEntryAvailable(); // template slot valid and the native load hooks verified (file check; not per frame)
+bool HostWorldEntryAvailable(); // a way into the host's world without restarting: a valid template, or one the client can make now (file check; not per frame)
 void OnWorldActivate();    // from the engine module's callbacks
 void OnWorldDeactivate();
 bool PrepareShutdown();    // cancel cooperative staging; false while native save/load still owns the stack

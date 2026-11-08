@@ -187,9 +187,9 @@ constexpr Translation Messages[] = {
     {L"New Game re-enters with your account's last host-saved character. Unsaved progress is discarded; Back continues this session.",
      L"Neues Spiel lädt deinen zuletzt beim Host gespeicherten Helden. Ungespeicherter Fortschritt geht verloren; Zurück setzt diese Sitzung fort.",
      L"Nowa gra przywraca ostatni zapis twojego bohatera u hosta. Niezapisany postęp zostaje odrzucony; Powrót kontynuuje tę sesję."},
-    {L"Rejoining needs one restart of Gothic 3: after it, choose New Game once so the game can save its rejoin template. Your saved character is not changed.",
-     L"Für den Wiedereinstieg muss Gothic 3 einmal neu gestartet werden: Wähle danach einmal Neues Spiel, damit die Vorlage gespeichert wird. Dein gespeicherter Held bleibt unverändert.",
-     L"Ponowne dołączenie wymaga jednego restartu Gothic 3: potem wybierz raz Nowa gra, aby zapisać szablon dołączenia. Twój zapisany bohater nie zostanie zmieniony."},
+    {L"Gothic 3 cannot start a second New Game in one run (it would freeze). Rejoining uses the rejoin template automatically; if that is not possible the reason is shown. See g3together.log.",
+     L"Gothic 3 kann pro Start kein zweites Neues Spiel beginnen (es würde einfrieren). Der Wiedereinstieg nutzt automatisch die Vorlage; ist das nicht möglich, wird der Grund angezeigt. Siehe g3together.log.",
+     L"Gothic 3 nie może rozpocząć drugiej Nowej gry w jednym uruchomieniu (zawiesiłaby się). Dołączenie używa szablonu automatycznie; jeśli to niemożliwe, pokazany zostanie powód. Zobacz g3together.log."},
     {L"Waiting for the host's world. You will enter it automatically with your own character when it is ready.",
      L"Warte auf die Welt des Hosts. Du betrittst sie automatisch mit deinem eigenen Helden, sobald sie bereit ist.",
      L"Czekam na świat hosta. Wejdziesz do niego automatycznie ze swoim bohaterem, gdy będzie gotowy."},
@@ -233,6 +233,9 @@ constexpr Translation Messages[] = {
     {L"starting hero %s", L"Startheld %s", L"początkowy bohater %s"},
     {L"ON", L"AN", L"WŁ."},
     {L"OFF", L"AUS", L"WYŁ."},
+    {L"Rejoin template: %s (system error %lu). See g3together.log, lines starting with \"template:\".",
+     L"Wiedereinstiegs-Vorlage: %s (Systemfehler %lu). Siehe g3together.log, Zeilen mit \"template:\".",
+     L"Szablon dołączenia: %s (błąd systemu %lu). Zobacz g3together.log, wiersze zaczynające się od \"template:\"."},
 };
 static_assert(sizeof(Messages) / sizeof(Messages[0]) == MessageCount, "Missing HUD translation");
 
@@ -323,6 +326,20 @@ wchar_t const* SaveReason(char const* code)
         {"slot-allocation", {L"The game could not allocate a new menu save slot.", L"Das Spiel konnte keinen neuen Menü-Speicherplatz anlegen.", L"Gra nie może utworzyć nowego miejsca zapisu."}},
         {"canceled-load", {L"A load replaced the pending save.", L"Ein Ladevorgang hat die Speicherung ersetzt.", L"Wczytywanie zastąpiło oczekujący zapis."}},
         {"canceled-delete", {L"The requested slot was deleted while saving.", L"Der angeforderte Spielstand wurde während der Speicherung gelöscht.", L"Żądany zapis został usunięty podczas zapisywania."}},
+        {"template-native-refused", {L"The game refused to save the rejoin template (the save was not allowed right now). It is retried at the next quiet moment.", L"Das Spiel hat das Speichern der Vorlage abgelehnt (gerade nicht erlaubt). Es wird im nächsten ruhigen Moment erneut versucht.", L"Gra odmówiła zapisu szablonu (zapis nie był teraz dozwolony). Ponowna próba nastąpi w spokojnej chwili."}},
+        {"template-native-calls", {L"The game's save did not run exactly once. See the log.", L"Der Speichervorgang des Spiels lief nicht genau einmal. Siehe Log.", L"Zapis gry nie wykonał się dokładnie raz. Zobacz log."}},
+        {"template-no-header", {L"The game did not write the template's header file. See the log for the path.", L"Das Spiel hat die Kopfdatei der Vorlage nicht geschrieben. Der Pfad steht im Log.", L"Gra nie zapisała pliku nagłówka szablonu. Ścieżka jest w logu."}},
+        {"template-no-world", {L"The game did not finish the template's world file in time. See the log for the path.", L"Das Spiel hat die Weltdatei der Vorlage nicht rechtzeitig fertiggestellt. Der Pfad steht im Log.", L"Gra nie ukończyła na czas pliku świata szablonu. Ścieżka jest w logu."}},
+        {"template-header-empty", {L"The template's header file is empty or invalid. See the log.", L"Die Kopfdatei der Vorlage ist leer oder ungültig. Siehe Log.", L"Plik nagłówka szablonu jest pusty lub nieprawidłowy. Zobacz log."}},
+        {"template-world-empty", {L"The template's world file is empty or invalid. See the log.", L"Die Weltdatei der Vorlage ist leer oder ungültig. Siehe Log.", L"Plik świata szablonu jest pusty lub nieprawidłowy. Zobacz log."}},
+        {"template-busy", {L"A template file stayed locked by another program (virus scanner, backup or the game itself). See the log for the path.", L"Eine Vorlagendatei blieb durch ein anderes Programm gesperrt (Virenscanner, Backup oder das Spiel selbst). Der Pfad steht im Log.", L"Plik szablonu pozostał zablokowany przez inny program (antywirus, kopia zapasowa lub sama gra). Ścieżka jest w logu."}},
+        {"template-folder", {L"The game's save folder is unavailable, so the template cannot be stored. See the log for the folder.", L"Der Spielstandordner des Spiels ist nicht verfügbar, die Vorlage kann nicht gespeichert werden. Der Ordner steht im Log.", L"Folder zapisów gry jest niedostępny, szablon nie może zostać zapisany. Folder jest w logu."}},
+        {"template-cleanup", {L"An old template file could not be removed. See the log for the path and system error.", L"Eine alte Vorlagendatei konnte nicht entfernt werden. Pfad und Systemfehler stehen im Log.", L"Nie można usunąć starego pliku szablonu. Ścieżka i błąd systemu są w logu."}},
+        {"template-seal", {L"The template could not be verified and sealed. See the log for the path and system error.", L"Die Vorlage konnte nicht geprüft und versiegelt werden. Pfad und Systemfehler stehen im Log.", L"Nie można sprawdzić ani zapieczętować szablonu. Ścieżka i błąd systemu są w logu."}},
+        {"template-abandoned", {L"The template save was abandoned (shutdown or world change).", L"Das Speichern der Vorlage wurde abgebrochen (Beenden oder Weltwechsel).", L"Zapis szablonu przerwano (zamknięcie lub zmiana świata)."}},
+        {"template-unavailable", {L"No rejoin template is available. See the log.", L"Keine Wiedereinstiegs-Vorlage verfügbar. Siehe Log.", L"Brak szablonu dołączenia. Zobacz log."}},
+        {"template-no-world-to-save", {L"There is no world to make the template from and the game cannot start a second New Game in one run. Restart Gothic 3 once; the template is then made at the first entry and later host loads need no restart.", L"Es gibt keine Welt für die Vorlage und das Spiel kann pro Start kein zweites Neues Spiel beginnen. Starte Gothic 3 einmal neu; die Vorlage entsteht beim ersten Beitritt, danach braucht kein Hostwechsel mehr einen Neustart.", L"Brak świata do utworzenia szablonu, a gra nie może rozpocząć drugiej Nowej gry w jednym uruchomieniu. Zrestartuj Gothic 3 raz; szablon powstanie przy pierwszym wejściu i kolejne wczytania hosta nie będą wymagać restartu."}},
+        {"template-carried-hero", {L"The only template is made from a played hero and this host save has no character for your account (only a fresh hero may start). Restart Gothic 3 once; the first entry makes a fresh-hero template.", L"Die einzige Vorlage stammt von einem gespielten Helden und dieser Host-Spielstand hat keinen Helden für dein Konto (nur ein neuer Held darf starten). Starte Gothic 3 einmal neu; der erste Beitritt erzeugt eine Vorlage mit neuem Helden.", L"Jedyny szablon pochodzi z granego bohatera, a ten zapis hosta nie ma bohatera dla twojego konta (może zacząć tylko nowy bohater). Zrestartuj Gothic 3 raz; pierwsze wejście utworzy szablon z nowym bohaterem."}},
     };
     for (auto const& reason : reasons) {
         if (!code || std::strcmp(code, reason.code)) continue;

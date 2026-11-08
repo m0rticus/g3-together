@@ -456,20 +456,39 @@ co-op save result and native loading are done), from the title screen, and for a
 already loaded; while the host is in its menu or loading the client waits. **Esc** during the countdown, or choosing
 **New Game** yourself, cancels it for that host world only (the next host load asks again); `client_autoload = off`
 disables it, then **New Game** (also in the in-game menu) enters on demand. Before the rejoin template exists (first
-launch of Gothic 3) the automatic entry is the same first New Game you would choose; it also saves the template.
+launch of Gothic 3) the automatic entry is the same first New Game you would choose; it also saves the template (a few
+seconds later, with no action from you).
 A failed start is retried after 3 s and 8 s, then reported; 60 seconds without the host's admission shows a notice and
 never leaves the world. A client already playing in the host's world (initial startup, same-epoch reconnect) is
 never restarted, and a protocol/install mismatch never enters.
 
-**Client rejoin template:** the first time you choose **New Game** after launching Gothic 3 (also the way to
-join the very first time; with `client_autoload = on` and a joined host world that first New Game is started for you),
-the game saves the fresh starting world once into your normal save folder as the
-slot `G3T_client_template` (three small files; nothing else is created, replaced or deleted, and it is never
-sent over the network). It is made on your own machine from your own New Game, so it matches your installed
-game; it is rebuilt automatically if the game files change. Later host loads/new campaigns use it to replace
-your world safely: Gothic 3's own New Game cannot restart a world that is already loaded (it froze the game),
-so a second New Game in the same launch is refused with a notice. Without the template (first launch, or the
-file was deleted) nothing is torn down: restart Gothic 3 once and choose New Game. Unsaved progress is
+**Client rejoin template:** the first time you enter a host world after launching Gothic 3 (the automatic first
+**New Game**, or the one you choose; the very first join works the same), the game saves that fresh starting world
+once into your normal save folder as the slot `G3T_client_template` and the mod seals it with a small `.g3t` marker.
+These are the only files the mod ever creates, replaces or deletes there (`G3T_client_template.g3savcp`,
+`.g3savcpdat`, `.g3t`, plus their `.tmp` staging files; with Alternative Balancing `.g3savcpx` / `.g3savcpxdat`). It is
+never sent over the network, it is made on your own machine from your own New Game, and the marker records the exact
+`Game.dll` size, the mod protocol, whether the hero is a fresh New Game hero, and the sizes and CRCs of both
+halves. A template that is missing, half-written, corrupt, or made for another game/mod version is removed (only those
+files) and made again. The game finishes writing the world half of a save a moment after the save call returns; the
+mod waits for it frame by frame (at most 8 s, never blocking the game) and only then seals the template, so you never
+need to wait or do anything. Later host loads/new campaigns use it to replace your world safely: Gothic 3's own New
+Game cannot restart a world that is already loaded (it froze the game), so a second New Game in the same launch is
+refused with a notice.
+
+**You should never have to restart Gothic 3 to rejoin.** If the template is missing when the host loads (deleted, first
+launch, game updated), the client still gets in: at the title screen of a fresh launch through the first New Game
+(which also makes the template); while playing, the client first makes the template from its current world at the next
+quiet moment (never during dialogue, trade, a save exchange or loading), then enters through it. While you are playing
+with no template the mod also regenerates it silently in the background (first try after 15 s, then after 2 min and 10
+min, only while you stand idle). The `.g3savcp` file of the template shows up in the game's **Load Game** list under
+the name `G3T_client_template` (the game lists every `.g3savcp` file and has no hidden-slot flag); do not load or delete
+it there, the host loads the shared save and the mod rebuilds the template when needed. If a template cannot be made, the
+client shows one message with the exact reason and the system error number (for example the save folder is not
+writable, the disk is full, another program locks the file) and stays at the menu; the log lines starting with
+`template:` give the paths. The only case that still asks for a restart of Gothic 3 is when there is no world at all
+to make a template from after this launch already entered one, or when the only template carries a played hero and the
+host's save has no character for your account (a new account only ever starts with a fresh hero). Unsaved progress is
 discarded, not saved over your last host-saved record. A campaign with no record for your account starts a
 fresh hero from the template, never the host's hero.
 

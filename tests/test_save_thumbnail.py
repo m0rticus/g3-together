@@ -77,9 +77,9 @@ class SaveThumbnailTests(unittest.TestCase):
         prepare = body(PERSIST, "void PrepareSaveThumbnail()")
         self.assertEqual(len(calls), 2, "definition plus the single request-time call")
         self.assertIn("if (choice != saving::thumb::Choice::KeepRetained) CaptureSceneImage(manager);", prepare)
-        template = body(PERSIST, "void SaveClientTemplate()")
+        template = body(PERSIST, "bool TemplateStart(rejoin::tmpl::Origin origin, TemplateJob job)")
         self.assertIn("uiEntries[4]", template)
-        self.assertEqual(PERSIST.count("uiEntries[4]"), 4, "template capture guard/call, scene capture helper, and install log")
+        self.assertEqual(PERSIST.count("uiEntries[4]"), 5, "template guard/log/call, scene capture helper, and install log")
         self.assertLess(definition, PERSIST.index("void PrepareSaveThumbnail()"))
 
     def test_menu_open_frames_stamp_the_world_epoch(self):

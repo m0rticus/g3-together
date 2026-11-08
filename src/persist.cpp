@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "config.h"
 #include "client_rejoin.h"
+#include "client_template_store.h"
 #include "client_autoload.h"
 #include "containers.h"
 #include "crashlog.h"
@@ -92,6 +93,11 @@ void (*worldCleanup)() = nullptr;
 bool rejoinHooks = false, nativeNewGame = false, requestCharacterAgain = false;
 bool clientWorldEntered = false;
 rejoin::tmpl::Capture templateCapture;
+// The hero inside the template is a fresh New Game hero (only that may start a NEW account) or a carried one (made from a played world).
+bool templateHeroFresh = true;
+// A played-world template waits (bounded) for the host's answer about this account before it may enter.
+uint32_t recordWaitSince = 0;
+bool recordWaitGaveUp = false;
 // Client autoload (client_autoload.h decides; EnterHostWorld / the first New Game perform). An entry queued by a host epoch
 // change waits for the controller's approval; a manual one (New Game command) does not.
 autoload::Controller autoloadState;
@@ -802,6 +808,7 @@ void AutoloadCancel(char const* by, bool notify = false)
 }
 void QueueClientReturn()
 {
+    recordWaitSince = 0; recordWaitGaveUp = false;
     clientRejoin.Queue();
     resetLocalWorld = true;
     freshLocalHero = false;
@@ -867,6 +874,7 @@ bool __stdcall NewGameDetour(void* self)
     } else {
         restoreFailed = false;
         clientWorldEntered = true;
+        templateHeroFresh = true;
         templateCapture.Want(GetTickCount());
         requestCharacterAgain = receivedNote.epoch != hostWorld.epoch || !receivedWelcome;
         Log("persist: client native New Game returned; fresh local world ready for own account record");
@@ -890,37 +898,181 @@ uint64_t GameModuleBytes()
     if (!game || !GetModuleFileNameA(game, path, MAX_PATH) || !GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return 0;
     return (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
 }
-bool HasBytes(std::string const& path)
+// ---- client rejoin template: facts, inspection, rollback (policy: client_template.h; files: client_template_store.h) ----
+rejoin::tmpl::store::Paths TemplatePaths()
 {
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    return !path.empty() && GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data) && (data.nFileSizeHigh || data.nFileSizeLow);
+    return {Path(rejoin::tmpl::Slot, 0), Path(rejoin::tmpl::Slot, 1), Path(rejoin::tmpl::Slot, rejoin::tmpl::Sidecar)};
 }
-bool TemplateValid()
+rejoin::tmpl::Identity TemplateIdentity() { return {GameModuleBytes(), saving::Protocol}; }
+void TemplateTrace(char const* step, std::string const& path, uint32_t code, bool ok)
 {
-    const std::string marker = Path(rejoin::tmpl::Slot, rejoin::tmpl::Sidecar);
-    const uint64_t game = GameModuleBytes();
-    if (!game || !HasBytes(Path(rejoin::tmpl::Slot, 0)) || !HasBytes(Path(rejoin::tmpl::Slot, 1)) || !Exists(marker)) return false;
-    Bytes bytes;
-    return ReadAll(marker, bytes) && rejoin::tmpl::MarkerMatches(bytes, game);
+    Logf("template: file operation=%s path=%s error=%lu ok=%d", step, path.c_str(), static_cast<unsigned long>(code), ok ? 1 : 0);
 }
-// Only our own three template files are ever removed; every other slot name belongs to the player.
-void RemoveTemplate()
+rejoin::tmpl::Report templateReport;
+uint32_t templateCheckedAt = 0;
+uint64_t templateVerified = 0; // signature of the files that passed the deep (CRC) check
+void TemplateInvalidate() { templateCheckedAt = 0; }
+// What is on disk. Cheap (sizes + marker) and cached for 500 ms; `deep` also verifies the CRCs once per file change.
+rejoin::tmpl::Report TemplateState(bool deep = false)
 {
-    for (int file = 0; file < 3; ++file) {
-        const std::string path = Path(rejoin::tmpl::Slot, file);
-        if (!path.empty() && Exists(path)) DeleteFileA(path.c_str());
+    namespace tpl = rejoin::tmpl;
+    const uint32_t now = GetTickCount();
+    if (!deep && templateCheckedAt && now - templateCheckedAt < 500) return templateReport;
+    const auto paths = TemplatePaths();
+    const auto identity = TemplateIdentity();
+    tpl::Facts facts;
+    tpl::store::Error error;
+    auto report = tpl::store::Check(paths, identity, false, &facts, &error);
+    const uint64_t signature = tpl::Signature(facts);
+    if (deep && report.health == tpl::Health::Valid && signature != templateVerified) {
+        report = tpl::store::Check(paths, identity, true, &facts, &error);
+        if (report.health == tpl::Health::Valid) templateVerified = signature;
     }
+    if (error.code) LogIo(error);
+    templateReport = report;
+    templateCheckedAt = now ? now : 1;
+    static std::string shown;
+    const std::string key = std::string(tpl::HealthName(report.health)) + tpl::WhyName(report.why) + std::to_string(signature) +
+                            (deep ? "d" : "");
+    if (key != shown) {
+        shown = key;
+        Logf("template: state=%s why=%s origin=%s header=%llu world=%llu marker=%llu leftovers=%d game=%llu protocol=%u deep=%d folder=%s",
+             tpl::HealthName(report.health), tpl::WhyName(report.why), report.sealed ? tpl::OriginName(report.seal.origin) : "-",
+             static_cast<unsigned long long>(facts.header.size), static_cast<unsigned long long>(facts.world.size),
+             static_cast<unsigned long long>(facts.marker.size),
+             (facts.headerTmp.exists || facts.worldTmp.exists || facts.markerTmp.exists) ? 1 : 0,
+             static_cast<unsigned long long>(identity.game), static_cast<unsigned>(identity.protocol), deep ? 1 : 0,
+             Folder().c_str());
+    }
+    return report;
 }
-// One native save of the fresh starting world, before the account record replaces the New Game hero.
-void SaveClientTemplate()
+bool TemplateValid() { return TemplateState().health == rejoin::tmpl::Health::Valid; }
+// Only our own template files (and their staging files) are ever removed; every other slot name belongs to the player.
+bool RemoveTemplate(char const* reason)
 {
-    void* manager = FileManager(false);
-    const uint64_t game = GameModuleBytes();
-    if (!manager || !originalSave || !uiEntries[4] || !game || !rejoin::tmpl::OwnSlot(rejoin::tmpl::Slot)) {
-        Log("persist: client template save skipped; native hooks or game identity unavailable");
+    if (!rejoin::tmpl::OwnSlot(rejoin::tmpl::Slot)) return false;
+    rejoin::tmpl::store::Error error;
+    const bool clean = rejoin::tmpl::store::RemoveOwn(TemplatePaths(), error, &TemplateTrace);
+    Logf("template: remove reason=%s clean=%d operation=%s path=%s error=%lu", reason, clean ? 1 : 0, error.operation,
+         error.path.c_str(), static_cast<unsigned long>(error.code));
+    TemplateInvalidate();
+    return clean;
+}
+// ---- one template save: native HUD.SaveGame, then the engine's asynchronous world write is awaited without blocking ----
+enum class TemplateJob { None, FirstEntry, Background, HostLoad };
+rejoin::tmpl::Publish templatePublish;
+rejoin::tmpl::Background templateBackground;
+TemplateJob templateJob = TemplateJob::None;
+unsigned templateFailures = 0, templateAttempts = 0;
+std::string templateFailCode, templateSettleShown;
+uint32_t templateFailError = 0, templateIoError = 0, templateNextRecover = 0;
+char const* TemplateJobName(TemplateJob job)
+{
+    return job == TemplateJob::FirstEntry ? "first-entry" : job == TemplateJob::Background ? "background" :
+           job == TemplateJob::HostLoad ? "host-load" : "-";
+}
+void NoticeText(wchar_t const* text, bool bad)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
+    else hud::Message(bad ? hud::Warning : hud::Info, text);
+}
+// The single user-visible explanation: an i18n reason code plus the system error, never a generic "restart".
+void TemplateNotify(char const* code, uint32_t error)
+{
+    wchar_t text[700]{};
+    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::ClientTemplateUnavailable), i18n::SaveReason(code), static_cast<unsigned long>(error));
+    Logf("template: notice reason=%s error=%lu", code, static_cast<unsigned long>(error));
+    NoticeText(text, true);
+}
+rejoin::Boundary ClientBoundary()
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    auto* infos = game.IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr;
+    const bool interaction = !trade::ReadyForSave() || (infos && infos->GetIsRunning()) ||
+        (manager && manager->IsAnyPageOpen() &&
+         (manager->GetActivePage() == gEGamePage_Trade || manager->GetActivePage() == gEGamePage_Dialog));
+    return {nativeLoadDepth != 0 || nativeSaveDepth != 0 || nativeNewGame, processDepth != 0 || menuCommandDepth != 0,
+            captured.valid || requestPending, interaction};
+}
+char const* SettleText(rejoin::tmpl::Facts const& f, char* buffer, size_t size)
+{
+    const auto show = [](rejoin::tmpl::File const& file, char* out, size_t n) {
+        if (!file.exists) _snprintf_s(out, n, _TRUNCATE, "missing(%lu)", static_cast<unsigned long>(file.error));
+        else _snprintf_s(out, n, _TRUNCATE, "%llu%s", static_cast<unsigned long long>(file.size),
+                         file.locked ? "+locked" : "");
+    };
+    char header[40], world[40], headerTmp[40], worldTmp[40];
+    show(f.header, header, sizeof(header)); show(f.world, world, sizeof(world));
+    show(f.headerTmp, headerTmp, sizeof(headerTmp)); show(f.worldTmp, worldTmp, sizeof(worldTmp));
+    _snprintf_s(buffer, size, _TRUNCATE, "header=%s world=%s header_tmp=%s world_tmp=%s", header, world, headerTmp, worldTmp);
+    return buffer;
+}
+// The save ended, in either direction: release the hold, roll a failure back to a clean slot, say why exactly once.
+void TemplateEnded(uint32_t now)
+{
+    namespace tpl = rejoin::tmpl;
+    const auto fail = templatePublish.failure();
+    const auto origin = templatePublish.origin();
+    const TemplateJob job = templateJob;
+    templateJob = TemplateJob::None;
+    TemplateInvalidate();
+    if (fail == tpl::Fail::None) {
+        templateFailures = 0; templateFailCode.clear(); templateFailError = 0;
+        if (job == TemplateJob::FirstEntry) templateCapture.Done();
         return;
     }
-    RemoveTemplate(); // an interrupted save must never look valid
+    RemoveTemplate("rollback"); // a half template must never block the next attempt
+    templateFailCode = tpl::FailName(fail);
+    templateFailError = templateIoError;
+    if (origin == tpl::Origin::World) ++templateFailures;
+    bool notify = false;
+    if (job == TemplateJob::FirstEntry) {
+        templateCapture.Failed(now);
+        notify = !templateCapture.wanted; // the retry inside the hold window was the last chance
+    } else if (job == TemplateJob::Background) notify = templateBackground.Attempts() >= tpl::Background::MaxAttempts;
+    Logf("template: failed reason=%s job=%s origin=%s elapsed_ms=%u failures=%u notify=%d", templateFailCode.c_str(),
+         TemplateJobName(job), tpl::OriginName(origin), templatePublish.Elapsed(now), templateFailures, notify ? 1 : 0);
+    if (notify) TemplateNotify(templateFailCode.c_str(), templateFailError);
+}
+// Native save of the running world into the template slot. The world half is still being written when it returns.
+bool TemplateStart(rejoin::tmpl::Origin origin, TemplateJob job)
+{
+    namespace tpl = rejoin::tmpl;
+    void* manager = FileManager(false);
+    const auto paths = TemplatePaths();
+    const auto identity = TemplateIdentity();
+    const uint32_t now = GetTickCount();
+    templateJob = job;
+    templateIoError = 0;
+    templateNextRecover = now; // a tick-relative reference: the signed comparison is only valid against a recent value
+    Logf("template: save start job=%s origin=%s attempt=%u slot=%s folder=%s game=%llu protocol=%u epoch=%08x hero=%p",
+         TemplateJobName(job), tpl::OriginName(origin), ++templateAttempts, tpl::Slot, Folder().c_str(),
+         static_cast<unsigned long long>(identity.game), static_cast<unsigned>(identity.protocol), hostWorld.epoch,
+         gCSession::GetInstance().GetHero());
+    if (!manager || !originalSave || !uiEntries[4] || !identity.game || !tpl::OwnSlot(tpl::Slot) || !paths.Usable()) {
+        Logf("template: refused reason=native-hooks manager=%p save=%p capture=%p game=%llu folder=%d", manager,
+             reinterpret_cast<void*>(originalSave), uiEntries[4], static_cast<unsigned long long>(identity.game),
+             paths.Usable() ? 1 : 0);
+        templatePublish.Begin(origin, now);
+        templatePublish.Abort(paths.Usable() ? tpl::Fail::NativeRefused : tpl::Fail::Folder);
+        TemplateEnded(now);
+        return false;
+    }
+    // The engine's final rename never replaces: every earlier file of the slot, staging files included, must be gone first.
+    tpl::store::Error error;
+    if (!tpl::store::RemoveOwn(paths, error, &TemplateTrace)) {
+        LogIo(error);
+        templateIoError = error.code;
+        templatePublish.Begin(origin, now);
+        templatePublish.Abort(tpl::store::FailFor(error, tpl::Fail::Cleanup));
+        TemplateEnded(now);
+        return false;
+    }
+    TemplateInvalidate();
+    remote::DespawnAll("client rejoin template"); // puppets are not part of the template world (as in the host save)
     {
         void* capture = uiEntries[4];
         __asm {
@@ -930,18 +1082,98 @@ void SaveClientTemplate()
             pop esi
         }
     }
-    const bCString name(rejoin::tmpl::Slot);
+    const bCString name(tpl::Slot);
     lowerSaveCalls = 0; lowerSaveGood = true;
+    templatePublish.Begin(origin, now);
     ++nativeSaveDepth;
     const bool nativeOk = originalSave(manager, &name);
     --nativeSaveDepth;
-    const std::string marker = rejoin::tmpl::Marker(game);
-    bool ok = nativeOk && lowerSaveCalls == 1 && lowerSaveGood &&
-              HasBytes(Path(rejoin::tmpl::Slot, 0)) && HasBytes(Path(rejoin::tmpl::Slot, 1));
-    ok = ok && WriteAtomic(Path(rejoin::tmpl::Slot, rejoin::tmpl::Sidecar), Bytes(marker.begin(), marker.end()));
-    if (!ok) RemoveTemplate();
-    Logf("persist: client template save slot=%s native_ok=%d lower_calls=%u lower_ok=%d ok=%d",
-         rejoin::tmpl::Slot, nativeOk ? 1 : 0, lowerSaveCalls, lowerSaveGood ? 1 : 0, ok ? 1 : 0);
+    const uint32_t returned = GetTickCount();
+    templatePublish.NativeReturned(nativeOk, lowerSaveCalls, lowerSaveGood, returned);
+    Logf("template: native HUD.SaveGame slot=%s ok=%d lower_calls=%u lower_ok=%d ms=%u", tpl::Slot, nativeOk ? 1 : 0,
+         lowerSaveCalls, lowerSaveGood ? 1 : 0, returned - now);
+    templateSettleShown.clear();
+    if (!templatePublish.Active()) { TemplateEnded(returned); return false; }
+    return true;
+}
+// Each frame while a save settles: look at the files (no waiting), recover an ignored native rename, seal, or give the exact reason.
+void TemplatePoll(uint32_t now)
+{
+    namespace tpl = rejoin::tmpl;
+    if (!templatePublish.PollDue(now)) return;
+    const auto paths = TemplatePaths();
+    const auto facts = tpl::store::Observe(paths, true);
+    char line[260];
+    SettleText(facts, line, sizeof(line));
+    if (templateSettleShown != line) {
+        templateSettleShown = line;
+        Logf("template: settle +%ums %s", templatePublish.Elapsed(now), line);
+    }
+    tpl::store::Error error;
+    const tpl::Step step = templatePublish.Poll(facts, now);
+    switch (step) {
+    case tpl::Step::Wait:
+        return;
+    case tpl::Step::RecoverHeader:
+    case tpl::Step::RecoverWorld: {
+        // The native rename was ignored (or the writer is slow): move the finished staging file ourselves, at most twice a second.
+        if (static_cast<int32_t>(now - templateNextRecover) < 0) return;
+        templateNextRecover = now + 500;
+        const bool header = step == tpl::Step::RecoverHeader;
+        const std::string& target = header ? paths.header : paths.world;
+        // A failure is not fatal: the writer may just have finished its own rename. The next poll re-observes the files
+        // and the settle window (a hard bound inside Publish) ends the save with the exact reason if nothing changes.
+        if (!tpl::store::Recover(target + ".tmp", target, error, &TemplateTrace)) { LogIo(error); templateIoError = error.code; }
+        return;
+    }
+    case tpl::Step::Seal: {
+        tpl::Seal seal;
+        tpl::Fail why = tpl::Fail::Seal;
+        if (!tpl::store::SealFiles(paths, templatePublish.origin(), TemplateIdentity(), seal, error, why)) {
+            LogIo(error); templateIoError = error.code;
+            templatePublish.Finish(false, why);
+            break;
+        }
+        TemplateInvalidate();
+        const auto report = TemplateState(true);
+        if (report.health != tpl::Health::Valid) {
+            Logf("template: verify failed state=%s why=%s", tpl::HealthName(report.health), tpl::WhyName(report.why));
+            templatePublish.Finish(false, tpl::Fail::Seal);
+            break;
+        }
+        Logf("template: ready slot=%s origin=%s header=%llu crc=%08x world=%llu crc=%08x game=%llu protocol=%u settle_ms=%u marker=%s",
+             tpl::Slot, tpl::OriginName(seal.origin), static_cast<unsigned long long>(seal.headerSize), seal.headerCrc,
+             static_cast<unsigned long long>(seal.worldSize), seal.worldCrc, static_cast<unsigned long long>(seal.game),
+             static_cast<unsigned>(seal.protocol), templatePublish.Elapsed(now), paths.marker.c_str());
+        templatePublish.Finish(true);
+        break;
+    }
+    case tpl::Step::Failed:
+        if (!templateIoError) {
+            templateIoError = !facts.header.exists ? facts.header.error : !facts.world.exists ? facts.world.error :
+                              facts.header.locked ? facts.header.error : facts.world.locked ? facts.world.error : 0;
+        }
+        Logf("template: settle timeout reason=%s +%ums %s", tpl::FailName(templatePublish.failure()),
+             templatePublish.Elapsed(now), line);
+        break;
+    }
+    if (!templatePublish.Active()) TemplateEnded(now);
+}
+// Silent regeneration of a missing/stale/corrupt template while admitted and calm (never in combat, dialogue, trade,
+// loading, a save exchange or while downed): the first try 15 s after the need appears, then 2 min, then 10 min.
+bool TemplateBackgroundDue(uint32_t now)
+{
+    namespace tpl = rejoin::tmpl;
+    auto& game = gCSession::GetInstance();
+    const bool needed = !net::IsHost() && rejoinHooks && originalSave && clientWorldEntered && !templatePublish.Active() &&
+                        TemplateState().health != tpl::Health::Valid;
+    templateBackground.Observe(needed, now);
+    if (!needed || !templateBackground.Due(now)) return false;
+    eCEntity* hero = game.GetHero();
+    if (!hero || !game.IsGameRunning() || !ownCharacterReady || !net::InWorld(net::LocalId()) || clientRejoin.pending ||
+        needsNewHero || NativeSaveReason() || requestPending || captured.valid || !trade::ReadyForSave() ||
+        rejoin::State{}.Waiting(ClientBoundary()) != rejoin::Wait::None) return false;
+    return static_cast<gEAniState>(Entity(hero).Routine.AniState) == gEAniState_Stand;
 }
 std::string CharacterPath()
 {
@@ -1490,7 +1722,7 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
     if (bytes.empty()) {
         needsNewHero = true;
         if (!containers::RestorePersonal({})) { restoreFailed = true; SaveFailure("personal-record"); return; }
-        if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu)) {
+        if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu) && templateHeroFresh) {
             // While the template save holds the fresh hero, Tick() admits it once the hold ends (newWorld stays set).
             if (!templateCapture.Holding(GetTickCount())) {
                 needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
@@ -1821,6 +2053,56 @@ bool FirstEntryPossible()
 {
     return confirmedStart && worldCleanup && !clientWorldEntered;
 }
+// The way back into the host's world (policy: tmpl::Decide), logged when it changes so the log explains every decision.
+std::string templateImpossibleCode;
+rejoin::tmpl::Plan EntryPlan(bool quiet)
+{
+    namespace tpl = rejoin::tmpl;
+    auto& game = gCSession::GetInstance();
+    const auto report = TemplateState();
+    tpl::Situation s;
+    s.health = report.health;
+    s.origin = report.sealed ? report.seal.origin : tpl::Origin::NewGame;
+    s.hooks = rejoinHooks && originalLoad && originalSave;
+    s.worldEntered = clientWorldEntered;
+    s.worldLoaded = game.GetHero() != nullptr || game.GetPlayer() != nullptr;
+    s.worldRunning = s.worldLoaded && game.IsGameRunning() && !NativeSaveReason();
+    s.quiet = quiet;
+    s.recordKnown = RecordKnown() || recordWaitGaveUp;
+    s.newAccount = needsNewHero && RecordKnown();
+    s.jobActive = templatePublish.Active();
+    s.failures = templateFailures;
+    const auto plan = tpl::Decide(s);
+    static const char* routes[] = {"template", "create", "first-entry", "wait", "impossible"};
+    static std::string shown;
+    char key[220];
+    _snprintf_s(key, _TRUNCATE, "route=%s why=%s state=%s origin=%s entered=%d loaded=%d running=%d quiet=%d new_account=%d job=%d failures=%u",
+                routes[static_cast<int>(plan.route)], tpl::BlockName(plan.why), tpl::HealthName(s.health), tpl::OriginName(s.origin),
+                s.worldEntered ? 1 : 0, s.worldLoaded ? 1 : 0, s.worldRunning ? 1 : 0, s.quiet ? 1 : 0, s.newAccount ? 1 : 0,
+                s.jobActive ? 1 : 0, s.failures);
+    if (shown != key) {
+        shown = key;
+        Logf("template: %s", key);
+    }
+    templateImpossibleCode = plan.route == tpl::Route::Impossible
+        ? (plan.why == tpl::Block::Failed && !templateFailCode.empty() ? templateFailCode : std::string(tpl::BlockCode(plan.why)))
+        : std::string();
+    return plan;
+}
+bool ClientQuietNow() { return rejoin::State{}.Waiting(ClientBoundary()) == rejoin::Wait::None; }
+// An impossible route is the only place the player is told they cannot get in: the exact reason, once per host world.
+void TemplateImpossible(rejoin::tmpl::Plan plan)
+{
+    namespace tpl = rejoin::tmpl;
+    const std::string code = plan.why == tpl::Block::Failed && !templateFailCode.empty() ? templateFailCode : tpl::BlockCode(plan.why);
+    Logf("template: route=impossible why=%s code=%s error=%lu epoch=%08x", tpl::BlockName(plan.why), code.c_str(),
+         static_cast<unsigned long>(templateFailError), hostWorld.epoch);
+    static std::string shown;
+    const std::string key = code + std::to_string(hostWorld.epoch);
+    if (key == shown) return;
+    shown = key;
+    TemplateNotify(code.c_str(), templateFailError);
+}
 autoload::Snapshot AutoloadSnapshot(uint32_t now)
 {
     auto& game = gCSession::GetInstance();
@@ -1945,7 +2227,12 @@ wchar_t const* AutoloadMenuText(wchar_t* buffer, size_t size)
         return buffer;
     case S::Held: return i18n::Text(i18n::ClientAutoloadCanceled);
     case S::GaveUp: return i18n::Text(i18n::ClientAutoloadGaveUp);
-    case S::NoRoute: return i18n::Text(i18n::ClientRestartToRejoin);
+    case S::NoRoute: {
+        const char* code = templateImpossibleCode.empty() ? "template-unavailable" : templateImpossibleCode.c_str();
+        _snwprintf_s(buffer, size, _TRUNCATE, i18n::Text(i18n::ClientTemplateUnavailable), i18n::SaveReason(code),
+                     static_cast<unsigned long>(templateFailError));
+        return buffer;
+    }
     default: return nullptr;
     }
 }
@@ -2058,16 +2345,20 @@ void SetWorldCleanup(void (*cleanup)()) { worldCleanup = cleanup; }
 bool ClientTransitionPending() { return !net::IsHost() && clientRejoin.pending; }
 bool HostWorldEntryAvailable()
 {
-    return !net::IsHost() && rejoinHooks && originalLoad && FileManager(true) != nullptr &&
-           rejoin::ChooseRoute(TemplateValid(), true) == rejoin::Route::Template;
+    if (net::IsHost() || !rejoinHooks || !originalLoad) return false;
+    const auto plan = EntryPlan(ClientQuietNow());
+    using R = rejoin::tmpl::Route;
+    return (plan.route == R::Template || plan.route == R::Create || plan.route == R::Wait) && FileManager(true) != nullptr;
 }
 EnterResult EnterHostWorld(char const* reason)
 {
     if (net::IsHost()) return EnterResult::NotClient;
     if (!HostWorldEntryAvailable()) {
-        Logf("persist: client enter state=unavailable reason=%s template=%d hooks=%d", reason ? reason : "-",
-             TemplateValid() ? 1 : 0, rejoinHooks ? 1 : 0);
-        Notice(i18n::ClientRestartToRejoin, true);
+        const auto plan = EntryPlan(ClientQuietNow());
+        Logf("persist: client enter state=unavailable reason=%s template=%s route=%d why=%s hooks=%d", reason ? reason : "-",
+             rejoin::tmpl::HealthName(TemplateState().health), static_cast<int>(plan.route), rejoin::tmpl::BlockName(plan.why),
+             rejoinHooks ? 1 : 0);
+        if (plan.route == rejoin::tmpl::Route::Impossible) TemplateImpossible(plan);
         return EnterResult::Unavailable;
     }
     if (clientRejoin.pending) return EnterResult::AlreadyQueued;
@@ -2082,8 +2373,11 @@ static void EnterTemplateWorld(uint32_t queuedAt)
     auto* manager = game.GetGUIManager();
     void* files = FileManager(true);
     const bCString name(rejoin::tmpl::Slot);
-    Logf("persist: client enter state=cleanup elapsed_ms=%u epoch=%08x player=%p running=%d",
-         GetTickCount() - queuedAt, hostWorld.epoch, game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
+    const auto report = TemplateState(true); // CRC-verified once per file change, before anything is torn down
+    templateHeroFresh = report.sealed && report.seal.origin == rejoin::tmpl::Origin::NewGame;
+    Logf("persist: client enter state=cleanup elapsed_ms=%u epoch=%08x player=%p running=%d template=%s origin=%s",
+         GetTickCount() - queuedAt, hostWorld.epoch, game.GetPlayer(), game.IsGameRunning() ? 1 : 0,
+         rejoin::tmpl::HealthName(report.health), report.sealed ? rejoin::tmpl::OriginName(report.seal.origin) : "-");
     ++nativeLoadDepth;
     nativeNewGame = true; // a native world change we started: OnWorldDeactivate must keep the client state
     if (manager) manager->ClosePage();
@@ -2113,39 +2407,50 @@ static void EnterTemplateWorld(uint32_t queuedAt)
          ok ? "returned" : "failed", hudOk ? 1 : 0, lowerLoadCalls, lowerLoadGood ? 1 : 0, GetTickCount() - queuedAt,
          game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
     if (ok) { clientWorldEntered = true; return; }
-    RemoveTemplate(); // regenerate on the next New Game rather than retry a template the engine refused
+    RemoveTemplate("native-load-failed"); // regenerate rather than retry a template the engine refused
     Notice(i18n::ClientRejoinFailed, true);
 }
 bool ProcessClientTransition()
 {
-    static uint32_t queuedAt = 0;
+    static uint32_t queuedAt = 0, createWaitSince = 0;
     if (net::IsHost() || !rejoinHooks || ai::ShuttingDown()) return false;
+    static bool startupLogged = false;
+    if (!startupLogged && !Folder().empty()) {
+        startupLogged = true; // one line at the first frame: what the template looks like on this machine, before any decision
+        Logf("template: startup slot=%s folder=%s", rejoin::tmpl::Slot, Folder().c_str());
+        TemplateState(true);
+    }
     if (ProcessAutoload()) return true; // the first-entry New Game consumed this frame; otherwise only approves queued entries
-    if (!clientRejoin.pending && !templateCapture.wanted) { queuedAt = 0; return false; }
+    const uint32_t now = GetTickCount();
+    const bool idleCandidate = !clientRejoin.pending && !templateCapture.wanted && !templatePublish.Active();
+    const bool background = idleCandidate && TemplateBackgroundDue(now);
+    if (idleCandidate && !background) { queuedAt = 0; return false; }
     // Never inspect a half-built native world, including frames nested in confirmation dialogs.
     if (nativeLoadDepth || nativeSaveDepth || processDepth || menuCommandDepth) return false;
-    const uint32_t now = GetTickCount();
     if (clientRejoin.pending && !queuedAt) queuedAt = now ? now : 1;
     auto& game = gCSession::GetInstance();
-    auto* manager = game.GetGUIManager();
-    auto* infos = game.IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr;
-    const bool interaction = !trade::ReadyForSave() || (infos && infos->GetIsRunning()) ||
-        (manager && manager->IsAnyPageOpen() &&
-         (manager->GetActivePage() == gEGamePage_Trade || manager->GetActivePage() == gEGamePage_Dialog));
-    const rejoin::Boundary boundary{nativeLoadDepth != 0 || nativeSaveDepth != 0 || nativeNewGame,
-                                   processDepth != 0 || menuCommandDepth != 0,
-                                   captured.valid || requestPending, interaction};
+    const rejoin::Boundary boundary = ClientBoundary();
+    const bool quiet = rejoin::State{}.Waiting(boundary) == rejoin::Wait::None;
+    // The engine finishes the world half of a template save on its own thread: look at the files each frame, never wait.
+    if (templatePublish.Active()) {
+        TemplatePoll(now);
+        return false;
+    }
     if (!clientRejoin.pending) {
+        if (background) {
+            templateBackground.Tried(now);
+            TemplateStart(rejoin::tmpl::Origin::World, TemplateJob::Background);
+            return true;
+        }
         // First native New Game of this launch: save the fresh starting world once, before the account record is applied.
         if (templateCapture.Expired(now)) {
             templateCapture.Done();
-            Log("persist: client template save abandoned; no quiet boundary within the hold window");
+            Log("template: save abandoned; no quiet boundary within the hold window");
             return false;
         }
-        if (!templateCapture.Due(now) || !game.GetHero() || !game.IsGameRunning() ||
-            rejoin::State{}.Waiting(boundary) != rejoin::Wait::None) return false;
-        templateCapture.Done();
-        SaveClientTemplate();
+        if (!templateCapture.Due(now) || !game.GetHero() || !game.IsGameRunning() || !quiet) return false;
+        templateCapture.Began();
+        TemplateStart(rejoin::tmpl::Origin::NewGame, TemplateJob::FirstEntry);
         return true;
     }
     const auto wait = clientRejoin.Waiting(boundary);
@@ -2159,20 +2464,70 @@ bool ProcessClientTransition()
     if (!worldCleanup || !clientRejoin.CanRetire(boundary)) return false;
     // An automatic entry (host epoch change) waits for the autoload decision: countdown, Esc, config; manual ones do not.
     if (!entryManual && !entryApproved) return false;
-    entryManual = entryApproved = false;
-    const uint32_t startedAt = queuedAt;
-    queuedAt = 0;
-    if (rejoin::ChooseRoute(TemplateValid(), originalLoad != nullptr && FileManager(true) != nullptr) != rejoin::Route::Template) {
-        // No teardown without a way back in: the old world stays intact and outside admission.
+    using R = rejoin::tmpl::Route;
+    const auto plan = EntryPlan(quiet);
+    if (plan.route == R::Create) {
+        // No valid template: make it from this world now (it is about to be replaced anyway), then enter through it.
+        createWaitSince = 0;
+        TemplateStart(rejoin::tmpl::Origin::World, TemplateJob::HostLoad);
+        return true;
+    }
+    if (plan.route == R::Wait) {
+        if (plan.why == rejoin::tmpl::Block::Record) {
+            // A template made from a played world may only start accounts the host has a record for: wait for the answer,
+            // but never forever (the existing guard in OnCharacter/Tick still refuses a carried hero for a new account).
+            if (!recordWaitSince) recordWaitSince = now ? now : 1;
+            if (now - recordWaitSince >= 12000 && !recordWaitGaveUp) {
+                recordWaitGaveUp = true;
+                Logf("template: record wait gave up after %u ms; entering without the host's answer", now - recordWaitSince);
+            }
+            return false;
+        }
+        if (plan.why != rejoin::tmpl::Block::NotQuiet) { createWaitSince = 0; return false; }
+        if (!createWaitSince) createWaitSince = now ? now : 1;
+        if (now - createWaitSince < 8000) return false;
+        // The game keeps refusing to save (downed, dialogue, no control...): say exactly why instead of waiting forever.
+        const char* reason = NativeSaveReason();
+        templateFailCode = reason ? reason : "not-running";
+        templateFailError = 0;
+        createWaitSince = 0;
+        entryManual = entryApproved = false;
+        const uint32_t startedAt = queuedAt;
+        queuedAt = 0;
         clientRejoin.Retired();
         clientRejoin.failed = true;
         rejoinWait = rejoin::Wait::None;
-        Logf("persist: client enter state=failed reason=no-template elapsed_ms=%u", now - startedAt);
-        Notice(i18n::ClientRestartToRejoin, true);
+        Logf("persist: client enter state=failed reason=template-save-refused detail=%s elapsed_ms=%u", templateFailCode.c_str(),
+             now - startedAt);
+        TemplateNotify(templateFailCode.c_str(), 0);
         return false;
     }
-    EnterTemplateWorld(startedAt);
-    return true;
+    createWaitSince = 0;
+    const uint32_t startedAt = queuedAt;
+    if (plan.route == R::Template) {
+        if (TemplateState(true).health != rejoin::tmpl::Health::Valid) {
+            RemoveTemplate("deep-check-failed"); // the files changed under us: the next frame creates a new one or refuses
+            return false;
+        }
+        entryManual = entryApproved = false;
+        queuedAt = 0;
+        recordWaitSince = 0; recordWaitGaveUp = false;
+        EnterTemplateWorld(startedAt);
+        return true;
+    }
+    // No way back in from here: the old world stays intact and outside admission, nothing is torn down.
+    entryManual = entryApproved = false;
+    queuedAt = 0;
+    recordWaitSince = 0; recordWaitGaveUp = false;
+    clientRejoin.Retired();
+    rejoinWait = rejoin::Wait::None;
+    Logf("persist: client enter state=failed reason=no-route route=%d why=%s elapsed_ms=%u", static_cast<int>(plan.route),
+         rejoin::tmpl::BlockName(plan.why), now - startedAt);
+    if (plan.route == R::Impossible) {
+        clientRejoin.failed = true;
+        TemplateImpossible(plan);
+    }
+    return false; // R::FirstEntry: no world to leave; the autoload controller starts the first New Game
 }
 
 bool BeginFrame()
@@ -2194,6 +2549,12 @@ bool PrepareShutdown()
         return false;
     }
     CancelSave("shutdown");
+    if (templatePublish.Active()) {
+        // Never leave a half template behind: the engine's writer may still hold a staging file, the next start cleans up.
+        templatePublish.Abort(rejoin::tmpl::Fail::Abandoned);
+        templateJob = TemplateJob::None;
+        RemoveTemplate("shutdown");
+    }
     StopSaveTimer();
     CleanupStaging();
     RetryCleanup(GetTickCount() + 3001);
@@ -2251,7 +2612,7 @@ void Tick()
         // Only a freshly initialized local hero is permitted when the host has no account record.
         if (net::IsHost()) {
             ownCharacterReady = true; current.key = {RandomId(), RandomId(), steam::PlayerId()}; NewEpoch();
-        } else if (needsNewHero && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu)) {
+        } else if (needsNewHero && templateHeroFresh && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu)) {
             needsNewHero = false; freshLocalHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
             clientRejoin.Left();
             story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();

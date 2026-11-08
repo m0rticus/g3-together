@@ -98,6 +98,7 @@ enum Message
     OptionsPlayerStart,
     OptionsOn,
     OptionsOff,
+    ClientTemplateUnavailable,
     MessageCount
 };
 

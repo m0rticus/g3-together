@@ -65,11 +65,11 @@ class ClientAutoloadTests(unittest.TestCase):
         persist = source("src/persist.cpp")
         transition = body(persist, "bool ProcessClientTransition()", "bool BeginFrame()")
         self.assertLess(transition.index("if (ProcessAutoload()) return true;"),
-                        transition.index("if (!clientRejoin.pending && !templateCapture.wanted)"))
+                        transition.index("const bool idleCandidate = !clientRejoin.pending && !templateCapture.wanted"))
         gate = transition.index("if (!entryManual && !entryApproved) return false;")
         self.assertLess(transition.index("clientRejoin.CanRetire(boundary)"), gate)
         self.assertLess(gate, transition.index("EnterTemplateWorld(startedAt);"))
-        self.assertLess(gate, transition.index("ChooseRoute(TemplateValid()"))
+        self.assertLess(gate, transition.index("EntryPlan(quiet)"))
         on_world = body(persist, "void OnWorld(uint8_t from", "void HostTick")
         self.assertIn("entryApproved = autoloadAwaiting = false;", on_world)  # a newer epoch restarts the countdown
         self.assertIn("AutoloadAvailable() ? i18n::ClientHostWorldChanged : i18n::ClientChooseNewGame", on_world)
