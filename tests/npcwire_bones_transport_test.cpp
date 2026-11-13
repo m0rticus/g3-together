@@ -46,6 +46,8 @@ size_t enet_list_size(ENetList* list)
 enet_uint32 enet_time_get() { return fakeTime; }
 int enet_address_set_host_ip(ENetAddress*, const char*) { return 0; }
 int enet_socket_set_option(ENetSocket, ENetSocketOption, int) { return 0; }
+int enet_socket_get_address(ENetSocket, ENetAddress* address) { if (address) *address = {}; return 0; }
+int enet_socket_send(ENetSocket, const ENetAddress*, const ENetBuffer*, size_t) { return 0; }
 ENetPacket* enet_packet_create(const void* data, size_t size, enet_uint32 flags)
 {
     auto* packet = new ENetPacket{};
@@ -159,6 +161,10 @@ std::vector<RelayDrop> TakeRelayDrops()
     result.swap(relayDrops);
     return result;
 }
+std::vector<DirectOffer> DirectOffers() { return {}; }
+bool DirectPeerIdentity(uint32_t, uint16_t, uint64_t&, char (&)[24], uint64_t&) { return false; }
+bool ClaimDirectPeerIdentity(uint32_t, uint16_t, uint32_t, uint64_t&, char (&)[24], uint64_t&) { return false; }
+void RegisterDirectPeerEndpoint(uint64_t, uint64_t, uint32_t, uint16_t) {}
 void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason)
 {
     if (account && generation) relayCloses.push_back({account, generation, reason ? reason : ""});

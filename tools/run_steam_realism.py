@@ -599,8 +599,8 @@ def evaluate_case(name, host, client, merge):
             "native_outbound_compressed_connect_frames", 0)
         compressed_verify = merge.get(
             "native_outbound_compressed_verify_frames", 0)
-        if outbound_connect == 0 or compressed_connect == 0 or observed_connect != 48:
-            return "NOT_REACHED", ["actual range-compressed native 48-byte CONNECT was not emitted"]
+        if outbound_connect == 0 or observed_connect != 48:
+            return "NOT_REACHED", ["actual native 48-byte CONNECT was not emitted"]
         if hc != 48:
             return "FAIL", [
                 "native ENet CONNECT classifier is " + str(hc) +
@@ -618,7 +618,7 @@ def evaluate_case(name, host, client, merge):
             return "FAIL", ["no LobbyEnter callback504"]
         if outbound_connect == 0 or outbound_verify == 0:
             return "FAIL", [
-                "actual compressed native CONNECT was emitted but no VERIFY completed",
+                "actual native CONNECT was emitted but no VERIFY completed",
                 "connect_frames=" + str(outbound_connect) +
                 " verify_frames=" + str(outbound_verify),
             ]
@@ -628,20 +628,14 @@ def evaluate_case(name, host, client, merge):
                 "CONNECT=" + str(observed_connect) +
                 " VERIFY_CONNECT=" + str(observed_verify),
             ]
-        if compressed_connect == 0 or compressed_verify == 0:
-            return "FAIL", [
-                "captured native handshake frames were not both range-compressed",
-                "compressed_connect=" + str(compressed_connect) +
-                " compressed_verify=" + str(compressed_verify),
-            ]
         linked = hm.get("host_link_observed") and cm.get("host_link_observed")
         connected = hm.get("enet_connected") and cm.get("enet_connected")
         if not linked or not connected:
             return "FAIL", [
-                "actual native compressed CONNECT did not complete the real Steam/ENet handshake"
+                "actual native CONNECT did not complete the real Steam/ENet handshake"
             ]
         return "PASS", [
-            "compressed native 48-byte CONNECT and 44-byte VERIFY_CONNECT"
+            "native 48-byte CONNECT and 44-byte VERIFY_CONNECT"
         ]
 
     if name == "metadata":

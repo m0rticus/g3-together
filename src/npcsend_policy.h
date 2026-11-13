@@ -354,9 +354,18 @@ inline bool Commit(State& state, Input const& in, Decision decision)
 inline uint32_t PresentationInterval(State const& state, Input const& in)
 {
     if (detail::Urgency(in)) return FastIntervalMs;
-    const bool nearBand = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
-    return (nearBand || in.nearby) && in.moving ? OrdinaryIntervalMs :
+    const bool nearBand = in.distanceCm <= (state.live && state.nearTier ? NearEnterCm : NearEnterCm);
+    const bool nearEffective = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
+    (void)nearBand;
+    return (nearEffective || in.nearby) && in.moving ? OrdinaryIntervalMs :
         in.moving ? MovingFarIntervalMs : IdleIntervalMs;
+}
+
+inline uint32_t EffectivePresentationInterval(Result const& evaluated, State const& state, Input const& in)
+{
+    if (evaluated.decision == Decision::Keyframe)
+        return QuietCadenceMs;
+    return Stretched(PresentationInterval(state, in), in.stretchPermille);
 }
 
 // Achieved-rate diagnostics (local only, never on the wire). One entry per scheduling tier: 0 fast, 1 ordinary, 2 slow.

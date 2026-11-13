@@ -21,6 +21,9 @@ inline ENetHost* CreateTransportHost(ENetAddress const* address, size_t peers, c
     }
     if (enet_host_compress_with_range_coder(host) != 0)
         error = "ENet lossless compression context allocation failed";
+    // Rice-packed bone deltas have ~7.6 bits/byte entropy (~6.7% range-coder reduction at heavy DIV/BST CPU cost).
+    // Keep decompress allocated for backward-compatible test frames while disabling all outbound range coding.
+    host->compressor.compress = nullptr;
     host->mtu = Mtu;
     constexpr int PoseBurstBuffer = 4 * 1024 * 1024;
     if (!error && (enet_socket_set_option(host->socket, ENET_SOCKOPT_RCVBUF, PoseBurstBuffer) < 0 ||
@@ -33,9 +36,9 @@ inline ENetHost* CreateTransportHost(ENetAddress const* address, size_t peers, c
     return host;
 }
 
-inline ENetPeer* ConnectTransportHost(ENetHost* host, ENetAddress const* address)
+inline ENetPeer* ConnectTransportHost(ENetHost* host, ENetAddress const* address, enet_uint32 data = 0)
 {
-    return enet_host_connect(host, address, ChannelCount, 0);
+    return enet_host_connect(host, address, ChannelCount, data);
 }
 
 inline char const* EnetPeerStateName(unsigned state)

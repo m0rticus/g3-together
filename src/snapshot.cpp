@@ -114,6 +114,15 @@ uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
         const uint32_t whole = static_cast<uint32_t>(advance);
         track.renderSent += whole;
         track.fractionalAdvance = advance - whole;
+        if (!track.combatClockProtected && error > 5000 && track.count &&
+            static_cast<int32_t>(track.snaps[track.count - 1].sent - track.renderSent) > 4000) {
+            track.renderSent = track.snaps[track.count - 1].sent -
+                static_cast<uint32_t>(std::clamp(track.delayMs, 0, 250));
+            track.fractionalAdvance = 0.0;
+            while (!track.pendingEvents.empty() &&
+                   static_cast<int32_t>(track.renderSent - track.pendingEvents.front().sent) > 0)
+                track.pendingEvents.pop_front();
+        }
     }
     if (!track.pendingEvents.empty() &&
         static_cast<int32_t>(track.renderSent - track.pendingEvents.front().sent) >= 0) {
@@ -204,11 +213,13 @@ float Distance(float const a[3], float const b[3])
 
 void SetPoseInterval(Track& track, uint32_t interval)
 {
-    if (track.predictive || interval < 16 || interval > 100 || interval == track.poseIntervalMs) return;
-    track.poseIntervalMs = interval;
+    if (track.predictive || interval < 16) return;
+    const uint32_t clamped = std::min<uint32_t>(interval, 100u);
+    if (clamped == track.poseIntervalMs) return;
+    track.poseIntervalMs = clamped;
     // Escalate the buffer immediately on a slower tier. Faster tiers still
     // decay gradually, without rewinding the presentation clock.
-    track.delayMs = std::max(track.delayMs, static_cast<int32_t>(interval * 2));
+    track.delayMs = std::max(track.delayMs, static_cast<int32_t>(clamped * 2));
 }
 
 void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived, int movementMode,
@@ -303,6 +314,8 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
         }
         for (int i = 1; i < SnapshotCount; ++i) track.snaps[i - 1] = track.snaps[i];
         --track.count;
+        while (track.pendingEvents.size() > 512u)
+            track.pendingEvents.pop_front();
     }
     const bool edge = track.count && EventChanged(track, track.snaps[track.count - 1].motion, motion);
     Track::Snap& state = track.snaps[track.count++];

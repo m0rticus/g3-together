@@ -22,6 +22,14 @@ int main()
     assert(PresentationFresh(true, false, 1000, 250));
     assert(PresentationFresh(true, false, 1100, 250));
     assert(!PresentationFresh(true, false, 1101, 250));
+    // Protocol 79 stretched and quiet heartbeat intervals prevent 350 ms mirror-held flapping.
+    assert(g3t::npclease::DecodePoseIntervalWire(g3t::npclease::EncodePoseIntervalWire(20)) == 20u);
+    assert(g3t::npclease::DecodePoseIntervalWire(g3t::npclease::EncodePoseIntervalWire(100)) == 100u);
+    const uint32_t stretchedSlow = g3t::npclease::DecodePoseIntervalWire(g3t::npclease::EncodePoseIntervalWire(400));
+    assert(stretchedSlow >= 400u && PresentationFresh(true, false, 450, stretchedSlow));
+    const uint32_t quietHeartbeat = g3t::npclease::DecodePoseIntervalWire(g3t::npclease::EncodePoseIntervalWire(1000));
+    assert(quietHeartbeat >= 1000u && PresentationFresh(true, false, 1200, quietHeartbeat));
+    assert(!PresentationFresh(true, false, 2501, quietHeartbeat));
     using namespace g3t::npclease;
     assert(CharacterPresentation("Slave_04", true, true, true, true));
     assert(CharacterPresentation("Wolf", true, true, true, true));

@@ -94,6 +94,7 @@ class EnetRelayHandshakeTests(unittest.TestCase):
     def test_native_win32_compressed_handshake_through_both_queues(self):
         self.assertIn("native ENet two-relay queued handshake/data/reconnect passed", self.run_case())
         self.assertIn("all 13 native command sizes match", self.run_case("sizes"))
+        self.assertIn("direct ENet UDP cookie hole-punch and uninvited packet drop passed", self.run_case("direct"))
 
     def test_native_win32_impaired_first_handshake_through_unreliable_queues(self):
         self.assertIn("impaired connected=2 exact_reliable_payloads=2",

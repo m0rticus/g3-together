@@ -27,10 +27,26 @@ inline bool ReconcileLife(bool locallyDead, bool recordedDead, bool hostDead)
     return !hostDead && (locallyDead || recordedDead);
 }
 
+inline uint8_t EncodePoseIntervalWire(uint32_t intervalMs)
+{
+    const uint32_t clamped = std::clamp(intervalMs, 16u, 4000u);
+    if (clamped <= 128u) return static_cast<uint8_t>(clamped);
+    const uint32_t steps = (clamped - 128u + 31u) / 32u;
+    return static_cast<uint8_t>((std::min)(255u, 128u + steps));
+}
+
+inline uint32_t DecodePoseIntervalWire(uint8_t wire)
+{
+    if (wire < 16u) return 0u;
+    if (wire <= 128u) return wire;
+    return 128u + static_cast<uint32_t>(wire - 128u) * 32u;
+}
+
 inline bool PresentationFresh(bool connected, bool released, uint32_t age, uint32_t interval)
 {
-    return connected && !released &&
-        age <= std::max(PresentationGraceMs, interval * 4 + PresentationJitterMs);
+    const uint32_t window = (std::min)(
+        2500u, (std::max)(PresentationGraceMs, interval * 4u + PresentationJitterMs));
+    return connected && !released && age <= window;
 }
 
 inline bool CharacterPresentation(char const* name, bool npc, bool routine, bool movement, bool damage)
@@ -47,7 +63,7 @@ inline float IdleTime(uint32_t elapsed, float duration)
 inline float ReactionTime(uint32_t elapsed, float duration)
 {
     return duration > 0.0f && std::isfinite(duration)
-        ? std::min(elapsed * 0.001f, std::nextafter(duration, 0.0f)) : 0.0f;
+        ? (std::min)(elapsed * 0.001f, std::nextafter(duration, 0.0f)) : 0.0f;
 }
 
 inline bool CosmeticContact(bool client, bool passive, bool hostPresentation, bool localPlayer,

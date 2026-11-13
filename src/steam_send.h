@@ -15,8 +15,29 @@ constexpr int Ok = 1, Timeout = 16, LimitExceeded = 25, Ignored = 41;
 constexpr int Reliable = 8, NoNagle = 1, NoDelay = 4, AutoRestart = 32;
 enum class Priority : unsigned { Critical, Definition, Pose, Bulk, Count };
 constexpr unsigned Classes = static_cast<unsigned>(Priority::Count);
+constexpr uint32_t MaxUnreliablePoseAgeMs = 250;
+constexpr size_t MaxUnreliablePoseBytes = 128 * 1024;
 
 inline bool Retryable(int result) { return result == LimitExceeded || result == Ignored; }
+
+inline std::string ExtractNpcPoseKey(uint8_t const* payload, size_t size)
+{
+    if (!payload || size < 31) return {};
+    const uint8_t type = payload[0];
+    // NpcsHeader is 23 bytes: MsgPosedNpc(39) and MsgCompactPosedNpc(44) follow with NpcRecord::guid[16].
+    if ((type == 39 || type == 44) && size >= 23 + 16) {
+        std::string key(1, 'G');
+        key.append(reinterpret_cast<char const*>(payload + 23), 16);
+        return key;
+    }
+    // MsgControlPose(49): NpcsHeader(23) + controlBytes(2) + generation(4) + WireControl::id(2).
+    if (type == 49 && size >= 23 + 2 + 4 + 2) {
+        std::string key(1, 'C');
+        key.append(reinterpret_cast<char const*>(payload + 25), 6);
+        return key;
+    }
+    return {};
+}
 
 class Codec {
     void* context_ = enet_range_coder_create();
@@ -72,6 +93,16 @@ struct Item {
     uint32_t at = 0;
     bool reliable = false;
     unsigned playerStates = 0;
+    Priority priority = Priority::Critical;
+    std::string npcKey;
+
+    Item() = default;
+    Item(std::vector<uint8_t> b, std::vector<std::string> r, uint32_t timestamp,
+         bool isReliable, unsigned states, Priority prio = Priority::Critical, std::string key = {})
+        : bytes(std::move(b)), retransmissions(std::move(r)), at(timestamp),
+          reliable(isReliable), playerStates(states), priority(prio), npcKey(std::move(key)) {}
+
+    uint16_t Lane() const { return static_cast<uint16_t>(priority); }
     int Flags() const
     {
         // ENet already owns ACKs/retransmission. Steam reliable would queue a
@@ -89,6 +120,7 @@ struct Counters {
     uint64_t retries = 0, duplicates = 0, plainBytes = 0, wireBytes = 0;
     uint64_t playerStates = 0;
     uint64_t unclassified = 0;
+    uint64_t npcUpdatesDropped = 0;
     size_t peakDepth = 0, peakBytes = 0;
     uint32_t peakAge = 0;
 };
@@ -96,7 +128,20 @@ struct Counters {
 class Queue {
     std::array<std::deque<Item>, Classes * 2> queues_;
     std::unordered_set<std::string> pendingReliable_;
-    size_t bytes_ = 0, depth_ = 0;
+    size_t bytes_ = 0, depth_ = 0, poseUnreliableBytes_ = 0;
+
+    void PopFront(unsigned index)
+    {
+        auto& q = queues_[index];
+        if (q.empty()) return;
+        auto const& item = q.front();
+        bytes_ -= item.bytes.size();
+        if (index == static_cast<unsigned>(Priority::Pose) * 2 + 1)
+            poseUnreliableBytes_ -= item.bytes.size();
+        --depth_;
+        for (auto const& key : item.retransmissions) pendingReliable_.erase(key);
+        q.pop_front();
+    }
 public:
     Counters counters;
     size_t Bytes() const { return bytes_; }
@@ -107,6 +152,20 @@ public:
         for (auto const& q : queues_)
             if (!q.empty()) age = (std::max)(age, now - q.front().at);
         return age;
+    }
+
+    void EvictStaleUnreliablePoses(uint32_t now, size_t incomingBytes = 0)
+    {
+        constexpr unsigned poseQueueIdx = static_cast<unsigned>(Priority::Pose) * 2 + 1;
+        auto& q = queues_[poseQueueIdx];
+        while (!q.empty()) {
+            const uint32_t age = now - q.front().at;
+            const bool tooOld = age > MaxUnreliablePoseAgeMs;
+            const bool overCap = poseUnreliableBytes_ + incomingBytes > MaxUnreliablePoseBytes;
+            if (!tooOld && !overCap) break;
+            PopFront(poseQueueIdx);
+            ++counters.npcUpdatesDropped;
+        }
     }
 
     bool Push(Codec& codec, void const* packet, size_t size, uint32_t now, EnetPacketParse* result = nullptr)
@@ -121,6 +180,7 @@ public:
             Item item;
             item.bytes.assign(bytes, bytes + size);
             item.at = now;
+            item.priority = Priority::Bulk;
             queues_[static_cast<unsigned>(Priority::Bulk) * 2 + 1].push_back(std::move(item));
             bytes_ += size;
             ++depth_;
@@ -135,6 +195,8 @@ public:
         const size_t header = plain[0] & 0x80u ? 4 : 2;
         std::array<std::vector<uint8_t>, Classes * 2> groups;
         std::array<std::vector<std::string>, Classes * 2> retransmissions;
+        std::array<std::string, Classes * 2> npcKeys;
+        std::array<unsigned, Classes * 2> commandCounts{};
         std::array<unsigned, Classes * 2> playerStates{};
         for (size_t at = header; at < plain.size();) {
             const unsigned command = plain[at] & 15u;
@@ -168,6 +230,15 @@ public:
             if ((command == 6 || command == 7) && channel == 0 &&
                 length > commandHeader && plain[at + commandHeader] == 3)
                 ++playerStates[groupId];
+            if (!reliable && priority == Priority::Pose && command == 7 && length > commandHeader) {
+                if (++commandCounts[groupId] == 1)
+                    npcKeys[groupId] = ExtractNpcPoseKey(plain.data() + at + commandHeader, length - commandHeader);
+                else
+                    npcKeys[groupId].clear();
+            } else {
+                ++commandCounts[groupId];
+                npcKeys[groupId].clear();
+            }
             if (group.empty()) group.assign(plain.begin(), plain.begin() + header);
             group.insert(group.end(), plain.begin() + at, plain.begin() + at + length);
             at += length;
@@ -176,13 +247,40 @@ public:
             auto& group = groups[i];
             if (group.empty()) continue;
             const bool reliable = (i & 1u) == 0;
+            const Priority priority = static_cast<Priority>(i / 2);
             auto& queue = queues_[i];
             counters.plainBytes += group.size();
-            codec.Encode(group);
+            // Do not re-compress with ENet's range coder: Rice-coded poses gain only ~6.7%
+            // while burning multiple passes of DIV/BST work on the relay and game threads.
             counters.wireBytes += group.size();
+            if (!reliable && priority == Priority::Pose) {
+                if (!npcKeys[i].empty()) {
+                    bool replaced = false;
+                    for (auto& existing : queue) {
+                        if (existing.npcKey == npcKeys[i]) {
+                            bytes_ -= existing.bytes.size();
+                            poseUnreliableBytes_ -= existing.bytes.size();
+                            existing.bytes = std::move(group);
+                            existing.at = now;
+                            bytes_ += existing.bytes.size();
+                            poseUnreliableBytes_ += existing.bytes.size();
+                            ++counters.npcUpdatesDropped;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (replaced) {
+                        EvictStaleUnreliablePoses(now, 0);
+                        continue;
+                    }
+                }
+                EvictStaleUnreliablePoses(now, group.size());
+                poseUnreliableBytes_ += group.size();
+            }
             bytes_ += group.size();
             ++depth_;
-            queue.push_back({std::move(group), std::move(retransmissions[i]), now, reliable, playerStates[i]});
+            queue.push_back({std::move(group), std::move(retransmissions[i]),
+                             now, reliable, playerStates[i], priority, std::move(npcKeys[i])});
         }
         counters.peakDepth = (std::max)(counters.peakDepth, depth_);
         counters.peakBytes = (std::max)(counters.peakBytes, bytes_);
@@ -213,10 +311,7 @@ public:
                 counters.bytes[i / 2] += item.bytes.size();
                 counters.playerStates += item.playerStates;
                 ++(item.reliable ? counters.reliableAccepted : counters.unreliableAccepted);
-                bytes_ -= item.bytes.size();
-                --depth_;
-                for (auto const& key : item.retransmissions) pendingReliable_.erase(key);
-                queue.pop_front();
+                PopFront(i);
             }
         }
         return blocked;

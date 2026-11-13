@@ -562,12 +562,19 @@ bool Contested(std::string const& key, uint8_t owner)
 bool receiving = true;  // QA (invariant self-test): RecvOff drops all NPC snapshots, so both machines simulate
 bool hostStreamSeen = false;
 uint32_t hostStreamSession = 0;
+uint32_t hostStreamFirstSeenAt = 0;
 
 int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint8_t owner, uint32_t generation)
 {
     if (net::IsHost() || owner != 1) return 0;
     if (!receiving) return 0;
-    if (count > 0) { hostStreamSeen = true; hostStreamSession = net::WelcomeSerial(); }
+    if (count > 0) {
+        const uint32_t serial = net::WelcomeSerial();
+        if (!hostStreamSeen || hostStreamSession != serial)
+            hostStreamFirstSeenAt = now ? now : 1;
+        hostStreamSeen = true;
+        hostStreamSession = serial;
+    }
     int accepted = 0;
     for (int i = 0; i < count; ++i) {
         if (npcremoval::Suppressed(records[i].guid)) continue;
@@ -1090,9 +1097,11 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                     streamDiag.Result(id, Drop::Paced);
                     continue;
                 }
+                const uint8_t intervalWire = npclease::EncodePoseIntervalWire(
+                    npcsend::EffectivePresentationInterval(result, state, input));
                 const bool queued = posed
                     ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, result.essential,
-                                         static_cast<uint8_t>(npcsend::PresentationInterval(state, input)))
+                                         intervalWire)
                     : net::SendNpcsTo(id, &r, 1, result.essential);
                 const uint32_t previousSentAt = state.sentAt;
                 const bool attackStart = combat_timing::RemoteCombat(r.flags, r.combatTarget) &&
@@ -3754,8 +3763,10 @@ bool HostPresentationAvailable(eCEntity const* entity)
     const auto& mirror = found->second;
     if (mirror.entity.GetInstance() != entity) return false;
     if (mirror.released) return net::Connected() && HostReleasePending(identity);
+    const uint32_t poseInt = npcplayback::PoseInterval(mirror.latest);
+    const uint32_t effectiveInt = poseInt ? poseInt : npcsend::QuietCadenceMs;
     return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
-        npcplayback::PoseInterval(mirror.latest));
+        effectiveInt);
 }
 
 bool HostStreamFresh(uint8_t const identity[16])
@@ -3763,8 +3774,10 @@ bool HostStreamFresh(uint8_t const identity[16])
     const auto found = mirrors.find(Key(identity));
     if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial() || !found->second.latestTicks) return false;
     auto const& mirror = found->second;
+    const uint32_t poseInt = npcplayback::PoseInterval(mirror.latest);
+    const uint32_t effectiveInt = poseInt ? poseInt : npcsend::QuietCadenceMs;
     return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
-        npcplayback::PoseInterval(mirror.latest));
+        effectiveInt);
 }
 
 bool HostStreamClaimed(uint8_t const identity[16])
@@ -3802,7 +3815,12 @@ uint32_t HostStreamDelay()
     return youngest == UINT32_MAX ? 0 : youngest;
 }
 
-bool HostStreamSeen() { return hostStreamSeen && hostStreamSession == net::WelcomeSerial(); }
+bool HostStreamSeen()
+{
+    if (!hostStreamSeen || hostStreamSession != net::WelcomeSerial()) return false;
+    // Allow the host's InitialPacer to deliver the opening world burst before treating unseen NPCs as absent.
+    return net::Now() - hostStreamFirstSeenAt >= 1500;
+}
 
 uint32_t HostStreamRecords(uint8_t const identity[16])
 {

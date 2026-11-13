@@ -567,6 +567,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         }
         puppet.spawned = true;
         puppet.body.puppet = true;  // QA (glide): counted apart from mirrored NPCs
+        puppet.body.track.pendingEvents.clear();
+        puppet.body.track.haveRenderTime = false;
         puppet.world = CurrentWorld();
         puppet.shape = requested;
         Logf("remote: puppet %d spawned for %s (%s)", id, remote.latest.name, wanted);

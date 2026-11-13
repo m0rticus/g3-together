@@ -1254,8 +1254,14 @@ void MaintainOwners(uint32_t now)
 
 void ScanClient(uint32_t now)
 {
+    static uint32_t lastWorldEntries = 0;
     if (ai::ShuttingDown() || persist::NativeLoading() || persist::HeroPending() ||
         !gCSession::GetInstance().IsGameRunning() || !remote::ControlledBody() || installFailed) return;
+    const uint32_t entriesNow = net::WorldEntryCount();
+    if (entriesNow != lastWorldEntries) {
+        lastWorldEntries = entriesNow;
+        sessionReadyAt = 0;
+    }
     if (!sessionReadyAt) sessionReadyAt = now ? now : 1;
     const bool settled = npcown::StreamSettled(now, sessionReadyAt, npcs::HostStreamSeen());
     const bool census = !ownReportAt || now - ownReportAt >= 5000;

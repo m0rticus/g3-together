@@ -48,6 +48,23 @@ struct RelayDrop {
     unsigned short port = 0;
     char reason[160] = {};
 };
+struct DirectEndpoint {
+    uint32_t hostIpv4 = 0;  // ENetAddress::host (network byte order IPv4)
+    uint16_t port = 0;      // host byte order port (matches ENetAddress::port)
+};
+struct DirectOffer {
+    uint64_t account = 0;
+    uint64_t generation = 0;
+    uint8_t cookie[16] = {};
+    DirectEndpoint candidates[8] = {};
+    unsigned candidateCount = 0;
+    bool ready = false;
+};
+std::vector<DirectOffer> DirectOffers();
+bool DirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint64_t& account, char (&name)[24], uint64_t& relayGeneration);
+bool ClaimDirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint32_t connectTag,
+                             uint64_t& account, char (&name)[24], uint64_t& relayGeneration);
+void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t hostIpv4, uint16_t port);
 std::vector<RelayDrop> TakeRelayDrops(); // engine thread: drain worker notifications
 void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason);
 // Wake the independent transport worker after ENet flushes. Does not run engine or ENet handlers.

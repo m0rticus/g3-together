@@ -15,6 +15,7 @@
 #include "npcwire_pose.h"
 #include "npcwire_control.h"
 #include "npcwire_control_policy.h"
+#include "npclease_presentation.h"
 #include "net_metrics.h"
 #include "playerwire.h"
 #include "parity.h"
@@ -40,7 +41,7 @@
 
 namespace g3t::net {
 namespace {
-constexpr uint16_t ProtocolVersion = saving::Protocol;  // 78: convergent NPC setup and independent packed keys
+constexpr uint16_t ProtocolVersion = saving::Protocol;  // 79: uncompressed high-throughput NPC/pose transport, rolling ACKs, stretched interval wire
 enum : uint8_t { MsgHello = 1, MsgWelcome = 2, MsgState = 3, MsgLeave = 4, MsgNpcs = 5, MsgMotionName = 6, MsgHitNpc = 7, MsgHitPlayer = 8, MsgStates = 9, MsgTalk = 10, MsgItem = 11, MsgContents = 12, MsgContainerTx = 13, MsgTxResult = 14, MsgWatch = 15, MsgKilled = 16, MsgRefused = 17, MsgDeath = 18, MsgCampaign = 19, MsgFileChunk = 20, MsgFileDone = 21, MsgClock = 22, MsgWorldState = 23, MsgSummon = 24, MsgShot = 25, MsgPlayerSpell = 26, MsgNpcSpell = 27, MsgEnclave = 28, MsgWorld = 29, MsgDialogLine = 30, MsgGoods = 31 };
 enum : uint8_t { MsgNpcRelease = 36, MsgPosedNpc = 39 };
 enum : uint8_t { MsgSave = 40, MsgBoneDictionary = 41, MsgBoneAck = 42, MsgBoneRequest = 43, MsgCompactPosedNpc = 44 };
@@ -295,6 +296,154 @@ struct BulkRefusal {
 BulkRefusal bulkRefusals[MaxPlayers];
 
 size_t PeerIndex(ENetPeer const* peer) { return static_cast<size_t>(peer - host->peers); }
+uint32_t peerConnectData[MaxPlayers] = {};
+
+struct DirectPunchSession {
+    uint64_t account = 0;
+    uint64_t generation = 0;
+    uint8_t cookie[16] = {};
+    steam::DirectEndpoint candidates[8] = {};
+    unsigned candidateCount = 0;
+    bool ready = false;
+    bool inboundVerified = false;
+    bool bidirectionalVerified = false;
+    bool connectStarted = false;
+    bool fallbackLogged = false;
+    ENetAddress verifiedAddress{};
+    uint32_t startedAt = 0;
+    uint32_t lastProbeAt = 0;
+};
+DirectPunchSession directSessions[MaxPlayers] = {};
+constexpr uint32_t DirectPunchTimeoutMs = 1500;
+constexpr uint32_t DirectPunchIntervalMs = 100;
+constexpr size_t DirectPunchBytes = 26;
+
+uint32_t DirectCookieTag(uint8_t const cookie[16])
+{
+    uint32_t tag = 0;
+    std::memcpy(&tag, cookie, sizeof(tag));
+    return tag ? tag : 0x67337431u;
+}
+
+bool ConstantTimeCookieEqual(uint8_t const a[16], uint8_t const b[16])
+{
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 16; ++i) diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+void SendDirectPunchPacket(ENetAddress const& to, uint8_t const cookie[16], uint8_t flags)
+{
+    if (!host || host->socket == ENET_SOCKET_NULL || !to.host || !to.port) return;
+    uint8_t packet[DirectPunchBytes] = {};
+    std::memcpy(packet, "G3TPUNCH", 8);
+    std::memcpy(packet + 8, cookie, 16);
+    packet[24] = flags;
+    packet[25] = isHost ? 1u : 2u;
+    ENetBuffer buf{sizeof(packet), packet};
+    enet_socket_send(host->socket, &to, &buf, 1);
+}
+
+int ENET_CALLBACK InterceptTransportPacket(ENetHost* currentHost, ENetEvent*)
+{
+    if (!currentHost || !currentHost->receivedData) return 0;
+    const ENetAddress from = currentHost->receivedAddress;
+    const size_t length = currentHost->receivedDataLength;
+    const uint8_t* data = currentHost->receivedData;
+    const bool isRelayPort = from.host == target.host &&
+        (isHost ? steam::IsPeerRelay(from.port) : from.port == target.port);
+    if (length == DirectPunchBytes && std::memcmp(data, "G3TPUNCH", 8) == 0) {
+        const uint8_t flags = data[24];
+        for (auto& session : directSessions) {
+            if (!session.account || !session.generation) continue;
+            if (!ConstantTimeCookieEqual(data + 8, session.cookie)) continue;
+            session.inboundVerified = true;
+            session.verifiedAddress = from;
+            steam::RegisterDirectPeerEndpoint(session.account, session.generation, from.host, from.port);
+            if (flags & 0x02u) session.bidirectionalVerified = true;
+            if (flags & 0x01u) SendDirectPunchPacket(from, session.cookie, 0x02u);
+            return 1;
+        }
+        return 1;
+    }
+    if (isRelayPort) return 0;
+    for (auto const& session : directSessions) {
+        if (!session.account || !session.inboundVerified) continue;
+        if (session.verifiedAddress.host == from.host && session.verifiedAddress.port == from.port)
+            return 0;
+    }
+    // Drop unauthenticated external UDP packets before ENet protocol handling.
+    return 1;
+}
+
+bool PeerRelayOrDirect(ENetPeer const* peer)
+{
+    if (!peer) return false;
+    if (peer->address.host == target.host && steam::IsPeerRelay(peer->address.port))
+        return true;
+    uint64_t account = 0, generation = 0;
+    char name[24] = {};
+    return steam::DirectPeerIdentity(peer->address.host, peer->address.port, account, name, generation);
+}
+
+bool ReadAuthenticatedPeerIdentity(ENetPeer const* peer, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    if (!peer) return false;
+    if (peer->address.host == target.host && steam::PeerIdentity(peer->address.port, account, name, generation))
+        return true;
+    return steam::DirectPeerIdentity(peer->address.host, peer->address.port, account, name, generation);
+}
+
+bool ClaimAuthenticatedPeerIdentity(ENetPeer const* peer, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    if (!peer) return false;
+    if (peer->address.host == target.host && steam::ClaimPeerIdentity(peer->address.port, account, name, generation))
+        return true;
+    const size_t idx = PeerIndex(peer);
+    const uint32_t connectTag = idx < MaxPlayers ? peerConnectData[idx] : 0;
+    return steam::ClaimDirectPeerIdentity(peer->address.host, peer->address.port, connectTag, account, name, generation);
+}
+
+void SyncDirectSessions(uint32_t now)
+{
+    const auto offers = steam::DirectOffers();
+    for (auto& s : directSessions) {
+        bool stillPresent = false;
+        for (auto const& o : offers)
+            if (o.account == s.account && o.generation == s.generation) { stillPresent = true; break; }
+        if (!stillPresent) s = DirectPunchSession{};
+    }
+    for (auto const& offer : offers) {
+        DirectPunchSession* slot = nullptr;
+        for (auto& s : directSessions)
+            if (s.account == offer.account && s.generation == offer.generation) { slot = &s; break; }
+        if (!slot) {
+            for (auto& s : directSessions)
+                if (!s.account) { slot = &s; break; }
+        }
+        if (!slot) continue;
+        if (!slot->account) {
+            slot->account = offer.account;
+            slot->generation = offer.generation;
+            slot->startedAt = now ? now : 1;
+        }
+        std::memcpy(slot->cookie, offer.cookie, 16);
+        slot->candidateCount = offer.candidateCount;
+        for (unsigned i = 0; i < offer.candidateCount && i < 8; ++i)
+            slot->candidates[i] = offer.candidates[i];
+        slot->ready = offer.ready;
+    }
+    for (auto& s : directSessions) {
+        if (!s.account || !s.ready || s.bidirectionalVerified) continue;
+        if (now - s.startedAt >= DirectPunchTimeoutMs) continue;
+        if (s.lastProbeAt && now - s.lastProbeAt < DirectPunchIntervalMs) continue;
+        s.lastProbeAt = now ? now : 1;
+        for (unsigned i = 0; i < s.candidateCount && i < 8; ++i) {
+            ENetAddress to{s.candidates[i].hostIpv4, s.candidates[i].port};
+            SendDirectPunchPacket(to, s.cookie, s.inboundVerified ? 0x03u : 0x01u);
+        }
+    }
+}
 
 uint32_t QueueBytes(ENetList const& list)
 {
@@ -1007,6 +1156,7 @@ bool DecodeControls(ENetPeer* peer, NpcsHeader const& header, uint8_t const* dat
             return false;
         }
         const auto previous = npcPublications.find(NpcKey(guid.data()));
+        size_t skippedStale = 0;
         if (!retainStaleAnchor && previous != npcPublications.end() && previous->second.publication.initialized &&
             !npcwire::Newer(header.publication, previous->second.publication.latest)) {
             ++npcStale;
@@ -1014,6 +1164,7 @@ bool DecodeControls(ENetPeer* peer, NpcsHeader const& header, uint8_t const* dat
             offset += length;
             continue;
         }
+        (void)skippedStale;
         npcwire::Control value;
         if (!npcwire::DecodeRecord(controlReceiver, raw, length, value)) {
             npcwire::Anchor saved;
@@ -1028,7 +1179,13 @@ bool DecodeControls(ENetPeer* peer, NpcsHeader const& header, uint8_t const* dat
         batch.insert(batch.end(), raw, raw + length);
         offset += length;
     }
-    if (offset != size || result.empty()) return false;
+    if (offset != size) return false;
+    if (result.empty()) {
+        // Every record in this valid message was simply overtaken by a newer publication on another channel.
+        records.clear();
+        acceptedBatch.clear();
+        return header.count != 0;
+    }
     batch[16] = static_cast<uint8_t>(result.size());
     batch[17] = static_cast<uint8_t>(result.size() >> 8);
     records = std::move(result);
@@ -1039,13 +1196,13 @@ bool DecodeControls(ENetPeer* peer, NpcsHeader const& header, uint8_t const* dat
 void OnReceive(ENetPeer* peer, ENetPacket* packet)
 {
     if (packet->dataLength) bandwidth.Rx(packet->data[0], packet->dataLength);
-    if (isHost && (peer->address.host != target.host || !steam::IsPeerRelay(peer->address.port))) return;
+    if (isHost && !PeerRelayOrDirect(peer)) return;
     if (isHost && peer->data) {
         const uintptr_t slot = reinterpret_cast<uintptr_t>(peer->data);
         uint64_t account = 0, relayGeneration = 0;
         char name[24] = {};
         if (slot < 2 || slot >= MaxPlayers || peers[slot] != peer ||
-            !steam::PeerIdentity(peer->address.port, account, name, relayGeneration) ||
+            !ReadAuthenticatedPeerIdentity(peer, account, name, relayGeneration) ||
             !peerAccounts[slot] || peerAccounts[slot] != account ||
             peerRelayGenerations[slot] != relayGeneration) {
             Log("identity: refused relay/account mismatch");
@@ -1108,7 +1265,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         uint64_t account = 0;
         uint64_t relayGeneration = 0;
         char displayName[24] = {};
-        if (!steam::ClaimPeerIdentity(peer->address.port, account, displayName, relayGeneration) ||
+        if (!ClaimAuthenticatedPeerIdentity(peer, account, displayName, relayGeneration) ||
             !account || account == steam::PlayerId()) {
             Logf("identity: refused invalid steamid=%llu source=transport-authenticated", account);
             strcpy_s(refusal.reason, "authenticated Steam identity unavailable");
@@ -1536,7 +1693,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                     ++npcRejected; return;
                 }
                 poseAnchor = (packet->data[offset + controlSize] & PoseAnchorFlag) != 0;
-                if (poseAnchor && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
+                poseEssential = (packet->data[offset + controlSize] & PoseEssentialFlag) != 0;
+                if ((poseAnchor || poseEssential) && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
                 if (controlSize < 4 + sizeof(npcwire::WireControl)) { ++npcRejected; return; }
                 expandedControl.resize(sizeof(npcwire::WireBatchHeader));
                 std::memcpy(expandedControl.data(), "NC\1\0", 4);
@@ -1549,11 +1707,12 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             if (!DecodeControls(peer, header,
                                 expandedControl.empty() ? controlData : expandedControl.data(),
                                 expandedControl.empty() ? controlSize : expandedControl.size(),
-                                controlRecords, acceptedBatch, poseAnchor)) {
+                                controlRecords, acceptedBatch, poseAnchor || poseEssential)) {
                 ++npcRejected;
                 if (BoneLog(controlErrors)) Log("net: compact NPC control decode failed");
                 return;
             }
+            if (controlRecords.empty()) return;
             offset += controlSize;
             if (type == MsgControlPose) {
                 if (packet->dataLength < offset + 2 + bonewire::DeltaHeaderBytes + 1) {
@@ -1565,7 +1724,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 if (poseEssential && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return; }
                 poseFlags = wireFlags & ~(PoseAnchorFlag | PoseEssentialFlag);
                 intervalMs = packet->data[offset++];
-                if ((poseFlags & ~pose::Facial) || intervalMs < 16 || intervalMs > 100) {
+                if ((poseFlags & ~pose::Facial) || !npclease::DecodePoseIntervalWire(intervalMs)) {
                     ++npcRejected; return;
                 }
                 uint16_t layoutId = 0;
@@ -1595,7 +1754,13 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 boneCount = static_cast<uint16_t>(decodedBones.size());
             }
             std::vector<npcwire::Control> acceptedControls;
-            if (!poseAnchor &&
+            const bool skipSequenceAdvance = poseAnchor ||
+                (poseEssential && !controlRecords.empty() &&
+                 npcPublications.count(NpcKey(controlRecords.front().guid)) &&
+                 npcPublications[NpcKey(controlRecords.front().guid)].publication.initialized &&
+                 !npcwire::Newer(header.publication,
+                                 npcPublications[NpcKey(controlRecords.front().guid)].publication.latest));
+            if (!skipSequenceAdvance &&
                 !npcwire::DecodeBatch(controlReceiver, acceptedBatch.data(), acceptedBatch.size(), acceptedControls)) {
                 ++npcRejected;
                 return;
@@ -1668,7 +1833,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             if (poseAnchor && !receivedPoseKey) { ++npcRejected; return; }
             boneCount = static_cast<uint16_t>(decodedBones.size());
         } else if (packet->dataLength != recordsSize) { ++npcRejected; return; }
-        if (bones && (intervalMs < 16 || intervalMs > 100)) { ++npcRejected; return; }
+        if (bones && !npclease::DecodePoseIntervalWire(intervalMs)) { ++npcRejected; return; }
         if (isHost) {
             header.owner = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
             if (header.owner < 2 || header.owner >= MaxPlayers) return;
@@ -1700,13 +1865,20 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                 }
                 const bool newer = isHost ? npcOrigins[header.owner][key].Accept(header.sequence)
                                          : npcPublications[key].Snapshot(header.owner, header.publication);
-                if (!newer) { ++npcStale; continue; }
+                if (!newer) {
+                    if (poseEssential && bones && npcPoseHandler && record.contact)
+                        npcPoseHandler(record, bones, boneCount, poseFlags, true, intervalMs);
+                    ++npcStale;
+                    continue;
+                }
                 if (bones && poseLayout && !poseAnchor) {
                     decodedPoses[key].Store(header.publication, record.incarnation, poseLayout, poseFlags,
                                            bones, boneCount, enet_time_get(), false);
                 }
                 if (bones) {
-                    bandwidth.Pose(intervalMs, packet->dataLength, receivedPoseBytes, boneCount, receivedPoseKey);
+                    const uint32_t decodedInt = npclease::DecodePoseIntervalWire(intervalMs);
+                    const uint8_t statsTierInterval = static_cast<uint8_t>((std::min)(decodedInt, 100u));
+                    bandwidth.Pose(statsTierInterval, packet->dataLength, receivedPoseBytes, boneCount, receivedPoseKey);
                     if (!poseLayout) {
                         receivedPoseStats.headerBytes = 2 + boneCount * sizeof(uint32_t);
                         receivedPoseStats.rotationBits = boneCount * 144;
@@ -2247,9 +2419,17 @@ void SetInWorld(uint8_t id, bool in)
     }
     if (id < 2 || id >= MaxPlayers || !peers[id] || clientInWorld[id] == in) return;
     if (in) {
-        // A rejoin must not make an old same-layout ACK valid for a new offer.
-        // The stream is shared, so rotate it for all peers and re-offer lazily.
-        ResetNpcReplication();
+        bool anyOtherInWorld = false;
+        for (uint8_t other = 2; other < MaxPlayers; ++other)
+            if (other != id && clientInWorld[other]) { anyOtherInWorld = true; break; }
+        // Only rotate global shared layouts when no other client is currently streaming;
+        // otherwise forget just the entering peer so existing clients avoid a setup storm.
+        if (!anyOtherInWorld) {
+            ResetNpcReplication();
+        } else {
+            ForgetBonePeer(id);
+            ForgetControlPeer(id);
+        }
     } else {
         ForgetBonePeer(id);
         ForgetControlPeer(id);
@@ -2592,7 +2772,7 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                     uint8_t intervalMs)
 {
     if (!host || !isHost || !bones || count <= 0 || count > pose::MaxBones || (poseFlags & ~pose::Facial) ||
-        intervalMs < 16 || intervalMs > 100 ||
+        !npclease::DecodePoseIntervalWire(intervalMs) ||
         (to && (to < 2 || to >= MaxPlayers || !peers[to]))) return false;
     uint32_t hashes[pose::MaxBones], sorted[pose::MaxBones];
     for (int i = 0; i < count; ++i) hashes[i] = sorted[i] = bones[i].name;
@@ -2751,7 +2931,9 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                          static_cast<unsigned>(i), static_cast<unsigned>(layoutId), header.publication, count, bytes,
                          orderedSetup ? 1u : 0u);
             }
-            bandwidth.Pose(intervalMs, bytes, poseBytes, count, poseKey || !compactReady);
+            const uint32_t decodedInt = npclease::DecodePoseIntervalWire(intervalMs);
+            const uint8_t statsTierInterval = static_cast<uint8_t>((std::min)(decodedInt ? decodedInt : uint32_t(intervalMs), 100u));
+            bandwidth.Pose(statsTierInterval, bytes, poseBytes, count, poseKey || !compactReady);
             if (!compactReady) {
                 poseStats.headerBytes = 2 + count * sizeof(uint32_t);
                 poseStats.rotationBits = count * 144;
@@ -2888,7 +3070,7 @@ uint64_t PeerAccount(uint8_t id)
     if (!isHost || id < 2 || id >= MaxPlayers || !peers[id]) return 0;
     uint64_t account = 0, generation = 0;
     char name[24] = {};
-    return steam::PeerIdentity(peers[id]->address.port, account, name, generation) &&
+    return ReadAuthenticatedPeerIdentity(peers[id], account, name, generation) &&
         account == peerAccounts[id] && generation == peerRelayGenerations[id] ? account : 0;
 }
 bool SendCharacter(uint8_t to, CharacterNote const& note, std::vector<uint8_t> const& bytes)
@@ -3342,21 +3524,30 @@ bool Start(bool asHost)
     enetInitialized = true;
     target = ENetAddress{};
     if (enet_address_set_host_ip(&target, "127.0.0.1") != 0) return StartFailed("loopback address unavailable");
+    ENetAddress bindAddress{};
+    bindAddress.host = ENET_HOST_ANY;
+    bindAddress.port = 0;
+    for (auto& session : directSessions) session = DirectPunchSession{};
+    for (auto& tag : peerConnectData) tag = 0;
     char const* createError = nullptr;
-    host = CreateTransportHost(&target, isHost ? MaxPlayers - 1 : 1, createError);
+    host = CreateTransportHost(&bindAddress, isHost ? MaxPlayers - 1 : 1, createError);
     if (!host) return StartFailed(createError);
-    host->compressor.compress = &CompressDatagram;
+    ENetAddress bound{};
+    if (enet_socket_get_address(host->socket, &bound) == 0 && bound.port)
+        host->address.port = bound.port;
+    host->compressor.compress = nullptr;
     host->compressor.decompress = &DecompressDatagram;
-    Logf("enet: host created role=%s channels=%u compress=on mtu=%u port=%u",
+    host->intercept = &InterceptTransportPacket;
+    Logf("enet: host created role=%s channels=%u compress=off mtu=%u port=%u",
          isHost ? "host" : "client", ChannelCount, host->mtu, host->address.port);
-    Log("enet: range coder guards active empty_buffers=skip checkpoint_payload=unchanged");
+    Log("enet: range coder outbound compression disabled; decompression guard retained");
     bandwidth = detail::BandwidthCounters{};
     bandwidthSince = enet_time_get();
     lastSentData = host->totalSentData;
     lastSentPackets = host->totalSentPackets;
     lastReceivedData = host->totalReceivedData;
     lastReceivedPackets = host->totalReceivedPackets;
-    if (!steam::Start(isHost, isHost ? host->address.port : 0)) return StartFailed(steam::Error());
+    if (!steam::Start(isHost, host->address.port)) return StartFailed(steam::Error());
     lastSteamTraffic = steam::Traffic();
     relayEnvelopeBytes = lastSteamTraffic.envelopeBytes;
     strcpy_s(localName, steam::PlayerName());
@@ -3419,8 +3610,7 @@ void ProcessRelayDrops()
             continue;
         }
         for (uint8_t id = 2; id < MaxPlayers; ++id)
-            if (peers[id] && peerAccounts[id] == drop.account && peerRelayGenerations[id] == drop.generation &&
-                peers[id]->address.port == drop.port)
+            if (peers[id] && peerAccounts[id] == drop.account && peerRelayGenerations[id] == drop.generation)
                 LeavePeer(peers[id], drop.reason, true);
     }
 }
@@ -3429,10 +3619,11 @@ void Service(PlayerState const& local, bool haveLocal)
 {
     strncpy_s(localName, steam::PlayerName(), _TRUNCATE);
     ProcessRelayDrops();
+    SyncDirectSessions(enet_time_get());
     if (isHost) for (uint8_t id = 2; id < MaxPlayers; ++id) {
         uint64_t account = 0, generation = 0;
         char name[24] = {};
-        if (peers[id] && steam::PeerIdentity(peers[id]->address.port, account, name, generation) &&
+        if (peers[id] && ReadAuthenticatedPeerIdentity(peers[id], account, name, generation) &&
             account == peerAccounts[id] && generation == peerRelayGenerations[id])
             strncpy_s(remotes[id].latest.name, name, _TRUNCATE);
     }
@@ -3452,11 +3643,13 @@ void Service(PlayerState const& local, bool haveLocal)
             if (!isHost)
                 steam::NoteClientEnetState(event.peer->state, event.type, event.data,
                                           startedAt ? enet_time_get() - startedAt : 0, "");
-            if (isHost && (event.peer->address.host != target.host || !steam::IsPeerRelay(event.peer->address.port))) {
-                Log("net: rejected an ENet connection outside the linked Steam relays");
+            if (isHost && !PeerRelayOrDirect(event.peer)) {
+                Log("net: rejected an ENet connection outside the linked Steam/direct peers");
                 enet_peer_reset(event.peer);
                 break;
             }
+            if (PeerIndex(event.peer) < MaxPlayers)
+                peerConnectData[PeerIndex(event.peer)] = event.data;
             // World loads and the intro video stop the engine loop (and so this service call) for
             // many seconds; the default ENet timeouts dropped a loading player after about 9 s.
             enet_peer_timeout(event.peer, G3T_PEER_TIMEOUT_LIMIT,
@@ -3553,16 +3746,34 @@ void Service(PlayerState const& local, bool haveLocal)
         }
     }
     if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {
-        lastConnectAttempt = now;
-        server = ConnectTransportHost(host, &target);
-        steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
-                                  now - startedAt, server ? "" : "ENet connect refused (no free peer)");
-        Logf("enet: connect request role=client channels=%u compress=on relay_port=%u result=%s state=%s elapsed_ms=%u",
-             ChannelCount, target.port, server ? "pending" : "refused",
-             EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED), now - startedAt);
-        if (!connectLogged) Logf("net: connecting over Steam (relay 127.0.0.1:%u): %s", target.port, server ? "pending" : "failed");
-        else Log(server ? "net: reconnecting" : "net: reconnect failed");
-        connectLogged = true;
+        DirectPunchSession* direct = nullptr;
+        for (auto& s : directSessions)
+            if (s.account && s.generation == hostRelayGeneration) { direct = &s; break; }
+        const bool punchWaiting = direct && !direct->bidirectionalVerified &&
+            (now - startedAt < DirectPunchTimeoutMs);
+        if (!punchWaiting) {
+            lastConnectAttempt = now;
+            const bool useDirect = direct && direct->bidirectionalVerified;
+            const ENetAddress connectTo = useDirect ? direct->verifiedAddress : target;
+            server = useDirect
+                ? ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))
+                : ConnectTransportHost(host, &target);
+            if (direct) direct->connectStarted = server != nullptr;
+            steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
+                                      now - startedAt, server ? "" : "ENet connect refused (no free peer)");
+            Logf("enet: connect request role=client channels=%u compress=off route=%s port=%u result=%s state=%s elapsed_ms=%u",
+                 ChannelCount, useDirect ? "direct-udp" : "steam-relay", connectTo.port, server ? "pending" : "refused",
+                 EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED), now - startedAt);
+            if (!connectLogged) {
+                if (useDirect)
+                    Logf("net: direct UDP hole-punch verified (port %u); connecting natively (zero relay overhead)", connectTo.port);
+                else
+                    Logf("net: connecting over Steam (relay 127.0.0.1:%u): %s", target.port, server ? "pending" : "failed");
+            } else {
+                Log(server ? "net: reconnecting" : "net: reconnect failed");
+            }
+            connectLogged = true;
+        }
     }
     UpdateBudgets(now);
     if (connected) {

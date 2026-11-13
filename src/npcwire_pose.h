@@ -440,6 +440,30 @@ public:
                     };
 
                     for (std::size_t i = 0; i < count; ++i) {
+                        bool unchangedPredicted = true;
+                        pose::Bone predictedBone = bones[i];
+                        int32_t predictedPrior[12] = {};
+                        for (int k = 0; k < 12; ++k) {
+                            const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
+                            const int64_t candidate = int64_t(prediction) + spatial(i, k, 1, 0);
+                            if (candidate < -32768 || candidate > 32767 ||
+                                candidate != int64_t(bones[i].values[k])) {
+                                unchangedPredicted = false;
+                                break;
+                            }
+                            predictedBone.values[k] = static_cast<int16_t>(candidate);
+                            predictedPrior[k] = static_cast<int32_t>(candidate - prediction);
+                        }
+                        if (unchangedPredicted) {
+                            rigidReconstruction[i] = predictedBone;
+                            boneType[i] = 0;
+                            for (int k = 0; k < 12; ++k) {
+                                prior[i][k] = predictedPrior[k];
+                                residual[i * 12 + k] = 0;
+                            }
+                            previousTypesForBone[i] = 0;
+                            continue;
+                        }
                         PoseQuat targetQuat = sourceQuaternions[i], recentQuat = predictedQuaternions[i];
                         bool rigid = quaternionReady[i];
                         pose::Bone rigidMatrix{};

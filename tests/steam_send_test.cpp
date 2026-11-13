@@ -100,20 +100,21 @@ static void CapacityConfiguration()
         assert(result.Verified());
     }
     assert(writes == 3);
-    assert((values == std::array<int32_t, 4>{Capacity, Capacity, Capacity, 5000}));
-    values[0] = Capacity * 2;
+    assert((values == std::array<int32_t, 4>{BufferCapacity, MinRateCapacity, MaxRateCapacity, 5000}));
     assert(Apply(Settings[0], get, set).Verified() && writes == 3);
+    values[0] = 4 * 1024 * 1024;
+    assert(Apply(Settings[0], get, set).Verified() && values[0] == BufferCapacity && writes == 4);
     values[0] = 1024;
     auto rejected = Apply(Settings[0], get, [](int, int32_t) { return false; });
     assert(!rejected.Verified() && rejected.after.value == 1024);
     auto unreadable = Apply(Settings[0], [](int) { return Read{-1, 0, 0}; }, set);
-    assert(!unreadable.Verified() && writes == 3);
+    assert(!unreadable.Verified() && writes == 4);
     auto wrongType = Apply(Settings[0], [](int) { return Read{1, 3, 1024}; }, set);
-    assert(!wrongType.Verified() && writes == 3);
+    assert(!wrongType.Verified() && writes == 4);
     auto unverified = Apply(Settings[0], get, [](int, int32_t) { return true; });
     assert(!unverified.Verified()); // accepted write alone is not an effective-value check
-    values[1] = Capacity * 2;
-    assert(Apply(Settings[1], get, set).Verified() && writes == 3);
+    values[1] = MinRateCapacity * 2;
+    assert(Apply(Settings[1], get, set).Verified() && writes == 4);
 
     // Pinned Valve SNP_ClampSendRate, d534c19: the BBR probe cycle is a FIXME.
     auto valveClamp = [](int estimate, int minimum, int maximum) {
@@ -122,10 +123,10 @@ static void CapacityConfiguration()
         return std::clamp(estimate, minimum, maximum);
     };
     int rate = 4380 * 1000 / 40; // Initial rate at 40 ms RTT, not a bandwidth measurement.
-    for (int i = 0; i < 100; ++i) rate = valveClamp(rate, 256 * 1024, Capacity);
+    for (int i = 0; i < 100; ++i) rate = valveClamp(rate, 256 * 1024, MaxRateCapacity);
     assert(rate == 256 * 1024); // Raising only max cannot make this sender probe upwards.
-    rate = valveClamp(rate, Capacity, Capacity);
-    assert(rate == Capacity);
+    rate = valveClamp(rate, MinRateCapacity, MaxRateCapacity);
+    assert(rate == MinRateCapacity);
 }
 
 static void SplittingAndRetransmissions()
@@ -377,6 +378,46 @@ static void SaturatedNpcStream()
     assert(queue.counters.accepted[2] == Samples && queue.counters.playerStates == players);
 }
 
+static void LatestPoseReplacementAndAgeBound()
+{
+    Codec codec;
+    Queue queue;
+    // MsgControlPose (49): NpcsHeader(23) + controlBytes(2) + generation(4) + WireControl::id(2) + payload.
+    auto controlPose = [&](uint16_t id, uint8_t seqByte, size_t totalLen = 600) {
+        std::vector<uint8_t> p(totalLen, seqByte);
+        p[0] = 49;
+        p[25] = 1; p[26] = 0; p[27] = 0; p[28] = 0; // generation = 1
+        p[29] = static_cast<uint8_t>(id & 0xffu);
+        p[30] = static_cast<uint8_t>(id >> 8);
+        return Command(4, seqByte, false, p);
+    };
+    // Multiple poses for the same NPC replace in-place rather than building multi-second FIFO debt.
+    for (unsigned step = 1; step <= 20; ++step) {
+        auto pkt = controlPose(7, static_cast<uint8_t>(step));
+        assert(queue.Push(codec, pkt.data(), pkt.size(), step * 10));
+        assert(!(pkt[0] & 0x40u));
+    }
+    assert(queue.Depth() == 1);
+    assert(queue.counters.npcUpdatesDropped == 19);
+    assert(queue.counters.plainBytes == queue.counters.wireBytes); // zero range-coder re-compression
+    assert(queue.Drain([&](Item const& item) {
+        assert(item.Lane() == static_cast<uint16_t>(Priority::Pose));
+        assert(!(item.bytes[0] & 0x40u));
+        return Ok;
+    }) == Ok);
+    assert(queue.Depth() == 0 && queue.Bytes() == 0);
+
+    // Poses across many distinct NPCs never exceed MaxUnreliablePoseAgeMs or MaxUnreliablePoseBytes.
+    for (unsigned npc = 1; npc <= 300; ++npc) {
+        auto pkt = controlPose(static_cast<uint16_t>(npc), static_cast<uint8_t>(npc), 900);
+        assert(queue.Push(codec, pkt.data(), pkt.size(), npc * 5));
+    }
+    queue.EvictStaleUnreliablePoses(300 * 5);
+    assert(queue.Bytes() <= MaxUnreliablePoseBytes);
+    assert(queue.OldestAge(300 * 5) <= MaxUnreliablePoseAgeMs);
+    assert(queue.counters.npcUpdatesDropped > 100);
+}
+
 int ENET_CALLBACK main()
 {
     RetentionAndPriority();
@@ -388,5 +429,6 @@ int ENET_CALLBACK main()
     FragmentRoundtrip();
     PayloadSavings();
     SaturatedNpcStream();
+    LatestPoseReplacementAndAgeBound();
     std::puts("Steam queue: retained 25/41 (16=Timeout), independent priority, single reliability, exact compression, fragments and command retransmission dedup passed");
 }

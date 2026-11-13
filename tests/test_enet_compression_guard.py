@@ -66,7 +66,7 @@ class EnetCompressionGuardTests(unittest.TestCase):
 
     def test_live_transport_installs_logging_guards(self):
         source = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
-        self.assertIn("host->compressor.compress = &CompressDatagram;", source)
+        self.assertIn("host->compressor.compress = nullptr;", source)
         self.assertIn("host->compressor.decompress = &DecompressDatagram;", source)
         self.assertIn("guard: ENet compression empty_buffers=", source)
         self.assertIn("action=skip-empty-preserve-checkpoint", source)

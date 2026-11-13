@@ -855,7 +855,9 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
         // standing state (stage A: the client fell, its puppet on the host kept standing); take the stance first.
         // Not during an action: an attack changes the body's stance by itself, and setting it back started that
         // stance's standing loop, which cut the attack within 150 ms (stage V2: 44 of 919 attacks showed).
-        if (stanceSync && !acting && target.aniState >= 0 && static_cast<int>(entity.Routine.AniState) != target.aniState) {
+        const bool loopLock = acting && state.playing[0] && strstr(state.playing, "_Loop_") != nullptr;
+        if (stanceSync && (!acting || loopLock) && target.aniState >= 0 &&
+            static_cast<int>(entity.Routine.AniState) != target.aniState) {
             entity.Routine.AniState = static_cast<gEAniState>(target.aniState);
             *state.playing = '\0';
         }
@@ -870,7 +872,6 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             !strcmp(target.motion, state.playing) && static_cast<int32_t>(now - state.loopCheckAt) >= 0) {
             const bool idle = strstr(target.motion, "_Ambient_") != nullptr;
             state.loopCheckAt = now + (idle ? 1000 : 300);
-            if (!idle) state.actionUntil = now + 1200;  // still in the loop: the pose every frame would cut it (see below)
             char shows[128];
             CurrentMotion(instance, shows, sizeof(shows));
             if (!SlotRunning(instance) || (!idle && strcmp(shows, target.motion) != 0)) {
@@ -879,6 +880,8 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
                 // still frozen), and restarting it every 300 ms kept a standing mirror turning on the spot.
                 state.idleAsScriptAni = idle;
                 ++loopRestarts;
+            } else if (!idle) {
+                state.actionUntil = now + 1200;  // still in the loop: the pose every frame would cut it (see below)
             }
         }
         // Protocol 58: a new action number with the same motion name is a new start of it (a second attack alike), shown only

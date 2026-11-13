@@ -378,7 +378,7 @@ int main()
     assert(outward.peak <= 12 * 1024 && outward.Empty() && inward.Empty());
     assert(npcControlCreated == Crowd && npcControlAckAccepted == Crowd);
     assert(bandwidth.poseDeltas > 1000 && bandwidth.poseAcks < samples / 5);
-    assert(inward.poseAckMessages == npcAnchorsSent);
+    assert(inward.poseAckMessages >= npcAnchorsSent);
     assert(maxAnchorAckDelay > 2500);
     assert(bandwidth.poseAckMisses == 0 && bandwidth.poseDecodeFailures == 0);
     const double cold = outward.offeredCold / 2.0;

@@ -28,7 +28,7 @@ class SteamConnectTests(unittest.TestCase):
             executable.unlink(missing_ok=True)
 
     def test_wire_and_header_dependencies(self):
-        self.assertIn("Protocol = 78", (ROOT / "src" / "saving_policy.h").read_text(encoding="utf-8"))
+        self.assertIn("Protocol = 79", (ROOT / "src" / "saving_policy.h").read_text(encoding="utf-8"))
         header = (ROOT / "src" / "steam_connect.h").read_text(encoding="utf-8")
         includes = re.findall(r'^\s*#\s*include\s*([<"][^>"]+[>"])', header, re.MULTILINE)
         self.assertEqual([name for name in includes if name.startswith('"')], ['"relaywire.h"'])
@@ -167,8 +167,9 @@ class SteamConnectTests(unittest.TestCase):
         start = self.between(net, "bool Start(bool asHost)", "void Service(")
         service = self.between(net, "void Service(", "void Flush()")
         reconnect = self.between(net, "void Reconnect(void (*log)(char const*))", "\n}")
-        self.assertIn("CreateTransportHost(&target, isHost ? MaxPlayers - 1 : 1, createError)", start)
+        self.assertIn("CreateTransportHost(&bindAddress, isHost ? MaxPlayers - 1 : 1, createError)", start)
         self.assertIn("ConnectTransportHost(host, &target)", service)
+        self.assertIn("ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))", service)
         self.assertIn("ConnectTransportHost(host, &target)", reconnect)
         self.assertNotIn("enet_host_create(", net)
         self.assertNotIn("enet_host_connect(", net)
@@ -176,7 +177,7 @@ class SteamConnectTests(unittest.TestCase):
         for required in ("ChannelDefinitions = 7", "ChannelCount = 8", "Mtu = 1200",
                          "enet_host_create(address, peers, ChannelCount, 0, 0)",
                          "enet_host_compress_with_range_coder(host)", "ENET_SOCKOPT_RCVBUF",
-                         "ENET_SOCKOPT_SNDBUF", "enet_host_connect(host, address, ChannelCount, 0)"):
+                         "ENET_SOCKOPT_SNDBUF", "enet_host_connect(host, address, ChannelCount, data)"):
             self.assertIn(required, policy)
 
         queued = self.between(steam, "bool QueueDatagram(", "void DrainDatagrams(")

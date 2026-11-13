@@ -158,12 +158,12 @@ static void PumpSide(Relay& relay, unsigned direction)
         assert(pushed.valid && pushed.firstCommand == decoded.firstCommand &&
                pushed.command == decoded.command && pushed.commandBytes == decoded.commandBytes);
         if (relay.impaired && direction == 0 && !relay.refusedConnect) {
-            assert(capture.receivedDatagrams == 1 && capture.connect == 1 && compressed);
+            assert(capture.receivedDatagrams == 1 && capture.connect == 1 && !compressed);
             assert(decoded.firstCommand == ENET_PROTOCOL_COMMAND_CONNECT);
             assert(queue.Depth() == 1 && queue.Bytes() > 0);
             std::vector<uint8_t> refused;
             assert(queue.Drain([&](Item const& item) {
-                assert(item.Flags() == 37 && item.reliable && (item.bytes[0] & 0x40u));
+                assert(item.Flags() == 37 && item.reliable && !(item.bytes[0] & 0x40u));
                 refused = item.bytes;
                 return LimitExceeded;
             }) == LimitExceeded);
@@ -196,7 +196,7 @@ static void PumpSide(Relay& relay, unsigned direction)
                 capture.outboundCompressed += (item.bytes[0] & 0x40u) != 0;
                 if (relay.impaired && direction == 1 && outputCapture.verify && !relay.lostVerify) {
                     assert(relay.lostConnect && relay.captures[0].connect >= 2 &&
-                           capture.verify == 1 && outputCapture.compressedVerify == 1 && item.reliable);
+                           capture.verify == 1 && outputCapture.compressedVerify == 0 && item.reliable);
                     relay.lostVerify = true;
                     ++capture.submittedDatagrams;
                     return Ok; // Also lose the first accepted VERIFY_CONNECT.
@@ -303,8 +303,8 @@ static void ImpairedHandshake(ENetHost* client, ENetHost* server, Relay& relay)
     assert(peer);
     Until([&] { return cs.connected == 1 && ss.connected == 1; }, client, cs, server, ss, relay, 10);
     assert(relay.refusedConnect && relay.lostConnect && relay.lostVerify);
-    assert(relay.captures[0].connect >= 2 && relay.captures[0].compressedConnect >= 2);
-    assert(relay.captures[1].verify >= 2 && relay.captures[1].compressedVerify >= 2);
+    assert(relay.captures[0].connect >= 2 && relay.captures[0].compressedConnect == 0);
+    assert(relay.captures[1].verify >= 2 && relay.captures[1].compressedVerify == 0);
     assert(peer == cs.peer && ss.peer && ss.connectData == 0);
 
     SendChannel(client, cs.peer, 1, 0, g3t::net::ChannelReliable);
@@ -332,11 +332,129 @@ static void ImpairedHandshake(ENetHost* client, ENetHost* server, Relay& relay)
                 relay.captures[1].verify, relay.captures[1].compressedVerify);
 }
 
+static void DirectUdpCookiePunch()
+{
+    assert(enet_initialize() == 0);
+    ENetAddress bindAny{ENET_HOST_ANY, 0};
+    char const* error = nullptr;
+    ENetHost* server = g3t::net::CreateTransportHost(&bindAny, 1, error);
+    ENetHost* client = g3t::net::CreateTransportHost(&bindAny, 1, error);
+    assert(server && client && !error);
+    ENetAddress serverBound{}, clientBound{};
+    assert(enet_socket_get_address(server->socket, &serverBound) == 0 && serverBound.port);
+    assert(enet_socket_get_address(client->socket, &clientBound) == 0 && clientBound.port);
+    ENetAddress serverLo{}, clientLo{};
+    assert(enet_address_set_host_ip(&serverLo, "127.0.0.1") == 0);
+    assert(enet_address_set_host_ip(&clientLo, "127.0.0.1") == 0);
+    serverLo.port = serverBound.port;
+    clientLo.port = clientBound.port;
+
+    static uint8_t const cookie[16] = {0x91,0x42,0x7c,0x10,0xaa,0x55,0x33,0xef,
+                                       0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0};
+    static bool serverVerified = false, clientBidirectional = false;
+    static unsigned uninvitedDropped = 0;
+    static ENetAddress verifiedClient{}, verifiedServer{};
+    serverVerified = clientBidirectional = false;
+    uninvitedDropped = 0;
+
+    server->intercept = [](ENetHost* h, ENetEvent*) -> int {
+        if (h->receivedDataLength == 26 && std::memcmp(h->receivedData, "G3TPUNCH", 8) == 0) {
+            if (std::memcmp(h->receivedData + 8, cookie, 16) == 0) {
+                serverVerified = true;
+                verifiedClient = h->receivedAddress;
+                uint8_t reply[26] = {};
+                std::memcpy(reply, "G3TPUNCH", 8);
+                std::memcpy(reply + 8, cookie, 16);
+                reply[24] = 0x02u;
+                reply[25] = 1u;
+                ENetBuffer b{sizeof(reply), reply};
+                enet_socket_send(h->socket, &h->receivedAddress, &b, 1);
+            }
+            return 1;
+        }
+        if (serverVerified && Same(h->receivedAddress, verifiedClient)) return 0;
+        ++uninvitedDropped;
+        return 1;
+    };
+    client->intercept = [](ENetHost* h, ENetEvent*) -> int {
+        if (h->receivedDataLength == 26 && std::memcmp(h->receivedData, "G3TPUNCH", 8) == 0) {
+            if (std::memcmp(h->receivedData + 8, cookie, 16) == 0 && (h->receivedData[24] & 0x02u)) {
+                clientBidirectional = true;
+                verifiedServer = h->receivedAddress;
+            }
+            return 1;
+        }
+        return clientBidirectional && Same(h->receivedAddress, verifiedServer) ? 0 : 1;
+    };
+
+    // Uninvited UDP connect attempt from another socket must be dropped by intercept before ENet sees it.
+    ENetHost* stranger = g3t::net::CreateTransportHost(&bindAny, 1, error);
+    assert(stranger && !error);
+    assert(g3t::net::ConnectTransportHost(stranger, &serverLo, 0xdeadbeefu) != nullptr);
+    enet_host_flush(stranger);
+    State cs{}, ss{}, xs{};
+    for (int tick = 0; tick < 20; ++tick) {
+        Service(stranger, xs);
+        Service(server, ss);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(ss.connected == 0 && uninvitedDropped >= 1);
+
+    // Cookie-authenticated punch opens the direct path with zero compression and full channel delivery.
+    uint8_t probe[26] = {};
+    std::memcpy(probe, "G3TPUNCH", 8);
+    std::memcpy(probe + 8, cookie, 16);
+    probe[24] = 0x01u;
+    probe[25] = 2u;
+    ENetBuffer pbuf{sizeof(probe), probe};
+    assert(enet_socket_send(client->socket, &serverLo, &pbuf, 1) == 26);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!clientBidirectional && std::chrono::steady_clock::now() < deadline) {
+        Service(server, ss);
+        Service(client, cs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(serverVerified && clientBidirectional);
+
+    uint32_t tag = 0;
+    std::memcpy(&tag, cookie, sizeof(tag));
+    cs.round = ss.round = 7;
+    cs.other = 1;
+    ss.other = 0;
+    ENetPeer* directPeer = g3t::net::ConnectTransportHost(client, &verifiedServer, tag);
+    assert(directPeer);
+    while ((cs.connected != 1 || ss.connected != 1) && std::chrono::steady_clock::now() < deadline) {
+        Service(client, cs);
+        Service(server, ss);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(cs.connected == 1 && ss.connected == 1 && ss.connectData == tag);
+    for (unsigned ch = 0; ch < g3t::net::ChannelCount; ++ch) {
+        SendChannel(client, cs.peer, 7, 0, ch);
+        SendChannel(server, ss.peer, 7, 1, ch);
+    }
+    while ((cs.received != 8 || ss.received != 8) && std::chrono::steady_clock::now() < deadline) {
+        Service(client, cs);
+        Service(server, ss);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(cs.channelMask == 0xff && ss.channelMask == 0xff);
+    enet_host_destroy(stranger);
+    enet_host_destroy(client);
+    enet_host_destroy(server);
+    enet_deinitialize();
+    std::puts("direct ENet UDP cookie hole-punch and uninvited packet drop passed");
+}
+
 int ENET_CALLBACK main(int argc, char** argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "sizes") == 0) {
         CommandSizes();
         std::puts("all 13 native command sizes match");
+        return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "direct") == 0) {
+        DirectUdpCookiePunch();
         return 0;
     }
     const bool impaired = argc == 2 && std::strcmp(argv[1], "impaired") == 0;
@@ -352,7 +470,7 @@ int ENET_CALLBACK main(int argc, char** argv)
     assert(client && !error);
     for (auto host : {client, server}) {
         assert(host->channelLimit == g3t::net::ChannelCount && host->mtu == g3t::net::Mtu);
-        assert(host->compressor.context && host->compressor.compress && host->compressor.decompress);
+        assert(host->compressor.context && !host->compressor.compress && host->compressor.decompress);
     }
     Relay relay;
     assert(relay.codecs[0].Ready() && relay.codecs[1].Ready());
@@ -419,13 +537,13 @@ int ENET_CALLBACK main(int argc, char** argv)
         std::printf("round=%u connected=2 payloads=16 channels=8 departure=2 data=%08x\n",
                     round, static_cast<unsigned>(ss.connectData));
     }
-    assert(relay.captures[0].connect >= 3 && relay.captures[0].compressedConnect >= 3);
+    assert(relay.captures[0].connect >= 3 && relay.captures[0].compressedConnect == 0);
     assert(relay.captures[0].nonzeroConnect >= 1);
-    assert(relay.captures[1].verify >= 3 && relay.captures[1].compressedVerify >= 3);
+    assert(relay.captures[1].verify >= 3 && relay.captures[1].compressedVerify == 0);
     for (unsigned direction = 0; direction < 2; ++direction) {
         auto const& c = relay.captures[direction];
         assert(c.reliable >= 12 && c.unreliable >= 12 && c.definitions >= 3 && c.throttle >= 3);
-        assert(c.receivedDatagrams && c.submittedDatagrams && c.outboundCompressed);
+        assert(c.receivedDatagrams && c.submittedDatagrams && !c.outboundCompressed);
         assert(relay.queues[direction].Depth() == 0);
         std::printf("direction=%u packets=%u delivered=%u connect=%u compressed_connect=%u "
                     "verify=%u compressed_verify=%u ack_only=%u reliable=%u unreliable=%u definitions=%u throttle=%u\n",

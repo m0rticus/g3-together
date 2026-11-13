@@ -139,7 +139,7 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   with the existing 10-ms lag. The original unlimited fake DLL cannot reproduce
   Steam's send-buffer failure. Install test tooling only in authorized copies.
 
-Application protocol is **78**; both players need the matching build. Reserved control
+Application protocol is **79**; both players need the matching build. Reserved control
 and pose flags now describe motion overrides and reliable pinned anchors, and independent
 Rice keys permit zero references. Bone packing also selects reversible second-order
 spatial prediction when smaller. Baseline/ID envelopes retain their layouts.
@@ -497,7 +497,7 @@ to the first 40 records plus one sample per five seconds. Inventory presence is 
 While waiting, NPCs must ignore the body rather than rob it; ordinary nonlethal guard knock-outs still
 allow the existing native half-gold robbery. Check corpse/chest loot and partner trade remain normal.
 
-### Host-managed save/load acceptance (protocol 78)
+### Host-managed save/load acceptance (protocol 79)
 
 ### HUD notices without movement interruption
 

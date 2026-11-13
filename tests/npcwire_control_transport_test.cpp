@@ -133,7 +133,7 @@ int main()
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     RefusedMsg refusal{};
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 72, host 78") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 72, host 79") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 73;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -141,7 +141,7 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 73, host 78") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 73, host 79") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 76;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -149,7 +149,7 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 76, host 78") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 76, host 79") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     oldHello.version = 77;
     std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
@@ -157,7 +157,7 @@ int main()
     Deliver(&fakePeers[1], oldHandshake);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 77, host 78") != nullptr);
+    assert(std::strstr(refusal.reason, "protocol 77, host 79") != nullptr);
     assert(!fakePeers[1].data && !peers[3]);
     fakePeers[1].data = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
     transmissions.clear();
@@ -943,5 +943,39 @@ int main()
     contact.melee = PredictedMelee;
     assert(!SendHitNpc(1, rigidRecord.guid, -1, weapon, nullptr, HitUnjudged, 0, HitNoReaction, 0, contact));
     assert(transmissions.empty());
+
+    // Protocol 79: cross-channel reordered MsgControlPose (ChannelPoses overtaking ChannelDefinitions)
+    // must NOT count as npcRejected or log decode errors, must preserve PoseEssentialFlag contact edges,
+    // and must accept stretched (>128 ms) wire intervals.
+    isHost = true;
+    localId = 1;
+    fakeTime += 33;
+    rigidRecord.sent = fakeTime;
+    rigidRecord.contact = 1;
+    const uint8_t quietWire = npclease::EncodePoseIntervalWire(1000);
+    assert(npclease::DecodePoseIntervalWire(quietWire) >= 1000u);
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, rigidRecord, rigidBones, 80, 0, true, quietWire));
+    const auto delayedEssential = transmissions;
+    fakeTime += 33;
+    rigidRecord.sent = fakeTime;
+    rigidRecord.contact = 0;
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, rigidRecord, rigidBones, 80, 0, false, quietWire));
+    const auto fasterUnreliable = transmissions;
+    clientReceive(fasterUnreliable);
+    const unsigned rejectedBefore = npcRejected;
+    const unsigned appliedBeforeEssential = applied;
+    size_t decodeErrsBefore = 0;
+    for (auto const& l : logs)
+        if (l.find("compact NPC control decode failed") != std::string::npos) ++decodeErrsBefore;
+    clientReceive(delayedEssential);
+    size_t decodeErrsAfter = 0;
+    for (auto const& l : logs)
+        if (l.find("compact NPC control decode failed") != std::string::npos) ++decodeErrsAfter;
+    assert(npcRejected == rejectedBefore);
+    assert(decodeErrsAfter == decodeErrsBefore);
+    assert(applied == appliedBeforeEssential + 1 && appliedEssential && appliedInterval == quietWire);
+
     return 0;
 }

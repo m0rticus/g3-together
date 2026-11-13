@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STEAM_DLL_SHA256 = 'fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da'
 
 HOST_INI = """# G3 Together: this player hosts the campaign.
-# This package speaks protocol 78 with convergent NPC streams: both players need this same package.
+# This package speaks protocol 79 with convergent NPC streams: both players need this same package.
 role = host
 # Player name is taken from Steam automatically.
 # Invite a Steam friend, or they can choose Join Game. Steam and G3Together/steam_api.dll are required; no direct-IP fallback.
@@ -72,7 +72,7 @@ friendly_fire = 0
 # choice in its INI (default on); the host's INI ignores it.
 """
 CLIENT_INI = """# G3 Together: this player joins the host.
-# This package speaks protocol 78 with convergent NPC streams: both players need this same package.
+# This package speaks protocol 79 with convergent NPC streams: both players need this same package.
 role = client
 # Wait for the host's Steam invite or choose Join Game on the host; Steam is required.
 # Finds the host in invite mode only after you accept the request. Saved characters, personal state and companion ownership

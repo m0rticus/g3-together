@@ -7,7 +7,7 @@
 int main()
 {
     using namespace g3t::saving;
-    static_assert(Protocol == 78, "convergent NPC streams require protocol 78");
+    static_assert(Protocol == 79, "high-throughput uncompressed NPC streams require protocol 79");
     static_assert(g3t::npcwire::bones::Version == 74, "bone dictionary format version advances separately");
     const std::string world(32, 'a'), checkpoint(32, 'b'), previous(32, 'c');
     const Key alice{world, checkpoint, 123}, bob{world, checkpoint, 456};

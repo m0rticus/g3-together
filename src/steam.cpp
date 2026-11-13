@@ -21,7 +21,10 @@
 // every friend as a separate local peer (coop-anything's HXCoop pattern) and needs no change. The host's ENet still
 // listens only on loopback and admits sockets belonging to linked Steam peers.
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 #include "steam.h"
 #include "player_identity.h"
@@ -138,6 +141,20 @@ struct Api
     sbool(__cdecl* SetConfigValue)(void*, int value, int scope, intptr_t object, int type, void const* data);
     int(__cdecl* GetConfigValue)(void*, int value, int scope, intptr_t object, int* type, void* data, size_t* size);
     int(__cdecl* GetSessionConnectionInfo)(void*, void const* identity, void* info, void* status);
+    void*(__cdecl* AllocateMessage)(void*, int cbAllocateBuffer);
+    void*(__cdecl* Sockets)();
+    uint32_t(__cdecl* CreateListenSocketP2P)(void*, int localVirtualPort, int nOptions, void const* options);
+    uint32_t(__cdecl* ConnectP2P)(void*, void const* identityRemote, int remoteVirtualPort, int nOptions, void const* options);
+    int(__cdecl* AcceptConnection)(void*, uint32_t conn);
+    sbool(__cdecl* CloseConnection)(void*, uint32_t peer, int reason, char const* debug, sbool linger);
+    sbool(__cdecl* CloseListenSocket)(void*, uint32_t socket);
+    int(__cdecl* ConfigureConnectionLanes)(void*, uint32_t conn, int numLanes, int const* priorities, uint16_t const* weights);
+    void(__cdecl* SendMessages)(void*, int nMessages, void* const* messages, int64_t* outMessageNumberOrResult);
+    int(__cdecl* FlushMessagesOnConnection)(void*, uint32_t conn);
+    int(__cdecl* ReceiveOnConnection)(void*, uint32_t conn, void** messages, int maxMessages);
+    sbool(__cdecl* GetConnectionInfo)(void*, uint32_t conn, void* info);
+    int(__cdecl* GetConnectionRealTimeStatus)(void*, uint32_t conn, void* status, int numLanes, void* lanes);
+    int(__cdecl* FakeSteamAbi)(void*, uint32_t);
 } api;
 
 struct Export { void** slot; char const* name; };
@@ -187,6 +204,20 @@ Export const OptionalExports[] = {
     {reinterpret_cast<void**>(&api.SetConfigValue), "SteamAPI_ISteamNetworkingUtils_SetConfigValue"},
     {reinterpret_cast<void**>(&api.GetConfigValue), "SteamAPI_ISteamNetworkingUtils_GetConfigValue"},
     {reinterpret_cast<void**>(&api.GetSessionConnectionInfo), "SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo"},
+    {reinterpret_cast<void**>(&api.AllocateMessage), "SteamAPI_ISteamNetworkingUtils_AllocateMessage"},
+    {reinterpret_cast<void**>(&api.Sockets), "SteamAPI_SteamNetworkingSockets_SteamAPI_v012"},
+    {reinterpret_cast<void**>(&api.CreateListenSocketP2P), "SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P"},
+    {reinterpret_cast<void**>(&api.ConnectP2P), "SteamAPI_ISteamNetworkingSockets_ConnectP2P"},
+    {reinterpret_cast<void**>(&api.AcceptConnection), "SteamAPI_ISteamNetworkingSockets_AcceptConnection"},
+    {reinterpret_cast<void**>(&api.CloseConnection), "SteamAPI_ISteamNetworkingSockets_CloseConnection"},
+    {reinterpret_cast<void**>(&api.CloseListenSocket), "SteamAPI_ISteamNetworkingSockets_CloseListenSocket"},
+    {reinterpret_cast<void**>(&api.ConfigureConnectionLanes), "SteamAPI_ISteamNetworkingSockets_ConfigureConnectionLanes"},
+    {reinterpret_cast<void**>(&api.SendMessages), "SteamAPI_ISteamNetworkingSockets_SendMessages"},
+    {reinterpret_cast<void**>(&api.FlushMessagesOnConnection), "SteamAPI_ISteamNetworkingSockets_FlushMessagesOnConnection"},
+    {reinterpret_cast<void**>(&api.ReceiveOnConnection), "SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection"},
+    {reinterpret_cast<void**>(&api.GetConnectionInfo), "SteamAPI_ISteamNetworkingSockets_GetConnectionInfo"},
+    {reinterpret_cast<void**>(&api.GetConnectionRealTimeStatus), "SteamAPI_ISteamNetworkingSockets_GetConnectionRealTimeStatus"},
+    {reinterpret_cast<void**>(&api.FakeSteamAbi), "FakeSteam_GetAbiInfoV1"},
 };
 
 // Callback ids and the 32-bit layouts (playbook, "Struct layouts"): read with memcpy at these offsets.
@@ -199,12 +230,37 @@ enum : int {
     CbLobbyChatUpdate = 506,     // LobbyChatUpdate_t { u64 lobby; u64 changed; u64 by; u32 state at 24; }
     CbLobbyCreated = 513,        // LobbyCreated_t { int result; u64 lobby at 8; }
     CbCallCompleted = 703,       // SteamAPICallCompleted_t { u64 call; int callback; u32 size; }
+    CbConnectionStatusChanged = 1221, // SteamNetConnectionStatusChangedCallback_t { u32 conn; pad4; ConnectionInfo(696); i32 oldState; }
     CbSessionRequest = 1251,     // SteamNetworkingMessagesSessionRequest_t { identity at 0; }
     CbSessionFailed = 1252,      // SteamNetworkingMessagesSessionFailed_t { connection info, its identity at 0; }
 };
 enum : int { SendUnreliable = 0, SendNoNagle = 1, SendReliable = 8, SendAutoRestart = 32 };
 enum : int { ResultOk = 1 };
 enum : int { ChannelData = 0, ChannelControl = 1 };
+constexpr int P2PVirtualPort = 1;
+constexpr int LaneCount = 4;
+#pragma pack(push, 8)
+struct OutboundSocketMessage {
+    void* data = nullptr;
+    int32_t size = 0;
+    uint32_t conn = 0;
+    uint8_t identityPeer[136] = {};
+    int64_t connUserData = 0;
+    int64_t timeReceived = 0;
+    int64_t messageNumber = 0;
+    void(__cdecl* freeData)(void*) = nullptr;
+    void(__cdecl* release)(void*) = nullptr;
+    int32_t channel = 0;
+    int32_t flags = 0;
+    int64_t userData = 0;
+    uint16_t lane = 0;
+    uint16_t pad = 0;
+};
+static_assert(offsetof(OutboundSocketMessage, release) == 0xb4 &&
+              offsetof(OutboundSocketMessage, flags) == 0xbc &&
+              offsetof(OutboundSocketMessage, lane) == 0xc8,
+              "SteamNetworkingMessage_t 32-bit ABI mismatch");
+#pragma pack(pop)
 constexpr int LobbyFriendsOnly = 1;
 constexpr int FriendFlagImmediate = 4;
 constexpr uint32_t GothicAppId = 39500;
@@ -231,6 +287,15 @@ struct Remote
     latency::Ping ping;
     SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
     unsigned short relayPort = 0;
+    uint32_t p2pConn = 0;
+    bool p2pConnected = false, p2pLanesConfigured = false;
+    bool haveDirectCookie = false, directReady = false;
+    uint8_t directCookie[16] = {};
+    DirectEndpoint directCandidates[8] = {};
+    unsigned directCandidateCount = 0;
+    uint32_t directPeerIpv4 = 0;
+    uint16_t directPeerPort = 0;
+    uint32_t lastDirectOfferSent = 0;
     unsigned toEnet = 0, toSteam = 0;
     send::Queue pending;
     uint64_t steamReliableOk = 0, steamUnreliableOk = 0, steamFailed[128] = {};
@@ -239,9 +304,11 @@ struct Remote
 struct Skipped { u64 lobby; uint32_t until; };  // until 0: for good (not a G3 Together lobby)
 
 bool ready = false, tried = false, winsockStarted = false, apiInitialized = false;
+bool socketsLaneTransport = false, directUdpEnabled = false;
+uint32_t listenSocketP2P = 0;
 char error[256] = "";
 HSteamPipe pipe = 0;
-void *user = nullptr, *matchmaking = nullptr, *friends = nullptr, *messages = nullptr;
+void *user = nullptr, *matchmaking = nullptr, *friends = nullptr, *messages = nullptr, *sockets = nullptr;
 void* networkingUtils = nullptr;
 u64 me = 0;
 char persona[64] = "";
@@ -309,11 +376,16 @@ struct Published
     u64 accounts[MaxRemotes] = {};
     uint64_t generations[MaxRemotes] = {};
     char names[MaxRemotes][24] = {}, playerName[24] = {};
+    DirectOffer directOffers[MaxRemotes] = {};
+    DirectEndpoint verifiedDirect[MaxRemotes] = {};
     char hostName[64] = {}, error[256] = {}, status[900] = {};
     Connection connection;
     TrafficCounters traffic;
 } published;
 std::mutex publishedMutex;
+DirectEndpoint registeredDirect[MaxRemotes] = {};
+uint64_t registeredDirectAccount[MaxRemotes] = {};
+uint64_t registeredDirectGen[MaxRemotes] = {};
 std::vector<RelayDrop> relayDrops;
 struct RelayClose { uint64_t account, generation; char reason[160]; };
 std::vector<RelayClose> relayCloses;
@@ -380,6 +452,16 @@ void Publish()
         if (r.linked) {
             next.ports[i] = r.relayPort; next.accounts[i] = r.id; next.generations[i] = r.generation;
             strcpy_s(next.names[i], r.name);
+            if (directUdpEnabled && r.haveDirectCookie) {
+                auto& offer = next.directOffers[i];
+                offer.account = r.id;
+                offer.generation = r.generation;
+                std::memcpy(offer.cookie, r.directCookie, sizeof(offer.cookie));
+                offer.candidateCount = r.directCandidateCount;
+                for (unsigned c = 0; c < r.directCandidateCount && c < 8; ++c)
+                    offer.candidates[c] = r.directCandidates[c];
+                offer.ready = r.directReady && r.directCandidateCount != 0;
+            }
         }
         if (!isHost && r.id == owner) {
             next.hostLinked = r.linked;
@@ -414,6 +496,204 @@ void Identity(char (&buffer)[160], u64 id)
     api.IdentitySetSteamId(buffer, id);
 }
 
+uint32_t CookieTag(uint8_t const cookie[16])
+{
+    uint32_t tag = 0;
+    std::memcpy(&tag, cookie, sizeof(tag));
+    return tag ? tag : 0x67337431u;
+}
+
+void ConfigureSocketOptions(int scope, intptr_t handle)
+{
+    if (!networkingUtils || !api.SetConfigValue) return;
+    int32_t ice = config::IceEnableAll;
+    api.SetConfigValue(networkingUtils, config::P2PTransportIceEnable, scope, handle, config::Int32, &ice);
+    int32_t buf = config::BufferCapacity;
+    api.SetConfigValue(networkingUtils, config::SendBufferSize, scope, handle, config::Int32, &buf);
+    int32_t minRate = config::MinRateCapacity;
+    api.SetConfigValue(networkingUtils, config::SendRateMin, scope, handle, config::Int32, &minRate);
+    int32_t maxRate = config::MaxRateCapacity;
+    api.SetConfigValue(networkingUtils, config::SendRateMax, scope, handle, config::Int32, &maxRate);
+}
+
+bool ConfigurePeerLanes(uint32_t conn)
+{
+    if (!socketsLaneTransport || !conn) return false;
+    static int const priorities[LaneCount] = {0, 1, 2, 3};
+    static uint16_t const weights[LaneCount] = {8, 4, 2, 1};
+    const int rc = api.ConfigureConnectionLanes(sockets, conn, LaneCount, priorities, weights);
+    if (rc != ResultOk)
+        Logf("steam-send: ConfigureConnectionLanes conn=%u failed result=%d", conn, rc);
+    return rc == ResultOk;
+}
+
+void ClosePeerP2P(Remote& r)
+{
+    if (r.p2pConn && sockets && api.CloseConnection)
+        api.CloseConnection(sockets, r.p2pConn, 0, "session ended", 0);
+    r.p2pConn = 0;
+    r.p2pConnected = r.p2pLanesConfigured = false;
+}
+
+void OpenClientP2P(Remote& r)
+{
+    if (!socketsLaneTransport || isHost || r.p2pConn) return;
+    char identity[160];
+    Identity(identity, r.id);
+    r.p2pConn = api.ConnectP2P(sockets, identity, P2PVirtualPort, 0, nullptr);
+    if (!r.p2pConn) {
+        Logf("steam-send: ConnectP2P to %llu failed; keeping Messages fallback", r.id);
+        return;
+    }
+    ConfigureSocketOptions(config::ConnectionScope, static_cast<intptr_t>(r.p2pConn));
+    r.p2pLanesConfigured = ConfigurePeerLanes(r.p2pConn);
+    Logf("steam-send: ConnectP2P peer=%llu conn=%u vport=%d lanes=%u ice=all",
+         r.id, r.p2pConn, P2PVirtualPort, r.p2pLanesConfigured ? LaneCount : 0u);
+}
+
+unsigned GatherLocalIpv4s(uint32_t (&out)[8])
+{
+    unsigned count = 0;
+    auto addUnique = [&](uint32_t netIpv4) {
+        if (!netIpv4 || netIpv4 == INADDR_NONE || count >= 8) return;
+        for (unsigned i = 0; i < count; ++i)
+            if (out[i] == netIpv4) return;
+        out[count++] = netIpv4;
+    };
+    char allowLoopback[8] = {};
+    if (GetEnvironmentVariableA("G3T_DIRECT_UDP_ALLOW_LOOPBACK", allowLoopback, sizeof(allowLoopback)) > 0 &&
+        allowLoopback[0] == '1') {
+        addUnique(htonl(INADDR_LOOPBACK));
+    }
+    SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (probe != INVALID_SOCKET) {
+        alignas(SOCKET_ADDRESS_LIST) char listBuf[1024] = {};
+        DWORD returned = 0;
+        if (WSAIoctl(probe, SIO_ADDRESS_LIST_QUERY, nullptr, 0, listBuf, sizeof(listBuf),
+                     &returned, nullptr, nullptr) == 0) {
+            auto const* list = reinterpret_cast<SOCKET_ADDRESS_LIST const*>(listBuf);
+            for (INT i = 0; i < list->iAddressCount && count < 8; ++i) {
+                if (!list->Address[i].lpSockaddr ||
+                    list->Address[i].iSockaddrLength < static_cast<INT>(sizeof(sockaddr_in)))
+                    continue;
+                auto const* sin = reinterpret_cast<sockaddr_in const*>(list->Address[i].lpSockaddr);
+                if (sin->sin_family != AF_INET) continue;
+                const uint32_t hostOrder = ntohl(sin->sin_addr.s_addr);
+                if ((hostOrder >> 24) == 127 || hostOrder == 0) continue;
+                addUnique(sin->sin_addr.s_addr);
+            }
+        }
+        closesocket(probe);
+    }
+    return count;
+}
+
+bool ExtractReflexiveIpv4(diagnostics::ConnectionInfo const& info, uint32_t& netIpv4)
+{
+    for (unsigned i = 0; i < 10; ++i)
+        if (info.remoteAddress[i] != 0) return false;
+    if (info.remoteAddress[10] != 0xff || info.remoteAddress[11] != 0xff) return false;
+    std::memcpy(&netIpv4, info.remoteAddress + 12, 4);
+    const uint32_t hostOrder = ntohl(netIpv4);
+    return hostOrder != 0 && (hostOrder >> 24) != 127 && !(info.flags & diagnostics::Relayed);
+}
+
+void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port)
+{
+    if (!netIpv4 || !port || r.directCandidateCount >= 8) return;
+    for (unsigned i = 0; i < r.directCandidateCount; ++i)
+        if (r.directCandidates[i].hostIpv4 == netIpv4 && r.directCandidates[i].port == port)
+            return;
+    r.directCandidates[r.directCandidateCount++] = DirectEndpoint{netIpv4, port};
+}
+
+int RawSend(u64 to, int flags, int channel, void const* data, unsigned size);
+
+void SendDirectUdpControl(Remote& r)
+{
+    if (!directUdpEnabled || !enetPort || !r.haveDirectCookie) return;
+    uint32_t localIps[8] = {};
+    const unsigned ipCount = GatherLocalIpv4s(localIps);
+    // Wire: 'U'(1) + generation:u64(8) + cookie(16) + enetPort:u16(2) + ipCount:u8(1) + ips(4*N) = max 60 bytes
+    uint8_t frame[60] = {};
+    frame[0] = 'U';
+    std::memcpy(frame + 1, &r.generation, 8);
+    std::memcpy(frame + 9, r.directCookie, 16);
+    std::memcpy(frame + 25, &enetPort, 2);
+    frame[27] = static_cast<uint8_t>(ipCount);
+    for (unsigned i = 0; i < ipCount; ++i)
+        std::memcpy(frame + 28 + i * 4, &localIps[i], 4);
+    if (RawSend(r.id, SendReliable, ChannelControl, frame, 28 + ipCount * 4) == ResultOk)
+        r.lastDirectOfferSent = Now() ? Now() : 1;
+}
+
+void RecordAcceptedDataTraffic(void const* data, unsigned size, std::size_t encodedSize)
+{
+    ++traffic.txDatagrams;
+    traffic.txBytes += size;
+    traffic.txEnvelopeBytes += encodedSize;
+    ++traffic.txDataDatagrams;
+    traffic.txDataBytes += size;
+    auto const* bytes = static_cast<uint8_t const*>(data);
+    EnetPacketParse enet;
+    if (size >= 2 && !(bytes[0] & 0x40u)) {
+        if (!ParseEnetDataPacket(bytes, size, &enet)) ++traffic.txEnetParseFailures;
+        else {
+            traffic.txEnetProtocolBytes += enet.protocolBytes;
+            traffic.txEnetAckBytes += enet.ackBytes;
+        }
+    } else {
+        std::vector<uint8_t> plain;
+        if (!sendCodec || !sendCodec->Decode(data, size, plain, &enet) || !enet.valid)
+            ++traffic.txEnetParseFailures;
+        else {
+            traffic.txEnetProtocolBytes += enet.protocolBytes;
+            traffic.txEnetAckBytes += enet.ackBytes;
+        }
+    }
+}
+
+int RawDataSend(Remote& r, send::Item const& item)
+{
+    const unsigned size = static_cast<unsigned>(item.bytes.size());
+    if (!socketsLaneTransport || !r.p2pConn || !r.p2pConnected || !r.p2pLanesConfigured || !api.AllocateMessage)
+        return RawSend(r.id, item.Flags(), ChannelData, item.bytes.data(), size);
+    char packet[RelayMaxEnvelopeSize];
+    if (!lobby || size > RelayPayloadLimit) return 2;
+    std::size_t encodedSize = 0;
+    if (!RelayEncode(lobby, GetConfig().sessionId, item.bytes.data(), size, packet, sizeof(packet), &encodedSize))
+        return 2;
+    auto* msg = static_cast<OutboundSocketMessage*>(
+        api.AllocateMessage(networkingUtils, static_cast<int>(encodedSize)));
+    if (!msg || !msg->data) {
+        if (msg) api.MessageRelease(msg);
+        return 2;
+    }
+    std::memcpy(msg->data, packet, encodedSize);
+    msg->conn = r.p2pConn;
+    msg->flags = item.Flags() & ~SendAutoRestart;
+    msg->lane = item.Lane() < LaneCount ? item.Lane() : static_cast<uint16_t>(LaneCount - 1);
+    void* batch[1] = {msg};
+    int64_t numberOrResult = 0;
+    api.SendMessages(sockets, 1, batch, &numberOrResult);
+    const int result = numberOrResult > 0 ? ResultOk
+        : numberOrResult < 0 ? static_cast<int>(-numberOrResult) : 2;
+    if (result == ResultOk) {
+        ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
+        RecordAcceptedDataTraffic(item.bytes.data(), size, encodedSize);
+    } else {
+        ++r.steamFailed[result >= 0 && result < 128 ? result : 0];
+        ++sendFailures;
+        const uint32_t now = Now();
+        if (!lastSendFailure || now - lastSendFailure >= 5000) {
+            lastSendFailure = now ? now : 1;
+            Logf("steam: P2P lane=%u message to %llu failed (result=%d bytes=%u failures=%u)",
+                 static_cast<unsigned>(msg->lane), r.id, result, size, sendFailures);
+        }
+    }
+    return result;
+}
+
 int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
 {
     char packet[RelayMaxEnvelopeSize];
@@ -443,23 +723,12 @@ int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
             lastSendFailure = now ? now : 1;
             Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)", to, result, channel, size, sendFailures);
         }
+    } else if (channel == ChannelData) {
+        RecordAcceptedDataTraffic(data, size, encodedSize);
     } else {
         ++traffic.txDatagrams;
         traffic.txBytes += size;
         traffic.txEnvelopeBytes += encodedSize;
-        if (channel == ChannelData) {
-            ++traffic.txDataDatagrams;
-            traffic.txDataBytes += size;
-            EnetPacketParse enet;
-            std::vector<uint8_t> plain;
-            const bool decoded = sendCodec && sendCodec->Decode(data, size, plain);
-            if (!decoded || !ParseEnetDataPacket(plain.data(), plain.size(), &enet))
-                ++traffic.txEnetParseFailures;
-            else {
-                traffic.txEnetProtocolBytes += enet.protocolBytes;
-                traffic.txEnetAckBytes += enet.ackBytes;
-            }
-        }
     }
     return result;
 }
@@ -568,10 +837,16 @@ void RecordClientEnd(char const* why, connect::ClientFlow::State before)
 void InvalidatePublished(u64 account, uint64_t generation)
 {
     for (int i = 0; i < MaxRemotes; ++i) {
+        if (registeredDirectAccount[i] == account && registeredDirectGen[i] == generation) {
+            registeredDirect[i] = {};
+            registeredDirectAccount[i] = registeredDirectGen[i] = 0;
+        }
         if (published.accounts[i] != account || published.generations[i] != generation) continue;
         published.ports[i] = 0;
         published.accounts[i] = published.generations[i] = 0;
         published.names[i][0] = '\0';
+        published.directOffers[i] = {};
+        published.verifiedDirect[i] = {};
         if (isHost && published.linked > 0) --published.linked;
     }
     if (!isHost && published.hostGeneration == generation) {
@@ -605,6 +880,7 @@ void Drop(Remote* r, char const* why)
         InvalidatePublished(drop.account, drop.generation);
         relayDrops.push_back(drop);
     }
+    ClosePeerP2P(*r);
     char identity[160];
     Identity(identity, r->id);
     api.CloseSession(messages, identity);
@@ -707,6 +983,7 @@ void LeaveLobby()
                 relayDrops.push_back(drop);
             }
             Control(r.id, 'B', true);
+            ClosePeerP2P(r);
             char identity[160];
             Identity(identity, r.id);
             api.CloseSession(messages, identity);
@@ -1336,6 +1613,54 @@ void OnCallback(int callback, char const* p, int size)
         std::memcpy(&b, p + 8, 8);
         OnLobbyInvite(a, b);
         break;
+    case CbConnectionStatusChanged: {
+        if (!socketsLaneTransport || size < static_cast<int>(8 + sizeof(diagnostics::ConnectionInfo) + 4)) break;
+        uint32_t conn = 0;
+        diagnostics::ConnectionInfo info{};
+        std::memcpy(&conn, p, 4);
+        std::memcpy(&info, p + 8, sizeof(info));
+        a = api.IdentityGetSteamId(info.identity);
+        if (info.state == 1 && isHost && listenSocketP2P && info.listenSocket == listenSocketP2P) {
+            Remote* r = lobby && a && (InLobby(a) || Find(a)) ? Get(a) : nullptr;
+            if (!r) {
+                api.CloseConnection(sockets, conn, 0, "unauthorized peer", 0);
+                break;
+            }
+            if (r->p2pConn && r->p2pConn != conn) ClosePeerP2P(*r);
+            ConfigureSocketOptions(config::ConnectionScope, static_cast<intptr_t>(conn));
+            const int rc = api.AcceptConnection(sockets, conn);
+            if (rc == ResultOk) {
+                r->p2pConn = conn;
+                r->p2pConnected = false;
+                r->p2pLanesConfigured = ConfigurePeerLanes(conn);
+                Logf("steam-send: P2P connection accepted peer=%llu conn=%u lanes=%u ice=all",
+                     a, conn, r->p2pLanesConfigured ? LaneCount : 0u);
+            } else {
+                Logf("steam-send: AcceptConnection peer=%llu conn=%u failed result=%d", a, conn, rc);
+                api.CloseConnection(sockets, conn, 0, "accept failed", 0);
+            }
+        } else if (info.state == diagnostics::Connected) {
+            if (Remote* r = Find(a); r && r->p2pConn == conn) {
+                r->p2pConnected = true;
+                if (!r->p2pLanesConfigured) r->p2pLanesConfigured = ConfigurePeerLanes(conn);
+                uint32_t reflexiveIp = 0;
+                if (r->directCandidateCount && ExtractReflexiveIpv4(info, reflexiveIp))
+                    AddDirectCandidate(*r, reflexiveIp, r->directCandidates[0].port);
+                Logf("steam-send: P2P lane session connected peer=%llu conn=%u lanes=%u relayed=%u",
+                     a, conn, r->p2pLanesConfigured ? LaneCount : 0u, (info.flags & diagnostics::Relayed) ? 1u : 0u);
+            }
+        } else if (info.state == 4 || info.state == 5) {
+            if (Remote* r = Find(a); r && r->p2pConn == conn) {
+                Logf("steam-send: P2P lane session closed peer=%llu conn=%u state=%d reason=%d",
+                     a, conn, info.state, info.endReason);
+                ClosePeerP2P(*r);
+                if (!isHost && r->linked) OpenClientP2P(*r);
+            } else if (conn) {
+                api.CloseConnection(sockets, conn, 0, nullptr, 0);
+            }
+        }
+        break;
+    }
     case CbSessionRequest: {
         a = api.IdentityGetSteamId(p);
         // Host: members of its lobby, and (invite mode) Steam friends, who may only ask to join. Strangers never get a session
@@ -1401,8 +1726,17 @@ void OnControl(Remote& r, char const* data, int size)
                 AfterHost("hello", before, hostFlow.Linked(r.id));
                 Logf("connect: connected: partner %llu (%s) is linked to this game", r.id, NameOf(r.id));
             }
+            if (directUdpEnabled && !r.haveDirectCookie) {
+                if (BCryptGenRandom(nullptr, r.directCookie, sizeof(r.directCookie),
+                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
+                    r.haveDirectCookie = true;
+                }
+            }
         }
-        if (r.linked) Control(r.id, 'W', true);
+        if (r.linked) {
+            if (directUdpEnabled && r.haveDirectCookie) SendDirectUdpControl(r);
+            Control(r.id, 'W', true);
+        }
         break;
     case 'W':
         if (size != 1) break;
@@ -1410,6 +1744,7 @@ void OnControl(Remote& r, char const* data, int size)
             r.linked = true;
             r.linkedAt = clientLinkedAt = Now();
             clientHadLink = true;
+            OpenClientP2P(r);
             Logf("steam: welcomed by the host %s; ENet goes over Steam now", hostName);
             if (connectionMode == connect::Mode::Invite) {
                 const connect::ClientFlow::State before = clientFlow.state();
@@ -1418,6 +1753,54 @@ void OnControl(Remote& r, char const* data, int size)
             }
         }
         break;
+    case 'U': {
+        if (!directUdpEnabled || size < 28) break;
+        uint64_t offerGen = 0;
+        uint8_t cookie[16] = {};
+        uint16_t peerPort = 0;
+        const unsigned ipCount = static_cast<unsigned char>(data[27]);
+        if (ipCount > 8 || size != static_cast<int>(28 + ipCount * 4)) break;
+        std::memcpy(&offerGen, data + 1, 8);
+        std::memcpy(cookie, data + 9, 16);
+        std::memcpy(&peerPort, data + 25, 2);
+        if (!peerPort) break;
+        if (isHost) {
+            if (!r.linked || !r.haveDirectCookie || offerGen != r.generation ||
+                std::memcmp(cookie, r.directCookie, 16) != 0)
+                break;
+        } else {
+            if (r.id != owner) break;
+            std::memcpy(r.directCookie, cookie, 16);
+            r.haveDirectCookie = true;
+        }
+        r.directCandidateCount = 0;
+        for (unsigned i = 0; i < ipCount; ++i) {
+            uint32_t netIp = 0;
+            std::memcpy(&netIp, data + 28 + i * 4, 4);
+            AddDirectCandidate(r, netIp, peerPort);
+        }
+        if (api.GetSessionConnectionInfo) {
+            char identity[160];
+            Identity(identity, r.id);
+            diagnostics::ConnectionInfo info{};
+            diagnostics::SessionStatus status{};
+            if (api.GetSessionConnectionInfo(messages, identity, &info, &status) == diagnostics::Connected) {
+                uint32_t reflexiveIp = 0;
+                if (ExtractReflexiveIpv4(info, reflexiveIp)) AddDirectCandidate(r, reflexiveIp, peerPort);
+            }
+        }
+        if (r.p2pConn && r.p2pConnected && api.GetConnectionInfo) {
+            diagnostics::ConnectionInfo info{};
+            uint32_t reflexiveIp = 0;
+            if (api.GetConnectionInfo(sockets, r.p2pConn, &info) && ExtractReflexiveIpv4(info, reflexiveIp))
+                AddDirectCandidate(r, reflexiveIp, peerPort);
+        }
+        r.directReady = r.directCandidateCount != 0;
+        if (!isHost && r.haveDirectCookie) SendDirectUdpControl(r);
+        Logf("steam: direct UDP endpoint exchange peer=%llu port=%u candidates=%u ready=%u",
+             r.id, static_cast<unsigned>(peerPort), r.directCandidateCount, r.directReady ? 1u : 0u);
+        break;
+    }
     case 'P':
         if (size == 9) {
             char pong[9];
@@ -1516,6 +1899,42 @@ void Receive(int channel)
     ++receiveCaps;
 }
 
+void ReceiveP2P()
+{
+    if (!socketsLaneTransport || !api.ReceiveOnConnection) return;
+    void* batch[32];
+    for (auto& r : remotes) {
+        if (!r.id || !r.p2pConn) continue;
+        for (int rounds = 0; rounds < 16; ++rounds) {
+            const int count = api.ReceiveOnConnection(sockets, r.p2pConn, batch, 32);
+            if (count < 0) ++receiveFailures;
+            if (count <= 0) break;
+            for (int i = 0; i < count; ++i) {
+                char const* m = static_cast<char const*>(batch[i]);
+                char const* data = nullptr;
+                int size = 0;
+                std::memcpy(&data, m, sizeof(data));
+                std::memcpy(&size, m + 4, sizeof(size));
+                void const* payload = nullptr;
+                std::size_t payloadSize = 0;
+                if (lobby && size >= 0 &&
+                    RelayDecode(data, static_cast<std::size_t>(size), lobby, GetConfig().sessionId, &payload, &payloadSize) &&
+                    payloadSize > 0) {
+                    ++traffic.rxDatagrams;
+                    traffic.rxBytes += payloadSize;
+                    traffic.rxEnvelopeBytes += static_cast<std::size_t>(size);
+                    r.heard = Now();
+                    OnData(r, static_cast<char const*>(payload), static_cast<int>(payloadSize));
+                } else {
+                    ++isolatedDrops;
+                }
+                api.MessageRelease(batch[i]);
+            }
+            if (rounds == 15) ++receiveCaps;
+        }
+    }
+}
+
 bool QueueDatagram(Remote& r, void const* data, unsigned size)
 {
     try {
@@ -1558,13 +1977,20 @@ bool QueueDatagram(Remote& r, void const* data, unsigned size)
 void DrainDatagrams(Remote& r)
 {
     try {
-        r.pending.counters.peakAge = (std::max)(r.pending.counters.peakAge, r.pending.OldestAge(Now()));
+        const uint32_t now = Now();
+        r.pending.EvictStaleUnreliablePoses(now);
+        r.pending.counters.peakAge = (std::max)(r.pending.counters.peakAge, r.pending.OldestAge(now));
+        bool flushedP2P = false;
         const int result = r.pending.Drain([&](send::Item const& item) {
-            const int sent = RawSend(r.id, item.Flags(), ChannelData, item.bytes.data(),
-                                     static_cast<unsigned>(item.bytes.size()));
-            if (sent == ResultOk) ++r.toSteam;
+            const int sent = RawDataSend(r, item);
+            if (sent == ResultOk) {
+                ++r.toSteam;
+                flushedP2P = flushedP2P || (socketsLaneTransport && r.p2pConn && r.p2pConnected);
+            }
             return sent;
         });
+        if (flushedP2P && api.FlushMessagesOnConnection && r.p2pConn)
+            api.FlushMessagesOnConnection(sockets, r.p2pConn);
         if (result != ResultOk && !send::Retryable(result)) {
             Logf("steam-send: peer=%llu action=close-session fatal_result=%d pending_datagrams=%zu pending_bytes=%zu",
                  r.id, result, r.pending.Depth(), r.pending.Bytes());
@@ -1622,7 +2048,10 @@ void SendDiagnostics(uint32_t now)
         bool verified = networkingConfigured;
         for (unsigned i = 0; i < 4; ++i) {
             current[i] = ReadNetworkingConfig(config::Settings[i].id);
-            verified = verified && current[i].Valid() && current[i].value >= networkingConfig[i].requested;
+            const bool ok = config::Settings[i].exact
+                ? current[i].value == networkingConfig[i].requested
+                : current[i].value >= networkingConfig[i].requested;
+            verified = verified && current[i].Valid() && ok;
         }
         Logf("steam-send: config-current scope=global verified=%u connection_config_verified=0 "
              "send_buffer=%d send_buffer_valid=%u send_rate_min=%d send_rate_min_valid=%u "
@@ -1645,16 +2074,17 @@ void SendDiagnostics(uint32_t now)
              c.retries, c.duplicates);
         Logf("steam-send: peer=%llu queue_datagrams=%zu queue_bytes=%zu oldest_ms=%u "
              "peak_datagrams=%zu peak_bytes=%zu peak_oldest_ms=%u plain_bytes=%llu wire_bytes=%llu "
-             "unclassified=%llu action=retry-retained-independent-priority npc_updates_dropped=0",
+             "unclassified=%llu action=retry-retained-independent-priority npc_updates_dropped=%llu",
              r.id, r.pending.Depth(), r.pending.Bytes(), r.pending.OldestAge(now),
              c.peakDepth, c.peakBytes, (std::max)(c.peakAge, r.pending.OldestAge(now)),
-             c.plainBytes, c.wireBytes, c.unclassified);
+             c.plainBytes, c.wireBytes, c.unclassified, c.npcUpdatesDropped);
         Logf("steam-send: peer=%llu steam_reliable_ok=%llu steam_unreliable_ok=%llu "
              "data_flags=%d data_reliability=ENet-only config_verified=%u send_buffer=%d send_rate_min=%d "
-             "send_rate_max=%d nagle_us=%d channels=data:0,control:1 channel_priority_lanes=0",
+             "send_rate_max=%d nagle_us=%d channels=data:0,control:1 channel_priority_lanes=%u",
              r.id, r.steamReliableOk, r.steamUnreliableOk, send::AutoRestart | send::NoDelay | send::NoNagle,
              networkingConfigured ? 1u : 0u, networkingConfig[0].after.value, networkingConfig[1].after.value,
-             networkingConfig[2].after.value, networkingConfig[3].after.value);
+             networkingConfig[2].after.value, networkingConfig[3].after.value,
+             (socketsLaneTransport && r.p2pConn && r.p2pLanesConfigured) ? LaneCount : 0u);
         if (api.GetSessionConnectionInfo) {
             char identity[160];
             Identity(identity, r.id);
@@ -1904,10 +2334,15 @@ bool ConfigureNetworking()
              setting.name, applied.before.value, applied.requested, applied.after.value,
              applied.before.result, applied.after.result,
              !applied.attempted ? "unchanged" : applied.accepted ? "accepted" : "rejected",
-             applied.Verified() ? 1u : 0u, setting.id == config::SendRateMin ? "manual-send-rate-floor" :
+             applied.Verified() ? 1u : 0u,
+             setting.id == config::SendBufferSize ? "bounded-buffer" :
+                 setting.id == config::SendRateMin ? "manual-send-rate-floor" :
                  setting.capacity ? "capacity-headroom" : "preserve-default");
         verified = verified && applied.Verified();
     }
+    int32_t iceAll = config::IceEnableAll;
+    if (api.SetConfigValue(networkingUtils, config::P2PTransportIceEnable, config::GlobalScope, 0, config::Int32, &iceAll))
+        Log("steam-send: config scope=global name=P2P_Transport_ICE_Enable requested=7 action=prefer-direct-ice");
     networkingConfigured = verified;
     Log("steam-send: rate_policy=manual-headroom adaptive_bandwidth_probe=not-assumed "
         "queued-data-only=1 warning=offered-traffic-must-fit-real-upload; no-NPC-cap-or-shedding");
@@ -1952,8 +2387,33 @@ bool Start(bool host, unsigned short port)
     TransportConfigDiagnostics();
     // Messages creates an implicit P2P listener; install capacity defaults before it can inherit them.
     messages = api.Messages();
+    sockets = api.Sockets ? api.Sockets() : nullptr;
+    socketsLaneTransport = sockets && api.CreateListenSocketP2P && api.ConnectP2P && api.AcceptConnection &&
+                           api.CloseConnection && api.CloseListenSocket && api.ConfigureConnectionLanes &&
+                           api.SendMessages && api.ReceiveOnConnection && api.AllocateMessage;
+    char directEnv[16] = {};
+    const DWORD directEnvLen = GetEnvironmentVariableA("G3T_DIRECT_UDP", directEnv, sizeof(directEnv));
+    if (directEnvLen > 0 && directEnv[0] == '0') directUdpEnabled = false;
+    else if (directEnvLen > 0 && directEnv[0] == '1') directUdpEnabled = enetPort != 0;
+    else directUdpEnabled = (api.FakeSteamAbi == nullptr) && (enetPort != 0);
     if (!user || !matchmaking || !friends || !messages) return Fail("Steam interfaces missing");
     if (networkingUtils) api.InitRelayNetworkAccess(networkingUtils);  // ready by the first message
+    if (socketsLaneTransport && isHost) {
+        listenSocketP2P = api.CreateListenSocketP2P(sockets, P2PVirtualPort, 0, nullptr);
+        if (listenSocketP2P) {
+            ConfigureSocketOptions(config::ListenSocketScope, static_cast<intptr_t>(listenSocketP2P));
+            Logf("steam-send: ISteamNetworkingSockets v012 P2P listener active vport=%d lanes=%d ice=all",
+                 P2PVirtualPort, LaneCount);
+        } else {
+            socketsLaneTransport = false;
+            Log("steam-send: CreateListenSocketP2P failed; falling back to ISteamNetworkingMessages");
+        }
+    } else if (socketsLaneTransport) {
+        Logf("steam-send: ISteamNetworkingSockets v012 P2P client lanes=%d ready", LaneCount);
+    }
+    Logf("steam: transport capabilities direct_udp=%u sockets_v012_lanes=%u fake_steam=%u enet_port=%u",
+         directUdpEnabled ? 1u : 0u, socketsLaneTransport ? 1u : 0u, api.FakeSteamAbi ? 1u : 0u,
+         static_cast<unsigned>(enetPort));
     me = api.UserSteamId(user);
     if (!me) return Fail("Steam did not provide a SteamID64");
     char const* steamName = api.PersonaName(friends);
@@ -2067,6 +2527,74 @@ bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24],
     return true;
 }
 
+std::vector<DirectOffer> DirectOffers()
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    std::vector<DirectOffer> result;
+    if (!published.ready) return result;
+    for (auto const& offer : published.directOffers)
+        if (offer.account && offer.generation) result.push_back(offer);
+    return result;
+}
+
+void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t hostIpv4, uint16_t port)
+{
+    if (!account || !generation || !hostIpv4 || !port) return;
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    for (int i = 0; i < MaxRemotes; ++i) {
+        if (published.accounts[i] != account || published.generations[i] != generation) continue;
+        registeredDirect[i] = DirectEndpoint{hostIpv4, port};
+        registeredDirectAccount[i] = account;
+        registeredDirectGen[i] = generation;
+        published.verifiedDirect[i] = registeredDirect[i];
+        return;
+    }
+}
+
+namespace {
+bool ReadDirectPeerIdentityLocked(uint32_t hostIpv4, uint16_t port, uint64_t& account,
+                                  char (&name)[24], uint64_t& generation, uint32_t* expectedTag)
+{
+    if (!published.ready || !isHost || !hostIpv4 || !port) return false;
+    for (int i = 0; i < MaxRemotes; ++i) {
+        if (!published.accounts[i]) continue;
+        if (registeredDirectAccount[i] != published.accounts[i] ||
+            registeredDirectGen[i] != published.generations[i])
+            continue;
+        if (registeredDirect[i].hostIpv4 != hostIpv4 || registeredDirect[i].port != port)
+            continue;
+        account = published.accounts[i];
+        generation = published.generations[i];
+        strcpy_s(name, published.names[i]);
+        if (expectedTag) *expectedTag = CookieTag(published.directOffers[i].cookie);
+        return true;
+    }
+    return false;
+}
+}
+
+bool DirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint64_t& account,
+                        char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    return ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, nullptr);
+}
+
+bool ClaimDirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint32_t connectTag,
+                             uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(publishedMutex);
+    uint32_t expectedTag = 0;
+    if (!ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, &expectedTag) ||
+        account == me || !expectedTag || connectTag != expectedTag)
+        return false;
+    relayCloses.erase(std::remove_if(relayCloses.begin(), relayCloses.end(),
+        [account, generation](RelayClose const& request) {
+            return request.account == account && request.generation == generation;
+        }), relayCloses.end());
+    return true;
+}
+
 std::vector<RelayDrop> TakeRelayDrops()
 {
     std::lock_guard<std::mutex> lock(publishedMutex);
@@ -2142,6 +2670,7 @@ void PumpOnce()
         HostTick();
     }
     // Data before control: a friend who quits sends ENet's goodbye and then 'B'; the other order closed its socket first.
+    ReceiveP2P();
     Receive(ChannelData);
     Receive(ChannelControl);
     // Lobby departure callbacks can precede a queued ENet goodbye. Drain it before closing that peer's relay.
@@ -2222,10 +2751,16 @@ void Stop()
         }
         Forward();  // ENet's goodbye to the others
         LeaveLobby();
+        if (listenSocketP2P && sockets && api.CloseListenSocket) {
+            api.CloseListenSocket(sockets, listenSocketP2P);
+            listenSocketP2P = 0;
+        }
         Log("steam: stopped");
     }
     if (relay != INVALID_SOCKET) closesocket(relay);
     relay = INVALID_SOCKET;
+    sockets = nullptr;
+    socketsLaneTransport = directUdpEnabled = false;
     sendCodec.reset();
     ready = false;
     if (apiInitialized) {
@@ -2239,6 +2774,10 @@ void Stop()
     {
         std::lock_guard<std::mutex> lock(publishedMutex);
         relayCloses.clear();
+        for (int i = 0; i < MaxRemotes; ++i) {
+            registeredDirect[i] = {};
+            registeredDirectAccount[i] = registeredDirectGen[i] = 0;
+        }
     }
     Publish();
 }

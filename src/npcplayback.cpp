@@ -104,7 +104,7 @@ struct NativePose {
     int count = 0;
     bool applied = false, evaluated = false, valid = true, evaluateOnly = false;
 };
-struct ReceivedPose { pose::History history; uint32_t arrived = 0, incarnation = 0; uint8_t intervalMs = 16; };
+struct ReceivedPose { pose::History history; uint32_t arrived = 0, incarnation = 0, intervalMs = 16; };
 std::unordered_map<std::string, ReceivedPose> receivedPoses;
 struct Unavailable {
     eCEntity const* entity = nullptr;
@@ -962,7 +962,7 @@ bool Start(bool client)
         if (received.history.Push(record.incarnation, record.sent, bones, count, flags)) {
             received.arrived = net::Now();
             received.incarnation = record.incarnation;
-            received.intervalMs = interval;
+            received.intervalMs = npclease::DecodePoseIntervalWire(interval);
         }
         else ++stalePoses;
     });
@@ -1333,18 +1333,32 @@ eCResourceDataEntity* NativeMotion(eCEntity* entity, gEAction action, gEPhase ph
     bCString extension;
     eCResourceAnimationMotion_PS::GetNativeFileExt(extension);
     // GetAni fixes native direction/primary pose; GetAniName would insert the supplied direction verbatim.
-    for (auto const& stem : {npc.GetAni(action, phase),
-                            npc.GetAni(action, gEUseType_None, gEUseType_None, phase)}) {
-        if (!stem.GetLength()) continue;
-        bCString varied(stem);
-        admin->GetAniVariation(varied);
-        for (auto const& candidate : {varied, stem}) {
-            bCString name(candidate);
-            name += extension;
-            unavailable[EntityKey(entity)].candidate = name.GetText();
-            if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate))
-                return resource;
+    auto tryCurrentStance = [&]() -> eCResourceDataEntity* {
+        for (auto const& stem : {npc.GetAni(action, phase),
+                                npc.GetAni(action, gEUseType_None, gEUseType_None, phase)}) {
+            if (!stem.GetLength()) continue;
+            bCString varied(stem);
+            admin->GetAniVariation(varied);
+            for (auto const& candidate : {varied, stem}) {
+                bCString name(candidate);
+                name += extension;
+                if (!IdleResourceName(name.GetText())) continue;
+                unavailable[EntityKey(entity)].candidate = name.GetText();
+                if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate))
+                    return resource;
+            }
         }
+        return nullptr;
+    };
+    if (auto* resource = tryCurrentStance()) return resource;
+    // NPCs lingering in gEAniState_Parade (e.g. Hamlar with None_Staff) can resolve to an invalid .fxm parade descriptor;
+    // fall back to gEAniState_Stand for the probe so idle bootstrap stays valid and keeps contacts active.
+    if (npc.Routine.AniState == gEAniState_Parade) {
+        const gEAniState savedStance = npc.Routine.AniState;
+        npc.Routine.AniState = gEAniState_Stand;
+        auto* fallback = tryCurrentStance();
+        npc.Routine.AniState = savedStance;
+        if (fallback) return fallback;
     }
     return nullptr;
 }
