@@ -250,6 +250,7 @@ void Notice(i18n::Message message, bool bad = false);
 void NoticeText(wchar_t const* text, hud::Kind kind);
 void NoticeText(wchar_t const* text, bool bad);
 void SaveFailure(char const* code);
+void ClientRestoreFailure(char const* code);
 bool TemplateStart(rejoin::tmpl::Origin origin, TemplateJob job);
 void OnSave(uint8_t from, net::SaveNote const& note);
 void NewEpoch();

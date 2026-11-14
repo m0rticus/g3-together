@@ -57,5 +57,22 @@ char const* ValidateLogicalContents(std::vector<Stack> const& stacks, std::vecto
 char const* ParseBoundRecord(char const* data, size_t size, saving::Key const& expected,
                              Schema const& schema, ParsedRecord& out);
 bool SameStacks(std::vector<Stack> const& a, std::vector<Stack> const& b);
+std::vector<size_t> RestoreStackOrder(std::vector<Stack> const& stacks, int skillCategory, int noneSlot = 0);
+
+// gCInventoryStackList::CreateItems merges into existing unlinked (or non-splitting slot) stacks with the same
+// template and quality; split the newly added amount back out before equipping so duplicate stacks survive intact.
+template <typename Ops>
+char const* RestoreItemStack(Stack const& s, int noneSlot, Ops&& ops)
+{
+    const int before = ops.StackCount();
+    int index = ops.CreateItems(s);
+    if (index < 0) return "could not create an item";
+    if (index < before && ops.GetAmount(index) > s.amount) {
+        index = ops.SplitStack(index, s.amount);
+        if (index < 0) return "could not split a merged item stack";
+    }
+    if (s.slot != noneSlot && !ops.EquipStackToSlot(index, s.slot)) return "could not equip an item";
+    return nullptr;
+}
 
 } // namespace g3t::hero::codec

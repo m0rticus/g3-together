@@ -151,6 +151,15 @@ void SaveFailure(char const* code)
     if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
     else hud::MenuLine(text);
 }
+void ClientRestoreFailure(char const* code)
+{
+    Logf("persist: client character restore failed reason=%s campaign=%s save=%s player=%llu", code,
+         *hostWorld.campaign ? hostWorld.campaign : "-", receivedNote.save, steam::PlayerId());
+    wchar_t label[80] = {}, text[500] = {};
+    if (*hostWorld.campaign) MultiByteToWideChar(CP_UTF8, 0, hostWorld.campaign, -1, label, 79);
+    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::RecordRefusedWaiting), *label ? label : i18n::SaveReason(code));
+    NoticeText(text, true);
+}
 
 void Evaluate()
 {
@@ -779,10 +788,6 @@ void Tick()
         // Only a freshly initialized local hero is permitted when the host has no account record.
         if (net::IsHost()) {
             ownCharacterReady = true; current.key = {RandomId(), RandomId(), steam::PlayerId()}; NewEpoch();
-        } else if (needsNewHero && templateHeroFresh && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu)) {
-            needsNewHero = false; freshLocalHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
-            clientRejoin.Left();
-            story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
         }
     }
     if (net::IsHost()) {
@@ -801,9 +806,14 @@ void Tick()
                                   !RestoreJournal() ? "journal-write" :
                                   !RestoreExtensions() ? "extension" : nullptr;
             if (refusal) {
-                restoreFailed = true; loading.clear(); SaveFailure(refusal); return;
+                receivedRecord.clear(); receivedPersonal.clear();
+                restoreFailed = true; loading.clear();
+                Logf("persist: host load failed slot=%s save=%s reason=%s", lastLoad.c_str(), current.key.save.c_str(), refusal);
+                Notice(i18n::SaveDamaged, true);
+                return;
             }
             receivedRecord.clear(); receivedPersonal.clear(); loading.clear(); ownCharacterReady = true; localKind = net::KindSaved;
+            for (uint8_t i = 2; i < net::MaxPlayers; ++i) clients[i].nextTry = 0;
             Logf("persist: host load settled save=%s epoch=%08x own_character=1", current.key.save.c_str(), epoch);
         }
         HostTick(now);
@@ -844,6 +854,13 @@ void Tick()
         answer.op = net::WorldOther; answer.kind = localKind; answer.epoch = hostWorld.epoch;
         if (net::SendWorld(answer, 1)) requestCharacterAgain = false;
     }
+    if (needsNewHero && templateHeroFresh && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu) &&
+        !restoreFailed && !resetLocalWorld && !templateHold &&
+        receivedWelcome == net::WelcomeSerial() && receivedNote.epoch == hostWorld.epoch) {
+        needsNewHero = false; freshLocalHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
+        clientRejoin.Left();
+        story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+    }
     if (!receivedRecord.empty() && !restoreFailed && !resetLocalWorld && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu) &&
         !templateCapture.Holding(now) && receivedWelcome == net::WelcomeSerial() &&
         receivedNote.epoch == hostWorld.epoch && static_cast<int32_t>(now - restoreAt) >= 0) {
@@ -854,7 +871,7 @@ void Tick()
             receivedPersonal.clear();
         }
         if (!ApplyCharacter(receivedRecord, {receivedNote.world, receivedNote.save, steam::PlayerId()})) {
-            restoreFailed = true; SaveFailure("character-record"); return;
+            restoreFailed = true; ClientRestoreFailure("character-record"); return;
         }
         if (!containers::RestorePersonal(receivedPersonal))
             Log("WARN persist: client personal container restore degraded; admitting restored character");

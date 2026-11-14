@@ -199,4 +199,18 @@ bool SameStacks(std::vector<Stack> const& a, std::vector<Stack> const& b)
     return true;
 }
 
+std::vector<size_t> RestoreStackOrder(std::vector<Stack> const& stacks, int skillCategory, int noneSlot)
+{
+    std::vector<size_t> order;
+    order.reserve(stacks.size());
+    for (int pass = 0; pass < 3; ++pass) {
+        for (size_t i = 0; i < stacks.size(); ++i) {
+            Stack const& s = stacks[i];
+            const int bucket = s.category == skillCategory ? 0 : (s.slot != noneSlot ? 1 : 2);
+            if (bucket == pass) order.push_back(i);
+        }
+    }
+    return order;
+}
+
 } // namespace g3t::hero::codec

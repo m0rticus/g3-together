@@ -20,6 +20,170 @@ SAVING_POLICY_TARGET = _testbuild.register_target(
     )],
 )
 
+HERO_RESTORE_TARGET = _testbuild.register_target(
+    "hero-restore-stacks",
+    [
+        _testbuild.unit("src/hero_codec.cpp", std="c++17", warnings="strict"),
+        _testbuild.inline_unit(
+            "hero_restore_stacks",
+            r'''
+#include "hero_codec.h"
+#include <cassert>
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace {
+using g3t::hero::codec::ParsedRecord;
+using g3t::hero::codec::RestoreItemStack;
+using g3t::hero::codec::RestoreStackOrder;
+using g3t::hero::codec::SameStacks;
+using g3t::hero::codec::Schema;
+using g3t::hero::codec::Stack;
+
+// Mirrors Game.dll gCInventoryStackList::CreateItems (0x100c3700), MustSplitBeforeLinking (0x100c0550),
+// gCInventoryStack::Split (0x100c09b0), and gCInventory_PS::EquipStackToSlot (0x100b80e0).
+struct FakeNativeInventory {
+    std::vector<Stack> stacks;
+    std::vector<int> quickSlots;
+
+    static bool MustSplitBeforeLinking(int slot)
+    {
+        return slot > 0 && slot != 14; // gESlot_Ammo (14) returns false unless RightHand.
+    }
+
+    int StackCount() const { return static_cast<int>(stacks.size()); }
+    int GetAmount(int index) const { return stacks[static_cast<size_t>(index)].amount; }
+
+    int CreateItems(Stack const& item)
+    {
+        for (size_t i = 0; i < stacks.size(); ++i) {
+            Stack& existing = stacks[i];
+            if (existing.id != item.id || existing.quality != item.quality || existing.category != item.category) continue;
+            const bool linked = existing.slot != 0;
+            const bool hasQuick = quickSlots[i] >= 0;
+            if ((!linked && !hasQuick) || !MustSplitBeforeLinking(existing.slot)) {
+                existing.amount += item.amount;
+                return static_cast<int>(i);
+            }
+        }
+        Stack created = item;
+        created.slot = 0;
+        stacks.push_back(created);
+        quickSlots.push_back(-1);
+        return static_cast<int>(stacks.size() - 1);
+    }
+
+    int SplitStack(int index, int splitAmount)
+    {
+        if (index < 0 || static_cast<size_t>(index) >= stacks.size()) return -1;
+        Stack& existing = stacks[static_cast<size_t>(index)];
+        if (splitAmount <= 0 || splitAmount >= existing.amount) return -1;
+        existing.amount -= splitAmount;
+        Stack tail = existing;
+        tail.amount = splitAmount;
+        tail.slot = 0;
+        stacks.push_back(tail);
+        quickSlots.push_back(-1);
+        return static_cast<int>(stacks.size() - 1);
+    }
+
+    bool EquipStackToSlot(int index, int slot)
+    {
+        if (index < 0 || static_cast<size_t>(index) >= stacks.size() || slot <= 0) return false;
+        for (Stack& other : stacks) {
+            if (other.slot == slot) other.slot = 0;
+        }
+        stacks[static_cast<size_t>(index)].slot = slot;
+        return true;
+    }
+};
+
+std::string MakeFullRecord(g3t::saving::Key const& key, std::vector<Stack> const& stacks)
+{
+    size_t tagCount = 0;
+    char const* const* tags = g3t::hero::codec::AttributeTags(tagCount);
+    std::string text = "G3THERO 4\n";
+    text += "identity " + key.world + " " + key.save + " " + std::to_string(key.player) + "\n";
+    text += "pose 100 200 300 0 0 0 1\ndowned 0\nlevel 4 4\nxp 2500\nlp 10 0\n";
+    for (size_t i = 0; i < tagCount; ++i) {
+        std::string const tag = tags[i];
+        if (tag == "HP" || tag == "MP" || tag == "SP") text += "attr " + tag + " 100 0 100 0\n";
+        else text += "attr " + tag + " 100 0\n";
+    }
+    for (Stack const& s : stacks) {
+        text += "stack " + s.id + " " + std::to_string(s.amount) + " " + std::to_string(s.quality) + " " +
+                std::to_string(s.slot) + " " + std::to_string(s.category);
+        if (s.category == 10) text += " " + std::to_string(s.learned);
+        text += "\n";
+    }
+    text += "quick_end 0 0\nend " + std::to_string(stacks.size()) + "\n";
+    return text;
+}
+} // namespace
+
+int main()
+{
+    const g3t::saving::Key key{"07c4959c878d0258fcad8b2d2af97409", "e0037c47a774b7683e887822e481ad11", 76561198068674551ULL};
+    const std::string bow = "2c77e863bf84f54ea4342bfdeab8eb72";
+    const std::string arrow = "582bdbe87e22c541a1041212ab0ef911";
+    const std::string ring = "91ab440123cd55ef6789ab0123cd45ef";
+    const std::string potion = "aa11bb22cc33dd44ee55ff6677889900";
+    const std::string perk = "ff00ee11dd22cc33bb44aa5599668877";
+    Schema schema;
+    schema.minSlot = 0;
+    schema.maxSlot = 15;
+    schema.categoryCount = 16;
+    schema.skillCategory = 10;
+    schema.spellbookCategory = 9;
+
+    // Saved stacks sorted by (id, slot): slot=0 bow precedes slot=7 bow, just as in G3_World_01_0372.g3t.
+    const std::vector<Stack> wanted = {
+        {bow, 1, 0, 0, 2, -1},
+        {bow, 1, 0, 7, 2, -1},
+        {arrow, 25, 0, 0, 3, -1},
+        {arrow, 50, 0, 14, 3, -1},
+        {ring, 1, 0, 12, 5, -1},
+        {ring, 1, 0, 13, 5, -1},
+        {potion, 5, 0, 0, 4, -1},
+        {potion, 3, 0, 0, 4, -1},
+        {perk, 1, 0, 0, 10, 1},
+    };
+    const std::string raw = MakeFullRecord(key, wanted);
+    ParsedRecord parsed;
+    assert(g3t::hero::codec::ParseBoundRecord(raw.data(), raw.size(), key, schema, parsed) == nullptr);
+
+    // Without RestoreStackOrder + RestoreItemStack, CreateItems merges slot=0 + slot=7 bow into {slot=7, amount=2}.
+    FakeNativeInventory broken;
+    for (Stack const& s : parsed.stacks) {
+        if (s.category == schema.skillCategory) { broken.stacks.push_back(s); broken.quickSlots.push_back(-1); continue; }
+        const int idx = broken.CreateItems(s);
+        if (s.slot != 0) broken.EquipStackToSlot(idx, s.slot);
+    }
+    assert(!SameStacks(broken.stacks, parsed.stacks));
+
+    // With RestoreStackOrder + RestoreItemStack, skills, equipped items, split ammo, twin rings, and split consumables match.
+    FakeNativeInventory restored;
+    const auto order = RestoreStackOrder(parsed.stacks, schema.skillCategory, 0);
+    assert(order.size() == parsed.stacks.size());
+    assert(parsed.stacks[order[0]].category == schema.skillCategory);
+    for (size_t idx : order) {
+        Stack const& s = parsed.stacks[idx];
+        if (s.category == schema.skillCategory) { restored.stacks.push_back(s); restored.quickSlots.push_back(-1); continue; }
+        assert(RestoreItemStack(s, 0, restored) == nullptr);
+    }
+    assert(restored.stacks.size() == parsed.stacks.size());
+    assert(SameStacks(restored.stacks, parsed.stacks));
+    return 0;
+}
+''',
+            includes=[ROOT / "src"],
+            std="c++17",
+            warnings="strict",
+        ),
+    ],
+)
+
 COOP_ENVELOPE_TARGET = _testbuild.register_target(
     "saving-coop-envelope",
     [_testbuild.inline_unit(
@@ -323,6 +487,31 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("self.Inventory.GetQuality(i) & QualityMask", stacks_fn)
         quicks_fn = function_body(self.hero, r"\bstd::vector<Quick>\s+QuickSlotsOf\s*\(")
         self.assertIn("self.Inventory.GetQuality(i) & QualityMask", quicks_fn)
+
+    def test_duplicate_stacks_and_load_lifecycle_regressions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = HERO_RESTORE_TARGET.run(cwd=folder)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        load_hero = function_body(self.hero, r"\bbool\s+LoadRecordImpl\s*\(")
+        rollback_hero = function_body(self.hero, r"\bvoid\s+RollbackHeroSnapshot\s*\(")
+        for fn in (load_hero, rollback_hero):
+            self.assertIn("codec::RestoreStackOrder(", fn)
+            self.assertIn("codec::RestoreItemStack(", fn)
+        quick_apply = function_body(self.hero, r"\bbool\s+ApplySpellAndQuick\s*\(")
+        self.assertLess(
+            quick_apply.index("AssignStackToQuickSlot(i, -1)"),
+            quick_apply.index("for (Quick const& q : wanted)"),
+        )
+
+        load_detour = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertNotIn('SaveFailure("character-record")', load_detour)
+        tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
+        self.assertNotIn("SaveFailure(refusal)", tick)
+        self.assertIn('ClientRestoreFailure("character-record")', tick)
+        self.assertIn("for (uint8_t i = 2; i < net::MaxPlayers; ++i) clients[i].nextTry = 0;", tick)
+        new_epoch = function_body(self.persist, r"\bvoid\s+NewEpoch\s*\(")
+        self.assertIn("clients[i].nextTry = 0", new_epoch)
 
 
 if __name__ == "__main__":

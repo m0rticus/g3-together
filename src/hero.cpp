@@ -258,21 +258,21 @@ bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::strin
             StackLearned(self, index) == 1) ++learned;
         else { ++spellsMissing; Logf("hero: record %s could not restore spell %s", source, id.c_str()); }
     }
+    for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
+        if (StackQuickSlot(self, i) >= 0) self.Inventory.AssignStackToQuickSlot(i, -1);
+    }
     unsigned assigned = 0, missing = 0;
-    bool assignedSlots[QuickSlots] = {};
     for (Quick const& q : wanted) {
         int index = -1;
         for (int i = 0; i < self.Inventory.GetStackCount() && index < 0; ++i) {
+            if (StackQuickSlot(self, i) >= 0) continue;
             const Template item = self.Inventory.GetTemplate(i);
             bCPropertyID const& id = item;
-            const int oldSlot = StackQuickSlot(self, i);
-            if (oldSlot >= 0 && oldSlot < QuickSlots && assignedSlots[oldSlot]) continue;
             if (Hex(id) == q.id && (self.Inventory.GetQuality(i) & QualityMask) == q.quality) index = i;
         }
         if (index >= 0 && self.Inventory.AssignStackToQuickSlot(index, q.slot) &&
             self.Inventory.FindStackIndexByQuickSlot(q.slot) == index && StackQuickSlot(self, index) == q.slot) {
             ++assigned;
-            assignedSlots[q.slot] = true;
         } else {
             ++missing;
             Logf("hero: record %s could not restore quick slot %d item=%s quality=%u",
@@ -332,7 +332,22 @@ void RollbackHeroSnapshot(Entity& self, eCDynamicEntity& hero, codec::ParsedReco
         if (self.Inventory.GetSlotFromStack(i) != gESlot_None) self.Inventory.UnEquipStack(i);
         self.Inventory.DeleteStack(i);
     }
-    for (Stack const& s : backup.stacks) {
+    auto makeItemOps = [&self]() {
+        struct Ops {
+            Entity& self;
+            int StackCount() const { return self.Inventory.GetStackCount(); }
+            int CreateItems(Stack const& s) const { return self.Inventory.CreateItems(FromHex(s.id), s.quality, s.amount); }
+            int GetAmount(int index) const { return self.Inventory.GetAmount(index); }
+            int SplitStack(int index, int amount) const { return self.Inventory.SplitStack(index, amount); }
+            bool EquipStackToSlot(int index, int slot) const
+            {
+                return self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(slot)) != GEFalse;
+            }
+        };
+        return Ops{self};
+    };
+    for (size_t idx : codec::RestoreStackOrder(backup.stacks, gEItemCategory_Skill, gESlot_None)) {
+        Stack const& s = backup.stacks[idx];
         const Template item = FromHex(s.id);
         if (s.category == gEItemCategory_Skill) {
             int index = FindSkillStack(self, s.id);
@@ -352,11 +367,13 @@ void RollbackHeroSnapshot(Entity& self, eCDynamicEntity& hero, codec::ParsedReco
                     index = self.Inventory.CreateItems(item, s.quality, s.amount);
                 }
             }
-            if (index >= 0 && s.slot != gESlot_None) self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot));
+            if (index >= 0) {
+                if (s.slot != gESlot_None) self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot));
+                else if (self.Inventory.GetSlotFromStack(index) != gESlot_None) self.Inventory.UnEquipStack(index);
+            }
             continue;
         }
-        const GEInt index = self.Inventory.CreateItems(item, s.quality, s.amount);
-        if (index >= 0 && s.slot != gESlot_None) self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot));
+        codec::RestoreItemStack(s, gESlot_None, makeItemOps());
     }
     self.NPC.Level = backup.level;
     self.NPC.LevelMax = backup.levelMax;
@@ -548,7 +565,19 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
             return fail("could not unequip an item");
         if (!self.Inventory.DeleteStack(i)) return fail("could not remove an item");
     }
-    for (Stack const& s : parsed.stacks) {
+    struct ItemOps {
+        Entity& self;
+        int StackCount() const { return self.Inventory.GetStackCount(); }
+        int CreateItems(Stack const& s) const { return self.Inventory.CreateItems(FromHex(s.id), s.quality, s.amount); }
+        int GetAmount(int index) const { return self.Inventory.GetAmount(index); }
+        int SplitStack(int index, int amount) const { return self.Inventory.SplitStack(index, amount); }
+        bool EquipStackToSlot(int index, int slot) const
+        {
+            return self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(slot)) != GEFalse;
+        }
+    } itemOps{self};
+    for (size_t idx : codec::RestoreStackOrder(parsed.stacks, gEItemCategory_Skill, gESlot_None)) {
+        Stack const& s = parsed.stacks[idx];
         const Template item = FromHex(s.id);
         if (s.category == gEItemCategory_Skill) {
             int index = FindSkillStack(self, s.id);
@@ -575,14 +604,15 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
                     ++skillsUnlearned;
                 }
             }
-            if (s.slot != gESlot_None && !self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot)))
-                return fail("could not equip a skill item");
+            if (s.slot != gESlot_None) {
+                if (!self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot)))
+                    return fail("could not equip a skill item");
+            } else if (self.Inventory.GetSlotFromStack(index) != gESlot_None && !self.Inventory.UnEquipStack(index)) {
+                return fail("could not unequip a skill item");
+            }
             continue;
         }
-        const GEInt index = self.Inventory.CreateItems(item, s.quality, s.amount);
-        if (index < 0) return fail("could not create an item");
-        if (s.slot != gESlot_None && !self.Inventory.EquipStackToSlot(index, static_cast<gESlot>(s.slot)))
-            return fail("could not equip an item");
+        if (char const* itemErr = codec::RestoreItemStack(s, gESlot_None, itemOps)) return fail(itemErr);
     }
     if (!codec::SameStacks(Stacks(self), parsed.stacks)) return fail("restored inventory does not match the record");
 

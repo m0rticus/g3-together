@@ -443,7 +443,7 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
         saving::Key embedded;
         if (!saving::store::UnpackPlayer(bytes, receivedRecord, receivedPersonal) ||
             !saving::store::HeroKey(receivedRecord, embedded) || !saving::Exact(embedded, key)) {
-            restoreFailed = true; receivedRecord.clear(); SaveFailure("character-record");
+            restoreFailed = true; receivedRecord.clear(); ClientRestoreFailure("character-record");
         }
     }
 }
@@ -527,7 +527,8 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
         }
         auto const* own = saving::store::Find(save, saving::store::Character, steam::PlayerId());
         if (!own || !ValidateCharacter(own->bytes, {save.key.world, save.key.save, steam::PlayerId()})) {
-            SaveFailure("character-record"); return false;
+            Logf("persist: load refused slot=%s save=%s reason=character-record", slot.c_str(), save.key.save.c_str());
+            Notice(i18n::SaveDamaged, true); return false;
         }
         if (!Materialize(slot, save)) {
             SaveFailure(saving::store::IoReason(lastIoFailure, "cache-publish-failed")); return false;
@@ -598,7 +599,7 @@ void NewEpoch()
     epoch = nonce | (++epochs & 0xffff);
     if (!epoch) epoch = ++epochs;
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
-        clients[i].ready = clients[i].recordSent = clients[i].cutover = 0;
+        clients[i].ready = clients[i].recordSent = clients[i].cutover = clients[i].nextTry = 0;
         clients[i].waitingSince = GetTickCount();
         clients[i].told = false;
         net::SetInWorld(i, false);
