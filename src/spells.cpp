@@ -232,6 +232,26 @@ void InstallTick()
     InstallGiveXp(base);
 }
 
+bool NormalizeCoopEarner(eCEntity* earner, eCDynamicEntity* hero)
+{
+    if (!hero || !earner || earner == hero) return false;
+    if (remote::IsPuppet(earner) || npcs::CompanionOwner(earner) > 1) return true;
+    if (earner->GetPropertySet(eEPropertySetType_Party)) {
+        Entity member(earner);
+        if (static_cast<int>(member.Party.PartyMemberType) == 5) return false;
+        if (eCEntity* leader = member.Party.GetPartyLeader().GetInstance(); leader && remote::IsPuppet(leader))
+            return true;
+    }
+    for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
+        eCEntity* puppet = id == net::LocalId() ? nullptr : remote::PuppetOf(id);
+        if (puppet && puppet->GetPropertySet(eEPropertySetType_Party) &&
+            Entity(puppet).Party.GetPartyLeader().GetInstance() == earner) {
+            return true;
+        }
+    }
+    return false;
+}
+
 GEInt GE_STDCALL HookGiveXp(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalGiveXp ? originalGiveXp(spu, self, other, args) : 0;
@@ -247,9 +267,20 @@ GEInt GE_STDCALL HookGiveXp(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
     }
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     const int heroBefore = hero ? static_cast<int>(Entity(hero).PlayerMemory.XP) : 0;
-    const GEInt result = originalGiveXp(spu, self, other, args);
+    Entity normalizedHero(hero);
+    GELPVoid callOther = NormalizeCoopEarner(earner, hero) ? static_cast<GELPVoid>(&normalizedHero) : other;
+    GEInt result = 0;
+    {
+        guards::LocalPlayer localPlayer;
+        result = originalGiveXp(spu, self, callOther, args);
+    }
     Logf("xp: GiveXP self=%s other=%s value=%d result=%d caller=SG+0x%x", victimName, earnerName, args, result, static_cast<unsigned>(caller));
-    if (hero) xpshare::NoteGiveXp(static_cast<int>(Entity(hero).PlayerMemory.XP) - heroBefore);
+    if (hero) {
+        const int gained = static_cast<int>(Entity(hero).PlayerMemory.XP) - heroBefore;
+        const bool isWorldEntity = victim && victim == Entity::GetWorldEntity().GetInstance();
+        if (gained > 0 && xpshare::counter::SharesNativeSource(isWorldEntity))
+            xpshare::NoteGiveXp(gained);
+    }
     return result;
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "xpshare.h"
 
+#include "guards.h"
 #include "log.h"
 #include "net.h"
 
@@ -60,13 +61,16 @@ bool Add(int amount)
     const int before = Experience(hero);
     const unsigned level = LevelOf(hero);
     applying = true;
-    const int whole = amount / 5;
-    if (whole > 0) GetScriptAdminExt().CallScript(bCString("GiveXP"), nullptr, hero, whole);
-    if (amount >= 1000) {  // a lift over several levels: the game checks the level only twice per call
-        for (int i = 0; i < 10; ++i) {
-            const unsigned now = LevelOf(hero);
-            GetScriptAdminExt().CallScript(bCString("GiveXP"), nullptr, hero, 0);
-            if (LevelOf(hero) == now) break;
+    {
+        guards::LocalPlayer localPlayer;
+        const int whole = amount / 5;
+        if (whole > 0) GetScriptAdminExt().CallScript(bCString("GiveXP"), nullptr, hero, whole);
+        if (amount >= 1000) {  // a lift over several levels: the game checks the level only twice per call
+            for (int i = 0; i < 10; ++i) {
+                const unsigned now = LevelOf(hero);
+                GetScriptAdminExt().CallScript(bCString("GiveXP"), nullptr, hero, 0);
+                if (LevelOf(hero) == now) break;
+            }
         }
     }
     applying = false;
@@ -247,7 +251,15 @@ void OnState(net::WorldState const& s)
     }
     const uint32_t gain = peer.Take(theirNonce, theirEarned, MaxGain);
     if (gain > 0) {
+        if (net::IsHost()) {
+            PrepareAdmissions(now);
+            for (uint8_t other = 2; other < net::MaxPlayers; ++other) {
+                if (other != from && peers[other].wasInWorld && peers[other].outgoing.nonce)
+                    peers[other].outgoing.Relay(gain);
+            }
+        }
         Gain(static_cast<int>(gain));
+        if (net::IsHost()) SendLive(now, false);
     }
     peer.total = theirTotal;
     peer.at = now;

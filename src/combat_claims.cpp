@@ -83,6 +83,107 @@ struct PendingKillReward {
 };
 std::vector<PendingKillReward> pendingKillRewards;
 std::unordered_map<std::string, DWORD> knockedAt;  // owner: when a claim knocked the victim out (IsDown follows a frame later)
+std::unordered_map<std::string, killconfirm::PlayerDamageStamp> playerDamaged;
+
+bool IsCoopPlayerSide(eCEntity* entity)
+{
+    if (!entity) return false;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (entity == hero || entity == remote::ControlledBody() ||
+        remote::PuppetOwner(entity) != 0 || npcs::CompanionOwner(entity) != 0) {
+        return true;
+    }
+    if (entity->GetPropertySet(eEPropertySetType_Party)) {
+        Entity member(entity);
+        if (static_cast<int>(member.Party.PartyMemberType) != 5 && SideOf(entity) != 0) return true;
+    }
+    if (hero && hero->GetPropertySet(eEPropertySetType_Party) &&
+        Entity(hero).Party.GetPartyLeader().GetInstance() == entity) {
+        return true;
+    }
+    for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
+        eCEntity* puppet = id == net::LocalId() ? nullptr : remote::PuppetOf(id);
+        if (puppet && puppet->GetPropertySet(eEPropertySetType_Party) &&
+            Entity(puppet).Party.GetPartyLeader().GetInstance() == entity) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool OwnsNpcDefeatXp(eCEntity* victim)
+{
+    if (!victim || !victim->GetPropertySet(eEPropertySetType_NPC) || HasPlayerMemory(victim) ||
+        remote::IsPuppet(victim) || victim == gCSession::GetInstance().GetHero() ||
+        victim == remote::ControlledBody()) {
+        return false;
+    }
+    if (net::IsHost()) return IsHostSimulatedNpc(victim);
+    return net::Connected() && npclease::LocalAuthority(victim);
+}
+
+bool PendingClaimFor(std::string const& key)
+{
+    if (killedHere.count(key) != 0) return true;
+    for (auto const& u : unconfirmed) {
+        if (KillKey(u.guid) == key) return true;
+    }
+    return false;
+}
+
+void AwardLocalDefeatXp(eCEntity* victim, char const* reason)
+{
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero || !victim || !gCSession::GetInstance().IsGameRunning()) return;
+    guards::LocalPlayer localPlayer;
+    Entity self(hero);
+    const int before = static_cast<int>(self.PlayerMemory.XP);
+    const GEInt result = CallScript("GiveXP", victim, hero, -1);
+    ++xpAwarded;
+    Logf("combat: rewarded co-op %s of %s: GiveXP=%d xp %d -> %d",
+         reason, Entity(victim).GetName().GetText(), result, before, static_cast<int>(self.PlayerMemory.XP));
+}
+
+void NotePlayerCombatDamage(eCEntity* victim, eCEntity* attacker)
+{
+    if (!OwnsNpcDefeatXp(victim) || !attacker || attacker == victim || !IsCoopPlayerSide(attacker)) return;
+    uint8_t guid[16];
+    Guid(victim, guid);
+    playerDamaged[KillKey(guid)] = {npcs::Incarnation(guid), GetTickCount()};
+}
+
+void ConfirmSharedKnockouts(DWORD now)
+{
+    if (!gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero()) return;
+    for (auto it = playerDamaged.begin(); it != playerDamaged.end();) {
+        uint8_t const* guid = reinterpret_cast<uint8_t const*>(it->first.data());
+        const uint32_t currentIncarnation = npcs::Incarnation(guid);
+        if (!killconfirm::RecentPlayerAssist(&it->second, currentIncarnation, now)) {
+            it = playerDamaged.erase(it);
+            continue;
+        }
+        eCEntity* rawVictim = npcs::NpcByGuid(guid);
+        if (!rawVictim) {
+            ++it;
+            continue;
+        }
+        Entity victim(rawVictim);
+        if (victim.NPC.DefeatedByPlayer || victim.IsDead()) {
+            it = playerDamaged.erase(it);
+            continue;
+        }
+        if (OwnsNpcDefeatXp(rawVictim) && victim.IsDown() && Outcome(victim) == net::HitKnockOut &&
+            killconfirm::ShouldPaySharedDefeat(false, PendingClaimFor(it->first),
+                                               IsCoopPlayerSide(victim.NPC.GetCurrentAttacker().GetInstance()),
+                                               &it->second, currentIncarnation, now)) {
+            victim.NPC.DefeatedByPlayer = GETrue;
+            it = playerDamaged.erase(it);
+            AwardLocalDefeatXp(rawVictim, "knockout");
+            continue;
+        }
+        ++it;
+    }
+}
 thread_local HostAppliedOriginKind hostAppliedOriginKind = HostAppliedOriginNone;
 thread_local uint8_t hostAppliedOriginPlayer = 0;
 thread_local uint32_t hostAppliedOriginSequence = 0;
@@ -193,6 +294,7 @@ void ConfirmKills()
 {
     const DWORD now = GetTickCount();
     DrainPendingKillRewards(now);
+    ConfirmSharedKnockouts(now);
     for (auto it = unconfirmed.begin(); it != unconfirmed.end();) {
         Entity victim(npcs::NpcByGuid(it->guid));
         const bool present = victim.GetInstance() != nullptr;
@@ -264,7 +366,9 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     HitDispatchScope pass(forwarded, heroForward);
     eCEntity* victim = target.GetInstance();
     if (HitPoints(target) + delta > 0) {
+        const int before = HitPoints(target);
         CallScript("AddHitPoints", victim, attacker.GetInstance() ? attacker.GetInstance() : victim, delta);
+        if (party && HitPoints(target) < before) NotePlayerCombatDamage(victim, PlayerActor(from));
         witness::HitSeen(victim, attacker.GetInstance());  // those around hear the fight (P7)
         return;
     }
@@ -499,7 +603,7 @@ bool TryApplyKillReward(uint8_t const guid[16], uint32_t incarnation)
     _GUID raw;
     std::memcpy(&raw, guid, 16);
     Entity victim = guid::Resolve(raw);
-    if (!hero || !victim.GetInstance()) return false;
+    if (!hero || !victim.GetInstance() || !gCSession::GetInstance().IsGameRunning()) return false;
     std::string identity(reinterpret_cast<char const*>(guid), 16);
     identity.append(reinterpret_cast<char const*>(&incarnation), sizeof(incarnation));
     if (!rewarded.insert(identity).second) {
@@ -507,6 +611,7 @@ bool TryApplyKillReward(uint8_t const guid[16], uint32_t incarnation)
         Logf("combat: the kill of %s was rewarded already; not again", victim.GetName().GetText());
         return true;
     }
+    guards::LocalPlayer localPlayer;
     Entity self(hero);
     const int before = static_cast<int>(self.PlayerMemory.XP);
     const GEInt result = CallScript("GiveXP", victim.GetInstance(), hero, -1);  // like the death script: self = the NPC, other = who earns it
@@ -603,7 +708,28 @@ void ClearClaims()
     unconfirmed.clear();
     rewarded.clear();
     knockedAt.clear();
+    playerDamaged.clear();
 }
+}
+void ResolveKillXp(eCEntity* victim, eCEntity* killer, bool wasDefeated)
+{
+    if (!victim || !victim->GetPropertySet(eEPropertySetType_NPC)) return;
+    uint8_t guid[16];
+    Guid(victim, guid);
+    const std::string key = KillKey(guid);
+    const auto found = playerDamaged.find(key);
+    const killconfirm::PlayerDamageStamp stamp = found != playerDamaged.end() ? found->second : killconfirm::PlayerDamageStamp{};
+    const bool hasStamp = found != playerDamaged.end();
+    if (hasStamp) playerDamaged.erase(found);
+    if (!OwnsNpcDefeatXp(victim)) return;
+    Entity victimEntity(victim);
+    const bool alreadyDefeated = wasDefeated || victimEntity.NPC.DefeatedByPlayer != GEFalse;
+    if (!killconfirm::ShouldPaySharedDefeat(alreadyDefeated, PendingClaimFor(key), IsCoopPlayerSide(killer),
+                                            hasStamp ? &stamp : nullptr, npcs::Incarnation(guid), GetTickCount())) {
+        return;
+    }
+    victimEntity.NPC.DefeatedByPlayer = GETrue;
+    AwardLocalDefeatXp(victim, "shared kill");
 }
 void SyncReport(LogFn log)
 {

@@ -37,6 +37,25 @@ namespace killconfirm {
 constexpr uint32_t UndoDelayMs = 2000;
 constexpr uint32_t DeathTaskExpiryMs = 10000;
 constexpr uint32_t PendingRewardExpiryMs = 5000;
+constexpr uint32_t PlayerAssistWindowMs = 30000;
+
+struct PlayerDamageStamp {
+    uint32_t incarnation = 0;
+    uint32_t at = 0;
+};
+
+inline bool RecentPlayerAssist(PlayerDamageStamp const* stamp, uint32_t currentIncarnation, uint32_t now)
+{
+    return stamp && stamp->incarnation == currentIncarnation &&
+           static_cast<uint32_t>(now - stamp->at) <= PlayerAssistWindowMs;
+}
+
+inline bool ShouldPaySharedDefeat(bool alreadyDefeated, bool pendingClaim, bool killerIsCoopSide,
+                                  PlayerDamageStamp const* stamp, uint32_t currentIncarnation, uint32_t now)
+{
+    if (alreadyDefeated || pendingClaim) return false;
+    return killerIsCoopSide || RecentPlayerAssist(stamp, currentIncarnation, now);
+}
 
 enum class Action : uint8_t {
     Wait = 0,
@@ -90,4 +109,5 @@ void OnHitPlayer(int32_t delta, uint8_t const npc[16], uint8_t attackerPlayer, b
 void DrainQueuedNpcHits();
 void ConfirmKills();
 void ClearClaims();
+void NotePlayerCombatDamage(eCEntity* victim, eCEntity* attacker);
 }

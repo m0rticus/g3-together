@@ -19,10 +19,18 @@ inline uint32_t Gain(uint32_t applied, uint32_t earned)
     return earned > applied ? earned - applied : 0;
 }
 
+// World_MCP is exclusively gCQuest_PS::SetStatus, which story.cpp replays natively on every peer.
+inline bool SharesNativeSource(bool isWorldEntity)
+{
+    return !isWorldEntity;
+}
+
 struct Sender {
-    uint32_t nonce = 0, origin = 0;
-    void Begin(uint32_t id, uint32_t earned) { nonce = id; origin = earned; }
-    uint32_t Total(uint32_t earned) const { return earned - origin; }
+    uint32_t nonce = 0, origin = 0, relayed = 0;
+    void Begin(uint32_t id, uint32_t earned) { nonce = id; origin = earned; relayed = 0; }
+    void Relay(uint32_t gain) { relayed += gain; }
+    uint32_t Outbound(uint32_t earned) const { return earned + relayed; }
+    uint32_t Total(uint32_t earned) const { return (earned - origin) + relayed; }
 };
 
 struct Receiver {
@@ -110,12 +118,13 @@ struct PeerLink : Receiver {
     OutboundPlan PlanLive(uint32_t earned, uint32_t now, bool heartbeatDue) const
     {
         if (!wasInWorld || !outgoing.nonce) return {};
+        const uint32_t streamEarned = outgoing.Outbound(earned);
         if (ackedNonce == outgoing.nonce) {
-            if (ackedSentEarned != earned || heartbeatDue) return {false, true};
+            if (ackedSentEarned != streamEarned || heartbeatDue) return {false, true};
             return {};
         }
         if (outgoing.Total(earned) == 0) return {};
-        if (attemptedEarned != earned || !lastBaselineAt || now - lastBaselineAt >= BaselineRetryMs) {
+        if (attemptedEarned != streamEarned || !lastBaselineAt || now - lastBaselineAt >= BaselineRetryMs) {
             return {true, true};
         }
         return {};
@@ -123,9 +132,10 @@ struct PeerLink : Receiver {
 
     void MarkLiveSent(uint32_t earned, uint32_t now, bool sentBaseline)
     {
+        const uint32_t streamEarned = outgoing.Outbound(earned);
         if (sentBaseline) MarkBaselineSent(now);
-        attemptedEarned = earned;
-        if (ackedNonce == outgoing.nonce) ackedSentEarned = earned;
+        attemptedEarned = streamEarned;
+        if (ackedNonce == outgoing.nonce) ackedSentEarned = streamEarned;
     }
 };
 }

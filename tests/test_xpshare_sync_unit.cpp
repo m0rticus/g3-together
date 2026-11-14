@@ -11,6 +11,7 @@ int main()
     using g3t::xpshare::counter::OutboundPlan;
     using g3t::xpshare::counter::PeerLink;
     using g3t::xpshare::counter::Receiver;
+    using g3t::xpshare::counter::SharesNativeSource;
 
     constexpr uint32_t maximum = 10000000;
 
@@ -134,6 +135,44 @@ int main()
         assert(resetReceiver.Snapshot(404, BaselineEarned));
         assert(resetReceiver.Take(404, sender.outgoing.Total(earned), maximum) == 120);
         assert(resetReceiver.Take(404, sender.outgoing.Total(earned), maximum) == 0);
+    }
+
+    // 5. World_MCP quest XP is excluded from xpshare (replicated natively by story.cpp),
+    //    while non-world GiveXP sources share normally; host relays client gains to other peers only.
+    {
+        assert(!SharesNativeSource(true));
+        assert(SharesNativeSource(false));
+
+        PeerLink toClientA, toClientB, lateJoinerC;
+        Receiver clientAReceiver, clientBReceiver, clientCReceiver;
+        uint32_t hostEarned = 300;
+
+        toClientA.wasInWorld = true;
+        toClientA.outgoing.Begin(501, hostEarned);
+        toClientA.NoteAck(501);
+        toClientA.MarkLiveSent(hostEarned, 2900, false);
+        assert(clientAReceiver.Snapshot(501, BaselineEarned));
+
+        toClientB.wasInWorld = true;
+        toClientB.outgoing.Begin(502, hostEarned);
+        toClientB.NoteAck(502);
+        toClientB.MarkLiveSent(hostEarned, 2900, false);
+        assert(clientBReceiver.Snapshot(502, BaselineEarned));
+
+        // Client A earns +80 XP and sends it to Host: Host relays +80 to Client B, not back to Client A.
+        toClientB.outgoing.Relay(80);
+        assert(!toClientA.PlanLive(hostEarned, 3000, false).sendLive);
+        const OutboundPlan relayPlan = toClientB.PlanLive(hostEarned, 3000, false);
+        assert(!relayPlan.sendBaseline && relayPlan.sendLive);
+        toClientB.MarkLiveSent(hostEarned, 3000, false);
+        assert(clientBReceiver.Take(502, toClientB.outgoing.Total(hostEarned), maximum) == 80);
+        assert(clientAReceiver.Take(501, toClientA.outgoing.Total(hostEarned), maximum) == 0);
+
+        // Late-joining Client C starts a fresh stream with relayed == 0 (no pre-join leak).
+        lateJoinerC.wasInWorld = true;
+        lateJoinerC.outgoing.Begin(503, hostEarned);
+        assert(clientCReceiver.Snapshot(503, BaselineEarned));
+        assert(clientCReceiver.Take(503, lateJoinerC.outgoing.Total(hostEarned), maximum) == 0);
     }
 
     return 0;

@@ -311,11 +311,14 @@ GEInt CallOriginalAndLog(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid ot
     Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     const bool logApplied = args < 0 && IsHostSimulatedNpc(recipient.GetInstance());
     const bool leaseHit = args < 0 && npclease::LocalAuthority(recipient.GetInstance());
-    const int before = logApplied || leaseHit ? HitPoints(recipient) : 0;
+    const bool localAuthority = logApplied || leaseHit;
+    const int before = localAuthority ? HitPoints(recipient) : 0;
     eCEntity* attacker = Attacker(spu, other);
     const GEInt result = original(spu, self, other, args);
-    if (leaseHit) npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints", before, HitPoints(recipient));
-    if (logApplied) LogAppliedHostNpcHit(recipient.GetInstance(), attacker, args, before, HitPoints(recipient), result);
+    const int after = localAuthority ? HitPoints(recipient) : 0;
+    if (localAuthority && after < before) NotePlayerCombatDamage(recipient.GetInstance(), attacker);
+    if (leaseHit) npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints", before, after);
+    if (logApplied) LogAppliedHostNpcHit(recipient.GetInstance(), attacker, args, before, after, result);
     return result;
 }
 

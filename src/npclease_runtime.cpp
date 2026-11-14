@@ -11,7 +11,9 @@
 
 #include "ai.h"
 #include "body.h"
+#include "combat.h"
 #include "config.h"
+#include "guards.h"
 #include "guid.h"
 #include "journal.h"
 #include "log.h"
@@ -514,6 +516,7 @@ GEBool __fastcall Quest(gCQuestManager_PS* self, void* edx, eCEntity const& vict
 }
 GEInt GE_STDCALL Kill(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    eCEntity* killer = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     Entry* entry = Find(victim);
     if (!ai::ShuttingDown() && !net::IsHost() && victim && !Player(victim) && HostWins(Key(victim))) {
@@ -523,21 +526,20 @@ GEInt GE_STDCALL Kill(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
         return 1;
     }
     if (!ai::ShuttingDown() && entry && entry->lease.epoch &&
-        (Fenced(victim) || (entry->lease.state.effects & NativeDeath))) {
-        ++repeatedDeaths;
-        return 1;
+        (Fenced(victim) || (entry->lease.state.effects & NativeDeath))) { ++repeatedDeaths; return 1; }
+    if (ai::ShuttingDown()) return originalKill(spu, self, other, args);
+    const bool wasDefeated = victim && victim->GetPropertySet(eEPropertySetType_NPC) && Entity(victim).NPC.DefeatedByPlayer;
+    guards::LocalPlayer localPlayer;
+    if (!entry || net::IsHost() || !entry->lease.ActiveLeases()) {
+        const GEInt r = originalKill(spu, self, other, args);
+        combat::ResolveKillXp(victim, killer, wasDefeated);
+        return r;
     }
-    if (ai::ShuttingDown() || !entry || net::IsHost() || !entry->lease.ActiveLeases())
-        return originalKill(spu, self, other, args);
-    if (!LocalAuthority(victim) || (entry->lease.state.effects & NativeDeath)) {
-        ++repeatedDeaths;
-        return 1;
-    }
+    if (!LocalAuthority(victim) || (entry->lease.state.effects & NativeDeath)) { ++repeatedDeaths; return 1; }
     CommitEffect(entry->lease.state, NativeDeath); // guard before native callbacks can recursively invoke Kill
-    eCEntity* before = ownerDeath;
-    ownerDeath = victim;
+    eCEntity* before = ownerDeath; ownerDeath = victim;
     const GEInt result = originalKill(spu, self, other, args);
-    ownerDeath = before;
+    ownerDeath = before; combat::ResolveKillXp(victim, killer, wasDefeated);
     Checkpoint final = entry->lease.state;
     if (!CaptureNative(victim, final))
         Log("FAIL npclease: native death recapture unavailable; terminal state retains last canonical pose");

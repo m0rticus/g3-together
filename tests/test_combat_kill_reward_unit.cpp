@@ -8,6 +8,10 @@ int main()
     using g3t::combat::killconfirm::Action;
     using g3t::combat::killconfirm::DeathTaskExpiryMs;
     using g3t::combat::killconfirm::Decide;
+    using g3t::combat::killconfirm::PlayerAssistWindowMs;
+    using g3t::combat::killconfirm::PlayerDamageStamp;
+    using g3t::combat::killconfirm::RecentPlayerAssist;
+    using g3t::combat::killconfirm::ShouldPaySharedDefeat;
     using g3t::combat::killconfirm::UndoDelayMs;
 
     const uint32_t t0 = 50000;
@@ -36,6 +40,24 @@ int main()
     assert(Decide(undoDue + 10, undoDue, expires, true, true, false, true, 2, true) == Action::Wait);
     assert(Decide(undoDue + 26, undoDue, expires, true, true, true, false, 2, true) == Action::Reward);
     assert(Decide(expires, undoDue, expires, true, true, false, true, 2, true) == Action::Drop);
+
+    // 7. Shared-fight defeat (e.g. PC_Hero + Player 2 damage Scout_09, non-party Diego finishes):
+    //    pays once when originalKill left DefeatedByPlayer false and no remote kill claim owns it.
+    const PlayerDamageStamp stamp{4, t0 + 1000};
+    assert(RecentPlayerAssist(&stamp, 4, t0 + 5000));
+    assert(ShouldPaySharedDefeat(false, false, false, &stamp, 4, t0 + 5000));
+
+    // 8. Co-op side killer (puppet/companion/null-assisted) left unpaid by native Kill pays once,
+    //    while already-defeated or claim-owned kills never double-pay.
+    assert(ShouldPaySharedDefeat(false, false, true, nullptr, 4, t0 + 5000));
+    assert(!ShouldPaySharedDefeat(true, false, true, &stamp, 4, t0 + 5000));
+    assert(!ShouldPaySharedDefeat(false, true, true, &stamp, 4, t0 + 5000));
+
+    // 9. Unassisted NPC-vs-NPC fights, stale incarnations, and expired stamps never pay XP.
+    assert(!ShouldPaySharedDefeat(false, false, false, nullptr, 4, t0 + 5000));
+    assert(!ShouldPaySharedDefeat(false, false, false, &stamp, 5, t0 + 5000));
+    assert(ShouldPaySharedDefeat(false, false, false, &stamp, 4, stamp.at + PlayerAssistWindowMs));
+    assert(!ShouldPaySharedDefeat(false, false, false, &stamp, 4, stamp.at + PlayerAssistWindowMs + 1));
 
     return 0;
 }

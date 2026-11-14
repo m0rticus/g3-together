@@ -14,4 +14,5 @@ bool InParadeMode(eCEntity* entity);
 bool LocalBlow(eCEntity* attacker);
 bool PlayerBlow(eCEntity* victim);
 bool LethalHit(eCEntity* victim);
+void ResolveKillXp(eCEntity* victim, eCEntity* killer, bool wasDefeated = false);
 }

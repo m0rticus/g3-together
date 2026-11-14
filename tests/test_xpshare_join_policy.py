@@ -66,6 +66,10 @@ class XPShareJoinPolicyTests(unittest.TestCase):
         self.assertIn("!Open(peer)) { ++gatedOut; return false; }", net)
         self.assertIn("XpHandshake(packet->data, packet->dataLength)", net)
         self.assertIn("peers[from] != peer || message.state.npcClass != from", net)
+        add_start = source.index("bool Add(int amount)")
+        gain_start = source.index("void Gain(int amount)", add_start)
+        self.assertIn("guards::LocalPlayer localPlayer;", source[add_start:gain_start])
+        self.assertIn("peers[other].outgoing.Relay(gain);", source[on_state:])
 
 
 if __name__ == "__main__":
