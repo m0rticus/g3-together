@@ -3,6 +3,7 @@
 
 #include "remote.h"
 #include "body.h"
+#include "movement_policy.h"
 #include "net.h"
 #include "npcplayback.h"
 #include "pose.h"
@@ -28,6 +29,7 @@ struct Puppet
     uint32_t truthSent = 0;
     uint32_t downedSequence = 0;
     body::State body;
+    movement::PuppetMotionHistory motions;
     std::string shape;
     std::unordered_map<uint32_t, std::string> presentationNames;
     bool terminal = false;

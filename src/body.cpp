@@ -4,6 +4,7 @@
 #include "config.h"
 #include "guards.h"
 #include "log.h"
+#include "movement_policy.h"
 
 #include <Windows.h>
 #include <algorithm>
@@ -20,23 +21,17 @@ unsigned actionsStarted = 0, actionsShown = 0, actionsPlayed = 0, pacifies = 0, 
 unsigned combatMoves = 0, combatMoveFaults = 0;
 bool staggerEffects = true;
 unsigned staggerEffectsPlayed = 0, staggerEffectsSkipped = 0;
-// Owner of motion slot 0 after a replayed action. Setting 5 (what the game's combat moves set) kept attacks from being
-// replaced by the stance's idle loop, but froze bodies in their bind pose once the motion ended (owner's look after V2:
-// ~80 % of the client's mirrors had nothing running). 0 = leave as StartPlayAni set it.
 int motionOwner = 0;
-bool combatReplay = true;  // QA comparison: combatreplayoff
-bool stanceSync = true;    // QA negative control: stanceoff (a body keeps its own AniState)
+bool combatReplay = true, stanceSync = true;
 unsigned kindStarted[3] = {}, kindPlayed[3] = {}, kindShown[3] = {};
 unsigned scriptAnis = 0, scriptAniFaults = 0, loopRestarts = 0;
-bool scriptAniReplay = true;  // QA comparison: scriptanioff
-bool loopRestart = true;      // QA comparison: looprestartoff
-bool swimStrokes = true;      // QA negative control: swimstrokeoff (a swimming puppet only glides, as before 26.10.)
+bool scriptAniReplay = true, loopRestart = true, swimStrokes = true;
 unsigned swimStrokesPlayed = 0;
 Glide glide[2];
-unsigned stanceStops = 0;   // replayed stance motions ended because the body set off
-unsigned stopOwners[8] = {};  // QA: slot 0's owner when that happened
-std::map<std::string, unsigned> glideMotions[2];  // what slot 0 showed while a body glided, ms by motion name
-std::map<std::string, unsigned> stillMotions[2];  // QA (28.10.): the sender's motion in the still frames, frames by name
+unsigned stanceStops = 0;
+unsigned stopOwners[8] = {};
+std::map<std::string, unsigned> glideMotions[2];
+std::map<std::string, unsigned> stillMotions[2];
 
 void GlideReport(void (*log)(char const*))
 {
@@ -106,41 +101,40 @@ bool fallMove = false;  // off: no gain (stageWalk 28.10.: fall still frames 37/
 bool actionSeq = true;  // on by default (stageActionSeq 28.10.: without it 68-83 starts of the same name lost, with it all replayed; stageV2 3/3 green)
 unsigned sameNameStarts = 0, sameNameReplayed = 0;
 
-uint8_t ActionSeq(eCEntity* entity, ActionClock& clock, char const* shown, uint16_t* elapsedMs)
-{
-    if (elapsedMs) *elapsedMs = 0;
-    const bool action = shown && *shown && !strstr(shown, "_Move_") && !strstr(shown, "_Ambient_");
-    if (!action) {
-        *clock.name = '\0';
-        return clock.seq;
-    }
-    auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
-    eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
-    const double time = actor ? actor->GetPlayTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)) : 0.0;
-    if (strcmp(shown, clock.name) != 0 || time + 0.05 < clock.time) {
-        ++clock.seq;
-        strncpy_s(clock.name, shown, _TRUNCATE);
-    }
-    clock.time = time;
-    if (elapsedMs) *elapsedMs = static_cast<uint16_t>(std::min(time * 1000.0, 65535.0));
-    return clock.seq;
-}
-
 int motionSeek = -1;
 unsigned seeks[2] = {};
 unsigned paceSteps[2] = {};
 std::vector<float> motionLags[2];  // ms the receiver's combat motion was behind where the sender's was, per Drive (+ behind)
 bool lagMsUnit = false;            // the last length looked like milliseconds (see MotionUnitMs)
-// QA (stageSeek 29.10.: no mirror sample at all): Drives with a combat motion as target, and why FollowSender measured none:
-// no fraction, not a combat motion, nothing running here, another motion here, over at the sender; and measured
 unsigned combatTargets[2] = {}, followSkips[2][6] = {}, otherNamesLogged[2] = {};
 
-// Play and max time of slot 0 come in one unit, not yet seen in a test (QA motiontime). The fraction travels without one; for
-// the age of a state (ms) it is needed: a combat motion lasts about 0.3 to 4 s, so a length over 30 is taken as milliseconds.
 double MotionUnitMs(double maxTime)
 {
     lagMsUnit = maxTime > 30.0;
     return lagMsUnit ? 1.0 : 1000.0;
+}
+
+uint8_t ActionSeq(eCEntity* entity, ActionClock& clock, char const* shown, uint16_t* elapsedMs)
+{
+    if (elapsedMs) *elapsedMs = 0;
+    if (!movement::IsTrackedActionMotion(shown)) {
+        *clock.name = '\0';
+        return clock.seq;
+    }
+    auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
+    eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
+    const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+    const double time = actor ? actor->GetPlayTime(slot0) : 0.0;
+    const double max = actor ? actor->GetMaxTime(slot0) : 0.0;
+    const bool wrapped = !movement::IsLoopingPuppetMotion(shown) && time + 0.05 < clock.time;
+    if (strcmp(shown, clock.name) != 0 || wrapped) {
+        ++clock.seq;
+        strncpy_s(clock.name, shown, _TRUNCATE);
+    }
+    clock.time = time;
+    const double unitMs = max > 0.0 ? MotionUnitMs(max) : 1000.0;
+    if (elapsedMs) *elapsedMs = static_cast<uint16_t>(std::clamp(time * unitMs, 0.0, 65535.0));
+    return clock.seq;
 }
 
 uint16_t MotionFraction(eCEntity* entity)
@@ -148,11 +142,11 @@ uint16_t MotionFraction(eCEntity* entity)
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
     eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
     const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
-    if (!actor || !actor->IsMotionRunning(slot0)) return 65535;
+    if (!actor || !actor->IsMotionRunning(slot0)) return movement::NoMotionFrac;
     const double max = actor->GetMaxTime(slot0);
-    if (!(max > 0.0)) return 65535;
+    if (!(max > 0.0)) return movement::NoMotionFrac;
     const double part = actor->GetPlayTime(slot0) / max;
-    return static_cast<uint16_t>(std::clamp(part, 0.0, 1.0) * 65535.0 + 0.5);
+    return movement::EncodeRunningMotionFrac(part);
 }
 
 void MotionTime(eCEntity* entity, void (*log)(char const*))
@@ -234,24 +228,22 @@ float Steadiness(Track const& track, State& state, uint32_t now)
     return rise < 1.0f ? rise : 1.0f;
 }
 
-
 bool mirrorLead = false;
 
 float const* SteerGoal(Track& track, uint32_t now, float ahead[3], float const* fallback, bool force)
 {
     if (!goalAhead && !force) return fallback;
     float turn[4];
-    const uint8_t lastCase = track.lastCase;  // the shown sample's, for the diagnostics
+    const uint8_t lastCase = track.lastCase;
     const bool got = Sample(track, now, ahead, turn, GoalAhead, false);
     track.lastCase = lastCase;
     return got ? ahead : fallback;
 }
 
-
 void NoteTruth(State& state, float const truth[3], uint32_t at)
 {
     int best = -1;
-    int32_t bestGap = 60;  // ms: a Drive at most this far from the time asked for
+    int32_t bestGap = 60;
     for (int i = 0; i < 16; ++i) {
         if (!state.shownAt[i]) continue;
         const int32_t gap = std::abs(static_cast<int32_t>(state.shownAt[i] - at));
@@ -262,46 +254,30 @@ void NoteTruth(State& state, float const truth[3], uint32_t at)
     if (errors.size() < 20000) errors.push_back(Distance(state.shownPos[best], truth));
 }
 
-
-void GlideStopOff(void (*log)(char const*))
-{
-    stopMotion = false;
-    log("GLIDESTOPOFF ok");
-}
-
-void GlideOld(void (*log)(char const*))
-{
-    arrivalSpeed = true;
-    settleStance = false;
-    log("GLIDEOLD on");
-}
+void GlideStopOff(void (*log)(char const*)) { stopMotion = false; log("GLIDESTOPOFF ok"); }
+void GlideOld(void (*log)(char const*)) { arrivalSpeed = true; settleStance = false; log("GLIDEOLD on"); }
 
 void GlideReset(void (*log)(char const*))
 {
     glide[0] = glide[1] = Glide{};
     motionLags[0].clear();
     motionLags[1].clear();
-    seeks[0] = seeks[1] = 0;
+    seeks[0] = seeks[1] = paceSteps[0] = paceSteps[1] = 0;
     for (int kind = 0; kind < 2; ++kind) {
         combatTargets[kind] = otherNamesLogged[kind] = 0;
         for (unsigned& n : followSkips[kind]) n = 0;
     }
-    glideMotions[0].clear();
-    stillMotions[0].clear();
-    stillMotions[1].clear();
-    glideMotions[1].clear();
+    glideMotions[0].clear(); glideMotions[1].clear();
+    stillMotions[0].clear(); stillMotions[1].clear();
     log("GLIDERESET ok");
 }
 
 int ReplayKind(char const* name)
 {
-    if (strstr(name, "KnockDown") || strstr(name, "GetUp")) return 1;
-    if (strstr(name, "Attack") || strstr(name, "Parade") || strstr(name, "Stumble")) return 0;
-    return 2;
+    return movement::ReplayKind(name);
 }
+
 namespace {
-// A driven body must not think for itself: no daily routine, AI mode "Abandoned" (perception reactions
-// such as watching a fight kept overriding plain tasks), and an idle task.
 char const* const Idle = "ZS_HangAround_DoNothing";
 
 gCScriptRoutine_PS* RoutineOf(eCEntity* entity)
@@ -309,41 +285,9 @@ gCScriptRoutine_PS* RoutineOf(eCEntity* entity)
     return entity ? static_cast<gCScriptRoutine_PS*>(entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) : nullptr;
 }
 
-// gEAction values of the combat moves whose motion names travel (GameEnum.h); deaths and knock-outs keep StartPlayAni.
-struct ActionName { char const* name; int value; };
-const ActionName CombatActions[] = {
-    // Stufe 4.3: JumpBack (the evasive jump of fighters and animals, _AI_JumpBack SG 0x46560) and ExitParade were replayed
-    // by name; they are combat moves too.
-    {"JumpBack", 51}, {"ExitParade", 19},
-    {"Attack", 1}, {"PowerAttack", 2}, {"QuickAttack", 3}, {"QuickAttackR", 4}, {"QuickAttackL", 5}, {"SimpleWhirl", 6},
-    {"SprintAttack", 9}, {"WhirlAttack", 10}, {"PierceAttack", 11}, {"JumpAttack", 12}, {"RamAttack", 13},
-    {"HackAttack", 14}, {"FinishingAttack", 15}, {"Parade", 16}, {"ParadeR", 17}, {"ParadeL", 18},
-    {"QuickParadeStumble", 20}, {"ParadeStumble", 21}, {"ParadeStumbleR", 22}, {"ParadeStumbleL", 23},
-    {"HeavyParadeStumble", 24}, {"QuickStumble", 25}, {"Stumble", 26}, {"StumbleR", 27}, {"StumbleL", 28},
-    {"GetUpAttack", 30}, {"GetUpParade", 31}, {"PierceStumble", 34}, {"AbortAttack", 39}};
-
-// "Orc_Stand_None_2H_P0_PowerAttack_Hit_N_Fwd_00_%_00_P1_140_R": the sixth part is the action, the seventh the phase.
 bool ParseCombatMove(char const* name, int& action, char* phase, size_t size)
 {
-    char const* part = name;
-    for (int i = 0; i < 5 && part; ++i) {
-        part = std::strchr(part, '_');
-        if (part) ++part;
-    }
-    if (!part) return false;
-    char const* end = std::strchr(part, '_');
-    if (!end) return false;
-    const size_t length = static_cast<size_t>(end - part);
-    action = 0;
-    for (auto const& entry : CombatActions)
-        if (std::strlen(entry.name) == length && !std::strncmp(entry.name, part, length)) action = entry.value;
-    if (!action) return false;
-    char const* phaseStart = end + 1;
-    char const* phaseEnd = std::strchr(phaseStart, '_');
-    if (!phaseEnd || static_cast<size_t>(phaseEnd - phaseStart) >= size) return false;
-    std::memcpy(phase, phaseStart, phaseEnd - phaseStart);
-    phase[phaseEnd - phaseStart] = '\0';
-    return true;
+    return movement::ParseCombatMove(name, action, phase, size);
 }
 
 GEBool CallCombatMove(gCScriptProcessingUnit::sAICombatMoveInstr_Args* args, gCScriptProcessingUnit* spu, bool* fault)
@@ -366,10 +310,6 @@ GEBool CallPlayAni(gCScriptProcessingUnit::sAIPlayAniInstr_Args* args, gCScriptP
     }
 }
 
-// Replay a gesture, a knock-down or anything else that is no combat move the way the game's scripts play them (e.g.
-// _AI_TransferItem in ZS_Cook): as a play-ani instruction on the body's script processing unit. Started with
-// Entity::StartPlayAni the body's stance replaced them within 150 ms (19.10.: 4 of 91 gestures and 4 of 77 knock-downs
-// still showing).
 bool PlayScriptAni(eCEntity* instance, State& state, char const* name)
 {
     if (!scriptAniReplay || state.scriptAniFaulted) return false;
@@ -388,16 +328,11 @@ bool PlayScriptAni(eCEntity* instance, State& state, char const* name)
     return true;
 }
 
-// Replay an attack, parade or stagger the way the game's own fight AI plays it: as a combat move on the body's
-// script processing unit, which keeps the motion (owner 5) and drives it to its end, then hands slot 0 back.
-// Only the local hero can be a contact target; each player's machine judges its own incoming hits (npcs.cpp TryLocalBlow).
 bool PlayCombatMove(eCEntity* instance, State& state, char const* name, uint32_t now)
 {
     int action = 0;
     char phase[24];
     if (!combatReplay || !state.combatMoves || state.combatFaulted || !ParseCombatMove(name, action, phase, sizeof(phase))) return false;
-    // The game's combat move goes on into its recover after the hit by itself (sAICombatMoveStartRecover); starting a
-    // recover as a move of its own faulted now and then. Leave it to the running move.
     if (!std::strcmp(phase, "Recover")) return static_cast<int32_t>(now - state.combatMoveAt) < 1500;
     gCScriptRoutine_PS* routine = RoutineOf(instance);
     if (!routine) return false;
@@ -407,15 +342,11 @@ bool PlayCombatMove(eCEntity* instance, State& state, char const* name, uint32_t
     CallCombatMove(args, &routine->GetSPU(), &fault);
     if (fault) {
         ++combatMoveFaults;
-        state.combatFaulted = true;  // never again on this body
+        state.combatFaulted = true;
         Logf("body: combat move %s faulted; this body replays by motion name from now on", name);
         return false;
     }
     ++combatMoves;
-    // A stagger from a blow (Stumble*, QuickStumble, PierceStumble: blood; ParadeStumble*: the clang of a parried blow), at its
-    // hit phase: the game's hit effect, as DoLogicalDamage starts it where the blow is judged (SG 0xb46d0). Not when our own
-    // blow showed on it at once (the game here started its effect with our hit), and once per stagger.
-    // Mirrors only: a puppet is struck on this machine, where the blow was judged and the game started its effect.
     if (staggerEffects && !state.puppet && !std::strcmp(phase, "Hit") && ((action >= 20 && action <= 28) || action == 34)) {
         if ((state.localHitAt && now - state.localHitAt < 1500) || (state.staggerEffectAt && now - state.staggerEffectAt < 400)) {
             ++staggerEffectsSkipped;
@@ -448,7 +379,7 @@ float SwingProgress(eCEntity* entity)
 {
     if (!LocallyAttacking(entity)) return -1.0f;
     const uint16_t part = MotionFraction(entity);
-    return part == 65535 ? -1.0f : static_cast<float>(part) / 65535.0f;
+    return part >= movement::NoMotionFrac ? -1.0f : static_cast<float>(part) / static_cast<float>(movement::MaxRunningMotionFrac);
 }
 
 
@@ -574,9 +505,6 @@ bool SlotRunning(eCEntity* instance)
     return actor && actor->IsMotionRunning(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0));
 }
 
-// The combat owner keeps the stance logic from replacing a replayed attack, but it also keeps it from taking over
-// when the attack has ended: with nothing running on slot 0 the body froze in its bind pose (owner's look after V2:
-// ~80 % of the client's mirrors stood still). Hand slot 0 back (owner 2, as the game does before it starts one).
 void ReleaseFinished(eCEntity* instance, State& state)
 {
     if (!state.combatOwned) return;
@@ -586,20 +514,17 @@ void ReleaseFinished(eCEntity* instance, State& state)
     if (actor && actor->IsMotionRunning(slot0)) return;
     if (animation) animation->SetMotionOwner(slot0, static_cast<eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner>(2));
     state.combatOwned = false;
-    state.actionUntil = 0;   // the action is over: pose and stance may be corrected again
-    *state.playing = '\0';   // the same motion may be started again
+    state.actionUntil = 0;
+    *state.playing = '\0';
     ++ownerReleases;
 }
 
-// Display step 4: a combat motion running here as at the sender is measured against where the sender's is now and, with
-// motion_seek, moved there. A combat move starts its motion a frame after it was asked for, so the start is caught in the first
-// frame slot 0 shows it.
 void FollowSenderOnce(eCEntity* instance, State& state, Target const& target, uint32_t now)
 {
     const int kind = state.puppet ? 1 : 0;
     if (!target.motion || !*target.motion || strstr(target.motion, "_Move_") || strstr(target.motion, "_Ambient_") ||
         ReplayKind(target.motion) != 0) { ++followSkips[kind][1]; return; }
-    if (target.motionFrac < 0 || target.motionFrac >= 65535) { ++followSkips[kind][0]; return; }
+    if (target.motionFrac < 0 || target.motionFrac >= movement::NoMotionFrac) { ++followSkips[kind][0]; return; }
     auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
     eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
     const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
@@ -614,8 +539,8 @@ void FollowSenderOnce(eCEntity* instance, State& state, Target const& target, ui
     const double max = actor->GetMaxTime(slot0);
     if (!(max > 0.0)) { ++followSkips[kind][2]; return; }
     const double unitMs = MotionUnitMs(max);
-    const double expected = target.motionFrac / 65535.0 * max + target.motionAgeMs / unitMs;
-    if (expected >= max) { ++followSkips[kind][4]; return; }  // over at the sender by now (or started again: its new number restarts it here)
+    const double expected = target.motionFrac / static_cast<double>(movement::MaxRunningMotionFrac) * max + target.motionAgeMs / unitMs;
+    if (expected >= max) { ++followSkips[kind][4]; return; }
     ++followSkips[kind][5];
     float lag = static_cast<float>((expected - actor->GetPlayTime(slot0)) * unitMs);
     const bool on = motionSeek < 0 ? GetConfig().motionSeek : motionSeek > 0;
@@ -623,10 +548,8 @@ void FollowSenderOnce(eCEntity* instance, State& state, Target const& target, ui
         actor->SetPlayTime(slot0, static_cast<float>(expected));
         state.seekAt = now + SeekEvery;
         ++seeks[kind];
-        lag = static_cast<float>((expected - actor->GetPlayTime(slot0)) * unitMs);  // what this frame shows: did it take?
+        lag = static_cast<float>((expected - actor->GetPlayTime(slot0)) * unitMs);
     }
-    // A jump of the play time shows as a hitch in the middle of one swing. Smaller lags are caught up by playing a little faster
-    // (or waiting a little) until the swing is where the sender's was.
     if (on && std::fabs(lag) > PaceDeadZone) {
         actor->SetPlaySpeed(slot0, std::clamp(1.0f + lag / PaceOver, 0.7f, 1.4f));
         state.paced = state.paceNow = true;
@@ -646,6 +569,169 @@ void FollowSender(eCEntity* instance, State& state, Target const& target, uint32
     auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
     if (eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr)
         actor->SetPlaySpeed(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0), 1.0f);
+}
+
+void DrivePuppetTimeline(Entity& entity, eCEntity* instance, State& state, Target const& target, bCMatrix const& pose,
+                         bool discontinuity, uint32_t now)
+{
+    if (!instance || guards::RejectRemoteWrite(instance, "body::Drive")) return;
+    state.steered = false;
+    if (state.walking) {
+        entity.CharacterMovement.StopMovement();
+        state.walking = false;
+    }
+    if (discontinuity) {
+        ++glide[1].hardSnaps;
+        entity.CharacterMovement.StopMovement();
+        entity.MoveTo(pose);
+        state.lastBranch = 1;
+        state.presentationSerial = target.presentationSerial;
+        *state.playing = '\0';
+    } else {
+        instance->SetToWorldMatrix(pose);
+        state.lastBranch = 0;
+    }
+    if (stanceSync && target.aniState >= 0 && static_cast<int>(entity.Routine.AniState) != target.aniState)
+        entity.Routine.AniState = static_cast<gEAniState>(target.aniState);
+    auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
+    eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
+    const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+    using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
+    if (!animation || !actor || !target.motion || !*target.motion) {
+        if (animation && (*state.playing || animation->GetMotionOwner(slot0) == static_cast<Owner>(4))) {
+            animation->SetMotionOwner(slot0, static_cast<Owner>(2));
+            if (actor && actor->IsMotionRunning(slot0)) animation->StopMotion(slot0, 0.1f);
+            if (actor) actor->SetPlaySpeed(slot0, 1.0f);
+        }
+        *state.playing = '\0';
+        state.combatOwned = false;
+        state.paced = false;
+        state.actionUntil = 0;
+        return;
+    }
+    char fileName[128];
+    if (std::strstr(target.motion, ".xmot")) strncpy_s(fileName, target.motion, _TRUNCATE);
+    else std::snprintf(fileName, sizeof(fileName), "%s.xmot", target.motion);
+    const bool looping = movement::IsLoopingPuppetMotion(fileName);
+    const bool trackedAction = movement::IsTrackedActionMotion(fileName);
+    bool seqRestart = false;
+    if (target.actionSeq >= 0) {
+        if (!looping && state.actionSeq >= 0 && target.actionSeq != state.actionSeq && std::strcmp(target.motion, state.playing) == 0) {
+            ++sameNameStarts;
+            if (actionSeq) { seqRestart = true; ++sameNameReplayed; }
+        }
+        state.actionSeq = target.actionSeq;
+    }
+    char currentSlot[128] = {};
+    MotionName(animation, 0, currentSlot, sizeof(currentSlot));
+    const bool sameClip = std::strcmp(target.motion, state.playing) == 0 && std::strcmp(currentSlot, fileName) == 0;
+    const bool needStart = !sameClip || seqRestart || (looping && !actor->IsMotionRunning(slot0));
+    if (needStart) {
+        entity.StopPlayAni();
+        if (gCScriptRoutine_PS* routine = RoutineOf(instance)) {
+            routine->AIStopPlayAnimation();
+            routine->AIStopCombatMove();
+        }
+        auto& desc = const_cast<eCVisualAnimation_PS::eSMotionDesc&>(animation->GetMotionDesc(slot0));
+        desc.SetMotion(bCString(fileName));
+        if (auto* resource = desc.GetMotion()) {
+            const float blendSec = discontinuity ? 0.0f : (trackedAction ? 0.10f : 0.14f);
+            if (blendSec > 0.0f) actor->SwitchFadeOut(slot0, GEFalse, blendSec);
+            for (int extra = 1; extra <= 3; ++extra) {
+                const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(extra);
+                if (actor->IsMotionRunning(slot)) animation->StopMotion(slot, blendSec);
+            }
+            struct MotionPlayDesc {
+                float blendInTime;
+                int32_t playMode;
+                float playSpeed;
+                int32_t maxLoops;
+                float targetWeight;
+                float blendOutTime;
+                int32_t blendMode;
+            } play{blendSec, 0, 1.0f, looping ? -1 : 1, 1.0f, 0.0f, 1};
+            static_assert(sizeof(MotionPlayDesc) == 28);
+            animation->SetMotion(slot0, resource);
+            animation->PlayMotion(slot0, reinterpret_cast<eCWrapper_emfx2Motion::eSMotionDesc*>(&play));
+            animation->SetMotionOwner(slot0, static_cast<Owner>(4));
+            actor->PauseMotion(GEFalse, slot0);
+            actor->SetTargetWeight(slot0, 1.0f);
+            state.combatOwned = false;
+            state.paced = false;
+        } else {
+            char stem[96];
+            strncpy_s(stem, fileName, _TRUNCATE);
+            if (char* ext = std::strstr(stem, ".xmot")) *ext = '\0';
+            if (!PlayScriptAni(instance, state, stem)) entity.StartPlayAni(bCString(stem), 0, GEFalse, 1.0f, GEFalse);
+        }
+        if (swimStrokes && static_cast<gECharMovementMode>(target.movementMode) == gECharMovementMode_Swim &&
+            std::strstr(fileName, "_Swim_") && std::strstr(fileName, "_Move_"))
+            ++swimStrokesPlayed;
+        if (trackedAction) {
+            char stem[96];
+            strncpy_s(stem, fileName, _TRUNCATE);
+            if (char* ext = std::strstr(stem, ".xmot")) *ext = '\0';
+            const int kind = ReplayKind(stem);
+            ++kindStarted[kind];
+            ++actionsStarted;
+            if (actor->IsMotionRunning(slot0)) { ++actionsPlayed; ++kindPlayed[kind]; }
+            state.checkAt = now + 150;
+            strncpy_s(state.started, stem, _TRUNCATE);
+            state.startedByMove = false;
+            state.actionUntil = now + 1200;
+        } else {
+            state.actionUntil = 0;
+        }
+        strncpy_s(state.playing, target.motion, _TRUNCATE);
+    }
+    if (!actor->IsMotionRunning(slot0)) return;
+    animation->SetMotionOwner(slot0, static_cast<Owner>(4));
+    const double max = actor->GetMaxTime(slot0);
+    if (!(max > 0.0) || !std::isfinite(max)) return;
+    if (state.lastCase == 3 && target.motionAgeMs > 180 && movement::IsTranslatingLocomotion(fileName)) {
+        actor->SetPlaySpeed(slot0, 0.0f);
+        state.paced = true;
+        return;
+    }
+    if (target.motionFrac < 0 || target.motionFrac >= movement::NoMotionFrac) {
+        if (state.paced) { actor->SetPlaySpeed(slot0, 1.0f); state.paced = false; }
+        return;
+    }
+    const double unitMs = MotionUnitMs(max);
+    const double expected = movement::ExpectedPuppetPlayTime(max, target.motionFrac, target.motionAgeMs, unitMs, looping);
+    const double maxPlay = std::nextafter(max, 0.0);
+    if (needStart) {
+        actor->SetPlayTime(slot0, static_cast<float>(std::clamp(expected, 0.0, maxPlay)));
+        actor->SetPlaySpeed(slot0, 1.0f);
+        return;
+    }
+    if (!looping && expected >= max) {
+        if (state.paced) { actor->SetPlaySpeed(slot0, 1.0f); state.paced = false; }
+        ++followSkips[1][4];
+        return;
+    }
+    float lag = movement::PuppetPhaseLagMs(actor->GetPlayTime(slot0), expected, max, unitMs, looping);
+    const bool seekOn = motionSeek < 0 ? GetConfig().motionSeek : motionSeek > 0;
+    const float seekLimit = looping ? 160.0f : SeekOver;
+    if (seekOn && std::fabs(lag) > seekLimit && static_cast<int32_t>(now - state.seekAt) >= 0) {
+        actor->SetPlayTime(slot0, static_cast<float>(std::clamp(expected, 0.0, maxPlay)));
+        state.seekAt = now + SeekEvery;
+        ++seeks[1];
+        lag = movement::PuppetPhaseLagMs(actor->GetPlayTime(slot0), expected, max, unitMs, looping);
+    }
+    if (seekOn) {
+        const float speed = movement::PuppetPaceSpeed(lag);
+        actor->SetPlaySpeed(slot0, speed);
+        state.paced = speed != 1.0f;
+        if (state.paced) ++paceSteps[1];
+    } else if (state.paced) {
+        actor->SetPlaySpeed(slot0, 1.0f);
+        state.paced = false;
+    }
+    if (!looping && ReplayKind(fileName) == 0 && !std::strstr(fileName, "_Move_")) {
+        ++followSkips[1][5];
+        if (motionLags[1].size() < 50000) motionLags[1].push_back(lag);
+    }
 }
 
 void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
@@ -712,9 +798,6 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             }
         }
     }
-    // Smoothness (S3): per driven frame while the sender moves. Since 28.10. by its travel over at least 200 ms of its states
-    // (smoothWindow): a sender stuck at an obstacle or restarting its walk jitters a few cm between close states, which
-    // counted as moving while its body rightly stood (stageWalk: 36-99 % "still" in the turn back). QA smoothwindowoff.
     const bool senderMoves = smoothWindow ? TravelSpeed(state.track) > 100.0f : target.speed > 100.0f;
     if (state.lastAt && dt > 0 && dt < 500 && senderMoves) {
         Glide& g = glide[state.puppet ? 1 : 0];
@@ -739,24 +822,13 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
     state.lastCase = state.track.lastCase;
     state.track.lastCase = 0;
     const bCMatrix pose = Pose(*instance, target.position, target.rotation);
-    // Movement motions (Move_*) belong to the engine's movement system and only play while a body really
-    // travels. A moving body is therefore steered through its movement controller with the sender's
-    // movement mode; MoveTo only snaps large errors (teleport, lag) and the final stance.
     const gECharMovementMode mode = static_cast<gECharMovementMode>(target.movementMode);
-    // An attack, parade or hit moves the body a little (lunges, steps back); steering it as walking showed a walk
-    // instead of the attack. Action motions play in place, the pose follows.
-    // A short fall (Fall_Loop, a step down while running) is travel, not an action (STILLMOTION 28.10.: the puppet stood while
-    // its sender fell on, 2-30 still frames a stageWalk run). Tried 28.10. (QA fallmoveon): not fewer, off by default.
     const bool falling = fallMove && target.motion && strstr(target.motion, "_Fall_");
     const bool action = target.motion && *target.motion && !strstr(target.motion, "_Move_") && !strstr(target.motion, "_Ambient_") && !falling;
     const bool moving = !action && ((mode >= gECharMovementMode_Sneak && mode <= gECharMovementMode_Sprint) || falling) &&
                         (target.speed > 40.0f || error > 60.0f);
-    // Stufe 3.2b: a puppet with its lead that ran past where its player stopped walks back instead of being pushed there.
     const bool actingNow = static_cast<int32_t>(state.actionUntil - now) > 0;
     const bool catchUp = target.smooth && !action && !actingNow && error >= DeadZone && error <= target.snapAt;
-    // Swimming is no mode the movement controller takes for a driven body (steered with mode 7 it stayed in mode 1, 26.10.):
-    // the body is placed and showed the swim idle while its player made strokes (stageSwim). The player's stroke
-    // (Hero_Swim_..._Move_*) plays here like a loop instead, and the pose follows closely.
     const bool swimStroke = swimStrokes && mode == gECharMovementMode_Swim && target.motion && strstr(target.motion, "_Swim_") &&
                             strstr(target.motion, "_Move_");
     if (!action && mode >= gECharMovementMode_Sneak && mode <= gECharMovementMode_Sprint &&
@@ -772,6 +844,11 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
         }
     }
     const bool discontinuity = target.timeline && state.presentationSerial != target.presentationSerial;
+    if (state.puppet && target.timeline) {
+        DrivePuppetTimeline(entity, instance, state, target, pose, discontinuity, now);
+        return;
+    }
+    if (!action) state.actionUntil = 0;
     // The timeline owns the position of a buffered body every frame. Its movement controller only supplies the walk motion (it
     // is given a goal far ahead, below), so it can never "arrive" and drop the clip while the body keeps travelling.
     if (target.timeline && !discontinuity)
@@ -785,24 +862,19 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
         state.lastBranch = 1;
         state.presentationSerial = target.presentationSerial;
     } else if (moving || catchUp || (!action && state.walking && error > 60.0f && !(target.smooth && error < DeadZone))) {
-        // Up from a knock-down and off at once: a body left in its sitting state cannot walk and froze on its get-up
-        // motion (19.10.: most of the raid's frozen mirrors). Take the stance here too, as below when standing.
         if (stanceSync && static_cast<int32_t>(state.actionUntil - now) <= 0 && target.aniState >= 0 &&
             static_cast<int>(entity.Routine.AniState) != target.aniState)
             entity.Routine.AniState = static_cast<gEAniState>(target.aniState);
-        // A stance motion replayed while the player stood (an idle loop, a gesture: StartPlayAni or a play-ani instruction)
-        // kept slot 0 when it walked off: the body travelled but showed it standing (stageGlide 23.10.: 13-16 % of the
-        // nearly all of it steered). End it as the body sets off, and again while it travels.
         if (settleStance && (!state.walking || static_cast<int32_t>(now - state.settleAt) >= 0)) {
             state.settleAt = now + 250;
             char shows[128];
             CurrentMotion(instance, shows, sizeof(shows));
             if (*shows && !strstr(shows, "_Move_")) {
-                // Stopping the replay alone left a looping idle on slot 0 now and then (host trace 23.10. 18:11: 1.4 s steered in
-                // Ambient_Loop); stop the motion on the slot too, blended, so movement takes it next frame. (Handing the slot to
-                // owner 2 instead made it worse: 85-98 % glided, run 20261023-182342.)
                 entity.StopPlayAni();
-                if (gCScriptRoutine_PS* routine = RoutineOf(instance)) routine->AIStopPlayAnimation();  // only a running play-ani
+                if (gCScriptRoutine_PS* routine = RoutineOf(instance)) {
+                    routine->AIStopPlayAnimation();
+                    routine->AIStopCombatMove();
+                }
                 if (auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation))) {
                     const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
                     ++stopOwners[static_cast<unsigned>(animation->GetMotionOwner(slot0)) & 7];
@@ -834,13 +906,10 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             entity.CharacterMovement.StopMovement();
             state.walking = false;
         }
-        // Setting the pose every frame restarted the body's motion and cut attacks short; while an action plays the
-        // pose is only corrected when it drifted.
         const bool acting = static_cast<int32_t>(state.actionUntil - now) > 0;
         if (target.timeline) {
             state.lastBranch = 3;
         } else if (target.smooth && !acting && error < DeadZone) {
-            // Dead zone: turned as its player, but not pushed the last few centimetres (a push shows as gliding)
             const bCVector& here = instance->GetWorldPosition();
             const float stay[3] = {here.GetX(), here.GetY(), here.GetZ()};
             entity.MoveTo(Pose(*instance, stay, target.rotation));
@@ -851,22 +920,12 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
         } else {
             state.lastBranch = 3;
         }
-        // A motion of another stance (lying knocked out: AniState 16) did not play while the body stayed in its
-        // standing state (stage A: the client fell, its puppet on the host kept standing); take the stance first.
-        // Not during an action: an attack changes the body's stance by itself, and setting it back started that
-        // stance's standing loop, which cut the attack within 150 ms (stage V2: 44 of 919 attacks showed).
         const bool loopLock = acting && state.playing[0] && strstr(state.playing, "_Loop_") != nullptr;
         if (stanceSync && (!acting || loopLock) && target.aniState >= 0 &&
             static_cast<int>(entity.Routine.AniState) != target.aniState) {
             entity.Routine.AniState = static_cast<gEAniState>(target.aniState);
             *state.playing = '\0';
         }
-        // A loop (frying, sweeping, thinking) keeps its name on the owner for as long as it runs there, but a replay
-        // plays it once: the mirror froze after the first round (19.10.: Gorn at the fire, 19 of 80 looks with
-        // nothing running). Start it again once it no longer runs. A stance idle (_Ambient_) only when nothing runs:
-        // standing, the body plays its own idle variants, but sitting or lying it froze as well (Gorn with fruit).
-        // An animal shown for a transformed player plays its idles through its own AI, which a driven body does not run
-        // (transformdiag: a wolf puppet stood frozen in 5 of 12 looks); its idles (_Ambient_Ambient) restart as well.
         if (loopRestart && target.motion && (strstr(target.motion, "_Loop_") || strstr(target.motion, "_Ambient_") || swimStroke) &&
             (!strstr(target.motion, "_Move_") || swimStroke) &&
             !strcmp(target.motion, state.playing) && static_cast<int32_t>(now - state.loopCheckAt) >= 0) {
@@ -876,16 +935,12 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             CurrentMotion(instance, shows, sizeof(shows));
             if (!SlotRunning(instance) || (!idle && strcmp(shows, target.motion) != 0)) {
                 *state.playing = '\0';
-                // An idle restarted with StartPlayAni did not run either (holding a bowl, sitting with meat: 778 restarts,
-                // still frozen), and restarting it every 300 ms kept a standing mirror turning on the spot.
                 state.idleAsScriptAni = idle;
                 ++loopRestarts;
             } else if (!idle) {
-                state.actionUntil = now + 1200;  // still in the loop: the pose every frame would cut it (see below)
+                state.actionUntil = now + 1200;
             }
         }
-        // Protocol 58: a new action number with the same motion name is a new start of it (a second attack alike), shown only
-        // with actionSeq (counted either way).
         if (target.actionSeq >= 0) {
             if (state.actionSeq >= 0 && target.actionSeq != state.actionSeq && target.motion && *target.motion && !strcmp(target.motion, state.playing)) {
                 ++sameNameStarts;
@@ -896,7 +951,6 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             }
             state.actionSeq = target.actionSeq;
         }
-        // Stance and action motions exist in the game; StartPlayAni takes the name without extension.
         if (target.motion && *target.motion && (!strstr(target.motion, "_Move_") || swimStroke) && strcmp(target.motion, state.playing) != 0) {
             if (swimStroke) ++swimStrokesPlayed;
             char name[96];
@@ -907,8 +961,6 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             state.idleAsScriptAni = false;
             if (!combatMove && !scriptAni) entity.StartPlayAni(bCString(name), 0, GEFalse, 1.0f, GEFalse);
             if (!strstr(name, "_Ambient_")) {
-                // Did StartPlayAni play it at all? It returns silently when the motion file is not found. (A combat
-                // move starts its motion on the body's next frame, so it never shows here.)
                 char now0[128];
                 CurrentMotion(instance, now0, sizeof(now0));
                 const int kind = ReplayKind(name);

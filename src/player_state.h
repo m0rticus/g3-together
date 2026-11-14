@@ -33,8 +33,8 @@ struct PlayerState
     // same motion counts too) and how far it has played (ms)
     uint8_t actionSeq = 0;
     uint16_t actionMs = 0;
-    // Protocol 59 (29.10.): how far slot 0's motion has played, 0..65535 of its length (body::MotionFraction; 65535 also when
-    // nothing runs), so the receiver can show a mirrored blow where it is at the sender (body.cpp, motion_seek)
+    // Protocol 59 (29.10.): how far slot 0's motion has played, 0..65534 of its length (body::MotionFraction; 65535 only
+    // when nothing runs), so the receiver can pace or seek slot 0 to the sender's phase (body.cpp)
     uint16_t motionFrac = 65535;
     uint32_t downedSequence = 0; // the owning player's current downed life; paid revives must echo it
     uint32_t focusNpc = 0, targetNpc = 0; // GUID HashGuid references, 0 = no NPC

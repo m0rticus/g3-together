@@ -56,4 +56,27 @@ void TestMovementPolicy()
         for (size_t byte = 0; byte < admin.size(); ++byte)
             assert(admin[byte] == (byte == 0xfd ? 1 : original[byte]));
     }
+
+    assert(IsContinuousPuppetMotion(""));
+    assert(IsContinuousPuppetMotion("Hero_None_None_None_P0_Move_Sprint_N_Fwd_600.xmot"));
+    assert(IsContinuousPuppetMotion("Hero_1H_1H_1H_P0_Move_Walk_N_Right_160.xmot"));
+    assert(IsContinuousPuppetMotion("Hero_None_None_None_P0_Jump_Up_N_Fwd_00_%_00_0.xmot"));
+    assert(IsContinuousPuppetMotion("Hero_None_None_None_P0_Fall_Loop_N_Fwd_00_%_00_0.xmot"));
+    assert(!IsContinuousPuppetMotion("Hero_1H_1H_1H_P0_Attack_Hit_N_Left_00_%_00_P1_0_R.xmot"));
+    assert(IsTrackedActionMotion("Hero_1H_1H_1H_P0_Attack_Hit_N_Left_00_%_00_P1_0_R.xmot"));
+    assert(!IsTrackedActionMotion("Hero_None_None_None_P0_Jump_Up_N_Fwd_00_%_00_0.xmot"));
+
+    assert(IsLoopingPuppetMotion("Hero_None_None_None_P0_Move_Sprint_N_Fwd_600.xmot"));
+    assert(IsLoopingPuppetMotion("Hero_1H_1H_1H_P0_Parade_Loop_N_Fwd_00_%_00_0.xmot"));
+    assert(IsLoopingPuppetMotion("Hero_None_None_None_P0_Jump_Loop_N_Fwd_00_%_00_0.xmot"));
+    assert(!IsLoopingPuppetMotion("Hero_None_None_None_P0_Jump_Up_N_Fwd_00_%_00_0.xmot"));
+    assert(!IsLoopingPuppetMotion("Hero_None_None_None_P0_Jump_End_N_Fwd_00_%_00_0.xmot"));
+    assert(!IsLoopingPuppetMotion("Hero_1H_1H_1H_P0_Attack_Hit_N_Left_00_%_00_P1_0_R.xmot"));
+
+    assert(EncodeRunningMotionFrac(1.0) == MaxRunningMotionFrac);
+    assert(EncodeRunningMotionFrac(1.0) < NoMotionFrac);
+    const uint16_t nearEnd = EncodeRunningMotionFrac(0.92);
+    const uint16_t afterWrap = EncodeRunningMotionFrac(0.08);
+    const uint16_t midWrap = InterpolateMotionFrac(nearEnd, afterWrap, 0.5f, true);
+    assert(midWrap <= EncodeRunningMotionFrac(0.02) || midWrap >= EncodeRunningMotionFrac(0.98));
 }

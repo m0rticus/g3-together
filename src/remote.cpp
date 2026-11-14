@@ -78,6 +78,10 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
         puppet.body.track = body::Track{};
         puppet.body.presentationSerial = 0;
         puppet.body.actionSeq = -1;
+        puppet.motions.Reset();
+        puppet.heldRight.clear();
+        puppet.heldLeft.clear();
+        puppet.holdChecked = 0;
         puppet.presentationNames.clear();
         puppet.terminal = false;
         puppet.terminalInitialized = false;
@@ -95,16 +99,31 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
             puppet.presentationNames[hash] = name;
         return hash;
     };
+    const uint32_t animHash = remember(state.animation);
+    const uint32_t rightHash = remember(state.heldRight);
+    const uint32_t leftHash = remember(state.heldLeft);
+    const bool continuous = movement::IsContinuousPuppetMotion(state.animation);
     body::MotionState motion;
-    motion.motion = remember(state.animation);
-    motion.heldRight = remember(state.heldRight);
-    motion.heldLeft = remember(state.heldLeft);
+    motion.motion = continuous ? 0u : animHash;
+    motion.heldRight = rightHash;
+    motion.heldLeft = leftHash;
     motion.aniState = state.aniState;
     motion.actionSeq = state.actionSeq;
     motion.motionFrac = state.motionFrac;
     motion.flags = state.flags;
     motion.locomotion = body::IsLocomotionMotion(state.animation);
     body::Feed(puppet.body.track, state.position, state.rotation, state.sent, arrived, state.movementMode, motion);
+    movement::PuppetMotionSample sample;
+    sample.sent = state.sent;
+    sample.motion = animHash;
+    sample.heldRight = rightHash;
+    sample.heldLeft = leftHash;
+    sample.motionFrac = state.motionFrac;
+    sample.movementMode = state.movementMode;
+    sample.aniState = state.aniState;
+    sample.actionSeq = state.actionSeq;
+    sample.looping = movement::IsLoopingPuppetMotion(state.animation);
+    puppet.motions.Push(puppet.body.track.serial, sample);
 }
 
 bool LocalState(net::PlayerState& state)
@@ -287,8 +306,12 @@ using internal::TakeOff;
 template <typename P>
 void Hold(P& puppet, char const* right, char const* left, uint32_t now)
 {
-    if (!qa.puppetHold || static_cast<int32_t>(now - puppet.holdChecked) < 250) return;
-    puppet.holdChecked = now;
+    if (!qa.puppetHold) return;
+    const bool changed = !puppet.holdChecked || puppet.heldRight != right || puppet.heldLeft != left;
+    if (!changed && static_cast<int32_t>(now - puppet.holdChecked) < 250) return;
+    puppet.holdChecked = now ? now : 1u;
+    puppet.heldRight = right;
+    puppet.heldLeft = left;
     const Entity inRight = puppet.entity.Inventory.GetItemFromSlot(gESlot_RightHand), inLeft = puppet.entity.Inventory.GetItemFromSlot(gESlot_LeftHand);
     const std::string haveRight = inRight.GetInstance() ? inRight.GetName().GetText() : "";
     const std::string haveLeft = inLeft.GetInstance() ? inLeft.GetName().GetText() : "";
@@ -579,6 +602,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         const auto it = puppet.presentationNames.find(hash);
         return it == puppet.presentationNames.end() ? "" : it->second.c_str();
     };
+    char const* wantedRight = remote.latest.heldRight;
+    char const* wantedLeft = remote.latest.heldLeft;
     if (timeline) {
         if (body::Sample(puppet.body.track, now, shownAt, shownTurn, -presentationDelay, true, &presentation)) {
             presented = true;
@@ -592,6 +617,20 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
             target.actionSeq = presentation.motion.actionSeq;
             target.motionFrac = presentation.motion.motionFrac;
             target.motionAgeMs = presentation.sent - presentation.stateSent;
+            wantedRight = nameOf(presentation.motion.heldRight);
+            wantedLeft = nameOf(presentation.motion.heldLeft);
+            movement::PuppetMotionSample sampledMotion;
+            uint32_t sampledAgeMs = 0;
+            if (puppet.motions.Sample(presentation.sent, sampledMotion, sampledAgeMs)) {
+                target.movementMode = sampledMotion.movementMode;
+                target.motion = nameOf(sampledMotion.motion);
+                target.aniState = sampledMotion.aniState;
+                target.actionSeq = sampledMotion.actionSeq;
+                target.motionFrac = sampledMotion.motionFrac;
+                target.motionAgeMs = sampledAgeMs;
+                wantedRight = nameOf(sampledMotion.heldRight);
+                wantedLeft = nameOf(sampledMotion.heldLeft);
+            }
             target.goal = body::Sample(puppet.body.track, now, smoothGoal, goalTurn, body::GoalAhead - presentationDelay, false)
                           ? smoothGoal : shownAt;
             target.smooth = true;
@@ -614,8 +653,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     if (!*remote.latest.shape) {  // a creature holds and wears nothing
         NoDrop(puppet, now);
-        Hold(puppet, presented ? nameOf(presentation.motion.heldRight) : remote.latest.heldRight,
-                     presented ? nameOf(presentation.motion.heldLeft) : remote.latest.heldLeft, now);
+        Hold(puppet, presented ? wantedRight : remote.latest.heldRight,
+                     presented ? wantedLeft : remote.latest.heldLeft, now);
         Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
     }
     // The player's swings replay as the game's combat moves too (owner's look: players' attacks hardly visible);
