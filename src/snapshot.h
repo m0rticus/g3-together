@@ -35,6 +35,7 @@ struct MotionState
     uint8_t contact = 0;
     uint8_t attitude = 0;
     bool locomotion = false;  // player animation name was classified as locomotion by the receiver
+    bool nonAttackCombat = false;  // combat locomotion/idle/recover/stumble may absorb accumulated clock lag
     net::NpcMotion motions[net::NpcMotionSlots];
 };
 

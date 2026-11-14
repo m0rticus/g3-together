@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npcplayback.h"
+#include "npcplayback_hit_policy.h"
 #include "npcplayback_hooks.h"
 #include "npcplayback_skeleton.h"
 #include "npcsend_policy.h"
@@ -462,6 +463,8 @@ bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion
     state.localOptions = options;
     strcpy_s(state.localMotion, motion);
     ++predictedHits;
+    Logf("combat: NPCHITSYNC stage=predict-start npc=%s hit=%u motion=%s duration_ms=%.0f",
+         entity->GetName().GetText(), hit, motion, state.localDuration * 1000.0f);
     return true;
 }
 
@@ -489,17 +492,32 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     if (state.pendingHit && state.acknowledgedAt &&
         static_cast<int32_t>(record.sent - state.acknowledgedAt) >= 0 &&
         record.motions[0].instance != state.localOptions.instance) state.pendingHit = 0;
+    if (npcplayback_hit_policy::PendingHitExpired(state.pendingHit, state.localStart, now))
+        state.pendingHit = 0;
     const float localAge = static_cast<float>(now - state.localStart) / 1000.0f;
-    const bool local = *state.localMotion && (state.pendingHit || localAge < state.localDuration);
+    const bool local = npcplayback_hit_policy::LocalStaggerActive(*state.localMotion != '\0', localAge, state.localDuration);
     char const* firstName = record.motions[0].active ? names(record.motions[0].name) : nullptr;
     const bool firstSuppressed = record.motions[0].active &&
         (state.suppressed[0] == record.motions[0].instance ||
          (record.hitPlayer == net::LocalId() && record.hitSequence &&
-          record.hitSequence == state.acknowledgedHit && ReactionMotion(firstName)));
-    const bool expectedEcho = !local && firstSuppressed && *state.localMotion;
-    bool echo = false;
+          record.hitSequence == state.acknowledgedHit && npcplayback_hit_policy::HitImpactMotion(firstName)));
     NativePose hostPose;
     const bool havePose = PreparePose(entity, *animation, state, record, names, hostPose);
+    const float hostFirstPhase = record.motions[0].active ? record.motions[0].phase : 0.0f;
+    const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
+        local, *state.localMotion != '\0', firstSuppressed, localAge, state.localDuration, havePose, hostFirstPhase);
+    const bool expectedEcho = holdEcho;
+    if (!local && !holdEcho && *state.localMotion) {
+        if (firstSuppressed && state.suppressed[0] == record.motions[0].instance)
+            state.suppressed[0] = 0;
+        char const* mode = firstSuppressed ? "host-pose-tail"
+            : (firstName && std::strstr(firstName, "_Recover_") ? "host-recover" : "host-motion");
+        Logf("combat: NPCHITSYNC stage=handoff npc=%s hit=%u mode=%s local_age_ms=%.0f local_duration_ms=%.0f "
+             "host_motion=%s host_phase=%.3f",
+             entity->GetName().GetText(), state.acknowledgedHit ? state.acknowledgedHit : state.pendingHit, mode,
+             localAge * 1000.0f, state.localDuration * 1000.0f, firstName ? firstName : "(none)", hostFirstPhase);
+    }
+    bool echo = false;
     if (!local && !expectedEcho && !havePose) return false;
     const bCMatrix pose = body::Pose(*entity, record.position, record.rotation);
     entity->SetToWorldMatrix(pose);
@@ -516,8 +534,9 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
         auto const& motion = record.motions[i];
         char const* name = motion.active ? names(motion.name) : nullptr;
-        if (record.hitPlayer == net::LocalId() && record.hitSequence && record.hitSequence == state.acknowledgedHit &&
-            ReactionMotion(name) && state.suppressed[i] != motion.instance) {
+        if ((local || holdEcho) && record.hitPlayer == net::LocalId() && record.hitSequence &&
+            record.hitSequence == state.acknowledgedHit && npcplayback_hit_policy::HitImpactMotion(name) &&
+            state.suppressed[i] != motion.instance) {
             state.suppressed[i] = motion.instance;
             ++skippedEchoes;
         }
@@ -533,7 +552,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
             state.instances[i] = 0;
             continue;
         }
-        if (motion.active && state.suppressed[i] == motion.instance && i == 0 && *state.localMotion) {
+        if (holdEcho && motion.active && state.suppressed[i] == motion.instance && i == 0 && *state.localMotion) {
             net::NpcMotion overlay = state.localOptions;
             overlay.phase = 1.0f;
             overlay.weight = 1.0f;

@@ -3,6 +3,7 @@
 #include "npc_corpse.h"
 
 #include "arena.h"
+#include "combat_timing.h"
 #include "guards.h"
 #include "guide.h"
 #include "hud.h"
@@ -640,6 +641,12 @@ void PackMotionFromRecord(body::MotionState& motion, net::NpcRecord const& r)
     motion.damageMultiplier = r.damageMultiplier;
     motion.contact = r.contact;
     motion.attitude = r.attitude;
+    char const* firstName = nullptr;
+    if (r.motions[0].active) {
+        if (auto const it = motionNames.find(r.motions[0].name); it != motionNames.end())
+            firstName = it->second.c_str();
+    }
+    motion.nonAttackCombat = r.motions[0].active && !combat_timing::IncomingAttackMotion(firstName, r.contact);
     std::memcpy(motion.motions, r.motions, sizeof(motion.motions));
 }
 

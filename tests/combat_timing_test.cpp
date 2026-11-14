@@ -1,4 +1,5 @@
 #include "../src/combat_timing.h"
+#include "../src/contact.h"
 #include "../src/npcsend_policy.h"
 #include "../src/snapshot.h"
 
@@ -549,6 +550,143 @@ void TestReliableMotionDescriptors()
     notIncomingNext.motions[0].name++;
     assert(!npcsend::EssentialChanged(notIncoming, notIncomingNext));
 }
+
+void TestBetweenSwingClockCatchUpAndEvictedHitPhase()
+{
+    assert(combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_Attack_Raise_N_Fwd_00.xmot", 0));
+    assert(combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_Attack_Hit_N_Fwd_00.xmot", 1));
+    assert(combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_RunAttack_Hit_N_Fwd_00.xmot", 0));
+    assert(combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_WhirlAttack_Begin_00.xmot", 0));
+    assert(combat_timing::IncomingAttackMotion(nullptr, 0));
+    assert(!combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_Attack_Recover_N_Fwd_00.xmot", 0));
+    assert(!combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_Move_Run_Loop_N_Fwd_00.xmot", 0));
+    assert(!combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_Ambient_Loop_00.xmot", 0));
+    assert(!combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_StumbleR_Hit_N_Back_00.xmot", 0));
+    assert(!combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_StumbleR_Recover_N_Fwd_00.xmot", 0));
+    assert(!combat_timing::IncomingAttackMotion("Orc_Stand_None_2H_P0_Parade_Loop_00.xmot", 0));
+
+    // Simulate real 16 ms client frames + 30 ms host combat packets with +/-12 ms jitter AND a
+    // 1,200 ms client hitch mid-fight: between-swing recovery/locomotion must keep steady-state
+    // backlog near zero (eliminating the Build 75 5,287 ms ratchet) and drain post-hitch backlog
+    // back under 50 ms while still protecting every active Attack_Raise / Attack_Hit window.
+    const float position[3] = {};
+    const float rotation[4] = {0, 0, 0, 1};
+    float shown[3], turn[4];
+    body::Presentation presentation;
+    body::Track track;
+    SetIncomingTrack(track);
+
+    uint32_t nextHostSend = 10000;
+    uint32_t clientNow = 10020;
+    uint32_t currentInstance = 10;
+    bool prevWasAttack = false;
+    uint32_t packetIndex = 0;
+    bool sawProtectedAttack = false;
+    bool sawUnprotectedRecovery = false;
+
+    auto deliverDuePackets = [&](uint32_t upToNow) {
+        while (true) {
+            const int32_t jitterSchedule[4] = {12, 0, -12, 0};
+            const int32_t jitter = jitterSchedule[packetIndex & 3u];
+            const uint32_t arrival = static_cast<uint32_t>(static_cast<int32_t>(nextHostSend) + 20 + jitter);
+            if (static_cast<int32_t>(upToNow - arrival) < 0)
+                break;
+            const uint32_t cyclePos = (nextHostSend - 10000u) % 1050u;
+            const bool isAttack = cyclePos < 450u;
+            if (packetIndex == 0 || isAttack != prevWasAttack) {
+                ++currentInstance;
+                prevWasAttack = isAttack;
+            }
+            const float phase = isAttack
+                ? static_cast<float>(cyclePos) / 450.0f
+                : static_cast<float>(cyclePos - 450u) / 600.0f;
+            body::MotionState m = IncomingAttack(currentInstance, isAttack ? 501u : 502u, phase);
+            m.contact = isAttack ? 1 : 0;
+            m.nonAttackCombat = !isAttack;
+            body::Feed(track, position, rotation, nextHostSend, arrival, 2, m);
+            nextHostSend += 30;
+            ++packetIndex;
+        }
+    };
+
+    // 1) 4 seconds of jittery combat: backlog must not ratchet upward.
+    for (int frame = 0; frame < 250; ++frame, clientNow += 16) {
+        deliverDuePackets(clientNow);
+        if (!track.count) continue;
+        assert(body::Sample(track, clientNow, shown, turn, -body::PlaybackDelay(track), true, &presentation));
+        if (!presentation.motion.nonAttackCombat && track.combatClockProtected)
+            sawProtectedAttack = true;
+        if (presentation.motion.nonAttackCombat && !track.combatClockProtected)
+            sawUnprotectedRecovery = true;
+    }
+    assert(sawProtectedAttack && sawUnprotectedRecovery);
+    assert(track.backlogMs <= 50);
+
+    // 2) 1,200 ms client stall mid-combat followed by 8 seconds of normal frames: drains back <= 50 ms.
+    clientNow += 1200;
+    deliverDuePackets(clientNow);
+    for (int frame = 0; frame < 500; ++frame, clientNow += 16) {
+        deliverDuePackets(clientNow);
+        assert(body::Sample(track, clientNow, shown, turn, -body::PlaybackDelay(track), true, &presentation));
+    }
+    if (track.backlogMs > 50 || track.catchUpFrames == 0) {
+        std::fprintf(stderr, "post-stall debug: backlogMs=%d catchUpFrames=%u delayMs=%d pending=%zu prot=%d\n",
+                     track.backlogMs, track.catchUpFrames, track.delayMs, body::PendingEvents(track),
+                     track.combatClockProtected ? 1 : 0);
+    }
+    assert(track.backlogMs <= 50 && track.catchUpFrames > 0);
+
+    // Even if intermediate frames of an Attack_Hit clip were evicted/dropped before Attack_Recover,
+    // Interpolate advances contact=1 Hit phase across 0.60 instead of freezing at 0.047.
+    body::Track evicted;
+    SetIncomingTrack(evicted);
+    body::MotionState startHit = IncomingAttack(90, 901, 0.047f);
+    startHit.contact = 1;
+    body::MotionState startRecover = IncomingAttack(91, 902, 0.0f);
+    startRecover.contact = 0;
+    startRecover.nonAttackCombat = true;
+    body::Feed(evicted, position, rotation, 2000, 2020, 2, startHit);
+    body::Feed(evicted, position, rotation, 2450, 2470, 2, startRecover);
+    // Prime initial event presentation at 2000, then sample across [2000, 2450).
+    assert(body::Sample(evicted, 2054, shown, turn, -34, true, &presentation));
+    bool reachedHitPhase = false;
+    for (uint32_t now = 2070; now <= 2460; now += 16) {
+        assert(body::Sample(evicted, now, shown, turn, -34, true, &presentation));
+        if (presentation.motion.contact &&
+            PresentedInstance(presentation) == 90 &&
+            combat_timing::HitPhaseReached(PresentedPhase(presentation))) {
+            reachedHitPhase = true;
+        }
+    }
+    assert(reachedHitPhase);
+}
+
+void TestSweptWeaponMidBladeCleave()
+{
+    // A 140 cm 2H Orc axe sweeps horizontally from left (-X) to right (+X) across a hero standing
+    // 120 cm in front of the attacker: grip passes at z=50, tip passes at z=190, end-of-tick blade is at x>=20..80.
+    const float oldA[3] = {-20.0f, 100.0f, 50.0f};
+    const float oldB[3] = {-80.0f, 100.0f, 190.0f};
+    const float a[3] = {20.0f, 100.0f, 50.0f};
+    const float b[3] = {80.0f, 100.0f, 190.0f};
+    const float heroFirst[3] = {0.0f, 35.0f, 120.0f};
+    const float heroLast[3] = {0.0f, 155.0f, 120.0f};
+    const float reach = 42.0f; // 35 cm capsule radius + 7 cm blade half-thickness
+    const float limit = reach * reach;
+
+    // Endpoint-only segments all miss (> 42 cm), proving why endpoint-only SweepsBody dropped mid-blade hits.
+    assert(contact::SegmentDistanceSquared(oldA, a, heroFirst, heroLast) > limit);
+    assert(contact::SegmentDistanceSquared(oldB, b, heroFirst, heroLast) > limit);
+    assert(contact::SegmentDistanceSquared(a, b, heroFirst, heroLast) > limit);
+
+    // Full swept weapon surface catches the mid-blade passing right through (0, 100, 120).
+    assert(contact::SweptSegmentDistanceSquared(oldA, oldB, a, b, heroFirst, heroLast, true) <= limit);
+
+    // Retreated hero at z=240 cm stays safely outside the swept surface.
+    const float retreatedFirst[3] = {0.0f, 35.0f, 240.0f};
+    const float retreatedLast[3] = {0.0f, 155.0f, 240.0f};
+    assert(contact::SweptSegmentDistanceSquared(oldA, oldB, a, b, retreatedFirst, retreatedLast, true) > limit);
+}
 }
 
 int main()
@@ -559,6 +697,8 @@ int main()
     TestDefenseAndOncePerInstance();
     TestDisplayClockProtectionAndWrap();
     TestReliableMotionDescriptors();
+    TestBetweenSwingClockCatchUpAndEvictedHitPhase();
+    TestSweptWeaponMidBladeCleave();
     std::puts("combat timing engine-free tests passed");
     return 0;
 }

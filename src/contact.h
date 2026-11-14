@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 
 namespace g3t::contact {
 inline float SegmentDistanceSquared(float const a[3], float const b[3], float const c[3], float const d[3])
@@ -34,5 +35,38 @@ inline float SegmentDistanceSquared(float const a[3], float const b[3], float co
         distance += delta * delta;
     }
     return distance;
+}
+
+inline void LerpPoint(float const a[3], float const b[3], float t, float out[3])
+{
+    for (int i = 0; i < 3; ++i) out[i] = a[i] + (b[i] - a[i]) * t;
+}
+
+// Minimum distance squared between a swept blade/limb segment [(oldA, oldB) -> (a, b)] and a
+// vertical character capsule axis [capsuleFirst, capsuleLast]. Sampling interior blade stations
+// and intermediate sweep chords prevents long 2H weapons from straddling a torso in one tick.
+inline float SweptSegmentDistanceSquared(float const oldA[3], float const oldB[3],
+                                         float const a[3], float const b[3],
+                                         float const capsuleFirst[3], float const capsuleLast[3],
+                                         bool weapon)
+{
+    float best = std::min(SegmentDistanceSquared(oldA, a, capsuleFirst, capsuleLast),
+                          SegmentDistanceSquared(oldB, b, capsuleFirst, capsuleLast));
+    if (!weapon) return best;
+    best = std::min(best, SegmentDistanceSquared(a, b, capsuleFirst, capsuleLast));
+    best = std::min(best, SegmentDistanceSquared(oldA, oldB, capsuleFirst, capsuleLast));
+    for (float station : {0.25f, 0.5f, 0.75f}) {
+        float from[3], to[3];
+        LerpPoint(oldA, oldB, station, from);
+        LerpPoint(a, b, station, to);
+        best = std::min(best, SegmentDistanceSquared(from, to, capsuleFirst, capsuleLast));
+    }
+    for (float step : {0.3333333f, 0.6666667f}) {
+        float grip[3], tip[3];
+        LerpPoint(oldA, a, step, grip);
+        LerpPoint(oldB, b, step, tip);
+        best = std::min(best, SegmentDistanceSquared(grip, tip, capsuleFirst, capsuleLast));
+    }
+    return best;
 }
 }

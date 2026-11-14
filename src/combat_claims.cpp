@@ -405,6 +405,8 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     reply.result.sequence = sequence;
     const uint32_t hostIncarnation = npcs::Incarnation(guid);
     reply.result.incarnation = hostIncarnation;
+    const uint32_t processedNow = net::Now();
+    reply.result.processedAt = processedNow ? processedNow : 1;
     const bool hostJudged = contact.melee == net::HostJudgedMelee;
     if (!net::ValidHitContact(delta, incarnation, seen, outcome, reaction, contact)) {
         Logf("combat: hit %u refused: invalid contact", sequence);
@@ -513,6 +515,12 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         if (attacker && !target.IsDead() && !target.IsDown()) React(target, attacker);
         if (hostJudged || reaction != net::HitNoReaction) npcs::HostHit(target.GetInstance(), from, sequence);
         if (!hostJudged) ApplyReaction(target, attacker, reaction);
+        if (claimsApplied <= 200) {
+            char id[40] = {};
+            guid::Format(guid, id, sizeof(id));
+            Logf("NPCHITSYNC stage=host-claim player=%u seq=%u guid=%s target=%s reaction=%u host_judged=%d processed_at=%u",
+                 from, sequence, id, target.GetName().GetText(), reaction, hostJudged ? 1 : 0, reply.result.processedAt);
+        }
         witness::HitSeen(target.GetInstance(), attacker);  // and those around hear the fight (P7)
         return;
     }

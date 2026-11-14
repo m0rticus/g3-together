@@ -67,6 +67,7 @@ struct QuarantinedEntity {
 struct HostHitNote {
     uint8_t player = 0;
     uint32_t sequence = 0;
+    uint32_t at = 0;
 };
 
 struct ForceSeqKey {
@@ -135,6 +136,15 @@ struct Mirror {
     bool contactConsumed = false;
     int contactBone = -1;
     float contactA[3] = {}, contactB[3] = {};
+    static constexpr int MaxSwingArcSamples = 8;
+    float swingArcA[MaxSwingArcSamples][3] = {}, swingArcB[MaxSwingArcSamples][3] = {};
+    uint8_t swingArcCount = 0;
+    uint8_t swingTests = 0;
+    bool swingLogged = true;
+    bool lastClockProtected = false;
+    float swingMaxPhase = 0.0f;
+    float swingClosestGapCm = 1e9f;
+    char const* swingMissReason = "phase_below_hit_threshold";
     bool partyApplied = false, appliedWaiting = false;
     uint8_t appliedOwner = 0;
     bool relationAcknowledged = false, guideAcknowledged = false;

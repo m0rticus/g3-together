@@ -2,6 +2,8 @@
 #include "npc_contact.h"
 #include "npc_corpse.h"
 
+#include "combat.h"
+#include "combat_timing.h"
 #include "contact.h"
 #include "log.h"
 #include "npclease_runtime.h"
@@ -204,20 +206,143 @@ bool PresentedContactPoints(Entity& entity, uint32_t heldRight, float a[3], floa
     return true;
 }
 
-bool SweepsBody(eCEntity* target, float const oldA[3], float const oldB[3], float const a[3], float const b[3],
-                float thickness, bool weapon)
+bool MeasureSweepsBody(eCEntity* target, float const oldA[3], float const oldB[3], float const a[3], float const b[3],
+                       float thickness, bool weapon, float& gapCm)
 {
     bCBox const& box = target->GetWorldNodeBoundary();
     const bCVector& low = box.GetMin();
     const bCVector& high = box.GetMax();
     const float radius = std::min(high.GetX() - low.GetX(), high.GetZ() - low.GetZ()) * 0.5f;
-    if (!(radius > 0.0f) || !std::isfinite(radius)) return false;
+    if (!(radius > 0.0f) || !std::isfinite(radius)) { gapCm = 1e9f; return false; }
     float first[3] = {(low.GetX() + high.GetX()) * 0.5f, low.GetY() + radius, (low.GetZ() + high.GetZ()) * 0.5f};
     float last[3] = {first[0], std::max(first[1], high.GetY() - radius), first[2]};
-    const float limit = (radius + thickness) * (radius + thickness);
-    return contact::SegmentDistanceSquared(oldA, a, first, last) <= limit ||
-           contact::SegmentDistanceSquared(oldB, b, first, last) <= limit ||
-           (weapon && contact::SegmentDistanceSquared(a, b, first, last) <= limit);
+    const float reach = radius + thickness;
+    const float distSq = contact::SweptSegmentDistanceSquared(oldA, oldB, a, b, first, last, weapon);
+    gapCm = std::sqrt(std::max(0.0f, distSq)) - reach;
+    return distSq <= reach * reach;
+}
+
+bool SweepsBody(eCEntity* target, float const oldA[3], float const oldB[3], float const a[3], float const b[3],
+                float thickness, bool weapon)
+{
+    float gapCm = 0.0f;
+    return MeasureSweepsBody(target, oldA, oldB, a, b, thickness, weapon, gapCm);
+}
+
+void ResetIncomingSwing(Mirror& m, uint32_t instance, eCEntity* hero)
+{
+    (void)hero;
+    m.swingArcCount = 0;
+    m.swingTests = 0;
+    m.swingLogged = instance == 0;
+    m.swingMaxPhase = 0.0f;
+    m.swingClosestGapCm = 1e9f;
+    m.swingMissReason = "phase_below_hit_threshold";
+}
+
+void RecordPreHitContact(Mirror& m, eCEntity* hero, float const a[3], float const b[3], int bone, float phase, uint32_t now)
+{
+    static unsigned contactsLogged = 0;
+    if (!m.contactAt && hero && contactsLogged++ < 16) {
+        const auto& at = hero->GetWorldPosition();
+        Logf("npcs: visible contact %s instance=%u bone=%d at %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f hero %.0f/%.0f/%.0f",
+             m.entity.GetName().GetText(), m.contactInstance, bone, a[0], a[1], a[2], b[0], b[1], b[2],
+             at.GetX(), at.GetY(), at.GetZ());
+    }
+    if (m.contactBone != bone) m.swingArcCount = 0;
+    std::memcpy(m.contactA, a, sizeof(m.contactA));
+    std::memcpy(m.contactB, b, sizeof(m.contactB));
+    m.contactAt = now;
+    m.contactBone = bone;
+    if (phase < 0.30f) return;
+    if (m.swingArcCount > 0 &&
+        body::Distance(m.swingArcA[m.swingArcCount - 1], a) < 8.0f &&
+        body::Distance(m.swingArcB[m.swingArcCount - 1], b) < 8.0f)
+        return;
+    if (m.swingArcCount == Mirror::MaxSwingArcSamples) {
+        for (int i = 1; i < Mirror::MaxSwingArcSamples; ++i) {
+            std::memcpy(m.swingArcA[i - 1], m.swingArcA[i], sizeof(m.swingArcA[i]));
+            std::memcpy(m.swingArcB[i - 1], m.swingArcB[i], sizeof(m.swingArcB[i]));
+        }
+        --m.swingArcCount;
+    }
+    std::memcpy(m.swingArcA[m.swingArcCount], a, sizeof(m.swingArcA[0]));
+    std::memcpy(m.swingArcB[m.swingArcCount], b, sizeof(m.swingArcB[0]));
+    ++m.swingArcCount;
+}
+
+bool EvaluateIncomingSwingSweep(eCEntity* hero, Mirror& m, float const oldA[3], float const oldB[3],
+                                float const a[3], float const b[3], float thickness, bool weapon, char const*& hitSource)
+{
+    if (m.swingTests < 255) ++m.swingTests;
+    float gapCm = 1e9f;
+    if (MeasureSweepsBody(hero, oldA, oldB, a, b, thickness, weapon, gapCm)) {
+        m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+        m.swingArcCount = 0;
+        hitSource = "live-sweep";
+        return true;
+    }
+    m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+    if (m.swingArcCount > 0) {
+        const uint8_t count = m.swingArcCount;
+        m.swingArcCount = 0;
+        for (uint8_t i = 1; i < count; ++i) {
+            if (MeasureSweepsBody(hero, m.swingArcA[i - 1], m.swingArcB[i - 1],
+                                  m.swingArcA[i], m.swingArcB[i], thickness, weapon, gapCm)) {
+                m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+                hitSource = "strike-arc-at-hit-phase";
+                return true;
+            }
+            m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+        }
+        if (MeasureSweepsBody(hero, m.swingArcA[count - 1], m.swingArcB[count - 1], oldA, oldB, thickness, weapon, gapCm)) {
+            m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+            hitSource = "strike-arc-at-hit-phase";
+            return true;
+        }
+        m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+    }
+    m.swingMissReason = "blade_outside_hero_capsule";
+    return false;
+}
+
+void FinishIncomingSwingDiag(Mirror& m, net::NpcRecord const& shown, uint32_t now)
+{
+    if (!m.contactInstance || m.contactConsumed || m.swingLogged) return;
+    m.swingLogged = true;
+    const int32_t bufferMs = static_cast<int32_t>(now - (shown.sent + static_cast<uint32_t>(m.body.track.offset)));
+    Logf("combat: NPCATTACK stage=local-miss npc=%s player=%u instance=%u reason=%s max_phase=%.3f tests=%u "
+         "closest_gap_cm=%.1f presentation_ms=%d backlog_ms=%d clock_protected=%d",
+         m.entity.GetInstance() ? m.entity.GetName().GetText() : "(unloaded)", net::LocalId(), m.contactInstance,
+         m.swingMissReason, m.swingMaxPhase, static_cast<unsigned>(m.swingTests),
+         m.swingTests ? m.swingClosestGapCm : -1.0f, bufferMs, m.body.track.backlogMs,
+         m.body.track.combatClockProtected ? 1 : 0);
+}
+
+void NoteIncomingClockTransition(Mirror& m, net::NpcRecord const& shown, uint32_t now)
+{
+    (void)shown;
+    (void)now;
+    const bool nowProtected = m.body.track.combatClockProtected;
+    if (m.lastClockProtected == nowProtected) return;
+    m.lastClockProtected = nowProtected;
+    if (!nowProtected && m.body.track.backlogMs >= 100 && m.entity.GetInstance())
+        Logf("combat: NPCATTACK stage=clock-release npc=%s player=%u backlog_ms=%d delay_ms=%d reason=between-swing-catchup",
+             m.entity.GetName().GetText(), net::LocalId(), m.body.track.backlogMs, body::PlaybackDelay(m.body.track));
+}
+
+void LogLocalBlowContact(Mirror& m, eCEntity* hero, net::NpcRecord const& shown, uint32_t instance,
+                         char const* hitSource, uint32_t now)
+{
+    const int32_t bufferMs = static_cast<int32_t>(now - (shown.sent + static_cast<uint32_t>(m.body.track.offset)));
+    const uint32_t oneWayMs = net::RoundTrip(m.owner) / 2;
+    Logf("combat: NPCATTACK stage=local-contact npc=%s player=%u instance=%u host_sample=%u client_judged=%u "
+         "phase=%.4f native_hit_phase=%.3f hit_source=%s closest_gap_cm=%.1f presentation_ms=%d backlog_ms=%d "
+         "one_way_est_ms=%u compensation_est_ms=%d clock_protected=%d block_state=%d authority=defender-local",
+         m.entity.GetName().GetText(), net::LocalId(), instance, shown.sent, now, shown.motions[0].phase,
+         combat_timing::NativeHitPhase, hitSource, m.swingClosestGapCm, bufferMs, m.body.track.backlogMs,
+         oneWayMs, bufferMs + static_cast<int32_t>(oneWayMs), m.body.track.combatClockProtected ? 1 : 0,
+         combat::InParadeMode(hero) ? 1 : 0);
 }
 
 void SamplePlayerContact(uint32_t now)
@@ -296,7 +421,10 @@ void OnHitResult(net::HitResult const& result)
         Logf("npcs: host refused hit %u on %s; authoritative state retained", result.sequence, m.entity.GetName().GetText());
     } else {
         m.replay.acknowledgedHit = static_cast<uint16_t>(result.sequence);
-        m.replay.acknowledgedAt = result.processedAt;
+        m.replay.acknowledgedAt = result.processedAt ? result.processedAt : 1;
+        Logf("combat: NPCHITSYNC stage=host-ack npc=%s hit=%u accepted=1 processed_at=%u",
+             m.entity.GetInstance() ? m.entity.GetName().GetText() : "(unloaded)", result.sequence,
+             m.replay.acknowledgedAt);
     }
 }
 

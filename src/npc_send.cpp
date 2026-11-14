@@ -8,8 +8,10 @@
 #include "journal.h"
 #include "log.h"
 #include "net_metrics.h"
+#include "npc_contact.h"
 #include "npclease_presentation.h"
 #include "npclease_runtime.h"
+#include "npcplayback_hit_policy.h"
 #include "npcsend_policy.h"
 #include "npcremoval.h"
 #include "talk.h"
@@ -244,7 +246,8 @@ void HostHit(eCEntity* entity, uint8_t player, uint32_t sequence)
     if (!net::IsHost() || !entity || !entity->GetPropertySet(eEPropertySetType_NPC) || remote::IsPuppet(entity)) return;
     uint8_t guid[16];
     Guid(entity, guid);
-    hostHits[Key(guid)] = {player, sequence};
+    const uint32_t at = net::Now();
+    hostHits[Key(guid)] = {player, sequence, at ? at : 1};
 }
 
 void ForgetRemoved(uint8_t const guid[16])
@@ -505,10 +508,18 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
         const uint32_t hash = net::HashName(held.GetName().GetText());
         if (namesSent.insert(hash).second) net::SendMotionName(hash, held.GetName().GetText());
     }
-    char motion[96];
+    char motion[96] = {};
     if (body::CurrentMotion(instance, motion, sizeof(motion)) && *motion) {
         r.motion = net::HashName(motion);
         if (namesSent.insert(r.motion).second) net::SendMotionName(r.motion, motion);
+    }
+    if (auto hit = hostHits.find(key); hit != hostHits.end()) {
+        if (npcplayback_hit_policy::HostHitStampExpired(
+                hit->second.at, r.sent, StaggerState(self.Routine.GetCurrentTask().GetText()), motion)) {
+            hostHits.erase(hit);
+            r.hitPlayer = 0;
+            r.hitSequence = 0;
+        }
     }
     const bool motionReady = npcplayback::Capture(instance, r, [](uint32_t hash, char const* name) {
         if (namesSent.insert(hash).second) net::SendMotionName(hash, name);

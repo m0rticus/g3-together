@@ -256,31 +256,33 @@ void LogClientDeath(Mirror& m, net::NpcRecord const& shown, uint32_t now)
 
 void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
 {
+    NoteIncomingClockTransition(m, shown, now);
     eCEntity* hero = m.body.contactTarget;
     if (!hero || !m.replayReady || !shown.contact || (shown.flags & 3) || *m.replay.localMotion ||
-        now - m.latestTicks > 250 || !shown.motions[0].active) { m.contactAt = 0; return; }
+        now - m.latestTicks > 250 || !shown.motions[0].active) {
+        FinishIncomingSwingDiag(m, shown, now);
+        m.contactAt = 0;
+        return;
+    }
     if (combat::IgnoreFriendlyHit(hero, m.entity.GetInstance())) return;
     ++localContactWindows;
+    const uint32_t instance = shown.motions[0].instance;
+    if (m.contactInstance != instance) {
+        FinishIncomingSwingDiag(m, shown, now);
+        m.contactInstance = instance; m.contactConsumed = false; m.contactAt = 0;
+        ResetIncomingSwing(m, instance, hero);
+    }
+    m.swingMaxPhase = std::max(m.swingMaxPhase, shown.motions[0].phase);
     float a[3], b[3], thickness = 0;
     int bone = -1;
     if (!PresentedContactPoints(m.entity, shown.heldRight, a, b, thickness, bone)) {
         ++localContactMissing;
+        m.swingMissReason = "missing_weapon_geometry";
         m.contactAt = 0;
         return;
     }
-    const uint32_t instance = shown.motions[0].instance;
-    if (m.contactInstance != instance) {
-        m.contactInstance = instance; m.contactConsumed = false; m.contactAt = 0;
-        static unsigned contactsLogged = 0;
-        if (contactsLogged++ < 16) {
-            const auto& at = hero->GetWorldPosition();
-            Logf("npcs: visible contact %s instance=%u bone=%d at %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f hero %.0f/%.0f/%.0f",
-                 m.entity.GetName().GetText(), instance, bone, a[0], a[1], a[2], b[0], b[1], b[2],
-                 at.GetX(), at.GetY(), at.GetZ());
-        }
-    }
     if (!combat_timing::HitPhaseReached(shown.motions[0].phase)) {
-        m.contactAt = 0;
+        RecordPreHitContact(m, hero, a, b, bone, shown.motions[0].phase, now);
         return;
     }
     const bool previous = m.contactAt && now - m.contactAt <= 100 && m.contactBone == bone;
@@ -290,21 +292,21 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
     m.contactAt = now; m.contactBone = bone;
     if (!previous || m.contactConsumed) return;
     ++localContactTests;
-    const bool touches = SweepsBody(hero, oldA, oldB, a, b, thickness, bone == -2);
-    if (!touches) { ++localBlowsOutOfReach; return; }
+    char const* hitSource = "live-sweep";
+    if (!EvaluateIncomingSwingSweep(hero, m, oldA, oldB, a, b, thickness, bone == -2, hitSource)) {
+        ++localBlowsOutOfReach;
+        return;
+    }
     ++localContactOverlaps;
-    if (!ClearContact(m.entity.GetInstance(), hero)) { ++localContactWalls; ++localBlowsOutOfReach; return; }
+    if (!ClearContact(m.entity.GetInstance(), hero)) {
+        m.swingMissReason = "wall_obstructed";
+        ++localContactWalls; ++localBlowsOutOfReach;
+        return;
+    }
     m.contactConsumed = true;
+    m.swingLogged = true;
     ++localBlowsJudged;
-    const int32_t bufferMs = static_cast<int32_t>(now - (shown.sent + static_cast<uint32_t>(m.body.track.offset)));
-    const uint32_t oneWayMs = net::RoundTrip(m.owner) / 2;
-    Logf("combat: NPCATTACK stage=local-contact npc=%s player=%u instance=%u host_sample=%u client_judged=%u "
-         "phase=%.4f native_hit_phase=%.3f presentation_ms=%d one_way_est_ms=%u compensation_est_ms=%d "
-         "clock_protected=%d block_state=%d authority=defender-local",
-         m.entity.GetName().GetText(), net::LocalId(), instance, shown.sent, now, shown.motions[0].phase,
-         combat_timing::NativeHitPhase, bufferMs, oneWayMs, bufferMs + static_cast<int32_t>(oneWayMs),
-         m.body.track.combatClockProtected ? 1 : 0,
-         combat::InParadeMode(hero) ? 1 : 0);
+    LogLocalBlowContact(m, hero, shown, instance, hitSource, now);
     combat::LocalBlow(m.entity.GetInstance());
 }
 

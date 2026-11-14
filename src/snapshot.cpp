@@ -68,18 +68,32 @@ bool IncomingCombatAt(Track const& track, uint32_t sent)
 {
     if (track.predictive || !track.combatPlayer || !track.count) return false;
     auto incoming = [&](Track::Snap const& snap) {
-        return combat_timing::IncomingCombat(snap.motion.flags, snap.motion.combatTarget, track.combatPlayer);
+        return !snap.motion.nonAttackCombat &&
+               combat_timing::IncomingCombat(snap.motion.flags, snap.motion.combatTarget, track.combatPlayer);
     };
-    // Protect before the start is displayed, even if its pose was evicted.
+    Track::Snap const* atSent = track.haveRetained && static_cast<int32_t>(sent - track.snaps[0].sent) < 0
+        ? &track.retained : &track.snaps[0];
+    for (int i = track.count - 1; i >= 0; --i) {
+        if (static_cast<int32_t>(sent - track.snaps[i].sent) >= 0) {
+            atSent = &track.snaps[i];
+            break;
+        }
+    }
+    const bool passiveAtSent = track.havePresentedMotion
+        ? track.presentedMotion.nonAttackCombat
+        : atSent->motion.nonAttackCombat;
+    auto withinPreAttackHorizon = [&](uint32_t futureSent) {
+        return !passiveAtSent || static_cast<int32_t>(sent - futureSent) >= 0;
+    };
+    // Protect before the start is displayed, even if its pose was evicted; when currently showing
+    // non-attack locomotion/recovery/stumble after a large stall, catch up until approaching the swing.
     for (auto const& event : track.pendingEvents)
-        if (incoming(event)) return true;
-    if (track.havePresentedMotion &&
+        if (incoming(event) && withinPreAttackHorizon(event.sent)) return true;
+    if (track.havePresentedMotion && !track.presentedMotion.nonAttackCombat &&
         combat_timing::IncomingCombat(track.presentedMotion.flags, track.presentedMotion.combatTarget, track.combatPlayer))
         return true;
-    if (incoming(track.snaps[track.count - 1])) return true;
-    for (int i = track.count - 1; i > 0; --i)
-        if (static_cast<int32_t>(sent - track.snaps[i].sent) >= 0) return incoming(track.snaps[i]);
-    return incoming(track.snaps[0]);
+    if (incoming(track.snaps[track.count - 1]) && withinPreAttackHorizon(track.snaps[track.count - 1].sent)) return true;
+    return incoming(*atSent);
 }
 
 uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
@@ -107,7 +121,8 @@ uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
     } else {
         // Slew clock-offset changes instead of rewinding or jumping the presentation timeline.
         const int32_t error = static_cast<int32_t>(desired - (track.renderSent + elapsed));
-        const double maximumAdjustment = elapsed * (error > 100 && !track.combatClockProtected ? 1.0 : 0.1);
+        const double catchUpRate = error > 100 ? 1.0 : (track.combatPlayer && error > 35 ? 0.5 : 0.1);
+        const double maximumAdjustment = elapsed * (!track.combatClockProtected ? catchUpRate : 0.1);
         const double advance = elapsed + std::clamp(static_cast<double>(error), -maximumAdjustment,
                                                     track.combatClockProtected ? 0.0 : maximumAdjustment)
                                + track.fractionalAdvance;
@@ -191,8 +206,13 @@ void Interpolate(Track const& track, Track::Snap const& a, Track::Snap const& b,
         for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
             auto const& first = a.motion.motions[slot];
             auto const& second = b.motion.motions[slot];
-            if (!first.active || !second.active || first.name != second.name || first.instance != second.instance) continue;
+            if (!first.active) continue;
             auto& shown = out->motion.motions[slot];
+            if (!second.active || first.name != second.name || first.instance != second.instance) {
+                if (slot == 0 && fraction < 1.0f && a.motion.contact && !b.motion.contact && first.speed >= 0.0f)
+                    shown.phase = std::clamp(first.phase + (1.0f - first.phase) * fraction, 0.0f, 1.0f);
+                continue;
+            }
             float phase = second.phase - first.phase;
             if (first.speed >= 0.0f && phase < 0.0f) phase += 1.0f;
             if (first.speed < 0.0f && phase > 0.0f) phase -= 1.0f;
