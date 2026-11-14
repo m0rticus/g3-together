@@ -71,8 +71,11 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         if (m.latestTicks && sameOwner && static_cast<int32_t>(captured - m.latestSent) < 0) continue;
         const bool reentered = m.released;
         m.released = false;
-        if (m.latestTicks && (!sameOwner || reentered))
+        if (m.latestTicks && (!sameOwner || reentered)) {
             ResetMirrorForNewStream(m, key, records[i], sameOwner);
+            m.replay = npcplayback::State{};
+            npclease::ForgetReceivedNpcPoseBefore(records[i].guid, records[i].incarnation, captured);
+        }
         if (!m.firstSeen) m.firstSeen = now ? now : 1;
         m.owner = owner;
         m.ownerGeneration = generation;
@@ -659,7 +662,10 @@ void PassiveMirrorTick()
             m.resolved = IsNpc(m.entity.GetInstance());
             m.missing = !m.resolved;
             if (!m.resolved) { ++it; continue; }
+            npcplayback::GuardForLease(m.entity.GetInstance());
             npcplayback::Silence(m.entity.GetInstance());
+            if (m.entity.GetInstance()->GetPropertySet(eEPropertySetType_CharacterMovement))
+                m.entity.CharacterMovement.StopMovement();
             if (auto* routine = static_cast<gCScriptRoutine_PS*>(
                 m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine))) {
                 strncpy_s(m.body.routine, static_cast<bCString const&>(routine->GetRoutine()).GetText(), _TRUNCATE);
@@ -808,16 +814,12 @@ void PassiveMirrorTick()
 }
 } // namespace
 
-bool MirrorFightsHero()
-{
-    return detail::MirrorFightsHeroImpl();
-}
+bool MirrorFightsHero() { return detail::MirrorFightsHeroImpl(); }
 
 void LeaseReleaseMirror(uint8_t const identity[16])
 {
     const auto key = Key(identity);
-    const auto found = mirrors.find(key);
-    if (found != mirrors.end()) {
+    if (const auto found = mirrors.find(key); found != mirrors.end()) {
         auto& mirror = found->second;
         if (mirror.entity.GetInstance()) {
             npcplayback::ReleaseUnavailable(mirror.entity.GetInstance());
@@ -828,9 +830,8 @@ void LeaseReleaseMirror(uint8_t const identity[16])
         }
         mirrors.erase(found);
     }
-    deadOnHost.erase(key);
-    corpses.erase(key);
-    absences.erase(key);
+    npclease::ForgetReceivedNpcPose(identity);
+    deadOnHost.erase(key); corpses.erase(key); absences.erase(key);
 }
 
 uint32_t HostPresentationAge(eCEntity const* entity)
@@ -981,3 +982,13 @@ void Tick()
 }
 
 } // namespace g3t::npcs
+
+namespace g3t::npclease {
+void SyncMirrorPoseInterval(uint8_t const guid[16], uint32_t incarnation, uint32_t intervalMs)
+{
+    if (!guid || net::IsHost()) return;
+    if (const auto found = npcs::detail::mirrors.find(npcs::detail::Key(guid));
+        found != npcs::detail::mirrors.end() && found->second.latestTicks && found->second.latest.incarnation == incarnation)
+        body::SetPoseInterval(found->second.body.track, intervalMs);
+}
+} // namespace g3t::npclease

@@ -735,9 +735,9 @@ bool IgnoreHostSnapshot(uint8_t const identity[16], uint32_t captured)
     const auto found = entries.find(Key(identity));
     if (found == entries.end()) return false;
     const auto& entry = found->second;
-    if (entry.hasPresentationFloor && !Newer(captured, entry.presentationFloor)) return true;
     // A client owner keeps receiving the stream: a fresh host stream is how it learns to yield.
     if (entry.local) return false;
+    if (entry.hasPresentationFloor && Newer(entry.presentationFloor, captured)) return true;
     return entry.lease.epoch && entry.lease.phase != Phase::Host;
 }
 bool IgnoreHostSnapshot(uint8_t const identity[16])

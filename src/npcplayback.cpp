@@ -124,6 +124,7 @@ bool Start(bool client)
             received.arrived = net::Now();
             received.incarnation = record.incarnation;
             received.intervalMs = npclease::DecodePoseIntervalWire(interval);
+            npclease::SyncMirrorPoseInterval(record.guid, record.incarnation, received.intervalMs);
         }
         else ++stalePoses;
     });
@@ -198,7 +199,10 @@ bool PreparePose(eCEntity* entity, eCVisualAnimation_PS& animation, State& state
     const auto received = receivedPoses.find(ToGuidKey(record.guid));
     std::vector<pose::Transform> transforms;
     uint8_t flags = 0;
-    if (received == receivedPoses.end() || !received->second.history.Sample(record.incarnation, record.sent, transforms, &flags)) {
+    constexpr uint32_t BoundarySlackMs = npcsend::QuietCadenceMs + 50;
+    if (received == receivedPoses.end() ||
+        !received->second.history.SampleClamped(record.incarnation, record.sent, BoundarySlackMs, BoundarySlackMs,
+                                                transforms, &flags)) {
         ++poseWaits;
         return false;
     }
@@ -466,10 +470,6 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     if (!entity || !names) return false;
     Silence(entity);
     PresentationScope scope;
-    const bCMatrix pose = body::Pose(*entity, record.position, record.rotation);
-    entity->SetToWorldMatrix(pose);
-    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-        rigid->SetPose(pose);
     auto* animation = Animation(entity);
     if (animation) animation->SetForceAlwaysVisible(GETrue);
     auto* actor = animation ? animation->GetActor() : nullptr;
@@ -491,9 +491,20 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         record.motions[0].instance != state.localOptions.instance) state.pendingHit = 0;
     const float localAge = static_cast<float>(now - state.localStart) / 1000.0f;
     const bool local = *state.localMotion && (state.pendingHit || localAge < state.localDuration);
+    char const* firstName = record.motions[0].active ? names(record.motions[0].name) : nullptr;
+    const bool firstSuppressed = record.motions[0].active &&
+        (state.suppressed[0] == record.motions[0].instance ||
+         (record.hitPlayer == net::LocalId() && record.hitSequence &&
+          record.hitSequence == state.acknowledgedHit && ReactionMotion(firstName)));
+    const bool expectedEcho = !local && firstSuppressed && *state.localMotion;
     bool echo = false;
     NativePose hostPose;
     const bool havePose = PreparePose(entity, *animation, state, record, names, hostPose);
+    if (!local && !expectedEcho && !havePose) return false;
+    const bCMatrix pose = body::Pose(*entity, record.position, record.rotation);
+    entity->SetToWorldMatrix(pose);
+    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+        rigid->SetPose(pose);
     actor = animation->GetActor();
     if (!actor) return false;
     animation->ClearLookAtConstraints();
@@ -918,3 +929,20 @@ bool TaskBlocked(gCScriptRoutine_PS* self, bCString const& task)
 } // namespace detail
 
 }
+
+namespace g3t::npclease {
+void ForgetReceivedNpcPose(uint8_t const guid[16])
+{
+    if (!guid) return;
+    npcplayback::receivedPoses.erase(ToGuidKey(guid));
+}
+
+void ForgetReceivedNpcPoseBefore(uint8_t const guid[16], uint32_t incarnation, uint32_t sent)
+{
+    if (!guid) return;
+    const auto found = npcplayback::receivedPoses.find(ToGuidKey(guid));
+    if (found == npcplayback::receivedPoses.end()) return;
+    found->second.history.DiscardBefore(incarnation, sent);
+    if (!found->second.history.Size()) npcplayback::receivedPoses.erase(found);
+}
+} // namespace g3t::npclease

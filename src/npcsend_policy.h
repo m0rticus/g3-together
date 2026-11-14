@@ -27,10 +27,12 @@ constexpr uint32_t FastIntervalMs = 16, OrdinaryIntervalMs = 33, MovingFarInterv
 // 200 ms buffer before captures become sparse, including movement-to-idle.
 constexpr uint32_t UrgentHoldMs = 2000, OrdinaryHoldMs = 2000, InterestWarmupMs = 200;
 constexpr uint32_t KeyframeMs = 1000;
-// Reserve 100 ms for capture-frame quantization before presentation grace expires.
-// Only unchanged snapshots use this congestion-independent keepalive.
-static_assert(npclease::PresentationGraceMs > 100, "presentation grace must leave room for capture jitter");
-constexpr uint32_t KeepaliveMs = npclease::PresentationGraceMs - 100;
+// Keep unchanged snapshots inside the 200 ms mirror playback buffer ceiling (and well inside PresentationGraceMs)
+// so idle mirrors never run out of buffered samples and rubber-band into 1.1x catch-up between heartbeats.
+static_assert(npclease::PresentationGraceMs > 170, "presentation grace must exceed quiet keepalive plus capture jitter");
+constexpr uint32_t KeepaliveMs = 180;
+static_assert(KeepaliveMs < IdleIntervalMs * 2 && KeepaliveMs <= npclease::PresentationGraceMs - 100,
+              "quiet keepalive must arrive before the 200 ms mirror buffer runs dry");
 // A due update (not a quiet heartbeat) that leaves later than this counts as overdue in the diagnostics; one frame hitch
 // of ~60 ms fits every tier. Multiplied by the congestion stretch like every interval.
 constexpr uint32_t FastMaxStaleMs = 100, OrdinaryMaxStaleMs = 150, SlowMaxStaleMs = 300;
@@ -367,7 +369,7 @@ inline bool Commit(State& state, Input const& in, Decision decision)
 
 inline uint32_t PresentationInterval(State const& state, Input const& in)
 {
-    if (detail::Urgency(in)) return FastIntervalMs;
+    if (in.combat || in.contact || (in.record && in.record->contact)) return FastIntervalMs;
     const bool nearEffective = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
     return (nearEffective || in.nearby) && in.moving ? OrdinaryIntervalMs :
         in.moving ? MovingFarIntervalMs : IdleIntervalMs;
@@ -378,6 +380,66 @@ inline uint32_t EffectivePresentationInterval(Result const& evaluated, State con
     if (evaluated.decision == Decision::Keyframe)
         return QuietCadenceMs;
     return Stretched(PresentationInterval(state, in), in.stretchPermille);
+}
+
+// Normalize out-of-range native property edge cases at capture time so uninitialized/transitional engine values
+// (e.g. Unset 0xFF attitude, -1 AIMode, 0 max HP, or default -1 emfx2 blend times) never drop an NPC stream as Invalid.
+inline void SanitizeCapturedRecord(net::NpcRecord& r)
+{
+    if (!r.incarnation) r.incarnation = 1;
+    if (r.hitPlayer >= net::MaxPlayers) r.hitPlayer = 0;
+    if (r.guidePlayer >= net::MaxPlayers) r.guidePlayer = 0;
+    if (r.partyPlayer >= net::MaxPlayers) r.partyPlayer = 0;
+    if (r.partyType > 8) r.partyType = 0;
+    if (r.waiting > 1) r.waiting = 1;
+    if (r.contact > 1) r.contact = 1;
+    if (r.attitude > 8) r.attitude = 0;
+    if (r.aiMode > 11) r.aiMode = 0;
+    if (r.attackReason > 21) r.attackReason = 0;
+    if (r.damageType > 7) r.damageType = 0;
+    if (r.damageAmount < -1000000) r.damageAmount = -1000000;
+    else if (r.damageAmount > 1000000) r.damageAmount = 1000000;
+    if (r.hitPoints < -1000000) r.hitPoints = -1000000;
+    else if (r.hitPoints > 1000000) r.hitPoints = 1000000;
+    if (r.hitPointsMax < 1) r.hitPointsMax = 1;
+    else if (r.hitPointsMax > 1000000) r.hitPointsMax = 1000000;
+    if (!std::isfinite(r.damageMultiplier) || std::fabs(r.damageMultiplier) > 1000.0f) r.damageMultiplier = 1.0f;
+    for (float& v : r.position) {
+        if (!std::isfinite(v)) v = 0.0f;
+        else if (v < -1e7f) v = -1e7f;
+        else if (v > 1e7f) v = 1e7f;
+    }
+    double lengthSq = 0.0;
+    bool finiteRot = true;
+    for (float v : r.rotation) {
+        if (!std::isfinite(v) || std::fabs(v) > 1e6f) { finiteRot = false; break; }
+        lengthSq += double(v) * v;
+    }
+    if (!finiteRot || lengthSq <= 0.01) {
+        r.rotation[0] = r.rotation[1] = r.rotation[2] = 0.0f;
+        r.rotation[3] = 1.0f;
+    } else if (lengthSq > 3.9) {
+        const float inv = static_cast<float>(1.0 / std::sqrt(lengthSq));
+        for (float& v : r.rotation) v *= inv;
+    }
+    for (auto& m : r.motions) {
+        m.active &= 3u;
+        if (!(m.active & 1u) || !m.name || !m.instance) {
+            m = net::NpcMotion{};
+            continue;
+        }
+        if (!std::isfinite(m.phase) || m.phase < 0.0f) m.phase = 0.0f;
+        else if (m.phase > 1.0f) m.phase = 1.0f;
+        if (!std::isfinite(m.speed)) m.speed = 0.0f;
+        else if (m.speed < -100.0f) m.speed = -100.0f;
+        else if (m.speed > 100.0f) m.speed = 100.0f;
+        if (!std::isfinite(m.weight) || m.weight < 0.0f) m.weight = 0.0f;
+        else if (m.weight > 10.0f) m.weight = 10.0f;
+        if (!std::isfinite(m.intro) || m.intro < 0.0f) m.intro = 0.0f;
+        else if (m.intro > 100000.0f) m.intro = 100000.0f;
+        if (!std::isfinite(m.extro) || m.extro < 0.0f) m.extro = 0.0f;
+        else if (m.extro > 100000.0f) m.extro = 100000.0f;
+    }
 }
 
 // Achieved-rate diagnostics (local only, never on the wire). One entry per scheduling tier: 0 fast, 1 ordinary, 2 slow.

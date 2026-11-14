@@ -335,6 +335,7 @@ char const* TakeOver(eCEntity* entity, GuidKey const& key, uint32_t now)
     entry.hasBaseline = true;
     entry.local = true; entry.active = true; entry.confirmed = false; entry.prepared = false;
     entry.cut = false; entry.recallAt = 0; entry.captureFailed = false;
+    entry.hasPresentationFloor = false; entry.presentationFloor = 0;
     entry.ownedAt = now ? now : 1;
     entry.ownedEntity = entity;
     entry.lastRequest = 0; entry.requestEvery = 500; entry.hostSeenAt = 0; entry.silentLogged = false;

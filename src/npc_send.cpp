@@ -517,6 +517,7 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
         });
     r.contact = motionReady && (r.flags & 128 ? motionReady : posed) &&
                 r.motions[0].weight > 0.0001f && body::LocallyAttacking(instance) ? 1 : 0;
+    npcsend::SanitizeCapturedRecord(r);
     LastSent& last = lastSent[key];
     const uint32_t t = net::Now();
     if (!(posed || motionReady) && !(r.flags & 1) && !last.at)
