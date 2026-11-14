@@ -143,16 +143,24 @@ void* JumpTo(unsigned char* target, void* detour, size_t stolen)
     }
     auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!trampoline) return nullptr;
-    trampoline[0] = 0x83; trampoline[1] = 0x3d;
+    std::memset(trampoline, 0xcc, 64);
+    trampoline[0] = 0x9c;
+    trampoline[1] = 0x83;
+    trampoline[2] = 0x3d;
     const uint32_t flag = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ShutdownFlagAddress()));
-    std::memcpy(trampoline + 2, &flag, sizeof(flag));
-    trampoline[6] = 0; trampoline[7] = 0x75; trampoline[8] = 5;
-    PutJump(trampoline + 9, detour);
+    std::memcpy(trampoline + 3, &flag, sizeof(flag));
+    trampoline[7] = 0x00;
+    trampoline[8] = 0x74;
+    trampoline[9] = 0x06;
+    trampoline[10] = 0x9d;
+    PutJump(trampoline + 11, trampoline + 24);
+    trampoline[16] = 0x9d;
+    PutJump(trampoline + 17, detour);
     if (existing) {
-        PutJump(trampoline + 14, existing->currentEntry);
+        PutJump(trampoline + 24, existing->currentEntry);
     } else {
-        std::memcpy(trampoline + 14, target, stolen);
-        PutJump(trampoline + 14 + stolen, target + stolen);
+        std::memcpy(trampoline + 24, target, stolen);
+        PutJump(trampoline + 24 + stolen, target + stolen);
     }
     DWORD old = 0;
     if (!VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old)) {
@@ -174,7 +182,7 @@ void* JumpTo(unsigned char* target, void* detour, size_t stolen)
     VirtualProtect(target, stolen, old, &ignored);
     FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
     FlushInstructionCache(GetCurrentProcess(), target, stolen);
-    return trampoline + 14;
+    return trampoline + 24;
 }
 
 bool PatchImportFromDll(HMODULE module, char const* dll, char const* funcName, void const* replacement, void const** originalOut)
