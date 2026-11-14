@@ -44,5 +44,35 @@ int main()
     assert(!DuplicateResync(cursor, first, ResyncReason::UnknownAnchor));
     assert(RetryAt(3100, 1000, 1000));
     assert(!RetryAt(1999, 1000, 1000));
+
+    // BUG-3: Resync invalidation, queue-gated cursor commit, and fresh serials on forced resync.
+    uint32_t nextSerial = 5000;
+    OfferTransaction tx{};
+    assert(BeginOffer(tx, first, false, nextSerial));
+    assert(tx.serial == 5001 && nextSerial == 5001 && !tx.acknowledged && !tx.idQueued && !tx.baselineQueued);
+    tx.idQueued = true;
+    // Ordinary retry preserves queued ID progress and current serial.
+    assert(BeginOffer(tx, first, false, nextSerial));
+    assert(tx.serial == 5001 && nextSerial == 5001 && tx.idQueued && !tx.baselineQueued);
+    tx.baselineQueued = true;
+    assert(!AlreadySatisfied(tx, first, false));
+    assert(CompleteAck(tx, first, 5001));
+    assert(tx.acknowledged && AlreadySatisfied(tx, first, false));
+    assert(!AlreadySatisfied(tx, first, true));
+
+    // Forced resync offer clears acknowledged/queued flags and issues a fresh serial so a late old ACK fails.
+    ResyncCursor resync{};
+    assert(!CommitResync(resync, first, ResyncReason::UnknownBaseline, false));
+    assert(!DuplicateResync(resync, first, ResyncReason::UnknownBaseline));
+    assert(BeginOffer(tx, first, true, nextSerial));
+    assert(tx.serial == 5002 && nextSerial == 5002 && !tx.acknowledged && !tx.idQueued && !tx.baselineQueued);
+    tx.idQueued = true;
+    tx.baselineQueued = true;
+    assert(CommitResync(resync, first, ResyncReason::UnknownBaseline, true));
+    assert(DuplicateResync(resync, first, ResyncReason::UnknownBaseline));
+    assert(!CompleteAck(tx, first, 5001));
+    assert(!tx.acknowledged);
+    assert(CompleteAck(tx, first, 5002));
+    assert(tx.acknowledged && AlreadySatisfied(tx, first, false));
     return 0;
 }

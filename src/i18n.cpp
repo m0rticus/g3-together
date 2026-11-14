@@ -370,14 +370,17 @@ char const* Language()
     return language;
 }
 
+namespace {
+wchar_t const* Pick(Translation const& t, char const* language)
+{
+    return !std::strcmp(language, "de") ? t.german : !std::strcmp(language, "pl") ? t.polish : t.english;
+}
+}
+
 wchar_t const* Text(Message message)
 {
     if (message < 0 || message >= MessageCount) return L"";
-    auto const& translation = Messages[message];
-    char const* language = Language();
-    if (!std::strcmp(language, "de")) return translation.german;
-    if (!std::strcmp(language, "pl")) return translation.polish;
-    return translation.english;
+    return Pick(Messages[message], Language());
 }
 
 wchar_t const* SaveReason(char const* code)
@@ -448,12 +451,11 @@ wchar_t const* SaveReason(char const* code)
     };
     for (auto const& reason : reasons) {
         if (!code || std::strcmp(code, reason.code)) continue;
-        char const* language = Language();
-        return !std::strcmp(language, "de") ? reason.text.german :
-               !std::strcmp(language, "pl") ? reason.text.polish : reason.text.english;
+        return Pick(reason.text, Language());
     }
-    return !std::strcmp(Language(), "de") ? L"Der Mitspieler meldet einen unbekannten Speicherfehler. Siehe Log." :
-           !std::strcmp(Language(), "pl") ? L"Gracz zgłosił nieznany błąd zapisu. Zobacz log." :
-           L"The partner reported an unrecognized save failure. See the log.";
+    constexpr Translation unknown{L"The partner reported an unrecognized save failure. See the log.",
+        L"Der Mitspieler meldet einen unbekannten Speicherfehler. Siehe Log.",
+        L"Gracz zgłosił nieznany błąd zapisu. Zobacz log."};
+    return Pick(unknown, Language());
 }
 }

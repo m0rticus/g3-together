@@ -17,9 +17,10 @@ struct AuthorityGuard {
     bool processingAllowed = false;
     // A client-first owner never expires: the host handshake window cannot freeze a native NPC.
     bool persistent = false;
+    bool hostClaimed = false;
 
-    bool Local(uint32_t now) const { return locallyDriven && (persistent || !Reached(now, deadline)); }
-    bool Processing(uint32_t now) const { return processingAllowed && (persistent || !Reached(now, deadline)); }
+    bool Local(uint32_t now) const { return !hostClaimed && locallyDriven && (persistent || !Reached(now, deadline)); }
+    bool Processing(uint32_t now) const { return !hostClaimed && processingAllowed && (persistent || !Reached(now, deadline)); }
     bool Fenced(uint32_t now) const { return leased && !Local(now); }
 };
 

@@ -8,304 +8,44 @@ a JSON report to an explicitly supplied path.
 from __future__ import annotations
 
 import argparse
-import ast
-import hashlib
 import json
-import os
-import stat
-import struct
+import re
 import sys
 from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_HOST = Path(r"C:\Repositories\g3-together\workspace\test-install")
-DEFAULT_CLIENT = Path(r"C:\Repositories\g3-together\workspace\test-client")
-DEFAULT_STEAM = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Gothic 3")
 WORKTREE = Path(__file__).resolve().parents[1]
-PACKAGE_AUDIT = Path(__file__).resolve().parents[1] / "expected-installation.json"
+PACKAGE_AUDIT = WORKTREE / "expected-installation.json"
 
-FOLDER_MODULES = (
-    "Game.dll",
-    "Engine.dll",
-    "SharedBase.dll",
-    "Dialogs.dll",
-    "paru_s2.dll",
-    r"scripts\Script_paru.dll",
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from _g3copy import (
+    DEFAULT_CLIENT, DEFAULT_HOST, DEFAULT_STEAM, FOLDER_MODULES, KNOWN_FAKE_SHA,
+    NATIVE_SLOTS, SLOT_GENUINE, SLOT_QA, STEAM_DLL_SHA256, TEST_REALISM_BUNDLE_FILES,
+    canonical as _canonical, is_hard_linked, is_within, overlaps,
+    package_ini_templates, parse_g3t_ini, parse_pe, reject_links as _reject_links,
+    sha256, validate_copy_roots,
 )
-
-NATIVE_SLOTS = {
-    "Game.dll": 0x32F2E6,
-    "Engine.dll": 0x4C0706,
-    "SharedBase.dll": 0x9796C,
-    "Dialogs.dll": 0x34874,
-    "paru_s2.dll": 0x90DCC,
-    r"scripts\Script_paru.dll": 0x6E8F6,
-}
-SLOT_QA = b"g3qa32.dll\x00\x00"
-SLOT_GENUINE = b"SHELL32.dll\x00"
-
-CORE_SHA = {
-    "scripts\\Script_G3Together.dll": "0fba732727c0f0467d8e2f6d7722760c4078f3a613c49d7e346f9fc5096eecb9",
-    "Script_Game.dll": "cdd9c46120abac49ebb6d53e5bed79512a528e5940238d6d88d150fe9aef3cdc",
-}
 
 
 class VerificationError(RuntimeError):
     pass
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def reject_links(path: Path) -> Path:
-    path = Path(os.path.abspath(str(path)))
-    current = path
-    while True:
-        if current.exists() or current.is_symlink():
-            info = current.lstat()
-            reparse = getattr(info, "st_file_attributes", 0) & getattr(
-                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-            )
-            if stat.S_ISLNK(info.st_mode) or reparse:
-                raise VerificationError(
-                    f"Link or reparse point is not allowed: {current}"
-                )
-        if current.parent == current:
-            break
-        current = current.parent
-    return path
+    return _reject_links(path, VerificationError)
 
 
 def canonical(path: Path) -> Path:
-    return reject_links(path).resolve(strict=False)
-
-
-def overlaps(left: Path, right: Path) -> bool:
-    left_text = os.path.normcase(str(left))
-    right_text = os.path.normcase(str(right))
-    try:
-        return left == right or left.is_relative_to(right) or right.is_relative_to(left)
-    except AttributeError:
-        return (
-            left_text == right_text
-            or left_text.startswith(right_text + os.sep)
-            or right_text.startswith(left_text + os.sep)
-        )
+    return _canonical(path, VerificationError)
 
 
 def validate_roots(
-    host: Path,
-    client: Path,
-    steam: Path,
-    fixture_roots: Iterable[Path] = (),
+    host: Path, client: Path, steam: Path, fixture_roots: Iterable[Path] = ()
 ) -> dict[str, Path]:
-    fixture_roots = [canonical(path) for path in fixture_roots]
-    roots: dict[str, Path] = {}
-    for role, path in (("host", host), ("client", client), ("steam", steam)):
-        root = canonical(path)
-        if fixture_roots:
-            if not any(root == allowed or overlaps(root, allowed) for allowed in fixture_roots):
-                raise VerificationError(
-                    f"{role} root is outside the explicitly allowed fixture roots: {root}"
-                )
-        else:
-            allowed = {
-                "host": DEFAULT_HOST,
-                "client": DEFAULT_CLIENT,
-                "steam": DEFAULT_STEAM,
-            }[role]
-            if canonical(allowed) != root:
-                raise VerificationError(
-                    f"{role} root must be explicitly authorized or supplied with --allow-fixture-root"
-                )
-        if not root.is_dir():
-            raise VerificationError(f"Missing {role} root: {root}")
-        roots[role] = root
-
-    for role, root in roots.items():
-        for other_role, other in roots.items():
-            if role != other_role and overlaps(root, other):
-                raise VerificationError(
-                    f"Roots overlap: {role}={root}, {other_role}={other}"
-                )
-    return roots
-
-
-def pe_rva_to_offset(
-    data: bytes,
-    rva: int,
-    sections: list[tuple[int, int, int, int]],
-) -> int:
-    if rva < 0:
-        raise ValueError("Negative PE RVA")
-    for virtual_address, virtual_size, raw_address, raw_size in sections:
-        mapped_size = max(virtual_size, raw_size)
-        if virtual_address <= rva < virtual_address + mapped_size:
-            offset = raw_address + rva - virtual_address
-            if offset < 0 or offset >= len(data):
-                raise ValueError("PE RVA maps outside the file")
-            return offset
-    raise ValueError(f"Unmapped PE RVA 0x{rva:x}")
-
-
-def read_ascii(data: bytes, offset: int) -> str:
-    if offset < 0 or offset >= len(data):
-        raise ValueError("PE string offset outside file")
-    end = data.find(b"\0", offset)
-    if end < 0:
-        raise ValueError("Unterminated PE import name")
-    try:
-        return data[offset:end].decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Non-ASCII PE import name") from exc
-
-
-def parse_pe(path: Path) -> tuple[dict[str, list[str]], dict[str, object]]:
-    data = path.read_bytes()
-    if len(data) < 0x40 or data[:2] != b"MZ":
-        raise ValueError(f"Not a PE file: {path}")
-    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
-    if pe_offset > len(data) - 24 or data[pe_offset:pe_offset + 4] != b"PE\0\0":
-        raise ValueError(f"Missing PE header: {path}")
-
-    machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
-    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
-    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
-    optional_offset = pe_offset + 24
-    if machine != 0x14C:
-        raise ValueError(f"Not a 32-bit PE file: {path}")
-    if optional_size < 112 or optional_offset + optional_size > len(data):
-        raise ValueError(f"Truncated PE32 optional header: {path}")
-    if struct.unpack_from("<H", data, optional_offset)[0] != 0x10B:
-        raise ValueError(f"Not PE32: {path}")
-
-    section_offset = optional_offset + optional_size
-    if section_offset + section_count * 40 > len(data):
-        raise ValueError(f"Truncated PE section table: {path}")
-    sections: list[tuple[int, int, int, int]] = []
-    for index in range(section_count):
-        header = section_offset + 40 * index
-        virtual_size = struct.unpack_from("<I", data, header + 8)[0]
-        virtual_address = struct.unpack_from("<I", data, header + 12)[0]
-        raw_size = struct.unpack_from("<I", data, header + 16)[0]
-        raw_address = struct.unpack_from("<I", data, header + 20)[0]
-        if raw_address + raw_size > len(data):
-            raise ValueError(f"Section maps outside PE file: {path}")
-        sections.append((virtual_address, virtual_size, raw_address, raw_size))
-
-    number_of_rvas = struct.unpack_from("<I", data, optional_offset + 92)[0]
-    imports: dict[str, list[str]] = {}
-    data_directory_rva = optional_offset + 96
-    if number_of_rvas < 2:
-        data_directory_rva = optional_offset + 96
-
-    import_rva = struct.unpack_from("<I", data, optional_offset + 104)[0]
-    import_size = struct.unpack_from("<I", data, optional_offset + 108)[0]
-    if import_rva:
-        if import_size == 0:
-            raise ValueError("PE import table has RVA but zero size")
-        descriptor_offset = pe_rva_to_offset(data, import_rva, sections)
-        for _ in range(4096):
-            if descriptor_offset + 20 > len(data):
-                raise ValueError(f"Truncated PE import table: {path}")
-            original_thunks, _timestamp, _forwarder, name_rva, thunks = (
-                struct.unpack_from("<IIIII", data, descriptor_offset)
-            )
-            if (
-                original_thunks == 0
-                and name_rva == 0
-                and thunks == 0
-            ):
-                break
-            if name_rva == 0:
-                raise ValueError(f"Missing PE import DLL name: {path}")
-            name_offset = pe_rva_to_offset(data, name_rva, sections)
-            dll_name = read_ascii(data, name_offset).lower()
-            thunk_rva = original_thunks or thunks
-            if thunk_rva == 0:
-                raise ValueError(f"Missing PE import thunk table: {dll_name}")
-            thunk_offset = pe_rva_to_offset(data, thunk_rva, sections)
-            for _ in range(65536):
-                if thunk_offset + 4 > len(data):
-                    raise ValueError(f"Truncated PE import thunk table: {path}")
-                value = struct.unpack_from("<I", data, thunk_offset)[0]
-                if value == 0:
-                    break
-                if value & 0x80000000:
-                    ordinal = value & 0xFFFF
-                    imports.setdefault(dll_name, []).append(f"<ordinal:{ordinal}>")
-                else:
-                    hint_name_offset = pe_rva_to_offset(data, value, sections)
-                    if hint_name_offset + 2 > len(data):
-                        raise ValueError(f"Truncated PE import name: {path}")
-                    import_name = read_ascii(data, hint_name_offset + 2)
-                    imports.setdefault(dll_name, []).append(import_name)
-                thunk_offset += 4
-            descriptor_offset += 20
-        else:
-            raise ValueError(f"PE import table descriptor loop overflow: {path}")
-
-    delay_rva = 0
-    delay_size = 0
-    if number_of_rvas > 13:
-        delay_rva = struct.unpack_from("<I", data, optional_offset + 208)[0]
-        delay_size = struct.unpack_from("<I", data, optional_offset + 212)[0]
-
-    exports: dict[str, object] = {}
-    export_rva = struct.unpack_from("<I", data, optional_offset + 96)[0]
-    export_size = struct.unpack_from("<I", data, optional_offset + 100)[0]
-    if export_rva:
-        if export_size == 0:
-            raise ValueError("PE export table has RVA but zero size")
-        export_offset = pe_rva_to_offset(data, export_rva, sections)
-        if export_offset + 40 > len(data):
-            raise ValueError(f"Truncated PE export table: {path}")
-        (
-            _flags,
-            _timestamp,
-            _major,
-            _minor,
-            name_rva,
-            ordinal_base,
-            address_count,
-            name_count,
-            address_rva,
-            names_rva,
-            ordinals_rva,
-        ) = struct.unpack_from("<IIHHIIIIIII", data, export_offset)
-        exports["ordinal_base"] = ordinal_base
-        exports["address_count"] = address_count
-        exports["names"] = []
-        for index in range(name_count):
-            if names_rva == 0 or ordinals_rva == 0 or address_rva == 0:
-                raise ValueError("Malformed PE export name tables")
-            name_entry_offset = pe_rva_to_offset(data, names_rva + 4 * index, sections)
-            name_entry_rva = struct.unpack_from("<I", data, name_entry_offset)[0]
-            name_offset = pe_rva_to_offset(data, name_entry_rva, sections)
-            export_name = read_ascii(data, name_offset)
-            ordinal_offset = pe_rva_to_offset(data, ordinals_rva + 2 * index, sections)
-            ordinal = struct.unpack_from("<H", data, ordinal_offset)[0]
-            if ordinal >= address_count:
-                raise ValueError("PE export ordinal outside address table")
-            address_offset = pe_rva_to_offset(
-                data, address_rva + 4 * ordinal, sections
-            )
-            export_address = struct.unpack_from("<I", data, address_offset)[0]
-            exports["names"].append((export_name, export_address))
-        exports["named_count"] = name_count
-
-    metadata = {
-        "imports": imports,
-        "exports": exports,
-        "delay_import": bool(delay_rva or delay_size),
-    }
-    return imports, metadata
+    return validate_copy_roots(host, client, steam, fixture_roots, VerificationError)
 
 
 def parse_ini(path: Path) -> dict[str, str]:
@@ -337,23 +77,6 @@ def parse_ini(path: Path) -> dict[str, str]:
             )
         result[key] = value.strip().strip('"')
     return result
-
-
-def extract_package_ini() -> tuple[str, str]:
-    package_path = WORKTREE / "tools" / "package.py"
-    tree = ast.parse(package_path.read_text(encoding="utf-8"), filename=str(package_path))
-    constants: dict[str, str] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in ("HOST_INI", "CLIENT_INI"):
-                    if isinstance(node.value, ast.Constant) and isinstance(
-                        node.value.value, str
-                    ):
-                        constants[target.id] = node.value.value
-    if set(constants) != {"HOST_INI", "CLIENT_INI"}:
-        raise VerificationError("Could not safely read HOST_INI/CLIENT_INI from tools/package.py")
-    return constants["HOST_INI"], constants["CLIENT_INI"]
 
 
 def load_audit(path: Path) -> dict:
@@ -590,12 +313,12 @@ def verify_scripts(root: Path, role: str) -> list[str]:
         if path.is_file() and path.name.lower().startswith("script")
         and path.suffix.lower() == ".dll"
     ]
-    allowed = {"Script_G3Together.dll", "Script_Game.dll", "Script_paru.dll"}
+    allowed = {"script_g3together.dll", "script_game.dll", "script_paru.dll"}
     if sum(name.lower() == "script_g3together.dll" for name in matches) != 1:
         failures.append(
             f"Expected exactly one Script_G3Together.dll in {role}; found {matches}"
         )
-    extras = [name for name in matches if name not in allowed]
+    extras = [name for name in matches if name.lower() not in allowed]
     if extras:
         failures.append(
             f"Unrecognized Script*.dll entries in {role}: {extras}"
@@ -603,8 +326,17 @@ def verify_scripts(root: Path, role: str) -> list[str]:
     return failures
 
 
+def current_protocol() -> int:
+    try:
+        text = (WORKTREE / "src" / "saving_policy.h").read_text(encoding="utf-8")
+        match = re.search(r"\bProtocol\s*=\s*(\d+)", text)
+        return int(match.group(1)) if match else 79
+    except OSError:
+        return 79
+
+
 def verify_profile_and_template(
-    roots: dict[str, Path],
+    roots: dict[str, Path], expected_protocol: int | None = None,
 ) -> tuple[list[list[str]], list[str], list[str]]:
     rows: list[list[str]] = []
     failures: list[str] = []
@@ -650,29 +382,34 @@ def verify_profile_and_template(
         roots["client"] / r"isolated-profile\Documents\gothic3"
     )
     marker = reject_links(template_dir / "G3T_client_template.g3t")
-    template_header = reject_links(template_dir / "G3T_client_template.g3savcp")
-    template_world = reject_links(template_dir / "G3T_client_template.g3savcpdat")
-    if not all(path.is_file() for path in (marker, template_header, template_world)):
+    pairs = [
+        (reject_links(template_dir / ("G3T_client_template." + ext)),
+         reject_links(template_dir / ("G3T_client_template." + ext + "dat")))
+        for ext in ("g3savcp", "g3savcpx")
+    ]
+    pair = next(((header, world) for header, world in pairs if header.is_file() and world.is_file()), None)
+    if not marker.is_file() or pair is None:
         failures.append("Client template is missing; warm rejoin is not verified")
     else:
-        if marker.stat().st_size != 116:
-            failures.append("Client template marker size mismatch")
-        if template_header.stat().st_size != 65708:
-            failures.append("Client template header size mismatch")
-        if template_world.stat().st_size != 1958922:
-            failures.append("Client template world size mismatch")
-        text = marker.read_text(encoding="utf-8", errors="replace").lower()
-        if not all(
-            token in text
-            for token in (
-                "g3t client template 2",
-                "protocol=77",
-                "origin=new-game",
-            )
-        ):
-            failures.append(
-                f"Client template marker lacks v2/protocol77/new-game: {text[:200]!r}"
-            )
+        text = marker.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        fields = dict(line.split("=", 1) for line in lines[1:] if "=" in line)
+        try:
+            header_size = int(fields["header"])
+            world_size = int(fields["world"])
+            protocol = int(fields["protocol"])
+            expected = current_protocol() if expected_protocol is None else expected_protocol
+            valid = (lines[0].strip().lower() == "g3t client template 2"
+                     and protocol == expected
+                     and fields.get("origin") in ("new-game", "existing-world")
+                     and 1024 <= header_size <= 16_777_216
+                     and 4096 <= world_size <= 268_435_456
+                     and pair[0].stat().st_size == header_size
+                     and pair[1].stat().st_size == world_size)
+        except (ValueError, KeyError, IndexError):
+            valid = False
+        if not valid:
+            failures.append("Client template marker, protocol, or recorded sizes are invalid")
 
     add_row(
         rows,
@@ -692,22 +429,13 @@ def verify_ini(
     rows: list[list[str]] = []
     failures: list[str] = []
     warnings: list[str] = []
-    try:
-        host_template, client_template = extract_package_ini()
-        host_template_ini = parse_ini_text(host_template)
-        client_template_ini = parse_ini_text(client_template)
-    except (OSError, SyntaxError, VerificationError) as exc:
-        failures.append(f"Could not read shipped INI constants safely: {exc}")
-        host_template_ini = {}
-        client_template_ini = {}
-
     for role in ("host", "client"):
         path = reject_links(roots[role] / "g3together.ini")
         if not path.is_file():
             failures.append(f"Missing g3together.ini {role}:{path}")
             continue
         try:
-            ini = parse_ini(path)
+            ini, _ = parse_g3t_ini(path.read_text(encoding="utf-8-sig", errors="replace"))
         except VerificationError as exc:
             failures.append(str(exc))
             continue
@@ -771,22 +499,6 @@ def verify_ini(
         "strict" if strict else "default policy; intentional differences WARN",
     )
     return rows, failures, warnings
-
-
-def parse_ini_text(text: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("#", ";")):
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip().lower()
-        if key in result:
-            raise VerificationError(f"Duplicate key in package INI: {key}")
-        result[key] = value.strip()
-    return result
 
 
 def verify_hardlinks(
@@ -948,10 +660,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("--strict-shipped-ini", action="store_true")
+    parser.add_argument("--protocol", type=int, default=current_protocol())
     parser.add_argument("--json", type=Path)
     args = parser.parse_args(argv)
 
     try:
+        if args.expected == PACKAGE_AUDIT and not args.expected.exists():
+            raise VerificationError("Pass --expected <expected-installation.json> explicitly")
         roots = validate_roots(
             args.host_root,
             args.client_root,
@@ -1015,7 +730,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         all_failures.extend(failures)
         all_warnings.extend(warnings)
 
-        profile_rows, failures, warnings = verify_profile_and_template(roots)
+        profile_rows, failures, warnings = verify_profile_and_template(roots, args.protocol)
         all_rows.extend(profile_rows)
         all_failures.extend(failures)
         all_warnings.extend(warnings)

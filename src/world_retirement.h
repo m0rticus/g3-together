@@ -47,6 +47,28 @@ bool DrainSlots(std::size_t count, CellAt cellAt, Cell* permanent, uint32_t inde
     return true;
 }
 
+template<class Cell, class CellAt, class ScanCell>
+std::size_t CountSlotEntities(std::size_t count, CellAt cellAt, Cell* permanent, uint32_t index, ScanCell scanCell)
+{
+    if (index >= 32) return 0;
+    const uint32_t bit = uint32_t(1) << index;
+    std::size_t matching = 0;
+    for (std::size_t i = 0; i < count; ++i)
+        if (auto* cell = cellAt(i); cell && cell != permanent) matching += scanCell(*cell, bit);
+    if (permanent) matching += scanCell(*permanent, bit);
+    return matching;
+}
+
+template<class Prefetcher, class Database, class DrainPrefetcher>
+bool DrainDualPrefetchers(Prefetcher* privatePrefetcher, Prefetcher& mainPrefetcher, Database& database, uint32_t index,
+                          DrainPrefetcher drainPrefetcher)
+{
+    if (index == 0xffffffffu) return true;
+    if (index >= 32) return false;
+    if (privatePrefetcher && !drainPrefetcher(*privatePrefetcher, database, index)) return false;
+    return drainPrefetcher(mainPrefetcher, database, index);
+}
+
 template<class Operations>
 bool Retire(Operations& operations)
 {

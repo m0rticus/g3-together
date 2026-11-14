@@ -73,20 +73,31 @@ struct PoseRiceWriter {
 };
 
 struct PoseRiceReader {
-    std::vector<uint8_t> const& bytes;
+    uint8_t const* data = nullptr;
+    std::size_t size = 0;
     std::size_t bits = 0;
     bool ok = true;
 
+    constexpr PoseRiceReader(uint8_t const* bytes, std::size_t length) noexcept
+        : data(bytes), size(length)
+    {
+    }
+
+    PoseRiceReader(std::vector<uint8_t> const& bytes) noexcept
+        : data(bytes.data()), size(bytes.size())
+    {
+    }
+
     uint32_t Get(unsigned width)
     {
-        if (width > 32 || bits + width > bytes.size() * 8) {
+        if (width > 32 || (!data && width) || bits + width > size * 8) {
             ok = false;
             return 0;
         }
         uint32_t value = 0;
         for (unsigned read = 0; read < width;) {
             const unsigned take = (std::min)(width - read, unsigned(8 - (bits & 7)));
-            value |= uint32_t((bytes[bits / 8] >> (bits & 7)) & ((1u << take) - 1)) << read;
+            value |= uint32_t((data[bits / 8] >> (bits & 7)) & ((1u << take) - 1)) << read;
             bits += take;
             read += take;
         }
@@ -116,7 +127,7 @@ struct PoseRiceReader {
     bool AlignAndFinish()
     {
         while (ok && (bits & 7)) if (Get(1)) ok = false;
-        return ok && bits == bytes.size() * 8;
+        return ok && bits == size * 8;
     }
 };
 

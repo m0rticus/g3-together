@@ -15,6 +15,7 @@
 #include "ending.h"
 #include "log.h"
 #include "net.h"
+#include "npclease_runtime.h"
 #include "npcs.h"
 #include "guards.h"
 #include "remote.h"
@@ -319,27 +320,28 @@ void Send(net::WorldState const& s)
 // A companion joins (true) or leaves (false) this client. Joining: the host's NPC is taken over here (the follow
 // state follows the local hero; follow false: the caller sets its task, a guide of P9). Leaving: handed back to the
 // host. False when nothing changes hands.
-bool Join(eCEntity* target, bool join, bool follow = true)
+bool Join(eCEntity* self, bool join, bool follow = true)
 {
-    if (join && npcs::IsMirrored(target)) {
-        npcs::Claim(target);
+    if (join && self && (npcs::IsMirrored(self) || npclease::LocalAuthority(self))) {
+        if (npclease::LocalAuthority(self)) npclease::RelinquishToHost(self, "companion joined");
+        npcs::Claim(self);
         net::WorldState s{};
         s.kind = 4;
-        GuidOf(target, s.guid);
-        const bool guide = !follow && Entity(gCSession::GetInstance().GetHero()).Party.GetPartyLeader().GetInstance() == target;
+        GuidOf(self, s.guid);
+        const bool guide = !follow && Entity(gCSession::GetInstance().GetHero()).Party.GetPartyLeader().GetInstance() == self;
         s.npcClass = guide ? 2 : 1;
         Send(s);
         return true;
     }
-    if (!join && npcs::Claimed(target)) {
-        npcs::Unclaim(target);
+    if (!join && npcs::Claimed(self)) {
+        npcs::Unclaim(self);
         net::WorldState s{};
         s.kind = 5;
-        GuidOf(target, s.guid);
+        GuidOf(self, s.guid);
         if (givebackPlace) {  // where it stands here: the host's copy far away stayed where the host last saw it (escortfardiag)
-            const bCVector& p = target->GetWorldPosition();
+            const bCVector& p = self->GetWorldPosition();
             s.position[0] = p.GetX(); s.position[1] = p.GetY(); s.position[2] = p.GetZ();
-            const bCQuaternion q = target->GetWorldRotation();
+            const bCQuaternion q = self->GetWorldRotation();
             s.rotation[0] = q.GetX(); s.rotation[1] = q.GetY(); s.rotation[2] = q.GetZ(); s.rotation[3] = q.GetW();
             s.moved = 1;
         }

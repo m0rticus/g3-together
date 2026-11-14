@@ -36,23 +36,26 @@ class NpcIdentityTests(unittest.TestCase):
         self.assertLess(tick.index("RedundantClientEntity(entity)"), tick.index("unavailable[key]"))
 
     def test_census_is_pointer_specific_and_resettable(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        census = source[source.index("void ReconcileClientEntities()"):source.index("bool Ready(")]
+        identity_source = (ROOT / "src" / "npc_identity.cpp").read_text(encoding="utf-8")
+        npcs_source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        census = identity_source[identity_source.index("void ReconcileClientEntities()"):
+                                 identity_source.index("namespace detail {")]
         for required in ("Entity::GetEntities()", "world::ProcessedEntities()", "npcidentity::AddPointer",
                          "npcidentity::Quarantine", "ActorDescendant(entity)", "guid_collisions=%u",
                          "duplicates=%u", "NPCNEAR_DIFFERENT_GUID", "NPCDUP_QUARANTINE",
                          "NPCDUP_RESTORE", "saved->second.guid != identity"):
             self.assertIn(required, census)
         self.assertIn("npcremoval::Suppressed(saved->second.rootGuid.data())", census)
-        helper = source[source.index("bool RedundantClientEntity("):source.index("void ReconcileClientEntities(")]
+        helper = identity_source[identity_source.index("bool RedundantClientEntity("):
+                                 identity_source.index("void ReconcileClientEntities(")]
         self.assertIn("quarantinedEntities.find(entity)", helper)
         self.assertIn("identity == found->second.guid", helper)
-        reset = source[source.index("void OnWorldDeactivate()"):]
+        reset = npcs_source[npcs_source.index("void OnWorldDeactivate()"):]
         self.assertIn("quarantinedEntities.clear()", reset)
         self.assertIn("identityCensusAt = identityLogAt = 0", reset)
 
     def test_quarantine_never_kills_or_deletes_native_entities(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        source = (ROOT / "src" / "npc_identity.cpp").read_text(encoding="utf-8")
         quarantine = source[source.index("void QuarantineTree("):source.index("void LogIdentity(")]
         for required in ("DisableProcessing(GETrue)", "EnableRendering(GEFalse)",
                          "EnablePicking(GEFalse, GEFalse)", "EnableCollision(GEFalse)",
@@ -67,10 +70,10 @@ class NpcIdentityTests(unittest.TestCase):
             self.assertIn(required, candidate)
 
     def test_only_the_bound_pointer_has_host_presentation_and_combat(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        presentation = source[source.index("bool HostPresentationAvailable("):
-                              source.index("bool HostCanPresent(")]
+        npcs_source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        presentation = npcs_source[npcs_source.index("bool HostPresentationAvailable("):
+                                   npcs_source.index("bool HostAttitude(")]
         self.assertIn("mirror.entity.GetInstance() != entity", presentation)
-        combat = source[source.index("net::NpcRecord const* CombatRecord("):
-                        source.index("bool CombatTarget(")]
+        combat = npcs_source[npcs_source.index("net::NpcRecord const* CombatRecord("):
+                             npcs_source.index("bool CombatTarget(")]
         self.assertIn("found->second.entity.GetInstance() != entity", combat)

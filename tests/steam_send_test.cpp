@@ -416,6 +416,41 @@ static void LatestPoseReplacementAndAgeBound()
     assert(queue.Bytes() <= MaxUnreliablePoseBytes);
     assert(queue.OldestAge(300 * 5) <= MaxUnreliablePoseAgeMs);
     assert(queue.counters.npcUpdatesDropped > 100);
+
+    // Multi-NPC interleaving: replacing NPC 7 after queuing NPC 8 must append at the tail so
+    // ENet unreliable sequence numbers and queue timestamps remain strictly monotonic.
+    Queue multi;
+    auto a1 = controlPose(7, 1);
+    auto b1 = controlPose(8, 2);
+    auto a2 = controlPose(7, 3);
+    assert(multi.Push(codec, a1.data(), a1.size(), 10));
+    assert(multi.Push(codec, b1.data(), b1.size(), 20));
+    assert(multi.Push(codec, a2.data(), a2.size(), 30));
+    assert(multi.Depth() == 2);
+
+    // Advancing past NPC 8's age deadline (280 - 20 = 260 > 250) must evict NPC 8 while keeping NPC 7 (age 250).
+    auto c1 = controlPose(9, 4);
+    assert(multi.Push(codec, c1.data(), c1.size(), 280));
+    assert(multi.Depth() == 2);
+
+    std::vector<uint16_t> drainedSeqs;
+    std::vector<uint32_t> drainedTimes;
+    assert(multi.Drain([&](Item const& item) {
+        std::vector<uint8_t> plain;
+        assert(codec.Decode(item.bytes.data(), item.bytes.size(), plain));
+        uint16_t seq = 0;
+        const bool ok = g3t::steam::ForEachEnetCommand(plain.data(), plain.size(), nullptr,
+            [&](std::size_t, g3t::steam::EnetCommandView const& view) {
+                assert(view.command == ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE);
+                seq = static_cast<uint16_t>((uint16_t(plain[view.offset + 4]) << 8) | plain[view.offset + 5]);
+            });
+        assert(ok);
+        drainedSeqs.push_back(seq);
+        drainedTimes.push_back(item.at);
+        return Ok;
+    }) == Ok);
+    assert((drainedSeqs == std::vector<uint16_t>{3, 4}));
+    assert((drainedTimes == std::vector<uint32_t>{30, 280}));
 }
 
 int ENET_CALLBACK main()

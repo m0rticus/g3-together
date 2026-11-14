@@ -16,9 +16,30 @@ struct Victim {
 enum class Decision { Allow, Party, Bystander, FightingEnemy, FriendlyCombatant, NeutralCombatant, TargetOnly };
 enum class ClientDecision { Reject, Predict, HostJudge };
 
+constexpr std::uint32_t UnstreamedHitIncarnation = 0xFFFFFFFFu;
+
+constexpr std::uint32_t ResolveOutgoingHitIncarnation(std::uint32_t knownIncarnation, std::uint32_t seenAt,
+                                                       std::uint8_t meleeKind)
+{
+    return knownIncarnation == 0 && seenAt == 0 && meleeKind == 0 ? UnstreamedHitIncarnation : knownIncarnation;
+}
+
+constexpr bool AcceptIncomingHitIncarnation(std::uint32_t packetIncarnation, std::uint32_t seenAt,
+                                             std::uint8_t meleeKind, std::uint32_t hostIncarnation)
+{
+    return packetIncarnation == 0 ||
+           (packetIncarnation == UnstreamedHitIncarnation && seenAt == 0 && meleeKind == 0) ||
+           packetIncarnation == hostIncarnation;
+}
+
 constexpr ClientDecision JudgeClient(bool allowed, bool relationsKnown)
 {
     return !relationsKnown ? ClientDecision::HostJudge : allowed ? ClientDecision::Predict : ClientDecision::Reject;
+}
+
+constexpr ClientDecision EvaluatePlayerMelee(std::uint8_t meleeKind, bool allowed, bool relationsKnown)
+{
+    return meleeKind > 2 ? ClientDecision::Reject : JudgeClient(allowed, relationsKnown);
 }
 
 constexpr bool ClaimedSwing(std::uint32_t swing, std::uint32_t currentLife, std::uint32_t unknownLife)

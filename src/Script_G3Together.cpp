@@ -53,16 +53,13 @@
 #include "movement.h"
 #include "body.h"
 #include "guid.h"
+#include "focus_diag.h"
 
 #include <Game.h>
 #include <Windows.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <map>
-#include <set>
-#include <string>
-#include <utility>
 
 namespace {
 unsigned long long frames = 0;
@@ -71,69 +68,34 @@ bool faulted = false;
 bool playbackErrorShown = false;
 unsigned moduleProcessDepth = 0;
 
-struct FocusNpc {
-    uintptr_t instance = 0;
-    int weapon = 0, ai = 0;
-    uint16_t fraction = UINT16_MAX;
-    std::string motion;
-};
-struct FocusObservation {
-    bool known = false, focused = false, paused = false, watching = false;
-    uint32_t frameAt = 0, lostAt = 0, resumedAt = 0, sampledAt = 0;
-    unsigned serial = 0, replacements = 0, details = 0, resourceResets = 0, resourceRestores = 0;
-    std::map<std::string, FocusNpc> npcs;
-    std::set<std::string> weapons, modes, draws;
-} focusObservation;
-
-void ResetFocusObservation() { focusObservation = FocusObservation{}; }
+void ResetFocusObservation() { g3t::focus_diag::Reset(); }
 
 void ObserveFocus()
 {
-    auto& observation = focusObservation;
     const uint32_t now = GetTickCount();
     const bool focused = g3t::partner::Focused();
     auto& session = gCSession::GetInstance();
     const bool paused = session.IsPaused();
-    const uint32_t gap = observation.known ? now - observation.frameAt : 0;
-    const bool lost = observation.known && observation.focused && !focused;
-    const bool regained = observation.known && !observation.focused && focused;
-    const bool resumed = observation.known && observation.paused && !paused;
-    const bool longGap = observation.known && gap >= 1000;
-    if (lost) observation.lostAt = now;
-    if (lost || regained || resumed || longGap) {
+    const bool inWorld = session.IsGameRunning() && !g3t::persist::NativeLoading() && !g3t::persist::HeroPending();
+    const auto header = g3t::focus_diag::AdvanceFrame(now, focused, paused, inWorld);
+    if (header.lost || header.regained || header.resumed || header.longGap) {
         eCEntity* instance = session.GetHero();
         Entity hero(instance);
         const bool routine = instance && instance->GetPropertySet(eEPropertySetType_ScriptRoutine);
         g3t::Logf("focus: %s role=%s serial=%u gap_ms=%u away_ms=%u native_dt_ms=%.1f paused=%d "
                   "task=%.48s state=%.48s ai=%d ani=%d",
-                  lost ? "lost" : regained ? "regained" : resumed ? "pause-resumed" : "frame-gap",
-                  g3t::net::IsHost() ? "host" : "client", ++observation.serial, gap,
-                  regained ? now - observation.lostAt : 0,
+                  header.lost ? "lost" : header.regained ? "regained" : header.resumed ? "pause-resumed" : "frame-gap",
+                  g3t::net::IsHost() ? "host" : "client", header.serial, header.gap, header.awayMs,
                   eCApplication::GetInstance().GetScaledFrameTimeInSeconds() * 1000.0f, paused ? 1 : 0,
                   routine ? hero.Routine.GetCurrentTask().GetText() : "-",
                   routine ? hero.Routine.GetCurrentState().GetText() : "-",
                   routine ? static_cast<int>(hero.Routine.AIMode) : -1,
                   routine ? static_cast<int>(hero.Routine.AniState) : -1);
-        if (regained || resumed || longGap) {
-            g3t::downed::OnFrameResume();
-            observation.watching = true;
-            observation.resumedAt = now;
-            observation.weapons.clear();
-            observation.modes.clear();
-            observation.draws.clear();
-            observation.replacements = observation.details = 0;
-            observation.sampledAt = now - 250;
-        }
+        if (header.regained || header.resumed || header.longGap) g3t::downed::OnFrameResume();
     }
-    observation.known = true;
-    observation.focused = focused;
-    observation.paused = paused;
-    observation.frameAt = now;
-    if (!session.IsGameRunning() || g3t::persist::NativeLoading() || g3t::persist::HeroPending()) return;
-    // Preserve the last foreground sample while away. GUIDs/integers are observations, never cached live entities.
-    if (!focused || now - observation.sampledAt < 250) return;
-    observation.sampledAt = now;
-    std::map<std::string, FocusNpc> current;
+    // Sample world NPCs only on foreground transition edges, post-resume watch windows, or sparse baseline refresh.
+    if (!header.sampleDue) return;
+    g3t::focus_diag::BeginSample(now);
     const auto all = Entity::GetNPCs();
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity npc = all.GetAt(i);
@@ -143,35 +105,27 @@ void ObserveFocus()
         char identity[40] = {}, motion[256] = {};
         g3t::guid::FormatEntity(entity, identity, sizeof(identity));
         g3t::body::CurrentMotion(entity, motion, sizeof(motion));
-        FocusNpc sample{reinterpret_cast<uintptr_t>(entity), static_cast<int>(gCEntity::GetCombatMode(entity)),
-                        static_cast<int>(npc.Routine.AIMode), g3t::body::MotionFraction(entity), motion};
-        const auto before = observation.npcs.find(identity);
-        if (observation.watching && before != observation.npcs.end()) {
-            const auto& previous = before->second;
-            const bool weapon = sample.weapon != previous.weapon, mode = sample.ai != previous.ai;
-            const bool draw = (std::strstr(motion, "Draw") || std::strstr(motion, "Equip")) &&
-                (sample.motion != previous.motion || (sample.fraction != UINT16_MAX &&
-                 previous.fraction != UINT16_MAX && sample.fraction + 3276 < previous.fraction));
-            if (weapon) observation.weapons.insert(identity);
-            if (mode) observation.modes.insert(identity);
-            if (draw) observation.draws.insert(identity);
-            if (sample.instance != previous.instance) ++observation.replacements;
-            if ((weapon || mode || draw) && observation.details++ < 8)
-                g3t::Logf("focus: npc serial=%u guid=%s name=%.48s weapon=%d->%d ai=%d->%d draw=%d motion=%.96s",
-                          observation.serial, identity, npc.GetName().GetText(), previous.weapon, sample.weapon,
-                          previous.ai, sample.ai, draw ? 1 : 0, motion);
-        }
-        current.emplace(identity, std::move(sample));
+        const g3t::focus_diag::NpcSample sample{
+            reinterpret_cast<uintptr_t>(entity),
+            static_cast<int>(gCEntity::GetCombatMode(entity)),
+            static_cast<int>(npc.Routine.AIMode),
+            g3t::body::MotionFraction(entity),
+            identity,
+            motion,
+        };
+        const auto change = g3t::focus_diag::RecordNpc(sample);
+        if (change.logDetail)
+            g3t::Logf("focus: npc serial=%u guid=%s name=%.48s weapon=%d->%d ai=%d->%d draw=%d motion=%.96s",
+                      header.serial, identity, npc.GetName().GetText(), change.prevWeapon, sample.weapon,
+                      change.prevAi, sample.ai, change.draw ? 1 : 0, motion);
     }
-    observation.npcs.swap(current);
-    if (observation.watching && now - observation.resumedAt >= 2000) {
+    g3t::focus_diag::SettleReport settled{};
+    if (g3t::focus_diag::FinishSample(now, settled))
         g3t::Logf("focus: settled serial=%u window_ms=%u sampled_npcs=%zu weapon_changed=%zu ai_changed=%zu "
                   "draw_motion=%zu actor_replacements=%u held=%d",
-                  observation.serial, now - observation.resumedAt, observation.npcs.size(),
-                  observation.weapons.size(), observation.modes.size(), observation.draws.size(),
-                  observation.replacements, g3t::downed::Held() ? 1 : 0);
-        observation.watching = false;
-    }
+                  settled.serial, settled.windowMs, settled.sampledNpcs,
+                  settled.weaponChanged, settled.aiChanged, settled.drawMotion,
+                  settled.actorReplacements, g3t::downed::Held() ? 1 : 0);
 }
 
 // Yaw in degrees around the up axis (Y in Gothic 3).
@@ -199,9 +153,9 @@ void Report()
 void Frame()
 {
     if (faulted) return;
+    ObserveFocus();
     __try {
         ++frames;
-        ObserveFocus();
         const DWORD now = GetTickCount();
         if (now - lastReport >= 1000) {
             lastReport = now;
@@ -264,7 +218,6 @@ class Module : public eCEngineComponentBase
     }
     bEResult Initialize() override
     {
-        g3t::persist::SetWorldCleanup(&ForgetWorld);
         g3t::world::Start();
         return bEResult_Ok;
     }
@@ -273,6 +226,10 @@ class Module : public eCEngineComponentBase
     // Forget every entity the mod holds. Loading a save (gCHUDFileManager::LoadGame) replaces the world's
     // entities and only activates the world again, without deactivating it first: the puppets kept from before
     // were deleted and the next frame crashed on them. So forget on both.
+    struct NamedCall {
+        char const* name;
+        void (*call)();
+    };
     static void ForgetStep(char const* name, void (*forget)())
     {
         g3t::crashlog::WorldEntryScope operation(name);
@@ -280,40 +237,47 @@ class Module : public eCEngineComponentBase
     }
     static void ForgetWorld()
     {
+        constexpr NamedCall earlySteps[] = {
+            {"world cleanup / native prefetch queues", &g3t::world::OnWorldDeactivate},
+            {"NPC playback cleanup / source-options mutex", &g3t::npcplayback::OnWorldDeactivate},
+            {"remote puppet cleanup", &g3t::remote::OnWorldDeactivate},
+            {"NPC cleanup / replication reset", &g3t::npcs::OnWorldDeactivate},
+            {"Ardea removal cleanup", &g3t::npcremoval::OnWorldDeactivate},
+            {"combat cleanup", &g3t::combat::OnWorldChange},
+            {"shot cleanup", &g3t::shot::OnWorldChange},
+            {"summon cleanup", &g3t::summon::OnWorldChange},
+            {"fight memory cleanup", &g3t::fightmem::OnWorldChange},
+            {"XP share cleanup", &g3t::xpshare::OnWorldChange},
+            {"talk cleanup", &g3t::talk::OnWorldChange},
+            {"journal cleanup", &g3t::journal::OnWorldChange},
+            {"story cleanup", &g3t::story::OnWorldChange},
+            {"info command cleanup", &g3t::infocmd::OnWorldChange},
+            {"guide cleanup", &g3t::guide::OnWorldChange},
+            {"arena cleanup", &g3t::arena::OnWorldChange},
+            {"ending cleanup", &g3t::ending::OnWorldChange},
+        };
+        constexpr NamedCall lateSteps[] = {
+            {"door cleanup", &g3t::doors::OnWorldChange},
+            {"enclave cleanup", &g3t::enclaves::OnWorldChange},
+            {"occupancy cleanup", &g3t::occupancy::OnWorldChange},
+            {"address cleanup", &g3t::address::OnWorldChange},
+            {"dialog audio cleanup / native channels", &g3t::dialogaudio::OnWorldChange},
+            {"container cleanup", &g3t::containers::OnWorldChange},
+            {"ransack cleanup", &g3t::ransack::OnWorldChange},
+            {"trade cleanup", &g3t::trade::OnWorldChange},  // forget the old hero before retiring its automatic transactions
+            {"offer cleanup", &g3t::offer::OnWorldChange},
+        };
         ResetFocusObservation();
         CaptureCacheInventory("before world cleanup");
-        ForgetStep("world cleanup / native prefetch queues", &g3t::world::OnWorldDeactivate);
-        ForgetStep("NPC playback cleanup / source-options mutex", &g3t::npcplayback::OnWorldDeactivate);
-        ForgetStep("remote puppet cleanup", &g3t::remote::OnWorldDeactivate);
-        ForgetStep("NPC cleanup / replication reset", &g3t::npcs::OnWorldDeactivate);
-        ForgetStep("Ardea removal cleanup", &g3t::npcremoval::OnWorldDeactivate);
-        ForgetStep("combat cleanup", &g3t::combat::OnWorldChange);
-        ForgetStep("shot cleanup", &g3t::shot::OnWorldChange);
-        ForgetStep("summon cleanup", &g3t::summon::OnWorldChange);
-        ForgetStep("fight memory cleanup", &g3t::fightmem::OnWorldChange);
-        ForgetStep("XP share cleanup", &g3t::xpshare::OnWorldChange);
-        ForgetStep("talk cleanup", &g3t::talk::OnWorldChange);
-        ForgetStep("journal cleanup", &g3t::journal::OnWorldChange);
-        ForgetStep("story cleanup", &g3t::story::OnWorldChange);
-        ForgetStep("info command cleanup", &g3t::infocmd::OnWorldChange);
-        ForgetStep("guide cleanup", &g3t::guide::OnWorldChange);
-        ForgetStep("arena cleanup", &g3t::arena::OnWorldChange);
-        ForgetStep("ending cleanup", &g3t::ending::OnWorldChange);
+        for (auto const& step : earlySteps) ForgetStep(step.name, step.call);
+        ForgetStep("clock cleanup", &g3t::clock::OnWorldChange);
         ForgetStep("HUD observation cleanup", &g3t::hud::OnWorldChange);
         ForgetStep("movement observation cleanup", &g3t::movement::OnWorldChange);
         {
             g3t::crashlog::WorldEntryScope operation("downed cleanup");
             g3t::downed::OnWorldChange();
         }
-        ForgetStep("door cleanup", &g3t::doors::OnWorldChange);
-        ForgetStep("enclave cleanup", &g3t::enclaves::OnWorldChange);
-        ForgetStep("occupancy cleanup", &g3t::occupancy::OnWorldChange);
-        ForgetStep("address cleanup", &g3t::address::OnWorldChange);
-        ForgetStep("dialog audio cleanup / native channels", &g3t::dialogaudio::OnWorldChange);
-        ForgetStep("container cleanup", &g3t::containers::OnWorldChange);
-        ForgetStep("ransack cleanup", &g3t::ransack::OnWorldChange);
-        ForgetStep("trade cleanup", &g3t::trade::OnWorldChange);  // forget the old hero before retiring its automatic transactions
-        ForgetStep("offer cleanup", &g3t::offer::OnWorldChange);
+        for (auto const& step : lateSteps) ForgetStep(step.name, step.call);
         CaptureCacheInventory("after world cleanup");
     }
     static void CaptureCacheInventory(char const* phase)
@@ -360,7 +324,6 @@ class Module : public eCEngineComponentBase
         ForgetWorld();
         g3t::crashlog::Stage("world deactivated");
         g3t::crashlog::Stage("forget done");
-        g3t::dialogaudio::OnWorldChange();  // no channel of ours outlives the audio system, whichever way the game ends
         g3t::net::Stop();
         g3t::crashlog::Stage("steam stopped");
         const auto patches = g3t::ai::RestorePatches();
@@ -374,21 +337,20 @@ class Module : public eCEngineComponentBase
     bEResult Shutdown() override
     {
         g3t::ai::BeginShutdown();
-        g3t::crashlog::BeginShutdown();
         g3t::crashlog::Shutdown();
         g3t::crashlog::Stage("shutdown called");
         return bEResult_Ok;
     }
     bEResult ResetResources(GEBool full) override
     {
-        const unsigned count = ++focusObservation.resourceResets;
+        const unsigned count = g3t::focus_diag::CountResourceReset();
         if (count <= 4 || count % 100 == 0)
             g3t::Logf("focus: resource-reset count=%u full=%d focused=%d", count, full ? 1 : 0, g3t::partner::Focused());
         return bEResult_Ok;
     }
     bEResult RestoreResources(GEBool full) override
     {
-        const unsigned count = ++focusObservation.resourceRestores;
+        const unsigned count = g3t::focus_diag::CountResourceRestore();
         if (count <= 4 || count % 100 == 0)
             g3t::Logf("focus: resource-restored count=%u full=%d focused=%d", count, full ? 1 : 0, g3t::partner::Focused());
         g3t::downed::OnFrameResume();
@@ -415,9 +377,9 @@ class Module : public eCEngineComponentBase
             }
             return;
         }
-        { g3t::movement::Stage stage("crashlog"); g3t::crashlog::Tick(); }
+        Step("crashlog", &g3t::crashlog::Tick);
         { g3t::movement::Stage stage("world"); g3t::world::Tick(); }
-        { g3t::movement::Stage stage("NPC removal"); g3t::npcremoval::Tick(); }
+        Step("NPC removal", &g3t::npcremoval::Tick);
         { g3t::movement::Stage stage("NPC identity"); g3t::npcs::ReconcileClientEntities(); }
         { g3t::movement::Stage stage("NPC playback"); g3t::npcplayback::Tick(); }
         {
@@ -435,42 +397,54 @@ class Module : public eCEngineComponentBase
         { g3t::movement::Stage stage("AI"); g3t::ai::Tick(); }
         { g3t::movement::Stage stage("NPC / lease"); g3t::npcs::Tick(); }
         { g3t::movement::Stage stage("combat"); g3t::combat::Tick(); }
-        { g3t::movement::Stage stage("summon"); g3t::summon::Tick(); }
-        { g3t::movement::Stage stage("story"); g3t::story::Tick(); }
-        { g3t::movement::Stage stage("talk"); g3t::talk::Tick(); }
+        constexpr NamedCall beforeDowned[] = {
+            {"summon", &g3t::summon::Tick},
+            {"story", &g3t::story::Tick},
+            {"talk", &g3t::talk::Tick},
+        };
+        for (auto const& step : beforeDowned) Step(step.name, step.call);
         { g3t::movement::Stage stage("downed"); g3t::downed::Tick(); }
-        { g3t::movement::Stage stage("range"); g3t::range::Tick(); }
-        { g3t::movement::Stage stage("partner jump"); g3t::partner::Tick(); }
-        { g3t::movement::Stage stage("doors"); g3t::doors::Tick(); }
-        { g3t::movement::Stage stage("enclaves"); g3t::enclaves::Tick(); }
-        { g3t::movement::Stage stage("journal"); g3t::journal::Tick(); }
+        constexpr NamedCall beforePersist[] = {
+            {"range", &g3t::range::Tick},
+            {"partner jump", &g3t::partner::Tick},
+            {"doors", &g3t::doors::Tick},
+            {"enclaves", &g3t::enclaves::Tick},
+            {"journal", &g3t::journal::Tick},
+        };
+        for (auto const& step : beforePersist) Step(step.name, step.call);
         {
             g3t::crashlog::WorldEntryScope operation("persist tick");
             g3t::movement::Stage stage("persist");
             g3t::persist::Tick();
         }
-        { g3t::movement::Stage stage("clock"); g3t::clock::Tick(); }
-        { g3t::movement::Stage stage("info command"); g3t::infocmd::Tick(); }
-        { g3t::movement::Stage stage("guide"); g3t::guide::Tick(); }
-        { g3t::movement::Stage stage("arena"); g3t::arena::Tick(); }
-        { g3t::movement::Stage stage("ending"); g3t::ending::Tick(); }
-        { g3t::movement::Stage stage("containers"); g3t::containers::Tick(); }
-        { g3t::movement::Stage stage("trade"); g3t::trade::Tick(); }
-        { g3t::movement::Stage stage("map marks"); g3t::mapmarks::Tick(); }
-        { g3t::movement::Stage stage("ransack"); g3t::ransack::Tick(); }
-        { g3t::movement::Stage stage("witness"); g3t::witness::Tick(); }
-        { g3t::movement::Stage stage("guards"); g3t::guards::Tick(); }
-        { g3t::movement::Stage stage("pickpocket"); g3t::pickpocket::Tick(); }
-        { g3t::movement::Stage stage("respawn"); g3t::respawn::Tick(); }
-        { g3t::movement::Stage stage("occupancy"); g3t::occupancy::Tick(); }
-        { g3t::movement::Stage stage("address"); g3t::address::Tick(); }
+        constexpr NamedCall beforeRelations[] = {
+            {"clock", &g3t::clock::Tick},
+            {"info command", &g3t::infocmd::Tick},
+            {"guide", &g3t::guide::Tick},
+            {"arena", &g3t::arena::Tick},
+            {"ending", &g3t::ending::Tick},
+            {"containers", &g3t::containers::Tick},
+            {"trade", &g3t::trade::Tick},
+            {"map marks", &g3t::mapmarks::Tick},
+            {"ransack", &g3t::ransack::Tick},
+            {"witness", &g3t::witness::Tick},
+            {"guards", &g3t::guards::Tick},
+            {"pickpocket", &g3t::pickpocket::Tick},
+            {"respawn", &g3t::respawn::Tick},
+            {"occupancy", &g3t::occupancy::Tick},
+            {"address", &g3t::address::Tick},
+        };
+        for (auto const& step : beforeRelations) Step(step.name, step.call);
         { g3t::movement::Stage stage("fight memory"); g3t::fightmem::Tick(); }
         { g3t::movement::Stage stage("relation"); g3t::relation::Tick(); }
-        { g3t::movement::Stage stage("XP share"); g3t::xpshare::Tick(); }
-        { g3t::movement::Stage stage("dialog audio"); g3t::dialogaudio::Tick(); }
-        { g3t::movement::Stage stage("offer"); g3t::offer::Tick(); }
-        { g3t::movement::Stage stage("shot"); g3t::shot::Tick(); }
-        { g3t::movement::Stage stage("spells"); g3t::spells::Tick(); }
+        constexpr NamedCall tailSteps[] = {
+            {"XP share", &g3t::xpshare::Tick},
+            {"dialog audio", &g3t::dialogaudio::Tick},
+            {"offer", &g3t::offer::Tick},
+            {"shot", &g3t::shot::Tick},
+            {"spells", &g3t::spells::Tick},
+        };
+        for (auto const& step : tailSteps) Step(step.name, step.call);
     }
     void PostProcess() override {}
     void OnBeginRenderSolid() override {}

@@ -51,6 +51,18 @@ class StartupVideoTests(unittest.TestCase):
             self.assertTrue(intro.is_file())
             self.assertEqual(intro.read_bytes(), b"Synthetic intro data")
 
+    def test_hard_linked_file_is_rejected_before_mutation(self):
+        import os
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "copy"
+            logos, _intro = self.make_copy(root)
+            shared = base / "shared-logo.ini"
+            os.link(logos, shared)
+            with self.assertRaisesRegex(RuntimeError, r"(?i)hard-linked"):
+                startup_videos.disable(root)
+            self.assertEqual(shared.read_bytes(), b"LogoA\nLogoB\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -93,7 +93,7 @@ it for you. Once connected, with `client_autoload = on` (default) you enter the 
 menu (Esc cancels it), or choose **New Game** yourself. The host sends your account's saved character and personal loot/merchant state, applied before
 admission. If no record exists for your account, you start fresh, never as a copy of the host.
 Only the host loads saved games; after a host load the client re-enters automatically (same countdown) through its own `G3T_client_template` slot
-(saved by your first entry of each launch; if it is missing the client makes it again by itself, no restart; see docs/PLAYING.md).
+(saved by your first entry of each launch; if it is missing the client makes it again by itself, no restart; see [PLAYING.md](PLAYING.md)).
 The host calendar, quest/status/timer/counter, dialog/event and nearby shared-door snapshots finish before admission.
 The client applies cutover changes and confirms entry before one-shot NPC/motion replays start.
 Restoration does not replay quest rewards. Native world files never travel over the network; gameplay acceptance remains manual.

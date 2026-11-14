@@ -583,11 +583,12 @@ class HostFlow
     };
     enum Fx : unsigned {
         None = 0,
-        CreateLobby = 1,   // create the friends-only lobby (host + MaxPartners members)
-        SendOffer = 2,     // send the lobby offer to partner()
-        SendDecline = 4,   // send declineWhy()/declineArg() to declineTo()
-        Teardown = 8,      // leave the lobby, drop the partner's relay (rich presence stays published)
+        CreateLobby = 1,    // create the friends-only lobby (host + MaxPartners members)
+        SendOffer = 2,      // send the lobby offer to partner()
+        SendDecline = 4,    // send declineWhy()/declineArg() to declineTo()
+        Teardown = 8,       // leave the lobby, drop the partner's relay (rich presence stays published)
         Ignored = 16,
+        RotatePartner = 32, // drop the prior linked relay generation before re-offering the same partner
     };
     struct Join
     {
@@ -631,8 +632,12 @@ class HostFlow
         case State::Opening:
             return join.from == partner_ ? Ignored : Decline(join.from, Why::Busy, 0);
         case State::Offered:
-        case State::Linked:
             return join.from == partner_ ? SendOffer : Decline(join.from, Why::Busy, 0);
+        case State::Linked:
+            if (join.from != partner_) return Decline(join.from, Why::Busy, 0);
+            state_ = State::Offered;
+            deadline_ = now + OfferWaitMs;
+            return RotatePartner | SendOffer;
         default:
             return Ignored;
         }

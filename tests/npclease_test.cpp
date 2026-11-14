@@ -2,7 +2,9 @@
 #define far SyntheticFarMacro
 #include "../src/npclease.h"
 #include "../src/npclease_client.h"
+#include "../src/npclease_guards.h"
 #include "../src/npclease_save.h"
+#include "../src/npcown_policy.h"
 #undef far
 #include <cassert>
 #include <cmath>
@@ -848,6 +850,59 @@ static void TestLegacyOverlayDiscard()
     assert(EncodeSaveText(overlay, capture) && capture.empty());
 }
 
+static void TestSection4MultiClientAndGuards()
+{
+    // F1c: GuardRegistry and AuthorityGuard::hostClaimed fence local/processing authority under mutex.
+    {
+        GuardRegistry registry;
+        GuardKey key{};
+        key[0] = 0x42;
+
+        AuthorityGuard clientLocal{};
+        clientLocal.leased = true;
+        clientLocal.locallyDriven = true;
+        clientLocal.processingAllowed = true;
+        clientLocal.persistent = true;
+        clientLocal.owner = 2;
+        registry.Put(key, clientLocal);
+        const auto loaded = registry.Get(key);
+        assert(loaded.Local(1000) && loaded.Processing(1000) && !loaded.Fenced(1000));
+
+        AuthorityGuard hostClaimed = clientLocal;
+        hostClaimed.hostClaimed = true;
+        registry.Put(key, hostClaimed);
+        const auto claimed = registry.Get(key);
+        assert(!claimed.Local(1000) && !claimed.Processing(1000) && claimed.Fenced(1000));
+        registry.Erase(key);
+        assert(!registry.Get(key).leased);
+    }
+
+    // F5: LocalId >= 3 yields shared NPCs to lower-ID clients and Frozen leases hand off cleanly to Client 2.
+    {
+        g3t::npcown::OwnerFacts facts{};
+        assert(g3t::npcown::Release(facts) == nullptr);
+        facts.sharedWithLowerClient = true;
+        const char* reason = g3t::npcown::Release(facts);
+        assert(reason && std::strcmp(reason, "lower-id client in reach") == 0);
+
+        Lease lease;
+        Checkpoint state = ValidCheckpoint(9);
+        assert(lease.Offer(3, 10, 1, 100, state));
+        assert(lease.Prepared(1, 120));
+        assert(CommitEffect(state, NativeDeath));
+        assert(lease.Cut(3, 10, 1, 1, 1, state));
+        assert(lease.phase == Phase::Frozen && lease.owner == 3);
+        assert(lease.HandBack(2, 200));
+        assert(lease.phase == Phase::Host && lease.owner == 1);
+        Checkpoint wiped = state;
+        wiped.effects = 0;
+        assert(!lease.Offer(2, 20, 3, 220, wiped));
+        assert(lease.Offer(2, 20, 3, 220, state));
+        assert(lease.Prepared(3, 240));
+        assert(lease.owner == 2 && lease.state.dead && (lease.state.effects & NativeDeath) != 0);
+    }
+}
+
 int main()
 {
     TestValidityAndWire();
@@ -863,6 +918,7 @@ int main()
     TestTerminalRecoveryWatermark();
     TestDisconnectLedger();
     TestLegacyOverlayDiscard();
+    TestSection4MultiClientAndGuards();
     std::fprintf(stdout, "sizeof(Checkpoint)=%zu sizeof(Message)=%zu\n",
                  sizeof(Checkpoint), sizeof(Message));
     std::puts("npclease_test: PASS");

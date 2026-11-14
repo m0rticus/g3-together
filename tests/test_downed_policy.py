@@ -11,21 +11,42 @@ DOWNED_CPP = ROOT / "src" / "downed.cpp"
 SCRIPT_CPP = ROOT / "src" / "Script_G3Together.cpp"
 
 
+SPLIT_SIBLINGS = (
+    (ROOT / "src" / "downed.cpp", (ROOT / "src" / "downed_terminal.cpp", ROOT / "src" / "player_immunity.cpp")),
+    (ROOT / "src" / "combat.cpp", (ROOT / "src" / "combat_melee.cpp", ROOT / "src" / "combat_claims.cpp")),
+    (ROOT / "src" / "ai.cpp", (ROOT / "src" / "npc_targets.cpp", ROOT / "src" / "patch.cpp")),
+)
+
+
+def _extract_function_body(source, signature):
+    for match in re.finditer(signature, source):
+        opening = source.find("{", match.end())
+        if opening < 0:
+            return None
+        if source.find(";", match.end(), opening) >= 0:
+            continue
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[opening + 1:index]
+    return None
+
+
 def function_body(source, signature):
-    match = re.search(signature, source)
-    if not match:
-        return None
-    opening = source.find("{", match.end())
-    if opening < 0:
-        return None
-    depth = 0
-    for index in range(opening, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return source[opening + 1:index]
+    body = _extract_function_body(source, signature)
+    if body is not None:
+        return body
+    for primary, siblings in SPLIT_SIBLINGS:
+        if primary.exists() and source == primary.read_text(encoding="utf-8"):
+            for sibling in siblings:
+                if sibling.exists():
+                    body = _extract_function_body(sibling.read_text(encoding="utf-8"), signature)
+                    if body is not None:
+                        return body
     return None
 
 
@@ -34,6 +55,14 @@ class DownedPolicyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.downed_h = DOWNED_H.read_text(encoding="utf-8")
         cls.downed_cpp = DOWNED_CPP.read_text(encoding="utf-8")
+        cls.downed_all = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in (
+                DOWNED_CPP,
+                ROOT / "src" / "downed_terminal.cpp",
+                ROOT / "src" / "player_immunity.cpp",
+            )
+        )
         cls.script_cpp = SCRIPT_CPP.read_text(encoding="utf-8")
 
     def test_die_is_idempotent_and_dispatches_native_ragdoll_death_once(self):
@@ -227,7 +256,7 @@ class DownedPolicyTests(unittest.TestCase):
     def test_paid_revive_is_bound_to_sender_and_down_episode(self):
         self.assertIn("sequence != life.sequence", self.downed_cpp)
         self.assertIn("life.Revive(pendingReviveSequence)", self.downed_cpp)
-        self.assertIn("hero.IsDown() || hero.IsDead()", self.downed_cpp)
+        self.assertIn("hero.IsDown() || hero.IsDead()", self.downed_all)
         tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(\s*\)")
         refused = function_body(tick, r"\bif\s*\(\s*revivedBy\s*&&\s*!Able\(remotes\[revivedBy\],\s*now\)\s*\)")
         self.assertIsNotNone(refused)
@@ -422,6 +451,21 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("NumberOfNames", export_lookup)
 
     def test_engine_free_transition_and_ordering_rules(self):
+        import shutil, tempfile
+        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
+        if compiler:
+            with tempfile.TemporaryDirectory(prefix="downed-policy-bin-") as tmp:
+                exe = Path(tmp) / ("downed_policy_test.exe" if os.name == "nt" else "downed_policy_test")
+                cpp = ROOT / "tests" / "downed_policy" / "downed_policy_test.cpp"
+                if Path(compiler).stem.lower() == "cl":
+                    cmd = [compiler, "/nologo", "/EHsc", "/std:c++17", str(cpp), f"/Fe:{exe}"]
+                else:
+                    cmd = [compiler, "-std=c++17", str(cpp), "-o", str(exe)]
+                res = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                run = subprocess.run([str(exe)], cwd=tmp, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            return
         build = ROOT / "build" / "downed-policy-tests"
         configure = ["cmake", "-S", str(ROOT / "tests" / "downed_policy"), "-B", str(build)]
         if os.name == "nt":
@@ -607,7 +651,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("puppet.entity.Dialog.TradeEnabled", update)
         self.assertNotIn('CallScript(bCString("Kill")', update)
         pay = function_body(self.downed_cpp, r"\bvoid\s+PayAndHelp\s*\(")
-        self.assertIn("!UnpaidEpisode(r.latest.downedSequence, paidSequence[i])", pay)
+        self.assertIn("!peers[i].payment.NeedsPayment(r.latest.downedSequence)", pay)
 
     def test_absence_boundaries_log_candidate_rejection_evidence(self):
         tick = function_body(self.downed_cpp, r"\bvoid\s+Tick\s*\(")

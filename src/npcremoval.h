@@ -12,4 +12,5 @@ void CaptureCacheInventory();  // engine thread only; raw applied pointers, not 
 bool ExcludeFromProcessing(eCEntity const* entity);
 bool Suppressed(eCEntity const* entity);
 bool Suppressed(uint8_t const guid[16]);
+bool SuppressedUnloaded(uint8_t const guid[16], char const* entityName, float const position[3]);
 }

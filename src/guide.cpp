@@ -4,6 +4,7 @@
 #include "infocmd.h"
 #include "log.h"
 #include "net.h"
+#include "npclease_runtime.h"
 #include "npcs.h"
 
 #include <Game.h>
@@ -125,8 +126,13 @@ void Tick()
         Entity e = Resolve(it->first);
         eCEntity* npc = e.GetInstance();
         if (npc && LeaderOf(npc) == hero) {
-            if (npcs::IsMirrored(npc)) {
-                if (net::Connected()) Take(npc, Follower);  // follows through the companion path
+            if (npcs::IsMirrored(npc) || npclease::LocalAuthority(npc)) {
+                if (net::Connected()) {
+                    if (!held.count(Key(npc)) && !npcs::Claimed(npc) && !npcs::HostTaken(npc) &&
+                        npclease::LocalAuthority(npc))
+                        npclease::RelinquishToHost(npc, "guide started");
+                    Take(npc, Follower);  // follows through the companion path
+                }
             } else {
                 // Simulated here: what JoinPlayer true does after JoinPlayerSlavery (re/findings/party-members.md).
                 e.Routine.FullStop();
@@ -142,7 +148,11 @@ void Tick()
         }
     }
     if (!net::Connected()) return;
-    if (eCEntity* leader = LeaderOf(hero); leader && leader != hero && npcs::IsMirrored(leader)) Take(leader, Guide);
+    if (eCEntity* npc = LeaderOf(hero); npc && npc != hero && (npcs::IsMirrored(npc) || npclease::LocalAuthority(npc))) {
+        if (!held.count(Key(npc)) && !npcs::Claimed(npc) && !npcs::HostTaken(npc) && npclease::LocalAuthority(npc))
+            npclease::RelinquishToHost(npc, "guide started");
+        Take(npc, Guide);
+    }
     // Given back once the relation ends: StopGuidePlayer at the destination, the slave's delivery, a dismissal.
     for (auto it = held.begin(); it != held.end();) {
         Entity e = Resolve(it->first);

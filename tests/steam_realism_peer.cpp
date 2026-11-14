@@ -76,6 +76,7 @@ extern "C" int RealismNativeSocketSend(
 namespace g3t {
 Config probeConfig;
 Config const& GetConfig() { return probeConfig; }
+Config const& GetLocalConfig() { return probeConfig; }
 
 void Log(char const* text) { if (text) std::puts(text); }
 void Logf(char const* format, ...)
@@ -308,12 +309,10 @@ static void ObserveCallback(int callback, char const* param, int size)
         uint64_t lobby = 0;
         std::memcpy(&lobby, param, sizeof(lobby));
         char const* tag = g3t::steam::api.GetLobbyData
-            ? g3t::steam::api.GetLobbyData(g3t::steam::api.Matchmaking,
-                                           lobby, "g3together")
+            ? g3t::steam::api.GetLobbyData(g3t::steam::rt.matchmaking, lobby, "g3together")
             : "";
         char const* session = g3t::steam::api.GetLobbyData
-            ? g3t::steam::api.GetLobbyData(g3t::steam::api.Matchmaking,
-                                           lobby, "session_id")
+            ? g3t::steam::api.GetLobbyData(g3t::steam::rt.matchmaking, lobby, "session_id")
             : "";
         std::lock_guard<std::mutex> lock(callbackObservationMutex);
         if (callback == 504) {

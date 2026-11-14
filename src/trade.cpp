@@ -22,7 +22,6 @@
 #include <map>
 #include <string>
 #include <vector>
-#include <vector>
 
 namespace g3t::trade {
 namespace {
@@ -495,6 +494,7 @@ bool OnOpen(eCEntity* body)
 
 void OnWorldChange()
 {
+    offer::OnWorldChange();
     const uint64_t previous = Epoch();
     epoch = 0;
     if (Epoch() <= previous) epoch = previous + 1;

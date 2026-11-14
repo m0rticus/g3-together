@@ -9,7 +9,6 @@ Native modules, Data, video, saves and templates are never touched.
 from __future__ import annotations
 
 import argparse
-import ast
 import datetime as dt
 import hashlib
 import json
@@ -22,178 +21,52 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_HOST = Path(r"C:\Repositories\g3-together\workspace\test-install")
-DEFAULT_CLIENT = Path(r"C:\Repositories\g3-together\workspace\test-client")
-DEFAULT_STEAM = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Gothic 3")
 WORKTREE = Path(__file__).resolve().parents[1]
-KNOWN_FAKE_SHA = "a3c85cda223e4bef581440f2f50da419e6d6c1218ee78cc2ebdbc88a998e13f3"
-ALLOWED_DESTINATIONS = {
-    "g3together.ini",
-    "G3Together/test-realism/fake_steam_api.dll",
-    "G3Together/test-realism/fake_steam_diag.h",
-    "G3Together/test-realism/fake_steam_abi.h",
-    "G3Together/test-realism/fake_steam_api.def",
-    "G3Together/test-realism/build.ps1",
-    "G3Together/test-realism/receipt.json",
-    "G3Together/test-realism/run_tests.ps1",
-    "G3Together/test-realism/README.md",
-    "G3Together/test-realism/source/fake_steam_api.c",
-    "G3Together/test-realism/source/fake_steam_test.c",
-    "G3Together/test-realism/fake_steam_process_test.c",
-    "G3Together/test-realism/fake_steam_contract_test.c",
-    "G3Together/test-realism/fake_steam_test.exe",
-    "G3Together/test-realism/fake_steam_process_test.exe",
-    "G3Together/test-realism/fake_steam_contract_test.exe",
-    "G3Together/test-realism/test-summary.txt",
-    "G3Together/test-realism/profiles/ideal.ini",
-    "G3Together/test-realism/profiles/steam-typical.ini",
-    "G3Together/test-realism/profiles/steam-bad.ini",
-}
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from _g3copy import (
+    DEFAULT_CLIENT, DEFAULT_HOST, DEFAULT_STEAM, FOLDER_MODULES, KNOWN_FAKE_SHA,
+    NATIVE_SLOTS, SLOT_GENUINE, SLOT_QA, STEAM_DLL_SHA256, TEST_REALISM_BUNDLE_FILES,
+    canonical as _canonical, is_hard_linked, is_within, overlaps,
+    package_ini_templates, parse_g3t_ini, parse_pe, reject_links as _reject_links,
+    sha256, validate_copy_roots,
+)
 
 
 class UpdateError(RuntimeError):
     pass
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def reject_links(path: Path) -> Path:
-    path = Path(os.path.abspath(str(path)))
-    current = path
-    while True:
-        if current.exists() or current.is_symlink():
-            info = current.lstat()
-            reparse = getattr(info, "st_file_attributes", 0) & getattr(
-                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-            )
-            if stat.S_ISLNK(info.st_mode) or reparse:
-                raise UpdateError(f"Link or reparse point is not allowed: {current}")
-        if current.parent == current:
-            break
-        current = current.parent
-    return path
+    return _reject_links(path, UpdateError)
 
 
 def canonical(path: Path) -> Path:
-    return reject_links(path).resolve(strict=False)
+    return _canonical(path, UpdateError)
 
 
-def overlaps(left: Path, right: Path) -> bool:
-    left_text = os.path.normcase(str(left))
-    right_text = os.path.normcase(str(right))
-    try:
-        return left == right or left.is_relative_to(right) or right.is_relative_to(left)
-    except AttributeError:
-        return (
-            left_text == right_text
-            or left_text.startswith(right_text + os.sep)
-            or right_text.startswith(left_text + os.sep)
-        )
+ALLOWED_DESTINATIONS = {"g3together.ini", *TEST_REALISM_BUNDLE_FILES}
 
 
 def validate_roots(
-    host: Path,
-    client: Path,
-    steam: Path,
-    fixture_roots: Iterable[Path] = (),
+    host: Path, client: Path, steam: Path, fixture_roots: Iterable[Path] = ()
 ) -> dict[str, Path]:
-    fixture_roots = [canonical(path) for path in fixture_roots]
-    roots: dict[str, Path] = {}
-    for role, path in (("host", host), ("client", client), ("steam", steam)):
-        root = canonical(path)
-        if fixture_roots:
-            if not any(root == allowed or overlaps(root, allowed) for allowed in fixture_roots):
-                raise UpdateError(
-                    f"{role} root is outside the explicitly allowed fixture roots: {root}"
-                )
-        else:
-            allowed = {
-                "host": DEFAULT_HOST,
-                "client": DEFAULT_CLIENT,
-                "steam": DEFAULT_STEAM,
-            }[role]
-            if canonical(allowed) != root:
-                raise UpdateError(
-                    f"{role} root must be explicitly authorized or supplied with --allow-fixture-root"
-                )
-        if not root.is_dir():
-            raise UpdateError(f"Missing {role} root: {root}")
-        roots[role] = root
-
-    for role, root in roots.items():
-        for other_role, other in roots.items():
-            if role != other_role and overlaps(root, other):
-                raise UpdateError(
-                    f"Roots overlap: {role}={root}, {other_role}={other}"
-                )
-    return roots
+    return validate_copy_roots(host, client, steam, fixture_roots, UpdateError)
 
 
 def validate_relative(relative: str) -> str:
-    if not relative or "\\" in relative or "/" in relative:
-        if "\\" in relative:
-            normalized = relative.replace("\\", "/")
-        else:
-            normalized = relative
-    else:
-        normalized = relative
+    normalized = relative.replace("\\", "/")
     parts = Path(normalized).parts
-    if normalized.startswith("/") or normalized.startswith("\\"):
-        raise UpdateError(f"Absolute manifest destination is forbidden: {relative}")
-    if ".." in parts or any(part in ("", ".", "") for part in parts):
-        raise UpdateError(f"Traversal-like manifest destination is forbidden: {relative}")
-    normalized_key = normalized.replace("\\", "/")
-    if normalized_key not in ALLOWED_DESTINATIONS:
+    if not normalized or normalized.startswith("/") or ".." in parts or any(part in ("", ".") for part in parts):
+        raise UpdateError(f"Traversal-like or absolute manifest destination is forbidden: {relative}")
+    if normalized not in ALLOWED_DESTINATIONS:
         raise UpdateError(f"Manifest destination is not in the allowlist: {relative}")
-    return normalized_key
+    return normalized
 
 
 def extract_package_ini() -> tuple[str, str]:
-    package_path = WORKTREE / "tools" / "package.py"
-    tree = ast.parse(package_path.read_text(encoding="utf-8"), filename=str(package_path))
-    constants: dict[str, str] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in ("HOST_INI", "CLIENT_INI"):
-                    if isinstance(node.value, ast.Constant) and isinstance(
-                        node.value.value, str
-                    ):
-                        constants[target.id] = node.value.value
-    if set(constants) != {"HOST_INI", "CLIENT_INI"}:
-        raise UpdateError("Could not safely read HOST_INI/CLIENT_INI from tools/package.py")
-    return constants["HOST_INI"], constants["CLIENT_INI"]
-
-
-def active_ini(path: Path) -> dict[str, str]:
-    if not path.is_file():
-        return {}
-    raw = path.read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("cp1252")
-    values: dict[str, str] = {}
-    for line_number, line in enumerate(text.splitlines(), 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("#", ";")):
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip().lower()
-        if key in values:
-            raise UpdateError(
-                f"Duplicate active INI key {key!r} in {path}:{line_number}"
-            )
-        values[key] = value.strip()
-    return values
+    return package_ini_templates()
 
 
 def set_ini_key(lines: list[str], key: str, value: str) -> None:
@@ -237,28 +110,22 @@ def render_ini(template: str, existing: Path, role: str, session_id: str) -> byt
     set_ini_key(lines, "transport", "steam")
     set_ini_key(lines, "connection", "invite")
     set_ini_key(lines, "session_id", session_id)
-    set_ini_key(lines, "language", "auto")
-
+    existing_values, owners = {}, []
     if existing.is_file():
-        existing_values = active_ini(existing)
-        template_values = active_ini(existing.with_name("__package_template_probe.ini")) if False else {}
-        base_keys = {
-            "role",
-            "transport",
-            "connection",
-            "session_id",
-            "language",
-        }
-        unknown = {
-            key: value
-            for key, value in existing_values.items()
-            if key not in base_keys
-            and key not in {"puppet_template", "partner_key", "friendly_fire"}
-        }
-        if unknown:
-            lines.extend(["", "# Preserved unknown personal/configuration keys"])
-            for key, value in sorted(unknown.items()):
-                set_ini_key(lines, key, value)
+        raw = existing.read_bytes()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252")
+        existing_values, owners = parse_g3t_ini(text)
+    language = existing_values.get("language", "auto").lower()
+    set_ini_key(lines, "language", language if language in {"en", "de", "pl"} else "auto")
+    managed = {"role", "transport", "connection", "session_id", "language"}
+    for key, value in existing_values.items():
+        if key not in managed:
+            set_ini_key(lines, key, value)
+    for owner in owners:
+        lines.append(f"legacy_companion_owner = {owner}")
 
     return ("\n".join(lines).rstrip() + "\n").encode("utf-8")
 
@@ -366,59 +233,47 @@ def safe_target(root: Path, relative: str) -> Path:
 
 
 def staged_fake_support(fake_dll: Path) -> dict[str, Path]:
+    prefix = "G3Together/test-realism/"
     bundle = fake_dll.parent
     candidates = {
-        "G3Together/test-realism/fake_steam_diag.h":
-            bundle / "fake_steam_diag.h",
-        "G3Together/test-realism/fake_steam_abi.h":
-            bundle / "fake_steam_abi.h",
-        "G3Together/test-realism/fake_steam_api.def":
-            bundle / "fake_steam_api.def",
-        "G3Together/test-realism/build.ps1":
-            bundle / "build.ps1",
-        "G3Together/test-realism/receipt.json":
-            bundle / "receipt.json",
-        "G3Together/test-realism/run_tests.ps1":
-            bundle / "run_tests.ps1",
-        "G3Together/test-realism/README.md":
-            bundle / "README.md",
-        "G3Together/test-realism/source/fake_steam_api.c":
-            bundle / "source" / "fake_steam_api.c",
-        "G3Together/test-realism/source/fake_steam_test.c":
-            bundle / "source" / "fake_steam_test.c",
-        "G3Together/test-realism/fake_steam_process_test.c":
-            bundle / "fake_steam_process_test.c",
-        "G3Together/test-realism/fake_steam_contract_test.c":
-            bundle / "fake_steam_contract_test.c",
-        "G3Together/test-realism/fake_steam_test.exe":
-            bundle / "fake_steam_test.exe",
-        "G3Together/test-realism/fake_steam_process_test.exe":
-            bundle / "fake_steam_process_test.exe",
-        "G3Together/test-realism/fake_steam_contract_test.exe":
-            bundle / "fake_steam_contract_test.exe",
-        "G3Together/test-realism/test-summary.txt":
-            bundle / "test-summary.txt",
-        "G3Together/test-realism/profiles/ideal.ini":
-            bundle / "profiles" / "ideal.ini",
-        "G3Together/test-realism/profiles/steam-typical.ini":
-            bundle / "profiles" / "steam-typical.ini",
-        "G3Together/test-realism/profiles/steam-bad.ini":
-            bundle / "profiles" / "steam-bad.ini",
+        relative: bundle / relative[len(prefix):]
+        for relative in TEST_REALISM_BUNDLE_FILES
+        if relative != prefix + "fake_steam_api.dll"
     }
-    existing_markers = sum(source.is_file() for source in candidates.values())
-    if existing_markers == 0:
+    if not any(source.is_file() for source in candidates.values()):
         return {}
-    missing = [
-        relative
-        for relative, source in candidates.items()
-        if not source.is_file()
-    ]
+    missing = [relative for relative, source in candidates.items() if not source.is_file()]
     if missing:
-        raise UpdateError(
-            "Incomplete staged fake-transport bundle; missing: "
-            + ", ".join(missing)
-        )
+        raise UpdateError("Incomplete staged fake-transport bundle; missing: " + ", ".join(missing))
     return candidates
+
+
+def plan_entry(
+    role: str,
+    root: Path,
+    relative: str,
+    kind: str,
+    proposed_bytes: bytes,
+    source_sha256: str | None = None,
+) -> dict:
+    target = safe_target(root, relative)
+    before_exists = target.is_file()
+    before_hash = sha256(target) if before_exists else None
+    after_hash = hashlib.sha256(proposed_bytes).hexdigest()
+    action = "NOOP" if before_exists and before_hash == after_hash else ("REPLACE" if before_exists else "ADD")
+    return {
+        "root_role": role,
+        "root": str(root),
+        "relative_path": relative,
+        "kind": kind,
+        "action": action,
+        "existed_before": before_exists,
+        "before_sha256": before_hash,
+        "after_sha256": after_hash,
+        "source_sha256": source_sha256,
+        "backup_relative": None,
+        "proposed_bytes": proposed_bytes,
+    }
 
 
 def build_plan(
@@ -430,12 +285,7 @@ def build_plan(
 ) -> tuple[str, list[dict]]:
     host_template, client_template = extract_package_ini()
     if fake_dll is None:
-        package_fake = (
-            Path(__file__).resolve().parents[1]
-            / "G3Together"
-            / "test-realism"
-            / "fake_steam_api.dll"
-        )
+        package_fake = Path(__file__).resolve().parents[1] / "G3Together" / "test-realism" / "fake_steam_api.dll"
         if package_fake.is_file():
             fake_dll = package_fake
     if fake_dll is not None:
@@ -443,8 +293,7 @@ def build_plan(
         if not fake_dll.is_file():
             raise UpdateError(f"Missing staged fake DLL: {fake_dll}")
         fake_hash = sha256(fake_dll)
-        approved = approved_fake_sha or KNOWN_FAKE_SHA
-        if fake_hash != approved:
+        if fake_hash != (approved_fake_sha or KNOWN_FAKE_SHA):
             raise UpdateError(
                 f"Unknown staged fake DLL SHA-256 {fake_hash}; "
                 "pass --approved-dll-sha256 for an explicitly reviewed hash"
@@ -459,87 +308,14 @@ def build_plan(
         root = roots[role]
         template = host_template if role == "host" else client_template
         ini_path = safe_target(root, "g3together.ini")
-        proposed_ini = render_ini(template, ini_path, role, session_id)
-        before_exists = ini_path.is_file()
-        before_hash = sha256(ini_path) if before_exists else None
-        after_hash = hashlib.sha256(proposed_ini).hexdigest()
-        action = "NOOP" if before_exists and before_hash == after_hash else (
-            "REPLACE" if before_exists else "ADD"
-        )
-        entries.append(
-            {
-                "root_role": role,
-                "root": str(root),
-                "relative_path": "g3together.ini",
-                "kind": "config",
-                "action": action,
-                "existed_before": before_exists,
-                "before_sha256": before_hash,
-                "after_sha256": after_hash,
-                "source_sha256": None,
-                "backup_relative": None,
-                "proposed_bytes": proposed_ini,
-            }
-        )
-
+        entries.append(plan_entry(role, root, "g3together.ini", "config",
+                                  render_ini(template, ini_path, role, session_id)))
         if fake_dll is not None:
-            fake_path = safe_target(
-                root,
-                "G3Together/test-realism/fake_steam_api.dll",
-            )
-            before_exists = fake_path.is_file()
-            before_hash = sha256(fake_path) if before_exists else None
-            source_bytes = fake_dll.read_bytes()
-            after_hash = hashlib.sha256(source_bytes).hexdigest()
-            action = "NOOP" if before_exists and before_hash == after_hash else (
-                "REPLACE" if before_exists else "ADD"
-            )
-            entries.append(
-                {
-                    "root_role": role,
-                    "root": str(root),
-                    "relative_path": "G3Together/test-realism/fake_steam_api.dll",
-                    "kind": "fake-dll",
-                    "action": action,
-                    "existed_before": before_exists,
-                    "before_sha256": before_hash,
-                    "after_sha256": after_hash,
-                    "source_sha256": fake_hash,
-                    "backup_relative": None,
-                    "proposed_bytes": source_bytes,
-                }
-            )
+            entries.append(plan_entry(role, root, "G3Together/test-realism/fake_steam_api.dll",
+                                      "fake-dll", fake_dll.read_bytes(), fake_hash))
             for support_relative, support_source in staged_fake_support(fake_dll).items():
-                support_path = safe_target(root, support_relative)
-                support_before_exists = support_path.is_file()
-                support_before_hash = (
-                    sha256(support_path) if support_before_exists else None
-                )
-                support_bytes = support_source.read_bytes()
-                support_after_hash = hashlib.sha256(support_bytes).hexdigest()
-                support_action = (
-                    "NOOP"
-                    if support_before_exists
-                    and support_before_hash == support_after_hash
-                    else "REPLACE"
-                    if support_before_exists
-                    else "ADD"
-                )
-                entries.append(
-                    {
-                        "root_role": role,
-                        "root": str(root),
-                        "relative_path": support_relative,
-                        "kind": "fake-support",
-                        "action": support_action,
-                        "existed_before": support_before_exists,
-                        "before_sha256": support_before_hash,
-                        "after_sha256": support_after_hash,
-                        "source_sha256": sha256(support_source),
-                        "backup_relative": None,
-                        "proposed_bytes": support_bytes,
-                    }
-                )
+                entries.append(plan_entry(role, root, support_relative, "fake-support",
+                                          support_source.read_bytes(), sha256(support_source)))
     return transaction_id, entries
 
 
@@ -687,7 +463,6 @@ def apply_entries(
                     handle.write(backup_bytes)
                     handle.flush()
                     os.fsync(handle.fileno())
-                fsync_file(backup_path)
                 if sha256(backup_path) != entry["before_sha256"]:
                     raise UpdateError(f"Independent backup verification failed: {backup_path}")
                 try:
@@ -704,7 +479,6 @@ def apply_entries(
                 handle.write(entry["proposed_bytes"])
                 handle.flush()
                 os.fsync(handle.fileno())
-            fsync_file(staged_path)
             if sha256(staged_path) != entry["after_sha256"]:
                 raise UpdateError(f"Staged replacement verification failed: {staged_path}")
 

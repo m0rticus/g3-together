@@ -89,6 +89,9 @@ class EnetFragmentTests(unittest.TestCase):
     def test_enet_recovers_reliable_actions_and_saves_over_unreliable_steam_relay(self):
         self.run_case("steam")
 
+    def test_multi_npc_pose_replacement_preserves_enet_unreliable_sequence_order(self):
+        self.run_case("pose-order")
+
 
 if __name__ == "__main__":
     unittest.main()

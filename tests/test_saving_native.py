@@ -52,7 +52,10 @@ class SavingNativeTests(unittest.TestCase):
         })
 
     def test_pup_identity_is_informational(self):
-        source = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+        source = "\n".join(
+            (ROOT / "src" / name).read_text(encoding="utf-8")
+            for name in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
+        )
         self.assertNotRegex(source, r'if\s*\(\s*!\s*(?:KnownPup|LogPupIdentity)\s*\(')
         self.assertNotRegex(source, r'PupRefused\s*\(\s*"companion-identity"')
         self.assertIn("persist: PUP identity digest=", source)

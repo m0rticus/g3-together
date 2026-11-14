@@ -116,7 +116,7 @@ Steam activity uses **Gothic 3 (AppID 39500)**, not Spacewar.
 **Either player can request a save**; only the host saves/loads the world. Clients start New Game to re-enter,
 then receive their account-exact character and personal loot state. Story/quest-runtime and nearby shared-door
 snapshots complete before admission without replaying quest rewards. Native gameplay still needs manual acceptance.
-Keep Steam display names unchanged to restore companions (character records themselves use the Steam account ID).
+Saved characters, personal state and companion ownership all use your Steam account ID (`SteamID64`); legacy pre-migration saves match an old display name once or via `legacy_companion_owner` in the host's INI.
 Read about [host saves, character restoration and recovery](docs/PLAYING.md#starting-and-saving).
 
 ## A few things to try
@@ -141,7 +141,7 @@ The host chooses `reputation = shared` (default), `together` (shared guilt) or `
 
 **Friendly fire is off by default.** Players and their followers cannot hurt, stagger, knock down or inflict harmful
 spell effects on one another; healing still works. Existing INIs with a nonzero `friendly_fire` keep that opt-in
-damage setting. Set `friendly_fire = 0` on both PCs and restart for full protection; both settings must match.
+damage setting. The host's `friendly_fire` value applies to the whole session in memory; set `friendly_fire = 0` on the host and restart it for full protection.
 
 ## Know the limits
 
@@ -159,7 +159,7 @@ Read the [full limitations](docs/PLAYING.md#known-limitations), including saving
 
 ### Found a bug?
 
-[Report a bug](https://github.com/GGM1k3y23/g3-together/issues) with the time, host, actions and what **each player** saw. Preserve both players' logs before restarting. With Python installed, run from the extracted package folder using your game path:
+[Report a bug](https://github.com/m0rticus/g3-together/issues) with the time, host, actions and what **each player** saw. Preserve both players' logs before restarting. With Python installed, run from the extracted package folder using your game path:
 
 ```powershell
 python "tools\collect_logs.py" "C:\Games\Gothic 3"

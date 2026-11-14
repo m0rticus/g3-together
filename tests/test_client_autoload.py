@@ -9,11 +9,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def source(name):
+    if name == "src/persist.cpp":
+        return "\n".join(
+            (ROOT / "src" / part).read_text(encoding="utf-8")
+            for part in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
+        )
     return (ROOT / name).read_text(encoding="utf-8")
 
 
 def body(text, start, end):
     return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def function_body(text, signature):
+    for match in re.finditer(signature, text):
+        opening = text.find("{", match.end())
+        if opening < 0 or ";" in text[match.end():opening]:
+            continue
+        depth = 0
+        for index in range(opening, len(text)):
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if not depth:
+                    return text[opening + 1:index]
+    raise AssertionError(f"missing function {signature}")
 
 
 class ClientAutoloadTests(unittest.TestCase):
@@ -45,14 +66,14 @@ class ClientAutoloadTests(unittest.TestCase):
         # The template load/teardown stays in EnterTemplateWorld; autoload only queues through the public entry point.
         self.assertEqual(len(re.findall(r'EnterHostWorld\("autoload"\)', persist)), 1)
         self.assertEqual(persist.count("confirmedStart();"), 1)  # the first New Game of a launch (no template yet)
-        step = body(persist, "bool ProcessAutoload()", "wchar_t const* AutoloadMenuText")
+        step = function_body(persist, r"\bbool\s+ProcessAutoload\s*\(")
         self.assertLess(step.index("menuCommandDepth) return false"), step.index("autoloadState.Step("))
         self.assertLess(step.index("autoloadState.Step("), step.index('EnterHostWorld("autoload")'))
         self.assertIn("GetAsyncKeyState(VK_ESCAPE)", step)
         self.assertIn("partner::Focused()", step)
         for forbidden in ("worldCleanup", "game.Stop()", "originalLoad", "TemplateValid", "SaveClientTemplate", "RemoveTemplate"):
             self.assertNotIn(forbidden, step)
-        first = body(persist, "bool FirstEntryNow(uint32_t now)", "// Outer module boundary")
+        first = function_body(persist, r"\bbool\s+FirstEntryNow\s*\(")
         self.assertIn("autoloadState.Entered(ok, GetTickCount())", first)  # timers start after the loading screen
         self.assertLess(first.index("clientRejoin.Left();"), first.index("confirmedStart();"))
         for forbidden in ("worldCleanup", "originalLoad", "SaveClientTemplate"):
@@ -63,25 +84,25 @@ class ClientAutoloadTests(unittest.TestCase):
 
     def test_gate_holds_automatic_entries_until_approved(self):
         persist = source("src/persist.cpp")
-        transition = body(persist, "bool ProcessClientTransition()", "bool BeginFrame()")
+        transition = function_body(persist, r"\bbool\s+ProcessClientTransition\s*\(")
         self.assertLess(transition.index("if (ProcessAutoload()) return true;"),
                         transition.index("const bool idleCandidate = !clientRejoin.pending && !templateCapture.wanted"))
         gate = transition.index("if (!entryManual && !entryApproved) return false;")
         self.assertLess(transition.index("clientRejoin.CanRetire(boundary)"), gate)
         self.assertLess(gate, transition.index("EnterTemplateWorld(startedAt);"))
         self.assertLess(gate, transition.index("EntryPlan(quiet)"))
-        on_world = body(persist, "void OnWorld(uint8_t from", "void HostTick")
+        on_world = function_body(persist, r"\bvoid\s+OnWorld\s*\(")
         self.assertIn("entryApproved = autoloadAwaiting = false;", on_world)  # a newer epoch restarts the countdown
         self.assertIn("AutoloadAvailable() ? i18n::ClientHostWorldChanged : i18n::ClientChooseNewGame", on_world)
         # Hero state never gates: the snapshot has no downed/dead input.
-        snapshot = body(persist, "autoload::Snapshot AutoloadSnapshot", "void CountdownText")
+        snapshot = function_body(persist, r"\bautoload::Snapshot\s+AutoloadSnapshot\s*\(")
         self.assertNotIn("downed::", snapshot)
         self.assertNotIn("Dead", snapshot)
         self.assertIn("s.queued = clientRejoin.pending && !entryManual && !entryApproved;", snapshot)
 
     def test_manual_new_game_takes_over(self):
         persist = source("src/persist.cpp")
-        command = body(persist, "void __fastcall NewGameCommandDetour", "bool __stdcall NewGameDetour")
+        command = function_body(persist, r"\bvoid\s+__fastcall\s+NewGameCommandDetour\s*\(")
         self.assertLess(command.index('AutoloadCancel("manual New Game")'), command.index("GetPlayer()"))
         self.assertEqual(command.count("entryManual = true;"), 2)
         self.assertIn("clientWorldEntered && HostWorldEntryAvailable()", command)
@@ -89,10 +110,10 @@ class ClientAutoloadTests(unittest.TestCase):
 
     def test_menu_text_precedes_legacy_hint_and_completion_is_polled(self):
         persist = source("src/persist.cpp")
-        hints = body(persist, "void StatusHints()", "void SetWorldCleanup")
+        hints = function_body(persist, r"\bvoid\s+StatusHints\s*\(")
         self.assertLess(hints.index("AutoloadMenuText"), hints.index("!config.host && clientRejoin.pending) {"))
         self.assertIn("menuButtonSeen", hints)
-        step = body(persist, "bool ProcessAutoload()", "wchar_t const* AutoloadMenuText")
+        step = function_body(persist, r"\bbool\s+ProcessAutoload\s*\(")
         self.assertIn("autoloadAwaiting && !clientRejoin.pending", step)
         self.assertIn("autoloadState.Entered(ok, now)", step)
         self.assertIn("autoload::Status::NoRoute && clientRejoin.pending", step)  # never leave a stale world frozen forever

@@ -26,6 +26,7 @@ LIST_MODULES_32BIT = 1
 WOW64_CONTEXT_FULL = 0x10000 | 0x1 | 0x2
 STACK_BYTES = 64 * 1024
 FRAMES = 60
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 class FloatSave(ctypes.Structure):
@@ -123,6 +124,8 @@ def after_call(process, address, kernel):
 
 def thread_ids(pid, kernel):
     snap = kernel.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE or snap == -1:
+        return None
     entry = ThreadEntry()
     entry.dwSize = ctypes.sizeof(entry)
     ids = []
@@ -147,13 +150,31 @@ def sample(pid: int) -> str:
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
     kernel.OpenProcess.restype = W.HANDLE
+    kernel.OpenThread.argtypes = [W.DWORD, W.BOOL, W.DWORD]
     kernel.OpenThread.restype = W.HANDLE
+    kernel.CreateToolhelp32Snapshot.argtypes = [W.DWORD, W.DWORD]
     kernel.CreateToolhelp32Snapshot.restype = W.HANDLE
+    kernel.Thread32First.argtypes = [W.HANDLE, ctypes.POINTER(ThreadEntry)]
+    kernel.Thread32First.restype = W.BOOL
+    kernel.Thread32Next.argtypes = [W.HANDLE, ctypes.POINTER(ThreadEntry)]
+    kernel.Thread32Next.restype = W.BOOL
+    kernel.CloseHandle.argtypes = [W.HANDLE]
+    kernel.CloseHandle.restype = W.BOOL
+    kernel.Wow64SuspendThread.argtypes = [W.HANDLE]
+    kernel.Wow64SuspendThread.restype = W.DWORD
+    kernel.Wow64GetThreadContext.argtypes = [W.HANDLE, ctypes.POINTER(Wow64Context)]
+    kernel.Wow64GetThreadContext.restype = W.BOOL
+    kernel.ResumeThread.argtypes = [W.HANDLE]
+    kernel.ResumeThread.restype = W.DWORD
+    kernel.GetThreadTimes.argtypes = [W.HANDLE] + [ctypes.POINTER(W.FILETIME)] * 4
+    kernel.GetThreadTimes.restype = W.BOOL
     kernel.ReadProcessMemory.argtypes = [
         W.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_size_t),
     ]
+    kernel.ReadProcessMemory.restype = W.BOOL
     psapi.EnumProcessModulesEx.argtypes = [
         W.HANDLE, ctypes.POINTER(W.HMODULE), W.DWORD, ctypes.POINTER(W.DWORD), W.DWORD,
     ]
@@ -168,7 +189,11 @@ def sample(pid: int) -> str:
 
     mods = modules(kernel, psapi, process)
     blocks = []
-    for tid in thread_ids(pid, kernel):
+    tids = thread_ids(pid, kernel)
+    if tids is None:
+        kernel.CloseHandle(process)
+        return f"hangstack: cannot snapshot threads for process {pid}\n"
+    for tid in tids:
         thread = kernel.OpenThread(
             THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
             False,
@@ -179,7 +204,7 @@ def sample(pid: int) -> str:
         context = Wow64Context()
         context.ContextFlags = WOW64_CONTEXT_FULL
         stack = b""
-        if kernel.Wow64SuspendThread(thread) != 0xFFFFFFFF:
+        if kernel.Wow64SuspendThread(thread) not in (-1, 0xFFFFFFFF):
             try:
                 if kernel.Wow64GetThreadContext(thread, ctypes.byref(context)):
                     stack = read_stack(process, context.Esp, kernel)
@@ -230,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text, encoding="utf-8")
     print(text, end="")
-    return 0
+    return 1 if text.startswith(("hangstack: cannot open process", "hangstack: cannot snapshot", "hangstack: process diagnostics require")) else 0
 
 
 if __name__ == "__main__":

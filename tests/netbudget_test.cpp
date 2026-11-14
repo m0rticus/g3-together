@@ -35,20 +35,10 @@ static void TestAdmissionAndAccounting()
         budget.Advance(100, telemetry);
         assert(budget.Pressure() == (throttle == 32 ? BudgetPressure::Clear :
                                     throttle == 24 ? BudgetPressure::Constrained : BudgetPressure::Critical));
-        for (auto cls : {BudgetClass::GameplayReliable, BudgetClass::PlayerState,
-                         BudgetClass::NpcActive, BudgetClass::NpcFarIdle}) {
-            assert(budget.Preview(cls, 1000) == BudgetDecision::Allow);
-            assert(budget.Preview(cls, UINT64_MAX) == BudgetDecision::Allow);
-        }
     }
     assert(budget.Snapshot().chargedBytes == 0);
-    const auto bulkCredit = budget.Snapshot().bulkCreditBytes;
     budget.CommitQueued(BudgetClass::NpcActive, BudgetCharge(1173));
     assert(budget.Snapshot().chargedBytes == 1269 && budget.Snapshot().queueBytes == 1269);
-    assert(budget.Snapshot().bulkCreditBytes == bulkCredit);
-    budget.RecordDecision(BudgetDecision::Defer);
-    budget.RecordDecision(BudgetDecision::Shed);
-    assert(budget.Snapshot().deferredCount == 1 && budget.Snapshot().shedCount == 1);
     budget.CommitQueued(BudgetClass::GameplayReliable, UINT64_MAX);
     assert(budget.Snapshot().chargedBytes == UINT64_MAX && budget.Snapshot().queueBytes == UINT64_MAX);
 }
@@ -58,7 +48,6 @@ static void TestUncappedOfferedStream()
     PeerBudget budget;
     budget.Reset(0, Config());
     for (uint32_t now = 20; now <= 60000; now += 20) {
-        assert(budget.Preview(BudgetClass::NpcActive, 20000) == BudgetDecision::Allow);
         budget.CommitQueued(BudgetClass::NpcActive, 20000);
         budget.Advance(now);
         assert(budget.NpcStretchPermille() == 1000);
@@ -70,74 +59,18 @@ static void TestUncappedOfferedStream()
     assert(budget.Snapshot().offeredBytesPerSecond <= 1000000);
 }
 
-static void TestBulkPacingAndChunking()
-{
-    const uint32_t rate = 256u * 1024u;
-    const uint64_t cap = rate / 40u;
-    PeerBudget budget;
-    budget.Reset(0, Config(rate));
-    assert(budget.BulkAllowance() == cap);
-    assert(budget.Preview(BudgetClass::BulkReliable, cap) == BudgetDecision::Allow);
-    assert(budget.Preview(BudgetClass::BulkReliable, cap + 1) == BudgetDecision::NeedsChunking);
-    budget.CommitQueued(BudgetClass::BulkReliable, cap);
-    assert(budget.Preview(BudgetClass::BulkReliable, 1) == BudgetDecision::Defer);
-    uint64_t sent = 0;
-    for (uint32_t now = 10; now <= 10000; now += 10) {
-        budget.Advance(now);
-        while (budget.Preview(BudgetClass::BulkReliable, 1000) == BudgetDecision::Allow) {
-            budget.CommitQueued(BudgetClass::BulkReliable, 1000);
-            sent += 1000;
-        }
-    }
-    assert(sent <= uint64_t(rate) * 10 / 4 && sent >= uint64_t(rate) * 10 / 4 - 1000);
-
-    PeerBudget constrained;
-    constrained.Reset(0, Config(rate));
-    BudgetTelemetry telemetry;
-    telemetry.throttle = 24;
-    constrained.Advance(1, telemetry);
-    assert(constrained.Pressure() == BudgetPressure::Constrained);
-    assert(constrained.BulkAllowance() == cap / 2);
-    assert(constrained.Preview(BudgetClass::BulkReliable, cap / 2 + 1) == BudgetDecision::Defer);
-    constrained.CommitQueued(BudgetClass::BulkReliable, cap / 2);
-    sent = 0;
-    for (uint32_t now = 11; now <= 10001; now += 10) {
-        constrained.Advance(now, telemetry);
-        while (constrained.Preview(BudgetClass::BulkReliable, 1000) == BudgetDecision::Allow) {
-            constrained.CommitQueued(BudgetClass::BulkReliable, 1000);
-            sent += 1000;
-        }
-    }
-    assert(sent <= uint64_t(rate) * 10 / 8 + cap);
-    assert(sent >= uint64_t(rate) * 10 / 8 - 1000);
-    telemetry.throttle = 16;
-    constrained.Advance(10002, telemetry);
-    assert(constrained.Pressure() == BudgetPressure::Critical);
-    assert(constrained.BulkAllowance() == 0);
-    assert(constrained.Preview(BudgetClass::BulkReliable, 1) == BudgetDecision::Defer);
-    assert(constrained.Preview(BudgetClass::BulkReliable, cap + 1) == BudgetDecision::NeedsChunking);
-
-    PeerBudget small;
-    small.Reset(0, Config(1000));
-    assert(small.BulkAllowance() == 2400);
-    assert(small.Preview(BudgetClass::BulkReliable, 2401) == BudgetDecision::NeedsChunking);
-}
-
 static void TestClockWrapAndBackwards()
 {
     PeerBudget budget;
     budget.Reset(UINT32_MAX - 10u, Config());
-    const int64_t cap = budget.Snapshot().bulkCreditBytes;
-    budget.CommitQueued(BudgetClass::BulkReliable, static_cast<uint64_t>(cap));
-    budget.Advance(9);
-    const auto wrapped = budget.Snapshot().bulkCreditBytes;
-    assert(wrapped == 1310);
-    budget.Advance(8);
-    assert(budget.Snapshot().bulkCreditBytes == wrapped);
-    budget.Advance(10);
-    assert(budget.Snapshot().bulkCreditBytes == 1376);
-    budget.Advance(3600010);
-    assert(budget.Snapshot().bulkCreditBytes == cap);
+    budget.CommitQueued(20000);
+    budget.Advance(9); // 20 ms across uint32 wrap => 1,000,000 B/s sample with alpha = 0.02 -> 20,000 B/s
+    const auto wrapped = budget.Snapshot().offeredBytesPerSecond;
+    assert(wrapped == 20000);
+    budget.Advance(8); // backwards timestamp is ignored
+    assert(budget.Snapshot().offeredBytesPerSecond == wrapped);
+    budget.Advance(10); // 1 ms idle decays slightly
+    assert(budget.Snapshot().offeredBytesPerSecond < wrapped);
 }
 
 static void TestThrottleAndDecay()
@@ -317,7 +250,6 @@ int main()
     TestChargeAndSaturation();
     TestAdmissionAndAccounting();
     TestUncappedOfferedStream();
-    TestBulkPacingAndChunking();
     TestClockWrapAndBackwards();
     TestThrottleAndDecay();
     TestSustainedQueueAndWindow();

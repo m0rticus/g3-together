@@ -6,6 +6,31 @@
 #include <initializer_list>
 
 namespace g3t::downed {
+// Episodes are 32-bit on the wire and in Life; do not truncate them here.
+struct RevivePaymentSlot
+{
+    uint32_t paidSequence = 0;
+    uint32_t generation = 0;
+
+    constexpr void ObserveConnection(bool connected, uint32_t peerGeneration = 0)
+    {
+        if (!connected || (peerGeneration && generation && peerGeneration != generation))
+            paidSequence = 0;
+        generation = connected ? peerGeneration : 0;
+    }
+    constexpr void ObservePlayerState(bool playingAlive, uint32_t downedSequence)
+    {
+        if (playingAlive && downedSequence == 0) paidSequence = 0;
+    }
+    constexpr bool NeedsPayment(uint32_t downedSequence) const
+    {
+        return downedSequence != 0 &&
+               (paidSequence == 0 || static_cast<int32_t>(downedSequence - paidSequence) > 0);
+    }
+    constexpr void MarkPaid(uint32_t downedSequence) { paidSequence = downedSequence; }
+    constexpr void Reset() { paidSequence = 0; generation = 0; }
+};
+
 inline bool HeldPuppet(uint8_t flags, uint32_t sequence)
 {
     return (flags & 8) && !(flags & 4) && sequence != 0;

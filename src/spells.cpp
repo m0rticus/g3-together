@@ -9,6 +9,7 @@
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "npclease_runtime.h"
 #include "guards.h"
 #include "remote.h"
 #include "shot.h"
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace g3t::spells {
 namespace {
@@ -71,6 +73,13 @@ unsigned nativeCastsHooked = 0;
 using GetNpcsFn = bTObjArray<Entity>(GE_STDCALL*)();
 GetNpcsFn originalGetNpcs = nullptr;
 thread_local eCEntity* areaCaster = nullptr;
+struct PendingTakeOver {
+    uint8_t from, guid[16];
+    uint32_t generation, world;
+    int index;
+    int32_t args;
+};
+std::vector<PendingTakeOver> pendingTakeOvers;
 
 struct AreaScope {
     eCEntity* before;
@@ -136,8 +145,10 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
         Logf("spells: %s on %s, simulated by player %u: sent", Specs[I].name, Entity(target).GetName().GetText(), npcs::OwnerOf(target));
         return 1;
     }
-    if (own && Specs[I].kind == TakeOver && target && npcs::IsMirrored(target)) {
+    if (own && !net::IsHost() && Specs[I].kind == TakeOver && target &&
+        (npcs::IsMirrored(target) || npclease::LocalAuthority(target))) {
         uint8_t guid[16]; guid::CopyEntity(target, guid);
+        if (npclease::LocalAuthority(target)) npclease::RelinquishToHost(target, "tame/control spell");
         net::SendNpcSpell(1, Specs[I].name, guid, args);
         ++npcSent;
         return GETrue;
@@ -148,7 +159,8 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
         net::SendNpcSpell(1, Specs[I].name, guid, args);
         ++npcSent;
         Logf("spells: %s around us: sent to the host", Specs[I].name);
-        return 1;
+        AreaScope area(Specs[I].kind == AroundCaster ? caster : nullptr);
+        return originals[I](spu, self, other, args);
     }
     AreaScope area(Specs[I].kind == AroundCaster ? caster : nullptr);
     const GEInt result = originals[I](spu, self, other, args);
@@ -283,6 +295,14 @@ void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_
     const bool known = net::IsHost() && index >= 0 && originals[index];
     const bool onNpc = known && (Specs[index].kind == OnNpc || Specs[index].kind == TakeOver || Specs[index].kind == OnPlayer);
     const bool at = known && Specs[index].kind == AroundCasterAt;
+    if (known && Specs[index].kind == TakeOver && puppet &&
+        (!target.GetInstance() || npclease::Fenced(target.GetInstance()) || npcs::IsMirrored(target.GetInstance()))) {
+        if (pendingTakeOvers.size() >= 512) { ++npcRefused; return; }
+        PendingTakeOver pending{from, {}, net::PeerGeneration(from), net::WorldEpoch(), index, args};
+        std::memcpy(pending.guid, guid, sizeof(pending.guid));
+        pendingTakeOvers.push_back(pending);
+        return;
+    }
     if (!known || !puppet || (onNpc && (!npcs::NpcByGuid(guid) || npcs::IsMirrored(target.GetInstance()))) || (at && !target.GetInstance())) {
         ++npcRefused;
         Logf("spells: %s from player %u refused (unknown, no puppet, or the NPC is not simulated here)", script, from);
@@ -327,6 +347,21 @@ void Start()
 
 void Tick()
 {
+    for (size_t i = 0; i < pendingTakeOvers.size();) {
+        const auto pending = pendingTakeOvers[i];
+        if (!net::IsHost() || pending.world != net::WorldEpoch() || !net::PeerJoined(pending.from) ||
+            net::PeerGeneration(pending.from) != pending.generation) {
+            pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
+            continue;
+        }
+        eCEntity* target = npcs::NpcByGuid(pending.guid);
+        if (!target || !remote::PuppetOf(pending.from) || npclease::Fenced(target) || npcs::IsMirrored(target)) {
+            ++i;
+            continue;
+        }
+        pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
+        OnNpcSpell(pending.from, Specs[pending.index].name, pending.guid, pending.args);
+    }
     const DWORD now = GetTickCount();
     if (installed || !gCSession::GetInstance().IsGameRunning() || now - lastTry < 1000) return;
     lastTry = now;

@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -10,6 +11,9 @@ from test_hud_notices import read_rva
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
+from _g3copy import win32_tool_environment
 
 
 class ClientPositionAuthorityTests(unittest.TestCase):
@@ -66,19 +70,25 @@ int main() {{
     assert(movement::PositionDiscontinuity(origin, fall, zero, zero, 10000, true));
 }}
 """
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        self.assertIsNotNone(compiler, "C++17 compiler required for authority policy")
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             source = directory / "authority.cpp"
             source.write_text(harness, encoding="utf-8")
             exe = directory / ("authority.exe" if os.name == "nt" else "authority")
-            result = subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source),
-                 "-I", str(ROOT / "src"), "-o", str(exe)],
-                capture_output=True, text=True, timeout=60)
+            compiler = shutil.which("clang++") or shutil.which("g++")
+            if compiler:
+                env = os.environ.copy()
+                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source),
+                           "-I", str(ROOT / "src"), "-o", str(exe)]
+            else:
+                env = win32_tool_environment(directory)
+                cl = shutil.which("cl", path=env.get("PATH"))
+                self.assertIsNotNone(cl, "C++17 compiler required for authority policy")
+                command = [cl, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", str(source),
+                           f"/I{ROOT / 'src'}", f"/Fe:{exe}", f"/Fo:{directory}\\"]
+            result = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
+            result = subprocess.run([str(exe)], cwd=directory, env=env, capture_output=True, text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_playback_guards_precede_every_writer(self):

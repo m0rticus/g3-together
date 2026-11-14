@@ -145,6 +145,7 @@ def main():
         for support in (
             'tools/collect_logs.py',
             'tools/copy_preflight.py',
+            'tools/_g3copy.py',
             'tools/hangstack.py',
             'tools/setup.ps1',
             'tools/startup_videos.py',

@@ -73,4 +73,22 @@ int main()
     }
     assert(track.backlogMs <= 50 && g3t::body::PendingEvents(track) == 0);
     assert(aligned.Size() == HistorySize);
+
+    // Unsampled or stalled streams remain bounded instead of growing without limit.
+    History unsampled;
+    for (uint32_t i = 0; i < 1500; ++i) {
+        bone.values[9] = static_cast<int16_t>(i);
+        assert(unsampled.Push(1, 10000 + i * 16, &bone, 1));
+        assert(unsampled.Size() <= MaxRetainedFrames);
+    }
+    assert(unsampled.Size() == MaxRetainedFrames);
+    assert(unsampled.Sample(1, 10000 + 1499 * 16, shown));
+    assert(unsampled.Size() == HistorySize);
+
+    for (uint32_t i = 1500; i < 3000; ++i) {
+        bone.values[9] = static_cast<int16_t>(i);
+        assert(unsampled.Push(1, 10000 + i * 16, &bone, 1));
+        assert(unsampled.Size() <= MaxRetainedFrames);
+    }
+    assert(unsampled.Size() == MaxRetainedFrames);
 }

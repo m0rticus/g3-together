@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "player_state.h"
 #ifndef G3T_PLAYERWIRE_HAS_PLAYERSTATE
 #include "net.h"
 #endif

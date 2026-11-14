@@ -39,17 +39,6 @@ uint32_t Sequence();      // zero while not waiting; carried by player state and
 void Restore(bool waiting, char const* source); // saves may restore a downed life, never release an existing one
 void NoteBlow();         // combat.cpp: a blow on the local hero came from an NPC that means to kill (judged on its owner's machine)
 bool NativeDown();       // ... or knocked out by the game's own rules (a guard, a duel): it stands up by itself; a winner may rob it
-using LogFn = void (*)(char const*);
-void Off(LogFn log);     // QA negative control: let the hero die again
-void HoldOff(LogFn log); // QA negative control: the hero gets up by itself again
-void PotionOff(LogFn log); // QA negative control: helping up costs nothing
-void LethalOnlyOff(LogFn log);  // QA negative control: every knock-out waits for help, not only an intercepted death
-void GivePotion(char const* argument, LogFn log);  // QA: "Template[-Amount]" into the hero's inventory ("-0" takes all away)
-void Potions(LogFn log); // QA: POTION lines for the hero's potions
-void Report(LogFn log);  // QA: DOWNED line
 bool ObserveDeathState(eCEntity* self, bool entered, bool successful = true); // false refuses duplicate native entry
-void AutoHelpOn(LogFn log);     // QA: standing next to a downed partner for 3 s helps it up again (as before 23.10.)
-void HelpOptionOff(LogFn log);  // QA negative control: a downed partner's puppet offers no help option
 void HelpLineSaid();  // infocmd.cpp: the line "Ich werde dir helfen." of the help option is being spoken
-bool Switch(char const* action, LogFn log);  // QA negative controls of the play-evening fixes (27.10.): true if it was one
 }

@@ -181,6 +181,14 @@ void Tick()
     net::SendClock(Now());
 }
 
+void OnWorldChange()
+{
+    lastLocal = 0;
+    requestedAt = 0;
+    waitJumped = false;
+    lastSend = 0;
+}
+
 void Report(LogFn log)
 {
     char line[200];

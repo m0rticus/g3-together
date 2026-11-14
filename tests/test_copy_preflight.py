@@ -73,6 +73,7 @@ class CopyPreflightTests(unittest.TestCase):
             root = Path(temporary)
             (root / "g3qa32.dll").write_bytes(b"shim")
             for module_name in copy_preflight.FOLDER_MODULES:
+                (root / module_name).parent.mkdir(parents=True, exist_ok=True)
                 (root / module_name).write_bytes(b"synthetic module")
             with mock.patch.object(
                 copy_preflight,
@@ -86,6 +87,7 @@ class CopyPreflightTests(unittest.TestCase):
             root = Path(temporary)
             (root / "g3qa32.dll").write_bytes(b"shim")
             for module_name in copy_preflight.FOLDER_MODULES:
+                (root / module_name).parent.mkdir(parents=True, exist_ok=True)
                 (root / module_name).write_bytes(b"synthetic module")
             with mock.patch.object(
                 copy_preflight,

@@ -18,16 +18,7 @@ constexpr std::size_t RelayMaxEnvelopeSize = RelayMaxHeaderSize + RelayPayloadLi
 
 inline bool ValidRelaySession(char const* session)
 {
-    if (!session || !session[0]) return false;
-    std::size_t length = 0;
-    for (; session[length]; ++length) {
-        char const c = session[length];
-        if (length >= RelayMaxSessionSize ||
-            !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '_' || c == '-'))
-            return false;
-    }
-    return length != 0;
+    return session && ValidSessionId(session);
 }
 
 inline std::size_t RelayHeaderSize(char const* session)
@@ -126,12 +117,26 @@ inline std::uint16_t RelayReadUint16(void const* bytes)
                                       static_cast<std::uint16_t>(p[1]));
 }
 
-inline bool ParseEnetDataPacket(void const* packet, std::size_t packetSize,
-                                EnetPacketParse* result)
+struct EnetCommandView
 {
-    if (!result) return false;
-    *result = EnetPacketParse{};
-    result->packetBytes = packetSize;
+    std::size_t offset = 0;
+    std::size_t headerBytes = 0;
+    std::size_t totalBytes = 0;
+    unsigned command = 0;
+    unsigned channel = 0;
+    unsigned char flagsByte = 0;
+    unsigned char const* payload = nullptr;
+    std::size_t payloadBytes = 0;
+};
+
+template <class Fn>
+inline bool ForEachEnetCommand(void const* packet, std::size_t packetSize,
+                               EnetPacketParse* result, Fn&& onCommand)
+{
+    EnetPacketParse local;
+    EnetPacketParse& parsed = result ? *result : local;
+    parsed = EnetPacketParse{};
+    parsed.packetBytes = packetSize;
     if (!packet || packetSize < 2) return false;
 
     auto const* data = static_cast<unsigned char const*>(packet);
@@ -141,47 +146,62 @@ inline bool ParseEnetDataPacket(void const* packet, std::size_t packetSize,
 
     if (peerFlags & 0x4000u) {
         if (packetSize == headerSize) return false;
-        result->valid = true;
-        result->compressed = true;
+        parsed.valid = true;
+        parsed.compressed = true;
         return true;
     }
     if (packetSize == headerSize) return false;
 
-    result->protocolBytes = headerSize;
+    parsed.protocolBytes = headerSize;
     std::size_t offset = headerSize;
     while (offset < packetSize) {
-        result->commandOffset = offset;
-        result->remainingBytes = packetSize - offset;
-        result->commandBytes = 4;
-        if (result->remainingBytes < 4) return false;
-        unsigned command = data[offset] & 0x0fu;
-        result->command = command;
-        if (offset == headerSize) result->firstCommand = command;
-        std::size_t commandSize = EnetCommandHeaderSize(command);
-        result->commandBytes = commandSize;
-        if (!commandSize) return false;
-        if (packetSize - offset < commandSize) return false;
+        parsed.commandOffset = offset;
+        parsed.remainingBytes = packetSize - offset;
+        parsed.commandBytes = 4;
+        if (parsed.remainingBytes < 4) return false;
+        unsigned char flagsByte = data[offset];
+        unsigned command = flagsByte & 0x0fu;
+        parsed.command = command;
+        if (offset == headerSize) parsed.firstCommand = command;
+        std::size_t headerBytes = EnetCommandHeaderSize(command);
+        parsed.commandBytes = headerBytes;
+        if (!headerBytes) return false;
+        if (packetSize - offset < headerBytes) return false;
 
         std::size_t payloadSize = 0;
         if (command == 6) {
             payloadSize = RelayReadUint16(data + offset + 4);
-            commandSize += payloadSize;
-        } else if (command == 7 || command == 9 || command == 12) {
+        } else if (command == 7 || command == 8 || command == 9 || command == 12) {
             payloadSize = RelayReadUint16(data + offset + 6);
-            commandSize += payloadSize;
-        } else if (command == 8) {
-            payloadSize = RelayReadUint16(data + offset + 6);
-            commandSize += payloadSize;
         }
-        result->commandBytes = commandSize;
+        std::size_t commandSize = headerBytes + payloadSize;
+        parsed.commandBytes = commandSize;
         if (packetSize - offset < commandSize) return false;
 
-        result->protocolBytes += commandSize - payloadSize;
-        if (command == 1) result->ackBytes += 8;
+        parsed.protocolBytes += headerBytes;
+        if (command == 1) parsed.ackBytes += 8;
+        EnetCommandView view{
+            offset,
+            headerBytes,
+            commandSize,
+            command,
+            data[offset + 1],
+            flagsByte,
+            payloadSize ? (data + offset + headerBytes) : nullptr,
+            payloadSize,
+        };
+        onCommand(headerSize, view);
         offset += commandSize;
     }
-    result->valid = true;
+    parsed.valid = true;
     return true;
+}
+
+inline bool ParseEnetDataPacket(void const* packet, std::size_t packetSize,
+                                EnetPacketParse* result)
+{
+    return result && ForEachEnetCommand(packet, packetSize, result,
+                                        [](std::size_t, EnetCommandView const&) {});
 }
 
 }

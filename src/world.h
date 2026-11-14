@@ -9,7 +9,6 @@
 
 namespace g3t::world {
 void RequestProcessingUpdate();  // incremental range refresh; never exit the local hero to force recollection
-using LogFn = void (*)(char const*);
 // Every entity the engine processes here, static ones included (doors, ore veins); null before the scene exists.
 bTSmallArray<eCEntity*> const* ProcessedEntities();
 struct ProcessingMembership {
@@ -19,7 +18,6 @@ ProcessingMembership ProcessingOf(eCEntity const* entity);
 // Registration is an optimization (engine range/processable lists); `why` names the exact reason when it returns false.
 bool QueueEntityProcessing(eCEntity* entity, char const** why = nullptr);
 void Tick();  // host: NPC-only extra ranges; native camera, ROI and static culling stay unchanged
-void ProcessingReport(LogFn log);
 void Start();
 void OnWorldActivate();
 void CaptureCacheInventory();  // engine thread only; publishes counts/pointers for worker-safe crash reporting
@@ -30,11 +28,4 @@ bool Extended();
 bool HostProcesses(float const at[3], float margin);
 // Compact state of the host's simulation around the other players for the 5-second `npc-stream:` line. Engine thread only.
 HostSimStatus HostSimulationStatus();
-void Usables(char const* radius, LogFn log);  // USABLE lines within radius cm (default 3000) of the hero, then USABLE end
-void Face(char const* name, LogFn log);       // FACE line: stand in front of the nearest entity of that name (or GUID)
-void Use(char const* name, LogFn log);        // USE line: the hero uses the nearest entity of that name
-void UseInfo(char const* name, LogFn log);    // USEINFO line: door, lock, user of the nearest entity of that name
-void Unlock(char const* name, LogFn log);  // QA stand-in for the lock-picking minigame or a key: UNLOCK line
-void FindEntities(char const* prefix, LogFn log);  // QA: FINDENT lines (name, position) of processed entities whose name starts so
-void FindAll(char const* name, LogFn log);  // QA: FINDALL lines (position, dead) of every entity of that name, processed or not
 }

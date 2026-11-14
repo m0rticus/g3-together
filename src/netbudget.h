@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-// Pure per-peer transport policy. It is an emergency valve plus bulk pacing, NOT a bandwidth cap:
+// Pure per-peer congestion valve, NOT a bandwidth cap:
 //  * NPC pose/control, player state and gameplay reliable traffic are never refused or charged against a credit.
-//    Preview() returns Allow for them in every state, so the normal NPC stream is not gated by this module.
 //  * Real congestion signals (ENet's own packet throttle, a standing outgoing queue, RTT growth while data is queued,
 //    fresh loss with a meaningful sample) raise NpcStretchPermille() from 1000 (normal) to 4000. The NPC scheduler multiplies
 //    every tier interval and staleness limit by that one factor: all NPCs slow down together and proportionally, none is selected,
 //    shed or starved. Normal LAN-like conditions keep the factor at exactly 1000.
-//  * BulkReliable (reserved bulk traffic on channel 6) has its own token bucket: bytesPerSecond/4 when clear,
-//    /8 when constrained, deferred while critical. It is decoupled from the NPC stream.
 // Parent-owned Send commits one conservative BudgetCharge once only after the common successful send.
 
 #include <algorithm>
@@ -22,15 +19,7 @@ enum class BudgetClass : uint8_t {
     GameplayReliable,
     PlayerState,
     NpcActive,
-    BulkReliable,
     NpcFarIdle
-};
-
-enum class BudgetDecision : uint8_t {
-    Allow,
-    Defer,
-    Shed,
-    NeedsChunking
 };
 
 enum class BudgetPressure : uint8_t {
@@ -49,9 +38,10 @@ enum BudgetSignal : uint8_t {
     SignalWindow = 16
 };
 
+constexpr uint32_t DefaultBandwidthBytesPerSecond = 256u * 1024u;
+
 struct BudgetConfig {
-    // Reserved bulk-channel pacing; never applied to NPC, player, character-save or gameplay traffic.
-    uint32_t bytesPerSecond = 256u * 1024u;
+    uint32_t bytesPerSecond = DefaultBandwidthBytesPerSecond;
     uint32_t mtuBytes = 1200u;
     uint32_t envelopeBytes = 16u;
     uint32_t checksumBytes = 0u;
@@ -78,11 +68,8 @@ struct BudgetSnapshot {
     uint64_t queueBytes = 0;
     uint64_t chargedBytes = 0;
     uint64_t offeredBytesPerSecond = 0;
-    uint64_t deferredCount = 0;
-    uint64_t shedCount = 0;
     uint32_t pressureTransitions = 0;
     uint32_t baseRttMs = 0;
-    int64_t bulkCreditBytes = 0;
 };
 
 inline uint64_t BudgetCharge(uint64_t payload, uint32_t mtu = 1200u,
@@ -128,14 +115,12 @@ public:
     {
         config_ = config;
         if (!config_.mtuBytes) config_.mtuBytes = 1200u;
-        bulkCapBytes_ = (std::max)(uint64_t(2) * config_.mtuBytes, uint64_t(config_.bytesPerSecond) / 40u);
         lastNowMs_ = nowMs;
-        bulkCreditMilli_ = static_cast<int64_t>(bulkCapBytes_) * 1000;
         telemetry_ = BudgetTelemetry{};
         pressure_ = BudgetPressure::Clear;
         stretch_ = StretchNormal;
         signals_ = SignalNone;
-        queueBytes_ = chargedBytes_ = deferredCount_ = shedCount_ = 0;
+        queueBytes_ = chargedBytes_ = 0;
         offeredBytesPerSecond_ = 0.0;
         offeredSinceAdvance_ = 0;
         pressureTransitions_ = 0;
@@ -154,7 +139,6 @@ public:
             const double sample = static_cast<double>(offeredSinceAdvance_) * 1000.0 / static_cast<double>(elapsed);
             offeredBytesPerSecond_ += (sample - offeredBytesPerSecond_) * alpha;
             offeredSinceAdvance_ = 0;
-            RefillBulk(elapsed);
             lastNowMs_ = nowMs;
         }
         telemetry_ = telemetry;
@@ -184,37 +168,17 @@ public:
         }
     }
 
-    // Only reserved bulk traffic is ever refused. Gameplay and character saves are always admitted.
-    BudgetDecision Preview(BudgetClass cls, uint64_t chargedBytes) const
-    {
-        if (cls != BudgetClass::BulkReliable) return BudgetDecision::Allow;
-        if (chargedBytes > bulkCapBytes_) return BudgetDecision::NeedsChunking;
-        if (pressure_ == BudgetPressure::Critical) return BudgetDecision::Defer;
-        return chargedBytes <= BulkAllowance() ? BudgetDecision::Allow : BudgetDecision::Defer;
-    }
-
-    uint64_t BulkAllowance() const
-    {
-        if (pressure_ == BudgetPressure::Critical) return 0;
-        return (std::min)(BulkCreditBytes(), BulkLimit());
-    }
-
-    void CommitQueued(BudgetClass cls, uint64_t chargedBytes)
+    void CommitQueued(uint64_t chargedBytes)
     {
         if (!chargedBytes) return;
         chargedBytes_ = SaturatingAdd(chargedBytes_, chargedBytes);
         queueBytes_ = SaturatingAdd(queueBytes_, chargedBytes);
         offeredSinceAdvance_ = SaturatingAdd(offeredSinceAdvance_, chargedBytes);
-        if (cls != BudgetClass::BulkReliable) return;
-        const int64_t charge = chargedBytes <= static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) / 1000u
-            ? static_cast<int64_t>(chargedBytes) * 1000 : (std::numeric_limits<int64_t>::max)();
-        bulkCreditMilli_ = bulkCreditMilli_ > charge ? bulkCreditMilli_ - charge : 0;
     }
 
-    void RecordDecision(BudgetDecision decision)
+    void CommitQueued(BudgetClass, uint64_t chargedBytes)
     {
-        if (decision == BudgetDecision::Defer) deferredCount_ = SaturatingAdd(deferredCount_, 1u);
-        else if (decision == BudgetDecision::Shed) shedCount_ = SaturatingAdd(shedCount_, 1u);
+        CommitQueued(chargedBytes);
     }
 
     // 1000 = unthrottled. Every NPC interval and staleness limit is multiplied by this single factor.
@@ -230,11 +194,8 @@ public:
         snapshot.queueBytes = queueBytes_;
         snapshot.chargedBytes = chargedBytes_;
         snapshot.offeredBytesPerSecond = static_cast<uint64_t>(offeredBytesPerSecond_);
-        snapshot.deferredCount = deferredCount_;
-        snapshot.shedCount = shedCount_;
         snapshot.pressureTransitions = pressureTransitions_;
         snapshot.baseRttMs = baseRttMs_;
-        snapshot.bulkCreditBytes = bulkCreditMilli_ / 1000;
         return snapshot;
     }
 
@@ -257,28 +218,6 @@ private:
         const uint64_t drain = (std::max)(DrainFloorBytesPerSecond, static_cast<uint64_t>(offeredBytesPerSecond_));
         if (queued > (std::numeric_limits<uint64_t>::max)() / 1000u) return (std::numeric_limits<uint64_t>::max)();
         return queued * 1000u / drain;
-    }
-
-    uint64_t BulkCreditBytes() const
-    {
-        return bulkCreditMilli_ > 0 ? static_cast<uint64_t>(bulkCreditMilli_ / 1000) : 0u;
-    }
-
-    uint64_t BulkLimit() const
-    {
-        if (pressure_ != BudgetPressure::Constrained) return bulkCapBytes_;
-        // A constrained link must still fit one complete unfragmented chunk.
-        return (std::max)(uint64_t(config_.mtuBytes) + 32 + config_.envelopeBytes, bulkCapBytes_ / 2);
-    }
-
-    void RefillBulk(uint32_t elapsedMs)
-    {
-        if (pressure_ == BudgetPressure::Critical) return;
-        const uint64_t perSecond = static_cast<uint64_t>(config_.bytesPerSecond) /
-                                   (pressure_ == BudgetPressure::Constrained ? 8u : 4u);
-        const int64_t cap = static_cast<int64_t>(BulkLimit()) * 1000;
-        const uint64_t add = perSecond * elapsedMs;
-        bulkCreditMilli_ = add >= static_cast<uint64_t>(cap) ? cap : (std::min)(cap, bulkCreditMilli_ + static_cast<int64_t>(add));
     }
 
     void TrackBaseRtt(uint32_t nowMs, const BudgetTelemetry& telemetry)
@@ -351,12 +290,8 @@ private:
     uint32_t lastNowMs_ = 0;
     uint32_t stretch_ = StretchNormal;
     uint8_t signals_ = SignalNone;
-    uint64_t bulkCapBytes_ = 2u * 1200u;
-    int64_t bulkCreditMilli_ = 0;
     uint64_t queueBytes_ = 0;
     uint64_t chargedBytes_ = 0;
-    uint64_t deferredCount_ = 0;
-    uint64_t shedCount_ = 0;
     uint64_t offeredSinceAdvance_ = 0;
     double offeredBytesPerSecond_ = 0.0;
     uint32_t pressureTransitions_ = 0;

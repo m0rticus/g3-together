@@ -28,7 +28,6 @@ char const* GameTextLanguage() { return eCLocAdmin::GetInstance().GetCurrentLang
 namespace g3t::hud {
 namespace {
 unsigned count = 0;
-std::string last[4];  // newest first, as UTF-8 for the log
 struct Notice { Kind kind; std::wstring text; };
 std::mutex noticeMutex;
 std::vector<Notice> pending;
@@ -238,8 +237,6 @@ void Tick()
         unsigned serial = 0;
         {
             std::lock_guard<std::mutex> lock(noticeMutex);
-            for (int i = 3; i > 0; --i) last[i] = last[i - 1];
-            last[0] = utf8;
             serial = ++count;
         }
         Logf("hud: [%d] %s", static_cast<int>(notice.kind), utf8);
@@ -256,16 +253,6 @@ void OnWorldChange()
     if (!observations.empty())
         Logf("hud-motion: phase=cancelled count=%zu reason=world-change", observations.size());
     observations.clear();
-}
-
-void Report(LogFn log)
-{
-    char line[400];
-    {
-        std::lock_guard<std::mutex> lock(noticeMutex);
-        Format(line, "HUD count=%u last=%s", count, last[0].c_str());
-    }
-    log(line);
 }
 
 bool InventoryOpen()
@@ -343,34 +330,4 @@ bool MenuLine(wchar_t const* text)
     return true;
 }
 
-void MenuLineReport(LogFn log)
-{
-    CFFGFCWnd* line = MenuElement(VersionLine);
-    char utf8[600] = {};
-    if (line) WideCharToMultiByte(CP_UTF8, 0, line->GetWindowTextA().GetText(), -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
-    std::string shown;  // a line break as \n: the version line holds a | itself
-    for (char const* c = utf8; *c; ++c) shown += *c == '\n' ? std::string("\\n") : std::string(1, *c);
-    std::string text = "MENULINE found=" + std::string(line ? "1" : "0") + " changed=" + (lineChanged ? "1" : "0") + " text=" + shown;
-    log(text.c_str());
-}
-
-// The existing HUD probes use the production passive route; subtitle remains a separate menu-text probe.
-void Probe(char const* way, LogFn log)
-{
-    gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
-    char line[160];
-    if (!std::strcmp(way, "hud")) {
-        Message(Info, L"G3 Together test: HUD message (GUI2)");
-    } else if (!std::strcmp(way, "gamemsg") && manager) {
-        Message(Warning, L"G3 Together test: PrintGameMessage (GUI manager)");
-    } else if (!std::strcmp(way, "subtitle") && manager) {
-        manager->ShowSubtitle(bCUnicodeString(L"G3 Together test: subtitle line (GUI manager)"));
-    } else {
-        Format(line, "REFUSED menutext %s: hud, gamemsg or subtitle (gui=%d)", way, manager ? 1 : 0);
-        log(line);
-        return;
-    }
-    Format(line, "MENUTEXT way=%s gui=%d running=%d", way, manager ? 1 : 0, gCSession::GetInstance().IsGameRunning() ? 1 : 0);
-    log(line);
-}
 }

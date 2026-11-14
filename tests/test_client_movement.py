@@ -168,6 +168,12 @@ int main() {{
         touch = function_body(self.movement, r"\bvoid\s+Touch\s*\(")
         self.assertLess(touch.index("GetCurrentThreadId() != observerThread"),
                         touch.index("guards::IsLocalPlayer(entity)"))
+        before = function_body(self.movement, r"\bSample\s+BeforeTransform\s*\(")
+        self.assertLess(before.index("GetCurrentThreadId() != observerThread"),
+                        before.index("guards::IsLocalPlayer(entity)"))
+        after = function_body(self.movement, r"\bvoid\s+AfterTransform\s*\(")
+        self.assertIn("after.capturedAt - before.capturedAt", after)
+        self.assertNotIn("previousSampleAt", after)
         self.assertIn("++nativeStops", touch)
         self.assertIn("++nativeFullStops", touch)
         self.assertIn("++nativeExits", touch)

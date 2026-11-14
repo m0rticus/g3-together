@@ -624,6 +624,20 @@ static void TestSendOwnedCandidateUnion()
     const std::vector<std::string> result = npcsend_candidates::Union(candidates);
     assert(result.size() == 2);
     assert(result[0] == actorA && result[1] == actorB);
+
+    using npcsend_candidates::GuidCandidate;
+    GuidKey gA{}, gB{}, gP{}, gS{}, gZ{};
+    gA.fill(0xAA); gB.fill(0xBB); gP.fill(0xCC); gS.fill(0xDD);
+    std::vector<GuidCandidate> guidCandidates = {
+        {gA, true, false, false, false, false},
+        {gB, true, false, false, false, false},
+        {gA, true, false, false, false, false},
+        {gP, true, true, false, false, false},
+        {gS, false, false, false, false, false},
+        {gZ, true, false, false, false, true},
+    };
+    const std::vector<GuidKey> guidResult = npcsend_candidates::Union(guidCandidates);
+    assert(guidResult.size() == 2 && guidResult[0] == gA && guidResult[1] == gB);
 }
 
 static void TestPacedCounter()

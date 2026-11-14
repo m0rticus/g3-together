@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "remote.h"
+#include "remote_internal.h"
 #include "occupancy.h"
 
 #include "ai.h"
@@ -37,38 +38,26 @@
 #include <vector>
 
 namespace g3t::remote {
-namespace {
-struct Puppet
-{
-    Entity entity;
-    bool spawned = false;
-    std::string heldRight, heldLeft;  // what the puppet holds (item names)
-    uint32_t holdChecked = 0;
-    std::string heldItems[2];         // GUIDs of the items in its right and left hand (NoDrop)
-    uint32_t dropChecked = 0;
-    uint32_t wearChecked = 0;
-    uint32_t world = 0;
-    uint32_t truthSent = 0;
-    uint32_t downedSequence = 0;
-    body::State body;
-    std::string shape;        // the shape it stands for (the player's hero template, or its creature)
-    std::unordered_map<uint32_t, std::string> presentationNames;
-    bool terminal = false;
-    bool terminalInitialized = false;
-    bool terminalSound = false;
-    uint32_t terminalTryAt = 0;
-    uint32_t terminalFails = 0;
-    std::vector<pose::Bone> terminalPose;
-    uint8_t terminalPoseFlags = 0;
-    npcplayback::State terminalReplay;
-};
+namespace internal {
 Puppet puppets[net::MaxPlayers];
+QaState qa;
+WearStats wearStats;
+bool haveAnchor = false;
+bCVector anchor;
+}
+
+namespace {
+using internal::anchor;
+using internal::haveAnchor;
+using internal::Puppet;
+using internal::puppets;
+using internal::qa;
+using internal::wearStats;
+
 bool departed[net::MaxPlayers] = {};
 bool started = false;
 uint32_t lastSyncReport = 0;
 bool templateWarned = false;
-bool haveAnchor = false;
-bCVector anchor;
 
 void PeerLeft(uint8_t id, char const* label)
 {
@@ -118,23 +107,6 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
     body::Feed(puppet.body.track, state.position, state.rotation, state.sent, arrived, state.movementMode, motion);
 }
 
-void LogMotions(char const* who, Entity& entity, LogFn log)
-{
-    eCEntity* engine = entity.GetInstance();
-    eCVisualAnimation_PS* animation = engine ? static_cast<eCVisualAnimation_PS*>(engine->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
-    char line[900];
-    int length = Format(line, "MOTIONS who=%s", who);
-    for (int type = 0; animation && type < 6 && length > 0; ++type) {
-        char name[128] = {};
-        const bool ok = body::MotionName(animation, type, name, sizeof(name));
-        length += Format(line + length, sizeof(line) - length, " %d=%s", type, *name ? name : "-");
-        if (!ok) break;
-    }
-    log(line);
-}
-
-bool badStates = false;  // QA (stage X1): the next states carry a NaN position and strings without terminator
-
 bool LocalState(net::PlayerState& state)
 {
     gCSession& session = gCSession::GetInstance();
@@ -142,7 +114,7 @@ bool LocalState(net::PlayerState& state)
     state.world = CurrentWorld();
     if (!own || !session.IsGameRunning()) { state.flags = 64; return false; }
     if (persist::HeroPending()) { state.flags = 32; return false; }
-    if (badStates) {
+    if (qa.badStates) {
         state.position[0] = std::nanf("");
         std::memset(state.name, 'X', sizeof(state.name));
         std::memset(state.shape, 'Y', sizeof(state.shape));
@@ -205,8 +177,6 @@ bool LocalState(net::PlayerState& state)
 // walk through Entity::GetNPCs() met a freed NPC still in that list, a per-frame copy of raw entity pointers (access
 // violation while the host saved, run 20261022-080317; re/findings/save-forget-npclist-c.md).
 std::unordered_set<std::string> contacts[net::MaxPlayers];
-bool byContacts = true;  // QA negative control: forgetnpclist (the walk through Entity::GetNPCs, as before 22.10.)
-bool noting = true;      // QA negative control: contactsoff (nothing is noted, so Forget lets nobody go)
 unsigned contactsNoted = 0, contactsLookedUp = 0, contactsGone = 0;
 
 std::string KeyOf(eCEntity* entity)
@@ -222,16 +192,12 @@ Entity ByKey(std::string const& key)
     return Entity(bCPropertyID(bCGuid(raw)));
 }
 
-// NPCs that fight a puppet hold it as target, attacker or spell target, and their AI states read it every frame: a
-// client crashed (access violation under an attack state, stage E2) when the host left mid-fight and its puppet was
-// destroyed. Every NPC that dealt with the puppet lets go of it first; the ones that were after it start their routine
-// again.
 void Forget(int id, eCEntity* entity)
 {
     if (!entity) return;
     occupancy::Forget(id, entity);  // a stool or bench it sat on (the object's user)
     std::vector<Entity> candidates;
-    if (byContacts) {
+    if (qa.byContacts) {
         for (auto const& key : contacts[id]) {
             ++contactsLookedUp;
             Entity npc = ByKey(key);
@@ -261,32 +227,16 @@ void Forget(int id, eCEntity* entity)
         }
         if (after) ++released;
     }
-    Logf("remote: %d NPCs let go of removed puppet %d (%zu %s)", released, id, candidates.size(), byContacts ? "known contacts" : "from Entity::GetNPCs");
+    Logf("remote: %d NPCs let go of removed puppet %d (%zu %s)", released, id, candidates.size(),
+         qa.byContacts ? "known contacts" : "from Entity::GetNPCs");
 }
 
-// The puppet used to join the local hero's party so enemies would attack it; that had no effect on GetAttitude
-// (re/findings/target-selection.md) and put the puppet into the hero's follower list. Enemies now judge puppets
-// through the GetAttitude wrapper (ai.cpp). Kept switchable for comparison only.
-bool puppetParty = false;  // QA: PuppetPartyOff (now the default)
-bool puppetHold = true;   // QA negative control: PuppetHoldOff
-
-// A knock-out makes the game drop what a body holds: the puppet's copy of the player's weapon lay here while the player
-// picked up its own over there, and the host's hero took that copy as well (two weapons, playtest 27.10.). The items in
-// the puppet's hands are remembered; one of them that lies in the world now is removed. false: as before 27.10.
-bool puppetNoDrop = true;
-int puppetLead = -1;  // QA puppetleadon/off: 1/0; -1: puppet_lead in the INI (Stufe 3.2)
-// Display step 1 (review 28.10.), the walk line, QA walklineon (off by default): the puppet on one timeline of its player's
-// states, WalkDelay behind the newest possible one. The shown pose, the speed and the controller's goal come from that line:
-// the goal WalkAhead further along it (beyond the newest state along its velocity, at most body::MaxAhead), the newest state
-// itself once the player stopped, so the controller never reaches its goal between two states while the player runs on (the
-// cause of the still frames: steered to the newest state, arrived, waited). Errors up to 6 m are walked off, not set.
-bool walkLine = false;
 constexpr int32_t WalkDelay = 100, WalkAhead = 250;  // ms
 unsigned walkLineFrames = 0;
 unsigned puppetDropsRemoved = 0;
 void NoDrop(Puppet& puppet, uint32_t now)
 {
-    if (!puppetNoDrop || static_cast<int32_t>(now - puppet.dropChecked) < 250) return;
+    if (!qa.puppetNoDrop || static_cast<int32_t>(now - puppet.dropChecked) < 250) return;
     puppet.dropChecked = now;
     for (int i = 0; i < 2; ++i) {
         std::string& key = puppet.heldItems[i];
@@ -308,10 +258,9 @@ void NoDrop(Puppet& puppet, uint32_t now)
         }
     }
 }
-bool puppetCombat = true; // QA negative control: PuppetCombatOff
+}
 
-// The stack of an item (by name) in the puppet's inventory; created if missing (a puppet's inventory holds only
-// what its template gave it).
+namespace internal {
 GEInt StackFor(Entity& body, char const* name)
 {
     if (!name || !*name) return -1;
@@ -324,12 +273,21 @@ GEInt StackFor(Entity& body, char const* name)
     return -1;
 }
 
-// The player's weapons in the puppet's hands: the host saw the client's character unarmed (first human look).
-// What the puppet really holds is checked every 250 ms (stopping its AI puts weapons away).
+void TakeOff(Entity& body, gESlot slot)
+{
+    for (GEInt i = 0; i < body.Inventory.GetStackCount(); ++i)
+        if (body.Inventory.GetSlotFromStack(i) == slot) body.Inventory.UnEquipStack(i);
+}
+}
+
+namespace {
+using internal::StackFor;
+using internal::TakeOff;
+
 template <typename P>
 void Hold(P& puppet, char const* right, char const* left, uint32_t now)
 {
-    if (!puppetHold || static_cast<int32_t>(now - puppet.holdChecked) < 250) return;
+    if (!qa.puppetHold || static_cast<int32_t>(now - puppet.holdChecked) < 250) return;
     puppet.holdChecked = now;
     const Entity inRight = puppet.entity.Inventory.GetItemFromSlot(gESlot_RightHand), inLeft = puppet.entity.Inventory.GetItemFromSlot(gESlot_LeftHand);
     const std::string haveRight = inRight.GetInstance() ? inRight.GetName().GetText() : "";
@@ -338,22 +296,11 @@ void Hold(P& puppet, char const* right, char const* left, uint32_t now)
     puppet.entity.Inventory.HoldStacks(StackFor(puppet.entity, left), StackFor(puppet.entity, right));
 }
 
-// The player's armor and helmet on the puppet (owner 23.10.: a new armor did not show on the other machine). Like the
-// hands, checked every 250 ms; an empty slot takes off what the puppet's template wore.
 constexpr gESlot WornSlots[2] = {gESlot_Body, gESlot_Helmet};
-bool puppetWear = true;  // QA negative control: wearoff
-bool remoteLooks = true;  // QA negative control: lookoff (every player shown as puppet_template, as before 23.10.)
-unsigned wearChanges = 0, wearEquipped = 0, wearLinked = 0, wearFailed = 0;
-
-void TakeOff(Entity& body, gESlot slot)
-{
-    for (GEInt i = 0; i < body.Inventory.GetStackCount(); ++i)
-        if (body.Inventory.GetSlotFromStack(i) == slot) body.Inventory.UnEquipStack(i);
-}
 
 void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now)
 {
-    if (!puppetWear || static_cast<int32_t>(now - puppet.wearChecked) < 250) return;
+    if (!qa.puppetWear || static_cast<int32_t>(now - puppet.wearChecked) < 250) return;
     puppet.wearChecked = now;
     char const* const wanted[2] = {armor, helmet};
     for (int i = 0; i < 2; ++i) {
@@ -363,16 +310,14 @@ void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now)
         if (!have.empty()) TakeOff(puppet.entity, WornSlots[i]);
         const GEInt stack = StackFor(puppet.entity, wanted[i]);
         if (stack < 0) continue;
-        ++wearChanges;
-        // EquipStackToSlot left the puppet bare (23.10.: 25 tries, helmet slot still empty). Equip it as the game does for
-        // the hero; where the puppet's template cannot equip it (requirements), link it to the slot: it is only shown.
+        ++wearStats.changes;
         if (puppet.entity.Inventory.EquipStack(stack) && puppet.entity.Inventory.GetSlotFromStack(stack) == WornSlots[i]) {
-            ++wearEquipped;
+            ++wearStats.equipped;
             continue;
         }
         auto* inventory = static_cast<gCInventory_PS*>(puppet.entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory));
-        if (inventory && inventory->LinkStackToSlot(stack, WornSlots[i], GETrue)) ++wearLinked;
-        else ++wearFailed;
+        if (inventory && inventory->LinkStackToSlot(stack, WornSlots[i], GETrue)) ++wearStats.linked;
+        else ++wearStats.failed;
     }
 }
 
@@ -405,7 +350,23 @@ void DespawnAll(char const* reason)
 }
 
 namespace {
-void UpdatePuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t now)
+eCVisualAnimation_PS* StopAllPuppetMotions(eCEntity* entity, eCWrapper_emfx2Actor*& actorOut)
+{
+    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+    actorOut = animation ? animation->GetActor() : nullptr;
+    if (actorOut) {
+        using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
+        for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
+            const auto type = static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot);
+            actorOut->StopMotion(type, 0.0f);
+            actorOut->SetTargetWeight(type, 0.0f);
+            animation->SetMotionOwner(type, static_cast<Owner>(2));
+        }
+    }
+    return animation;
+}
+
+void UpdatePuppetTerminal(Puppet& puppet, int id, eCEntity const&, uint32_t now)
 {
     if (!puppet.spawned || !puppet.entity.GetInstance()) return;
     eCEntity* entity = puppet.entity.GetInstance();
@@ -419,17 +380,8 @@ void UpdatePuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t
     if (puppet.terminalInitialized) return;
     if (static_cast<int32_t>(now - puppet.terminalTryAt) < 0) return;
 
-    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
-    auto* actor = animation ? animation->GetActor() : nullptr;
-    if (actor) {
-        using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
-        for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
-            const auto type = static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot);
-            actor->StopMotion(type, 0.0f);
-            actor->SetTargetWeight(type, 0.0f);
-            animation->SetMotionOwner(type, static_cast<Owner>(2));
-        }
-    }
+    eCWrapper_emfx2Actor* actor = nullptr;
+    auto* animation = StopAllPuppetMotions(entity, actor);
     if (animation && (!animation->GetRagDollEnabled() || !animation->GetRagDollController()))
         animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
 
@@ -471,18 +423,9 @@ void StartPuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t 
     puppet.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
     puppet.entity.StopPlayAni();
 
-    auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
-    auto* actor = animation ? animation->GetActor() : nullptr;
-    if (actor) {
-        using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
-        for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
-            const auto type = static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot);
-            actor->StopMotion(type, 0.0f);
-            actor->SetTargetWeight(type, 0.0f);
-            animation->SetMotionOwner(type, static_cast<Owner>(2));
-        }
-    }
-    if (animation) animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
+    eCWrapper_emfx2Actor* actor = nullptr;
+    if (auto* animation = StopAllPuppetMotions(entity, actor))
+        animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
     world::RequestProcessingUpdate();
 
     if (!puppet.terminalSound) {
@@ -509,11 +452,10 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     Puppet& puppet = puppets[id];
     if (guards::RejectRemoteWrite(puppet.entity.GetInstance(), "remote::UpdatePuppet")) { puppet = Puppet{}; return; }
-    // A client's loop stops during videos and loading (the intro once removed and respawned a puppet after 5 s),
-    // so only a long silence removes the puppet. Stamps come from the network clock; GetTickCount() runs a few ms apart and made fresh states look
-    // ancient after unsigned underflow (the puppet was removed and respawned hundreds of times).
     const uint32_t now = net::Now();
-    const bool heldOwner = remote.activity.known && now - remote.activity.ticks < downed::ActivityStaleMs &&
+    const int32_t activityAge = static_cast<int32_t>(now - remote.activity.ticks);
+    const bool heldOwner = remote.activity.known && activityAge >= 0 &&
+                           static_cast<uint32_t>(activityAge) < downed::ActivityStaleMs &&
                            (remote.activity.flags & 8) && (remote.latest.flags & 8) &&
                            remote.activity.downedSequence &&
                            remote.activity.downedSequence == remote.latest.downedSequence &&
@@ -525,10 +467,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         Despawn(id, !fresh ? "no recent state" : "other world");
         return;
     }
-    // A transformed player is shown as its creature: a human body played the wolf's motions (or none) before. Otherwise
-    // as the look it chose in its INI (owner 21.10.: each player picks how the others see it), else as puppet_template.
     char const* requested = *remote.latest.shape ? remote.latest.shape
-                          : remoteLooks && *remote.latest.look ? remote.latest.look : GetConfig().puppetTemplate;
+                          : qa.remoteLooks && *remote.latest.look ? remote.latest.look : GetConfig().puppetTemplate;
     if (puppet.spawned && puppet.shape != requested) {
         const std::string from = puppet.shape;
         Despawn(id, "changed shape");
@@ -560,7 +500,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         // Enemies chose only this machine's hero, never a puppet (first human test: the host's orcs attacked the host 39
         // times, the client's puppet 0 times). Experiment: the puppet joins the local hero's party, as companions do,
         // whom the player's enemies attack too.
-        if (puppetParty) {
+        if (qa.puppetParty) {
             puppet.entity.Party.SetPartyLeader(Entity(&hero));
             puppet.entity.Party.PartyMemberType = gEPartyMemberType_Party;
             puppet.entity.Party.Waiting = GEFalse;
@@ -604,7 +544,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     // Stufe 3.2, puppet lead: the sample half a round trip ahead of the newest state (at most 150 ms), so the puppet stands about
     // where its player is now; the host's NPCs then strike at that place, not where the player was. The movement controller
     // walks to that point too (not to the older newest state, which it would reach and stop at).
-    const bool lead = (puppetLead < 0 ? GetConfig().puppetLead : puppetLead > 0) && roundTrip;
+    const bool lead = (qa.puppetLead < 0 ? GetConfig().puppetLead : qa.puppetLead > 0) && roundTrip;
     const int32_t shift = lead ? static_cast<int32_t>(std::min<uint32_t>(roundTrip / 2, 150)) : -body::BufferDelay;
     // Stufe 3.2b: the lead only while the player moves steadily, rising over 200 ms; it stops, starts, brakes or turns: none at
     // once (the overshoot after a stop showed as gliding: 4 % with the lead, 1-2 % without, stageGlide 28.10.). The shown point
@@ -660,7 +600,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         }
     }
     float lineAt[3], lineTurn[4], lineBefore[3], lineBeforeTurn[4], lineGoal[3], lineGoalTurn[4];
-    if (!timeline && walkLine && body::Sample(puppet.body.track, now, lineAt, lineTurn, -WalkDelay, false) &&
+    if (!timeline && qa.walkLine && body::Sample(puppet.body.track, now, lineAt, lineTurn, -WalkDelay, false) &&
         body::Sample(puppet.body.track, now - 100, lineBefore, lineBeforeTurn, -WalkDelay, false) &&
         body::Sample(puppet.body.track, now, lineGoal, lineGoalTurn, -WalkDelay + WalkAhead, false)) {
         const bool stopped = speed < 40.0f;  // its newest two states: the player stands
@@ -717,7 +657,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
              id, puppet.downedSequence, remote.latest.sequence, remote.latest.flags);
     }
     puppet.downedSequence = held ? remote.latest.downedSequence : 0;
-    puppet.body.combatMoves = puppetCombat;
+    puppet.body.combatMoves = qa.puppetCombat;
     body::Drive(puppet.entity, puppet.body, target, now);
     if (held) {
         // Mode 8/9 takes PS_GonnaLoot before AssessTalk (Script_Game +0x81e72). Lie is presentation only.
@@ -767,19 +707,11 @@ unsigned CurrentWorld()
     return current ? net::HashWorld(current->GetFileBaseName().GetText()) : 0;
 }
 
-bool followShape = true;  // QA negative control: shapeoff (a transformed player is sent as its hidden hero again)
-
 eCEntity* ControlledBody()
 {
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* player = Entity::GetPlayer().GetInstance();
-    return followShape && hero && player && player != hero && !IsPuppet(player) ? player : hero;
-}
-
-void ShapeOff(LogFn log)
-{
-    followShape = false;
-    log("SHAPEOFF transformed players are sent as their hero");
+    return qa.followShape && hero && player && player != hero && !IsPuppet(player) ? player : hero;
 }
 
 bool IsPuppet(eCEntity const* entity)
@@ -870,26 +802,8 @@ void CaptureCacheInventory()
 void NoteContact(eCEntity* npc, eCEntity* puppet)
 {
     const int id = PuppetOwner(puppet);
-    if (!noting || !id || !npc || npc == puppet) return;
+    if (!qa.noting || !id || !npc || npc == puppet) return;
     if (contacts[id].insert(KeyOf(npc)).second) ++contactsNoted;
-}
-
-void BadStates(char const* argument, LogFn log)
-{
-    badStates = std::strcmp(argument, "off") != 0;
-    log(badStates ? "BADSTATES on" : "BADSTATES off");
-}
-
-void ContactsOff(LogFn log)
-{
-    noting = false;
-    log("CONTACTSOFF ok=1");
-}
-
-void ForgetNpcListOn(LogFn log)
-{
-    byContacts = false;
-    log("FORGETNPCLIST ok=1 (puppets are forgotten by walking Entity::GetNPCs, as before)");
 }
 
 void Tick()
@@ -916,336 +830,5 @@ void Tick()
         npcs::SyncReport(&Log);
         combat::SyncReport(&Log);
     }
-}
-
-void Report(LogFn log)
-{
-    char line[400];
-    Format(line, "NET local_id=%u connected=%d world=%08x perception_filter=%d blocked=%u wrapped=%u skipped=%u unknown=%u", net::LocalId(),
-              net::Connected(), CurrentWorld(), ai::PerceptionFiltered(), ai::BlockedCount(), ai::WrappedCount(), ai::SkippedCount(),
-              ai::UnknownCount());
-    log(line);
-    net::Remote const* remotes = net::Remotes();
-    const uint32_t now = net::Now();
-    for (int id = 1; id < net::MaxPlayers; ++id) {
-        net::Remote const& r = remotes[id];
-        if (id == net::LocalId() || !r.connected) continue;
-        float puppetPos[3] = {};
-        eCEntity* entity = puppets[id].spawned ? puppets[id].entity.GetInstance() : nullptr;
-        if (entity) {
-            const bCVector& p = entity->GetWorldPosition();
-            puppetPos[0] = p.GetX(); puppetPos[1] = p.GetY(); puppetPos[2] = p.GetZ();
-        }
-        Format(line, "REMOTE id=%d name=%s world=%08x same_world=%d age_ms=%u pos=%.1f,%.1f,%.1f puppet=%d puppet_pos=%.1f,%.1f,%.1f",
-                  id, r.latest.name, r.latest.world, r.latest.world == CurrentWorld(), r.latestTicks ? now - r.latestTicks : 0,
-                  r.latest.position[0], r.latest.position[1], r.latest.position[2], entity != nullptr,
-                  puppetPos[0], puppetPos[1], puppetPos[2]);
-        log(line);
-        Format(line, "ANIM id=%d remote=%s requested=%s", id, *r.latest.animation ? r.latest.animation : "-",
-                  *puppets[id].body.playing ? puppets[id].body.playing : "-");
-        log(line);
-        {
-            // What the puppet really shows: the motion on slot 0 and whether it runs (nothing running = bind pose).
-            char shows[128] = "-";
-            int running = -1;
-            if (entity) {
-                body::CurrentMotion(entity, shows, sizeof(shows));
-                if (auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)))
-                    if (eCWrapper_emfx2Actor* actor = animation->GetActor())
-                        running = actor->IsMotionRunning(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)) ? 1 : 0;
-            }
-            Format(line, "PUPPETPOSE id=%d remote=%s shows=%s run0=%d shape=%s body=%s", id, *r.latest.animation ? r.latest.animation : "-",
-                      *shows ? shows : "-", running, *r.latest.shape ? r.latest.shape : "-",
-                      // body: the template it is made from (its entity is named G3T_Player<id> since 23.10.)
-                      puppets[id].spawned && puppets[id].entity.GetInstance() ? puppets[id].shape.c_str() : "-");
-            log(line);
-        }
-        {
-            Entity body(entity);
-            const Entity held = entity ? body.Inventory.GetItemFromSlot(gESlot_RightHand) : Entity();
-            Format(line, "HELD id=%d remote=%s puppet=%s", id, *r.latest.heldRight ? r.latest.heldRight : "-",
-                      held.GetInstance() ? held.GetName().GetText() : "-");
-            log(line);
-            const Entity armor = entity ? body.Inventory.GetItemFromSlot(gESlot_Body) : Entity();
-            const Entity helmet = entity ? body.Inventory.GetItemFromSlot(gESlot_Helmet) : Entity();
-            Format(line, "WEAR id=%d remote_armor=%s remote_helmet=%s puppet_armor=%s puppet_helmet=%s look=%s template=%s changes=%u"
-                            " equipped=%u linked=%u failed=%u", id,
-                      *r.latest.armor ? r.latest.armor : "-", *r.latest.helmet ? r.latest.helmet : "-",
-                      armor.GetInstance() ? armor.GetName().GetText() : "-", helmet.GetInstance() ? helmet.GetName().GetText() : "-",
-                      *r.latest.look ? r.latest.look : "-", puppets[id].spawned ? puppets[id].shape.c_str() : "-", wearChanges,
-                      wearEquipped, wearLinked, wearFailed);
-            log(line);
-        }
-        if (entity) {
-            char who[16];
-            Format(who, "puppet%d", id);
-            LogMotions(who, puppets[id].entity, log);
-        }
-    }
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (hero) {
-        // A puppet may use the hero's own template (PC_Hero). The game must still find the real player.
-        Format(line, "PLAYER_CHECK getplayer_is_hero=%d by_name_is_hero=%d",
-                  Entity::GetPlayer().GetInstance() == hero, Entity::GetEntity(bCString("PC_Hero")).GetInstance() == hero);
-        log(line);
-        Entity self(hero);
-        LogMotions("hero", self, log);
-    }
-}
-
-void WalkTo(int index, LogFn log)
-{
-    char line[200];
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || !gCSession::GetInstance().IsGameRunning()) { log("REFUSED walkto: no hero"); return; }
-    if (!haveAnchor) { anchor = hero->GetWorldPosition(); haveAnchor = true; }
-    const float angle = index * 0.785398f;
-    const bCVector target(anchor.GetX() + 1500.0f * std::cos(angle), anchor.GetY(), anchor.GetZ() + 1500.0f * std::sin(angle));
-    const GEBool ok = Entity(hero).StartGoto(target, gEWalkMode_Run);
-    Format(line, "WALKTO index=%d started=%d target=%.1f,%.1f,%.1f", index, ok, target.GetX(), target.GetY(), target.GetZ());
-    log(line);
-}
-
-// QA (stageWalk, display review 28.10.): the hero runs to anchor + (dx, dz) cm by the game's goto; "stop" ends it where it is.
-void WalkRel(char const* argument, LogFn log)
-{
-    char line[200];
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || !gCSession::GetInstance().IsGameRunning()) { log("REFUSED walkrel: no hero"); return; }
-    if (!haveAnchor) { anchor = hero->GetWorldPosition(); haveAnchor = true; }
-    Entity self(hero);
-    if (argument && !std::strcmp(argument, "stop")) {
-        self.Routine.FullStop();
-        self.CharacterMovement.StopMovement();
-        const bCVector& p = hero->GetWorldPosition();
-        Format(line, "WALKREL stop pos=%.1f,%.1f,%.1f", p.GetX(), p.GetY(), p.GetZ());
-        log(line);
-        return;
-    }
-    float dx = 0.0f, dz = 0.0f;
-    if (!argument || std::sscanf(argument, "%f_%f", &dx, &dz) != 2) { log("REFUSED walkrel: need dx_dz"); return; }
-    const bCVector target(anchor.GetX() + dx, anchor.GetY(), anchor.GetZ() + dz);
-    const GEBool ok = self.StartGoto(target, gEWalkMode_Run);
-    Format(line, "WALKREL started=%d target=%.1f,%.1f,%.1f", ok, target.GetX(), target.GetY(), target.GetZ());
-    log(line);
-}
-
-void Step(int index, LogFn log)
-{
-    char line[200];
-    eCEntity* hero = gCSession::GetInstance().GetHero() ? ControlledBody() : nullptr;  // transformed: the creature
-    if (!hero || !gCSession::GetInstance().IsGameRunning()) { log("REFUSED step: no hero"); return; }
-    if (!haveAnchor) { anchor = hero->GetWorldPosition(); haveAnchor = true; }
-    const float angle = index * 0.785398f;  // 45 degrees per step
-    const float position[3] = {anchor.GetX() + 300.0f * std::cos(angle), anchor.GetY(), anchor.GetZ() + 300.0f * std::sin(angle)};
-    const bCQuaternion q = hero->GetWorldRotation();
-    const float rotation[4] = {q.GetX(), q.GetY(), q.GetZ(), q.GetW()};
-    Entity(hero).MoveTo(body::Pose(*hero, position, rotation));
-    const bCVector& p = hero->GetWorldPosition();
-    Format(line, "STEP index=%d target=%.1f,%.1f,%.1f pos=%.1f,%.1f,%.1f", index, position[0], position[1], position[2],
-              p.GetX(), p.GetY(), p.GetZ());
-    log(line);
-}
-}
-
-namespace g3t::remote {
-void PuppetPartyOff(LogFn log)
-{
-    puppetParty = false;
-    for (int id = 1; id < net::MaxPlayers; ++id)
-        if (puppets[id].spawned && puppets[id].entity.GetInstance()) {
-            puppets[id].entity.Party.SetPartyLeader(Entity());
-            puppets[id].entity.Party.PartyMemberType = gEPartyMemberType_None;
-        }
-    log("PUPPETPARTYOFF ok=1");
-}
-}
-
-namespace g3t::remote {
-void PuppetHoldOff(LogFn log)
-{
-    puppetHold = false;
-    log("PUPPETHOLDOFF ok=1");
-}
-
-void PuppetCombatOff(LogFn log)
-{
-    puppetCombat = false;
-    log("PUPPETCOMBATOFF ok=1");
-}
-
-// QA (stage Wear): the local hero puts on an item by name (armor or helmet, by its use type); "-armor" / "-helmet" takes
-// that slot off.
-void WearHero(char const* argument, LogFn log)
-{
-    char line[1000];  // equipped= lists every filled slot (up to 900 characters)
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || !argument || !*argument) { log("REFUSED wear: no hero or no item"); return; }
-    Entity self(hero);
-    if (!std::strcmp(argument, "-armor") || !std::strcmp(argument, "-helmet")) {
-        TakeOff(self, argument[1] == 'a' ? gESlot_Body : gESlot_Helmet);
-    } else {
-        const bool known = Template(argument).IsValid();
-        const GEInt stack = StackFor(self, argument);
-        // The game picks the slot itself: a Body_* armor goes to slot 17, a helmet to 18. (It_Armor_* are the packets one
-        // picks up, use type 0: EquipStack refuses them, and UseStack answers true without equipping, armor-equip-c.md.)
-        const GEBool ok = stack >= 0 ? self.Inventory.EquipStack(stack) : GEFalse;
-        if (!ok) {
-            // Why not: what the game says is missing.
-            int length = Format(line, "REFUSED wear: %s template=%d stack=%d not equipped", argument, known, stack);
-            auto* inventory = static_cast<gCInventory_PS*>(hero->GetPropertySet(eEPropertySetType_Inventory));
-            if (inventory && stack >= 0) {
-                bTObjArray<gCInventory_PS::SMissingAttrib> attribs;
-                bTValArray<gCInventory_PS::SMissingSkill> skills;
-                const GEBool can = inventory->CanEquip(stack, attribs, skills);
-                length += Format(line + length, sizeof(line) - length, " can=%d", can ? 1 : 0);
-                for (GEInt i = 0; i < attribs.GetCount() && i < 6 && length < 800; ++i)
-                    length += Format(line + length, sizeof(line) - length, " attrib:%.24s-%d", attribs[i].MissingAttribName.GetText(),
-                                        attribs[i].MissingAttribValue);
-                for (GEInt i = 0; i < skills.GetCount() && i < 6 && length < 800; ++i)
-                    length += Format(line + length, sizeof(line) - length, " skill:%.40s",
-                                        skills[i].MissingSkill ? skills[i].MissingSkill->GetName().GetText() : "?");
-                Format(line + length, sizeof(line) - length, " use=%d", static_cast<int>(self.Inventory.GetUseType(stack)));
-            }
-            log(line);
-            return;
-        }
-    }
-    const Entity armor = self.Inventory.GetItemFromSlot(gESlot_Body), helmet = self.Inventory.GetItemFromSlot(gESlot_Helmet);
-    int length = Format(line, "WEARHERO armor=%s helmet=%s equipped=", armor.GetInstance() ? armor.GetName().GetText() : "-",
-                           helmet.GetInstance() ? helmet.GetName().GetText() : "-");
-    for (GEInt i = 0; i < self.Inventory.GetStackCount() && length > 0 && length < 900; ++i) {
-        const int slot = static_cast<int>(self.Inventory.GetSlotFromStack(i));
-        const Entity item = slot ? self.Inventory.GetTemplateItem(i) : Entity();
-        if (item.GetInstance()) length += Format(line + length, sizeof(line) - length, "%d:%.40s,", slot, item.GetName().GetText());
-    }
-    log(line);
-}
-
-// QA (stage Wear): armor and helmet items NPCs within 100 m carry (worn or not; by use type or the armor category),
-// to pick real names; for the first five NPCs every filled slot too (WORNSLOTS), to see where their armor is.
-void WornScan(LogFn log)
-{
-    char line[1000];  // WORNSLOTS: up to 18 slots of 45 characters
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    int count = 0, slotted = 0;
-    if (hero) {
-        const bCVector& h = hero->GetWorldPosition();
-        const float at[3] = {h.GetX(), h.GetY(), h.GetZ()};
-        const bTObjArray<Entity> all = Entity::GetNPCs();
-        for (int i = 0; i < all.GetCount() && count < 40; ++i) {
-            Entity npc = all.GetAt(i);
-            eCEntity* instance = npc.GetInstance();
-            if (!instance || IsPuppet(instance)) continue;
-            const bCVector& p = instance->GetWorldPosition();
-            const float there[3] = {p.GetX(), p.GetY(), p.GetZ()};
-            if (body::Distance(at, there) > 10000.0f) continue;
-            if (slotted < 5) {
-                ++slotted;
-                int length = Format(line, "WORNSLOTS npc=%s stacks=%d", npc.GetName().GetText(), npc.Inventory.GetStackCount());
-                for (int slot = 1; slot <= 18 && length > 0; ++slot) {
-                    const Entity in = npc.Inventory.GetItemFromSlot(static_cast<gESlot>(slot));
-                    if (in.GetInstance()) length += Format(line + length, sizeof(line) - length, " %d:%.40s", slot, in.GetName().GetText());
-                }
-                log(line);
-            }
-            for (GEInt k = 0; k < npc.Inventory.GetStackCount() && count < 40; ++k) {
-                Entity item = npc.Inventory.GetTemplateItem(k);
-                if (!item.GetInstance()) continue;
-                const int use = static_cast<int>(item.Interaction.GetUseType());
-                const bool armorCategory = static_cast<int>(item.Item.GetCategory()) == gEItemCategory_Armor;
-                if (use != gEUseType_Armor && use != gEUseType_Helmet && !armorCategory) continue;
-                Format(line, "WORN npc=%s item=%s kind=%s slot=%d use=%d", npc.GetName().GetText(), item.GetName().GetText(),
-                          use == gEUseType_Helmet ? "helmet" : "armor", static_cast<int>(npc.Inventory.GetSlotFromStack(k)), use);
-                log(line);
-                ++count;
-            }
-        }
-    }
-    Format(line, "WORN end count=%d", count);
-    log(line);
-}
-
-void WearOff(LogFn log)
-{
-    puppetWear = false;
-    log("WEAROFF ok");
-}
-
-void LookOff(LogFn log)
-{
-    remoteLooks = false;
-    log("LOOKOFF ok");
-}
-
-// QA (phase 2, ENTWURF-HANDEL): "<id>_<Info>": player <id>'s puppet gets a name of its own (G3T_Player<id>; an option owned
-// by its template name would show on that NPC too) and a copy of the named dialog option, owned by it.
-void PuppetInfo(char const* argument, LogFn log)
-{
-    char line[400], source[96] = {};
-    const int id = std::atoi(argument);
-    char const* sep = std::strchr(argument, '_');
-    if (sep) strncpy_s(source, sep + 1, _TRUNCATE);
-    eCEntity* puppet = PuppetOf(id);
-    gCInfoManager_PS* manager = gCSession::GetInstance().IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr;
-    gCInfo_PS* from = manager && *source ? manager->GetInfo(bCString(source)) : nullptr;
-    if (!puppet || !from) { log("REFUSED puppetinfo: <id>_<Info> with a puppet and a known info"); return; }
-    char own[32], name[128];
-    Format(own, "G3T_Player%d", id);
-    Format(name, "G3T_%s_%d", source, id);
-    puppet->SetName(bCString(own));
-    gCInfo_PS* info = manager->GetInfo(bCString(name));
-    const bool added = !info;
-    if (!info) info = manager->AddInfo(bCString(name));
-    if (!info) { log("REFUSED puppetinfo: AddInfo failed"); return; }
-    info->CopyFrom(*from);
-    info->AccessName() = bCString(name);
-    info->AccessOwner() = bCString(own);
-    info->AccessInfoGiven() = GEFalse;
-    info->AccessPermanent() = GETrue;
-    // CopyFrom left the condition type at General (puppettalkdiag 23.10.); a trader's own option is Trade, and its NPC
-    // has trading switched on.
-    info->AccessConditionType() = static_cast<gEInfoCondType const&>(from->AccessConditionType());
-    info->AccessType() = static_cast<gEInfoType const&>(from->AccessType());
-    Entity body(puppet);
-    body.Dialog.TradeEnabled = GETrue;
-    gCInfoScript_PS* script = info->AccessInfoScript().GetObject();
-    Format(line, "PUPPETINFO id=%d puppet=%s by_name=%d info=%s added=%d cond_type=%d type=%d owner=%s lines=%d infos=%d has_info=%d trade=%d", id,
-              puppet->GetName().GetText(), Entity::GetEntity(bCString(own)).GetInstance() == puppet ? 1 : 0, name, added ? 1 : 0,
-              static_cast<int>(static_cast<gEInfoCondType const&>(info->AccessConditionType())),
-              static_cast<int>(static_cast<gEInfoType const&>(info->AccessType())), info->AccessOwner().GetText(),
-              script ? script->AccessInfoScriptLines().GetCount() : -1, manager->GetInfos().GetCount(), manager->HasInfos(puppet) ? 1 : 0,
-              body.Dialog.TradeEnabled ? 1 : 0);
-    log(line);
-}
-
-// QA (phase 2): trading switched on for player <id>'s puppet; the game then offers its own trade option (FILLER27, "Zeig mir
-// deine Ware!") and ENDE when the player addresses it (puppettalkdiag 23.10.).
-void PuppetTradeOn(char const* argument, LogFn log)
-{
-    char line[200];
-    eCEntity* puppet = PuppetOf(std::atoi(argument));
-    if (!puppet) { log("REFUSED puppettradeon: no such puppet"); return; }
-    Entity body(puppet);
-    body.Dialog.TradeEnabled = GETrue;
-    gCInfoManager_PS* manager = gCSession::GetInstance().IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr;
-    Format(line, "PUPPETTRADE id=%s name=%s trade=%d has_info=%d", argument, puppet->GetName().GetText(), body.Dialog.TradeEnabled ? 1 : 0,
-              manager && manager->HasInfos(puppet) ? 1 : 0);
-    log(line);
-}
-// QA negative controls of the play-evening fixes (27.10.): each switches its fix off (on: clientfameon).
-bool Switch(char const* action, LogFn log)
-{
-    if (!std::strcmp(action, "puppetnodropoff")) { puppetNoDrop = false; log("SWITCH puppetnodropoff ok=1"); return true; }
-    if (!std::strcmp(action, "puppetleadon")) { puppetLead = 1; log("SWITCH puppetleadon ok=1"); return true; }
-    if (!std::strcmp(action, "walklineon")) { walkLine = true; log("SWITCH walklineon ok=1"); return true; }
-    if (!std::strcmp(action, "puppetleadoff")) { puppetLead = 0; log("SWITCH puppetleadoff ok=1"); return true; }
-    if (!std::strcmp(action, "offsetwindowoff")) { body::offsetWindow = false; log("SWITCH offsetwindowoff ok=1"); return true; }
-    if (!std::strcmp(action, "goalaheadon")) { body::goalAhead = true; log("SWITCH goalaheadon ok=1"); return true; }
-    if (!std::strcmp(action, "staggereffectsoff")) { body::staggerEffects = false; log("SWITCH staggereffectsoff ok=1"); return true; }
-    if (!std::strcmp(action, "mirrorleadon")) { body::mirrorLead = true; log("SWITCH mirrorleadon ok=1"); return true; }
-    if (!std::strcmp(action, "leadoldon")) { body::leadOld = true; log("SWITCH leadoldon ok=1"); return true; }
-    if (!std::strcmp(action, "goalaheadoff")) { body::goalAhead = false; log("SWITCH goalaheadoff ok=1"); return true; }
-    return false;
 }
 }

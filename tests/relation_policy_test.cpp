@@ -153,17 +153,20 @@ int main()
             for (int currentSession = 0; currentSession <= 1; ++currentSession) {
                 for (int haveRecord = 0; haveRecord <= 1; ++haveRecord) {
                     for (int attitude = None; attitude <= 7; ++attitude) {
-                        bool const expected = mirrored != 0 && currentSession != 0 &&
-                                              haveRecord != 0 && attitude <= Panic;
-                        (void)expected;
-                        assert(MirrorAnswersFromHost(mirrored != 0, currentSession != 0,
-                                                     haveRecord != 0, static_cast<uint8_t>(attitude)) ==
-                               expected);
+                        for (int sharedValid = 0; sharedValid <= 1; ++sharedValid) {
+                            bool const expected = mirrored != 0 && currentSession != 0 &&
+                                                  haveRecord != 0 && sharedValid != 0 && attitude <= Panic;
+                            (void)expected;
+                            assert(MirrorAnswersFromHost(mirrored != 0, currentSession != 0,
+                                                         haveRecord != 0, static_cast<uint8_t>(attitude),
+                                                         sharedValid != 0) == expected);
+                        }
                     }
                 }
             }
         }
         assert(!MirrorAnswersFromHost(true, true, true, 0xFF));
+        assert(!MirrorAnswersFromHost(true, true, true, Hostile, false));
     }
 
     // Client diagnostics separate drift, unapplied host updates, and normal playback delay.

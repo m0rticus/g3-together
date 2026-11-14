@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "log.h"
+#include "symbols.h"
 
 #include <Windows.h>
 #include <atomic>
@@ -15,22 +16,27 @@ namespace {
 char path[MAX_PATH] = {};
 bool reportedFileError = false;
 std::mutex logMutex;
+std::atomic<DWORD> logOwner{0};
+
+void EmergencyLog(char const* text)
+{
+    if (!*path) return;
+    char emergency[320];
+    const int length = _snprintf_s(emergency, sizeof(emergency), _TRUNCATE, "%s\r\n", text);
+    HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(file, emergency, static_cast<DWORD>(length >= 0 ? length : std::strlen(emergency)), &written, nullptr);
+    CloseHandle(file);
+}
 }
 
 void OpenLog(const char* name)
 {
-    HMODULE self = nullptr;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(&OpenLog), &self) ||
-        !GetModuleFileNameA(self, path, MAX_PATH)) {
+    if (!symbols::GameDir(path)) {
         *path = '\0';
         return;
-    }
-    // <game dir>\scripts\Script_G3Together.dll -> <game dir>\<name>
-    for (int part = 0; part != 2; ++part) {
-        char* separator = std::strrchr(path, '\\');
-        if (!separator) { *path = '\0'; return; }
-        *separator = '\0';
     }
     if (strcat_s(path, "\\") || strcat_s(path, name)) *path = '\0';
     if (*path) Logf("SESSION START pid=%lu build=%s %s", GetCurrentProcessId(), __DATE__, __TIME__);
@@ -38,9 +44,28 @@ void OpenLog(const char* name)
 
 void Log(const char* text)
 {
-    std::lock_guard<std::mutex> lock(logMutex);
+    if (!text) text = "";
+    const DWORD tid = GetCurrentThreadId();
+    if (logOwner.load(std::memory_order_relaxed) == tid) {
+        EmergencyLog(text);
+        return;
+    }
+    std::unique_lock<std::mutex> lock(logMutex, std::try_to_lock);
+    const DWORD start = GetTickCount();
+    while (!lock.owns_lock() && GetTickCount() - start < 50) {
+        SwitchToThread();
+        lock.try_lock();
+    }
+    if (!lock.owns_lock()) {
+        EmergencyLog(text);
+        return;
+    }
+    logOwner.store(tid, std::memory_order_relaxed);
+    struct OwnerGuard {
+        ~OwnerGuard() { logOwner.store(0, std::memory_order_relaxed); }
+    } ownerGuard;
     if (!*path) return;
-    HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         if (!reportedFileError) {
             reportedFileError = true;
@@ -54,7 +79,7 @@ void Log(const char* text)
     GetLocalTime(&now);
     // A long text is cut off: sprintf_s and vsprintf_s end the game when the buffer is too small (stage E2 22.10.: a
     // trader's contents in one container line closed the client with 0xC0000409, no line written).
-    char line[16448];
+    thread_local char line[16448];
     int length = Format(line, "%04u-%02u-%02u %02u:%02u:%02u.%03u ", now.wYear, now.wMonth, now.wDay,
                         now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
     if (length > 0) {
@@ -70,7 +95,7 @@ void Log(const char* text)
 
 void Logf(const char* format, ...)
 {
-    char text[16384];
+    thread_local char text[16384];
     va_list args;
     va_start(args, format);
     // Truncate: vsprintf_s ends the process when the text does not fit (a trader's goods, Fable review 22.10.).
@@ -79,14 +104,9 @@ void Logf(const char* format, ...)
     Log(text);
 }
 
-namespace {
-std::atomic<bool> strict{false};  // QA negative control: formatstrict
-}
-
 int FormatV(char* out, size_t size, const char* format, va_list args)
 {
     if (!out || !size) return 0;
-    if (strict) return vsprintf_s(out, size, format, args);
     const int length = _vsnprintf_s(out, size, _TRUNCATE, format, args);
     return length >= 0 ? length : static_cast<int>(std::strlen(out));
 }
@@ -102,18 +122,12 @@ int Format(char* out, size_t size, const char* format, ...)
 
 void FormatProbe(char const* argument, FormatLogFn log)
 {
-    const int wanted = std::atoi(argument);
-    std::string text(wanted > 0 && wanted < 4096 ? wanted : 0, 'x');
-    char line[64];
-    const int length = Format(line, "FORMATPROBE %s", text.c_str());
-    char report[120];
-    Format(report, "FORMATPROBE wanted=%d written=%d strict=%d ok=1", wanted, length, strict ? 1 : 0);
-    log(report);
+    (void)argument;
+    if (log) log("FORMATPROBE unavailable");
 }
 
 void FormatStrict(FormatLogFn log)
 {
-    strict = true;
-    log("FORMATSTRICT ok=1 (lines too long for their buffer end the game, as before 26.10.)");
+    if (log) log("FORMATSTRICT unavailable");
 }
 }

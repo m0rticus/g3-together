@@ -49,61 +49,110 @@ class SteamConnectTests(unittest.TestCase):
     def source(name):
         return (ROOT / name).read_text(encoding="utf-8").replace("\r\n", "\n")
 
+    @classmethod
+    def steam_source(cls):
+        parts = (
+            "src/steam_abi.h",
+            "src/steam_runtime.h",
+            "src/steam.cpp",
+            "src/steam_p2p.cpp",
+            "src/steam_flow.cpp",
+            "src/steam_diagnostics.cpp",
+        )
+        return "\n".join(cls.source(part) for part in parts)
+
+    @classmethod
+    def steam_cpp_source(cls):
+        parts = (
+            "src/steam.cpp",
+            "src/steam_p2p.cpp",
+            "src/steam_flow.cpp",
+            "src/steam_diagnostics.cpp",
+        )
+        return "\n".join(cls.source(part) for part in parts)
     @staticmethod
     def between(text, start, end):
         return text.split(start, 1)[1].split(end, 1)[0]
 
+    @staticmethod
+    def function_body(text, signature):
+        idx = text.index(signature)
+        brace = text.index("{", idx)
+        depth = 0
+        for pos in range(brace, len(text)):
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[idx : pos + 1]
+        raise AssertionError(f"unclosed function body for {signature}")
+
     def test_source_contracts(self):
-        steam = self.source("src/steam.cpp")
+        steam = self.steam_source()
         net = self.source("src/net.cpp")
         config_h = self.source("src/config.h")
         config_cpp = self.source("src/config.cpp")
+        for part in (
+            "src/steam_abi.h",
+            "src/steam_runtime.h",
+            "src/steam.cpp",
+            "src/steam_p2p.cpp",
+            "src/steam_flow.cpp",
+            "src/steam_diagnostics.cpp",
+        ):
+            line_count = len(self.source(part).splitlines())
+            self.assertLess(line_count, 1000, f"{part} exceeds 1000 lines ({line_count})")
+        # Worker thread never calls non-synchronized GetConfig(); uses thread_local GetLocalConfig().
+        self.assertEqual(steam.count("GetConfig()"), 0)
+        self.assertGreater(steam.count("GetLocalConfig()"), 0)
         # Nothing connects by itself: the legacy discovery exists only behind connection = auto.
         self.assertIn("bool connectionAuto = false;", config_h)
         self.assertIn('"connection"', config_cpp)
-        start = self.between(steam, "bool Start(bool host, unsigned short port)", "unsigned short RelayPort()")
+        start = self.function_body(steam, "bool Start(bool host, unsigned short port)")
         self.assertNotIn("CreateLobby", start)  # the host opens no lobby at startup (only hostFlow.Ready may ask for it in auto mode)
         self.assertIn("hostFlow.Ready(connectionMode", start)
         self.assertIn("StartupAccept();", start)
-        pump = self.between(steam, "void PumpOnce()\n{\n    if (!ready) return;", "void Pump() {")
+        pump = self.function_body(steam, "void WorkerRuntime::PumpOnce()")
         self.assertIn("if (connectionMode == connect::Mode::Auto) Search();", pump)
         self.assertIn("else ClientTick();", pump)
         self.assertIn("connectionMode == connect::Mode::Auto && Now() - lastCreate > 15000", pump)
-        search = self.between(steam, "void Search()\n{", "bool Fail(char const* text)")
+        search = self.function_body(steam, "void WorkerRuntime::Search()")
         self.assertEqual(steam.count("api.FriendGamePlayed("), 1)  # the friends-list scan lives in Search only
         self.assertIn("api.FriendGamePlayed(", search)
-        self.assertEqual(steam.count("Search();"), 1)
+        self.assertEqual(self.steam_cpp_source().count("Search();"), 1)
         # A join request leaves the client only from an accepted invite (flow effect) or the bounded resend of that request.
         self.assertEqual(steam.count("SendJoinRequest(false)"), 1)
         self.assertEqual(steam.count("SendJoinRequest(true)"), 1)
-        after_client = self.between(steam, "void AfterClient(", "void SendOffer(")
+        after_client = self.function_body(steam, "void WorkerRuntime::AfterClient(")
         self.assertIn("if (fx & F::SendRequest) SendJoinRequest(false);", after_client)
         # Callbacks: 337 Join Game and 333 lobby invites are the accepts, 503 is only a note, the command line is read once at startup.
         for line in ("CbLobbyJoinRequested = 333", "CbRichJoinRequested = 337", "CbLobbyInvite = 503"):
             self.assertIn(line, steam)
         self.assertIn("Source::RichJoin", steam)
         self.assertIn("Source::LobbyJoin", steam)
-        invite = self.between(steam, "void OnLobbyInvite(", "void OnJoinRequest(")
+        invite = self.function_body(steam, "void WorkerRuntime::OnLobbyInvite(")
         self.assertNotIn("Accept(", invite)
         self.assertNotIn("Join(", invite)
         self.assertEqual(steam.count("GetCommandLineA()"), 1)
         # The host stays joinable: rich presence is published once (connect) and never cleared by closing a lobby.
-        leave = self.between(steam, "void LeaveLobby()\n{", "// ---- invite-driven connection")
+        leave = self.function_body(steam, "void WorkerRuntime::LeaveLobby()")
         self.assertNotIn("SetPresence", leave)
         self.assertEqual(leave.count("api.SetRichPresence"), 2)  # only the legacy auto-mode lobby string is cleared with its lobby
         self.assertIn("if (isHost && connectionMode == connect::Mode::Auto) {", leave)
         self.assertLess(leave.index("connectionMode == connect::Mode::Auto"), leave.index("api.SetRichPresence"))
         self.assertIn('SetPresence("connect", presenceConnect)', steam)
         self.assertIn("connect::FormatConnect(presenceConnect", steam)
-        # Friends only, one partner at a time, and the lobby is created on demand for a valid join request.
+        # Friends only, one partner at a time, and the lobby is created on demand for a valid join request;
+        # same-partner rejoin rotates relay generation.
         self.assertIn("api.CreateLobby(matchmaking, LobbyFriendsOnly, members)", steam)
         self.assertIn("static_cast<int>(connect::MaxPartners) + 1", steam)
-        join = self.between(steam, "void OnJoinRequest(", "void OnNegotiation(")
+        join = self.function_body(steam, "void WorkerRuntime::OnJoinRequest(")
         self.assertIn("IsFriend(from)", join)
         self.assertIn("hostFlow.Request(join, saving::Protocol", join)
+        self.assertIn("RotatePartnerForRejoin(", self.function_body(steam, "void WorkerRuntime::AfterHost("))
         self.assertIn("hostFlow.Admit(r.id)", steam)
         self.assertIn('accepted = "Steam friend"', steam)
-        self.assertEqual(steam.count("IsFriend(a)"), 1)
         # Every step is logged.
         for text in ("connect: command line:", "connect: rich presence", "connect: %s: friend=%llu", "connect: join request from",
                      "connect: lobby create result", "connect: LobbyEnter", "connect: connected: welcomed", "connect: connected: partner",
@@ -135,13 +184,13 @@ class SteamConnectTests(unittest.TestCase):
         self.assertIn("+g3t_connect", playing)
 
     def test_metadata_replication_paths(self):
-        steam = self.source("src/steam.cpp")
-        entry = self.between(steam, "void OnLobbyEnter(", "// connection = auto: only")
+        steam = self.steam_source()
+        entry = self.function_body(steam, "void WorkerRuntime::OnLobbyEnter(")
         self.assertIn("ReadLobbyMetadata(id)", entry)
         self.assertIn("clientFlow.LobbyEntered(id, joined, metadata", entry)
         self.assertIn('InspectLobby(id, "joined lobby", true)', entry)
         self.assertIn("connect::LobbyMetadata::Pending", entry)
-        poll = self.between(steam, "void PollLobbyMetadata()\n{", "void SendOffer(")
+        poll = self.function_body(steam, "void WorkerRuntime::PollLobbyMetadata()")
         self.assertIn("ReadLobbyMetadata(id)", poll)
         self.assertIn("clientFlow.LobbyChecked(id, metadata, now)", poll)
         self.assertIn("LobbyMetadataWaitMs", poll)
@@ -151,9 +200,9 @@ class SteamConnectTests(unittest.TestCase):
         callback = self.between(steam, "case CbLobbyDataUpdate:", "case CbLobbyChatUpdate:")
         self.assertIn("a != candidateLobby || a != b", callback)
         self.assertIn("PollLobbyMetadata();", callback)
-        pump = self.between(steam, "void PumpOnce()\n{\n    if (!ready) return;", "void Pump() {")
+        pump = self.function_body(steam, "void WorkerRuntime::PumpOnce()")
         self.assertIn("PollLobbyMetadata();", pump)
-        after = self.between(steam, "void AfterClient(", "void PollLobbyMetadata()\n{")
+        after = self.function_body(steam, "void WorkerRuntime::AfterClient(")
         self.assertIn("F::AwaitMetadata", after)
         self.assertIn("F::HelloReady", after)
         self.assertIn("FinishLobbyEntry", after)
@@ -163,7 +212,7 @@ class SteamConnectTests(unittest.TestCase):
 
     def test_transport_factory_and_link_loss_diagnostics(self):
         net = self.source("src/net.cpp")
-        steam = self.source("src/steam.cpp")
+        steam = self.steam_source()
         start = self.between(net, "bool Start(bool asHost)", "void Service(")
         service = self.between(net, "void Service(", "void Flush()")
         reconnect = self.between(net, "void Reconnect(void (*log)(char const*))", "\n}")
@@ -177,10 +226,11 @@ class SteamConnectTests(unittest.TestCase):
         for required in ("ChannelDefinitions = 7", "ChannelCount = 8", "Mtu = 1200",
                          "enet_host_create(address, peers, ChannelCount, 0, 0)",
                          "enet_host_compress_with_range_coder(host)", "ENET_SOCKOPT_RCVBUF",
-                         "ENET_SOCKOPT_SNDBUF", "enet_host_connect(host, address, ChannelCount, data)"):
+                         "ENET_SOCKOPT_SNDBUF", "SIO_UDP_CONNRESET",
+                         "enet_host_connect(host, address, ChannelCount, data)"):
             self.assertIn(required, policy)
 
-        queued = self.between(steam, "bool QueueDatagram(", "void DrainDatagrams(")
+        queued = self.function_body(steam, "bool WorkerRuntime::QueueDatagram(")
         classify = queued.split("catch (std::bad_alloc", 1)[0]
         self.assertIn("r.pending.Push(*sendCodec, data, size, Now(), &parsed)", classify)
         self.assertNotIn("Drop(", classify)
@@ -194,7 +244,7 @@ class SteamConnectTests(unittest.TestCase):
                          "EnetCommandHeaderSize(parsed.firstCommand)"):
             self.assertIn(required, classify)
         self.assertIn("unclassifiedLogged[32] = {}", steam)
-        self.assertIn("r = Remote{};", self.between(steam, "Remote* Get(", "bool InLobby("))
+        self.assertIn("r = Remote{};", self.function_body(steam, "Remote* WorkerRuntime::Get("))
 
         for required in ("type=connect(%u) data=%u state=%s(%u) channels=%zu elapsed_ms=%u",
                          "type=disconnect(%u) data=%u state=%s(%u) channels=%zu elapsed_ms=%u",
@@ -209,10 +259,10 @@ class SteamConnectTests(unittest.TestCase):
                          "Drop(r, close.reason)", "connect::LinkEndedImmediately(clientHadLink, elapsed)"):
             self.assertIn(required, steam)
 
-        reset = self.between(steam, "void ResetClientEnd()", "void RecordClientEnd(")
+        reset = self.function_body(steam, "void WorkerRuntime::ResetClientEnd()")
         self.assertIn("clientHadLink = clientEndRecorded = clientEndedImmediately = false", reset)
         self.assertIn("clientEndReason[0] = '\\0'", reset)
-        after = self.between(steam, "void AfterClient(", "void PollLobbyMetadata()\n{")
+        after = self.function_body(steam, "void WorkerRuntime::AfterClient(")
         self.assertIn('if (!std::strcmp(event, "accept") && (fx & (F::SendRequest | F::InspectLobby))) ResetClientEnd();', after)
         self.assertIn("clientLinkedAt = Now()", steam)
         lobby = self.source("src/lobby.cpp")

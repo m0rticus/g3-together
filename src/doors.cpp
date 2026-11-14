@@ -232,6 +232,7 @@ void OnState(uint8_t from, net::WorldState const& s)
         return;
     }
     if ((s.npcClass & Baseline) && (net::IsHost() || from != 1 || !story::AdmissionStarted())) return;
+    if (!(s.npcClass & Baseline) && (net::IsHost() ? !net::InWorld(from) : from != 1)) return;
     if (s.guard > 1 || s.alignment > 1 || !(s.npcClass & 3) || (s.npcClass & ~(Baseline | 3))) return;
     _GUID raw;
     std::memcpy(&raw, s.guid, 16);

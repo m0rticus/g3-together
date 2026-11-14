@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "npclease_wire.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -25,21 +27,6 @@ inline bool ReleasePending(bool released, int count, bool presented, uint32_t sh
 inline bool ReconcileLife(bool locallyDead, bool recordedDead, bool hostDead)
 {
     return !hostDead && (locallyDead || recordedDead);
-}
-
-inline uint8_t EncodePoseIntervalWire(uint32_t intervalMs)
-{
-    const uint32_t clamped = std::clamp(intervalMs, 16u, 4000u);
-    if (clamped <= 128u) return static_cast<uint8_t>(clamped);
-    const uint32_t steps = (clamped - 128u + 31u) / 32u;
-    return static_cast<uint8_t>((std::min)(255u, 128u + steps));
-}
-
-inline uint32_t DecodePoseIntervalWire(uint8_t wire)
-{
-    if (wire < 16u) return 0u;
-    if (wire <= 128u) return wire;
-    return 128u + static_cast<uint32_t>(wire - 128u) * 32u;
 }
 
 inline bool PresentationFresh(bool connected, bool released, uint32_t age, uint32_t interval)

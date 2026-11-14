@@ -4,15 +4,10 @@
 
 #include "log.h"
 #include "ai.h"
-#include "config.h"
-#include "net.h"
-#include "shutdown_policy.h"
+#include "symbols.h"
 #include <Game.h>
 #include <Windows.h>
 #include <DbgHelp.h>
-#include <TlHelp32.h>
-#include <intrin.h>
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -22,23 +17,10 @@
 namespace g3t::crashlog {
 namespace {
 bool installed = false, dumpInstalled = false;
-volatile bool probing = false;
 LONG logged = 0;
 std::atomic<char const*> lastEndStep{nullptr};
-worldentry::Progress entryOperation, entryGate;
-std::atomic<uint32_t> entryEpoch{0}, entryWelcome{0};
-worldentry::Reports entryReports;
-std::atomic<DWORD> entryThread{0};
 std::atomic<uint32_t> sampledSince{0};
 constexpr uint32_t MainSampleMs = 15000;
-struct CacheSnapshot {
-    std::atomic<uint32_t> count{0};
-    std::atomic<void const*> first{nullptr};
-};
-CacheSnapshot cacheSnapshots[static_cast<size_t>(CacheKind::Count)];
-char const* const cacheNames[] = {"cameras", "prefetchers", "private_entities", "spheres", "anchors",
-                                 "native_range", "puppets", "disabled", "summon_records", "npc_lease_records"};
-static_assert(std::size(cacheNames) == std::size(cacheSnapshots), "cache inventory names");
 
 void LogEndStep()
 {
@@ -61,148 +43,13 @@ LONG dumps = 0;
 constexpr LONG MaxFirstChanceDumps = 2;
 LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
 PVOID vectoredHandler = nullptr;
-HANDLE watchdogCancel = nullptr, watchdogThreadHandle = nullptr;
-std::atomic<bool> preShutdownFinished{false}, fastExitReady{false};
-std::atomic<uint32_t> preShutdownAt{0};
-struct GraphicsSites {
-    DWORD thread = 0;
-    uintptr_t nativeWait = 0;
-    uint32_t conditionReturn = 0, driverReturn = 0, deviceReturn = 0;
-};
-GraphicsSites graphicsSites;
-shutdown::GraphicsWait lastGraphicsWait;
-bool lastGraphicsMatched = false;
-char const* lastGraphicsSample = "not sampled";
-DWORD lastGraphicsError = 0;
-bool stageWorld = false, stageForget = false, stageSteam = false, stageHooks = false;
-bool stageThreads = false, stagePreShutdown = false, stageShutdownCalled = false;
 
-bool ReadMemory(uintptr_t address, void* bytes, size_t size)
-{
-    SIZE_T read = 0;
-    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), bytes, size, &read) &&
-           read == size;
-}
-
-GraphicsSites FindGraphicsSites()
-{
-    GraphicsSites sites;
-    sites.thread = GetCurrentThreadId();
-    HMODULE engine = GetModuleHandleA("Engine.dll"), driver = GetModuleHandleA("AMDXN32.DLL");
-    HMODULE kernel = GetModuleHandleA("KERNELBASE.dll"), native = GetModuleHandleA("ntdll.dll");
-    const auto device = reinterpret_cast<uintptr_t>(GetProcAddress(engine, "??1eCDX9Device@@UAE@XZ"));
-    const auto condition = reinterpret_cast<uintptr_t>(GetProcAddress(kernel, "SleepConditionVariableCS"));
-    const auto wait = reinterpret_cast<uintptr_t>(GetProcAddress(native, "NtWaitForAlertByThreadId"));
-    uint8_t deviceCode[15]{}, driverCode[18]{}, conditionCode[34]{}, waitCode[15]{};
-    const uintptr_t driverSite = reinterpret_cast<uintptr_t>(driver) + 0x2cad4;
-    uintptr_t conditionImport = 0;
-    if (!engine || !driver || !kernel || !native || !device || !condition || !wait ||
-        !ReadMemory(device + 0x317, deviceCode, sizeof(deviceCode)) ||
-        !shutdown::DeviceReleaseSite(deviceCode, sizeof(deviceCode)) ||
-        !ReadMemory(driverSite, driverCode, sizeof(driverCode)) ||
-        !shutdown::DriverWaitSite(driverCode, sizeof(driverCode)) ||
-        !ReadMemory(condition, conditionCode, sizeof(conditionCode)) ||
-        conditionCode[0x1a] != 0xff || conditionCode[0x1b] != 0x15 ||
-        conditionCode[0x20] != 0x8b || conditionCode[0x21] != 0xf0 ||
-        !ReadMemory(wait, waitCode, sizeof(waitCode)) ||
-        waitCode[0] != 0xb8 || waitCode[0xc] != 0xc2 || waitCode[0xd] != 8 || waitCode[0xe] != 0) {
-        Log("shutdown watchdog: native graphics signatures unsupported; diagnostic-only");
-        return sites;
-    }
-    uint32_t importSlot = 0;
-    std::memcpy(&importSlot, driverCode + 9, sizeof(importSlot));
-    if (!ReadMemory(importSlot, &conditionImport, sizeof(conditionImport)) || conditionImport != condition) {
-        Log("shutdown watchdog: AMD condition import differs; diagnostic-only");
-        return sites;
-    }
-    sites.nativeWait = wait;
-    sites.conditionReturn = static_cast<uint32_t>(condition + 0x20);
-    sites.driverReturn = static_cast<uint32_t>(driverSite + 13);
-    sites.deviceReturn = static_cast<uint32_t>(device + 0x322);
-    Logf("shutdown watchdog: native graphics wait verified thread=%lu device_return=%08x driver_return=%08x",
-         sites.thread, sites.deviceReturn, sites.driverReturn);
-    return sites;
-}
-
-bool SampleGraphicsWait(shutdown::GraphicsWait& wait)
-{
-    lastGraphicsError = 0;
-    lastGraphicsSample = "unsupported signatures";
-    if (!graphicsSites.nativeWait) return false;
-    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, graphicsSites.thread);
-    if (!thread) {
-        lastGraphicsSample = "OpenThread failed";
-        lastGraphicsError = GetLastError();
-        return false;
-    }
-    const DWORD suspended = SuspendThread(thread);
-    if (suspended == static_cast<DWORD>(-1)) {
-        lastGraphicsSample = "SuspendThread failed";
-        lastGraphicsError = GetLastError();
-        CloseHandle(thread);
-        return false;
-    }
-    CONTEXT context{};
-    context.ContextFlags = CONTEXT_FULL;
-    uint32_t stack[1024]{}, objectWords[22]{};
-    SIZE_T read = 0;
-    const bool captured = GetThreadContext(thread, &context) != FALSE;
-    lastGraphicsSample = captured ? "outside verified native wait" : "GetThreadContext failed";
-    if (!captured) lastGraphicsError = GetLastError();
-    bool matched = !suspended && captured && context.Eip == graphicsSites.nativeWait + 0xc;
-    if (suspended) lastGraphicsSample = "thread was already suspended";
-    if (matched) {
-        const BOOL stackRead = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
-                                                 stack, sizeof(stack), &read);
-        if (!stackRead) lastGraphicsError = GetLastError();
-        const uint32_t object = shutdown::WaitingObject(stack, read / sizeof(stack[0]),
-            graphicsSites.conditionReturn, graphicsSites.driverReturn, graphicsSites.deviceReturn);
-        lastGraphicsSample = object ? "driver counters unreadable" : "nested wait stack not matched";
-        matched = object && ReadMemory(object, objectWords, sizeof(objectWords));
-        if (matched) {
-            lastGraphicsSample = "verified native graphics wait";
-            wait = {object, objectWords[0x48 / 4], objectWords[0x50 / 4], objectWords[0x54 / 4]};
-        } else if (object) {
-            lastGraphicsError = GetLastError();
-        }
-    }
-    // No logging, allocation, engine access or termination while the main thread is suspended.
-    const DWORD resumed = ResumeThread(thread);
-    const DWORD error = resumed == static_cast<DWORD>(-1) ? GetLastError() : 0;
-    CloseHandle(thread);
-    if (resumed == static_cast<DWORD>(-1)) {
-        Logf("shutdown watchdog: main thread resume failed error=%lu; fast exit disabled", error);
-        lastGraphicsSample = "ResumeThread failed";
-        lastGraphicsError = error;
-        fastExitReady.store(false);
-        return false;
-    }
-    return matched;
-}
-
-void DeriveDumpDir()
+void EnsureDumpDir()
 {
     if (*dumpDir) return;
-    HMODULE self = nullptr;
-    char path[MAX_PATH] = {};
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(&DeriveDumpDir), &self) &&
-        GetModuleFileNameA(self, path, MAX_PATH)) {
-        for (int part = 0; part != 2; ++part) {
-            char* slash = std::strrchr(path, '\\');
-            if (!slash) { *path = '\0'; break; }
-            *slash = '\0';
-        }
-    }
-    if (!*path) {
-        if (!GetCurrentDirectoryA(MAX_PATH, dumpDir)) dumpDir[0] = '\0';
-    } else {
-        strcpy_s(dumpDir, path);
-    }
-    if (*dumpDir) {
-        size_t length = std::strlen(dumpDir);
-        if (length && dumpDir[length - 1] != '\\') strcat_s(dumpDir, "\\");
-    }
+    if (!symbols::GameDir(dumpDir) && !GetCurrentDirectoryA(MAX_PATH, dumpDir)) dumpDir[0] = '\0';
+    const size_t length = std::strlen(dumpDir);
+    if (length && dumpDir[length - 1] != '\\') strcat_s(dumpDir, "\\");
 }
 
 bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception)
@@ -227,10 +74,19 @@ bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception)
         char const* name;
     };
     const Profile profiles[] = {{detailed, "detailed"}, {legacyRich, "legacy-rich"}, {MiniDumpNormal, "normal"}};
+    struct DeferredRetry { char const* failed; char const* next; DWORD error; } retries[2]{};
+    size_t retryCount = 0;
+    auto logRetries = [&]() {
+        for (size_t j = 0; j < retryCount; ++j)
+            Logf("crashlog: crash dump profile=%s unsupported error=%lu; retrying %s",
+                 retries[j].failed, retries[j].error, retries[j].next);
+        retryCount = 0;
+    };
     // The game ships dbghelp 5.2: only unsupported flags permit a more compatible profile.
     for (size_t i = 0; i != std::size(profiles); ++i) {
-        if (i && !rewind()) return false;
+        if (i && !rewind()) { logRetries(); return false; }
         if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, profiles[i].type, exception, nullptr, nullptr)) {
+            logRetries();
             Logf("crashlog: crash dump success profile=%s type=%lu", profiles[i].name,
                  static_cast<unsigned long>(profiles[i].type));
             return true;
@@ -238,13 +94,14 @@ bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception)
         DWORD error = GetLastError();
         if (error == ERROR_INVALID_PARAMETER || error == static_cast<DWORD>(E_INVALIDARG)) {
             if (i + 1 == std::size(profiles)) {
+                logRetries();
                 Logf("crashlog: crash dump profile=%s unsupported error=%lu", profiles[i].name, error);
                 break;
             }
-            Logf("crashlog: crash dump profile=%s unsupported error=%lu; retrying %s",
-                 profiles[i].name, error, profiles[i + 1].name);
+            retries[retryCount++] = {profiles[i].name, profiles[i + 1].name, error};
             continue;
         }
+        logRetries();
         Logf("crashlog: crash dump write failed profile=%s error=%lu", profiles[i].name, error);
         return false;
     }
@@ -338,8 +195,8 @@ LONG WINAPI LastChance(EXCEPTION_POINTERS* info)
 {
     if (ai::ShuttingDown() || GetCurrentThreadId() == dumpWorkerThreadId)
         return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
-    LogEndStep();
     if (InterlockedIncrement(&dumps) <= 4) Dump(info);
+    LogEndStep();
     return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -347,7 +204,7 @@ void InstallDumps()
 {
     if (dumpInstalled) return;
     dumpInstalled = true;
-    DeriveDumpDir();
+    EnsureDumpDir();
     if (!*dumpDir) { Log("crashlog: no minidumps (game directory unavailable)"); return; }
     HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
     writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
@@ -368,10 +225,6 @@ struct Module {
 Module modules[] = {{"Gothic3.exe"}, {"Engine.dll"}, {"Game.dll"}, {"Script.dll"}, {"Script_Game.dll"}, {"SharedBase.dll"},
                     {"Script_G3Together.dll"}, {"Script_paru.dll"}};
 
-// Function names in crash lines (29.10.): the nearest export at or below the address, for Script_Game.dll also the scripts
-// the game registered (most of them are not exported). Mangled names are undecorated by dbghelp, loaded at install time.
-bool names = true;  // QA crashnamesoff: module+RVA only
-unsigned named = 0;
 using UndecorateFn = DWORD(WINAPI*)(PCSTR, PSTR, DWORD, DWORD);
 UndecorateFn undecorate = nullptr;
 constexpr DWORD UndnameNameOnly = 0x1000;  // UNDNAME_NAME_ONLY
@@ -565,6 +418,8 @@ void FindModules()
     FindKnownSymbols();
 }
 
+}
+
 // "Module+rva" for an address in one of the modules, else nothing; for the game's modules with " (Function+offset)".
 bool Where(uintptr_t address, char* out, size_t size)
 {
@@ -572,7 +427,7 @@ bool Where(uintptr_t address, char* out, size_t size)
         if (m.base && address >= m.base && address < m.base + m.size) {
             const uintptr_t rva = address - m.base;
             int length = Format(out, size, "%s+%#x", m.name, static_cast<unsigned>(rva));
-            if (!names || !Executable(m, rva)) return true;
+            if (!Executable(m, rva)) return true;
             uintptr_t start = 0, exportStart = 0, scriptStart = 0;
             char const* name = NearestKnownSymbol(m, rva, &start);
             char const* kind = name ? "nearest known symbol" : nullptr;
@@ -591,12 +446,32 @@ bool Where(uintptr_t address, char* out, size_t size)
             char plain[160];
             if (*name == '?' && undecorate && undecorate(name, plain, sizeof(plain), UndnameNameOnly)) name = plain;
             Format(out + length, size - length, " (%s %s+%#x)", kind, name, static_cast<unsigned>(rva - start));
-            ++named;
             return true;
         }
     return false;
 }
 
+bool WriteProcessDump(char const* path)
+{
+    if (!writeDump) {
+        HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+        writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    }
+    if (!writeDump) {
+        Log("shutdown watchdog: dmp write failed (MiniDumpWriteDump unavailable)");
+        return false;
+    }
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        Logf("shutdown watchdog: dmp create failed error=%lu", GetLastError());
+        return false;
+    }
+    const bool ok = WriteDump(file, nullptr);
+    CloseHandle(file);
+    return ok;
+}
+
+namespace {
 LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
 {
     if (ai::ShuttingDown()) return EXCEPTION_CONTINUE_SEARCH;
@@ -612,9 +487,9 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     // Drivers can handle their own first-chance exceptions. Dumping those may block graphics teardown.
     // Unhandled exceptions from any module still reach LastChance.
     if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
-    LogEndStep();
-    if (!probing && GetCurrentThreadId() != dumpWorkerThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps)
+    if (GetCurrentThreadId() != dumpWorkerThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps)
         Dump(info);  // before anything
+    LogEndStep();
     // that could fault again
     if (InterlockedIncrement(&logged) > 12) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT const& c = *info->ContextRecord;
@@ -625,375 +500,69 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
               static_cast<unsigned long>(info->ExceptionRecord->ExceptionInformation[1]), c.Eax, c.Ebx, c.Ecx, c.Edx, c.Esi, c.Edi, c.Esp,
               c.Ebp, GetCurrentThreadId());
     Log(line);
-    // Return addresses (and other code pointers) on the stack, nearest first. Log() keeps about 1000 characters of a line,
-    // so a long stack goes on "CRASH stack+" lines.
+    // Return addresses (and other code pointers) on the stack, nearest first. Read via ReadProcessMemory so guard pages cannot fault.
     char stack[3000] = "CRASH stack";
     size_t lineStart = 0;
     int found = 0;
-    auto const* top = reinterpret_cast<uintptr_t const*>(c.Esp);
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(top, &mbi, sizeof(mbi))) {
-        const uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        for (int i = 0; i < 4096 && found < 32 && reinterpret_cast<uintptr_t>(top + i) + sizeof(uintptr_t) <= end; ++i) {
-            char where[240];
-            if (!Where(top[i], where, sizeof(where))) continue;
-            const size_t need = std::strlen(where) + 2;
-            size_t length = std::strlen(stack + lineStart);
-            if (length + need >= 1000) {  // this line is full: log it, the next one starts behind it
-                if (lineStart + length + 1 + 16 + need >= sizeof(stack)) break;
-                Log(stack + lineStart);
-                lineStart += length + 1;
-                strcpy_s(stack + lineStart, sizeof(stack) - lineStart, "CRASH stack+");
-                length = std::strlen(stack + lineStart);
-            }
-            if (lineStart + length + need >= sizeof(stack)) break;
-            strcat_s(stack + lineStart, sizeof(stack) - lineStart, " ");
-            strcat_s(stack + lineStart, sizeof(stack) - lineStart, where);
-            ++found;
+    for (int i = 0; i < 4096 && found < 32; ++i) {
+        uintptr_t candidate = 0;
+        if (!symbols::ReadMemory(static_cast<uintptr_t>(c.Esp) + static_cast<size_t>(i) * sizeof(uintptr_t),
+                                 &candidate, sizeof(candidate)))
+            break;
+        char where[240];
+        if (!Where(candidate, where, sizeof(where))) continue;
+        const size_t need = std::strlen(where) + 2;
+        size_t length = std::strlen(stack + lineStart);
+        if (length + need >= 1000) {
+            if (lineStart + length + 1 + 16 + need >= sizeof(stack)) break;
+            Log(stack + lineStart);
+            lineStart += length + 1;
+            strcpy_s(stack + lineStart, sizeof(stack) - lineStart, "CRASH stack+");
+            length = std::strlen(stack + lineStart);
         }
+        if (lineStart + length + need >= sizeof(stack)) break;
+        strcat_s(stack + lineStart, sizeof(stack) - lineStart, " ");
+        strcat_s(stack + lineStart, sizeof(stack) - lineStart, where);
+        ++found;
     }
     Log(stack + lineStart);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// QA crashprobe: an access violation inside Engine.dll that is caught here (the vectored handler logs it first).
-__declspec(noinline) void TouchBadEntity()
+void SampleThread(DWORD id, symbols::ThreadSample& sample)
 {
-    bCVector position;
-    reinterpret_cast<eCEntity const*>(0x10)->GetWorldPosition(position);
-}
-
-int ProbeFault()
-{
-    __try {
-        TouchBadEntity();
-        return 0;
-    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        return 1;
-    }
-}
-
-struct WatchdogModule {
-    DWORD_PTR base;
-    DWORD_PTR size;
-    char path[MAX_PATH];
-};
-
-bool WriteText(HANDLE file, char const* text)
-{
-    if (file == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const size_t length = std::strlen(text);
-    return length == 0 || (WriteFile(file, text, static_cast<DWORD>(length), &written, nullptr) && written == length);
-}
-
-void WatchdogWhere(WatchdogModule const* watchModules, unsigned count, DWORD_PTR address, char* out, size_t size)
-{
-    for (unsigned i = 0; i < count; ++i)
-        if (address >= watchModules[i].base && address < watchModules[i].base + watchModules[i].size) {
-            Format(out, size, "%08IX +%08IX", watchModules[i].base, address - watchModules[i].base);
-            char const* slash = std::strrchr(watchModules[i].path, '\\');
-            char suffix[MAX_PATH];
-            Format(suffix, "%s", slash ? slash + 1 : watchModules[i].path);
-            strcat_s(out, size, " ");
-            strcat_s(out, size, suffix);
-            return;
-        }
-    Format(out, size, "unknown");
-}
-
-void WriteWatchdogText(char const* path)
-{
-    HANDLE text = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (text == INVALID_HANDLE_VALUE) {
-        Logf("shutdown watchdog: text create failed error=%lu", GetLastError());
-        return;
-    }
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    char line[1024];
-    Format(line, "G3 Together shutdown watchdog\nUTC/local %02u:%02u:%02u process=%lu watchdog_thread=%lu\n",
-           now.wHour, now.wMinute, now.wSecond, GetCurrentProcessId(), GetCurrentThreadId());
-    WriteText(text, line);
-
-    Format(line, "SHUTDOWN_THREAD id=%lu cleanup_complete=%d fast_exit_eligible=%d graphics_supported=%d\n"
-                 "GRAPHICS_WAIT matched=%d object=%08x completed=%u produced=%u retired=%u\n"
-                 "GRAPHICS_SAMPLE status=%s error=%lu\n"
-                 "STACK_NOTE candidate_word entries are raw stack values, not unwound frames\n",
-           graphicsSites.thread, preShutdownFinished.load() ? 1 : 0, fastExitReady.load() ? 1 : 0,
-           graphicsSites.nativeWait ? 1 : 0, lastGraphicsMatched ? 1 : 0, lastGraphicsWait.object,
-           lastGraphicsWait.completed, lastGraphicsWait.produced, lastGraphicsWait.retired,
-           lastGraphicsSample, lastGraphicsError);
-    WriteText(text, line);
-
-    WatchdogModule watchModules[128] = {};
-    unsigned moduleCount = 0;
-    HANDLE moduleSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (moduleSnapshot != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32 module{};
-        module.dwSize = sizeof(module);
-        if (Module32First(moduleSnapshot, &module)) {
-            do {
-                if (moduleCount >= std::size(watchModules)) break;
-                watchModules[moduleCount].base = reinterpret_cast<DWORD_PTR>(module.modBaseAddr);
-                watchModules[moduleCount].size = module.modBaseSize;
-                strncpy_s(watchModules[moduleCount].path, module.szExePath, _TRUNCATE);
-                ++moduleCount;
-                Format(line, "MODULE base=%08IX size=%08IX path=%s\n",
-                       reinterpret_cast<DWORD_PTR>(module.modBaseAddr), static_cast<DWORD_PTR>(module.modBaseSize), module.szExePath);
-                WriteText(text, line);
-            } while (Module32Next(moduleSnapshot, &module));
-        }
-        CloseHandle(moduleSnapshot);
-    } else {
-        WriteText(text, "MODULE_INVENTORY failed=CreateToolhelp32Snapshot\n");
-    }
-
-    CONTEXT selfContext{};
-    selfContext.ContextFlags = CONTEXT_FULL;
-    RtlCaptureContext(&selfContext);
-    Format(line, "WATCHDOG_THREAD id=%lu EIP=%08lX ESP=%08lX EBP=%08lX (captured without suspension)\n",
-           GetCurrentThreadId(), selfContext.Eip, selfContext.Esp, selfContext.Ebp);
-    WriteText(text, line);
-    if (selfContext.Eip) {
-        char where[300];
-        WatchdogWhere(watchModules, moduleCount, selfContext.Eip, where, sizeof(where));
-        Format(line, "WATCHDOG_THREAD id=%lu frame=eip address=%08lX module+offset=%s\n",
-               GetCurrentThreadId(), selfContext.Eip, where);
-        WriteText(text, line);
-    }
-
-    HANDLE threadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (threadSnapshot == INVALID_HANDLE_VALUE) {
-        WriteText(text, "THREAD_INVENTORY failed=CreateToolhelp32Snapshot\n");
-        CloseHandle(text);
-        return;
-    }
-    THREADENTRY32 thread{};
-    thread.dwSize = sizeof(thread);
-    if (Thread32First(threadSnapshot, &thread)) {
-        do {
-            if (thread.th32OwnerProcessID != GetCurrentProcessId()) continue;
-            const DWORD tid = thread.th32ThreadID;
-            if (tid == GetCurrentThreadId()) continue;
-            HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
-            if (!handle) {
-                Format(line, "THREAD id=%lu CONTEXT failed=OpenThread error=%lu\n", tid, GetLastError());
-                WriteText(text, line);
-                continue;
-            }
-            DWORD suspended = SuspendThread(handle);
-            if (suspended == static_cast<DWORD>(-1)) {
-                Format(line, "THREAD id=%lu CONTEXT failed=SuspendThread error=%lu\n", tid, GetLastError());
-                WriteText(text, line);
-                CloseHandle(handle);
-                continue;
-            }
-            CONTEXT context{};
-            context.ContextFlags = CONTEXT_FULL;
-            if (!GetThreadContext(handle, &context)) {
-                Format(line, "THREAD id=%lu CONTEXT failed=GetThreadContext error=%lu\n", tid, GetLastError());
-                WriteText(text, line);
-            } else {
-                Format(line, "THREAD id=%lu EIP=%08lX ESP=%08lX EBP=%08lX\n",
-                       tid, context.Eip, context.Esp, context.Ebp);
-                WriteText(text, line);
-
-                char where[300];
-                WatchdogWhere(watchModules, moduleCount, context.Eip, where, sizeof(where));
-                Format(line, "THREAD id=%lu frame=eip address=%08lX module+offset=%s\n", tid, context.Eip, where);
-                WriteText(text, line);
-
-                unsigned char stackBytes[4096];
-                SIZE_T read = 0;
-                if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
-                                      stackBytes, sizeof(stackBytes), &read) && read >= sizeof(DWORD)) {
-                    unsigned frame = 0;
-                    for (SIZE_T i = 0; i + sizeof(DWORD) <= read && frame < 64; i += sizeof(DWORD)) {
-                        DWORD_PTR address;
-                        std::memcpy(&address, stackBytes + i, sizeof(DWORD));
-                        WatchdogWhere(watchModules, moduleCount, address, where, sizeof(where));
-                        if (!std::strcmp(where, "unknown")) continue;
-                        Format(line, "THREAD id=%lu candidate_word=%u address=%08IX module+offset=%s\n",
-                               tid, static_cast<unsigned>(i / sizeof(DWORD)), address, where);
-                        ++frame;
-                        WriteText(text, line);
-                    }
-                }
-
-                DWORD ebp = context.Ebp;
-                unsigned ebpFrame = 0;
-                for (unsigned i = 0; i < 32 && ebp; ++i) {
-                    DWORD pair[2] = {};
-                    SIZE_T got = 0;
-                    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(ebp),
-                                            pair, sizeof(pair), &got) || got != sizeof(pair))
-                        break;
-                    if (!pair[1]) break;
-                    WatchdogWhere(watchModules, moduleCount, pair[1], where, sizeof(where));
-                    if (!std::strcmp(where, "unknown")) { ebp = pair[0]; continue; }
-                    Format(line, "THREAD id=%lu ebp-frame=%u address=%08lX module+offset=%s\n",
-                           tid, ebpFrame++, pair[1], where);
-                    WriteText(text, line);
-                    if (!pair[0] || pair[0] == ebp) break;
-                    ebp = pair[0];
-                }
-            }
-            const DWORD resumed = ResumeThread(handle);
-            if (resumed == static_cast<DWORD>(-1)) {
-                Format(line, "THREAD id=%lu RESUME failed=ResumeThread error=%lu\n", tid, GetLastError());
-                WriteText(text, line);
-            }
-            CloseHandle(handle);
-        } while (Thread32Next(threadSnapshot, &thread));
-    }
-    CloseHandle(threadSnapshot);
-    CloseHandle(text);
-}
-
-void WriteWatchdogDump(char const* path)
-{
-    if (!writeDump) {
-        HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-        writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
-    }
-    if (!writeDump) {
-        Log("shutdown watchdog: dmp write failed (MiniDumpWriteDump unavailable)");
-        return;
-    }
-    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        Logf("shutdown watchdog: dmp create failed error=%lu", GetLastError());
-        return;
-    }
-    WriteDump(file, nullptr);
-    CloseHandle(file);
-}
-
-DWORD WINAPI WatchdogThread(LPVOID)
-{
-    const uint32_t began = GetTickCount();
-    shutdown::ExitPolicy exit;
-    for (;;) {
-        const DWORD result = WaitForSingleObject(watchdogCancel, shutdown::PollMs);
-        if (result == WAIT_OBJECT_0) return 0;
-        if (result != WAIT_TIMEOUT) {
-            Logf("shutdown watchdog: wait failed error=%lu", GetLastError());
-            return 0;
-        }
-        const uint32_t now = GetTickCount();
-        const bool finished = preShutdownFinished.load();
-        const uint32_t finishedAt = preShutdownAt.load();
-        lastGraphicsMatched = finished && fastExitReady.load() && SampleGraphicsWait(lastGraphicsWait);
-        if (exit.Observe(now, finished && fastExitReady.load(), finishedAt, lastGraphicsMatched, lastGraphicsWait)) {
-            Logf("shutdown: native DX9/AMD Release stalled after cleanup thread=%lu object=%08x "
-                 "completed=%u target=%u; exiting process without DLL detach",
-                 graphicsSites.thread, lastGraphicsWait.object, lastGraphicsWait.completed,
-                 lastGraphicsWait.produced - lastGraphicsWait.retired);
-            // ExitProcess runs DLL detach, which can wait on a driver lock held by
-            // a terminated thread. Our world/save/transport cleanup already returned.
-            if (!TerminateProcess(GetCurrentProcess(), 0)) {
-                Logf("shutdown: native graphics fast exit failed error=%lu; retaining hang diagnostics", GetLastError());
-                fastExitReady.store(false);
-            }
-        }
-        if (now - (finished ? finishedAt : began) >= shutdown::DiagnosticMs) break;
-    }
-    LogCacheInventory("shutdown watchdog");
-    DeriveDumpDir();
-    if (!*dumpDir) {
-        Log("shutdown watchdog: write failed (game directory unavailable)");
-        return 0;
-    }
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    char base[MAX_PATH + 64];
-    Format(base, "%sg3together-hang-%02u%02u%02u", dumpDir, now.wHour, now.wMinute, now.wSecond);
-    char dmp[MAX_PATH + 64], txt[MAX_PATH + 64];
-    Format(dmp, "%s.dmp", base);
-    Format(txt, "%s.txt", base);
-    WriteWatchdogDump(dmp);
-    WriteWatchdogText(txt);
-    Logf("shutdown watchdog: files=%s ; %s", dmp, txt);
-    return 0;
-}
-}
-
-void WorldEntryWait(char const* step)
-{
-    if (GetConfig().host || ai::ShuttingDown()) return;
-    entryEpoch.store(net::WorldEpoch());
-    entryWelcome.store(net::WelcomeSerial());
-    const auto previous = entryGate.Set(step, GetTickCount());
-    if (!step && previous.name)
-        Logf("world-entry: complete epoch=%08x welcome=%u", entryEpoch.load(), entryWelcome.load());
-}
-
-WorldEntryScope::WorldEntryScope(char const* operation)
-{
-    active = !GetConfig().host && !ai::ShuttingDown() && entryGate.Read().name;
-    if (active) {
-        entryThread.store(GetCurrentThreadId());
-        previous = entryOperation.Set(operation, GetTickCount());
-    }
-}
-
-WorldEntryScope::~WorldEntryScope()
-{
-    Complete();
-}
-
-void WorldEntryScope::Complete()
-{
-    if (!active) return;
-    entryOperation.Restore(previous);
-    active = false;
-}
-
-namespace {
-struct MainSample {
-    uintptr_t eip = 0, esp = 0, ebp = 0;
-    uintptr_t words[256] = {};
-    unsigned count = 0;
-    bool ok = false;
-};
-
-bool CopyStackWords(uintptr_t esp, MainSample& sample)
-{
-    __try {
-        auto const* source = reinterpret_cast<uintptr_t const*>(esp);
-        for (; sample.count < std::size(sample.words); ++sample.count) sample.words[sample.count] = source[sample.count];
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-    return sample.count != 0;
-}
-
-// Suspended only long enough to copy registers and stack words: no allocation, lock or logging while it is stopped.
-void SampleThread(DWORD id, MainSample& sample)
-{
+    sample = symbols::ThreadSample{};
     HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id);
-    if (!thread) return;
-    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
-        CONTEXT context{};
-        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        if (GetThreadContext(thread, &context)) {
-            sample.eip = context.Eip;
-            sample.esp = context.Esp;
-            sample.ebp = context.Ebp;
-            sample.ok = CopyStackWords(context.Esp, sample);
-        }
-        ResumeThread(thread);
+    if (!thread) { sample.openError = GetLastError(); return; }
+    if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+        sample.suspendError = GetLastError();
+        CloseHandle(thread);
+        return;
     }
+    sample.suspended = true;
+    CONTEXT context{};
+    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    sample.contextOk = GetThreadContext(thread, &context) != FALSE;
+    if (sample.contextOk) {
+        sample.eip = context.Eip;
+        sample.esp = context.Esp;
+        sample.ebp = context.Ebp;
+        symbols::CopyRemoteStackWords(sample.esp, sample.words, sample.count);
+        sample.ok = true;
+    } else sample.contextError = GetLastError();
+    sample.resumed = ResumeThread(thread) != static_cast<DWORD>(-1);
+    if (!sample.resumed) sample.resumeError = GetLastError();
     CloseHandle(thread);
 }
 
 // A native call that never returns leaves no dump (a hang is not a crash): say where the main thread is standing.
 void LogMainThread(char const* operation)
 {
-    const DWORD id = entryThread.load();
-    MainSample sample;
+    WorldEntryState state;
+    const DWORD id = ReadWorldEntry(state) ? static_cast<DWORD>(state.threadId) : 0;
+    symbols::ThreadSample sample;
     if (id) SampleThread(id, sample);
-    if (!sample.ok) {
+    if (!sample.ok || !sample.resumed) {
         Logf("world-entry: main thread stack unavailable operation=%s thread=%lu", operation ? operation : "-", id);
         return;
     }
@@ -1013,86 +582,22 @@ void LogMainThread(char const* operation)
 
 void PollWorldEntry()
 {
-    worldentry::Step gate, operation;
-    if (!entryGate.Read(gate) || !gate.name || !entryOperation.Read(operation)) return;
+    WorldEntryState state;
+    if (!ReadWorldEntry(state)) return;
+    const auto& gate = state.gate;
+    const auto& operation = state.operation;
     const uint32_t now = GetTickCount();
     if (operation.name && now - operation.since >= MainSampleMs && sampledSince.exchange(operation.since) != operation.since)
         LogMainThread(operation.name);
-    if (!entryReports.Due(now, operation, gate)) return;
+    if (!WorldEntryReportDue(now, operation, gate)) return;
     Logf("world-entry: still waiting for %s for %u s; operation=%s operation_ms=%u epoch=%08x welcome=%u",
          gate.name, (now - gate.since) / 1000, operation.name ? operation.name : "engine outside mod",
-         operation.name ? now - operation.since : 0, entryEpoch.load(), entryWelcome.load());
+         operation.name ? now - operation.since : 0, state.epoch, state.welcome);
 }
 
 void EndStep(char const* step)
 {
     lastEndStep.store(step);
-}
-
-void CacheObjects(CacheKind kind, uint32_t count, void const* first)
-{
-    auto& snapshot = cacheSnapshots[static_cast<size_t>(kind)];
-    snapshot.first.store(first);
-    snapshot.count.store(count);
-}
-
-void LogCacheInventory(char const* phase)
-{
-    char line[800];
-    int length = Format(line, "world-cache: inventory %s", phase);
-    for (size_t i = 0; i < std::size(cacheSnapshots) && length > 0; ++i) {
-        const int written = Format(line + length, sizeof(line) - length, " %s=%u/%p", cacheNames[i],
-                                   cacheSnapshots[i].count.load(), cacheSnapshots[i].first.load());
-        if (written < 0 || static_cast<size_t>(length + written) >= sizeof(line)) {
-            Log("FAIL world-cache: inventory diagnostic exceeded its buffer");
-            return;
-        }
-        length += written;
-    }
-    Log(line);
-}
-
-void NativeStack(char const* reason)
-{
-    auto describe = [](void* frame, char* out, size_t size) {
-        MEMORY_BASIC_INFORMATION memory{};
-        char path[MAX_PATH] = {};
-        if (!VirtualQuery(frame, &memory, sizeof(memory)) || memory.Type != MEM_IMAGE ||
-            !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
-            !GetModuleFileNameA(static_cast<HMODULE>(memory.AllocationBase), path, MAX_PATH)) return false;
-        char const* module = std::strrchr(path, '\\');
-        Format(out, size, "%s+%#x", module ? module + 1 : path,
-               static_cast<unsigned>(reinterpret_cast<uintptr_t>(frame) - reinterpret_cast<uintptr_t>(memory.AllocationBase)));
-        return true;
-    };
-    void* frames[24] = {};
-    const USHORT count = CaptureStackBackTrace(1, static_cast<DWORD>(std::size(frames)), frames, nullptr);
-    Logf("CRASH native-stack reason=%s pid=%lu thread=%lu frames=%u", reason,
-         GetCurrentProcessId(), GetCurrentThreadId(), static_cast<unsigned>(count));
-    for (USHORT i = 0; i < count; ++i) {
-        char where[MAX_PATH + 24];
-        if (!describe(frames[i], where, sizeof(where))) strcpy_s(where, "(module unavailable)");
-        Logf("CRASH native-stack frame=%u address=%p %s", static_cast<unsigned>(i), frames[i], where);
-    }
-    // x86 engine functions omit frame pointers. Keep bounded raw candidates separately, never label them unwound frames.
-    auto* stack = static_cast<uintptr_t const*>(_AddressOfReturnAddress());
-    auto const* tib = reinterpret_cast<NT_TIB const*>(NtCurrentTeb());
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(stack), top = reinterpret_cast<uintptr_t>(tib->StackBase);
-    if (begin < reinterpret_cast<uintptr_t>(tib->StackLimit) || begin >= top) {
-        Log("FAIL CRASH native-stack: current-thread stack bounds unavailable");
-        return;
-    }
-    const size_t words = std::min<size_t>((top - begin) / sizeof(uintptr_t), 1024);
-    uintptr_t candidates[32] = {};
-    unsigned retained = 0;
-    for (size_t i = 0; i < words && retained < std::size(candidates); ++i) {
-        if (!stack[i] || std::find(candidates, candidates + retained, stack[i]) != candidates + retained) continue;
-        char where[MAX_PATH + 24];
-        if (!describe(reinterpret_cast<void*>(stack[i]), where, sizeof(where))) continue;
-        candidates[retained++] = stack[i];
-        Logf("CRASH native-stack candidate_word=%u address=%p %s", static_cast<unsigned>(i),
-             reinterpret_cast<void*>(stack[i]), where);
-    }
 }
 
 void Tick()
@@ -1105,64 +610,6 @@ void Tick()
     undecorate = dbghelp ? reinterpret_cast<UndecorateFn>(GetProcAddress(dbghelp, "UnDecorateSymbolName")) : nullptr;
     if (!vectoredHandler) vectoredHandler = AddVectoredExceptionHandler(1, &OnException);
     Log("crashlog: access violations are logged");
-}
-
-void NamesOff(LogFn log)
-{
-    names = false;
-    log("CRASHNAMESOFF ok=1 (crash lines show module+RVA only)");
-}
-
-void Probe(LogFn log)
-{
-    const unsigned before = named;
-    probing = true;  // no minidump for it
-    const int fault = ProbeFault();
-    probing = false;
-    char line[120];
-    Format(line, "CRASHPROBE fault=%d named=%u scripts=%d names=%d", fault, named - before, static_cast<int>(scriptCount),
-           names ? 1 : 0);
-    log(line);
-}
-
-void Stage(char const* name)
-{
-    if (!name) return;
-    if (!std::strcmp(name, "world deactivated") && stageWorld) return;
-    if (!std::strcmp(name, "forget done") && stageForget) return;
-    if (!std::strcmp(name, "steam stopped") && stageSteam) return;
-    if (!std::strcmp(name, "hooks removed") && stageHooks) return;
-    if (!std::strcmp(name, "threads joined") && stageThreads) return;
-    if (!std::strcmp(name, "pre-shutdown done") && stagePreShutdown) return;
-    if (!std::strcmp(name, "shutdown called") && stageShutdownCalled) return;
-    if (!std::strcmp(name, "world deactivated")) stageWorld = true;
-    if (!std::strcmp(name, "forget done")) stageForget = true;
-    if (!std::strcmp(name, "steam stopped")) stageSteam = true;
-    if (!std::strcmp(name, "hooks removed")) stageHooks = true;
-    if (!std::strcmp(name, "threads joined")) stageThreads = true;
-    if (!std::strcmp(name, "pre-shutdown done")) stagePreShutdown = true;
-    if (!std::strcmp(name, "shutdown called")) stageShutdownCalled = true;
-    char line[160];
-    Format(line, "shutdown-stage: %s", name);
-    Log(line);
-}
-
-void CancelWatchdog()
-{
-    if (watchdogCancel) SetEvent(watchdogCancel);
-    if (watchdogThreadHandle) {
-        const DWORD waited = WaitForSingleObject(watchdogThreadHandle, 2000);
-        if (waited == WAIT_TIMEOUT) {
-            Log("crashlog: watchdog cancel timed out; leaving worker and event live");
-            return;
-        }
-        CloseHandle(watchdogThreadHandle);
-        watchdogThreadHandle = nullptr;
-    }
-    if (watchdogCancel) {
-        CloseHandle(watchdogCancel);
-        watchdogCancel = nullptr;
-    }
 }
 
 void BeginShutdown()
@@ -1201,40 +648,10 @@ bool Shutdown()
             dumpThreadHandle = nullptr;
         }
     }
-    if (!joined) {
-        return false;
-    }
+    if (!joined) return false;
     if (dumpRequest) { CloseHandle(dumpRequest); dumpRequest = nullptr; }
     if (dumpDone) { CloseHandle(dumpDone); dumpDone = nullptr; }
     if (dumpStop) { CloseHandle(dumpStop); dumpStop = nullptr; }
     return true;
-}
-
-void StartWatchdog()
-{
-    if (watchdogThreadHandle) return;
-    DeriveDumpDir();
-    graphicsSites = FindGraphicsSites();
-    watchdogCancel = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    if (!watchdogCancel) {
-        Log("shutdown watchdog: start failed (cancel event unavailable)");
-        return;
-    }
-    watchdogThreadHandle = CreateThread(nullptr, 256 * 1024, &WatchdogThread, nullptr, 0, nullptr);
-    if (!watchdogThreadHandle) {
-        CloseHandle(watchdogCancel);
-        watchdogCancel = nullptr;
-        Log("shutdown watchdog: start failed (thread unavailable)");
-        return;
-    }
-}
-
-void CompletePreShutdown(bool safeToExit)
-{
-    preShutdownAt.store(GetTickCount());
-    fastExitReady.store(safeToExit);
-    preShutdownFinished.store(true);
-    Logf("shutdown watchdog: cleanup complete thread=%lu fast_exit_eligible=%d",
-         GetCurrentThreadId(), safeToExit ? 1 : 0);
 }
 }

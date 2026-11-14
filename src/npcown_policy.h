@@ -108,6 +108,7 @@ struct OwnerFacts {
     bool hostPresenting = false;     // proven unreleased host stream: discard local state, including local death
     bool hostCommit = false;         // host announced it took the NPC (Commit owner=1 / Abort)
     bool hostRecallDue = false;      // host recalled it and a safe cut point was reached
+    bool sharedWithLowerClient = false;
     bool leaseExpired = false;
     bool hostSilent = false;
     bool checkpointBusy = false;
@@ -124,6 +125,7 @@ inline char const* Release(OwnerFacts const& facts)
     if (facts.hostPresenting) return "host presenting";
     if (facts.hostCommit) return "host took over";
     if (facts.hostRecallDue) return "host recall";
+    if (facts.sharedWithLowerClient) return "lower-id client in reach";
     return nullptr;
 }
 

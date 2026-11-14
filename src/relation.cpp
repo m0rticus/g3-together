@@ -3,6 +3,8 @@
 
 #include "ai.h"
 #include "downed.h"
+#include "enclaves.h"
+#include "fightmem.h"
 #include "guid.h"
 #include "log.h"
 #include "net.h"
@@ -102,7 +104,7 @@ View Inspect(eCEntity* entity, bool wantTruth)
         if (ai::LocalAttitude(entity, truth)) v.truth = truth;
     }
     Observation& o = v.observation;
-    o.mirrorBound = v.info.mirrored && v.info.bound;
+    o.mirrorBound = v.info.mirrored && v.info.bound && enclaves::Together() && !fightmem::HasLocalOverride(entity);
     o.alive = v.alive;
     const uint8_t owner = npcs::CompanionOwner(entity);
     o.ledByRemote = owner && owner != net::LocalId();
@@ -228,6 +230,17 @@ void Tick()
     if (ai::ShuttingDown() || !gCSession::GetInstance().IsGameRunning()) return;
     eCEntity* hero = remote::ControlledBody();
     if (!hero) return;
+    if (!net::IsHost()) {
+        const auto all = Entity::GetNPCs();
+        for (int i = 0; i < all.GetCount(); ++i) {
+            eCEntity* npc = all.GetAt(i).GetInstance();
+            if (!Eligible(npc) || !npcs::IsMirrored(npc) ||
+                (enclaves::Together() && !fightmem::HasLocalOverride(npc))) continue;
+            int local = -1;
+            if (ai::LocalAttitude(npc, local) && ValidAttitude(local) && Stored(npc) != local)
+                Entity(npc).NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(local);
+        }
+    }
     const uint32_t now = net::Now();
     const uint32_t mask = downed::UnavailablePlayers();
     char const* reason = nullptr;

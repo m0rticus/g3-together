@@ -327,6 +327,74 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
     if (edge) track.pendingEvents.push_back(state);
 }
 
+namespace {
+void SampleNpc(Track& track, Track::Snap const& newest, uint32_t now, int32_t shift, bool counted,
+               float position[3], float rotation[4], Presentation* out)
+{
+    std::memcpy(position, newest.position, sizeof(newest.position));
+    std::memcpy(rotation, newest.rotation, sizeof(newest.rotation));
+    Describe(out, newest, 0.0f, newest.sent);
+    if (counted) {
+        ++sampledHeld, track.lastCase = 3;
+        const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
+        const int32_t late = std::max(0, static_cast<int32_t>(desired - newest.sent));
+        const uint32_t measuredCadence = std::min(track.cadenceMin, track.previousCadenceMin);
+        const uint32_t interval = track.poseIntervalMs ? std::max(track.poseIntervalMs, measuredCadence) : measuredCadence;
+        // A whole missing interval, not a rounding-boundary hold, warrants more buffering.
+        if (track.count >= 2 && late > static_cast<int32_t>(interval) && !(newest.motion.flags & 1) &&
+            (!track.underrunAt || now - track.underrunAt >= 100)) {
+            track.underrunAt = now;
+            track.recoveryUntil = now + OffsetWindow;
+            track.delayMs = std::min(track.delayMs + static_cast<int32_t>(interval), MaximumBufferDelay);
+            ++track.underruns;
+        }
+    }
+}
+
+bool SamplePlayer(Track& track, Track::Snap const& newest, uint32_t now, uint32_t render, int32_t shift, bool counted,
+                  float position[3], float rotation[4], Presentation* out)
+{
+    const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
+    const int32_t wanted = shift <= 0
+        ? std::max(0, static_cast<int32_t>(desired - newest.sent))
+        : static_cast<int32_t>(render - newest.sent);
+    const int32_t ahead = std::min(wanted, MaxAhead);
+    if (counted) {
+        if (wanted > MaxAhead) {
+            ++sampledHeld, track.lastCase = 3;
+            if (!track.underrunAt || now - track.underrunAt >= 100) {
+                track.underrunAt = now;
+                track.recoveryUntil = now + OffsetWindow;
+                track.delayMs = std::min(track.delayMs + 25, MaximumBufferDelay);
+                ++track.underruns;
+            }
+        }
+        else ++sampledAhead, track.lastCase = 2;
+    }
+    std::memcpy(position, newest.position, sizeof(newest.position));
+    std::memcpy(rotation, newest.rotation, sizeof(newest.rotation));
+    float speed = 0.0f;
+    bool canPredict = false;
+    if (track.count >= 2) {
+        Track::Snap const& before = track.snaps[track.count - 2];
+        const int32_t span = static_cast<int32_t>(newest.sent - before.sent);
+        if (span > 0 && span <= static_cast<int32_t>(RestartAfter) && newest.movementMode != 1 &&
+            newest.motion.locomotion && !(newest.motion.flags & 0x1eu)) {
+            canPredict = true;
+            speed = Distance(before.position, newest.position) * 1000.0f / span;
+            const float scale = speed > MaximumTravelSpeed ? MaximumTravelSpeed / speed : 1.0f;
+            for (int k = 0; k < 3; ++k)
+                position[k] += (newest.position[k] - before.position[k]) * ahead / span * scale;
+            speed = std::min(speed, MaximumTravelSpeed);
+        }
+    }
+    if (wanted > MaxAhead) speed = 0.0f;
+    const bool predicted = canPredict && ahead > 0;
+    Describe(out, newest, speed, newest.sent + static_cast<uint32_t>(canPredict ? ahead : 0));
+    return predicted;
+}
+}
+
 bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], int32_t shift, bool counted, Presentation* presentation)
 {
     if (counted) track.lastCase = 0;
@@ -384,64 +452,8 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
     }
     Track::Snap const& newest = track.snaps[track.count - 1];
     if (static_cast<int32_t>(render - newest.sent) >= 0) {
-        if (!track.predictive) {
-            std::memcpy(position, newest.position, sizeof(newest.position));
-            std::memcpy(rotation, newest.rotation, sizeof(newest.rotation));
-            Describe(out, newest, 0.0f, newest.sent);
-            if (counted) {
-                ++sampledHeld, track.lastCase = 3;
-                const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
-                const int32_t late = std::max(0, static_cast<int32_t>(desired - newest.sent));
-                const uint32_t measuredCadence = std::min(track.cadenceMin, track.previousCadenceMin);
-                const uint32_t interval = track.poseIntervalMs ? std::max(track.poseIntervalMs, measuredCadence) : measuredCadence;
-                // A whole missing interval, not a rounding-boundary hold, warrants more buffering.
-                if (track.count >= 2 && late > static_cast<int32_t>(interval) && !(newest.motion.flags & 1) &&
-                    (!track.underrunAt || now - track.underrunAt >= 100)) {
-                    track.underrunAt = now;
-                    track.recoveryUntil = now + OffsetWindow;
-                    track.delayMs = std::min(track.delayMs + static_cast<int32_t>(interval), MaximumBufferDelay);
-                    ++track.underruns;
-                }
-            }
-            return done();
-        }
-        const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
-        const int32_t wanted = shift <= 0
-            ? std::max(0, static_cast<int32_t>(desired - newest.sent))
-            : static_cast<int32_t>(render - newest.sent);
-        const int32_t ahead = std::min(wanted, MaxAhead);
-        if (counted) {
-            if (wanted > MaxAhead) {
-                ++sampledHeld, track.lastCase = 3;
-                if (!track.underrunAt || now - track.underrunAt >= 100) {
-                    track.underrunAt = now;
-                    track.recoveryUntil = now + OffsetWindow;
-                    track.delayMs = std::min(track.delayMs + 25, MaximumBufferDelay);
-                    ++track.underruns;
-                }
-            }
-            else ++sampledAhead, track.lastCase = 2;
-        }
-        std::memcpy(position, newest.position, sizeof(newest.position));
-        std::memcpy(rotation, newest.rotation, sizeof(newest.rotation));
-        float speed = 0.0f;
-        bool canPredict = false;
-        if (track.count >= 2) {
-            Track::Snap const& before = track.snaps[track.count - 2];
-            const int32_t span = static_cast<int32_t>(newest.sent - before.sent);
-            if (span > 0 && span <= static_cast<int32_t>(RestartAfter) && newest.movementMode != 1 &&
-                newest.motion.locomotion && !(newest.motion.flags & 0x1eu)) {
-                canPredict = true;
-                speed = Distance(before.position, newest.position) * 1000.0f / span;
-                const float scale = speed > MaximumTravelSpeed ? MaximumTravelSpeed / speed : 1.0f;
-                for (int k = 0; k < 3; ++k)
-                    position[k] += (newest.position[k] - before.position[k]) * ahead / span * scale;
-                speed = std::min(speed, MaximumTravelSpeed);
-            }
-        }
-        if (wanted > MaxAhead) speed = 0.0f;
-        predicted = canPredict && ahead > 0;
-        Describe(out, newest, speed, newest.sent + static_cast<uint32_t>(canPredict ? ahead : 0));
+        if (!track.predictive) SampleNpc(track, newest, now, shift, counted, position, rotation, out);
+        else predicted = SamplePlayer(track, newest, now, render, shift, counted, position, rotation, out);
         return done();
     }
     for (int i = track.count - 1; i > 0; --i) {

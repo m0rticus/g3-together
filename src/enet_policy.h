@@ -3,6 +3,7 @@
 
 #include <enet/enet.h>
 #include <cstdint>
+#include <cstring>
 
 namespace g3t::net {
 constexpr enet_uint32 Mtu = 1200;
@@ -10,6 +11,26 @@ enum : uint8_t {
     ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3,
     ChannelPoses = 4, ChannelPosesAlt = 5, ChannelBulk = 6, ChannelDefinitions = 7, ChannelCount = 8
 };
+
+#ifdef _WIN32
+inline bool DisableWindowsUdpConnReset(ENetSocket socket)
+{
+    if (socket == ENET_SOCKET_NULL) return false;
+    const HMODULE ws2 = GetModuleHandleA("ws2_32.dll");
+    if (!ws2) return false;
+    const FARPROC proc = GetProcAddress(ws2, "WSAIoctl");
+    if (!proc) return false;
+    using WsaIoctlFn = decltype(&::WSAIoctl);
+    static_assert(sizeof(WsaIoctlFn) == sizeof(proc), "WSAIoctl pointer size mismatch");
+    WsaIoctlFn wsaIoctl = nullptr;
+    std::memcpy(&wsaIoctl, &proc, sizeof(wsaIoctl));
+    BOOL connResetOff = FALSE;
+    DWORD connResetBytes = 0;
+    constexpr DWORD UdpConnReset = 0x9800000Cu; // SIO_UDP_CONNRESET
+    return wsaIoctl(socket, UdpConnReset, &connResetOff, sizeof(connResetOff),
+                    nullptr, 0, &connResetBytes, nullptr, nullptr) == 0;
+}
+#endif
 
 inline ENetHost* CreateTransportHost(ENetAddress const* address, size_t peers, char const*& error)
 {
@@ -25,6 +46,9 @@ inline ENetHost* CreateTransportHost(ENetAddress const* address, size_t peers, c
     // Keep decompress allocated for backward-compatible test frames while disabling all outbound range coding.
     host->compressor.compress = nullptr;
     host->mtu = Mtu;
+#ifdef _WIN32
+    DisableWindowsUdpConnReset(host->socket);
+#endif
     constexpr int PoseBurstBuffer = 4 * 1024 * 1024;
     if (!error && (enet_socket_set_option(host->socket, ENET_SOCKOPT_RCVBUF, PoseBurstBuffer) < 0 ||
                   enet_socket_set_option(host->socket, ENET_SOCKOPT_SNDBUF, PoseBurstBuffer) < 0))

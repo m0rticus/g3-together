@@ -4,8 +4,10 @@
 #include "log.h"
 #include "player_identity.h"
 #include "options.h"
+#include "symbols.h"
 
 #include <Windows.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +15,7 @@
 namespace g3t {
 namespace {
 Config config;
+std::atomic<uint32_t> configRevision{1};
 
 void Trim(char* text)
 {
@@ -32,24 +35,27 @@ void Trim(char* text)
 Config const& GetLocalConfig() { return config; }
 Config const& GetConfig()
 {
-    static Config effective;
-    effective = config;
+    thread_local Config effective;
+    thread_local uint32_t seenRevision = 0;
+    const uint32_t rev = configRevision.load(std::memory_order_acquire);
+    if (seenRevision != rev) {
+        effective = config;
+        seenRevision = rev;
+    }
+    effective.friendlyFire = config.friendlyFire;
+    effective.npcDamage = config.npcDamage;
+    effective.npcHp = config.npcHp;
     options::ApplyMod(effective);
     return effective;
 }
 
 Config const& LoadConfig()
 {
+    config = Config{};
+    configRevision.fetch_add(1, std::memory_order_release);
     char path[MAX_PATH] = {};
-    HMODULE self = nullptr;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(&LoadConfig), &self) ||
-        !GetModuleFileNameA(self, path, MAX_PATH))
+    if (!symbols::GameDir(path))
         return config;
-    for (int part = 0; part != 2; ++part) {
-        char* separator = std::strrchr(path, '\\');
-        if (separator) *separator = '\0';
-    }
     strcat_s(path, "\\g3together.ini");
     FILE* file = nullptr;
     if (fopen_s(&file, path, "r") || !file) {
@@ -58,6 +64,14 @@ Config const& LoadConfig()
     }
     char line[256];
     while (fgets(line, sizeof(line), file)) {
+        if (!std::strchr(line, '\n') && std::strlen(line) == sizeof(line) - 1) {
+            int next = fgetc(file);
+            if (next != '\n' && next != EOF) {
+                while ((next = fgetc(file)) != '\n' && next != EOF) {}
+                Log("config: line too long; ignoring setting");
+                continue;
+            }
+        }
         char const* setting = line;
         while (*setting == ' ' || *setting == '\t') ++setting;
         const bool identityMapping = !_strnicmp(setting, "legacy_companion_owner", 22) &&
@@ -211,6 +225,7 @@ Config const& LoadConfig()
          *config.steamLobby ? config.steamLobby : "-", *config.steamHost ? config.steamHost : "-");
     Logf("config: send_rate=%d Hz (compact player states; reliable gameplay immediate; NPC policy independent) network_budget_kib=%d per peer (bulk save pacing base; never caps NPC/gameplay traffic)",
          config.sendRate, config.networkBudgetKib);
+    configRevision.fetch_add(1, std::memory_order_release);
     return config;
 }
 }

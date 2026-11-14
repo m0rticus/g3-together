@@ -680,6 +680,147 @@ class TestCopyUpdateTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ROLE: client-only", result.stdout)
 
+    def test_legacy_companion_owner_hash_and_multiple_lines_round_trip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            existing = base / "g3together.ini"
+            existing.write_text(
+                "role = host\n"
+                "friendly_fire = 25 # inline comment stripped\n"
+                "legacy_companion_owner = 76561198011111111 Diego#1\n"
+                "legacy_companion_owner = 76561198022222222 Milten#2\n",
+                encoding="utf-8",
+            )
+            scalars, owners = verifier.parse_g3t_ini(existing)
+            self.assertEqual(scalars["friendly_fire"], "25")
+            self.assertEqual(
+                owners,
+                ["76561198011111111 Diego#1", "76561198022222222 Milten#2"],
+            )
+            host_template, _client_template = updater.extract_package_ini()
+            rendered = updater.render_ini(host_template, existing, "host", "pair-red").decode("utf-8")
+            self.assertIn("friendly_fire = 25", rendered)
+            self.assertIn("legacy_companion_owner = 76561198011111111 Diego#1", rendered)
+            self.assertIn("legacy_companion_owner = 76561198022222222 Milten#2", rendered)
+
+    def test_setup_ps1_preserves_production_and_legacy_companion_owner_keys(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            pkg = base / "pkg"
+            (pkg / "tools").mkdir(parents=True)
+            (pkg / "scripts").mkdir(parents=True)
+            shutil.copy2(ROOT / "tools" / "setup.ps1", pkg / "tools" / "setup.ps1")
+            (pkg / "scripts" / "Script_G3Together.dll").write_bytes(b"synthetic-mod-dll")
+
+            game = base / "game"
+            (game / "scripts").mkdir(parents=True)
+            (game / "Ini").mkdir(parents=True)
+            (game / "G3Together").mkdir(parents=True)
+            (game / "Gothic3.exe").write_bytes(b"MZ")
+            # Inject a synthetic steam_api.dll whose SHA-256 matches the setup script's substituted test hash.
+            fake_steam = b"synthetic-verified-steam-api"
+            fake_hash = hashlib.sha256(fake_steam).hexdigest().upper()
+            (game / "G3Together" / "steam_api.dll").write_bytes(fake_steam)
+            setup_script = pkg / "tools" / "setup.ps1"
+            setup_text = setup_script.read_text(encoding="utf-8").replace(
+                "FDAFB7C65EC7D4182B42BF92CC8671C68E4DC547CC6E613899D2618A47EB65DA",
+                fake_hash,
+            )
+            setup_script.write_text(setup_text, encoding="utf-8")
+
+            ini_path = game / "g3together.ini"
+            ini_path.write_text(
+                "role = host\n"
+                "session_id = old-room\n"
+                "friendly_fire = 40 # comment\n"
+                "npc_damage = 1.5\n"
+                "custom_future_key = keep-me\n"
+                "address = 127.0.0.1\n"
+                "legacy_companion_owner = 76561198011111111 Diego#1\n"
+                "legacy_companion_owner = 76561198022222222 Milten#2\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(setup_script),
+                    "-GamePath",
+                    str(game),
+                    "-Role",
+                    "host",
+                    "-SessionId",
+                    "new-room",
+                    "-Yes",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rewritten = ini_path.read_text(encoding="utf-8")
+            self.assertIn("session_id = new-room", rewritten)
+            self.assertIn("friendly_fire = 40", rewritten)
+            self.assertEqual(rewritten.count("friendly_fire ="), 1)
+            self.assertIn("npc_damage = 1.5", rewritten)
+            self.assertIn("custom_future_key = keep-me", rewritten)
+            self.assertNotIn("address =", rewritten)
+            self.assertIn("legacy_companion_owner = 76561198011111111 Diego#1", rewritten)
+            self.assertIn("legacy_companion_owner = 76561198022222222 Milten#2", rewritten)
+
+    def test_verify_fixture_root_containment_and_client_template_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            roots = self.make_roots(allowed)
+            outside = base / "outside-steam"
+            outside.mkdir()
+            with self.assertRaisesRegex(verifier.VerificationError, "outside the explicitly allowed"):
+                verifier.validate_roots(roots["host"], roots["client"], outside, [allowed])
+
+            host_prof = roots["host"] / "isolated-profile" / "Documents" / "gothic3"
+            client_prof = roots["client"] / "isolated-profile" / "Documents" / "gothic3"
+            host_prof.mkdir(parents=True)
+            client_prof.mkdir(parents=True)
+            (host_prof / "UserOptions.ini").write_text("[Options.Difficulty]\nDifficulty=Medium\n", encoding="utf-8")
+            (client_prof / "UserOptions.ini").write_text("[Options.Difficulty]\nDifficulty=Easy\n", encoding="utf-8")
+            (client_prof / "G3T_client_template.g3savcp").write_bytes(b"h" * 1024)
+            rows, failures, _warnings = verifier.verify_profile_and_template(roots, expected_protocol=79)
+            self.assertTrue(any("Client template is missing" in item for item in failures))
+            (client_prof / "G3T_client_template.g3savcpdat").write_bytes(b"w" * 4096)
+            (client_prof / "G3T_client_template.g3t").write_text(
+                "g3t client template 2\nprotocol=79\norigin=new-game\nheader=1024\nworld=4096\n",
+                encoding="utf-8",
+            )
+            rows, failures, _warnings = verifier.verify_profile_and_template(roots, expected_protocol=79)
+            self.assertEqual(failures, [])
+            self.assertEqual(rows[0][1], "PASS")
+
+    def test_hangstack_treats_negative_suspend_count_as_failure_and_exits_nonzero(self):
+        hangstack = load_tool("hangstack")
+
+        class FakeKernel:
+            def CreateToolhelp32Snapshot(self, _flags, _pid):
+                return -1
+
+        self.assertIsNone(hangstack.thread_ids(1234, FakeKernel()))
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary) / "diag.txt"
+            with mock.patch.object(
+                hangstack,
+                "sample",
+                return_value="hangstack: cannot open process 999999 (error 87)\n",
+            ):
+                rc = hangstack.main(["--pid", "999999", "--output", str(out)])
+            self.assertEqual(rc, 1)
+            self.assertIn("cannot open process 999999", out.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

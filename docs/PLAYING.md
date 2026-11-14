@@ -763,7 +763,7 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   parries blocks either player's blows the same way.
 - Friendly fire is off by default (`friendly_fire = 0`): players and their followers cannot damage, stagger, knock down,
   poison, freeze or otherwise harm one another. Healing and revival still work. Enemy attacks and environmental damage
-  are unchanged for standing players. Both players must use the same value and restart after changing it. An explicit value from 1 to 100
+  are unchanged for standing players. The joining player adopts the host's value in memory for the session; restart the host after changing its INI. An explicit value from 1 to 100
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
@@ -839,8 +839,8 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
 - Dialog changes to NPCs, such as trader, teacher, guard and routine settings, apply to everyone,
   as do dialog-triggered duels, attacks and companion recruitment. Dialog items go to the player
   speaking.
-- The host's save records which player owns each companion. After loading, a companion returns to
-  its player when that player rejoins, identified by their Steam display name. Do not change that name.
+- The host's save records which player owns each companion by authenticated Steam account ID (`SteamID64`). After loading, a companion returns to
+  its player when that account rejoins, even if their Steam display name changed (legacy pre-migration saves match an old display name once or via `legacy_companion_owner` in the host's INI).
   After a disconnect without loading, companions initially belong to the host.
 - If the host loads a save during a session, the other players are loaded into it automatically. Until they
   are done, you do not see each other.

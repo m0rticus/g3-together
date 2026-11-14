@@ -265,7 +265,25 @@ void RecoveryCornerCases()
     const Step atNewStable = switched.Poll(different, changed + RecoverStableMs);
     const bool switchedOk = atChange == Step::Wait && beforeNewStable == Step::Wait && atNewStable == Step::RecoverWorld;
     if (!switchedOk) std::cerr << "a different recovery candidate inherited the previous candidate's timer\n";
-    assert(wrapOk && switchedOk);
+
+    Publish growing;
+    growing.Begin(Origin::World, 200);
+    growing.NativeReturned(true, 1, true, 200);
+    Facts mutating;
+    mutating.header.exists = true; mutating.header.size = MinHeaderBytes;
+    mutating.worldTmp.exists = true; mutating.worldTmp.size = MinWorldBytes / 2; mutating.worldTmp.stamp = 10;
+    assert(growing.Poll(mutating, 200 + RecoverAfterMs) == Step::Wait);
+    mutating.worldTmp.size = MinWorldBytes;
+    const uint32_t resizedAt = 200 + RecoverAfterMs + RecoverStableMs;
+    assert(growing.Poll(mutating, resizedAt) == Step::Wait);
+    mutating.worldTmp.stamp = 11;
+    const uint32_t restampedAt = resizedAt + RecoverStableMs;
+    const Step atRestamp = growing.Poll(mutating, restampedAt);
+    const Step beforeFinalStable = growing.Poll(mutating, restampedAt + RecoverStableMs - 1);
+    const Step atFinalStable = growing.Poll(mutating, restampedAt + RecoverStableMs);
+    const bool growingOk = atRestamp == Step::Wait && beforeFinalStable == Step::Wait && atFinalStable == Step::RecoverWorld;
+    if (!growingOk) std::cerr << "size or write-timestamp change did not reset recovery stability timer\n";
+    assert(wrapOk && switchedOk && growingOk);
 }
 
 void Scenario(Situation const& s, Route route, Block block)

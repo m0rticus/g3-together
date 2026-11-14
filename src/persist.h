@@ -32,21 +32,6 @@ bool HostWorldEntryAvailable(); // a way into the host's world without restartin
 void OnWorldActivate();    // from the engine module's callbacks
 void OnWorldDeactivate();
 bool PrepareShutdown();    // cancel cooperative staging; false while native save/load still owns the stack
-using LogFn = void (*)(char const*);
-void Off(LogFn log);     // QA negative control: write no sidecar
-// Retired compatibility commands; they only explain retirement, never alter saving/admission.
-void CampaignOff(LogFn log);
-void WorldSyncOff(LogFn log);
-void BadTransfer(LogFn log);
-void GenerationOff(LogFn log);
-void Pause(char const* argument, LogFn log);
-void WorldGateLate(LogFn log);
-void RecordWaitOff(LogFn log);
-void Waiting(LogFn log);       // QA (stage W7): RECORDWAIT line, whether the player waits for its own hero record
-void LoadTicksOff(char const* argument, LogFn log);  // QA stage W6: negative control; hold/release/welcome are deterministic timing probes
-void WorldReport(LogFn log);   // QA: WORLD line
-void Report(LogFn log);  // QA: PERSIST line
-bool Switch(char const* action, LogFn log);  // QA negative controls of the play-evening fixes (27.10.): true if it was one
 namespace SaveExtensions {
 using Capture = bool (*)(std::vector<uint8_t>& bytes);
 using Restore = bool (*)(uint32_t savedVersion, std::vector<uint8_t> const& bytes);

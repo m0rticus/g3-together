@@ -9,7 +9,28 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def source(name):
+    if name == "src/persist.cpp":
+        return "\n".join(
+            (ROOT / "src" / part).read_text(encoding="utf-8")
+            for part in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
+        )
     return (ROOT / name).read_text(encoding="utf-8")
+
+
+def function_body(text, signature):
+    for match in re.finditer(signature, text):
+        opening = text.find("{", match.end())
+        if opening < 0 or ";" in text[match.end():opening]:
+            continue
+        depth = 0
+        for index in range(opening, len(text)):
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if not depth:
+                    return text[opening + 1:index]
+    raise AssertionError(f"missing function {signature}")
 
 
 class ClientAdmissionTests(unittest.TestCase):
@@ -63,21 +84,21 @@ class ClientAdmissionTests(unittest.TestCase):
 
     def test_hero_pending_covers_clients_without_paired_saves(self):
         persist = source("src/persist.cpp")
-        body = persist.split("bool HeroPending()", 1)[1].split("void OnWorldActivate()", 1)[0]
+        body = function_body(persist, r"\bbool\s+HeroPending\s*\(")
         self.assertIn("(pairedEnabled || !net::IsHost())", body)
-        self.assertNotRegex(body, r"^\s*\{\s*return\s+pairedEnabled\s*&&")
+        self.assertNotRegex(body, r"^\s*return\s+pairedEnabled\s*&&")
 
     def test_player_entries_are_adopted_and_bounded(self):
         persist = source("src/persist.cpp")
-        new_game = persist.split("bool __stdcall NewGameDetour", 1)[1].split("bool WriteAtomic", 1)[0]
+        new_game = function_body(persist, r"\bbool\s+__stdcall\s+NewGameDetour\s*\(")
         self.assertIn("autoloadState.Adopted(GetTickCount())", new_game)
-        transition = persist.split("bool ProcessClientTransition()", 1)[1].split("bool BeginFrame()", 1)[0]
+        transition = function_body(persist, r"\bbool\s+ProcessClientTransition\s*\(")
         self.assertIn("manualEntry && clientRejoin.fresh", transition)
         self.assertEqual(len(re.findall(r'EnterHostWorld\("autoload"\)', persist)), 1)  # the correction reuses the one entry point
 
     def test_snapshot_marks_adoptable_worlds_and_keeps_admission_in_flight(self):
         persist = source("src/persist.cpp")
-        snapshot = persist.split("autoload::Snapshot AutoloadSnapshot", 1)[1].split("void CountdownText", 1)[0]
+        snapshot = function_body(persist, r"\bautoload::Snapshot\s+AutoloadSnapshot\s*\(")
         self.assertIn("s.adoptable = ", snapshot)
         self.assertIn("clientRejoin.fresh || (ownCharacterReady && synced == hostWorld.epoch)", snapshot)
         self.assertIn("s.hooks = rejoinHooks", snapshot)
@@ -85,7 +106,7 @@ class ClientAdmissionTests(unittest.TestCase):
 
     def test_unsupported_install_is_loud_on_both_roles(self):
         persist = source("src/persist.cpp")
-        hints = persist.split("void StatusHints()", 1)[1].split("void SetWorldCleanup", 1)[0]
+        hints = function_body(persist, r"\bvoid\s+StatusHints\s*\(")
         self.assertIn("HooksUnsupported()", hints)
         self.assertIn("UnsupportedText(", hints)
         self.assertIn("admission: unsupported install", hints)

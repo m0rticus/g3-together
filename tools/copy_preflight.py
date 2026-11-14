@@ -19,41 +19,10 @@ from typing import Iterable
 
 
 REPO = Path(__file__).resolve().parents[1]
-FOLDER_MODULES = ("Game.dll", "Engine.dll", "SharedBase.dll", "Dialogs.dll", "paru_s2.dll")
-
-
-def reject_links(path: Path) -> Path:
-    """Reject symlinks and Windows reparse points on a path and every parent."""
-    path = Path(os.path.abspath(path))
-    for part in (path, *path.parents):
-        if part.exists() or part.is_symlink():
-            info = part.lstat()
-            reparse = getattr(info, "st_file_attributes", 0) & getattr(
-                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-            )
-            if stat.S_ISLNK(info.st_mode) or reparse:
-                raise RuntimeError(f"Link or reparse point is not allowed: {part}")
-    return path
-
-
-def canonical(path: Path) -> Path:
-    return reject_links(path).resolve()
-
-
-def overlaps(left: Path, right: Path) -> bool:
-    try:
-        return left == right or left.is_relative_to(right) or right.is_relative_to(left)
-    except AttributeError:
-        left_text = os.path.normcase(str(left))
-        right_text = os.path.normcase(str(right))
-        return left_text == right_text or left_text.startswith(right_text + os.sep) or right_text.startswith(left_text + os.sep)
-
-
-def is_hard_linked(path: Path) -> bool:
-    try:
-        return path.stat(follow_symlinks=False).st_nlink != 1
-    except TypeError:
-        return path.lstat().st_nlink != 1
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from _g3copy import FOLDER_MODULES, canonical, reject_links, overlaps, is_hard_linked, pe_rva_to_offset, parse_pe, sha256
 
 
 def read_workspace_config(workspace: Path) -> dict:
@@ -91,99 +60,8 @@ def require_directory(root: Path, relative: str) -> Path:
     return path
 
 
-def pe_rva_to_offset(data: bytes, rva: int, sections: list[tuple[int, int, int, int]], pe_offset: int) -> int:
-    for virtual_address, virtual_size, raw_address, raw_size in sections:
-        if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
-            return raw_address + rva - virtual_address
-    raise ValueError(f"Unmapped PE RVA 0x{rva:x}")
-
-
-def read_ascii(data: bytes, offset: int) -> str:
-    end = data.find(b"\0", offset)
-    if end < 0:
-        raise ValueError("Unterminated PE import name")
-    try:
-        return data[offset:end].decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Non-ASCII PE import name") from exc
-
-
 def imports(path: Path) -> dict[str, list[str]]:
-    """Read PE32 imports without loading executable code."""
-    data = Path(path).read_bytes()
-    if data[:2] != b"MZ":
-        raise ValueError(f"Not a PE file: {path}")
-    if len(data) < 0x40:
-        raise ValueError(f"Truncated PE file: {path}")
-    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
-    if pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\0\0":
-        raise ValueError(f"Missing PE header: {path}")
-
-    machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
-    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
-    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
-    optional_offset = pe_offset + 24
-    if machine != 0x14C:
-        raise ValueError(f"Not a 32-bit PE file: {path}")
-    if optional_size < 112 or optional_offset + optional_size > len(data):
-        raise ValueError(f"Truncated PE32 optional header: {path}")
-    if struct.unpack_from("<H", data, optional_offset)[0] != 0x10B:
-        raise ValueError(f"Not PE32: {path}")
-
-    section_offset = optional_offset + optional_size
-    sections = []
-    for index in range(section_count):
-        header = section_offset + 40 * index
-        if header + 40 > len(data):
-            raise ValueError(f"Truncated PE section table: {path}")
-        virtual_size = struct.unpack_from("<I", data, header + 8)[0]
-        virtual_address = struct.unpack_from("<I", data, header + 12)[0]
-        raw_size = struct.unpack_from("<I", data, header + 16)[0]
-        raw_address = struct.unpack_from("<I", data, header + 20)[0]
-        sections.append((virtual_address, virtual_size, raw_address, raw_size))
-
-    rva_count = struct.unpack_from("<I", data, optional_offset + 92)[0]
-    if rva_count < 2:
-        return {}
-    import_rva = struct.unpack_from("<I", data, optional_offset + 104)[0]
-    if import_rva == 0:
-        return {}
-
-    found: dict[str, list[str]] = {}
-    descriptor_offset = pe_rva_to_offset(data, import_rva, sections, pe_offset)
-    while True:
-        if descriptor_offset + 20 > len(data):
-            raise ValueError(f"Truncated PE import table: {path}")
-        original_thunks, _timestamp, _forwarder, name_rva, thunks = struct.unpack_from(
-            "<IIIII", data, descriptor_offset
-        )
-        if original_thunks == 0 and name_rva == 0 and thunks == 0:
-            break
-        if name_rva == 0:
-            raise ValueError(f"Missing PE import DLL name: {path}")
-        name_offset = pe_rva_to_offset(data, name_rva, sections, pe_offset)
-        dll_name = read_ascii(data, name_offset).lower()
-
-        thunk_rva = original_thunks or thunks
-        if thunk_rva == 0:
-            raise ValueError(f"Missing PE import thunk table: {dll_name}")
-        thunk_offset = pe_rva_to_offset(data, thunk_rva, sections, pe_offset)
-        while thunk_offset + 4 <= len(data):
-            value = struct.unpack_from("<I", data, thunk_offset)[0]
-            if value == 0:
-                break
-            if value & 0x80000000:
-                thunk_offset += 4
-                continue
-            hint_name_offset = pe_rva_to_offset(data, value, sections, pe_offset)
-            if hint_name_offset + 2 > len(data):
-                raise ValueError(f"Truncated PE import name: {path}")
-            name_offset = hint_name_offset + 2
-            found.setdefault(dll_name, []).append(read_ascii(data, name_offset))
-            thunk_offset += 4
-
-        descriptor_offset += 20
-    return found
+    return parse_pe(path)[0]
 
 
 def check_isolation_modules(root: Path) -> None:
@@ -228,6 +106,7 @@ def check_writable_hard_links(root: Path) -> None:
         "g3together.log",
         "g3trace.log",
         "Ini/ge3.ini",
+        "Ini/logo.ini",
         "isolated-profile/Documents/gothic3/UserOptions.ini",
     )
     for name in names:
@@ -245,14 +124,6 @@ def check_competing_mods(root: Path) -> None:
     if competing:
         names = ", ".join(path.name for path in competing)
         raise RuntimeError(f"Another co-op mod is active in {root}: {names}")
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def resolve_paths(args: argparse.Namespace) -> tuple[Path, list[Path], Path]:

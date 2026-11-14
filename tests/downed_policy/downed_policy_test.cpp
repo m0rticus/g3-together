@@ -359,6 +359,38 @@ void HeldEntryConvergence()
     assert(life.Revive(sequence)); // repair never changes the payment/episode authority
 }
 
+void RevivePaymentSlotAcrossDisconnectAndRejoin()
+{
+    using namespace g3t::downed;
+    RevivePaymentSlot slot;
+    slot.ObserveConnection(true, 1);
+    assert(slot.NeedsPayment(1));
+    assert(slot.NeedsPayment(5));
+    slot.MarkPaid(5);
+    assert(!slot.NeedsPayment(5));
+    assert(!slot.NeedsPayment(1)); // same session: older sequence <= paidSequence stays paid
+    assert(slot.NeedsPayment(6));
+
+    // Disconnect clears paidSequence so rejoining peer starting at sequence 1 can be revived again.
+    slot.ObserveConnection(false, 0);
+    slot.ObserveConnection(true, 2);
+    assert(slot.NeedsPayment(1));
+    slot.MarkPaid(3);
+    assert(!slot.NeedsPayment(1));
+
+    // Fast reconnect observed within a single tick via peer generation bump also resets paidSequence.
+    slot.ObserveConnection(true, 3);
+    assert(slot.NeedsPayment(1));
+
+    // Ordered live non-held PlayerState with downedSequence == 0 also resets paidSequence, and 32-bit wrap holds.
+    slot.MarkPaid(4);
+    assert(!slot.NeedsPayment(4));
+    slot.ObservePlayerState(true, 0);
+    assert(slot.NeedsPayment(1));
+    slot.MarkPaid(UINT32_MAX);
+    assert(slot.NeedsPayment(1));
+}
+
 int main()
 {
     StickyAndRevive();
@@ -370,5 +402,6 @@ int main()
     RealUnavailableAndAllDown();
     ActivityOrderingAndTimerWrap();
     HeldEntryConvergence();
+    RevivePaymentSlotAcrossDisconnectAndRejoin();
     return 0;
 }

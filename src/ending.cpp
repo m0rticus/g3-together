@@ -19,16 +19,13 @@ constexpr uint8_t Kind = 17;
 constexpr uint32_t CheckEvery = 250;   // ms
 constexpr uint32_t TellAfter = 3000;    // ms busy before the player is told the epilogue waits for this hero
 constexpr uint32_t TellAgain = 60000;  // ms between reminders while it waits
-constexpr uint32_t OldLimit = 60000;   // ms; QA endinglimit: the limit before the review (26.10.), as a negative control
-bool on = true;
-bool limited = false;   // QA endinglimit
-uint32_t holdUntil = 0;  // QA endinghold: this hero counts as busy until then
+constexpr bool on = true;
 std::string announced;  // the epilogue info that started here, by this hero or for another player
 std::string waiting;    // the one another player started, to start here
 uint8_t waitingFrom = 0;
 bool knew = false;  // the epilogue's events reached this hero once (its first info clears Epilog_FirstInfo again)
 uint32_t waitingSince = 0, nextCheck = 0, lastTold = 0;
-unsigned sent = 0, received = 0, started = 0, givenUp = 0, told = 0, refused = 0;
+unsigned sent = 0, received = 0, started = 0, told = 0, refused = 0;
 
 gCInfoManager_PS* Infos() { return gCSession::GetInstance().IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr; }
 
@@ -85,17 +82,10 @@ void Tick()
     }
     // Review 26.10.: no time limit (it was 60 s); a long dialog or fight must not cost this player the end. Not even the
     // other player leaving ends the wait, since their game closes at the epilogue's last info. A load or another world does.
-    if (limited && now - waitingSince > OldLimit) {
-        Logf("ending: the epilogue %s of player %u does not start here (QA endinglimit: this hero stayed busy)", waiting.c_str(), waitingFrom);
-        waiting.clear();
-        ++givenUp;
-        return;
-    }
     // The events count once they were here: the other player's first info clears Epilog_FirstInfo a few seconds later, and
     // that clear reaches this hero too (stageEndingWait 26.10.: known for 7 s during the hold, then never again).
     if (!knew && Knows(self, info)) knew = true;
-    const bool held = static_cast<int32_t>(now - holdUntil) < 0;  // QA endinghold
-    if (held || manager->AccessIsRunning() || !knew || !manager->StartInfoManager(*hero, *hero)) {
+    if (manager->AccessIsRunning() || !knew || !manager->StartInfoManager(*hero, *hero)) {
         // After this hero's own dialog, menu or fight, once the events are here. Until then the player knows why.
         if (now - waitingSince >= TellAfter && (!told || now - lastTold >= TellAgain)) {
             lastTold = now;
@@ -133,33 +123,8 @@ void OnWorldChange()
     knew = false;
 }
 
-void Report(LogFn log)
-{
-    char line[300];
-    Format(line, "ENDING on=%d sent=%u received=%u started=%u given_up=%u told=%u refused=%u limited=%d announced=%s waiting=%s",
-           on ? 1 : 0, sent, received, started, givenUp, told, refused, limited ? 1 : 0, announced.empty() ? "-" : announced.c_str(),
-           waiting.empty() ? "-" : waiting.c_str());
-    log(line);
-}
-
-void Hold(char const* seconds, LogFn log)
-{
-    const int s = std::atoi(seconds);
-    holdUntil = net::Now() + static_cast<uint32_t>(s > 0 ? s : 0) * 1000;
-    char line[80];
-    Format(line, "ENDINGHOLD seconds=%d", s > 0 ? s : 0);
-    log(line);
-}
-
-void Limit(LogFn log)
-{
-    limited = true;
-    log("ENDINGLIMIT ok=1");
-}
-
-void Off(LogFn log)
-{
-    on = false;
-    log("ENDINGSYNCOFF ok=1");
-}
+void Report(LogFn) {}
+void Hold(char const*, LogFn) {}
+void Limit(LogFn) {}
+void Off(LogFn) {}
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "enet_policy.h"
 #include "relaywire.h"
 #include <enet/enet.h>
 #include <algorithm>
@@ -48,9 +49,8 @@ public:
     Codec& operator=(Codec const&) = delete;
     bool Ready() const { return context_ != nullptr; }
 
-    bool Decode(void const* packet, size_t size, std::vector<uint8_t>& plain, EnetPacketParse* result = nullptr)
+    bool DecompressToPlain(void const* packet, size_t size, std::vector<uint8_t>& plain)
     {
-        if (result) *result = {};
         if (!context_ || !packet || size < 2 || size > RelayPayloadLimit) return false;
         auto const* bytes = static_cast<uint8_t const*>(packet);
         const size_t header = bytes[0] & 0x80u ? 4 : 2;
@@ -66,6 +66,13 @@ public:
         } else {
             plain.insert(plain.end(), bytes + header, bytes + size);
         }
+        return true;
+    }
+
+    bool Decode(void const* packet, size_t size, std::vector<uint8_t>& plain, EnetPacketParse* result = nullptr)
+    {
+        if (result) *result = {};
+        if (!DecompressToPlain(packet, size, plain)) return false;
         EnetPacketParse parsed;
         const bool valid = ParseEnetDataPacket(plain.data(), plain.size(), &parsed) && !parsed.compressed;
         if (result) *result = parsed;
@@ -95,12 +102,17 @@ struct Item {
     unsigned playerStates = 0;
     Priority priority = Priority::Critical;
     std::string npcKey;
+    size_t protocolBytes = 0;
+    size_t ackBytes = 0;
+    bool parsedEnet = true;
 
     Item() = default;
     Item(std::vector<uint8_t> b, std::vector<std::string> r, uint32_t timestamp,
-         bool isReliable, unsigned states, Priority prio = Priority::Critical, std::string key = {})
+         bool isReliable, unsigned states, Priority prio = Priority::Critical, std::string key = {},
+         size_t proto = 0, size_t acks = 0, bool parsed = true)
         : bytes(std::move(b)), retransmissions(std::move(r)), at(timestamp),
-          reliable(isReliable), playerStates(states), priority(prio), npcKey(std::move(key)) {}
+          reliable(isReliable), playerStates(states), priority(prio), npcKey(std::move(key)),
+          protocolBytes(proto), ackBytes(acks), parsedEnet(parsed) {}
 
     uint16_t Lane() const { return static_cast<uint16_t>(priority); }
     int Flags() const
@@ -173,7 +185,71 @@ public:
         if (result) *result = {};
         if (!packet || !size || size > RelayPayloadLimit) return false;
         std::vector<uint8_t> plain;
-        if (!codec.Decode(packet, size, plain, result)) {
+        const bool decompressed = codec.DecompressToPlain(packet, size, plain);
+        std::array<std::vector<uint8_t>, Classes * 2> groups;
+        std::array<std::vector<std::string>, Classes * 2> retransmissions;
+        std::array<std::string, Classes * 2> npcKeys;
+        std::array<unsigned, Classes * 2> commandCounts{};
+        std::array<unsigned, Classes * 2> playerStates{};
+        std::array<size_t, Classes * 2> groupProtocolBytes{};
+        std::array<size_t, Classes * 2> groupAckBytes{};
+        unsigned duplicateCount = 0;
+        EnetPacketParse parsed;
+        const bool validEnet = decompressed &&
+            ForEachEnetCommand(plain.data(), plain.size(), &parsed,
+                               [&](std::size_t header, EnetCommandView const& view) {
+                const bool reliable = (view.flagsByte & 0x80u) != 0 || view.command == 1;
+                Priority priority = Priority::Critical;
+                if (view.channel == net::ChannelBulk && view.command >= 6)
+                    priority = Priority::Bulk;
+                else if (view.command >= 6 &&
+                         (view.channel == net::ChannelPoses || view.channel == net::ChannelPosesAlt ||
+                          (view.channel == net::ChannelNpcs && !reliable)))
+                    priority = Priority::Pose;
+                else if (view.channel == net::ChannelDefinitions && view.command >= 6)
+                    priority = Priority::Definition;
+                const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
+                if (reliable) {
+                    // An ENet retry may be packed beside different commands.
+                    // Match the command, not that incidental datagram grouping.
+                    std::string key(reinterpret_cast<char const*>(plain.data()), 2);
+                    key.append(reinterpret_cast<char const*>(plain.data() + view.offset), view.totalBytes);
+                    if (pendingReliable_.count(key)) {
+                        ++duplicateCount;
+                        return;
+                    }
+                    for (auto const& batch : retransmissions)
+                        for (auto const& staged : batch)
+                            if (staged == key) {
+                                ++duplicateCount;
+                                return;
+                            }
+                    retransmissions[groupId].push_back(std::move(key));
+                }
+                auto& group = groups[groupId];
+                if ((view.command == 6 || view.command == 7) && view.channel == net::ChannelState &&
+                    view.payloadBytes > 0 && view.payload[0] == 3)
+                    ++playerStates[groupId];
+                if (!reliable && priority == Priority::Pose && view.command == 7 && view.payloadBytes > 0) {
+                    if (++commandCounts[groupId] == 1)
+                        npcKeys[groupId] = ExtractNpcPoseKey(view.payload, view.payloadBytes);
+                    else
+                        npcKeys[groupId].clear();
+                } else {
+                    ++commandCounts[groupId];
+                    npcKeys[groupId].clear();
+                }
+                if (group.empty()) {
+                    group.assign(plain.begin(), plain.begin() + header);
+                    groupProtocolBytes[groupId] = header;
+                }
+                group.insert(group.end(), plain.begin() + view.offset,
+                             plain.begin() + view.offset + view.totalBytes);
+                groupProtocolBytes[groupId] += view.headerBytes;
+                if (view.command == 1) groupAckBytes[groupId] += 8;
+            }) && !parsed.compressed;
+        if (result) *result = parsed;
+        if (!validEnet) {
             // Classification is not transport validation. Keep unknown datagrams
             // intact and let the receiving ENet endpoint validate them.
             auto const* bytes = static_cast<uint8_t const*>(packet);
@@ -181,6 +257,7 @@ public:
             item.bytes.assign(bytes, bytes + size);
             item.at = now;
             item.priority = Priority::Bulk;
+            item.parsedEnet = false;
             queues_[static_cast<unsigned>(Priority::Bulk) * 2 + 1].push_back(std::move(item));
             bytes_ += size;
             ++depth_;
@@ -192,56 +269,9 @@ public:
             counters.peakAge = (std::max)(counters.peakAge, OldestAge(now));
             return true;
         }
-        const size_t header = plain[0] & 0x80u ? 4 : 2;
-        std::array<std::vector<uint8_t>, Classes * 2> groups;
-        std::array<std::vector<std::string>, Classes * 2> retransmissions;
-        std::array<std::string, Classes * 2> npcKeys;
-        std::array<unsigned, Classes * 2> commandCounts{};
-        std::array<unsigned, Classes * 2> playerStates{};
-        for (size_t at = header; at < plain.size();) {
-            const unsigned command = plain[at] & 15u;
-            const unsigned channel = plain[at + 1];
-            const size_t commandHeader = EnetCommandHeaderSize(command);
-            size_t length = commandHeader;
-            if (command == 6) length += RelayReadUint16(plain.data() + at + 4);
-            if (command == 7 || command == 8 || command == 9 || command == 12)
-                length += RelayReadUint16(plain.data() + at + 6);
-            const bool reliable = (plain[at] & 0x80u) != 0 || command == 1;
-            Priority priority = Priority::Critical;
-            if (channel == 6 && command >= 6) priority = Priority::Bulk;
-            else if (command >= 6 && (channel == 4 || channel == 5 || (channel == 2 && !reliable)))
-                priority = Priority::Pose;
-            else if (channel == 7 && command >= 6)
-                priority = Priority::Definition;
-            const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
-            if (reliable) {
-                // An ENet retry may be packed beside different commands.
-                // Match the command, not that incidental datagram grouping.
-                std::string key(reinterpret_cast<char const*>(plain.data()), 2);
-                key.append(reinterpret_cast<char const*>(plain.data() + at), length);
-                if (!pendingReliable_.insert(key).second) {
-                    ++counters.duplicates;
-                    at += length;
-                    continue;
-                }
-                retransmissions[groupId].push_back(std::move(key));
-            }
-            auto& group = groups[groupId];
-            if ((command == 6 || command == 7) && channel == 0 &&
-                length > commandHeader && plain[at + commandHeader] == 3)
-                ++playerStates[groupId];
-            if (!reliable && priority == Priority::Pose && command == 7 && length > commandHeader) {
-                if (++commandCounts[groupId] == 1)
-                    npcKeys[groupId] = ExtractNpcPoseKey(plain.data() + at + commandHeader, length - commandHeader);
-                else
-                    npcKeys[groupId].clear();
-            } else {
-                ++commandCounts[groupId];
-                npcKeys[groupId].clear();
-            }
-            if (group.empty()) group.assign(plain.begin(), plain.begin() + header);
-            group.insert(group.end(), plain.begin() + at, plain.begin() + at + length);
-            at += length;
+        counters.duplicates += duplicateCount;
+        for (unsigned i = 0; i < groups.size(); ++i) {
+            for (auto const& key : retransmissions[i]) pendingReliable_.insert(key);
         }
         for (unsigned i = 0; i < groups.size(); ++i) {
             auto& group = groups[i];
@@ -255,23 +285,15 @@ public:
             counters.wireBytes += group.size();
             if (!reliable && priority == Priority::Pose) {
                 if (!npcKeys[i].empty()) {
-                    bool replaced = false;
-                    for (auto& existing : queue) {
-                        if (existing.npcKey == npcKeys[i]) {
-                            bytes_ -= existing.bytes.size();
-                            poseUnreliableBytes_ -= existing.bytes.size();
-                            existing.bytes = std::move(group);
-                            existing.at = now;
-                            bytes_ += existing.bytes.size();
-                            poseUnreliableBytes_ += existing.bytes.size();
+                    for (auto it = queue.begin(); it != queue.end(); ++it) {
+                        if (it->npcKey == npcKeys[i]) {
+                            bytes_ -= it->bytes.size();
+                            poseUnreliableBytes_ -= it->bytes.size();
+                            --depth_;
+                            queue.erase(it);
                             ++counters.npcUpdatesDropped;
-                            replaced = true;
                             break;
                         }
-                    }
-                    if (replaced) {
-                        EvictStaleUnreliablePoses(now, 0);
-                        continue;
                     }
                 }
                 EvictStaleUnreliablePoses(now, group.size());
@@ -280,7 +302,8 @@ public:
             bytes_ += group.size();
             ++depth_;
             queue.push_back({std::move(group), std::move(retransmissions[i]),
-                             now, reliable, playerStates[i], priority, std::move(npcKeys[i])});
+                             now, reliable, playerStates[i], priority, std::move(npcKeys[i]),
+                             groupProtocolBytes[i], groupAckBytes[i], true});
         }
         counters.peakDepth = (std::max)(counters.peakDepth, depth_);
         counters.peakBytes = (std::max)(counters.peakBytes, bytes_);

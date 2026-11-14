@@ -28,9 +28,15 @@ def function_body(source, signature):
 class SavingPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.persist = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+        cls.persist = "\n".join(
+            (ROOT / "src" / name).read_text(encoding="utf-8")
+            for name in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
+        )
         cls.net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
-        cls.hero = (ROOT / "src" / "hero.cpp").read_text(encoding="utf-8")
+        cls.hero = "\n".join(
+            (ROOT / "src" / name).read_text(encoding="utf-8")
+            for name in ("hero.cpp", "hero_codec.cpp")
+        )
 
     def test_production_record_policy_executes_without_engine(self):
         compiler = shutil.which("clang++") or shutil.which("g++")
@@ -183,6 +189,24 @@ class SavingPolicyTests(unittest.TestCase):
         save = function_body(self.hero, r"\bbool\s+SaveRecordImpl\s*\(")
         self.assertIn("_commit(_fileno(file))", save)
         self.assertIn("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH", save)
+
+    def test_host_load_retires_live_world_and_drains_pvs_before_native_load(self):
+        load = function_body(self.persist, r"\bbool\s+__stdcall\s+LoadDetour\s*\(")
+        self.assertIn("if (worldCleanup) worldCleanup();", load)
+        self.assertIn("clock::OnWorldChange();", load)
+        self.assertLess(load.index("if (worldCleanup) worldCleanup();"),
+                        load.index("originalLoad(self, name)", load.index('CancelSave("canceled-load")')))
+
+    def test_character_validation_and_restore_use_in_memory_records_and_door_admission(self):
+        validate = function_body(self.persist, r"\bbool\s+ValidateCharacter\s*\(")
+        self.assertIn("hero::ValidateRecordMemory(bytes.data(), bytes.size(), key)", validate)
+        self.assertNotIn(".validate", validate)
+        apply_fn = function_body(self.persist, r"\bbool\s+ApplyCharacter\s*\(")
+        self.assertIn("hero::LoadRecordFromMemory(bytes.data(), bytes.size(), key)", apply_fn)
+        self.assertNotIn(".restore", apply_fn)
+        on_world = function_body(self.persist, r"\bvoid\s+OnWorld\s*\(")
+        ready_branch = on_world.split("if (note.op == net::WorldReady)", 1)[1].split("if (note.op != net::WorldHost)", 1)[0]
+        self.assertIn("!story::AdmissionReady() || !doors::AdmissionReady()", ready_branch)
 
 
 if __name__ == "__main__":

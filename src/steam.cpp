@@ -1,163 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Combined with Valve's steam_api.dll under the additional permission in COPYING.STEAMWORKS (GPLv3 section 7).
-// Steam transport, see steam.h. steam_api.dll (32-bit, Steamworks.NET Standalone 2025.164.1, SHA-256
-// fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da) is loaded at run time and driven through its flat C
-// API with manual callback dispatch: no Steamworks headers or import libraries. The flat API table, the lobby and session
-// handling and the hello/welcome/ping link are adapted from Jericho Co-op's native/steam_net.c (MIT, Copyright (c) 2026
-// Jericho Co-op contributors, thirdparty/licenses/jericho-coop-LICENSE), which a real two-account test confirmed
-// (2026-10-21: the sender identity at offset 12 in the 32-bit DLL, LobbyCreated twice, no overlay in a D3D9 game).
-//
-// On top of NetworkingMessages:
-//   channel 1 (control): 'H' hello (client -> lobby owner until welcomed), 'W' welcome, 'P'+time ping and 'Q'+time pong
-//            every second (round trip for the status), 'B' bye. Before a lobby exists (invite-driven connection, see
-//            steam_connect.h) the same channel carries the plain ASCII join request/offer/decline frames "G3T1J/L/N".
-//   channel 0 (data): ENet commands grouped by priority, losslessly compressed. ENet alone owns data reliability;
-//            busy Steam submissions are retained by our queue, never mistaken for completed loopback sends.
-// Nothing connects by itself (connection = invite, the default): the host publishes Join Game rich presence and opens its
-// friends-only lobby only for a friend's join request; the client connects only after its player accepts a Steam invite.
-// Every step is logged as "connect: ..." (connection = auto keeps the old automatic discovery for the stand-in/tests).
-// The relay: a client's ENet connects to a 127.0.0.1 socket of this file, which passes each datagram to the host's
-// SteamID. On the host each linked friend gets its own 127.0.0.1 socket that talks to the host's ENet port, so ENet sees
-// every friend as a separate local peer (coop-anything's HXCoop pattern) and needs no change. The host's ENet still
-// listens only on loopback and admits sockets belonging to linked Steam peers.
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
+// Steam transport lifecycle, worker thread and published engine-thread readers; see steam.h,
+// steam_abi.h, steam_runtime.h, steam_p2p.cpp, steam_flow.cpp and steam_diagnostics.cpp.
+#include "steam_runtime.h"
 
-#include "steam.h"
-#include "player_identity.h"
-#include "relaywire.h"
-#include "saving_policy.h"
-#include "steam_connect.h"
-#include "steam_send.h"
-#include "enet_policy.h"
-#include "steam_config.h"
-#include "steam_diagnostics.h"
+#ifdef _MSC_VER
+#pragma comment(lib, "bcrypt.lib")
+#endif
 
 #include "config.h"
 #include "crashlog.h"
-#include "latency.h"
 #include "log.h"
-#include "net.h"
+#include "relaywire.h"
+#include "saving_policy.h"
+#include "session.h"
 
-#include <cstdio>
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <float.h>
-#include <mutex>
-#include <memory>
-#include <new>
 #include <process.h>
-#include <xmmintrin.h>
 
 namespace g3t::steam {
+Api api;
+WorkerRuntime rt;
+PublishedStore store;
+
 namespace {
-using u64 = unsigned long long;
-using sbool = unsigned char;  // C++ bool, returned in AL
-using HSteamPipe = int;
-
-unsigned short FpuControl()
-{
-    unsigned short value;
-    __asm fnstcw value
-    return value;
-}
-
-// Real Steam startup changes x87 precision from the engine's single precision to double precision.
-class SteamFpScope
-{
-    unsigned short control = FpuControl();
-    unsigned mxcsr = _mm_getcsr();
-    char const* operation;
-  public:
-    explicit SteamFpScope(char const* name) : operation(name)
-    {
-        const unsigned short libraryControl = static_cast<unsigned short>((control & ~_MCW_PC) | _PC_53);
-        __asm fldcw libraryControl
-    }
-    ~SteamFpScope()
-    {
-        const unsigned short after = FpuControl();
-        const unsigned sseAfter = _mm_getcsr();
-        static thread_local unsigned changes = 0;
-        if ((after != control || ((sseAfter ^ mxcsr) & ~0x3fu)) && ++changes <= 8)
-            Logf("steam: restoring engine FP state after %s: x87=%04x->%04x mxcsr=%08x->%08x",
-                 operation, after, control, sseAfter, mxcsr);
-        const unsigned short saved = control;
-        __asm fldcw saved
-        _mm_setcsr(mxcsr);
-    }
-    SteamFpScope(SteamFpScope const&) = delete;
-    SteamFpScope& operator=(SteamFpScope const&) = delete;
-};
-
-// The flat API: plain __cdecl functions (the mod's own default is __stdcall, /Gz), the interface first.
-struct Api
-{
-    int(__cdecl* InitFlat)(char* error);
-    void(__cdecl* Shutdown)();
-    void*(__cdecl* ClientUtils)();
-    uint32_t(__cdecl* AppId)(void*);
-    HSteamPipe(__cdecl* GetHSteamPipe)();
-    void(__cdecl* DispatchInit)();
-    void(__cdecl* DispatchRunFrame)(HSteamPipe);
-    sbool(__cdecl* DispatchNext)(HSteamPipe, void* message);
-    void(__cdecl* DispatchFree)(HSteamPipe);
-    sbool(__cdecl* DispatchResult)(HSteamPipe, u64 call, void* buffer, int size, int callback, sbool* failed);
-    void*(__cdecl* User)();
-    u64(__cdecl* UserSteamId)(void*);
-    void*(__cdecl* Matchmaking)();
-    u64(__cdecl* CreateLobby)(void*, int type, int maxMembers);
-    u64(__cdecl* JoinLobby)(void*, u64 lobby);
-    void(__cdecl* LeaveLobby)(void*, u64 lobby);
-    sbool(__cdecl* SetLobbyData)(void*, u64 lobby, char const* key, char const* value);
-    char const*(__cdecl* GetLobbyData)(void*, u64 lobby, char const* key);
-    sbool(__cdecl* RequestLobbyData)(void*, u64 lobby);
-    u64(__cdecl* GetLobbyOwner)(void*, u64 lobby);
-    int(__cdecl* MemberCount)(void*, u64 lobby);
-    u64(__cdecl* MemberByIndex)(void*, u64 lobby, int index);
-    void*(__cdecl* Friends)();
-    char const*(__cdecl* PersonaName)(void*);
-    int(__cdecl* FriendCount)(void*, int flags);
-    u64(__cdecl* FriendByIndex)(void*, int index, int flags);
-    sbool(__cdecl* FriendGamePlayed)(void*, u64 user, void* info);
-    char const*(__cdecl* FriendPersonaName)(void*, u64 user);
-    sbool(__cdecl* SetRichPresence)(void*, char const* key, char const* value);
-    int(__cdecl* FriendRelationship)(void*, u64 user);  // optional: older stand-ins lack it; 3 = friend
-    void*(__cdecl* Messages)();
-    int(__cdecl* SendToUser)(void*, void const* identity, void const* data, unsigned size, int flags, int channel);
-    int(__cdecl* ReceiveOnChannel)(void*, int channel, void** messages, int max);
-    sbool(__cdecl* AcceptSession)(void*, void const* identity);
-    sbool(__cdecl* CloseSession)(void*, void const* identity);
-    void(__cdecl* IdentitySetSteamId)(void* identity, u64 id);
-    u64(__cdecl* IdentityGetSteamId)(void const* identity);
-    void(__cdecl* MessageRelease)(void* message);
-    void*(__cdecl* Utils)();
-    void(__cdecl* InitRelayNetworkAccess)(void*);
-    sbool(__cdecl* SetConfigValue)(void*, int value, int scope, intptr_t object, int type, void const* data);
-    int(__cdecl* GetConfigValue)(void*, int value, int scope, intptr_t object, int* type, void* data, size_t* size);
-    int(__cdecl* GetSessionConnectionInfo)(void*, void const* identity, void* info, void* status);
-    void*(__cdecl* AllocateMessage)(void*, int cbAllocateBuffer);
-    void*(__cdecl* Sockets)();
-    uint32_t(__cdecl* CreateListenSocketP2P)(void*, int localVirtualPort, int nOptions, void const* options);
-    uint32_t(__cdecl* ConnectP2P)(void*, void const* identityRemote, int remoteVirtualPort, int nOptions, void const* options);
-    int(__cdecl* AcceptConnection)(void*, uint32_t conn);
-    sbool(__cdecl* CloseConnection)(void*, uint32_t peer, int reason, char const* debug, sbool linger);
-    sbool(__cdecl* CloseListenSocket)(void*, uint32_t socket);
-    int(__cdecl* ConfigureConnectionLanes)(void*, uint32_t conn, int numLanes, int const* priorities, uint16_t const* weights);
-    void(__cdecl* SendMessages)(void*, int nMessages, void* const* messages, int64_t* outMessageNumberOrResult);
-    int(__cdecl* FlushMessagesOnConnection)(void*, uint32_t conn);
-    int(__cdecl* ReceiveOnConnection)(void*, uint32_t conn, void** messages, int maxMessages);
-    sbool(__cdecl* GetConnectionInfo)(void*, uint32_t conn, void* info);
-    int(__cdecl* GetConnectionRealTimeStatus)(void*, uint32_t conn, void* status, int numLanes, void* lanes);
-    int(__cdecl* FakeSteamAbi)(void*, uint32_t);
-} api;
-
-struct Export { void** slot; char const* name; };
 Export const Exports[] = {
     {reinterpret_cast<void**>(&api.InitFlat), "SteamAPI_InitFlat"},
     {reinterpret_cast<void**>(&api.Shutdown), "SteamAPI_Shutdown"},
@@ -220,203 +88,94 @@ Export const OptionalExports[] = {
     {reinterpret_cast<void**>(&api.FakeSteamAbi), "FakeSteam_GetAbiInfoV1"},
 };
 
-// Callback ids and the 32-bit layouts (playbook, "Struct layouts"): read with memcpy at these offsets.
-enum : int {
-    CbLobbyJoinRequested = 333,  // GameLobbyJoinRequested_t { u64 lobby; u64 friend; }: an invite accepted in the game
-    CbRichJoinRequested = 337,   // GameRichPresenceJoinRequested_t { u64 friend; char connect[256]; }: "Join game"
-    CbLobbyInvite = 503,         // LobbyInvite_t { u64 inviter; u64 lobby; u64 game; }: an invite arrived, not accepted yet
-    CbLobbyEnter = 504,          // LobbyEnter_t { u64 lobby; u32 perms; bool locked; u32 response at 16; } 1 = success
-    CbLobbyDataUpdate = 505,     // LobbyDataUpdate_t { u64 lobby; u64 member; bool success; }
-    CbLobbyChatUpdate = 506,     // LobbyChatUpdate_t { u64 lobby; u64 changed; u64 by; u32 state at 24; }
-    CbLobbyCreated = 513,        // LobbyCreated_t { int result; u64 lobby at 8; }
-    CbCallCompleted = 703,       // SteamAPICallCompleted_t { u64 call; int callback; u32 size; }
-    CbConnectionStatusChanged = 1221, // SteamNetConnectionStatusChangedCallback_t { u32 conn; pad4; ConnectionInfo(696); i32 oldState; }
-    CbSessionRequest = 1251,     // SteamNetworkingMessagesSessionRequest_t { identity at 0; }
-    CbSessionFailed = 1252,      // SteamNetworkingMessagesSessionFailed_t { connection info, its identity at 0; }
-};
-enum : int { SendUnreliable = 0, SendNoNagle = 1, SendReliable = 8, SendAutoRestart = 32 };
-enum : int { ResultOk = 1 };
-enum : int { ChannelData = 0, ChannelControl = 1 };
-constexpr int P2PVirtualPort = 1;
-constexpr int LaneCount = 4;
-#pragma pack(push, 8)
-struct OutboundSocketMessage {
-    void* data = nullptr;
-    int32_t size = 0;
-    uint32_t conn = 0;
-    uint8_t identityPeer[136] = {};
-    int64_t connUserData = 0;
-    int64_t timeReceived = 0;
-    int64_t messageNumber = 0;
-    void(__cdecl* freeData)(void*) = nullptr;
-    void(__cdecl* release)(void*) = nullptr;
-    int32_t channel = 0;
-    int32_t flags = 0;
-    int64_t userData = 0;
-    uint16_t lane = 0;
-    uint16_t pad = 0;
-};
-static_assert(offsetof(OutboundSocketMessage, release) == 0xb4 &&
-              offsetof(OutboundSocketMessage, flags) == 0xbc &&
-              offsetof(OutboundSocketMessage, lane) == 0xc8,
-              "SteamNetworkingMessage_t 32-bit ABI mismatch");
-#pragma pack(pop)
-constexpr int LobbyFriendsOnly = 1;
-constexpr int FriendFlagImmediate = 4;
-constexpr uint32_t GothicAppId = 39500;
-char const LobbyTag[] = "g3together";
-char const LobbyVersion[] = "3";  // compact LE lobby + marker/length + exact ASCII session relay framing
-// The transport worker continues during native loads; allow ENet's shorter bounded timeout to decide network loss.
-// A friend who quits leaves the lobby, which ends the link at once.
-constexpr uint32_t SilenceMs = 180000;
-constexpr uint32_t ScanMs = 3000;       // client: how often the friends list is searched for a host
-constexpr uint32_t JoinWaitMs = 15000;  // client: a lobby that does not answer the join in this time is skipped for a while
-constexpr uint32_t MetadataRequestRetryMs = 1000;
-constexpr int MaxRemotes = net::MaxPlayers;
-
-struct Remote
+unsigned __stdcall TransportThread(void*)
 {
-    u64 id = 0;
-    uint64_t generation = 0;
-    char name[24] = {};
-    bool linked = false;   // host: said hello while in the lobby; client: the host welcomed us
-    bool leaving = false;
-    uint32_t createdAt = 0, linkedAt = 0, lobbyChange = 0;
-    bool firstEnetLogged = false, unclassifiedLogged[32] = {};
-    uint32_t heard = 0, lastPing = 0;
-    latency::Ping ping;
-    SOCKET socket = INVALID_SOCKET;  // host: this friend's 127.0.0.1 socket to the host's ENet port
-    unsigned short relayPort = 0;
-    uint32_t p2pConn = 0;
-    bool p2pConnected = false, p2pLanesConfigured = false;
-    bool haveDirectCookie = false, directReady = false;
-    uint8_t directCookie[16] = {};
-    DirectEndpoint directCandidates[8] = {};
-    unsigned directCandidateCount = 0;
-    uint32_t directPeerIpv4 = 0;
-    uint16_t directPeerPort = 0;
-    uint32_t lastDirectOfferSent = 0;
-    unsigned toEnet = 0, toSteam = 0;
-    send::Queue pending;
-    uint64_t steamReliableOk = 0, steamUnreliableOk = 0, steamFailed[128] = {};
-};
-
-struct Skipped { u64 lobby; uint32_t until; };  // until 0: for good (not a G3 Together lobby)
-
-bool ready = false, tried = false, winsockStarted = false, apiInitialized = false;
-bool socketsLaneTransport = false, directUdpEnabled = false;
-uint32_t listenSocketP2P = 0;
-char error[256] = "";
-HSteamPipe pipe = 0;
-void *user = nullptr, *matchmaking = nullptr, *friends = nullptr, *messages = nullptr, *sockets = nullptr;
-void* networkingUtils = nullptr;
-u64 me = 0;
-char persona[64] = "";
-char playerName[24] = "";
-unsigned sendFailures = 0;
-config::Applied networkingConfig[4];
-bool networkingConfigured = false;
-unsigned isolatedDrops = 0;
-uint32_t lastSendFailure = 0, lastDiagnostics = 0;
-
-bool isHost = false;
-unsigned short enetPort = 0;
-u64 lobby = 0, owner = 0;
-uint32_t lastCreate = 0;
-Remote remotes[MaxRemotes];
-uint64_t nextRelayGeneration = 0;
-int senderOffset = 0;  // where a message's sender identity sits: 12 in the real 32-bit DLL, 16 by the headers; 0: unknown
-
-// Client
-SOCKET relay = INVALID_SOCKET;   // 127.0.0.1:<RelayPort>, the address the client's ENet connects to
-unsigned short relayPort = 0;
-sockaddr_in enetAddress{};       // where the client's ENet sends from (learnt from its first datagram)
-bool haveEnetAddress = false;
-u64 wantedLobby = 0;             // from steam_lobby in the INI or +connect_lobby on the command line
-bool wantedWaitLogged = false;
-u64 pendingLobby = 0;            // an invite or "Join game" accepted through Steam
-u64 candidateLobby = 0;          // metadata being checked before or after JoinLobby
-uint32_t candidateAt = 0, candidateRequestAt = 0;
-bool candidateJoined = false, candidatePendingLogged = false;
-char candidateReason[64] = "";
-uint32_t joinedAt = 0, lastScan = 0, lastHello = 0;
-char hostName[64] = "";
-Skipped skipped[16] = {};
-bool searchLogged = false;
-
-// The invite-driven connection (steam_connect.h): both flows live on the transport worker like everything below.
-connect::Mode connectionMode = connect::Mode::Invite;
-connect::ClientFlow clientFlow;
-connect::HostFlow hostFlow;
-struct Label { u64 id = 0; uint32_t at = 0; char text[64] = ""; } labels[3];  // display names of the people the flows name
-char presenceStatus[96] = "", presenceConnect[256] = "";
-bool connectPublished = false;  // host: the Join Game rich presence (connect) was accepted by Steam
-uint32_t lastPresence = 0;
-u64 requestedHost = 0;          // client: the host a join request went to (its session is closed when the attempt ends)
-std::atomic<bool> disconnectRequested{false};  // engine thread -> worker: the ENet connection ended, end the link too
-struct ClientEnet {
-    unsigned state = 0, event = 0;
-    uint32_t data = 0, elapsedMs = 0, sampledAt = 0;
-    char reason[160] = {};
-} clientEnet;
-uint32_t clientAttemptAt = 0, clientLinkedAt = 0;
-bool clientHadLink = false, clientEndRecorded = false, clientEndedImmediately = false;
-char clientEndReason[160] = {};
-
-// Only the transport worker owns the API, sockets and remotes after startup.
-// Engine-thread readers copy published state, never wait on a Steam call or inspect its mutable buffers.
-struct Published
-{
-    bool ready = false, hostLinked = false;
-    uint64_t hostGeneration = 0;
-    u64 lobby = 0;
-    int linked = 0, ping = -1;
-    uint32_t pingSampleAt = 0;
-    unsigned short ports[MaxRemotes] = {};
-    u64 accounts[MaxRemotes] = {};
-    uint64_t generations[MaxRemotes] = {};
-    char names[MaxRemotes][24] = {}, playerName[24] = {};
-    DirectOffer directOffers[MaxRemotes] = {};
-    DirectEndpoint verifiedDirect[MaxRemotes] = {};
-    char hostName[64] = {}, error[256] = {}, status[900] = {};
-    Connection connection;
-    TrafficCounters traffic;
-} published;
-std::mutex publishedMutex;
-DirectEndpoint registeredDirect[MaxRemotes] = {};
-uint64_t registeredDirectAccount[MaxRemotes] = {};
-uint64_t registeredDirectGen[MaxRemotes] = {};
-std::vector<RelayDrop> relayDrops;
-struct RelayClose { uint64_t account, generation; char reason[160]; };
-std::vector<RelayClose> relayCloses;
-HANDLE worker = nullptr, stopEvent = nullptr, wakeEvent = nullptr, pollTimer = nullptr;
-uint32_t lastPump = 0;
-latency::Samples pollGaps, pumpWork;
-unsigned receiveCaps = 0, forwardCaps = 0, socketFailures = 0, receiveFailures = 0, invalidPongs = 0;
-int socketError = 0;
-TrafficCounters traffic;
-std::unique_ptr<send::Codec> sendCodec;
-
-double PingSeconds()
-{
-    static const LONGLONG frequency = [] { LARGE_INTEGER value; QueryPerformanceFrequency(&value); return value.QuadPart; }();
-    LARGE_INTEGER value;
-    QueryPerformanceCounter(&value);
-    return static_cast<double>(value.QuadPart) / frequency;
-}
-// Keep relay intervals/ages on QPC too, independent of an occluded game's millisecond timer resolution.
-uint32_t Now() { return static_cast<uint32_t>(static_cast<uint64_t>(PingSeconds() * 1000.0)); }
-
-void FillConnection(Connection& out);  // after the Steam helpers below
-
-int CountLinked()
-{
-    int count = 0;
-    for (auto const& r : remotes) count += r.linked ? 1 : 0;
-    return count;
+    for (;;) {
+        const DWORD stop = WaitForSingleObject(store.stopEvent, 0);
+        if (stop == WAIT_OBJECT_0) break;
+        if (stop == WAIT_FAILED) {
+            rt.ready = false;
+            rt.Fail("transport stop event failed");
+            break;
+        }
+        crashlog::PollWorldEntry();
+        rt.PumpOnce();
+        HANDLE events[] = {store.stopEvent, store.wakeEvent, store.pollTimer};
+        if (store.pollTimer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -static_cast<LONGLONG>(latency::RelayPollMs) * 10000;
+            if (!SetWaitableTimer(store.pollTimer, &due, 0, nullptr, nullptr, FALSE)) {
+                rt.ready = false;
+                rt.Fail("transport timer could not be armed");
+                break;
+            }
+        }
+        const DWORD result = WaitForMultipleObjects(store.pollTimer ? 3 : 2, events, FALSE,
+                                                    store.pollTimer ? INFINITE : latency::RelayPollMs);
+        if (result == WAIT_OBJECT_0) break;
+        if (result == WAIT_FAILED) {
+            rt.ready = false;
+            rt.Fail("transport wait failed");
+            break;
+        }
+    }
+    return 0;
 }
 
-void Publish()
+bool ReadPeerIdentityLocked(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    if (!store.published.ready || !rt.isHost || !port) return false;
+    for (int i = 0; i < MaxRemotes; ++i) {
+        auto const& peer = store.published.peers[i];
+        if (peer.port == port && peer.account) {
+            account = peer.account;
+            generation = peer.generation;
+            strcpy_s(name, peer.name);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReadDirectPeerIdentityLocked(uint32_t hostIpv4, uint16_t port, uint64_t& account,
+                                  char (&name)[24], uint64_t& generation, uint32_t* expectedTag)
+{
+    if (!store.published.ready || !rt.isHost || !hostIpv4 || !port) return false;
+    for (int i = 0; i < MaxRemotes; ++i) {
+        auto const& peer = store.published.peers[i];
+        if (!peer.account || !peer.directPinned) continue;
+        if (peer.verifiedDirect.hostIpv4 != hostIpv4 || peer.verifiedDirect.port != port) continue;
+        account = peer.account;
+        generation = peer.generation;
+        strcpy_s(name, peer.name);
+        if (expectedTag) *expectedTag = CookieTag(peer.directOffer.cookie);
+        return true;
+    }
+    return false;
+}
+}
+
+void InvalidatePublishedLocked(PublishedStore& target, bool isHostRole, u64 account, uint64_t generation)
+{
+    for (int i = 0; i < MaxRemotes; ++i) {
+        auto& peer = target.published.peers[i];
+        if (peer.account != account || peer.generation != generation) continue;
+        peer = PublishedPeer{};
+        if (isHostRole && target.published.linked > 0) --target.published.linked;
+    }
+    if (!isHostRole && target.published.hostGeneration == generation) {
+        target.published.hostLinked = false;
+        target.published.hostGeneration = 0;
+    }
+}
+
+void WorkerRuntime::Identity(char (&buffer)[160], u64 id) const
+{
+    std::memset(buffer, 0, sizeof(buffer));
+    api.IdentitySetSteamId(buffer, id);
+}
+
+void WorkerRuntime::Publish()
 {
     Published next;
     const uint32_t now = Now();
@@ -425,7 +184,7 @@ void Publish()
     next.linked = CountLinked();
     next.traffic = traffic;
     strcpy_s(next.playerName, playerName);
-    next.traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetConfig().sessionId));
+    next.traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetLocalConfig().sessionId));
     for (auto const& r : remotes)
         if (r.linked && r.ping.Value(now) > next.ping) {
             next.ping = r.ping.Value(now);
@@ -439,9 +198,9 @@ void Publish()
                    "poll_timer=%s poll_gap_avg_ms=%.2f poll_gap_max_ms=%u pump_work_max_ms=%u receive_caps=%u forward_caps=%u "
                    "socket_failures=%u socket_error=%d receive_failures=%u invalid_pongs=%u",
                    GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, next.linked, next.ping,
-                   sendFailures, senderOffset, *error ? error : "-", GetConfig().sessionId, isolatedDrops,
-                   pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum, receiveCaps, forwardCaps,
-                   socketFailures, socketError, receiveFailures, invalidPongs);
+                   sendFailures, senderOffset, *error ? error : "-", GetLocalConfig().sessionId, isolatedDrops,
+                   store.pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum,
+                   receiveCaps, forwardCaps, socketFailures, socketError, receiveFailures, invalidPongs);
     n += Format(next.status + n, sizeof(next.status) - n, " connect_mode=%s connect_state=%s why=%s",
                 connectionMode == connect::Mode::Auto ? "auto" : "invite",
                 isHost ? connect::StateName(hostFlow.state()) : connect::StateName(clientFlow.state()),
@@ -450,10 +209,13 @@ void Publish()
         auto const& r = remotes[i];
         if (!r.id) continue;
         if (r.linked) {
-            next.ports[i] = r.relayPort; next.accounts[i] = r.id; next.generations[i] = r.generation;
-            strcpy_s(next.names[i], r.name);
+            auto& peer = next.peers[i];
+            peer.port = r.relayPort;
+            peer.account = r.id;
+            peer.generation = r.generation;
+            strcpy_s(peer.name, r.name);
             if (directUdpEnabled && r.haveDirectCookie) {
-                auto& offer = next.directOffers[i];
+                auto& offer = peer.directOffer;
                 offer.account = r.id;
                 offer.generation = r.generation;
                 std::memcpy(offer.cookie, r.directCookie, sizeof(offer.cookie));
@@ -471,1767 +233,20 @@ void Publish()
                     r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
                     r.ping.milliseconds < 0 ? 0u : now - r.ping.sampledAt);
     }
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    published = next;
-}
-
-char const* Text(char const* text) { return text ? text : ""; }  // Steam's strings, never null for the CRT
-
-void CopyName(char* out, size_t size, char const* source)
-{
-    size_t length = std::strlen(Text(source));
-    if (length >= size) {
-        length = size - 1;
-        while (length && (static_cast<unsigned char>(source[length]) & 0xc0) == 0x80) --length;
-    }
-    std::memcpy(out, Text(source), length);
-    for (size_t i = 0; i < length; ++i)
-        if (static_cast<unsigned char>(out[i]) < 32 || out[i] == 127) out[i] = '_';
-    out[length] = '\0';
-}
-
-void Identity(char (&buffer)[160], u64 id)
-{
-    std::memset(buffer, 0, sizeof(buffer));  // a SteamNetworkingIdentity is 136 bytes; filled only through SetSteamID64
-    api.IdentitySetSteamId(buffer, id);
-}
-
-uint32_t CookieTag(uint8_t const cookie[16])
-{
-    uint32_t tag = 0;
-    std::memcpy(&tag, cookie, sizeof(tag));
-    return tag ? tag : 0x67337431u;
-}
-
-void ConfigureSocketOptions(int scope, intptr_t handle)
-{
-    if (!networkingUtils || !api.SetConfigValue) return;
-    int32_t ice = config::IceEnableAll;
-    api.SetConfigValue(networkingUtils, config::P2PTransportIceEnable, scope, handle, config::Int32, &ice);
-    int32_t buf = config::BufferCapacity;
-    api.SetConfigValue(networkingUtils, config::SendBufferSize, scope, handle, config::Int32, &buf);
-    int32_t minRate = config::MinRateCapacity;
-    api.SetConfigValue(networkingUtils, config::SendRateMin, scope, handle, config::Int32, &minRate);
-    int32_t maxRate = config::MaxRateCapacity;
-    api.SetConfigValue(networkingUtils, config::SendRateMax, scope, handle, config::Int32, &maxRate);
-}
-
-bool ConfigurePeerLanes(uint32_t conn)
-{
-    if (!socketsLaneTransport || !conn) return false;
-    static int const priorities[LaneCount] = {0, 1, 2, 3};
-    static uint16_t const weights[LaneCount] = {8, 4, 2, 1};
-    const int rc = api.ConfigureConnectionLanes(sockets, conn, LaneCount, priorities, weights);
-    if (rc != ResultOk)
-        Logf("steam-send: ConfigureConnectionLanes conn=%u failed result=%d", conn, rc);
-    return rc == ResultOk;
-}
-
-void ClosePeerP2P(Remote& r)
-{
-    if (r.p2pConn && sockets && api.CloseConnection)
-        api.CloseConnection(sockets, r.p2pConn, 0, "session ended", 0);
-    r.p2pConn = 0;
-    r.p2pConnected = r.p2pLanesConfigured = false;
-}
-
-void OpenClientP2P(Remote& r)
-{
-    if (!socketsLaneTransport || isHost || r.p2pConn) return;
-    char identity[160];
-    Identity(identity, r.id);
-    r.p2pConn = api.ConnectP2P(sockets, identity, P2PVirtualPort, 0, nullptr);
-    if (!r.p2pConn) {
-        Logf("steam-send: ConnectP2P to %llu failed; keeping Messages fallback", r.id);
-        return;
-    }
-    ConfigureSocketOptions(config::ConnectionScope, static_cast<intptr_t>(r.p2pConn));
-    r.p2pLanesConfigured = ConfigurePeerLanes(r.p2pConn);
-    Logf("steam-send: ConnectP2P peer=%llu conn=%u vport=%d lanes=%u ice=all",
-         r.id, r.p2pConn, P2PVirtualPort, r.p2pLanesConfigured ? LaneCount : 0u);
-}
-
-unsigned GatherLocalIpv4s(uint32_t (&out)[8])
-{
-    unsigned count = 0;
-    auto addUnique = [&](uint32_t netIpv4) {
-        if (!netIpv4 || netIpv4 == INADDR_NONE || count >= 8) return;
-        for (unsigned i = 0; i < count; ++i)
-            if (out[i] == netIpv4) return;
-        out[count++] = netIpv4;
-    };
-    char allowLoopback[8] = {};
-    if (GetEnvironmentVariableA("G3T_DIRECT_UDP_ALLOW_LOOPBACK", allowLoopback, sizeof(allowLoopback)) > 0 &&
-        allowLoopback[0] == '1') {
-        addUnique(htonl(INADDR_LOOPBACK));
-    }
-    SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (probe != INVALID_SOCKET) {
-        alignas(SOCKET_ADDRESS_LIST) char listBuf[1024] = {};
-        DWORD returned = 0;
-        if (WSAIoctl(probe, SIO_ADDRESS_LIST_QUERY, nullptr, 0, listBuf, sizeof(listBuf),
-                     &returned, nullptr, nullptr) == 0) {
-            auto const* list = reinterpret_cast<SOCKET_ADDRESS_LIST const*>(listBuf);
-            for (INT i = 0; i < list->iAddressCount && count < 8; ++i) {
-                if (!list->Address[i].lpSockaddr ||
-                    list->Address[i].iSockaddrLength < static_cast<INT>(sizeof(sockaddr_in)))
-                    continue;
-                auto const* sin = reinterpret_cast<sockaddr_in const*>(list->Address[i].lpSockaddr);
-                if (sin->sin_family != AF_INET) continue;
-                const uint32_t hostOrder = ntohl(sin->sin_addr.s_addr);
-                if ((hostOrder >> 24) == 127 || hostOrder == 0) continue;
-                addUnique(sin->sin_addr.s_addr);
-            }
-        }
-        closesocket(probe);
-    }
-    return count;
-}
-
-bool ExtractReflexiveIpv4(diagnostics::ConnectionInfo const& info, uint32_t& netIpv4)
-{
-    for (unsigned i = 0; i < 10; ++i)
-        if (info.remoteAddress[i] != 0) return false;
-    if (info.remoteAddress[10] != 0xff || info.remoteAddress[11] != 0xff) return false;
-    std::memcpy(&netIpv4, info.remoteAddress + 12, 4);
-    const uint32_t hostOrder = ntohl(netIpv4);
-    return hostOrder != 0 && (hostOrder >> 24) != 127 && !(info.flags & diagnostics::Relayed);
-}
-
-void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port)
-{
-    if (!netIpv4 || !port || r.directCandidateCount >= 8) return;
-    for (unsigned i = 0; i < r.directCandidateCount; ++i)
-        if (r.directCandidates[i].hostIpv4 == netIpv4 && r.directCandidates[i].port == port)
-            return;
-    r.directCandidates[r.directCandidateCount++] = DirectEndpoint{netIpv4, port};
-}
-
-int RawSend(u64 to, int flags, int channel, void const* data, unsigned size);
-
-void SendDirectUdpControl(Remote& r)
-{
-    if (!directUdpEnabled || !enetPort || !r.haveDirectCookie) return;
-    uint32_t localIps[8] = {};
-    const unsigned ipCount = GatherLocalIpv4s(localIps);
-    // Wire: 'U'(1) + generation:u64(8) + cookie(16) + enetPort:u16(2) + ipCount:u8(1) + ips(4*N) = max 60 bytes
-    uint8_t frame[60] = {};
-    frame[0] = 'U';
-    std::memcpy(frame + 1, &r.generation, 8);
-    std::memcpy(frame + 9, r.directCookie, 16);
-    std::memcpy(frame + 25, &enetPort, 2);
-    frame[27] = static_cast<uint8_t>(ipCount);
-    for (unsigned i = 0; i < ipCount; ++i)
-        std::memcpy(frame + 28 + i * 4, &localIps[i], 4);
-    if (RawSend(r.id, SendReliable, ChannelControl, frame, 28 + ipCount * 4) == ResultOk)
-        r.lastDirectOfferSent = Now() ? Now() : 1;
-}
-
-void RecordAcceptedDataTraffic(void const* data, unsigned size, std::size_t encodedSize)
-{
-    ++traffic.txDatagrams;
-    traffic.txBytes += size;
-    traffic.txEnvelopeBytes += encodedSize;
-    ++traffic.txDataDatagrams;
-    traffic.txDataBytes += size;
-    auto const* bytes = static_cast<uint8_t const*>(data);
-    EnetPacketParse enet;
-    if (size >= 2 && !(bytes[0] & 0x40u)) {
-        if (!ParseEnetDataPacket(bytes, size, &enet)) ++traffic.txEnetParseFailures;
-        else {
-            traffic.txEnetProtocolBytes += enet.protocolBytes;
-            traffic.txEnetAckBytes += enet.ackBytes;
-        }
-    } else {
-        std::vector<uint8_t> plain;
-        if (!sendCodec || !sendCodec->Decode(data, size, plain, &enet) || !enet.valid)
-            ++traffic.txEnetParseFailures;
-        else {
-            traffic.txEnetProtocolBytes += enet.protocolBytes;
-            traffic.txEnetAckBytes += enet.ackBytes;
-        }
-    }
-}
-
-int RawDataSend(Remote& r, send::Item const& item)
-{
-    const unsigned size = static_cast<unsigned>(item.bytes.size());
-    if (!socketsLaneTransport || !r.p2pConn || !r.p2pConnected || !r.p2pLanesConfigured || !api.AllocateMessage)
-        return RawSend(r.id, item.Flags(), ChannelData, item.bytes.data(), size);
-    char packet[RelayMaxEnvelopeSize];
-    if (!lobby || size > RelayPayloadLimit) return 2;
-    std::size_t encodedSize = 0;
-    if (!RelayEncode(lobby, GetConfig().sessionId, item.bytes.data(), size, packet, sizeof(packet), &encodedSize))
-        return 2;
-    auto* msg = static_cast<OutboundSocketMessage*>(
-        api.AllocateMessage(networkingUtils, static_cast<int>(encodedSize)));
-    if (!msg || !msg->data) {
-        if (msg) api.MessageRelease(msg);
-        return 2;
-    }
-    std::memcpy(msg->data, packet, encodedSize);
-    msg->conn = r.p2pConn;
-    msg->flags = item.Flags() & ~SendAutoRestart;
-    msg->lane = item.Lane() < LaneCount ? item.Lane() : static_cast<uint16_t>(LaneCount - 1);
-    void* batch[1] = {msg};
-    int64_t numberOrResult = 0;
-    api.SendMessages(sockets, 1, batch, &numberOrResult);
-    const int result = numberOrResult > 0 ? ResultOk
-        : numberOrResult < 0 ? static_cast<int>(-numberOrResult) : 2;
-    if (result == ResultOk) {
-        ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
-        RecordAcceptedDataTraffic(item.bytes.data(), size, encodedSize);
-    } else {
-        ++r.steamFailed[result >= 0 && result < 128 ? result : 0];
-        ++sendFailures;
-        const uint32_t now = Now();
-        if (!lastSendFailure || now - lastSendFailure >= 5000) {
-            lastSendFailure = now ? now : 1;
-            Logf("steam: P2P lane=%u message to %llu failed (result=%d bytes=%u failures=%u)",
-                 static_cast<unsigned>(msg->lane), r.id, result, size, sendFailures);
-        }
-    }
-    return result;
-}
-
-int RawSend(u64 to, int flags, int channel, void const* data, unsigned size)
-{
-    char packet[RelayMaxEnvelopeSize];
-    if (!lobby || size > RelayPayloadLimit) {
-        Logf("steam: cannot send relay message (lobby=%llu bytes=%u)", lobby, size);
-        return 2;
-    }
-    std::size_t encodedSize = 0;
-    if (!RelayEncode(lobby, GetConfig().sessionId, data, size, packet, sizeof(packet), &encodedSize)) {
-        Logf("steam: cannot encode relay message (lobby=%llu bytes=%u)", lobby, size);
-        return 2;
-    }
-    char identity[160];
-    Identity(identity, to);
-    const int result = api.SendToUser(messages, identity, packet, static_cast<unsigned>(encodedSize),
-                                      flags | (channel == ChannelControl ? SendNoNagle : 0) | SendAutoRestart, channel);
-    for (auto& r : remotes) {
-        if (r.id != to) continue;
-        if (result == ResultOk) ++(flags & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
-        else ++r.steamFailed[result >= 0 && result < 128 ? result : 0];
-        break;
-    }
-    if (result != ResultOk) {
-        ++sendFailures;
-        const uint32_t now = Now();
-        if (!lastSendFailure || now - lastSendFailure >= 5000) {
-            lastSendFailure = now ? now : 1;
-            Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)", to, result, channel, size, sendFailures);
-        }
-    } else if (channel == ChannelData) {
-        RecordAcceptedDataTraffic(data, size, encodedSize);
-    } else {
-        ++traffic.txDatagrams;
-        traffic.txBytes += size;
-        traffic.txEnvelopeBytes += encodedSize;
-    }
-    return result;
-}
-
-void Control(u64 to, char what, bool reliable)
-{
-    char buffer[9] = {what};
-    const double time = PingSeconds();
-    std::memcpy(buffer + 1, &time, sizeof(time));
-    const int result = RawSend(to, reliable ? SendReliable : SendUnreliable, ChannelControl, buffer, what == 'P' ? 9 : 1);
-    if (what == 'P' && result == ResultOk)
-        for (auto& r : remotes) if (r.id == to) r.ping.Sent(time);
-}
-
-SOCKET LoopbackSocket(unsigned short* port)
-{
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return s;
-    sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int size = sizeof(local);
-    u_long nonBlocking = 1;
-    constexpr int RelayBuffer = 4 * 1024 * 1024;
-    // Windows reports an earlier datagram to a closed port as WSAECONNRESET on the next receive; turn that off.
-    DWORD off = FALSE, bytes = 0;
-    constexpr DWORD UdpConnReset = 0x9800000C;  // SIO_UDP_CONNRESET
-    if (bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0 || ioctlsocket(s, FIONBIO, &nonBlocking) != 0 ||
-        getsockname(s, reinterpret_cast<sockaddr*>(&local), &size) != 0 ||
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char const*>(&RelayBuffer), sizeof(RelayBuffer)) != 0 ||
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char const*>(&RelayBuffer), sizeof(RelayBuffer)) != 0) {
-        Logf("steam: cannot configure the owned loopback relay socket (WSA %d)", WSAGetLastError());
-        closesocket(s);
-        return INVALID_SOCKET;
-    }
-    WSAIoctl(s, UdpConnReset, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
-    if (port) *port = ntohs(local.sin_port);
-    return s;
-}
-
-Remote* Find(u64 id)
-{
-    for (auto& r : remotes) if (r.id == id) return &r;
-    return nullptr;
-}
-
-Remote* Get(u64 id)
-{
-    if (Remote* r = Find(id)) return r;
-    for (auto& r : remotes)
-        if (!r.id) {
-            r = Remote{};
-            r.id = id;
-            r.generation = ++nextRelayGeneration;
-            r.createdAt = r.heard = Now();
-            return &r;
-        }
-    return nullptr;
-}
-
-bool InLobby(u64 id)
-{
-    const int count = api.MemberCount(matchmaking, lobby);
-    for (int i = 0; i < count; ++i)
-        if (api.MemberByIndex(matchmaking, lobby, i) == id) return true;
-    return false;
-}
-
-void LeaveLobby();
-void OnClientLinkLost(u64 id, char const* why);
-void OnHostLinkLost(u64 id, char const* why);
-
-void ResetClientEnd()
-{
-    clientAttemptAt = Now();
-    clientLinkedAt = 0;
-    clientHadLink = clientEndRecorded = clientEndedImmediately = false;
-    clientEndReason[0] = '\0';
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    clientEnet = {};
-}
-
-void RecordClientEnd(char const* why, connect::ClientFlow::State before)
-{
-    if (isHost || clientEndRecorded) return;
-    clientEndRecorded = true;
-    CopyName(clientEndReason, sizeof(clientEndReason), why);
-    const uint32_t now = Now();
-    const uint32_t elapsed = now - (clientHadLink ? clientLinkedAt : clientAttemptAt);
-    clientEndedImmediately = connect::LinkEndedImmediately(clientHadLink, elapsed);
-    ClientEnet enet;
-    {
-        std::lock_guard<std::mutex> lock(publishedMutex);
-        enet = clientEnet;
-    }
-    const Remote* r = Find(owner ? owner : requestedHost);
-    Logf("connect: client link ended: reason=%s steam_state=%s enet_state=%s(%u) enet_event=%u event_data=%u "
-         "elapsed_ms=%u enet_elapsed_ms=%u immediate=%d arg=%llu lobby=%llu relay_port=%u generation=%llu "
-         "to_enet=%u to_steam=%u",
-         clientEndReason, connect::StateName(before), net::EnetPeerStateName(enet.state), enet.state, enet.event, enet.data,
-         elapsed, enet.elapsedMs + (enet.sampledAt ? now - enet.sampledAt : 0), clientEndedImmediately ? 1 : 0,
-         clientFlow.arg(), lobby, relayPort, r ? r->generation : 0, r ? r->toEnet : 0, r ? r->toSteam : 0);
-}
-
-// publishedMutex must be held: an engine reader must not authenticate an already-closing relay.
-void InvalidatePublished(u64 account, uint64_t generation)
-{
+    std::lock_guard<std::mutex> lock(store.mutex);
     for (int i = 0; i < MaxRemotes; ++i) {
-        if (registeredDirectAccount[i] == account && registeredDirectGen[i] == generation) {
-            registeredDirect[i] = {};
-            registeredDirectAccount[i] = registeredDirectGen[i] = 0;
-        }
-        if (published.accounts[i] != account || published.generations[i] != generation) continue;
-        published.ports[i] = 0;
-        published.accounts[i] = published.generations[i] = 0;
-        published.names[i][0] = '\0';
-        published.directOffers[i] = {};
-        published.verifiedDirect[i] = {};
-        if (isHost && published.linked > 0) --published.linked;
-    }
-    if (!isHost && published.hostGeneration == generation) {
-        published.hostLinked = false;
-        published.hostGeneration = 0;
-    }
-}
-
-void Drop(Remote* r, char const* why)
-{
-    if (!r || !r->id) return;
-    const u64 id = r->id;
-    if (!isHost && id == owner) RecordClientEnd(why, clientFlow.state());
-    if (isHost)
-        Logf("connect: host link ended: peer=%llu reason=%s steam_state=%s elapsed_ms=%u "
-             "stage=%s lobby_callback=%u lobby_flags=0x%x enet_port=%u relay_port=%u to_enet=%u to_steam=%u",
-             id, why, connect::StateName(hostFlow.state()), Now() - (r->linked ? r->linkedAt : r->createdAt),
-             r->toEnet || r->toSteam ? "enet-traffic" : "before-enet", r->lobbyChange ? CbLobbyChatUpdate : 0,
-             r->lobbyChange, enetPort, r->relayPort, r->toEnet, r->toSteam);
-    if (r->pending.Depth())
-        Logf("steam-send: peer=%llu action=close-session pending_datagrams=%zu pending_bytes=%zu reason=%s",
-             id, r->pending.Depth(), r->pending.Bytes(), why);
-    Logf("steam: %llu dropped (%s; %u datagrams to ENet, %u to Steam)", r->id, why, r->toEnet, r->toSteam);
-    if ((isHost && r->relayPort) || (!isHost && r->id == owner && r->linked)) {
-        RelayDrop drop;
-        drop.account = id;
-        drop.generation = r->generation;
-        drop.port = r->relayPort;
-        strncpy_s(drop.reason, why, _TRUNCATE);
-        std::lock_guard<std::mutex> lock(publishedMutex);
-        InvalidatePublished(drop.account, drop.generation);
-        relayDrops.push_back(drop);
-    }
-    ClosePeerP2P(*r);
-    char identity[160];
-    Identity(identity, r->id);
-    api.CloseSession(messages, identity);
-    if (r->socket != INVALID_SOCKET) closesocket(r->socket);
-    const bool wasHost = !isHost && r->id == owner;
-    *r = Remote{};
-    if (wasHost) LeaveLobby();  // the engine thread consumes the queued relay drop
-    if (connectionMode != connect::Mode::Invite) return;
-    if (wasHost) OnClientLinkLost(id, why);
-    else if (isHost) OnHostLinkLost(id, why);
-}
-
-void Skip(u64 id, uint32_t forMs)
-{
-    Skipped* slot = &skipped[0];
-    for (auto& s : skipped) {
-        if (s.lobby == id) { slot = &s; break; }
-        if (!s.lobby || (s.until && static_cast<int32_t>(s.until - slot->until) < 0)) slot = &s;
-    }
-    slot->lobby = id;
-    slot->until = forMs ? (Now() + forMs) | 1 : 0;
-}
-
-bool IsSkipped(u64 id)
-{
-    for (auto& s : skipped)
-        if (s.lobby == id) return !s.until || static_cast<int32_t>(s.until - Now()) > 0;
-    return false;
-}
-
-// ---- lobby ----
-
-bool CreateLobby()
-{
-    lastCreate = Now();
-    const int members = connectionMode == connect::Mode::Invite ? static_cast<int>(connect::MaxPartners) + 1 : net::MaxPlayers;
-    const u64 call = api.CreateLobby(matchmaking, LobbyFriendsOnly, members);
-    if (!call) {
-        Logf("connect: Steam rejected the CreateLobby request");
-        return false;
-    }
-    Logf("connect: CreateLobby called (friends-only, %d members); waiting for Steam's answer", members);
-    return true;
-}
-
-// connection = auto (legacy): the lobby exists from the start and is retried every 15 s.
-void CreateLobbyAuto()
-{
-    if (!CreateLobby()) {
-        strcpy_s(error, "Steam rejected the lobby creation request");
-        Logf("steam: %s", error);
-        return;
-    }
-    Log("steam: creating a friends-only lobby");
-}
-
-void Join(u64 id, char const* why)
-{
-    LeaveLobby();
-    if (connectionMode == connect::Mode::Auto) ResetClientEnd();
-    lobby = id;
-    owner = 0;
-    joinedAt = Now();
-    api.JoinLobby(matchmaking, id);
-    Logf("steam: joining lobby %llu (%s)", id, why);
-}
-
-void InspectLobby(u64 id, char const* why, bool joined = false)
-{
-    candidateLobby = id;
-    candidateAt = candidateRequestAt = Now();
-    candidateJoined = joined;
-    candidatePendingLogged = false;
-    strncpy_s(candidateReason, why, _TRUNCATE);
-    Logf("connect: reading the metadata of lobby %llu (%s)", id, why);
-    if (!api.RequestLobbyData(matchmaking, id))
-        Logf("steam: could not request lobby %llu metadata", id);
-}
-
-connect::LobbyMetadata ReadLobbyMetadata(u64 id)
-{
-    return connect::CheckLobbyMetadata(Text(api.GetLobbyData(matchmaking, id, LobbyTag)), LobbyVersion,
-                                       Text(api.GetLobbyData(matchmaking, id, "session_id")), GetConfig().sessionId);
-}
-
-void LeaveLobby()
-{
-    if (!lobby) return;
-    if (!isHost && owner) RecordClientEnd("local lobby closed", clientFlow.state());
-    for (auto& r : remotes)
-        if (r.id && (isHost || r.id == owner)) {
-            if ((isHost && r.relayPort) || (!isHost && r.id == owner && r.linked)) {
-                RelayDrop drop;
-                drop.account = r.id;
-                drop.generation = r.generation;
-                drop.port = r.relayPort;
-                strcpy_s(drop.reason, "lobby closed");
-                std::lock_guard<std::mutex> lock(publishedMutex);
-                InvalidatePublished(drop.account, drop.generation);
-                relayDrops.push_back(drop);
-            }
-            Control(r.id, 'B', true);
-            ClosePeerP2P(r);
-            char identity[160];
-            Identity(identity, r.id);
-            api.CloseSession(messages, identity);
-            if (r.socket != INVALID_SOCKET) closesocket(r.socket);
-            r = Remote{};
-        }
-    api.LeaveLobby(matchmaking, lobby);
-    if (isHost && connectionMode == connect::Mode::Auto) {  // legacy: its Join Game string names this lobby (invite mode keeps its own)
-        api.SetRichPresence(friends, "connect", "");
-        api.SetRichPresence(friends, "status", "");
-    }
-    Logf("steam: left lobby %llu", lobby);
-    lobby = owner = 0;
-    hostName[0] = '\0';
-    searchLogged = false;
-}
-
-// ---- invite-driven connection (steam_connect.h) ----
-
-// Display label only (the persona name Steam knows); nobody is ever identified by it.
-char const* NameOf(u64 id)
-{
-    if (!id || !friends) return "";
-    Label* slot = &labels[0];
-    for (auto& l : labels) {
-        if (l.id == id) { slot = &l; break; }
-        if (l.at < slot->at) slot = &l;
-    }
-    const uint32_t now = Now();
-    if (slot->id != id) {
-        *slot = Label{};
-        slot->id = id;
-    }
-    if (!slot->text[0] && (!slot->at || now - slot->at > 2000)) {  // Steam may not know the name yet; ask again later
-        slot->at = now ? now : 1;
-        CopyName(slot->text, sizeof(slot->text), api.FriendPersonaName(friends, id));
-    }
-    return slot->text[0] ? slot->text : "a friend";
-}
-
-bool IsFriend(u64 id)
-{
-    if (!id || id == me) return false;
-    if (api.FriendRelationship) return api.FriendRelationship(friends, id) == 3;  // k_EFriendRelationshipFriend
-    const int count = api.FriendCount(friends, FriendFlagImmediate);
-    for (int i = 0; i < count; ++i)
-        if (api.FriendByIndex(friends, i, FriendFlagImmediate) == id) return true;
-    return false;
-}
-
-u64 FriendByName(char const* name)
-{
-    const int count = api.FriendCount(friends, FriendFlagImmediate);
-    for (int i = 0; i < count; ++i) {
-        const u64 id = api.FriendByIndex(friends, i, FriendFlagImmediate);
-        if (!_stricmp(Text(api.FriendPersonaName(friends, id)), name)) return id;
-    }
-    return 0;
-}
-
-// A negotiation frame (steam_connect.h): plain ASCII on the control channel, reliable, before any lobby exists.
-int SendFrame(u64 to, char const* what, char const* frame, size_t size)
-{
-    char identity[160];
-    Identity(identity, to);
-    const int result = api.SendToUser(messages, identity, frame, static_cast<unsigned>(size),
-                                      SendReliable | SendNoNagle | SendAutoRestart, ChannelControl);
-    Logf("connect: sent %s to %llu (%s) result=%d%s", what, to, NameOf(to), result, result == ResultOk ? "" : " (Steam did not accept the message)");
-    return result;
-}
-
-bool SetPresence(char const* key, char const* value)
-{
-    if (!friends) return false;
-    const bool ok = api.SetRichPresence(friends, key, value) != 0;
-    Logf("connect: rich presence %s=\"%s\" ok=%d", key, value, ok ? 1 : 0);
-    return ok;
-}
-
-// Host: the Join Game rich presence stays published for the whole run (also while a partner is connected, so the same friend can
-// accept again after a drop); only the status text follows the flow.
-void PublishPresence()
-{
-    if (!isHost || connectionMode != connect::Mode::Invite || !apiInitialized) return;
-    lastPresence = Now();
-    if (!connectPublished) {
-        if (!connect::FormatConnect(presenceConnect, sizeof(presenceConnect), me, GetConfig().sessionId)) {
-            strcpy_s(error, "cannot build the Join Game connect string");
-            Logf("connect: %s (host %llu, session %s)", error, me, GetConfig().sessionId);
-            return;
-        }
-        if (SetPresence("connect", presenceConnect)) {
-            connectPublished = true;
-            error[0] = '\0';
-        } else {
-            strcpy_s(error, "Steam did not accept the Join Game rich presence");
-            Logf("connect: %s; trying again in 5 s", error);
+        auto const& prev = store.published.peers[i];
+        auto& cur = next.peers[i];
+        if (cur.account && cur.generation && prev.directPinned &&
+            prev.account == cur.account && prev.generation == cur.generation) {
+            cur.verifiedDirect = prev.verifiedDirect;
+            cur.directPinned = true;
         }
     }
-    using S = connect::HostFlow::State;
-    const S state = hostFlow.state();
-    char const* status = state == S::Linked ? "G3 Together: playing with a partner"
-        : state == S::Opening || state == S::Offered ? "G3 Together: a partner is connecting"
-        : "G3 Together: open for a partner (Join Game)";
-    if (std::strcmp(status, presenceStatus) != 0 && SetPresence("status", status)) strcpy_s(presenceStatus, status);
+    store.published = next;
 }
 
-void SendJoinRequest(bool resend)
-{
-    const u64 host = clientFlow.host();
-    char frame[connect::FrameMax + 1];
-    const size_t size = connect::EncodeJoin(frame, sizeof(frame), GetConfig().sessionId, saving::Protocol);
-    if (!host || !size) {
-        Logf("connect: cannot send a join request (host=%llu)", host);
-        return;
-    }
-    requestedHost = host;
-    SendFrame(host, resend ? "join request (again, no answer yet)" : "join request", frame, size);
-}
-
-void TearDownClient()
-{
-    candidateLobby = 0;
-    if (lobby) LeaveLobby();
-    if (requestedHost) {
-        char identity[160];
-        Identity(identity, requestedHost);
-        api.CloseSession(messages, identity);
-        requestedHost = 0;
-    }
-    owner = 0;
-}
-
-void LogClientChange(char const* event, connect::ClientFlow::State before, unsigned fx, bool quiet)
-{
-    using F = connect::ClientFlow;
-    const F::State after = clientFlow.state();
-    if (after == F::State::Declined && before != after)
-        Logf("connect: client %s -> %s on %s: %s (arg=%llu%s%s)", connect::StateName(before), connect::StateName(after), event,
-             connect::WhyName(clientFlow.why()), clientFlow.arg(), *clientFlow.hostSession() ? ", host session " : "", clientFlow.hostSession());
-    else if (after != before)
-        Logf("connect: client %s -> %s on %s", connect::StateName(before), connect::StateName(after), event);
-    else if ((fx & F::Ignored) && !quiet)
-        Logf("connect: client %s: %s ignored (nothing changes)", connect::StateName(before), event);
-}
-
-void PollLobbyMetadata();
-
-void FinishLobbyEntry(u64 id, u64 lobbyOwner)
-{
-    if (!lobbyOwner) {
-        Logf("connect: lobby %llu has no owner after entry", id);
-        strcpy_s(error, "the Steam lobby has no owner");
-        RecordClientEnd("the Steam lobby has no owner", clientFlow.state());
-        LeaveLobby();
-        Skip(id, 30000);
-        return;
-    }
-    error[0] = '\0';
-    owner = lobbyOwner;
-    CopyName(hostName, sizeof(hostName), api.FriendPersonaName(friends, owner));
-    if (Remote* r = Get(owner)) r->heard = Now();
-    lastHello = 0;
-    Logf("connect: in lobby %llu of %s (%llu); saying hello", id, hostName, owner);
-}
-
-void AfterClient(char const* event, connect::ClientFlow::State before, unsigned fx, bool quiet = false)
-{
-    using F = connect::ClientFlow;
-    LogClientChange(event, before, fx, quiet);
-    if (fx & F::Teardown) {
-        RecordClientEnd(clientFlow.state() == F::State::Declined ? connect::WhyName(clientFlow.why()) :
-                        !std::strcmp(event, "accept") ? "another Steam invite accepted" : event, before);
-        TearDownClient();
-    }
-    if (!std::strcmp(event, "accept") && (fx & (F::SendRequest | F::InspectLobby))) ResetClientEnd();
-    if (fx & F::SendRequest) SendJoinRequest(false);
-    if (fx & F::InspectLobby) {
-        InspectLobby(clientFlow.lobby(), "lobby invite");
-        PollLobbyMetadata();
-    }
-    if (fx & F::JoinLobby) {
-        Logf("connect: JoinLobby(%llu)", clientFlow.lobby());
-        Join(clientFlow.lobby(), "accepted invite");
-    }
-    if (fx & F::AwaitMetadata) {
-        InspectLobby(clientFlow.lobby(), "joined lobby", true);
-        PollLobbyMetadata();
-    }
-    if (fx & F::HelloReady) FinishLobbyEntry(clientFlow.lobby(), clientFlow.host());
-}
-
-void PollLobbyMetadata()
-{
-    if (!candidateLobby) return;
-    const u64 id = candidateLobby;
-    const uint32_t now = Now();
-    const auto metadata = ReadLobbyMetadata(id);
-    if (connectionMode == connect::Mode::Auto && candidatePendingLogged &&
-        now - candidateAt >= connect::LobbyMetadataWaitMs) {
-        Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", id, now - candidateAt);
-        RecordClientEnd("Steam lobby metadata timed out", clientFlow.state());
-        candidateLobby = 0;
-        if (candidateJoined && lobby == id) LeaveLobby();
-        Skip(id, 30000);
-        strcpy_s(error, "Steam did not deliver the lobby's data in time; accept the invite again");
-        lastScan = now - ScanMs;
-        return;
-    }
-    if (metadata == connect::LobbyMetadata::Pending) {
-        if (!candidatePendingLogged) {
-            Logf("connect: lobby %llu metadata pending (g3together=\"%s\" session_id=\"%s\"), waiting up to %u ms", id,
-                 Text(api.GetLobbyData(matchmaking, id, LobbyTag)), Text(api.GetLobbyData(matchmaking, id, "session_id")),
-                 connect::LobbyMetadataWaitMs);
-            candidatePendingLogged = true;
-        }
-        if (connectionMode == connect::Mode::Invite) {
-            const auto before = clientFlow.state();
-            const unsigned fx = clientFlow.LobbyChecked(id, metadata, now);
-            if ((fx & connect::ClientFlow::Teardown) && clientFlow.why() == connect::Why::MetadataTimeout)
-                Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", id, now - candidateAt);
-            AfterClient("lobby metadata pending", before, fx, true);
-            if (fx & connect::ClientFlow::Teardown) return;
-        }
-        if (now - candidateRequestAt >= MetadataRequestRetryMs) {
-            candidateRequestAt = now;
-            if (!api.RequestLobbyData(matchmaking, id))
-                Logf("steam: could not refresh lobby %llu metadata", id);
-        }
-        return;
-    }
-
-    if (candidatePendingLogged)
-        Logf("connect: lobby %llu metadata arrived after %u ms: %s", id, now - candidateAt,
-             metadata == connect::LobbyMetadata::Match ? "ok" : "different");
-    else
-        Logf("connect: lobby %llu metadata: %s", id, metadata == connect::LobbyMetadata::Match ? "ok" : "different");
-    const bool joined = candidateJoined;
-    candidateLobby = 0;
-    if (connectionMode == connect::Mode::Invite) {
-        const auto before = clientFlow.state();
-        const unsigned fx = clientFlow.LobbyChecked(id, metadata, now);
-        if ((fx & connect::ClientFlow::Teardown) && clientFlow.why() == connect::Why::MetadataTimeout)
-            Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys in time", id, now - candidateAt);
-        AfterClient("lobby metadata", before, fx);
-    } else if (metadata == connect::LobbyMetadata::Match) {
-        if (joined) FinishLobbyEntry(id, api.GetLobbyOwner(matchmaking, id));
-        else Join(id, candidateReason);
-    } else {
-        Logf("steam: skipping lobby %llu: different session_id or incompatible transport (wanted %s)", id, GetConfig().sessionId);
-        if (joined && lobby == id) LeaveLobby();
-        Skip(id, 30000);
-        if (wantedLobby == id || !std::strcmp(candidateReason, "accepted through Steam"))
-            strcpy_s(error, "different session_id or incompatible G3 Together transport");
-        lastScan = now - ScanMs;
-    }
-}
-
-void SendOffer(u64 partner)
-{
-    char frame[connect::FrameMax + 1];
-    const size_t size = connect::EncodeOffer(frame, sizeof(frame), lobby, GetConfig().sessionId);
-    if (!lobby || !size) {
-        Logf("connect: cannot send the lobby offer (lobby=%llu)", lobby);
-        return;
-    }
-    SendFrame(partner, "lobby offer", frame, size);
-}
-
-void SendDecline(u64 to, connect::Why why, u64 arg)
-{
-    char frame[connect::FrameMax + 1];
-    const size_t size = connect::EncodeDecline(frame, sizeof(frame), why, GetConfig().sessionId, arg);
-    Logf("connect: declining %llu (%s): %s", to, NameOf(to), connect::WhyName(why));
-    if (!to || !size) return;
-    SendFrame(to, "decline", frame, size);
-}
-
-void AfterHost(char const* event, connect::HostFlow::State before, unsigned fx, bool quiet = false)
-{
-    using H = connect::HostFlow;
-    const H::State after = hostFlow.state();
-    if (after != before)
-        Logf("connect: host %s -> %s on %s", connect::StateName(before), connect::StateName(after), event);
-    else if ((fx & H::Ignored) && !quiet)
-        Logf("connect: host %s: %s ignored (nothing changes)", connect::StateName(before), event);
-    if (fx & H::SendDecline) SendDecline(hostFlow.declineTo(), hostFlow.declineWhy(), hostFlow.declineArg());
-    if (fx & H::Teardown) LeaveLobby();
-    if (fx & H::CreateLobby) {
-        if (connectionMode == connect::Mode::Auto) {
-            CreateLobbyAuto();
-        } else if (!CreateLobby()) {
-            const H::State rejected = hostFlow.state();
-            AfterHost("CreateLobby rejected", rejected, hostFlow.LobbyCreated(false, 2, Now()));
-        }
-    }
-    if (fx & H::SendOffer) SendOffer(hostFlow.partner());
-    PublishPresence();
-}
-
-void DescribeTarget(connect::Target const& target, char (&out)[160])
-{
-    if (target.kind == connect::Target::Kind::Host) Format(out, "host %llu, session %s", target.id, target.session);
-    else if (target.kind == connect::Target::Kind::Lobby) Format(out, "lobby %llu", target.id);
-    else Format(out, "%s", target.malformed ? "malformed G3 Together connect string" : "not a G3 Together connect string");
-}
-
-// The player accepted something in Steam (or the INI/command line says so): the only way a client starts connecting.
-void OnAccepted(connect::ClientFlow::Source source, char const* what, u64 friendId, char const* raw)
-{
-    const connect::Target target = connect::ParseConnect(raw);
-    char described[160];
-    DescribeTarget(target, described);
-    Logf("connect: %s: friend=%llu (%s) connect=\"%.200s\" -> %s", what, friendId, NameOf(friendId), raw ? raw : "", described);
-    if (isHost) {
-        Log("connect: ignored: this copy is the host (invites are for the client)");
-        return;
-    }
-    if (connectionMode == connect::Mode::Auto) {
-        if (target.kind == connect::Target::Kind::Lobby) pendingLobby = target.id;
-        else Log("connect: connection=auto only follows +connect_lobby; the friends-list search goes on");
-        return;
-    }
-    const connect::ClientFlow::State before = clientFlow.state();
-    AfterClient("accept", before, clientFlow.Accept(source, friendId, target, Now()));
-}
-
-void OnLobbyInvite(u64 inviter, u64 lobbyId)
-{
-    Logf("connect: lobby invite from %llu (%s) lobby=%llu: not joining by itself, the player has to accept it in Steam",
-         inviter, NameOf(inviter), lobbyId);
-    if (isHost || connectionMode != connect::Mode::Invite) return;
-    const connect::ClientFlow::State before = clientFlow.state();
-    AfterClient("lobby invite", before, clientFlow.LobbyInvite(inviter, lobbyId));
-}
-
-void OnJoinRequest(u64 from, connect::Frame const& frame)
-{
-    connect::HostFlow::Join join;
-    join.from = from;
-    join.friendOk = IsFriend(from);
-    join.sessionOk = !std::strcmp(frame.session, GetConfig().sessionId);
-    join.protocol = frame.protocol;
-    Logf("connect: join request from %llu (%s): session=%s protocol=%u friend=%d", from, NameOf(from), frame.session, frame.protocol,
-         join.friendOk ? 1 : 0);
-    const connect::HostFlow::State before = hostFlow.state();
-    AfterHost("join request", before, hostFlow.Request(join, saving::Protocol, Now()));
-}
-
-void OnNegotiation(u64 from, char const* data, int size)
-{
-    connect::Frame frame;
-    if (!from || size <= 0 || !connect::DecodeFrame(data, static_cast<size_t>(size), &frame)) {
-        Logf("connect: malformed negotiation frame from %llu (%d bytes) dropped", from, size);
-        return;
-    }
-    if (isHost) {
-        if (frame.type == 'J') OnJoinRequest(from, frame);
-        else Logf("connect: frame '%c' from %llu ignored: the host only answers join requests", frame.type, from);
-        return;
-    }
-    if (connectionMode != connect::Mode::Invite) {
-        Logf("connect: frame '%c' from %llu ignored: connection=auto", frame.type, from);
-        return;
-    }
-    const connect::ClientFlow::State before = clientFlow.state();
-    if (frame.type == 'L') {
-        if (std::strcmp(frame.session, GetConfig().sessionId)) {
-            Logf("connect: offer from %llu names session %s, not ours (%s); ignored", from, frame.session, GetConfig().sessionId);
-            return;
-        }
-        Logf("connect: lobby offer from %llu (%s): lobby=%llu", from, NameOf(from), frame.lobby);
-        AfterClient("lobby offer", before, clientFlow.Offer(from, frame.lobby, Now()));
-    } else if (frame.type == 'N') {
-        const connect::Why why = connect::DeclineWhy(frame.code);
-        Logf("connect: host %llu (%s) declined the join request: %s (code %c)", from, NameOf(from), connect::WhyName(why), frame.code);
-        AfterClient("host declined", before, clientFlow.HostDeclined(from, why, frame.number, frame.code == 'S' ? frame.session : nullptr));
-    } else {
-        Logf("connect: frame '%c' from %llu ignored: a client only expects offers and declines", frame.type, from);
-    }
-}
-
-void OnClientLinkLost(u64 id, char const* why)
-{
-    const connect::ClientFlow::State before = clientFlow.state();
-    const unsigned fx = clientFlow.LinkLost(id);
-    if (fx & connect::ClientFlow::Teardown) RecordClientEnd(why, before);
-    if (clientFlow.state() == connect::ClientFlow::State::Lost)
-        Logf("connect: connection to %llu (%s) ended (%s); nothing reconnects by itself: accept their invite again", id, NameOf(id), why);
-    AfterClient("link lost", before, fx);
-}
-
-void OnHostLinkLost(u64 id, char const* why)
-{
-    const connect::HostFlow::State before = hostFlow.state();
-    const unsigned fx = hostFlow.LinkLost(id);
-    if (fx & connect::HostFlow::Teardown)
-        Logf("connect: partner %llu (%s) is gone (%s); lobby closed, waiting for the next invite", id, NameOf(id), why);
-    AfterHost("link lost", before, fx);
-}
-
-void ClientTick()
-{
-    const uint32_t now = Now();
-    if (clientFlow.ResendDue(now)) SendJoinRequest(true);
-    const connect::ClientFlow::State before = clientFlow.state();
-    const u64 waitingLobby = clientFlow.lobby();
-    const unsigned fx = clientFlow.Tick(now);
-    if ((fx & connect::ClientFlow::Teardown) && clientFlow.why() == connect::Why::MetadataTimeout)
-        Logf("connect: lobby %llu metadata timed out after %u ms; Steam did not deliver both keys", waitingLobby, now - candidateAt);
-    AfterClient("timer", before, fx, true);
-}
-
-void HostTick()
-{
-    const uint32_t now = Now();
-    const connect::HostFlow::State before = hostFlow.state();
-    AfterHost("timer", before, hostFlow.Tick(now), true);
-    if (!connectPublished && now - lastPresence > 5000) PublishPresence();
-}
-
-void ParseLegacyConnect(char const* text);
-
-// Client, once Steam is ready. Steam may have started the game with the host's connect string on the command line (Join Game /
-// an invite accepted while the game was closed); the INI's steam_lobby / steam_host are explicit manual joins. One attempt.
-void StartupAccept()
-{
-    char const* line = GetCommandLineA();
-    Logf("connect: command line: %.300s", line ? line : "");
-    if (connectionMode == connect::Mode::Auto) {
-        ParseLegacyConnect(line);
-        return;
-    }
-    const connect::Target target = connect::ParseConnect(line);
-    if (target.kind != connect::Target::Kind::None || target.malformed) {
-        OnAccepted(connect::ClientFlow::Source::CommandLine, "Steam started the game with a connect string",
-                   target.kind == connect::Target::Kind::Host ? target.id : 0, line);
-        return;
-    }
-    Log("connect: no G3 Together connect string on the command line");
-    if (wantedLobby) {
-        char text[64];
-        Format(text, "+connect_lobby %llu", wantedLobby);
-        OnAccepted(connect::ClientFlow::Source::Manual, "steam_lobby in g3together.ini (manual join, one attempt)", 0, text);
-        return;
-    }
-    if (*GetConfig().steamHost) {
-        const u64 id = FriendByName(GetConfig().steamHost);
-        char text[96];
-        if (id && connect::FormatConnect(text, sizeof(text), id, GetConfig().sessionId)) {
-            OnAccepted(connect::ClientFlow::Source::Manual, "steam_host in g3together.ini (manual join, one attempt)", id, text);
-            return;
-        }
-        Logf("connect: steam_host '%s' is not on your Steam friends list", GetConfig().steamHost);
-    }
-    Log("connect: waiting for an invite (accept a Steam invite or Join Game on the host; nothing connects by itself)");
-}
-
-void FillConnection(Connection& out)
-{
-    out.automatic = connectionMode == connect::Mode::Auto;
-    out.host = isHost;
-    out.hostState = hostFlow.state();
-    out.clientState = clientFlow.state();
-    out.why = clientFlow.why();
-    out.arg = clientFlow.arg();
-    strcpy_s(out.hostSession, clientFlow.hostSession());
-    out.lobbyInvitePending = !isHost && clientFlow.Idle() && clientFlow.lobbyInvitedBy() != 0;
-    strcpy_s(out.endReason, clientEndReason);
-    out.endedImmediately = clientEndedImmediately;
-    const u64 who = isHost ? hostFlow.partner() : out.lobbyInvitePending ? clientFlow.lobbyInvitedBy() : clientFlow.inviter();
-    CopyName(out.name, sizeof(out.name), NameOf(who));
-}
-
-void OnLobbyCreated(char const* p)
-{
-    int result = 0;
-    u64 id = 0;
-    std::memcpy(&result, p, 4);
-    std::memcpy(&id, p + 8, 8);
-    if (!isHost || (lobby && lobby == id)) return;  // arrives twice on real Steam: as the call result and as a broadcast
-    Logf("connect: lobby create result=%d lobby=%llu", result, id);
-    const bool invite = connectionMode == connect::Mode::Invite;
-    if (invite && hostFlow.state() != connect::HostFlow::State::Opening) {
-        // Nobody is waiting for it (the request timed out or was withdrawn): close it again.
-        if (result == ResultOk) {
-            api.LeaveLobby(matchmaking, id);
-            Logf("connect: lobby %llu closed again: no join request is waiting for it", id);
-        }
-        return;
-    }
-    if (result != ResultOk) {
-        if (invite) {
-            const connect::HostFlow::State before = hostFlow.state();
-            AfterHost("lobby create failed", before, hostFlow.LobbyCreated(false, result, Now()));
-            return;
-        }
-        Format(error, "Steam lobby not created (result %d)", result);
-        Logf("steam: %s; trying again in 15 s", error);
-        return;
-    }
-    error[0] = '\0';
-    lobby = id;
-    owner = me;
-    if (!api.SetLobbyData(matchmaking, id, "session_id", GetConfig().sessionId) ||
-        !api.SetLobbyData(matchmaking, id, LobbyTag, LobbyVersion)) {
-        Log("connect: Steam did not publish the co-op session ID and lobby tag");
-        LeaveLobby();
-        if (invite) {
-            const connect::HostFlow::State before = hostFlow.state();
-            AfterHost("lobby data not published", before, hostFlow.LobbyCreated(false, 2, Now()));
-        } else {
-            strcpy_s(error, "Steam did not publish the co-op session ID and lobby tag");
-            Logf("steam: %s", error);
-        }
-        return;
-    }
-    if (!api.SetLobbyData(matchmaking, id, "name", persona)) Log("steam: could not publish the lobby's player name");
-    Logf("connect: lobby %llu session metadata accepted by Steam; remote propagation may still be pending", id);
-    Logf("connect: lobby %llu open (friends-only); session_id=%s (case-sensitive; only matching sessions can connect)", id,
-         GetConfig().sessionId);
-    if (invite) {
-        const connect::HostFlow::State before = hostFlow.state();
-        AfterHost("lobby created", before, hostFlow.LobbyCreated(true, result, Now()));
-        return;
-    }
-    char text[64];
-    Format(text, "+connect_lobby %llu", id);
-    if (!SetPresence("status", "G3 Together") || !SetPresence("connect", text)) Log("steam: could not publish Join game rich presence");
-    Logf("steam: lobby %llu open; friends join over Steam (friends list: Join game, or steam_lobby = %llu)", id, id);
-}
-
-void OnLobbyEnter(char const* p)
-{
-    u64 id = 0;
-    unsigned response = 0;
-    std::memcpy(&id, p, 8);
-    std::memcpy(&response, p + 16, 4);
-    if (isHost || id != lobby || owner) return;
-    if (connectionMode == connect::Mode::Auto && candidateJoined && candidateLobby == id) return;
-    const bool joined = response == 1;
-    const auto metadata = joined ? ReadLobbyMetadata(id) : connect::LobbyMetadata::Pending;
-    Logf("connect: LobbyEnter lobby=%llu response=%u metadata=%s", id, response, !joined ? "-" :
-         metadata == connect::LobbyMetadata::Pending ? "pending" :
-         metadata == connect::LobbyMetadata::Match ? "ok" : "different session_id or transport");
-    if (connectionMode == connect::Mode::Invite) {
-        const u64 lobbyOwner = joined ? api.GetLobbyOwner(matchmaking, id) : 0;
-        const connect::ClientFlow::State before = clientFlow.state();
-        const unsigned fx = clientFlow.LobbyEntered(id, joined, metadata, lobbyOwner, Now());
-        AfterClient("lobby entered", before, fx);
-        return;
-    }
-    if (!joined || metadata == connect::LobbyMetadata::Different) {
-        Logf("steam: lobby %llu refused (response %u, incompatible session ID or transport)", id, response);
-        Format(error, response != 1 ? "the Steam lobby is full or closed" : "different session_id or incompatible G3 Together transport");
-        RecordClientEnd(error, clientFlow.state());
-        LeaveLobby();
-        Skip(id, 30000);
-        return;
-    }
-    if (metadata == connect::LobbyMetadata::Pending) {
-        InspectLobby(id, "joined lobby", true);
-        PollLobbyMetadata();
-        return;
-    }
-    FinishLobbyEntry(id, api.GetLobbyOwner(matchmaking, id));
-}
-
-// connection = auto: only the legacy "+connect_lobby <id>" is followed, by the friends-list search.
-void ParseLegacyConnect(char const* text)
-{
-    char const* key = text ? std::strstr(text, "+connect_lobby ") : nullptr;
-    if (key) pendingLobby = _strtoui64(key + 15, nullptr, 10);
-}
-
-void OnCallback(int callback, char const* p, int size)
-{
-    u64 a = 0, b = 0;
-    unsigned state = 0;
-    switch (callback) {
-    case CbLobbyCreated:
-        OnLobbyCreated(p);
-        break;
-    case CbLobbyEnter:
-        OnLobbyEnter(p);
-        break;
-    case CbLobbyDataUpdate:
-        if (size < 17 || isHost) break;
-        std::memcpy(&a, p, 8);
-        std::memcpy(&b, p + 8, 8);
-        if (a != candidateLobby || a != b) break;
-        if (!p[16]) Logf("connect: lobby %llu metadata update failed; still waiting for Steam", a);
-        PollLobbyMetadata();
-        break;
-    case CbLobbyChatUpdate:
-        std::memcpy(&a, p, 8);
-        std::memcpy(&b, p + 8, 8);
-        std::memcpy(&state, p + 24, 4);
-        if (a == lobby && (state & 0x1e)) {
-            if (Remote* r = Find(b)) {
-                r->leaving = true;
-                r->lobbyChange = state;
-            }
-            else if (isHost && connectionMode == connect::Mode::Invite && b == hostFlow.partner())
-                OnHostLinkLost(b, "left the lobby before saying hello");  // no relay exists yet to drop
-        }
-        break;
-    case CbLobbyJoinRequested: {  // the player accepted a lobby invite
-        char text[64];
-        std::memcpy(&a, p, 8);
-        if (size >= 16) std::memcpy(&b, p + 8, 8);
-        Format(text, "+connect_lobby %llu", a);
-        OnAccepted(connect::ClientFlow::Source::LobbyJoin, "invite accepted (GameLobbyJoinRequested_t 333)", b, text);
-        break;
-    }
-    case CbRichJoinRequested: {  // the player pressed Join Game / accepted an invite while the game runs
-        char text[257] = {};
-        if (size < 8) break;
-        std::memcpy(&a, p, 8);
-        std::memcpy(text, p + 8, size - 8 < 256 ? static_cast<size_t>(size - 8) : 256);
-        OnAccepted(connect::ClientFlow::Source::RichJoin, "Join Game accepted (GameRichPresenceJoinRequested_t 337)", a, text);
-        break;
-    }
-    case CbLobbyInvite:
-        if (size < 16) break;
-        std::memcpy(&a, p, 8);
-        std::memcpy(&b, p + 8, 8);
-        OnLobbyInvite(a, b);
-        break;
-    case CbConnectionStatusChanged: {
-        if (!socketsLaneTransport || size < static_cast<int>(8 + sizeof(diagnostics::ConnectionInfo) + 4)) break;
-        uint32_t conn = 0;
-        diagnostics::ConnectionInfo info{};
-        std::memcpy(&conn, p, 4);
-        std::memcpy(&info, p + 8, sizeof(info));
-        a = api.IdentityGetSteamId(info.identity);
-        if (info.state == 1 && isHost && listenSocketP2P && info.listenSocket == listenSocketP2P) {
-            Remote* r = lobby && a && (InLobby(a) || Find(a)) ? Get(a) : nullptr;
-            if (!r) {
-                api.CloseConnection(sockets, conn, 0, "unauthorized peer", 0);
-                break;
-            }
-            if (r->p2pConn && r->p2pConn != conn) ClosePeerP2P(*r);
-            ConfigureSocketOptions(config::ConnectionScope, static_cast<intptr_t>(conn));
-            const int rc = api.AcceptConnection(sockets, conn);
-            if (rc == ResultOk) {
-                r->p2pConn = conn;
-                r->p2pConnected = false;
-                r->p2pLanesConfigured = ConfigurePeerLanes(conn);
-                Logf("steam-send: P2P connection accepted peer=%llu conn=%u lanes=%u ice=all",
-                     a, conn, r->p2pLanesConfigured ? LaneCount : 0u);
-            } else {
-                Logf("steam-send: AcceptConnection peer=%llu conn=%u failed result=%d", a, conn, rc);
-                api.CloseConnection(sockets, conn, 0, "accept failed", 0);
-            }
-        } else if (info.state == diagnostics::Connected) {
-            if (Remote* r = Find(a); r && r->p2pConn == conn) {
-                r->p2pConnected = true;
-                if (!r->p2pLanesConfigured) r->p2pLanesConfigured = ConfigurePeerLanes(conn);
-                uint32_t reflexiveIp = 0;
-                if (r->directCandidateCount && ExtractReflexiveIpv4(info, reflexiveIp))
-                    AddDirectCandidate(*r, reflexiveIp, r->directCandidates[0].port);
-                Logf("steam-send: P2P lane session connected peer=%llu conn=%u lanes=%u relayed=%u",
-                     a, conn, r->p2pLanesConfigured ? LaneCount : 0u, (info.flags & diagnostics::Relayed) ? 1u : 0u);
-            }
-        } else if (info.state == 4 || info.state == 5) {
-            if (Remote* r = Find(a); r && r->p2pConn == conn) {
-                Logf("steam-send: P2P lane session closed peer=%llu conn=%u state=%d reason=%d",
-                     a, conn, info.state, info.endReason);
-                ClosePeerP2P(*r);
-                if (!isHost && r->linked) OpenClientP2P(*r);
-            } else if (conn) {
-                api.CloseConnection(sockets, conn, 0, nullptr, 0);
-            }
-        }
-        break;
-    }
-    case CbSessionRequest: {
-        a = api.IdentityGetSteamId(p);
-        // Host: members of its lobby, and (invite mode) Steam friends, who may only ask to join. Strangers never get a session
-        // (code review 28.10. P2: anyone's session was accepted and took one of the slots).
-        char const* accepted = nullptr;
-        if (isHost && lobby && InLobby(a)) accepted = "lobby member";
-        else if (!isHost && owner && a == owner) accepted = "the host";
-        else if (!isHost && connectionMode == connect::Mode::Invite && clientFlow.host() == a && clientFlow.Active()) accepted = "the host we asked to join";
-        else if (isHost && connectionMode == connect::Mode::Invite && IsFriend(a)) accepted = "Steam friend";
-        if (accepted) {
-            api.AcceptSession(messages, p);
-            Logf("connect: session with %llu (%s) accepted: %s", a, NameOf(a), accepted);
-        } else {
-            Logf("connect: session from %llu ignored (neither a lobby member nor a Steam friend asking to join)", a);
-        }
-        break;
-    }
-    case CbSessionFailed:
-        a = api.IdentityGetSteamId(p);
-        Logf("connect: session with %llu (%s) failed; dropping its relay (Steam callback=%d bytes=%d)",
-             a, NameOf(a), CbSessionFailed, size);
-        if (!isHost && connectionMode == connect::Mode::Invite) {
-            const connect::ClientFlow::State before = clientFlow.state();
-            const unsigned fx = clientFlow.SessionFailed(a);
-            if (fx & connect::ClientFlow::Teardown) RecordClientEnd("Steam session failed (callback 1252)", before);
-            AfterClient("session failed", before, fx);
-        }
-        Drop(Find(a), "session failed");
-        break;
-    default:
-        break;
-    }
-}
-
-// ---- messages ----
-
-void OnControl(Remote& r, char const* data, int size)
-{
-    if (!data || size <= 0) return;
-    switch (data[0]) {
-    case 'H':
-        if (size != 1) break;
-        if (isHost && lobby && !r.linked && InLobby(r.id)) {
-            if (connectionMode == connect::Mode::Invite && !hostFlow.Admit(r.id)) {
-                Logf("connect: hello from %llu (%s) refused: not the invited partner", r.id, NameOf(r.id));
-                break;
-            }
-            if (CountLinked() + 1 >= net::MaxPlayers) {
-                Logf("steam: %llu refused, the game is full", r.id);
-                break;
-            }
-            r.socket = LoopbackSocket(&r.relayPort);
-            if (r.socket == INVALID_SOCKET) {
-                Logf("steam: no local socket for %llu (%d)", r.id, WSAGetLastError());
-                break;
-            }
-            r.linked = true;
-            r.linkedAt = Now();
-            CopyName(r.name, sizeof(r.name), api.FriendPersonaName(friends, r.id));
-            Logf("steam: %s (%llu) linked to this game", Text(api.FriendPersonaName(friends, r.id)), r.id);
-            if (connectionMode == connect::Mode::Invite) {
-                const connect::HostFlow::State before = hostFlow.state();
-                AfterHost("hello", before, hostFlow.Linked(r.id));
-                Logf("connect: connected: partner %llu (%s) is linked to this game", r.id, NameOf(r.id));
-            }
-            if (directUdpEnabled && !r.haveDirectCookie) {
-                if (BCryptGenRandom(nullptr, r.directCookie, sizeof(r.directCookie),
-                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
-                    r.haveDirectCookie = true;
-                }
-            }
-        }
-        if (r.linked) {
-            if (directUdpEnabled && r.haveDirectCookie) SendDirectUdpControl(r);
-            Control(r.id, 'W', true);
-        }
-        break;
-    case 'W':
-        if (size != 1) break;
-        if (!isHost && r.id == owner && !r.linked) {
-            r.linked = true;
-            r.linkedAt = clientLinkedAt = Now();
-            clientHadLink = true;
-            OpenClientP2P(r);
-            Logf("steam: welcomed by the host %s; ENet goes over Steam now", hostName);
-            if (connectionMode == connect::Mode::Invite) {
-                const connect::ClientFlow::State before = clientFlow.state();
-                AfterClient("welcomed", before, clientFlow.Welcomed(r.id));
-                Logf("connect: connected: welcomed by host %llu (%s)", r.id, hostName);
-            }
-        }
-        break;
-    case 'U': {
-        if (!directUdpEnabled || size < 28) break;
-        uint64_t offerGen = 0;
-        uint8_t cookie[16] = {};
-        uint16_t peerPort = 0;
-        const unsigned ipCount = static_cast<unsigned char>(data[27]);
-        if (ipCount > 8 || size != static_cast<int>(28 + ipCount * 4)) break;
-        std::memcpy(&offerGen, data + 1, 8);
-        std::memcpy(cookie, data + 9, 16);
-        std::memcpy(&peerPort, data + 25, 2);
-        if (!peerPort) break;
-        if (isHost) {
-            if (!r.linked || !r.haveDirectCookie || offerGen != r.generation ||
-                std::memcmp(cookie, r.directCookie, 16) != 0)
-                break;
-        } else {
-            if (r.id != owner) break;
-            std::memcpy(r.directCookie, cookie, 16);
-            r.haveDirectCookie = true;
-        }
-        r.directCandidateCount = 0;
-        for (unsigned i = 0; i < ipCount; ++i) {
-            uint32_t netIp = 0;
-            std::memcpy(&netIp, data + 28 + i * 4, 4);
-            AddDirectCandidate(r, netIp, peerPort);
-        }
-        if (api.GetSessionConnectionInfo) {
-            char identity[160];
-            Identity(identity, r.id);
-            diagnostics::ConnectionInfo info{};
-            diagnostics::SessionStatus status{};
-            if (api.GetSessionConnectionInfo(messages, identity, &info, &status) == diagnostics::Connected) {
-                uint32_t reflexiveIp = 0;
-                if (ExtractReflexiveIpv4(info, reflexiveIp)) AddDirectCandidate(r, reflexiveIp, peerPort);
-            }
-        }
-        if (r.p2pConn && r.p2pConnected && api.GetConnectionInfo) {
-            diagnostics::ConnectionInfo info{};
-            uint32_t reflexiveIp = 0;
-            if (api.GetConnectionInfo(sockets, r.p2pConn, &info) && ExtractReflexiveIpv4(info, reflexiveIp))
-                AddDirectCandidate(r, reflexiveIp, peerPort);
-        }
-        r.directReady = r.directCandidateCount != 0;
-        if (!isHost && r.haveDirectCookie) SendDirectUdpControl(r);
-        Logf("steam: direct UDP endpoint exchange peer=%llu port=%u candidates=%u ready=%u",
-             r.id, static_cast<unsigned>(peerPort), r.directCandidateCount, r.directReady ? 1u : 0u);
-        break;
-    }
-    case 'P':
-        if (size == 9) {
-            char pong[9];
-            std::memcpy(pong, data, 9);
-            pong[0] = 'Q';
-            RawSend(r.id, SendUnreliable, ChannelControl, pong, 9);
-        }
-        break;
-    case 'Q':
-        if (size == 9) {
-            double sent = 0;
-            std::memcpy(&sent, data + 1, 8);
-            if (!r.ping.Reply(sent, PingSeconds(), Now())) ++invalidPongs;
-        }
-        break;
-    case 'B':
-        if (size == 1) Drop(&r, "said bye");
-        break;
-    default:
-        break;
-    }
-}
-
-void OnData(Remote& r, char const* data, int size)
-{
-    if (!r.linked || size <= 0) return;
-    int sent = 0;
-    if (isHost) {
-        sockaddr_in to{};
-        to.sin_family = AF_INET;
-        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        to.sin_port = htons(enetPort);
-        sent = sendto(r.socket, data, size, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
-    } else if (haveEnetAddress) {
-        sent = sendto(relay, data, size, 0, reinterpret_cast<sockaddr*>(&enetAddress), sizeof(enetAddress));
-    } else return;
-    if (sent != size) { ++socketFailures; socketError = WSAGetLastError(); return; }
-    ++r.toEnet;
-}
-
-u64 Sender(char const* message)
-{
-    if (senderOffset) return api.IdentityGetSteamId(message + senderOffset);
-    // GetSteamID64 answers 0 unless the identity's type field says SteamID, so the wrong offset reads 0 (Jericho's order).
-    const u64 at16 = api.IdentityGetSteamId(message + 16), at12 = api.IdentityGetSteamId(message + 12);
-    if (at16 || at12) {
-        senderOffset = at16 ? 16 : 12;
-        Logf("steam: a message's sender identity is at offset %d", senderOffset);
-    }
-    return at16 ? at16 : at12;
-}
-
-void Receive(int channel)
-{
-    void* batch[32];
-    for (int rounds = 0; rounds < 16; ++rounds) {
-        const int count = api.ReceiveOnChannel(messages, channel, batch, 32);
-        if (count < 0) ++receiveFailures;
-        if (count <= 0) return;
-        for (int i = 0; i < count; ++i) {
-            char const* m = static_cast<char const*>(batch[i]);
-            char const* data = nullptr;
-            int size = 0;
-            std::memcpy(&data, m, sizeof(data));  // SteamNetworkingMessage_t (32-bit): data at 0, size at 4
-            std::memcpy(&size, m + 4, sizeof(size));
-            const u64 from = Sender(m);
-            void const* payload = nullptr;
-            std::size_t payloadSize = 0;
-            const bool relayFrame = lobby && size >= 0 && RelayDecode(data, static_cast<std::size_t>(size), lobby,
-                                                                      GetConfig().sessionId, &payload, &payloadSize);
-            if (!relayFrame && channel == ChannelControl && connect::IsFrame(data, size < 0 ? 0 : static_cast<std::size_t>(size))) {
-                OnNegotiation(from, data, size);  // join request / offer / decline: no lobby (or a different one) yet
-                api.MessageRelease(batch[i]);
-                continue;
-            }
-            if (!relayFrame) {
-                ++isolatedDrops;
-                api.MessageRelease(batch[i]);
-                continue;
-            }
-            ++traffic.rxDatagrams;
-            traffic.rxBytes += payloadSize;
-            traffic.rxEnvelopeBytes += static_cast<std::size_t>(size);
-            data = static_cast<char const*>(payload);
-            size = static_cast<int>(payloadSize);
-            // Host: a slot only for a member of its lobby (checked before Get reserves one), or one it has already.
-            Remote* r = !from || (!isHost && from != owner) ? nullptr : isHost && !Find(from) && !(lobby && InLobby(from)) ? nullptr : Get(from);
-            if (r && size > 0) {
-                r->heard = Now();
-                if (channel == ChannelControl) OnControl(*r, data, size);
-                else OnData(*r, data, size);
-            }
-            api.MessageRelease(batch[i]);
-        }
-    }
-    ++receiveCaps;
-}
-
-void ReceiveP2P()
-{
-    if (!socketsLaneTransport || !api.ReceiveOnConnection) return;
-    void* batch[32];
-    for (auto& r : remotes) {
-        if (!r.id || !r.p2pConn) continue;
-        for (int rounds = 0; rounds < 16; ++rounds) {
-            const int count = api.ReceiveOnConnection(sockets, r.p2pConn, batch, 32);
-            if (count < 0) ++receiveFailures;
-            if (count <= 0) break;
-            for (int i = 0; i < count; ++i) {
-                char const* m = static_cast<char const*>(batch[i]);
-                char const* data = nullptr;
-                int size = 0;
-                std::memcpy(&data, m, sizeof(data));
-                std::memcpy(&size, m + 4, sizeof(size));
-                void const* payload = nullptr;
-                std::size_t payloadSize = 0;
-                if (lobby && size >= 0 &&
-                    RelayDecode(data, static_cast<std::size_t>(size), lobby, GetConfig().sessionId, &payload, &payloadSize) &&
-                    payloadSize > 0) {
-                    ++traffic.rxDatagrams;
-                    traffic.rxBytes += payloadSize;
-                    traffic.rxEnvelopeBytes += static_cast<std::size_t>(size);
-                    r.heard = Now();
-                    OnData(r, static_cast<char const*>(payload), static_cast<int>(payloadSize));
-                } else {
-                    ++isolatedDrops;
-                }
-                api.MessageRelease(batch[i]);
-            }
-            if (rounds == 15) ++receiveCaps;
-        }
-    }
-}
-
-bool QueueDatagram(Remote& r, void const* data, unsigned size)
-{
-    try {
-        EnetPacketParse parsed;
-        if (sendCodec && r.pending.Push(*sendCodec, data, size, Now(), &parsed)) {
-            auto const* bytes = static_cast<unsigned char const*>(data);
-            const bool compressed = (bytes[0] & 0x40u) != 0;
-            if (!r.firstEnetLogged) {
-                r.firstEnetLogged = true;
-                Logf("steam-send: first ENet datagram role=%s peer=%llu wire_bytes=%u decoded_bytes=%zu "
-                     "compressed=%d command=%u command_header_bytes=%zu action=%s",
-                     isHost ? "host" : "client", r.id, size, parsed.packetBytes, compressed ? 1 : 0,
-                     parsed.firstCommand, EnetCommandHeaderSize(parsed.firstCommand),
-                     parsed.valid ? "classified-and-queued" : "queued-as-unclassified-bulk");
-            }
-            if (!parsed.valid) {
-                const unsigned kind = (compressed ? 16u : 0u) | (parsed.command & 15u);
-                if (!r.unclassifiedLogged[kind]) {
-                    r.unclassifiedLogged[kind] = true;
-                    char hex[33] = {};
-                    for (unsigned i = 0; i < (std::min)(size, 16u); ++i)
-                        std::snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", bytes[i]);
-                    Logf("steam-send: peer=%llu unclassified_enet_bytes=%u first_bytes=%s decoded_bytes=%zu "
-                         "command=%u offset=%zu required=%zu remaining=%zu action=sent-as-bulk",
-                         r.id, size, hex, parsed.packetBytes, parsed.command, parsed.commandOffset,
-                         parsed.commandBytes, parsed.remainingBytes);
-                }
-            }
-            return true;
-        }
-        Logf("steam-send: peer=%llu invalid_local_datagram_bytes=%u codec_ready=%d action=not-queued",
-             r.id, size, sendCodec && sendCodec->Ready() ? 1 : 0);
-    } catch (std::bad_alloc const&) {
-        Logf("steam-send: peer=%llu action=close-session allocation-failed pending_bytes=%zu", r.id, r.pending.Bytes());
-        Drop(&r, "Steam send queue allocation failed");
-    }
-    return false;
-}
-
-void DrainDatagrams(Remote& r)
-{
-    try {
-        const uint32_t now = Now();
-        r.pending.EvictStaleUnreliablePoses(now);
-        r.pending.counters.peakAge = (std::max)(r.pending.counters.peakAge, r.pending.OldestAge(now));
-        bool flushedP2P = false;
-        const int result = r.pending.Drain([&](send::Item const& item) {
-            const int sent = RawDataSend(r, item);
-            if (sent == ResultOk) {
-                ++r.toSteam;
-                flushedP2P = flushedP2P || (socketsLaneTransport && r.p2pConn && r.p2pConnected);
-            }
-            return sent;
-        });
-        if (flushedP2P && api.FlushMessagesOnConnection && r.p2pConn)
-            api.FlushMessagesOnConnection(sockets, r.p2pConn);
-        if (result != ResultOk && !send::Retryable(result)) {
-            Logf("steam-send: peer=%llu action=close-session fatal_result=%d pending_datagrams=%zu pending_bytes=%zu",
-                 r.id, result, r.pending.Depth(), r.pending.Bytes());
-            char why[160];
-            Format(why, "Steam data submission failed (result=%d)", result);
-            Drop(&r, why);
-        }
-    } catch (std::bad_alloc const&) {
-        Logf("steam-send: peer=%llu action=close-session allocation-failed pending_bytes=%zu", r.id, r.pending.Bytes());
-        Drop(&r, "Steam send queue allocation failed");
-    }
-}
-
-config::Read ReadNetworkingConfig(int id)
-{
-    config::Read read;
-    if (!networkingUtils || !api.GetConfigValue) return read;
-    size_t size = sizeof(read.value);
-    read.result = api.GetConfigValue(networkingUtils, id, config::GlobalScope, 0, &read.type, &read.value, &size);
-    if (size != sizeof(read.value)) read.type = 0;
-    return read;
-}
-
-void TransportConfigDiagnostics()
-{
-    const auto ice = ReadNetworkingConfig(diagnostics::IceEnable);
-    const auto icePenalty = ReadNetworkingConfig(diagnostics::IcePenalty);
-    const auto sdrPenalty = ReadNetworkingConfig(diagnostics::SdrPenalty);
-    size_t stunBytes = 0;
-    int stunType = 0, stunResult = 0;
-    if (networkingUtils && api.GetConfigValue)
-        stunResult = api.GetConfigValue(networkingUtils, diagnostics::StunServerList,
-                                       config::GlobalScope, 0, &stunType, nullptr, &stunBytes);
-    Logf("steam: transport-config scope=global action=read-only ice_enable=%d ice_valid=%u ice_read_result=%d "
-         "ice_penalty_ms=%d ice_penalty_valid=%u sdr_penalty_ms=%d sdr_penalty_valid=%u "
-         "stun_list_bytes=%zu stun_type=%d stun_read_result=%d "
-         "ice_default_minus_one=Steam-user-policy peer_resolved_config_available=0",
-         ice.value, ice.Valid() ? 1u : 0u, ice.result, icePenalty.value, icePenalty.Valid() ? 1u : 0u,
-         sdrPenalty.value, sdrPenalty.Valid() ? 1u : 0u, stunBytes, stunType, stunResult);
-    const auto initial = ReadNetworkingConfig(diagnostics::TimeoutInitial);
-    const auto connected = ReadNetworkingConfig(diagnostics::TimeoutConnected);
-    const auto mtu = ReadNetworkingConfig(diagnostics::MtuPacketSize);
-    const auto unencrypted = ReadNetworkingConfig(diagnostics::Unencrypted);
-    Logf("steam: transport-config scope=global action=read-only timeout_initial_ms=%d timeout_initial_valid=%u "
-         "timeout_connected_ms=%d timeout_connected_valid=%u mtu_packet_bytes=%d mtu_valid=%u "
-         "unencrypted=%d unencrypted_valid=%u",
-         initial.value, initial.Valid() ? 1u : 0u, connected.value, connected.Valid() ? 1u : 0u,
-         mtu.value, mtu.Valid() ? 1u : 0u, unencrypted.value, unencrypted.Valid() ? 1u : 0u);
-}
-
-void SendDiagnostics(uint32_t now)
-{
-    if (CountLinked()) {
-        config::Read current[4];
-        bool verified = networkingConfigured;
-        for (unsigned i = 0; i < 4; ++i) {
-            current[i] = ReadNetworkingConfig(config::Settings[i].id);
-            const bool ok = config::Settings[i].exact
-                ? current[i].value == networkingConfig[i].requested
-                : current[i].value >= networkingConfig[i].requested;
-            verified = verified && current[i].Valid() && ok;
-        }
-        Logf("steam-send: config-current scope=global verified=%u connection_config_verified=0 "
-             "send_buffer=%d send_buffer_valid=%u send_rate_min=%d send_rate_min_valid=%u "
-             "send_rate_max=%d send_rate_max_valid=%u nagle_us=%d nagle_valid=%u action=read-only",
-             verified ? 1u : 0u, current[0].value, current[0].Valid() ? 1u : 0u,
-             current[1].value, current[1].Valid() ? 1u : 0u, current[2].value, current[2].Valid() ? 1u : 0u,
-             current[3].value, current[3].Valid() ? 1u : 0u);
-        TransportConfigDiagnostics();
-    }
-    for (auto& r : remotes) {
-        if (!r.linked) continue;
-        auto const& c = r.pending.counters;
-        Logf("steam-send: peer=%llu accepted_datagrams=%llu accepted_bytes=%llu "
-             "critical=%llu/%llu definition=%llu/%llu npc_pose=%llu/%llu bulk=%llu/%llu "
-             "enet_reliable_ok=%llu enet_unreliable_ok=%llu player_state_commands=%llu reliable_failed=%llu unreliable_failed=%llu "
-             "retained_retries=%llu dedup_retransmit_commands=%llu",
-             r.id, c.reliableAccepted + c.unreliableAccepted, c.bytes[0] + c.bytes[1] + c.bytes[2] + c.bytes[3],
-             c.accepted[0], c.bytes[0], c.accepted[1], c.bytes[1], c.accepted[2], c.bytes[2], c.accepted[3], c.bytes[3],
-             c.reliableAccepted, c.unreliableAccepted, c.playerStates, c.reliableFailed, c.unreliableFailed,
-             c.retries, c.duplicates);
-        Logf("steam-send: peer=%llu queue_datagrams=%zu queue_bytes=%zu oldest_ms=%u "
-             "peak_datagrams=%zu peak_bytes=%zu peak_oldest_ms=%u plain_bytes=%llu wire_bytes=%llu "
-             "unclassified=%llu action=retry-retained-independent-priority npc_updates_dropped=%llu",
-             r.id, r.pending.Depth(), r.pending.Bytes(), r.pending.OldestAge(now),
-             c.peakDepth, c.peakBytes, (std::max)(c.peakAge, r.pending.OldestAge(now)),
-             c.plainBytes, c.wireBytes, c.unclassified, c.npcUpdatesDropped);
-        Logf("steam-send: peer=%llu steam_reliable_ok=%llu steam_unreliable_ok=%llu "
-             "data_flags=%d data_reliability=ENet-only config_verified=%u send_buffer=%d send_rate_min=%d "
-             "send_rate_max=%d nagle_us=%d channels=data:0,control:1 channel_priority_lanes=%u",
-             r.id, r.steamReliableOk, r.steamUnreliableOk, send::AutoRestart | send::NoDelay | send::NoNagle,
-             networkingConfigured ? 1u : 0u, networkingConfig[0].after.value, networkingConfig[1].after.value,
-             networkingConfig[2].after.value, networkingConfig[3].after.value,
-             (socketsLaneTransport && r.p2pConn && r.p2pLanesConfigured) ? LaneCount : 0u);
-        if (api.GetSessionConnectionInfo) {
-            char identity[160];
-            Identity(identity, r.id);
-            diagnostics::ConnectionInfo info;
-            diagnostics::SessionStatus status;
-            const int state = api.GetSessionConnectionInfo(messages, identity, &info, &status);
-            const bool current = diagnostics::Current(state, info, status);
-            const auto description = diagnostics::Description(info);
-            Logf("steam: path peer=%llu transport=%s evidence=%s available=%u state=%d info_state=%d status_state=%d "
-                 "flags=0x%x pop_relay=0x%08x pop_remote=0x%08x peer_address_present=%u "
-                 "ping_ms=%d est_bandwidth_bytes_per_s=%d estimate_kind=Steam-send-rate-not-link-speed "
-                 "pending_unreliable_bytes=%d pending_reliable_bytes=%d queue_us=%lld "
-                 "description=\"%s\" address_tokens=redacted",
-                 r.id, diagnostics::Transport(state, info, status), diagnostics::Evidence(state, info, status),
-                 current ? 1u : 0u, state, info.state, status.state, static_cast<unsigned>(info.flags),
-                 info.popRelay, info.popRemote, diagnostics::HasRemoteAddress(info) ? 1u : 0u,
-                 status.ping, status.sendRate, status.pendingUnreliable, status.pendingReliable,
-                 static_cast<long long>(status.queueMicros), description.data());
-            Logf("steam-send: session peer=%llu available=%u state=%d ping_ms=%d "
-                 "send_rate_bytes_per_s=%d pending_unreliable_bytes=%d pending_reliable_bytes=%d "
-                 "sent_unacked_reliable_bytes=%d queue_us=%lld out_packets_per_s=%.1f out_bytes_per_s=%.1f "
-                 "quality_local=%.3f quality_remote=%.3f",
-                 r.id, current ? 1u : 0u, state, status.ping, status.sendRate,
-                 status.pendingUnreliable, status.pendingReliable, status.sentUnackedReliable,
-                 static_cast<long long>(status.queueMicros), status.outPackets, status.outBytes,
-                 status.qualityLocal, status.qualityRemote);
-        } else {
-            Logf("steam: path peer=%llu transport=unknown available=0 reason=status-export-unavailable", r.id);
-            Logf("steam-send: session peer=%llu available=0 reason=status-export-unavailable", r.id);
-        }
-        for (unsigned result = 0; result < 128; ++result)
-            if (r.steamFailed[result])
-                Logf("steam-send: peer=%llu result=%u failed_datagrams=%llu data_failed=%llu control_failed=%llu "
-                     "data_action=%s control_action=control-flow-retry",
-                     r.id, result, r.steamFailed[result], c.failed[result], r.steamFailed[result] - c.failed[result],
-                     send::Retryable(static_cast<int>(result)) ? "retained-for-retry" : "close-session");
-        r.pending.counters = {};
-        r.pending.counters.peakDepth = r.pending.Depth();
-        r.pending.counters.peakBytes = r.pending.Bytes();
-        r.pending.counters.peakAge = r.pending.OldestAge(now);
-        r.steamReliableOk = r.steamUnreliableOk = 0;
-        std::memset(r.steamFailed, 0, sizeof(r.steamFailed));
-    }
-}
-
-// ENet -> Steam: gather before draining so player/critical traffic bypasses queued NPC poses.
-void Forward()
-{
-    char datagram[4096];
-    sockaddr_in from{};
-    int fromSize = sizeof(from);
-    if (isHost) {
-        for (auto& r : remotes) {
-            if (!r.linked || r.socket == INVALID_SOCKET) continue;
-            for (int n = 0; n < 256; ++n) {
-                fromSize = sizeof(from);
-                const int size = recvfrom(r.socket, datagram, sizeof(datagram), 0, reinterpret_cast<sockaddr*>(&from), &fromSize);
-                if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
-                if (size <= 0) {
-                    if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-                        ++socketFailures; socketError = WSAGetLastError();
-                    }
-                    break;
-                }
-                if (ntohs(from.sin_port) != enetPort) continue;
-                if (!QueueDatagram(r, datagram, static_cast<unsigned>(size))) break;
-                if (n == 255) ++forwardCaps;
-            }
-            if (r.linked) DrainDatagrams(r);
-        }
-        return;
-    }
-    if (relay == INVALID_SOCKET) return;
-    Remote* host = owner ? Find(owner) : nullptr;
-    for (int n = 0; n < 256; ++n) {
-        fromSize = sizeof(from);
-        const int size = recvfrom(relay, datagram, sizeof(datagram), 0, reinterpret_cast<sockaddr*>(&from), &fromSize);
-        if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
-        if (size <= 0) {
-            if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-                ++socketFailures; socketError = WSAGetLastError();
-            }
-            break;
-        }
-        enetAddress = from;
-        haveEnetAddress = true;
-        if (!host || !host->linked) continue;  // no host yet: ENet keeps trying to connect until there is one
-        if (!QueueDatagram(*host, datagram, static_cast<unsigned>(size))) break;
-        if (n == 255) ++forwardCaps;
-    }
-    if (host && host->linked) DrainDatagrams(*host);
-}
-
-// Client without a lobby: an accepted invite, the INI's lobby, else the first friend hosting a G3 Together game.
-void Search()
-{
-    if (candidateLobby) return;
-    if (lobby) {
-        if (!owner && Now() - joinedAt > JoinWaitMs) {
-            Logf("steam: lobby %llu did not answer the join; trying others", lobby);
-            RecordClientEnd("Steam lobby did not answer JoinLobby", clientFlow.state());
-            Skip(lobby, 30000);
-            api.LeaveLobby(matchmaking, lobby);
-            lobby = 0;
-        }
-        return;
-    }
-    if (pendingLobby) {
-        const u64 id = pendingLobby;
-        pendingLobby = 0;
-        InspectLobby(id, "accepted through Steam");
-        return;
-    }
-    if (Now() - lastScan < ScanMs) return;
-    lastScan = Now();
-    // steam_lobby set: that lobby only. Refused or silent, it is tried again after its pause; the friends' games are not
-    // searched instead (code review 28.10. P2: that could join another friend's host).
-    if (wantedLobby) {
-        if (!IsSkipped(wantedLobby)) InspectLobby(wantedLobby, "steam_lobby");
-        else if (!wantedWaitLogged) {
-            wantedWaitLogged = true;
-            Logf("steam: steam_lobby %llu refused or did not answer; waiting for it (no other host)", wantedLobby);
-        }
-        return;
-    }
-    char const* wantedHost = GetConfig().steamHost;
-    const int count = api.FriendCount(friends, FriendFlagImmediate);
-    for (int i = 0; i < count; ++i) {
-        const u64 id = api.FriendByIndex(friends, i, FriendFlagImmediate);
-        // FriendGameInfo_t { CGameID game; u32 ip; u16 port, queryPort; CSteamID lobby at 16; }
-        struct { u64 game; uint32_t ip; uint16_t port, queryPort; u64 lobby; } info{};
-        if (!api.FriendGamePlayed(friends, id, &info) || (info.game & 0xffffff) != GothicAppId || !info.lobby) continue;
-        if (IsSkipped(info.lobby)) continue;
-        char const* name = Text(api.FriendPersonaName(friends, id));
-        uint64_t wantedId = 0;
-        if (*wantedHost && (identity::SteamId(wantedHost, wantedId) ? id != wantedId : _stricmp(name, wantedHost) != 0)) continue;
-        InspectLobby(info.lobby, *name ? name : "a friend");
-        return;
-    }
-    if (!searchLogged) {
-        Logf("steam: no friend hosting a G3 Together game yet%s%s; looking every %u s", *wantedHost ? " named " : "", wantedHost,
-             ScanMs / 1000);
-        searchLogged = true;
-    }
-}
-
-bool Fail(char const* text)
+bool WorkerRuntime::Fail(char const* text)
 {
     strncpy_s(error, text, _TRUNCATE);
     Logf("steam: not used: %s", error);
@@ -2240,52 +255,16 @@ bool Fail(char const* text)
     return false;
 }
 
-void PumpOnce();
-unsigned __stdcall TransportThread(void*)
-{
-    for (;;) {
-        const DWORD stop = WaitForSingleObject(stopEvent, 0);
-        if (stop == WAIT_OBJECT_0) break;
-        if (stop == WAIT_FAILED) {
-            ready = false;
-            Fail("transport stop event failed");
-            break;
-        }
-        crashlog::PollWorldEntry();
-        PumpOnce();
-        HANDLE events[] = {stopEvent, wakeEvent, pollTimer};
-        if (pollTimer) {
-            LARGE_INTEGER due;
-            due.QuadPart = -static_cast<LONGLONG>(latency::RelayPollMs) * 10000;  // relative 100 ns units
-            if (!SetWaitableTimer(pollTimer, &due, 0, nullptr, nullptr, FALSE)) {
-                ready = false;
-                Fail("transport timer could not be armed");
-                break;
-            }
-        }
-        const DWORD result = WaitForMultipleObjects(pollTimer ? 3 : 2, events, FALSE, pollTimer ? INFINITE : latency::RelayPollMs);
-        if (result == WAIT_OBJECT_0) break;
-        if (result == WAIT_FAILED) {
-            ready = false;
-            Fail("transport wait failed");
-            break;
-        }
-    }
-    return 0;
-}
-
-// <game>\G3Together\steam_api.dll (the mod's own copy, never one the game may have), or G3T_STEAM_DLL (QA: the
-// stand-in tools/fakesteam, Steam over 127.0.0.1).
-bool Load()
+bool WorkerRuntime::Load()
 {
     char path[MAX_PATH] = {};
     if (GetEnvironmentVariableA("G3T_STEAM_DLL", path, MAX_PATH) == 0 || !*path) {
         HMODULE self = nullptr;
         if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                reinterpret_cast<LPCSTR>(&Load), &self) ||
+                                reinterpret_cast<LPCSTR>(&Start), &self) ||
             !GetModuleFileNameA(self, path, MAX_PATH))
             return Fail("no game folder");
-        for (int part = 0; part != 2; ++part) {
+        for (int part = 0; part < 2; ++part) {
             char* separator = std::strrchr(path, '\\');
             if (separator) *separator = '\0';
         }
@@ -2316,307 +295,7 @@ bool Load()
     return true;
 }
 
-bool ConfigureNetworking()
-{
-    if (!networkingUtils || !api.SetConfigValue || !api.GetConfigValue) {
-        Log("steam-send: config unavailable action=keep-Steam-defaults; capacity not verified (older stand-in/API)");
-        return true;
-    }
-    bool verified = true;
-    for (unsigned i = 0; i < 4; ++i) {
-        auto const& setting = config::Settings[i];
-        auto& applied = networkingConfig[i];
-        applied = config::Apply(setting, ReadNetworkingConfig, [&](int id, int32_t value) {
-            return api.SetConfigValue(networkingUtils, id, config::GlobalScope, 0, config::Int32, &value) != 0;
-        });
-        Logf("steam-send: config scope=global name=%s before=%d requested=%d effective=%d "
-             "read_result=%d/%d set=%s verified=%u action=%s",
-             setting.name, applied.before.value, applied.requested, applied.after.value,
-             applied.before.result, applied.after.result,
-             !applied.attempted ? "unchanged" : applied.accepted ? "accepted" : "rejected",
-             applied.Verified() ? 1u : 0u,
-             setting.id == config::SendBufferSize ? "bounded-buffer" :
-                 setting.id == config::SendRateMin ? "manual-send-rate-floor" :
-                 setting.capacity ? "capacity-headroom" : "preserve-default");
-        verified = verified && applied.Verified();
-    }
-    int32_t iceAll = config::IceEnableAll;
-    if (api.SetConfigValue(networkingUtils, config::P2PTransportIceEnable, config::GlobalScope, 0, config::Int32, &iceAll))
-        Log("steam-send: config scope=global name=P2P_Transport_ICE_Enable requested=7 action=prefer-direct-ice");
-    networkingConfigured = verified;
-    Log("steam-send: rate_policy=manual-headroom adaptive_bandwidth_probe=not-assumed "
-        "queued-data-only=1 warning=offered-traffic-must-fit-real-upload; no-NPC-cap-or-shedding");
-    return verified;
-}
-}
-
-bool Start(bool host, unsigned short port)
-{
-    if (tried) return Ready();
-    SteamFpScope floatingPoint("startup");
-    tried = true;
-    traffic = {};
-    traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetConfig().sessionId));
-    isHost = host;
-    enetPort = port;
-    if (!GetConfig().sessionIdValid || !ValidSessionId(GetConfig().sessionId))
-        return Fail("invalid session_id: use 1-63 ASCII letters, digits, '_' or '-'");
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return Fail("winsock not started");
-    winsockStarted = true;
-    sendCodec = std::make_unique<send::Codec>();
-    if (!sendCodec->Ready()) return Fail("Steam send compression context allocation failed");
-    if (!Load()) return false;
-    char text[1024] = "";
-    const int result = api.InitFlat(text);
-    if (result != 0) {
-        Logf("steam: InitFlat %d: %s", result, text);
-        return Fail(result == 2 ? "Steam is not running" : result == 3 ? "the Steam client is too old" : *text ? text : "Steam did not start");
-    }
-    apiInitialized = true;
-    void* clientUtils = api.ClientUtils();
-    if (!clientUtils || api.AppId(clientUtils) != GothicAppId) return Fail("Steam initialized with an unexpected game AppID");
-    Logf("steam: initialized Gothic 3 AppID %u", GothicAppId);
-    api.DispatchInit();
-    pipe = api.GetHSteamPipe();
-    user = api.User();
-    matchmaking = api.Matchmaking();
-    friends = api.Friends();
-    networkingUtils = api.Utils();
-    if (!ConfigureNetworking()) return Fail("Steam networking capacity configuration failed; see steam-send config");
-    TransportConfigDiagnostics();
-    // Messages creates an implicit P2P listener; install capacity defaults before it can inherit them.
-    messages = api.Messages();
-    sockets = api.Sockets ? api.Sockets() : nullptr;
-    socketsLaneTransport = sockets && api.CreateListenSocketP2P && api.ConnectP2P && api.AcceptConnection &&
-                           api.CloseConnection && api.CloseListenSocket && api.ConfigureConnectionLanes &&
-                           api.SendMessages && api.ReceiveOnConnection && api.AllocateMessage;
-    char directEnv[16] = {};
-    const DWORD directEnvLen = GetEnvironmentVariableA("G3T_DIRECT_UDP", directEnv, sizeof(directEnv));
-    if (directEnvLen > 0 && directEnv[0] == '0') directUdpEnabled = false;
-    else if (directEnvLen > 0 && directEnv[0] == '1') directUdpEnabled = enetPort != 0;
-    else directUdpEnabled = (api.FakeSteamAbi == nullptr) && (enetPort != 0);
-    if (!user || !matchmaking || !friends || !messages) return Fail("Steam interfaces missing");
-    if (networkingUtils) api.InitRelayNetworkAccess(networkingUtils);  // ready by the first message
-    if (socketsLaneTransport && isHost) {
-        listenSocketP2P = api.CreateListenSocketP2P(sockets, P2PVirtualPort, 0, nullptr);
-        if (listenSocketP2P) {
-            ConfigureSocketOptions(config::ListenSocketScope, static_cast<intptr_t>(listenSocketP2P));
-            Logf("steam-send: ISteamNetworkingSockets v012 P2P listener active vport=%d lanes=%d ice=all",
-                 P2PVirtualPort, LaneCount);
-        } else {
-            socketsLaneTransport = false;
-            Log("steam-send: CreateListenSocketP2P failed; falling back to ISteamNetworkingMessages");
-        }
-    } else if (socketsLaneTransport) {
-        Logf("steam-send: ISteamNetworkingSockets v012 P2P client lanes=%d ready", LaneCount);
-    }
-    Logf("steam: transport capabilities direct_udp=%u sockets_v012_lanes=%u fake_steam=%u enet_port=%u",
-         directUdpEnabled ? 1u : 0u, socketsLaneTransport ? 1u : 0u, api.FakeSteamAbi ? 1u : 0u,
-         static_cast<unsigned>(enetPort));
-    me = api.UserSteamId(user);
-    if (!me) return Fail("Steam did not provide a SteamID64");
-    char const* steamName = api.PersonaName(friends);
-    if (!steamName || !*steamName) return Fail("Steam did not provide a player name");
-    CopyName(persona, sizeof(persona), steamName);
-    CopyName(playerName, sizeof(playerName), steamName);
-    if (!*playerName) return Fail("Steam player name does not fit the network protocol");
-    ready = true;
-    Logf("steam: ready as Gothic 3 (%u), %s (%llu), %s", GothicAppId, persona, me, isHost ? "host" : "client");
-    connectionMode = GetConfig().connectionAuto ? connect::Mode::Auto : connect::Mode::Invite;
-    if (connectionMode == connect::Mode::Invite)
-        Log("connect: mode=invite: nothing connects, searches the friends list or opens a lobby by itself; it all starts when a Steam invite / Join Game is accepted");
-    else
-        Log("connect: mode=auto (legacy): the host opens a lobby at startup and the client searches its friends list by itself");
-    if (isHost) {
-        const connect::HostFlow::State before = hostFlow.state();
-        const unsigned fx = hostFlow.Ready(connectionMode, Now());
-        if (connectionMode == connect::Mode::Invite)
-            Logf("connect: host ready: no lobby until a friend accepts the invite and its join request arrives; session_id=%s protocol=%u",
-                 GetConfig().sessionId, static_cast<unsigned>(saving::Protocol));
-        AfterHost("steam ready", before, fx);
-    } else {
-        relay = LoopbackSocket(&relayPort);
-        if (relay == INVALID_SOCKET) {
-            ready = false;
-            return Fail("no local relay socket");
-        }
-        wantedLobby = _strtoui64(GetConfig().steamLobby, nullptr, 10);
-        Logf("steam: relay on 127.0.0.1:%u%s", relayPort, wantedLobby ? " (steam_lobby set)" : "");
-        clientFlow.Configure(me, GetConfig().sessionId);
-        clientFlow.Ready();
-        StartupAccept();
-    }
-    stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    wakeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    if (!stopEvent || !wakeEvent) {
-        ready = false;
-        return Fail("transport events could not be created");
-    }
-    // Unlike a timed wait/timeBeginPeriod, this retains sub-frame scheduling for an occluded Windows 11 game.
-    pollTimer = CreateWaitableTimerExA(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
-    if (!pollTimer) {
-        const DWORD failure = GetLastError();
-        if (failure != ERROR_INVALID_PARAMETER) {
-            ready = false;
-            return Fail("transport timer could not be created");
-        }
-        Log("steam: high-resolution timers unavailable on this Windows version; using timed wait (see poll_gap diagnostics)");
-    }
-    Publish();
-    worker = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &TransportThread, nullptr, 0, nullptr));
-    if (!worker) {
-        ready = false;
-        return Fail("transport worker could not be started");
-    }
-    Logf("steam: independent transport worker poll_ms=%u timer=%s; ping=QPC control RTT",
-         latency::RelayPollMs, pollTimer ? "highres" : "legacy");
-    return true;
-}
-
-unsigned short RelayPort() { return relayPort; }
-
-bool IsPeerRelay(unsigned short port)
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    if (!published.ready || !isHost || !port) return false;
-    for (auto const linkedPort : published.ports) if (linkedPort == port) return true;
-    return false;
-}
-
-uint64_t PeerId(unsigned short port)
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    if (!published.ready || !isHost || !port) return 0;
-    for (int i = 0; i < MaxRemotes; ++i)
-        if (published.ports[i] == port) return published.accounts[i];
-    return 0;
-}
-bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
-{
-    uint64_t generation = 0;
-    return PeerIdentity(port, account, name, generation);
-}
-namespace {
-bool ReadPeerIdentityLocked(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    if (!published.ready || !isHost || !port) return false;
-    for (int i = 0; i < MaxRemotes; ++i)
-        if (published.ports[i] == port && published.accounts[i]) {
-            account = published.accounts[i];
-            generation = published.generations[i];
-            strcpy_s(name, published.names[i]);
-            return true;
-        }
-    return false;
-}
-}
-bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return ReadPeerIdentityLocked(port, account, name, generation);
-}
-bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    if (!ReadPeerIdentityLocked(port, account, name, generation) || account == me) return false;
-    relayCloses.erase(std::remove_if(relayCloses.begin(), relayCloses.end(),
-        [account, generation](RelayClose const& request) {
-            return request.account == account && request.generation == generation;
-        }), relayCloses.end());
-    return true;
-}
-
-std::vector<DirectOffer> DirectOffers()
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    std::vector<DirectOffer> result;
-    if (!published.ready) return result;
-    for (auto const& offer : published.directOffers)
-        if (offer.account && offer.generation) result.push_back(offer);
-    return result;
-}
-
-void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t hostIpv4, uint16_t port)
-{
-    if (!account || !generation || !hostIpv4 || !port) return;
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    for (int i = 0; i < MaxRemotes; ++i) {
-        if (published.accounts[i] != account || published.generations[i] != generation) continue;
-        registeredDirect[i] = DirectEndpoint{hostIpv4, port};
-        registeredDirectAccount[i] = account;
-        registeredDirectGen[i] = generation;
-        published.verifiedDirect[i] = registeredDirect[i];
-        return;
-    }
-}
-
-namespace {
-bool ReadDirectPeerIdentityLocked(uint32_t hostIpv4, uint16_t port, uint64_t& account,
-                                  char (&name)[24], uint64_t& generation, uint32_t* expectedTag)
-{
-    if (!published.ready || !isHost || !hostIpv4 || !port) return false;
-    for (int i = 0; i < MaxRemotes; ++i) {
-        if (!published.accounts[i]) continue;
-        if (registeredDirectAccount[i] != published.accounts[i] ||
-            registeredDirectGen[i] != published.generations[i])
-            continue;
-        if (registeredDirect[i].hostIpv4 != hostIpv4 || registeredDirect[i].port != port)
-            continue;
-        account = published.accounts[i];
-        generation = published.generations[i];
-        strcpy_s(name, published.names[i]);
-        if (expectedTag) *expectedTag = CookieTag(published.directOffers[i].cookie);
-        return true;
-    }
-    return false;
-}
-}
-
-bool DirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint64_t& account,
-                        char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, nullptr);
-}
-
-bool ClaimDirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint32_t connectTag,
-                             uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    uint32_t expectedTag = 0;
-    if (!ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, &expectedTag) ||
-        account == me || !expectedTag || connectTag != expectedTag)
-        return false;
-    relayCloses.erase(std::remove_if(relayCloses.begin(), relayCloses.end(),
-        [account, generation](RelayClose const& request) {
-            return request.account == account && request.generation == generation;
-        }), relayCloses.end());
-    return true;
-}
-
-std::vector<RelayDrop> TakeRelayDrops()
-{
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    std::vector<RelayDrop> result;
-    result.swap(relayDrops);
-    return result;
-}
-
-void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason)
-{
-    if (!account || !generation) return;
-    {
-        std::lock_guard<std::mutex> lock(publishedMutex);
-        RelayClose close{account, generation, {}};
-        strncpy_s(close.reason, reason, _TRUNCATE);
-        relayCloses.push_back(close);
-    }
-    if (wakeEvent) SetEvent(wakeEvent);
-}
-
-namespace {
-void PumpOnce()
+void WorkerRuntime::PumpOnce()
 {
     if (!ready) return;
     const uint32_t began = Now();
@@ -2624,19 +303,18 @@ void PumpOnce()
     lastPump = began;
     SteamFpScope floatingPoint("callbacks");
     api.DispatchRunFrame(pipe);
-    struct { int user; int callback; char* param; int size; } message{};  // CallbackMsg_t
+    DispatchCallbackMsg message{};
     while (api.DispatchNext(pipe, &message)) {
-        if (message.callback == CbCallCompleted) {
-            u64 call = 0;
-            int callback = 0;
-            unsigned size = 0;
-            std::memcpy(&call, message.param, 8);
-            std::memcpy(&callback, message.param + 8, 4);
-            std::memcpy(&size, message.param + 12, 4);
+        if (message.callback == CbCallCompleted && message.param &&
+            message.size >= static_cast<int>(sizeof(CallCompletedParam))) {
+            CallCompletedParam completed{};
+            std::memcpy(&completed, message.param, sizeof(completed));
             char result[512];
             sbool failed = 0;
-            if (size <= sizeof(result) && api.DispatchResult(pipe, call, result, static_cast<int>(size), callback, &failed) && !failed)
-                OnCallback(callback, result, static_cast<int>(size));
+            if (completed.size <= sizeof(result) &&
+                api.DispatchResult(pipe, completed.call, result, static_cast<int>(completed.size),
+                                   completed.callback, &failed) && !failed)
+                OnCallback(completed.callback, result, static_cast<int>(completed.size));
         } else {
             OnCallback(message.callback, message.param, message.size);
         }
@@ -2644,21 +322,24 @@ void PumpOnce()
     }
     std::vector<RelayClose> closes;
     {
-        std::lock_guard<std::mutex> lock(publishedMutex);
-        closes.swap(relayCloses);
+        std::lock_guard<std::mutex> lock(store.mutex);
+        closes.swap(store.relayCloses);
         for (auto const& close : closes)
-            InvalidatePublished(close.account, close.generation);
+            InvalidatePublishedLocked(store, isHost, close.account, close.generation);
     }
-    if (isHost) for (auto const& close : closes)
-        if (Remote* r = Find(close.account); r && r->generation == close.generation)
-            Drop(r, close.reason);
+    if (isHost) {
+        for (auto const& close : closes)
+            if (Remote* r = Find(close.account); r && r->generation == close.generation)
+                Drop(r, close.reason);
+    }
     if (isHost && !lobby && connectionMode == connect::Mode::Auto && Now() - lastCreate > 15000)
-        CreateLobbyAuto();  // the first try failed: again every 15 s (legacy mode only)
-    if (disconnectRequested.exchange(false) && !isHost && connectionMode == connect::Mode::Invite && clientFlow.Active()) {
+        CreateLobbyAuto();
+    if (store.disconnectRequested.exchange(false) && !isHost &&
+        connectionMode == connect::Mode::Invite && clientFlow.Active()) {
         ClientEnet enet;
         {
-            std::lock_guard<std::mutex> lock(publishedMutex);
-            enet = clientEnet;
+            std::lock_guard<std::mutex> lock(store.mutex);
+            enet = store.clientEnet;
         }
         OnClientLinkLost(clientFlow.host(), enet.reason[0] ? enet.reason : "ENet connection ended (no event reason)");
     }
@@ -2669,11 +350,9 @@ void PumpOnce()
     } else if (connectionMode == connect::Mode::Invite) {
         HostTick();
     }
-    // Data before control: a friend who quits sends ENet's goodbye and then 'B'; the other order closed its socket first.
     ReceiveP2P();
     Receive(ChannelData);
     Receive(ChannelControl);
-    // Lobby departure callbacks can precede a queued ENet goodbye. Drain it before closing that peer's relay.
     for (auto& r : remotes)
         if (r.leaving) {
             char why[160];
@@ -2682,9 +361,8 @@ void PumpOnce()
         }
     Forward();
     const uint32_t now = Now();
-    static uint32_t lastNames = 0;
-    if (now - lastNames >= 1000) {
-        lastNames = now;
+    if (!lastNames || now - lastNames >= 1000) {
+        lastNames = now ? now : 1;
         CopyName(playerName, sizeof(playerName), api.PersonaName(friends));
         CopyName(persona, sizeof(persona), api.PersonaName(friends));
         for (auto& r : remotes)
@@ -2697,10 +375,10 @@ void PumpOnce()
             Control(owner, 'H', true);
             lastHello = now;
         }
+        if (host && host->linked && !host->p2pConn) OpenClientP2P(*host);
     }
     for (auto& r : remotes) {
         if (!r.id) continue;
-        // A stranger's session (any Steam user may write to a host) or a hello that never got through goes after 60 s.
         if (now - r.heard > (r.linked ? SilenceMs : 60000)) {
             Drop(&r, r.linked ? "silent for 180 s" : "not linked after 60 s");
             continue;
@@ -2722,152 +400,396 @@ void PumpOnce()
     }
     pumpWork.Add(Now() - began);
 }
+
+bool Start(bool host, unsigned short port)
+{
+    if (rt.tried) return Ready();
+    SteamFpScope floatingPoint("startup");
+    rt.tried = true;
+    rt.traffic = {};
+    char const* session = GetLocalConfig().sessionId;
+    rt.traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(session));
+    rt.isHost = host;
+    rt.enetPort = port;
+    if (!GetLocalConfig().sessionIdValid || !ValidSessionId(session))
+        return rt.Fail("invalid session_id: use 1-63 ASCII letters, digits, '_' or '-'");
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return rt.Fail("winsock not started");
+    rt.winsockStarted = true;
+    rt.sendCodec = std::make_unique<send::Codec>();
+    if (!rt.sendCodec->Ready()) return rt.Fail("Steam send compression context allocation failed");
+    if (!rt.Load()) return false;
+    char text[1024] = "";
+    const int result = api.InitFlat(text);
+    if (result != 0) {
+        Logf("steam: InitFlat %d: %s", result, text);
+        return rt.Fail(result == 2 ? "Steam is not running"
+            : result == 3 ? "the Steam client is too old"
+            : *text ? text : "Steam did not start");
+    }
+    rt.apiInitialized = true;
+    void* clientUtils = api.ClientUtils();
+    if (!clientUtils || api.AppId(clientUtils) != GothicAppId)
+        return rt.Fail("Steam initialized with an unexpected game AppID");
+    Logf("steam: initialized Gothic 3 AppID %u", GothicAppId);
+    api.DispatchInit();
+    rt.pipe = api.GetHSteamPipe();
+    rt.user = api.User();
+    rt.matchmaking = api.Matchmaking();
+    rt.friends = api.Friends();
+    rt.networkingUtils = api.Utils();
+    if (!rt.ConfigureNetworking()) return rt.Fail("Steam networking capacity configuration failed; see steam-send config");
+    rt.TransportConfigDiagnostics();
+    rt.messages = api.Messages();
+    rt.sockets = api.Sockets ? api.Sockets() : nullptr;
+    rt.socketsLaneTransport = rt.sockets && api.CreateListenSocketP2P && api.ConnectP2P && api.AcceptConnection &&
+                              api.CloseConnection && api.CloseListenSocket && api.ConfigureConnectionLanes &&
+                              api.SendMessages && api.ReceiveOnConnection && api.AllocateMessage;
+    char directEnv[16] = {};
+    const DWORD directEnvLen = GetEnvironmentVariableA("G3T_DIRECT_UDP", directEnv, sizeof(directEnv));
+    if (directEnvLen > 0 && directEnv[0] == '0') rt.directUdpEnabled = false;
+    else if (directEnvLen > 0 && directEnv[0] == '1') rt.directUdpEnabled = rt.enetPort != 0;
+    else rt.directUdpEnabled = (api.FakeSteamAbi == nullptr) && (rt.enetPort != 0);
+    if (!rt.user || !rt.matchmaking || !rt.friends || !rt.messages) return rt.Fail("Steam interfaces missing");
+    if (rt.networkingUtils) api.InitRelayNetworkAccess(rt.networkingUtils);
+    if (rt.socketsLaneTransport && rt.isHost) {
+        rt.listenSocketP2P = api.CreateListenSocketP2P(rt.sockets, P2PVirtualPort, 0, nullptr);
+        if (rt.listenSocketP2P) {
+            rt.ConfigureSocketOptions(config::ListenSocketScope, static_cast<intptr_t>(rt.listenSocketP2P));
+            Logf("steam-send: ISteamNetworkingSockets v012 P2P listener active vport=%d lanes=%d ice=all",
+                 P2PVirtualPort, LaneCount);
+        } else {
+            rt.socketsLaneTransport = false;
+            Log("steam-send: CreateListenSocketP2P failed; falling back to ISteamNetworkingMessages");
+        }
+    } else if (rt.socketsLaneTransport) {
+        Logf("steam-send: ISteamNetworkingSockets v012 P2P client lanes=%d ready", LaneCount);
+    }
+    Logf("steam: transport capabilities direct_udp=%u sockets_v012_lanes=%u fake_steam=%u enet_port=%u",
+         rt.directUdpEnabled ? 1u : 0u, rt.socketsLaneTransport ? 1u : 0u, api.FakeSteamAbi ? 1u : 0u,
+         static_cast<unsigned>(rt.enetPort));
+    rt.me = api.UserSteamId(rt.user);
+    if (!rt.me) return rt.Fail("Steam did not provide a SteamID64");
+    char const* steamName = api.PersonaName(rt.friends);
+    if (!steamName || !*steamName) return rt.Fail("Steam did not provide a player name");
+    CopyName(rt.persona, sizeof(rt.persona), steamName);
+    CopyName(rt.playerName, sizeof(rt.playerName), steamName);
+    if (!*rt.playerName) return rt.Fail("Steam player name does not fit the network protocol");
+    rt.ready = true;
+    Logf("steam: ready as Gothic 3 (%u), %s (%llu), %s", GothicAppId, rt.persona, rt.me, rt.isHost ? "host" : "client");
+    auto const connectionMode = GetLocalConfig().connectionAuto ? connect::Mode::Auto : connect::Mode::Invite;
+    rt.connectionMode = connectionMode;
+    auto& hostFlow = rt.hostFlow;
+    if (connectionMode == connect::Mode::Invite)
+        Log("connect: mode=invite: nothing connects, searches the friends list or opens a lobby by itself; it all starts when a Steam invite / Join Game is accepted");
+    else
+        Log("connect: mode=auto (legacy): the host opens a lobby at startup and the client searches its friends list by itself");
+    if (rt.isHost) {
+        const connect::HostFlow::State before = hostFlow.state();
+        const unsigned fx = hostFlow.Ready(connectionMode, Now());
+        if (connectionMode == connect::Mode::Invite)
+            Logf("connect: host ready: no lobby until a friend accepts the invite and its join request arrives; session_id=%s protocol=%u",
+                 session, static_cast<unsigned>(saving::Protocol));
+        rt.AfterHost("steam ready", before, fx);
+    } else {
+        rt.relay = LoopbackSocket(&rt.relayPort);
+        if (rt.relay == INVALID_SOCKET) {
+            rt.ready = false;
+            return rt.Fail("no local relay socket");
+        }
+        rt.wantedLobby = _strtoui64(GetLocalConfig().steamLobby, nullptr, 10);
+        Logf("steam: relay on 127.0.0.1:%u%s", rt.relayPort, rt.wantedLobby ? " (steam_lobby set)" : "");
+        rt.clientFlow.Configure(rt.me, session);
+        rt.clientFlow.Ready();
+        auto StartupAccept = [&] { rt.StartupAccept(); };
+        StartupAccept();
+    }
+    store.stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    store.wakeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!store.stopEvent || !store.wakeEvent) {
+        rt.ready = false;
+        return rt.Fail("transport events could not be created");
+    }
+    store.pollTimer = CreateWaitableTimerExA(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                             TIMER_MODIFY_STATE | SYNCHRONIZE);
+    if (!store.pollTimer) {
+        const DWORD failure = GetLastError();
+        if (failure != ERROR_INVALID_PARAMETER) {
+            rt.ready = false;
+            return rt.Fail("transport timer could not be created");
+        }
+        Log("steam: high-resolution timers unavailable on this Windows version; using timed wait (see poll_gap diagnostics)");
+    }
+    rt.Publish();
+    store.worker = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &TransportThread, nullptr, 0, nullptr));
+    if (!store.worker) {
+        rt.ready = false;
+        return rt.Fail("transport worker could not be started");
+    }
+    Logf("steam: independent transport worker poll_ms=%u timer=%s; ping=QPC control RTT",
+         latency::RelayPollMs, store.pollTimer ? "highres" : "legacy");
+    return true;
 }
 
-void Pump() { if (wakeEvent) SetEvent(wakeEvent); }
+unsigned short RelayPort() { return rt.relayPort; }
+
+bool IsPeerRelay(unsigned short port)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    if (!store.published.ready || !rt.isHost || !port) return false;
+    for (auto const& peer : store.published.peers)
+        if (peer.port == port) return true;
+    return false;
+}
+
+uint64_t PeerId(unsigned short port)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    if (!store.published.ready || !rt.isHost || !port) return 0;
+    for (auto const& peer : store.published.peers)
+        if (peer.port == port) return peer.account;
+    return 0;
+}
+
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
+{
+    uint64_t generation = 0;
+    return PeerIdentity(port, account, name, generation);
+}
+
+bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return ReadPeerIdentityLocked(port, account, name, generation);
+}
+
+bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    if (!ReadPeerIdentityLocked(port, account, name, generation) || account == rt.me) return false;
+    store.relayCloses.erase(std::remove_if(store.relayCloses.begin(), store.relayCloses.end(),
+        [account, generation](RelayClose const& request) {
+            return request.account == account && request.generation == generation;
+        }), store.relayCloses.end());
+    return true;
+}
+
+std::vector<DirectOffer> DirectOffers()
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    std::vector<DirectOffer> result;
+    if (!store.published.ready) return result;
+    for (auto const& peer : store.published.peers)
+        if (peer.directOffer.account && peer.directOffer.generation)
+            result.push_back(peer.directOffer);
+    return result;
+}
+
+void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t hostIpv4, uint16_t port)
+{
+    if (!account || !generation || !IsValidDirectCandidateEndpoint(hostIpv4, port, AllowDirectLoopback()))
+        return;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    for (int i = 0; i < MaxRemotes; ++i) {
+        auto& peer = store.published.peers[i];
+        if (peer.account != account || peer.generation != generation) continue;
+        if (peer.directPinned) {
+            if (peer.verifiedDirect.hostIpv4 == hostIpv4 && peer.verifiedDirect.port == port) return;
+            Logf("steam: refusing direct endpoint rebind for peer=%llu gen=%llu",
+                 static_cast<unsigned long long>(account), static_cast<unsigned long long>(generation));
+            return;
+        }
+        peer.verifiedDirect = DirectEndpoint{hostIpv4, port};
+        peer.directPinned = true;
+        return;
+    }
+}
+
+bool DirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint64_t& account,
+                        char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, nullptr);
+}
+
+bool ClaimDirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint32_t connectTag,
+                             uint64_t& account, char (&name)[24], uint64_t& generation)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    uint32_t expectedTag = 0;
+    if (!ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, &expectedTag) ||
+        account == rt.me || !expectedTag || connectTag != expectedTag)
+        return false;
+    store.relayCloses.erase(std::remove_if(store.relayCloses.begin(), store.relayCloses.end(),
+        [account, generation](RelayClose const& request) {
+            return request.account == account && request.generation == generation;
+        }), store.relayCloses.end());
+    return true;
+}
+
+std::vector<RelayDrop> TakeRelayDrops()
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    std::vector<RelayDrop> result;
+    result.swap(store.relayDrops);
+    return result;
+}
+
+void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason)
+{
+    if (!account || !generation) return;
+    {
+        std::lock_guard<std::mutex> lock(store.mutex);
+        RelayClose close{account, generation, {}};
+        strncpy_s(close.reason, reason, _TRUNCATE);
+        store.relayCloses.push_back(close);
+    }
+    if (store.wakeEvent) SetEvent(store.wakeEvent);
+}
+
+void Pump() { if (store.wakeEvent) SetEvent(store.wakeEvent); }
 
 void Stop()
 {
-    if (worker) {
-        SetEvent(stopEvent);
-        // Never close the worker's sockets/API underneath it, including during engine shutdown.
-        if (WaitForSingleObject(worker, INFINITE) != WAIT_OBJECT_0) {
+    if (store.worker) {
+        SetEvent(store.stopEvent);
+        if (WaitForSingleObject(store.worker, INFINITE) != WAIT_OBJECT_0) {
             Logf("steam: transport worker join failed (Windows error %lu); resources retained", GetLastError());
             return;
         }
-        CloseHandle(worker);
-        worker = nullptr;
+        CloseHandle(store.worker);
+        store.worker = nullptr;
     }
-    if (wakeEvent) CloseHandle(wakeEvent);
-    if (stopEvent) CloseHandle(stopEvent);
-    if (pollTimer) CloseHandle(pollTimer);
-    wakeEvent = stopEvent = pollTimer = nullptr;
+    if (store.wakeEvent) CloseHandle(store.wakeEvent);
+    if (store.stopEvent) CloseHandle(store.stopEvent);
+    if (store.pollTimer) CloseHandle(store.pollTimer);
+    store.wakeEvent = store.stopEvent = store.pollTimer = nullptr;
     SteamFpScope floatingPoint("shutdown");
-    if (apiInitialized) {
-        if (!isHost && (owner || clientFlow.Active())) RecordClientEnd("local transport shutdown", clientFlow.state());
-        if (isHost) {  // not joinable any more once the game is closed
-            SetPresence("connect", "");
-            SetPresence("status", "");
+    if (rt.apiInitialized) {
+        if (!rt.isHost && (rt.owner || rt.clientFlow.Active()))
+            rt.RecordClientEnd("local transport shutdown", rt.clientFlow.state());
+        if (rt.isHost) {
+            rt.SetPresence("connect", "");
+            rt.SetPresence("status", "");
         }
-        Forward();  // ENet's goodbye to the others
-        LeaveLobby();
-        if (listenSocketP2P && sockets && api.CloseListenSocket) {
-            api.CloseListenSocket(sockets, listenSocketP2P);
-            listenSocketP2P = 0;
+        rt.Forward();
+        rt.LeaveLobby();
+        if (rt.listenSocketP2P && rt.sockets && api.CloseListenSocket) {
+            api.CloseListenSocket(rt.sockets, rt.listenSocketP2P);
+            rt.listenSocketP2P = 0;
         }
         Log("steam: stopped");
     }
-    if (relay != INVALID_SOCKET) closesocket(relay);
-    relay = INVALID_SOCKET;
-    sockets = nullptr;
-    socketsLaneTransport = directUdpEnabled = false;
-    sendCodec.reset();
-    ready = false;
-    if (apiInitialized) {
-        api.Shutdown();
-        apiInitialized = false;
-    }
-    if (winsockStarted) {
-        WSACleanup();
-        winsockStarted = false;
-    }
+    if (rt.relay != INVALID_SOCKET) closesocket(rt.relay);
+    rt.relay = INVALID_SOCKET;
+    const bool wasInitialized = rt.apiInitialized;
+    const bool wasWinsock = rt.winsockStarted;
+    rt.sendCodec.reset();
+    rt.Reset();
+    if (wasInitialized) api.Shutdown();
+    if (wasWinsock) WSACleanup();
     {
-        std::lock_guard<std::mutex> lock(publishedMutex);
-        relayCloses.clear();
-        for (int i = 0; i < MaxRemotes; ++i) {
-            registeredDirect[i] = {};
-            registeredDirectAccount[i] = registeredDirectGen[i] = 0;
-        }
+        std::lock_guard<std::mutex> lock(store.mutex);
+        store.relayCloses.clear();
+        store.clientEnet = {};
+        store.disconnectRequested.store(false);
+        store.published = Published{};
     }
-    Publish();
 }
 
-bool Ready() { std::lock_guard<std::mutex> lock(publishedMutex); return published.ready; }
-uint64_t LobbyId() { std::lock_guard<std::mutex> lock(publishedMutex); return published.lobby; }
+bool Ready() { std::lock_guard<std::mutex> lock(store.mutex); return store.published.ready; }
+uint64_t LobbyId() { std::lock_guard<std::mutex> lock(store.mutex); return store.published.lobby; }
 char const* PlayerName()
 {
     thread_local char copy[24];
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    strcpy_s(copy, published.playerName);
+    std::lock_guard<std::mutex> lock(store.mutex);
+    strcpy_s(copy, store.published.playerName);
     return copy;
 }
-uint64_t PlayerId() { return me; }
+uint64_t PlayerId() { return rt.me; }
 int Ping()
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return published.ping >= 0 && Now() - published.pingSampleAt < latency::PingExpiryMs ? published.ping : -1;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return store.published.ping >= 0 && Now() - store.published.pingSampleAt < latency::PingExpiryMs
+        ? store.published.ping : -1;
 }
 char const* Error()
 {
-    thread_local char copy[sizeof(error)];
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    strcpy_s(copy, published.error);
+    thread_local char copy[sizeof(rt.error)];
+    std::lock_guard<std::mutex> lock(store.mutex);
+    strcpy_s(copy, store.published.error);
     return copy;
 }
 char const* HostName()
 {
-    thread_local char copy[sizeof(hostName)];
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    strcpy_s(copy, published.hostName);
+    thread_local char copy[sizeof(rt.hostName)];
+    std::lock_guard<std::mutex> lock(store.mutex);
+    strcpy_s(copy, store.published.hostName);
     return copy;
 }
 
 bool HostLinked()
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return published.hostLinked;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return store.published.hostLinked;
 }
 
 uint64_t HostRelayGeneration()
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return published.hostGeneration;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return store.published.hostGeneration;
 }
 
 bool RequestClientDisconnect()
 {
-    if (isHost || connectionMode != connect::Mode::Invite) return false;
-    disconnectRequested.store(true);
-    if (wakeEvent) SetEvent(wakeEvent);
+    if (rt.isHost || rt.connectionMode != connect::Mode::Invite) return false;
+    store.disconnectRequested.store(true);
+    if (store.wakeEvent) SetEvent(store.wakeEvent);
     return true;
 }
 
 void NoteClientEnetState(unsigned state, unsigned event, uint32_t data, uint32_t elapsedMs, char const* reason)
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    clientEnet.state = state;
-    clientEnet.event = event;
-    clientEnet.data = data;
-    clientEnet.elapsedMs = elapsedMs;
-    clientEnet.sampledAt = Now();
-    strncpy_s(clientEnet.reason, reason, _TRUNCATE);
+    std::lock_guard<std::mutex> lock(store.mutex);
+    store.clientEnet.state = state;
+    store.clientEnet.event = event;
+    store.clientEnet.data = data;
+    store.clientEnet.elapsedMs = elapsedMs;
+    store.clientEnet.sampledAt = Now();
+    strncpy_s(store.clientEnet.reason, reason, _TRUNCATE);
 }
 
 Connection Flow()
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return published.connection;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return store.published.connection;
 }
 
 int LinkedCount()
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return published.linked;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return store.published.linked;
 }
 
 TrafficCounters Traffic()
 {
-    std::lock_guard<std::mutex> lock(publishedMutex);
-    return published.traffic;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    return store.published.traffic;
 }
 
 void Status(void (*log)(char const*))
 {
-    char line[sizeof(published.status)];
+    char line[sizeof(store.published.status)];
     {
-        std::lock_guard<std::mutex> lock(publishedMutex);
-        strcpy_s(line, published.status);
+        std::lock_guard<std::mutex> lock(store.mutex);
+        strcpy_s(line, store.published.status);
     }
     log(line);
 }
 }
+
+#ifdef G3T_REALISM_SOURCE
+#include "steam_p2p.cpp"
+#include "steam_flow.cpp"
+#include "steam_diagnostics.cpp"
+#endif

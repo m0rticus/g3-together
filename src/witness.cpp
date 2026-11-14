@@ -7,6 +7,7 @@
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "patch.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -85,7 +86,9 @@ unsigned char* NativeAssess()
     HMODULE module = GetModuleHandleA("Script_Game.dll");
     if (!module) return nullptr;
     auto* code = reinterpret_cast<unsigned char*>(module) + AssessRva;
-    return std::memcmp(code, expected, sizeof(expected)) == 0 ? code : nullptr;
+    return !std::memcmp(code, expected, sizeof(expected)) ||
+        (patch::IsPatchedByUs(code, expected, 6) && !std::memcmp(code + 6, expected + 6, sizeof(expected) - 6))
+        ? code : nullptr;
 }
 
 // The scripts' common prologue in this build: push ebp; mov ebp,esp; and esp,-8; sub esp,<frame>.

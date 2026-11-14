@@ -615,6 +615,40 @@ static void SecondOrderSpatial()
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout) == Status::Malformed);
     assert(receiver.Store(1, 2, 1, 0, identity.data(), identity.size(), 101, true, true));
     assert(receiver.Decode(dictionary, valid.data(), valid.size(), 1, 0, decoded, layout) == Status::WrongGeneration);
+
+    // BUG-5: Mode 4 with secondOrder=true must reconstruct identically on encoder and decoder.
+    PoseCache mode4SecondSender, mode4SecondReceiver;
+    auto frameA = identity, frameB = identity, frameC = identity;
+    for (size_t i = 0; i < frameA.size(); ++i) {
+        auto makeFrame = [&](int step, pose::Bone& out) {
+            pose::Transform tr;
+            tr.name = static_cast<uint32_t>(i + 1);
+            const double a = 0.04 * step + 0.015 * double(i);
+            tr.values[0] = tr.values[8] = float(std::cos(a));
+            tr.values[2] = float(std::sin(a));
+            tr.values[6] = -tr.values[2];
+            tr.values[4] = 1.0f;
+            // Chaotic temporal velocity on bone 0 + rigid constant spatial offset across bones makes secondOrder win!
+            const float jitter = (step == 2) ? 18.0f : (step == 1 ? -9.0f : 0.0f);
+            tr.values[9] = jitter + float(i) * 0.25f;
+            tr.values[10] = -jitter * 0.5f;
+            tr.values[11] = jitter * 0.25f;
+            assert(pose::Encode(tr, out));
+        };
+        makeFrame(0, frameA[i]);
+        makeFrame(1, frameB[i]);
+        makeFrame(3, frameC[i]);
+    }
+    assert(mode4SecondSender.Store(1, 1, 1, 0, frameA.data(), frameA.size(), 100, true, true));
+    assert(mode4SecondSender.Store(2, 1, 1, 0, frameB.data(), frameB.size(), 200, true, true));
+    assert(mode4SecondReceiver.Store(1, 1, 1, 0, frameA.data(), frameA.size(), 100, true, true));
+    assert(mode4SecondReceiver.Store(2, 1, 1, 0, frameB.data(), frameB.size(), 200, true, true));
+    assert(mode4SecondSender.Ack(1, 1) && mode4SecondSender.Ack(2, 1));
+    assert(mode4SecondSender.EncodeCompact(dictionary, 1, 1, 0, frameC.data(), frameC.size(), 300,
+                                           bytes, key, reconstructed, &stats) == Status::Ok && !key);
+    assert(bytes[6] == 4);
+    assert(mode4SecondReceiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout) == Status::Ok);
+    assert(Same(decoded, reconstructed));
 }
 
 static void LongDelayedFirstAnchor()

@@ -9,7 +9,7 @@ Gothic 3.
 1. Read-only full copy check:
 
 ```powershell
-python tools\verify_test_copies.py --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3" --deep --strict-shipped-ini --json test-copy-verification.json
+python tools\verify_test_copies.py --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3" --expected <expected-installation.json> --deep --strict-shipped-ini --json test-copy-verification.json
 ```
 
 Strict shipped INI mode expects explicit `connection`, `session_id` and `language`.
@@ -26,7 +26,7 @@ python tools\update_test_copies.py --host-root "C:\Repositories\g3-together\work
 
 ```powershell
 python tools\update_test_copies.py --apply --manifest-out update-transaction.json --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3" --session-id pair-red --fake-dll <approved-staged-fake.dll> --approved-dll-sha256 <reviewed-sha>
-python tools\verify_test_copies.py --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3" --deep --json post-update-verification.json
+python tools\verify_test_copies.py --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3" --expected <expected-installation.json> --deep --json post-update-verification.json
 python tools\update_test_copies.py --rollback update-transaction.json --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3"
 python tools\update_test_copies.py --apply --rollback update-transaction.json --host-root "C:\Repositories\g3-together\workspace\test-install" --client-root "C:\Repositories\g3-together\workspace\test-client" --steam-root "C:\Program Files (x86)\Steam\steamapps\common\Gothic 3"
 ```
@@ -55,9 +55,9 @@ workspace path:
 python <coordinator-tools>\run_steam_realism.py --source-root <coordinator-source-root> --fake-dll <package>\G3Together\test-realism\fake_steam_api.dll --output-dir C:\approved-run\matrix --scenario all --seconds 60
 ```
 
-The strict saturation case always offers400000 application B/s and is not
+The strict saturation case always offers 400000 application B/s and is not
 reduced to make it pass. For a separately labelled transport-volume check
-using build69's measured212659 compressed/framing B/s steady rate:
+using build 69's measured 212659 compressed/framing B/s steady rate:
 
 ```powershell
 python <coordinator-tools>\run_steam_realism.py --source-root <build69-source-root> --fake-dll <package>\G3Together\test-realism\fake_steam_api.dll --output-dir C:\approved-run\steady --scenario steady-load --offered-bps 212659 --seconds 60

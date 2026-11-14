@@ -2,11 +2,16 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
+from _g3copy import win32_tool_environment
 
 
 def body(source, signature):
@@ -32,22 +37,23 @@ class BandwidthGoodsPolicyTests(unittest.TestCase):
         cls.trade = (ROOT / "src" / "trade.cpp").read_text(encoding="utf-8")
 
     def test_engine_free_policy(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
-        # Keep compiler intermediates inside the worktree, not the system temp directory.
-        stem = f"bandwidth_goods_policy_{os.getpid()}"
-        executable = ROOT / "tests" / (stem + (".exe" if os.name == "nt" else ""))
-        environment = dict(os.environ, TMP=str(ROOT / "tests"), TEMP=str(ROOT / "tests"))
-        try:
-            subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 str(ROOT / "tests" / "bandwidth_goods_policy_test.cpp"), "-o", str(executable)],
-                check=True, capture_output=True, text=True, cwd=ROOT, env=environment,
-            )
-            subprocess.run([str(executable)], check=True, capture_output=True, text=True, cwd=ROOT)
-        finally:
-            executable.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            executable = directory / ("bandwidth_goods_policy.exe" if os.name == "nt" else "bandwidth_goods_policy")
+            source = ROOT / "tests" / "bandwidth_goods_policy_test.cpp"
+            compiler = shutil.which("clang++") or shutil.which("g++")
+            if compiler:
+                env = dict(os.environ, TMP=str(directory), TEMP=str(directory))
+                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)]
+            else:
+                env = win32_tool_environment(directory)
+                cl = shutil.which("cl", path=env.get("PATH"))
+                if not cl:
+                    self.skipTest("C++17 compiler required")
+                command = [cl, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
+                           str(source), f"/Fe:{executable}", f"/Fo:{directory}\\"]
+            subprocess.run(command, check=True, capture_output=True, text=True, cwd=directory, env=env)
+            subprocess.run([str(executable)], check=True, capture_output=True, text=True, cwd=directory, env=env)
 
     def test_measurement_uses_common_delivery_points(self):
         send = body(self.net, r"\bbool\s+Send\s*\(")

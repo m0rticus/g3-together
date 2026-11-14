@@ -3,5 +3,4 @@
 
 namespace g3t::tradeview {
 void Install();
-void Uninstall();
 }

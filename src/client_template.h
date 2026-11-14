@@ -283,6 +283,7 @@ class Publish {
     Phase phase_ = Phase::Idle;
     Origin origin_ = Origin::NewGame;
     uint32_t started_ = 0, native_ = 0, lastPoll_ = 0, candidateSince_ = 0;
+    uint64_t candidateSize_ = 0, candidateStamp_ = 0;
     uint8_t candidate_ = 0; // 0 none, 1 header, 2 world: the staging file the stability timer is running for
     bool polled_ = false;
     Fail fail_ = Fail::None;
@@ -305,6 +306,7 @@ class Publish {
         started_ = native_ = now;
         candidate_ = 0;
         candidateSince_ = 0;
+        candidateSize_ = candidateStamp_ = 0;
         polled_ = false;
         fail_ = Fail::None;
     }
@@ -347,9 +349,18 @@ class Publish {
         const bool worldCandidate = !f.world.exists && Settled(f.worldTmp);
         if (since >= RecoverAfterMs && (headerCandidate || worldCandidate)) {
             const uint8_t which = headerCandidate ? 1 : 2;
-            if (candidate_ != which) { candidate_ = which; candidateSince_ = now; }
+            File const& chosen = headerCandidate ? f.headerTmp : f.worldTmp;
+            if (candidate_ != which || candidateSize_ != chosen.size || candidateStamp_ != chosen.stamp) {
+                candidate_ = which;
+                candidateSize_ = chosen.size;
+                candidateStamp_ = chosen.stamp;
+                candidateSince_ = now;
+            }
             if (now - candidateSince_ >= RecoverStableMs) return headerCandidate ? Step::RecoverHeader : Step::RecoverWorld;
-        } else candidate_ = 0;
+        } else {
+            candidate_ = 0;
+            candidateSize_ = candidateStamp_ = 0;
+        }
         return Step::Wait;
     }
     // The exact reason when the settle window closed, header first (it is complete at the native return).

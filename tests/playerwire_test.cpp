@@ -6,35 +6,6 @@
 #include <limits>
 #include <vector>
 
-#define G3T_PLAYERWIRE_HAS_PLAYERSTATE 1
-namespace g3t::net {
-struct PlayerState {
-    std::uint8_t id = 0;
-    std::uint32_t sequence = 0;
-    std::uint32_t sent = 0;
-    std::uint32_t world = 0;
-    float position[3] = {};
-    float rotation[4] = {};
-    std::uint8_t flags = 0;
-    std::uint8_t movementMode = 0;
-    std::uint8_t aniState = 0;
-    char name[24] = {};
-    char animation[96] = {};
-    char heldRight[40] = {};
-    char heldLeft[40] = {};
-    char shape[32] = {};
-    char armor[40] = {};
-    char helmet[40] = {};
-    char look[32] = {};
-    std::int32_t gold = 0;
-    std::uint8_t actionSeq = 0;
-    std::uint16_t actionMs = 0;
-    std::uint16_t motionFrac = 65535;
-    std::uint32_t downedSequence = 0;
-    std::uint32_t focusNpc = 0;
-    std::uint32_t targetNpc = 0;
-};
-}
 #include "../src/playerwire.h"
 
 namespace {

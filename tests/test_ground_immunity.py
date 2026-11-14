@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -9,6 +10,9 @@ from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
+from _g3copy import win32_tool_environment
 
 
 class GroundImmunityTests(unittest.TestCase):
@@ -25,19 +29,22 @@ class GroundImmunityTests(unittest.TestCase):
         return result
 
     def test_exact_pose_life_flags_recovery_and_terminal_policy(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "The engine-free immunity test needs a C++ compiler")
-        with tempfile.TemporaryDirectory(prefix="ground-policy-", dir=ROOT) as temporary:
+        with tempfile.TemporaryDirectory(prefix="ground-policy-") as temporary:
             directory = Path(temporary)
             executable = directory / ("ground.exe" if os.name == "nt" else "ground")
             source = str(ROOT / "tests" / "ground_immunity_test.cpp")
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", source, f"/Fe:{executable}"]
-            else:
+            compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++")
+            if compiler:
+                env = os.environ.copy()
                 command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", source, "-o", str(executable)]
-            compiled = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=60)
+            else:
+                env = win32_tool_environment(directory)
+                cl = shutil.which("cl", path=env.get("PATH"))
+                self.assertIsNotNone(cl, "The engine-free immunity test needs a C++ compiler")
+                command = [cl, "/nologo", "/std:c++17", "/EHsc", source, f"/Fe:{executable}", f"/Fo:{directory}\\"]
+            compiled = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run([str(executable)], cwd=directory, capture_output=True, text=True, timeout=20)
+            executed = subprocess.run([str(executable)], cwd=directory, env=env, capture_output=True, text=True, timeout=20)
             self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_synthetic_contact_restores_vanilla_pose_gate_before_judgement(self):

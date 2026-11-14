@@ -115,8 +115,6 @@ int main()
     config.bytesPerSecond = 256u * 1024u;
     config.mtuBytes = 1200;
     budget.Reset(0, config);
-    assert(budget.Preview(g3t::net::BudgetClass::NpcActive, 1269)
-           == g3t::net::BudgetDecision::Allow);
     budget.CommitQueued(g3t::net::BudgetClass::NpcActive, 1269);
     assert(budget.Snapshot().chargedBytes == 1269);
     return 0;

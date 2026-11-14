@@ -303,6 +303,14 @@ void OnWorldChange()
     grudges.clear();
 }
 
+bool HasLocalOverride(eCEntity* npc)
+{
+    if (!IsNpc(npc)) return false;
+    if (!net::IsHost() && Read(npc).value != gELastFightAgainstPlayer_None) return true;
+    const auto it = grudges.find(Key(npc, net::LocalId()));
+    return it != grudges.end() && it->second.value != gELastFightAgainstPlayer_None;
+}
+
 // The game's grudge on sight (AssessActivePerception, its player's slot): an NPC that gave up a fight with its player
 // (CancelAttack: Cancel and the time) takes it up again when it sees that player within a while, by the reason it fought
 // for (IsUpset 0x115d0), with AssessTarget(self, player, LastPlayerAR). Here for another player whose fight this machine

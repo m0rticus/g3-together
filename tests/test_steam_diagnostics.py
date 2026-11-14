@@ -27,6 +27,32 @@ class SteamDiagnosticsTests(unittest.TestCase):
         finally:
             shutil.rmtree(build)
 
+    def test_v012_runtime_lanes_fallback_pinning_and_rejoin_rotation(self):
+        compiler = shutil.which("clang++") or shutil.which("g++")
+        self.assertIsNotNone(compiler, "C++17 compiler required")
+        build = ROOT / "tests" / f".steam-v012-runtime-build-{os.getpid()}"
+        build.mkdir()
+        try:
+            obj = build / "compress.o"
+            exe = build / "steam-v012-runtime.exe"
+            commands = [
+                [compiler, "-x", "c", "-std=c11", "-O2",
+                 "-I", str(ROOT / "thirdparty" / "enet" / "include"), "-c",
+                 str(ROOT / "thirdparty" / "enet" / "compress.c"), "-o", str(obj)],
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O2",
+                 "-I", str(ROOT / "thirdparty" / "enet" / "include"),
+                 str(ROOT / "tests" / "steam_v012_runtime_test.cpp"), str(obj),
+                 "-lws2_32", "-lbcrypt", "-o", str(exe)],
+                [str(exe)],
+            ]
+            for command in commands:
+                result = subprocess.run(command, cwd=build, capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if command == commands[-1]:
+                    print(result.stdout, end="")
+        finally:
+            shutil.rmtree(build)
+
 
 if __name__ == "__main__":
     unittest.main()

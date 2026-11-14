@@ -6,7 +6,10 @@
 // machine, where hits on others' NPCs go to their owners as claims.
 #pragma once
 
+class eCEntity;
+
 namespace g3t::summon {
+bool HitBlocked(eCEntity const* entity);
 void OnWorldChange();
 void CaptureCacheInventory();  // engine thread only; counts records without resolving their GUIDs
 void Start();

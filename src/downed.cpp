@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "downed.h"
-#include "downed_policy.h"
-
+#include "downed_terminal.h"
+#include "player_immunity.h"
 #include "ai.h"
 #include "body.h"
 #include "crashlog.h"
@@ -9,240 +9,65 @@
 #include "i18n.h"
 #include "items.h"
 #include "log.h"
-#include "net.h"
 #include "persist.h"
 #include "remote.h"
 #include "movement.h"
-
-#include <Game.h>
-#include <Script.h>
 #include <Windows.h>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <intrin.h>
-#include <string>
 
 namespace g3t::downed {
+LocalLifeState life;
+PeerLifeState peers[net::MaxPlayers];
 namespace {
-bool enabled = true;      // death becomes a knock-out
-bool holdEnabled = true;  // a knocked-out hero waits for a partner
-bool potionNeeded = true; // QA negative control: potionoff (helping up is free again)
-// Only a death the mod turned into a knock-out (RedirectDeath) waits for help (PLAN-2026-10-22 2.2, re/findings/
-// defeat-arena-c.md). A knock-out of the game's own (guards, a duel, the arena: Defeat) takes the game's course:
-// the winner may rob the hero, the hero stands up by itself. Before, every knock-out was held (spieltest 21.10.
-// 21:35: guards knocked a player out, a partner paid a potion, nobody robbed him).
-bool lethalOnly = true;   // QA negative control: lethalonlyoff (every knock-out waits for help again)
-bool lethalBlows = true;  // QA negative control: lethalblowsoff (a knock-out of the game's own is never a death, as before 3 Nov.)
-unsigned redirects = 0, revives = 0, releases = 0, deaths = 0, potionsPaid = 0, refusedNoPotion = 0;
-// Helping up through a dialog (owner 23.10.): a partner waiting for help gets an option on its puppet, the player's line
-// "Ich werde dir helfen." (INFO_SKALVERAM320060309153144, C trade-screen-c.md 6.); chosen, the hero pays a healing potion and
-// helps it up. Standing next to it for 3 s no longer does (QA autohelpon: that again).
-bool autoHelp = false;
-bool helpOption = true;  // QA negative control: helpoptionoff (no option is offered)
-char const* const HelpLine = "INFO_SKALVERAM320060309153144";
-// The help counts only once its line is spoken (infocmd.cpp sees the Say): the info manager's current info was ours as
-// soon as a dialog with the puppet began, so talking to a downed partner, or choosing the trade, helped it up and paid a
-// potion without the line being chosen (the host's report, playtest 27.10.: "chose to help" in the same ms as the trade).
-bool helpLineOnly = true;  // false: as before 27.10.
-uint32_t helpSaidAt = 0;
-unsigned helpNotSaid = 0;
-bool helpStarted[net::MaxPlayers] = {};  // our option for player i is the running info (once per choice)
-uint32_t lastOffer = 0;
-unsigned optionsOffered = 0, optionsChosen = 0;
+auto& recovery = life.recovery;
+auto& convergence = life.convergence;
+auto& lethal = life.lethal;
+auto& lethalSeenDown = life.lethalSeenDown;
+auto& lethalAt = life.lethalAt;
+auto& lastHp = life.lastHp;
+auto& lethalBlowAt = life.lethalBlowAt;
+auto& nativeLethal = life.nativeLethal;
+auto& nativeNoted = life.nativeNoted;
+auto& recoveryUnknownNoted = life.recoveryUnknownNoted;
+auto& nativeTerminalKills = life.nativeTerminalKills;
+auto& nativeTerminalKillChecked = life.nativeTerminalKillChecked;
+auto& terminalTask = life.terminalTask;
+auto& inHand = life.inHand;
+auto& wasDown = life.wasDown;
+auto& aloneSince = life.aloneSince;
+auto& revivedBy = life.revivedBy;
+auto& pendingReviveSequence = life.pendingReviveSequence;
+auto& transitions = life.transitions;
+auto& corrections = life.corrections;
+auto& lastCorrection = life.lastCorrection;
+auto& standRefusals = life.standRefusals;
+auto& redirects = life.redirects;
+auto& revives = life.revives;
+}
 char const* const KnockOutTask = "ZS_LieKnockDown";
-char const* const PotionPrefix = "It_Potion_Health";  // healing potions (the game's own templates)
-constexpr float ReviveRange = 250.0f;  // cm: a partner standing next to the hero
-constexpr uint32_t ReviveTime = 3000;  // ms the partner has to stay there
-constexpr uint32_t StaleState = 5000;  // ms: a remote state older than this does not count
-constexpr uint32_t PaidCooldown = 5000; // ms: the revived player's state still says "down" for a moment
-
-Life life;                     // authority is the paid revive, not the native body's current state
-Recovery recovery;
-HeldConvergence convergence;
-PeerRecovery puppetRecovery[net::MaxPlayers];
-InteractionProtection interaction;
-eCEntity* interactionHero = nullptr;
-bool interactionWorldActive = true;
-bool recoveryUnknownNoted = false;
-bool maintainingHp = false;
-bool lethal = false;            // the knock-out it lies in replaced its death (RedirectDeath)
-bool lethalSeenDown = false;    // ... and the hero has lain down since (until then a frame without IsDown is no standing up)
-uint32_t lethalAt = 0;          // when RedirectDeath set it
-int lastHp = -1;                // the hero's hit points a frame ago
-uint32_t lethalBlowAt = 0;      // when a blow by someone who means to kill took hit points off the hero
-unsigned nativeLethal = 0;      // knock-outs of the game's own that were a lethal blow (promoted to the partner's help)
-bool nativeNoted = false;       // logged once per knock-out of the game's own
-unsigned terminalStateEntries = 0, terminalStateReturns = 0;
-unsigned nativeTerminalKills = 0;
-bool nativeTerminalKillChecked = false;
-uint32_t terminalAt = 0, terminalSampleAt = 0;
-std::string terminalTask, terminalState;
-int terminalHp = -1, terminalAi = -1, terminalMovement = -1;
-unsigned terminalMutations = 0;
-uint32_t terminalMutationAt = 0;
-std::string inHand[2];         // the hero's right and left hand while standing (a knock-out drops them)
-bool wasDown = false;
-uint32_t aloneSince = 0;        // when the knocked-out hero last had nobody known able to help (0: someone can)
-int revivedBy = 0;              // a partner paid for our revive (set by the network, handled in Tick)
-bool told[net::MaxPlayers] = {};  // this player already saw "X is down" for player i
-bool toldDead[net::MaxPlayers] = {};
-uint32_t helpingSince[net::MaxPlayers] = {};  // local hero next to downed player i since then (0: not there)
-bool hinted[net::MaxPlayers] = {};            // "you need a potion" shown for this stay next to player i
-uint32_t paidAt[net::MaxPlayers] = {};        // when we paid a potion for player i
-uint32_t paidSequence[net::MaxPlayers] = {};
-uint32_t pendingReviveSequence = 0;
-unsigned transitions = 0, corrections = 0;
-uint32_t lastCorrection = 0;
-uint32_t lastStandRefusal = 0;
-unsigned standRefusals = 0;
-
-int NativeInteractionPage(gCGUIManager* manager)
-{
-    if (!manager) return -1;
-    static bool checked = false, supported = false;
-    if (!checked) {
-        HMODULE game = GetModuleHandleA("Game.dll");
-        if (!game) return -1;
-        checked = true;
-        auto* code = reinterpret_cast<unsigned char*>(game);
-        static unsigned char const pageBytes[] = {
-            0x8b, 0x41, 0x08, 0x85, 0xc0, 0x74, 0x11, 0x83, 0x78, 0x48, 0xff, 0x0f, 0x95, 0xc0,
-            0x84, 0xc0, 0x74, 0x06, 0xb8, 0x11, 0x00, 0x00, 0x00, 0xc3, 0x8b, 0x49, 0x04,
-            0x85, 0xc9, 0x74, 0x07, 0x8b, 0x81, 0x84, 0x00, 0x00, 0x00, 0xc3, 0x83, 0xc8, 0xff, 0xc3
-        };
-        static unsigned char const tutorialSelect[] = {0x83, 0xff, 0x0f};
-        static unsigned char const tutorialSave[] = {
-            0x8b, 0x85, 0x84, 0x00, 0x00, 0x00, 0x89, 0x85, 0x88, 0x00, 0x00, 0x00
-        };
-        supported = GetProcAddress(game, "?GetActivePage@gCGUIManager@@QBE?AW4gEGamePage@@XZ") ==
-                        reinterpret_cast<FARPROC>(code + 0x7b490) &&
-                    !std::memcmp(code + 0x7b490, pageBytes, sizeof(pageBytes)) &&
-                    !std::memcmp(code + 0x8b359, tutorialSelect, sizeof(tutorialSelect)) &&
-                    !std::memcmp(code + 0x8b384, tutorialSave, sizeof(tutorialSave));
-        Log(supported ? "downed: native interaction pages ready (dialog/trade beneath overlays and tutorial)"
-                      : "downed: ANOMALY interaction page layout mismatch; overlay protection unavailable");
+void SyncStates() {
+    auto const* remotes = net::Remotes();
+    for (int i = 0; i < net::MaxPlayers; ++i) {
+        auto& peer = peers[i];
+        const uint32_t generation = net::PeerGeneration(static_cast<uint8_t>(i));
+        const bool changed = remotes[i].connected && generation && peer.payment.generation && generation != peer.payment.generation;
+        if (!remotes[i].connected || changed) { peer.Reset(); ResetPeerImmunity(i); }
+        peer.payment.ObserveConnection(remotes[i].connected, generation);
+        if (remotes[i].connected && remotes[i].latestTicks != 0) {
+            const uint8_t flags = remotes[i].latest.flags;
+            peer.payment.ObservePlayerState((flags & 1) != 0 && (flags & 14) == 0,
+                                            remotes[i].latest.downedSequence);
+        }
     }
-    if (!supported) return static_cast<int>(manager->GetActivePage());
-    // GetActivePage masks the main page with secondary overlays; tutorial saves it at +0x88.
-    void* root = nullptr;
-    std::memcpy(&root, reinterpret_cast<unsigned char*>(manager) + 4, sizeof(root));
-    if (!root) return -1;
-    int page = -1, beforeTutorial = -1;
-    std::memcpy(&page, static_cast<unsigned char*>(root) + 0x84, sizeof(page));
-    if (page == gEGamePage_Tutorial)
-        std::memcpy(&beforeTutorial, static_cast<unsigned char*>(root) + 0x88, sizeof(beforeTutorial));
-    return InteractionPage(page, beforeTutorial);
 }
-
-uint8_t InteractionOf(eCEntity* entity)
-{
-    if (!entity) return 0;
-    eCEntity* hero = gCSession::GetInstance().GetHero();
-    if (hero && (entity == hero || entity == remote::ControlledBody())) return LocalInteractionFlags();
-    const int id = remote::PuppetOwner(entity);
-    if (id <= 0 || id >= net::MaxPlayers || !interactionWorldActive ||
-        persist::NativeLoading() || persist::HeroPending() || ai::ShuttingDown()) return 0;
-    return PlayerInteractionFlags(static_cast<unsigned>(id));
-}
-
-bool TrackPuppetRecovery(int id)
-{
-    net::Remote const& r = net::Remotes()[id];
-    PeerRecovery& peer = puppetRecovery[id];
-    const bool wasHeld = peer.held, wasGrace = peer.recovery.grace;
-    const uint32_t now = net::Now();
-    const bool present = r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld();
-    peer.Observe(present, r.latest.flags,
-                 RecoveryStanding(r.latest.aniState, (r.latest.flags & 2) != 0, r.latest.animation), now);
-    if (wasHeld && !peer.held && peer.recovery.Protected(now))
-        Logf("downed: puppet recovery begin player=%d flags=%u motion=%s", id, r.latest.flags, r.latest.animation);
-    if (!wasGrace && peer.recovery.grace)
-        Logf("downed: puppet recovery standing player=%d grace_ms=%u motion=%s", id, ReviveGraceMs, r.latest.animation);
-    return peer.recovery.Protected(now);
-}
-
 void Transition(char const* reason, char const* source)
 {
     Logf("downed: transition=%u player=%u role=%s held=%d terminal=%d sequence=%u reason=%s source=%s",
          ++transitions, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
          life.terminal ? 1 : 0, life.sequence, reason, source);
 }
-
-void EndStep(char const* step)
-{
-    crashlog::EndStep(step);
-    Logf("downed: end step=%s player=%u role=%s held=%d terminal=%d native_kills=%u sequence=%u",
-         step, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
-         life.terminal ? 1 : 0, nativeTerminalKills, life.sequence);
-}
-
-bool LocalTerminal(eCEntity* entity)
-{
-    return life.terminal && entity && entity == gCSession::GetInstance().GetHero() &&
-           !persist::NativeLoading() && !ai::ShuttingDown();
-}
-
-void Caller(void* address, char* text, size_t size)
-{
-    HMODULE module = nullptr;
-    char path[MAX_PATH] = {};
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          static_cast<LPCSTR>(address), &module) && GetModuleFileNameA(module, path, MAX_PATH)) {
-        char const* name = std::strrchr(path, '\\');
-        Format(text, size, "%s+0x%x", name ? name + 1 : path,
-               static_cast<unsigned>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)));
-    } else {
-        Format(text, size, "%p", address);
-    }
-}
-
-void Mutation(char const* source, char const* field, char const* requested, bool refused, void* caller = nullptr)
-{
-    const uint32_t now = net::Now();
-    ++terminalMutations;
-    if (refused && terminalMutations > 40 && now - terminalMutationAt < 1000) return;
-    terminalMutationAt = now;
-    char from[MAX_PATH + 16] = "-";
-    if (caller) Caller(caller, from, sizeof(from));
-    Logf("downed: terminal mutation=%u player=%u role=%s source=%s field=%s requested=%s refused=%d caller=%s",
-         terminalMutations, net::LocalId(), net::IsHost() ? "host" : "client", source, field, requested,
-         refused ? 1 : 0, from);
-    if (!caller) return;
-    void* frames[6] = {};
-    const USHORT count = CaptureStackBackTrace(2, 6, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        Caller(frames[i], from, sizeof(from));
-        Logf("downed: terminal caller mutation=%u frame=%u at=%s", terminalMutations, i, from);
-    }
-}
-
-using SetModeFn = void(__fastcall*)(gCScriptRoutine_PS*, void*, bTPropertyContainer<gEAIMode> const&);
-using SetHpFn = GEBool(__fastcall*)(gCPlayerMemory_PS*, void*, bCString const&, GEInt);
-using SetTaskFn = void(__fastcall*)(gCScriptProcessingUnit*, void*, bCString, GEBool);
-using SetStateFn = void(__fastcall*)(gCScriptProcessingUnit*, void*, bCString);
-SetModeFn originalSetMode = nullptr;
-SetHpFn originalSetHp = nullptr;
-SetHpFn originalAddHp = nullptr, originalSetValue = nullptr;
-SetTaskFn originalSetTask = nullptr;
-SetStateFn originalSetState = nullptr;
-bool terminalGuardsInstalled = false;
-
-struct MaintainHp
-{
-    bool before = maintainingHp;
-    MaintainHp() { maintainingHp = true; }
-    ~MaintainHp() { maintainingHp = before; }
-};
-
-bool RejectHp(eCEntity* entity, bCString const& tag, int value, bool additive, char const* path)
-{
-    if (tag != "HP" || maintainingHp || !entity) return false;
-    const int before = Entity(entity).PlayerMemory.GetHitPoints();
-    if ((additive ? value < 0 : value < before) && RejectHarm(entity, nullptr, path)) return true;
-    return false;
-}
-
 void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer<gEAIMode> const& value)
 {
     eCEntity* entity = self ? self->GetEntity() : nullptr;
@@ -265,83 +90,6 @@ void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer
     originalSetMode(self, edx, value);
     ObserveTerminal(entity, "SetAIMode");
 }
-
-GEBool __fastcall SetHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
-{
-    eCEntity* entity = self ? self->GetEntity() : nullptr;
-    if (RejectHp(entity, tag, value, false, "SetBaseValue(HP)")) return GEFalse;
-    if (LocalTerminal(entity) && tag == "HP") {
-        const bool refused = !life.TerminalHpAllowed(value);
-        if (refused || Entity(entity).PlayerMemory.GetHitPoints() != value) {
-            char text[24];
-            Format(text, "%d", value);
-            Mutation("SetBaseValue(HP)", "hp", text, refused, _ReturnAddress());
-        }
-        if (refused) return GEFalse;
-    }
-    const int before = entity && tag == "HP" ? Entity(entity).PlayerMemory.GetHitPoints() : 0;
-    const GEBool result = originalSetHp(self, edx, tag, value);
-    if (entity && tag == "HP" && !maintainingHp)
-        LogGroundEvent(entity, nullptr, "SetBaseValue(HP)", before, Entity(entity).PlayerMemory.GetHitPoints(), "native");
-    ObserveTerminal(entity, "SetBaseValue");
-    return result;
-}
-
-GEBool __fastcall AddHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
-{
-    eCEntity* entity = self ? self->GetEntity() : nullptr;
-    if (RejectHp(entity, tag, value, true, "AddBaseValue(HP)")) return GEFalse;
-    if (LocalTerminal(entity) && tag == "HP" && value > 0) {
-        Mutation("AddBaseValue(HP)", "hp", "positive delta", true, _ReturnAddress());
-        return GEFalse;
-    }
-    const int before = entity && tag == "HP" ? Entity(entity).PlayerMemory.GetHitPoints() : 0;
-    const GEBool result = originalAddHp(self, edx, tag, value);
-    if (entity && tag == "HP")
-        LogGroundEvent(entity, nullptr, "AddBaseValue(HP)", before, Entity(entity).PlayerMemory.GetHitPoints(), "native");
-    ObserveTerminal(entity, "AddBaseValue");
-    return result;
-}
-
-GEBool __fastcall SetValue(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
-{
-    eCEntity* entity = self ? self->GetEntity() : nullptr;
-    if (RejectHp(entity, tag, value, false, "SetValue(HP)")) return GEFalse;
-    if (LocalTerminal(entity) && tag == "HP" && !life.TerminalHpAllowed(value)) {
-        Mutation("SetValue(HP)", "hp", "positive value", true, _ReturnAddress());
-        return GEFalse;
-    }
-    const int before = entity && tag == "HP" ? Entity(entity).PlayerMemory.GetHitPoints() : 0;
-    const GEBool result = originalSetValue(self, edx, tag, value);
-    if (entity && tag == "HP")
-        LogGroundEvent(entity, nullptr, "SetValue(HP)", before, Entity(entity).PlayerMemory.GetHitPoints(), "native");
-    ObserveTerminal(entity, "SetValue");
-    return result;
-}
-
-bool DownTask(char const* task);
-
-void StandRefused(char const* state, char const* source)
-{
-    const uint32_t now = net::Now();
-    if (++standRefusals == 1 || now - lastStandRefusal >= 5000) {
-        lastStandRefusal = now;
-        Logf("downed: stand refused player=%u sequence=%u source=%s state=%s count=%u repair=module-boundary",
-             net::LocalId(), life.sequence, source, state, standRefusals);
-    }
-}
-
-bool RejectHeldTransition(eCEntity* entity, char const* state, char const* source)
-{
-    if (!life.held || life.terminal || !entity || entity != gCSession::GetInstance().GetHero() ||
-        !gCSession::GetInstance().IsGameRunning() || persist::NativeLoading() ||
-        persist::HeroPending() || ai::ShuttingDown()) return false;
-    if (DownTask(state) || !std::strcmp(state, "ZS_Unconscious_Loop")) return false;
-    if (!convergence.settled) convergence.Request();
-    StandRefused(state, source);
-    return true;
-}
-
 void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, GEBool caught)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
@@ -356,7 +104,6 @@ void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, 
     originalSetTask(self, edx, task, caught);
     ObserveTerminal(entity, "AISetTask");
 }
-
 void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state)
 {
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
@@ -371,44 +118,20 @@ void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state
     originalSetState(self, edx, state);
     ObserveTerminal(entity, "AISetState");
 }
-
-template <size_t N>
-void* InstallGuard(HMODULE game, char const* name, unsigned char const (&bytes)[N], void* detour)
+void InstallHpGuards(void* module)
 {
-    auto* entry = reinterpret_cast<unsigned char*>(GetProcAddress(game, name));
-    if (!entry || std::memcmp(entry, bytes, N)) {
-        Logf("downed: ANOMALY terminal guard prologue mismatch function=%s; not installed", name);
-        return nullptr;
-    }
-    void* original = ai::JumpTo(entry, detour, N);
-    if (!original) Logf("downed: ANOMALY terminal guard patch failed function=%s", name);
-    return original;
+    auto game = static_cast<HMODULE>(module);
+    static unsigned char const hpBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08, 0x56};
+    static unsigned char const valueBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08};
+    auto guard = [&](char const* name, auto const& bytes, void* detour) -> SetHpFn {
+        auto* entry = reinterpret_cast<unsigned char*>(GetProcAddress(game, name));
+        if (!entry || std::memcmp(entry, bytes, sizeof(bytes))) return nullptr;
+        return reinterpret_cast<SetHpFn>(ai::JumpTo(entry, detour, sizeof(bytes)));
+    };
+    originalSetHp = guard("?SetBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&SetHp));
+    originalAddHp = guard("?AddBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&AddHp));
+    originalSetValue = guard("?SetValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", valueBytes, reinterpret_cast<void*>(&SetValue));
 }
-
-void KeepTerminal(Entity& hero, char const* source)
-{
-    ObserveTerminal(hero.GetInstance(), source);
-    if (hero.PlayerMemory.GetHitPoints() > 0) {
-        Mutation(source, "hp", "0", false);
-        hero.PlayerMemory.SetHitPoints(0);
-    }
-    if (!life.deathFinished) return;
-    auto* routine = static_cast<gCScriptRoutine_PS*>(hero.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
-    if (hero.Routine.AIMode != gEAIMode_Dead) {
-        Mutation(source, "ai", "9", false);
-        hero.Routine.AIMode = gEAIMode_Dead;
-    }
-    // Repair the displayed task without re-queuing the fatal entry; only its corpse loop may be restarted.
-    if (hero.Routine.GetCurrentTask() != "ZS_RagDollDead") {
-        Mutation(source, "task", "ZS_RagDollDead (field only)", false);
-        routine->SetCurrentTask(bCString("ZS_RagDollDead"));
-    }
-    if (hero.Routine.GetCurrentState() != "ZS_RagDollDead_Loop") {
-        Mutation(source, "state", "ZS_RagDollDead_Loop", false);
-        routine->AISetState(bCString("ZS_RagDollDead_Loop"));
-    }
-}
-
 bool DownTask(char const* task)
 {
     return !std::strcmp(task, KnockOutTask) || !std::strcmp(task, "ZS_Unconscious") || !std::strcmp(task, "ZS_PiercedKO");
@@ -473,82 +196,7 @@ void Hold(char const* reason, char const* source)
     revivedBy = 0;
     pendingReviveSequence = 0;
     Transition(reason, source);
-    hud::Message(hud::Bad, potionNeeded ? i18n::Text(i18n::KnockedOutNeedsPotion) : i18n::Text(i18n::KnockedOut));
-}
-
-Availability HelperState(net::Remote const& r, uint32_t now)
-{
-    return HelperAvailability(r.connected, r.activity.known, r.activity.ticks, r.activity.flags, now);
-}
-
-// Being able to travel back and help is independent of the loaded/presented body and world location.
-bool Able(net::Remote const& r, uint32_t now)
-{
-    return HelperState(r, now) == Availability::Able;
-}
-
-// Paying/interacting still needs a current nearby body in this ready gameplay world.
-bool Present(net::Remote const& r, uint32_t now)
-{
-    return r.connected && r.latestTicks && now - r.latestTicks < StaleState && (r.latest.flags & 1) &&
-           r.latest.world == remote::CurrentWorld() && net::InWorld(r.latest.id);
-}
-
-// Every connected partner is playing and down, knocked out, or dead, wherever its body is.
-bool AllOthersDown(net::Remote const* remotes, uint32_t now)
-{
-    bool present = false;
-    for (int i = 1; i < net::MaxPlayers; ++i) {
-        if (i == net::LocalId()) continue;
-        net::Remote const& r = remotes[i];
-        if (!r.connected) continue;
-        if (!Playing(HelperState(r, now))) return false;
-        present = true;
-        if (HelperState(r, now) != Availability::Down) return false;
-    }
-    return present;
-}
-
-char const* HelperReason(Availability state)
-{
-    switch (state) {
-    case Availability::Able: return "able";
-    case Availability::Down: return "down-or-dead";
-    case Availability::Disconnected: return "disconnected";
-    case Availability::Unknown: return "no-activity";
-    case Availability::Stale: return "activity-stale";
-    case Availability::NotPlaying: return "loading-or-menu";
-    }
-    return "invalid";
-}
-
-void LogHelpers(Entity* hero, char const* event, uint32_t now)
-{
-    float here[3] = {};
-    if (hero) {
-        const bCVector& at = hero->GetInstance()->GetWorldPosition();
-        here[0] = at.GetX(); here[1] = at.GetY(); here[2] = at.GetZ();
-    }
-    for (int i = 1; i < net::MaxPlayers; ++i) {
-        if (i == net::LocalId()) continue;
-        net::Remote const& r = net::Remotes()[i];
-        Logf("downed: helpers event=%s player=%u partner=%d name=%s connected=%d joined=%d gate=%d "
-             "activity_known=%d activity_age=%u activity_packet=%u flags=%u loading=%d menu=%d "
-             "pose_known=%d pose_age=%u pose_packet=%u pose_flags=%u sequence=%u "
-             "world=%08x partner_world=%08x pose_world=%08x epoch=%08x partner_epoch=%08x "
-             "distance_cm=%.0f local_position_known=%d zone=not-sent reject=%s",
-             event, net::LocalId(), i, *r.latest.name ? r.latest.name : "-", r.connected ? 1 : 0,
-             (net::IsHost() ? net::PeerJoined(static_cast<uint8_t>(i)) : net::Joined() && r.connected) ? 1 : 0,
-             net::InWorld(static_cast<uint8_t>(i)) ? 1 : 0, r.activity.known ? 1 : 0,
-             r.activity.known ? now - r.activity.ticks : 0, r.activity.sequence, r.activity.flags,
-             (!(r.activity.flags & 1) && (r.activity.flags & 32)) ? 1 : 0,
-             (!(r.activity.flags & 1) && (r.activity.flags & 64)) ? 1 : 0,
-             r.latestTicks ? 1 : 0, r.latestTicks ? now - r.latestTicks : 0, r.latest.sequence,
-             r.latest.flags, r.activity.downedSequence, hero ? remote::CurrentWorld() : 0, r.activity.world,
-             r.latest.world, net::WorldEpoch(), r.activity.epoch,
-             hero && r.latestTicks ? body::Distance(r.latest.position, here) : -1.0f,
-             hero ? 1 : 0, HelperReason(HelperState(r, now)));
-    }
+    hud::Message(hud::Bad, i18n::Text(i18n::KnockedOutNeedsPotion));
 }
 
 void CancelAlone(char const* source)
@@ -561,386 +209,9 @@ void CancelAlone(char const* source)
     aloneSince = 0;
 }
 
-void Wide(char const* text, wchar_t* out, int size)
-{
-    out[0] = 0;
-    if (!MultiByteToWideChar(CP_UTF8, 0, text, -1, out, size)) out[0] = 0;
-    out[size - 1] = 0;
-}
-
-void StandUp(Entity& hero)
-{
-    const int max = hero.PlayerMemory.GetHitPointsMax();
-    hero.Routine.FullStop();
-    hero.PlayerMemory.SetHitPoints(max / 4 > 1 ? max / 4 : 1);
-    hero.Routine.ContinueRoutine();  // like the knock-out loop itself: Rtn_Player stands the hero up
-}
-
-// The weakest healing potion the hero carries (cheapest by gold value), or -1.
-GEInt SmallestPotion(Entity& hero, char* name, size_t size)
-{
-    GEInt best = -1, bestValue = 0;
-    for (GEInt i = 0; i < hero.Inventory.GetStackCount(); ++i) {
-        Entity item = hero.Inventory.GetTemplateItem(i);
-        if (!item.GetInstance() || hero.Inventory.GetAmount(i) < 1) continue;
-        if (std::strncmp(item.GetName().GetText(), PotionPrefix, std::strlen(PotionPrefix)) != 0) continue;
-        const GEInt value = item.Item.GetGoldValue();
-        if (best < 0 || value < bestValue) { best = i; bestValue = value; strncpy_s(name, size, item.GetName().GetText(), _TRUNCATE); }
-    }
-    return best;
-}
-
-void SendToPlayer(uint8_t kind, int player, uint32_t sequence)
-{
-    net::WorldState s{};
-    s.kind = kind;
-    s.guard = static_cast<uint8_t>(player);      // to this player
-    s.npcClass = net::LocalId();                 // from this one (the host passes it on)
-    std::memcpy(s.guid, &sequence, sizeof(sequence)); // kind 8/9 has no entity GUID: bind it to the target's downed life
-    net::SendWorldState(s, 0);
-}
-
-// The local hero helps player i up: it pays a healing potion (the smallest it carries) or is told it needs one.
-void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
-{
-    const bCVector& at = hero.GetInstance()->GetWorldPosition();
-    const float here[3] = {at.GetX(), at.GetY(), at.GetZ()};
-    if (life.held || life.terminal || hero.IsDown() || hero.IsDead() || i == net::LocalId() || !Present(r, now) ||
-        !HeldPuppet(r.latest.flags, r.latest.downedSequence) ||
-        body::Distance(r.latest.position, here) > ReviveRange ||
-        !UnpaidEpisode(r.latest.downedSequence, paidSequence[i])) {
-        Logf("downed: help refused player=%u target=%d sequence=%u reason=not-eligible", net::LocalId(), i, r.latest.downedSequence);
-        return;
-    }
-    wchar_t name[32], text[200];
-    Wide(r.latest.name, name, 32);
-    char potion[64] = "";
-    const GEInt stack = potionNeeded ? SmallestPotion(hero, potion, sizeof(potion)) : -1;
-    if (potionNeeded && stack < 0) {
-        if (!hinted[i]) {
-            hinted[i] = true;
-            ++refusedNoPotion;
-            swprintf_s(text, i18n::Text(i18n::NeedHealingPotion), name);
-            hud::Message(hud::Warning, text);
-            SendToPlayer(9, i, r.latest.downedSequence);
-            Logf("downed: wants to help player %d without a healing potion", i);
-        }
-        return;
-    }
-    if (stack >= 0) {
-        if (!hero.Inventory.DeleteItems(stack, 1)) {
-            Logf("downed: help refused player=%u target=%d sequence=%u reason=potion-removal-failed potion=%s",
-                 net::LocalId(), i, r.latest.downedSequence, potion);
-            return;
-        }
-        ++potionsPaid;
-    }
-    paidAt[i] = now;
-    paidSequence[i] = r.latest.downedSequence;
-    helpingSince[i] = 0;
-    hinted[i] = false;
-    SendToPlayer(8, i, r.latest.downedSequence);
-    swprintf_s(text, potionNeeded ? i18n::Text(i18n::HelpedUpWithPotion) : i18n::Text(i18n::HelpedUp), name);
-    hud::Message(hud::Good, text);
-    Logf("downed: helped player %d up, paid %s sequence=%u source=help-line", i, *potion ? potion : "nothing", r.latest.downedSequence);
-}
-
-// QA autohelpon (as before 23.10.): the local hero stands next to a downed partner: after ReviveTime it helps it up.
-void Help(Entity& hero, net::Remote const* remotes, uint32_t now)
-{
-    const bCVector& at = hero.GetInstance()->GetWorldPosition();
-    const float here[3] = {at.GetX(), at.GetY(), at.GetZ()};
-    for (int i = 1; i < net::MaxPlayers; ++i) {
-        if (i == net::LocalId()) continue;
-        net::Remote const& r = remotes[i];
-        const bool down = Present(r, now) && (r.latest.flags & 8) && !(r.latest.flags & 4);  // waiting for help, not any knock-out
-        if (!down || body::Distance(r.latest.position, here) > ReviveRange || now - paidAt[i] < PaidCooldown) {
-            helpingSince[i] = 0;
-            hinted[i] = false;
-            continue;
-        }
-        if (!helpingSince[i]) { helpingSince[i] = now; continue; }
-        if (now - helpingSince[i] < ReviveTime) continue;
-        PayAndHelp(hero, i, r, now);
-    }
-}
-
-// The manager finds a speaker's infos through a map by owner it builds when it loads them; AddInfo does not enter a new
-// one there, so it never showed in a dialog (stageA2 24.10.: "G3T_HelpUp_2" could not be chosen). The game's own
-// BuildMapInfosByOwners (private, exported by Game.dll) builds the map again from all infos.
-void RebuildOwnerMap(gCInfoManager_PS* manager)
-{
-    using Build = void(__thiscall*)(gCInfoManager_PS*);
-    static Build build = reinterpret_cast<Build>(GetProcAddress(GetModuleHandleA("Game.dll"), "?BuildMapInfosByOwners@gCInfoManager_PS@@AAEXXZ"));
-    if (build) build(manager);
-    else Log("downed: BuildMapInfosByOwners not found; the help option will not show");
-}
-
-// Player i's puppet offers our help while i waits for it (its info is hidden otherwise); the option chosen, we pay and
-// help. Infos are looked up by name, never kept: a load makes the info manager anew.
-void OfferHelp(Entity& hero, net::Remote const* remotes, uint32_t now)
-{
-    gCInfoManager_PS* manager = gCInfoManager_PS::GetInstance();
-    if (!manager) return;
-    gCInfo_PS* running = manager->AccessIsRunning() ? manager->GetCurrentInfo() : nullptr;
-    const bool scan = now - lastOffer >= 250;
-    if (scan) lastOffer = now;
-    for (int i = 1; i < net::MaxPlayers; ++i) {
-        if (i == net::LocalId()) continue;
-        char infoName[32];
-        Format(infoName, "G3T_HelpUp_%d", i);
-        // Chosen: the running info is ours (once per choice; the option hides itself when it ran).
-        const bool ours = running && !std::strcmp(running->AccessName().GetText(), infoName);
-        // Or the game marked the shown option given: it does when the option runs (shown, it is not given, OfferHelp below).
-        gCInfo_PS* helpInfo = ours ? manager->GetInfo(bCString(infoName)) : nullptr;
-        const bool said = !helpLineOnly || (helpSaidAt && now - helpSaidAt < 5000) || (helpInfo && helpInfo->AccessInfoGiven());
-        if (ours && !helpStarted[i] && !said) ++helpNotSaid;
-        if (ours && !helpStarted[i] && said) {
-            helpSaidAt = 0;
-            helpStarted[i] = true;
-            ++optionsChosen;
-            Logf("downed: the player chose to help player %d up", i);
-            hinted[i] = false;  // every choice without a potion says so again
-            PayAndHelp(hero, i, remotes[i], now);
-        }
-        if (!ours) helpStarted[i] = false;
-        if (!scan) continue;
-        net::Remote const& r = remotes[i];
-        const bool waiting = helpOption && Present(r, now) && HeldPuppet(r.latest.flags, r.latest.downedSequence) &&
-                             UnpaidEpisode(r.latest.downedSequence, paidSequence[i]);
-        gCInfo_PS* info = manager->GetInfo(bCString(infoName));
-        if (!info && waiting) {
-            info = manager->AddInfo(bCString(infoName));
-            if (!info) continue;
-            char owner[32];
-            Format(owner, "G3T_Player%d", i);  // the puppet's name (remote.cpp)
-            info->AccessOwner() = bCString(owner);
-            info->AccessConditionType() = gEInfoCondType_General;
-            info->AccessType() = gEInfoType_Info;
-            info->AccessPermanent() = GEFalse;
-            info->AccessInfoGiven() = GETrue;
-            if (gCInfoScript_PS* script = info->AccessInfoScript().GetObject())
-                script->AddCommand(bCString("Say"), bCString("player"), bCString(""), bCString(""), bCString(""), eCLocString(bCString(HelpLine)));
-            RebuildOwnerMap(manager);
-            Logf("downed: help option for player %d made (%s)", i, owner);
-        }
-        if (!info) continue;
-        // Shown (not given) while i waits, hidden (given) otherwise; running it marks it given, so a choice without a
-        // potion shows it again on the next look while i still waits.
-        const bool shown = !info->AccessInfoGiven();
-        if (waiting && !shown && !ours) {
-            info->AccessInfoGiven() = GEFalse;
-            ++optionsOffered;
-        } else if (!waiting && shown) {
-            info->AccessInfoGiven() = GETrue;
-        }
-    }
-}
-
-// The game knocks a human out where it would kill an animal (its hit judgement: a hero hit by an orc, a goblin with a club or
-// a man with a weapon lies down at 0 hit points, then stands up by itself), so the hero never died in a fight with them and
-// the help-up rule above never applied: 13 knock-outs and no death in the 2 Nov. play session (owner: "we can't die now").
-// Each blow that takes hit points off the hero is noted when its attacker means to kill (the game's HasAttackReasonToKill:
-// raiders, monsters, an intruder; not a duel, the arena or a fight with another player), and a knock-out at 0 hit points that
-// follows such a blow is held for a partner like a death that the mod turned into a knock-out.
-void WatchBlows(Entity& hero, uint32_t now)
-{
-    const int hp = hero.PlayerMemory.GetHitPoints();
-    const int before = lastHp;
-    lastHp = hp;
-    if (before < 0 || hp >= before || !net::Connected()) return;
-    eCEntity* attacker = hero.NPC.GetCurrentAttacker().GetInstance();
-    if (!attacker || remote::IsPuppet(attacker) || !attacker->GetPropertySet(eEPropertySetType_NPC)) return;
-    if (GetScriptAdminExt().CallScript(bCString("HasAttackReasonToKill"), attacker, hero.GetInstance(), 0)) lethalBlowAt = now ? now : 1;
-}
-
-// A partner is in the game (any world): only then does a lethal knock-out wait for help, else the game's own rule stands as in
-// single-player.
-bool PartnerPresent(net::Remote const* remotes, uint32_t now)
-{
-    for (int i = 1; i < net::MaxPlayers; ++i)
-        if (i != net::LocalId() && Playing(HelperState(remotes[i], now))) return true;
-    return false;
-}
-
-// Known all-down state is immediate; unknown partner state waits for AloneGrace. Both paths end this life once.
-// ZS_RagDollDead is the sole native terminal entry; dispatch once without waiting on the unconscious scheduler.
-void Die(Entity& hero, char const* reason)
-{
-    if (!life.End()) {
-        EndStep("skipped-terminal");
-        return;
-    }
-    recovery.Clear();
-    lethal = false;
-    lethalSeenDown = false;
-    revivedBy = 0;
-    pendingReviveSequence = 0;
-    EndStep("decision");
-    Transition(reason, "end-policy");
-    ++deaths;
-    Logf("downed: nobody can help; the hero dies reason=%s hero=%p hp=%d task=%s state=%s ai=%d",
-         reason, hero.GetInstance(), hero.PlayerMemory.GetHitPoints(), hero.Routine.GetCurrentTask().GetText(),
-         hero.Routine.GetCurrentState().GetText(), static_cast<int>(hero.Routine.AIMode));
-    const uint32_t now = net::Now();
-    terminalAt = now;
-    terminalSampleAt = now - 100;
-    LogHelpers(&hero, reason, now);
-    hud::Message(hud::Bad, i18n::Text(i18n::NobodyCanHelp));
-    EndStep("set-hp");
-    hero.PlayerMemory.SetHitPoints(0);
-    EndStep("death-full-stop");
-    hero.Routine.FullStop();
-    hero.CharacterMovement.StopMovement();
-    // ZS_RagDollDead obtains the native killer and lethal-hit force from these fields. Clear both
-    // before entering the state so native Kill receives killer=null and no stale inflictor can AddForce.
-    Entity clearAttacker;
-    Entity clearInflictor;
-    hero.NPC.SetCurrentAttacker(clearAttacker);
-    hero.DamageReceiver.SetLastInflictor(clearInflictor);
-    const bool attackerClear = hero.NPC.GetCurrentAttacker().GetInstance() == nullptr;
-    const bool inflictorClear = hero.DamageReceiver.GetLastInflictor().GetInstance() == nullptr;
-    Logf("downed: terminal native inputs clear player=%u attacker_clear=%d inflictor_clear=%d "
-         "force=no-force killer=null victim=hero",
-         net::LocalId(), attackerClear ? 1 : 0, inflictorClear ? 1 : 0);
-    EndStep("death-native-inputs-cleared");
-    // ZS_RagDollDead is the native death-presentation entry: it requests DEAD, calls its direct
-    // native Kill, and enables ragdoll movement mode 14.
-    hero.Routine.AIMode = gEAIMode_Reaction;
-    auto* routine = static_cast<gCScriptRoutine_PS*>(hero.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
-    routine->AISetTask(bCString("ZS_RagDollDead"));
-    EndStep("death-state-dispatch");
-    const bool ran = ai::EnterTerminalDeath(hero.GetInstance());
-    if (!ran || !life.deathFinished) {
-        EndStep("death-state-failed");
-        Logf("downed: ANOMALY terminal native entry failed player=%u ran=%d entered=%u returned=%u dead=%d",
-             net::LocalId(), ran ? 1 : 0, terminalStateEntries, terminalStateReturns, hero.IsDead() ? 1 : 0);
-    } else {
-        EndStep("death-state-complete");
-    }
-    ObserveTerminal(hero.GetInstance(), "Die-return");
-}
-}
-
-void InstallTerminalGuards()
-{
-    if (terminalGuardsInstalled || ai::ShuttingDown()) return;
-    HMODULE game = GetModuleHandleA("Game.dll");
-    if (!game) return; // scripts/engine have not loaded yet
-    terminalGuardsInstalled = true;
-    // Complete, position-independent instructions verified against CP 1.75.20108.14.
-    static unsigned char const modeBytes[] = {0x56, 0x8b, 0xf1, 0x8b, 0x06, 0x8b, 0x50, 0x58};
-    static unsigned char const hpBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08, 0x56};
-    static unsigned char const valueBytes[] = {0x53, 0x8b, 0x5c, 0x24, 0x08};
-    static unsigned char const taskBytes[] = {0x57, 0x8b, 0xf9, 0x80, 0x7f, 0x64, 0x01};
-    static unsigned char const stateBytes[] = {0x8d, 0x44, 0x24, 0x04, 0x50};
-    originalSetMode = reinterpret_cast<SetModeFn>(InstallGuard(game,
-        "?SetAIMode@gCScriptRoutine_PS@@QAEXABV?$bTPropertyContainer@W4gEAIMode@@@@@Z", modeBytes,
-        reinterpret_cast<void*>(&SetMode)));
-    originalSetHp = reinterpret_cast<SetHpFn>(InstallGuard(game,
-        "?SetBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&SetHp)));
-    originalAddHp = reinterpret_cast<SetHpFn>(InstallGuard(game,
-        "?AddBaseValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", hpBytes, reinterpret_cast<void*>(&AddHp)));
-    originalSetValue = reinterpret_cast<SetHpFn>(InstallGuard(game,
-        "?SetValue@gCPlayerMemory_PS@@QAE_NABVbCString@@H@Z", valueBytes, reinterpret_cast<void*>(&SetValue)));
-    originalSetTask = reinterpret_cast<SetTaskFn>(InstallGuard(game,
-        "?AISetTask@gCScriptProcessingUnit@@QAEXVbCString@@_N@Z", taskBytes, reinterpret_cast<void*>(&SetTask)));
-    originalSetState = reinterpret_cast<SetStateFn>(InstallGuard(game,
-        "?AISetState@gCScriptProcessingUnit@@QAEXVbCString@@@Z", stateBytes, reinterpret_cast<void*>(&SetState)));
-    Logf("downed: terminal native guards installed mode=%d hp=%d task=%d state=%d",
-         originalSetMode != nullptr, originalSetHp != nullptr, originalSetTask != nullptr, originalSetState != nullptr);
-    Logf("downed: ground HP guards set=%d add=%d value=%d revive_grace_ms=%u",
-         originalSetHp != nullptr, originalAddHp != nullptr, originalSetValue != nullptr, ReviveGraceMs);
-}
-
-void ObserveTerminal(eCEntity* self, char const* source)
-{
-    if (!LocalTerminal(self)) return;
-    Entity hero(self);
-    const bCString task = hero.Routine.GetCurrentTask(), state = hero.Routine.GetCurrentState();
-    const int hp = hero.PlayerMemory.GetHitPoints(), aiMode = static_cast<int>(hero.Routine.AIMode);
-    const int movement = static_cast<int>(hero.CharacterMovement.GetMovementMode());
-    const uint32_t now = net::Now();
-    const bool changed = terminalTask != task.GetText() || terminalState != state.GetText() ||
-                         terminalHp != hp || terminalAi != aiMode || terminalMovement != movement;
-    if (!changed && (now - terminalAt > 5000 || now - terminalSampleAt < 100)) return;
-    terminalSampleAt = now;
-    terminalTask = task.GetText();
-    terminalState = state.GetText();
-    terminalHp = hp;
-    terminalAi = aiMode;
-    terminalMovement = movement;
-    auto* routine = static_cast<gCScriptRoutine_PS*>(self->GetPropertySet(eEPropertySetType_ScriptRoutine));
-    Logf("downed: end-state player=%u role=%s elapsed_ms=%u source=%s changed=%d hp=%d ai=%d task=%s "
-         "state=%s movement=%d output=%d task_pos=%d state_pos=%d entered=%u returned=%u native_kills=%u",
-         net::LocalId(), net::IsHost() ? "host" : "client", now - terminalAt, source, changed ? 1 : 0,
-         hp, aiMode, task.GetText(), state.GetText(), movement, routine->GetSPU().IsOutputPlaying() ? 1 : 0,
-         routine->GetSPU().AIGetTaskPosition(), routine->GetSPU().AIGetStatePosition(),
-         terminalStateEntries, terminalStateReturns, nativeTerminalKills);
-}
-
-bool ObserveDeathState(eCEntity* self, bool entered, bool successful)
-{
-    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!life.terminal || !self || self != hero) return true;
-    Entity entity(hero);
-    if (entered) {
-        if (!life.BeginDeath()) {
-            Logf("downed: ANOMALY terminal native entry admission failed player=%u", net::LocalId());
-            return false;
-        }
-        ++terminalStateEntries;
-        if (terminalStateEntries == 1) {
-            Logf("downed: local ZS_RagDollDead entry player=%u native_sound=DEAD owner=local "
-                 "task=%s hp=%d ai=%d native_player_is_hero=%d",
-                 net::LocalId(), entity.Routine.GetCurrentTask().GetText(),
-                 entity.PlayerMemory.GetHitPoints(), static_cast<int>(entity.Routine.AIMode),
-                 Entity::GetPlayer().GetInstance() == hero ? 1 : 0);
-        } else {
-            Logf("downed: ANOMALY repeated ZS_RagDollDead entry player=%u count=%u",
-                 net::LocalId(), terminalStateEntries);
-        }
-        return true;
-    }
-    ++terminalStateReturns;
-    auto* animation = static_cast<eCVisualAnimation_PS*>(hero->GetPropertySet(eEPropertySetType_Animation));
-    const bool ragdoll = animation && animation->GetRagDollEnabled();
-    const bool controller = animation && animation->GetRagDollController();
-    Logf("downed: local ZS_RagDollDead return player=%u count=%u task=%s state=%s hp=%d ai=%d "
-         "movement=%d ragdoll=%d controller=%d dead=%d",
-         net::LocalId(), terminalStateReturns, entity.Routine.GetCurrentTask().GetText(),
-         entity.Routine.GetCurrentState().GetText(), entity.PlayerMemory.GetHitPoints(),
-         static_cast<int>(entity.Routine.AIMode),
-         static_cast<int>(entity.CharacterMovement.GetMovementMode()),
-         ragdoll ? 1 : 0, controller ? 1 : 0, entity.IsDead() ? 1 : 0);
-    if (successful && !nativeTerminalKillChecked) {
-        nativeTerminalKillChecked = true;
-        const bool dead = entity.IsDead();
-        const bool deadMode = entity.Routine.AIMode == gEAIMode_Dead &&
-                              static_cast<int>(entity.Routine.AIMode) == 9;
-        if (dead && deadMode) {
-            life.FinishDeath(true);
-            nativeTerminalKills = 1;
-            Logf("downed: native Kill confirmed from ZS_RagDollDead player=%u killer=null victim=hero "
-                 "dead=%d ai=%d",
-                 net::LocalId(), dead ? 1 : 0, static_cast<int>(entity.Routine.AIMode));
-        } else {
-            Logf("downed: ANOMALY native Kill not confirmed from ZS_RagDollDead player=%u killer=null victim=hero "
-                 "dead=%d ai=%d",
-                 net::LocalId(), dead ? 1 : 0, static_cast<int>(entity.Routine.AIMode));
-        }
-    }
-    return true;
-}
-
-// A hero's death runs through the tasks ZS_Dead or ZS_RagDollDead (the hit judgement and the kill cheat set
-// them); their script Kill then shows "Game over" and the player can only load a save (stage A exploration:
-// the hero lay dead with the session still running). The knock-out task ends with the hero standing up again
-// (from 0 hit points to 20 to 30 within 10 s in the same exploration), so it replaces the death, unless nobody
-// can help any more (Die).
 bool RedirectDeath(eCEntity* self, char const* state)
 {
-    if (!enabled || life.terminal || !self || self != gCSession::GetInstance().GetHero()) return false;
+    if (life.terminal || !self || self != gCSession::GetInstance().GetHero()) return false;
     if (std::strcmp(state, "ZS_Dead") != 0 && std::strcmp(state, "ZS_RagDollDead") != 0) return false;
     if (RejectHarm(self, nullptr, "redirect-death")) return true;
     Entity hero(self);
@@ -949,7 +220,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
     lethal = life.held || !persist::HeroPending();
     lethalSeenDown = false;
     lethalAt = net::Now();
-    if (holdEnabled && !persist::HeroPending()) Hold("redirect-death", state);
+    if (!persist::HeroPending()) Hold("redirect-death", state);
     ++redirects;
     Logf("downed: hero would die (%s), knocked out instead (hp=%d)", state, hero.PlayerMemory.GetHitPoints());
     return true;
@@ -991,14 +262,9 @@ bool GuardState(eCEntity* self, char const* state)
     return true;
 }
 
-// The knocked-out hero gets up when its knock-out loop (ZS_Unconscious_Loop) finds the task time above 5 s
-// and calls ContinueRoutine (static analysis). The task time is held at 0 and the hit points at most 1 (the loop
-// heals +10 per second) until a partner chooses the help dialog and pays a healing potion; then it stands up
-// with a quarter of its hit points. Without a potion the partner is told so and the
-// hero stays down. When every known, connected partner is down or dead, the hero dies immediately. Unknown, stale,
-// loading or disconnected partner activity retains the original 5-second grace; distance/world location does not.
 void Tick()
 {
+    SyncStates();
     LocalInteractionFlags();
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
@@ -1021,13 +287,11 @@ void Tick()
         const bool known = body::CurrentMotion(instance, motion, sizeof(motion)) && motion[0];
         const int pose = static_cast<int>(hero.Routine.AniState);
         if (!known && !recoveryUnknownNoted)
-            Logf("downed: recovery waiting player=%u sequence=%u ani=%d reason=no-current-motion",
-                 net::LocalId(), life.sequence, pose);
+            Logf("downed: recovery waiting player=%u sequence=%u ani=%d reason=no-current-motion", net::LocalId(), life.sequence, pose);
         recoveryUnknownNoted = !known;
         recovery.Observe(RecoveryStanding(pose, hero.IsDown(), known ? motion : nullptr), now);
         if (!recovery.rising)
-            Logf("downed: recovery standing player=%u sequence=%u grace_ms=%u motion=%s",
-                 net::LocalId(), life.sequence, ReviveGraceMs, motion);
+            Logf("downed: recovery standing player=%u sequence=%u grace_ms=%u motion=%s", net::LocalId(), life.sequence, ReviveGraceMs, motion);
     } else {
         recovery.Observe(false, now);
     }
@@ -1043,17 +307,16 @@ void Tick()
         const bool dead = present && (remotes[i].activity.flags & 4);
         const bool down = present && (remotes[i].activity.flags & 8) && !dead;
         Wide(remotes[i].latest.name, name, 32);
-        if (down && !told[i]) {
-            swprintf_s(text, potionNeeded ? i18n::Text(i18n::PartnerDownNeedsPotion)
-                                          : i18n::Text(i18n::PartnerDown), name);
+        if (down && !peers[i].told) {
+            swprintf_s(text, i18n::Text(i18n::PartnerDownNeedsPotion), name);
             hud::Message(hud::Warning, text);
         }
-        if (dead && !toldDead[i]) {
+        if (dead && !peers[i].toldDead) {
             swprintf_s(text, i18n::Text(i18n::PartnerDied), name);
             hud::Message(hud::Bad, text);
         }
-        told[i] = down;
-        toldDead[i] = dead;
+        peers[i].told = down;
+        peers[i].toldDead = dead;
     }
 
     if (life.terminal) {
@@ -1098,15 +361,13 @@ void Tick()
         nativeNoted = false;
         CancelAlone("not-held");
         revivedBy = 0;
-        if (autoHelp) Help(hero, remotes, now);
-        else OfferHelp(hero, remotes, now);
+        OfferHelp(hero, remotes, now);
         return;
     }
     if (!life.held) {
-        if (!holdEnabled) return;  // QA negative control: the game's own timer stands the hero up
         // A knock-out of the game's own at 0 hit points after a blow that meant to kill: a death the game turned into a
         // knock-out; the partner helps it up, else it is one.
-        if (lethalOnly && !lethal && !nativeNoted && lethalBlows && hero.PlayerMemory.GetHitPoints() <= 0 && lethalBlowAt &&
+        if (!lethal && !nativeNoted && hero.PlayerMemory.GetHitPoints() <= 0 && lethalBlowAt &&
             now - lethalBlowAt < 3000 && PartnerPresent(remotes, now)) {
             lethal = true;
             lethalSeenDown = true;
@@ -1114,7 +375,7 @@ void Tick()
             ++nativeLethal;
             Logf("downed: lethal blow by someone who means to kill; knocked out like a death (hp=%d)", hero.PlayerMemory.GetHitPoints());
         }
-        if (lethalOnly && !lethal) {
+        if (!lethal) {
             if (!nativeNoted) {
                 nativeNoted = true;
                 Logf("downed: hero knocked out by the game's own rules (not a death; hp=%d); it stands up by itself",
@@ -1137,15 +398,10 @@ void Tick()
         const int by = revivedBy;
         revivedBy = 0;
         if (life.terminal || !life.Revive(pendingReviveSequence)) return;
+        CancelAlone("paid-revive");
+        life.Reset();
         convergence.Clear();
         recovery.Begin();
-        recoveryUnknownNoted = false;
-        pendingReviveSequence = 0;
-        lethal = false;
-        lethalSeenDown = false;
-        lethalBlowAt = 0;
-        nativeNoted = false;
-        CancelAlone("paid-revive");
         ++revives;
         Transition("paid-revive", "network");
         StandUp(hero);
@@ -1173,7 +429,6 @@ void Tick()
     }
 }
 
-// A partner paid a potion for us (WorldState kind 8 to this player).
 void Revived(int byPlayer, uint32_t sequence)
 {
     gCSession& session = gCSession::GetInstance();
@@ -1191,7 +446,6 @@ void Revived(int byPlayer, uint32_t sequence)
     Logf("downed: revive accepted player=%u helper=%d sequence=%u source=network", net::LocalId(), byPlayer, sequence);
 }
 
-// A partner stood next to us without a healing potion (kind 9).
 void HelperHasNoPotion(int byPlayer)
 {
     if (byPlayer <= 0 || byPlayer >= net::MaxPlayers || !life.held) return;
@@ -1201,146 +455,12 @@ void HelperHasNoPotion(int byPlayer)
     hud::Message(hud::Info, text);
 }
 
-bool Held() { return life.held; }
-
-uint8_t LocalInteractionFlags()
-{
-    gCSession& session = gCSession::GetInstance();
-    eCEntity* hero = session.GetHero();
-    if (hero != interactionHero) {
-        interaction.Clear();
-        interactionHero = hero;
-    }
-    const uint32_t now = net::Now();
-    static uint8_t lastFlags = 0;
-    const uint8_t before = lastFlags;
-    const bool eligible = interactionWorldActive && hero && session.IsGameRunning() &&
-                          !ai::ShuttingDown() && !persist::NativeLoading() && !persist::HeroPending() &&
-                          !life.held && !life.terminal;
-    if (!eligible) {
-        interaction.Clear();
-    } else {
-        Entity player(hero);
-        const bool alive = !player.IsDead() && !player.IsDown();
-        const int page = alive ? NativeInteractionPage(session.GetGUIManager()) : -1;
-        gCInfoManager_PS* infos = alive ? gCInfoManager_PS::GetInstance() : nullptr;
-        eCEntity* partner = infos && infos->AccessIsRunning() && !infos->AccessEndRequested() &&
-                           infos->GetDialogPartner1() == hero ? infos->GetDialogPartnerNPC() : nullptr;
-        const bool spoken = partner && partner != hero &&
-                            partner->GetPropertySet(eEPropertySetType_NPC) && !Entity(partner).IsDead();
-        const bool dialogue = DialogueObserved(page, infos && infos->AccessIsRunning(),
-                                              infos && infos->AccessEndRequested(),
-                                              infos && infos->GetDialogPartner1() == hero, spoken);
-        interaction.Observe(alive, dialogue, page == gEGamePage_Trade, now);
-    }
-    const uint8_t flags = interaction.Flags(now);
-    if (before != flags)
-        Logf("PROTECTION role=%s player=%u reason=%s previous=%s flags=%u grace_ms=%u",
-             net::IsHost() ? "host" : "client", net::LocalId(), InteractionReason(flags),
-             InteractionReason(before), flags, (flags & InteractionGrace) ? InteractionGraceMs : 0);
-    lastFlags = flags;
-    return flags;
-}
-
-uint8_t PlayerInteractionFlags(unsigned player)
-{
-    if (!player || player >= net::MaxPlayers) return 0;
-    if (player == net::LocalId()) return LocalInteractionFlags();
-    if (!interactionWorldActive || ai::ShuttingDown() || persist::NativeLoading() ||
-        persist::HeroPending() || !gCSession::GetInstance().IsGameRunning()) return 0;
-    net::Remote const& r = net::Remotes()[player];
-    return PeerInteraction(r.connected, r.activity.known, r.activity.ticks, r.activity.world,
-                           remote::CurrentWorld(), r.activity.flags, net::Now());
-}
-
-void OnWorldDeactivate()
-{
-    interaction.Clear();
-    interactionHero = nullptr;
-    interactionWorldActive = false;
-}
-
-bool HarmProtected(eCEntity* entity)
-{
-    if (!entity || ai::ShuttingDown() || persist::NativeLoading() || persist::HeroPending() ||
-        !gCSession::GetInstance().IsGameRunning()) return false;
-    eCEntity* hero = gCSession::GetInstance().GetHero();
-    if (hero && (entity == hero || entity == remote::ControlledBody()))
-        return HarmImmune(true, life.held, life.terminal, 0, recovery.Protected(net::Now()), LocalInteractionFlags() != 0);
-    const int id = remote::PuppetOwner(entity);
-    if (id <= 0 || id >= net::MaxPlayers) return false;
-    net::Remote const& r = net::Remotes()[id];
-    const bool present = r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld();
-    return HarmImmune(present, false, false, r.latest.flags, TrackPuppetRecovery(id)) || InteractionOf(entity) != 0;
-}
-
 bool SyntheticProne(eCEntity* victim)
 {
     eCEntity* hero = gCSession::GetInstance().GetHero();
     return victim && hero && (victim == hero || victim == remote::ControlledBody()) &&
            !life.terminal && !persist::NativeLoading() && !persist::HeroPending() &&
            VanillaProne(static_cast<int>(Entity(victim).Routine.AniState));
-}
-
-void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int before, int after, char const* decision)
-{
-    if (!victim || ai::ShuttingDown()) return;
-    eCEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || (victim != hero && victim != remote::ControlledBody())) return;
-    Entity player(victim);
-    const bCString task = player.Routine.GetCurrentTask(), state = player.Routine.GetCurrentState();
-    const int pose = static_cast<int>(player.Routine.AniState);
-    const uint32_t now = net::Now();
-    const uint8_t interactionFlags = LocalInteractionFlags();
-    if (!interactionFlags && !life.held && !life.terminal && !recovery.Protected(now) && !(pose >= 15 && pose <= 21) &&
-        !HarmfulReaction(task.GetText()) && !HarmfulReaction(state.GetText()) &&
-        !std::strstr(task.GetText(), "Fall") && !std::strstr(state.GetText(), "Fall")) return;
-    Logf("GROUNDHIT role=%s player=%u episode=%u path=%s attacker=%s hp=%d->%d held=%d terminal=%d "
-         "rising=%d grace_ms=%u ai=%d ani=%d task=%s state=%s decision=%s protection=%s",
-         net::IsHost() ? "host" : "client", net::LocalId(), life.sequence, path,
-         attacker ? Entity(attacker).GetName().GetText() : "-", before, after,
-         life.held ? 1 : 0, life.terminal ? 1 : 0, recovery.rising ? 1 : 0,
-         recovery.grace && now - recovery.stoodAt < ReviveGraceMs ? ReviveGraceMs - (now - recovery.stoodAt) : 0,
-         static_cast<int>(player.Routine.AIMode), pose, task.GetText(), state.GetText(), decision,
-         InteractionReason(interactionFlags));
-}
-
-bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path)
-{
-    if (!HarmProtected(victim)) return false;
-    Entity player(victim);
-    const int hp = victim->GetPropertySet(eEPropertySetType_PlayerMemory)
-        ? player.PlayerMemory.GetHitPoints() : static_cast<int>(player.DamageReceiver.HitPoints);
-    LogGroundEvent(victim, attacker, path, hp, hp, "reject-before-effects");
-    if (const uint8_t flags = InteractionOf(victim)) {
-        static unsigned refused = 0;
-        static uint32_t lastLog = 0;
-        const uint32_t now = net::Now();
-        if (++refused <= 40 || now - lastLog >= 5000) {
-            lastLog = now;
-            const int id = remote::PuppetOwner(victim);
-            Logf("PROTECTEDHIT role=%s player=%u path=%s reason=%s hp=%d decision=reject-before-effects",
-                 net::IsHost() ? "host" : "client", id ? static_cast<unsigned>(id) : net::LocalId(),
-                 path, InteractionReason(flags), hp);
-        }
-    }
-    if (victim->GetPropertySet(eEPropertySetType_DamageReceiver)) player.DamageReceiver.DamageAmount = 0;
-    return true;
-}
-
-bool RejectReaction(eCEntity* victim, char const* state, char const* path)
-{
-    if (!victim || !HarmfulReaction(state) || !HarmProtected(victim)) return false;
-    // The held task itself and its native loop must still establish/maintain the lying pose.
-    if (life.held && victim == gCSession::GetInstance().GetHero() && DownTask(state)) {
-        if (!convergence.settled) return false;
-        convergence.Request();
-        return true;
-    }
-    eCEntity* attacker = Entity(victim).NPC.GetCurrentAttacker().GetInstance();
-    if (!RejectHarm(victim, attacker, path)) return false;
-    Logf("downed: ground reaction refused player=%u path=%s requested=%s", net::LocalId(), path, state);
-    return true;
 }
 
 bool CombatUnavailable(eCEntity* entity)
@@ -1353,7 +473,6 @@ bool CombatUnavailable(eCEntity* entity)
     }
     const int id = remote::PuppetOwner(entity);
     if (!id) return false;
-    TrackPuppetRecovery(id);
     net::Remote const& r = net::Remotes()[id];
     // Latest accepted player state is authority, not the talkable puppet's native mode or lying animation.
     return r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld() &&
@@ -1405,6 +524,7 @@ void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bo
 }
 
 uint32_t Sequence() { return life.held ? life.sequence : 0; }
+bool Held() { return life.held; }
 bool Terminal() { return life.terminal; }
 
 void OnFrameResume()
@@ -1429,8 +549,6 @@ void NoteBlow()
     lethalBlowAt = net::Now() ? net::Now() : 1;
 }
 
-// Not a death the mod turned into a knock-out (that one waits for help, and nobody robs it): RedirectDeath sets lethal
-// before the hero lies down.
 bool NativeDown()
 {
     eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
@@ -1439,150 +557,41 @@ bool NativeDown()
     return hero.IsDown() && !hero.IsDead();
 }
 
-void OnWorldChange()
-{
+void OnWorldChange() {
+    CancelAlone("world-change");
+    life.OnWorldChange();
+    life.Reset(true);
+    recovery.Clear();
+    convergence.Clear();
+    nativeTerminalKills = 0;
+    nativeTerminalKillChecked = false;
+    terminalTask.clear();
+    pendingReviveSequence = 0;
     interaction.Clear();
     interactionHero = nullptr;
     interactionWorldActive = true;
-    life.OnWorldChange(); // old-world paid revives must not apply after the load
-    recovery.Clear();
-    convergence.Clear();
-    standRefusals = 0;
-    lastStandRefusal = 0;
-    recoveryUnknownNoted = false;
-    lethal = life.held;
-    lethalSeenDown = false;
-    lethalAt = 0;
-    lastHp = -1;
-    lethalBlowAt = 0;
-    nativeNoted = false;
-    terminalStateEntries = 0;
-    terminalStateReturns = 0;
-    nativeTerminalKills = 0;
-    nativeTerminalKillChecked = false;
-    terminalAt = terminalSampleAt = 0;
-    terminalTask.clear();
-    terminalState.clear();
-    terminalHp = terminalAi = terminalMovement = -1;
-    terminalMutations = 0;
-    terminalMutationAt = 0;
-    crashlog::EndStep("world-change");
-    Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
-    wasDown = false;
-    CancelAlone("world-change");
-    revivedBy = 0;
-    pendingReviveSequence = 0;
+    lastInteractionFlags = 0;
     for (int i = 0; i < net::MaxPlayers; ++i) {
         puppetRecovery[i].Clear();
-        told[i] = false;
-        toldDead[i] = false;
-        helpingSince[i] = 0;
-        hinted[i] = false;
-        paidAt[i] = 0;
-        paidSequence[i] = 0;
+        peers[i].payment.Reset();
+        peers[i].Reset();
     }
-    for (int i = 0; i < 2; ++i) inHand[i].clear();
+    crashlog::EndStep("world-change");
+    Transition(life.held ? "carry-downed-life" : "reset-terminal-life", "world-change");
 }
-
-void Off(LogFn log)
-{
-    enabled = false;
-    log("DOWNEDOFF ok=1");
-}
-
-void HoldOff(LogFn log)
-{
-    holdEnabled = false;
-    log("HOLDOFF ok=1");
-}
-
-void PotionOff(LogFn log)
-{
-    potionNeeded = false;
-    log("POTIONOFF helping up is free");
-}
-
-void LethalOnlyOff(LogFn log)
-{
-    lethalOnly = false;
-    log("LETHALONLYOFF ok=1");
-}
-
-// QA: items for the local hero ("Template" or "Template-Amount"; QA arguments allow only [A-Za-z0-9_-]).
-void GivePotion(char const* argument, LogFn log)
-{
-    char line[200], templ[64] = {};
-    strncpy_s(templ, argument, _TRUNCATE);
-    int amount = 1;
-    if (char* dash = std::strrchr(templ, '-')) {
-        *dash = '\0';
-        amount = std::atoi(dash + 1);
+void OnWorldDeactivate() {
+    CancelAlone("world-deactivate");
+    life.Reset(true);
+    recovery.Clear();
+    convergence.Clear();
+    interaction.Clear();
+    interactionHero = nullptr;
+    interactionWorldActive = false;
+    lastInteractionFlags = 0;
+    for (int i = 0; i < net::MaxPlayers; ++i) {
+        puppetRecovery[i].Clear();
+        peers[i].payment.Reset();
+        peers[i].Reset();
     }
-    eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
-    const Template item(templ);
-    if (!instance || !item.IsValid()) { Format(line, "GIVEPOTION name=%s valid=%d", templ, item.IsValid() ? 1 : 0); log(line); return; }
-    Entity hero(instance);
-    if (amount > 0) {
-        hero.Inventory.CreateItems(item, 0, amount);
-    } else {  // "-0": take all of them away
-        for (GEInt i = hero.Inventory.GetStackCount() - 1; i >= 0; --i) {
-            Entity carried = hero.Inventory.GetTemplateItem(i);
-            if (carried.GetInstance() && !std::strcmp(carried.GetName().GetText(), templ)) hero.Inventory.DeleteItems(i, hero.Inventory.GetAmount(i));
-        }
-    }
-    Format(line, "GIVEPOTION name=%s valid=1 amount=%d now=%d", templ, amount, hero.Inventory.GetItemAmount(item));
-    log(line);
-}
-
-// QA: the healing potions the local hero carries.
-void Potions(LogFn log)
-{
-    char line[300];
-    eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
-    if (!instance) { log("POTIONS end count=0"); return; }
-    Entity hero(instance);
-    int total = 0;
-    for (GEInt i = 0; i < hero.Inventory.GetStackCount(); ++i) {
-        Entity item = hero.Inventory.GetTemplateItem(i);
-        if (!item.GetInstance() || std::strncmp(item.GetName().GetText(), "It_Potion", 9) != 0) continue;
-        const GEInt amount = hero.Inventory.GetAmount(i);
-        if (!std::strncmp(item.GetName().GetText(), PotionPrefix, std::strlen(PotionPrefix))) total += amount;
-        Format(line, "POTION name=%s amount=%d gold=%d", item.GetName().GetText(), amount, item.Item.GetGoldValue());
-        log(line);
-    }
-    Format(line, "POTIONS end health=%d", total);
-    log(line);
-}
-
-void Report(LogFn log)
-{
-    char line[240];
-    Format(line, "DOWNED lethal=%d lethal_only=%d lethal_blows=%d native_lethal=%u enabled=%d hold=%d held=%d redirects=%u revives=%u releases=%u deaths=%u potions_paid=%u no_potion=%u potion_needed=%d"
-                    " auto_help=%d help_option=%d offered=%u chosen=%u",
-              lethal ? 1 : 0, lethalOnly ? 1 : 0, lethalBlows ? 1 : 0, nativeLethal, enabled ? 1 : 0, holdEnabled ? 1 : 0, life.held ? 1 : 0, redirects, revives, releases, deaths, potionsPaid, refusedNoPotion,
-              potionNeeded ? 1 : 0, autoHelp ? 1 : 0, helpOption ? 1 : 0, optionsOffered, optionsChosen);
-    log(line);
-}
-
-void AutoHelpOn(LogFn log)
-{
-    autoHelp = true;
-    log("AUTOHELPON ok");
-}
-
-void HelpOptionOff(LogFn log)
-{
-    helpOption = false;
-    log("HELPOPTIONOFF ok");
-}
-void HelpLineSaid() { helpSaidAt = net::Now() ? net::Now() : 1; }
-
-// QA negative controls of the play-evening fixes (27.10.): each switches its fix off (on: clientfameon).
-bool Switch(char const* action, LogFn log)
-{
-    if (!std::strcmp(action, "helplineoff")) { helpLineOnly = false; log("SWITCH helplineoff ok=1"); return true; }
-    if (!std::strcmp(action, "autohelpoff")) { autoHelp = false; log("SWITCH autohelpoff ok=1"); return true; }
-    if (!std::strcmp(action, "lethalblowsoff")) { lethalBlows = false; log("SWITCH lethalblowsoff ok=1"); return true; }
-    return false;
 }
 }

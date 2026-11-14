@@ -286,11 +286,12 @@ German and Polish messages; `language = auto` (what the setup writes) follows th
 choose independently; the setting changes only mod messages.
 
 - [ ] Both players have identical mod DLLs and installation files. The host checks Game.dll, Script.dll, Engine.dll,
-  DLLs in `scripts`, rules archives, names and sizes of other Data archives, game options and the entire `[Game]`
+  DLLs in `scripts`, rules archives, names and sizes of other Data archives, and unrecognized keys in the `[Game]`
   section of `Ini\ge3.ini`. Loose files in Data subfolders and custom difficulty sliders are not covered.
-- [ ] Compare difficulty, alternative balancing, alternative AI, minimum hit duration, XP factor and Quick Loot.
-  If joining is refused, read the reason in `g3together.log`.
-- [ ] With matching `friendly_fire = 0` (the default), allied melee, projectiles and harmful spells must not cost victim
+- [ ] `Difficulty` and `QuickLoot` remain local per player; `ExtendedContent`, `AIMode`, `MinHitDuration`, `XPModifier`,
+  `PlayerStart`, `friendly_fire`, `npc_damage` and `npc_hp` follow the host in memory for the session without writing
+  the client's INI. If joining is refused, read the reason in `g3together.log`.
+- [ ] With host `friendly_fire = 0` (the default), allied melee, projectiles and harmful spells must not cost victim
   HP or blocking stamina, stagger, knock down or apply statuses. Include followers and both attack directions.
   Healing and enemy hits must still work. Knock-out/revive checks below require an enemy, not your partner.
 - [ ] The client starts New Game locally on first entry of each launch and re-enters after every host load through its own
@@ -497,8 +498,6 @@ to the first 40 records plus one sample per five seconds. Inventory presence is 
 While waiting, NPCs must ignore the body rather than rob it; ordinary nonlethal guard knock-outs still
 allow the existing native half-gold robbery. Check corpse/chest loot and partner trade remain normal.
 
-### Host-managed save/load acceptance (protocol 79)
-
 ### HUD notices without movement interruption
 
 Use matching builds in the two isolated copies; this is a manual check, not a game-launching test.
@@ -518,8 +517,10 @@ handles and camera identity. The immediate before/after must not change those st
 position should continue advancing with input held. `display_us` measures only the native text insertion,
 not diagnostic log I/O. Delayed samples report their actual elapsed time; a load/body replacement
 explicitly cancels them instead of inspecting an old hero.
-smoke-check partner trade, native/nonlethal knockout, terminal death, save/load, NPC leases/mirroring and
+Smoke-check partner trade, native/nonlethal knockout, terminal death, save/load, NPC leases/mirroring and
 join/rejoin. No QA command or negative-control switch is needed.
+
+### Host-managed save/load acceptance (protocol 79)
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified save/load entry points; `save UI hooked` also identifies the verified quicksave handler,
@@ -862,8 +863,7 @@ share unredacted INI files, saves, campaign sidecars or a complete Documents fol
 - Real internet play remains untested. A first short human test with two windows on one PC found
   two bugs that need further human verification.
 - Only two players were tested.
-- Companions are restored after loading by player name. Changing your name loses that association.
-- If the host loads another save during a session, the client returns to its menu when safe and chooses
-  New Game to re-enter with its own saved character; it does not load the host's native save automatically.
+- Companions are restored after loading by authenticated Steam account ID (`SteamID64`), independent of Steam display-name changes (legacy pre-migration saves match an old display name once or via `legacy_companion_owner` in the host's INI).
+- If the host loads another save during a session, `client_autoload` returns the client to the menu when safe and re-enters via its local `G3T_client_template` slot after a short countdown (or manually via New Game if `client_autoload` is off or canceled with Esc); it never loads the host's native save directly.
 - Untested: monsters attacking downed heroes, the actual bed dialog, and the
   mouse controls of the trade window (dragging items, its buttons).

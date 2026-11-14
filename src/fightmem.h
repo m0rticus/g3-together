@@ -16,6 +16,7 @@ class eCEntity;
 namespace g3t::net { struct WorldState; }
 
 namespace g3t::fightmem {
+bool HasLocalOverride(eCEntity* npc);
 void Tick();  // installs the hooks once the game's scripts are registered
 eCEntity* StateActor(eCEntity* self, char const* state);  // ai.cpp: the puppet an attack state of `self` fights, else none
 void AfterState(eCEntity* self);                         // ai.cpp, after that state ran: memory changes go out

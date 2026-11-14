@@ -278,6 +278,24 @@ inline bool DynamicChanged(State const& state, Input const& in)
                 (k < 9 ? BoneBasisChange : BoneTranslationChange)) return true;
     return false;
 }
+inline Tier DesiredTier(State const& state, Input const& in, bool nearTier, uint8_t urgent)
+{
+    const bool ordinaryWanted = (nearTier || in.nearby) && in.moving;
+    const bool fast = urgent || (state.live && in.now - state.enteredAt < InterestWarmupMs) ||
+        (state.haveUrgentHold && static_cast<int32_t>(state.urgentUntil - in.now) > 0);
+    const bool ordinary = ordinaryWanted ||
+        (state.haveOrdinaryHold && static_cast<int32_t>(state.ordinaryUntil - in.now) > 0);
+    return fast ? Tier::Fast : ordinary ? Tier::Ordinary : in.moving ? Tier::MovingFar : Tier::Idle;
+}
+
+inline bool ImmediateEdge(State const& state, Input const& in, uint8_t urgent, bool essential)
+{
+    return (urgent & ~state.urgent) || in.force || essential ||
+        MotionEdge(state.record, *in.record) || PoseSemantic(state, in) ||
+        DistanceSquared(state.record.position, in.record->position) >=
+            double(RootDiscontinuityCm) * RootDiscontinuityCm ||
+        RotationChanged(state.record.rotation, in.record->rotation, RotationDiscontinuityDegrees);
+}
 }
 
 // Evaluate never changes the sent baseline or clears a live entry. It does track
@@ -293,24 +311,20 @@ inline Result Evaluate(State& state, Input const& in)
         (in.interest == Interest::Distance && in.distanceCm <= (state.live ? InterestExitCm : InterestEnterCm));
     if (!interested) return {state.live ? Decision::FinalAndRelease : Decision::Outside, Tier::Idle, state.live};
     const bool nearTier = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
-    if (state.live) state.nearTier = nearTier;
     const uint8_t urgent = detail::Urgency(in);
-    if (state.live) state.urgent &= urgent;
-    if (state.live && urgent) { state.urgentUntil = in.now + UrgentHoldMs; state.haveUrgentHold = true; }
-    const bool ordinaryWanted = (nearTier || in.nearby) && in.moving;
-    if (state.live && ordinaryWanted) { state.ordinaryUntil = in.now + OrdinaryHoldMs; state.haveOrdinaryHold = true; }
-    const bool fast = urgent || (state.live && in.now - state.enteredAt < InterestWarmupMs) ||
-        (state.haveUrgentHold && static_cast<int32_t>(state.urgentUntil - in.now) > 0);
-    const bool ordinary = ordinaryWanted ||
-        (state.haveOrdinaryHold && static_cast<int32_t>(state.ordinaryUntil - in.now) > 0);
-    const Tier tier = fast ? Tier::Fast : ordinary
-        ? Tier::Ordinary : in.moving ? Tier::MovingFar : Tier::Idle;
+    if (state.live) {
+        state.nearTier = nearTier;
+        state.urgent &= urgent;
+        if (urgent) { state.urgentUntil = in.now + UrgentHoldMs; state.haveUrgentHold = true; }
+        if ((nearTier || in.nearby) && in.moving) {
+            state.ordinaryUntil = in.now + OrdinaryHoldMs;
+            state.haveOrdinaryHold = true;
+        }
+    }
+    const Tier tier = detail::DesiredTier(state, in, nearTier, urgent);
     if (!state.live) return {Decision::Initial, Tier::Fast, true};
     const bool essential = EssentialChanged(state.record, *in.record);
-    if ((urgent & ~state.urgent) || in.force || essential || detail::MotionEdge(state.record, *in.record) || detail::PoseSemantic(state, in) ||
-        detail::DistanceSquared(state.record.position, in.record->position) >=
-            double(RootDiscontinuityCm) * RootDiscontinuityCm ||
-        detail::RotationChanged(state.record.rotation, in.record->rotation, RotationDiscontinuityDegrees))
+    if (detail::ImmediateEdge(state, in, urgent, essential))
         return {Decision::Semantic, tier, essential};
     const uint32_t elapsed = in.now - state.sentAt;
     const uint32_t stretch = in.stretchPermille;
@@ -354,9 +368,7 @@ inline bool Commit(State& state, Input const& in, Decision decision)
 inline uint32_t PresentationInterval(State const& state, Input const& in)
 {
     if (detail::Urgency(in)) return FastIntervalMs;
-    const bool nearBand = in.distanceCm <= (state.live && state.nearTier ? NearEnterCm : NearEnterCm);
     const bool nearEffective = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
-    (void)nearBand;
     return (nearEffective || in.nearby) && in.moving ? OrdinaryIntervalMs :
         in.moving ? MovingFarIntervalMs : IdleIntervalMs;
 }

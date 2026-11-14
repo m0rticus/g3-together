@@ -54,6 +54,7 @@ unsigned creaturesAnnounced = 0, creatureCopies = 0, creatureCopyFailed = 0, cre
 struct CreatureCopy {
     uint8_t guid[16];
     uint32_t netId = 0;
+    uint8_t ownerPlayer = 0;
 };
 std::vector<CreatureCopy> creatureCopyList;
 std::vector<net::SummonNote> hostCreatures;
@@ -265,12 +266,13 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
     auto setOwner = [&](Entity& copy) {
         if (copy.GetInstance() && copy.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
             eCEntity* owner = note.ownerPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(note.ownerPlayer);
-            copy.Party.SetPartyLeader(Entity(owner));
+            if (owner) copy.Party.SetPartyLeader(Entity(owner));
             copy.Party.PartyMemberType = gEPartyMemberType_Summoned;
         }
     };
-    for (auto const& existing : creatureCopyList)
+    for (auto& existing : creatureCopyList)
         if (!std::memcmp(existing.guid, note.guid, 16) && existing.netId == note.netId) {
+            existing.ownerPlayer = note.ownerPlayer;
             Entity copy(npcs::NpcByGuid(note.guid));
             setOwner(copy);
             npcs::Rebind(note.guid);
@@ -285,6 +287,7 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
         CreatureCopy tracked;
         std::memcpy(tracked.guid, note.guid, 16);
         tracked.netId = note.netId;
+        tracked.ownerPlayer = note.ownerPlayer;
         creatureCopyList.push_back(tracked);
         npcs::Foreign(note.guid);
         npcs::Rebind(note.guid);
@@ -315,6 +318,7 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
     CreatureCopy c;
     std::memcpy(c.guid, note.guid, 16);
     c.netId = note.netId;
+    c.ownerPlayer = note.ownerPlayer;
     creatureCopyList.push_back(c);
     ++creatureCopies;
     Logf("summon: creature net %08X from player %u: %s copy under its GUID", note.netId, from, note.spawn);
@@ -459,8 +463,19 @@ void Resolve()
 void CheckKnown()
 {
     const DWORD now = GetTickCount();
-    if (known.empty() || now - lastCheck < 250) return;
+    if ((known.empty() && creatureCopyList.empty()) || now - lastCheck < 250) return;
     lastCheck = now;
+    if (!net::IsHost()) {
+        for (auto const& creature : creatureCopyList) {
+            if (!creature.ownerPlayer) continue;
+            Entity copy(npcs::NpcByGuid(creature.guid));
+            eCEntity* leader = creature.ownerPlayer == net::LocalId() ? remote::ControlledBody() :
+                remote::PuppetOf(creature.ownerPlayer);
+            if (leader && copy.GetInstance() && copy.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
+                copy.Party.GetPartyLeader().GetInstance() != leader)
+                copy.Party.SetPartyLeader(Entity(leader));
+        }
+    }
     for (size_t i = 0; i < known.size();) {
         Entity e = ByGuid(known[i].guid);
         if (e.GetInstance() && known[i].removeAt && static_cast<int32_t>(now - known[i].removeAt) >= 0) {
@@ -589,6 +604,23 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
 }
 }
 
+bool HitBlocked(eCEntity const* entity)
+{
+    if (!entity) return false;
+    uint8_t guid[16];
+    Guid(const_cast<eCEntity*>(entity), guid);
+    for (Known const& k : known)
+        if (!k.own && !std::memcmp(k.guid, guid, 16)) return true;
+    if (!net::IsHost()) {
+        for (CreatureCopy const& copy : creatureCopyList)
+            if (copy.ownerPlayer != net::LocalId() && !std::memcmp(copy.guid, guid, 16)) return true;
+    } else {
+        for (auto const& creature : hostCreatures)
+            if (creature.ownerPlayer == 0 && !std::memcmp(creature.guid, guid, 16)) return true;
+    }
+    return false;
+}
+
 void Start() { net::SetSummonHandler(&OnSummon); }
 
 void OnWorldChange()
@@ -660,10 +692,20 @@ void Tick()
                 net::SendSummon(gone);
                 it = hostCreatures.erase(it);
             } else {
-                const uint8_t owner = npcs::CompanionOwner(ByGuid(it->guid).GetInstance());
+                Entity creature = ByGuid(it->guid);
+                const uint8_t owner = npcs::CompanionOwner(creature.GetInstance());
+                if (!owner && it->ownerPlayer > 1 && !net::PeerJoined(it->ownerPlayer) &&
+                    !remote::PuppetOf(it->ownerPlayer)) {
+                    creature.Kill();
+                    net::SummonNote gone = *it;
+                    gone.op = net::SummonGone;
+                    net::SendSummon(gone);
+                    it = hostCreatures.erase(it);
+                    continue;
+                }
+                if (!owner) { ++it; continue; }
                 const bool changed = owner != it->ownerPlayer;
                 it->ownerPlayer = owner;
-                Entity creature = ByGuid(it->guid);
                 eCEntity* leader = owner == 1 ? remote::ControlledBody() : remote::PuppetOf(owner);
                 if (creature.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
                     creature.Party.GetPartyLeader().GetInstance() != leader)

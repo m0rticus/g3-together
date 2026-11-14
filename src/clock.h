@@ -10,6 +10,7 @@ namespace g3t::net { struct ClockState; }
 namespace g3t::clock {
 void Start();
 void Tick();             // once per frame
+void OnWorldChange();
 bool CaptureAdmission(net::ClockState& state);
 bool RestoreAdmission(net::ClockState const& state);  // clock setters and sleep-origin reset, before quest timers
 using LogFn = void (*)(char const*);

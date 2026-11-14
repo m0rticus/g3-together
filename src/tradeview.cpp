@@ -29,7 +29,6 @@ unsigned char* predicate = nullptr;
 unsigned char* trampoline = nullptr;
 uintptr_t tradeListVTable = 0;
 uint8_t originalBytes[Stolen] = {};
-uint8_t patchedBytes[Stolen] = {};
 bool installed = false;
 bool failed = false;
 
@@ -101,7 +100,6 @@ void Install()
         return;
     }
 
-    std::memcpy(patchedBytes, target, Stolen);
     if (target[0] != 0xe9 || target[5] != 0x90) {
         DWORD old = 0;
         if (VirtualProtect(target, Stolen, PAGE_EXECUTE_READWRITE, &old)) {
@@ -120,17 +118,5 @@ void Install()
     tradeListVTable = reinterpret_cast<uintptr_t>(base + TradeListVTableRva);
     installed = true;
     Log("trade: native local player-trade grid visibility hook installed");
-}
-
-void Uninstall()
-{
-    // Restoration is owned by ai::RestorePatches; never free the executable trampoline
-    // because a native caller may have entered it during teardown.
-    if (!installed) return;
-    predicate = nullptr;
-    originalVisible = nullptr;
-    tradeListVTable = 0;
-    installed = false;
-    Log("trade: native local player-trade grid visibility hook uninstalled");
 }
 }

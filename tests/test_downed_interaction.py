@@ -64,6 +64,18 @@ int main()
     assert(!UnpaidEpisode(0, paid));
     assert(UnpaidEpisode(UINT32_MAX, 1));
     assert(UnpaidEpisode(1, UINT32_MAX));
+
+    RevivePaymentSlot slot;
+    slot.ObserveConnection(true, 10);
+    assert(slot.NeedsPayment(1));
+    slot.MarkPaid(4);
+    assert(!slot.NeedsPayment(1) && !slot.NeedsPayment(4));
+    slot.ObserveConnection(false, 0);
+    slot.ObserveConnection(true, 11);
+    assert(slot.NeedsPayment(1)); // rejoining player starting back at sequence 1 is revivable
+    slot.MarkPaid(3);
+    slot.ObserveConnection(true, 12); // generation bump within a single tick also resets payment state
+    assert(slot.NeedsPayment(1));
 }
 '''
         with tempfile.TemporaryDirectory(prefix="downed-interaction-test-", dir=ROOT) as directory:
@@ -148,18 +160,18 @@ int main()
 
     def test_successful_payment_and_option_suppression_are_episode_bound(self):
         payment = function_body(self.source["downed"], r"\bvoid\s+PayAndHelp\s*\(")
-        self.assertIn("!UnpaidEpisode(r.latest.downedSequence, paidSequence[i])", payment)
+        self.assertIn("!peers[i].payment.NeedsPayment(r.latest.downedSequence)", payment)
         self.assertIn("if (!hero.Inventory.DeleteItems(stack, 1))", payment)
         failure = function_body(payment, r"\bif\s*\(\s*!hero\.Inventory\.DeleteItems")
         self.assertIn("potion-removal-failed", failure)
         self.assertIn("return;", failure)
-        for forbidden in ("SendToPlayer", "++potionsPaid", "paidSequence[i] ="):
+        for forbidden in ("SendToPlayer", "++potionsPaid", "MarkPaid"):
             self.assertNotIn(forbidden, failure)
-        self.assertLess(payment.index("hero.Inventory.DeleteItems"), payment.index("paidSequence[i] ="))
-        self.assertLess(payment.index("paidSequence[i] ="), payment.index("SendToPlayer(8"))
+        self.assertLess(payment.index("hero.Inventory.DeleteItems"), payment.index("peers[i].payment.MarkPaid("))
+        self.assertLess(payment.index("peers[i].payment.MarkPaid("), payment.index("SendToPlayer(8"))
         offer = function_body(self.source["downed"], r"\bvoid\s+OfferHelp\s*\(")
-        self.assertIn("UnpaidEpisode(r.latest.downedSequence, paidSequence[i])", offer)
-        self.assertIn("helpStarted[i]", offer)
+        self.assertIn("peers[i].payment.NeedsPayment(r.latest.downedSequence)", offer)
+        self.assertIn("peers[i].helpStarted", offer)
         self.assertIn("PayAndHelp(hero, i, remotes[i], now)", offer)
 
     def test_diagnostics_observe_real_calls_without_speculative_assessment(self):

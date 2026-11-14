@@ -8,50 +8,19 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from _g3copy import win32_tool_environment
+
 HOST_ID = 76561198011111111
 CLIENT_ID = 76561198022222222
 SCENARIOS = ("connect", "metadata", "compressed-connect", "saturation",
              "bad", "rejoin", "compressible", "refusal41")
-
-
-def win32_tool_environment(build):
-    env = os.environ.copy()
-    env["TEMP"] = env["TMP"] = str(build)
-    if env.get("VSCMD_ARG_TGT_ARCH") == "x86" and shutil.which("cl", path=env.get("PATH")):
-        return env
-    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / \
-        "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-    if not vswhere.is_file():
-        raise RuntimeError("Visual Studio vswhere is required to locate the Win32 toolchain")
-    result = subprocess.run(
-        [str(vswhere), "-latest", "-products", "*",
-         "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-         "-property", "installationPath"],
-        capture_output=True, text=True, timeout=30, env=env)
-    if result.returncode or not result.stdout.strip():
-        raise RuntimeError("Visual Studio Win32 C++ tools not found: " + result.stderr)
-    vcvars = Path(result.stdout.strip()) / "VC" / "Auxiliary" / "Build" / "vcvars32.bat"
-    if not vcvars.is_file():
-        raise RuntimeError("Win32 toolchain setup not found: " + str(vcvars))
-    command = f'"{os.environ.get("COMSPEC", "cmd.exe")}" /d /s /c "call "{vcvars}" >nul && set"'
-    result = subprocess.run(command, cwd=build, env=env,
-                            capture_output=True, text=True, timeout=90)
-    if result.returncode:
-        raise RuntimeError("Win32 toolchain setup failed:\n" + result.stdout + result.stderr)
-    for line in result.stdout.splitlines():
-        if "=" in line and not line.startswith("="):
-            name, value = line.split("=", 1)
-            for existing in list(env):
-                if existing.lower() == name.lower() and existing != name:
-                    del env[existing]
-            env[name] = value
-    env["TEMP"] = env["TMP"] = str(build)
-    return env
 
 
 def source_revision(source_root):
@@ -172,20 +141,10 @@ def scenario_environment(fake_dll, output_dir, role, peer_id,
     env["G3T_STEAM_DLL"] = str(fake_dll)
     env["G3T_FAKESTEAM_ID"] = str(peer_id)
     env["G3T_FAKESTEAM_NAME"] = "Realism" + ("Host" if role == "host" else "Client")
-    env["G3T_FAKESTEAM_DIR"] = str(output_dir / "fakesteam")
     env["G3T_FAKESTEAM_PORT"] = str(peer_port)
     env["G3T_FAKESTEAM_PROFILE"] = "steam-typical"
     env["G3T_FAKESTEAM_REMOTE"] = f"127.0.0.1:{remote_port}:{remote_id}"
     env["G3T_FAKESTEAM_LISTREMOTE"] = "1"
-    for name in (
-            "G3T_FAKESTEAM_LATENCY_MS", "G3T_FAKESTEAM_JITTER_MS",
-            "G3T_FAKESTEAM_LOSS_PERMILLE", "G3T_FAKESTEAM_ACK_LOSS_PERMILLE",
-            "G3T_FAKESTEAM_OUTAGE_MS", "G3T_FAKESTEAM_RECONNECT_MS",
-            "G3T_FAKESTEAM_METADATA_DELAY_MS", "G3T_FAKESTEAM_NODELAY_POLICY",
-            "G3T_FAKESTEAM_JOIN_FRIEND", "G3T_FAKESTEAM_JOIN_CONNECT",
-            "G3T_FAKESTEAM_JOIN_DELAY_MS", "G3T_FAKESTEAM_PHYSICAL_RATE_BPS",
-            "G3T_FAKESTEAM_SETUP_MS"):
-        env.pop(name, None)
     env["G3T_FAKESTEAM_LATENCY_MS"] = "20"
     env["G3T_FAKESTEAM_JITTER_MS"] = "7"
     env["G3T_FAKESTEAM_LOSS_PERMILLE"] = "0"
@@ -197,8 +156,7 @@ def scenario_environment(fake_dll, output_dir, role, peer_id,
 
     if role == "client":
         env["G3T_FAKESTEAM_JOIN_FRIEND"] = str(HOST_ID)
-        env["G3T_FAKESTEAM_JOIN_CONNECT"] = (
-            "+g3t_connect " + str(HOST_ID) + " realism")
+        env["G3T_FAKESTEAM_JOIN_CONNECT"] = "+g3t_connect " + str(HOST_ID) + " realism"
         env["G3T_FAKESTEAM_JOIN_DELAY_MS"] = "0"
     if scenario == "metadata":
         env["G3T_FAKESTEAM_METADATA_DELAY_MS"] = "300"
@@ -252,49 +210,6 @@ def peer_args(role, scenario, seconds, leave_ms, offered_bps=None):
     return args
 
 
-def run_peer(executable, base_env, role, scenario, seconds, output_dir,
-             case_dir, leave_ms, peer_port, remote_port, remote_id,
-             offered_bps=None):
-    namespace = uuid.uuid4().hex
-    is_host = role == "host"
-    peer_id = HOST_ID if is_host else CLIENT_ID
-    env = scenario_environment(
-        Path(base_env["G3T_REALISM_FAKE_DLL"]), case_dir, role, peer_id,
-        peer_port, remote_port, remote_id, scenario, seconds)
-    for name, value in base_env.items():
-        if name not in env and not name.upper().startswith("G3T_FAKESTEAM_"):
-            env[name] = value
-    args = [str(executable), *peer_args(
-                role, scenario, seconds, leave_ms, offered_bps),
-            "--out", str(case_dir / (role + "-metrics.json"))]
-    log = case_dir / (role + ".log")
-    with log.open("w", encoding="utf-8", errors="replace") as capture:
-        proc = subprocess.Popen(args, cwd=str(case_dir), env=env,
-                                stdout=capture, stderr=subprocess.STDOUT,
-                                text=True)
-    try:
-        proc.wait(timeout=seconds + 45)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-        return {"timed_out": True, "returncode": proc.returncode,
-                "log": str(log)}
-    metric_path = case_dir / (role + "-metrics.json")
-    if not metric_path.is_file():
-        metrics = {"__metrics_error__": "structured metrics file missing"}
-    else:
-        try:
-            metrics = json.loads(metric_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            metrics = {"__metrics_error__": "structured metrics file invalid: " + str(exc)}
-    return {"timed_out": False, "returncode": proc.returncode,
-            "log": str(log), "metrics": metrics}
-
-
 def run_pair(executable, base_env, scenario, seconds, output_dir, case_dir,
              leave_ms, offered_bps=None):
     namespace = uuid.uuid4().hex
@@ -338,23 +253,15 @@ def run_pair(executable, base_env, scenario, seconds, output_dir, case_dir,
     try:
         host_proc, host_capture, host_log = launch("host")
         client_proc, client_capture, client_log = launch("client")
-        try:
-            host_proc.wait(timeout=seconds + 45)
-        except subprocess.TimeoutExpired:
-            timed_out.add("host")
-        try:
-            client_proc.wait(timeout=seconds + 45)
-        except subprocess.TimeoutExpired:
-            timed_out.add("client")
+        for role, proc in (("host", host_proc), ("client", client_proc)):
+            try:
+                proc.wait(timeout=seconds + 45)
+            except subprocess.TimeoutExpired:
+                timed_out.add(role)
     finally:
-        for role, proc, capture in (
-                ("host", host_proc, host_capture),
-                ("client", client_proc, client_capture)):
+        for proc, capture in ((host_proc, host_capture), (client_proc, client_capture)):
             if proc is not None and proc.poll() is None:
-                if role in timed_out:
-                    proc.terminate()
-                else:
-                    proc.terminate()
+                proc.terminate()
                 try:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
@@ -371,8 +278,7 @@ def run_pair(executable, base_env, scenario, seconds, output_dir, case_dir,
             try:
                 metrics = json.loads(metric_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
-                metrics = {"__metrics_error__":
-                           "structured metrics file invalid: " + str(exc)}
+                metrics = {"__metrics_error__": "structured metrics file invalid: " + str(exc)}
         return {
             "timed_out": role in timed_out,
             "returncode": proc.returncode if proc is not None else -1,
@@ -384,129 +290,59 @@ def run_pair(executable, base_env, scenario, seconds, output_dir, case_dir,
             result("client", client_proc, client_log))
 
 
+MAX_METRICS = (
+    "channel0_outstanding_bytes", "channel0_peak_outstanding_bytes",
+    "channel0_outstanding_slope_bytes_per_second", "stress_offer_duration_ms",
+    "stress_offer_bps_observed", "product_queue_bytes", "product_queue_depth",
+    "product_queue_oldest_ms", "product_queue_peak_bytes",
+    "product_queue_peak_depth", "product_queue_peak_age_ms",
+    "product_queue_slope_bytes_per_second", "rtt_enet_p50_ms",
+    "rtt_enet_p95_ms", "rtt_enet_max_ms", "exact_reliable_payload_mismatch",
+    "native_connect_header_size", "native_verify_header_size",
+    "native_observed_connect_header", "native_observed_verify_header",
+)
+SUM_METRICS = (
+    "exact_reliable_payloads_sent", "exact_reliable_payloads_received",
+    "native_outbound_frames", "native_outbound_compressed_frames",
+    "native_outbound_connect_frames", "native_outbound_verify_frames",
+    "native_outbound_compressed_connect_frames",
+    "native_outbound_compressed_verify_frames",
+)
+
+
 def merge_metrics(host, client):
     hm = host.get("metrics") or {}
     cm = client.get("metrics") or {}
-    if hm and cm:
-        plain_bytes = (hm.get("steam_plain_tx_bytes", 0) +
-                       cm.get("steam_plain_tx_bytes", 0))
-        wire_bytes = (hm.get("steam_wire_tx_bytes", 0) +
-                      cm.get("steam_wire_tx_bytes", 0))
-        return {
-            "host": hm,
-            "client": cm,
-            "linked": bool(hm.get("linked_count", 0) or
-                           cm.get("host_link_observed")),
-            "host_enet_connected": bool(hm.get("enet_connected")),
-            "client_enet_connected": bool(cm.get("enet_connected")),
-            "enet_connected": bool(hm.get("enet_connected") and cm.get("enet_connected")),
-            "host_link_observed": bool(hm.get("host_link_observed") and
-                                       cm.get("host_link_observed")),
-            "channel0_app_offered_bytes": hm.get("channel0_app_offered_bytes",
-                                                 cm.get("channel0_app_offered_bytes", 0)),
-            "channel0_app_received_bytes": cm.get("channel0_app_received_bytes",
-                                                  hm.get("channel0_app_received_bytes", 0)),
-            "channel0_outstanding_bytes": max(
-                hm.get("channel0_outstanding_bytes", 0),
-                cm.get("channel0_outstanding_bytes", 0)),
-            "channel0_peak_outstanding_bytes": max(
-                hm.get("channel0_peak_outstanding_bytes", 0),
-                cm.get("channel0_peak_outstanding_bytes", 0)),
-            "channel0_outstanding_slope_bytes_per_second": max(
-                hm.get("channel0_outstanding_slope_bytes_per_second", 0),
-                cm.get("channel0_outstanding_slope_bytes_per_second", 0)),
-            "stress_offer_started": bool(
-                hm.get("stress_offer_started") or cm.get("stress_offer_started")),
-            "stress_offer_duration_ms": max(
-                hm.get("stress_offer_duration_ms", 0),
-                cm.get("stress_offer_duration_ms", 0)),
-            "stress_offer_bps_observed": max(
-                hm.get("stress_offer_bps_observed", 0),
-                cm.get("stress_offer_bps_observed", 0)),
-            "product_queue_bytes": max(
-                hm.get("product_queue_bytes", 0),
-                cm.get("product_queue_bytes", 0)),
-            "product_queue_depth": max(
-                hm.get("product_queue_depth", 0),
-                cm.get("product_queue_depth", 0)),
-            "product_queue_oldest_ms": max(
-                hm.get("product_queue_oldest_ms", 0),
-                cm.get("product_queue_oldest_ms", 0)),
-            "product_queue_peak_bytes": max(
-                hm.get("product_queue_peak_bytes", 0),
-                cm.get("product_queue_peak_bytes", 0)),
-            "product_queue_peak_depth": max(
-                hm.get("product_queue_peak_depth", 0),
-                cm.get("product_queue_peak_depth", 0)),
-            "product_queue_peak_age_ms": max(
-                hm.get("product_queue_peak_age_ms", 0),
-                cm.get("product_queue_peak_age_ms", 0)),
-            "product_queue_slope_bytes_per_second": max(
-                hm.get("product_queue_slope_bytes_per_second", 0),
-                cm.get("product_queue_slope_bytes_per_second", 0)),
-            "channel0_echo": hm.get("channel0_echo"),
-            "channel1_echo": hm.get("channel1_echo"),
-            "player_opcode3_echo": hm.get("player_opcode3_echo"),
-            "rtt_enet_p50_ms": max(
-                hm.get("rtt_enet_p50_ms", 0), cm.get("rtt_enet_p50_ms", 0)),
-            "rtt_enet_p95_ms": max(
-                hm.get("rtt_enet_p95_ms", 0), cm.get("rtt_enet_p95_ms", 0)),
-            "rtt_enet_max_ms": max(
-                hm.get("rtt_enet_max_ms", 0), cm.get("rtt_enet_max_ms", 0)),
-            "exact_reliable_payloads_sent": (
-                hm.get("exact_reliable_payloads_sent", 0) +
-                cm.get("exact_reliable_payloads_sent", 0)),
-            "exact_reliable_payloads_received": (
-                hm.get("exact_reliable_payloads_received", 0) +
-                cm.get("exact_reliable_payloads_received", 0)),
-            "exact_reliable_payload_mismatch": max(
-                hm.get("exact_reliable_payload_mismatch", 0),
-                cm.get("exact_reliable_payload_mismatch", 0)),
-            "native_connect_header_size": max(
-                hm.get("native_connect_header_size", 0),
-                cm.get("native_connect_header_size", 0)),
-            "native_verify_header_size": max(
-                hm.get("native_verify_header_size", 0),
-                cm.get("native_verify_header_size", 0)),
-            "native_outbound_frames": (
-                hm.get("native_outbound_frames", 0) +
-                cm.get("native_outbound_frames", 0)),
-            "native_outbound_compressed_frames": (
-                hm.get("native_outbound_compressed_frames", 0) +
-                cm.get("native_outbound_compressed_frames", 0)),
-            "native_outbound_connect_frames": (
-                hm.get("native_outbound_connect_frames", 0) +
-                cm.get("native_outbound_connect_frames", 0)),
-            "native_outbound_verify_frames": (
-                hm.get("native_outbound_verify_frames", 0) +
-                cm.get("native_outbound_verify_frames", 0)),
-            "native_outbound_compressed_connect_frames": (
-                hm.get("native_outbound_compressed_connect_frames", 0) +
-                cm.get("native_outbound_compressed_connect_frames", 0)),
-            "native_outbound_compressed_verify_frames": (
-                hm.get("native_outbound_compressed_verify_frames", 0) +
-                cm.get("native_outbound_compressed_verify_frames", 0)),
-            "native_observed_connect_header": max(
-                hm.get("native_observed_connect_header", 0),
-                cm.get("native_observed_connect_header", 0)),
-            "native_observed_verify_header": max(
-                hm.get("native_observed_verify_header", 0),
-                cm.get("native_observed_verify_header", 0)),
-            "steam_plain_tx_bytes": plain_bytes,
-            "steam_wire_tx_bytes": wire_bytes,
-            "compression_ratio_plain_over_wire": (
-                plain_bytes / wire_bytes if wire_bytes else 0),
-            "compression_ratio_scope": "both-directions-byte-weighted",
-            "fake_stats": {
-                "host": hm.get("fake_stats"),
-                "client": cm.get("fake_stats"),
-            },
-            "fake_config": {
-                "host": hm.get("fake_config"),
-                "client": cm.get("fake_config"),
-            },
-        }
-    return {"host": hm, "client": cm}
+    if not (hm and cm):
+        return {"host": hm, "client": cm}
+    plain_bytes = hm.get("steam_plain_tx_bytes", 0) + cm.get("steam_plain_tx_bytes", 0)
+    wire_bytes = hm.get("steam_wire_tx_bytes", 0) + cm.get("steam_wire_tx_bytes", 0)
+    merged = {
+        "host": hm,
+        "client": cm,
+        "linked": bool(hm.get("linked_count", 0) or cm.get("host_link_observed")),
+        "host_enet_connected": bool(hm.get("enet_connected")),
+        "client_enet_connected": bool(cm.get("enet_connected")),
+        "enet_connected": bool(hm.get("enet_connected") and cm.get("enet_connected")),
+        "host_link_observed": bool(hm.get("host_link_observed") and cm.get("host_link_observed")),
+        "channel0_app_offered_bytes": hm.get("channel0_app_offered_bytes", cm.get("channel0_app_offered_bytes", 0)),
+        "channel0_app_received_bytes": cm.get("channel0_app_received_bytes", hm.get("channel0_app_received_bytes", 0)),
+        "stress_offer_started": bool(hm.get("stress_offer_started") or cm.get("stress_offer_started")),
+        "channel0_echo": hm.get("channel0_echo"),
+        "channel1_echo": hm.get("channel1_echo"),
+        "player_opcode3_echo": hm.get("player_opcode3_echo"),
+        "steam_plain_tx_bytes": plain_bytes,
+        "steam_wire_tx_bytes": wire_bytes,
+        "compression_ratio_plain_over_wire": plain_bytes / wire_bytes if wire_bytes else 0,
+        "compression_ratio_scope": "both-directions-byte-weighted",
+        "fake_stats": {"host": hm.get("fake_stats"), "client": cm.get("fake_stats")},
+        "fake_config": {"host": hm.get("fake_config"), "client": cm.get("fake_config")},
+    }
+    for key in MAX_METRICS:
+        merged[key] = max(hm.get(key, 0), cm.get(key, 0))
+    for key in SUM_METRICS:
+        merged[key] = hm.get(key, 0) + cm.get(key, 0)
+    return merged
 
 
 def bounded_traffic_reasons(metrics, p95_ms=250, maximum_ms=1000):

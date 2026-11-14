@@ -28,6 +28,7 @@ class NpcStreamDiagnosticsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
         cls.npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        cls.npc_send = (ROOT / "src" / "npc_send.cpp").read_text(encoding="utf-8")
 
     def test_engine_free_diagnostics(self):
         compiler = shutil.which("clang++") or shutil.which("g++")
@@ -85,8 +86,8 @@ class NpcStreamDiagnosticsTests(unittest.TestCase):
 
     def test_sendowned_stream_instrumentation_without_bandwidth_gate(self):
         start = self.npcs.index("void SendOwned(")
-        end = self.npcs.index("// A client simulates", start)
-        sendowned = self.npcs[start:end]
+        end = self.npcs.index("void TryPlayerBlow(", start)
+        sendowned = self.npcs[start:end] + "\n" + self.npc_send
         for call in (
             "streamDiag.BeginTick(", "streamDiag.Candidates(", "streamDiag.Reach(",
             "streamDiag.Sent(", "streamDiag.Released(", "streamDiag.Flush(",

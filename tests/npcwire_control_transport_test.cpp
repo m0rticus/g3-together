@@ -977,5 +977,61 @@ int main()
     assert(decodeErrsAfter == decodeErrsBefore);
     assert(applied == appliedBeforeEssential + 1 && appliedEssential && appliedInterval == quietWire);
 
+    // Forced same-baseline resync allocates a fresh offer serial (rejecting any late pre-resync ACK)
+    // and only commits the resync cursor once ID + baseline offers actually enqueue.
+    ResetNpcReplication();
+    NpcRecord resyncRecord = Record(903);
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, resyncRecord, streamBones, 1, 0, false, 33));
+    const auto initialBootstrap = transmissions;
+    transmissions.clear();
+    isHost = false;
+    for (auto const& packet : initialBootstrap) Deliver(&fakePeer, packet);
+    Transmission firstControlAck{};
+    for (auto const& response : transmissions) {
+        if (response.bytes[0] == MsgControlSignal) firstControlAck = response;
+        isHost = true;
+        Deliver(&fakePeer, response);
+        isHost = false;
+    }
+    assert(!firstControlAck.bytes.empty());
+    isHost = true;
+    assert(controlAcknowledged[2].size() == 1);
+    const uint16_t resyncControlId = controlAcknowledged[2].begin()->first;
+    // Simulate client losing its control receiver and requesting a resync while host Send fails.
+    controlReceiver = npcwire::Context{};
+    receivedControlGeneration = 0;
+    requestedControlId = 0;
+    fakeTime += 33;
+    resyncRecord.sent = fakeTime;
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, resyncRecord, streamBones, 1, 0, false, 33));
+    const auto compactSample = transmissions.front();
+    transmissions.clear();
+    isHost = false;
+    Deliver(&fakePeer, compactSample);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
+    const auto resyncSignal = transmissions.front();
+    transmissions.clear();
+    isHost = true;
+    failSend = true;
+    Deliver(&fakePeer, resyncSignal);
+    failSend = false;
+    assert(controlAcknowledged[2].empty());
+    // Because the offer failed to enqueue, CommitResync did not suppress a retry of the same resync.
+    transmissions.clear();
+    Deliver(&fakePeer, resyncSignal);
+    assert(transmissions.size() >= 2 &&
+           transmissions[0].bytes[0] == MsgControlId &&
+           transmissions[1].bytes[0] == MsgControlBaseline);
+    const auto reofferedPackets = transmissions;
+    // A late copy of the pre-resync ACK (old serial) must be rejected and not satisfy the new offer.
+    const unsigned rejectedBeforeStaleAck = npcRejected;
+    Deliver(&fakePeer, firstControlAck);
+    assert(npcRejected == rejectedBeforeStaleAck + 1);
+    assert(!controlAcknowledged[2].count(resyncControlId));
+    clientReceive(reofferedPackets);
+    assert(controlAcknowledged[2].count(resyncControlId) == 1);
+
     return 0;
 }

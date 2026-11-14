@@ -84,8 +84,8 @@ class NpcLeasePresentationTests(unittest.TestCase):
         hold = source[source.index("bool HoldUnavailable("):source.index("void ReleaseUnavailable(")]
         self.assertIn("reactionDuration", hold)
         self.assertLess(hold.index("HostPresentationAvailable"), hold.index("PoseProvenance::Reaction"))
-        combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
-        contact = combat[combat.index("bool SendHostJudgedMelee("):combat.index("// Stufe 4.1:")]
+        combat = (ROOT / "src" / "combat_melee.cpp").read_text(encoding="utf-8")
+        contact = combat[combat.index("bool SendHostJudgedMelee("):combat.index("void PlayHitEffect(")]
         self.assertLess(contact.index("CosmeticHit"), contact.index("net::SendHitNpc"))
         self.assertIn("contact.motion", contact)
         self.assertIn("visual=%u", source)

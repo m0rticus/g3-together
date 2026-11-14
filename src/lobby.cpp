@@ -15,6 +15,24 @@
 namespace g3t::lobby {
 namespace connect = steam::connect;
 
+namespace {
+void CountJoinedClients(State& state)
+{
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+        if (net::PeerJoined(id)) {
+            ++state.clients;
+            state.readyClients += net::InWorld(id) ? 1 : 0;
+        }
+    }
+}
+
+Phase ClientSessionPhase()
+{
+    if (!net::Joined()) return Phase::Connecting;
+    return net::Connected() ? Phase::Joined : Phase::WaitingCampaign;
+}
+}
+
 State Snapshot()
 {
     State state;
@@ -40,18 +58,11 @@ State Snapshot()
         if (flow.automatic) {
             if (state.host) {
                 state.phase = state.id ? Phase::Hosting : Phase::Creating;
-                for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
-                    if (net::PeerJoined(id)) {
-                        ++state.clients;
-                        state.readyClients += net::InWorld(id) ? 1 : 0;
-                    }
-                }
+                CountJoinedClients(state);
             } else if (!state.id) {
                 state.phase = Phase::Searching;
-            } else if (!net::Joined()) {
-                state.phase = Phase::Connecting;
             } else {
-                state.phase = net::Connected() ? Phase::Joined : Phase::WaitingCampaign;
+                state.phase = ClientSessionPhase();
             }
         } else if (state.host) {
             switch (flow.hostState) {
@@ -71,12 +82,7 @@ State Snapshot()
                 break;
             case connect::HostFlow::State::Linked:
                 state.phase = Phase::Hosting;
-                for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
-                    if (net::PeerJoined(id)) {
-                        ++state.clients;
-                        state.readyClients += net::InWorld(id) ? 1 : 0;
-                    }
-                }
+                CountJoinedClients(state);
                 break;
             }
         } else {
@@ -97,8 +103,7 @@ State Snapshot()
                 if (!state.id || !*state.name) strncpy_s(state.name, flow.name, _TRUNCATE);
                 break;
             case connect::ClientFlow::State::Linked:
-                if (!net::Joined()) state.phase = Phase::Connecting;
-                else state.phase = net::Connected() ? Phase::Joined : Phase::WaitingCampaign;
+                state.phase = ClientSessionPhase();
                 break;
             case connect::ClientFlow::State::Declined:
                 state.phase = Phase::Declined;

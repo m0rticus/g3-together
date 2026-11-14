@@ -9,6 +9,7 @@
 namespace g3t::pose {
 constexpr int MaxBones = 256;
 constexpr int HistorySize = 128;
+constexpr size_t MaxRetainedFrames = 512;
 constexpr float BasisScale = 4096.0f;
 constexpr float PositionScale = 4.0f;
 constexpr uint8_t Facial = 1;
@@ -64,6 +65,8 @@ class History {
         while (frames.size() - consumed > HistorySize && haveSampled &&
                static_cast<int32_t>(sampledSent - frames[consumed + 1].sent) >= 0)
             ++consumed;
+        if (frames.size() - consumed > MaxRetainedFrames)
+            consumed = frames.size() - MaxRetainedFrames;
         if (consumed) frames.erase(frames.begin(), frames.begin() + consumed);
     }
 

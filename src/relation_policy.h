@@ -89,9 +89,10 @@ inline Apply ApplyHost(int stored, uint8_t wanted, uint8_t lastWritten)
 }
 
 // A script of this machine asking a passive mirror for its relation gets the host's answer.
-inline bool MirrorAnswersFromHost(bool mirrored, bool currentHostSession, bool haveRecord, uint8_t hostAttitude)
+inline bool MirrorAnswersFromHost(bool mirrored, bool currentHostSession, bool haveRecord, uint8_t hostAttitude,
+                                  bool sharedAttitudeValid = true)
 {
-    return mirrored && currentHostSession && haveRecord && ValidAttitude(hostAttitude);
+    return mirrored && currentHostSession && haveRecord && ValidAttitude(hostAttitude) && sharedAttitudeValid;
 }
 
 enum Mismatch : unsigned { Drift = 1, Unapplied = 2, StaleNone = 4, Unsent = 8, TruthDiffers = 16 };

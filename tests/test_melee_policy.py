@@ -13,6 +13,9 @@ class MeleePolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
+        cls.combat_melee = (ROOT / "src" / "combat_melee.cpp").read_text(encoding="utf-8")
+        cls.combat_claims = (ROOT / "src" / "combat_claims.cpp").read_text(encoding="utf-8")
+        cls.combat_all = "\n".join((cls.combat, cls.combat_melee, cls.combat_claims))
         cls.net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
         cls.net_h = (ROOT / "src" / "net.h").read_text(encoding="utf-8")
         cls.npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
@@ -42,6 +45,18 @@ int main()
     static_assert(JudgeClient(true, false) == ClientDecision::HostJudge);
     static_assert(JudgeClient(false, true) == ClientDecision::Reject);
     static_assert(JudgeClient(true, true) == ClientDecision::Predict);
+    static_assert(EvaluatePlayerMelee(0, true, true) == ClientDecision::Predict);
+    static_assert(EvaluatePlayerMelee(1, false, false) == ClientDecision::HostJudge);
+    static_assert(EvaluatePlayerMelee(3, true, true) == ClientDecision::Reject);
+    static_assert(ResolveOutgoingHitIncarnation(0, 0, 0) == UnstreamedHitIncarnation);
+    static_assert(ResolveOutgoingHitIncarnation(7, 0, 0) == 7);
+    static_assert(ResolveOutgoingHitIncarnation(0, 12, 0) == 0);
+    static_assert(ResolveOutgoingHitIncarnation(0, 0, 1) == 0);
+    static_assert(AcceptIncomingHitIncarnation(UnstreamedHitIncarnation, 0, 0, 42));
+    static_assert(!AcceptIncomingHitIncarnation(UnstreamedHitIncarnation, 1, 0, 42));
+    static_assert(!AcceptIncomingHitIncarnation(UnstreamedHitIncarnation, 0, 1, 42));
+    static_assert(AcceptIncomingHitIncarnation(42, 10, 1, 42));
+    static_assert(!AcceptIncomingHitIncarnation(41, 10, 1, 42));
     assert(ClaimedSwing(2082, 0, 2082)); // first snapshot must not permit the same unknown-life swing twice
     assert(ClaimedSwing(2082, 2082, 0));
     assert(!ClaimedSwing(2083, 2082, 2082));
@@ -171,22 +186,27 @@ int main()
             self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_local_rule_precedes_judgement_flinch_and_perception(self):
-        judge = self.combat.split("GEInt Judge(int which", 1)[1].split("// Owner of the NPC:", 1)[0]
+        judge = self.combat.split("GEInt Judge(int which", 1)[1].split("GEInt GE_STDCALL FilterLogical(", 1)[0]
         gate = judge.index("!LocalMeleeAllowed(")
         for operation in ("if (which >= 2)", "npcplayback::BeginHit(", "ai::DamagePerception perception", "judge[which]("):
             self.assertLess(gate, judge.index(operation))
         self.assertIn("which == 0 ? other : self", judge)
         self.assertIn("which == 0 ? self : other", judge)
         self.assertIn("judge[which](spu, self, other, args)", judge)  # originals keep their native argument order
+        self.assertNotIn(".at(", judge)
 
     def test_host_revalidation_precedes_all_hit_side_effects(self):
-        claim = self.combat.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
-        gate = claim.index("if (!verdict.allowed) return;")
-        for operation in ("Scaled(", "remote::NoteContact(", "npcplayback::HitOrigin", "struct Pass", "++claimsApplied",
+        claim = self.combat_claims.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
+        fence = claim.index("if (!net::InWorld(from) || downed::CombatUnavailable(attacker)")
+        gate = claim.index("melee::EvaluatePlayerMelee(contact.melee, verdict.allowed, verdict.relationsKnown)")
+        self.assertLess(fence, claim.index("if (contact.melee)"))
+        self.assertIn("summon::HitBlocked(target.GetInstance())", claim)
+        for operation in ("Scaled(", "remote::NoteContact(", "npcplayback::HitOrigin", "HitDispatchScope pass", "++claimsApplied",
                           'CallScript("AddHitPoints"', "PlayHitEffect(", "React(", "ApplyReaction(", "witness::HitSeen("):
             self.assertLess(gate, claim.index(operation))
         self.assertLess(claim.index("OutsideBout("), claim.index("remote::NoteContact("))
         self.assertIn('if (!attacker) {', claim)
+        self.assertIn("if (target.IsDead()) RewardKill(from, guid);", claim)
 
     def test_attitude_query_does_not_redirect_or_register_contact(self):
         query = self.ai.split("bool TryPlayerAttitude(", 1)[1].split("unsigned AttitudeAsked(", 1)[0]
@@ -209,8 +229,8 @@ int main()
         self.assertNotIn("allowed", contact)
         self.assertIn("constexpr uint16_t ProtocolVersion = saving::Protocol;", self.net)
         self.assertIn("message.incarnation, message.contact", self.net)
-        self.assertIn("hit.contact = contact;", self.combat)
-        self.assertIn("hit.incarnation, hit.contact", self.combat)
+        self.assertIn("hit.contact = contact;", self.combat_all)
+        self.assertIn("hit.incarnation, hit.contact", self.combat_all)
 
     def test_npc_opponent_replay_and_contact_query_share_collision_checked_identity(self):
         self.assertIn("r.combatTarget = net::HashGuid(targetGuid)", self.npcs)
@@ -232,19 +252,19 @@ int main()
         self.assertIn("AccessCurrentTargetEntity().SetEntity(opponent)", replay)
         self.assertNotIn("CallScript", replay)
         self.assertNotIn("SetCurrentTarget", replay)
-        judge = self.combat.split("MeleeVerdict JudgeMelee(", 1)[1].split("void LogMelee(", 1)[0]
+        judge = self.combat_melee.split("MeleeVerdict JudgeMelee(", 1)[1].split("void LogMelee(", 1)[0]
         self.assertNotIn("npcs::Ready(", judge)
         self.assertIn("npcs::CombatRecord(result.focus)", judge)
         self.assertIn("npcs::CombatRecord(opponent)", judge)
         self.assertLess(judge.index('result.decision = "missing-relation-record"'), judge.index("v.attitude = RawAttitude("))
 
     def test_incomplete_contacts_are_sent_before_local_damage_or_reaction(self):
-        judge = self.combat.split("GEInt Judge(int which", 1)[1].split("// Owner of the NPC:", 1)[0]
+        judge = self.combat.split("GEInt Judge(int which", 1)[1].split("GEInt GE_STDCALL FilterLogical(", 1)[0]
         send = judge.index("SendHostJudgedMelee(")
         for operation in ("npcplayback::BeginHit(", "ai::DamagePerception perception", "judge[which](spu"):
             self.assertLess(send, judge.index(operation))
         self.assertNotIn("npcs::Ready(", judge)
-        submit = self.combat.split("bool SendHostJudgedMelee(", 1)[1].split("// Stufe 4.1:", 1)[0]
+        submit = self.combat_melee.split("bool SendHostJudgedMelee(", 1)[1].split("void PlayHitEffect(", 1)[0]
         self.assertIn("ClaimedPlayerSwing(identity, contact.motion)", submit)
         self.assertIn("contact.melee = net::HostJudgedMelee;", submit)
         self.assertIn("identity, 0, weapon, nullptr, net::HitUnjudged", submit)
@@ -253,13 +273,15 @@ int main()
         self.assertIn("npcs::AwaitHit(victim, hit)", submit)
         for forbidden in ("GameHit(", "npcs::LocalHit(", "PlayHitEffect(", "BeginHit(", "DamagePerception"):
             self.assertNotIn(forbidden, submit)
-        host = self.combat.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
-        self.assertLess(host.index("if (!verdict.allowed) return;"), host.index("JudgeDamage("))
+        host = self.combat_claims.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
+        gate = host.index("melee::EvaluatePlayerMelee(contact.melee, verdict.allowed, verdict.relationsKnown)")
+        self.assertLess(gate, host.index("JudgeDamage("))
         self.assertLess(host.index("IgnoreFriendlyHit("), host.index("JudgeDamage("))
         self.assertLess(host.index("OutsideBout("), host.index("JudgeDamage("))
         self.assertLess(host.index("bool finishing = false;"), host.index("JudgeDamage("))
         self.assertLess(host.index("if (target.IsDown() || since < 3000)"), host.index("JudgeDamage("))
-        self.assertIn("reply.result.incarnation = npcs::Incarnation(guid)", host)
+        self.assertIn("const uint32_t hostIncarnation = npcs::Incarnation(guid);", host)
+        self.assertIn("reply.result.incarnation = hostIncarnation;", host)
         self.assertIn("delta = -pending;", host)
 
     def test_visible_player_sweeps_and_notice_do_not_depend_on_replay_success(self):
@@ -273,7 +295,7 @@ int main()
         self.assertIn("ClearContact(hero, victim)", sweep)
         tick = self.npcs.split("void PassiveMirrorTick()", 1)[1].split("bool MirrorFightsHero()", 1)[0]
         self.assertIn("npcplayback::IsPassive(victim)) TryPlayerBlow(victim)", tick)
-        blow = self.combat.split("bool PlayerBlow(", 1)[1].split("bool Switch(", 1)[0]
+        blow = self.combat_melee.split("bool PlayerBlow(", 1)[1]
         self.assertNotIn("npcs::Ready(", blow)
         self.assertLess(blow.index("SendHostJudgedMelee("), blow.index("GameHit("))
         replay = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
@@ -289,20 +311,21 @@ int main()
         self.assertIn("ValidHitContact(", send)
 
     def test_contact_context_and_dedup_are_retained_until_send_then_cleared(self):
-        self.assertIn("context->second.contact.motion == npcplayback::MotionInstance(localMeleeActor)", self.combat)
-        self.assertIn("contact = context->second.contact;", self.combat)
-        self.assertIn("playerClaims[claimKey] = swing;", self.combat)
-        self.assertIn("playerMeleeContacts.clear();", self.combat)
-        self.assertIn("refusedMelee.clear();", self.combat)
-        self.assertIn("playerMeleeContacts.at(KillKey(guid)).verdict", self.combat)
+        self.assertIn("context->second.contact.motion == npcplayback::MotionInstance(localMeleeActor)", self.combat_all)
+        self.assertIn("contact = context->second.contact;", self.combat_all)
+        self.assertIn("playerClaims[claimKey] = swing;", self.combat_all)
+        self.assertIn("playerMeleeContacts.clear();", self.combat_all)
+        self.assertIn("refusedMelee.clear();", self.combat_all)
+        self.assertIn("playerMeleeContacts.find(KillKey(identity))", self.combat_all)
+        self.assertNotIn(".at(", self.combat_all)
 
     def test_tail_contacts_are_classified_and_local_geometry_bout_gates_remain(self):
-        classify = self.combat.split("bool IsLocalMelee(", 1)[1].split("net::MeleeContact CaptureMelee(", 1)[0]
+        classify = self.combat_melee.split("bool IsLocalMelee(", 1)[1].split("net::MeleeContact CaptureMelee(", 1)[0]
         self.assertNotIn("LocallyAttacking", classify)
         self.assertIn("eEPropertySetType_Projectile", classify)
         self.assertIn("Interaction.GetSpell()", classify)
-        self.assertIn('result.decision = "outside-bout";', self.combat)
-        local = self.combat.split("bool LocalMeleeAllowed(", 1)[1].split("// Stufe 4.1:", 1)[0]
+        self.assertIn('result.decision = "outside-bout";', self.combat_melee)
+        local = self.combat_melee.split("bool LocalMeleeAllowed(", 1)[1].split("bool SendHostJudgedMelee(", 1)[0]
         self.assertIn("!Entity(attacker).IsInFOV(Entity(victim))", local)
         self.assertIn("contact.item && !Entity(attacker).IsInFOV(Entity(victim))", local)
         self.assertLess(local.index("IsInFOV("), local.index("playerMeleeContacts[key]"))

@@ -403,8 +403,11 @@ HostExpected Expected(HostSnapshot s, HostFixture f, HE e)
             s.declineWhy = Why::Busy;
             s.declineArg = 0;
             fx = H::SendDecline;
-        } else if (f.state == HS::Offered || f.state == HS::Linked) {
+        } else if (f.state == HS::Offered) {
             fx = H::SendOffer;
+        } else if (f.state == HS::Linked) {
+            s.state = HS::Offered;
+            fx = H::RotatePartner | H::SendOffer;
         }
     } else if (e == HE::Created || e == HE::Failed) {
         if (f.state != HS::Opening) {
@@ -698,6 +701,21 @@ void Simulation()
     assert(host.declineWhy() == Why::Busy && host.partner() == Self && host.state() == HS::Linked);
     DeliverDecline(host, second, Other, "default");
     assert(second.state() == CS::Declined && second.why() == Why::Busy);
+
+    // Same partner rejoining while Linked rotates once to Offered (with fresh OfferWaitMs deadline),
+    // and any retransmitted request while Offered re-sends the offer without rotating again.
+    C rejoin = ReadyClient(Self);
+    assert(rejoin.Accept(C::Source::RichJoin, Host, HostTarget(), Start + 500) == C::SendRequest);
+    assert(SendJoin(rejoin, host, Self, true, "default", Protocol, Protocol, Start + 500) ==
+           (H::RotatePartner | H::SendOffer));
+    assert(host.state() == HS::Offered && host.partner() == Self);
+    assert(SendJoin(rejoin, host, Self, true, "default", Protocol, Protocol, Start + 1500) == H::SendOffer);
+    assert(host.Tick(Start + 500 + OfferWaitMs - 1) == H::None);
+    DeliverOffer(host, rejoin, Start + 1500);
+    assert(rejoin.LobbyEntered(Lobby, true, M::Match, Host, Start + 1600) == C::HelloReady);
+    assert(host.Admit(Self) && host.Linked(Self) == H::None);
+    assert(rejoin.Welcomed(Host) == C::None);
+    assert(host.state() == HS::Linked && rejoin.state() == CS::Linked);
 
     // Host quits: the client is inert until a fresh accept, and the host can reserve again.
     assert(client.LinkLost(Host) == C::Teardown && client.state() == CS::Lost);

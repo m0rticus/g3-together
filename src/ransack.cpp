@@ -14,6 +14,7 @@
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -199,15 +200,18 @@ void Hook()
 // Robbed side: pay a take from the real hero (as much as it still has), and say so.
 void Pay(uint8_t from, net::RansackNote const& note)
 {
+    if (note.amount <= 0) return;
     ++takesReceived;
     net::RansackNote reply;
     reply.op = net::RansackPaid;
     reply.seq = note.seq;
     std::memcpy(reply.robber, note.robber, 16);
-    if (!applied[from].insert(note.seq).second) {  // the same robbery again: paid already, nothing more
+    if (applied[from].count(note.seq)) {  // the same robbery again: paid already, nothing more
         Logf("ransack: robbery %u of player %d came again; paid already", note.seq, from);
         return;
     }
+    if (applied[from].size() >= 1024) applied[from].erase(applied[from].begin());
+    applied[from].insert(note.seq);
     if (downed::Held()) {
         net::SendRansack(from, reply);
         Logf("ransack: robbery %u refused; this player is waiting for help", note.seq);
@@ -215,7 +219,7 @@ void Pay(uint8_t from, net::RansackNote const& note)
     }
     eCDynamicEntity* instance = gCSession::GetInstance().GetHero();
     int paid = 0, before = 0;
-    if (instance && note.amount > 0) {
+    if (instance) {
         Entity hero(instance);
         before = hero.Inventory.GetItemAmount(Template(Gold));
         paid = TakeGold(hero, note.amount);
@@ -245,15 +249,16 @@ void Paid(uint8_t from, net::RansackNote const& note)
 {
     for (auto it = pending.begin(); it != pending.end(); ++it) {
         if (it->player != from || it->seq != note.seq) continue;
+        const int32_t paidAmount = std::clamp<int32_t>(note.amount, 0, it->amount);
         ++takesPaid;
-        goldPaid += note.amount;
-        if (note.amount < it->amount) {
+        goldPaid += paidAmount;
+        if (paidAmount < it->amount) {
             Entity robber = ByGuid(it->robber);
-            const int back = robber.GetInstance() ? TakeGold(robber, it->amount - note.amount) : 0;
+            const int back = robber.GetInstance() ? TakeGold(robber, it->amount - paidAmount) : 0;
             ++corrections;
-            Logf("ransack: player %d paid %d of %d gold (robbery %u); the robber gives %d back", from, note.amount, it->amount, note.seq, back);
+            Logf("ransack: player %d paid %d of %d gold (robbery %u); the robber gives %d back", from, paidAmount, it->amount, note.seq, back);
         } else {
-            Logf("ransack: player %d paid %d gold (robbery %u)", from, note.amount, note.seq);
+            Logf("ransack: player %d paid %d gold (robbery %u)", from, paidAmount, note.seq);
         }
         pending.erase(it);
         return;
@@ -263,11 +268,12 @@ void Paid(uint8_t from, net::RansackNote const& note)
 
 void OnRansack(uint8_t from, net::RansackNote const& note)
 {
-    if (from <= 0 || from >= net::MaxPlayers) return;
+    if (from <= 0 || from >= net::MaxPlayers || from == net::LocalId() || !net::Remotes()[from].connected) return;
     if (note.op == net::RansackHold) {
         // As the robbery does to the body it robs: its knock-out timer starts again, the hero does not stand up meanwhile.
-        if (!downed::NativeDown()) return;
-        Entity(gCSession::GetInstance().GetHero()).Routine.SetTaskTime(0.0f);
+        eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+        if (!hero || !downed::NativeDown()) return;
+        Entity(hero).Routine.SetTaskTime(0.0f);
         if (!holdsTaken++) Logf("ransack: a robber of player %d is at work; this hero stays down meanwhile", from);
     } else if (note.op == net::RansackTake) {
         Pay(from, note);
@@ -364,6 +370,7 @@ void Tick()
 
 void OnWorldChange()
 {
+    lastTick = 0;
     for (auto& victim : victims) victim = Victim{};
     for (auto& seen : applied) seen.clear();
     if (!pending.empty()) Logf("ransack: %zu unpaid robberies forgotten (world change)", pending.size());

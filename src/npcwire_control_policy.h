@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace g3t::npcwire::control_policy {
 
@@ -70,6 +71,38 @@ inline bool ShouldSendBaseline(OfferTransaction const& offer)
     return !offer.baselineQueued;
 }
 
+inline bool AlreadySatisfied(OfferTransaction const& offer, Reference const& reference,
+                             bool force)
+{
+    return !force && offer.serial != 0 && offer.acknowledged &&
+           offer.idQueued && offer.baselineQueued &&
+           SameReference(offer.reference, reference);
+}
+
+inline bool BeginOffer(OfferTransaction& offer, Reference const& reference,
+                       bool force, std::uint32_t& nextSerial)
+{
+    if (AlreadySatisfied(offer, reference, force)) return true;
+    const bool retry = !force && RetryOffer(offer, reference);
+    if (!retry) {
+        if (nextSerial == (std::numeric_limits<std::uint32_t>::max)()) return false;
+        offer.reference = reference;
+        offer.serial = ++nextSerial;
+        offer.idQueued = false;
+        offer.baselineQueued = false;
+        offer.acknowledged = false;
+    }
+    return true;
+}
+
+inline bool CompleteAck(OfferTransaction& offer, Reference const& reference,
+                        std::uint32_t serial)
+{
+    if (!AcceptAck(offer, reference, serial)) return false;
+    offer.acknowledged = true;
+    return true;
+}
+
 enum class ResyncReason : std::uint8_t {
     None,
     UnknownId,
@@ -89,6 +122,16 @@ inline bool DuplicateResync(ResyncCursor const& cursor, Reference const& referen
 {
     return cursor.handled && SameReference(cursor.reference, reference) &&
            cursor.reason == reason;
+}
+
+inline bool CommitResync(ResyncCursor& cursor, Reference const& reference,
+                         ResyncReason reason, bool offerQueued)
+{
+    if (!offerQueued) return false;
+    cursor.reference = reference;
+    cursor.reason = reason;
+    cursor.handled = true;
+    return true;
 }
 
 inline bool RetryAt(std::uint32_t now, std::uint32_t attemptedAt,

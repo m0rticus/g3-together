@@ -2,12 +2,42 @@
 #pragma once
 
 #include "npclease.h"
+#include "npcown_policy.h"
+#include <algorithm>
 #include <cmath>
+#include <string>
+#include <unordered_map>
 
 namespace g3t::npclease {
 inline bool LeaseProcessingRange(bool permit, float distance)
 {
     return permit && std::isfinite(distance) && distance >= 0.0f && distance <= ClientRadiusCm;
+}
+
+inline int FormatScanCensus(char* out, size_t capacity, npcown::OwnStats& snap, npcown::OwnStats const& totals,
+                            std::unordered_map<std::string, unsigned> const& refused,
+                            std::unordered_map<std::string, unsigned> const& waiting)
+{
+    const auto pick = [](auto const& values, char const*& label, unsigned& amount) {
+        label = "-"; amount = 0;
+        for (auto const& value : values)
+            if (value.second > amount) { label = value.first.c_str(); amount = value.second; }
+    };
+    unsigned refusedCount = 0, waitCount = 0;
+    char const* refusedTop; char const* waitingTop;
+    pick(refused, refusedTop, refusedCount);
+    pick(waiting, waitingTop, waitCount);
+    snap.refusedTop = refusedTop; snap.refusedTopCount = refusedCount;
+    snap.waitingTop = waitingTop; snap.waitingTopCount = waitCount;
+    snap.frozenTop = waitingTop; snap.frozenTopCount = snap.frozen ? waitCount : 0;
+    snap.visualOnly = snap.refused + snap.waiting;
+    snap.visualTop = refusedCount >= waitCount ? refusedTop : waitingTop;
+    snap.visualTopCount = (std::max)(refusedCount, waitCount);
+    snap.hitsApplied = totals.hitsApplied; snap.deaths = totals.deaths; snap.handBacks = totals.handBacks;
+    snap.yields = totals.yields; snap.takeovers = totals.takeovers; snap.reclaims = totals.reclaims;
+    snap.registrationAlready = totals.registrationAlready; snap.registrationQueued = totals.registrationQueued;
+    snap.registrationEnabled = totals.registrationEnabled; snap.registrationFailed = totals.registrationFailed;
+    return npcown::FormatSummary(out, capacity, snap);
 }
 
 // Observations about a client-owned NPC. Only the first two can end ownership (LossReason); every other field merely

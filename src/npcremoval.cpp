@@ -7,6 +7,7 @@
 #include "guid.h"
 #include "log.h"
 #include "net.h"
+#include "npc_targets.h"
 #include "npcplayback.h"
 #include "npcs.h"
 #include "remote.h"
@@ -20,6 +21,7 @@ struct Removal {
     policy::Fence fence;
     eCEntity const* applied = nullptr;
     bool noted = false;
+    bool needsScrub = false;
     policy::Publication publications[net::MaxPlayers];
 };
 Removal removals[policy::Count];
@@ -126,6 +128,7 @@ void Apply(size_t index)
             npc.CharacterMovement.StopMovement();
         DisableTree(instance);
         removal.applied = instance;
+        removal.needsScrub = true;
     }
     npcs::ReleaseRemovedAim(instance);
     if (!removal.noted) {
@@ -160,6 +163,12 @@ bool Suppressed(uint8_t const bytes[16])
 {
     const int index = policy::Index(bytes);
     return index >= 0 && removals[index].fence.Removed();
+}
+
+bool SuppressedUnloaded(uint8_t const bytes[16], char const* entityName, float const position[3])
+{
+    return Suppressed(bytes) || (entityName && position &&
+        policy::Matches(GetConfig().ardeaRemoveNpcs, MainWorld(), bytes, entityName, position, false));
 }
 
 bool Suppressed(eCEntity const* entity)
@@ -237,5 +246,10 @@ void Tick()
     ClearReferences(gCSession::GetInstance().GetHero());
     if (remote::ControlledBody() != gCSession::GetInstance().GetHero())
         ClearReferences(remote::ControlledBody());
+    for (auto& removal : removals) {
+        if (!removal.needsScrub || !removal.applied) continue;
+        npc_targets::ScrubEntityReferences(const_cast<eCEntity*>(removal.applied), true, false);
+        removal.needsScrub = false;
+    }
 }
 }

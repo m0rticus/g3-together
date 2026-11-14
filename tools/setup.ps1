@@ -54,7 +54,7 @@ $t = @{
     IniBackup    = 'Your previous g3together.ini is kept in {0}.'
     IniDone      = 'g3together.ini written: {0}'
     DoneHost     = 'Done. Start Gothic 3 and begin a new game or load your co-op campaign; then your partner starts.'
-    DoneClient   = 'Done. Start Gothic 3 once the host plays. If the host loaded a save, stay in the main menu: it is loaded for you.'
+    DoneClient   = 'Done. Accept the host Steam invite or Join Game. When the host plays, your client enters automatically after a short countdown, or manually via New Game.'
     Yes          = 'y'
     YesNo        = '(y/n)'
 }
@@ -123,26 +123,41 @@ function Backup([string]$game) {
     return $folder
 }
 
+$legacyOwners = New-Object System.Collections.Generic.List[string]
 function ReadIni([string]$path) {
+    $legacyOwners.Clear()
     $values = [ordered]@{}
     if (-not (Test-Path -LiteralPath $path)) { return $values }
     foreach ($line in Get-Content -LiteralPath $path) {
-        $text = ($line -split '#', 2)[0]
-        if ($text -match '^\s*([A-Za-z_]+)\s*=\s*(.*?)\s*$') { $values[$Matches[1].ToLower()] = $Matches[2] }
+        if ($line -notmatch '^\s*([A-Za-z_]+)\s*=\s*(.*?)\s*$') { continue }
+        $key = $Matches[1].ToLower()
+        $value = $Matches[2]
+        if ($key -ne 'legacy_companion_owner') { $value = ($value -split '#', 2)[0].Trim() }
+        if ($value.Length -ge 2 -and $value.StartsWith('"') -and $value.EndsWith('"')) { $value = $value.Substring(1, $value.Length - 2) }
+        if ($key -eq 'legacy_companion_owner') { $legacyOwners.Add($value) } else { $values[$key] = $value }
     }
     return $values
+}
+
+function FileSha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($path)
+        try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+        finally { $stream.Dispose() }
+    } finally { $sha.Dispose() }
 }
 
 function InstallSteamDll([string]$game) {
     $folder = Join-Path $game 'G3Together'
     $target = Join-Path $folder 'steam_api.dll'
-    if ((Test-Path -LiteralPath $target) -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $steamDllHash) {
+    if ((Test-Path -LiteralPath $target) -and (FileSha256 $target) -eq $steamDllHash) {
         Say ($t.SteamDllOk -f $target) 'Green'
         return $true
     }
     if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
     $bundled = Join-Path $package 'G3Together\steam_api.dll'
-    if ((Test-Path -LiteralPath $bundled) -and (Get-FileHash -LiteralPath $bundled -Algorithm SHA256).Hash -eq $steamDllHash) {
+    if ((Test-Path -LiteralPath $bundled) -and (FileSha256 $bundled) -eq $steamDllHash) {
         Copy-Item -LiteralPath $bundled -Destination $target -Force
         Say ($t.SteamDllDone -f $target) 'Green'
         return $true
@@ -156,7 +171,7 @@ function InstallSteamDll([string]$game) {
         Invoke-WebRequest -Uri $steamZip -OutFile $zip -UseBasicParsing
         Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $temp 'x') -Force
         $dll = Join-Path $temp 'x\Windows-x86\steam_api.dll'
-        if (-not (Test-Path -LiteralPath $dll) -or (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash -ne $steamDllHash) {
+        if (-not (Test-Path -LiteralPath $dll) -or (FileSha256 $dll) -ne $steamDllHash) {
             Say $t.SteamDllBad 'Red'
             return $false
         }
@@ -281,13 +296,10 @@ $lines.Add('transport = steam')
 $lines.Add("session_id = $SessionId")
 $lines.Add('# Player names are taken from Steam automatically.')
 $lines.Add('# Mod messages: auto follows the Gothic 3 text language; en, de or pl can override it.')
-$lines.Add('language = auto')
-$productionKeys = @(
-    'partner_key', 'look', 'puppet_template', 'reputation', 'host_roi', 'host_sim',
-    'puppet_lead', 'motion_seek', 'listener_textbox', 'friendly_fire', 'npc_damage',
-    'npc_hp', 'steam_host', 'connection', 'ardea_remove_npcs'
-)
-$kept = @($old.Keys | Where-Object { $productionKeys -contains $_.ToString().ToLower() })
+$language = if ($old['language'] -in @('en', 'de', 'pl')) { $old['language'].ToLower() } else { 'auto' }
+$lines.Add("language = $language")
+$managedOrLegacyKeys = @('role', 'transport', 'session_id', 'language', 'address', 'port', 'name')
+$kept = @($old.Keys | Where-Object { $managedOrLegacyKeys -notcontains $_.ToString().ToLower() })
 if ($kept.Count -gt 0) {
     $lines.Add('# Kept from the previous g3together.ini:')
     foreach ($key in $kept) { $lines.Add("$key = $($old[$key])") }
@@ -301,8 +313,9 @@ if ($kept.Count -gt 0) {
         $lines.Add('# reputation = shared')
     }
 }
+foreach ($owner in $legacyOwners) { $lines.Add("legacy_companion_owner = $owner") }
 if (-not $old.Contains('friendly_fire')) {
-    $lines.Add('# Friendly fire is off, including allied hit reactions and harmful effects. Both players must match.')
+    $lines.Add('# Friendly fire is off, including allied hit reactions and harmful effects. The host setting applies to the session in memory.')
     $lines.Add('friendly_fire = 0')
 }
 if (Test-Path -LiteralPath $iniPath) {

@@ -32,6 +32,7 @@ long long NowUs()
 
 struct Sample {
     uintptr_t body = 0, active = 0, focus = 0;
+    long long capturedAt = 0;
     float position[3] = {}, velocity[3] = {};
     int ai = -1, ani = -1, mode = -1;
     unsigned input = 0;
@@ -81,6 +82,7 @@ Sample Capture(eCEntity* observed = nullptr)
     eCEntity* body = observed ? observed : remote::ControlledBody();
     if (!body) return s;
     s.body = reinterpret_cast<uintptr_t>(body);
+    s.capturedAt = NowUs();
     const auto& p = body->GetWorldPosition();
     s.position[0] = p.GetX(); s.position[1] = p.GetY(); s.position[2] = p.GetZ();
     auto* movement = static_cast<gCCharacterMovement_PS*>(body->GetPropertySet(eEPropertySetType_CharacterMovement));
@@ -241,7 +243,8 @@ PoseFn originalPose = nullptr;
 
 Sample BeforeTransform(eCEntity* entity)
 {
-    if (GetConfig().host || ai::ShuttingDown() || persist::NativeLoading() ||
+    if (GetConfig().host || GetCurrentThreadId() != observerThread ||
+        ai::ShuttingDown() || persist::NativeLoading() ||
         !entity || !guards::IsLocalPlayer(entity)) return {};
     return Capture(entity);
 }
@@ -250,9 +253,8 @@ void AfterTransform(Sample const& before, eCEntity* entity, char const* kind, vo
 {
     if (!before.body) return;
     const Sample after = Capture(entity);
-    const long long now = NowUs();
-    const uint64_t elapsed = previousSampleAt && now >= previousSampleAt
-        ? static_cast<uint64_t>(now - previousSampleAt) : 0;
+    const uint64_t elapsed = before.capturedAt && after.capturedAt >= before.capturedAt
+        ? static_cast<uint64_t>(after.capturedAt - before.capturedAt) : 0;
     if (!Discontinuity(before, after, elapsed)) return;
     ++transformDiscontinuities;
     if (positionWriteCount == positionWrites.size()) { ++positionWriteDropped; return; }

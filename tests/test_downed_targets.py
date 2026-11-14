@@ -81,7 +81,8 @@ int main()
         for forbidden in ("player.IsDown()", "player.IsDead()", "StaleState", "net::Now()", "r.previous"):
             self.assertNotIn(forbidden, remote)
         publication = function_body(self.ai, r"\bvoid\s+SyncDownedTargets\s*\(")
-        self.assertIn("if (!net::IsHost()", publication)
+        self.assertIn("if (!gCSession::GetInstance().IsGameRunning() || !downed::UnavailablePlayers()) return;", publication)
+        self.assertIn("npclease::LocalAuthority(instance)", publication)
         self.assertIn("downed::UnavailablePlayers()", publication)
         self.assertIn("ReleaseDownedTargets", publication)
         for forbidden in ("AIMode =", "SetHitPoints", "gEAIMode_Dead", "SetTask", "SetPartyLeader"):
@@ -90,9 +91,10 @@ int main()
     def test_exact_references_are_released_after_instruction_stop(self):
         release = function_body(self.ai, r"\bbool\s+ReleaseDownedTargets\s*\(")
         host = function_body(self.ai, r"\bbool\s+HostNpc\s*\(")
-        self.assertIn("net::IsHost()", host)
+        self.assertIn("net::IsHost() || npclease::LocalAuthority(entity)", host)
         self.assertIn("!guards::IsLocalPlayer(entity)", host)
-        self.assertIn("!Driven(entity)", host)
+        self.assertIn("!remote::IsPuppet(entity)", host)
+        self.assertIn("!npcs::IsMirrored(entity) || npclease::LocalAuthority(entity)", host)
         for flag, setter in (("Current", "SetCurrentTarget"), ("Alternative", "SetAlternativeTarget"),
                              ("Attacker", "SetCurrentAttacker"), ("LastAttacker", "SetLastAttacker"),
                              ("Spell", "SetSpellTarget"), ("Alignment", "SetAlignmentTarget"),
@@ -146,7 +148,7 @@ int main()
         self.assertLess(judge.index("RejectDownedHit"), judge.index("if (which >= 2)"))
         hp = function_body(self.combat, r"\bGEInt\s+GE_STDCALL\s+Filter\s*\(")
         self.assertIn("args < 0 && RejectDownedHit", hp)
-        self.assertLess(hp.index("RejectDownedHit"), hp.index("if (bypass)"))
+        self.assertNotIn("bypass", hp)
         self.assertLess(hp.index("RejectDownedHit"), hp.index("if (forwarded)"))
         reject = function_body(self.combat, r"\bbool\s+RejectDownedHit\s*\(")
         self.assertIn("player.DamageReceiver.DamageAmount = 0", reject)

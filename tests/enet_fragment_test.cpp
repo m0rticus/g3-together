@@ -224,6 +224,84 @@ int main(int argc, char** argv)
         assert(host.totalSentPackets == 2);
     } else if (!std::strcmp(argv[1], "steam")) {
         ReliableSteamRelay();
+    } else if (!std::strcmp(argv[1], "pose-order")) {
+        using namespace g3t::steam::send;
+        assert(enet_initialize() == 0);
+        directSockets = true;
+        ENetAddress bindAddress{ENET_HOST_ANY, 0};
+        char const* err = nullptr;
+        auto* sender = g3t::net::CreateTransportHost(&bindAddress, 1, err);
+        auto* receiver = g3t::net::CreateTransportHost(&bindAddress, 1, err);
+        assert(sender && receiver && !err);
+#ifdef _WIN32
+        assert(g3t::net::DisableWindowsUdpConnReset(sender->socket));
+        assert(g3t::net::DisableWindowsUdpConnReset(receiver->socket));
+#endif
+        ENetAddress target{0, receiver->address.port};
+        assert(enet_address_set_host_ip(&target, "127.0.0.1") == 0);
+        auto* peer = g3t::net::ConnectTransportHost(sender, &target, 0x12345678u);
+        assert(peer);
+        ENetEvent event{};
+        const auto deadline = enet_time_get() + 5000;
+        while (peer->state != ENET_PEER_STATE_CONNECTED &&
+               static_cast<int32_t>(deadline - enet_time_get()) > 0) {
+            enet_host_service(receiver, &event, 1);
+            enet_host_service(sender, &event, 1);
+        }
+        assert(peer->state == ENET_PEER_STATE_CONNECTED);
+        enet_host_flush(receiver);
+        enet_host_service(sender, &event, 1);
+
+        toReceiver = g3t::steam::send::Queue{};
+        senderSocket = sender->socket;
+        relayActive = true;
+
+        auto makeControlPose = [](uint16_t npcId, uint8_t sample) {
+            std::vector<uint8_t> p(120, sample);
+            p[0] = 49; // MsgControlPose
+            p[25] = 1; p[26] = 0; p[27] = 0; p[28] = 0;
+            p[29] = static_cast<uint8_t>(npcId & 0xffu);
+            p[30] = static_cast<uint8_t>(npcId >> 8);
+            p[31] = sample;
+            return p;
+        };
+        const auto sendPose = [&](uint16_t npcId, uint8_t sample) {
+            auto payload = makeControlPose(npcId, sample);
+            auto* pkt = enet_packet_create(payload.data(), payload.size(), 0);
+            assert(pkt && enet_peer_send(peer, g3t::net::ChannelPoses, pkt) == 0);
+            enet_host_flush(sender);
+        };
+        // Queue A(v1), B(v1), then A(v2). Tail-append replacement must deliver B(v1) BEFORE A(v2)
+        // so ENet's incomingUnreliableSequenceNumber accepts both NPCs' poses.
+        sendPose(10, 1);
+        sendPose(20, 1);
+        sendPose(10, 2);
+        assert(toReceiver.Depth() == 2);
+        assert(toReceiver.Drain([&](Item const& item) {
+            ENetBuffer buffer{item.bytes.size(), const_cast<uint8_t*>(item.bytes.data())};
+            assert(enet_socket_send(sender->socket, &target, &buffer, 1) == static_cast<int>(buffer.dataLength));
+            return Ok;
+        }) == Ok);
+
+        std::vector<std::pair<uint16_t, uint8_t>> delivered;
+        while (enet_host_service(receiver, &event, 10) > 0) {
+            if (event.type != ENET_EVENT_TYPE_RECEIVE) continue;
+            assert(event.channelID == g3t::net::ChannelPoses);
+            assert(event.packet->dataLength >= 32);
+            const uint16_t npcId = static_cast<uint16_t>(event.packet->data[29] | (uint16_t(event.packet->data[30]) << 8));
+            const uint8_t sample = event.packet->data[31];
+            delivered.emplace_back(npcId, sample);
+            enet_packet_destroy(event.packet);
+        }
+        assert(delivered.size() == 2);
+        assert(delivered[0].first == 20 && delivered[0].second == 1);
+        assert(delivered[1].first == 10 && delivered[1].second == 2);
+
+        relayActive = false;
+        directSockets = false;
+        enet_host_destroy(sender);
+        enet_host_destroy(receiver);
+        enet_deinitialize();
     } else {
         assert(false);
     }

@@ -210,4 +210,46 @@ int main()
         assert(!activate.Paused() && !activate.Resumable());
         assert(!activate.ResumeAfterStop(true));
     }
+
+    {
+        // Build 70 regression: remote camera registered database=1 globally; private prefetcher has 0 entities while
+        // mainPrefetcher cached remoteOnly (databases=0x2) and sharedHeroEntity (databases=0x3 = slot 0 | slot 1).
+        struct Prefetcher {
+        std::vector<Cell*> valid;
+        Cell permanent{0, 0, {}};
+        unsigned cleared = 0;
+        void ClearCells(unsigned&) { ++cleared; }
+        };
+        Prefetcher privatePrefetcher, mainPrefetcher;
+        Entity remoteOnly{0x2}, sharedHeroEntity{0x3};
+        Cell mainCell{6000, 0x3, {&remoteOnly, &sharedHeroEntity}};
+        mainPrefetcher.valid.push_back(&mainCell);
+        unsigned db = 1;
+        auto drainPrefetcher = [](Prefetcher& p, unsigned& database, uint32_t slot) {
+        if (!DrainSlots(p.valid.size(), [&](size_t i) { return p.valid[i]; }, &p.permanent, slot)) return false;
+        p.ClearCells(database);
+        return true;
+        };
+        auto scanCell = [](Cell const& cell, uint32_t bit) {
+        size_t n = 0;
+        for (auto const* entity : cell.entities)
+            if (entity && (entity->databases & bit)) ++n;
+        return n;
+        };
+        assert(CountSlotEntities(privatePrefetcher.valid.size(), [&](size_t i) { return privatePrefetcher.valid[i]; },
+                             &privatePrefetcher.permanent, 1, scanCell) == 0);
+        assert(CountSlotEntities(mainPrefetcher.valid.size(), [&](size_t i) { return mainPrefetcher.valid[i]; },
+                             &mainPrefetcher.permanent, 1, scanCell) == 2);
+
+        assert(!DrainDualPrefetchers(&privatePrefetcher, mainPrefetcher, db, 32, drainPrefetcher));
+        assert(DrainDualPrefetchers(&privatePrefetcher, mainPrefetcher, db, 0xffffffffu, drainPrefetcher));
+        assert(privatePrefetcher.cleared == 0 && mainPrefetcher.cleared == 0);
+
+        assert(DrainDualPrefetchers(&privatePrefetcher, mainPrefetcher, db, 1, drainPrefetcher));
+        assert(privatePrefetcher.cleared == 1 && mainPrefetcher.cleared == 1);
+        assert(!remoteOnly.cached && remoteOnly.databases == 0 && remoteOnly.releases == 1);
+        assert(sharedHeroEntity.cached && sharedHeroEntity.databases == 0x1 && sharedHeroEntity.releases == 0);
+        assert(CountSlotEntities(mainPrefetcher.valid.size(), [&](size_t i) { return mainPrefetcher.valid[i]; },
+                             &mainPrefetcher.permanent, 1, scanCell) == 0);
+    }
 }
