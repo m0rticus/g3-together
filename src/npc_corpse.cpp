@@ -14,6 +14,102 @@ namespace g3t::npcs::detail {
 namespace {
 using Vec3 = ragdoll::Vector;
 
+struct CorpseGroundAnchor {
+    uint32_t incarnation = 0;
+    Vec3 origin{};
+    uint32_t updatedAt = 0;
+};
+
+std::unordered_map<GuidKey, CorpseGroundAnchor, GuidHash> corpseGroundAnchors;
+
+bool FiniteMatrix(bCMatrix const& matrix, float maxTranslationCm = ragdoll::MaximumTransformCoordCm)
+{
+    const bCVector axes[] = {matrix.GetXAxis(), matrix.GetYAxis(), matrix.GetZAxis(), matrix.GetTranslation()};
+    float values[12];
+    for (int axis = 0; axis < 4; ++axis) {
+        values[axis * 3] = axes[axis].GetX();
+        values[axis * 3 + 1] = axes[axis].GetY();
+        values[axis * 3 + 2] = axes[axis].GetZ();
+    }
+    return ragdoll::FiniteMatrix12(values, maxTranslationCm);
+}
+
+Vec3 SafeVec3(bCVector const& v, Vec3 fallback = {0.0f, 0.0f, 0.0f})
+{
+    const Vec3 out{v.GetX(), v.GetY(), v.GetZ()};
+    return ragdoll::Finite(out) ? out : fallback;
+}
+
+int SafeActorBoneCount(eCVisualAnimation_PS* animation)
+{
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    auto* skeleton = actor ? actor->GetInstance() : nullptr;
+    if (!skeleton || !skeleton->mNodes.mData) return 0;
+    return ragdoll::ClampedBoneCount(skeleton->mNodes.mLength);
+}
+
+bool ActorBonesFinite(eCVisualAnimation_PS* animation)
+{
+    const int count = SafeActorBoneCount(animation);
+    if (count <= 0) return false;
+    auto const* nodes = animation->GetActor()->GetInstance()->mNodes.mData;
+    for (int i = 0; i < count; ++i) {
+        bCMatrix local;
+        std::memcpy(&local, reinterpret_cast<unsigned char const*>(nodes + i) + 0x44, sizeof(local));
+        if (!FiniteMatrix(local, 5000.0f)) return false;
+    }
+    return true;
+}
+
+bool EnsureFiniteRagdollPose(Mirror& m, eCEntity* entity, eCVisualAnimation_PS* animation)
+{
+    if (!entity || !animation || !animation->GetActor() || !animation->GetActor()->GetInstance()) return false;
+    if (!FiniteMatrix(entity->GetWorldMatrix())) {
+        if (m.corpsePose.empty() || !FiniteMatrix(m.corpseRoot)) return false;
+        entity->SetToWorldMatrix(m.corpseRoot);
+        if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+            rigid->SetPose(m.corpseRoot);
+    }
+    if (ActorBonesFinite(animation)) return true;
+    if (!m.corpsePose.empty())
+        npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
+    else if (!animation->GetRagDollEnabled())
+        npcplayback::UpdatePresentation(entity);
+    if (ActorBonesFinite(animation)) return true;
+    if (m.ragdollFails < 3)
+        Logf("npcs: CLIENTRAGDOLL name=%s action=refuse_start reason=invalid_bones", entity->GetName().GetText());
+    return false;
+}
+
+void RecordCorpseGroundAnchor(GuidKey const& key, uint32_t incarnation, Vec3 const& origin, uint32_t now, bool overwrite)
+{
+    if (!ragdoll::Finite(origin)) return;
+    if (corpseGroundAnchors.size() > 512) {
+        for (auto it = corpseGroundAnchors.begin(); it != corpseGroundAnchors.end();) {
+            if (!mirrors.count(it->first) && !corpses.count(it->first)) it = corpseGroundAnchors.erase(it);
+            else ++it;
+        }
+    }
+    auto found = corpseGroundAnchors.find(key);
+    if (found != corpseGroundAnchors.end() && !overwrite && found->second.incarnation == incarnation &&
+        ragdoll::Finite(found->second.origin)) {
+        found->second.updatedAt = now;
+        return;
+    }
+    corpseGroundAnchors[key] = {incarnation, origin, now};
+}
+
+Vec3 ResolveCorpseGroundAnchor(Mirror const& m)
+{
+    const auto found = corpseGroundAnchors.find(Key(m.latest.guid));
+    if (found != corpseGroundAnchors.end() && found->second.incarnation == m.latest.incarnation &&
+        ragdoll::Finite(found->second.origin))
+        return found->second.origin;
+    if (!m.corpsePose.empty() && FiniteMatrix(m.corpseRoot))
+        return SafeVec3(m.corpseRoot.GetTranslation());
+    return SafeVec3(m.entity.GetInstance()->GetWorldPosition());
+}
+
 void TraceCorpse(Mirror& m, uint32_t now)
 {
     if (!m.ragdollInitialized || m.ragdollTraceStage >= 3) return;
@@ -23,12 +119,14 @@ void TraceCorpse(Mirror& m, uint32_t now)
     auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
     char identity[40];
     guid::Format(m.latest.guid, identity, sizeof(identity));
-    const bCVector& root = entity->GetWorldPosition();
-    const bCVector velocity = entity->GetLinearVelocity();
+    const Vec3 root = SafeVec3(entity->GetWorldPosition());
+    const Vec3 velocity = SafeVec3(entity->GetLinearVelocity());
     Vec3 center{};
     unsigned bones = 0;
     bCMatrix bone;
-    for (int i = 0; animation && i < 128 && animation->GetBoneMatrix(i, bone); ++i) {
+    const int boneCount = SafeActorBoneCount(animation);
+    for (int i = 0; i < boneCount && animation->GetBoneMatrix(i, bone); ++i) {
+        if (!FiniteMatrix(bone)) continue;
         const bCVector& at = bone.GetTranslation();
         center.x += at.GetX();
         center.y += at.GetY();
@@ -36,18 +134,17 @@ void TraceCorpse(Mirror& m, uint32_t now)
         ++bones;
     }
     if (bones) { center.x /= bones; center.y /= bones; center.z /= bones; }
-    else center = {root.GetX(), root.GetY(), root.GetZ()};
+    else center = root;
+    if (!ragdoll::Finite(center)) center = root;
     const uint32_t dt = m.ragdollTraceStage ? now - m.ragdollTraceSampleAt : 0;
-    const float scale = dt ? 1000.0f / dt : 0.0f;
-    const Vec3 boneVelocity{(center.x - m.ragdollTracePosition[0]) * scale,
-                           (center.y - m.ragdollTracePosition[1]) * scale,
-                           (center.z - m.ragdollTracePosition[2]) * scale};
+    const Vec3 previousCenter{m.ragdollTracePosition[0], m.ragdollTracePosition[1], m.ragdollTracePosition[2]};
+    const Vec3 boneVelocity = ragdoll::SafeTraceVelocity(center, previousCenter, dt, m.ragdollTraceStage != 0);
     if (!m.ragdollTraceStage) m.ragdollTraceAt = now;
     Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=sample incarnation=%u stage=%u elapsed_ms=%u source=%s applied=%u physics=%d root=%.1f/%.1f/%.1f velocity=%.1f/%.1f/%.1f bone_center=%.1f/%.1f/%.1f bone_velocity=%.1f/%.1f/%.1f sample_ms=%u",
          m.entity.GetName().GetText(), identity, m.latest.incarnation, m.ragdollTraceStage, now - m.ragdollTraceAt,
          m.deathImpulse.Pending() ? "pending" : RagdollSource(m), m.deathImpulse.applied,
-         animation && animation->GetRagDollController() ? 1 : 0, root.GetX(), root.GetY(), root.GetZ(),
-         velocity.GetX(), velocity.GetY(), velocity.GetZ(), center.x, center.y, center.z,
+         animation && animation->GetRagDollController() ? 1 : 0, root.x, root.y, root.z,
+         velocity.x, velocity.y, velocity.z, center.x, center.y, center.z,
          boneVelocity.x, boneVelocity.y, boneVelocity.z, dt);
     m.ragdollTraceSampleAt = now;
     m.ragdollTracePosition[0] = center.x;
@@ -217,7 +314,9 @@ bool HostForceAvailable(Mirror const& m)
     const auto pending = pendingForces.find(Key(m.latest.guid));
     if (pending == pendingForces.end()) return false;
     for (auto const& force : pending->second)
-        if (force.incarnation == m.latest.incarnation && static_cast<int32_t>(m.shownSent - force.sent) >= 0) return true;
+        if (force.incarnation == m.latest.incarnation &&
+            (m.killed || static_cast<int32_t>(m.shownSent - force.sent) >= 0))
+            return true;
     return false;
 }
 
@@ -237,20 +336,18 @@ bool TryApplyForce(Mirror& m, uint32_t now)
     }
     if (!active) return false;
 
-    const bCVector& position = m.entity.GetInstance()->GetWorldPosition();
+    const Vec3 groundOrigin = ResolveCorpseGroundAnchor(m);
     bool applied = false;
     const auto pending = pendingForces.find(Key(m.latest.guid));
     if (pending != pendingForces.end()) {
         for (auto it = pending->second.begin(); it != pending->second.end();) {
             if (it->incarnation < m.latest.incarnation) { it = pending->second.erase(it); ++ragdollForcesLate; continue; }
             if (it->incarnation != m.latest.incarnation) { ++it; continue; }
-            if (static_cast<int32_t>(m.shownSent - it->sent) < 0) { ++it; continue; }
             if (!m.deathImpulse.Pending()) { it = pending->second.erase(it); ++ragdollForcesLate; continue; }
             const Vec3 raw{it->force[0], it->force[1], it->force[2]};
-            const Vec3 offset{it->at[0], it->at[1], it->at[2]};
-            Vec3 force{};
-            const Vec3 at = ragdoll::WorldPoint(offset, {position.GetX(), position.GetY(), position.GetZ()});
-            if (!ragdoll::LimitForce(raw, force) || !ragdoll::Finite(offset) || !ragdoll::Finite(at)) {
+            const Vec3 rawOffset{it->at[0], it->at[1], it->at[2]};
+            Vec3 force{}, offset{}, at{};
+            if (!ragdoll::ShapeCorpseImpulse(raw, rawOffset, groundOrigin, force, offset, at)) {
                 Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=refuse_force incarnation=%u sequence=%u reason=nonfinite",
                      m.entity.GetName().GetText(), identity, it->incarnation, it->sequence);
                 it = pending->second.erase(it);
@@ -258,10 +355,12 @@ bool TryApplyForce(Mirror& m, uint32_t now)
                 continue;
             }
             if (!m.deathImpulse.Choose(ragdoll::Source::Host)) { ++it; continue; }
-            animation->AddForceAtPos(bCVector(force.x, force.y, force.z), bCVector(at.x, at.y, at.z));
-            Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u sequence=%u source=host_force applied=%u raw_magnitude=%.1f magnitude=%.1f force=%.1f/%.1f/%.1f at_relative=%.1f/%.1f/%.1f",
+            if (ragdoll::Magnitude(force) > 0.0)
+                animation->AddForceAtPos(bCVector(force.x, force.y, force.z), bCVector(at.x, at.y, at.z));
+            Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u sequence=%u source=host_force applied=%u raw_magnitude=%.1f magnitude=%.1f force=%.1f/%.1f/%.1f at_relative=%.1f/%.1f/%.1f raw_force=%.1f/%.1f/%.1f raw_at_relative=%.1f/%.1f/%.1f anchor=%.1f/%.1f/%.1f",
                  m.entity.GetName().GetText(), identity, it->incarnation, it->sequence, m.deathImpulse.applied,
-                 ragdoll::Magnitude(raw), ragdoll::Magnitude(force), force.x, force.y, force.z, offset.x, offset.y, offset.z);
+                 ragdoll::Magnitude(raw), ragdoll::Magnitude(force), force.x, force.y, force.z, offset.x, offset.y, offset.z,
+                 raw.x, raw.y, raw.z, rawOffset.x, rawOffset.y, rawOffset.z, groundOrigin.x, groundOrigin.y, groundOrigin.z);
             it = pending->second.erase(it);
             ++ragdollForcesApplied;
             std::strcpy(m.presentationSource, "host_force");
@@ -298,6 +397,7 @@ void CaptureCorpsePose(Mirror& m, uint32_t now, bool final)
     auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor || !actor->GetInstance()) return;
+    if (!FiniteMatrix(entity->GetWorldMatrix()) || !ActorBonesFinite(animation)) return;
     std::vector<pose::Bone> bones;
     uint8_t flags = 0;
     if (!npcplayback::CapturePose(entity, bones, flags, nullptr)) return;
@@ -310,7 +410,7 @@ void CaptureCorpsePose(Mirror& m, uint32_t now, bool final)
 
 void RestoreCorpseActor(Mirror& m)
 {
-    if (!m.ragdollInitialized || m.corpsePose.empty()) return;
+    if (!m.ragdollInitialized || m.corpsePose.empty() || !FiniteMatrix(m.corpseRoot)) return;
     auto* entity = m.entity.GetInstance();
     auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
     auto* actor = animation ? animation->GetActor() : nullptr;
@@ -357,13 +457,49 @@ void UpdateCorpsePresentation(Mirror& m, uint32_t now)
 void PresentDeadMirror(GuidKey const& key, Mirror& m, net::NpcRecord const& shown, uint32_t now)
 {
     deadOnHost.insert(key);
+    auto* entity = m.entity.GetInstance();
     if (!m.corpsePlaced) {
-        const bCMatrix pose = m.ragdollInitialized && !m.corpsePose.empty()
-            ? m.corpseRoot : body::Pose(*m.entity.GetInstance(), shown.position, shown.rotation);
-        m.entity.GetInstance()->SetToWorldMatrix(pose);
-        if (auto* rigid = static_cast<eCRigidBody_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_RigidBody)))
-            rigid->SetPose(pose);
-        m.corpsePlaced = true;
+        if (m.ragdollInitialized && !m.corpsePose.empty() && FiniteMatrix(m.corpseRoot)) {
+            entity->SetToWorldMatrix(m.corpseRoot);
+            if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+                rigid->SetPose(m.corpseRoot);
+            RecordCorpseGroundAnchor(key, shown.incarnation, SafeVec3(m.corpseRoot.GetTranslation()), now, false);
+            m.corpsePlaced = true;
+        } else {
+            const bCVector& cur = entity->GetWorldPosition();
+            ragdoll::CorpseOriginInput originInput{};
+            originInput.entityPos = {cur.GetX(), cur.GetY(), cur.GetZ()};
+            originInput.previousPos = {m.previous.position[0], m.previous.position[1], m.previous.position[2]};
+            originInput.shownPos = {shown.position[0], shown.position[1], shown.position[2]};
+            originInput.livePresented = (m.replay.initialized || m.replayReady) && FiniteMatrix(entity->GetWorldMatrix());
+            originInput.havePreviousAlive = m.previousTicks != 0 &&
+                (m.previous.flags & 1) == 0 && (m.previous.flags & 128) == 0 &&
+                m.previous.movementMode != static_cast<uint8_t>(gECharMovementMode_RagDollDead);
+            originInput.hostRagdoll = (shown.flags & 128) != 0 ||
+                shown.movementMode == static_cast<uint8_t>(gECharMovementMode_RagDollDead) ||
+                (m.latest.flags & 128) != 0 ||
+                m.latest.movementMode == static_cast<uint8_t>(gECharMovementMode_RagDollDead);
+            ragdoll::CorpseOriginResult chosen{};
+            if (ragdoll::SelectCorpseOrigin(originInput, chosen)) {
+                if (!chosen.keepLiveMatrix) {
+                    const float pos[3] = {chosen.origin.x, chosen.origin.y, chosen.origin.z};
+                    bCMatrix pose = body::Pose(*entity, pos, shown.rotation);
+                    if (!FiniteMatrix(pose)) {
+                        pose = entity->GetWorldMatrix();
+                        pose.AccessTranslation() = bCVector(chosen.origin.x, chosen.origin.y, chosen.origin.z);
+                    }
+                    if (FiniteMatrix(pose)) {
+                        entity->SetToWorldMatrix(pose);
+                        if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+                            rigid->SetPose(pose);
+                    }
+                }
+                if (FiniteMatrix(entity->GetWorldMatrix())) {
+                    RecordCorpseGroundAnchor(key, shown.incarnation, chosen.origin, now, true);
+                    m.corpsePlaced = true;
+                }
+            }
+        }
     }
     LayDown(m, now);
     TryApplyForce(m, now);
@@ -409,16 +545,31 @@ void LayDown(Mirror& m, uint32_t now)
     if (!deadPose || static_cast<int32_t>(now - m.lieCheckAt) < 0) return;
     if (m.ragdollStarted || (!net::IsHost() && m.killed) ||
         (m.latest.flags & 128) || m.latest.movementMode == gECharMovementMode_RagDollDead) {
-        auto* animation = static_cast<eCVisualAnimation_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
+        auto* entity = m.entity.GetInstance();
+        auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
         if (m.ragdollInitialized) {
             TryApplyForce(m, now);
             m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
             return;
         }
+        auto completeRagdollStart = [&]() {
+            if (!m.ragdollInitialized) {
+                m.ragdollInitialized = true;
+                ++m.ragdollStarts;
+                ++ragdollsStarted;
+                std::strcpy(m.presentationSource, RagdollSource(m));
+                Logf("npcs: CLIENTRAGDOLL name=%s action=start source=%s host_force_queued=%d host_force_available=%d fallback=%s",
+                     m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m), "gravity");
+            }
+            TryApplyForce(m, now);
+            m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
+        };
         if (!m.ragdollStarted) {
-            if (!npcplayback::IsPassive(m.entity.GetInstance())) body::Pacify(m.entity, m.body);
+            if (!npcplayback::IsPassive(entity)) body::Pacify(m.entity, m.body);
             CaptureCorpsePose(m, now);
-            auto* routine = static_cast<gCScriptRoutine_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
+            if (FiniteMatrix(entity->GetWorldMatrix()))
+                RecordCorpseGroundAnchor(Key(m.latest.guid), m.latest.incarnation, SafeVec3(entity->GetWorldPosition()), now, false);
+            auto* routine = static_cast<gCScriptRoutine_PS*>(entity->GetPropertySet(eEPropertySetType_ScriptRoutine));
             if (!routine) {
                 m.ragdollTryAt = now + 1500;
                 m.lieCheckAt = now + 1500;
@@ -428,29 +579,36 @@ void LayDown(Mirror& m, uint32_t now)
             }
             routine->AccessAIMode().AccessValue() = gEAIMode_Dead;
             m.entity.CharacterMovement.StopMovement();
-            m.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
+            const bool haveActor = animation && animation->GetActor() && animation->GetActor()->GetInstance();
+            if (haveActor && !EnsureFiniteRagdollPose(m, entity, animation)) {
+                ++m.ragdollFails;
+                ++ragdollsNotReady;
+                m.ragdollTryAt = now + (m.ragdollFails < 4 ? 250 : 1500);
+                m.lieCheckAt = m.ragdollTryAt;
+                std::strcpy(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+                return;
+            }
+            if (haveActor) m.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
             m.ragdollStarted = true;
             if (!corpseRoiUpdateAt || now - corpseRoiUpdateAt >= 1000) {
                 world::RequestProcessingUpdate();
                 corpseRoiUpdateAt = now ? now : 1;
             }
-            m.lieCheckAt = now + 250;
-            return;
         }
         if (animation && animation->GetRagDollEnabled() && animation->GetRagDollController()) {
-            if (!m.ragdollInitialized) {
-                ++m.ragdollStarts;
-                ++ragdollsStarted;
-                std::strcpy(m.presentationSource, RagdollSource(m));
-                Logf("npcs: CLIENTRAGDOLL name=%s action=start source=%s host_force_queued=%d host_force_available=%d fallback=%s",
-                     m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m), "gravity");
-            }
-            m.ragdollInitialized = true;
-            TryApplyForce(m, now);
-            m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
+            completeRagdollStart();
             return;
         }
-        if (animation && animation->GetActor() && static_cast<int32_t>(now - m.ragdollTryAt) >= 0) {
+        if (animation && animation->GetActor() && animation->GetActor()->GetInstance() &&
+            static_cast<int32_t>(now - m.ragdollTryAt) >= 0) {
+            if (!EnsureFiniteRagdollPose(m, entity, animation)) {
+                ++m.ragdollFails;
+                ++ragdollsNotReady;
+                m.ragdollTryAt = now + (m.ragdollFails < 4 ? 250 : 1500);
+                m.lieCheckAt = m.ragdollTryAt;
+                std::strcpy(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+                return;
+            }
             using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
             m.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
             for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
@@ -461,20 +619,12 @@ void LayDown(Mirror& m, uint32_t now)
             }
             if (!animation->GetRagDollEnabled() || !animation->GetRagDollController())
                 animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
-            const bool on = animation->GetRagDollEnabled() && animation->GetRagDollController();
-            if (on) {
-                m.ragdollInitialized = true;
-                ++m.ragdollStarts;
-                ++ragdollsStarted;
-                std::strcpy(m.presentationSource, RagdollSource(m));
-                Logf("npcs: CLIENTRAGDOLL name=%s action=start source=%s host_force_queued=%d host_force_available=%d fallback=%s",
-                     m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m), "gravity");
-                TryApplyForce(m, now);
-                m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
+            if (animation->GetRagDollEnabled() && animation->GetRagDollController()) {
+                completeRagdollStart();
                 return;
             }
             if (!m.corpsePose.empty())
-                npcplayback::ReplayFrozenPose(m.entity.GetInstance(), m.replay, m.corpsePose, m.corpsePoseFlags);
+                npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
             ++m.ragdollFails;
             ++ragdollsNotReady;
             m.ragdollTryAt = now + (m.ragdollFails < 4 ? 1500 : 5000);
