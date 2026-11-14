@@ -1,35 +1,25 @@
-import shutil
 import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "ragdoll_force", ["tests/ragdoll_force_test.cpp"],
+    respect_env=False, msvc_vcvars=False,
+)
 
 
 class RagdollForceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise unittest.SkipTest("An existing C++ compiler is needed for the engine-free force tests")
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        cls.temporary = tempfile.TemporaryDirectory(prefix="ragdoll-tests-", dir=build)
-        cls.addClassCleanup(cls.temporary.cleanup)
-        directory = Path(cls.temporary.name)
-        cls.executable = directory / "ragdoll_force_test.exe"
-        source = ROOT / "tests" / "ragdoll_force_test.cpp"
-        if Path(compiler).stem.lower() == "cl":
-            command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                       str(source), f"/Fe{cls.executable}", f"/Fo{directory / 'test.obj'}"]
-        else:
-            command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                       str(source), "-o", str(cls.executable)]
-        result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(f"Force test compilation failed:\n{result.stdout}{result.stderr}")
+        cls.executable = TARGET.executable()
 
     def run_case(self, case):
         subprocess.run([str(self.executable), case], check=True, capture_output=True, text=True)

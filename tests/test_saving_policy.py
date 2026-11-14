@@ -1,12 +1,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import re
-import shutil
-import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+SAVING_POLICY_TARGET = _testbuild.register_target(
+    "saving-policy",
+    [_testbuild.unit(
+        "tests/saving_policy_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
 
 
 def function_body(source, signature):
@@ -29,26 +41,19 @@ class SavingPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.persist = "\n".join(
-            (ROOT / "src" / name).read_text(encoding="utf-8")
+            _testbuild.src_text(name)
             for name in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
         )
-        cls.net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        cls.net = _testbuild.src_text("net.cpp")
         cls.hero = "\n".join(
-            (ROOT / "src" / name).read_text(encoding="utf-8")
+            _testbuild.src_text(name)
             for name in ("hero.cpp", "hero_codec.cpp")
         )
 
     def test_production_record_policy_executes_without_engine(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
         with tempfile.TemporaryDirectory() as folder:
-            executable = Path(folder) / "saving-policy.exe"
-            result = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                                     str(ROOT / "tests" / "saving_policy_test.cpp"), "-o", str(executable)],
-                                    capture_output=True, text=True)
+            result = SAVING_POLICY_TARGET.run(cwd=folder)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            subprocess.run([str(executable)], check=True, capture_output=True, text=True)
 
     def test_no_world_file_transport_or_client_native_operations(self):
         for obsolete in ("QueueFileTransfer", "OnFileChunk", "OnFileDone", "SaveStored",

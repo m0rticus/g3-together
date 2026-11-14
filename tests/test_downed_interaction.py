@@ -1,28 +1,17 @@
-import os
 from pathlib import Path
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 
 from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
-
-class DownedInteractionTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.source = {
-            name: (ROOT / "src" / f"{name}.cpp").read_text(encoding="utf-8")
-            for name in ("remote", "downed", "containers", "talk", "ransack", "pickpocket", "ai")
-        }
-
-    def test_held_and_payment_policy_executes_without_engine(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "The engine-free policy test needs clang++, g++, or cl")
-        source = r'''
+HARNESS = r'''
 #include "downed_policy.h"
 #include <cassert>
 using namespace g3t::downed;
@@ -78,19 +67,24 @@ int main()
     assert(slot.NeedsPayment(1));
 }
 '''
-        with tempfile.TemporaryDirectory(prefix="downed-interaction-test-", dir=ROOT) as directory:
-            directory = Path(directory)
-            cpp = directory / "policy.cpp"
-            exe = directory / ("policy.exe" if os.name == "nt" else "policy")
-            cpp.write_text(source, encoding="utf-8")
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/EHsc", "/std:c++17", f"/I{ROOT / 'src'}", str(cpp), f"/Fe:{exe}"]
-            else:
-                command = [compiler, "-std=c++17", "-I", str(ROOT / "src"), str(cpp), "-o", str(exe)]
-            build = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            result = subprocess.run([str(exe)], cwd=directory, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+TARGET = _testbuild.register_target(
+    "downed_interaction",
+    [_testbuild.inline_unit("downed_interaction.cpp", HARNESS, warnings="none", includes=(ROOT / "src",))],
+    msvc_vcvars=False,
+)
+
+
+class DownedInteractionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = {
+            name: _testbuild.src_text(f"{name}.cpp")
+            for name in ("remote", "downed", "containers", "talk", "ransack", "pickpocket", "ai")
+        }
+
+    def test_held_and_payment_policy_executes_without_engine(self):
+        result = TARGET.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_both_replicas_publish_talkable_mode_after_held_pose_drive(self):
         update = function_body(self.source["remote"], r"\bvoid\s+UpdatePuppet\s*\(")

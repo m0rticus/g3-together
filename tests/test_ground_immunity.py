@@ -10,16 +10,31 @@ from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
 if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
-from _g3copy import win32_tool_environment
+GROUND_TARGET = _testbuild.register_target(
+    "ground-immunity",
+    [
+        _testbuild.unit(
+            "tests/ground_immunity_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 class GroundImmunityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sources = {
-            name: (ROOT / "src" / f"{name}.cpp").read_text(encoding="utf-8")
+            name: _testbuild.src_text(f"{name}.cpp")
             for name in ("downed", "combat", "spells", "npcs", "npcplayback")
         }
 
@@ -29,23 +44,8 @@ class GroundImmunityTests(unittest.TestCase):
         return result
 
     def test_exact_pose_life_flags_recovery_and_terminal_policy(self):
-        with tempfile.TemporaryDirectory(prefix="ground-policy-") as temporary:
-            directory = Path(temporary)
-            executable = directory / ("ground.exe" if os.name == "nt" else "ground")
-            source = str(ROOT / "tests" / "ground_immunity_test.cpp")
-            compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++")
-            if compiler:
-                env = os.environ.copy()
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", source, "-o", str(executable)]
-            else:
-                env = win32_tool_environment(directory)
-                cl = shutil.which("cl", path=env.get("PATH"))
-                self.assertIsNotNone(cl, "The engine-free immunity test needs a C++ compiler")
-                command = [cl, "/nologo", "/std:c++17", "/EHsc", source, f"/Fe:{executable}", f"/Fo:{directory}\\"]
-            compiled = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run([str(executable)], cwd=directory, env=env, capture_output=True, text=True, timeout=20)
-            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+        executed = GROUND_TARGET.run(timeout=20)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_synthetic_contact_restores_vanilla_pose_gate_before_judgement(self):
         hit = self.body("combat", r"\bGEInt\s+GameHit\s*\(")
@@ -73,7 +73,7 @@ class GroundImmunityTests(unittest.TestCase):
         self.assertNotIn("recovery", targeting)
         for source in ("remote", "net", "body"):
             # Protocol and pose/heartbeat encoders are not part of the immunity contract.
-            self.assertNotIn("HarmImmune", (ROOT / "src" / f"{source}.cpp").read_text(encoding="utf-8"))
+            self.assertNotIn("HarmImmune", _testbuild.src_text(f"{source}.cpp"))
 
     def test_recovery_lifecycle_and_native_standing_detection(self):
         tick = self.body("downed", r"\bvoid\s+Tick\s*\(")

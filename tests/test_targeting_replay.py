@@ -1,38 +1,40 @@
 import re
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGETING_REPLAY_TARGET = _testbuild.register_target(
+    "targeting-replay",
+    [
+        _testbuild.unit(
+            "tests/targeting_replay_test.cpp",
+            std="c++17",
+            warnings="strict",
+        ),
+        _testbuild.unit(
+            "src/snapshot.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=("src",),
+        ),
+    ],
+)
 
 
 class TargetingReplayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise RuntimeError("The engine-free targeting test needs an existing C++ compiler")
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        cls.temporary = tempfile.TemporaryDirectory(prefix="targeting-tests-", dir=build)
-        cls.addClassCleanup(cls.temporary.cleanup)
-        directory = Path(cls.temporary.name)
-        cls.executable = directory / "targeting_replay_test.exe"
-        sources = [ROOT / "tests" / "targeting_replay_test.cpp", ROOT / "src" / "snapshot.cpp"]
-        if Path(compiler).stem.lower() == "cl":
-            command = [compiler, "/nologo", "/std:c++17", "/EHsc",
-                       *(str(source) for source in sources), f"/Fe{cls.executable}"]
-        else:
-            command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                       *(str(source) for source in sources), "-o", str(cls.executable)]
-        result = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=60)
-        if result.returncode:
-            raise RuntimeError(f"Targeting test compilation failed:\n{result.stdout}{result.stderr}")
+        cls.executable = TARGETING_REPLAY_TARGET.executable()
 
     def run_case(self, case):
+        import subprocess
         subprocess.run([str(self.executable), case], check=True, capture_output=True, text=True, timeout=10)
 
     def test_opponent_and_player_flags_follow_the_same_buffered_ai_state(self):
@@ -42,13 +44,13 @@ class TargetingReplayTests(unittest.TestCase):
         self.run_case("order")
 
     def test_native_target_uses_presented_not_latest_opponent(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcs.cpp")
         self.assertIn("motion.combatTarget = records[i].combatTarget;", source)
         self.assertIn("shown.combatTarget = presentation.motion.combatTarget;", source)
         self.assertIn("a.aiMode != b.aiMode || a.combatTarget != b.combatTarget", source)
 
     def test_production_diagnostic_observes_without_selecting_or_mutating(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcs.cpp")
         diagnostic = source.split("struct FocusInspection :", 1)[1].split("void PassiveMirrorTick()", 1)[0]
         for forbidden in ("FindFocusEntity(", "SetFocusEntity(", "SetCurrentTarget(", "SetTask(",
                           "EnableAutoAiming(", "CollectInteractionEntities("):
@@ -60,7 +62,7 @@ class TargetingReplayTests(unittest.TestCase):
         self.assertIn("targetingWatch = TargetingWatch{};", source)
 
     def test_diagnostic_records_fit_the_production_log_buffer(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcs.cpp")
         diagnostic = source.split("struct FocusInspection :", 1)[1].split("void PassiveMirrorTick()", 1)[0]
         formats = re.findall(r'Logf\("(npcs: FOCUS[^"\n]*)"', diagnostic)
         self.assertGreaterEqual(len(formats), 10)

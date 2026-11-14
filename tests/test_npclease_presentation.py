@@ -2,33 +2,37 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+NPCLEASE_PRESENTATION_TARGET = _testbuild.register_target(
+    "npclease-presentation",
+    [
+        _testbuild.unit(
+            "tests/npclease_presentation_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 class NpcLeasePresentationTests(unittest.TestCase):
     def test_unavailable_policy(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "C++17 compiler required")
-        with tempfile.TemporaryDirectory(prefix=".npclease-presentation-", dir=ROOT / "tests") as directory:
-            build = Path(directory)
-            executable = build / ("presentation.exe" if os.name == "nt" else "presentation")
-            source = ROOT / "tests" / "npclease_presentation_test.cpp"
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", str(source),
-                           f"/Fe:{executable}"]
-            else:
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source),
-                           "-o", str(executable)]
-            result = subprocess.run(command, cwd=build, capture_output=True, text=True, timeout=120)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable)], cwd=build, capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = NPCLEASE_PRESENTATION_TARGET.run(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_release_keeps_presentation_and_detach_is_inert(self):
-        source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcs.cpp")
         passive = source[source.index("void PassiveMirrorTick()"):source.index("bool MirrorFightsHero()")]
         self.assertNotIn("if (m.released) { it = mirrors.erase(it); continue; }", passive)
         self.assertIn("if (!HostPresentationAvailable(m.entity.GetInstance()))", passive)
@@ -39,7 +43,7 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertIn("strncpy_s(m.body.routine", passive)
 
     def test_hold_does_not_kill_or_restart_ai(self):
-        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcplayback.cpp")
         hold = source[source.index("bool HoldUnavailable("):source.index("void UpdatePresentation(")]
         self.assertIn("npc.IsDead() || npc.IsDown()", hold)
         self.assertIn("ReplayFrozenPose(", hold)
@@ -48,7 +52,7 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertNotIn("Kill", hold)
 
     def test_idle_bootstrap_is_evaluated_and_script_free(self):
-        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcplayback.cpp")
         idle = source[source.index("eCResourceDataEntity* NativeMotion("):source.index("bool CosmeticHit(")]
         for required in ("npc.GetAni(action, phase)", "GetAniVariation",
                          "QueryMotionDataEntity", "gEUseType_None", "EvaluateIdle(",
@@ -73,7 +77,7 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertIn("EvaluateIdle(entity, *animation, net::Now()", hold)
 
     def test_cosmetic_contact_is_script_free_finite_and_host_superseded(self):
-        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcplayback.cpp")
         hit = source[source.index("bool CosmeticHit("):source.index("bool LocalHit(")]
         for required in ("HostPresentationAvailable", "npclease::Fenced", "RedundantClientEntity",
                          "waiting.hitSwing == swing", "gEAction_QuickStumble, gEPhase_Hit",
@@ -84,14 +88,14 @@ class NpcLeasePresentationTests(unittest.TestCase):
         hold = source[source.index("bool HoldUnavailable("):source.index("void ReleaseUnavailable(")]
         self.assertIn("reactionDuration", hold)
         self.assertLess(hold.index("HostPresentationAvailable"), hold.index("PoseProvenance::Reaction"))
-        combat = (ROOT / "src" / "combat_melee.cpp").read_text(encoding="utf-8")
+        combat = _testbuild.src_text("combat_melee.cpp")
         contact = combat[combat.index("bool SendHostJudgedMelee("):combat.index("void PlayHitEffect(")]
         self.assertLess(contact.index("CosmeticHit"), contact.index("net::SendHitNpc"))
         self.assertIn("contact.motion", contact)
         self.assertIn("visual=%u", source)
 
     def test_fallback_scans_processed_npcs_and_bounds_resource_retries(self):
-        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcplayback.cpp")
         tick = source[source.index("void Tick()"):]
         self.assertIn("world::ProcessedEntities()", tick)
         self.assertNotIn("Entity::GetNPCs()", tick)
@@ -102,7 +106,7 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertLess(hold.index("provenPoses.find(key)"), hold.index("BootstrapIdle(entity"))
 
     def test_missing_pose_never_changes_rendering(self):
-        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcplayback.cpp")
         self.assertNotIn("EnableRendering(", source)
         self.assertIn("retaining visibility contacts=off", source)
         self.assertIn("PresentationCensus(cleanupNow)", source)
@@ -111,17 +115,17 @@ class NpcLeasePresentationTests(unittest.TestCase):
             self.assertIn(counter, source)
         tick = source[source.index("void Tick()"): ]
         self.assertLess(tick.index("if (!IsCharacter(entity))"), tick.index("Entity npc(entity)"))
-        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        npcs = _testbuild.src_text("npcs.cpp")
         send = npcs[npcs.index("void SendOwned("):npcs.index("const bTObjArray<Entity> all", npcs.index("void SendOwned("))]
         self.assertIn("npcplayback::IsCharacter(instance)", send)
 
     def test_native_pose_is_preserved_before_creature_stop(self):
-        source = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npcplayback.cpp")
         native = source[source.index("bool RememberNativePresentation("):source.index("bool CosmeticHit(")]
         for required in ("GetTargetWeight", "GetPlayTime", "originalActorProcess(",
                          "GETrue, GEFalse, 0.0f", "PoseProvenance::Native"):
             self.assertIn(required, native)
-        runtime = (ROOT / "src" / "npclease_runtime.cpp").read_text(encoding="utf-8")
+        runtime = _testbuild.src_text("npclease_runtime.cpp")
         stop = runtime[runtime.index("void Stop("):runtime.index("bool Import(")]
         self.assertIn("if (!entity || Player(entity) || !entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;", stop)
         self.assertLess(stop.index("RememberNativePresentation(entity)"), stop.index("npc.Routine.FullStop()"))

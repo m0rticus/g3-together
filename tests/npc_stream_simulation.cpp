@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <random>
 #include <vector>
@@ -39,7 +40,7 @@ static void Check(bool condition, char const* expression, int line, char const* 
 
 namespace {
 constexpr int Bones = 80;
-constexpr uint32_t OneWayMs = 12, LoadingMs = 3000, SteadyFromMs = 4000, SteadyForMs = 16000;
+constexpr uint32_t OneWayMs = 12, LoadingMs = 2000, SteadyFromMs = 2500, SteadyForMs = 5000;
 constexpr size_t FullPoseBytes = 3 + Bones * sizeof(pose::Bone);
 
 enum class Kind { Fighter, Walker, Idle, Static, Far };
@@ -163,7 +164,8 @@ Result Run(Params const& p)
     npcsend::InitialPacer pacer;
     Result result;
     const uint32_t entry = LoadingMs;
-    const uint32_t steadyFrom = entry + SteadyFromMs, steadyTo = steadyFrom + SteadyForMs;
+    const uint32_t steadyFrom = entry + SteadyFromMs, steadyTo = p.steadyEndMs;
+    const double steadyDurationMs = static_cast<double>(steadyTo - steadyFrom);
     std::deque<std::pair<uint32_t, std::pair<size_t, uint32_t>>> acks;  // due, npc, token
     std::vector<uint64_t> windows(p.steadyEndMs / 100 + 2, 0);
     uint64_t steadyBytes = 0, steadyDatagrams = 0, updates = 0, boneBytes = 0;
@@ -313,7 +315,7 @@ Result Run(Params const& p)
     (void)steadyDatagrams;
     for (uint64_t w : windows) result.maxWindow100 = std::max(result.maxWindow100, w);
     for (size_t w = 0; w < 15 && w < windows.size(); ++w) result.burstWindow100 = std::max(result.burstWindow100, windows[w]);
-    result.bytesPerSecond = steadyBytes * 1000.0 / SteadyForMs;
+    result.bytesPerSecond = steadyBytes * 1000.0 / steadyDurationMs;
     result.meanBytesPerUpdate = updates ? double(boneBytes) / updates : 0.0;
     result.pacer = pacer;
     uint32_t lastFirst = 0;
@@ -331,7 +333,7 @@ Result Run(Params const& p)
             if (clientLast) clientGap = std::max(clientGap, t - clientLast);
             clientLast = t;
         }
-        result.rates.push_back(count * 1000.0 / SteadyForMs);
+        result.rates.push_back(count * 1000.0 / steadyDurationMs);
         result.counts.push_back(count);
         result.kinds.push_back(n.kind);
         result.maxGaps.push_back(gap);
@@ -371,8 +373,9 @@ void PrintTiers(char const* name, npcsend::Stats const& s)
 }
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    const bool includeBrawl = argc > 1 && std::strcmp(argv[1], "--brawl") == 0;
     // 1. The regression, reproduced with the real build-18 budget and scheduler rule.
     Params legacyParams;
     legacyParams.legacy = true;
@@ -425,7 +428,8 @@ int main()
     // 3. Emergency valve: real congestion signals stretch every NPC alike, nobody starves, and it decays back.
     Params valve;
     const uint32_t entry = LoadingMs, base = entry + SteadyFromMs;
-    valve.episodes = {{base + 3000, base + 5000, 16, 0}, {base + 9000, base + 10000, 32, 600000}};
+    valve.episodes = {{base + 400, base + 2200, 16, 0}, {base + 5400, base + 6300, 32, 600000}};
+    valve.steadyEndMs = base + 9500;
     const Result congested = Run(valve);
     Print("new-valve-episodes", congested);
     PrintTiers("new-valve-throttle16", congested.episode[0]);
@@ -445,13 +449,17 @@ int main()
         if (congested.kinds[i] != Kind::Static) CHECK(congested.maxGaps[i] <= 4 * 1000 + 100, "episode run NPC %zu gap %u", i, congested.maxGaps[i]);
 
     // 4. Worst case: every NPC fighting. Numbers only; this scene is the live crowd fight (the game-start orc raid).
-    Params brawl;
-    brawl.mix = {70, 0, 0, 5, 0};
-    const Result fight = Run(brawl);
-    Print("new-brawl-70-fighters", fight);
-    PrintTiers("new-brawl-70-fighters", fight.steady);
+    double brawlBps = 0.0;
+    if (includeBrawl) {
+        Params brawl;
+        brawl.mix = {70, 0, 0, 5, 0};
+        const Result fight = Run(brawl);
+        Print("new-brawl-70-fighters", fight);
+        PrintTiers("new-brawl-70-fighters", fight.steady);
+        brawlBps = fight.bytesPerSecond;
+    }
     std::printf("STREAM-SIM summary: legacy min Hz %.2f worst gap %u ms -> new min Hz %.2f worst gap %u ms; design mix %.0f B/s "
                 "(legacy %.0f B/s), brawl %.0f B/s\n", legacyMin, legacyWorstGap, newMin, newWorstGap, fixedRun.bytesPerSecond,
-                legacy.bytesPerSecond, fight.bytesPerSecond);
+                legacy.bytesPerSecond, brawlBps);
     return 0;
 }

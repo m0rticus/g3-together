@@ -5,36 +5,40 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import sys
 import unittest
 
 from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+NPC_RETARGET_TARGET = _testbuild.register_target(
+    "npc-retarget",
+    [
+        _testbuild.unit(
+            "tests/npc_retarget_policy_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 class NpcRetargetTests(unittest.TestCase):
     def test_selection_and_episode_policy_without_engine(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "C++17 compiler required")
-        with tempfile.TemporaryDirectory(prefix=".npc-retarget-", dir=ROOT / "tests") as directory:
-            directory = Path(directory)
-            exe = directory / ("retarget.exe" if os.name == "nt" else "retarget")
-            source = ROOT / "tests" / "npc_retarget_policy_test.cpp"
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                           str(source), f"/Fe:{exe}"]
-            else:
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                           str(source), "-o", str(exe)]
-            compiled = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=120)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            ran = subprocess.run([str(exe)], cwd=directory, capture_output=True, text=True, timeout=30)
-            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        ran = NPC_RETARGET_TARGET.run(timeout=30)
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
 
     def test_native_cancel_and_attack_guards_precede_fight_exit(self):
-        ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
-        fightmem = (ROOT / "src" / "fightmem.cpp").read_text(encoding="utf-8")
+        ai = _testbuild.src_text("ai.cpp")
+        fightmem = _testbuild.src_text("fightmem.cpp")
         release = function_body(ai, r"\bbool\s+ReleaseDownedTargets\s*\(")
         self.assertLess(release.index("DownedReleaseScope scope"), release.index("npc.Routine.FullStop()"))
         self.assertLess(release.index("instance == releasingDownedNpc"), release.index("if (!bindings)"))
@@ -62,15 +66,15 @@ class NpcRetargetTests(unittest.TestCase):
             self.assertIn(required, release)
 
     def test_publication_after_release_and_passive_mirror_target_timeline(self):
-        script = (ROOT / "src" / "Script_G3Together.cpp").read_text(encoding="utf-8")
+        script = _testbuild.src_text("Script_G3Together.cpp")
         self.assertLess(script.index("g3t::remote::Tick()"), script.index("g3t::ai::Tick()"))
         self.assertLess(script.index("g3t::ai::Tick()"), script.index("g3t::npcs::Tick()"))
-        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        npcs = _testbuild.src_text("npcs.cpp")
         for required in ("self.NPC.GetCurrentTarget()", "r.combatTarget = net::HashGuid(targetGuid)",
                          "shown.combatTarget = presentation.motion.combatTarget",
                          "routine->AccessAIMode().AccessValue()", "npcProperties->AccessCurrentTargetEntity().SetEntity(opponent)"):
             self.assertIn(required, npcs)
-        policy = (ROOT / "src" / "npcsend_policy.h").read_text(encoding="utf-8")
+        policy = _testbuild.src_text("npcsend_policy.h")
         essential = function_body(policy, r"\bbool\s+EssentialChanged\s*\(")
         self.assertIn("0xBFu", essential)
         self.assertIn("sent.aiMode != current.aiMode", essential)
@@ -81,7 +85,7 @@ class NpcRetargetTests(unittest.TestCase):
         if not game:
             self.skipTest("Set G3T_GAME_DLL to check the actual companion Script_Game.dll read-only")
         image = Path(game).parent / "scripts" / "Script_Game.dll"
-        data = image.read_bytes()
+        data = _testbuild.cached_bytes(image)
         self.assertEqual(hashlib.sha256(data).hexdigest(),
                          "cdd9c46120abac49ebb6d53e5bed79512a528e5940238d6d88d150fe9aef3cdc")
         pe = struct.unpack_from("<I", data, 0x3C)[0]

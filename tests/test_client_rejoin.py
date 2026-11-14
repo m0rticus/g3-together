@@ -1,18 +1,25 @@
-import hashlib
 import os
 import re
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "client_rejoin", [ROOT / "tests" / "client_rejoin_test.cpp"],
+    allow_msvc=False, respect_env=False,
+    skip_message="C++17 compiler required for engine-free client rejoin tests",
+)
 
 
 def persist_source():
     return "\n".join(
-        (ROOT / "src" / part).read_text(encoding="utf-8")
+        _testbuild.src_text(part)
         for part in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
     )
 
@@ -36,36 +43,26 @@ def function_body(text, signature):
 class ClientRejoinTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            raise unittest.SkipTest("C++17 compiler required for engine-free client rejoin tests")
-        cls.folder = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.folder.cleanup)
-        cls.executable = Path(cls.folder.name) / "client_rejoin.exe"
-        subprocess.run(
-            [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-             str(ROOT / "tests" / "client_rejoin_test.cpp"), "-o", str(cls.executable)],
-            check=True, capture_output=True, text=True,
-        )
+        cls.executable = TARGET.executable()
 
     def test_production_state_policy_and_native_guards(self):
-        subprocess.run([str(self.executable)], check=True, capture_output=True, text=True)
+        TARGET.run(check=True)
 
     def test_real_cp_menu_loader_and_aslr(self):
         path = os.environ.get("G3T_GAME_DLL")
         if not path:
             self.skipTest("Set G3T_GAME_DLL for read-only native rejoin checks")
         self.assertIn(
-            hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            _testbuild.cached_sha256(path),
             {
                 "4491a10cdd5908a6f6d9111e0bd5406add7a79901eeeb8d80f769858147a6ca4",
                 "c7191a6ab0889fb2da38d56e683bf207d62c4bde6b6aa7ace136ee434f8b1d21",
             },
         )
-        subprocess.run([str(self.executable), path], check=True, capture_output=True, text=True)
+        TARGET.run([path], check=True)
 
     def test_transition_runs_before_frame_and_outside_enet(self):
-        module = (ROOT / "src" / "Script_G3Together.cpp").read_text()
+        module = _testbuild.src_text("Script_G3Together.cpp")
         process = module.split("void Process() override", 1)[1].split("void PostProcess()", 1)[0]
         self.assertLess(process.index("ProcessClientTransition()"), process.index("FrameScope frame"))
         self.assertIn("ClientTransitionPending()", process)
@@ -106,7 +103,7 @@ class ClientRejoinTests(unittest.TestCase):
         self.assertIn("QueueClientReturn();", entry)  # queue only: no native call from ENet dispatch
         self.assertNotIn("originalLoad", entry)
         self.assertNotIn("worldCleanup", entry)
-        header = (ROOT / "src" / "persist.h").read_text(encoding="utf-8")
+        header = _testbuild.src_text("persist.h")
         self.assertIn("EnterResult EnterHostWorld(char const* reason);", header)
         self.assertIn("bool HostWorldEntryAvailable();", header)
 
@@ -164,7 +161,7 @@ class ClientRejoinTests(unittest.TestCase):
         self.assertIn("i18n::ClientTemplateUnavailable", text.split("case S::NoRoute", 1)[1])
         menu = function_body(source, r"\bwchar_t const\*\s+AutoloadMenuText\s*\(")
         self.assertIn("AdmissionText(autoloadStatus", menu)
-        policy = (ROOT / "src" / "client_template.h").read_text(encoding="utf-8")
+        policy = _testbuild.src_text("client_template.h")
         decide = policy.split("inline Plan Decide(Situation const& s)", 1)[1].split("// Silent regeneration", 1)[0]
         self.assertEqual(decide.count("Route::Impossible"), 5)
 
@@ -183,7 +180,7 @@ class ClientRejoinTests(unittest.TestCase):
         self.assertIn("QueueClientReturn();", command)
 
     def test_world_entry_hang_is_located_without_a_dump(self):
-        source = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("crashlog.cpp")
         self.assertIn("world-entry: main thread stack operation=", source)
         poll = source.split("void PollWorldEntry()", 1)[1].split("void EndStep", 1)[0]
         self.assertLess(poll.index("LogMainThread(operation.name)"), poll.index("still waiting for"))

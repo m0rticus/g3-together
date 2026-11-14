@@ -3,10 +3,29 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+NPCSTREAM_DIAG_TARGET = _testbuild.register_target(
+    "npcstream-diag",
+    [
+        _testbuild.unit(
+            "tests/npcstream_diag_test.cpp",
+            std="c++17",
+            warnings="strict",
+            defines=("NDEBUG",),
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 def function_body(source, declaration):
@@ -26,28 +45,13 @@ def function_body(source, declaration):
 class NpcStreamDiagnosticsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
-        cls.npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        cls.npc_send = (ROOT / "src" / "npc_send.cpp").read_text(encoding="utf-8")
+        cls.world = _testbuild.src_text("world.cpp")
+        cls.npcs = _testbuild.src_text("npcs.cpp")
+        cls.npc_send = _testbuild.src_text("npc_send.cpp")
 
     def test_engine_free_diagnostics(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required for engine-free NPC stream diagnostics")
-        executable = ROOT / "tests" / f".npcstream-diag-test-{os.getpid()}.exe"
-        try:
-            compiled = subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-DNDEBUG",
-                 str(ROOT / "tests" / "npcstream_diag_test.cpp"), "-o", str(executable)],
-                cwd=ROOT, capture_output=True, text=True, timeout=120,
-            )
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run(
-                [str(executable)], cwd=ROOT, capture_output=True, text=True, timeout=60,
-            )
-            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
-        finally:
-            executable.unlink(missing_ok=True)
+        executed = NPCSTREAM_DIAG_TARGET.run(timeout=60)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_retirement_callers_distinguish_stop_and_callback(self):
         stop = function_body(self.world, "void __fastcall StopSession(")

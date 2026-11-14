@@ -1,20 +1,28 @@
 import re
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "client_autoload", [ROOT / "tests" / "client_autoload_test.cpp"],
+    allow_msvc=False, respect_env=False,
+    skip_message="C++17 compiler required for engine-free client autoload tests",
+)
 
 
 def source(name):
     if name == "src/persist.cpp":
         return "\n".join(
-            (ROOT / "src" / part).read_text(encoding="utf-8")
+            _testbuild.src_text(part)
             for part in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
         )
-    return (ROOT / name).read_text(encoding="utf-8")
+    return _testbuild.src_text(name[4:]) if name.startswith("src/") else _testbuild.cached_text(ROOT / name)
 
 
 def body(text, start, end):
@@ -40,20 +48,10 @@ def function_body(text, signature):
 class ClientAutoloadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            raise unittest.SkipTest("C++17 compiler required for engine-free client autoload tests")
-        cls.folder = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.folder.cleanup)
-        cls.executable = Path(cls.folder.name) / "client_autoload.exe"
-        subprocess.run(
-            [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-             str(ROOT / "tests" / "client_autoload_test.cpp"), "-o", str(cls.executable)],
-            check=True, capture_output=True, text=True,
-        )
+        cls.executable = TARGET.executable()
 
     def test_production_decision_table(self):
-        subprocess.run([str(self.executable)], check=True, capture_output=True, text=True)
+        TARGET.run(check=True)
 
     def test_no_wire_change(self):
         self.assertIn("Protocol = 79", source("src/saving_policy.h"))

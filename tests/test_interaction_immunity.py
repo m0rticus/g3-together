@@ -11,16 +11,31 @@ from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
 if str(ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(ROOT / "tools"))
-from _g3copy import win32_tool_environment
+INTERACTION_TARGET = _testbuild.register_target(
+    "interaction-immunity",
+    [
+        _testbuild.unit(
+            "tests/interaction_immunity_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 class InteractionImmunityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sources = {
-            name: (ROOT / "src" / f"{name}.cpp").read_text(encoding="utf-8")
+            name: _testbuild.src_text(f"{name}.cpp")
             for name in ("downed", "remote", "net", "combat", "spells", "Script_G3Together")
         }
 
@@ -30,23 +45,8 @@ class InteractionImmunityTests(unittest.TestCase):
         return result
 
     def test_production_window_grace_symmetry_release_and_wire_policy(self):
-        with tempfile.TemporaryDirectory(prefix="interaction-policy-") as temporary:
-            directory = Path(temporary)
-            executable = directory / ("interaction.exe" if os.name == "nt" else "interaction")
-            source = str(ROOT / "tests" / "interaction_immunity_test.cpp")
-            compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++")
-            if compiler:
-                env = os.environ.copy()
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", source, "-o", str(executable)]
-            else:
-                env = win32_tool_environment(directory)
-                cl = shutil.which("cl", path=env.get("PATH"))
-                self.assertIsNotNone(cl, "The engine-free immunity test needs a C++ compiler")
-                command = [cl, "/nologo", "/std:c++17", "/EHsc", source, f"/Fe:{executable}", f"/Fo:{directory}\\"]
-            compiled = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run([str(executable)], cwd=directory, env=env, capture_output=True, text=True, timeout=20)
-            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+        executed = INTERACTION_TARGET.run(timeout=20)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_native_observation_is_live_bilateral_and_not_a_cached_task(self):
         state = self.body("downed", r"\buint8_t\s+LocalInteractionFlags\s*\(")
@@ -76,8 +76,7 @@ class InteractionImmunityTests(unittest.TestCase):
         path = os.environ.get("G3T_GAME_DLL")
         if not path:
             self.skipTest("Set G3T_GAME_DLL for read-only native byte verification")
-        import pefile
-        image = pefile.PE(path)
+        image = _testbuild.cached_pe(path)
         native = self.body("downed", r"\bint\s+NativeInteractionPage\s*\(")
         for name, address in (("pageBytes", 0x7B490), ("tutorialSelect", 0x8B359), ("tutorialSave", 0x8B384)):
             array = re.search(rf"\b{name}\[\]\s*=\s*\{{([^}}]+)\}}", native)
@@ -162,7 +161,7 @@ class InteractionImmunityTests(unittest.TestCase):
         targeting = self.body("downed", r"\bbool\s+CombatUnavailable\s*\(\s*eCEntity")
         self.assertNotIn("Interaction", targeting)  # avoid FullStop of a native dialog partner
         self.assertIn("life.held", targeting)
-        trade = (ROOT / "src" / "trade.cpp").read_text(encoding="utf-8")
+        trade = _testbuild.src_text("trade.cpp")
         self.assertIn("manager->GetActivePage() == gEGamePage_Trade", trade)
 
 

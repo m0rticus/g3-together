@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -101,6 +102,9 @@ def validate_copy_roots(
     return roots
 
 
+_WIN32_ENV_MEM_CACHE: dict[str, dict[str, str]] = {}
+
+
 def win32_tool_environment(build: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["TEMP"] = env["TMP"] = str(build)
@@ -110,6 +114,26 @@ def win32_tool_environment(build: Path) -> dict[str, str]:
                / "Microsoft Visual Studio" / "Installer" / "vswhere.exe")
     if not vswhere.is_file():
         raise RuntimeError("Visual Studio vswhere is required to locate the Win32 toolchain")
+    vs_stat = vswhere.stat()
+    cache_key = hashlib.sha256(
+        f"{vswhere}:{vs_stat.st_mtime_ns}:{vs_stat.st_size}:{env.get('PATH', '')}".encode("utf-8", errors="replace")
+    ).hexdigest()[:20]
+    cached_base = _WIN32_ENV_MEM_CACHE.get(cache_key)
+    cache_dir = Path(__file__).resolve().parents[1] / "build" / "test-cache" / "env"
+    cache_file = cache_dir / f"vcvars32-{cache_key}.json"
+    if cached_base is None and cache_file.is_file():
+        try:
+            loaded = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and shutil.which("cl", path=loaded.get("PATH") or loaded.get("Path")):
+                cached_base = {str(k): str(v) for k, v in loaded.items()}
+                _WIN32_ENV_MEM_CACHE[cache_key] = cached_base
+        except OSError:
+            cached_base = None
+    if cached_base is not None:
+        out = cached_base.copy()
+        out["TEMP"] = out["TMP"] = str(build)
+        return out
+
     result = subprocess.run(
         [str(vswhere), "-latest", "-products", "*",
          "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
@@ -131,6 +155,14 @@ def win32_tool_environment(build: Path) -> dict[str, str]:
                 if existing.lower() == name.lower() and existing != name:
                     del env[existing]
             env[name] = value
+    _WIN32_ENV_MEM_CACHE[cache_key] = env.copy()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = cache_dir / f"vcvars32-{cache_key}.tmp.{os.getpid()}.json"
+        tmp_file.write_text(json.dumps(env), encoding="utf-8")
+        os.replace(tmp_file, cache_file)
+    except OSError:
+        pass
     env["TEMP"] = env["TMP"] = str(build)
     return env
 

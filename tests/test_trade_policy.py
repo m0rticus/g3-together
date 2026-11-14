@@ -1,4 +1,5 @@
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 TRADE_H = ROOT / "src" / "trade.h"
 TRADE_CPP = ROOT / "src" / "trade.cpp"
 OFFER_CPP = ROOT / "src" / "offer.cpp"
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
 
 def function_body(source, signature):
@@ -30,9 +35,9 @@ def function_body(source, signature):
 class TradePolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.trade_h = TRADE_H.read_text(encoding="utf-8")
-        cls.trade_cpp = TRADE_CPP.read_text(encoding="utf-8")
-        cls.offer_cpp = OFFER_CPP.read_text(encoding="utf-8")
+        cls.trade_h = _testbuild.src_text("trade.h")
+        cls.trade_cpp = _testbuild.src_text("trade.cpp")
+        cls.offer_cpp = _testbuild.src_text("offer.cpp")
 
     def test_shared_classifier_is_declared_and_has_one_stack_definition(self):
         self.assertRegex(self.trade_h, r"\bTradableItem\s*\(")

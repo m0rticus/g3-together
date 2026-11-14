@@ -13,7 +13,7 @@ using namespace g3t::npcwire::bones;
 
 namespace {
 constexpr int BoneCount = 76, NpcCount = 75;
-constexpr uint32_t Seconds = 20, AckDelay = 25;
+constexpr uint32_t SimMs = 3000, SessionMs = 20000, AckDelay = 25;
 
 struct Matrix {
     double m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, p[3] = {};
@@ -195,7 +195,7 @@ void Scene(int fighters, uint32_t frameMs)
     uint64_t oldComponents[5] = {}, newComponents[5] = {};
     size_t worstBasis = 0;
     double encodeMicros = 0;
-    for (uint32_t now = 0; now < Seconds * 1000; now += frameMs) {
+    for (uint32_t now = 0; now < SimMs; now += frameMs) {
         std::vector<Message> oldMessages, newMessages;
         for (int i = 0; i < NpcCount; ++i) {
             auto& n = npcs[i];
@@ -316,15 +316,16 @@ void Scene(int fighters, uint32_t frameMs)
     for (int i = 0; i < BoneCount; ++i) bootstrapMessages.emplace_back(101, true);
     bootstrapMessages.emplace_back(20 + BoneCount * 4, true);
     uint64_t bootstrapPackets = 0;
-    const uint64_t bootstrap = Pack(bootstrapMessages, bootstrapPackets);
+    const double simSec = SimMs / 1000.0;
+    const uint64_t bootstrap = (Pack(bootstrapMessages, bootstrapPackets) * SimMs + SessionMs - 1) / SessionMs;
     before += bootstrap; after += bootstrap;
     std::printf("BONE_SCENE fighters=%d frame_ms=%u bones=%d updates_per_s=%.1f "
                 "bone_before_after_Bpu=%.1f/%.1f envelope_before_after_Bps=%.0f/%.0f "
                 "control_before_after_Bps=%.0f/%.0f pose_updates_per_datagram_after=%.2f keys=%llu "
                 "max_basis_error_q12=%zu origin_error_cm=0 skin_200cm_bound_cm=%.4f encode_us_per_update=%.1f\n",
-                fighters, frameMs, BoneCount, double(updates) / Seconds, double(oldBone) / updates, double(newBone) / updates,
-                double(before) / Seconds, double(after) / Seconds, double(oldControlBytes) / Seconds,
-                double(newControlBytes) / Seconds, double(updates) / newPackets, static_cast<unsigned long long>(keys),
+                fighters, frameMs, BoneCount, double(updates) / simSec, double(oldBone) / updates, double(newBone) / updates,
+                double(before) / simSec, double(after) / simSec, double(oldControlBytes) / simSec,
+                double(newControlBytes) / simSec, double(updates) / newPackets, static_cast<unsigned long long>(keys),
                 worstBasis, double(worstBasis) * 600 / 4096, encodeMicros / updates);
     std::fflush(stdout);
     std::printf("BONE_COMPONENTS before_after_Bpu header=%.1f/%.1f mask=%.1f/%.1f rotation=%.1f/%.1f "
@@ -343,13 +344,14 @@ void Scene(int fighters, uint32_t frameMs)
     std::fflush(stdout);
     assert(after < before);
     assert(newBone < oldBone);
-    if (frameMs == 33) assert(after / Seconds < 1000000);
+    if (frameMs == 33) assert(double(after) / simSec < 1000000);
 }
 }
 
-int main()
+int main(int argc, char** argv)
 {
     Scene(5, 22);
     Scene(65, 33);
-    Scene(70, 22);
+    if (argc > 1 && std::strcmp(argv[1], "--full") == 0)
+        Scene(70, 22);
 }

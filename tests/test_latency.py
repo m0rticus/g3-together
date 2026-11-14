@@ -1,38 +1,40 @@
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+LATENCY_TARGET = _testbuild.register_target(
+    "latency",
+    [
+        _testbuild.unit(
+            "tests/latency_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        ),
+        _testbuild.unit(
+            "src/snapshot.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "src",),
+        ),
+    ],
+)
 
 
 class LatencyTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise unittest.SkipTest("An existing C++ compiler is needed for engine-free latency tests")
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        cls.temporary = tempfile.TemporaryDirectory(prefix="latency-tests-", dir=build)
-        cls.addClassCleanup(cls.temporary.cleanup)
-        directory = Path(cls.temporary.name)
-        cls.executable = directory / "latency_test.exe"
-        sources = [ROOT / "tests" / "latency_test.cpp", ROOT / "src" / "snapshot.cpp"]
-        if Path(compiler).stem.lower() == "cl":
-            command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                       *(str(source) for source in sources), f"/Fe{cls.executable}", f"/Fo{directory}\\"]
-        else:
-            command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                       *(str(source) for source in sources), "-o", str(cls.executable)]
-        result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(f"Latency test compilation failed:\n{result.stdout}{result.stderr}")
-
     def run_case(self, case):
-        result = subprocess.run([str(self.executable), case], capture_output=True, text=True)
+        result = LATENCY_TARGET.run([case], timeout=60)
         self.assertEqual(result.returncode, 0, f"{case} failed:\n{result.stdout}{result.stderr}")
 
     def test_clean_link_uses_34_ms_npc_floor_without_changing_player_delay(self):

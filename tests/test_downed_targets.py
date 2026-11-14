@@ -1,27 +1,17 @@
-import os
 from pathlib import Path
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 
 from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
-
-class DownedTargetTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
-        cls.combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
-        cls.downed = (ROOT / "src" / "downed.cpp").read_text(encoding="utf-8")
-
-    def test_player_life_and_binding_policy_executes_without_engine(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "The engine-free policy test needs clang++, g++, or cl")
-        source = r'''
+HARNESS = r'''
 #include "downed_policy.h"
 #include <cassert>
 using namespace g3t::downed;
@@ -58,19 +48,23 @@ int main()
     assert(!life.Revive(life.sequence));
 }
 '''
-        with tempfile.TemporaryDirectory(prefix="downed-target-test-", dir=ROOT) as directory:
-            directory = Path(directory)
-            cpp = directory / "policy.cpp"
-            exe = directory / ("policy.exe" if os.name == "nt" else "policy")
-            cpp.write_text(source, encoding="utf-8")
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/EHsc", "/std:c++17", f"/I{ROOT / 'src'}", str(cpp), f"/Fe:{exe}"]
-            else:
-                command = [compiler, "-std=c++17", "-I", str(ROOT / "src"), str(cpp), "-o", str(exe)]
-            build = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            result = subprocess.run([str(exe)], cwd=directory, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+TARGET = _testbuild.register_target(
+    "downed_targets",
+    [_testbuild.inline_unit("downed_targets.cpp", HARNESS, warnings="none", includes=(ROOT / "src",))],
+    msvc_vcvars=False,
+)
+
+
+class DownedTargetTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai = _testbuild.src_text("ai.cpp")
+        cls.combat = _testbuild.src_text("combat.cpp")
+        cls.downed = _testbuild.src_text("downed.cpp")
+
+    def test_player_life_and_binding_policy_executes_without_engine(self):
+        result = TARGET.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_remote_truth_does_not_read_published_native_mode_or_timeout(self):
         query = function_body(self.downed, r"\bbool\s+CombatUnavailable\s*\(\s*eCEntity\s*\*\s*entity\s*\)")

@@ -1,32 +1,35 @@
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+NPCREMOVAL_TARGET = _testbuild.register_target(
+    "npcremoval",
+    [
+        _testbuild.unit(
+            "tests/npcremoval_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 class NpcRemovalTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        import os
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise unittest.SkipTest("C++17 compiler required for engine-free NPC removal fixture")
-        cls.folder = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.folder.cleanup)
-        cls.executable = Path(cls.folder.name) / "npcremoval.exe"
-        src = ROOT / "tests" / "npcremoval_test.cpp"
-        if Path(compiler).stem.lower() == "cl":
-            cmd = [compiler, "/nologo", "/EHsc", "/std:c++17", "/W4", str(src), f"/Fe:{cls.executable}"]
-        else:
-            cmd = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(cls.executable)]
-        subprocess.run(cmd, cwd=cls.folder.name, check=True, capture_output=True, text=True)
-
     def run_fixture(self, section):
-        subprocess.run([str(self.executable), section], check=True, capture_output=True, text=True)
+        result = NPCREMOVAL_TARGET.run([section], timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_atomic_name_configuration(self):
         self.run_fixture("names")

@@ -8,6 +8,10 @@ test_dir = str(Path(__file__).resolve().parent)
 if test_dir not in sys.path:
     sys.path.insert(0, test_dir)
 from test_hud_notices import read_rva
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -18,17 +22,17 @@ def section(source, start, end):
 class NpcLeaseRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.host_source = (ROOT / "src" / "npclease_runtime.cpp").read_text(encoding="utf-8")
-        cls.client_source = (ROOT / "src" / "npclease_client.cpp").read_text(encoding="utf-8")
+        cls.host_source = _testbuild.src_text("npclease_runtime.cpp")
+        cls.client_source = _testbuild.src_text("npclease_client.cpp")
         cls.runtime = cls.host_source + "\n" + cls.client_source
-        cls.policy = (ROOT / "src" / "npcown_policy.h").read_text(encoding="utf-8")
+        cls.policy = _testbuild.src_text("npcown_policy.h")
 
     def test_split_translation_units_are_bounded(self):
         self.assertLess(len(self.host_source.splitlines()), 880)
         self.assertLess(len(self.client_source.splitlines()), 800)
         self.assertIn("void ReceiveHost(", self.host_source)
         self.assertIn("void TickClient(", self.client_source)
-        client_header = (ROOT / "src" / "npclease_client.h").read_text(encoding="utf-8")
+        client_header = _testbuild.src_text("npclease_client.h")
         self.assertNotIn("<Game.h>", client_header)
 
     def test_review_regressions_preserved_across_split(self):
@@ -140,8 +144,8 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("CurrentPeer(client, entry.previousGeneration)", host)
 
     def test_live_dormant_pending_leases_never_refuse_or_mutate_on_save(self):
-        persist = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
-        i18n = (ROOT / "src" / "i18n.cpp").read_text(encoding="utf-8")
+        persist = _testbuild.src_text("persist.cpp")
+        i18n = _testbuild.src_text("i18n.cpp")
         self.assertNotIn("npclease::", persist)
         self.assertNotIn("npc-lease-active", persist + i18n)
         self.assertNotIn("NPC lease active", persist + i18n)
@@ -196,7 +200,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertNotIn("busy", readiness)
         self.assertNotIn("AIMode", readiness)
         self.assertNotIn("HitPoints", readiness)
-        world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
+        world = _testbuild.src_text("world.cpp")
         self.assertIn("GetEntitiesInProcessingRange()", section(world, "bTSmallArray<eCEntity*> const* Processed()", "\n}\n\nbTSmallArray"))
 
     def test_takeover_is_fenced_before_registration_and_handshake(self):
@@ -238,7 +242,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertNotIn("Reached(", guard)
 
     def test_entity_queue_and_client_range_preserve_native_hero_membership(self):
-        world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
+        world = _testbuild.src_text("world.cpp")
         queue = section(world, "bool QueueEntityProcessing(", "// Extra ranges")
         self.assertIn("admin.AddDirtyProcessingRangeEntity(entity, GETrue)", queue)
         self.assertLess(queue.index("MarkProcessingDirty(&admin, why)"),
@@ -266,7 +270,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("!npcremoval::Suppressed(entity)", permit)
 
     def test_native_restart_retires_zero_speed_playback_instances(self):
-        playback = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        playback = _testbuild.src_text("npcplayback.cpp")
         release = section(playback, "bool ReleaseNativePresentation(", "void UpdatePresentation(")
         self.assertIn("Passive(entity)", release)
         self.assertIn("actor->StopMotion(slot, 0.0f)", release)
@@ -279,7 +283,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         if not game:
             self.skipTest("G3T_GAME_DLL required for read-only Engine.dll byte verification")
         engine = Path(game).parent / "Engine.dll"
-        data = engine.read_bytes()
+        data = _testbuild.cached_bytes(engine)
         self.assertEqual(read_rva(data, 0x2544a0, 7), bytes.fromhex("8d81e0000000c3"))
         self.assertEqual(read_rva(data, 0x7a270, 7), bytes.fromhex("8d81e8000000c3"))
         self.assertEqual(read_rva(data, 0x23155d, 7), bytes.fromhex("8b7c24108b4f3c"))
@@ -307,7 +311,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("Send(key, entry, Kind::Adopt)", maintain)
         control = section(self.client_source, "Message Control(", "bool Exact(")
         self.assertIn("note.state = entry.lease.state", control)
-        combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
+        combat = _testbuild.src_text("combat.cpp")
         self.assertIn('npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints"', combat)
         self.assertIn("npclease::NoteHit(victim.GetInstance(), attacker, Judgements[which]", combat)
 
@@ -359,8 +363,8 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("if (entry.local) return false", floor)
         self.assertIn("!LocalOwner(identity)", floor)
         self.assertIn("found->second.local && found->second.active", floor)
-        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        playback = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        npcs = _testbuild.src_text("npcs.cpp")
+        playback = _testbuild.src_text("npcplayback.cpp")
         self.assertIn("npclease::IgnoreHostSnapshot(records[i].guid, captured)", npcs)
         self.assertIn("npclease::IgnoreHostSnapshot(record.guid, record.sent)", playback)
 
@@ -411,7 +415,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("installation failed", diagnostic)
         self.assertIn("EligibilityReason(entity)", diagnostic)
         self.assertIn("npclease: admission-refused guid=%s name=%s reason=%s", self.runtime)
-        journal = (ROOT / "src" / "journal.cpp").read_text(encoding="utf-8")
+        journal = _testbuild.src_text("journal.cpp")
         deathQuery = section(journal, "bool RecordedDeath(", "unsigned Write(")
         self.assertIn("deaths.count", deathQuery)
         for mutation in ("deaths[", "Kill(", "CountQuest(", "SendDeath("):
@@ -488,7 +492,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("entry.ownedEntity != entity && !HostWins(key)", maintain)
         self.assertLess(kill.index("HostWins(Key(victim))"), kill.index("return originalKill"))
         self.assertIn("native death refused", kill)
-        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        npcs = _testbuild.src_text("npcs.cpp")
         claim = section(npcs, "bool HostStreamClaimed(", "uint32_t HostStreamDelay(")
         self.assertNotIn("PresentationFresh", claim)
         self.assertNotIn("latestTicks", claim)

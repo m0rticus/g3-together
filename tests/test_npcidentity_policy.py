@@ -2,42 +2,46 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+NPCIDENTITY_POLICY_TARGET = _testbuild.register_target(
+    "npcidentity-policy",
+    [
+        _testbuild.unit(
+            "tests/npcidentity_policy_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "tests",),
+        )
+    ],
+)
 
 
 class NpcIdentityTests(unittest.TestCase):
     def test_production_identity_policy(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "C++17 compiler required")
-        with tempfile.TemporaryDirectory(prefix=".npcidentity-", dir=ROOT / "tests") as directory:
-            build = Path(directory)
-            executable = build / ("identity.exe" if os.name == "nt" else "identity")
-            source = ROOT / "tests" / "npcidentity_policy_test.cpp"
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                           str(source), f"/Fe:{executable}"]
-            else:
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                           str(source), "-o", str(executable)]
-            result = subprocess.run(command, cwd=build, capture_output=True, text=True, timeout=120)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable)], cwd=build, capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = NPCIDENTITY_POLICY_TARGET.run(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_reconciliation_runs_before_passive_playback(self):
-        frame = (ROOT / "src" / "Script_G3Together.cpp").read_text(encoding="utf-8")
+        frame = _testbuild.src_text("Script_G3Together.cpp")
         self.assertLess(frame.index("npcs::ReconcileClientEntities()"), frame.index("npcplayback::Tick()"))
-        playback = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        playback = _testbuild.src_text("npcplayback.cpp")
         tick = playback[playback.index("void Tick()"):]
         self.assertLess(tick.index("RedundantClientEntity(entity)"), tick.index("HoldUnavailable("))
         self.assertLess(tick.index("RedundantClientEntity(entity)"), tick.index("unavailable[key]"))
 
     def test_census_is_pointer_specific_and_resettable(self):
-        identity_source = (ROOT / "src" / "npc_identity.cpp").read_text(encoding="utf-8")
-        npcs_source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        identity_source = _testbuild.src_text("npc_identity.cpp")
+        npcs_source = _testbuild.src_text("npcs.cpp")
         census = identity_source[identity_source.index("void ReconcileClientEntities()"):
                                  identity_source.index("namespace detail {")]
         for required in ("Entity::GetEntities()", "world::ProcessedEntities()", "npcidentity::AddPointer",
@@ -55,7 +59,7 @@ class NpcIdentityTests(unittest.TestCase):
         self.assertIn("identityCensusAt = identityLogAt = 0", reset)
 
     def test_quarantine_never_kills_or_deletes_native_entities(self):
-        source = (ROOT / "src" / "npc_identity.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("npc_identity.cpp")
         quarantine = source[source.index("void QuarantineTree("):source.index("void LogIdentity(")]
         for required in ("DisableProcessing(GETrue)", "EnableRendering(GEFalse)",
                          "EnablePicking(GEFalse, GEFalse)", "EnableCollision(GEFalse)",
@@ -70,7 +74,7 @@ class NpcIdentityTests(unittest.TestCase):
             self.assertIn(required, candidate)
 
     def test_only_the_bound_pointer_has_host_presentation_and_combat(self):
-        npcs_source = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
+        npcs_source = _testbuild.src_text("npcs.cpp")
         presentation = npcs_source[npcs_source.index("bool HostPresentationAvailable("):
                                    npcs_source.index("bool HostAttitude(")]
         self.assertIn("mirror.entity.GetInstance() != entity", presentation)

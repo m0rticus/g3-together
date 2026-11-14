@@ -90,7 +90,7 @@ void Run(char const* name, std::vector<unsigned char> const& input)
     ENetBuffer buffer;
     buffer.data = const_cast<unsigned char*>(input.data());
     buffer.dataLength = input.size();
-    constexpr unsigned Iterations = 1000;
+    constexpr unsigned Iterations = 25;
     auto started = std::chrono::steady_clock::now();
     size_t compressedSize = 0;
     for (unsigned i = 0; i < Iterations; ++i)

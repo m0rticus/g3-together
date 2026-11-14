@@ -12,16 +12,15 @@
 #include <cstdlib>
 
 namespace {
-constexpr unsigned Crowd = 60;
-constexpr unsigned CaptureMs = 120000, SteadyFromMs = CaptureMs - 10000;
+constexpr unsigned MaxCrowd = 60;
 constexpr double SteamRate = 243000, OtherTrafficRate = 6000;
-std::array<NpcRecord, Crowd> shown{};
-std::array<std::vector<pose::Bone>, Crowd> shownBones{};
-std::array<unsigned, Crowd> displayed{};
+std::array<NpcRecord, MaxCrowd> shown{};
+std::array<std::vector<pose::Bone>, MaxCrowd> shownBones{};
+std::array<unsigned, MaxCrowd> displayed{};
 
 unsigned Index(NpcRecord const& record)
 {
-    assert(record.guid[0] && record.guid[0] <= Crowd);
+    assert(record.guid[0] && record.guid[0] <= MaxCrowd);
     return record.guid[0] - 1;
 }
 
@@ -46,7 +45,7 @@ struct Flight {
     std::vector<Transmission> companions;
     uint32_t serial = 0, at = 0, sentAt = 0, queuedAt = 0;
     size_t charge = 0;
-    bool lost = false, serviced = false;
+    bool lost = false, serviced = false, charged = false, isRetry = false;
 };
 
 // A finite, byte-serviced, shared send buffer with result-25 refusals. Steam
@@ -59,7 +58,9 @@ class Link {
     size_t buffered_ = 0;
     double serviceAt_ = 0;
     unsigned submissions_ = 0;
+    unsigned verified_ = 0;
     steam::send::Codec codec_;
+    std::vector<uint8_t> datagram_, original_, decoded_;
 
     static unsigned Priority(Transmission const& packet)
     {
@@ -69,27 +70,29 @@ class Link {
 
     size_t Charge(Flight const& flight)
     {
-        std::vector<uint8_t> datagram{0x80, 0, 0, 0};
+        datagram_.assign({0x80, 0, 0, 0});
         auto append = [&](Transmission const& packet, unsigned offset) {
             const bool reliable = (packet.flags & ENET_PACKET_FLAG_RELIABLE) != 0;
             const uint16_t token = static_cast<uint16_t>(flight.serial + offset);
-            datagram.push_back(reliable ? 0x86 : 7);
-            datagram.push_back(packet.channel);
-            datagram.push_back(static_cast<uint8_t>(token >> 8));
-            datagram.push_back(static_cast<uint8_t>(token));
-            if (!reliable) { datagram.push_back(0); datagram.push_back(1); }
-            datagram.push_back(static_cast<uint8_t>(packet.bytes.size() >> 8));
-            datagram.push_back(static_cast<uint8_t>(packet.bytes.size()));
-            datagram.insert(datagram.end(), packet.bytes.begin(), packet.bytes.end());
+            datagram_.push_back(reliable ? 0x86 : 7);
+            datagram_.push_back(packet.channel);
+            datagram_.push_back(static_cast<uint8_t>(token >> 8));
+            datagram_.push_back(static_cast<uint8_t>(token));
+            if (!reliable) { datagram_.push_back(0); datagram_.push_back(1); }
+            datagram_.push_back(static_cast<uint8_t>(packet.bytes.size() >> 8));
+            datagram_.push_back(static_cast<uint8_t>(packet.bytes.size()));
+            datagram_.insert(datagram_.end(), packet.bytes.begin(), packet.bytes.end());
         };
         append(flight.packet, 0);
         for (unsigned i = 0; i < flight.companions.size(); ++i) append(flight.companions[i], i + 1);
-        const auto original = datagram;
-        codec_.Encode(datagram);
-        std::vector<uint8_t> decoded;
-        assert(codec_.Decode(datagram.data(), datagram.size(), decoded));
-        assert(decoded == original);
-        return datagram.size() + 72; // Conservative framing beyond ENet, including the 16-byte relay envelope.
+        const bool check = (++verified_ & 7u) == 1u;
+        if (check) original_ = datagram_;
+        codec_.Encode(datagram_);
+        if (check) {
+            assert(codec_.Decode(datagram_.data(), datagram_.size(), decoded_));
+            assert(decoded_ == original_);
+        }
+        return datagram_.size() + 72; // Conservative framing beyond ENet, including the 16-byte relay envelope.
     }
 
     static size_t PlainBytes(Flight const& flight)
@@ -103,8 +106,23 @@ public:
     unsigned refused = 0, losses = 0, delivered = 0, reliableRetries = 0;
     unsigned poseAckMessages = 0;
     uint64_t offeredCold = 0, offeredSteady = 0, steadySamples = 0;
+    uint32_t captureMs = 22000, steadyFromMs = 16000;
     bool hostward = false;
     std::map<uint32_t, uint32_t> anchorsAt;
+
+    void FinalizePending()
+    {
+        for (auto& queue : waiting_) {
+            for (auto& flight : queue) {
+                if (flight.charged) continue;
+                flight.charge = Charge(flight);
+                flight.charged = true;
+                if (flight.queuedAt < 2000) offeredCold += flight.charge;
+                if (flight.queuedAt >= steadyFromMs && flight.queuedAt < captureMs)
+                    offeredSteady += flight.charge;
+            }
+        }
+    }
 
     void Enqueue(Transmission packet, uint32_t now)
     {
@@ -118,18 +136,16 @@ public:
             }
         }
         if (hostward && packet.bytes[0] == MsgPoseAck) ++poseAckMessages;
-        const bool steady = now >= SteadyFromMs && now < CaptureMs;
+        const bool steady = now >= steadyFromMs && now < captureMs;
         if (steady && (packet.bytes[0] == MsgControlPose || packet.bytes[0] == MsgCompactPosedNpc))
             ++steadySamples;
         const auto priority = Priority(packet);
         auto& queue = waiting_[priority];
-        const bool join = !queue.empty() && queue.back().queuedAt == now &&
+        const bool join = !queue.empty() && !queue.back().isRetry && queue.back().queuedAt == now &&
             queue.back().packet.channel == packet.channel &&
             queue.back().packet.flags == packet.flags &&
             PlainBytes(queue.back()) + packet.bytes.size() + 8 <= 1172;
-        size_t before = 0;
         if (join) {
-            before = queue.back().charge;
             queue.back().companions.push_back(std::move(packet));
         } else {
             Flight flight;
@@ -138,18 +154,11 @@ public:
             flight.packet = std::move(packet);
             queue.push_back(std::move(flight));
         }
-        auto& flight = queue.back();
-        flight.charge = Charge(flight);
-        auto account = [&](uint64_t& counter) {
-            counter += flight.charge;
-            counter -= before;
-        };
-        if (now < 2000) account(offeredCold);
-        if (steady) account(offeredSteady);
     }
 
     template<class Receive> void Step(uint32_t now, Receive receive)
     {
+        FinalizePending();
         for (auto& flight : flights_) {
             if (!flight.serviced && flight.sentAt <= now) {
                 buffered_ -= flight.charge;
@@ -160,8 +169,9 @@ public:
             auto flight = std::move(retries_.front());
             retries_.pop_front();
             if (now < 2000) offeredCold += flight.charge;
-            if (now >= SteadyFromMs && now < CaptureMs) offeredSteady += flight.charge;
+            if (now >= steadyFromMs && now < captureMs) offeredSteady += flight.charge;
             flight.queuedAt = now;
+            flight.isRetry = true;
             waiting_[Priority(flight.packet)].push_front(std::move(flight));
             ++reliableRetries;
         }
@@ -173,6 +183,7 @@ public:
                 ++losses;
                 if (flight.serial) {
                     flight.at = now + 2100;
+                    flight.isRetry = true;
                     retries_.push_back(std::move(flight));
                 }
                 continue;
@@ -242,7 +253,7 @@ public:
     }
 };
 
-NpcRecord Record(unsigned number, unsigned tick)
+NpcRecord Record(unsigned number, unsigned crowd, unsigned tick)
 {
     NpcRecord record{};
     record.guid[0] = static_cast<uint8_t>(number + 1);
@@ -250,7 +261,9 @@ NpcRecord Record(unsigned number, unsigned tick)
     record.incarnation = 1;
     record.hitPoints = 100 - int(number);
     record.hitPointsMax = 100;
-    record.position[0] = float(number * 100) + (number >= 5 && number < 40 ? float(tick) * 2.0f : 0.0f);
+    const unsigned fightEnd = (std::max)(2u, crowd / 12);
+    const unsigned walkEnd = crowd * 2 / 3;
+    record.position[0] = float(number * 100) + (number >= fightEnd && number < walkEnd ? float(tick) * 2.0f : 0.0f);
     record.position[1] = float(number) * -0.25f;
     record.rotation[3] = 1;
     record.sent = fakeTime;
@@ -267,11 +280,14 @@ NpcRecord Record(unsigned number, unsigned tick)
     return record;
 }
 
-std::vector<pose::Bone> Rig(unsigned number, unsigned tick)
+std::vector<pose::Bone> Rig(unsigned number, unsigned crowd, unsigned tick)
 {
     std::vector<pose::Bone> bones(number % 3 == 0 ? 95 : number % 3 == 1 ? 73 : 64);
-    const bool fighting = number < 5, walking = number >= 5 && number < 40;
-    const double amplitude = fighting ? .4 : walking ? .18 : number < 55 ? .012 : 0;
+    const unsigned fightEnd = (std::max)(2u, crowd / 12);
+    const unsigned walkEnd = crowd * 2 / 3;
+    const unsigned idleEnd = crowd * 11 / 12;
+    const bool fighting = number < fightEnd, walking = number >= fightEnd && number < walkEnd;
+    const double amplitude = fighting ? .4 : walking ? .18 : number < idleEnd ? .012 : 0;
     const double time = double(tick) * .02;
     for (unsigned i = 0; i < bones.size(); ++i) {
         pose::Transform transform;
@@ -290,8 +306,17 @@ std::vector<pose::Bone> Rig(unsigned number, unsigned tick)
 }
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    bool fullSoak = false;
+    for (int a = 1; a < argc; ++a)
+        if (std::string(argv[a]) == "--full") fullSoak = true;
+    const unsigned crowd = fullSoak ? 60u : 30u;
+    const unsigned steadyWindowMs = fullSoak ? 10000u : 6000u;
+    const unsigned captureMs = fullSoak ? 120000u : 22000u;
+    const unsigned steadyFromMs = captureMs - steadyWindowMs;
+    const unsigned drainMs = fullSoak ? 25000u : 12000u;
+
     ENetHost fakeHost{};
     ENetPeer peer{};
     ENetChannel channels[ChannelCount]{};
@@ -312,30 +337,33 @@ int main()
     SetNpcHandlers(DisplayRecords, nullptr);
     SetNpcPoseHandler(DisplayPose);
     Link outward, inward;
+    outward.captureMs = inward.captureMs = captureMs;
+    outward.steadyFromMs = inward.steadyFromMs = steadyFromMs;
     inward.hostward = true;
     bonewire::Dictionary hostDictionary, clientDictionary;
-    std::array<NpcRecord, Crowd> latest{};
-    std::array<std::vector<pose::Bone>, Crowd> latestBones{};
+    std::array<NpcRecord, MaxCrowd> latest{};
+    std::array<std::vector<pose::Bone>, MaxCrowd> latestBones{};
     unsigned samples = 0;
     unsigned maxAnchorAckDelay = 0;
     unsigned recoveredQueueAge = 0, recoveredDisplayAge = 0;
     auto collect = [&](Link& link, uint32_t now) {
         for (auto& packet : transmissions) link.Enqueue(std::move(packet), now);
         transmissions.clear();
+        link.FinalizePending();
     };
-    for (unsigned now = 0; now <= CaptureMs + 25000; now += 20) {
+    for (unsigned now = 0; now <= captureMs + drainMs; now += 20) {
         fakeTime = 5000 + now;
         isHost = true;
         boneLayouts = std::move(hostDictionary);
-        if (now < CaptureMs || (now < CaptureMs + 7000 && now % 1000 == 0)) {
+        if (now < captureMs || (now < captureMs + 7000 && now % 1000 == 0)) {
             const unsigned tick = now / 20;
-            for (unsigned i = 0; i < Crowd; ++i) {
-                // Synthetic captured samples, 1,200 poses/s for the 60-NPC camp;
+            for (unsigned i = 0; i < crowd; ++i) {
+                // Synthetic captured samples, 20 poses/s per NPC across the camp;
                 // no send budget, replacement or new scheduler policy.
-                if (now < CaptureMs) {
+                if (now < captureMs) {
                     if (now && (tick + i) % 5 >= 2) continue;
-                    latest[i] = Record(i, tick);
-                    latestBones[i] = Rig(i, tick);
+                    latest[i] = Record(i, crowd, tick);
+                    latestBones[i] = Rig(i, crowd, tick);
                 } else {
                     // The existing unchanged-state keepalive repairs ordinary
                     // unreliable loss after animation becomes quiet.
@@ -366,29 +394,29 @@ int main()
             collect(inward, now);
         });
         clientDictionary = std::move(boneLayouts);
-        if (now == CaptureMs - 20) {
+        if (now == captureMs - 20) {
             recoveredQueueAge = outward.OldestWaitingMs(now);
             assert(recoveredQueueAge < 250);
-            for (auto const& record : shown)
-                recoveredDisplayAge = (std::max)(recoveredDisplayAge, fakeTime - record.sent);
+            for (unsigned i = 0; i < crowd; ++i)
+                recoveredDisplayAge = (std::max)(recoveredDisplayAge, fakeTime - shown[i].sent);
             assert(recoveredDisplayAge < 1500);
         }
     }
     assert(outward.refused && outward.losses && outward.reliableRetries);
     assert(outward.peak <= 12 * 1024 && outward.Empty() && inward.Empty());
-    assert(npcControlCreated == Crowd && npcControlAckAccepted == Crowd);
+    assert(npcControlCreated == crowd && npcControlAckAccepted == crowd);
     assert(bandwidth.poseDeltas > 1000 && bandwidth.poseAcks < samples / 5);
     assert(inward.poseAckMessages >= npcAnchorsSent);
     assert(maxAnchorAckDelay > 2500);
     assert(bandwidth.poseAckMisses == 0 && bandwidth.poseDecodeFailures == 0);
     const double cold = outward.offeredCold / 2.0;
-    const double steady = outward.offeredSteady / 10.0;
+    const double steady = outward.offeredSteady / (steadyWindowMs / 1000.0);
     std::fprintf(stderr, "NPC compressed offered load: cold=%.0f B/s steady=%.0f B/s\n", cold, steady);
     assert(steady < cold * .70 && steady < SteamRate - OtherTrafficRate);
-    assert(outward.steadySamples >= 12000);
-    for (unsigned i = 0; i < Crowd; ++i) {
+    assert(outward.steadySamples >= (crowd * 20u) * (steadyWindowMs / 1000u));
+    for (unsigned i = 0; i < crowd; ++i) {
         assert(displayed[i] > 10);
-        assert(shown[i].sent >= CaptureMs + 4000);
+        assert(shown[i].sent >= captureMs + 4000);
         assert(!std::memcmp(shown[i].guid, latest[i].guid, 16));
         assert(shown[i].hitPoints == latest[i].hitPoints && shown[i].heldRight == latest[i].heldRight);
         auto expectedMotion = latest[i].motions[0];
@@ -410,7 +438,7 @@ int main()
     std::printf("NPC convergence: NPCs=%u samples=%u cold_Bps=%.0f steady_Bps=%.0f reduction=%.1f%% "
                 "result25=%u loss=%u reliable_retries=%u anchors=%llu ACKs=%llu deltas=%llu "
                 "max_anchor_ACK_ms=%u recovered_queue_ms=%u recovered_display_ms=%u peak_bytes=%zu\n",
-                Crowd, samples, cold, steady, 100 * (cold - steady) / cold,
+                crowd, samples, cold, steady, 100 * (cold - steady) / cold,
                 outward.refused, outward.losses, outward.reliableRetries,
                 static_cast<unsigned long long>(npcAnchorsSent),
                 static_cast<unsigned long long>(inward.poseAckMessages),

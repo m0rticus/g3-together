@@ -1,31 +1,34 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-import shutil
-import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+STORY_POLICY_TARGET = _testbuild.register_target(
+    "story-policy",
+    [_testbuild.unit(
+        "tests/story_policy_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
 
 
 class StoryRestorationTests(unittest.TestCase):
     def test_production_snapshot_and_runtime_wire_policy(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
         with tempfile.TemporaryDirectory() as folder:
-            executable = Path(folder) / "story-policy.exe"
-            result = subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 str(ROOT / "tests" / "story_policy_test.cpp"), "-o", str(executable)],
-                capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable)], capture_output=True, text=True)
+            result = STORY_POLICY_TARGET.run(cwd=folder)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_atomic_reward_free_admission_wiring(self):
-        story = (ROOT / "src" / "story.cpp").read_text(encoding="utf-8")
-        persist = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+        story = _testbuild.src_text("story.cpp")
+        persist = _testbuild.src_text("persist.cpp")
         commit = story[story.index("bool CommitBaselines()"):story.index("void OnStates(")]
         self.assertLess(commit.index("!d.baseline.complete"), commit.index("Apply(runtime"))
         self.assertIn("quest->AccessStatus() = static_cast<gEQuestStatus>(value)", story)
@@ -42,8 +45,8 @@ class StoryRestorationTests(unittest.TestCase):
         self.assertIn("!story::FinishAdmission(from) || !doors::FinishAdmission(from)", persist)
 
     def test_bootstrap_does_not_require_its_own_admission_gate(self):
-        story = (ROOT / "src" / "story.cpp").read_text(encoding="utf-8")
-        doors = (ROOT / "src" / "doors.cpp").read_text(encoding="utf-8")
+        story = _testbuild.src_text("story.cpp")
+        doors = _testbuild.src_text("doors.cpp")
         poll = story[story.index("void Poll("):story.index("void Start()")]
         self.assertIn("!net::Joined()", poll)
         self.assertNotIn("net::Connected()", poll)
@@ -55,8 +58,8 @@ class StoryRestorationTests(unittest.TestCase):
         self.assertIn("!baselines.count(key) || wanted.count(key)", ready)
 
     def test_personal_pickup_tombstones_cannot_grant_again(self):
-        items = (ROOT / "src" / "items.cpp").read_text(encoding="utf-8")
-        ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
+        items = _testbuild.src_text("items.cpp")
+        ai = _testbuild.src_text("ai.cpp")
         self.assertIn("if (!items::BeforeTake(spu)) return GETrue;", ai)
         before = items[items.index("bool BeforeTake("):items.index("void AfterTake(")]
         self.assertIn("if (consumed.count(key))", before)

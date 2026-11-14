@@ -1,5 +1,4 @@
 import os
-import shutil
 import struct
 import subprocess
 import sys
@@ -9,50 +8,21 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "tools") not in sys.path:
-    sys.path.insert(0, str(ROOT / "tools"))
-from _g3copy import win32_tool_environment
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
+SHUTDOWN_POLICY_TARGET = _testbuild.register_target(
+    "shutdown-policy",
+    [_testbuild.unit(
+        "tests/shutdown_policy_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
 
-def compile_cpp17(sources, output, folder, includes=()):
-    compiler = shutil.which("clang++") or shutil.which("g++")
-    if compiler:
-        command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                   *(f"-I{inc}" for inc in includes), *map(str, sources), "-o", str(output)]
-        subprocess.run(command, check=True, cwd=folder, capture_output=True, text=True)
-        return os.environ.copy()
-    env = win32_tool_environment(folder)
-    cl = shutil.which("cl", path=env.get("PATH"))
-    if not cl:
-        raise unittest.SkipTest("C++17 compiler required")
-    command = [cl, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-               *(f"/I{inc}" for inc in includes), *map(str, sources),
-               f"/Fe:{output}", f"/Fo:{folder}\\"]
-    subprocess.run(command, check=True, cwd=folder, env=env, capture_output=True, text=True)
-    return env
-
-
-def function(source, signature):
-    start = source.index(signature)
-    brace = source.index("{", start)
-    depth = 1
-    end = brace + 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[brace:end]
-
-
-class ShutdownPolicyTests(unittest.TestCase):
-    def test_production_wait_classification_and_exit_thresholds_without_engine(self):
-        with tempfile.TemporaryDirectory() as folder:
-            folder_path = Path(folder)
-            executable = folder_path / "shutdown_policy.exe"
-            env = compile_cpp17([ROOT / "tests" / "shutdown_policy_test.cpp"], executable, folder_path)
-            subprocess.run([str(executable)], check=True, cwd=folder_path, env=env, capture_output=True, text=True)
-
-    def test_config_thread_local_snapshot_and_long_line_parsing_without_engine(self):
-        harness = r"""
+CONFIG_DRIVER_SOURCE = r"""
 #include "config.h"
 #include "options.h"
 #include "symbols.h"
@@ -103,8 +73,6 @@ int main(int argc, char** argv) {
             << "legacy_companion_owner = 76561198011111111 Diego#1\n"
             << "legacy_companion_owner = 76561198022222222 Milten#2\n"
             << "# " << std::string(300, 'x') << "\nrole = host\n";
-        // Notice the 300-char comment line ends with '\n' followed by a real 'role = host' line,
-        // while an overlong setting line without newline before 255 chars must be ignored completely:
         out << "look = " << std::string(280, 'A') << "role = host\n";
     }
     const auto& loaded = g3t::LoadConfig();
@@ -117,7 +85,6 @@ int main(int argc, char** argv) {
     assert(loaded.legacyCompanionOwners.at("Diego#1") == 76561198011111111ULL);
     assert(loaded.legacyCompanionOwners.at("Milten#2") == 76561198022222222ULL);
 
-    // Verify local balance values are restored when host override turns off, and concurrent threads do not race.
     std::atomic<bool> stop{false};
     std::vector<std::thread> workers;
     for (int t = 0; t < 4; ++t) {
@@ -147,22 +114,53 @@ int main(int argc, char** argv) {
     return 0;
 }
 """
+
+CONFIG_DRIVER_TARGET = _testbuild.register_target(
+    "shutdown-config-driver",
+    [
+        _testbuild.inline_unit(
+            "shutdown_config_driver.cpp",
+            CONFIG_DRIVER_SOURCE,
+            std="c++17",
+            warnings="strict",
+            includes=("src",),
+        ),
+        _testbuild.unit(
+            "src/config.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=("src",),
+        ),
+    ],
+)
+
+
+def function(source, signature):
+    start = source.index(signature)
+    brace = source.index("{", start)
+    depth = 1
+    end = brace + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[brace:end]
+
+
+class ShutdownPolicyTests(unittest.TestCase):
+    def test_production_wait_classification_and_exit_thresholds_without_engine(self):
         with tempfile.TemporaryDirectory() as folder:
             folder_path = Path(folder)
-            driver = folder_path / "config_driver.cpp"
-            driver.write_text(harness, encoding="utf-8")
-            executable = folder_path / "config_driver.exe"
-            env = compile_cpp17(
-                [driver, ROOT / "src" / "config.cpp"],
-                executable,
-                folder_path,
-                includes=[ROOT / "src"],
-            )
-            subprocess.run([str(executable), str(folder_path)], check=True, cwd=folder_path,
-                           env=env, capture_output=True, text=True)
+            result = SHUTDOWN_POLICY_TARGET.run(cwd=folder_path)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_config_thread_local_snapshot_and_long_line_parsing_without_engine(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder_path = Path(folder)
+            result = CONFIG_DRIVER_TARGET.run(args=[str(folder_path)], cwd=folder_path)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_cleanup_precedes_exit_eligibility_without_changing_menu_leave(self):
-        source = (ROOT / "src" / "Script_G3Together.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("Script_G3Together.cpp")
         pre = function(source, "bEResult PreShutdown() override")
         ordered = ["ai::BeginShutdown()", "crashlog::StartWatchdog()", "persist::PrepareShutdown()",
                    "ForgetWorld()", "net::Stop()", "ai::RestorePatches()", "crashlog::Shutdown()",
@@ -177,7 +175,7 @@ int main(int argc, char** argv) {
             self.assertNotIn("PrepareShutdown", body)
 
     def test_native_writers_are_not_interrupted_and_staging_uses_existing_failure_path(self):
-        source = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("persist.cpp")
         body = function(source, "bool PrepareShutdown()")
         self.assertLess(body.index("nativeLoadDepth || nativeSaveDepth"), body.index('CancelSave("shutdown")'))
         self.assertIn("return false;", body)
@@ -189,8 +187,8 @@ int main(int argc, char** argv) {
         self.assertNotIn("SaveDetour", body)
 
     def test_monitor_survives_our_shutdown_and_unknown_hangs_keep_diagnostics(self):
-        crashlog = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
-        source = (ROOT / "src" / "shutdown_watchdog.cpp").read_text(encoding="utf-8")
+        crashlog = _testbuild.src_text("crashlog.cpp")
+        source = _testbuild.src_text("shutdown_watchdog.cpp")
         self.assertNotIn("CancelWatchdog", function(crashlog, "bool Shutdown()"))
         monitor = function(source, "DWORD WINAPI WatchdogThread(LPVOID)")
         self.assertIn("finished && fastExitReady.load() && SampleGraphicsWait", monitor)
@@ -220,7 +218,7 @@ int main(int argc, char** argv) {
         path = os.environ.get("G3T_GAME_DLL")
         if not path:
             self.skipTest("G3T_GAME_DLL required for CP image byte fixture")
-        image = Path(path).with_name("Engine.dll").read_bytes()
+        image = _testbuild.cached_bytes(Path(path).with_name("Engine.dll"))
         nt = struct.unpack_from("<I", image, 0x3C)[0]
         count = struct.unpack_from("<H", image, nt + 6)[0]
         optional_size = struct.unpack_from("<H", image, nt + 20)[0]

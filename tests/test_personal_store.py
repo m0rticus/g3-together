@@ -1,12 +1,21 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import os
-import shutil
 import struct
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "personal_store", ["tests/personal_store_test.cpp"],
+    allow_msvc=False, respect_env=False,
+)
 
 EXPECTED_SITES = {
     "?GeneratePlunderInvFromTreasureSets@gCInventory_PS@@QAE_NXZ": (0xB71F0, 8),
@@ -25,7 +34,7 @@ EXPECTED_SITES = {
 class PeFile:
     """Read only the configured on-disk PE; never load or execute it."""
     def __init__(self, path):
-        self.data = Path(path).read_bytes()
+        self.data = _testbuild.cached_bytes(path)
         pe = self.u32(0x3C)
         if self.u16(0) != 0x5A4D or self.u32(pe) != 0x4550 or self.u16(pe + 4) != 0x14C:
             raise ValueError("not a 32-bit x86 PE")
@@ -117,20 +126,7 @@ class PeFile:
 class PersonalStoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            raise unittest.SkipTest("C++17 compiler required")
-        cls.executable = ROOT / "tests" / "personal-store-test.exe"
-        try:
-            result = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                                     str(ROOT / "tests" / "personal_store_test.cpp"), "-o", str(cls.executable)],
-                                    capture_output=True, text=True)
-            if result.returncode:
-                raise AssertionError(result.stdout + result.stderr)
-        except BaseException:
-            cls.executable.unlink(missing_ok=True)
-            raise
-        cls.addClassCleanup(cls.executable.unlink, missing_ok=True)
+        cls.executable = TARGET.executable()
         result = subprocess.run([str(cls.executable), "--hook-sites"], capture_output=True, text=True, check=True)
         cls.sites = []
         for line in result.stdout.splitlines():
@@ -144,7 +140,7 @@ class PersonalStoreTests(unittest.TestCase):
     def test_verified_guard_registration(self):
         self.assertEqual(len(self.sites), len(EXPECTED_SITES))
         self.assertEqual({symbol: (rva, stolen) for _, symbol, rva, stolen, _ in self.sites}, EXPECTED_SITES)
-        source = (ROOT / "src" / "containers.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("containers.cpp")
         install = source[source.index("void* InstallPersonalNative("):source.index("void HookQuickLoot()")]
         self.assertIn("personal::native::Find(module, symbol)", install)
         self.assertIn("personal::native::Match(*site, site->rva, entry, site->headSize)", install)
@@ -204,7 +200,7 @@ class PersonalStoreTests(unittest.TestCase):
                          ("Script.dll", "?TransferAmountTo@PSInventory@@QAE_NHHAAVEntity@@@Z"))
 
     def test_trade_chains_through_the_export(self):
-        source = (ROOT / "src" / "trade.cpp").read_text(encoding="utf-8")
+        source = _testbuild.src_text("trade.cpp")
         native = source[source.index("GEBool __fastcall NativeTransfer("):source.index("bool __stdcall NativeCanExchange(")]
         self.assertIn("if (!fromPlayer && !toPlayer) return originalTransfer(from, to, type);", native)
         self.assertIn("BeginExchange(from, to, toPlayer)", native)
@@ -215,9 +211,9 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertIn("std::memcpy(base + call + 1, &offset", install)
 
     def test_native_access_guards_and_deferred_capture(self):
-        containers_source = (ROOT / "src" / "containers.cpp").read_text(encoding="utf-8")
-        ledger_source = (ROOT / "src" / "personal_ledger.cpp").read_text(encoding="utf-8")
-        ledger_header = (ROOT / "src" / "personal_ledger.h").read_text(encoding="utf-8")
+        containers_source = _testbuild.src_text("containers.cpp")
+        ledger_source = _testbuild.src_text("personal_ledger.cpp")
+        ledger_header = _testbuild.src_text("personal_ledger.h")
 
         def part(text, start, end):
             return text[text.index(start):text.index(end, text.index(start))]

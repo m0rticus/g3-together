@@ -1,35 +1,35 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-import os
-import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+CODEC_TARGET = _testbuild.register_target(
+    "npcwire_bones_codec",
+    ["tests/npcwire_bones_codec_test.cpp", "src/npcwire_bones.cpp"],
+    pedantic=True, respect_env=False, msvc_vcvars=False,
+)
+TRANSPORT_TARGET = _testbuild.register_target(
+    "npcwire_bones_transport",
+    [_testbuild.unit("tests/npcwire_bones_transport_test.cpp", pedantic=True,
+                     includes=(_testbuild.ENET_INCLUDE_DIR,), warnings="warn",
+                     extra_gnu_flags=("-Werror",)),
+     *_testbuild.NPCWIRE_UNITS],
+    respect_env=False, msvc_vcvars=False,
+)
 
 
 class NpcWireBoneCodecTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise unittest.SkipTest("A C++17 compiler is required for the engine-free codec tests")
-        prefix = ROOT / "tests" / f"npcwire_bones_codec_{os.getpid()}"
-        cls.executable = prefix.with_suffix(".exe")
-        objects = [Path(f"{prefix}_fixture.obj"), Path(f"{prefix}_codec.obj")]
-        cls.addClassCleanup(lambda: [path.unlink(missing_ok=True) for path in [cls.executable, *objects]])
-        sources = [ROOT / "tests" / "npcwire_bones_codec_test.cpp", ROOT / "src" / "npcwire_bones.cpp"]
-        if Path(compiler).stem.lower() == "cl":
-            for source, obj in zip(sources, objects):
-                subprocess.run([compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                                "/c", str(source), f"/Fo{obj}"], cwd=ROOT, check=True,
-                               capture_output=True, text=True)
-            command = [compiler, "/nologo", *map(str, objects), f"/Fe{cls.executable}"]
-        else:
-            command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                       *map(str, sources), "-o", str(cls.executable)]
-        subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True)
+        cls.executable = CODEC_TARGET.executable()
 
     def run_case(self, case):
         subprocess.run([str(self.executable), case], cwd=ROOT, check=True,
@@ -50,28 +50,7 @@ class NpcWireBoneCodecTests(unittest.TestCase):
 
 class NpcWireBoneTransportTests(unittest.TestCase):
     def test_ack_fallback_reordering_recovery_and_rejoin(self):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            self.skipTest("A C++17 compiler is required for the in-memory transport fixture")
-        prefix = ROOT / "tests" / f"npcwire_bones_transport_{os.getpid()}"
-        executable = prefix.with_suffix(".exe")
-        objects = [Path(f"{prefix}_fixture.obj"), Path(f"{prefix}_codec.obj"),
-                   Path(f"{prefix}_control.obj"), Path(f"{prefix}_adapter.obj")]
-        self.addCleanup(lambda: [path.unlink(missing_ok=True) for path in [executable, *objects]])
-        sources = [ROOT / "tests" / "npcwire_bones_transport_test.cpp", ROOT / "src" / "npcwire_bones.cpp",
-                   ROOT / "src" / "npcwire_control.cpp", ROOT / "src" / "npcwire_adapter.cpp"]
-        include = ROOT / "thirdparty" / "enet" / "include"
-        if Path(compiler).stem.lower() == "cl":
-            for source, obj in zip(sources, objects):
-                subprocess.run([compiler, "/nologo", "/std:c++17", "/EHsc", "/W4",
-                                f"/I{include}", "/c", str(source), f"/Fo{obj}"],
-                               cwd=ROOT, check=True, capture_output=True, text=True)
-            command = [compiler, "/nologo", *map(str, objects), f"/Fe{executable}"]
-        else:
-            command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                       f"-I{include}", *map(str, sources), "-o", str(executable)]
-        subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True)
-        subprocess.run([str(executable)], cwd=ROOT, check=True, capture_output=True, text=True)
+        TRANSPORT_TARGET.run(check=True)
 
 
 if __name__ == "__main__":

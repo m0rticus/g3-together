@@ -1,28 +1,29 @@
-import hashlib
 import os
-import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+SAVING_NATIVE_TARGET = _testbuild.register_target(
+    "saving-native-test",
+    [_testbuild.unit(
+        "tests/saving_native_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
 
 
 class SavingNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            raise unittest.SkipTest("C++17 compiler required for native saving matcher fixture")
-        cls.executable = ROOT / "tests" / (
-            ".saving_native_test.exe" if os.name == "nt" else ".saving_native_test"
-        )
-        subprocess.run(
-            [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-             str(ROOT / "tests" / "saving_native_test.cpp"), "-o", str(cls.executable)],
-            check=True, capture_output=True, text=True,
-        )
-        cls.addClassCleanup(cls.executable.unlink, missing_ok=True)
+        cls.executable = SAVING_NATIVE_TARGET.executable()
 
     def test_paired_save_recognizer_and_unique_native_patterns(self):
         subprocess.run([str(self.executable)], check=True, capture_output=True, text=True)
@@ -43,7 +44,7 @@ class SavingNativeTests(unittest.TestCase):
         if not path or not Path(path).is_file():
             self.skipTest("Set G3T_PUP_DLL to the read-only PUP companion paru_s2.dll")
         fixture = Path(path)
-        digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        digest = _testbuild.cached_sha256(fixture)
         result = subprocess.run([str(self.executable), "--pup", path], check=True,
                                 capture_output=True, text=True)
         self.assertIn(result.stdout.strip(), {
@@ -53,7 +54,7 @@ class SavingNativeTests(unittest.TestCase):
 
     def test_pup_identity_is_informational(self):
         source = "\n".join(
-            (ROOT / "src" / name).read_text(encoding="utf-8")
+            _testbuild.src_text(name)
             for name in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
         )
         self.assertNotRegex(source, r'if\s*\(\s*!\s*(?:KnownPup|LogPupIdentity)\s*\(')

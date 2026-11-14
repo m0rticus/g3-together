@@ -1,31 +1,23 @@
-import os
-import shutil
-import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "npcwire_control", ["src/npcwire_control.cpp", "tests/npcwire_control_test.cpp"],
+    pedantic=True, allow_msvc=False, respect_env=False,
+)
 
 
 class NpcWireControlTests(unittest.TestCase):
     def test_standalone_codec(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
-        executable = ROOT / "tests" / f"npcwire-control-{os.getpid()}.exe"
-        env = os.environ.copy()
-        env["TEMP"] = env["TMP"] = str(ROOT)
-        try:
-            subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                 str(ROOT / "src" / "npcwire_control.cpp"),
-                 str(ROOT / "tests" / "npcwire_control_test.cpp"), "-o", str(executable)],
-                check=True, env=env,
-            )
-            subprocess.run([str(executable)], check=True, env=env)
-        finally:
-            executable.unlink(missing_ok=True)
+        TARGET.run(check=True)
 
 
 if __name__ == "__main__":

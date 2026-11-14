@@ -1,30 +1,31 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-import shutil
-import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGETS = {
+    name: _testbuild.register_target(
+        Path(name).stem, [ROOT / "tests" / name], allow_msvc=False, respect_env=False
+    )
+    for name in ("client_template_test.cpp", "client_template_store_test.cpp")
+}
 
 
 class ClientTemplateTests(unittest.TestCase):
     def compile_and_run(self, source, needs_folder=False):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
-        with tempfile.TemporaryDirectory() as folder:
-            executable = Path(folder) / "client-template.exe"
-            result = subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 str(ROOT / "tests" / source), "-o", str(executable)],
-                capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            args = [str(executable)]
-            if needs_folder:
-                args.append(folder)
-            result = subprocess.run(args, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if needs_folder:
+            with tempfile.TemporaryDirectory() as folder:
+                result = TARGETS[source].run([folder])
+        else:
+            result = TARGETS[source].run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_template_policy(self):
         self.compile_and_run("client_template_test.cpp")

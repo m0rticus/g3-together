@@ -2,10 +2,14 @@
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from tools import run_realism_history as history
 
 
@@ -14,6 +18,11 @@ class RealismHistoryTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="g3t-history-unit-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        repository = self.root / "repository"
+        repository.mkdir()
+        root_patch = patch.object(history, "ROOT", repository)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
         self.fake = self.root / "fake.dll"
         self.fake.write_bytes(b"unit fixture; never loaded")
         self.output = self.root / "results"

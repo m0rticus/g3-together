@@ -1,7 +1,4 @@
-import os
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,10 +6,20 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "tools") not in sys.path:
-    sys.path.insert(0, str(ROOT / "tools"))
-from _g3copy import win32_tool_environment
-PERSIST = (ROOT / "src" / "persist.cpp").read_text(encoding="utf-8")
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+SAVETHUMB_TARGET = _testbuild.register_target(
+    "savethumb",
+    [_testbuild.unit(
+        "tests/savethumb_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
+PERSIST = _testbuild.src_text("persist.cpp")
 
 
 def body(source, signature):
@@ -39,21 +46,8 @@ class SaveThumbnailTests(unittest.TestCase):
     def test_capture_policy_without_engine(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
-            executable = directory / "savethumb.exe"
-            source = ROOT / "tests" / "savethumb_test.cpp"
-            compiler = shutil.which("clang++") or shutil.which("g++")
-            if compiler:
-                env = os.environ.copy()
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)]
-            else:
-                env = win32_tool_environment(directory)
-                cl = shutil.which("cl", path=env.get("PATH"))
-                if not cl:
-                    self.skipTest("C++17 compiler required for engine-free thumbnail policy fixture")
-                command = [cl, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                           str(source), f"/Fe:{executable}", f"/Fo:{directory}\\"]
-            subprocess.run(command, check=True, cwd=directory, env=env, capture_output=True, text=True)
-            subprocess.run([str(executable)], check=True, cwd=directory, env=env, capture_output=True, text=True)
+            result = SAVETHUMB_TARGET.run(cwd=directory)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_thumbnail_is_chosen_at_request_and_never_recaptured_at_execution(self):
         # HUD.SaveGame passes [manager+8]; the save page is still drawn when SaveNow runs, so a capture

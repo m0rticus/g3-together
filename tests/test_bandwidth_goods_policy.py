@@ -1,17 +1,19 @@
-import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "tools") not in sys.path:
-    sys.path.insert(0, str(ROOT / "tools"))
-from _g3copy import win32_tool_environment
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "bandwidth_goods_policy", [ROOT / "tests" / "bandwidth_goods_policy_test.cpp"],
+    respect_env=False,
+)
 
 
 def body(source, signature):
@@ -33,27 +35,11 @@ def body(source, signature):
 class BandwidthGoodsPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
-        cls.trade = (ROOT / "src" / "trade.cpp").read_text(encoding="utf-8")
+        cls.net = _testbuild.src_text("net.cpp")
+        cls.trade = _testbuild.src_text("trade.cpp")
 
     def test_engine_free_policy(self):
-        with tempfile.TemporaryDirectory() as folder:
-            directory = Path(folder)
-            executable = directory / ("bandwidth_goods_policy.exe" if os.name == "nt" else "bandwidth_goods_policy")
-            source = ROOT / "tests" / "bandwidth_goods_policy_test.cpp"
-            compiler = shutil.which("clang++") or shutil.which("g++")
-            if compiler:
-                env = dict(os.environ, TMP=str(directory), TEMP=str(directory))
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)]
-            else:
-                env = win32_tool_environment(directory)
-                cl = shutil.which("cl", path=env.get("PATH"))
-                if not cl:
-                    self.skipTest("C++17 compiler required")
-                command = [cl, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                           str(source), f"/Fe:{executable}", f"/Fo:{directory}\\"]
-            subprocess.run(command, check=True, capture_output=True, text=True, cwd=directory, env=env)
-            subprocess.run([str(executable)], check=True, capture_output=True, text=True, cwd=directory, env=env)
+        TARGET.run(check=True)
 
     def test_measurement_uses_common_delivery_points(self):
         send = body(self.net, r"\bbool\s+Send\s*\(")

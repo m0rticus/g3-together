@@ -1,51 +1,73 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+
+NET_SEPARATE_DEFINES = ("G3T_NET_SEPARATE_TUS=1",)
+NET_SEPARATE_UNITS = tuple(
+    _testbuild.unit(
+        source,
+        std="c++17",
+        warnings="strict",
+        defines=NET_SEPARATE_DEFINES,
+        includes=(ROOT / "thirdparty" / "enet" / "include", ROOT / "src"),
+    )
+    for source in (
+        "src/net.cpp",
+        "src/net_session.cpp",
+        "src/net_npc.cpp",
+        "src/net_npc_pose.cpp",
+        "src/net_messages.cpp",
+    )
+)
+NET_DIRECT_PUNCH_TARGET = _testbuild.register_target(
+    "net-direct-punch",
+    [
+        _testbuild.unit(
+            "tests/net_direct_punch_test.cpp",
+            std="c++17",
+            warnings="strict",
+            includes=(ROOT / "thirdparty" / "enet" / "include", ROOT / "src"),
+        ),
+        *NET_SEPARATE_UNITS,
+        *(
+            _testbuild.unit(
+                "src/npcwire_bones.cpp",
+                std="c++17",
+                warnings="strict",
+                includes=(ROOT / "src",),
+            ),
+            _testbuild.unit(
+                "src/npcwire_control.cpp",
+                std="c++17",
+                warnings="strict",
+                includes=(ROOT / "src",),
+            ),
+            _testbuild.unit(
+                "src/npcwire_adapter.cpp",
+                std="c++17",
+                warnings="strict",
+                includes=(ROOT / "src",),
+            ),
+        ),
+    ],
+)
 
 
 class NetDirectPunchTests(unittest.TestCase):
     def test_direct_punch_security_fallback_and_goods_validation_separate_tus(self):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            self.skipTest("A C++17 compiler is required")
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="net-direct-punch-", dir=build) as temporary:
-            directory = Path(temporary)
-            executable = directory / "net_direct_punch.exe"
-            sources = [
-                ROOT / "tests" / "net_direct_punch_test.cpp",
-                ROOT / "src" / "net.cpp",
-                ROOT / "src" / "net_session.cpp",
-                ROOT / "src" / "net_npc.cpp",
-                ROOT / "src" / "net_npc_pose.cpp",
-                ROOT / "src" / "net_messages.cpp",
-                ROOT / "src" / "npcwire_bones.cpp",
-                ROOT / "src" / "npcwire_control.cpp",
-                ROOT / "src" / "npcwire_adapter.cpp",
-            ]
-            include = ROOT / "thirdparty" / "enet" / "include"
-            if Path(compiler).stem.lower() == "cl":
-                command = [
-                    compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                    "/DG3T_NET_SEPARATE_TUS=1",
-                    f"/I{include}", *map(str, sources), f"/Fe{executable}", f"/Fo{directory}\\",
-                ]
-            else:
-                command = [
-                    compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    "-DG3T_NET_SEPARATE_TUS=1",
-                    f"-I{include}", *map(str, sources), "-o", str(executable),
-                ]
-            result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable)], cwd=directory, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = NET_DIRECT_PUNCH_TARGET.run(timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

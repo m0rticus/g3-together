@@ -57,12 +57,14 @@ void ReliableSteamRelay()
     // Establish directly: the separate CONNECT-classifier regression owns that path.
     while (peer->state != ENET_PEER_STATE_CONNECTED &&
            static_cast<int32_t>(deadline - enet_time_get()) > 0) {
-        enet_host_service(receiver, &event, 1);
-        enet_host_service(sender, &event, 1);
+        enet_host_service(sender, &event, 0);
+        enet_host_service(receiver, &event, 0);
+        if (peer->state != ENET_PEER_STATE_CONNECTED)
+            enet_host_service(sender, &event, 1);
     }
     assert(peer->state == ENET_PEER_STATE_CONNECTED);
     enet_host_flush(receiver);
-    enet_host_service(sender, &event, 1);
+    enet_host_service(sender, &event, 0);
     senderSocket = sender->socket;
     relayActive = true;
     const std::vector<uint8_t> action(120, 0x5a), save(4000, 0x36);
@@ -245,12 +247,14 @@ int main(int argc, char** argv)
         const auto deadline = enet_time_get() + 5000;
         while (peer->state != ENET_PEER_STATE_CONNECTED &&
                static_cast<int32_t>(deadline - enet_time_get()) > 0) {
-            enet_host_service(receiver, &event, 1);
-            enet_host_service(sender, &event, 1);
+            enet_host_service(sender, &event, 0);
+            enet_host_service(receiver, &event, 0);
+            if (peer->state != ENET_PEER_STATE_CONNECTED)
+                enet_host_service(sender, &event, 1);
         }
         assert(peer->state == ENET_PEER_STATE_CONNECTED);
         enet_host_flush(receiver);
-        enet_host_service(sender, &event, 1);
+        enet_host_service(sender, &event, 0);
 
         toReceiver = g3t::steam::send::Queue{};
         senderSocket = sender->socket;
@@ -284,7 +288,7 @@ int main(int argc, char** argv)
         }) == Ok);
 
         std::vector<std::pair<uint16_t, uint8_t>> delivered;
-        while (enet_host_service(receiver, &event, 10) > 0) {
+        while (delivered.size() < 2 && enet_host_service(receiver, &event, 10) > 0) {
             if (event.type != ENET_EVENT_TYPE_RECEIVE) continue;
             assert(event.channelID == g3t::net::ChannelPoses);
             assert(event.packet->dataLength >= 32);
@@ -293,6 +297,7 @@ int main(int argc, char** argv)
             delivered.emplace_back(npcId, sample);
             enet_packet_destroy(event.packet);
         }
+        assert(enet_host_service(receiver, &event, 0) == 0);
         assert(delivered.size() == 2);
         assert(delivered[0].first == 20 && delivered[0].second == 1);
         assert(delivered[1].first == 10 && delivered[1].second == 2);

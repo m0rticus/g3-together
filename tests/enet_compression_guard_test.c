@@ -101,8 +101,10 @@ static void transport_checkpoint(void)
     assert(peer);
     deadline = enet_time_get() + 2000;
     while (peer->state != ENET_PEER_STATE_CONNECTED && (int32_t)(deadline - enet_time_get()) > 0) {
-        enet_host_service(receiver, &event, 1);
-        enet_host_service(sender, &event, 1);
+        enet_host_service(sender, &event, 0);
+        enet_host_service(receiver, &event, 0);
+        if (peer->state != ENET_PEER_STATE_CONNECTED)
+            enet_host_service(sender, &event, 1);
     }
     assert(peer->state == ENET_PEER_STATE_CONNECTED && peer->channelCount == 8);
     memset(payload, 0x51, sizeof(payload));

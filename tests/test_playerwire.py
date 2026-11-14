@@ -1,36 +1,25 @@
-import os
-import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "playerwire", ["tests/playerwire_test.cpp"],
+    pedantic=True, respect_env=False, msvc_vcvars=False,
+)
 
 
 class PlayerWireTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise unittest.SkipTest("A C++17 compiler is required for the standalone player codec tests")
-        prefix = ROOT / "tests" / f"playerwire_{os.getpid()}"
-        cls.executable = prefix.with_suffix(".exe")
-        cls.object = Path(f"{prefix}.obj")
-        cls.addClassCleanup(lambda: [path.unlink(missing_ok=True)
-                                     for path in [cls.executable, cls.object]])
-
-        source = ROOT / "tests" / "playerwire_test.cpp"
-        if Path(compiler).stem.lower() == "cl":
-            subprocess.run([compiler, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
-                            "/c", str(source), f"/Fo{cls.object}"],
-                           cwd=ROOT, check=True, capture_output=True, text=True)
-            subprocess.run([compiler, "/nologo", str(cls.object), f"/Fe{cls.executable}"],
-                           cwd=ROOT, check=True, capture_output=True, text=True)
-        else:
-            subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                            "-pedantic", str(source), "-o", str(cls.executable)],
-                           cwd=ROOT, check=True, capture_output=True, text=True)
+        cls.executable = TARGET.executable()
 
     def run_case(self, case):
         subprocess.run([str(self.executable), case], cwd=ROOT, check=True,

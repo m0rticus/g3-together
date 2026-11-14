@@ -2,29 +2,18 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
-
-class MeleePolicyTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
-        cls.combat_melee = (ROOT / "src" / "combat_melee.cpp").read_text(encoding="utf-8")
-        cls.combat_claims = (ROOT / "src" / "combat_claims.cpp").read_text(encoding="utf-8")
-        cls.combat_all = "\n".join((cls.combat, cls.combat_melee, cls.combat_claims))
-        cls.net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
-        cls.net_h = (ROOT / "src" / "net.h").read_text(encoding="utf-8")
-        cls.npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        cls.ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
-
-    def test_native_relational_rule_executes_without_the_engine(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "The engine-free C++ policy test needs clang++, g++, or cl on PATH")
-        source = r'''
+MELEE_POLICY_SOURCE = r'''
 #include "melee_policy.h"
 #include "net.h"
 #include "npcwire_control.h"
@@ -171,19 +160,36 @@ int main()
     assert(Judge(v) == Decision::Bystander);
 }
 '''
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            cpp = directory / "melee_policy.cpp"
-            executable = directory / ("melee_policy.exe" if os.name == "nt" else "melee_policy")
-            cpp.write_text(source, encoding="ascii")
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", f"/I{ROOT / 'src'}", str(cpp), f"/Fe:{executable}"]
-            else:
-                command = [compiler, "-std=c++17", "-I", str(ROOT / "src"), str(cpp), "-o", str(executable)]
-            compiled = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=60)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run([str(executable)], cwd=directory, capture_output=True, text=True, timeout=10)
-            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+
+MELEE_POLICY_TARGET = _testbuild.register_target(
+    "melee-policy",
+    [
+        _testbuild.inline_unit(
+            "melee_policy.cpp",
+            MELEE_POLICY_SOURCE,
+            std="c++17",
+            warnings="none",
+            includes=(ROOT / "src",),
+        )
+    ],
+)
+
+
+class MeleePolicyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.combat = _testbuild.src_text("combat.cpp")
+        cls.combat_melee = _testbuild.src_text("combat_melee.cpp")
+        cls.combat_claims = _testbuild.src_text("combat_claims.cpp")
+        cls.combat_all = "\n".join((cls.combat, cls.combat_melee, cls.combat_claims))
+        cls.net = _testbuild.src_text("net.cpp")
+        cls.net_h = _testbuild.src_text("net.h")
+        cls.npcs = _testbuild.src_text("npcs.cpp")
+        cls.ai = _testbuild.src_text("ai.cpp")
+
+    def test_native_relational_rule_executes_without_the_engine(self):
+        executed = MELEE_POLICY_TARGET.run(timeout=10)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_local_rule_precedes_judgement_flinch_and_perception(self):
         judge = self.combat.split("GEInt Judge(int which", 1)[1].split("GEInt GE_STDCALL FilterLogical(", 1)[0]
@@ -298,10 +304,10 @@ int main()
         blow = self.combat_melee.split("bool PlayerBlow(", 1)[1]
         self.assertNotIn("npcs::Ready(", blow)
         self.assertLess(blow.index("SendHostJudgedMelee("), blow.index("GameHit("))
-        replay = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        replay = _testbuild.src_text("npcplayback.cpp")
         self.assertNotIn("NpcStatePending", replay)
         self.assertNotIn("presentationMissingAt", replay)
-        self.assertNotIn("Waiting for NPC presentation", (ROOT / "src" / "i18n.cpp").read_text(encoding="utf-8"))
+        self.assertNotIn("Waiting for NPC presentation", _testbuild.src_text("i18n.cpp"))
 
     def test_resync_republishes_gameplay_and_queue_failure_is_not_counted_as_success(self):
         signal = self.net.split("} else if (type == MsgControlSignal)", 1)[1].split("} else if (type == MsgBoneDictionary)", 1)[0]

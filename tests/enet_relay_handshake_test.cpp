@@ -125,13 +125,14 @@ struct Relay {
     Capture captures[2];
 };
 
-static void PumpSide(Relay& relay, unsigned direction)
+static bool PumpSide(Relay& relay, unsigned direction)
 {
     ENetSocket const receiving = direction == 0 ? relay.clientSide : relay.serverSide;
     ENetSocket const sending = direction == 0 ? relay.serverSide : relay.clientSide;
     auto& codec = relay.codecs[direction];
     auto& queue = relay.queues[direction];
     auto& capture = relay.captures[direction];
+    bool moved = false;
     for (unsigned i = 0; i < 128; ++i) {
         uint8_t bytes[RelayPayloadLimit];
         ENetBuffer buffer{sizeof(bytes), bytes};
@@ -139,6 +140,7 @@ static void PumpSide(Relay& relay, unsigned direction)
         int const length = enet_socket_receive(receiving, &from, &buffer, 1);
         assert(length >= 0);
         if (!length) break;
+        moved = true;
         if (direction == 0) {
             if (relay.haveClient) assert(Same(from, relay.clientAddress));
             relay.clientAddress = from;
@@ -209,6 +211,7 @@ static void PumpSide(Relay& relay, unsigned direction)
             return Ok;
         }) == Ok);
     }
+    return moved;
 }
 
 struct State {
@@ -226,11 +229,13 @@ static std::vector<uint8_t> Payload(unsigned round, unsigned sender, unsigned ch
     return data;
 }
 
-static void Service(ENetHost* host, State& state)
+static bool Service(ENetHost* host, State& state)
 {
     ENetEvent event{};
     int result;
+    bool active = false;
     while ((result = enet_host_service(host, &event, 0)) > 0) {
+        active = true;
         if (event.type == ENET_EVENT_TYPE_CONNECT) {
             ++state.connected;
             state.peer = event.peer;
@@ -253,15 +258,16 @@ static void Service(ENetHost* host, State& state)
         }
     }
     assert(result == 0);
+    return active;
 }
 
 static void Tick(ENetHost* client, State& cs, ENetHost* server, State& ss, Relay& relay)
 {
-    Service(client, cs);
-    PumpSide(relay, 0);
-    Service(server, ss);
-    PumpSide(relay, 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bool active = Service(client, cs);
+    active = PumpSide(relay, 0) || active;
+    active = Service(server, ss) || active;
+    active = PumpSide(relay, 1) || active;
+    if (!active) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 template<class Predicate>

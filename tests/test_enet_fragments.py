@@ -1,75 +1,38 @@
 import os
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "enet_fragment_test",
+    [*_testbuild.enet_units(exclude=("protocol.c",), opt=None, warnings="none",
+                            extra_gnu_flags=("-std=c99",)),
+     _testbuild.unit(ROOT / "thirdparty" / "enet" / "protocol.c", lang="c",
+                     std="c99", warnings="none",
+                     defines=("enet_socket_send=g3t_test_socket_send",),
+                     includes=(_testbuild.ENET_INCLUDE_DIR,)),
+     _testbuild.unit(ROOT / "tests" / "enet_fragment_test.cpp",
+                     includes=(_testbuild.ENET_INCLUDE_DIR,))],
+    libs=("ws2_32", "winmm") if os.name == "nt" else (),
+    respect_env=False, msvc_vcvars=False,
+    skip_message="An existing C/C++ toolchain is needed for ENet queue tests",
+)
 
 
 class EnetFragmentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++") or shutil.which("cl")
-        if not compiler:
-            raise unittest.SkipTest("An existing C/C++ toolchain is needed for ENet queue tests")
-        compiler = Path(compiler)
-        msvc = compiler.stem.lower() == "cl"
-        c_name = "clang" if compiler.stem.lower() == "clang++" else "gcc"
-        c_compiler = compiler if msvc else compiler.with_name(c_name + (".exe" if os.name == "nt" else ""))
-        if not c_compiler.is_file():
-            raise unittest.SkipTest("The C compiler accompanying the C++ toolchain is needed")
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        cls.temporary = tempfile.TemporaryDirectory(prefix="enet-queue-tests-", dir=build)
-        cls.addClassCleanup(cls.temporary.cleanup)
-        directory = Path(cls.temporary.name)
-        cls.executable = directory / "enet_fragment_test.exe"
-        enet = ROOT / "thirdparty" / "enet"
-        include = enet / "include"
-        sources = list(enet.glob("*.c"))
-        protocol = enet / "protocol.c"
-        sources.remove(protocol)
-        if msvc:
-            command = [str(c_compiler), "/nologo", "/TC", "/c", f"/I{include}",
-                       *(str(source) for source in sources), f"/Fo{directory}\\"]
-            suffix = ".obj"
-        else:
-            command = [str(c_compiler), "-std=c99", "-c", "-I", str(include),
-                       *(str(source) for source in sources)]
-            suffix = ".o"
-        result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(f"Vendored ENet compilation failed:\n{result.stdout}{result.stderr}")
-        if msvc:
-            command = [str(c_compiler), "/nologo", "/TC", "/c", f"/I{include}",
-                       "/Denet_socket_send=g3t_test_socket_send", str(protocol), f"/Fo{directory}\\protocol.obj"]
-        else:
-            command = [str(c_compiler), "-std=c99", "-c", "-I", str(include),
-                       "-Denet_socket_send=g3t_test_socket_send", str(protocol)]
-        result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(f"ENet mock-socket compilation failed:\n{result.stdout}{result.stderr}")
-        sources.append(protocol)
-        source = ROOT / "tests" / "enet_fragment_test.cpp"
-        objects = [str(directory / (source.stem + suffix)) for source in sources]
-        if msvc:
-            command = [str(compiler), "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", f"/I{include}",
-                       str(source), *objects, f"/Fe{cls.executable}", f"/Fo{directory / 'test.obj'}",
-                       "ws2_32.lib", "winmm.lib"]
-        else:
-            command = [str(compiler), "-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", str(include),
-                       str(source), *objects, "-o", str(cls.executable)]
-            if os.name == "nt":
-                command.extend(["-lws2_32", "-lwinmm"])
-        result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(f"ENet queue test compilation failed:\n{result.stdout}{result.stderr}")
+        TARGET.build()
 
     def run_case(self, case):
-        subprocess.run([str(self.executable), case], check=True, capture_output=True, text=True)
+        TARGET.run([case], check=True)
 
     def test_old_1199_byte_promotion_is_reproduced_and_best_effort_boundaries_stay_unreliable(self):
         self.run_case("boundary")

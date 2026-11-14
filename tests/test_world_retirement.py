@@ -1,26 +1,30 @@
-import shutil
-import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+WORLD_RETIREMENT_TARGET = _testbuild.register_target(
+    "world-retirement",
+    [_testbuild.unit(
+        "tests/world_retirement_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
 
 
 class WorldRetirementTests(unittest.TestCase):
     def test_native_owner_retirement_policy_without_engine(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required for engine-free PVS retirement fixture")
         with tempfile.TemporaryDirectory() as folder:
-            executable = Path(folder) / "world_retirement.exe"
-            subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 str(ROOT / "tests" / "world_retirement_test.cpp"), "-o", str(executable)],
-                check=True, capture_output=True, text=True,
-            )
-            subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+            result = WORLD_RETIREMENT_TARGET.run(cwd=folder)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

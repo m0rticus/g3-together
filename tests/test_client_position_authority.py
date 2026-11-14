@@ -1,9 +1,6 @@
 import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import tempfile
 import unittest
 
 from test_downed_policy import function_body
@@ -11,20 +8,15 @@ from test_hud_notices import read_rva
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "tools") not in sys.path:
-    sys.path.insert(0, str(ROOT / "tools"))
-from _g3copy import win32_tool_environment
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
-
-class ClientPositionAuthorityTests(unittest.TestCase):
-    def source(self, name):
-        return (ROOT / "src" / name).read_text(encoding="utf-8")
-
-    def test_production_local_body_guard_and_discontinuity_policy(self):
-        guards = self.source("guards.cpp")
-        identify = function_body(guards, r"\bbool\s+IsLocalPlayer\s*\(")
-        reject = function_body(guards, r"\bbool\s+RejectRemoteWrite\s*\(")
-        harness = f"""
+_guards = _testbuild.src_text("guards.cpp")
+identify = function_body(_guards, r"\bbool\s+IsLocalPlayer\s*\(")
+reject = function_body(_guards, r"\bbool\s+RejectRemoteWrite\s*\(")
+HARNESS = f"""
 #include "position_policy.h"
 #include <cassert>
 class eCEntity {{}};
@@ -70,26 +62,20 @@ int main() {{
     assert(movement::PositionDiscontinuity(origin, fall, zero, zero, 10000, true));
 }}
 """
-        with tempfile.TemporaryDirectory() as temp:
-            directory = Path(temp)
-            source = directory / "authority.cpp"
-            source.write_text(harness, encoding="utf-8")
-            exe = directory / ("authority.exe" if os.name == "nt" else "authority")
-            compiler = shutil.which("clang++") or shutil.which("g++")
-            if compiler:
-                env = os.environ.copy()
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source),
-                           "-I", str(ROOT / "src"), "-o", str(exe)]
-            else:
-                env = win32_tool_environment(directory)
-                cl = shutil.which("cl", path=env.get("PATH"))
-                self.assertIsNotNone(cl, "C++17 compiler required for authority policy")
-                command = [cl, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", str(source),
-                           f"/I{ROOT / 'src'}", f"/Fe:{exe}", f"/Fo:{directory}\\"]
-            result = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(exe)], cwd=directory, env=env, capture_output=True, text=True, timeout=20)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+TARGET = _testbuild.register_target(
+    "client_position_authority",
+    [_testbuild.inline_unit("authority.cpp", HARNESS, includes=(ROOT / "src",))],
+    respect_env=False,
+)
+
+
+class ClientPositionAuthorityTests(unittest.TestCase):
+    def source(self, name):
+        return _testbuild.src_text(name)
+
+    def test_production_local_body_guard_and_discontinuity_policy(self):
+        result = TARGET.run(timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_playback_guards_precede_every_writer(self):
         body = self.source("body.cpp")
@@ -170,7 +156,7 @@ int main() {{
         game = os.environ.get("G3T_GAME_DLL")
         if not game:
             self.skipTest("Set G3T_GAME_DLL for read-only native transform signatures")
-        data = Path(game).with_name("Engine.dll").read_bytes()
+        data = _testbuild.cached_bytes(Path(game).with_name("Engine.dll"))
         self.assertEqual(read_rva(data, 0x227100, 6), bytes.fromhex("55 8b ec 83 e4 f8"))
         self.assertEqual(read_rva(data, 0x177E10, 6), bytes.fromhex("8b 44 24 04 8b 11"))
         self.assertIn("matrixEntry == engine + 0x227100", self.source("movement.cpp"))

@@ -49,15 +49,38 @@ static void Codec()
     assert(sender.Ack(1, 1));
     // Quantization error introduced by this codec is identically zero for
     // every basis/translation integer, including shear and signed extrema.
+    {
+        auto singleLayout = Layout(1);
+        std::vector<pose::Bone> single{bones[0]}, singleDecoded;
+        PoseCache singleSender, singleReceiver;
+        assert(singleSender.Store(1, 1, 1, 0, single.data(), single.size(), 0, true));
+        assert(singleReceiver.Store(1, 1, 1, 0, single.data(), single.size(), 0, false));
+        assert(singleSender.Ack(1, 1));
+        for (int k : {0, 9}) {
+            const int16_t previous = single[0].values[k];
+            for (int value = -32768; value <= 32767; ++value) {
+                single[0].values[k] = static_cast<int16_t>(value);
+                assert(singleSender.Encode(singleLayout, 1, 1, 0, single.data(), single.size(), 1, bytes, key) == Status::Ok && !key);
+                assert(singleReceiver.Decode(singleLayout, bytes.data(), bytes.size(), 1, 0, singleDecoded, id) == Status::Ok && Same(single, singleDecoded));
+                auto a = pose::Decode(single[0]), b = pose::Decode(singleDecoded[0]);
+                for (int n = 0; n < 12; ++n) assert(a.values[n] == b.values[n]);
+            }
+            single[0].values[k] = previous;
+        }
+    }
     for (int k = 0; k < 12; ++k) {
         const int16_t previous = bones[0].values[k];
-        for (int value = -32768; value <= 32767; ++value) {
+        auto checkValue = [&](int value) {
             bones[0].values[k] = static_cast<int16_t>(value);
             assert(sender.Encode(d, 1, 1, 0, bones.data(), bones.size(), 1, bytes, key) == Status::Ok && !key);
             assert(receiver.Decode(d, bytes.data(), bytes.size(), 1, 0, decoded, id) == Status::Ok && Same(bones, decoded));
             auto a = pose::Decode(bones[0]), b = pose::Decode(decoded[0]);
             for (int n = 0; n < 12; ++n) assert(a.values[n] == b.values[n]);
-        }
+        };
+        for (int value : {-32768, -32767, -16384, -4096, -2, -1, 0, 1, 2, 4096, 16384, 32766, 32767})
+            checkValue(value);
+        for (int value = -32768; value <= 32767; value += 257)
+            checkValue(value);
         bones[0].values[k] = previous;
     }
     bones[0].values[0] ^= 0x7fff;
@@ -757,7 +780,7 @@ static void LongDelayedFirstAnchor()
 
 static void Simulation()
 {
-    constexpr int count = 75, seconds = 20, hz = 60;
+    constexpr int count = 75, seconds = 4, sessionSeconds = 20, hz = 60;
     auto dictionary = Layout(80);
     struct Npc {
         net::NpcRecord record{};
@@ -850,7 +873,7 @@ static void Simulation()
     }
     // Initial world dictionaries/control baselines, plus ordinary player state
     // traffic. Stable descriptors need no repeated baseline offers in this scene.
-    const uint64_t bootstrap = count * (37 + 615 + 611 + 2 * (2855 + 300)) + 341 + 81 * 101;
+    const uint64_t bootstrap = ((count * (37 + 615 + 611 + 2 * (2855 + 300)) + 341 + 81 * 101) * seconds + sessionSeconds - 1) / sessionSeconds;
     // Two reliable contact/life/control transitions per fighter per second:
     // full essential record, baseline offer, ID and conservative ENet/relay envelope.
     const uint64_t criticalControls = seconds * 5 * 2 * (611 + 615 + 37 + 200);

@@ -1,11 +1,19 @@
 import re
-import os
-import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "downed_policy", [ROOT / "tests" / "downed_policy" / "downed_policy_test.cpp"],
+    warnings="none",
+)
 DOWNED_H = ROOT / "src" / "downed.h"
 DOWNED_CPP = ROOT / "src" / "downed.cpp"
 SCRIPT_CPP = ROOT / "src" / "Script_G3Together.cpp"
@@ -41,10 +49,10 @@ def function_body(source, signature):
     if body is not None:
         return body
     for primary, siblings in SPLIT_SIBLINGS:
-        if primary.exists() and source == primary.read_text(encoding="utf-8"):
+        if primary.exists() and source == _testbuild.cached_text(primary):
             for sibling in siblings:
                 if sibling.exists():
-                    body = _extract_function_body(sibling.read_text(encoding="utf-8"), signature)
+                    body = _extract_function_body(_testbuild.cached_text(sibling), signature)
                     if body is not None:
                         return body
     return None
@@ -53,17 +61,17 @@ def function_body(source, signature):
 class DownedPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.downed_h = DOWNED_H.read_text(encoding="utf-8")
-        cls.downed_cpp = DOWNED_CPP.read_text(encoding="utf-8")
+        cls.downed_h = _testbuild.cached_text(DOWNED_H)
+        cls.downed_cpp = _testbuild.cached_text(DOWNED_CPP)
         cls.downed_all = "\n".join(
-            p.read_text(encoding="utf-8")
+            _testbuild.cached_text(p)
             for p in (
                 DOWNED_CPP,
                 ROOT / "src" / "downed_terminal.cpp",
                 ROOT / "src" / "player_immunity.cpp",
             )
         )
-        cls.script_cpp = SCRIPT_CPP.read_text(encoding="utf-8")
+        cls.script_cpp = _testbuild.cached_text(SCRIPT_CPP)
 
     def test_die_is_idempotent_and_dispatches_native_ragdoll_death_once(self):
         body = function_body(
@@ -179,7 +187,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn('KeepDown(hero, "tick")', tick)
         before_terminal = tick[:tick.index("if (life.terminal)")]
         self.assertNotIn("life.held = false", before_terminal)
-        ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
+        ai = _testbuild.src_text("ai.cpp")
         self.assertLess(ai.index("downed::GuardState(self, name)"), ai.index("if (SpectatorState(name))"))
         self.assertIn('std::strcmp(name, "ZS_RagDollDead") == 0', ai)
         self.assertIn('downed::ObserveDeathState(self, true)', ai)
@@ -213,7 +221,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("!persist::HeroPending()", redirect)
 
     def test_terminal_native_boundaries_are_guarded_and_observed(self):
-        ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
+        ai = _testbuild.src_text("ai.cpp")
         enter = function_body(ai, r"\bbool\s+EnterTerminalDeath\s*\(")
         self.assertIn("bTObjStack<gScriptRunTimeSingleState> stack;", enter)
         self.assertIn("gScriptRunTimeSingleState state;", enter)
@@ -241,11 +249,11 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("now - terminalSampleAt < 100", samples)
         self.assertIn("end-state player=", samples)
         self.assertIn("hp=%d ai=%d task=%s", samples)
-        ending = (ROOT / "src" / "ending.cpp").read_text(encoding="utf-8")
+        ending = _testbuild.src_text("ending.cpp")
         self.assertIn("if (!on || downed::Terminal()) return;", function_body(ending, r"\bvoid\s+Tick\s*\("))
 
     def test_records_preserve_downed_state_before_restoring_hp(self):
-        hero = (ROOT / "src" / "hero.cpp").read_text(encoding="utf-8")
+        hero = _testbuild.src_text("hero.cpp")
         save = function_body(hero, r"\bbool\s+SaveRecordImpl\s*\(")
         load = function_body(hero, r"\bbool\s+LoadRecordImpl\s*\(")
         self.assertIn('fprintf(file, "downed %d\\n"', save)
@@ -265,12 +273,12 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertLess(tick.index("revivedBy && !Able(remotes[revivedBy], now)"),
                         tick.index("life.Revive(pendingReviveSequence)"))
         self.assertIn("life.terminal || !life.Revive(pendingReviveSequence)", tick)
-        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        net = _testbuild.src_text("net.cpp")
         self.assertIn("message.state.npcClass = from;", net)
         self.assertIn("constexpr uint16_t ProtocolVersion = saving::Protocol;", net)
 
     def test_client_revive_world_states_and_kind_19_routing(self):
-        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        net = _testbuild.src_text("net.cpp")
         send = function_body(net, r"\bvoid\s+SendWorldState\s*\(")
         special = function_body(send, r"\bif\s*\(\s*state\.kind\s*==\s*19\s*\)")
         self.assertIsNotNone(special)
@@ -306,7 +314,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("if (message.state.dialog > 3) return;", special_receive)
         self.assertIn("from < 2 || from >= MaxPlayers || peers[from] != peer || message.state.npcClass != from", special_receive)
         self.assertIn("from != 1 || message.state.npcClass != 1", special_receive)
-        infocmd = (ROOT / "src" / "infocmd.cpp").read_text(encoding="utf-8")
+        infocmd = _testbuild.src_text("infocmd.cpp")
         self.assertIn("if (net::IsHost() && s.kind != 3 && s.kind != 16) net::SendWorldState(s, from);", infocmd)
         apply = function_body(infocmd, r"\bvoid\s+Apply\s*\(")
         help_message = function_body(apply, r"\bif\s*\(\s*s\.kind\s*==\s*8\s*\|\|\s*s\.kind\s*==\s*9\s*\)")
@@ -316,8 +324,8 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("else downed::HelperHasNoPotion(s.npcClass);", target)
 
     def test_cached_end_step_reaches_crash_handlers(self):
-        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
-        crash_h = (ROOT / "src" / "crashlog.h").read_text(encoding="utf-8")
+        crash = _testbuild.src_text("crashlog.cpp")
+        crash_h = _testbuild.src_text("crashlog.h")
         end_step = function_body(self.downed_cpp, r"\bvoid\s+EndStep\s*\(")
         self.assertIn("crashlog::EndStep(step);", end_step)
         self.assertIn("downed: end step=%s", end_step)
@@ -338,7 +346,7 @@ class DownedPolicyTests(unittest.TestCase):
             self.assertIn("LogEndStep();", body)
 
     def test_minidump_fallback_is_limited_and_truncates_before_retry(self):
-        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        crash = _testbuild.src_text("crashlog.cpp")
         dump = function_body(crash, r"\bbool\s+WriteDump\s*\(")
         self.assertIsNotNone(dump)
         for flag in ("MiniDumpWithThreadInfo", "MiniDumpWithHandleData", "MiniDumpWithUnloadedModules",
@@ -370,7 +378,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("WriteDump(file, nullptr);", crash)
 
     def test_dump_worker_owns_exception_context_and_busy_admission(self):
-        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        crash = _testbuild.src_text("crashlog.cpp")
         self.assertIn("EXCEPTION_RECORD dumpExceptionRecord{};", crash)
         self.assertIn("CONTEXT dumpContext{};", crash)
         self.assertIn("EXCEPTION_POINTERS dumpExceptionPointers{};", crash)
@@ -408,7 +416,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("guard: crashlog missing exception record/context", handler)
 
     def test_known_crash_symbols_use_actual_enet_entries_and_executable_rva_bounds(self):
-        crash = (ROOT / "src" / "crashlog.cpp").read_text(encoding="utf-8")
+        crash = _testbuild.src_text("crashlog.cpp")
         self.assertLess(crash.index("#include <enet/enet.h>"), crash.index("#include <Game.h>"))
         known = function_body(crash, r"\bvoid\s+FindKnownSymbols\s*\(")
         self.assertIsNotNone(known)
@@ -451,30 +459,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("NumberOfNames", export_lookup)
 
     def test_engine_free_transition_and_ordering_rules(self):
-        import shutil, tempfile
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        if compiler:
-            with tempfile.TemporaryDirectory(prefix="downed-policy-bin-") as tmp:
-                exe = Path(tmp) / ("downed_policy_test.exe" if os.name == "nt" else "downed_policy_test")
-                cpp = ROOT / "tests" / "downed_policy" / "downed_policy_test.cpp"
-                if Path(compiler).stem.lower() == "cl":
-                    cmd = [compiler, "/nologo", "/EHsc", "/std:c++17", str(cpp), f"/Fe:{exe}"]
-                else:
-                    cmd = [compiler, "-std=c++17", str(cpp), "-o", str(exe)]
-                res = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True)
-                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                run = subprocess.run([str(exe)], cwd=tmp, capture_output=True, text=True)
-                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            return
-        build = ROOT / "build" / "downed-policy-tests"
-        configure = ["cmake", "-S", str(ROOT / "tests" / "downed_policy"), "-B", str(build)]
-        if os.name == "nt":
-            configure += ["-A", "Win32"]
-        for command in (configure, ["cmake", "--build", str(build), "--config", "Debug"]):
-            result = subprocess.run(command, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        executable = build / "Debug" / "downed_policy_test.exe" if os.name == "nt" else build / "downed_policy_test"
-        result = subprocess.run([str(executable)], capture_output=True, text=True)
+        result = TARGET.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_refused_stand_defers_repair_without_replaying_entry(self):
@@ -563,7 +548,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("if (!Playing(HelperState(r, now))) return false;", all_down)
         self.assertIn("if (HelperState(r, now) != Availability::Down) return false;", all_down)
         self.assertIn("return present;", all_down)
-        policy = (ROOT / "src" / "downed_policy.h").read_text(encoding="utf-8")
+        policy = _testbuild.src_text("downed_policy.h")
         self.assertIn("constexpr uint32_t AbsenceGraceMs = 5000;", policy)
         self.assertIsNotNone(tick)
         self.assertIn("AllOthersDown(remotes, now)", tick)
@@ -585,7 +570,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertNotIn("world", helper)
 
     def test_activity_heartbeat_is_authenticated_reliable_and_gate_independent(self):
-        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        net = _testbuild.src_text("net.cpp")
         gate = function_body(net, r"\bbool\s+Gated\s*\(")
         self.assertIn("case MsgPlayerActivity:", gate)
         self.assertNotIn("case MsgState:", gate) # presentation/gameplay still gated
@@ -608,7 +593,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("local.actionSeq != currentLocal.actionSeq", service)
 
     def test_world_gate_clears_only_presentation_disconnect_clears_activity(self):
-        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        net = _testbuild.src_text("net.cpp")
         clear = function_body(net, r"\bvoid\s+ClearPresentation\s*\(")
         self.assertIn("cleared.activity = remotes[id].activity", clear)
         self.assertIn("cleared.connected = remotes[id].connected", clear)
@@ -619,7 +604,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("remotes[id] = Remote{}", drop)
 
     def test_arriving_held_puppet_uses_owner_life_not_buffered_wake(self):
-        remote = (ROOT / "src" / "remote.cpp").read_text(encoding="utf-8")
+        remote = _testbuild.src_text("remote.cpp")
         update = function_body(remote, r"\bvoid\s+UpdatePuppet\s*\(")
         held = function_body(update, r"\bif\s*\(\s*held\s*\)")
         local_state = function_body(remote, r"\bbool\s+LocalState\s*\(")

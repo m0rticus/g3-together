@@ -1,27 +1,30 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-import shutil
-import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+SAVING_PUBLISH_TARGET = _testbuild.register_target(
+    "saving-publish",
+    [_testbuild.unit(
+        "tests/saving_publish_test.cpp",
+        std="c++17",
+        warnings="strict",
+    )],
+)
 
 
 class SavingPublishTests(unittest.TestCase):
     def test_production_publish_faults_cleanup_and_retry(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
         with tempfile.TemporaryDirectory() as folder:
-            executable = Path(folder) / "saving-publish.exe"
-            result = subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 str(ROOT / "tests" / "saving_publish_test.cpp"), "-o", str(executable)],
-                capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable), str(Path(folder) / "slot")],
-                                    capture_output=True, text=True)
+            slot = Path(folder) / "slot"
+            result = SAVING_PUBLISH_TARGET.run(args=[str(slot)], cwd=folder)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 

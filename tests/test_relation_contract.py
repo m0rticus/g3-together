@@ -1,14 +1,19 @@
 import os
 from pathlib import Path
 import struct
+import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
 
 def source(name):
-    return (SRC / name).read_text(encoding="utf-8")
+    return _testbuild.src_text(name)
 
 
 def between(text, start, end):
@@ -18,7 +23,7 @@ def between(text, start, end):
 
 class MinimalPe:
     def __init__(self, path):
-        self.data = Path(path).read_bytes()
+        self.data = _testbuild.cached_bytes(path)
         pe = struct.unpack_from("<I", self.data, 0x3C)[0]
         sections, = struct.unpack_from("<H", self.data, pe + 6)
         optional_size, = struct.unpack_from("<H", self.data, pe + 20)
@@ -138,7 +143,7 @@ class RelationContractTests(unittest.TestCase):
         self.assertIn("DiagnosticIntervalMs", tick)
         frame = source("Script_G3Together.cpp")
         self.assertLess(frame.index("g3t::fightmem::Tick()"), frame.index("g3t::relation::Tick()"))
-        self.assertIn("src/relation.cpp", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
+        self.assertIn("src/relation.cpp", _testbuild.cached_text(ROOT / "CMakeLists.txt"))
 
     def test_wire_and_pose_codecs_are_untouched(self):
         for name in ("npcwire_pose.h", "npcwire_bonepack.h"):

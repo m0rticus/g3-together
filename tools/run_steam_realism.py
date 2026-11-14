@@ -13,9 +13,12 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
-if str(TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(TOOLS_DIR))
+TESTS_DIR = ROOT / "tests"
+for _sys_dir in (str(TOOLS_DIR), str(TESTS_DIR)):
+    if _sys_dir not in sys.path:
+        sys.path.insert(0, _sys_dir)
 from _g3copy import win32_tool_environment
+import _testbuild
 
 HOST_ID = 76561198011111111
 CLIENT_ID = 76561198022222222
@@ -71,64 +74,50 @@ def build_peer(source_root, output_dir, fake_dll, header):
     sources = sorted(enet.glob("*.c"))
     if not sources:
         raise RuntimeError("historical ENet sources not found at " + str(enet))
-    objects = [build / (source.stem + ".obj") for source in sources]
-    enet_command = [
-        compiler, "/nologo", "/TC", "/c", "/Gz", "/O2", "/W3",
-        "/D_CRT_SECURE_NO_WARNINGS", "/D_WINSOCK_DEPRECATED_NO_WARNINGS",
-        "/Denet_socket_send=RealismNativeSocketSend",
-        "/I" + str(include_enet),
-        *(str(source) for source in sources if source.name != "win32.c"),
-        "/Fo" + str(build) + "\\",
-    ]
-    enet_result = subprocess.run(enet_command, cwd=build, env=env,
-                                 capture_output=True, text=True, timeout=180)
-    if enet_result.returncode:
-        raise RuntimeError("ENet build failed:\n" +
-                           enet_result.stdout + enet_result.stderr)
-    win32_source = enet / "win32.c"
-    if win32_source.is_file():
-        win32_command = [
-            compiler, "/nologo", "/TC", "/c", "/Gz", "/O2", "/W3",
-            "/D_CRT_SECURE_NO_WARNINGS", "/D_WINSOCK_DEPRECATED_NO_WARNINGS",
-            "/I" + str(include_enet),
-            str(win32_source),
-            "/Fo" + str(build) + "\\",
-        ]
-        win32_result = subprocess.run(win32_command, cwd=build, env=env,
-                                      capture_output=True, text=True,
-                                      timeout=180)
-        if win32_result.returncode:
-            raise RuntimeError("ENet Win32 build failed:\n" +
-                               win32_result.stdout + win32_result.stderr)
-
     peer_cpp = ROOT / "tests" / "steam_realism_peer.cpp"
     source_cpp = (source_root / "src" / "steam.cpp").resolve()
     if not source_cpp.is_file():
         raise RuntimeError("steam.cpp not found at " + str(source_cpp))
-    header_dir = header.parent
-    executable = build / "steam_realism_peer.exe"
-    peer_command = [
-        compiler, "/nologo", "/std:c++17", "/EHsc", "/Gz", "/O2", "/W3",
-        "/D_CRT_SECURE_NO_WARNINGS", "/D_WINSOCK_DEPRECATED_NO_WARNINGS",
-        "/DG3T_REALISM_SOURCE=\"" +
-        str(source_cpp) + "\"",
-        "/I" + str(source_root / "src"),
-        "/I" + str(include_enet),
-        "/I" + str(header_dir),
-        str(peer_cpp),
-        *(str(obj) for obj in objects),
-        "/Fo" + str(build / "steam_realism_peer.obj"),
-        "/Fe" + str(executable),
-        "/link", "ws2_32.lib", "winmm.lib",
+    header_dir = header.resolve().parent
+
+    common_defs = ("_CRT_SECURE_NO_WARNINGS", "_WINSOCK_DEPRECATED_NO_WARNINGS")
+    c_units = [
+        _testbuild.unit(
+            src,
+            lang="c",
+            opt="-O2",
+            warnings="w3",
+            stdcall_gz=True,
+            defines=(
+                common_defs
+                if src.name == "win32.c"
+                else (*common_defs, "enet_socket_send=RealismNativeSocketSend")
+            ),
+            includes=(include_enet,),
+        )
+        for src in sources
     ]
-    peer_result = subprocess.run(peer_command, cwd=build, env=env,
-                                 capture_output=True, text=True, timeout=180)
-    output = peer_result.stdout + peer_result.stderr
-    warnings = [line for line in output.splitlines()
-                if "warning C5287:" in line]
-    if peer_result.returncode:
-        raise RuntimeError("peer build failed:\n" + output)
-    return executable, env, warnings
+    peer_unit = _testbuild.unit(
+        peer_cpp,
+        lang="c++",
+        std="c++17",
+        opt="-O2",
+        warnings="w3",
+        stdcall_gz=True,
+        defines=(*common_defs, f'G3T_REALISM_SOURCE="{source_cpp}"'),
+        includes=(source_root / "src", include_enet, header_dir),
+        extra_deps=(source_cpp, header.resolve()),
+    )
+    target = _testbuild.NativeTarget(
+        "steam_realism_peer",
+        [peer_unit, *c_units],
+        toolchain="win32_cl",
+        libs=("ws2_32", "winmm"),
+        register=False,
+    )
+    built = target.build()
+    warnings = [line for line in built.warnings if "warning C5287:" in line]
+    return built.executable, env, warnings
 
 
 def scenario_environment(fake_dll, output_dir, role, peer_id,

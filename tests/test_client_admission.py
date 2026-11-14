@@ -1,20 +1,28 @@
 import re
-import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "client_admission", [ROOT / "tests" / "client_admission_test.cpp"],
+    allow_msvc=False, respect_env=False,
+    skip_message="C++17 compiler required for engine-free client admission tests",
+)
 
 
 def source(name):
     if name == "src/persist.cpp":
         return "\n".join(
-            (ROOT / "src" / part).read_text(encoding="utf-8")
+            _testbuild.src_text(part)
             for part in ("persist.cpp", "persist_hooks.cpp", "persist_storage.cpp", "persist_client.cpp")
         )
-    return (ROOT / name).read_text(encoding="utf-8")
+    return _testbuild.src_text(name[4:]) if name.startswith("src/") else _testbuild.cached_text(ROOT / name)
 
 
 def function_body(text, signature):
@@ -36,20 +44,10 @@ def function_body(text, signature):
 class ClientAdmissionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            raise unittest.SkipTest("C++17 compiler required for engine-free client admission tests")
-        cls.folder = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.folder.cleanup)
-        cls.executable = Path(cls.folder.name) / "client_admission.exe"
-        subprocess.run(
-            [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-             str(ROOT / "tests" / "client_admission_test.cpp"), "-o", str(cls.executable)],
-            check=True, capture_output=True, text=True,
-        )
+        cls.executable = TARGET.executable()
 
     def run_case(self, name):
-        result = subprocess.run([str(self.executable), name], capture_output=True, text=True)
+        result = TARGET.run([name])
         self.assertEqual(result.returncode, 0, f"{name}: {result.stderr}")
 
     def test_scenarios(self):

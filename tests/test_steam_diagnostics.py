@@ -1,57 +1,48 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-import os
-from pathlib import Path
-import shutil
-import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+STEAM_DIAGNOSTICS_TARGET = _testbuild.register_target(
+    "steam-diagnostics",
+    [_testbuild.unit(
+        "tests/steam_diagnostics_test.cpp",
+        std="c++17",
+        opt="-O2",
+        warnings="strict",
+    )],
+)
+STEAM_V012_RUNTIME_TARGET = _testbuild.register_target(
+    "steam-v012-runtime",
+    [
+        _testbuild.ENET_COMPRESS_UNIT,
+        _testbuild.unit(
+            "tests/steam_v012_runtime_test.cpp",
+            std="c++17",
+            opt="-O2",
+            warnings="strict",
+            includes=(_testbuild.ENET_INCLUDE_DIR,),
+        ),
+    ],
+    libs=("ws2_32", "bcrypt"),
+)
 
 
 class SteamDiagnosticsTests(unittest.TestCase):
     def test_flat_api_route_evidence_and_description_privacy(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        self.assertIsNotNone(compiler, "C++17 compiler required")
-        build = ROOT / "tests" / f".steam-diagnostics-build-{os.getpid()}"
-        build.mkdir()
-        try:
-            exe = build / "steam-diagnostics.exe"
-            commands = [
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O2",
-                 str(ROOT / "tests" / "steam_diagnostics_test.cpp"), "-o", str(exe)],
-                [str(exe)],
-            ]
-            for command in commands:
-                result = subprocess.run(command, cwd=build, capture_output=True, text=True, timeout=120)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        finally:
-            shutil.rmtree(build)
+        result = STEAM_DIAGNOSTICS_TARGET.run(cwd=ROOT, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_v012_runtime_lanes_fallback_pinning_and_rejoin_rotation(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        self.assertIsNotNone(compiler, "C++17 compiler required")
-        build = ROOT / "tests" / f".steam-v012-runtime-build-{os.getpid()}"
-        build.mkdir()
-        try:
-            obj = build / "compress.o"
-            exe = build / "steam-v012-runtime.exe"
-            commands = [
-                [compiler, "-x", "c", "-std=c11", "-O2",
-                 "-I", str(ROOT / "thirdparty" / "enet" / "include"), "-c",
-                 str(ROOT / "thirdparty" / "enet" / "compress.c"), "-o", str(obj)],
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O2",
-                 "-I", str(ROOT / "thirdparty" / "enet" / "include"),
-                 str(ROOT / "tests" / "steam_v012_runtime_test.cpp"), str(obj),
-                 "-lws2_32", "-lbcrypt", "-o", str(exe)],
-                [str(exe)],
-            ]
-            for command in commands:
-                result = subprocess.run(command, cwd=build, capture_output=True, text=True, timeout=120)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                if command == commands[-1]:
-                    print(result.stdout, end="")
-        finally:
-            shutil.rmtree(build)
+        result = STEAM_V012_RUNTIME_TARGET.run(cwd=ROOT, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        print(result.stdout, end="")
 
 
 if __name__ == "__main__":

@@ -1,41 +1,38 @@
 import os
 from pathlib import Path
 import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+_compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
+_warnings = "none" if _compiler and Path(_compiler).stem.lower() == "cl" else "strict"
+_includes = (ROOT / "src",) if _warnings == "none" else ()
+TARGET = _testbuild.register_target(
+    "combat_timing",
+    [_testbuild.unit(path, warnings=_warnings, includes=_includes) for path in (
+        ROOT / "tests" / "combat_timing_test.cpp", ROOT / "src" / "snapshot.cpp"
+    )],
+    msvc_vcvars=False,
+)
 
 
 class CombatTimingTests(unittest.TestCase):
     def test_engine_free_combat_timing(self):
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "The engine-free C++ combat timing test needs a compiler")
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            executable = directory / ("combat_timing.exe" if os.name == "nt" else "combat_timing")
-            sources = [
-                str(ROOT / "tests" / "combat_timing_test.cpp"),
-                str(ROOT / "src" / "snapshot.cpp"),
-            ]
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", *sources,
-                           f"/Fe:{executable}", f"/I{ROOT / 'src'}"]
-            else:
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", *sources,
-                           "-o", str(executable)]
-            compiled = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=60)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run([str(executable)], cwd=directory, capture_output=True, text=True, timeout=20)
-            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
-            if executed.stdout:
-                print(executed.stdout, end="")
+        executed = TARGET.run(timeout=20)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+        if executed.stdout:
+            print(executed.stdout, end="")
 
     def test_try_local_blow_phase_gate_wiring(self):
-        npcs = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
-        snapshot = (ROOT / "src" / "snapshot.cpp").read_text(encoding="utf-8")
+        npcs = _testbuild.src_text("npcs.cpp")
+        snapshot = _testbuild.src_text("snapshot.cpp")
 
         start = npcs.index("void TryLocalBlow(")
         end = npcs.index("\nvoid MirrorTick()", start)

@@ -1,6 +1,7 @@
 import os
 import re
 import struct
+import sys
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,10 @@ from test_downed_policy import function_body
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
 
 def read_rva(data, rva, size):
@@ -27,9 +32,9 @@ def read_rva(data, rva, size):
 class HudNoticeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.hud = (ROOT / "src" / "hud.cpp").read_text(encoding="utf-8")
-        cls.header = (ROOT / "src" / "hud.h").read_text(encoding="utf-8")
-        cls.module = (ROOT / "src" / "Script_G3Together.cpp").read_text(encoding="utf-8")
+        cls.hud = _testbuild.src_text("hud.cpp")
+        cls.header = _testbuild.src_text("hud.h")
+        cls.module = _testbuild.src_text("Script_G3Together.cpp")
 
     def test_message_copies_text_only_without_engine_or_file_io(self):
         body = function_body(self.hud, r"\bvoid\s+Message\s*\(")
@@ -52,7 +57,7 @@ class HudNoticeTests(unittest.TestCase):
                      "StartOutput", "StartSay", "SetFocus", "BringWindowToTop", "ShowSubtitle"):
             self.assertNotIn(call, display)
         for source in (ROOT / "src").glob("*.cpp"):
-            text = source.read_text(encoding="utf-8")
+            text = _testbuild.src_text(source.relative_to(ROOT / "src").as_posix())
             self.assertNotRegex(text, r"(?:gui2\.|manager->)PrintGameMessage\s*\(", str(source))
 
     def test_unavailable_display_preserves_all_queued_notices_without_caps(self):
@@ -105,7 +110,7 @@ class HudNoticeTests(unittest.TestCase):
         self.assertIn('ForgetStep("HUD observation cleanup", &g3t::hud::OnWorldChange)', self.module)
 
     def test_partner_notice_loop_never_applies_local_down_guards(self):
-        downed = (ROOT / "src" / "downed.cpp").read_text(encoding="utf-8")
+        downed = _testbuild.src_text("downed.cpp")
         tick = function_body(downed, r"\bvoid\s+Tick\s*\(")
         notices = tick[tick.index("// Tell this player"):tick.index("if (life.terminal)")]
         self.assertIn("if (i == self) continue;", notices)
@@ -150,7 +155,7 @@ class HudNoticeTests(unittest.TestCase):
         path = os.environ.get("G3T_GAME_DLL")
         if not path or not Path(path).is_file():
             self.skipTest("Set G3T_GAME_DLL for read-only CP 1.75 HUD byte-contract checks")
-        data = Path(path).read_bytes()
+        data = _testbuild.cached_bytes(path)
         contracts = {"RootLayout": 0x7CD3C, "ListLayout": 0x7CD96, "AppendArguments": 0x7CDAB,
                      "AppendEntry": 0xA76D0, "AppendReturn": 0xA77D2}
         for name, address in contracts.items():

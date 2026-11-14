@@ -1,29 +1,23 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-import os
-import shutil
-import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+TARGET = _testbuild.register_target(
+    "npcwire_control_policy", ["tests/npcwire_control_policy_test.cpp"],
+    pedantic=True, allow_msvc=False, respect_env=False,
+)
 
 
 class NpcWireControlPolicyTests(unittest.TestCase):
     def test_engine_free_policy(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
-        executable = ROOT / "tests" / f"npcwire-control-policy-{os.getpid()}.exe"
-        try:
-            subprocess.run(
-                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                 str(ROOT / "tests" / "npcwire_control_policy_test.cpp"),
-                 "-o", str(executable)],
-                cwd=ROOT, check=True,
-            )
-            subprocess.run([str(executable)], cwd=ROOT, check=True)
-        finally:
-            executable.unlink(missing_ok=True)
+        TARGET.run(check=True)
 
 
 if __name__ == "__main__":

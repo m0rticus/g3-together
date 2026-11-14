@@ -1,35 +1,34 @@
-import os
 import re
-import shutil
-import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+STEAM_CONNECT_TARGET = _testbuild.register_target(
+    "steam-connect",
+    [_testbuild.unit(
+        "tests/steam_connect_test.cpp",
+        std="c++17",
+        warnings="strict",
+        pedantic=True,
+    )],
+)
 
 
 class SteamConnectTests(unittest.TestCase):
     def test_production_policy(self):
-        compiler = shutil.which("clang++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++17 compiler required")
-        build = ROOT / "build"
-        build.mkdir(exist_ok=True)
-        executable = build / f"steam-connect-test-{os.getpid()}.exe"
-        try:
-            command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                       str(ROOT / "tests" / "steam_connect_test.cpp"), "-o", str(executable)]
-            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        finally:
-            executable.unlink(missing_ok=True)
+        result = STEAM_CONNECT_TARGET.run(cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_wire_and_header_dependencies(self):
-        self.assertIn("Protocol = 79", (ROOT / "src" / "saving_policy.h").read_text(encoding="utf-8"))
-        header = (ROOT / "src" / "steam_connect.h").read_text(encoding="utf-8")
+        self.assertIn("Protocol = 79", _testbuild.src_text("saving_policy.h"))
+        header = _testbuild.src_text("steam_connect.h")
         includes = re.findall(r'^\s*#\s*include\s*([<"][^>"]+[>"])', header, re.MULTILINE)
         self.assertEqual([name for name in includes if name.startswith('"')], ['"relaywire.h"'])
         standard = set("""algorithm any array atomic bitset cassert cctype cerrno cfenv cfloat
@@ -47,7 +46,11 @@ class SteamConnectTests(unittest.TestCase):
 
     @staticmethod
     def source(name):
-        return (ROOT / name).read_text(encoding="utf-8").replace("\r\n", "\n")
+        if name.startswith("src/"):
+            text = _testbuild.src_text(name[len("src/"):])
+        else:
+            text = _testbuild.cached_text(ROOT / name)
+        return text.replace("\r\n", "\n")
 
     @classmethod
     def steam_source(cls):

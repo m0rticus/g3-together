@@ -1,8 +1,7 @@
 import os
 from pathlib import Path
 import shutil
-import subprocess
-import tempfile
+import sys
 import unittest
 
 from test_downed_policy import function_body
@@ -10,26 +9,17 @@ from test_hud_notices import read_rva
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
 
-
-class ClientMovementTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.guards = (ROOT / "src" / "guards.cpp").read_text(encoding="utf-8")
-        cls.ai = (ROOT / "src" / "ai.cpp").read_text(encoding="utf-8")
-        cls.movement = (ROOT / "src" / "movement.cpp").read_text(encoding="utf-8")
-        cls.module = (ROOT / "src" / "Script_G3Together.cpp").read_text(encoding="utf-8")
-        cls.downed = (ROOT / "src" / "downed.cpp").read_text(encoding="utf-8")
-
-    def test_engine_free_nested_identity_and_stop_thresholds(self):
-        # Compile the actual scope method bodies with inert entities, not a reimplementation.
-        acting = function_body(self.guards, r"Acting::Acting\s*\(")
-        acting_end = function_body(self.guards, r"Acting::~Acting\s*\(")
-        local = function_body(self.guards, r"LocalPlayer::LocalPlayer\s*\(")
-        local_end = function_body(self.guards, r"LocalPlayer::~LocalPlayer\s*\(")
-        self.assertIn("LocalPlayer::LocalPlayer(bool local) : before(actor)", self.guards)
-        self.assertIn("Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor)", self.guards)
-        harness = f"""
+_guards = _testbuild.src_text("guards.cpp")
+acting = function_body(_guards, r"Acting::Acting\s*\(")
+acting_end = function_body(_guards, r"Acting::~Acting\s*\(")
+local = function_body(_guards, r"LocalPlayer::LocalPlayer\s*\(")
+local_end = function_body(_guards, r"LocalPlayer::~LocalPlayer\s*\(")
+HARNESS = f"""
 #include "guards.h"
 #include "movement.h"
 #include <cassert>
@@ -77,24 +67,31 @@ int main() {{
     TestMovementPolicy();
 }}
 """
-        compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
-        self.assertIsNotNone(compiler, "Engine-free movement regression needs a C++ compiler")
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            source = directory / "scope.cpp"
-            source.write_text(harness, encoding="utf-8")
-            exe = directory / ("movement.exe" if os.name == "nt" else "movement")
-            policy = ROOT / "tests" / "client_movement_test.cpp"
-            if Path(compiler).stem.lower() == "cl":
-                command = [compiler, "/nologo", "/std:c++17", "/EHsc", str(source), str(policy),
-                           f"/I{ROOT / 'src'}", f"/Fe:{exe}"]
-            else:
-                command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), str(policy),
-                           "-I", str(ROOT / "src"), "-o", str(exe)]
-            compiled = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=60)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            executed = subprocess.run([str(exe)], cwd=directory, capture_output=True, text=True, timeout=20)
-            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+_compiler = shutil.which(os.environ.get("CXX", "clang++")) or shutil.which("g++") or shutil.which("cl")
+_warnings = "none" if _compiler and Path(_compiler).stem.lower() == "cl" else "strict"
+TARGET = _testbuild.register_target(
+    "client_movement",
+    [_testbuild.inline_unit("scope.cpp", HARNESS, warnings=_warnings, includes=(ROOT / "src",)),
+     _testbuild.unit(ROOT / "tests" / "client_movement_test.cpp",
+                     warnings=_warnings, includes=(ROOT / "src",))],
+    msvc_vcvars=False,
+)
+
+
+class ClientMovementTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.guards = _testbuild.src_text("guards.cpp")
+        cls.ai = _testbuild.src_text("ai.cpp")
+        cls.movement = _testbuild.src_text("movement.cpp")
+        cls.module = _testbuild.src_text("Script_G3Together.cpp")
+        cls.downed = _testbuild.src_text("downed.cpp")
+
+    def test_engine_free_nested_identity_and_stop_thresholds(self):
+        self.assertIn("LocalPlayer::LocalPlayer(bool local) : before(actor)", self.guards)
+        self.assertIn("Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor)", self.guards)
+        executed = TARGET.run(timeout=20)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_all_local_script_boundaries_isolate_identity_before_native_work(self):
         for signature, native in (
@@ -144,7 +141,7 @@ int main() {{
         self.assertIn("frame_native_exit=%u", event)
         self.assertIn("(current.input & 7u) == 7u", self.movement)
         self.assertEqual(event.count("Logf("), 1)
-        logger = (ROOT / "src" / "log.cpp").read_text(encoding="utf-8")
+        logger = _testbuild.src_text("log.cpp")
         self.assertIn("char text[16384]", logger)
         self.assertIn("char line[16448]", logger)
         reset = function_body(self.movement, r"\bvoid\s+OnWorldChange\s*\(")
@@ -152,7 +149,7 @@ int main() {{
             self.assertIn(clear, reset)
 
     def test_processing_refresh_never_clears_live_membership(self):
-        world = (ROOT / "src" / "world.cpp").read_text(encoding="utf-8")
+        world = _testbuild.src_text("world.cpp")
         request = function_body(world, r"\bvoid\s+RequestProcessingUpdate\s*\(")
         self.assertIn("MarkProcessingDirty", request)
         self.assertIn('"ROI-dirty"', request)
@@ -178,17 +175,17 @@ int main() {{
         self.assertIn("++nativeFullStops", touch)
         self.assertIn("++nativeExits", touch)
         self.assertIn("last.stage == phase", touch)
-        remote = (ROOT / "src" / "remote.cpp").read_text(encoding="utf-8")
+        remote = _testbuild.src_text("remote.cpp")
         for name in ("remote capture", "ENet service", "remote puppet update"):
             self.assertIn(f'Stage stage("{name}")', remote)
-        net = (ROOT / "src" / "net.cpp").read_text(encoding="utf-8")
+        net = _testbuild.src_text("net.cpp")
         self.assertIn('Stage stage("ENet receive")', net)
 
     def test_read_only_engine_bytes_match_dirty_write_and_exit_observer(self):
         game = os.environ.get("G3T_GAME_DLL")
         if not game:
             self.skipTest("Set G3T_GAME_DLL for sibling Engine.dll native signatures")
-        data = Path(game).with_name("Engine.dll").read_bytes()
+        data = _testbuild.cached_bytes(Path(game).with_name("Engine.dll"))
         self.assertEqual(read_rva(data, 0x231e00, 17),
                          bytes.fromhex("56 8b f1 e8 f8 fb ff ff c6 86 fd 00 00 00 01 5e c3"))
         self.assertEqual(read_rva(data, 0x223af0, 6), bytes.fromhex("56 8b f1 8b 46 3c"))
@@ -219,7 +216,7 @@ int main() {{
         path = os.environ.get("G3T_GAME_DLL")
         if not path:
             self.skipTest("Set G3T_GAME_DLL for read-only CP 1.75 native signatures")
-        data = Path(path).read_bytes()
+        data = _testbuild.cached_bytes(path)
         self.assertEqual(read_rva(data, 0xEB660, 6), bytes.fromhex("55 8b ec 83 e4 f8"))
         self.assertEqual(read_rva(data, 0x164430, 6), bytes.fromhex("8d 41 64 8b 48 74"))
         self.assertIn("stopEntry == game + 0xeb660", self.movement)
