@@ -17,6 +17,96 @@ TARGET = _testbuild.register_target(
     allow_msvc=False, respect_env=False,
 )
 
+NORMALIZE_TARGET = _testbuild.register_target(
+    "personal_store_normalize",
+    [_testbuild.inline_unit(
+        "personal_store_normalize",
+        r'''
+#include "personal_store.h"
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace {
+std::string MakeGuid(uint16_t index)
+{
+    std::string id(16, '\0');
+    id[0] = static_cast<char>((index & 0xffu) ? (index & 0xffu) : 1u);
+    id[1] = static_cast<char>((index >> 8) & 0xffu);
+    id[15] = 0x42;
+    return id;
+}
+} // namespace
+
+int main()
+{
+    using namespace g3t::saving::personal;
+
+    Inventory gelford;
+    gelford.kind = Kind::Trader;
+    gelford.flags = GeneratedTrade;
+    const std::string zeroId(16, '\0');
+    const std::string rebelArmor = MakeGuid(1);
+    const std::string goldCoin = MakeGuid(2);
+    const std::string healingPotion = MakeGuid(3);
+
+    // Quirky engine stacks: zero-GUID dummy, 0-amount placeholder, high quality flag bits (>= 1024),
+    // duplicate (item, maskedQuality, stock) groups, and an oversized stack above MaxAmount.
+    gelford.stacks.push_back({zeroId, 5, 0, Stock::Merchandise});
+    gelford.stacks.push_back({rebelArmor, 0, 0, Stock::Merchandise});
+    gelford.stacks.push_back({rebelArmor, 1, 2048u | 7u, Stock::Merchandise});
+    gelford.stacks.push_back({rebelArmor, 2, 4096u | 7u, Stock::Merchandise});
+    gelford.stacks.push_back({goldCoin, MaxAmount + 55u, 0, Stock::Merchandise});
+    gelford.stacks.push_back({healingPotion, 4, 1024u, Stock::Normal});
+
+    bool truncated = true;
+    NormalizeStacks(gelford.stacks, &truncated);
+    assert(!truncated);
+    assert(Valid(gelford));
+    assert(gelford.stacks.size() == 3);
+
+    Snapshot snap;
+    snap[MakeGuid(100)] = gelford;
+    std::vector<uint8_t> encoded;
+    assert(Encode(snap, encoded));
+    Snapshot decoded;
+    assert(Decode(encoded, decoded));
+    assert(decoded.size() == 1);
+    auto const& restored = decoded.begin()->second;
+    assert(restored.kind == Kind::Trader);
+    assert(restored.stacks.size() == 3);
+    assert(restored.stacks[0].item == rebelArmor && restored.stacks[0].amount == 3 &&
+           restored.stacks[0].quality == 7 && restored.stacks[0].type == Stock::Merchandise);
+    assert(restored.stacks[1].item == goldCoin && restored.stacks[1].amount == MaxAmount);
+    assert(restored.stacks[2].item == healingPotion && restored.stacks[2].amount == 4 &&
+           restored.stacks[2].quality == 0 && restored.stacks[2].type == Stock::Normal);
+
+    // Exceeding MaxStacks keeps player Stock::Normal items ahead of excess Stock::Merchandise rows.
+    Inventory crowded;
+    crowded.kind = Kind::Trader;
+    crowded.flags = GeneratedTrade;
+    for (uint16_t i = 1; i <= MaxStacks + 16; ++i)
+        crowded.stacks.push_back({MakeGuid(static_cast<uint16_t>(200 + i)), 1, 0, Stock::Merchandise});
+    const std::string playerSword = MakeGuid(9999);
+    crowded.stacks.push_back({playerSword, 1, 15, Stock::Normal});
+    NormalizeStacks(crowded.stacks, &truncated);
+    assert(truncated);
+    assert(crowded.stacks.size() == MaxStacks);
+    assert(Valid(crowded));
+    bool foundPlayerSword = false;
+    for (auto const& stack : crowded.stacks)
+        if (stack.item == playerSword && stack.type == Stock::Normal && stack.quality == 15) foundPlayerSword = true;
+    assert(foundPlayerSword);
+    return 0;
+}
+''',
+        includes=[ROOT / "src"],
+    )],
+    allow_msvc=False,
+    respect_env=False,
+)
+
 EXPECTED_SITES = {
     "?GeneratePlunderInvFromTreasureSets@gCInventory_PS@@QAE_NXZ": (0xB71F0, 8),
     "?GenerateTradeInvFromTreasureSets@gCInventory_PS@@QAE_NXZ": (0xB7340, 8),
@@ -233,12 +323,15 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertLess(ensure.index("!ApplyPersonal"), ensure.index("personalPending.erase"))
         capture = part(ledger_source, "bool Capture(", "bool Restore(")
         self.assertIn("!installAccessGuards()", capture)
-        self.assertIn("!FlushPersonalObservers()", capture)
-        self.assertIn("!PersonalPass(true)", capture)
-        self.assertIn("!EnsurePersonal(entity) || !RememberPersonal(entity)", capture)
+        self.assertIn("FlushPersonalObservers()", capture)
+        self.assertIn("PersonalPass(true)", capture)
+        self.assertIn("EnsurePersonal(entity)", capture)
+        self.assertIn("RememberPersonal(entity)", capture)
         self.assertIn("items::AppendPersonal(ground)", capture)
-        self.assertIn("!combined.emplace(entry).second", capture)
+        self.assertIn("combined.emplace(entry).second", capture)
         self.assertIn("personal::Encode(combined, out)", capture)
+        self.assertNotIn("personalErrors", capture)
+        self.assertNotIn("personalErrorOverflow", capture)
         restore = part(ledger_source, "bool Restore(", "bool PersonalMutation::Enter(")
         self.assertLess(restore.index("personal::Decode"), restore.index("personalLedger.swap"))
         self.assertIn("!bytes.empty() && !personal::Decode", restore)
@@ -249,7 +342,7 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertIn("PersonalPass(false, &attempted)", restore)
         self.assertIn("guid::Resolve", restore)
         self.assertIn("AwaitingDeath", restore)
-        self.assertIn("if (!EnsurePersonal(entity)) ok = false", restore)
+        self.assertIn("EnsurePersonal(entity);", restore)
         self.assertLess(restore.index("if (personalLedger.empty()) return true"),
                         restore.index("if (!installAccessGuards || !installAccessGuards())"))
         reset_ledger = part(ledger_source, "void Reset()", "bool Capture(")
@@ -289,6 +382,37 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertIn("PersonalPass(false)", tick)
         self.assertNotIn("HostTick();", tick)
         self.assertNotIn("ClientTick();", tick)
+
+    def test_merchant_quirks_normalize_and_never_poison_saves(self):
+        result = NORMALIZE_TARGET.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        ledger_source = _testbuild.src_text("personal_ledger.cpp")
+        containers_source = _testbuild.src_text("containers.cpp")
+
+        def part(text, start, end):
+            return text[text.index(start):text.index(end, text.index(start))]
+
+        read_fn = part(ledger_source, "bool ReadPersonal(", "bool CompatiblePersonalKind(")
+        self.assertIn("StackMerchandise(entity, *inventory, i, kind)", read_fn)
+        self.assertIn("personal::MaskQuality(entity.Inventory.GetQuality(i))", read_fn)
+        self.assertIn("personal::NormalizeStacks(result.stacks", read_fn)
+
+        resolve_fn = part(ledger_source, "bool ResolveStackTemplates(", "void ApplyPersonalMetadata(")
+        self.assertIn("entity.Inventory.GetSlotFromStack(i) == gESlot_None", resolve_fn)
+
+        apply_fn = part(ledger_source, "bool ApplyPersonal(", "bool AwaitingDeath(")
+        self.assertIn("CompatiblePersonalKind(row.kind, kind)", apply_fn)
+
+        remember_fn = part(ledger_source, "bool RememberPersonal(", "bool TrackPersonalFocus(")
+        self.assertIn("observer->changes.Refreshed()", remember_fn)
+
+        enter_fn = part(ledger_source, "bool PersonalMutation::Enter(", "bool PersonalMutation::StillAvailable(")
+        self.assertNotIn("if (!RememberPersonal(entity)) return false", enter_fn)
+
+        prepare_trade = part(containers_source, "bool PrepareLocalTrade(", "bool Opened(")
+        self.assertNotIn("cannot refresh personal stock", prepare_trade)
+        self.assertIn("AccessGeneratedTrade() = GETrue", prepare_trade)
 
 
 if __name__ == "__main__":

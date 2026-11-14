@@ -53,10 +53,27 @@ char const* NativeSaveReason()
     if (reason) return reason;
     return session.IsSaveAllowed() ? nullptr : "native-save";
 }
+char const* ClientSaveReason()
+{
+    if (!eCApplication::IsInitialised()) return "not-running";
+    if (nativeLoadDepth || nativeSaveDepth || !loading.empty()) return "loading";
+    gCSession& session = gCSession::GetInstance();
+    if (!session.IsGameRunning() || !session.GetHero()) return "not-running";
+    if (session.GetPlayer() != session.GetHero()) return "control";
+    gCWorld* world = gCWorld::GetCurrentWorld();
+    if (!world || !world->GetWorldEntity()) return "world";
+    if (Folder().empty()) return "folder";
+    void* controlled = nullptr;
+    std::memcpy(&controlled, reinterpret_cast<unsigned char const*>(&session) + 0x28, sizeof(controlled));
+    if (controlled != nullptr) return "control";
+    Entity self(session.GetHero());
+    if (self.IsDead() && !downed::Held()) return "dead";
+    return nullptr;
+}
 char const* SaveReadiness()
 {
     if (!net::IsHost() && clientRejoin.pending) return "peer-loading";
-    if (char const* reason = NativeSaveReason()) return reason;
+    if (char const* reason = net::IsHost() ? NativeSaveReason() : ClientSaveReason()) return reason;
     if (!ownCharacterReady) return "own-character";
     if (!trade::ReadyForSave()) return "trade";
     return nullptr;
@@ -241,7 +258,7 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         Bytes hero, state;
         if (!CaptureCharacter(savingManifest.key, hero)) { CancelSave("character-write"); return; }
         saving::store::Set(savingManifest, {saving::store::Character, 4, steam::PlayerId(), std::move(hero)});
-        if (!containers::CapturePersonal(state)) { CancelSave("personal-record"); return; }
+        if (!CapturePersonalWithFallback(steam::PlayerId(), state)) { CancelSave("personal-record"); return; }
         saving::store::Set(savingManifest, {saving::store::Personal, 1, steam::PlayerId(), std::move(state)});
         if (!CaptureJournal(state)) { CancelSave("journal-write"); return; }
         saving::store::Set(savingManifest, {saving::store::Journal, 1, 0, std::move(state)});
@@ -772,11 +789,15 @@ void Tick()
         PollSave(now);
         if (!loading.empty() && running && static_cast<int32_t>(now - restoreAt) >= 0) {
             if (!PersonalReadyForRestore(receivedPersonal)) {
-                if (now - restoreAt > 10000) { restoreFailed = true; loading.clear(); SaveFailure("personal-hooks"); }
-                HostTick(now); return;
+                if (now - restoreAt <= 3000) { HostTick(now); return; }
+                Log("WARN persist: personal hooks unavailable during host load; continuing without personal container overlay");
+                SaveFailure("personal-hooks");
+                receivedPersonal.clear();
             }
             const bool ownOk = receivedRecord.empty() || ApplyCharacter(receivedRecord, pendingKey);
-            const char* refusal = !ownOk ? "character-record" : !containers::RestorePersonal(receivedPersonal) ? "personal-record" :
+            if (!receivedPersonal.empty() && !containers::RestorePersonal(receivedPersonal))
+                Log("WARN persist: host personal container restore degraded; character and world remain active");
+            const char* refusal = !ownOk ? "character-record" :
                                   !RestoreJournal() ? "journal-write" :
                                   !RestoreExtensions() ? "extension" : nullptr;
             if (refusal) {
@@ -827,15 +848,16 @@ void Tick()
         !templateCapture.Holding(now) && receivedWelcome == net::WelcomeSerial() &&
         receivedNote.epoch == hostWorld.epoch && static_cast<int32_t>(now - restoreAt) >= 0) {
         if (!PersonalReadyForRestore(receivedPersonal)) {
-            if (now - restoreAt > 10000) { restoreFailed = true; SaveFailure("personal-hooks"); }
-            return;
+            if (now - restoreAt <= 3000) return;
+            Log("WARN persist: personal hooks unavailable during client restore; admitting character without personal overlay");
+            SaveFailure("personal-hooks");
+            receivedPersonal.clear();
         }
         if (!ApplyCharacter(receivedRecord, {receivedNote.world, receivedNote.save, steam::PlayerId()})) {
             restoreFailed = true; SaveFailure("character-record"); return;
         }
-        if (!containers::RestorePersonal(receivedPersonal)) {
-            restoreFailed = true; SaveFailure("personal-record"); return;
-        }
+        if (!containers::RestorePersonal(receivedPersonal))
+            Log("WARN persist: client personal container restore degraded; admitting restored character");
         receivedRecord.clear(); receivedPersonal.clear(); ownCharacterReady = true; synced = hostWorld.epoch;
         freshLocalHero = false; clientRejoin.Left();
         story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();

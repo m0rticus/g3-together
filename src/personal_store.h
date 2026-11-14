@@ -106,6 +106,47 @@ inline bool Id(std::string const& id)
     return id.size() == 16 && std::any_of(id.begin(), id.end(), [](char c) { return c != 0; });
 }
 
+inline constexpr uint32_t MaskQuality(uint32_t quality) { return quality & MaxQuality; }
+
+inline void NormalizeStacks(std::vector<Stack>& stacks, bool* truncated = nullptr)
+{
+    if (truncated) *truncated = false;
+    struct Group {
+        std::string item;
+        uint32_t quality = 0;
+        Stock type = Stock::Normal;
+        bool operator<(Group const& other) const
+        {
+            if (type != other.type) return static_cast<uint8_t>(type) < static_cast<uint8_t>(other.type);
+            if (item != other.item) return item < other.item;
+            return quality < other.quality;
+        }
+    };
+    std::map<Group, uint64_t> merged;
+    for (auto const& stack : stacks) {
+        if (!Id(stack.item) || !stack.amount) continue;
+        const Stock stock = stack.type == Stock::Merchandise ? Stock::Merchandise : Stock::Normal;
+        const uint64_t clamped = stack.amount > MaxAmount ? MaxAmount : stack.amount;
+        uint64_t& total = merged[{stack.item, MaskQuality(stack.quality), stock}];
+        total = total + clamped > MaxAmount ? MaxAmount : total + clamped;
+    }
+    std::vector<Stack> normalized;
+    normalized.reserve(merged.size() < MaxStacks ? merged.size() : MaxStacks);
+    for (auto const& [group, total] : merged) {
+        if (normalized.size() == MaxStacks) {
+            if (truncated) *truncated = true;
+            break;
+        }
+        normalized.push_back({group.item, static_cast<uint32_t>(total), group.quality, group.type});
+    }
+    std::sort(normalized.begin(), normalized.end(), [](Stack const& a, Stack const& b) {
+        if (a.item != b.item) return a.item < b.item;
+        if (a.quality != b.quality) return a.quality < b.quality;
+        return static_cast<uint8_t>(a.type) < static_cast<uint8_t>(b.type);
+    });
+    stacks.swap(normalized);
+}
+
 inline bool Valid(Inventory const& row)
 {
     if (row.kind == Kind::GroundTaken) return row.flags == 0 && row.stacks.empty();

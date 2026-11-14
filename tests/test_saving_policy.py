@@ -20,6 +20,88 @@ SAVING_POLICY_TARGET = _testbuild.register_target(
     )],
 )
 
+COOP_ENVELOPE_TARGET = _testbuild.register_target(
+    "saving-coop-envelope",
+    [_testbuild.inline_unit(
+        "saving_coop_envelope",
+        r'''
+#include "saving_store.h"
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace {
+std::vector<uint8_t> MakeHeroRecord(std::string const& world, std::string const& save, uint64_t player, unsigned level, int xp)
+{
+    std::string text = "G3THERO 4\n";
+    text += "identity " + world + " " + save + " " + std::to_string(player) + "\n";
+    text += "pose 100 200 300 0 0 0 1\n";
+    text += "downed 0\n";
+    text += "level " + std::to_string(level) + " " + std::to_string(level) + "\n";
+    text += "xp " + std::to_string(xp) + "\nlp 10 0\n";
+    text += "quick_end 0 0\nend 0\n";
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+} // namespace
+
+int main()
+{
+    using namespace g3t::saving;
+    const std::string world = "0123456789abcdef0123456789abcdef";
+    const std::string save1 = "fedcba9876543210fedcba9876543210";
+    const std::string save2 = "11112222333344445555666677778888";
+    const uint64_t hostId = 76561198000000001ULL;
+    const uint64_t clientId = 76561198000000002ULL;
+
+    // Fallback empty G3TPERS1 personal state packs cleanly with Player 2's G3THERO 4 character record.
+    std::vector<uint8_t> emptyPersonal;
+    assert(personal::Encode({}, emptyPersonal));
+    assert(emptyPersonal.size() == 12);
+
+    const auto hostHero = MakeHeroRecord(world, save1, hostId, 5, 4500);
+    const auto clientHero = MakeHeroRecord(world, save1, clientId, 2, 1700);
+    std::vector<uint8_t> envelope;
+    assert(store::PackPlayer(clientHero, emptyPersonal, envelope));
+
+    std::vector<uint8_t> unpackedHero, unpackedPersonal;
+    assert(store::UnpackPlayer(envelope, unpackedHero, unpackedPersonal));
+    assert(unpackedHero == clientHero);
+    assert(unpackedPersonal == emptyPersonal);
+
+    store::Save manifest;
+    manifest.key = {world, save1, hostId};
+    store::Set(manifest, {store::NativeHeader, 1, 0, {1, 2, 3, 4}});
+    store::Set(manifest, {store::NativeWorld, 1, 0, {5, 6, 7, 8, 9}});
+    store::Set(manifest, {store::Character, 4, hostId, hostHero});
+    store::Set(manifest, {store::Personal, 1, hostId, emptyPersonal});
+    store::Set(manifest, {store::Character, 4, clientId, unpackedHero});
+    store::Set(manifest, {store::Personal, 1, clientId, unpackedPersonal});
+    store::Set(manifest, {store::Journal, 1, 0, {'d', 'o', 'w', 'n', 'e', 'd', ' ', '0', '\n'}});
+
+    std::vector<uint8_t> sidecar;
+    assert(store::Encode(manifest, sidecar));
+    store::Save loaded;
+    assert(store::Decode(sidecar, loaded));
+    auto const* p1 = store::Find(loaded, store::Character, hostId);
+    auto const* p2 = store::Find(loaded, store::Character, clientId);
+    assert(p1 && p2);
+    assert(p1->bytes == hostHero);
+    assert(p2->bytes == clientHero);
+
+    // Offline Player 2 character rebinds cleanly onto save2 when host saves solo later.
+    std::vector<uint8_t> rebound = p2->bytes;
+    assert(store::Rebind(rebound, {world, save2, clientId}));
+    Key reboundKey;
+    assert(store::HeroKey(rebound, reboundKey));
+    assert(Exact(reboundKey, {world, save2, clientId}));
+    return 0;
+}
+''',
+        includes=[ROOT / "src"],
+    )],
+)
+
 
 def function_body(source, signature):
     for match in re.finditer(signature, source):
@@ -212,6 +294,35 @@ class SavingPolicyTests(unittest.TestCase):
         on_world = function_body(self.persist, r"\bvoid\s+OnWorld\s*\(")
         ready_branch = on_world.split("if (note.op == net::WorldReady)", 1)[1].split("if (note.op != net::WorldHost)", 1)[0]
         self.assertIn("!story::AdmissionReady() || !doors::AdmissionReady()", ready_branch)
+
+    def test_coop_save_load_and_rejoin_never_abort_on_personal_containers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = COOP_ENVELOPE_TARGET.run(cwd=folder)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        readiness = function_body(self.persist, r"\bchar const\*\s+SaveReadiness\s*\(")
+        self.assertIn("net::IsHost() ? NativeSaveReason() : ClientSaveReason()", readiness)
+        client_reason = function_body(self.persist, r"\bchar const\*\s+ClientSaveReason\s*\(")
+        self.assertNotIn("IsSaveAllowed()", client_reason)
+        self.assertNotIn("GetIsRunning()", client_reason)
+        self.assertIn("self.IsDead() && !downed::Held()", client_reason)
+
+        save_now = function_body(self.persist, r"\bvoid\s+CALLBACK\s+SaveNow\s*\(")
+        self.assertIn("CapturePersonalWithFallback(steam::PlayerId(), state)", save_now)
+        self.assertNotIn("if (!containers::CapturePersonal(state)) { CancelSave", save_now)
+
+        capture_player = function_body(self.persist, r"\bbool\s+CapturePlayer\s*\(")
+        self.assertIn("CapturePersonalWithFallback(key.player, state)", capture_player)
+        self.assertNotIn('reason = "personal-record"', capture_player)
+
+        tick = function_body(self.persist, r"\bvoid\s+Tick\s*\(")
+        self.assertNotIn('!containers::RestorePersonal(receivedPersonal) ? "personal-record"', tick)
+        self.assertNotIn('SaveFailure("personal-record")', tick)
+
+        stacks_fn = function_body(self.hero, r"\bstd::vector<Stack>\s+Stacks\s*\(")
+        self.assertIn("self.Inventory.GetQuality(i) & QualityMask", stacks_fn)
+        quicks_fn = function_body(self.hero, r"\bstd::vector<Quick>\s+QuickSlotsOf\s*\(")
+        self.assertIn("self.Inventory.GetQuality(i) & QualityMask", quicks_fn)
 
 
 if __name__ == "__main__":

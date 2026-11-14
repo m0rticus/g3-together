@@ -189,6 +189,7 @@ std::string RandomId();
 std::string CharacterPath();
 bool ValidateCharacter(Bytes const& bytes, saving::Key const& key);
 bool CaptureCharacter(saving::Key const& key, Bytes& bytes);
+bool CapturePersonalWithFallback(uint64_t account, Bytes& state);
 bool CapturePlayer(saving::Key const& key, Bytes& bytes, char const*& reason);
 bool PersonalReadyForRestore(Bytes const& bytes);
 bool ApplyCharacter(Bytes const& bytes, saving::Key const& key);

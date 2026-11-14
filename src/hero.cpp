@@ -76,6 +76,8 @@ int FindSkillStack(Entity& self, std::string const& hex)
     return -1;
 }
 
+constexpr unsigned QualityMask = 1023u;
+
 std::vector<Stack> Stacks(Entity& self)
 {
     std::vector<Stack> out;
@@ -85,8 +87,9 @@ std::vector<Stack> Stacks(Entity& self)
         bCPropertyID const& id = item;
         s.id = Hex(id);
         s.amount = self.Inventory.GetAmount(i);
-        s.quality = self.Inventory.GetQuality(i);
+        s.quality = self.Inventory.GetQuality(i) & QualityMask;
         s.slot = static_cast<int>(self.Inventory.GetSlotFromStack(i));
+        if (s.amount <= 0 && s.slot == gESlot_None) continue;
         s.category = static_cast<int>(self.Inventory.GetCategory(i));
         if (s.category == gEItemCategory_Skill) {
             const Template skill = SkillOf(self, i);
@@ -205,7 +208,7 @@ std::vector<Quick> QuickSlotsOf(Entity& self)
         if (i < 0 || i >= self.Inventory.GetStackCount() || StackQuickSlot(self, i) != slot) continue;
         const Template item = self.Inventory.GetTemplate(i);
         bCPropertyID const& id = item;
-        out.push_back({slot, Hex(id), self.Inventory.GetQuality(i)});
+        out.push_back({slot, Hex(id), self.Inventory.GetQuality(i) & QualityMask});
     }
     return out;
 }
@@ -264,7 +267,7 @@ bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::strin
             bCPropertyID const& id = item;
             const int oldSlot = StackQuickSlot(self, i);
             if (oldSlot >= 0 && oldSlot < QuickSlots && assignedSlots[oldSlot]) continue;
-            if (Hex(id) == q.id && self.Inventory.GetQuality(i) == q.quality) index = i;
+            if (Hex(id) == q.id && (self.Inventory.GetQuality(i) & QualityMask) == q.quality) index = i;
         }
         if (index >= 0 && self.Inventory.AssignStackToQuickSlot(index, q.slot) &&
             self.Inventory.FindStackIndexByQuickSlot(q.slot) == index && StackQuickSlot(self, index) == q.slot) {
@@ -333,7 +336,8 @@ void RollbackHeroSnapshot(Entity& self, eCDynamicEntity& hero, codec::ParsedReco
         const Template item = FromHex(s.id);
         if (s.category == gEItemCategory_Skill) {
             int index = FindSkillStack(self, s.id);
-            if (index >= 0 && (self.Inventory.GetQuality(index) != s.quality || self.Inventory.GetAmount(index) != s.amount)) {
+            if (index >= 0 && ((self.Inventory.GetQuality(index) & QualityMask) != s.quality ||
+                               self.Inventory.GetAmount(index) != s.amount)) {
                 self.Inventory.DeleteStack(index);
                 index = -1;
             }
@@ -398,7 +402,13 @@ bool SaveRecordImpl(char const* path, saving::Key const& key)
     if (!Ready(hero)) { Logf("hero: record %s not written (hero not ready)", path); return false; }
     const bCVector& p = hero->GetWorldPosition();
     const bCQuaternion q = hero->GetWorldRotation();
-    const saving::RecordPose pose = {{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+    saving::RecordPose pose = {{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+    const float qLen2 = pose.rotation[0] * pose.rotation[0] + pose.rotation[1] * pose.rotation[1] +
+                        pose.rotation[2] * pose.rotation[2] + pose.rotation[3] * pose.rotation[3];
+    if (std::isfinite(qLen2) && qLen2 > 0.25f && (qLen2 < 0.99f || qLen2 > 1.01f)) {
+        const float inv = 1.0f / std::sqrt(qLen2);
+        for (float& component : pose.rotation) component *= inv;
+    }
     if (!saving::ValidRecordPose(pose)) { Logf("hero: record %s not written (invalid pose)", path); return false; }
 
     Entity self(hero);
@@ -542,7 +552,8 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
         const Template item = FromHex(s.id);
         if (s.category == gEItemCategory_Skill) {
             int index = FindSkillStack(self, s.id);
-            if (index >= 0 && (self.Inventory.GetQuality(index) != s.quality || self.Inventory.GetAmount(index) != s.amount)) {
+            if (index >= 0 && ((self.Inventory.GetQuality(index) & QualityMask) != s.quality ||
+                               self.Inventory.GetAmount(index) != s.amount)) {
                 if (!self.Inventory.DeleteStack(index)) return fail("could not replace a skill stack");
                 index = -1;
             }

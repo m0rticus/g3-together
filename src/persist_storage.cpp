@@ -124,12 +124,35 @@ bool CaptureCharacter(saving::Key const& key, Bytes& bytes)
     return ok;
 }
 
+bool CapturePersonalWithFallback(uint64_t account, Bytes& state)
+{
+    saving::personal::Snapshot decoded;
+    if (containers::CapturePersonal(state) && saving::personal::Decode(state, decoded)) return true;
+    state.clear();
+    if (net::IsHost()) {
+        auto const* previous = saving::store::Find(current, saving::store::Personal, account);
+        if (previous && saving::personal::Decode(previous->bytes, decoded)) {
+            state = previous->bytes;
+            Logf("WARN persist: personal container capture degraded account=%llu; retaining previous snapshot bytes=%zu",
+                 account, state.size());
+            return true;
+        }
+    }
+    if (!saving::personal::Encode({}, state)) return false;
+    Logf("WARN persist: personal container capture degraded account=%llu; using empty personal snapshot", account);
+    return true;
+}
+
 bool CapturePlayer(saving::Key const& key, Bytes& bytes, char const*& reason)
 {
     Bytes hero, state;
     if (!CaptureCharacter(key, hero)) { reason = "character-write"; return false; }
-    if (!containers::CapturePersonal(state) || !saving::store::PackPlayer(hero, state, bytes)) {
-        reason = "personal-record"; return false;
+    if (!CapturePersonalWithFallback(key.player, state) || !saving::store::PackPlayer(hero, state, bytes)) {
+        state.clear();
+        if (!saving::personal::Encode({}, state) || !saving::store::PackPlayer(hero, state, bytes)) {
+            reason = "character-write";
+            return false;
+        }
     }
     Logf("persist: player envelope captured account=%llu hero_bytes=%zu personal_bytes=%zu total=%zu",
          key.player, hero.size(), state.size(), bytes.size());
@@ -405,7 +428,8 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
     current = {}; current.key = key;
     if (bytes.empty()) {
         needsNewHero = true;
-        if (!containers::RestorePersonal({})) { restoreFailed = true; SaveFailure("personal-record"); return; }
+        if (!containers::RestorePersonal({}))
+            Log("WARN persist: clearing personal containers degraded while awaiting fresh hero");
         if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu) && templateHeroFresh) {
             if (!templateCapture.Holding(GetTickCount())) {
                 needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
@@ -628,7 +652,8 @@ void HostTick(uint32_t now)
         Bytes envelope, state;
         if (record) {
             auto const* personal = saving::store::Find(current, saving::store::Personal, account);
-            if (personal) state = personal->bytes;
+            saving::personal::Snapshot snapshot;
+            if (personal && saving::personal::Decode(personal->bytes, snapshot)) state = personal->bytes;
             else if (!saving::personal::Encode({}, state)) { SaveFailure("personal-record"); return; }
             if (!saving::store::PackPlayer(record->bytes, state, envelope)) { SaveFailure("character-record"); return; }
         }
