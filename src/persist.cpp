@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "clock.h"
+#include "combat.h"
 #include "config.h"
 #include "containers.h"
 #include "crashlog.h"
@@ -22,6 +23,7 @@
 #include "story.h"
 #include "trade.h"
 #include "world.h"
+#include "xpshare.h"
 
 #include <algorithm>
 #include <array>
@@ -244,6 +246,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
         // Live native objects are retired at the next outer module boundary, never in ENet dispatch.
         if (!clientRejoin.pending) {
             story::OnWorldChange(); doors::OnWorldChange(); clock::OnWorldChange();
+            combat::OnWorldChange(); xpshare::OnWorldChange();
         }
     }
     hostWorld = note;

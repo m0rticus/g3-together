@@ -4,6 +4,7 @@
 
 #include "ai.h"
 #include "clock.h"
+#include "combat.h"
 #include "containers.h"
 #include "crashlog.h"
 #include "dialogaudio.h"
@@ -19,6 +20,7 @@
 #include "story.h"
 #include "trade.h"
 #include "world.h"
+#include "xpshare.h"
 
 #include <bcrypt.h>
 #include <algorithm>
@@ -174,7 +176,11 @@ bool ApplyCharacter(Bytes const& bytes, saving::Key const& key)
     const bool ok = hero::LoadRecordFromMemory(bytes.data(), bytes.size(), key);
     Logf("persist: character restore account=%llu save=%s bytes=%zu ok=%d reason=%s",
          key.player, key.save.c_str(), bytes.size(), ok ? 1 : 0, hero::LastRefusal() ? hero::LastRefusal() : "-");
-    if (ok) ++recordsApplied;
+    if (ok) {
+        ++recordsApplied;
+        combat::OnWorldChange();
+        xpshare::OnWorldChange();
+    }
     return ok;
 }
 

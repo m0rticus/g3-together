@@ -78,6 +78,7 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
         puppet.body.track = body::Track{};
         puppet.body.presentationSerial = 0;
         puppet.body.actionSeq = -1;
+        puppet.body.playing[0] = '\0';
         puppet.motions.Reset();
         puppet.heldRight.clear();
         puppet.heldLeft.clear();

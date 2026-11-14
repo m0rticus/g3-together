@@ -77,6 +77,7 @@ class PuppetAnimationSyncTests(unittest.TestCase):
 
     def test_feed_player_and_hold_keep_continuous_motions_stall_free_and_weapons_instant(self):
         feed = function_body(self.remote, r"\bvoid\s+FeedPlayer\s*\(")
+        self.assertIn("puppet.body.playing[0] = '\\0';", feed)
         self.assertIn("movement::IsContinuousPuppetMotion(state.animation)", feed)
         self.assertIn("motion.motion = continuous ? 0u : animHash", feed)
         self.assertIn("puppet.motions.Push(puppet.body.track.serial, sample)", feed)

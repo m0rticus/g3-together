@@ -512,6 +512,11 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("for (uint8_t i = 2; i < net::MaxPlayers; ++i) clients[i].nextTry = 0;", tick)
         new_epoch = function_body(self.persist, r"\bvoid\s+NewEpoch\s*\(")
         self.assertIn("clients[i].nextTry = 0", new_epoch)
+        apply_fn = function_body(self.persist, r"\bbool\s+ApplyCharacter\s*\(")
+        self.assertIn("combat::OnWorldChange();", apply_fn)
+        self.assertIn("xpshare::OnWorldChange();", apply_fn)
+        on_world = function_body(self.persist, r"\bvoid\s+OnWorld\s*\(")
+        self.assertIn("combat::OnWorldChange(); xpshare::OnWorldChange();", on_world)
 
 
 if __name__ == "__main__":
