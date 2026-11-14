@@ -222,8 +222,18 @@ struct Module {
     char const* name;
     uintptr_t base = 0, size = 0;
 };
-Module modules[] = {{"Gothic3.exe"}, {"Engine.dll"}, {"Game.dll"}, {"Script.dll"}, {"Script_Game.dll"}, {"SharedBase.dll"},
-                    {"Script_G3Together.dll"}, {"Script_paru.dll"}};
+struct ModuleSlot {
+    char const* name;
+    std::atomic<uintptr_t> base{0}, size{0};
+    Module Load() const
+    {
+        const uintptr_t b = base.load(std::memory_order_acquire);
+        return {name, b, b ? size.load(std::memory_order_relaxed) : 0};
+    }
+};
+ModuleSlot modules[] = {{"Gothic3.exe"}, {"Gothic3Final.exe"}, {"Engine.dll"}, {"Game.dll"}, {"Script.dll"},
+                        {"Script_Game.dll"}, {"SharedBase.dll"}, {"Script_G3Together.dll"}, {"Script_paru.dll"},
+                        {"steam_api.dll"}, {"steamclient.dll"}};
 
 using UndecorateFn = DWORD(WINAPI*)(PCSTR, PSTR, DWORD, DWORD);
 UndecorateFn undecorate = nullptr;
@@ -407,15 +417,15 @@ void TakeScripts()
 
 void FindModules()
 {
-    for (Module& m : modules) {
+    for (ModuleSlot& m : modules) {
         HMODULE h = GetModuleHandleA(m.name);
         if (!h) continue;
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(h);
         auto* nt = reinterpret_cast<IMAGE_NT_HEADERS const*>(reinterpret_cast<unsigned char const*>(h) + dos->e_lfanew);
-        m.base = reinterpret_cast<uintptr_t>(h);
-        m.size = nt->OptionalHeader.SizeOfImage;
+        m.size.store(nt->OptionalHeader.SizeOfImage, std::memory_order_relaxed);
+        m.base.store(reinterpret_cast<uintptr_t>(h), std::memory_order_release);
     }
-    FindKnownSymbols();
+    if (!knownSymbolCount) FindKnownSymbols();
 }
 
 }
@@ -423,7 +433,8 @@ void FindModules()
 // "Module+rva" for an address in one of the modules, else nothing; for the game's modules with " (Function+offset)".
 bool Where(uintptr_t address, char* out, size_t size)
 {
-    for (Module const& m : modules)
+    for (ModuleSlot const& slot : modules) {
+        const Module m = slot.Load();
         if (m.base && address >= m.base && address < m.base + m.size) {
             const uintptr_t rva = address - m.base;
             int length = Format(out, size, "%s+%#x", m.name, static_cast<unsigned>(rva));
@@ -448,6 +459,7 @@ bool Where(uintptr_t address, char* out, size_t size)
             Format(out + length, size - length, " (%s %s+%#x)", kind, name, static_cast<unsigned>(rva - start));
             return true;
         }
+    }
     return false;
 }
 
@@ -482,8 +494,10 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
     bool gameFault = false;
-    for (Module const& module : modules)
+    for (ModuleSlot const& slot : modules) {
+        const Module module = slot.Load();
         if (module.base && fault >= module.base && fault - module.base < module.size) { gameFault = true; break; }
+    }
     // Drivers can handle their own first-chance exceptions. Dumping those may block graphics teardown.
     // Unhandled exceptions from any module still reach LastChance.
     if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
@@ -600,16 +614,27 @@ void EndStep(char const* step)
     lastEndStep.store(step);
 }
 
-void Tick()
+void RefreshModules()
+{
+    FindModules();
+}
+
+void Install()
 {
     InstallDumps();  // every player: last-chance minidumps
-    if (installed) { TakeScripts(); return; }
+    if (installed) return;
     installed = true;
     FindModules();
     HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
     undecorate = dbghelp ? reinterpret_cast<UndecorateFn>(GetProcAddress(dbghelp, "UnDecorateSymbolName")) : nullptr;
     if (!vectoredHandler) vectoredHandler = AddVectoredExceptionHandler(1, &OnException);
     Log("crashlog: access violations are logged");
+}
+
+void Tick()
+{
+    Install();
+    TakeScripts();
 }
 
 void BeginShutdown()

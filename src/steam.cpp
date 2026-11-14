@@ -419,6 +419,7 @@ bool Start(bool host, unsigned short port)
     rt.sendCodec = std::make_unique<send::Codec>();
     if (!rt.sendCodec->Ready()) return rt.Fail("Steam send compression context allocation failed");
     if (!rt.Load()) return false;
+    crashlog::RefreshModules();
     char text[1024] = "";
     const int result = api.InitFlat(text);
     if (result != 0) {
@@ -428,6 +429,7 @@ bool Start(bool host, unsigned short port)
             : *text ? text : "Steam did not start");
     }
     rt.apiInitialized = true;
+    crashlog::RefreshModules();
     void* clientUtils = api.ClientUtils();
     if (!clientUtils || api.AppId(clientUtils) != GothicAppId)
         return rt.Fail("Steam initialized with an unexpected game AppID");

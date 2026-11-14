@@ -87,15 +87,32 @@ void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port, bool allowLo
 
 void WorkerRuntime::ConfigureSocketOptions(int scope, intptr_t handle)
 {
-    if (!networkingUtils || !api.SetConfigValue) return;
-    int32_t ice = config::IceEnableAll;
-    api.SetConfigValue(networkingUtils, config::P2PTransportIceEnable, scope, handle, config::Int32, &ice);
-    int32_t buf = config::BufferCapacity;
-    api.SetConfigValue(networkingUtils, config::SendBufferSize, scope, handle, config::Int32, &buf);
-    int32_t minRate = config::MinRateCapacity;
-    api.SetConfigValue(networkingUtils, config::SendRateMin, scope, handle, config::Int32, &minRate);
-    int32_t maxRate = config::MaxRateCapacity;
-    api.SetConfigValue(networkingUtils, config::SendRateMax, scope, handle, config::Int32, &maxRate);
+    if (!networkingUtils || !api.SetConfigValue || !handle ||
+        (scope != config::ListenSocketScope && scope != config::ConnectionScope))
+        return;
+    auto readScoped = [&](int id) {
+        config::Read read;
+        if (!api.GetConfigValue) return read;
+        size_t size = sizeof(read.value);
+        read.result = api.GetConfigValue(networkingUtils, id, scope, handle, &read.type, &read.value, &size);
+        if (size != sizeof(read.value)) read.result = -1;
+        return read;
+    };
+    auto writeScoped = [&](int id, int32_t value) {
+        return api.SetConfigValue(networkingUtils, id, scope, handle, config::Int32, &value) != 0;
+    };
+    const config::Read iceBefore = readScoped(config::P2PTransportIceEnable);
+    if (scope == config::ListenSocketScope || !iceBefore.Valid() || iceBefore.value != config::IceEnableAll)
+        writeScoped(config::P2PTransportIceEnable, config::IceEnableAll);
+    for (size_t i = 0; i < 3; ++i) {
+        auto const& setting = config::Settings[i];
+        if (api.GetConfigValue) {
+            const config::Applied applied = config::Apply(setting, readScoped, writeScoped);
+            if (!applied.before.Valid()) writeScoped(setting.id, setting.capacity);
+        } else {
+            writeScoped(setting.id, setting.capacity);
+        }
+    }
 }
 
 bool WorkerRuntime::ConfigurePeerLanes(uint32_t conn)

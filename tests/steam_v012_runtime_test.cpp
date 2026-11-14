@@ -22,7 +22,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" void* ENET_CALLBACK enet_malloc(size_t size) { return std::malloc(size); }
@@ -76,6 +79,7 @@ int Format(char* out, size_t size, char const* format, ...)
 
 namespace crashlog {
 void PollWorldEntry() {}
+void RefreshModules() {}
 }
 }
 
@@ -106,7 +110,120 @@ int g_sendMessagesError = -8;
 unsigned g_flushes = 0;
 unsigned g_closedConns = 0;
 unsigned g_connectP2PCalls = 0;
+unsigned g_lockedConfigWriteAttempts = 0;
 u64 g_lobbyMember = 0;
+std::map<int, int32_t> g_globalConfig;
+std::map<std::pair<uint32_t, int>, int32_t> g_listenSocketConfig;
+std::map<std::pair<uint32_t, int>, int32_t> g_connConfig;
+std::set<uint32_t> g_liveListenSockets;
+std::set<uint32_t> g_liveConnections;
+std::set<uint32_t> g_iceLockedConnections;
+
+int32_t DefaultValveConfigValue(int id)
+{
+    switch (id) {
+        case config::SendBufferSize: return 512 * 1024;
+        case config::SendRateMin: return 128 * 1024;
+        case config::SendRateMax: return 1024 * 1024;
+        case config::NagleTime: return 5000;
+        case config::P2PTransportIceEnable: return -1;
+        default: return 0;
+    }
+}
+
+int32_t InheritedGlobalValue(int id)
+{
+    auto it = g_globalConfig.find(id);
+    return it != g_globalConfig.end() ? it->second : DefaultValveConfigValue(id);
+}
+
+// Mirrors Valve's CSteamNetworkingUtils::GetConfigValue / SetConfigValue scope contract:
+// 1 = Global (object == 0), 2 = SocketsInterface (object MUST be ISteamNetworkingSockets*),
+// 3 = ListenSocket (HSteamListenSocket), 4 = Connection (HSteamNetConnection).
+int TEST_CALL FakeGetConfigValue(void*, int id, int scope, intptr_t object, int* outType, void* outValue, size_t* ioSize)
+{
+    assert(outType && ioSize);
+    if (*ioSize < sizeof(int32_t) || !outValue) return -2;
+    *outType = config::Int32;
+    *ioSize = sizeof(int32_t);
+    int32_t resolved = 0;
+    int status = 1;
+    if (scope == config::GlobalScope) {
+        assert(object == 0);
+        auto it = g_globalConfig.find(id);
+        resolved = it != g_globalConfig.end() ? it->second : DefaultValveConfigValue(id);
+    } else if (scope == config::SocketsInterfaceScope) {
+        assert(object == reinterpret_cast<intptr_t>(rt.sockets));
+        resolved = InheritedGlobalValue(id);
+        status = 2;
+    } else if (scope == config::ListenSocketScope) {
+        const auto sock = static_cast<uint32_t>(object);
+        assert(sock != 0 && g_liveListenSockets.count(sock) == 1);
+        auto it = g_listenSocketConfig.find({sock, id});
+        if (it != g_listenSocketConfig.end()) {
+            resolved = it->second;
+            status = 1;
+        } else {
+            resolved = InheritedGlobalValue(id);
+            status = 2;
+        }
+    } else if (scope == config::ConnectionScope) {
+        const auto conn = static_cast<uint32_t>(object);
+        assert(conn != 0 && g_liveConnections.count(conn) == 1);
+        auto it = g_connConfig.find({conn, id});
+        if (it != g_connConfig.end()) {
+            resolved = it->second;
+            status = 1;
+        } else if (rt.isHost && rt.listenSocketP2P && g_liveListenSockets.count(rt.listenSocketP2P) == 1) {
+            auto lsIt = g_listenSocketConfig.find({rt.listenSocketP2P, id});
+            resolved = lsIt != g_listenSocketConfig.end() ? lsIt->second : InheritedGlobalValue(id);
+            status = 2;
+        } else {
+            resolved = InheritedGlobalValue(id);
+            status = 2;
+        }
+    } else {
+        assert(false && "invalid ESteamNetworkingConfigScope");
+        return -1;
+    }
+    std::memcpy(outValue, &resolved, sizeof(resolved));
+    return status;
+}
+
+sbool TEST_CALL FakeSetConfigValue(void*, int id, int scope, intptr_t object, int type, void const* value)
+{
+    assert(type == config::Int32 && value != nullptr);
+    int32_t v = 0;
+    std::memcpy(&v, value, sizeof(v));
+    if (scope == config::GlobalScope) {
+        assert(object == 0);
+        g_globalConfig[id] = v;
+        return 1;
+    }
+    if (scope == config::SocketsInterfaceScope) {
+        // Real steamclient.dll casts object to CSteamNetworkingSockets* and dereferences it!
+        assert(object == reinterpret_cast<intptr_t>(rt.sockets));
+        return 1;
+    }
+    if (scope == config::ListenSocketScope) {
+        const auto sock = static_cast<uint32_t>(object);
+        assert(sock != 0 && g_liveListenSockets.count(sock) == 1);
+        g_listenSocketConfig[{sock, id}] = v;
+        return 1;
+    }
+    if (scope == config::ConnectionScope) {
+        const auto conn = static_cast<uint32_t>(object);
+        assert(conn != 0 && g_liveConnections.count(conn) == 1);
+        if (id == config::P2PTransportIceEnable && g_iceLockedConnections.count(conn) == 1) {
+            ++g_lockedConfigWriteAttempts;
+            return 0;
+        }
+        g_connConfig[{conn, id}] = v;
+        return 1;
+    }
+    assert(false && "invalid ESteamNetworkingConfigScope");
+    return 0;
+}
 
 void TEST_CALL FakeFreeMessageData(void* raw)
 {
@@ -161,9 +278,24 @@ int TEST_CALL FakeFlushMessages(void*, uint32_t)
     return ResultOk;
 }
 
-sbool TEST_CALL FakeCloseConnection(void*, uint32_t, int, char const*, sbool)
+sbool TEST_CALL FakeCloseConnection(void*, uint32_t conn, int, char const*, sbool)
 {
     ++g_closedConns;
+    g_liveConnections.erase(conn);
+    g_iceLockedConnections.erase(conn);
+    return 1;
+}
+
+uint32_t TEST_CALL FakeCreateListenSocketP2P(void*, int, int, void const*)
+{
+    const uint32_t sock = 0x00010000u; // Low integer handle that crashes if dereferenced as CSteamNetworkingSockets*.
+    g_liveListenSockets.insert(sock);
+    return sock;
+}
+
+sbool TEST_CALL FakeCloseListenSocket(void*, uint32_t sock)
+{
+    g_liveListenSockets.erase(sock);
     return 1;
 }
 
@@ -181,7 +313,10 @@ int TEST_CALL FakeAcceptConnection(void*, uint32_t)
 uint32_t TEST_CALL FakeConnectP2P(void*, void const*, int, int, void const*)
 {
     ++g_connectP2PCalls;
-    return 500u + g_connectP2PCalls;
+    const uint32_t conn = 500u + g_connectP2PCalls;
+    g_liveConnections.insert(conn);
+    g_iceLockedConnections.insert(conn); // Valve CheckInitICE locks P2P_Transport_ICE_Enable during ConnectP2P.
+    return conn;
 }
 
 int TEST_CALL FakeSendToUser(void*, void const* identity, void const* pubData, uint32_t cubData, int nSendFlags, int nRemoteChannel)
@@ -286,7 +421,14 @@ void ResetHarness()
     g_flushes = 0;
     g_closedConns = 0;
     g_connectP2PCalls = 0;
+    g_lockedConfigWriteAttempts = 0;
     g_lobbyMember = 0;
+    g_globalConfig.clear();
+    g_listenSocketConfig.clear();
+    g_connConfig.clear();
+    g_liveListenSockets.clear();
+    g_liveConnections.clear();
+    g_iceLockedConnections.clear();
 
     rt.Reset();
     rt.sendCodec = std::make_unique<send::Codec>();
@@ -311,9 +453,13 @@ void ResetHarness()
     api.SendMessages = &FakeSendMessages;
     api.FlushMessagesOnConnection = &FakeFlushMessages;
     api.CloseConnection = &FakeCloseConnection;
+    api.CreateListenSocketP2P = &FakeCreateListenSocketP2P;
+    api.CloseListenSocket = &FakeCloseListenSocket;
     api.ConfigureConnectionLanes = &FakeConfigureLanes;
     api.AcceptConnection = &FakeAcceptConnection;
     api.ConnectP2P = &FakeConnectP2P;
+    api.SetConfigValue = &FakeSetConfigValue;
+    api.GetConfigValue = &FakeGetConfigValue;
     api.SendToUser = &FakeSendToUser;
     api.GetConnectionInfo = &FakeGetConnectionInfo;
     api.GetConnectionRealTimeStatus = &FakeGetConnectionRealTimeStatus;
@@ -622,6 +768,87 @@ void TestClientForwardPortFilter()
     rt.relay = INVALID_SOCKET;
     WSACleanup();
 }
+
+void TestRealSteamConfigScopesOnHostAndClient()
+{
+    ResetHarness();
+    static_assert(config::GlobalScope == 1);
+    static_assert(config::SocketsInterfaceScope == 2);
+    static_assert(config::ListenSocketScope == 3);
+    static_assert(config::ConnectionScope == 4);
+
+    // Pre-existing higher global send-rate ceilings must be preserved across global, listen-socket, and connection scopes.
+    g_globalConfig[config::SendRateMin] = 2 * 1024 * 1024;
+    g_globalConfig[config::SendRateMax] = 16 * 1024 * 1024;
+
+    assert(rt.ConfigureNetworking());
+    rt.TransportConfigDiagnostics();
+    assert(g_globalConfig[config::P2PTransportIceEnable] == config::IceEnableAll);
+    assert(g_globalConfig[config::SendBufferSize] == config::BufferCapacity);
+    assert(g_globalConfig[config::SendRateMin] == 2 * 1024 * 1024);
+    assert(g_globalConfig[config::SendRateMax] == 16 * 1024 * 1024);
+
+    // Host startup creates P2P listen socket (0x00010000) and configures ListenSocketScope (3), NOT SocketsInterfaceScope (2)!
+    rt.isHost = true;
+    rt.listenSocketP2P = api.CreateListenSocketP2P(rt.sockets, P2PVirtualPort, 0, nullptr);
+    assert(rt.listenSocketP2P == 0x00010000u);
+    rt.ConfigureSocketOptions(config::ListenSocketScope, static_cast<intptr_t>(rt.listenSocketP2P));
+    assert((g_listenSocketConfig[{rt.listenSocketP2P, config::P2PTransportIceEnable}] == config::IceEnableAll));
+
+    size_t sz = sizeof(int32_t);
+    int outType = 0;
+    int32_t val = 0;
+    assert(FakeGetConfigValue(rt.networkingUtils, config::SendBufferSize, config::ListenSocketScope,
+                              static_cast<intptr_t>(rt.listenSocketP2P), &outType, &val, &sz) >= 1 &&
+           val == config::BufferCapacity);
+    assert(FakeGetConfigValue(rt.networkingUtils, config::SendRateMin, config::ListenSocketScope,
+                              static_cast<intptr_t>(rt.listenSocketP2P), &outType, &val, &sz) >= 1 &&
+           val == 2 * 1024 * 1024);
+    assert(FakeGetConfigValue(rt.networkingUtils, config::SendRateMax, config::ListenSocketScope,
+                              static_cast<intptr_t>(rt.listenSocketP2P), &outType, &val, &sz) >= 1 &&
+           val == 16 * 1024 * 1024);
+
+    // Invalid scope or zero handle is ignored safely before touching SetConfigValue.
+    rt.ConfigureSocketOptions(config::SocketsInterfaceScope, static_cast<intptr_t>(rt.listenSocketP2P));
+    rt.ConfigureSocketOptions(config::ListenSocketScope, 0);
+
+    // Host incoming P2P connection accept uses ConnectionScope (4), respects locked ICE, and preserves larger ceilings.
+    const u64 peerId = 76561198000000005ULL;
+    g_lobbyMember = peerId;
+    rt.lobby = 9001;
+    const uint32_t incomingConn = 401u;
+    g_liveConnections.insert(incomingConn);
+    g_iceLockedConnections.insert(incomingConn);
+    ConnectionStatusChangedParam incoming{};
+    incoming.conn = incomingConn;
+    incoming.info.listenSocket = rt.listenSocketP2P;
+    incoming.info.state = 1; // Connecting
+    FakeIdentitySetSteamId(incoming.info.identity, peerId);
+    rt.OnP2PStatusChanged(reinterpret_cast<char const*>(&incoming), sizeof(incoming));
+
+    Remote* hostPeer = rt.Find(peerId);
+    assert(hostPeer && hostPeer->p2pConn == incomingConn && hostPeer->p2pLanesConfigured);
+    assert(g_lockedConfigWriteAttempts == 0);
+    assert(FakeGetConfigValue(rt.networkingUtils, config::SendRateMin, config::ConnectionScope,
+                              static_cast<intptr_t>(incomingConn), &outType, &val, &sz) >= 1 &&
+           val == 2 * 1024 * 1024);
+    assert(FakeGetConfigValue(rt.networkingUtils, config::SendRateMax, config::ConnectionScope,
+                              static_cast<intptr_t>(incomingConn), &outType, &val, &sz) >= 1 &&
+           val == 16 * 1024 * 1024);
+
+    // Client outgoing P2P connection uses ConnectionScope (4), respects locked ICE, and raises defaults when lower.
+    ResetHarness();
+    g_globalConfig[config::P2PTransportIceEnable] = config::IceEnableAll;
+    rt.isHost = false;
+    Remote* clientHostPeer = rt.Get(peerId);
+    clientHostPeer->linked = true;
+    rt.OpenClientP2P(*clientHostPeer);
+    assert(clientHostPeer->p2pConn == 501u && clientHostPeer->p2pLanesConfigured);
+    assert(g_lockedConfigWriteAttempts == 0);
+    assert((g_connConfig[{501u, config::SendBufferSize}] == config::BufferCapacity));
+    assert((g_connConfig[{501u, config::SendRateMin}] == config::MinRateCapacity));
+    assert((g_connConfig[{501u, config::SendRateMax}] == config::MaxRateCapacity));
+}
 }
 
 int main()
@@ -631,6 +858,7 @@ int main()
     TestDirectCandidateFilteringAndReflexivePort();
     TestDirectEndpointPinningAndInviteRejoinGenerationRotation();
     TestClientForwardPortFilter();
-    std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, endpoint pinning, rejoin rotation and port filtering passed");
+    TestRealSteamConfigScopesOnHostAndClient();
+    std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, endpoint pinning, rejoin rotation, port filtering and real Steam config scopes passed");
     return 0;
 }

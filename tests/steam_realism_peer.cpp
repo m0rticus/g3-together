@@ -105,7 +105,10 @@ int Format(char* out, size_t size, char const* format, ...)
     va_end(args);
     return result;
 }
-namespace crashlog { void PollWorldEntry() {} }
+namespace crashlog {
+void PollWorldEntry() {}
+void RefreshModules() {}
+}
 }
 
 namespace {

@@ -464,6 +464,7 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
     static gSScriptInit scripts;
     g3t::OpenLog("g3together.log");
     g3t::LoadConfig();
+    g3t::crashlog::Install();
     const bool playbackReady = g3t::npcplayback::Start(!g3t::GetConfig().host);
     g3t::trace::Configure(g3t::GetConfig().trace);
     g3t::remote::Start();

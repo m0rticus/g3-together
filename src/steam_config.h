@@ -5,7 +5,8 @@
 #include <cstdint>
 
 namespace g3t::steam::config {
-constexpr int GlobalScope = 1, ListenSocketScope = 2, ConnectionScope = 3, Int32 = 1;
+// Valve ESteamNetworkingConfigScope: 1=Global, 2=SocketsInterface (ISteamNetworkingSockets*), 3=ListenSocket, 4=Connection.
+constexpr int GlobalScope = 1, SocketsInterfaceScope = 2, ListenSocketScope = 3, ConnectionScope = 4, Int32 = 1;
 constexpr int SendBufferSize = 9, SendRateMin = 10, SendRateMax = 11, NagleTime = 12;
 constexpr int P2PTransportIceEnable = 104, IceEnableAll = 7;
 constexpr int32_t BufferCapacity = 256 * 1024;

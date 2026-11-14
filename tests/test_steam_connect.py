@@ -186,6 +186,21 @@ class SteamConnectTests(unittest.TestCase):
         self.assertIn("connection", playing)
         self.assertIn("+g3t_connect", playing)
 
+    def test_steam_config_scopes_and_early_crashlog_install(self):
+        steam_cfg = self.source("src/steam_config.h")
+        self.assertIn("GlobalScope = 1", steam_cfg)
+        self.assertIn("SocketsInterfaceScope = 2", steam_cfg)
+        self.assertIn("ListenSocketScope = 3", steam_cfg)
+        self.assertIn("ConnectionScope = 4", steam_cfg)
+        script_init = self.function_body(self.source("src/Script_G3Together.cpp"), "ScriptInit()")
+        self.assertLess(script_init.index("g3t::crashlog::Install();"), script_init.index("g3t::npcplayback::Start("))
+        self.assertLess(script_init.index("g3t::crashlog::Install();"), script_init.index("g3t::remote::Start();"))
+        steam_start = self.function_body(self.source("src/steam.cpp"), "bool Start(bool host, unsigned short port)")
+        self.assertGreaterEqual(steam_start.count("crashlog::RefreshModules();"), 2)
+        crashlog = self.source("src/crashlog.cpp")
+        for mod in ('"Gothic3Final.exe"', '"steam_api.dll"', '"steamclient.dll"'):
+            self.assertIn(mod, crashlog)
+
     def test_metadata_replication_paths(self):
         steam = self.steam_source()
         entry = self.function_body(steam, "void WorkerRuntime::OnLobbyEnter(")
