@@ -473,6 +473,7 @@ void ReconcileMirrorAlive(GuidKey const& key, Mirror& m)
     std::strcpy(m.presentationSource, "gravity");
     std::strcpy(m.killerAttribution, "host_or_npc_unknown");
     deadOnHost.erase(key);
+    ForgetCorpseGroundAnchor(key);
 }
 
 void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown)

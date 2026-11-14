@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npc_identity.h"
+#include "npc_corpse.h"
 #include "npc_state.h"
 
 #include "log.h"
@@ -393,6 +394,7 @@ void ResetWorldNpcTables()
     sentStates.clear();
     inSphereSince.clear();
     deadOnHost.clear();
+    ClearCorpseGroundAnchors();
     lastSent.clear();
     for (auto& states : recipientNpcs) states.clear();
     std::fill(recipientGenerations, recipientGenerations + net::MaxPlayers, 0);

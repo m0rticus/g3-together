@@ -831,7 +831,7 @@ void LeaseReleaseMirror(uint8_t const identity[16])
         mirrors.erase(found);
     }
     npclease::ForgetReceivedNpcPose(identity);
-    deadOnHost.erase(key); corpses.erase(key); absences.erase(key);
+    deadOnHost.erase(key); corpses.erase(key); absences.erase(key); ForgetCorpseGroundAnchor(key);
 }
 
 uint32_t HostPresentationAge(eCEntity const* entity)

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npc_companions.h"
+#include "npc_corpse.h"
 
 #include "arena.h"
 #include "guards.h"
@@ -604,6 +605,7 @@ void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const
             if (queue.empty()) pendingForces.erase(forces);
         }
         forceSequences.erase(ForceSeqKey{key, m.latest.incarnation});
+        ForgetCorpseGroundAnchor(key);
     }
     m.body.track = body::Track{};
     m.body.presentationSerial = 0;

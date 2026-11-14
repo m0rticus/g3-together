@@ -26,5 +26,7 @@ void LayDown(Mirror& m, uint32_t now);
 void LogClientDeathImpl(Mirror& m, net::NpcRecord const& shown, uint32_t now);
 void TickDeathFocusWatch(Mirror& m, uint32_t now);
 void CorpseTick(uint32_t now);
+void ForgetCorpseGroundAnchor(GuidKey const& key);
+void ClearCorpseGroundAnchors();
 
 } // namespace g3t::npcs::detail

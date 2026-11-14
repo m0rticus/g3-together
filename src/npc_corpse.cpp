@@ -816,6 +816,16 @@ void CorpseTick(uint32_t now)
     }
 }
 
+void ForgetCorpseGroundAnchor(GuidKey const& key)
+{
+    corpseGroundAnchors.erase(key);
+}
+
+void ClearCorpseGroundAnchors()
+{
+    corpseGroundAnchors.clear();
+}
+
 } // namespace g3t::npcs::detail
 
 namespace g3t::npcs {

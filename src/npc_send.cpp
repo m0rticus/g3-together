@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npc_send.h"
 #include "npc_companions.h"
+#include "npc_corpse.h"
 
 #include "combat.h"
 #include "combat_timing.h"
@@ -261,6 +262,7 @@ void ForgetRemoved(uint8_t const guid[16])
     owned.erase(key);
     sendNotes.erase(key);
     deadOnHost.erase(key);
+    ForgetCorpseGroundAnchor(key);
     for (auto& recipient : recipientNpcs) recipient.erase(key);
     for (auto it = forceSequences.begin(); it != forceSequences.end();)
         if (it->first.guid == key) it = forceSequences.erase(it);
@@ -321,6 +323,7 @@ void NewLife(uint8_t const guid[16])
         forceHistory.erase(key);
     }
     if (newLife && deadOnHost.erase(key)) Logf("npcs: %s no longer held dead here (it stood up again)", Resolve(guid).GetName().GetText());
+    if (newLife) ForgetCorpseGroundAnchor(key);
 }
 
 bool HostKnows(uint8_t const identity[16])

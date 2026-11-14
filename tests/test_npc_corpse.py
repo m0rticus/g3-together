@@ -221,6 +221,13 @@ class NpcCorpseTests(unittest.TestCase):
         capture = section(self.corpse_cpp, "void CaptureCorpsePose(", "void RestoreCorpseActor(")
         self.assertIn("!FiniteMatrix(entity->GetWorldMatrix()) || !ActorBonesFinite(animation)", capture)
 
+    def test_corpse_ground_anchors_clear_across_world_lease_and_life_transitions(self):
+        self.assertIn("ClearCorpseGroundAnchors()", _testbuild.src_text("npc_identity.cpp"))
+        self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npcs.cpp"))
+        self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npc_contact.cpp"))
+        self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npc_companions.cpp"))
+        self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npc_send.cpp"))
+
 
 if __name__ == "__main__":
     unittest.main()
