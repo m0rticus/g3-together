@@ -145,6 +145,8 @@ struct Mirror {
     float swingMaxPhase = 0.0f;
     float swingClosestGapCm = 1e9f;
     char const* swingMissReason = "phase_below_hit_threshold";
+    char swingBlocker[48] = {};
+    float swingRayCm = 0.0f, swingHitCm = 0.0f;
     bool partyApplied = false, appliedWaiting = false;
     uint8_t appliedOwner = 0;
     bool relationAcknowledged = false, guideAcknowledged = false;

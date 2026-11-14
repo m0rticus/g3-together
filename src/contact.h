@@ -69,4 +69,53 @@ inline float SweptSegmentDistanceSquared(float const oldA[3], float const oldB[3
     }
     return best;
 }
+
+// Upper-torso melee line-of-sight endpoint Y. Passive mirrored NPCs have CharacterMovement processing disabled and never
+// run CreateDependantShapes (Game.dll 0xe8370), leaving GetCharacterHeight() at 0.0f (boot soles touching terrain).
+// Matching IsFreeLOSAndSurrounding (Game.dll 0xea8f0), prefer WorldNodeBoundary Min.Y + 0.75 * span (~135-150 cm on
+// humanoids) and clamp the chest offset to [55, 170] cm so sloped ground stays clear while walls, cliffs, and doors hit.
+inline float ContactRayY(float worldPosY, float boxMinY, float boxMaxY, float charMovementHeight) noexcept
+{
+    const float boxSpan = (std::isfinite(boxMinY) && std::isfinite(boxMaxY)) ? (boxMaxY - boxMinY) : 0.0f;
+    float baseY = worldPosY;
+    float height = 180.0f;
+    if (boxSpan > 20.0f && boxSpan < 1000.0f) {
+        baseY = boxMinY;
+        height = boxSpan;
+    } else if (std::isfinite(charMovementHeight) && charMovementHeight > 20.0f && charMovementHeight < 1000.0f) {
+        height = charMovementHeight;
+    }
+    return baseY + std::clamp(height * 0.75f, 55.0f, 170.0f);
 }
+
+inline bool RayHitStrictlyBetween(float hitDistance, float rayLength) noexcept
+{
+    return std::isfinite(hitDistance) && std::isfinite(rayLength) &&
+           rayLength > 4.0f && hitDistance > 0.0f && hitDistance < rayLength - 2.0f;
+}
+
+inline int IncomingMissRank(char const* reason) noexcept
+{
+    if (!reason || !*reason) return 0;
+    auto eq = [](char const* a, char const* b) noexcept {
+        while (*a && *a == *b) { ++a; ++b; }
+        return *a == *b;
+    };
+    if (eq(reason, "phase_below_hit_threshold")) return 1;
+    if (eq(reason, "contact_window_closed")) return 2;
+    if (eq(reason, "interrupted_by_local_stumble")) return 2;
+    if (eq(reason, "missing_weapon_geometry")) return 3;
+    if (eq(reason, "blade_outside_hero_capsule")) return 4;
+    if (eq(reason, "wall_obstructed")) return 5;
+    if (eq(reason, "local_blow_rejected")) return 6;
+    return 1;
+}
+
+inline char const* ChooseIncomingMissReason(char const* current, char const* candidate) noexcept
+{
+    if (!candidate || !*candidate) return current ? current : "phase_below_hit_threshold";
+    if (!current || !*current) return candidate;
+    return IncomingMissRank(candidate) >= IncomingMissRank(current) ? candidate : current;
+}
+
+} // namespace g3t::contact

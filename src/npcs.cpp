@@ -260,6 +260,7 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
     eCEntity* hero = m.body.contactTarget;
     if (!hero || !m.replayReady || !shown.contact || (shown.flags & 3) || *m.replay.localMotion ||
         now - m.latestTicks > 250 || !shown.motions[0].active) {
+        if (*m.replay.localMotion) UpdateIncomingMissReason(m, "interrupted_by_local_stumble");
         FinishIncomingSwingDiag(m, shown, now);
         m.contactAt = 0;
         return;
@@ -277,7 +278,7 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
     int bone = -1;
     if (!PresentedContactPoints(m.entity, shown.heldRight, a, b, thickness, bone)) {
         ++localContactMissing;
-        m.swingMissReason = "missing_weapon_geometry";
+        UpdateIncomingMissReason(m, "missing_weapon_geometry");
         m.contactAt = 0;
         return;
     }
@@ -298,16 +299,24 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
         return;
     }
     ++localContactOverlaps;
-    if (!ClearContact(m.entity.GetInstance(), hero)) {
-        m.swingMissReason = "wall_obstructed";
+    ContactObstruction obstruction;
+    if (!ClearContact(m.entity.GetInstance(), hero, &obstruction)) {
+        UpdateIncomingMissReason(m, "wall_obstructed");
+        std::snprintf(m.swingBlocker, sizeof(m.swingBlocker), "%s", obstruction.blocker);
+        m.swingRayCm = obstruction.rayCm; m.swingHitCm = obstruction.hitCm;
         ++localContactWalls; ++localBlowsOutOfReach;
         return;
     }
-    m.contactConsumed = true;
-    m.swingLogged = true;
+    m.swingArcCount = 0;
     ++localBlowsJudged;
     LogLocalBlowContact(m, hero, shown, instance, hitSource, now);
-    combat::LocalBlow(m.entity.GetInstance());
+    if (!combat::LocalBlow(m.entity.GetInstance())) {
+        UpdateIncomingMissReason(m, "local_blow_rejected");
+        std::snprintf(m.swingBlocker, sizeof(m.swingBlocker), "%s", combat::LastLocalBlowRejectReason());
+        FinishIncomingSwingDiag(m, shown, now);
+    }
+    m.contactConsumed = true;
+    m.swingLogged = true;
 }
 
 void MirrorTick() {}
@@ -800,7 +809,7 @@ void PassiveMirrorTick()
         m.replayReady = npcplayback::Replay(m.entity.GetInstance(), m.replay, shown, &MotionNameOf, now);
         if (m.replayReady) {
             RecordMirrorWalkTelemetry(m, shown, now);
-            m.body.contactTarget = (shown.flags & 4) && ((shown.flags >> 3) & 7) == net::LocalId()
+            m.body.contactTarget = combat_timing::IncomingCombat(shown.flags, shown.combatTarget, net::LocalId())
                                       ? remote::ControlledBody() : nullptr;
             TryLocalBlow(m, shown, now);
         }

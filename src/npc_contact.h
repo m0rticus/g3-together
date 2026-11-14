@@ -5,7 +5,14 @@
 
 namespace g3t::npcs::detail {
 
-bool ClearContact(eCEntity* attacker, eCEntity* hero);
+struct ContactObstruction {
+    char blocker[48] = {};
+    float rayCm = 0.0f;
+    float hitCm = 0.0f;
+};
+
+bool ClearContact(eCEntity* attacker, eCEntity* hero, ContactObstruction* obstruction = nullptr);
+void UpdateIncomingMissReason(Mirror& m, char const* reason);
 bool PresentedContactPoints(Entity& entity, uint32_t heldRight, float a[3], float b[3], float& thickness, int& bone);
 bool SweepsBody(eCEntity* target, float const oldA[3], float const oldB[3], float const a[3], float const b[3],
                 float thickness, bool weapon);

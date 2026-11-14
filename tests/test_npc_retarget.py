@@ -80,6 +80,34 @@ class NpcRetargetTests(unittest.TestCase):
         self.assertIn("sent.aiMode != current.aiMode", essential)
         self.assertIn("sent.combatTarget != current.combatTarget", essential)
 
+    def test_host_hit_attacker_history_and_stumble_puppet_scope(self):
+        claims = _testbuild.src_text("combat_claims.cpp")
+        fightmem = _testbuild.src_text("fightmem.cpp")
+        guards = _testbuild.src_text("guards.cpp")
+
+        claim = claims.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
+        shift_last = claim.index("target.NPC.SetLastAttacker(target.NPC.GetCurrentAttacker());")
+        set_cur = claim.index("target.NPC.SetCurrentAttacker(Entity(attacker));")
+        apply_rx = claim.index("ApplyReaction(target, attacker, reaction);")
+        plan_call = claim.index("combat_retarget::PlanHostNpcHit(")
+        self.assertLess(shift_last, set_cur)
+        self.assertLess(set_cur, apply_rx)
+        self.assertLess(apply_rx, plan_call)
+        self.assertIn("if (plan.immediateCombatTarget)", claim)
+        self.assertIn("if (plan.runImmediateAssessAgressor) React(target, attacker);", claim)
+
+        state_actor = function_body(fightmem, r"\beCEntity\*\s+StateActor\s*\(")
+        self.assertIn("StumbleReactionState(state)", state_actor)
+        self.assertIn("AttackerOf(self)", state_actor)
+        stumble_pred = function_body(fightmem, r"\bbool\s+StumbleReactionState\s*\(")
+        for task in ("ZS_Stumble", "ZS_QuickStumble", "ZS_PierceStumble", "ZS_SitKnockDown", "ZS_StandUp"):
+            self.assertIn(task, stumble_pred)
+
+        follows = function_body(guards, r"\bbool\s+FollowsPlayer\s*\(")
+        self.assertIn("ZS_ReactToDamage", follows)
+        guard_actor = function_body(guards, r"\beCEntity\*\s+StateActor\s*\(")
+        self.assertIn("GetCurrentAttacker()", guard_actor)
+
     def test_real_native_selector_and_attack_signatures_read_only(self):
         game = os.environ.get("G3T_GAME_DLL")
         if not game:

@@ -12,6 +12,7 @@ using LogFn = void (*)(char const*);
 void SyncReport(LogFn log);
 bool InParadeMode(eCEntity* entity);
 bool LocalBlow(eCEntity* attacker);
+char const* LastLocalBlowRejectReason();
 bool PlayerBlow(eCEntity* victim);
 bool LethalHit(eCEntity* victim);
 void ResolveKillXp(eCEntity* victim, eCEntity* killer, bool wasDefeated = false);

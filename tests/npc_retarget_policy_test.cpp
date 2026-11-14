@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/npc_retarget_policy.h"
+#include "../src/combat_retarget_policy.h"
 
 #include <cassert>
 #include <limits>
@@ -73,4 +74,47 @@ int main()
     life.End();
     assert(!life.Revive(life.sequence));
     assert(!EligibleTarget(true, false, CombatUnavailable(true, life.held, life.terminal, false, false, 0), 10));
+
+    // Host hit retargeting (Build 76 Warrior_04 fighting companion Milten while G3T_Player2 lands repeated blows).
+    {
+        using namespace combat_retarget;
+        constexpr uintptr_t Milten = 0x1001;
+        constexpr uintptr_t Player2 = 0x2002;
+
+        // Engaged with Milten (combatState == 1): Hit 1 shifts Milten -> LastAttacker, sets CurrentAttacker = Player2,
+        // lets ZS_QuickStumble run without immediate AssessAgressor overwrite, and keeps Milten on a single stray blow.
+        NpcCombatSnapshot s{Milten, Milten, 0, true, 1};
+        const auto hit1 = PlanHostNpcHit(s, Player2, false, true, true);
+        assert(hit1.shiftAttackers);
+        assert(hit1.nextLastAttacker == Milten && hit1.nextCurrentAttacker == Player2);
+        assert(hit1.applyReactionTask && !hit1.runImmediateAssessAgressor);
+        assert(hit1.immediateCombatTarget == 0);
+
+        // Hit 2 from Player2: LastAttacker becomes Player2 -> immediate retarget to Player2 even while stumbling.
+        s.lastAttacker = hit1.nextLastAttacker;
+        s.currentAttacker = hit1.nextCurrentAttacker;
+        const auto hit2 = PlanHostNpcHit(s, Player2, false, true, true);
+        assert(hit2.nextLastAttacker == Player2 && hit2.nextCurrentAttacker == Player2);
+        assert(hit2.immediateCombatTarget == Player2);
+        assert(!hit2.runImmediateAssessAgressor);
+
+        // Unengaged combat state (combatState == 0) switches on the very first blow, matching native AssessAgressor.
+        const NpcCombatSnapshot unengaged{Milten, 0, 0, true, 0};
+        const auto firstSwitch = PlanHostNpcHit(unengaged, Player2, false, true, true);
+        assert(firstSwitch.immediateCombatTarget == Player2);
+
+        // Routine/friendly NPC hit with stumble: does NOT force immediateCombatTarget and runs AssessAgressor only once
+        // when ZS_*Stumble finishes; without stumble (HitNoReaction), runs immediate AssessAgressor via React().
+        const NpcCombatSnapshot routine{0, 0, 0, false, 0};
+        const auto routineStumble = PlanHostNpcHit(routine, Player2, false, true, true);
+        assert(routineStumble.immediateCombatTarget == 0 && !routineStumble.runImmediateAssessAgressor);
+        const auto routinePoised = PlanHostNpcHit(routine, Player2, false, false, false);
+        assert(routinePoised.immediateCombatTarget == 0 && routinePoised.runImmediateAssessAgressor);
+
+        // Host-judged hit where native AssessHit already shifted attackers to (Last=Player2, Cur=Player2) and started stumble.
+        const NpcCombatSnapshot hostJudgedSnap{Milten, Player2, Player2, true, 1};
+        const auto judged = PlanHostNpcHit(hostJudgedSnap, Player2, true, true, true);
+        assert(!judged.shiftAttackers && !judged.applyReactionTask && !judged.runImmediateAssessAgressor);
+        assert(judged.immediateCombatTarget == Player2);
+    }
 }

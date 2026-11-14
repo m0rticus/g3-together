@@ -364,6 +364,8 @@ bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player)
     return false;
 }
 bool InParadeMode(eCEntity* entity) { return entity && CallScript("IsInParadeMode", entity, nullptr, 0) != 0; }
+namespace { char const* lastLocalBlowReject = "none"; }
+char const* LastLocalBlowRejectReason() { return lastLocalBlowReject; }
 
 // One blow of a mirrored NPC on this machine's own hero, judged by this machine's game as a swing it showed (npcs.cpp calls this
 // at the hit part of a visible swing, in reach and facing the hero). The game's own judgement then decides parade, armour and
@@ -371,12 +373,14 @@ bool InParadeMode(eCEntity* entity) { return entity && CallScript("IsInParadeMod
 bool LocalBlow(eCEntity* attacker)
 {
     eCEntity* body = remote::ControlledBody();
-    if (!installed || !body || !attacker || gCSession::GetInstance().GetCheats().GetCheatGodEnabled()) return false;
+    if (!installed || !body || !attacker) { lastLocalBlowReject = "missing_actor"; return false; }
+    if (gCSession::GetInstance().GetCheats().GetCheatGodEnabled()) { lastLocalBlowReject = "god_mode"; return false; }
     Entity self(body);
     GroundProbe ground(body, attacker, "visible-NPC-contact");
-    if (RejectDownedHit(body, attacker, "visible-NPC-contact")) return false;
-    if (self.IsDead() || self.IsDown()) return false;
-    if (hud::InventoryOpen()) { NoteInventoryHit(); return false; }
+    if (RejectDownedHit(body, attacker, "visible-NPC-contact")) { lastLocalBlowReject = "downed_protected"; return false; }
+    if (self.IsDead() || self.IsDown()) { lastLocalBlowReject = "hero_dead_or_down"; return false; }
+    if (hud::InventoryOpen()) { NoteInventoryHit(); lastLocalBlowReject = "inventory_open"; return false; }
+    lastLocalBlowReject = "none";
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker), &kind);
     int pending = 0;

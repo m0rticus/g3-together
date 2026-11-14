@@ -62,6 +62,41 @@ class CombatTimingTests(unittest.TestCase):
         self.assertIn("mirrors.clear();", npcs)
         self.assertIn("m.body.track.predictive = false;", npcs)
 
+    def test_incoming_contact_barrier_and_miss_diagnostics_wiring(self):
+        npcs = _testbuild.src_text("npcs.cpp")
+        npc_contact = _testbuild.src_text("npc_contact.cpp")
+        combat_melee = _testbuild.src_text("combat_melee.cpp")
+
+        clear_start = npc_contact.index("bool ClearContact(")
+        clear_end = npc_contact.index("\nbool PresentedContactPoints(", clear_start)
+        clear_fn = npc_contact[clear_start:clear_end]
+        self.assertIn("ChestRayEndpoint(attacker)", clear_fn)
+        self.assertIn("ChestRayEndpoint(hero)", clear_fn)
+        self.assertIn("eETraceRayHints_TestStaticShapes", clear_fn)
+        self.assertIn("eETraceRayHints_IncludeCollisionGroup17", clear_fn)
+        self.assertNotIn("eETraceRayHints_TestDynamicShapes", clear_fn)
+        self.assertIn("contact::RayHitStrictlyBetween(dist, length)", clear_fn)
+        self.assertIn("IsNonBarrierEntity(hit)", clear_fn)
+
+        sweep_start = npc_contact.index("bool EvaluateIncomingSwingSweep(")
+        sweep_end = npc_contact.index("\nvoid FinishIncomingSwingDiag(", sweep_start)
+        sweep_fn = npc_contact[sweep_start:sweep_end]
+        live_branch = sweep_fn.split('hitSource = "live-sweep";', 1)[0]
+        self.assertNotIn("m.swingArcCount = 0", live_branch)
+        self.assertIn('UpdateIncomingMissReason(m, "blade_outside_hero_capsule")', sweep_fn)
+
+        self.assertIn(
+            "m.body.contactTarget = combat_timing::IncomingCombat(shown.flags, shown.combatTarget, net::LocalId())",
+            npcs,
+        )
+        blow_start = npcs.index("void TryLocalBlow(")
+        blow_end = npcs.index("\nvoid MirrorTick()", blow_start)
+        blow_fn = npcs[blow_start:blow_end]
+        self.assertIn('UpdateIncomingMissReason(m, "wall_obstructed")', blow_fn)
+        self.assertIn('UpdateIncomingMissReason(m, "local_blow_rejected")', blow_fn)
+        self.assertIn("combat::LastLocalBlowRejectReason()", blow_fn)
+        self.assertIn("LastLocalBlowRejectReason()", combat_melee)
+
 
 if __name__ == "__main__":
     unittest.main()

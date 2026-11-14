@@ -260,10 +260,19 @@ void Tick()
          originalDefeated != nullptr, originalDefeat != nullptr, originalCancel != nullptr, originalWatch != nullptr);
 }
 
+bool StumbleReactionState(char const* state)
+{
+    return !std::strncmp(state, "ZS_Stumble", 10) || !std::strncmp(state, "ZS_QuickStumble", 15) ||
+           !std::strncmp(state, "ZS_PierceStumble", 16) || !std::strncmp(state, "ZS_SitKnockDown", 15) ||
+           !std::strncmp(state, "ZS_StandUp", 10);
+}
+
 eCEntity* StateActor(eCEntity* self, char const* state)
 {
-    if (!on || !state || std::strncmp(state, "ZS_Attack", 9) != 0 || guards::IsLocalPlayer(self)) return nullptr;
-    eCEntity* puppet = PuppetAmong({TargetOf(self)});
+    if (!on || !state || guards::IsLocalPlayer(self)) return nullptr;
+    const bool attack = std::strncmp(state, "ZS_Attack", 9) == 0;
+    if (!attack && !StumbleReactionState(state)) return nullptr;
+    eCEntity* puppet = attack ? PuppetAmong({TargetOf(self)}) : PuppetAmong({AttackerOf(self), TargetOf(self)});
     if (!puppet) return nullptr;
     ++stateRuns;
     frames.push_back({Read(self), ReasonOf(self), puppet});

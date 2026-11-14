@@ -687,6 +687,46 @@ void TestSweptWeaponMidBladeCleave()
     const float retreatedLast[3] = {0.0f, 155.0f, 240.0f};
     assert(contact::SweptSegmentDistanceSquared(oldA, oldB, a, b, retreatedFirst, retreatedLast, true) > limit);
 }
+
+void TestContactRayAndIncomingMissPriority()
+{
+    // Build 76 Ardea slope case: passive mirror Scout_01 has GetCharacterHeight() == 0.0f because
+    // CreateDependantShapes never runs on passive mirrors, while WorldNodeBoundary spans [5438, 5626].
+    const float scoutRayY = contact::ContactRayY(5438.0f, 5438.0f, 5626.0f, 0.0f);
+    const float heroRayY = contact::ContactRayY(5209.0f, 5209.0f, 5389.0f, 180.0f);
+    assert(scoutRayY > 5438.0f + 130.0f && scoutRayY < 5626.0f);
+    assert(heroRayY > 5209.0f + 130.0f && heroRayY < 5389.0f);
+
+    // Degenerate bounds + zero CharacterMovement height still lift to upper chest (+135 cm), never boot soles (+0 cm).
+    assert(std::fabs(contact::ContactRayY(1000.0f, 0.0f, 0.0f, 0.0f) - 1135.0f) < 0.01f);
+    // Small scavengers/wolves clamp to >= +55 cm; tall trolls/ogres clamp to <= +170 cm.
+    assert(std::fabs(contact::ContactRayY(500.0f, 500.0f, 560.0f, 60.0f) - 555.0f) < 0.01f);
+    assert(std::fabs(contact::ContactRayY(500.0f, 500.0f, 850.0f, 350.0f) - 670.0f) < 0.01f);
+
+    // Strictly interior barrier distance check ignores endpoint ground grazes (dist >= length - 2) and point-blank <= 4 cm.
+    assert(contact::RayHitStrictlyBetween(80.0f, 160.0f));
+    assert(!contact::RayHitStrictlyBetween(0.0f, 160.0f));
+    assert(!contact::RayHitStrictlyBetween(158.5f, 160.0f));
+    assert(!contact::RayHitStrictlyBetween(160.0f, 160.0f));
+    assert(!contact::RayHitStrictlyBetween(2.0f, 3.5f));
+
+    // Follow-through frames outside the capsule must never clobber wall_obstructed or local_blow_rejected.
+    char const* reason = "phase_below_hit_threshold";
+    reason = contact::ChooseIncomingMissReason(reason, "interrupted_by_local_stumble");
+    assert(std::string(reason) == "interrupted_by_local_stumble");
+    reason = contact::ChooseIncomingMissReason(reason, "blade_outside_hero_capsule");
+    assert(std::string(reason) == "blade_outside_hero_capsule");
+    reason = contact::ChooseIncomingMissReason(reason, "wall_obstructed");
+    assert(std::string(reason) == "wall_obstructed");
+    reason = contact::ChooseIncomingMissReason(reason, "blade_outside_hero_capsule");
+    assert(std::string(reason) == "wall_obstructed");
+    reason = contact::ChooseIncomingMissReason(reason, "interrupted_by_local_stumble");
+    assert(std::string(reason) == "wall_obstructed");
+    reason = contact::ChooseIncomingMissReason(reason, "local_blow_rejected");
+    assert(std::string(reason) == "local_blow_rejected");
+    reason = contact::ChooseIncomingMissReason(reason, "wall_obstructed");
+    assert(std::string(reason) == "local_blow_rejected");
+}
 }
 
 int main()
@@ -699,6 +739,7 @@ int main()
     TestReliableMotionDescriptors();
     TestBetweenSwingClockCatchUpAndEvictedHitPhase();
     TestSweptWeaponMidBladeCleave();
+    TestContactRayAndIncomingMissPriority();
     std::puts("combat timing engine-free tests passed");
     return 0;
 }

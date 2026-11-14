@@ -110,34 +110,67 @@ void LocalHitWithSwing(eCEntity* entity, uint32_t sequence, uint32_t swing)
         return;
     }
 }
+bCVector ChestRayEndpoint(eCEntity* entity)
+{
+    bCVector point = entity->GetWorldPosition();
+    bCBox const& box = entity->GetWorldNodeBoundary();
+    auto* move = static_cast<gCCharacterMovement_PS*>(entity->GetPropertySet(eEPropertySetType_CharacterMovement));
+    point.AccessY() = contact::ContactRayY(point.GetY(), box.GetMin().GetY(), box.GetMax().GetY(),
+                                           move ? move->GetCharacterHeight() : 0.0f);
+    return point;
+}
+
+bool IsNonBarrierEntity(eCEntity* hit)
+{
+    return hit && (hit->GetPropertySet(eEPropertySetType_NPC) ||
+                   hit->GetPropertySet(eEPropertySetType_PlayerMemory) ||
+                   hit->GetPropertySet(eEPropertySetType_CharacterMovement) ||
+                   hit->GetPropertySet(eEPropertySetType_Item) ||
+                   hit->GetPropertySet(eEPropertySetType_Projectile));
+}
 } // namespace
 
-bool ClearContact(eCEntity* attacker, eCEntity* hero)
+bool ClearContact(eCEntity* attacker, eCEntity* hero, ContactObstruction* obstruction)
 {
-    bCVector start = attacker->GetWorldPosition(), end = hero->GetWorldPosition();
-    auto* a = static_cast<gCCharacterMovement_PS*>(attacker->GetPropertySet(eEPropertySetType_CharacterMovement));
-    auto* h = static_cast<gCCharacterMovement_PS*>(hero->GetPropertySet(eEPropertySetType_CharacterMovement));
-    if (!a || !h) return false;
-    start.AccessY() += a->GetCharacterHeight() * 0.5f;
-    end.AccessY() += h->GetCharacterHeight() * 0.5f;
+    if (!attacker || !hero) return false;
+    const bCVector start = ChestRayEndpoint(attacker), end = ChestRayEndpoint(hero);
+    const float length = (end - start).GetMagnitude();
+    if (!(length > 4.0f) || !std::isfinite(length)) return true;
     auto& physics = eCPhysicsScene::GetInstance();
-    const GEU32 hints = eETraceRayHints_TestStaticShapes | eETraceRayHints_TestDynamicShapes | eETraceRayHints_Distance |
-                        eETraceRayHints_IncludeCollisionGroup17;
+    // Match native IsFreeLOSAndSurrounding (Game.dll 0xea8f0): test static world geometry plus Mover group 17
+    // (doors/gates), never TestDynamicShapes (which hits nearby NPCs' +100 cm WeaponTrigger/Parade spheres, corpses, and items).
+    const GEU32 hints = eETraceRayHints_TestStaticShapes | eETraceRayHints_Distance | eETraceRayHints_IncludeCollisionGroup17;
     if (!physics.TraceRayAllHits(start, end - start, attacker, hints)) return true;
     auto const& report = physics.GetQueryReport();
-    const float length = (end - start).GetMagnitude();
-    for (int i = 0; i < report.m_arrHitEntity.GetCount(); ++i) {
+    float bestDist = length;
+    eCEntity* bestHit = nullptr;
+    bool obstructed = false;
+    const int count = std::min(report.m_arrHitEntity.GetCount(), report.m_arrDistance.GetCount());
+    for (int i = 0; i < count; ++i) {
+        const float dist = report.m_arrDistance[i];
+        if (!contact::RayHitStrictlyBetween(dist, length)) continue;
         eCEntity* hit = report.m_arrHitEntity[i];
-        if (i < report.m_arrDistance.GetCount() && report.m_arrDistance[i] > length + 1.0f) continue;
-        if (!hit || (!AttachedTo(hit, attacker) && !AttachedTo(hit, hero))) {
-            static unsigned noted = 0;
-            if (noted++ < 12)
-                Logf("npcs: displayed contact %s -> %s obstructed by %s (ray %.0f cm)",
-                     attacker->GetName().GetText(), hero->GetName().GetText(), hit ? hit->GetName().GetText() : "(static geometry)", length);
-            return false;
+        if (hit && (AttachedTo(hit, attacker) || AttachedTo(hit, hero) || IsNonBarrierEntity(hit))) continue;
+        if (!obstructed || dist < bestDist) {
+            obstructed = true;
+            bestDist = dist;
+            bestHit = hit;
         }
     }
-    return true;
+    if (!obstructed) return true;
+    char const* blockerName = (bestHit && bestHit->GetName().GetText() && *bestHit->GetName().GetText())
+                                  ? bestHit->GetName().GetText()
+                                  : "(static_geometry)";
+    if (obstruction) {
+        std::snprintf(obstruction->blocker, sizeof(obstruction->blocker), "%s", blockerName);
+        obstruction->rayCm = length;
+        obstruction->hitCm = bestDist;
+    }
+    static unsigned noted = 0;
+    if (noted++ < 24)
+        Logf("npcs: displayed contact %s -> %s obstructed by %s (hit %.0f / ray %.0f cm)",
+             attacker->GetName().GetText(), hero->GetName().GetText(), blockerName, bestDist, length);
+    return false;
 }
 
 bool PresentedContactPoints(Entity& entity, uint32_t heldRight, float a[3], float b[3], float& thickness, int& bone)
@@ -229,6 +262,11 @@ bool SweepsBody(eCEntity* target, float const oldA[3], float const oldB[3], floa
     return MeasureSweepsBody(target, oldA, oldB, a, b, thickness, weapon, gapCm);
 }
 
+void UpdateIncomingMissReason(Mirror& m, char const* reason)
+{
+    m.swingMissReason = contact::ChooseIncomingMissReason(m.swingMissReason, reason);
+}
+
 void ResetIncomingSwing(Mirror& m, uint32_t instance, eCEntity* hero)
 {
     (void)hero;
@@ -238,6 +276,9 @@ void ResetIncomingSwing(Mirror& m, uint32_t instance, eCEntity* hero)
     m.swingMaxPhase = 0.0f;
     m.swingClosestGapCm = 1e9f;
     m.swingMissReason = "phase_below_hit_threshold";
+    m.swingBlocker[0] = '\0';
+    m.swingRayCm = 0.0f;
+    m.swingHitCm = 0.0f;
 }
 
 void RecordPreHitContact(Mirror& m, eCEntity* hero, float const a[3], float const b[3], int bone, float phase, uint32_t now)
@@ -278,14 +319,12 @@ bool EvaluateIncomingSwingSweep(eCEntity* hero, Mirror& m, float const oldA[3], 
     float gapCm = 1e9f;
     if (MeasureSweepsBody(hero, oldA, oldB, a, b, thickness, weapon, gapCm)) {
         m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
-        m.swingArcCount = 0;
         hitSource = "live-sweep";
         return true;
     }
     m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
     if (m.swingArcCount > 0) {
         const uint8_t count = m.swingArcCount;
-        m.swingArcCount = 0;
         for (uint8_t i = 1; i < count; ++i) {
             if (MeasureSweepsBody(hero, m.swingArcA[i - 1], m.swingArcB[i - 1],
                                   m.swingArcA[i], m.swingArcB[i], thickness, weapon, gapCm)) {
@@ -301,8 +340,9 @@ bool EvaluateIncomingSwingSweep(eCEntity* hero, Mirror& m, float const oldA[3], 
             return true;
         }
         m.swingClosestGapCm = std::min(m.swingClosestGapCm, gapCm);
+        m.swingArcCount = 0;
     }
-    m.swingMissReason = "blade_outside_hero_capsule";
+    UpdateIncomingMissReason(m, "blade_outside_hero_capsule");
     return false;
 }
 
@@ -312,10 +352,11 @@ void FinishIncomingSwingDiag(Mirror& m, net::NpcRecord const& shown, uint32_t no
     m.swingLogged = true;
     const int32_t bufferMs = static_cast<int32_t>(now - (shown.sent + static_cast<uint32_t>(m.body.track.offset)));
     Logf("combat: NPCATTACK stage=local-miss npc=%s player=%u instance=%u reason=%s max_phase=%.3f tests=%u "
-         "closest_gap_cm=%.1f presentation_ms=%d backlog_ms=%d clock_protected=%d",
+         "closest_gap_cm=%.1f blocker=%s hit_cm=%.0f ray_cm=%.0f presentation_ms=%d backlog_ms=%d clock_protected=%d",
          m.entity.GetInstance() ? m.entity.GetName().GetText() : "(unloaded)", net::LocalId(), m.contactInstance,
          m.swingMissReason, m.swingMaxPhase, static_cast<unsigned>(m.swingTests),
-         m.swingTests ? m.swingClosestGapCm : -1.0f, bufferMs, m.body.track.backlogMs,
+         m.swingTests ? m.swingClosestGapCm : -1.0f, m.swingBlocker[0] ? m.swingBlocker : "-",
+         m.swingHitCm, m.swingRayCm, bufferMs, m.body.track.backlogMs,
          m.body.track.combatClockProtected ? 1 : 0);
 }
 

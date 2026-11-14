@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "combat_internal.h"
+#include "combat_retarget_policy.h"
 #include "ai.h"
 #include "enclaves.h"
 #include "hud.h"
@@ -509,17 +510,47 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
                  npcs::OwnerOf(target.GetInstance()), npcs::IsMirrored(target.GetInstance()));
         }
         PlayHitEffect(target.GetInstance(), false);
-        // The game's hit path (DoLogicalDamage) also decides how the NPC reacts; AddHitPoints alone left a friendly NPC
-        // talking on while the client struck it (friendlydiag 20.10.). Let it judge the attacker as the game does when an
-        // NPC takes damage: fight back, complain, flee or call for help (React).
-        if (attacker && !target.IsDead() && !target.IsDown()) React(target, attacker);
+        eCEntity* prevTarget = target.NPC.GetCurrentTarget().GetInstance();
+        // Match native AssessHit (0x2b580) + AssessAgressor (0x24490): shift CurrentAttacker -> LastAttacker before
+        // recording attacker, let active stumble tasks run AssessAgressor once on completion instead of overwriting
+        // them immediately, and commit earned in-combat retargets immediately so companion blows cannot steal them.
+        if (attacker && !target.IsDead() && !target.IsDown()) {
+            const combat_retarget::NpcCombatSnapshot snap{
+                reinterpret_cast<uintptr_t>(prevTarget),
+                reinterpret_cast<uintptr_t>(target.NPC.GetCurrentAttacker().GetInstance()),
+                reinterpret_cast<uintptr_t>(target.NPC.GetLastAttacker().GetInstance()),
+                target.Routine.AIMode == gEAIMode_Combat,
+                static_cast<uint32_t>(target.NPC.CombatState),
+            };
+            const bool hasReactionCode = reaction == net::HitQuickStumble || reaction == net::HitStumble ||
+                                         reaction == net::HitPierceStumble || reaction == net::HitSitKnockDown;
+            if (!hostJudged) {
+                target.NPC.SetLastAttacker(target.NPC.GetCurrentAttacker());
+                target.NPC.SetCurrentAttacker(Entity(attacker));
+                ApplyReaction(target, attacker, reaction);
+            }
+            const auto plan = combat_retarget::PlanHostNpcHit(
+                snap, reinterpret_cast<uintptr_t>(attacker), hostJudged, hasReactionCode,
+                Reaction(target) != net::HitNoReaction);
+            if (plan.immediateCombatTarget) {
+                target.NPC.SetCurrentTarget(Entity(attacker));
+                target.NPC.AttackReason = gEAttackReason_ReactToDamage;
+            }
+            if (plan.runImmediateAssessAgressor) React(target, attacker);
+        }
         if (hostJudged || reaction != net::HitNoReaction) npcs::HostHit(target.GetInstance(), from, sequence);
-        if (!hostJudged) ApplyReaction(target, attacker, reaction);
         if (claimsApplied <= 200) {
             char id[40] = {};
             guid::Format(guid, id, sizeof(id));
-            Logf("NPCHITSYNC stage=host-claim player=%u seq=%u guid=%s target=%s reaction=%u host_judged=%d processed_at=%u",
-                 from, sequence, id, target.GetName().GetText(), reaction, hostJudged ? 1 : 0, reply.result.processedAt);
+            eCEntity* nextTarget = target.NPC.GetCurrentTarget().GetInstance();
+            eCEntity* lastAttacker = target.NPC.GetLastAttacker().GetInstance();
+            Logf("NPCHITSYNC stage=host-claim player=%u seq=%u guid=%s target=%s reaction=%u host_judged=%d "
+                 "prev_target=%s next_target=%s last_attacker=%s processed_at=%u",
+                 from, sequence, id, target.GetName().GetText(), reaction, hostJudged ? 1 : 0,
+                 prevTarget ? prevTarget->GetName().GetText() : "-",
+                 nextTarget ? nextTarget->GetName().GetText() : "-",
+                 lastAttacker ? lastAttacker->GetName().GetText() : "-",
+                 reply.result.processedAt);
         }
         witness::HitSeen(target.GetInstance(), attacker);  // and those around hear the fight (P7)
         return;

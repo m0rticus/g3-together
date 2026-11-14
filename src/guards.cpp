@@ -252,7 +252,8 @@ eCEntity* WaitActor(eCEntity* self)
 bool FollowsPlayer(char const* state)
 {
     static char const* const names[] = {"ZS_ReactToZone", "ZS_GotoPlayerZone", "ZS_ObserveZonePlayer", "ZS_ObserveSuspect",
-                                        "ZS_ObserveWeapon", "ZS_ReactToWeapon", "ZS_Threaten", "ZS_ReactToSneak"};
+                                        "ZS_ObserveWeapon", "ZS_ReactToWeapon", "ZS_Threaten", "ZS_ReactToSneak",
+                                        "ZS_ReactToDamage"};
     for (char const* name : names)
         if (!std::strncmp(state, name, std::strlen(name))) return true;
     return false;
@@ -318,7 +319,9 @@ eCEntity* StateActor(eCEntity* self, char const* state)
     if (!std::strcmp(state, "ZS_WaitForFreeDestination_Loop")) return WaitActor(self);
     if (!FollowsPlayer(state) && std::strncmp(state, "ZS_Talk", 7)) return nullptr;
     eCEntity* target = Entity(self).NPC.GetCurrentTarget().GetInstance();
-    return (target && remote::IsPuppet(target)) ? target : nullptr;
+    if (target && remote::IsPuppet(target)) return target;
+    eCEntity* attacker = Entity(self).NPC.GetCurrentAttacker().GetInstance();
+    return (attacker && remote::IsPuppet(attacker)) ? attacker : nullptr;
 }
 
 static void WatchZones()
