@@ -17,6 +17,7 @@ bool PresentedContactPoints(Entity& entity, uint32_t heldRight, float a[3], floa
 bool SweepsBody(eCEntity* target, float const oldA[3], float const oldB[3], float const a[3], float const b[3],
                 float thickness, bool weapon);
 void ResetIncomingSwing(Mirror& m, uint32_t instance, eCEntity* hero);
+void ResetMirrorIncomingContact(Mirror& m);
 void RecordPreHitContact(Mirror& m, eCEntity* hero, float const a[3], float const b[3], int bone, float phase, uint32_t now);
 bool EvaluateIncomingSwingSweep(eCEntity* hero, Mirror& m, float const oldA[3], float const oldB[3],
                                 float const a[3], float const b[3], float thickness, bool weapon, char const*& hitSource);

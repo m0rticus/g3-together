@@ -31,6 +31,13 @@ inline bool HitImpactMotion(char const* name)
     return name && std::strstr(name, "Stumble") && !std::strstr(name, "_Recover_");
 }
 
+// Suppresses own-hit stumble echoes across back-to-back combo hits even after acknowledgedHit advances to hit #2.
+inline bool OwnImpactSequenceSeen(uint16_t acknowledgedHit, uint16_t recordHitSequence)
+{
+    return acknowledgedHit != 0 && recordHitSequence != 0 &&
+           static_cast<int16_t>(acknowledgedHit - recordHitSequence) >= 0;
+}
+
 // Local predicted stagger runs strictly for its own clip duration and never pins phase=1.0f
 // while waiting on network acknowledgement or delayed buffered state.
 inline bool LocalStaggerActive(bool hasLocalMotion, float localAgeSeconds, float localDurationSeconds)
@@ -166,6 +173,12 @@ struct HitKnockbackState {
     float carryOffset[3] = {};
     float currentOffset[3] = {};
 };
+
+inline bool KnockbackMatchesHostRecord(HitKnockbackState const& kb, uint16_t acknowledgedHit, uint16_t recordHitSequence)
+{
+    return kb.active && kb.hitSequence != 0 && acknowledgedHit == kb.hitSequence &&
+           recordHitSequence == kb.hitSequence;
+}
 
 inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint32_t nowMs, float durationSec,
                               float const dirXZ[2], float stepCm, float groundDeltaY = 0.0f)

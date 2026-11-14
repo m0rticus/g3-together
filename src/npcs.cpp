@@ -698,6 +698,10 @@ void PassiveMirrorTick()
             KeepHostAttitude(m, m.latest.attitude, "held");
             if (!m.staleHeld) {
                 m.staleHeld = true;
+                ResetMirrorIncomingContact(m);
+                m.replay.knockback = {};
+                m.replay.pendingHit = 0;
+                m.replay.localMotion[0] = '\0';
                 ++staleMirrorReleases;
                 Logf("npclease: degraded name=%s reason=%s age_ms=%u contacts=off",
                      m.entity.GetName().GetText(), m.released ? "host release" : "presentation unavailable",
@@ -753,6 +757,12 @@ void PassiveMirrorTick()
         const bool firstDeath = !m.killed;
         m.killed = (shown.flags & 1) != 0;
         if (m.killed && (firstDeath || m.deathReferencesCleared != m.entity.GetInstance())) {
+            if (firstDeath) {
+                ResetMirrorIncomingContact(m);
+                m.replay.knockback = {};
+                m.replay.pendingHit = 0;
+                m.replay.localMotion[0] = '\0';
+            }
             if (m.deathReferencesCleared != m.entity.GetInstance()) {
                 m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);
                 m.deathReferencesCleared = m.entity.GetInstance();

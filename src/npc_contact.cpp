@@ -314,6 +314,18 @@ void ResetIncomingSwing(Mirror& m, uint32_t instance, eCEntity* hero)
     m.swingHitCm = 0.0f;
 }
 
+void ResetMirrorIncomingContact(Mirror& m)
+{
+    m.contactInstance = 0;
+    m.contactAt = 0;
+    m.contactConsumed = false;
+    m.contactBone = -1;
+    m.lastClockProtected = false;
+    m.body.contactTarget = nullptr;
+    m.body.lastAt = 0;
+    ResetIncomingSwing(m, 0, nullptr);
+}
+
 void RecordPreHitContact(Mirror& m, eCEntity* hero, float const a[3], float const b[3], int bone, float phase, uint32_t now)
 {
     static unsigned contactsLogged = 0;
@@ -499,15 +511,14 @@ void OnHitResult(net::HitResult const& result)
     const auto found = mirrors.find(key);
     if (found == mirrors.end()) return;
     Mirror& m = found->second;
-    if (result.incarnation != m.latest.incarnation ||
-        static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
+    if (static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
     if (!result.accepted) {
         npcplayback::CancelLocalHit(m.replay, net::Now());
         m.replay.pendingHit = 0;
         m.replay.localMotion[0] = '\0';
         m.replay.initialized = false;
         Logf("npcs: host refused hit %u on %s; authoritative state retained", result.sequence, m.entity.GetName().GetText());
-    } else {
+    } else if (result.incarnation == m.latest.incarnation) {
         m.replay.acknowledgedHit = static_cast<uint16_t>(result.sequence);
         m.replay.acknowledgedAt = result.processedAt ? result.processedAt : 1;
         Logf("combat: NPCHITSYNC stage=host-ack npc=%s hit=%u accepted=1 processed_at=%u",
@@ -668,6 +679,7 @@ void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
     m.resolved = m.replayReady = m.corpsePlaced = m.corpseSimulating = false;
     m.resolvedAt = 0;
     m.replay = npcplayback::State{};
+    ResetMirrorIncomingContact(m);
     m.ragdollStarted = m.ragdollInitialized = keepCorpse;
     if (!keepCorpse) m.corpsePose.clear();
     m.corpseActor = nullptr;
@@ -680,6 +692,8 @@ void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
 
 void ReconcileMirrorAlive(GuidKey const& key, Mirror& m)
 {
+    m.replay.knockback = {};
+    ResetMirrorIncomingContact(m);
     m.ragdollStarted = m.laid = m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
     m.deathImpulse = {};
     m.ragdollTraceAt = m.ragdollTraceSampleAt = m.ragdollTraceStage = 0;

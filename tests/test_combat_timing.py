@@ -96,6 +96,10 @@ class CombatTimingTests(unittest.TestCase):
         self.assertIn('UpdateIncomingMissReason(m, "local_blow_rejected")', blow_fn)
         self.assertIn("combat::LastLocalBlowRejectReason()", blow_fn)
         self.assertIn("LastLocalBlowRejectReason()", combat_melee)
+        npc_companions = _testbuild.src_text("npc_companions.cpp")
+        self.assertIn("ResetMirrorIncomingContact(m);", npc_contact)
+        self.assertIn("ResetMirrorIncomingContact(m);", npc_companions)
+        self.assertIn("ResetMirrorIncomingContact(m);", npcs)
 
 
 if __name__ == "__main__":

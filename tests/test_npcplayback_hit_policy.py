@@ -137,6 +137,30 @@ int main() {
     float endCancelPos[3] = {};
     AdvanceHitKnockback(kb, 2200, 2132, 0, false, 0.0f, false, originPos, endCancelPos);
     assert(!kb.active && endCancelPos[0] == 500.0f);
+
+    // Back-to-back combo hit #2 while hit #1's stumble snapshots are still draining from the buffer:
+    // Hit #1's echo remains suppressed for animations, while knockback only matches kb.hitSequence == 2
+    // so Hit #2 still steps back immediately without being zeroed or terminated by Hit #1's tail.
+    assert(OwnImpactSequenceSeen(1, 1));
+    assert(OwnImpactSequenceSeen(2, 1));
+    assert(OwnImpactSequenceSeen(2, 2));
+    assert(!OwnImpactSequenceSeen(1, 2));
+    assert(!OwnImpactSequenceSeen(0, 1));
+    StartHitKnockback(kb, 1, 3000, durSec, dir, 90.0f, 0.0f);
+    float comboPos1[3] = {};
+    const float comboBase1[3] = {1000.0f + 90.0f * 0.65f, 0.0f, 0.0f};
+    AdvanceHitKnockback(kb, 3260, 3185, 3015, true, 0.65f, false, comboBase1, comboPos1);
+    assert(comboPos1[0] >= 1075.0f);
+    // Combo Hit #2 lands at t=3280 while buffered snapshot at t=3296 still carries Hit #1 (recordSeq=1, phase=0.80).
+    StartHitKnockback(kb, 2, 3280, durSec, dir, 90.0f, 0.0f);
+    assert(!KnockbackMatchesHostRecord(kb, 1, 1));
+    assert(!KnockbackMatchesHostRecord(kb, 2, 1));
+    assert(KnockbackMatchesHostRecord(kb, 2, 2));
+    float comboPos2[3] = {};
+    const float comboBase2[3] = {1000.0f + 90.0f * 0.80f, 0.0f, 0.0f};
+    AdvanceHitKnockback(kb, 3312, 3237, 0, KnockbackMatchesHostRecord(kb, 1, 1), 0.80f, false, comboBase2, comboPos2);
+    assert(kb.active && !kb.hostImpactDone);
+    assert(comboPos2[0] > comboBase2[0] + 15.0f); // immediate combo #2 step-back preserved!
     return 0;
 }
 ''', encoding="utf-8")
@@ -165,6 +189,9 @@ int main() {
         self.assertIn("npcplayback_hit_policy::ParseMotionDisplacementCm", playback_hit)
         self.assertIn("npcplayback_hit_policy::NativeStumblePlaySpeed", playback_hit)
         self.assertIn("npcplayback_hit_policy::CancelHitKnockback", playback_hit)
+        self.assertIn("contact::ContactRayY", playback_hit)
+        self.assertIn("npcplayback_hit_policy::OwnImpactSequenceSeen", playback)
+        self.assertIn("npcplayback_hit_policy::KnockbackMatchesHostRecord", playback)
         self.assertIn("if (ownImpactEcho) state.effects[i] = motion.instance;", playback)
         self.assertIn("NPCHITSYNC stage=predict-start", playback)
         self.assertIn("NPCHITSYNC stage=handoff", playback)

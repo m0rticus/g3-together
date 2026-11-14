@@ -506,17 +506,21 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     const float localAge = static_cast<float>(now - state.localStart) / 1000.0f;
     const bool local = npcplayback_hit_policy::LocalStaggerActive(*state.localMotion != '\0', localAge, state.localDuration);
     char const* firstName = record.motions[0].active ? names(record.motions[0].name) : nullptr;
-    const bool slot0OwnImpactEcho = record.motions[0].active && record.hitPlayer == net::LocalId() &&
-        record.hitSequence && record.hitSequence == state.acknowledgedHit &&
+    const bool ownSequenceSeen = record.hitPlayer == net::LocalId() &&
+        npcplayback_hit_policy::OwnImpactSequenceSeen(state.acknowledgedHit, record.hitSequence);
+    const bool slot0OwnImpactEcho = record.motions[0].active && ownSequenceSeen &&
         npcplayback_hit_policy::HitImpactMotion(firstName);
     const bool firstSuppressed = record.motions[0].active &&
         (state.suppressed[0] == record.motions[0].instance || slot0OwnImpactEcho);
     NativePose hostPose;
     const bool havePose = PreparePose(entity, *animation, state, record, names, hostPose);
     const float hostFirstPhase = record.motions[0].active ? record.motions[0].phase : 0.0f;
+    const uint32_t knockbackAckAt = state.acknowledgedHit == state.knockback.hitSequence ? state.acknowledgedAt : 0;
+    const bool knockbackOwnEcho = slot0OwnImpactEcho &&
+        npcplayback_hit_policy::KnockbackMatchesHostRecord(state.knockback, state.acknowledgedHit, record.hitSequence);
     float presentedPosition[3] = {record.position[0], record.position[1], record.position[2]};
     npcplayback_hit_policy::AdvanceHitKnockback(
-        state.knockback, now, record.sent, state.acknowledgedAt, slot0OwnImpactEcho, hostFirstPhase,
+        state.knockback, now, record.sent, knockbackAckAt, knockbackOwnEcho, hostFirstPhase,
         (record.flags & 3) != 0, record.position, presentedPosition);
     const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
         local, *state.localMotion != '\0', firstSuppressed, localAge, state.localDuration, havePose, hostFirstPhase);
@@ -531,6 +535,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
              "host_motion=%s host_phase=%.3f lead_cm=%.1f",
              entity->GetName().GetText(), state.acknowledgedHit ? state.acknowledgedHit : state.pendingHit, mode,
              localAge * 1000.0f, state.localDuration * 1000.0f, firstName ? firstName : "(none)", hostFirstPhase, leadCm);
+        *state.localMotion = '\0';
     }
     bool echo = false;
     if (!local && !expectedEcho && !havePose) return false;
@@ -549,8 +554,8 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
         auto const& motion = record.motions[i];
         char const* name = motion.active ? names(motion.name) : nullptr;
-        const bool ownImpactEcho = motion.active && record.hitPlayer == net::LocalId() && record.hitSequence &&
-            record.hitSequence == state.acknowledgedHit && npcplayback_hit_policy::HitImpactMotion(name);
+        const bool ownImpactEcho = motion.active && ownSequenceSeen &&
+            npcplayback_hit_policy::HitImpactMotion(name);
         if (ownImpactEcho) state.effects[i] = motion.instance;
         if ((local || holdEcho) && ownImpactEcho && state.suppressed[i] != motion.instance) {
             state.suppressed[i] = motion.instance;

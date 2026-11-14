@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "contact.h"
 #include "npcplayback.h"
 #include "npcplayback_hit_policy.h"
 #include "remote.h"
@@ -23,33 +24,44 @@ bool ReactionMotionResourceName(char const* name)
            lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos;
 }
 
+bool KnockbackNonBarrierEntity(eCEntity* hit, eCEntity* self)
+{
+    if (!hit) return false;
+    for (eCEntity* cursor = hit; cursor; cursor = cursor->GetParent())
+        if (cursor == self) return true;
+    return hit->GetPropertySet(eEPropertySetType_NPC) ||
+           hit->GetPropertySet(eEPropertySetType_PlayerMemory) ||
+           hit->GetPropertySet(eEPropertySetType_CharacterMovement) ||
+           hit->GetPropertySet(eEPropertySetType_Item) ||
+           hit->GetPropertySet(eEPropertySetType_Projectile);
+}
+
 float ClampKnockbackToWorld(eCEntity* entity, float const dirXZ[2], float desiredStepCm, float& outGroundDeltaY)
 {
     outGroundDeltaY = 0.0f;
     if (!entity || !(desiredStepCm > 0.5f)) return 0.0f;
     const bCVector origin = entity->GetWorldPosition();
-    float height = 180.0f;
-    if (auto* movement = static_cast<gCCharacterMovement_PS*>(entity->GetPropertySet(eEPropertySetType_CharacterMovement))) {
-        const float ch = movement->GetCharacterHeight();
-        if (ch > 20.0f && std::isfinite(ch)) height = ch;
-    }
+    bCBox const& box = entity->GetWorldNodeBoundary();
+    auto* movement = static_cast<gCCharacterMovement_PS*>(entity->GetPropertySet(eEPropertySetType_CharacterMovement));
     auto& physics = eCPhysicsScene::GetInstance();
     constexpr float CapsuleMarginCm = 45.0f;
     const GEU32 wallHints = eETraceRayHints_TestStaticShapes | eETraceRayHints_Distance |
                             eETraceRayHints_IncludeCollisionGroup17;
     bCVector waist = origin;
-    waist.AccessY() += height * 0.5f;
+    waist.AccessY() = contact::ContactRayY(origin.GetY(), box.GetMin().GetY(), box.GetMax().GetY(),
+                                           movement ? movement->GetCharacterHeight() : 0.0f);
     const float probeLen = desiredStepCm + CapsuleMarginCm;
     const bCVector wallRay(dirXZ[0] * probeLen, 0.0f, dirXZ[1] * probeLen);
     float stepCm = desiredStepCm;
     if (physics.TraceRayAllHits(waist, wallRay, entity, wallHints)) {
         auto const& report = physics.GetQueryReport();
-        for (int i = 0; i < report.m_arrDistance.GetCount(); ++i) {
-            eCEntity* hit = i < report.m_arrHitEntity.GetCount() ? report.m_arrHitEntity[i] : nullptr;
-            if (hit == entity) continue;
+        const int count = std::min(report.m_arrHitEntity.GetCount(), report.m_arrDistance.GetCount());
+        for (int i = 0; i < count; ++i) {
             const float dist = report.m_arrDistance[i];
-            if (std::isfinite(dist) && dist >= 0.0f && dist <= probeLen + 1.0f)
-                stepCm = std::min(stepCm, std::max(0.0f, dist - CapsuleMarginCm));
+            if (!contact::RayHitStrictlyBetween(dist, probeLen + 1.0f)) continue;
+            eCEntity* hit = report.m_arrHitEntity[i];
+            if (KnockbackNonBarrierEntity(hit, entity)) continue;
+            stepCm = std::min(stepCm, std::max(0.0f, dist - CapsuleMarginCm));
         }
     }
     if (!(stepCm > 0.5f)) return 0.0f;
