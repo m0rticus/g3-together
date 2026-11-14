@@ -200,6 +200,11 @@ class SteamConnectTests(unittest.TestCase):
         crashlog = self.source("src/crashlog.cpp")
         for mod in ('"Gothic3Final.exe"', '"steam_api.dll"', '"steamclient.dll"'):
             self.assertIn(mod, crashlog)
+        tick = self.function_body(crashlog, "void Tick()")
+        self.assertIn("if (!tickModulesRefreshed)", tick)
+        self.assertIn("FindModules();", tick)
+        take_scripts = self.function_body(crashlog, "void TakeScripts()")
+        self.assertIn("FindModules();", take_scripts)
 
     def test_metadata_replication_paths(self):
         steam = self.steam_source()

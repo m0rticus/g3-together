@@ -246,6 +246,7 @@ struct Script {
 Script scripts[4096];
 volatile LONG scriptCount = 0;
 bool scriptsTaken = false;
+bool tickModulesRefreshed = false;
 
 bool RvaRange(Module const& m, uintptr_t rva, size_t size)
 {
@@ -390,11 +391,25 @@ char const* NearestScript(Module const& m, uintptr_t address, uintptr_t* start)
     return best;
 }
 
+void FindModules()
+{
+    for (ModuleSlot& m : modules) {
+        HMODULE h = GetModuleHandleA(m.name);
+        if (!h) continue;
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(h);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS const*>(reinterpret_cast<unsigned char const*>(h) + dos->e_lfanew);
+        m.size.store(nt->OptionalHeader.SizeOfImage, std::memory_order_relaxed);
+        m.base.store(reinterpret_cast<uintptr_t>(h), std::memory_order_release);
+    }
+    if (!knownSymbolCount) FindKnownSymbols();
+}
+
 // Once a game runs, all scripts are registered: their entry points with their names, for crash lines.
 void TakeScripts()
 {
     if (scriptsTaken || !gCSession::GetInstance().IsGameRunning()) return;
     scriptsTaken = true;
+    FindModules();
     gCScriptAdminExt& admin = GetScriptAdminExt();
     LONG count = 0;
     auto take = [&](bCString const& name, void const* fn) {
@@ -413,19 +428,6 @@ void TakeScripts()
         if (callback) take(name, reinterpret_cast<void const*>(callback->m_funcScriptAICallback));
     InterlockedExchange(&scriptCount, count);
     Logf("crashlog: %d script names taken for crash lines", static_cast<int>(count));
-}
-
-void FindModules()
-{
-    for (ModuleSlot& m : modules) {
-        HMODULE h = GetModuleHandleA(m.name);
-        if (!h) continue;
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(h);
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS const*>(reinterpret_cast<unsigned char const*>(h) + dos->e_lfanew);
-        m.size.store(nt->OptionalHeader.SizeOfImage, std::memory_order_relaxed);
-        m.base.store(reinterpret_cast<uintptr_t>(h), std::memory_order_release);
-    }
-    if (!knownSymbolCount) FindKnownSymbols();
 }
 
 }
@@ -634,6 +636,10 @@ void Install()
 void Tick()
 {
     Install();
+    if (!tickModulesRefreshed) {
+        tickModulesRefreshed = true;
+        FindModules();
+    }
     TakeScripts();
 }
 
