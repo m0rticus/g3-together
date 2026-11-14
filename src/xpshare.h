@@ -43,6 +43,91 @@ struct Receiver {
         return gain;
     }
 };
+
+constexpr uint32_t BaselineRetryMs = 200;
+constexpr uint32_t HeartbeatMs = 2000;
+constexpr uint32_t UnsentEarned = 0xffffffffu;
+
+struct OutboundPlan {
+    bool sendBaseline = false;
+    bool sendLive = false;
+};
+
+struct PeerLink : Receiver {
+    uint32_t total = 0;
+    uint32_t generation = 0;
+    bool wasInWorld = false;
+    Sender outgoing;
+    uint32_t ackedNonce = 0;
+    uint32_t lastBaselineAt = 0;
+    uint32_t attemptedEarned = UnsentEarned;
+    uint32_t ackedSentEarned = UnsentEarned;
+
+    bool SyncGeneration(bool joined, uint32_t currentGeneration)
+    {
+        if (!joined) {
+            *this = PeerLink{};
+            return false;
+        }
+        if (generation != currentGeneration) {
+            *this = PeerLink{};
+            generation = currentGeneration;
+        }
+        return true;
+    }
+
+    void LeaveWorld()
+    {
+        wasInWorld = false;
+        outgoing = Sender{};
+        ResetAdmissionHandshake();
+    }
+
+    void ResetAdmissionHandshake()
+    {
+        ackedNonce = 0;
+        lastBaselineAt = 0;
+        attemptedEarned = UnsentEarned;
+        ackedSentEarned = UnsentEarned;
+    }
+
+    bool ShouldSendBaseline(uint32_t now) const
+    {
+        return wasInWorld && outgoing.nonce != 0 && ackedNonce != outgoing.nonce &&
+               (!lastBaselineAt || now - lastBaselineAt >= BaselineRetryMs);
+    }
+
+    void MarkBaselineSent(uint32_t now)
+    {
+        lastBaselineAt = now ? now : 1u;
+    }
+
+    void NoteAck(uint32_t theirNonce)
+    {
+        if (theirNonce && theirNonce == outgoing.nonce) ackedNonce = theirNonce;
+    }
+
+    OutboundPlan PlanLive(uint32_t earned, uint32_t now, bool heartbeatDue) const
+    {
+        if (!wasInWorld || !outgoing.nonce) return {};
+        if (ackedNonce == outgoing.nonce) {
+            if (ackedSentEarned != earned || heartbeatDue) return {false, true};
+            return {};
+        }
+        if (outgoing.Total(earned) == 0) return {};
+        if (attemptedEarned != earned || !lastBaselineAt || now - lastBaselineAt >= BaselineRetryMs) {
+            return {true, true};
+        }
+        return {};
+    }
+
+    void MarkLiveSent(uint32_t earned, uint32_t now, bool sentBaseline)
+    {
+        if (sentBaseline) MarkBaselineSent(now);
+        attemptedEarned = earned;
+        if (ackedNonce == outgoing.nonce) ackedSentEarned = earned;
+    }
+};
 }
 
 void Tick();                                  // sends this machine's total, applies what is waiting

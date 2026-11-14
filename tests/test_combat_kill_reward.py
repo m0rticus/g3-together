@@ -1,0 +1,67 @@
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+import _testbuild
+
+KILL_REWARD_TARGET = _testbuild.register_target(
+    "combat-kill-reward-unit",
+    [_testbuild.unit(
+        "tests/test_combat_kill_reward_unit.cpp",
+        std="c++17",
+        warnings="strict",
+        includes=(ROOT / "src",),
+    )],
+)
+
+
+class CombatKillRewardTests(unittest.TestCase):
+    def test_kill_confirm_policy_rewards_next_frame_without_2s_wait(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = KILL_REWARD_TARGET.run(cwd=folder)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_kill_claim_reward_and_givexp_wiring(self):
+        claims = _testbuild.src_text("combat_claims.cpp")
+        combat = _testbuild.src_text("combat.cpp")
+        spells = _testbuild.src_text("spells.cpp")
+
+        reward_start = claims.index("void RewardKill(")
+        expect_start = claims.index("void Expect(", reward_start)
+        reward_body = claims[reward_start:expect_start]
+        self.assertIn("net::SendKilled(player, guid, incarnation);", reward_body)
+        self.assertIn("net::Flush();", reward_body)
+
+        confirm_start = claims.index("void ConfirmKills()")
+        confirm_end = claims.index("// The species the game knocks out", confirm_start)
+        confirm_body = claims[confirm_start:confirm_end]
+        self.assertNotIn("now - it->due", confirm_body)
+        self.assertNotIn("now + 250", confirm_body)
+        self.assertIn("killconfirm::Decide(", confirm_body)
+        self.assertIn("if (it->clearDefeatedOnUndo) victim.NPC.DefeatedByPlayer = GEFalse;", confirm_body)
+
+        # Already-defeated (knocked-out) NPCs must not pay a second time on a finishing blow.
+        self.assertGreaterEqual(claims.count("const bool paysXp = !target.NPC.DefeatedByPlayer;"), 3)
+
+        tick_start = combat.index("void Tick()")
+        tick_end = combat.index("void OnWorldChange()", tick_start)
+        tick_body = combat[tick_start:tick_end]
+        self.assertLess(tick_body.index("InstallHooks();"), tick_body.index("DrainQueuedNpcHits();"))
+        self.assertLess(tick_body.index("DrainQueuedNpcHits();"), tick_body.index("ConfirmKills();"))
+
+        spells_start = spells.index("void Start()")
+        spells_tick = spells.index("void Tick()", spells_start)
+        self.assertIn("InstallTick();", spells[spells_start:spells_tick])
+        self.assertLess(
+            spells.index("InstallTick();", spells_tick),
+            spells.index("now - lastTry < 1000", spells_tick),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

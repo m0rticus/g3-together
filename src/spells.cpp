@@ -343,10 +343,12 @@ void Start()
 {
     net::SetPlayerSpellHandler(&OnPlayerSpell);
     net::SetNpcSpellHandler(&OnNpcSpell);
+    if (!tickTried && GetModuleHandleA("Script_Game.dll")) InstallTick();
 }
 
 void Tick()
 {
+    if (!tickTried && GetModuleHandleA("Script_Game.dll")) InstallTick();
     for (size_t i = 0; i < pendingTakeOvers.size();) {
         const auto pending = pendingTakeOvers[i];
         if (!net::IsHost() || pending.world != net::WorldEpoch() || !net::PeerJoined(pending.from) ||

@@ -70,11 +70,18 @@ std::unordered_set<std::string> killedHere;  // host: victims killed here for a 
 std::unordered_set<std::string> rewarded;    // client: victims this player was rewarded for
 struct Unconfirmed {
     uint8_t guid[16];
-    DWORD due, expires;
+    DWORD undoDue, expires;
     uint8_t rewardPlayer;
+    bool clearDefeatedOnUndo;
     uint32_t generation, incarnation;
 };
 std::vector<Unconfirmed> unconfirmed;
+struct PendingKillReward {
+    uint8_t guid[16];
+    uint32_t incarnation;
+    DWORD expires;
+};
+std::vector<PendingKillReward> pendingKillRewards;
 std::unordered_map<std::string, DWORD> knockedAt;  // owner: when a claim knocked the victim out (IsDown follows a frame later)
 thread_local HostAppliedOriginKind hostAppliedOriginKind = HostAppliedOriginNone;
 thread_local uint8_t hostAppliedOriginPlayer = 0;
@@ -159,17 +166,24 @@ eCEntity* PlayerActor(uint8_t player)
 }
 
 void OnKilled(uint8_t const guid[16], uint32_t incarnation);
+bool TryApplyKillReward(uint8_t const guid[16], uint32_t incarnation);
+void DrainPendingKillRewards(DWORD now);
 void RewardKill(uint8_t player, uint8_t const guid[16])
 {
     const uint32_t incarnation = npcs::Incarnation(guid);
-    if (player == net::LocalId()) OnKilled(guid, incarnation);
-    else net::SendKilled(player, guid, incarnation);
+    if (player == net::LocalId()) {
+        OnKilled(guid, incarnation);
+    } else {
+        net::SendKilled(player, guid, incarnation);
+        net::Flush();
+    }
 }
 
-void Expect(uint8_t const guid[16], uint8_t rewardPlayer = 0)
+void Expect(uint8_t const guid[16], uint8_t rewardPlayer = 0, bool clearDefeatedOnUndo = false)
 {
     const DWORD now = GetTickCount();
-    Unconfirmed u{{}, now + 2000, now + 10000, rewardPlayer,
+    Unconfirmed u{{}, now + killconfirm::UndoDelayMs, now + killconfirm::DeathTaskExpiryMs,
+                  rewardPlayer, clearDefeatedOnUndo,
                   rewardPlayer ? net::PeerGeneration(rewardPlayer) : 0, npcs::Incarnation(guid)};
     std::memcpy(u.guid, guid, 16);
     unconfirmed.push_back(u);
@@ -178,24 +192,27 @@ void Expect(uint8_t const guid[16], uint8_t rewardPlayer = 0)
 void ConfirmKills()
 {
     const DWORD now = GetTickCount();
+    DrainPendingKillRewards(now);
     for (auto it = unconfirmed.begin(); it != unconfirmed.end();) {
-        if (static_cast<int32_t>(now - it->due) < 0) { ++it; continue; }
         Entity victim(npcs::NpcByGuid(it->guid));
-        if (npcs::Incarnation(it->guid) != it->incarnation) {
-            it = unconfirmed.erase(it);
-            continue;
-        }
-        if (victim.GetInstance() && victim.IsDead() && it->rewardPlayer &&
+        const bool present = victim.GetInstance() != nullptr;
+        const bool dead = present && victim.IsDead();
+        const bool deathTask = present && !dead && Outcome(victim) == net::HitDeath;
+        const bool sameIncarnation = npcs::Incarnation(it->guid) == it->incarnation;
+        const bool rewardEligible = it->rewardPlayer != 0 &&
             (it->rewardPlayer == net::LocalId() ||
-             (net::PeerJoined(it->rewardPlayer) && net::PeerGeneration(it->rewardPlayer) == it->generation)))
-            RewardKill(it->rewardPlayer, it->guid);
-        else if (victim.GetInstance() && !victim.IsDead() && it->rewardPlayer &&
-                 Outcome(victim) == net::HitDeath && static_cast<int32_t>(now - it->expires) < 0) {
-            it->due = now + 250;
+             (net::PeerJoined(it->rewardPlayer) && net::PeerGeneration(it->rewardPlayer) == it->generation));
+        const killconfirm::Action action = killconfirm::Decide(
+            now, it->undoDue, it->expires, sameIncarnation, present, dead, deathTask,
+            it->rewardPlayer, rewardEligible);
+        if (action == killconfirm::Action::Wait) {
             ++it;
             continue;
         }
-        if (victim.GetInstance() && !victim.IsDead() && Outcome(victim) != net::HitDeath) {
+        if (action == killconfirm::Action::Reward) {
+            RewardKill(it->rewardPlayer, it->guid);
+        } else if (action == killconfirm::Action::UndoAndDrop) {
+            if (it->clearDefeatedOnUndo) victim.NPC.DefeatedByPlayer = GEFalse;
             killedHere.erase(KillKey(it->guid));
             ++killsUndone;
             Logf("combat: the kill of %s did not take (task %s, %d hit points); its next hit counts again", victim.GetName().GetText(),
@@ -256,13 +273,14 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     killedHere.insert(KillKey(guid));  // before the death call: OnHitNpc drops further hits on it (R9)
     if (party) enclaves::NoteRemoteKill(guid, from, attacker.GetInstance());  // a murder by the sender's party counts (P7)
     witness::MurderSeen(victim, attacker.GetInstance());  // and those around saw the killing, as where it was decided
+    const bool paysXp = !target.NPC.DefeatedByPlayer;
     target.NPC.DefeatedByPlayer = GETrue;
     CallScript("AddHitPoints", victim, victim, -HitPoints(target));
     CallScript("OnCheatKill", victim, victim, 0);
-    Expect(guid);
+    Expect(guid, party && paysXp && !target.IsDead() ? from : 0, paysXp);
     ++npcKills;
     if (party) {  // the sender's companion or summon killed it: the sender's hero earns the experience
-        RewardKill(from, guid);
+        if (paysXp && target.IsDead()) RewardKill(from, guid);
         ++partyKills;
     }
     Logf("combat: %s of player %u killed %s", attacker.GetInstance() ? attacker.GetName().GetText() : "an NPC", from, target.GetName().GetText());
@@ -414,6 +432,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             // The game's way, as in the bout above: ZS_Unconscious runs Defeat(CurrentAttacker, victim). The puppet as attacker;
             // remote.cpp lets go of it when the puppet goes. The experience on the sender's machine, once per victim (OnKilled).
             eCEntity* victim = target.GetInstance();
+            const bool paysXp = !target.NPC.DefeatedByPlayer;
             target.NPC.SetCurrentAttacker(Entity(attacker));
             target.NPC.DefeatedByPlayer = GETrue;
             CallScript("AddHitPoints", victim, attacker, -HitPoints(target));
@@ -422,7 +441,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             knockedAt[KillKey(guid)] = GetTickCount();
             witness::KnockOutSeen(victim, attacker);
             ++knockedOut;
-            RewardKill(from, guid);
+            if (paysXp) RewardKill(from, guid);
             Logf("combat: player %u knocked %s out (outcome %u)", from, target.GetName().GetText(), outcome);
             return;
         }
@@ -436,6 +455,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     // right after (its player left) made them use a deleted entity (eCEntity::QueryEntityProxyInternal crash on a
     // client in stage E2). The real killer is rewarded on its own machine (SendKilled).
     eCEntity* victim = target.GetInstance();
+    const bool paysXp = !target.NPC.DefeatedByPlayer;
     killedHere.insert(KillKey(guid));  // before the death call (R9)
     knockedAt.erase(KillKey(guid));
     enclaves::NoteRemoteKill(guid, from, attacker);  // its Kill counts the murder for the sender (P7)
@@ -443,9 +463,9 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     target.NPC.DefeatedByPlayer = GETrue;
     CallScript("AddHitPoints", victim, victim, -HitPoints(target));
     CallScript("OnCheatKill", victim, victim, 0);  // like the console: self = the one who kills, other = the target
-    Expect(guid, target.IsDead() ? 0 : from);
+    Expect(guid, paysXp && !target.IsDead() ? from : 0, paysXp);
     ++kills;
-    if (target.IsDead()) RewardKill(from, guid);
+    if (paysXp && target.IsDead()) RewardKill(from, guid);
     Logf("combat: player %u killed %s (OnCheatKill%s)", from, target.GetName().GetText(), finishing ? ", finishing blow" : "");  // ZS_RagDollDead takes effect next frame
 }
 
@@ -472,21 +492,20 @@ void QueueHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t co
     pendingNpcHits.push_back(hit);
 }
 
-// Client: this player's hit killed a host NPC: the game's own reward (GiveXP computes it from the NPC's level).
-void OnKilled(uint8_t const guid[16], uint32_t incarnation)
+bool TryApplyKillReward(uint8_t const guid[16], uint32_t incarnation)
 {
-    if (npcremoval::Suppressed(guid)) return;
+    if (npcremoval::Suppressed(guid)) return true;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     _GUID raw;
     std::memcpy(&raw, guid, 16);
     Entity victim = guid::Resolve(raw);
-    if (!hero || !victim.GetInstance()) return;
+    if (!hero || !victim.GetInstance()) return false;
     std::string identity(reinterpret_cast<char const*>(guid), 16);
     identity.append(reinterpret_cast<char const*>(&incarnation), sizeof(incarnation));
     if (!rewarded.insert(identity).second) {
         ++rewardsRepeated;
         Logf("combat: the kill of %s was rewarded already; not again", victim.GetName().GetText());
-        return;
+        return true;
     }
     Entity self(hero);
     const int before = static_cast<int>(self.PlayerMemory.XP);
@@ -494,6 +513,31 @@ void OnKilled(uint8_t const guid[16], uint32_t incarnation)
     ++xpAwarded;
     Logf("combat: rewarded the kill of %s: GiveXP=%d xp %d -> %d", victim.GetName().GetText(), result, before,
          static_cast<int>(self.PlayerMemory.XP));
+    return true;
+}
+
+void DrainPendingKillRewards(DWORD now)
+{
+    for (auto it = pendingKillRewards.begin(); it != pendingKillRewards.end();) {
+        if (TryApplyKillReward(it->guid, it->incarnation) ||
+            static_cast<int32_t>(now - it->expires) >= 0) {
+            it = pendingKillRewards.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Client: this player's hit killed a host NPC: the game's own reward (GiveXP computes it from the NPC's level).
+void OnKilled(uint8_t const guid[16], uint32_t incarnation)
+{
+    if (TryApplyKillReward(guid, incarnation)) return;
+    if (pendingKillRewards.size() >= 64) return;
+    PendingKillReward pending{};
+    std::memcpy(pending.guid, guid, 16);
+    pending.incarnation = incarnation;
+    pending.expires = GetTickCount() + killconfirm::PendingRewardExpiryMs;
+    pendingKillRewards.push_back(pending);
 }
 
 // Client: something on the host hit this player's puppet; the real hero takes the damage.
@@ -554,6 +598,7 @@ void DrainQueuedNpcHits()
 void ClearClaims()
 {
     pendingNpcHits.clear();
+    pendingKillRewards.clear();
     killedHere.clear();
     unconfirmed.clear();
     rewarded.clear();

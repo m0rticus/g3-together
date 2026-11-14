@@ -18,24 +18,29 @@ uint32_t nonce = 0;     // this process, so that a restarted player starts over
 uint32_t worldSerial = 0;
 uint32_t streamSerial = 0;
 uint32_t earned = 0;    // what this machine's hero earned itself since the game started
-uint32_t sentEarned = 0xffffffff;
 DWORD lastSend = 0;
 int waiting = 0;        // experience to add as soon as the hero can take it
-constexpr DWORD Heartbeat = 2000;
+constexpr DWORD Heartbeat = counter::HeartbeatMs;
 constexpr int MaxGain = 10000000;  // a sanity bound for one step
 
-struct Peer : counter::Receiver {
-    uint32_t total = 0;    // its hero's experience in its last message
+struct Peer : counter::PeerLink {
     DWORD at = 0;
-    bool wasInWorld = false;
-    uint32_t generation = 0;
-    counter::Sender outgoing;
-    uint32_t ackedNonce = 0;
-    DWORD lastBaseline = 0;
 };
 Peer peers[net::MaxPlayers + 1];
 unsigned sent = 0, received = 0, gainsApplied = 0, lifts = 0, queued = 0, repaired = 0;
 int appliedTotal = 0;
+
+bool SessionReady()
+{
+    return net::IsHost() ? net::Connected() : net::Joined();
+}
+
+bool SyncPeerGeneration(uint8_t id)
+{
+    const bool joined = net::IsHost() ? net::PeerJoined(id) : (id == 1 && net::Joined());
+    const uint32_t generation = net::IsHost() ? net::PeerGeneration(id) : net::WelcomeSerial();
+    return peers[id].SyncGeneration(joined, generation);
+}
 
 eCDynamicEntity* Hero()
 {
@@ -82,33 +87,10 @@ void Gain(int amount)
     else { waiting += amount; ++queued; }
 }
 
-void SendLive()
+bool SendBaselineTo(uint8_t to, DWORD now)
 {
     eCDynamicEntity* hero = Hero();
-    if (!hero || !net::Connected() || !net::InWorld(net::LocalId())) return;
-    const uint32_t total = static_cast<uint32_t>(Experience(hero) > 0 ? Experience(hero) : 0);
-    bool delivered = false;
-    const uint8_t first = net::IsHost() ? 2 : 1, end = net::IsHost() ? net::MaxPlayers : 2;
-    for (uint8_t id = first; id < end; ++id) {
-        Peer const& peer = peers[id];
-        if (!peer.wasInWorld || !peer.outgoing.nonce || peer.ackedNonce != peer.outgoing.nonce || !net::InWorld(id)) continue;
-        net::WorldState s{};
-        s.kind = 19;
-        s.npcClass = net::LocalId();
-        s.dialog = counter::Live;
-        const uint32_t relative = peer.outgoing.Total(earned);
-        std::memcpy(s.guid, &peer.outgoing.nonce, 4);
-        std::memcpy(s.guid + 4, &relative, 4);
-        std::memcpy(s.guid + 8, &total, 4);
-        if (net::SendWorldStateTo(id, s)) { ++sent; delivered = true; }
-    }
-    if (delivered) { sentEarned = earned; lastSend = GetTickCount(); }
-}
-
-void SendBaselineTo(uint8_t to)
-{
-    eCDynamicEntity* hero = Hero();
-    if (!hero || !net::Connected() || !peers[to].outgoing.nonce) return;
+    if (!hero || !SessionReady() || !peers[to].outgoing.nonce) return false;
     net::WorldState s{};
     s.kind = 19;
     s.dialog = counter::Baseline;
@@ -117,46 +99,76 @@ void SendBaselineTo(uint8_t to)
     std::memcpy(s.guid, &peers[to].outgoing.nonce, 4);
     std::memcpy(s.guid + 4, &counter::BaselineEarned, 4);
     std::memcpy(s.guid + 8, &total, 4);
-    net::SendWorldStateTo(to, s);
-    peers[to].lastBaseline = GetTickCount();
+    if (!net::SendWorldStateTo(to, s)) return false;
+    peers[to].MarkBaselineSent(now);
+    return true;
 }
 
-void SendAckTo(uint8_t to, uint32_t theirNonce)
+bool SendAckTo(uint8_t to, uint32_t theirNonce)
 {
-    if (!net::Connected()) return;
+    if (!SessionReady()) return false;
     net::WorldState s{};
     s.kind = 19;
     s.dialog = counter::Ack;
     s.npcClass = net::LocalId();
     std::memcpy(s.guid, &theirNonce, 4);
-    net::SendWorldStateTo(to, s);
+    return net::SendWorldStateTo(to, s);
 }
 
-void SendRequestTo(uint8_t to)
+bool SendRequestTo(uint8_t to)
 {
-    if (!net::Connected()) return;
+    if (!SessionReady()) return false;
     net::WorldState s{};
     s.kind = 19;
     s.dialog = counter::Request;
     s.npcClass = net::LocalId();
-    net::SendWorldStateTo(to, s);
+    return net::SendWorldStateTo(to, s);
+}
+
+void SendLive(DWORD now = GetTickCount(), bool heartbeatDue = false)
+{
+    eCDynamicEntity* hero = Hero();
+    if (!hero || !net::Connected() || !net::InWorld(net::LocalId())) return;
+    const uint32_t total = static_cast<uint32_t>(Experience(hero) > 0 ? Experience(hero) : 0);
+    bool delivered = false;
+    const uint8_t first = net::IsHost() ? 2 : 1, end = net::IsHost() ? net::MaxPlayers : 2;
+    for (uint8_t id = first; id < end; ++id) {
+        Peer& peer = peers[id];
+        if (!peer.wasInWorld || !peer.outgoing.nonce || !net::InWorld(id)) continue;
+        const counter::OutboundPlan plan = peer.PlanLive(earned, now, heartbeatDue);
+        if (!plan.sendLive) continue;
+        if (plan.sendBaseline && !SendBaselineTo(id, now)) continue;
+        net::WorldState s{};
+        s.kind = 19;
+        s.npcClass = net::LocalId();
+        s.dialog = counter::Live;
+        const uint32_t relative = peer.outgoing.Total(earned);
+        std::memcpy(s.guid, &peer.outgoing.nonce, 4);
+        std::memcpy(s.guid + 4, &relative, 4);
+        std::memcpy(s.guid + 8, &total, 4);
+        if (net::SendWorldStateTo(id, s)) {
+            peer.MarkLiveSent(earned, now, plan.sendBaseline);
+            ++sent;
+            delivered = true;
+        }
+    }
+    if (delivered) {
+        lastSend = now ? now : 1;
+        net::Flush();
+    }
 }
 
 void PrepareAdmissions(DWORD now)
 {
-    if (!net::Connected()) return;
+    if (!SessionReady()) return;
+    bool sentBaseline = false;
     const uint8_t first = net::IsHost() ? 2 : 1, end = net::IsHost() ? net::MaxPlayers : 2;
     for (uint8_t id = first; id < end; ++id) {
+        if (!SyncPeerGeneration(id)) continue;
         Peer& peer = peers[id];
-        const bool joined = net::IsHost() ? net::PeerJoined(id) : net::Joined();
-        const uint32_t generation = net::IsHost() ? net::PeerGeneration(id) : net::WelcomeSerial();
-        if (!joined) { peer = Peer{}; continue; }
-        if (peer.generation != generation) { peer = Peer{}; peer.generation = generation; }
         const bool inWorld = net::InWorld(net::LocalId()) && net::InWorld(id);
         if (!inWorld) {
-            peer.wasInWorld = false;
-            peer.outgoing = counter::Sender{};
-            peer.ackedNonce = 0;
+            peer.LeaveWorld();
             continue;
         }
         if (!peer.wasInWorld) {
@@ -164,13 +176,13 @@ void PrepareAdmissions(DWORD now)
             uint32_t stream = 0;
             while (!stream) stream = nonce ^ (++streamSerial * 2654435761u);
             peer.outgoing.Begin(stream, earned);
-            peer.ackedNonce = 0;
-            peer.lastBaseline = 0;
+            peer.ResetAdmissionHandshake();
         }
-        if (peer.ackedNonce != peer.outgoing.nonce && (!peer.lastBaseline || now - peer.lastBaseline >= Heartbeat)) {
-            SendBaselineTo(id);
+        if (peer.ShouldSendBaseline(now) && SendBaselineTo(id, now)) {
+            sentBaseline = true;
         }
     }
+    if (sentBaseline) net::Flush();
 }
 
 }
@@ -178,11 +190,12 @@ void PrepareAdmissions(DWORD now)
 void NoteGiveXp(int gained)
 {
     if (!enabled || applying || gained <= 0 || gained > MaxGain) return;
+    const DWORD now = GetTickCount();
     // Capture a new peer's origin before adding its first future reward.
-    PrepareAdmissions(GetTickCount());
+    PrepareAdmissions(now);
     earned += static_cast<uint32_t>(gained);
     Logf("xpshare: the hero earned %d (%u in all)", gained, earned);
-    SendLive();
+    SendLive(now, false);
 }
 
 void OnState(net::WorldState const& s)
@@ -190,24 +203,29 @@ void OnState(net::WorldState const& s)
     if (!enabled) return;
     const uint8_t from = s.npcClass;
     if (from == 0 || from >= net::MaxPlayers || from == net::LocalId()) return;
+    if (!SyncPeerGeneration(from)) return;
     uint32_t theirNonce, theirEarned, theirTotal;
     std::memcpy(&theirNonce, s.guid, 4);
     std::memcpy(&theirEarned, s.guid + 4, 4);
     std::memcpy(&theirTotal, s.guid + 8, 4);
     ++received;
+    const DWORD now = GetTickCount();
     Peer& peer = peers[from];
     if (s.dialog == counter::Ack) {
-        if (theirNonce == peer.outgoing.nonce) peer.ackedNonce = theirNonce;
-        peer.at = GetTickCount();
-        SendLive();
+        peer.NoteAck(theirNonce);
+        peer.at = now;
+        SendLive(now, false);
         return;
     }
     if (s.dialog == counter::Request) {
-        PrepareAdmissions(GetTickCount());
-        peer.ackedNonce = 0;
-        peer.lastBaseline = 0;
-        SendBaselineTo(from);
-        peer.at = GetTickCount();
+        PrepareAdmissions(now);
+        peer.ResetAdmissionHandshake();
+        peer.at = now;
+        if (peer.wasInWorld && peer.outgoing.nonce && peer.outgoing.Total(earned) > 0) {
+            SendLive(now, false);
+        } else if (SendBaselineTo(from, now)) {
+            net::Flush();
+        }
         return;
     }
     if (s.dialog == counter::Baseline) {
@@ -216,15 +234,15 @@ void OnState(net::WorldState const& s)
             return;
         }
         peer.total = theirTotal;
-        peer.at = GetTickCount();
-        SendAckTo(from, theirNonce);
+        peer.at = now;
+        if (SendAckTo(from, theirNonce)) net::Flush();
         return;
     }
     if (s.dialog != counter::Live) return;
     if (!peer.known || peer.nonce != theirNonce) {
         // A live packet without a baseline for this epoch is not proof of a future gain.
-        peer.at = GetTickCount();
-        SendRequestTo(from);
+        peer.at = now;
+        if (SendRequestTo(from)) net::Flush();
         return;
     }
     const uint32_t gain = peer.Take(theirNonce, theirEarned, MaxGain);
@@ -232,7 +250,7 @@ void OnState(net::WorldState const& s)
         Gain(static_cast<int>(gain));
     }
     peer.total = theirTotal;
-    peer.at = GetTickCount();
+    peer.at = now;
 }
 
 void OnWorldChange()
@@ -240,7 +258,7 @@ void OnWorldChange()
     // A loaded hero keeps its saved XP/level. Only gains earned after this baseline are shared.
     waiting = 0;
     earned = 0;
-    sentEarned = 0xffffffff;
+    lastSend = 0;
     nonce = GetTickCount() ^ (GetCurrentProcessId() << 16) ^ (++worldSerial * 2654435761u);
     if (!nonce) nonce = 1;
     for (auto& peer : peers) peer = Peer{};
@@ -257,10 +275,11 @@ void Tick()
         waiting = 0;
         Gain(amount);
     }
-    PrepareAdmissions(GetTickCount());
-    if (!net::Connected()) return;
     const DWORD now = GetTickCount();
-    if (earned != sentEarned || now - lastSend >= Heartbeat) SendLive();
+    PrepareAdmissions(now);
+    if (!net::Connected()) return;
+    const bool heartbeatDue = !lastSend || now - lastSend >= Heartbeat;
+    SendLive(now, heartbeatDue);
 }
 
 void Report(LogFn log)

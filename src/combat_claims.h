@@ -32,6 +32,34 @@ private:
     bool previousForwarded_;
     bool previousHeroForward_;
 };
+
+namespace killconfirm {
+constexpr uint32_t UndoDelayMs = 2000;
+constexpr uint32_t DeathTaskExpiryMs = 10000;
+constexpr uint32_t PendingRewardExpiryMs = 5000;
+
+enum class Action : uint8_t {
+    Wait = 0,
+    Drop = 1,
+    Reward = 2,
+    UndoAndDrop = 3,
+};
+
+// Check confirmed death on every tick so kill XP is paid as soon as ZS_RagDollDead/ZS_Dead
+// commits on the next frame, while keeping the 2s/10s undo window when OnCheatKill did not take.
+inline Action Decide(uint32_t now, uint32_t undoDue, uint32_t expires, bool sameIncarnation,
+                     bool present, bool dead, bool deathTask, uint8_t rewardPlayer, bool rewardEligible)
+{
+    if (!sameIncarnation) return Action::Drop;
+    if (present && dead) return rewardEligible ? Action::Reward : Action::Drop;
+    if (static_cast<int32_t>(now - undoDue) < 0) return Action::Wait;
+    if (present && rewardPlayer != 0 && deathTask && static_cast<int32_t>(now - expires) < 0) {
+        return Action::Wait;
+    }
+    if (present && !deathTask) return Action::UndoAndDrop;
+    return Action::Drop;
+}
+}
 }
 
 namespace g3t::combat::detail {

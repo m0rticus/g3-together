@@ -588,14 +588,12 @@ void Start()
     net::SetHitHandlers(&QueueHitNpc, &OnHitPlayer);
     net::SetKilledHandler(&OnKilled);
 }
-void Tick()
+void InstallHooks()
 {
-    DrainQueuedNpcHits();
-    ConfirmKills();
     if (installed || !gCSession::GetInstance().IsGameRunning()) return;
     const DWORD now = GetTickCount();
-    if (now - lastTry < 1000) return;
-    lastTry = now;
+    if (lastTry && now - lastTry < 1000) return;
+    lastTry = now ? now : 1;
     gSScript* script = Find(GetScriptAdminExt().GetScripts(), "AddHitPoints");
     if (!script || !script->m_funcScript) return;
     original = WrapDamageScript(*script, &Filter, "AddHitPoints");
@@ -622,6 +620,12 @@ void Tick()
         musicTick = reinterpret_cast<gFScript>(ai::JumpTo(code, reinterpret_cast<void*>(&MusicTick)));
     Logf("combat: HandleMusicSituation %s", musicTick ? "wrapped (fight music for mirrors)" : code ? "has other bytes; no fight music for mirrors"
                                                                                               : "not found; no fight music for mirrors");
+}
+void Tick()
+{
+    InstallHooks();
+    DrainQueuedNpcHits();
+    ConfirmKills();
 }
 void OnWorldChange()
 {
