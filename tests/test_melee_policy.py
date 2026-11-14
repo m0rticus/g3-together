@@ -212,7 +212,7 @@ class MeleePolicyTests(unittest.TestCase):
             self.assertLess(gate, claim.index(operation))
         self.assertLess(claim.index("OutsideBout("), claim.index("remote::NoteContact("))
         self.assertIn('if (!attacker) {', claim)
-        self.assertIn("if (target.IsDead()) RewardKill(from, guid);", claim)
+        self.assertIn("if (paysXp && target.IsDead()) RewardKill(from, guid);", claim)
 
     def test_attitude_query_does_not_redirect_or_register_contact(self):
         query = self.ai.split("bool TryPlayerAttitude(", 1)[1].split("unsigned AttitudeAsked(", 1)[0]
