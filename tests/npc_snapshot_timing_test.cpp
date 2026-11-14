@@ -125,4 +125,45 @@ int main()
         Feed(player, position, rotation, now, now, 1, motion);
     }
     assert(PlaybackDelay(player) > BufferDelay);
+
+    // Combat 16 ms NPC pausing stationary for KeepaliveMs (180 ms) emits QuietCadenceMs (250 ms)
+    // keyframes; those heartbeats must not escalate combat playback delay to 200 ms or trigger underruns.
+    Track combatNpc;
+    combatNpc.predictive = false;
+    SetPoseInterval(combatNpc, 16);
+    float combatPos[3] = {500.0f, 0.0f, 500.0f};
+    uint32_t combatNow = 5000;
+    for (int i = 0; i < 40; ++i) {
+        combatNow += 16;
+        combatPos[0] += 1.5f;
+        Feed(combatNpc, combatPos, rotation, combatNow, combatNow + 15, 2, motion);
+        Sample(combatNpc, combatNow + 15, shown, turn, -PlaybackDelay(combatNpc), true, &presentation);
+    }
+    assert(PlaybackDelay(combatNpc) == NpcBufferFloor);
+    const unsigned underrunsBeforeHold = combatNpc.underruns;
+    // Stationary 5.4 s pause across multiple OffsetWindows emitting QuietCadenceMs (250 ms) heartbeats:
+    combatNow += 16;
+    Feed(combatNpc, combatPos, rotation, combatNow, combatNow + 15, 1, motion);
+    for (int holdBeat = 0; holdBeat < 30; ++holdBeat) {
+        for (uint32_t wait = 16; wait < 180; wait += 16)
+            Sample(combatNpc, combatNow + 15 + wait, shown, turn, -PlaybackDelay(combatNpc), true, &presentation);
+        combatNow += 180;
+        SetPoseInterval(combatNpc, 250);
+        Feed(combatNpc, combatPos, rotation, combatNow, combatNow + 15, 1, motion);
+        Sample(combatNpc, combatNow + 15, shown, turn, -PlaybackDelay(combatNpc), true, &presentation);
+    }
+    assert(PlaybackDelay(combatNpc) == NpcBufferFloor);
+    assert(combatNpc.underruns == underrunsBeforeHold);
+    // Waking 16 ms combat packet 170 ms after last heartbeat keeps crisp 34 ms buffer immediately:
+    combatNow += 170;
+    combatPos[0] += 2.0f;
+    SetPoseInterval(combatNpc, 16);
+    Feed(combatNpc, combatPos, rotation, combatNow, combatNow + 15, 2, motion);
+    Sample(combatNpc, combatNow + 15, shown, turn, -PlaybackDelay(combatNpc), true, &presentation);
+    assert(PlaybackDelay(combatNpc) == NpcBufferFloor);
+    combatNow += 16;
+    combatPos[0] += 2.0f;
+    Feed(combatNpc, combatPos, rotation, combatNow, combatNow + 15, 2, motion);
+    Sample(combatNpc, combatNow + 15, shown, turn, -PlaybackDelay(combatNpc), true, &presentation);
+    assert(PlaybackDelay(combatNpc) == NpcBufferFloor);
 }

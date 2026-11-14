@@ -52,7 +52,7 @@ net::NpcRecord const* CombatRecord(eCEntity const* entity); // received relation
 bool CombatTarget(eCEntity* entity, eCEntity*& target);
 void AwaitHit(eCEntity* entity, uint32_t sequence); // no predicted reaction until the host accepts
 void LocalHit(eCEntity* entity);  // our hero hit this mirror: its stagger shows here at once, as this game judged it (owner 2 Nov.: favour the client's feel)
-void LocalHit(eCEntity* entity, uint32_t sequence);
+void LocalHit(eCEntity* entity, uint32_t sequence, uint8_t reaction = 0);
 void HostHit(eCEntity* entity, uint8_t player, uint32_t sequence);
 void Despawn(eCEntity* entity);  // host: publish removal of this NPC incarnation, without client death/respawn scripts
 void ForgetRemoved(uint8_t const guid[16]); // discard presentation/publication state without a death transition

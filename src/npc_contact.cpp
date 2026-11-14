@@ -46,26 +46,40 @@ void Point(bCVector const& vector, float out[3])
     out[2] = vector.GetZ();
 }
 
-std::string StumbleMotion(char const* skeleton, char const* stance)
+std::string StumbleMotion(char const* skeleton, char const* stance, uint8_t reaction, bool frontHit, bool leftFoot)
 {
-    const std::string key = std::string(skeleton) + "_" + stance;
+    char const* dirTag = frontHit ? "_Back_" : "_Fwd_";
+    char const* actionTag = reaction == net::HitQuickStumble ? "_QuickStumble_Hit_"
+        : reaction == net::HitPierceStumble ? "_PierceStumble_Hit_"
+        : (leftFoot ? "_StumbleR_Hit_" : "_StumbleL_Hit_");
+    const std::string key = std::string(skeleton) + "_" + stance + actionTag + dirTag;
     if (auto it = stumbleFor.find(key); it != stumbleFor.end()) return it->second;
-    std::string any, same;
+    std::string bestExact, bestAction, bestStance, any;
     const std::string prefix = std::string(skeleton) + "_Stand_";
     for (auto const& [hash, name] : motionNames) {
         if (name.compare(0, prefix.size(), prefix) || name.find("Stumble") == std::string::npos || name.find("_Hit_") == std::string::npos) continue;
         if (name.find("Parade") != std::string::npos) continue;
         if (any.empty()) any = name;
-        if (*stance && name.find(std::string("_") + stance + "_") != std::string::npos) { same = name; break; }
+        const bool matchStance = !*stance || name.find(std::string("_") + stance + "_") != std::string::npos;
+        const bool matchAction = name.find(actionTag) != std::string::npos ||
+            (reaction != net::HitQuickStumble && name.find("_Stumble") != std::string::npos && name.find("_QuickStumble_") == std::string::npos);
+        const bool matchDir = name.find(dirTag) != std::string::npos;
+        if (matchStance && bestStance.empty()) bestStance = name;
+        if (matchStance && matchAction && bestAction.empty()) bestAction = name;
+        if (matchStance && matchAction && matchDir) { bestExact = name; break; }
     }
-    std::string chosen = same.empty() ? any : same;
+    std::string chosen = !bestExact.empty() ? bestExact : !bestAction.empty() ? bestAction : !bestStance.empty() ? bestStance : any;
     if (chosen.empty() && fallbackStumbles) {
+        char const* dirWord = frontHit ? "Back" : "Fwd";
+        char const* stepWord = frontHit ? "90" : "200";
         if (!std::strcmp(skeleton, "Hero") && (!*stance || !std::strcmp(stance, "None")))
-            chosen = "Hero_Stand_None_None_P0_StumbleR_Hit_N_Back_00_%_00_P0_90";
+            chosen = std::string("Hero_Stand_None_None_P0_StumbleR_Hit_N_") + dirWord + "_00_%_00_P0_" + stepWord;
+        else if (!std::strcmp(skeleton, "Hero") && reaction == net::HitQuickStumble)
+            chosen = std::string("Hero_Stand_None_") + stance + "_P0_QuickStumble_Hit_N_" + dirWord + "_00_%_00_P0_90";
         else if (!std::strcmp(skeleton, "Hero"))
-            chosen = std::string("Hero_Stand_None_") + stance + "_P0_QuickStumble_Hit_N_Fwd_00_%_00_P0_90";
+            chosen = std::string("Hero_Stand_None_") + stance + (leftFoot ? "_P0_StumbleR_Hit_N_" : "_P0_StumbleL_Hit_N_") + dirWord + "_00_%_00_P0_" + stepWord;
         else
-            chosen = std::string(skeleton) + "_Stand_None_Fist_P0_StumbleR_Hit_N_Back_00_%_00_P0_200";
+            chosen = std::string(skeleton) + "_Stand_None_Fist_P0_StumbleR_Hit_N_" + dirWord + "_00_%_00_P0_200";
         return chosen;
     }
     if (const size_t dot = chosen.find(".xmot"); dot != std::string::npos) chosen.resize(dot);
@@ -73,7 +87,7 @@ std::string StumbleMotion(char const* skeleton, char const* stance)
     return chosen;
 }
 
-void LocalHitWithSwing(eCEntity* entity, uint32_t sequence, uint32_t swing)
+void LocalHitWithSwing(eCEntity* entity, uint32_t sequence, uint32_t swing, uint8_t reaction = 0)
 {
     if (entity && sequence && !npcs::HostPresentationAvailable(entity)) {
         const uint32_t effectiveSwing = swing ? swing : npcplayback::MotionInstance(remote::ControlledBody());
@@ -100,9 +114,28 @@ void LocalHitWithSwing(eCEntity* entity, uint32_t sequence, uint32_t swing)
                 if (n + 1 < sizeof(stance)) stance[n] = *c, stance[n + 1] = '\0';
             }
         }
-        std::string motion = StumbleMotion(m.skeleton, stance);
-        if (!motion.empty() && motion.find(".xmot") == std::string::npos) motion += ".xmot";
-        if (motion.empty() || !npcplayback::LocalHit(entity, m.replay, motion.c_str(), m.latest.motions[0], sequence, net::Now())) {
+        eCEntity* attacker = remote::ControlledBody();
+        const uint8_t effectiveReaction = reaction ? reaction : static_cast<uint8_t>(net::HitStumble);
+        char nativeMotion[96] = {};
+        float playSpeed = 1.3f;
+        std::string motion;
+        if (npcplayback::ResolveHitMotion(entity, attacker, effectiveReaction, shown, nativeMotion, playSpeed)) {
+            motion = nativeMotion;
+        } else {
+            const bCVector victimPos = entity->GetWorldPosition();
+            const bCVector attackerPos = attacker ? attacker->GetWorldPosition() : victimPos;
+            const bCVector forward = entity->GetWorldMatrix().GetZAxis();
+            const bool frontHit = npcplayback_hit_policy::FrontHitDirection(
+                forward.GetX(), forward.GetZ(),
+                attackerPos.GetX() - victimPos.GetX(), attackerPos.GetZ() - victimPos.GetZ());
+            const bool leftFoot = std::strstr(shown, "_L.") != nullptr;
+            motion = StumbleMotion(m.skeleton, stance, effectiveReaction, frontHit, leftFoot);
+            if (!motion.empty() && motion.find(".xmot") == std::string::npos) motion += ".xmot";
+            const bool quickUsed = motion.find("QuickStumble") != std::string::npos;
+            playSpeed = npcplayback_hit_policy::NativeStumblePlaySpeed(effectiveReaction, quickUsed, false);
+        }
+        if (motion.empty() || !npcplayback::LocalHit(entity, m.replay, motion.c_str(), m.latest.motions[0], sequence,
+                                                     net::Now(), playSpeed, attacker, effectiveReaction)) {
             Logf("npcs: immediate hit presentation could not start for %s", m.entity.GetName().GetText());
             return;
         }
@@ -389,14 +422,28 @@ void LogLocalBlowContact(Mirror& m, eCEntity* hero, net::NpcRecord const& shown,
 void SamplePlayerContact(uint32_t now)
 {
     eCEntity* hero = remote::ControlledBody();
-    if (!hero || !net::Connected() || !body::LocallyAttacking(hero)) { playerContact = PlayerContact{}; return; }
-    ++playerSwingFrames;
-    const uint32_t instance = npcplayback::MotionInstance(hero);
+    if (!hero || !net::Connected()) { playerContact = PlayerContact{}; return; }
     Entity player(hero);
     float a[3], b[3], thickness = 0;
     int bone = -1;
-    if (!instance || !PresentedContactPoints(player, HeldHash(player, gESlot_RightHand), a, b, thickness, bone)) {
+    if (!PresentedContactPoints(player, HeldHash(player, gESlot_RightHand), a, b, thickness, bone)) {
         playerContact = PlayerContact{};
+        return;
+    }
+    if (!body::LocallyAttacking(hero)) {
+        std::memcpy(playerContact.a, a, sizeof(a));
+        std::memcpy(playerContact.b, b, sizeof(b));
+        playerContact.instance = 0;
+        playerContact.at = now;
+        playerContact.thickness = thickness;
+        playerContact.bone = bone;
+        playerContact.ready = false;
+        return;
+    }
+    ++playerSwingFrames;
+    const uint32_t instance = npcplayback::MotionInstance(hero);
+    if (!instance) {
+        playerContact.ready = false;
         return;
     }
     if (instance != playerContact.instance) {
@@ -418,8 +465,7 @@ void SamplePlayerContact(uint32_t now)
                  box.GetMax().GetX(), box.GetMax().GetY(), box.GetMax().GetZ());
         }
     }
-    const bool previous = playerContact.at && now - playerContact.at <= 100 &&
-                          playerContact.instance == instance && playerContact.bone == bone;
+    const bool previous = playerContact.at && now - playerContact.at <= 100 && playerContact.bone == bone;
     std::memcpy(playerContact.previousA, playerContact.a, sizeof(a));
     std::memcpy(playerContact.previousB, playerContact.b, sizeof(b));
     std::memcpy(playerContact.a, a, sizeof(a));
@@ -456,6 +502,7 @@ void OnHitResult(net::HitResult const& result)
     if (result.incarnation != m.latest.incarnation ||
         static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
     if (!result.accepted) {
+        npcplayback::CancelLocalHit(m.replay, net::Now());
         m.replay.pendingHit = 0;
         m.replay.localMotion[0] = '\0';
         m.replay.initialized = false;
@@ -474,9 +521,9 @@ void OnHitResult(net::HitResult const& result)
 namespace g3t::npcs {
 using namespace detail;
 
-void LocalHit(eCEntity* entity) { LocalHit(entity, 0); }
+void LocalHit(eCEntity* entity) { LocalHit(entity, 0, 0); }
 
-void LocalHit(eCEntity* entity, uint32_t sequence) { LocalHitWithSwing(entity, sequence, 0); }
+void LocalHit(eCEntity* entity, uint32_t sequence, uint8_t reaction) { LocalHitWithSwing(entity, sequence, 0, reaction); }
 
 bool LocalReaction(eCEntity const* entity, char const* state)
 {

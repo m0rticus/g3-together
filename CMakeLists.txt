@@ -42,6 +42,7 @@ target_sources(Script_G3Together PRIVATE
     src/npcwire_pose.cpp
     src/npcplayback_skeleton.cpp
     src/npcplayback_hooks.cpp
+    src/npcplayback_hit.cpp
     src/npc_corpse.cpp
     src/npc_companions.cpp
     src/npc_identity.cpp

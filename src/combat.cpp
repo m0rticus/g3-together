@@ -462,7 +462,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
                 if (context != playerMeleeContacts.end())
                     LogMelee("claim-sent", net::LocalId(), hit, instance, contact, context->second.verdict);
             }
-            if (reaction != net::HitNoReaction) npcs::LocalHit(instance, hit);
+            if (reaction != net::HitNoReaction) npcs::LocalHit(instance, hit, reaction);
         }
         npcplayback::BeginHit(nullptr);
         return GETrue;

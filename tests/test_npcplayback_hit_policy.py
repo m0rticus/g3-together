@@ -74,6 +74,69 @@ int main() {
     assert(!HostHitStampExpired(1000, 1500, true, "Orc_Stand_None_2H_P0_Ambient_Loop_00.xmot"));
     assert(!HostHitStampExpired(1000, 1500, false, "Orc_Stand_None_2H_P0_StumbleR_Recover_N_Fwd_00.xmot"));
     assert(HostHitStampExpired(1000, 1500, false, "Orc_Stand_None_2H_P0_Ambient_Loop_00.xmot"));
+
+    // Native CP 1.75 .xmot displacement token (index 13) and play speeds.
+    assert(ParseMotionDisplacementCm("Orc_Stand_None_2H_P0_StumbleL_Hit_N_Back_00_%_00_P1_90.xmot") == 90.0f);
+    assert(ParseMotionDisplacementCm("Hero_Stand_None_1H_P0_StumbleR_Hit_N_Fwd_00_%_00_P0_200.xmot") == 200.0f);
+    assert(ParseMotionDisplacementCm("Orc_Stand_None_2H_P0_Stumble_Recover_00_0.xmot") == 0.0f);
+    assert(ParseMotionDisplacementCm(nullptr) == 0.0f);
+
+    assert(NativeStumblePlaySpeed(ReactionQuickStumble, true, false) == 2.0f);
+    assert(NativeStumblePlaySpeed(ReactionQuickStumble, false, false) == 1.3f);
+    assert(NativeStumblePlaySpeed(ReactionStumble, false, false) == 1.3f);
+    assert(NativeStumblePlaySpeed(ReactionPierceStumble, false, false) == 1.0f);
+    assert(NativeStumblePlaySpeed(ReactionQuickStumble, true, true) == 1.5f);
+
+    // Front hits select "_Back_" recoil; hits from behind select "_Fwd_".
+    assert(FrontHitDirection(0.0f, 1.0f, 0.0f, 120.0f));
+    assert(!FrontHitDirection(0.0f, 1.0f, 0.0f, -120.0f));
+    float pushDir[2] = {};
+    assert(ComputeKnockbackStepDirection(100.0f, 300.0f, 100.0f, 150.0f, 0.0f, -1.0f, pushDir));
+    assert(pushDir[0] == 0.0f && pushDir[1] > 0.999f);
+
+    // Build 76 30 ms RTT + 45 ms snapshot delay (75 ms total lag):
+    // NPC steps back immediately on impact (0..308 ms) and stays planted at +200 cm while
+    // buffered host snapshots catch up, with zero late slide and zero double-stepping.
+    HitKnockbackState kb;
+    const float dir[2] = {1.0f, 0.0f};
+    const float durSec = 0.40f / 1.3f; // 307.7 ms native StumbleL/R duration
+    StartHitKnockback(kb, 1, 1000, durSec, dir, 200.0f, 0.0f);
+    float prevX = 1000.0f;
+    for (uint32_t t = 0; t <= 600; t += 16) {
+        const uint32_t nowMs = 1000 + t;
+        const uint32_t recordSent = 1000 + t - 75;
+        const uint32_t ackAt = t >= 30 ? 1015u : 0u; // HitResult arrives at t=30 ms, processed on host at 1015
+        const float hostStumbleAgeSec = recordSent > 1031 ? static_cast<float>(recordSent - 1031) / 1000.0f : 0.0f;
+        const bool ownEcho = recordSent >= 1031 && hostStumbleAgeSec < durSec;
+        const float hostPhase = ownEcho ? (hostStumbleAgeSec / durSec) : 0.0f;
+        const float hostAppliedFrac = hostStumbleAgeSec <= 0.0f ? 0.0f
+            : (hostStumbleAgeSec >= durSec ? 1.0f : (hostStumbleAgeSec / durSec));
+        const float basePos[3] = {1000.0f + 200.0f * hostAppliedFrac, 0.0f, 0.0f};
+        float outPos[3] = {};
+        AdvanceHitKnockback(kb, nowMs, recordSent, ackAt, ownEcho, hostPhase, false, basePos, outPos);
+        if (t == 32) assert(outPos[0] > 1015.0f); // immediate step-back in first 2 frames
+        if (t >= 320) {
+            // Once local stumble finishes (~308 ms), NPC remains planted at 1200 cm: no late slide!
+            assert(outPos[0] >= 1198.0f && outPos[0] <= 1201.0f);
+        }
+        assert(outPos[0] - prevX >= -1.0f && outPos[0] - prevX <= 16.0f); // smooth, monotonic motion
+        prevX = outPos[0];
+    }
+    assert(!kb.active);
+
+    // Refused hit blends out smoothly instead of snapping back in one frame.
+    StartHitKnockback(kb, 2, 2000, durSec, dir, 90.0f, 0.0f);
+    float refusedPos[3] = {};
+    const float originPos[3] = {500.0f, 0.0f, 0.0f};
+    AdvanceHitKnockback(kb, 2048, 1980, 0, false, 0.0f, false, originPos, refusedPos);
+    assert(refusedPos[0] > 510.0f);
+    CancelHitKnockback(kb, 2048);
+    float midCancelPos[3] = {};
+    AdvanceHitKnockback(kb, 2096, 2028, 0, false, 0.0f, false, originPos, midCancelPos);
+    assert(midCancelPos[0] > 500.5f && midCancelPos[0] < refusedPos[0]);
+    float endCancelPos[3] = {};
+    AdvanceHitKnockback(kb, 2200, 2132, 0, false, 0.0f, false, originPos, endCancelPos);
+    assert(!kb.active && endCancelPos[0] == 500.0f);
     return 0;
 }
 ''', encoding="utf-8")
@@ -86,18 +149,30 @@ int main() {
 
     def test_playback_and_claim_sources_wire_non_freezing_handoff_and_logs(self):
         playback = (ROOT / "src" / "npcplayback.cpp").read_text(encoding="utf-8")
+        playback_hit = (ROOT / "src" / "npcplayback_hit.cpp").read_text(encoding="utf-8")
         claims = (ROOT / "src" / "combat_claims.cpp").read_text(encoding="utf-8")
+        combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
         npc_send = (ROOT / "src" / "npc_send.cpp").read_text(encoding="utf-8")
         npc_contact = (ROOT / "src" / "npc_contact.cpp").read_text(encoding="utf-8")
 
+        self.assertLess(len(playback.splitlines()), 1000)
+        self.assertLess(len(playback_hit.splitlines()), 1000)
         self.assertIn("npcplayback_hit_policy::LocalStaggerActive", playback)
         self.assertIn("npcplayback_hit_policy::HitImpactMotion", playback)
         self.assertIn("npcplayback_hit_policy::HoldSuppressedImpact", playback)
+        self.assertIn("npcplayback_hit_policy::AdvanceHitKnockback", playback)
+        self.assertIn("detail::StartLocalHitKnockback", playback)
+        self.assertIn("npcplayback_hit_policy::ParseMotionDisplacementCm", playback_hit)
+        self.assertIn("npcplayback_hit_policy::NativeStumblePlaySpeed", playback_hit)
+        self.assertIn("npcplayback_hit_policy::CancelHitKnockback", playback_hit)
         self.assertIn("if (ownImpactEcho) state.effects[i] = motion.instance;", playback)
         self.assertIn("NPCHITSYNC stage=predict-start", playback)
         self.assertIn("NPCHITSYNC stage=handoff", playback)
         self.assertNotIn("state.pendingHit || localAge < state.localDuration", playback)
 
+        self.assertIn("npcs::LocalHit(instance, hit, reaction)", combat)
+        self.assertIn("npcplayback::ResolveHitMotion(", npc_contact)
+        self.assertIn("npcplayback::CancelLocalHit(", npc_contact)
         self.assertIn("reply.result.processedAt =", claims)
         self.assertIn("NPCHITSYNC stage=host-claim", claims)
         self.assertIn("npcplayback_hit_policy::HostHitStampExpired", npc_send)

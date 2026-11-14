@@ -33,7 +33,8 @@ bool EventChanged(Track const& track, MotionState const& a, MotionState const& b
 int32_t RequiredDelay(Track const& track)
 {
     const uint32_t measured = std::min(track.cadenceMin, track.previousCadenceMin);
-    const uint32_t cadence = !track.predictive && track.count < 2 && !track.poseIntervalMs ? 17
+    const uint32_t cadence = !track.predictive && track.count < 2
+        ? (track.poseIntervalMs ? track.poseIntervalMs : 17u)
         : !track.predictive && track.poseIntervalMs
         ? std::max(track.poseIntervalMs, measured) : measured;
     return std::clamp(static_cast<int32_t>(2 * cadence + std::ceil(track.jitterMs * 2.0f + track.recentTransitMs)),
@@ -234,6 +235,15 @@ float Distance(float const a[3], float const b[3])
 void SetPoseInterval(Track& track, uint32_t interval)
 {
     if (track.predictive || interval < 16) return;
+    if (interval == npcsend::QuietCadenceMs) {
+        // Stationary keepalive keyframes report QuietCadenceMs (250 ms) even while an NPC
+        // remains in its 16/33 ms combat tier; preserve the active tier instead of inflating
+        // playback delay to 200 ms.
+        track.quietHold = true;
+        if (!track.poseIntervalMs) track.poseIntervalMs = 16;
+        return;
+    }
+    track.quietHold = false;
     const uint32_t clamped = std::min<uint32_t>(interval, 100u);
     if (clamped == track.poseIntervalMs) return;
     track.poseIntervalMs = clamped;
@@ -274,7 +284,9 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
             track.predictive = predictive;
             track.combatPlayer = combatPlayer;
             SetPoseInterval(track, interval);
-        } else if (track.predictive || static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs) {
+        } else if (track.predictive ||
+                   (!track.quietHold && !track.lastQuietHold &&
+                    static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs)) {
             // Sparse idle NPC keyframes are intentional, not evidence of network jitter.
             const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, 100u);
             if (arrived - track.cadenceWindowAt >= OffsetWindow) {
@@ -344,6 +356,7 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
     state.motion = motion;
     std::memcpy(state.position, position, sizeof(state.position));
     std::memcpy(state.rotation, rotation, sizeof(state.rotation));
+    track.lastQuietHold = track.quietHold;
     if (edge) track.pendingEvents.push_back(state);
 }
 
@@ -360,8 +373,13 @@ void SampleNpc(Track& track, Track::Snap const& newest, uint32_t now, int32_t sh
         const int32_t late = std::max(0, static_cast<int32_t>(desired - newest.sent));
         const uint32_t measuredCadence = std::min(track.cadenceMin, track.previousCadenceMin);
         const uint32_t interval = track.poseIntervalMs ? std::max(track.poseIntervalMs, measuredCadence) : measuredCadence;
-        // A whole missing interval, not a rounding-boundary hold, warrants more buffering.
-        if (track.count >= 2 && late > static_cast<int32_t>(interval) && !(newest.motion.flags & 1) &&
+        const bool stationaryHold = track.count >= 2 &&
+            (track.quietHold ||
+             (Distance(track.snaps[track.count - 2].position, newest.position) < npcsend::RootChangeCm &&
+              !newest.motion.contact));
+        const uint32_t expectedGap = stationaryHold ? std::max<uint32_t>(interval, npcsend::QuietCadenceMs) : interval;
+        // A whole missing interval, not a rounding-boundary hold or intentional stationary keepalive pause, warrants more buffering.
+        if (track.count >= 2 && late > static_cast<int32_t>(expectedGap) && !(newest.motion.flags & 1) &&
             (!track.underrunAt || now - track.underrunAt >= 100)) {
             track.underrunAt = now;
             track.recoveryUntil = now + OffsetWindow;

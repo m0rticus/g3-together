@@ -2,6 +2,7 @@
 #pragma once
 
 #include "net.h"
+#include "npcplayback_hit_policy.h"
 #include <unordered_map>
 
 class eCEntity;
@@ -24,8 +25,11 @@ struct State {
     uint32_t localStart = 0;
     uint32_t acknowledgedAt = 0;
     float localDuration = 0.0f;
+    float localPlaySpeed = 1.0f;
+    uint8_t localReaction = 0;
     char localMotion[96] = {};
     net::NpcMotion localOptions;
+    npcplayback_hit_policy::HitKnockbackState knockback;
     void const* nodes = nullptr;
     int nodeCount = 0;
     std::unordered_map<uint32_t, int> boneIndices;
@@ -63,7 +67,15 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
 uint32_t PoseInterval(net::NpcRecord const& record);
 bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindName names, uint32_t now);
 bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> const& bones, uint8_t flags);
-bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now);
+bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now,
+              float playSpeed = 1.0f, eCEntity const* attacker = nullptr, uint8_t reaction = 0);
+bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reaction, char const* currentMotion,
+                      char outMotion[96], float& outPlaySpeed);
+void CancelLocalHit(State& state, uint32_t now);
+namespace detail {
+float StartLocalHitKnockback(eCEntity* entity, eCEntity const* attacker, State& state, char const* motion, uint32_t hit,
+                             uint32_t now);
+}
 void Tick();
 void OnWorldDeactivate();
 void ForgetRemoved(uint8_t const guid[16]);

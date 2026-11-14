@@ -445,7 +445,8 @@ bool CosmeticHit(eCEntity* entity, uint32_t swing)
     return true;
 }
 
-bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now)
+bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now,
+              float playSpeed, eCEntity const* attacker, uint8_t reaction)
 {
     if (!entity || !motion || !*motion || !hit || !options.active || !IsPassive(entity)) return false;
     auto* animation = Animation(entity);
@@ -453,18 +454,24 @@ bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion
     if (!actor) { Log("npcplayback: local hit has no presentation actor"); return false; }
     PresentationScope scope;
     net::NpcMotion local = options;
+    local.active = 3;
     local.phase = 0.0f;
     local.weight = 1.0f;
     if (!PresentMotion(*animation, *actor, 0, motion, local, true)) return false;
+    const float clipDuration = static_cast<float>(actor->GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
+    const float effectiveSpeed = (playSpeed > 0.05f && std::isfinite(playSpeed)) ? playSpeed : 1.0f;
     state.pendingHit = static_cast<uint16_t>(hit);
     state.acknowledgedAt = 0;
     state.localStart = now;
-    state.localDuration = static_cast<float>(actor->GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
+    state.localPlaySpeed = effectiveSpeed;
+    state.localReaction = reaction;
+    state.localDuration = clipDuration / effectiveSpeed;
     state.localOptions = options;
     strcpy_s(state.localMotion, motion);
+    const float stepCm = detail::StartLocalHitKnockback(entity, attacker, state, motion, hit, now);
     ++predictedHits;
-    Logf("combat: NPCHITSYNC stage=predict-start npc=%s hit=%u motion=%s duration_ms=%.0f",
-         entity->GetName().GetText(), hit, motion, state.localDuration * 1000.0f);
+    Logf("combat: NPCHITSYNC stage=predict-start npc=%s hit=%u reaction=%u motion=%s duration_ms=%.0f speed=%.2f step_cm=%.0f",
+         entity->GetName().GetText(), hit, reaction, motion, state.localDuration * 1000.0f, state.localPlaySpeed, stepCm);
     return true;
 }
 
@@ -482,10 +489,12 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         state = State{};
         state.incarnation = record.incarnation;
     }
-    if (record.flags & 3) { state.pendingHit = 0; *state.localMotion = '\0'; }
+    if (record.flags & 3) { state.pendingHit = 0; *state.localMotion = '\0'; state.knockback = {}; }
     const bool acknowledged = state.pendingHit && record.hitPlayer == net::LocalId() &&
                               static_cast<int16_t>(record.hitSequence - state.pendingHit) >= 0;
     if (acknowledged) {
+        if (!state.acknowledgedAt || state.acknowledgedHit != record.hitSequence)
+            state.acknowledgedAt = record.sent ? record.sent : 1;
         state.acknowledgedHit = record.hitSequence;
         if (record.motions[0].instance != state.localOptions.instance) state.pendingHit = 0;
     }
@@ -497,13 +506,18 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     const float localAge = static_cast<float>(now - state.localStart) / 1000.0f;
     const bool local = npcplayback_hit_policy::LocalStaggerActive(*state.localMotion != '\0', localAge, state.localDuration);
     char const* firstName = record.motions[0].active ? names(record.motions[0].name) : nullptr;
+    const bool slot0OwnImpactEcho = record.motions[0].active && record.hitPlayer == net::LocalId() &&
+        record.hitSequence && record.hitSequence == state.acknowledgedHit &&
+        npcplayback_hit_policy::HitImpactMotion(firstName);
     const bool firstSuppressed = record.motions[0].active &&
-        (state.suppressed[0] == record.motions[0].instance ||
-         (record.hitPlayer == net::LocalId() && record.hitSequence &&
-          record.hitSequence == state.acknowledgedHit && npcplayback_hit_policy::HitImpactMotion(firstName)));
+        (state.suppressed[0] == record.motions[0].instance || slot0OwnImpactEcho);
     NativePose hostPose;
     const bool havePose = PreparePose(entity, *animation, state, record, names, hostPose);
     const float hostFirstPhase = record.motions[0].active ? record.motions[0].phase : 0.0f;
+    float presentedPosition[3] = {record.position[0], record.position[1], record.position[2]};
+    npcplayback_hit_policy::AdvanceHitKnockback(
+        state.knockback, now, record.sent, state.acknowledgedAt, slot0OwnImpactEcho, hostFirstPhase,
+        (record.flags & 3) != 0, record.position, presentedPosition);
     const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
         local, *state.localMotion != '\0', firstSuppressed, localAge, state.localDuration, havePose, hostFirstPhase);
     const bool expectedEcho = holdEcho;
@@ -512,14 +526,15 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
             state.suppressed[0] = 0;
         char const* mode = firstSuppressed ? "host-pose-tail"
             : (firstName && std::strstr(firstName, "_Recover_") ? "host-recover" : "host-motion");
+        const float leadCm = std::hypot(state.knockback.currentOffset[0], state.knockback.currentOffset[2]);
         Logf("combat: NPCHITSYNC stage=handoff npc=%s hit=%u mode=%s local_age_ms=%.0f local_duration_ms=%.0f "
-             "host_motion=%s host_phase=%.3f",
+             "host_motion=%s host_phase=%.3f lead_cm=%.1f",
              entity->GetName().GetText(), state.acknowledgedHit ? state.acknowledgedHit : state.pendingHit, mode,
-             localAge * 1000.0f, state.localDuration * 1000.0f, firstName ? firstName : "(none)", hostFirstPhase);
+             localAge * 1000.0f, state.localDuration * 1000.0f, firstName ? firstName : "(none)", hostFirstPhase, leadCm);
     }
     bool echo = false;
     if (!local && !expectedEcho && !havePose) return false;
-    const bCMatrix pose = body::Pose(*entity, record.position, record.rotation);
+    const bCMatrix pose = body::Pose(*entity, presentedPosition, record.rotation);
     entity->SetToWorldMatrix(pose);
     if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
         rigid->SetPose(pose);
