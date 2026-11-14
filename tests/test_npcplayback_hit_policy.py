@@ -93,6 +93,7 @@ int main() {
         self.assertIn("npcplayback_hit_policy::LocalStaggerActive", playback)
         self.assertIn("npcplayback_hit_policy::HitImpactMotion", playback)
         self.assertIn("npcplayback_hit_policy::HoldSuppressedImpact", playback)
+        self.assertIn("if (ownImpactEcho) state.effects[i] = motion.instance;", playback)
         self.assertIn("NPCHITSYNC stage=predict-start", playback)
         self.assertIn("NPCHITSYNC stage=handoff", playback)
         self.assertNotIn("state.pendingHit || localAge < state.localDuration", playback)

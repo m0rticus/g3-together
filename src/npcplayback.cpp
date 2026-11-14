@@ -534,9 +534,10 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
         auto const& motion = record.motions[i];
         char const* name = motion.active ? names(motion.name) : nullptr;
-        if ((local || holdEcho) && record.hitPlayer == net::LocalId() && record.hitSequence &&
-            record.hitSequence == state.acknowledgedHit && npcplayback_hit_policy::HitImpactMotion(name) &&
-            state.suppressed[i] != motion.instance) {
+        const bool ownImpactEcho = motion.active && record.hitPlayer == net::LocalId() && record.hitSequence &&
+            record.hitSequence == state.acknowledgedHit && npcplayback_hit_policy::HitImpactMotion(name);
+        if (ownImpactEcho) state.effects[i] = motion.instance;
+        if ((local || holdEcho) && ownImpactEcho && state.suppressed[i] != motion.instance) {
             state.suppressed[i] = motion.instance;
             ++skippedEchoes;
         }
