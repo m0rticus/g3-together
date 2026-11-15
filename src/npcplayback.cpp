@@ -507,11 +507,15 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     const uint32_t knockbackAckAt = state.acknowledgedHit == state.knockback.hitSequence ? state.acknowledgedAt : 0;
     const bool matchKnockback =
         npcplayback_hit_policy::KnockbackMatchesHostRecord(state.knockback, state.acknowledgedHit, record.hitSequence);
+    const float hostClipStepCm = (slot0OwnImpactEcho && matchKnockback)
+        ? npcplayback_hit_policy::EffectiveNativeKnockbackCm(
+              npcplayback_hit_policy::ParseMotionDisplacementCm(firstName), state.knockback.hitDurationSec)
+        : -1.0f;
     float presentedPosition[3] = {record.position[0], record.position[1], record.position[2]};
     npcplayback_hit_policy::AdvanceHitKnockback(
         state.knockback, now, record.sent, knockbackAckAt,
         slot0OwnImpactEcho && matchKnockback, slot0OwnRecoverEcho && matchKnockback, hostFirstPhase,
-        (record.flags & 3) != 0, record.position, presentedPosition);
+        (record.flags & 3) != 0, record.position, presentedPosition, hostClipStepCm);
     const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
         local, *state.localMotion != '\0', firstSuppressed, localAge, localStep.totalDurationSec,
         havePose, hostFirstPhase, slot0OwnRecoverEcho);

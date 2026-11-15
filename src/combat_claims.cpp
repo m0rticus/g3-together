@@ -538,15 +538,20 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             }
             if (plan.runImmediateAssessAgressor) React(target, attacker);
         }
-        if (hostJudged || reaction != net::HitNoReaction) npcs::HostHit(target.GetInstance(), from, sequence);
+        const uint8_t effectiveReaction =
+            (!target.IsDead() && !target.IsDown()) ? Reaction(target) : static_cast<uint8_t>(net::HitNoReaction);
+        npcplayback::EstimateHostHitKnockback(target.GetInstance(), attacker, effectiveReaction, reply.result);
+        if (hostJudged || effectiveReaction != net::HitNoReaction || reaction != net::HitNoReaction)
+            npcs::HostHit(target.GetInstance(), from, sequence);
         if (claimsApplied <= 200) {
             char id[40] = {};
             guid::Format(guid, id, sizeof(id));
             eCEntity* nextTarget = target.NPC.GetCurrentTarget().GetInstance();
             eCEntity* lastAttacker = target.NPC.GetLastAttacker().GetInstance();
-            Logf("NPCHITSYNC stage=host-claim player=%u seq=%u guid=%s target=%s reaction=%u host_judged=%d "
-                 "prev_target=%s next_target=%s last_attacker=%s processed_at=%u",
-                 from, sequence, id, target.GetName().GetText(), reaction, hostJudged ? 1 : 0,
+            Logf("NPCHITSYNC stage=host-claim player=%u seq=%u guid=%s target=%s reaction=%u host_reaction=%u "
+                 "host_step_cm=%.1f host_judged=%d prev_target=%s next_target=%s last_attacker=%s processed_at=%u",
+                 from, sequence, id, target.GetName().GetText(), reaction, effectiveReaction,
+                 reply.result.stepCm, hostJudged ? 1 : 0,
                  prevTarget ? prevTarget->GetName().GetText() : "-",
                  nextTarget ? nextTarget->GetName().GetText() : "-",
                  lastAttacker ? lastAttacker->GetName().GetText() : "-",

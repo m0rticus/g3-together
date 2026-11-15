@@ -228,6 +228,17 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     case MsgHitResult: {
         HitResultMsg message{};
         if (isHost || !UnpackFixed(packet, message)) return true;
+        if (message.result.knockbackValid > 1) return true;
+        if (message.result.knockbackValid) {
+            for (int k = 0; k < 3; ++k) {
+                if (!std::isfinite(message.result.originPos[k]) || std::fabs(message.result.originPos[k]) > 1e7f ||
+                    !std::isfinite(message.result.goalPos[k]) || std::fabs(message.result.goalPos[k]) > 1e7f)
+                    return true;
+            }
+            if (!std::isfinite(message.result.stepCm) || message.result.stepCm < 0.0f || message.result.stepCm > 2000.0f ||
+                message.result.hitDurationMs > 10000u || message.result.moveDurationMs > 10000u)
+                return true;
+        }
         if (message.result.epoch == worldEpoch && message.result.accepted <= 1 && handlers.hitResult)
             handlers.hitResult(message.result);
         return true;

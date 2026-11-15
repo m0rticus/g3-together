@@ -87,6 +87,8 @@ bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reacti
                       char outMotion[96], float& outPlaySpeed);
 void ResetLocalHitState(State& state);
 void CancelLocalHit(State& state, uint32_t now, eCEntity* entity = nullptr);
+bool EstimateHostHitKnockback(eCEntity* entity, eCEntity const* attacker, uint8_t reaction, net::HitResult& outResult);
+void ConfirmLocalHitKnockback(State& state, net::HitResult const& result, uint32_t now);
 namespace detail {
 struct NativePose;
 float StartLocalHitKnockback(eCEntity* entity, eCEntity const* attacker, State& state, char const* motion, uint32_t hit,

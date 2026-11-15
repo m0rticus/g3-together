@@ -234,6 +234,88 @@ int main() {
     float endCancelPos[3] = {};
     AdvanceHitKnockback(refusedKb, 5200, 5125, 0, false, false, 0.0f, false, originPos, endCancelPos);
     assert(!refusedKb.active && endCancelPos[0] == 500.0f);
+
+    // 1) Native SPU loop-cutoff calibration matches Game.dll sAICombatMoveStart / sAICombatMoveItlLoop (~186 cm on 200 cm clip).
+    const float eff200 = EffectiveNativeKnockbackCm(200.0f, 0.615f);
+    assert(eff200 > 184.0f && eff200 < 188.0f);
+    const float eff90 = EffectiveNativeKnockbackCm(90.0f, 0.615f);
+    assert(eff90 > 82.5f && eff90 < 85.0f);
+
+    // 2) Live character capsule obstacle clamp (e.g., Gorn/Milten/Diego behind an Orc) and walkable slope check.
+    assert(std::fabs(ClampKnockbackToCharacterObstacle(0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 186.0f, 120.0f, 0.0f, 0.0f, 82.0f) - 38.0f) < 0.5f);
+    assert(std::fabs(ClampKnockbackToCharacterObstacle(0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 186.0f, 120.0f, 0.0f, 95.0f, 82.0f) - 186.0f) < 0.01f);
+    assert(std::fabs(ClampKnockbackToCharacterObstacle(0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 186.0f, 120.0f, 260.0f, 0.0f, 82.0f) - 186.0f) < 0.01f);
+    assert(WalkableKnockbackGroundDelta(100.0f, 40.0f));
+    assert(!WalkableKnockbackGroundDelta(40.0f, 72.0f));
+
+    // 3) Authoritative HitResult confirmation at 30 ms RTT:
+    //    (a) Predicted 186 cm Fwd_200 corrected by host to 84 cm Back_90 without position jump at ack time.
+    HitKnockbackState authKb;
+    const float authOrigin[3] = {3000.0f, 0.0f, 0.0f};
+    StartHitKnockback(authKb, 11, 1000, 0.615f, 0.538f, authOrigin, dir, 186.3f, 0.0f, 0.615f);
+    float ackFramePos[3] = {};
+    AdvanceHitKnockback(authKb, 1030, 955, 0, false, false, 0.0f, false, authOrigin, ackFramePos);
+    const float preConfirmX = ackFramePos[0];
+    const float hostGoal84[3] = {3083.8f, 0.0f, 0.0f};
+    ConfirmHitKnockback(authKb, 11, 1030, ReactionStumble, 615, 615, authOrigin, hostGoal84, 83.8f);
+    AdvanceHitKnockback(authKb, 1030, 955, 1015, false, false, 0.0f, false, authOrigin, ackFramePos);
+    assert(std::fabs(ackFramePos[0] - preConfirmX) < 0.05f); // zero discontinuity on ack!
+    AdvanceHitKnockback(authKb, 1615, 1540, 1015, false, true, 0.25f, false, hostGoal84, ackFramePos);
+    assert(std::fabs(ackFramePos[0] - 3083.8f) < 0.4f); // converged cleanly to host's 83.8 cm!
+
+    //    (b) Host HitNoReaction (0-step) stops outward prediction at ~9 cm instead of sliding 186 cm.
+    HitKnockbackState noReactKb;
+    StartHitKnockback(noReactKb, 12, 2000, 0.615f, 0.538f, authOrigin, dir, 186.3f, 0.0f, 0.615f);
+    float nrPos[3] = {};
+    AdvanceHitKnockback(noReactKb, 2030, 1955, 0, false, false, 0.0f, false, authOrigin, nrPos);
+    assert(nrPos[0] > 3008.0f && nrPos[0] < 3012.0f);
+    ConfirmHitKnockback(noReactKb, 12, 2030, ReactionNone, 0, 0, authOrigin, authOrigin, 0.0f);
+    AdvanceHitKnockback(noReactKb, 2046, 1971, 2015, false, false, 0.0f, false, authOrigin, nrPos);
+    assert(nrPos[0] <= 3010.5f); // never slides past ack position!
+
+    //    (c) Blocked combo Hit #2 when client was already ahead of hostGoalPos does not stack overshoot.
+    HitKnockbackState blockedComboKb;
+    const float overshotStart[3] = {3060.0f, 0.0f, 0.0f};
+    const float blockedHostGoal[3] = {3035.0f, 0.0f, 0.0f};
+    StartHitKnockback(blockedComboKb, 13, 3000, 0.615f, 0.538f, overshotStart, dir, 186.3f, 0.0f, 0.615f);
+    ConfirmHitKnockback(blockedComboKb, 13, 3030, ReactionStumble, 615, 115, authOrigin, blockedHostGoal, 35.0f);
+    float bcPos[3] = {};
+    AdvanceHitKnockback(blockedComboKb, 3300, 3225, 3015, true, false, 0.50f, false, blockedHostGoal, bcPos, 186.3f);
+    assert(bcPos[0] <= 3060.5f); // clamped in place instead of sliding to 3246 cm!
+
+    // 4) Closed-loop ownImpactEcho stall braking + host-pose-tail hold + velocity-bounded smooth reconciliation:
+    //    Suppose a moving companion blocks the host NPC mid-stumble at +45 cm (unknown at t=0).
+    HitKnockbackState stallKb;
+    StartHitKnockback(stallKb, 14, 4000, 0.615f, 0.538f, authOrigin, dir, 186.3f, 0.0f, 0.615f);
+    const float stalledBase[3] = {3045.0f, 0.0f, 0.0f};
+    float stPos[3] = {};
+    AdvanceHitKnockback(stallKb, 4180, 4105, 4015, true, false, 0.22f, false, stalledBase, stPos, 186.3f);
+    AdvanceHitKnockback(stallKb, 4260, 4185, 4015, true, false, 0.35f, false, stalledBase, stPos, 186.3f);
+    AdvanceHitKnockback(stallKb, 4340, 4265, 4015, true, false, 0.48f, false, stalledBase, stPos, 186.3f);
+    AdvanceHitKnockback(stallKb, 4615, 4540, 4015, true, false, 0.93f, false, stalledBase, stPos, 186.3f);
+    // Mid-stumble echo braking kept total displacement vastly below 3186 cm, and phase=0.93 tail did not settle early!
+    assert(stPos[0] < 3120.0f && !stallKb.settling);
+
+    // Once host enters Recover at 3045 cm, residual offset reconciles smoothly at <= 90 cm/s (never a 160 ms teleport!).
+    float settlePrevX = stPos[0];
+    AdvanceHitKnockback(stallKb, 4631, 4556, 4015, false, true, 0.05f, false, stalledBase, stPos);
+    assert(stallKb.settling);
+    for (uint32_t t = 4647; t <= 4967; t += 16) {
+        AdvanceHitKnockback(stallKb, t, t - 75, 4015, false, true, 0.30f, false, stalledBase, stPos);
+        const float stepDelta = std::fabs(stPos[0] - settlePrevX);
+        assert(stepDelta <= 90.0f * 0.016f + 0.25f); // strictly bounded per-frame reconciliation velocity!
+        settlePrevX = stPos[0];
+    }
+    // And while reconciling, if the host NPC begins walking forward (+4 cm per 16 ms = 250 cm/s), outPos tracks live motion smoothly.
+    HitKnockbackState walkSettleKb;
+    StartHitKnockback(walkSettleKb, 15, 6000, 0.50f, 0.40f, authOrigin, dir, 90.0f, 0.0f, 0.50f);
+    const float settleHost0[3] = {3060.0f, 0.0f, 0.0f};
+    float wsPos[3] = {};
+    AdvanceHitKnockback(walkSettleKb, 6500, 6425, 6015, false, true, 0.10f, false, settleHost0, wsPos);
+    assert(walkSettleKb.settling && std::fabs(wsPos[0] - 3090.0f) < 0.5f);
+    const float settleHost1[3] = {3064.0f, 0.0f, 0.0f}; // NPC moved +4 cm toward +X while offset was +30 cm
+    AdvanceHitKnockback(walkSettleKb, 6516, 6441, 6015, false, false, 0.15f, false, settleHost1, wsPos);
+    assert(wsPos[0] > 3090.5f && wsPos[0] < 3094.0f); // preserves live NPC motion while gently decaying offset!
     return 0;
 }
 ''', encoding="utf-8")
@@ -251,12 +333,15 @@ int main() {
         playback_policy = (ROOT / "src" / "npcplayback_hit_policy.h").read_text(encoding="utf-8")
         claims = (ROOT / "src" / "combat_claims.cpp").read_text(encoding="utf-8")
         combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
+        net_h = (ROOT / "src" / "net.h").read_text(encoding="utf-8")
+        net_messages = (ROOT / "src" / "net_messages.cpp").read_text(encoding="utf-8")
         npc_send = (ROOT / "src" / "npc_send.cpp").read_text(encoding="utf-8")
         npc_send_h = (ROOT / "src" / "npc_send.h").read_text(encoding="utf-8")
         npc_contact = (ROOT / "src" / "npc_contact.cpp").read_text(encoding="utf-8")
         npcs_cpp = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
 
-        for src_text in (playback, playback_h, playback_hit, playback_policy, npc_contact, npc_send, npc_send_h, npcs_cpp):
+        for src_text in (playback, playback_h, playback_hit, playback_policy, claims, net_h, net_messages,
+                         npc_contact, npc_send, npc_send_h, npcs_cpp):
             self.assertLess(len(src_text.splitlines()), 1000)
         self.assertLessEqual(len(playback.splitlines()), 990)
         self.assertLessEqual(len(npcs_cpp.splitlines()), 975)
@@ -278,6 +363,10 @@ int main() {
         self.assertIn("npcplayback_hit_policy::NativeStumbleLeftFoot", playback_hit)
         self.assertIn("npcplayback_hit_policy::BuildRecoverStemFromHitMotion", playback_hit)
         self.assertIn("npcplayback_hit_policy::ParseMotionDisplacementCm", playback_hit)
+        self.assertIn("npcplayback_hit_policy::EffectiveNativeKnockbackCm", playback_hit)
+        self.assertIn("npcplayback_hit_policy::ClampKnockbackToCharacterObstacle", playback_hit)
+        self.assertIn("npcplayback_hit_policy::WalkableKnockbackGroundDelta", playback_hit)
+        self.assertIn("npcplayback_hit_policy::ConfirmHitKnockback", playback_hit)
         self.assertIn("npcplayback_hit_policy::NativeStumblePlaySpeed", playback_hit)
         self.assertIn("npcplayback_hit_policy::CancelHitKnockback", playback_hit)
         self.assertIn("CaptureEntityPoseBlend(", playback_hit)
@@ -309,6 +398,8 @@ int main() {
         self.assertIn("npcplayback_hit_policy::NativeStumbleLeftFoot", npc_contact)
         self.assertIn("npcplayback::CancelLocalHit(", npc_contact)
         self.assertIn("reply.result.processedAt =", claims)
+        self.assertIn("npcplayback::EstimateHostHitKnockback(", claims)
+        self.assertIn("npcplayback::ConfirmLocalHitKnockback(", npc_contact)
         self.assertIn("NPCHITSYNC stage=host-claim", claims)
         self.assertIn("npcplayback_hit_policy::HostHitStampExpired", npc_send)
         self.assertIn("NPCHITSYNC stage=host-ack", npc_contact)

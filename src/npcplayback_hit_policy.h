@@ -20,6 +20,12 @@ constexpr float HitRecoverBlendSeconds = 0.075f;
 constexpr float HitExitBlendSeconds = 0.120f;
 constexpr float KnockbackSettleSeconds = 0.160f;
 constexpr float KnockbackRefusedFadeSeconds = 0.120f;
+constexpr float KnockbackReconcileTauSeconds = 0.160f;
+constexpr float KnockbackStationaryReconcileSpeedCmPerSec = 90.0f;
+constexpr float KnockbackMaxReconcileSeconds = 1.60f;
+constexpr float NativeKnockbackCutoffSeconds = 0.042f;
+constexpr float CharacterKnockbackCombinedRadiusCm = 82.0f;
+constexpr float CharacterKnockbackVerticalOverlapCm = 165.0f;
 constexpr uint32_t PendingHitTimeoutMs = 2000u;
 constexpr int32_t HostHitStampMinHoldMs = 250;
 
@@ -341,30 +347,79 @@ inline float PoseBlendAlpha(bool active, uint32_t startedAtMs, uint32_t nowMs, f
     return SmoothStep01(elapsedSec / durationSec);
 }
 
-// World-anchored 1x knockback trajectory matching CP 1.75 Game.dll sAICombatMoveStart (0x1016abb0):
-// Translates linearly from anchorPos to goalPos = anchorPos + dirXZ * stepCm over [0, hitDurationSec],
-// holds planted at goalPos during Stumble_Recover (zero native velocity in sAICombatMoveStartRecover),
-// and smoothly reconverges to authoritative basePos once the buffered host snapshot completes Hit.
-// Because the trajectory is anchored in world space rather than added on top of basePos, buffered
-// host position updates and back-to-back combo hits never stack beyond exact 1.0x native displacement.
+// Accounts for CP 1.75 Game.dll sAICombatMoveStart (0x1016abb0) / sAICombatMoveItlLoop (0x1016dd00)
+// startup and mCurLoops >= 1 exit tick cutoff, where ProcessControledTranslation integrates ~42 ms
+// less than nominal clip duration (~186 cm on a 200 cm / 615 ms Stumble clip).
+inline float EffectiveNativeKnockbackCm(float rawClipStepCm, float hitDurationSec)
+{
+    if (!(rawClipStepCm > 0.5f) || !std::isfinite(rawClipStepCm)) return 0.0f;
+    if (!(hitDurationSec > 0.05f) || !std::isfinite(hitDurationSec)) return rawClipStepCm;
+    const float activeRatio = std::clamp((hitDurationSec - NativeKnockbackCutoffSeconds) / hitDurationSec, 0.84f, 1.0f);
+    return rawClipStepCm * activeRatio;
+}
+
+// Horizontal ray-circle capsule sweep against another live character controller (companions, NPCs, puppets).
+inline float ClampKnockbackToCharacterObstacle(
+    float originX, float originY, float originZ,
+    float dirX, float dirZ, float stepCm,
+    float otherX, float otherY, float otherZ,
+    float combinedRadiusCm = CharacterKnockbackCombinedRadiusCm)
+{
+    if (!(stepCm > 0.5f) || !(combinedRadiusCm > 1.0f)) return std::max(0.0f, stepCm);
+    if (std::fabs(otherY - originY) > CharacterKnockbackVerticalOverlapCm) return stepCm;
+    const float relX = otherX - originX;
+    const float relZ = otherZ - originZ;
+    const float proj = relX * dirX + relZ * dirZ;
+    if (proj <= 4.0f) return stepCm;
+    const float distSq = relX * relX + relZ * relZ;
+    const float perpSq = std::max(0.0f, distSq - proj * proj);
+    const float radiusSq = combinedRadiusCm * combinedRadiusCm;
+    if (perpSq >= radiusSq) return stepCm;
+    const float contactDist = std::max(0.0f, proj - std::sqrt(radiusSq - perpSq));
+    return std::min(stepCm, contactDist);
+}
+
+// Walkable ground step/slope limit matching Game.dll GetMovementModeAtPosition (0x100e7fc0).
+inline bool WalkableKnockbackGroundDelta(float horizontalDistCm, float groundDeltaY)
+{
+    if (!std::isfinite(groundDeltaY) || !std::isfinite(horizontalDistCm)) return false;
+    const float maxRiseOrDrop = std::min(75.0f, 36.0f + std::max(0.0f, horizontalDistCm) * 0.84f);
+    return std::fabs(groundDeltaY) <= maxRiseOrDrop;
+}
+
+// World-anchored 1x knockback trajectory matching CP 1.75 Game.dll sAICombatMoveStart (0x1016abb0),
+// synchronized with authoritative HitResult goals (~30 ms RTT), live ownImpactEcho mobility tracking,
+// and velocity-bounded offset reconciliation so prediction never teleports or stacks overshoot.
 struct HitKnockbackState {
     bool active = false;
     bool refused = false;
     bool settling = false;
     bool hasPresentedPos = false;
+    bool hostConfirmed = false;
     bool hostImpactSeen = false;
     bool hostImpactDone = false;
+    bool hasEchoSample = false;
+    bool hasPrevBasePos = false;
     uint16_t hitSequence = 0;
     uint32_t startedAtMs = 0;
+    uint32_t segmentStartMs = 0;
     uint32_t settleStartMs = 0;
+    uint32_t lastSettleUpdateMs = 0;
     float hitDurationSec = 0.0f;
+    float segmentDurationSec = 0.0f;
     float recoverDurationSec = 0.0f;
     float dirXZ[2] = {};
     float stepCm = 0.0f;
     float groundDeltaY = 0.0f;
+    float lastEchoPhase = 0.0f;
+    float hostMoveRatio = 1.0f;
     float anchorPos[3] = {};
+    float segmentOriginPos[3] = {};
     float goalPos[3] = {};
     float settleOriginPos[3] = {};
+    float reconcileOffset[3] = {};
+    float lastEchoBasePos[3] = {};
+    float prevBasePos[3] = {};
     float lastPresentedPos[3] = {};
     float currentOffset[3] = {};
 };
@@ -378,7 +433,7 @@ inline bool KnockbackMatchesHostRecord(HitKnockbackState const& kb, uint16_t ack
 inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint32_t nowMs,
                               float hitDurationSec, float recoverDurationSec,
                               float const anchorPos[3], float const dirXZ[2],
-                              float stepCm, float groundDeltaY = 0.0f)
+                              float stepCm, float groundDeltaY = 0.0f, float moveDurationSec = -1.0f)
 {
     float startWorld[3] = {};
     if (anchorPos) {
@@ -393,11 +448,15 @@ inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint3
     kb = HitKnockbackState{};
     kb.hitSequence = hitSequence;
     kb.startedAtMs = nowMs;
+    kb.segmentStartMs = nowMs;
     kb.hitDurationSec = std::max(0.0f, hitDurationSec);
+    kb.segmentDurationSec = (moveDurationSec > 0.005f)
+        ? std::clamp(moveDurationSec, 0.02f, std::max(0.02f, kb.hitDurationSec))
+        : kb.hitDurationSec;
     kb.recoverDurationSec = std::max(0.0f, recoverDurationSec);
-    kb.anchorPos[0] = kb.goalPos[0] = kb.lastPresentedPos[0] = startWorld[0];
-    kb.anchorPos[1] = kb.goalPos[1] = kb.lastPresentedPos[1] = startWorld[1];
-    kb.anchorPos[2] = kb.goalPos[2] = kb.lastPresentedPos[2] = startWorld[2];
+    for (int k = 0; k < 3; ++k) {
+        kb.anchorPos[k] = kb.segmentOriginPos[k] = kb.goalPos[k] = kb.lastPresentedPos[k] = startWorld[k];
+    }
     kb.hasPresentedPos = true;
     if (dirXZ && stepCm > 0.5f && kb.hitDurationSec > 0.01f) {
         kb.dirXZ[0] = dirXZ[0];
@@ -411,6 +470,64 @@ inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint3
     }
 }
 
+inline void ConfirmHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint32_t nowMs,
+                                uint8_t hostReaction, uint16_t hostHitDurationMs, uint16_t hostMoveDurationMs,
+                                float const hostOriginPos[3], float const hostGoalPos[3], float hostStepCm)
+{
+    if (hitSequence == 0 || kb.hitSequence != hitSequence || kb.refused || !hostOriginPos || !hostGoalPos) return;
+    float const* cur = kb.hasPresentedPos ? kb.lastPresentedPos : kb.anchorPos;
+    const float curPos[3] = {cur[0], cur[1], cur[2]};
+    const float spanX = hostGoalPos[0] - curPos[0];
+    const float spanZ = hostGoalPos[2] - curPos[2];
+    if ((spanX * spanX + spanZ * spanZ) > 380.0f * 380.0f) return;
+
+    kb.hostConfirmed = true;
+    if (hostReaction == ReactionNone || !(hostStepCm > 0.5f)) {
+        if (!kb.active) return;
+        for (int k = 0; k < 3; ++k) kb.segmentOriginPos[k] = kb.goalPos[k] = curPos[k];
+        kb.stepCm = 0.0f;
+        kb.groundDeltaY = 0.0f;
+        kb.hostImpactDone = true;
+        return;
+    }
+
+    const float hdx = hostGoalPos[0] - hostOriginPos[0];
+    const float hdz = hostGoalPos[2] - hostOriginPos[2];
+    const float hlen = std::hypot(hdx, hdz);
+    if (hlen > 0.5f) {
+        kb.dirXZ[0] = hdx / hlen;
+        kb.dirXZ[1] = hdz / hlen;
+    }
+    const float elapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.startedAtMs)) / 1000.0f);
+    if (hostHitDurationMs >= 80u) {
+        const float hostHitSec = static_cast<float>(hostHitDurationMs) / 1000.0f;
+        if (!(kb.hitDurationSec > 0.05f) || std::fabs(hostHitSec - kb.hitDurationSec) >= 0.06f)
+            kb.hitDurationSec = hostHitSec;
+    }
+    const float hostMoveRatio = (hostHitDurationMs >= 80u && hostMoveDurationMs >= 30u)
+        ? std::clamp(static_cast<float>(hostMoveDurationMs) / static_cast<float>(hostHitDurationMs), 0.05f, 1.0f)
+        : 1.0f;
+    const float hostMoveSec = kb.hitDurationSec * hostMoveRatio;
+    kb.segmentStartMs = nowMs;
+    kb.segmentDurationSec = std::max(0.05f, hostMoveSec - elapsedSec);
+    for (int k = 0; k < 3; ++k) kb.segmentOriginPos[k] = curPos[k];
+
+    const float forwardRem = (hostGoalPos[0] - curPos[0]) * kb.dirXZ[0] +
+                             (hostGoalPos[2] - curPos[2]) * kb.dirXZ[1];
+    if (forwardRem > 0.5f && !kb.settling) {
+        kb.goalPos[0] = hostGoalPos[0];
+        kb.goalPos[1] = hostGoalPos[1];
+        kb.goalPos[2] = hostGoalPos[2];
+    } else if (!kb.settling) {
+        kb.goalPos[0] = curPos[0];
+        kb.goalPos[1] = curPos[1];
+        kb.goalPos[2] = curPos[2];
+    }
+    kb.stepCm = hlen > 0.5f ? hlen : hostStepCm;
+    kb.groundDeltaY = hostGoalPos[1] - hostOriginPos[1];
+    kb.active = true;
+}
+
 inline void CancelHitKnockback(HitKnockbackState& kb, uint32_t nowMs)
 {
     if (!kb.active) return;
@@ -422,13 +539,13 @@ inline void CancelHitKnockback(HitKnockbackState& kb, uint32_t nowMs)
     kb.refused = true;
     kb.settling = true;
     kb.settleStartMs = nowMs;
+    kb.lastSettleUpdateMs = nowMs;
 }
 
 inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t recordSentMs, uint32_t acknowledgedAtMs,
                                 bool ownImpactEcho, bool ownRecoverEcho, float hostMotionPhase, bool incapacitated,
-                                float const basePos[3], float outPos[3])
+                                float const basePos[3], float outPos[3], float hostClipStepCm = -1.0f)
 {
-    (void)hostMotionPhase;
     outPos[0] = basePos[0];
     outPos[1] = basePos[1];
     outPos[2] = basePos[2];
@@ -444,10 +561,10 @@ inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t 
         kb = HitKnockbackState{};
         return false;
     }
-    float const* refPos = kb.settling ? kb.settleOriginPos : kb.goalPos;
+    float const* refPos = kb.settling ? kb.lastPresentedPos : kb.goalPos;
     const float jumpDx = basePos[0] - refPos[0];
     const float jumpDz = basePos[2] - refPos[2];
-    const float maxAllowedSpan = kb.stepCm + 260.0f;
+    const float maxAllowedSpan = std::max(kb.stepCm, 200.0f) + 260.0f;
     if ((jumpDx * jumpDx + jumpDz * jumpDz) > maxAllowedSpan * maxAllowedSpan) {
         kb = HitKnockbackState{};
         kb.lastPresentedPos[0] = basePos[0];
@@ -479,40 +596,114 @@ inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t 
 
     if (ownImpactEcho) {
         kb.hostImpactSeen = true;
+        kb.hostImpactDone = false;
+        if (!kb.settling && hostClipStepCm >= 0.0f && std::isfinite(hostMotionPhase)) {
+            const float clampedPhase = std::clamp(hostMotionPhase, 0.0f, 1.0f);
+            if (!kb.hasEchoSample) {
+                kb.hasEchoSample = true;
+                kb.lastEchoPhase = clampedPhase;
+                kb.lastEchoBasePos[0] = basePos[0];
+                kb.lastEchoBasePos[1] = basePos[1];
+                kb.lastEchoBasePos[2] = basePos[2];
+            } else {
+                const float dPhase = clampedPhase - kb.lastEchoPhase;
+                if (dPhase >= 0.05f) {
+                    const float dForward = (basePos[0] - kb.lastEchoBasePos[0]) * kb.dirXZ[0] +
+                                           (basePos[2] - kb.lastEchoBasePos[2]) * kb.dirXZ[1];
+                    const float dExpected = hostClipStepCm * dPhase;
+                    if (dExpected >= 4.0f) {
+                        const float sampleRatio = std::clamp(dForward / dExpected, 0.0f, 1.15f);
+                        kb.hostMoveRatio = kb.hostMoveRatio * 0.35f + sampleRatio * 0.65f;
+                    }
+                    kb.lastEchoPhase = clampedPhase;
+                    kb.lastEchoBasePos[0] = basePos[0];
+                    kb.lastEchoBasePos[1] = basePos[1];
+                    kb.lastEchoBasePos[2] = basePos[2];
+                }
+            }
+            if (clampedPhase >= 0.25f) {
+                const float remCm = (1.0f - clampedPhase) * hostClipStepCm * std::clamp(kb.hostMoveRatio, 0.0f, 1.05f);
+                const float projEndX = basePos[0] + kb.dirXZ[0] * remCm;
+                const float projEndZ = basePos[2] + kb.dirXZ[1] * remCm;
+                const float excessCm = (kb.goalPos[0] - projEndX) * kb.dirXZ[0] +
+                                       (kb.goalPos[2] - projEndZ) * kb.dirXZ[1];
+                if (excessCm > 6.0f) {
+                    const float curX = kb.hasPresentedPos ? kb.lastPresentedPos[0] : kb.segmentOriginPos[0];
+                    const float curY = kb.hasPresentedPos ? kb.lastPresentedPos[1] : kb.segmentOriginPos[1];
+                    const float curZ = kb.hasPresentedPos ? kb.lastPresentedPos[2] : kb.segmentOriginPos[2];
+                    const float forwardFromCur = (projEndX - curX) * kb.dirXZ[0] + (projEndZ - curZ) * kb.dirXZ[1];
+                    const float totalElapsed = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.startedAtMs)) / 1000.0f);
+                    kb.segmentStartMs = nowMs;
+                    kb.segmentDurationSec = std::max(0.05f, kb.hitDurationSec - totalElapsed);
+                    kb.segmentOriginPos[0] = curX;
+                    kb.segmentOriginPos[1] = curY;
+                    kb.segmentOriginPos[2] = curZ;
+                    if (forwardFromCur > 0.5f) {
+                        kb.goalPos[0] = projEndX;
+                        kb.goalPos[1] = basePos[1];
+                        kb.goalPos[2] = projEndZ;
+                    } else {
+                        kb.goalPos[0] = curX;
+                        kb.goalPos[1] = curY;
+                        kb.goalPos[2] = curZ;
+                    }
+                }
+            }
+        }
     } else if (ownRecoverEcho || kb.hostImpactSeen) {
         kb.hostImpactDone = true;
     } else if (acknowledgedAtMs != 0) {
         // Native ZS_Stumble starts sAICombatMoveStart on the host frame after OnHitNpc and finishes after hitDurationSec.
         const int32_t hostAfterAckMs = static_cast<int32_t>(recordSentMs - acknowledgedAtMs) - 16;
-        const int32_t hitMs = static_cast<int32_t>(kb.hitDurationSec * 1000.0f) + 16;
+        const int32_t hitMs = static_cast<int32_t>(kb.hitDurationSec * 1000.0f) + 32;
         if (hostAfterAckMs >= hitMs) kb.hostImpactDone = true;
     }
 
-    const float elapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.startedAtMs)) / 1000.0f);
-    const float localProgress = kb.hitDurationSec > 0.01f ? std::clamp(elapsedSec / kb.hitDurationSec, 0.0f, 1.0f) : 1.0f;
+    const float totalElapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.startedAtMs)) / 1000.0f);
+    const float totalProgress = kb.hitDurationSec > 0.01f ? std::clamp(totalElapsedSec / kb.hitDurationSec, 0.0f, 1.0f) : 1.0f;
+    const float segElapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.segmentStartMs)) / 1000.0f);
+    const float segProgress = kb.segmentDurationSec > 0.005f ? std::clamp(segElapsedSec / kb.segmentDurationSec, 0.0f, 1.0f) : 1.0f;
     float targetPos[3] = {
-        kb.anchorPos[0] + (kb.goalPos[0] - kb.anchorPos[0]) * localProgress,
-        kb.anchorPos[1] + (kb.goalPos[1] - kb.anchorPos[1]) * localProgress,
-        kb.anchorPos[2] + (kb.goalPos[2] - kb.anchorPos[2]) * localProgress,
+        kb.segmentOriginPos[0] + (kb.goalPos[0] - kb.segmentOriginPos[0]) * segProgress,
+        kb.segmentOriginPos[1] + (kb.goalPos[1] - kb.segmentOriginPos[1]) * segProgress,
+        kb.segmentOriginPos[2] + (kb.goalPos[2] - kb.segmentOriginPos[2]) * segProgress,
     };
 
-    if (localProgress >= 1.0f && !kb.settling) {
+    const bool earlyZeroStepDone = kb.hostConfirmed && kb.hostImpactDone && kb.stepCm <= 0.5f;
+    if ((totalProgress >= 1.0f || earlyZeroStepDone) && !kb.settling) {
         const float unackHoldLimit = kb.hitDurationSec + 0.25f;
-        const float ackHoldLimit = kb.hitDurationSec + std::max(kb.recoverDurationSec, 0.28f) + 0.20f;
-        const bool unackExpired = !acknowledgedAtMs && !kb.hostImpactSeen && elapsedSec >= unackHoldLimit;
-        if (kb.hostImpactDone || unackExpired || elapsedSec >= ackHoldLimit) {
+        const float ackHoldLimit = kb.hitDurationSec + std::max(kb.recoverDurationSec, 0.32f) + 0.25f;
+        const bool unackExpired = !acknowledgedAtMs && !kb.hostImpactSeen && totalElapsedSec >= unackHoldLimit;
+        const bool hostStillInHitTail = ownImpactEcho && hostMotionPhase < 0.98f && totalElapsedSec < (ackHoldLimit + 0.25f);
+        if (!hostStillInHitTail && (kb.hostImpactDone || unackExpired || totalElapsedSec >= ackHoldLimit)) {
             kb.settling = true;
             kb.settleStartMs = nowMs;
-            kb.settleOriginPos[0] = targetPos[0];
-            kb.settleOriginPos[1] = targetPos[1];
-            kb.settleOriginPos[2] = targetPos[2];
+            kb.lastSettleUpdateMs = nowMs;
+            kb.reconcileOffset[0] = targetPos[0] - basePos[0];
+            kb.reconcileOffset[1] = targetPos[1] - basePos[1];
+            kb.reconcileOffset[2] = targetPos[2] - basePos[2];
         }
     }
 
+    float baseDeltaXZ = 0.0f;
+    if (kb.hasPrevBasePos) {
+        baseDeltaXZ = std::hypot(basePos[0] - kb.prevBasePos[0], basePos[2] - kb.prevBasePos[2]);
+    }
+    kb.prevBasePos[0] = basePos[0];
+    kb.prevBasePos[1] = basePos[1];
+    kb.prevBasePos[2] = basePos[2];
+    kb.hasPrevBasePos = true;
+
     if (kb.settling) {
-        const float settleAge = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.settleStartMs)) / 1000.0f);
-        const float s = SmoothStep01(settleAge / KnockbackSettleSeconds);
-        if (s >= 0.999f) {
+        const float dtSec = std::clamp(
+            static_cast<float>(static_cast<int32_t>(nowMs - kb.lastSettleUpdateMs)) / 1000.0f, 0.0f, 0.100f);
+        kb.lastSettleUpdateMs = nowMs;
+        const float settleAgeSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.settleStartMs)) / 1000.0f);
+        const float offsetLen = std::sqrt(
+            kb.reconcileOffset[0] * kb.reconcileOffset[0] +
+            kb.reconcileOffset[1] * kb.reconcileOffset[1] +
+            kb.reconcileOffset[2] * kb.reconcileOffset[2]);
+        if (offsetLen <= 0.35f || settleAgeSec >= KnockbackMaxReconcileSeconds) {
             kb = HitKnockbackState{};
             kb.lastPresentedPos[0] = basePos[0];
             kb.lastPresentedPos[1] = basePos[1];
@@ -520,7 +711,31 @@ inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t 
             kb.hasPresentedPos = true;
             return false;
         }
-        for (int k = 0; k < 3; ++k) outPos[k] = kb.settleOriginPos[k] + (basePos[k] - kb.settleOriginPos[k]) * s;
+        if (dtSec > 0.0f) {
+            const float hostSpeedCmPerSec = dtSec > 0.002f ? (baseDeltaXZ / dtSec) : 0.0f;
+            const float maxSpeedCmPerSec = KnockbackStationaryReconcileSpeedCmPerSec +
+                std::min(135.0f, std::max(0.0f, hostSpeedCmPerSec - 20.0f) * 0.55f);
+            const float maxStepCm = maxSpeedCmPerSec * dtSec;
+            const float expShrinkCm = offsetLen * (1.0f - std::exp(-dtSec / KnockbackReconcileTauSeconds));
+            const float minCrawlCm = std::min(offsetLen, 20.0f * dtSec);
+            const float shrinkCm = std::min(offsetLen, std::min(maxStepCm, std::max(expShrinkCm, minCrawlCm)));
+            const float remaining = offsetLen - shrinkCm;
+            if (remaining <= 0.35f) {
+                kb = HitKnockbackState{};
+                kb.lastPresentedPos[0] = basePos[0];
+                kb.lastPresentedPos[1] = basePos[1];
+                kb.lastPresentedPos[2] = basePos[2];
+                kb.hasPresentedPos = true;
+                return false;
+            }
+            const float scale = remaining / offsetLen;
+            kb.reconcileOffset[0] *= scale;
+            kb.reconcileOffset[1] *= scale;
+            kb.reconcileOffset[2] *= scale;
+        }
+        outPos[0] = basePos[0] + kb.reconcileOffset[0];
+        outPos[1] = basePos[1] + kb.reconcileOffset[1];
+        outPos[2] = basePos[2] + kb.reconcileOffset[2];
     } else {
         outPos[0] = targetPos[0];
         outPos[1] = targetPos[1];

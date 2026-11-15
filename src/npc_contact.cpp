@@ -513,8 +513,9 @@ void OnHitResult(net::HitResult const& result)
         (!awaited->second.incarnation || awaited->second.incarnation == result.incarnation)) {
         const uint32_t swing = awaited->second.swing;
         awaitedHits.erase(awaited);
-        if (result.accepted && result.incarnation == npcs::Incarnation(result.guid))
-            LocalHitWithSwing(npcs::NpcByGuid(result.guid), result.sequence, swing);
+        if (result.accepted && result.incarnation == npcs::Incarnation(result.guid) &&
+            (!result.knockbackValid || result.hostReaction != net::HitNoReaction))
+            LocalHitWithSwing(npcs::NpcByGuid(result.guid), result.sequence, swing, result.hostReaction);
     }
     const auto found = mirrors.find(key);
     if (found == mirrors.end()) return;
@@ -525,11 +526,13 @@ void OnHitResult(net::HitResult const& result)
         m.replay.initialized = false;
         Logf("npcs: host refused hit %u on %s; authoritative state retained", result.sequence, m.entity.GetName().GetText());
     } else if (result.incarnation == m.latest.incarnation) {
+        const uint32_t ackNow = net::Now();
         m.replay.acknowledgedHit = static_cast<uint16_t>(result.sequence);
         m.replay.acknowledgedAt = result.processedAt ? result.processedAt : 1;
-        Logf("combat: NPCHITSYNC stage=host-ack npc=%s hit=%u accepted=1 processed_at=%u",
+        npcplayback::ConfirmLocalHitKnockback(m.replay, result, ackNow);
+        Logf("combat: NPCHITSYNC stage=host-ack npc=%s hit=%u accepted=1 host_reaction=%u host_step_cm=%.1f processed_at=%u",
              m.entity.GetInstance() ? m.entity.GetName().GetText() : "(unloaded)", result.sequence,
-             m.replay.acknowledgedAt);
+             result.hostReaction, result.stepCm, m.replay.acknowledgedAt);
     }
 }
 

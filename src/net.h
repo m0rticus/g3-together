@@ -240,6 +240,13 @@ struct HitResult {
     uint8_t guid[16] = {};
     uint32_t epoch = 0, sequence = 0, incarnation = 0, processedAt = 0;
     uint8_t accepted = 0;
+    uint8_t knockbackValid = 0;
+    uint8_t hostReaction = 0;
+    uint16_t hitDurationMs = 0;
+    uint16_t moveDurationMs = 0;
+    float originPos[3] = {};
+    float goalPos[3] = {};
+    float stepCm = 0.0f;
 };
 #pragma pack(pop)
 void SendHitResult(uint8_t to, HitResult const& result);

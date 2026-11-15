@@ -49,8 +49,8 @@ bool KnockbackNonBarrierEntity(eCEntity* hit, eCEntity* self)
            hit->GetPropertySet(eEPropertySetType_Projectile);
 }
 
-float ClampKnockbackToWorld(eCEntity* entity, bCVector const& origin, float const dirXZ[2],
-                            float desiredStepCm, float& outGroundDeltaY)
+float ClampKnockbackToWorld(eCEntity* entity, eCEntity const* attacker, bCVector const& origin,
+                            float const dirXZ[2], float desiredStepCm, float& outGroundDeltaY)
 {
     outGroundDeltaY = 0.0f;
     if (!entity || !(desiredStepCm > 0.5f)) return 0.0f;
@@ -60,13 +60,16 @@ float ClampKnockbackToWorld(eCEntity* entity, bCVector const& origin, float cons
     constexpr float CapsuleMarginCm = 45.0f;
     const GEU32 wallHints = eETraceRayHints_TestStaticShapes | eETraceRayHints_Distance |
                             eETraceRayHints_IncludeCollisionGroup17;
-    bCVector waist = origin;
-    waist.AccessY() = contact::ContactRayY(origin.GetY(), box.GetMin().GetY(), box.GetMax().GetY(),
-                                           movement ? movement->GetCharacterHeight() : 0.0f);
-    const float probeLen = desiredStepCm + CapsuleMarginCm;
-    const bCVector wallRay(dirXZ[0] * probeLen, 0.0f, dirXZ[1] * probeLen);
+    const float waistY = contact::ContactRayY(origin.GetY(), box.GetMin().GetY(), box.GetMax().GetY(),
+                                              movement ? movement->GetCharacterHeight() : 0.0f);
+    const float kneeY = std::min(waistY, origin.GetY() + 48.0f);
     float stepCm = desiredStepCm;
-    if (physics.TraceRayAllHits(waist, wallRay, entity, wallHints)) {
+    auto probeWallAtY = [&](float rayY) {
+        if (!(stepCm > 0.5f)) return;
+        const float probeLen = stepCm + CapsuleMarginCm;
+        const bCVector rayOrigin(origin.GetX(), rayY, origin.GetZ());
+        const bCVector wallRay(dirXZ[0] * probeLen, 0.0f, dirXZ[1] * probeLen);
+        if (!physics.TraceRayAllHits(rayOrigin, wallRay, entity, wallHints)) return;
         auto const& report = physics.GetQueryReport();
         const int count = std::min(report.m_arrHitEntity.GetCount(), report.m_arrDistance.GetCount());
         for (int i = 0; i < count; ++i) {
@@ -76,7 +79,30 @@ float ClampKnockbackToWorld(eCEntity* entity, bCVector const& origin, float cons
             if (KnockbackNonBarrierEntity(hit, entity)) continue;
             stepCm = std::min(stepCm, std::max(0.0f, dist - CapsuleMarginCm));
         }
-    }
+    };
+    probeWallAtY(waistY);
+    if (waistY - kneeY > 8.0f) probeWallAtY(kneeY);
+    if (!(stepCm > 0.5f)) return 0.0f;
+
+    auto clampCharacter = [&](eCEntity* other) {
+        if (!other || other == entity || other == attacker || !(stepCm > 0.5f)) return;
+        if (other->GetPropertySet(eEPropertySetType_NPC)) {
+            Entity otherNpc(other);
+            if (otherNpc.IsDead() || otherNpc.IsDown()) return;
+        }
+        const bCVector& otherPos = other->GetWorldPosition();
+        const float reach = stepCm + npcplayback_hit_policy::CharacterKnockbackCombinedRadiusCm;
+        if (std::fabs(otherPos.GetX() - origin.GetX()) > reach ||
+            std::fabs(otherPos.GetZ() - origin.GetZ()) > reach) return;
+        stepCm = npcplayback_hit_policy::ClampKnockbackToCharacterObstacle(
+            origin.GetX(), origin.GetY(), origin.GetZ(), dirXZ[0], dirXZ[1], stepCm,
+            otherPos.GetX(), otherPos.GetY(), otherPos.GetZ());
+    };
+    const auto allNpcs = Entity::GetNPCs();
+    for (int i = 0; i < allNpcs.GetCount() && stepCm > 0.5f; ++i)
+        clampCharacter(allNpcs.GetAt(i).GetInstance());
+    clampCharacter(gCSession::GetInstance().GetHero());
+    clampCharacter(remote::ControlledBody());
     if (!(stepCm > 0.5f)) return 0.0f;
 
     const GEU32 groundHints = eETraceRayHints_TestStaticShapes | eETraceRayHints_Distance;
@@ -98,10 +124,30 @@ float ClampKnockbackToWorld(eCEntity* entity, bCVector const& origin, float cons
     };
     float originGroundDist = 0.0f;
     if (probeGround(origin.GetX(), origin.GetZ(), originGroundDist)) {
-        float destGroundDist = 0.0f;
-        if (!probeGround(origin.GetX() + dirXZ[0] * stepCm, origin.GetZ() + dirXZ[1] * stepCm, destGroundDist))
-            return 0.0f;
-        outGroundDeltaY = std::clamp(originGroundDist - destGroundDist, -60.0f, 60.0f);
+        float acceptedStep = 0.0f;
+        float acceptedDeltaY = 0.0f;
+        for (float frac : {1.0f, 0.70f, 0.40f}) {
+            const float candStep = stepCm * frac;
+            if (!(candStep > 0.5f)) continue;
+            float destGroundDist = 0.0f;
+            if (!probeGround(origin.GetX() + dirXZ[0] * candStep, origin.GetZ() + dirXZ[1] * candStep, destGroundDist))
+                continue;
+            const float dy = originGroundDist - destGroundDist;
+            if (!npcplayback_hit_policy::WalkableKnockbackGroundDelta(candStep, dy)) continue;
+            if (candStep > 60.0f) {
+                float midGroundDist = 0.0f;
+                const float midStep = candStep * 0.5f;
+                if (!probeGround(origin.GetX() + dirXZ[0] * midStep, origin.GetZ() + dirXZ[1] * midStep, midGroundDist) ||
+                    !npcplayback_hit_policy::WalkableKnockbackGroundDelta(midStep, originGroundDist - midGroundDist))
+                    continue;
+            }
+            acceptedStep = candStep;
+            acceptedDeltaY = std::clamp(dy, -60.0f, 60.0f);
+            break;
+        }
+        if (!(acceptedStep > 0.5f)) return 0.0f;
+        stepCm = acceptedStep;
+        outGroundDeltaY = acceptedDeltaY;
     }
     return stepCm;
 }
@@ -256,9 +302,11 @@ float StartLocalHitKnockback(eCEntity* entity, eCEntity const* attacker, State& 
     float dirXZ[2] = {};
     float stepCm = 0.0f;
     float groundDeltaY = 0.0f;
+    float moveDurationSec = state.localDuration;
     float anchorWorld[3] = {};
     eCEntity const* sourceAttacker = attacker ? attacker : remote::ControlledBody();
     const float rawStepCm = npcplayback_hit_policy::ParseMotionDisplacementCm(motion);
+    const float desiredStepCm = npcplayback_hit_policy::EffectiveNativeKnockbackCm(rawStepCm, state.localDuration);
     if (entity) {
         const bCVector worldPos = entity->GetWorldPosition();
         if (state.knockback.active && state.knockback.hasPresentedPos) {
@@ -270,20 +318,22 @@ float StartLocalHitKnockback(eCEntity* entity, eCEntity const* attacker, State& 
             anchorWorld[1] = worldPos.GetY();
             anchorWorld[2] = worldPos.GetZ();
         }
-        if (rawStepCm > 0.5f) {
+        if (desiredStepCm > 0.5f) {
             const bCVector origin(anchorWorld[0], anchorWorld[1], anchorWorld[2]);
             const bCVector attackerPos = sourceAttacker ? sourceAttacker->GetWorldPosition() : origin;
             const bCVector forward = entity->GetWorldMatrix().GetZAxis();
             if (npcplayback_hit_policy::ComputeKnockbackStepDirection(
                     origin.GetX(), origin.GetZ(), attackerPos.GetX(), attackerPos.GetZ(),
                     forward.GetX(), forward.GetZ(), dirXZ)) {
-                stepCm = ClampKnockbackToWorld(entity, origin, dirXZ, rawStepCm, groundDeltaY);
+                stepCm = ClampKnockbackToWorld(entity, sourceAttacker, origin, dirXZ, desiredStepCm, groundDeltaY);
+                if (stepCm > 0.5f)
+                    moveDurationSec = std::clamp(state.localDuration * (stepCm / desiredStepCm), 0.05f, state.localDuration);
             }
         }
     }
     npcplayback_hit_policy::StartHitKnockback(
         state.knockback, static_cast<uint16_t>(hit), now, state.localDuration, state.localRecoverDuration,
-        anchorWorld, dirXZ, stepCm, groundDeltaY);
+        anchorWorld, dirXZ, stepCm, groundDeltaY, moveDurationSec);
     return stepCm;
 }
 
@@ -512,5 +562,69 @@ void CancelLocalHit(State& state, uint32_t now, eCEntity* entity)
     state.localMotion[0] = '\0';
     state.localRecoverMotion[0] = '\0';
     npcplayback_hit_policy::CancelHitKnockback(state.knockback, now);
+}
+
+bool EstimateHostHitKnockback(eCEntity* entity, eCEntity const* attacker, uint8_t reaction, net::HitResult& outResult)
+{
+    outResult.knockbackValid = 0;
+    outResult.hostReaction = reaction;
+    outResult.hitDurationMs = 0;
+    outResult.moveDurationMs = 0;
+    outResult.stepCm = 0.0f;
+    if (!entity) return false;
+    const bCVector origin = entity->GetWorldPosition();
+    outResult.originPos[0] = outResult.goalPos[0] = origin.GetX();
+    outResult.originPos[1] = outResult.goalPos[1] = origin.GetY();
+    outResult.originPos[2] = outResult.goalPos[2] = origin.GetZ();
+    outResult.knockbackValid = 1;
+
+    const bool stumbleReaction = reaction == net::HitQuickStumble || reaction == net::HitStumble ||
+                                 reaction == net::HitPierceStumble || reaction == net::HitSitKnockDown;
+    if (!stumbleReaction) return true;
+
+    auto* animation = detail::Animation(entity);
+    const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+    char const* currentMotion = (animation && animation->GetActor() && animation->GetActor()->HasMotionInstance(slot0))
+        ? animation->GetMotionDesc(slot0).GetMotionFilename().GetText()
+        : nullptr;
+    char motion[96] = {};
+    float playSpeed = 1.0f;
+    if (!ResolveHitMotion(entity, attacker, reaction, currentMotion, motion, playSpeed)) return true;
+
+    const float rawStepCm = npcplayback_hit_policy::ParseMotionDisplacementCm(motion);
+    constexpr float DefaultStumbleClipSec = 0.80f;
+    const float estHitDurationSec = DefaultStumbleClipSec / std::max(playSpeed, 0.1f);
+    outResult.hitDurationMs = static_cast<uint16_t>(std::clamp(estHitDurationSec * 1000.0f + 0.5f, 80.0f, 5000.0f));
+    if (!(rawStepCm > 0.5f)) return true;
+
+    const float desiredStepCm = npcplayback_hit_policy::EffectiveNativeKnockbackCm(rawStepCm, estHitDurationSec);
+    float dirXZ[2] = {};
+    const bCVector attackerPos = attacker ? attacker->GetWorldPosition() : origin;
+    const bCVector forward = entity->GetWorldMatrix().GetZAxis();
+    if (!npcplayback_hit_policy::ComputeKnockbackStepDirection(
+            origin.GetX(), origin.GetZ(), attackerPos.GetX(), attackerPos.GetZ(),
+            forward.GetX(), forward.GetZ(), dirXZ)) {
+        return true;
+    }
+    float groundDeltaY = 0.0f;
+    const float stepCm = ClampKnockbackToWorld(entity, attacker, origin, dirXZ, desiredStepCm, groundDeltaY);
+    outResult.stepCm = stepCm;
+    if (stepCm > 0.5f && desiredStepCm > 0.5f) {
+        outResult.goalPos[0] = origin.GetX() + dirXZ[0] * stepCm;
+        outResult.goalPos[1] = origin.GetY() + groundDeltaY;
+        outResult.goalPos[2] = origin.GetZ() + dirXZ[1] * stepCm;
+        const float moveSec = std::clamp(estHitDurationSec * (stepCm / desiredStepCm), 0.05f, estHitDurationSec);
+        outResult.moveDurationMs = static_cast<uint16_t>(std::clamp(moveSec * 1000.0f + 0.5f, 50.0f, 5000.0f));
+    }
+    return true;
+}
+
+void ConfirmLocalHitKnockback(State& state, net::HitResult const& result, uint32_t now)
+{
+    if (!result.knockbackValid) return;
+    npcplayback_hit_policy::ConfirmHitKnockback(
+        state.knockback, static_cast<uint16_t>(result.sequence), now,
+        result.hostReaction, result.hitDurationMs, result.moveDurationMs,
+        result.originPos, result.goalPos, result.stepCm);
 }
 }
