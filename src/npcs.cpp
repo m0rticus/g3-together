@@ -136,82 +136,21 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     auto const* processed = world::ProcessedEntities();
     for (GEU16 i = 0; processed && i < processed->GetCount(); ++i) addCandidate(processed->GetAt(i));
     const std::vector<GuidKey> candidateKeys = npcsend_candidates::Union(candidates);
-    using npcstream_diag::Drop;
-    streamDiag.BeginTick(net::Now());
-    std::unordered_set<GuidKey, GuidHash> processedKeys;
-    unsigned interactionNpcs = 0, processedNpcs = 0;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        if (!npcsend_candidates::Eligible(candidates[i])) continue;
-        if (i < firstProcessed) ++interactionNpcs;
-        else { ++processedNpcs; processedKeys.insert(candidates[i].key); }
-    }
-    streamDiag.Candidates(interactionNpcs, processedNpcs, static_cast<unsigned>(candidateKeys.size()),
-                          processed ? processed->GetCount() : 0u);
+    HostSendFrame frame;
+    PrepareHostSendFrame(candidates, firstProcessed, static_cast<unsigned>(candidateKeys.size()),
+                         processed ? processed->GetCount() : 0u, frame);
     eCEntity* hostFocus = controlled && controlled->GetPropertySet(eEPropertySetType_Focus)
         ? Entity(controlled).Focus.GetFocusEntity().GetInstance() : nullptr;
     eCEntity* hostTarget = controlled && controlled->GetPropertySet(eEPropertySetType_NPC)
         ? Entity(controlled).NPC.GetCurrentTarget().GetInstance() : nullptr;
-    net::Remote const* remotes = net::Remotes();
-    bool recipientHere[net::MaxPlayers] = {};
-    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
-        if (!remotes[id].connected) continue;
-        recipientHere[id] = net::InWorld(id) && (remotes[id].latest.flags & 1) && remotes[id].latest.world == remote::CurrentWorld();
-        streamDiag.Player(id, net::InWorld(id), recipientHere[id], net::RemoteStateAgeMs(id), remotes[id].latest.position);
-    }
-    const auto countSkipped = [&](GuidKey const& key, net::NpcSendDecision decision) {
-        for (uint8_t id = 2; id < net::MaxPlayers; ++id)
-            if (net::InWorld(id) && remotes[id].connected && !recipientNpcs[id].count(key))
-                net::RecordNpcSendDecision(decision);
-    };
     std::vector<pose::Bone> bones;
-    uint32_t stretchOf[net::MaxPlayers];
-    for (uint8_t id = 0; id < net::MaxPlayers; ++id)
-        stretchOf[id] = id >= 2 ? net::NpcStretchPermille(id) : npcsend::StretchNormal;
     for (GuidKey const& candidateKey : candidateKeys) {
-        Entity npc = guid::Resolve(candidateKey.data());
-        eCEntity* instance = npc.GetInstance();
-        if (!instance) { streamDiag.Candidate(Drop::Unresolved); continue; }
-        if (instance == hero || remote::IsPuppet(instance)) { streamDiag.Candidate(Drop::Hero); continue; }
-        if (instance == controlled) { streamDiag.Candidate(Drop::Hero); continue; }
-        if (npcremoval::Suppressed(instance)) { streamDiag.Candidate(Drop::Removed); continue; }
         uint8_t guid[16];
-        guid::CopyEntity(instance, guid);
-        const GuidKey key = Key(guid);
-        if (npclease::SuppressHostPublication(guid)) { streamDiag.Candidate(Drop::Lease); continue; }
-        {
-            const bCVector& w = instance->GetWorldPosition();
-            const float where[3] = {w.GetX(), w.GetY(), w.GetZ()};
-            const bool fromProcessing = processedKeys.count(candidateKey) != 0;
-            for (uint8_t id = 2; id < net::MaxPlayers; ++id)
-                if (recipientHere[id])
-                    streamDiag.Reach(id, body::Distance(where, remotes[id].latest.position), fromProcessing,
-                                     GetConfig().hostRoi, npcsend::InterestEnterCm);
-        }
-        SendNote& note = sendNotes[key];
-        note.at = net::Now();
-        if (journal::Pending(instance)) {
-            note.reason = "pending"; streamDiag.Candidate(Drop::Pending); countSkipped(key, net::NpcSendDecision::SkippedIrrelevant); continue;
-        }
-        if (mirrors.count(key)) {
-            note.reason = "mirror"; streamDiag.Candidate(Drop::Mirror); countSkipped(key, net::NpcSendDecision::SkippedIrrelevant); continue;
-        }
-        if (deadStays && !net::IsHost() && deadOnHost.count(key)) {
-            Entity corpse(instance);
-            KeepDead(corpse);
-            note.reason = "dead on host";
-            continue;
-        }
-        const auto back = givenBack.find(key);
-        if (back != givenBack.end() && static_cast<int32_t>(net::Now() - back->second) < 0) {
-            note.reason = "givenback"; streamDiag.Candidate(Drop::GivenBack); countSkipped(key, net::NpcSendDecision::SkippedIrrelevant); continue;
-        }
-        const bCVector& p = instance->GetWorldPosition();
-        const float at[3] = {p.GetX(), p.GetY(), p.GetZ()};
-        if (!CheckHostSendRange(instance, key, at, players, playerCount, note)) {
-            streamDiag.Candidate(Drop::Range);
-            countSkipped(key, net::NpcSendDecision::SkippedFar);
-            continue;
-        }
+        GuidKey key{};
+        float at[3] = {};
+        eCEntity* instance = AdmitHostSendCandidate(candidateKey, hero, controlled, frame, players, playerCount,
+                                                    guid, key, at);
+        if (!instance) continue;
         net::NpcRecord r{};
         std::memcpy(r.guid, guid, 16);
         owned.insert(key);
@@ -232,7 +171,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         uint8_t poseFlags = 0;
         bool posed = false, moving = false;
         CaptureAndRecordOwnedNpc(self, instance, key, r, bones, poseFlags, posed, moving);
-        SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, bones, poseFlags, posed, moving, stretchOf);
+        SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, bones, poseFlags, posed, moving, frame.stretchOf);
     }
     FinishOwnedTick(hero, players, playerCount);
 }
@@ -699,9 +638,7 @@ void PassiveMirrorTick()
             if (!m.staleHeld) {
                 m.staleHeld = true;
                 ResetMirrorIncomingContact(m);
-                m.replay.knockback = {};
-                m.replay.pendingHit = 0;
-                m.replay.localMotion[0] = '\0';
+                npcplayback::ResetLocalHitState(m.replay);
                 ++staleMirrorReleases;
                 Logf("npclease: degraded name=%s reason=%s age_ms=%u contacts=off",
                      m.entity.GetName().GetText(), m.released ? "host release" : "presentation unavailable",
@@ -759,9 +696,7 @@ void PassiveMirrorTick()
         if (m.killed && (firstDeath || m.deathReferencesCleared != m.entity.GetInstance())) {
             if (firstDeath) {
                 ResetMirrorIncomingContact(m);
-                m.replay.knockback = {};
-                m.replay.pendingHit = 0;
-                m.replay.localMotion[0] = '\0';
+                npcplayback::ResetLocalHitState(m.replay);
             }
             if (m.deathReferencesCleared != m.entity.GetInstance()) {
                 m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);

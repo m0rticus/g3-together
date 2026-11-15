@@ -468,11 +468,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         state = State{};
         state.incarnation = record.incarnation;
     }
-    if (record.flags & 3) {
-        state.pendingHit = 0; state.localInRecover = false;
-        *state.localMotion = '\0'; *state.localRecoverMotion = '\0';
-        state.poseBlend.active = false; state.knockback = {};
-    }
+    if (record.flags & 3) ResetLocalHitState(state);
     const bool acknowledged = state.pendingHit && record.hitPlayer == net::LocalId() &&
                               static_cast<int16_t>(record.hitSequence - state.pendingHit) >= 0;
     if (acknowledged) {

@@ -84,6 +84,7 @@ bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion
               float playSpeed = 1.0f, eCEntity const* attacker = nullptr, uint8_t reaction = 0);
 bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reaction, char const* currentMotion,
                       char outMotion[96], float& outPlaySpeed);
+void ResetLocalHitState(State& state);
 void CancelLocalHit(State& state, uint32_t now, eCEntity* entity = nullptr);
 namespace detail {
 struct NativePose;

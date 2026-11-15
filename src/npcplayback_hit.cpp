@@ -493,6 +493,16 @@ bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reacti
     return true;
 }
 
+void ResetLocalHitState(State& state)
+{
+    state.pendingHit = 0;
+    state.localInRecover = false;
+    state.localMotion[0] = '\0';
+    state.localRecoverMotion[0] = '\0';
+    state.poseBlend.active = false;
+    state.knockback = {};
+}
+
 void CancelLocalHit(State& state, uint32_t now, eCEntity* entity)
 {
     if (entity && state.initialized && *state.localMotion)

@@ -252,10 +252,24 @@ int main() {
         claims = (ROOT / "src" / "combat_claims.cpp").read_text(encoding="utf-8")
         combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
         npc_send = (ROOT / "src" / "npc_send.cpp").read_text(encoding="utf-8")
+        npc_send_h = (ROOT / "src" / "npc_send.h").read_text(encoding="utf-8")
         npc_contact = (ROOT / "src" / "npc_contact.cpp").read_text(encoding="utf-8")
+        npcs_cpp = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
 
-        for src_text in (playback, playback_h, playback_hit, playback_policy, npc_contact):
+        for src_text in (playback, playback_h, playback_hit, playback_policy, npc_contact, npc_send, npc_send_h, npcs_cpp):
             self.assertLess(len(src_text.splitlines()), 1000)
+        self.assertLessEqual(len(playback.splitlines()), 990)
+        self.assertLessEqual(len(npcs_cpp.splitlines()), 975)
+
+        reset_body = playback_hit.split("void ResetLocalHitState(State& state)", 1)[1].split("void CancelLocalHit(", 1)[0]
+        for cleared in ("state.pendingHit = 0;", "state.localInRecover = false;",
+                        "state.localMotion[0] = '\\0';", "state.localRecoverMotion[0] = '\\0';",
+                        "state.poseBlend.active = false;", "state.knockback = {};"):
+            self.assertIn(cleared, reset_body)
+        self.assertIn("void ResetLocalHitState(State& state);", playback_h)
+        self.assertIn("if (record.flags & 3) ResetLocalHitState(state);", playback)
+        self.assertGreaterEqual(npcs_cpp.count("npcplayback::ResetLocalHitState(m.replay);"), 2)
+        self.assertIn("npcplayback::ResetLocalHitState(m.replay);", npc_contact)
 
         # Native GetAni direction selection via SetCurrentAniDirection (never GetAniEx action-override misuse).
         self.assertNotIn("GetAniEx(", playback_hit)

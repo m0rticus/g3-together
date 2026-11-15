@@ -50,6 +50,89 @@ uint8_t FightFlags(Entity& npc)
     return static_cast<uint8_t>((fighting ? 4 : 0) | ((player & 7) << 3));
 }
 
+void PrepareHostSendFrame(std::vector<npcsend_candidates::GuidCandidate> const& candidates,
+                          size_t firstProcessed, unsigned candidateKeyCount, unsigned processedCount,
+                          HostSendFrame& out)
+{
+    streamDiag.BeginTick(net::Now());
+    unsigned interactionNpcs = 0, processedNpcs = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (!npcsend_candidates::Eligible(candidates[i])) continue;
+        if (i < firstProcessed) ++interactionNpcs;
+        else { ++processedNpcs; out.processedKeys.insert(candidates[i].key); }
+    }
+    streamDiag.Candidates(interactionNpcs, processedNpcs, candidateKeyCount, processedCount);
+    net::Remote const* remotes = net::Remotes();
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+        if (!remotes[id].connected) continue;
+        out.recipientHere[id] = net::InWorld(id) && (remotes[id].latest.flags & 1) &&
+                                remotes[id].latest.world == remote::CurrentWorld();
+        streamDiag.Player(id, net::InWorld(id), out.recipientHere[id], net::RemoteStateAgeMs(id),
+                          remotes[id].latest.position);
+    }
+    for (uint8_t id = 0; id < net::MaxPlayers; ++id)
+        out.stretchOf[id] = id >= 2 ? net::NpcStretchPermille(id) : npcsend::StretchNormal;
+}
+
+eCEntity* AdmitHostSendCandidate(GuidKey const& candidateKey, eCEntity* hero, eCEntity* controlled,
+                                 HostSendFrame const& frame, float const players[][3], int playerCount,
+                                 uint8_t outGuid[16], GuidKey& outKey, float outAt[3])
+{
+    using npcstream_diag::Drop;
+    net::Remote const* remotes = net::Remotes();
+    const auto countSkipped = [&](GuidKey const& key, net::NpcSendDecision decision) {
+        for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+            if (net::InWorld(id) && remotes[id].connected && !recipientNpcs[id].count(key))
+                net::RecordNpcSendDecision(decision);
+    };
+    Entity npc = guid::Resolve(candidateKey.data());
+    eCEntity* instance = npc.GetInstance();
+    if (!instance) { streamDiag.Candidate(Drop::Unresolved); return nullptr; }
+    if (instance == hero || remote::IsPuppet(instance) || instance == controlled) {
+        streamDiag.Candidate(Drop::Hero);
+        return nullptr;
+    }
+    if (npcremoval::Suppressed(instance)) { streamDiag.Candidate(Drop::Removed); return nullptr; }
+    guid::CopyEntity(instance, outGuid);
+    outKey = Key(outGuid);
+    if (npclease::SuppressHostPublication(outGuid)) { streamDiag.Candidate(Drop::Lease); return nullptr; }
+    const bCVector& w = instance->GetWorldPosition();
+    const float where[3] = {w.GetX(), w.GetY(), w.GetZ()};
+    const bool fromProcessing = frame.processedKeys.count(candidateKey) != 0;
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+        if (frame.recipientHere[id])
+            streamDiag.Reach(id, body::Distance(where, remotes[id].latest.position), fromProcessing,
+                             GetConfig().hostRoi, npcsend::InterestEnterCm);
+    SendNote& note = sendNotes[outKey];
+    note.at = net::Now();
+    if (journal::Pending(instance)) {
+        note.reason = "pending"; streamDiag.Candidate(Drop::Pending);
+        countSkipped(outKey, net::NpcSendDecision::SkippedIrrelevant); return nullptr;
+    }
+    if (mirrors.count(outKey)) {
+        note.reason = "mirror"; streamDiag.Candidate(Drop::Mirror);
+        countSkipped(outKey, net::NpcSendDecision::SkippedIrrelevant); return nullptr;
+    }
+    if (deadStays && !net::IsHost() && deadOnHost.count(outKey)) {
+        Entity corpse(instance);
+        KeepDead(corpse);
+        note.reason = "dead on host";
+        return nullptr;
+    }
+    const auto back = givenBack.find(outKey);
+    if (back != givenBack.end() && static_cast<int32_t>(net::Now() - back->second) < 0) {
+        note.reason = "givenback"; streamDiag.Candidate(Drop::GivenBack);
+        countSkipped(outKey, net::NpcSendDecision::SkippedIrrelevant); return nullptr;
+    }
+    outAt[0] = w.GetX(); outAt[1] = w.GetY(); outAt[2] = w.GetZ();
+    if (!CheckHostSendRange(instance, outKey, outAt, players, playerCount, note)) {
+        streamDiag.Candidate(Drop::Range);
+        countSkipped(outKey, net::NpcSendDecision::SkippedFar);
+        return nullptr;
+    }
+    return instance;
+}
+
 void SendNpcToRecipients(Entity& self, eCEntity* instance, eCEntity* hostFocus, eCEntity* hostTarget,
                          GuidKey const& key, uint8_t const guid[16], float const at[3], net::NpcRecord const& r,
                          std::vector<pose::Bone> const& bones, uint8_t poseFlags, bool posed, bool moving,

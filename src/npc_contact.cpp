@@ -698,7 +698,7 @@ void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
 
 void ReconcileMirrorAlive(GuidKey const& key, Mirror& m)
 {
-    m.replay.knockback = {};
+    npcplayback::ResetLocalHitState(m.replay);
     ResetMirrorIncomingContact(m);
     m.ragdollStarted = m.laid = m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
     m.deathImpulse = {};
