@@ -51,10 +51,10 @@ std::string StumbleMotion(char const* skeleton, char const* stance, uint8_t reac
     char const* dirTag = frontHit ? "_Back_" : "_Fwd_";
     char const* actionTag = reaction == net::HitQuickStumble ? "_QuickStumble_Hit_"
         : reaction == net::HitPierceStumble ? "_PierceStumble_Hit_"
-        : (leftFoot ? "_StumbleR_Hit_" : "_StumbleL_Hit_");
+        : (leftFoot ? "_StumbleL_Hit_" : "_StumbleR_Hit_");
     const std::string key = std::string(skeleton) + "_" + stance + actionTag + dirTag;
     if (auto it = stumbleFor.find(key); it != stumbleFor.end()) return it->second;
-    std::string bestExact, bestAction, bestStance, any;
+    std::string bestExact, bestStanceDir, bestDir, bestAction, bestStance, any;
     const std::string prefix = std::string(skeleton) + "_Stand_";
     for (auto const& [hash, name] : motionNames) {
         if (name.compare(0, prefix.size(), prefix) || name.find("Stumble") == std::string::npos || name.find("_Hit_") == std::string::npos) continue;
@@ -65,21 +65,29 @@ std::string StumbleMotion(char const* skeleton, char const* stance, uint8_t reac
             (reaction != net::HitQuickStumble && name.find("_Stumble") != std::string::npos && name.find("_QuickStumble_") == std::string::npos);
         const bool matchDir = name.find(dirTag) != std::string::npos;
         if (matchStance && bestStance.empty()) bestStance = name;
+        if (matchDir && bestDir.empty()) bestDir = name;
+        if (matchStance && matchDir && bestStanceDir.empty()) bestStanceDir = name;
         if (matchStance && matchAction && bestAction.empty()) bestAction = name;
         if (matchStance && matchAction && matchDir) { bestExact = name; break; }
     }
-    std::string chosen = !bestExact.empty() ? bestExact : !bestAction.empty() ? bestAction : !bestStance.empty() ? bestStance : any;
+    std::string chosen = !bestExact.empty() ? bestExact
+        : !bestStanceDir.empty() ? bestStanceDir
+        : !bestDir.empty() ? bestDir
+        : fallbackStumbles ? std::string()
+        : !bestAction.empty() ? bestAction
+        : !bestStance.empty() ? bestStance : any;
     if (chosen.empty() && fallbackStumbles) {
         char const* dirWord = frontHit ? "Back" : "Fwd";
         char const* stepWord = frontHit ? "90" : "200";
+        char const* sideWord = leftFoot ? "_P0_StumbleL_Hit_N_" : "_P0_StumbleR_Hit_N_";
         if (!std::strcmp(skeleton, "Hero") && (!*stance || !std::strcmp(stance, "None")))
-            chosen = std::string("Hero_Stand_None_None_P0_StumbleR_Hit_N_") + dirWord + "_00_%_00_P0_" + stepWord;
+            chosen = std::string("Hero_Stand_None_None") + sideWord + dirWord + "_00_%_00_P0_" + stepWord;
         else if (!std::strcmp(skeleton, "Hero") && reaction == net::HitQuickStumble)
             chosen = std::string("Hero_Stand_None_") + stance + "_P0_QuickStumble_Hit_N_" + dirWord + "_00_%_00_P0_90";
         else if (!std::strcmp(skeleton, "Hero"))
-            chosen = std::string("Hero_Stand_None_") + stance + (leftFoot ? "_P0_StumbleR_Hit_N_" : "_P0_StumbleL_Hit_N_") + dirWord + "_00_%_00_P0_" + stepWord;
+            chosen = std::string("Hero_Stand_None_") + stance + sideWord + dirWord + "_00_%_00_P0_" + stepWord;
         else
-            chosen = std::string(skeleton) + "_Stand_None_Fist_P0_StumbleR_Hit_N_" + dirWord + "_00_%_00_P0_200";
+            chosen = std::string(skeleton) + "_Stand_None_Fist" + sideWord + dirWord + "_00_%_00_P0_" + stepWord;
         return chosen;
     }
     if (const size_t dot = chosen.find(".xmot"); dot != std::string::npos) chosen.resize(dot);
@@ -128,7 +136,7 @@ void LocalHitWithSwing(eCEntity* entity, uint32_t sequence, uint32_t swing, uint
             const bool frontHit = npcplayback_hit_policy::FrontHitDirection(
                 forward.GetX(), forward.GetZ(),
                 attackerPos.GetX() - victimPos.GetX(), attackerPos.GetZ() - victimPos.GetZ());
-            const bool leftFoot = std::strstr(shown, "_L.") != nullptr;
+            const bool leftFoot = npcplayback_hit_policy::NativeStumbleLeftFoot(shown);
             motion = StumbleMotion(m.skeleton, stance, effectiveReaction, frontHit, leftFoot);
             if (!motion.empty() && motion.find(".xmot") == std::string::npos) motion += ".xmot";
             const bool quickUsed = motion.find("QuickStumble") != std::string::npos;
@@ -513,9 +521,7 @@ void OnHitResult(net::HitResult const& result)
     Mirror& m = found->second;
     if (static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
     if (!result.accepted) {
-        npcplayback::CancelLocalHit(m.replay, net::Now());
-        m.replay.pendingHit = 0;
-        m.replay.localMotion[0] = '\0';
+        npcplayback::CancelLocalHit(m.replay, net::Now(), m.entity.GetInstance());
         m.replay.initialized = false;
         Logf("npcs: host refused hit %u on %s; authoritative state retained", result.sequence, m.entity.GetName().GetText());
     } else if (result.incarnation == m.latest.incarnation) {

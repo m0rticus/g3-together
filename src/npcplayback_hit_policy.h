@@ -9,11 +9,17 @@
 
 namespace g3t::npcplayback_hit_policy {
 
-// Maximum bridge when a high-RTT host's Stumble_Hit is still in its early frames after the
-// local predicted Stumble_Hit clip has already finished. Prevents rewinding the stagger
-// without freezing the NPC across Stumble_Recover or multi-hundred-ms backlogs.
+// Maximum bridge when a high-RTT host's Stumble_Hit/Recover is still in its early frames after the
+// local predicted Stumble_Hit + Stumble_Recover sequence has finished. Prevents rewinding without
+// freezing the NPC across multi-hundred-ms backlogs.
 constexpr float MaxEchoBridgeSeconds = 0.15f;
 constexpr float HostTailHandoffPhase = 0.75f;
+constexpr float RecoverTailHandoffPhase = 0.55f;
+constexpr float HitEntryBlendSeconds = 0.065f;
+constexpr float HitRecoverBlendSeconds = 0.075f;
+constexpr float HitExitBlendSeconds = 0.120f;
+constexpr float KnockbackSettleSeconds = 0.160f;
+constexpr float KnockbackRefusedFadeSeconds = 0.120f;
 constexpr uint32_t PendingHitTimeoutMs = 2000u;
 constexpr int32_t HostHitStampMinHoldMs = 250;
 
@@ -24,11 +30,141 @@ constexpr uint8_t ReactionStumble = 2;
 constexpr uint8_t ReactionPierceStumble = 3;
 constexpr uint8_t ReactionSitKnockDown = 4;
 
-// Only the initial hit-impact stumble duplicates LocalHit's predicted Stumble_Hit clip.
-// Stumble_Recover is the recovery animation out of recoil and must play normally.
+// Matches CP 1.75 GameEnum.h values (static_assert-verified in npcplayback_hit.cpp).
+constexpr int SpeciesOrc = 5;
+constexpr int UseNone = 0;
+constexpr int Use1H = 2;
+constexpr int UseShield = 9;
+constexpr int UseTorch = 24;
+constexpr int PoseNone = 0;
+constexpr int PoseP0 = 1;
+constexpr int PoseP1 = 2;
+constexpr int PoseP2 = 3;
+constexpr int PoseP3 = 4;
+
+// Initial hit-impact stumble clip (excludes Stumble_Recover).
 inline bool HitImpactMotion(char const* name)
 {
     return name && std::strstr(name, "Stumble") && !std::strstr(name, "_Recover_");
+}
+
+// Recovery clip chained immediately after Stumble_Hit by Game.dll sAICombatMoveStartRecover (0x1016e360).
+inline bool HitRecoverMotion(char const* name)
+{
+    return name && std::strstr(name, "Stumble") && std::strstr(name, "_Recover_") != nullptr;
+}
+
+// Matches any stumble sequence clip (both Hit and Recover phases) for echo and effect suppression.
+inline bool HitStumbleSequenceMotion(char const* name)
+{
+    return name && std::strstr(name, "Stumble") != nullptr;
+}
+
+// Matches CP 1.75 Script_Game.dll _AI_Stumble (0x1004aaf0) and _AI_QuickStumble (0x100489c0):
+// Contains(currentMovementAni, "_L.") selects gEAction_StumbleL (28); otherwise gEAction_StumbleR (27).
+inline bool NativeStumbleLeftFoot(char const* currentMotion)
+{
+    return currentMotion && std::strstr(currentMotion, "_L.") != nullptr;
+}
+
+// Matches CP 1.75 Script_Game.dll _AI_QuickStumble (0x100489c0, 0x10048b08..0x10048b5d):
+// QuickStumble (0x19) is used only for Orcs or 1H + {None, Shield, Torch}; all other stances
+// (2H, Staff, Polearm, Bow, CrossBow, Fist, Dual) fall through to StumbleL/StumbleR at 1.3x.
+inline bool NativeQuickStumbleAllowed(int species, int rightUse, int leftUse)
+{
+    if (species == SpeciesOrc) return true;
+    return rightUse == Use1H && (leftUse == UseNone || leftUse == UseShield || leftUse == UseTorch);
+}
+
+// Extracts token 4 primary pose (P0..P3 -> 1..4) from a Gothic 3 .xmot filename so passive mirrors
+// resolve the exact same P0/P1 stumble variant as the host.
+inline int ParseMotionPrimaryPose(char const* motionName)
+{
+    if (!motionName || !*motionName) return PoseNone;
+    char const* base = motionName;
+    for (char const* p = motionName; *p; ++p) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    int token = 0;
+    char const* tokenStart = base;
+    for (char const* p = base;; ++p) {
+        if (*p == '_' || *p == '.' || *p == '\0') {
+            if (token == 4 && (p - tokenStart) == 2 && tokenStart[0] == 'P' &&
+                tokenStart[1] >= '0' && tokenStart[1] <= '3') {
+                return PoseP0 + (tokenStart[1] - '0');
+            }
+            if (*p != '_') break;
+            ++token;
+            tokenStart = p + 1;
+        }
+    }
+    return PoseNone;
+}
+
+// Builds the native 10-token gEPhase_Recover GetAniName stem (ending in '_00_') from a resolved Hit .xmot name,
+// matching Game.dll sAICombatMoveStartRecover (0x1016e360) + GetAniName (0x1016f840): replaces token 6 ("Hit")
+// with "Recover" and updates token 4 (entry PrimaryPose) to the Hit clip's exit pose token (hitIdx + 6, e.g. P0 -> P1).
+inline bool BuildRecoverStemFromHitMotion(char const* hitMotion, char* outStem, std::size_t outCap,
+                                          bool useExitPose = true)
+{
+    if (!outStem || outCap == 0) return false;
+    outStem[0] = '\0';
+    if (!hitMotion || !*hitMotion) return false;
+    char const* base = hitMotion;
+    for (char const* p = hitMotion; *p; ++p) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    struct Span { char const* s; std::size_t n; };
+    Span tokens[20] = {};
+    int count = 0;
+    char const* end = base;
+    while (*end) ++end;
+    if (end - base >= 5 && std::memcmp(end - 5, ".xmot", 5) == 0) end -= 5;
+    char const* start = base;
+    for (char const* p = base; p <= end && count < 20; ++p) {
+        if (p == end || *p == '_') {
+            tokens[count++] = {start, static_cast<std::size_t>(p - start)};
+            start = p + 1;
+        }
+    }
+    int hitIdx = -1;
+    for (int i = 4; i < count; ++i) {
+        if (tokens[i].n == 3 && std::memcmp(tokens[i].s, "Hit", 3) == 0) { hitIdx = i; break; }
+    }
+    if (hitIdx < 0) return false;
+    // Native GetAniName stem has 4 tokens after Hit: <Action>_Recover_<N|O>_<Dir>_<00>_
+    const int stemCount = (hitIdx + 4 <= count) ? (hitIdx + 4) : count;
+    char dualExitBuf[2] = {'P', '0'};
+    Span exitPose = {nullptr, 0};
+    const int exitIdx = hitIdx + 6;
+    if (useExitPose && exitIdx < count && tokens[exitIdx].s[0] == 'P') {
+        if (tokens[exitIdx].n == 2 && tokens[exitIdx].s[1] >= '0' && tokens[exitIdx].s[1] <= '3') {
+            exitPose = tokens[exitIdx];
+        } else if (tokens[exitIdx].n == 3 && tokens[exitIdx].s[1] >= '0' && tokens[exitIdx].s[1] <= '3' &&
+                   tokens[exitIdx].s[2] >= '0' && tokens[exitIdx].s[2] <= '3') {
+            const char entryDigit = (4 < count && tokens[4].n == 2 && tokens[4].s[0] == 'P') ? tokens[4].s[1] : '\0';
+            dualExitBuf[1] = (tokens[exitIdx].s[1] != entryDigit) ? tokens[exitIdx].s[1] : tokens[exitIdx].s[2];
+            exitPose = {dualExitBuf, 2};
+        }
+    }
+    std::size_t pos = 0;
+    for (int i = 0; i < stemCount; ++i) {
+        char const* src = tokens[i].s;
+        std::size_t len = tokens[i].n;
+        if (i == hitIdx) {
+            src = "Recover";
+            len = 7;
+        } else if (i == 4 && exitPose.s && len >= 2 && src[0] == 'P') {
+            src = exitPose.s;
+            len = exitPose.n;
+        }
+        if (pos + len + 2 > outCap) { outStem[0] = '\0'; return false; }
+        if (len) std::memcpy(outStem + pos, src, len);
+        pos += len;
+        outStem[pos++] = '_';
+    }
+    outStem[pos] = '\0';
+    return pos > 0;
 }
 
 // Suppresses own-hit stumble echoes across back-to-back combo hits even after acknowledgedHit advances to hit #2.
@@ -46,14 +182,57 @@ inline bool LocalStaggerActive(bool hasLocalMotion, float localAgeSeconds, float
            localAgeSeconds >= 0.0f && localAgeSeconds < localDurationSeconds;
 }
 
+enum class LocalStumbleStage : uint8_t {
+    None = 0,
+    Hit = 1,
+    Recover = 2,
+};
+
+struct LocalStumbleStep {
+    LocalStumbleStage stage = LocalStumbleStage::None;
+    float phase = 0.0f;
+    float totalDurationSec = 0.0f;
+};
+
+// Evaluates the chained local Hit -> Recover animation timeline matching Game.dll
+// sAICombatMoveInstr (0x101696e0) -> sAICombatMoveStartRecover (0x1016e360).
+inline LocalStumbleStep EvaluateLocalStumbleTimeline(bool hasHitMotion, bool hasRecoverMotion,
+                                                     float localAgeSec, float hitDurationSec,
+                                                     float recoverDurationSec,
+                                                     bool hostInterruptingNonStumble = false)
+{
+    LocalStumbleStep out;
+    if (!hasHitMotion || !(hitDurationSec > 0.0f) || localAgeSec < 0.0f) return out;
+    const float recoverSec = (hasRecoverMotion && recoverDurationSec > 0.01f) ? recoverDurationSec : 0.0f;
+    out.totalDurationSec = hitDurationSec + recoverSec;
+    if (localAgeSec < hitDurationSec) {
+        out.stage = LocalStumbleStage::Hit;
+        out.phase = std::clamp(localAgeSec / hitDurationSec, 0.0f, 1.0f);
+        return out;
+    }
+    if (recoverSec > 0.0f && localAgeSec < out.totalDurationSec) {
+        if (hostInterruptingNonStumble) {
+            out.phase = 1.0f;
+            return out;
+        }
+        const float recoverAge = localAgeSec - hitDurationSec;
+        out.stage = LocalStumbleStage::Recover;
+        out.phase = std::clamp(recoverAge / recoverSec, 0.0f, 1.0f);
+        return out;
+    }
+    out.phase = 1.0f;
+    return out;
+}
+
 inline bool HoldSuppressedImpact(bool localActive, bool hasLocalMotion, bool suppressedSlot0,
                                  float localAgeSeconds, float localDurationSeconds,
-                                 bool haveHostPose, float hostPhase)
+                                 bool haveHostPose, float hostPhase, bool hostInRecover = false)
 {
     if (localActive || !hasLocalMotion || !suppressedSlot0) return false;
     const float overtime = localAgeSeconds - localDurationSeconds;
     if (overtime >= MaxEchoBridgeSeconds) return false;
-    if (haveHostPose && hostPhase >= HostTailHandoffPhase) return false;
+    const float tailPhase = hostInRecover ? RecoverTailHandoffPhase : HostTailHandoffPhase;
+    if (haveHostPose && hostPhase >= tailPhase) return false;
     return true;
 }
 
@@ -154,23 +333,39 @@ inline float SmoothStep01(float t)
     return x * x * (3.0f - 2.0f * x);
 }
 
-// Phase-canceling knockback lead compensator:
-// Advances the mirror immediately over [0, durationSec] by stepCm along dirXZ while subtracting
-// the exact fraction already present in the buffered host snapshot (hostProgress), so the NPC
-// steps back crisply on impact and holds steady without double-stepping or sliding away late.
+inline float PoseBlendAlpha(bool active, uint32_t startedAtMs, uint32_t nowMs, float durationSec)
+{
+    if (!active || !(durationSec > 0.001f)) return 1.0f;
+    const float elapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - startedAtMs)) / 1000.0f);
+    if (elapsedSec >= durationSec) return 1.0f;
+    return SmoothStep01(elapsedSec / durationSec);
+}
+
+// World-anchored 1x knockback trajectory matching CP 1.75 Game.dll sAICombatMoveStart (0x1016abb0):
+// Translates linearly from anchorPos to goalPos = anchorPos + dirXZ * stepCm over [0, hitDurationSec],
+// holds planted at goalPos during Stumble_Recover (zero native velocity in sAICombatMoveStartRecover),
+// and smoothly reconverges to authoritative basePos once the buffered host snapshot completes Hit.
+// Because the trajectory is anchored in world space rather than added on top of basePos, buffered
+// host position updates and back-to-back combo hits never stack beyond exact 1.0x native displacement.
 struct HitKnockbackState {
     bool active = false;
     bool refused = false;
+    bool settling = false;
+    bool hasPresentedPos = false;
     bool hostImpactSeen = false;
     bool hostImpactDone = false;
     uint16_t hitSequence = 0;
     uint32_t startedAtMs = 0;
-    uint32_t refusedAtMs = 0;
-    float durationSec = 0.0f;
+    uint32_t settleStartMs = 0;
+    float hitDurationSec = 0.0f;
+    float recoverDurationSec = 0.0f;
     float dirXZ[2] = {};
     float stepCm = 0.0f;
     float groundDeltaY = 0.0f;
-    float carryOffset[3] = {};
+    float anchorPos[3] = {};
+    float goalPos[3] = {};
+    float settleOriginPos[3] = {};
+    float lastPresentedPos[3] = {};
     float currentOffset[3] = {};
 };
 
@@ -180,54 +375,68 @@ inline bool KnockbackMatchesHostRecord(HitKnockbackState const& kb, uint16_t ack
            recordHitSequence == kb.hitSequence;
 }
 
-inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint32_t nowMs, float durationSec,
-                              float const dirXZ[2], float stepCm, float groundDeltaY = 0.0f)
+inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint32_t nowMs,
+                              float hitDurationSec, float recoverDurationSec,
+                              float const anchorPos[3], float const dirXZ[2],
+                              float stepCm, float groundDeltaY = 0.0f)
 {
-    const float carry[3] = {
-        kb.active ? kb.currentOffset[0] : 0.0f,
-        kb.active ? kb.currentOffset[1] : 0.0f,
-        kb.active ? kb.currentOffset[2] : 0.0f,
-    };
-    const bool hasCarry = (carry[0] * carry[0] + carry[1] * carry[1] + carry[2] * carry[2]) > 0.25f;
+    float startWorld[3] = {};
+    if (anchorPos) {
+        startWorld[0] = anchorPos[0];
+        startWorld[1] = anchorPos[1];
+        startWorld[2] = anchorPos[2];
+    } else if (kb.hasPresentedPos) {
+        startWorld[0] = kb.lastPresentedPos[0];
+        startWorld[1] = kb.lastPresentedPos[1];
+        startWorld[2] = kb.lastPresentedPos[2];
+    }
     kb = HitKnockbackState{};
-    kb.carryOffset[0] = carry[0];
-    kb.carryOffset[1] = carry[1];
-    kb.carryOffset[2] = carry[2];
-    kb.currentOffset[0] = carry[0];
-    kb.currentOffset[1] = carry[1];
-    kb.currentOffset[2] = carry[2];
     kb.hitSequence = hitSequence;
     kb.startedAtMs = nowMs;
-    kb.durationSec = std::max(0.0f, durationSec);
-    if (dirXZ && stepCm > 0.5f && kb.durationSec > 0.01f) {
+    kb.hitDurationSec = std::max(0.0f, hitDurationSec);
+    kb.recoverDurationSec = std::max(0.0f, recoverDurationSec);
+    kb.anchorPos[0] = kb.goalPos[0] = kb.lastPresentedPos[0] = startWorld[0];
+    kb.anchorPos[1] = kb.goalPos[1] = kb.lastPresentedPos[1] = startWorld[1];
+    kb.anchorPos[2] = kb.goalPos[2] = kb.lastPresentedPos[2] = startWorld[2];
+    kb.hasPresentedPos = true;
+    if (dirXZ && stepCm > 0.5f && kb.hitDurationSec > 0.01f) {
         kb.dirXZ[0] = dirXZ[0];
         kb.dirXZ[1] = dirXZ[1];
         kb.stepCm = stepCm;
         kb.groundDeltaY = groundDeltaY;
+        kb.goalPos[0] = startWorld[0] + dirXZ[0] * stepCm;
+        kb.goalPos[1] = startWorld[1] + groundDeltaY;
+        kb.goalPos[2] = startWorld[2] + dirXZ[1] * stepCm;
+        kb.active = true;
     }
-    kb.active = (kb.stepCm > 0.5f && kb.durationSec > 0.01f) || hasCarry;
 }
 
 inline void CancelHitKnockback(HitKnockbackState& kb, uint32_t nowMs)
 {
     if (!kb.active) return;
-    kb.carryOffset[0] = kb.currentOffset[0];
-    kb.carryOffset[1] = kb.currentOffset[1];
-    kb.carryOffset[2] = kb.currentOffset[2];
+    kb.settleOriginPos[0] = kb.hasPresentedPos ? kb.lastPresentedPos[0] : kb.anchorPos[0];
+    kb.settleOriginPos[1] = kb.hasPresentedPos ? kb.lastPresentedPos[1] : kb.anchorPos[1];
+    kb.settleOriginPos[2] = kb.hasPresentedPos ? kb.lastPresentedPos[2] : kb.anchorPos[2];
     kb.stepCm = 0.0f;
     kb.groundDeltaY = 0.0f;
     kb.refused = true;
-    kb.refusedAtMs = nowMs;
+    kb.settling = true;
+    kb.settleStartMs = nowMs;
 }
 
 inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t recordSentMs, uint32_t acknowledgedAtMs,
-                                bool ownImpactEcho, float hostMotionPhase, bool incapacitated,
+                                bool ownImpactEcho, bool ownRecoverEcho, float hostMotionPhase, bool incapacitated,
                                 float const basePos[3], float outPos[3])
 {
+    (void)hostMotionPhase;
     outPos[0] = basePos[0];
     outPos[1] = basePos[1];
     outPos[2] = basePos[2];
     if (!kb.active) {
+        kb.lastPresentedPos[0] = basePos[0];
+        kb.lastPresentedPos[1] = basePos[1];
+        kb.lastPresentedPos[2] = basePos[2];
+        kb.hasPresentedPos = true;
         kb.currentOffset[0] = kb.currentOffset[1] = kb.currentOffset[2] = 0.0f;
         return false;
     }
@@ -235,70 +444,94 @@ inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t 
         kb = HitKnockbackState{};
         return false;
     }
-    constexpr float CarryFadeSec = 0.12f;
-    const uint32_t carryOrigin = kb.refused ? kb.refusedAtMs : kb.startedAtMs;
-    const float carryAge = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - carryOrigin)) / 1000.0f);
-    const float carryScale = carryAge >= CarryFadeSec ? 0.0f : (1.0f - SmoothStep01(carryAge / CarryFadeSec));
+    float const* refPos = kb.settling ? kb.settleOriginPos : kb.goalPos;
+    const float jumpDx = basePos[0] - refPos[0];
+    const float jumpDz = basePos[2] - refPos[2];
+    const float maxAllowedSpan = kb.stepCm + 260.0f;
+    if ((jumpDx * jumpDx + jumpDz * jumpDz) > maxAllowedSpan * maxAllowedSpan) {
+        kb = HitKnockbackState{};
+        kb.lastPresentedPos[0] = basePos[0];
+        kb.lastPresentedPos[1] = basePos[1];
+        kb.lastPresentedPos[2] = basePos[2];
+        kb.hasPresentedPos = true;
+        return false;
+    }
+
     if (kb.refused) {
-        kb.currentOffset[0] = kb.carryOffset[0] * carryScale;
-        kb.currentOffset[1] = kb.carryOffset[1] * carryScale;
-        kb.currentOffset[2] = kb.carryOffset[2] * carryScale;
-        if (carryScale <= 0.001f) {
+        const float ageSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.settleStartMs)) / 1000.0f);
+        const float s = SmoothStep01(ageSec / KnockbackRefusedFadeSeconds);
+        if (s >= 0.999f) {
             kb = HitKnockbackState{};
+            kb.lastPresentedPos[0] = basePos[0];
+            kb.lastPresentedPos[1] = basePos[1];
+            kb.lastPresentedPos[2] = basePos[2];
+            kb.hasPresentedPos = true;
             return false;
         }
-        outPos[0] += kb.currentOffset[0];
-        outPos[1] += kb.currentOffset[1];
-        outPos[2] += kb.currentOffset[2];
+        for (int k = 0; k < 3; ++k) {
+            outPos[k] = kb.settleOriginPos[k] + (basePos[k] - kb.settleOriginPos[k]) * s;
+            kb.lastPresentedPos[k] = outPos[k];
+            kb.currentOffset[k] = outPos[k] - basePos[k];
+        }
+        kb.hasPresentedPos = true;
         return true;
     }
 
-    const float elapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.startedAtMs)) / 1000.0f);
-    const float localProgress = kb.durationSec > 0.01f ? std::clamp(elapsedSec / kb.durationSec, 0.0f, 1.0f) : 0.0f;
-
-    float hostProgress = 0.0f;
     if (ownImpactEcho) {
         kb.hostImpactSeen = true;
-        hostProgress = std::clamp(hostMotionPhase, 0.0f, 1.0f);
-    } else if (kb.hostImpactSeen) {
+    } else if (ownRecoverEcho || kb.hostImpactSeen) {
         kb.hostImpactDone = true;
-        hostProgress = 1.0f;
     } else if (acknowledgedAtMs != 0) {
-        // Native ZS_Stumble starts sAICombatMoveStart on the host frame following OnHitNpc.
+        // Native ZS_Stumble starts sAICombatMoveStart on the host frame after OnHitNpc and finishes after hitDurationSec.
         const int32_t hostAfterAckMs = static_cast<int32_t>(recordSentMs - acknowledgedAtMs) - 16;
-        if (hostAfterAckMs > 0) {
-            hostProgress = kb.durationSec > 0.01f
-                ? std::clamp((static_cast<float>(hostAfterAckMs) / 1000.0f) / kb.durationSec, 0.0f, 1.0f)
-                : 1.0f;
-            if (hostProgress >= 1.0f) kb.hostImpactDone = true;
+        const int32_t hitMs = static_cast<int32_t>(kb.hitDurationSec * 1000.0f) + 16;
+        if (hostAfterAckMs >= hitMs) kb.hostImpactDone = true;
+    }
+
+    const float elapsedSec = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.startedAtMs)) / 1000.0f);
+    const float localProgress = kb.hitDurationSec > 0.01f ? std::clamp(elapsedSec / kb.hitDurationSec, 0.0f, 1.0f) : 1.0f;
+    float targetPos[3] = {
+        kb.anchorPos[0] + (kb.goalPos[0] - kb.anchorPos[0]) * localProgress,
+        kb.anchorPos[1] + (kb.goalPos[1] - kb.anchorPos[1]) * localProgress,
+        kb.anchorPos[2] + (kb.goalPos[2] - kb.anchorPos[2]) * localProgress,
+    };
+
+    if (localProgress >= 1.0f && !kb.settling) {
+        const float unackHoldLimit = kb.hitDurationSec + 0.25f;
+        const float ackHoldLimit = kb.hitDurationSec + std::max(kb.recoverDurationSec, 0.28f) + 0.20f;
+        const bool unackExpired = !acknowledgedAtMs && !kb.hostImpactSeen && elapsedSec >= unackHoldLimit;
+        if (kb.hostImpactDone || unackExpired || elapsedSec >= ackHoldLimit) {
+            kb.settling = true;
+            kb.settleStartMs = nowMs;
+            kb.settleOriginPos[0] = targetPos[0];
+            kb.settleOriginPos[1] = targetPos[1];
+            kb.settleOriginPos[2] = targetPos[2];
         }
     }
 
-    float lead = std::max(0.0f, localProgress - hostProgress);
-    if (!acknowledgedAtMs && !kb.hostImpactSeen) {
-        const float holdLimit = kb.durationSec + 0.25f;
-        if (elapsedSec > holdLimit) {
-            const float fade = 1.0f - SmoothStep01((elapsedSec - holdLimit) / 0.18f);
-            lead *= fade;
-            if (fade <= 0.001f) kb.hostImpactDone = true;
+    if (kb.settling) {
+        const float settleAge = std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - kb.settleStartMs)) / 1000.0f);
+        const float s = SmoothStep01(settleAge / KnockbackSettleSeconds);
+        if (s >= 0.999f) {
+            kb = HitKnockbackState{};
+            kb.lastPresentedPos[0] = basePos[0];
+            kb.lastPresentedPos[1] = basePos[1];
+            kb.lastPresentedPos[2] = basePos[2];
+            kb.hasPresentedPos = true;
+            return false;
         }
-    } else if (elapsedSec > kb.durationSec + 0.80f) {
-        const float fade = 1.0f - SmoothStep01((elapsedSec - (kb.durationSec + 0.80f)) / 0.15f);
-        lead *= fade;
-        if (fade <= 0.001f) kb.hostImpactDone = true;
+        for (int k = 0; k < 3; ++k) outPos[k] = kb.settleOriginPos[k] + (basePos[k] - kb.settleOriginPos[k]) * s;
+    } else {
+        outPos[0] = targetPos[0];
+        outPos[1] = targetPos[1];
+        outPos[2] = targetPos[2];
     }
 
-    kb.currentOffset[0] = kb.carryOffset[0] * carryScale + kb.dirXZ[0] * (kb.stepCm * lead);
-    kb.currentOffset[1] = kb.carryOffset[1] * carryScale + kb.groundDeltaY * lead;
-    kb.currentOffset[2] = kb.carryOffset[2] * carryScale + kb.dirXZ[1] * (kb.stepCm * lead);
-
-    if ((kb.hostImpactDone || lead <= 0.0005f) && localProgress >= 1.0f && carryScale <= 0.0005f) {
-        kb = HitKnockbackState{};
-        return false;
+    for (int k = 0; k < 3; ++k) {
+        kb.lastPresentedPos[k] = outPos[k];
+        kb.currentOffset[k] = outPos[k] - basePos[k];
     }
-    outPos[0] += kb.currentOffset[0];
-    outPos[1] += kb.currentOffset[1];
-    outPos[2] += kb.currentOffset[2];
+    kb.hasPresentedPos = true;
     return true;
 }
 

@@ -212,7 +212,7 @@ bool PreparePose(eCEntity* entity, eCVisualAnimation_PS& animation, State& state
 
 bool ReactionMotion(char const* name)
 {
-    return name && std::strstr(name, "Stumble");
+    return npcplayback_hit_policy::HitImpactMotion(name);
 }
 
 GuidKey EntityKey(eCEntity const* entity)
@@ -448,30 +448,9 @@ bool CosmeticHit(eCEntity* entity, uint32_t swing)
 bool LocalHit(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options, uint32_t hit, uint32_t now,
               float playSpeed, eCEntity const* attacker, uint8_t reaction)
 {
-    if (!entity || !motion || !*motion || !hit || !options.active || !IsPassive(entity)) return false;
-    auto* animation = Animation(entity);
-    auto* actor = animation ? animation->GetActor() : nullptr;
-    if (!actor) { Log("npcplayback: local hit has no presentation actor"); return false; }
-    PresentationScope scope;
-    net::NpcMotion local = options;
-    local.active = 3;
-    local.phase = 0.0f;
-    local.weight = 1.0f;
-    if (!PresentMotion(*animation, *actor, 0, motion, local, true)) return false;
-    const float clipDuration = static_cast<float>(actor->GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
-    const float effectiveSpeed = (playSpeed > 0.05f && std::isfinite(playSpeed)) ? playSpeed : 1.0f;
-    state.pendingHit = static_cast<uint16_t>(hit);
-    state.acknowledgedAt = 0;
-    state.localStart = now;
-    state.localPlaySpeed = effectiveSpeed;
-    state.localReaction = reaction;
-    state.localDuration = clipDuration / effectiveSpeed;
-    state.localOptions = options;
-    strcpy_s(state.localMotion, motion);
-    const float stepCm = detail::StartLocalHitKnockback(entity, attacker, state, motion, hit, now);
+    if (!detail::StartLocalHitPresentation(entity, state, motion, options, hit, now, playSpeed, attacker, reaction))
+        return false;
     ++predictedHits;
-    Logf("combat: NPCHITSYNC stage=predict-start npc=%s hit=%u reaction=%u motion=%s duration_ms=%.0f speed=%.2f step_cm=%.0f",
-         entity->GetName().GetText(), hit, reaction, motion, state.localDuration * 1000.0f, state.localPlaySpeed, stepCm);
     return true;
 }
 
@@ -489,7 +468,11 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         state = State{};
         state.incarnation = record.incarnation;
     }
-    if (record.flags & 3) { state.pendingHit = 0; *state.localMotion = '\0'; state.knockback = {}; }
+    if (record.flags & 3) {
+        state.pendingHit = 0; state.localInRecover = false;
+        *state.localMotion = '\0'; *state.localRecoverMotion = '\0';
+        state.poseBlend.active = false; state.knockback = {};
+    }
     const bool acknowledged = state.pendingHit && record.hitPlayer == net::LocalId() &&
                               static_cast<int16_t>(record.hitSequence - state.pendingHit) >= 0;
     if (acknowledged) {
@@ -504,28 +487,54 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     if (npcplayback_hit_policy::PendingHitExpired(state.pendingHit, state.localStart, now))
         state.pendingHit = 0;
     const float localAge = static_cast<float>(now - state.localStart) / 1000.0f;
-    const bool local = npcplayback_hit_policy::LocalStaggerActive(*state.localMotion != '\0', localAge, state.localDuration);
     char const* firstName = record.motions[0].active ? names(record.motions[0].name) : nullptr;
     const bool ownSequenceSeen = record.hitPlayer == net::LocalId() &&
         npcplayback_hit_policy::OwnImpactSequenceSeen(state.acknowledgedHit, record.hitSequence);
     const bool slot0OwnImpactEcho = record.motions[0].active && ownSequenceSeen &&
         npcplayback_hit_policy::HitImpactMotion(firstName);
+    const bool slot0OwnRecoverEcho = record.motions[0].active && ownSequenceSeen &&
+        npcplayback_hit_policy::HitRecoverMotion(firstName);
+    const bool slot0OwnStumbleEcho = slot0OwnImpactEcho || slot0OwnRecoverEcho;
+    const bool hostInterruptingNonStumble = ownSequenceSeen && state.knockback.hostImpactDone &&
+        firstName && !npcplayback_hit_policy::HitStumbleSequenceMotion(firstName);
+    const auto localStep = npcplayback_hit_policy::EvaluateLocalStumbleTimeline(
+        *state.localMotion != '\0', *state.localRecoverMotion != '\0', localAge,
+        state.localDuration, state.localRecoverDuration, hostInterruptingNonStumble);
+    const bool local = npcplayback_hit_policy::LocalStaggerActive(
+        *state.localMotion != '\0', localAge, localStep.totalDurationSec) &&
+        localStep.stage != npcplayback_hit_policy::LocalStumbleStage::None;
     const bool firstSuppressed = record.motions[0].active &&
-        (state.suppressed[0] == record.motions[0].instance || slot0OwnImpactEcho);
+        (state.suppressed[0] == record.motions[0].instance || slot0OwnStumbleEcho);
     NativePose hostPose;
     const bool havePose = PreparePose(entity, *animation, state, record, names, hostPose);
     const float hostFirstPhase = record.motions[0].active ? record.motions[0].phase : 0.0f;
     const uint32_t knockbackAckAt = state.acknowledgedHit == state.knockback.hitSequence ? state.acknowledgedAt : 0;
-    const bool knockbackOwnEcho = slot0OwnImpactEcho &&
+    const bool matchKnockback =
         npcplayback_hit_policy::KnockbackMatchesHostRecord(state.knockback, state.acknowledgedHit, record.hitSequence);
     float presentedPosition[3] = {record.position[0], record.position[1], record.position[2]};
     npcplayback_hit_policy::AdvanceHitKnockback(
-        state.knockback, now, record.sent, knockbackAckAt, knockbackOwnEcho, hostFirstPhase,
+        state.knockback, now, record.sent, knockbackAckAt,
+        slot0OwnImpactEcho && matchKnockback, slot0OwnRecoverEcho && matchKnockback, hostFirstPhase,
         (record.flags & 3) != 0, record.position, presentedPosition);
     const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
-        local, *state.localMotion != '\0', firstSuppressed, localAge, state.localDuration, havePose, hostFirstPhase);
-    const bool expectedEcho = holdEcho;
+        local, *state.localMotion != '\0', firstSuppressed, localAge, localStep.totalDurationSec,
+        havePose, hostFirstPhase, slot0OwnRecoverEcho);
+    if (local && localStep.stage == npcplayback_hit_policy::LocalStumbleStage::Recover && !state.localInRecover) {
+        if (state.initialized)
+            detail::CaptureEntityPoseBlend(entity, state, now, npcplayback_hit_policy::HitRecoverBlendSeconds);
+        state.localInRecover = true;
+        Logf("combat: NPCHITSYNC stage=recover-start npc=%s hit=%u motion=%s recover_ms=%.0f",
+             entity->GetName().GetText(), state.acknowledgedHit ? state.acknowledgedHit : state.pendingHit,
+             state.localRecoverMotion, state.localRecoverDuration * 1000.0f);
+    }
+    char const* activeLocalClip =
+        (localStep.stage == npcplayback_hit_policy::LocalStumbleStage::Recover ||
+         (!local && *state.localRecoverMotion != '\0'))
+            ? state.localRecoverMotion
+            : state.localMotion;
     if (!local && !holdEcho && *state.localMotion) {
+        if (state.initialized)
+            detail::CaptureEntityPoseBlend(entity, state, now, npcplayback_hit_policy::HitExitBlendSeconds);
         if (firstSuppressed && state.suppressed[0] == record.motions[0].instance)
             state.suppressed[0] = 0;
         char const* mode = firstSuppressed ? "host-pose-tail"
@@ -534,11 +543,14 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         Logf("combat: NPCHITSYNC stage=handoff npc=%s hit=%u mode=%s local_age_ms=%.0f local_duration_ms=%.0f "
              "host_motion=%s host_phase=%.3f lead_cm=%.1f",
              entity->GetName().GetText(), state.acknowledgedHit ? state.acknowledgedHit : state.pendingHit, mode,
-             localAge * 1000.0f, state.localDuration * 1000.0f, firstName ? firstName : "(none)", hostFirstPhase, leadCm);
+             localAge * 1000.0f, localStep.totalDurationSec * 1000.0f, firstName ? firstName : "(none)",
+             hostFirstPhase, leadCm);
         *state.localMotion = '\0';
+        *state.localRecoverMotion = '\0';
+        state.localInRecover = false;
     }
     bool echo = false;
-    if (!local && !expectedEcho && !havePose) return false;
+    if (!local && !holdEcho && !havePose) return false;
     const bCMatrix pose = body::Pose(*entity, presentedPosition, record.rotation);
     entity->SetToWorldMatrix(pose);
     if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
@@ -555,7 +567,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         auto const& motion = record.motions[i];
         char const* name = motion.active ? names(motion.name) : nullptr;
         const bool ownImpactEcho = motion.active && ownSequenceSeen &&
-            npcplayback_hit_policy::HitImpactMotion(name);
+            npcplayback_hit_policy::HitStumbleSequenceMotion(name);
         if (ownImpactEcho) state.effects[i] = motion.instance;
         if ((local || holdEcho) && ownImpactEcho && state.suppressed[i] != motion.instance) {
             state.suppressed[i] = motion.instance;
@@ -564,20 +576,24 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         if (local) {
             if (i == 0) {
                 net::NpcMotion overlay = state.localOptions;
-                overlay.phase = state.localDuration > 0.0f ? std::min(localAge / state.localDuration, 1.0f) : 1.0f;
+                overlay.phase = localStep.phase;
                 overlay.weight = 1.0f;
-                if (!PresentMotion(*animation, *actor, i, state.localMotion, overlay, false)) return false;
+                const bool changedLocal =
+                    std::strcmp(activeLocalClip, animation->GetMotionDesc(slot).GetMotionFilename().GetText()) != 0;
+                if (!PresentMotion(*animation, *actor, i, activeLocalClip, overlay, changedLocal)) return false;
             } else if (actor->HasMotionInstance(slot)) {
                 animation->StopMotion(slot, 0.0f);
             }
             state.instances[i] = 0;
             continue;
         }
-        if (holdEcho && motion.active && state.suppressed[i] == motion.instance && i == 0 && *state.localMotion) {
+        if (holdEcho && motion.active && state.suppressed[i] == motion.instance && i == 0 && *activeLocalClip) {
             net::NpcMotion overlay = state.localOptions;
             overlay.phase = 1.0f;
             overlay.weight = 1.0f;
-            if (!PresentMotion(*animation, *actor, i, state.localMotion, overlay, false)) return false;
+            const bool changedLocal =
+                std::strcmp(activeLocalClip, animation->GetMotionDesc(slot).GetMotionFilename().GetText()) != 0;
+            if (!PresentMotion(*animation, *actor, i, activeLocalClip, overlay, changedLocal)) return false;
             echo = true;
             continue;
         }
@@ -605,18 +621,23 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         }
         state.instances[i] = motion.instance;
     }
-    if (!local && !echo) *state.localMotion = '\0';
+    if (!local && !echo) {
+        *state.localMotion = '\0';
+        *state.localRecoverMotion = '\0';
+        state.localInRecover = false;
+    }
     state.initialized = true;
     ++presentedFrames;
     if (!local && !echo && !havePose) return false;
-    NativePoseScope poseScope(local || echo ? nullptr : &hostPose);
-    UpdatePresentation(entity);
     if (!local && !echo) {
+        const bool crossfadingExit = detail::ApplyPoseBlend(state, hostPose, now);
+        NativePoseScope poseScope(&hostPose);
+        UpdatePresentation(entity);
         if (!hostPose.evaluated || !hostPose.applied || !hostPose.valid) {
             Log("npcplayback: canonical skeletal evaluation failed; contacts disabled");
             return false;
         }
-        if (!FullPose(hostPose) || !RememberPose(entity, npclease::PoseProvenance::Canonical)) {
+        if (!crossfadingExit && (!FullPose(hostPose) || !RememberPose(entity, npclease::PoseProvenance::Canonical))) {
             provenPoses.erase(EntityKey(entity));
         }
         state.holding = false;
@@ -638,36 +659,14 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         // The authoritative bones are the visible pose. Secondary native clip bookkeeping cannot invalidate them.
         return true;
     }
-    animation = Animation(entity);
-    actor = animation ? animation->GetActor() : nullptr;
-    if (!actor) return false;
-    for (int i = 0; i < Slots; ++i) {
-        const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
-        const auto& motion = record.motions[i];
-        char const* expected = nullptr;
-        if (i == 0 && (local || echo)) expected = state.localMotion;
-        else if (!local && motion.active && state.suppressed[i] != motion.instance) expected = names(motion.name);
-        const bool visible = actor->HasMotionInstance(slot) && actor->GetTargetWeight(slot) > 0.0001f;
-        bool phaseMatches = true;
-        if (expected && visible) {
-            const float duration = static_cast<float>(actor->GetMaxTime(slot));
-            const float phase = i == 0 && local
-                ? (state.localDuration > 0.0f ? std::min(localAge / state.localDuration, 1.0f) : 1.0f)
-                : i == 0 && echo ? 1.0f : motion.phase;
-            const float expectedTime = std::min(duration * phase, std::nextafter(duration, 0.0f));
-            const float error = std::fabs(static_cast<float>(actor->GetPlayTime(slot)) - expectedTime);
-            maximumReplayPhaseError = std::max(maximumReplayPhaseError, error);
-            phaseMatches = std::isfinite(error) && error <= 0.001f;
-        }
-        const bool expectedVisible = expected && (local || echo || motion.weight > 0.0001f);
-        if ((expectedVisible && (!visible || std::strcmp(expected, animation->GetMotionDesc(slot).GetMotionFilename().GetText()))) ||
-            (!expected && visible) || !phaseMatches) {
-            static unsigned failedPresentations = 0;
-            if (failedPresentations++ < 20)
-                Logf("npcplayback: %s slot %d changed during visual update; contacts disabled", entity->GetName().GetText(), i);
-            return false;
-        }
-    }
+    NativePose localPose;
+    if (!detail::EvaluateLocalActorPose(entity, localPose)) return false;
+    detail::ApplyPoseBlend(state, localPose, now);
+    { NativePoseScope poseScope(&localPose); UpdatePresentation(entity); }
+    if (!localPose.evaluated || !localPose.applied || !localPose.valid) return false;
+    if (!detail::VerifyLocalHitPresentation(entity, state, record, names, activeLocalClip, local, echo,
+                                            localStep.phase, maximumReplayPhaseError))
+        return false;
     state.holding = false;
     unavailable.erase(EntityKey(entity));
     return true;
