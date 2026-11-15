@@ -51,7 +51,7 @@ target_sources(Script_G3Together PRIVATE
     src/npc_qa.cpp
 )
 target_compile_definitions(Script_G3Together PRIVATE G3T_NPCWIRE_POSE_SEPARATE_TU=1)
-target_sources(Script_G3Together PRIVATE src/world_pvs.cpp)
+target_sources(Script_G3Together PRIVATE src/world_pvs.cpp src/world_collision.cpp)
 target_sources(Script_G3Together PRIVATE src/hero_codec.cpp)
 target_sources(Script_G3Together PRIVATE src/personal_ledger.cpp)
 target_sources(Script_G3Together PRIVATE src/persist_hooks.cpp)

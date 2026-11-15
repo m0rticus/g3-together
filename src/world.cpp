@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "world.h"
+#include "world_collision.h"
 #include "world_pvs.h"
 #include "log.h"
 
@@ -173,7 +174,8 @@ bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, u
     if (!net::IsHost()) return npclease::ProcessingAuthority(entity);
     const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
     ++checks;
-    const bool included = processing::IncludesNpc(native, npc, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount);
+    const bool included = processing::IncludesNpc(native, npc, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount) &&
+                          collision::IsNpcCollisionReady(entity);
     if (included) ++expanded;
     return included;
 }
@@ -262,7 +264,7 @@ void HookSpheres()
 void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
 {
     lastAdmin = admin;
-    auto const& simulationAnchors = pvs::SimulationAnchors();
+    auto const& simulationAnchors = pvs::ReadySimulationAnchors();
     std::vector<Sphere> wanted(simulationAnchors.size() + 3);
     int n = 0;
     float const* at = camera ? reinterpret_cast<float const*>(reinterpret_cast<char const*>(camera) + 0x8c) : nullptr;
@@ -307,7 +309,11 @@ void __fastcall ElasticProcess(eCEntityAdmin* admin, void*)
     }
     eCEntity* camera = nullptr;
     camera = reinterpret_cast<eCEntity*>(&eCApplication::GetInstance().GetCurrentCamera());  // Process reads the same one
-    if (net::IsHost()) PlaceSpheres(admin, camera);
+    if (net::IsHost()) {
+        PlaceSpheres(admin, camera);
+        if (collision::SyncSphereStaticCollision(admin, spheres.data(), sphereCount))
+            MarkProcessingDirty(admin);
+    }
     originalProcess(admin);
 }
 
@@ -434,6 +440,7 @@ void RetireWorld(bool bySession)
     }
     struct FinishRetirement { ~FinishRetirement() { retirementGate.Finish(); } } finish;
     CaptureCacheInventory();
+    collision::Retire();
     pvs::RetireHostRegions();
     spheres.clear();
     sphereCount = 0;
@@ -456,6 +463,8 @@ bool pvs::GatePaused() { return retirementGate.Paused(); }
 
 void Start()
 {
+    pvs::InstallDatabaseIndexFix();
     pvs::StartDestroyDiagnostics();
+    collision::EnsureHooksInstalled();
 }
 }

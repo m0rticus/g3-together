@@ -11,6 +11,8 @@
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "world_collision.h"
+#include "world_collision_policy.h"
 #include "world_retirement.h"
 
 #include <Engine.h>
@@ -42,9 +44,12 @@ std::vector<RemoteRegionState> hostRegions;
 unsigned regionLogs = 0;
 std::atomic<unsigned> regionOwners{0};
 std::vector<std::array<float, 3>> simulationAnchors;
+std::vector<std::array<float, 3>> readySimulationAnchors;
 uint32_t anchorsCheckedAt = 0;
 unsigned remoteRegionFailures = 0;
 uint32_t regionErrorShownAt = 0;
+bool freeIndexTried = false;
+bool freeIndexPatched = false;
 
 using CacheOutFn = GEBool(__fastcall*)(eCPVSPrefetcher3*, void*, eCEntity*);
 CacheOutFn originalCacheOut = nullptr;
@@ -198,6 +203,11 @@ GEBool __fastcall CacheOut(eCPVSPrefetcher3* self, void* edx, eCEntity* entity)
     return originalCacheOut(self, edx, entity);
 }
 
+int32_t __fastcall FixedGetFreeIndex(collision::NativeIndexPtrMap* map, void*)
+{
+    return map ? collision::PopFreeIndex(*map) : -1;
+}
+
 bool InstallRemoteCacheOut()
 {
     if (originalCacheOut) return true;
@@ -250,6 +260,23 @@ struct CellLock {
     CellLock() { lock.Acquire(); }
     ~CellLock() { lock.Release(); }
 };
+
+bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3])
+{
+    CellLock lock;
+    bTSmallArray<eCPVSCellItem*> cells;
+    prefetcher.GetAllValidCells(cells);
+    auto* permanent = prefetcher.GetNonDeactivationCell();
+    const bool jobDone = !prefetcher.IsJobRunning();
+    for (GEU16 i = 0; i < cells.GetCount(); ++i) {
+        auto* cell = cells.GetAt(i);
+        if (!cell || cell == permanent) continue;
+        auto const* box = reinterpret_cast<float const*>(&cell->GetCellBox());
+        if (!collision::BoxContainsXZ(box, anchor[0], anchor[2], 0.0f)) continue;
+        if (jobDone || cell->GetStaticEntities().GetCount() > 0) return true;
+    }
+    return false;
+}
 
 CellInventory Inventory(eCPVSPrefetcher3* prefetcher)
 {
@@ -402,7 +429,8 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
     }
     if (!region.camera) {
         auto* renderer = RenderAdmin();
-        if (!renderer || !InstallRemoteCacheOut() || !InstallContextOwnership(renderer->GetPVSPrefetcher3())) {
+        if (!renderer || !InstallDatabaseIndexFix() || !InstallRemoteCacheOut() ||
+            !InstallContextOwnership(renderer->GetPVSPrefetcher3())) {
             region.failed = true;
             region.retryAt = net::Now() + 5000;
             ++remoteRegionFailures;
@@ -480,11 +508,38 @@ void __fastcall DestroyEntity(eCEntity* entity, void* edx)
         crashlog::NativeStack("eCEntity::Destroy cached-in invariant");
         reportingDestroy = false;
     }
+    collision::OnEntityDestroyed(entity);
     originalDestroyEntity(entity, edx);
 }
 }
 
+bool InstallDatabaseIndexFix()
+{
+    if (freeIndexTried) return freeIndexPatched;
+    freeIndexTried = true;
+    HMODULE engine = GetModuleHandleA("Engine.dll");
+    auto* code = engine ? reinterpret_cast<unsigned char*>(engine) + 0x1d7c80 : nullptr;
+    if (!collision::VerifyFreeIndexSignature(code)) {
+        Log("FAIL world-cache: unsupported bTIndexPtrMap::GetFreeIndex; remote slot protection unavailable");
+        return false;
+    }
+    freeIndexPatched = ai::JumpTo(code, reinterpret_cast<void*>(&FixedGetFreeIndex), 5) != nullptr;
+    Log(freeIndexPatched ? "world-cache: native database free-index fix installed" :
+                           "FAIL world-cache: native database free-index fix could not be installed");
+    return freeIndexPatched;
+}
+
 std::vector<std::array<float, 3>> const& SimulationAnchors() { return simulationAnchors; }
+
+std::vector<std::array<float, 3>> const& ReadySimulationAnchors() { return readySimulationAnchors; }
+
+void CollectReadyPrefetchers(std::vector<eCPVSPrefetcher3*>& out)
+{
+    out.clear();
+    if (auto* renderer = RenderAdmin()) out.push_back(&renderer->GetPVSPrefetcher3());
+    for (auto const& region : hostRegions)
+        if (!region.failed && region.camera && region.prefetcher) out.push_back(region.prefetcher.get());
+}
 
 std::size_t ActiveRegionCount() { return hostRegions.size(); }
 
@@ -534,7 +589,9 @@ void TickHostRegions()
     }
     struct Group { std::array<float, 3> low, high; };
     std::vector<Group> groups;
-    for (auto const& anchor : simulationAnchors) {
+    std::vector<size_t> anchorGroups(simulationAnchors.size(), static_cast<size_t>(-1));
+    for (size_t idx = 0; idx < simulationAnchors.size(); ++idx) {
+        auto const& anchor = simulationAnchors[idx];
         if (body::Distance(here, anchor.data()) + GetConfig().hostRoi + 1000.0f < camera.GetClipDepth().GetY()) continue;
         size_t group = groups.size();
         for (size_t previous = 0; previous < groups.size(); ++previous) {
@@ -550,8 +607,12 @@ void TickHostRegions()
                 groups[group].high[k] = std::max(groups[group].high[k], anchor[k]);
             }
         }
+        anchorGroups[idx] = group;
     }
-    for (size_t i = groups.size(); i < hostRegions.size(); ++i) ReleaseRegion(hostRegions[i]);
+    for (size_t i = groups.size(); i < hostRegions.size(); ++i) {
+        if (collision::ShouldAttemptRegionRelease(hostRegions[i].failed, net::Now(), hostRegions[i].retryAt))
+            ReleaseRegion(hostRegions[i]);
+    }
     size_t retained = groups.size();
     for (size_t i = groups.size(); i < hostRegions.size(); ++i)
         if (hostRegions[i].camera || hostRegions[i].prefetcher) retained = i + 1;
@@ -562,6 +623,24 @@ void TickHostRegions()
         for (int k = 0; k < 3; ++k) centre[k] = (groups[id].low[k] + groups[id].high[k]) * 0.5f;
         const float radius = GetConfig().hostRoi + body::Distance(groups[id].low.data(), groups[id].high.data()) * 0.5f + 1500.0f;
         PlaceRegion(region, centre, radius);
+    }
+    readySimulationAnchors.clear();
+    readySimulationAnchors.reserve(simulationAnchors.size());
+    auto& mainPrefetcher = renderer->GetPVSPrefetcher3();
+    for (size_t idx = 0; idx < simulationAnchors.size(); ++idx) {
+        auto const& anchor = simulationAnchors[idx];
+        const size_t group = anchorGroups[idx];
+        const bool withinMain = group == static_cast<size_t>(-1);
+        const bool mainReady = withinMain && HasReadyAnchorCell(mainPrefetcher, anchor.data());
+        bool remoteReady = false;
+        if (!withinMain && group < hostRegions.size()) {
+            auto const& region = hostRegions[group];
+            const bool cellReady = region.prefetcher && HasReadyAnchorCell(*region.prefetcher, anchor.data());
+            remoteReady = collision::IsRemoteRegionReady(region.failed, region.camera != nullptr,
+                                                         region.prefetcher != nullptr, cellReady);
+        }
+        if (collision::ShouldIncludeSimulationAnchor(withinMain, mainReady, remoteReady))
+            readySimulationAnchors.push_back(anchor);
     }
 }
 
@@ -575,6 +654,7 @@ void RetireHostRegions()
             ++i;
     }
     simulationAnchors.clear();
+    readySimulationAnchors.clear();
     anchorsCheckedAt = 0;
     if (hostRegions.empty()) RestoreContextOwnership();
 }

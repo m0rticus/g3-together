@@ -9,7 +9,10 @@
 
 namespace g3t::world::pvs {
 bool GatePaused();
+bool InstallDatabaseIndexFix();
 std::vector<std::array<float, 3>> const& SimulationAnchors();
+std::vector<std::array<float, 3>> const& ReadySimulationAnchors();
+void CollectReadyPrefetchers(std::vector<eCPVSPrefetcher3*>& out);
 std::size_t ActiveRegionCount();
 void TickHostRegions();
 void RefreshContexts();
