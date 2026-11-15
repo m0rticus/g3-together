@@ -28,5 +28,5 @@ void JoinQa(char const* argument, LogFn log);  // QA: Name_1 / Name_0, like Join
 // A client takes over a mirrored NPC as its companion (true) or gives it back (false), as a dialog's JoinPlayer does:
 // used by spells.cpp for word of control and tame animal, guide.cpp for guides and escorted NPCs. follow false: no
 // ZS_FollowPlayer 0.7 s later (the caller chooses the task). False when nothing changes hands.
-bool TakeOver(eCEntity* target, bool join, bool follow = true);
+bool TakeOver(eCEntity* target, bool join, bool follow = true, char const* questName = nullptr);
 }

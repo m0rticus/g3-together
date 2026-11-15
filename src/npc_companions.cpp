@@ -7,6 +7,7 @@
 #include "combat_timing.h"
 #include "guards.h"
 #include "guide.h"
+#include "guide_policy.h"
 #include "hud.h"
 #include "i18n.h"
 #include "journal.h"
@@ -14,6 +15,7 @@
 #include "npclease_runtime.h"
 #include "npcremoval.h"
 #include "steam.h"
+#include "talk.h"
 #include "world.h"
 
 #include <algorithm>
@@ -180,6 +182,14 @@ void ClaimTick(uint32_t now)
             claimSeen.erase(it->first);
             directedBy.erase(it->first);
             it = claimedBy.erase(it);
+            if (!talk::IsHeld(npc.GetInstance())) {
+                const bCString currentTask = npc.Routine.GetCurrentTask();
+                if (!std::strcmp(currentTask.GetText(), "ZS_GuidePlayer") ||
+                    !std::strcmp(currentTask.GetText(), "ZS_FollowPlayer")) {
+                    npc.Routine.FullStop();
+                    npc.Routine.ContinueRoutine();
+                }
+            }
             continue;
         }
         ++claimsRevoked;
@@ -342,32 +352,42 @@ bool HostTaken(eCEntity const* entity)
 uint8_t CompanionOwner(eCEntity* entity)
 {
     if (!entity) return 0;
-    if (net::IsHost()) {
-        uint8_t guid[16];
-        Guid(entity, guid);
-        auto saved = companionIdentity.owners.find(CompanionKey(guid));
-        if (saved != companionIdentity.owners.end()) {
-            if (saved->second.account == steam::PlayerId()) return 1;
-            for (uint8_t id = 2; id < net::MaxPlayers; ++id)
-                if (saved->second.account && saved->second.account == net::PeerAccount(id)) return id;
-            return 0;
-        }
-    }
-    if (!net::IsHost()) {
-        uint8_t guid[16];
-        Guid(entity, guid);
-        if (auto mirror = mirrors.find(Key(guid)); mirror != mirrors.end()) return mirror->second.latest.partyPlayer;
-    }
-    if (entity->GetPropertySet(eEPropertySetType_Party)) {
-        const uint8_t player = PlayerOf(Entity(entity).Party.GetPartyLeader().GetInstance());
-        if (player) return player;
-    }
     uint8_t guid[16];
     Guid(entity, guid);
     const GuidKey key = Key(guid);
-    if (const auto it = claimedBy.find(key); it != claimedBy.end()) return it->second;
-    if (const auto it = mirrors.find(key); it != mirrors.end()) return it->second.latest.partyPlayer;
-    return 0;
+    if (!net::IsHost()) {
+        if (auto mirror = mirrors.find(key); mirror != mirrors.end())
+            return mirror->second.latest.partyPlayer ? mirror->second.latest.partyPlayer
+                                                     : mirror->second.latest.guidePlayer;
+        if (entity->GetPropertySet(eEPropertySetType_Party))
+            return PlayerOf(Entity(entity).Party.GetPartyLeader().GetInstance());
+        return 0;
+    }
+    uint8_t activeClaim = 0;
+    if (const auto it = claimedBy.find(key); it != claimedBy.end() && net::Remotes()[it->second].connected)
+        activeClaim = it->second;
+    uint8_t activeGuide = 0;
+    for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
+        if (id != net::LocalId() && !net::Remotes()[id].connected) continue;
+        eCEntity* actor = id == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(id);
+        if (actor && actor->GetPropertySet(eEPropertySetType_Party) &&
+            Entity(actor).Party.GetPartyLeader().GetInstance() == entity) {
+            activeGuide = id;
+            break;
+        }
+    }
+    uint8_t partyLeader = 0;
+    if (entity->GetPropertySet(eEPropertySetType_Party))
+        partyLeader = PlayerOf(Entity(entity).Party.GetPartyLeader().GetInstance());
+    uint8_t savedOwner = 0;
+    if (const auto saved = companionIdentity.owners.find(CompanionKey(guid)); saved != companionIdentity.owners.end()) {
+        if (saved->second.account == steam::PlayerId()) savedOwner = 1;
+        else {
+            for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+                if (saved->second.account && saved->second.account == net::PeerAccount(id)) { savedOwner = id; break; }
+        }
+    }
+    return guide_policy::ResolveCompanionOwner(activeClaim, activeGuide, partyLeader, savedOwner);
 }
 
 void SetContext(eCEntity* entity, uint8_t player)
@@ -408,18 +428,70 @@ uint8_t ContextPlayer(eCEntity* entity)
     return player;
 }
 
-bool Guide(uint8_t const guid[16], uint8_t player)
+eCEntity* ResolveQuestGuideDestination(Entity const& npc, char const* questName)
+{
+    gCQuestManager_PS* manager = gCSession::GetInstance().IsGameRunning() ? gCQuestManager_PS::GetInstance() : nullptr;
+    if (!manager || !npc.GetInstance()) return nullptr;
+    auto resolveFromQuest = [&](gCQuest_PS* quest) -> eCEntity* {
+        if (!quest || quest->GetType().GetValue() != gEQuestType_FollowNpc) return nullptr;
+        bCString const& destName = quest->GetDestinationEntity();
+        eCEntity* dest = destName.GetLength() > 0 ? Entity::GetEntity(destName).GetInstance() : nullptr;
+        return guide_policy::SelectGuideDestination(destName.GetLength() > 0, dest != nullptr) ==
+                       guide_policy::GuideDestinationSource::QuestDestinationEntity
+                   ? dest
+                   : nullptr;
+    };
+    if (questName && *questName) {
+        if (gCQuest_PS* quest = manager->GetQuest(bCString(questName))) {
+            if (quest->GetType().GetValue() == gEQuestType_FollowNpc &&
+                quest->GetStatus().GetValue() == gEQuestStatus_Open)
+                manager->RunQuest(bCString(questName));
+            if (quest->GetStatus().GetValue() == gEQuestStatus_Running)
+                return resolveFromQuest(quest);
+        }
+    }
+    const bCString npcName = npc.GetName();
+    auto& quests = manager->AccessQuests();
+    for (GEInt qi = 0; qi < quests.GetCount(); ++qi) {
+        auto* quest = static_cast<gCQuest_PS*>(quests.AccessAt(qi));
+        if (!quest || quest->GetType().GetValue() != gEQuestType_FollowNpc ||
+            quest->GetStatus().GetValue() != gEQuestStatus_Running)
+            continue;
+        auto const& delivery = quest->GetDeliveryEntities();
+        for (GEInt i = 0; i < delivery.GetCount(); ++i)
+            if (delivery.GetAt(i) == npcName) return resolveFromQuest(quest);
+    }
+    return nullptr;
+}
+
+bool Guide(uint8_t const guid[16], uint8_t player, char const* questName)
 {
     if (!net::IsHost() || !player || player >= net::MaxPlayers) return false;
     Entity npc(NpcByGuid(guid));
     eCEntity* actor = player == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(player);
     if (!npc.GetInstance() || !actor) { Log("npcs: guide request refused: missing NPC or player"); return false; }
     SetContext(npc.GetInstance(), player);
-    guards::Acting context(player == net::LocalId() ? nullptr : actor);
-    GetScriptAdminExt().CallScript(bCString("StartGuidePlayer"), npc.GetInstance(), actor, 0);
-    npc.NPC.SetCurrentTarget(Entity(actor));
-    npc.Routine.FullStop();
-    npc.Routine.ContinueRoutine();
+    eCEntity* destination = ResolveQuestGuideDestination(npc, questName);
+    {
+        guards::Acting context(player == net::LocalId() ? nullptr : actor);
+        GetScriptAdminExt().CallScript(bCString("StartGuidePlayer"), npc.GetInstance(), destination, 0);
+    }
+    if (actor->GetPropertySet(eEPropertySetType_Party))
+        Entity(actor).Party.SetPartyLeader(npc);
+    if (npc.GetInstance()->GetPropertySet(eEPropertySetType_Navigation)) {
+        npc.Navigation.IsOnDestination = GEFalse;
+        if (destination) {
+            Entity destEntity(destination);
+            npc.Navigation.SetCurrentDestinationPoint(destEntity);
+        }
+    }
+    if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(false, talk::IsHeld(npc.GetInstance()))) {
+        npc.Routine.FullStop();
+        npc.Routine.ContinueRoutine();
+    }
+    Logf("npcs: %s guides player %u toward %s (held_in_talk=%d)", npc.GetName().GetText(), player,
+         destination ? Entity(destination).GetName().GetText() : "(quest-routine)",
+         talk::IsHeld(npc.GetInstance()) ? 1 : 0);
     return true;
 }
 
@@ -725,16 +797,24 @@ void SyncMirrorPartyAndGuide(GuidKey const& key, Mirror& m, net::NpcRecord const
             request.immortal = waiting ? 1 : 0;
             net::SendWorldState(request, 0);
         }
+        const auto decodedWaiting = guide_policy::DecodeWaitingField(
+            shown.partyPlayer, shown.guidePlayer, shown.waiting, m.guideDestinationApplied);
         eCEntity* leader = shown.partyPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(shown.partyPlayer);
         const bool pending = myClaims.count(key) && !m.relationAcknowledged && actualOwner == net::LocalId();
         if (!pending) {
             if (m.entity.Party.GetPartyLeader().GetInstance() != leader) m.entity.Party.SetPartyLeader(Entity(leader));
             m.entity.Party.PartyMemberType = static_cast<gEPartyMemberType>(shown.partyType);
-            m.entity.Party.Waiting = shown.waiting ? GETrue : GEFalse;
+            m.entity.Party.Waiting = decodedWaiting.partyWaiting ? GETrue : GEFalse;
         }
         m.partyApplied = true;
         m.appliedOwner = shown.partyPlayer;
-        m.appliedWaiting = shown.waiting != 0;
+        m.appliedWaiting = decodedWaiting.partyWaiting;
+    }
+    const auto decodedGuide = guide_policy::DecodeWaitingField(
+        shown.partyPlayer, shown.guidePlayer, shown.waiting, m.guideDestinationApplied);
+    if (decodedGuide.writeGuideDestination && m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Navigation)) {
+        m.entity.Navigation.IsOnDestination = decodedGuide.guideIsOnDestination ? GETrue : GEFalse;
+        m.guideDestinationApplied = shown.partyPlayer == 0 && shown.guidePlayer != 0;
     }
     eCEntity* hero = remote::ControlledBody();
     if (hero && hero->GetPropertySet(eEPropertySetType_Party)) {
@@ -742,8 +822,11 @@ void SyncMirrorPartyAndGuide(GuidKey const& key, Mirror& m, net::NpcRecord const
         if (shown.guidePlayer == net::LocalId()) {
             m.guideAcknowledged = true;
             player.Party.SetPartyLeader(m.entity);
-        } else if (m.guideAcknowledged && player.Party.GetPartyLeader().GetInstance() == m.entity.GetInstance())
+        } else if (m.guideAcknowledged &&
+                   player.Party.GetPartyLeader().GetInstance() == m.entity.GetInstance()) {
+            m.guideAcknowledged = false;
             player.Party.SetPartyLeader(Entity());
+        }
     }
 }
 

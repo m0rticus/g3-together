@@ -16,6 +16,8 @@ bool IsQuestGuide(eCEntity* npc);
 // the NPC's leader, it follows at once, as a dialog's JoinPlayer makes a companion (the slave started only ~50 s later on
 // the host, never on a client, 25.10.).
 void Joined(eCEntity* npc);
+void NoteQuestStatusFromHost(char const* questName, int status);
+void OnClientFollowQuestRunning(unsigned char fromPlayer, char const* questName, int previousStatus, int currentStatus);
 void OnWorldChange();  // the world (or save) was left: nothing is held any more
 using LogFn = void (*)(char const*);
 void Report(char const* name, LogFn log);  // QA: GUIDE line (the hero's leader; with a name, that NPC's leader and task)

@@ -61,7 +61,7 @@ uint32_t Incarnation(uint8_t const guid[16]);
 void SetContext(eCEntity* entity, uint8_t player);
 uint8_t ContextPlayer(eCEntity* entity);
 bool Follow(uint8_t const guid[16], uint8_t player, uint8_t memberType, bool waiting = false);
-bool Guide(uint8_t const guid[16], uint8_t player);
+bool Guide(uint8_t const guid[16], uint8_t player, char const* questName = nullptr);
 bool LocalReaction(eCEntity const* entity, char const* state);  // ai.cpp: the state is our own blow's stagger (or its helper) on this mirror: let it run
 // The NPC with this GUID from the network: null unless it is an NPC (NPC, script routine and damage receiver property sets)
 // and neither the local hero nor a puppet (Fable's review 22.10. 1.6, 1.7: handlers ran NPC wrappers on any entity).

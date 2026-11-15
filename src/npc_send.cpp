@@ -5,6 +5,7 @@
 
 #include "combat.h"
 #include "combat_timing.h"
+#include "guide_policy.h"
 #include "journal.h"
 #include "log.h"
 #include "net_metrics.h"
@@ -618,14 +619,18 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
 {
     r.movementMode = static_cast<uint8_t>(self.CharacterMovement.GetMovementMode());
     r.flags = static_cast<uint8_t>((self.IsDead() ? 1 : 0) | (self.IsDown() ? 2 : 0) | FightFlags(self));
+    bool partyWaiting = false;
     if (instance->GetPropertySet(eEPropertySetType_Party)) {
         r.partyPlayer = PlayerOf(self.Party.GetPartyLeader().GetInstance());
         r.partyType = static_cast<uint8_t>(static_cast<gEPartyMemberType>(self.Party.PartyMemberType));
-        r.waiting = self.Party.Waiting ? 1 : 0;
+        partyWaiting = self.Party.Waiting != GEFalse;
     }
     for (uint8_t player = 1; player < net::MaxPlayers; ++player) {
         if (partyLeaderOf[player] == instance) r.guidePlayer = player;
     }
+    const bool navOnDestination = instance->GetPropertySet(eEPropertySetType_Navigation) &&
+                                  self.Navigation.IsOnDestination != GEFalse;
+    r.waiting = guide_policy::EncodeWaitingField(r.partyPlayer, r.guidePlayer, partyWaiting, navOnDestination);
     if (self.IsDead() && (r.movementMode == gECharMovementMode_RagDollDead ||
                           !std::strncmp(self.Routine.GetCurrentTask().GetText(), "ZS_RagDollDead", 14)))
         r.flags |= 128;

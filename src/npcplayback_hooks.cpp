@@ -10,6 +10,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "talk.h"
+#include "talk_policy.h"
 
 #include <Windows.h>
 #include <array>
@@ -240,8 +241,9 @@ GEBool __fastcall AddProperty(eCEntity* self, void* edx, eCEntityPropertySet* pr
 void __fastcall Routine(eCEntityPropertySet* self, void* edx)
 {
     if (ai::ShuttingDown()) { if (originalRoutine) originalRoutine(self, edx); return; }
-    if (IsPassive(self->GetEntity()) && !DialogPartner(self->GetEntity())) { ++counters.blockedRoutines; return; }
-    const uint8_t player = npcs::ContextPlayer(self->GetEntity());
+    eCEntity* entity = self->GetEntity();
+    if (IsPassive(entity) && !DialogPartner(entity)) { ++counters.blockedRoutines; return; }
+    const uint8_t player = talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity));
     guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
     originalRoutine(self, edx);
 }
@@ -263,7 +265,10 @@ void __fastcall MovementUpdated(eCEntityPropertySet* self, void* edx)
 bEResult __fastcall Script(gCScriptProcessingUnit* self, void* edx)
 {
     if (ai::ShuttingDown()) return originalScript ? originalScript(self, edx) : bEResult_Ok;
-    if (IsPassive(self->GetSelfEntity()) && !DialogPartner(self->GetSelfEntity())) { ++counters.blockedScripts; return bEResult_Ok; }
+    eCEntity* entity = self->GetSelfEntity();
+    if (IsPassive(entity) && !DialogPartner(entity)) { ++counters.blockedScripts; return bEResult_Ok; }
+    const uint8_t player = talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity));
+    guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
     return originalScript(self, edx);
 }
 
@@ -286,7 +291,13 @@ void __fastcall Play(eCVisualAnimation_PS* self, void* edx, eCWrapper_emfx2Actor
                      eCWrapper_emfx2Motion::eSMotionDesc* options)
 {
     if (ai::ShuttingDown()) { if (originalPlay) originalPlay(self, edx, slot, options); return; }
-    if (!presenting && IsPassive(self->GetEntity())) { ++counters.blockedAnimations; return; }
+    eCEntity* entity = self->GetEntity();
+    if (!presenting && IsPassive(entity)) {
+        if (DialogPartner(entity) && static_cast<int>(slot) == 0)
+            talk::OnPartnerMotion(entity, self->GetMotionDesc(slot).GetMotionFilename().GetText());
+        ++counters.blockedAnimations;
+        return;
+    }
     originalPlay(self, edx, slot, options);
 }
 

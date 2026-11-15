@@ -11,6 +11,7 @@
 #include "body.h"
 #include "downed.h"
 #include "guide.h"
+#include "guide_policy.h"
 #include "arena.h"
 #include "ending.h"
 #include "log.h"
@@ -49,7 +50,7 @@ char const* const StateCommands[] = {"SetClass", "SetPAL", "SetTeachEnabled", "S
                                      "JoinNPC", "JoinPlayer"};
 constexpr uint32_t ReadAfter = 700;
 
-struct Pending { uint8_t guid[16]; std::string sector; uint32_t due; bool moved = false; bool follow = false; bool story = false; };
+struct Pending { uint8_t guid[16]; std::string sector; uint32_t due; bool moved = false; bool follow = false; bool story = false; std::string routine; };
 std::vector<Pending> pending;
 
 // Host: fights that dialogs on clients started with the host's NPCs, waiting until the dialog hold ends.
@@ -190,11 +191,13 @@ void Apply(net::WorldState const& s, uint8_t from)
                 Entity player(actor);
                 if (player.Party.GetPartyLeader().GetInstance() == npc.GetInstance()) player.Party.SetPartyLeader(Entity());
             }
-            npc.Routine.FullStop();
-            npc.Routine.ContinueRoutine();
+            if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(false, talk::IsHeld(npc.GetInstance()))) {
+                npc.Routine.FullStop();
+                npc.Routine.ContinueRoutine();
+            }
         } else if (s.npcClass == 2) {
             if (!npcs::OnClaim(s.guid, from, true)) return;
-            npcs::Guide(s.guid, from);
+            npcs::Guide(s.guid, from, s.routine);
         } else if (npcs::OnClaim(s.guid, from, true)) {
             npcs::Follow(s.guid, from, static_cast<uint8_t>(gEPartyMemberType_Slave));
         }
@@ -273,7 +276,10 @@ void Apply(net::WorldState const& s, uint8_t from)
         if (*s.routine && std::strcmp(nav->AccessRoutine().GetText(), s.routine) != 0) {
             if (mirrored) nav->AccessRoutine() = bCString(s.routine);
             else e.Navigation.SetRoutine(bCString(s.routine));
-            if (!mirrored) { e.Routine.FullStop(); e.Routine.ContinueRoutine(); }
+            if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(mirrored, talk::IsHeld(instance))) {
+                e.Routine.FullStop();
+                e.Routine.ContinueRoutine();
+            }
         }
     }
     const bCVector& p = instance->GetWorldPosition();
@@ -293,8 +299,13 @@ void OnWorldState(uint8_t from, net::WorldState const& s)
         Logf("downed: help message kind=%u transport=%u helper=%u target=%u sequence=%u source=world-state",
              s.kind, from, s.npcClass, s.guard, sequence);
     }
-    if (s.kind == 14 || s.kind == 15) {
-        Logf("infocmd: obsolete NPC lifecycle/gesture result from player %u refused; host snapshots own NPC state", from);
+    if (s.kind == 15) {
+        if (net::IsHost())
+            talk::OnGesture(from, s.guid, static_cast<uint32_t>(std::strtoul(s.routine, nullptr, 16)), s.rotation);
+        return;
+    }
+    if (s.kind == 14) {
+        Logf("infocmd: obsolete NPC lifecycle result from player %u refused; host snapshots own NPC state", from);
         return;
     }
     if (net::IsHost() && s.kind == 1) {
@@ -320,7 +331,7 @@ void Send(net::WorldState const& s)
 // A companion joins (true) or leaves (false) this client. Joining: the host's NPC is taken over here (the follow
 // state follows the local hero; follow false: the caller sets its task, a guide of P9). Leaving: handed back to the
 // host. False when nothing changes hands.
-bool Join(eCEntity* self, bool join, bool follow = true)
+bool Join(eCEntity* self, bool join, bool follow = true, char const* questName = nullptr)
 {
     if (join && self && (npcs::IsMirrored(self) || npclease::LocalAuthority(self))) {
         if (npclease::LocalAuthority(self)) npclease::RelinquishToHost(self, "companion joined");
@@ -328,8 +339,13 @@ bool Join(eCEntity* self, bool join, bool follow = true)
         net::WorldState s{};
         s.kind = 4;
         GuidOf(self, s.guid);
-        const bool guide = !follow && Entity(gCSession::GetInstance().GetHero()).Party.GetPartyLeader().GetInstance() == self;
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        const bool heroGuidedBySelf = hero && hero->GetPropertySet(eEPropertySetType_Party) &&
+                                      Entity(hero).Party.GetPartyLeader().GetInstance() == self;
+        const bool guide = !follow && ((questName && *questName) || heroGuidedBySelf);
         s.npcClass = guide ? 2 : 1;
+        if (guide && questName && *questName)
+            strncpy_s(s.routine, questName, _TRUNCATE);
         Send(s);
         return true;
     }
@@ -484,7 +500,9 @@ void Observe(gCScriptProcessingUnit* spu)
         if (Join(target, join)) return;
     }
     if (!IsStateCommand(name) || !target || target == gCSession::GetInstance().GetHero() || remote::IsPuppet(target)) return;
-    Pending p{{}, {}, net::Now() + ReadAfter, std::strcmp(name, "MoveTo") == 0};
+    const bool immediateRoutine = !std::strcmp(name, "SetRoutine") && *command.GetID1().GetText();
+    Pending p{{}, {}, immediateRoutine ? net::Now() : (net::Now() + ReadAfter), std::strcmp(name, "MoveTo") == 0};
+    if (immediateRoutine) p.routine = command.GetID1().GetText();
     GuidOf(target, p.guid);
     pending.push_back(p);
 }
@@ -523,6 +541,8 @@ void Tick()
                 Logf("infocmd: %s follows this player", e.GetName().GetText());
             } else if (e.GetInstance()) {
                 Snapshot(e, s);
+                if (!it->routine.empty())
+                    strncpy_s(s.routine, it->routine.c_str(), _TRUNCATE);
                 s.moved = it->story ? 2 : it->moved ? 1 : 0;
                 ++snapshotsSent;
                 Send(s);
@@ -584,7 +604,7 @@ void Report(LogFn log)
 
 namespace g3t::infocmd {
 // QA, stage E3: "join Name_1" / "join Name_0" on a client, the same path as the dialog command JoinPlayer.
-bool TakeOver(eCEntity* target, bool join, bool follow) { return Join(target, join, follow); }
+bool TakeOver(eCEntity* target, bool join, bool follow, char const* questName) { return Join(target, join, follow, questName); }
 
 void JoinQa(char const* argument, LogFn log)
 {

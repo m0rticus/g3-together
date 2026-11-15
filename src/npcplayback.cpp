@@ -19,6 +19,7 @@
 #include "guards.h"
 #include "guid.h"
 #include "talk.h"
+#include "talk_policy.h"
 #include "world.h"
 
 #include <Game.h>
@@ -168,7 +169,7 @@ bool GuardForLease(eCEntity* entity) { return enabled && entity && detail::Regis
 
 void Silence(eCEntity* entity)
 {
-    if (!Passive(entity)) return;
+    if (!talk_policy::ShouldSilencePassiveRoutine(Passive(entity), talk::TalkingWithHero(entity))) return;
     auto* routine = static_cast<gCScriptRoutine_PS*>(entity->GetPropertySet(eEPropertySetType_ScriptRoutine));
     if (!routine || (!routine->AccessCurrentTask().GetLength() && !routine->AccessCurrentState().GetLength())) return;
     routine->AIFullStop();

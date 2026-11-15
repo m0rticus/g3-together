@@ -19,6 +19,8 @@
 #include "npcs.h"
 #include "parity.h"
 #include "persist.h"
+#include "talk.h"
+#include "talk_policy.h"
 #include "trade.h"
 #include "world.h"
 #include "npcplayback.h"
@@ -698,7 +700,20 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     puppet.downedSequence = held ? remote.latest.downedSequence : 0;
     puppet.body.combatMoves = qa.puppetCombat;
+    auto* puppetRoutine = static_cast<gCScriptRoutine_PS*>(
+        puppet.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    if (puppetRoutine) {
+        char const* preTask = talk_policy::PuppetRoutineTask(true, held, false, body::IdleTask());
+        if (std::strcmp(puppetRoutine->AccessCurrentTask().GetText(), preTask) != 0)
+            puppetRoutine->AccessCurrentTask() = bCString(preTask);
+    }
     body::Drive(puppet.entity, puppet.body, target, now);
+    if (puppetRoutine) {
+        const bool holdingTalk = net::IsHost() && talk::HoldingForPlayer(static_cast<uint8_t>(id));
+        char const* postTask = talk_policy::PuppetRoutineTask(false, held, holdingTalk, body::IdleTask());
+        if (std::strcmp(puppetRoutine->AccessCurrentTask().GetText(), postTask) != 0)
+            puppetRoutine->AccessCurrentTask() = bCString(postTask);
+    }
     if (held) {
         // Mode 8/9 takes PS_GonnaLoot before AssessTalk (Script_Game +0x81e72). Lie is presentation only.
         puppet.entity.Routine.AIMode = gEAIMode_Abandoned;

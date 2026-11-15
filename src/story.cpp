@@ -4,6 +4,7 @@
 #include "body.h"
 #include "combat.h"
 #include "clock.h"
+#include "guide.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -358,8 +359,13 @@ bool CommitBaselines()
         for (auto const& entry : runtime.baseline.values)
             if ((entry.first.back() == 'n') == (phase == 0)) Apply(runtime, entry.first.c_str(), entry.second, true);
     for (Domain& d : domains) {
-        if (d.kind != net::StateQuestRuntime && d.kind != net::StateWorldClock)
-            for (auto const& entry : d.baseline.values) Apply(d, entry.first.c_str(), entry.second, true);
+        if (d.kind != net::StateQuestRuntime && d.kind != net::StateWorldClock) {
+            for (auto const& entry : d.baseline.values) {
+                Apply(d, entry.first.c_str(), entry.second, true);
+                if (d.kind == net::StateQuests)
+                    guide::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
+            }
+        }
         d.known.clear();
         for (auto const& entry : d.baseline.values) d.known[entry.first] = entry.second;
         d.primed = true; d.wasConnected = true;
@@ -466,7 +472,18 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
     }
     if (net::IsHost()) {
         // A client changed these: apply, then tell everyone the host's resulting values.
-        for (auto const& entry : decoded) Apply(*d, entry.first.c_str(), entry.second);
+        for (auto const& entry : decoded) {
+            int prevQuestStatus = -1;
+            if (d->kind == net::StateQuests && !snapshot) {
+                if (gCQuest_PS* quest = Quests()->GetQuest(bCString(entry.first.c_str())))
+                    prevQuestStatus = StatusOf(quest);
+            }
+            Apply(*d, entry.first.c_str(), entry.second);
+            if (d->kind == net::StateQuests && !snapshot && prevQuestStatus >= 0) {
+                if (gCQuest_PS* quest = Quests()->GetQuest(bCString(entry.first.c_str())))
+                    guide::OnClientFollowQuestRunning(from, entry.first.c_str(), prevQuestStatus, StatusOf(quest));
+            }
+        }
         States current;
         d->snapshot(current);
         std::vector<net::StateEntry> result;
@@ -486,6 +503,8 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
             }
             d->known[entry.first] = entry.second;
             if (d->kind != net::StateWorldClock) Apply(*d, entry.first.c_str(), entry.second, catchup);
+            if (d->kind == net::StateQuests)
+                guide::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
         }
     }
 }

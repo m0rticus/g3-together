@@ -150,7 +150,7 @@ struct Mirror {
     float swingRayCm = 0.0f, swingHitCm = 0.0f;
     bool partyApplied = false, appliedWaiting = false;
     uint8_t appliedOwner = 0;
-    bool relationAcknowledged = false, guideAcknowledged = false;
+    bool relationAcknowledged = false, guideAcknowledged = false, guideDestinationApplied = false;
     net::NpcRecord previous;
     net::NpcRecord latest;
     uint32_t previousTicks = 0;
