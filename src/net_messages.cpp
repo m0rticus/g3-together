@@ -227,7 +227,13 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     case MsgHitResult: {
         HitResultMsg message{};
-        if (isHost || !UnpackFixed(packet, message)) return true;
+        if (isHost) return true;
+        if (packet->dataLength == LegacyHitResultMsgSize) {
+            std::memcpy(&message, packet->data, LegacyHitResultMsgSize);
+            message.result.knockbackValid = 0;
+        } else if (!UnpackFixed(packet, message)) {
+            return true;
+        }
         if (message.result.knockbackValid > 1) return true;
         if (message.result.knockbackValid) {
             for (int k = 0; k < 3; ++k) {

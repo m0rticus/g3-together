@@ -649,6 +649,7 @@ void PassiveMirrorTick()
                      m.entity.GetName().GetText(), m.released ? "host release" : "presentation unavailable",
                      now - m.latestTicks);
             }
+            if (m.latest.flags & 3) npcplayback::ResetLocalHitState(m.replay);
             if (m.latest.flags & 1) {
                 m.deathLife.Observe(m.latest.incarnation, true);
                 m.killed = true;
@@ -712,13 +713,13 @@ void PassiveMirrorTick()
                 Logf("NPCRECONCILE name=%s incarnation=%u local_dead=1 host_alive=1 host_hp=%d receive_age_ms=%u",
                      m.entity.GetName().GetText(), shown.incarnation, shown.hitPoints, now - m.latestTicks);
         }
+        if (shown.flags & 3) {
+            ResetMirrorIncomingContact(m);
+            npcplayback::ResetLocalHitState(m.replay);
+        }
         const bool firstDeath = !m.killed;
         m.killed = (shown.flags & 1) != 0;
         if (m.killed && (firstDeath || m.deathReferencesCleared != m.entity.GetInstance())) {
-            if (firstDeath) {
-                ResetMirrorIncomingContact(m);
-                npcplayback::ResetLocalHitState(m.replay);
-            }
             if (m.deathReferencesCleared != m.entity.GetInstance()) {
                 m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);
                 m.deathReferencesCleared = m.entity.GetInstance();

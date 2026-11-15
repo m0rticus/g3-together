@@ -341,6 +341,7 @@ bool StartLocalHitPresentation(eCEntity* entity, State& state, char const* motio
                                uint32_t hit, uint32_t now, float playSpeed, eCEntity const* attacker, uint8_t reaction)
 {
     if (!entity || !motion || !*motion || !hit || !options.active || !IsPassive(entity)) return false;
+    if (Entity(entity).IsDead() || Entity(entity).IsDown()) return false;
     auto* animation = Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor) { Log("npcplayback: local hit has no presentation actor"); return false; }

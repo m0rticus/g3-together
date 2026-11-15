@@ -549,16 +549,16 @@ inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t 
     outPos[0] = basePos[0];
     outPos[1] = basePos[1];
     outPos[2] = basePos[2];
+    if (incapacitated) {
+        kb = HitKnockbackState{};
+        return false;
+    }
     if (!kb.active) {
         kb.lastPresentedPos[0] = basePos[0];
         kb.lastPresentedPos[1] = basePos[1];
         kb.lastPresentedPos[2] = basePos[2];
         kb.hasPresentedPos = true;
         kb.currentOffset[0] = kb.currentOffset[1] = kb.currentOffset[2] = 0.0f;
-        return false;
-    }
-    if (incapacitated) {
-        kb = HitKnockbackState{};
         return false;
     }
     float const* refPos = kb.settling ? kb.lastPresentedPos : kb.goalPos;

@@ -316,6 +316,15 @@ int main() {
     const float settleHost1[3] = {3064.0f, 0.0f, 0.0f}; // NPC moved +4 cm toward +X while offset was +30 cm
     AdvanceHitKnockback(walkSettleKb, 6516, 6441, 6015, false, false, 0.15f, false, settleHost1, wsPos);
     assert(wsPos[0] > 3090.5f && wsPos[0] < 3094.0f); // preserves live NPC motion while gently decaying offset!
+
+    // 5) Death / downed (incapacitated=true) unconditionally clears both active knockback and settling reconcileOffset,
+    //    and never caches corpse/downed ragdoll pelvis positions into lastPresentedPos.
+    AdvanceHitKnockback(walkSettleKb, 6532, 6457, 6015, false, false, 0.20f, true, settleHost1, wsPos);
+    assert(!walkSettleKb.active && !walkSettleKb.settling && !walkSettleKb.hasPresentedPos);
+    assert(wsPos[0] == settleHost1[0] && walkSettleKb.reconcileOffset[0] == 0.0f);
+    const float corpsePelvisPos[3] = {3064.0f, 92.0f, 0.0f};
+    AdvanceHitKnockback(walkSettleKb, 6548, 6473, 6015, false, false, 0.0f, true, corpsePelvisPos, wsPos);
+    assert(!walkSettleKb.active && !walkSettleKb.hasPresentedPos && wsPos[1] == 92.0f);
     return 0;
 }
 ''', encoding="utf-8")
@@ -334,17 +343,21 @@ int main() {
         claims = (ROOT / "src" / "combat_claims.cpp").read_text(encoding="utf-8")
         combat = (ROOT / "src" / "combat.cpp").read_text(encoding="utf-8")
         net_h = (ROOT / "src" / "net.h").read_text(encoding="utf-8")
+        net_internal = (ROOT / "src" / "net_internal.h").read_text(encoding="utf-8")
         net_messages = (ROOT / "src" / "net_messages.cpp").read_text(encoding="utf-8")
         npc_send = (ROOT / "src" / "npc_send.cpp").read_text(encoding="utf-8")
         npc_send_h = (ROOT / "src" / "npc_send.h").read_text(encoding="utf-8")
         npc_contact = (ROOT / "src" / "npc_contact.cpp").read_text(encoding="utf-8")
         npcs_cpp = (ROOT / "src" / "npcs.cpp").read_text(encoding="utf-8")
 
-        for src_text in (playback, playback_h, playback_hit, playback_policy, claims, net_h, net_messages,
-                         npc_contact, npc_send, npc_send_h, npcs_cpp):
+        for src_text in (playback, playback_h, playback_hit, playback_policy, claims, net_h, net_internal,
+                         net_messages, npc_contact, npc_send, npc_send_h, npcs_cpp):
             self.assertLess(len(src_text.splitlines()), 1000)
         self.assertLessEqual(len(playback.splitlines()), 990)
         self.assertLessEqual(len(npcs_cpp.splitlines()), 975)
+
+        self.assertIn("LegacyHitResultMsgSize = offsetof(HitResultMsg, result) + offsetof(HitResult, knockbackValid);", net_internal)
+        self.assertIn("packet->dataLength == LegacyHitResultMsgSize", net_messages)
 
         reset_body = playback_hit.split("void ResetLocalHitState(State& state)", 1)[1].split("void CancelLocalHit(", 1)[0]
         for cleared in ("state.pendingHit = 0;", "state.localInRecover = false;",

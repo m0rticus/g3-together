@@ -106,7 +106,7 @@ void LocalHitWithSwing(eCEntity* entity, uint32_t sequence, uint32_t swing, uint
     for (auto& entry : mirrors) {
         Mirror& m = entry.second;
         if (m.entity.GetInstance() != entity) continue;
-        if (m.killed) continue;
+        if (m.killed || (m.latest.flags & 3) != 0 || m.entity.IsDead() || m.entity.IsDown()) continue;
         m.localHitValid = true;
         const uint32_t hitAt = net::Now();
         m.localHitAt = hitAt ? hitAt : 1;
@@ -520,7 +520,11 @@ void OnHitResult(net::HitResult const& result)
     const auto found = mirrors.find(key);
     if (found == mirrors.end()) return;
     Mirror& m = found->second;
-    if (static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
+    if (!m.replay.pendingHit || static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
+    if (m.killed || (m.latest.flags & 3) != 0 || m.entity.IsDead() || m.entity.IsDown()) {
+        npcplayback::ResetLocalHitState(m.replay);
+        return;
+    }
     if (!result.accepted) {
         npcplayback::CancelLocalHit(m.replay, net::Now(), m.entity.GetInstance());
         m.replay.initialized = false;

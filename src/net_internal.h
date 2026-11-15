@@ -109,6 +109,8 @@ struct CharacterMsg { uint8_t type; CharacterNote note; };
 #pragma pack(pop)
 
 static_assert(sizeof(HitNpcMsg) == 112, "NPC hit wire layout changed");
+constexpr size_t LegacyHitResultMsgSize = offsetof(HitResultMsg, result) + offsetof(HitResult, knockbackValid);
+static_assert(LegacyHitResultMsgSize == 34 && sizeof(HitResultMsg) == 68, "HitResultMsg wire layout changed");
 static_assert(sizeof(NpcsHeader) == 23, "NPC datagram budget must match its wire header");
 static_assert(sizeof(SaveMsg) == 122, "save message wire layout changed");
 static_assert(sizeof(CharacterMsg) == 88, "character envelope wire layout changed");

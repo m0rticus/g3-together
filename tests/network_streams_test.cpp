@@ -500,5 +500,56 @@ int main()
     assert(receivedPlayerHits == 1);
     SetHitHandlers(nullptr, nullptr);
     transmissions.clear();
+
+    // Build 79 MsgHitResult accepts both 68-byte knockback-enriched replies and legacy 34-byte replies (knockbackValid=0).
+    static_assert(saving::Protocol == 79, "Build 79 protocol version must remain 79");
+    static_assert(LegacyHitResultMsgSize == 34 && sizeof(HitResultMsg) == 68, "HitResultMsg wire layout");
+    static unsigned hitResultsReceived = 0;
+    static HitResult lastHitResult{};
+    SetHitResultHandler([](HitResult const& res) {
+        ++hitResultsReceived;
+        lastHitResult = res;
+    });
+    isHost = true;
+    localId = 1;
+    clientInWorld[2] = true;
+    HitResult fullResult{};
+    fullResult.guid[0] = 0xAB;
+    fullResult.sequence = 77;
+    fullResult.incarnation = 5;
+    fullResult.accepted = 1;
+    fullResult.knockbackValid = 1;
+    fullResult.hostReaction = HitStumble;
+    fullResult.hitDurationMs = 615;
+    fullResult.moveDurationMs = 615;
+    fullResult.originPos[0] = 1000.0f;
+    fullResult.goalPos[0] = 1083.8f;
+    fullResult.stepCm = 83.8f;
+    SendHitResult(2, fullResult);
+    assert(transmissions.size() == 1 && transmissions[0].bytes.size() == 68 && transmissions[0].channel == ChannelCombat);
+    const auto fullHitPacket = transmissions[0];
+    transmissions.clear();
+    isHost = false;
+    localId = 2;
+    connected = inWorld = true;
+    Deliver(server, fullHitPacket);
+    assert(hitResultsReceived == 1 && lastHitResult.sequence == 77 && lastHitResult.knockbackValid == 1);
+    assert(lastHitResult.hostReaction == HitStumble && std::fabs(lastHitResult.stepCm - 83.8f) < 0.01f);
+
+    auto legacyHitPacket = fullHitPacket;
+    legacyHitPacket.bytes.resize(LegacyHitResultMsgSize);
+    lastHitResult = {};
+    Deliver(server, legacyHitPacket);
+    assert(hitResultsReceived == 2 && lastHitResult.sequence == 77 && lastHitResult.accepted == 1);
+    assert(lastHitResult.knockbackValid == 0 && lastHitResult.hostReaction == 0 && lastHitResult.stepCm == 0.0f);
+
+    for (size_t badSize : {size_t(33), size_t(35), size_t(67), size_t(69)}) {
+        auto malformed = fullHitPacket;
+        malformed.bytes.resize(badSize, 0);
+        Deliver(server, malformed);
+        assert(hitResultsReceived == 2);
+    }
+    SetHitResultHandler(nullptr);
+    transmissions.clear();
     host = nullptr;
 }
