@@ -141,6 +141,7 @@ npcown::RoleFacts RoleOf(eCEntity* entity, bool prototype)
     npcown::RoleFacts role;
     role.removed = npcremoval::Suppressed(entity);
     if (!prototype) {
+        if (npcs::IsDespawned(Key(entity).data())) role.removed = true;
         role.hero = entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody() ||
             entity->GetPropertySet(eEPropertySetType_PlayerMemory);
         role.remotePuppet = remote::IsPuppet(entity);
@@ -404,7 +405,7 @@ void ReceiveHost(uint8_t from, Message const& note)
         interest.hostPresent = interest.hostPresent && npcs::HostCanPresent(note.guid);
         if (!entry.interest.Delegate(interest, now)) { reject(note.state.name, DelegateRefusal(interest)); return; }
         if (native && !npcplayback::GuardForLease(native)) {
-            Refusal(key, baseline.name, "native property authority fence unavailable"); return;
+            reject(baseline.name, "native property authority fence unavailable"); return;
         }
         if (authoritySerial == UINT32_MAX) { ++refused; Log("FAIL npclease: authority epoch exhausted"); return; }
         const Lease previousLease = entry.lease;

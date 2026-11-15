@@ -709,7 +709,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     body::Drive(puppet.entity, puppet.body, target, now);
     if (puppetRoutine) {
-        const bool holdingTalk = net::IsHost() && talk::HoldingForPlayer(static_cast<uint8_t>(id));
+        const bool holdingTalk = talk::HoldingForPlayer(static_cast<uint8_t>(id));
         char const* postTask = talk_policy::PuppetRoutineTask(false, held, holdingTalk, body::IdleTask());
         if (std::strcmp(puppetRoutine->AccessCurrentTask().GetText(), postTask) != 0)
             puppetRoutine->AccessCurrentTask() = bCString(postTask);

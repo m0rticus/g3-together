@@ -43,7 +43,14 @@ class NpcPresencePolicyTests(unittest.TestCase):
             self.assertIn(flag_call, hide)
             self.assertIn(flag_call, restore)
         self.assertNotIn("DisableProcessing(", hide)
-        self.assertIn("ClearLocalReferencesToDeadMirror(entity", hide)
+        self.assertIn("ClearLocalReferencesToDeadMirror(entity, nullptr, false, true)", hide)
+
+        presence_facts = identity[identity.index("npcpresence::Facts PresenceFacts("):
+                                  identity.index("bool RedundantClientEntity(")]
+        self.assertIn("facts.clientDialogPartner = talk::TalkingWithHero(entity)", presence_facts)
+        self.assertIn("facts.clientGuideActive =", presence_facts)
+        self.assertIn("guide::ClientHolding(entity)", presence_facts)
+        self.assertIn("npclease::PreviouslyVetted(guid)", presence_facts)
 
         tick = npcs[npcs.index("void Tick()"):]
         self.assertLess(tick.index("PassiveMirrorTick()"), tick.index("detail::ReconcileClientPresence()"))
@@ -68,6 +75,7 @@ class NpcPresencePolicyTests(unittest.TestCase):
         self.assertIn("absences[key] = record", despawn)
         self.assertIn("corpses.erase(key)", despawn)
         self.assertIn("npcpresence::VoidDespawnX", despawn)
+        self.assertIn("npcsend::SanitizeCapturedRecord(record)", despawn)
 
         host_tick = send[send.index("void HostTick("):send.index("} // namespace g3t::npcs::detail")]
         self.assertIn("for (auto const& entry : absences) net::SendNpcs(&entry.second, 1, true)", host_tick)

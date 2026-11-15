@@ -3,6 +3,7 @@
 #include "npc_corpse.h"
 #include "npc_state.h"
 
+#include "guide.h"
 #include "log.h"
 #include "npclease_presentation.h"
 #include "npclease_runtime.h"
@@ -178,7 +179,7 @@ void HideClientTree(eCEntity* entity, GuidKey const& key)
             c.collision = child->GetEntityFlags().m_CollisionEnabled != 0;
             state.children.push_back(c);
         }
-        ClearLocalReferencesToDeadMirror(entity, nullptr, false, false);
+        ClearLocalReferencesToDeadMirror(entity, nullptr, false, true);
     } else {
         for (auto* child : nodes) {
             npcidentity::Guid childId{};
@@ -222,6 +223,8 @@ npcpresence::Facts PresenceFacts(eCEntity* entity)
     facts.despawned = IsDespawned(guid) ||
         static_cast<int>(npc.NPC.Species) == npcpresence::DespawnedSpecies ||
         npcpresence::IsVoidDespawnPosition(pos);
+    facts.clientDialogPartner = talk::TalkingWithHero(entity);
+    bool hostMarksLocalGuideOrParty = false;
     if (const auto m = mirrors.find(key); m != mirrors.end() &&
         m->second.hostSession == net::WelcomeSerial() && m->second.entity.GetInstance() == entity) {
         facts.hostMirrorBound = true;
@@ -229,6 +232,8 @@ npcpresence::Facts PresenceFacts(eCEntity* entity)
         facts.hostMirrorPlaced = m->second.havePresentation || m->second.killed || m->second.corpsePlaced;
         facts.hostMirrorReleased = m->second.released;
         facts.hostReleasePending = HostReleasePending(guid);
+        hostMarksLocalGuideOrParty = m->second.latest.guidePlayer == net::LocalId() ||
+                                     m->second.latest.partyPlayer == net::LocalId();
     }
     if (const auto c = corpses.find(key); c != corpses.end() &&
         c->second.entity.GetInstance() == entity && c->second.hostSession == net::WelcomeSerial()) {
@@ -236,6 +241,9 @@ npcpresence::Facts PresenceFacts(eCEntity* entity)
     }
     facts.clientLeaseVetted = npclease::VettedLocalAuthority(entity);
     facts.clientHandbackPending = npclease::HandbackPending(guid);
+    facts.clientGuideActive = Claimed(entity) || guide::ClientHolding(entity) || hostMarksLocalGuideOrParty;
+    facts.clientPreviouslyVetted = facts.clientLeaseVetted || facts.clientHandbackPending ||
+        npclease::PreviouslyVetted(guid);
     return facts;
 }
 } // namespace

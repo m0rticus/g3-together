@@ -51,6 +51,9 @@ struct Facts {
     bool removed = false;
     bool duplicateQuarantined = false;
     bool despawned = false;
+    bool clientDialogPartner = false;
+    bool clientGuideActive = false;
+    bool clientPreviouslyVetted = false;
     bool hostMirrorBound = false;
     bool hostMirrorPlaced = false;
     bool hostMirrorDead = false;
@@ -67,11 +70,13 @@ inline Verdict Decide(Facts const& f) noexcept
     if (f.removed || f.duplicateQuarantined) return Verdict::Hidden;
     if (f.isHost || f.playerOrPuppet) return Verdict::Present;
     if (f.despawned) return Verdict::Hidden;
+    if (f.clientDialogPartner) return Verdict::Present;
     if (f.hostMirrorBound && f.hostMirrorPlaced &&
-        (f.hostMirrorDead || !f.hostMirrorReleased || f.hostReleasePending)) {
+        (f.hostMirrorDead || !f.hostMirrorReleased || f.hostReleasePending || f.clientGuideActive)) {
         return Verdict::Present;
     }
     if (f.hostCorpseBound) return Verdict::Present;
+    if (f.clientGuideActive && f.clientPreviouslyVetted) return Verdict::Present;
     if (f.clientLeaseVetted || f.clientHandbackPending) return Verdict::Present;
     return Verdict::Hidden;
 }

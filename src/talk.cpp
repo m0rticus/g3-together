@@ -309,7 +309,19 @@ void Tick()
     }
 }
 
-bool TalkingWithHero(eCEntity const* entity) { return entity && entity == talkingWith; }
+bool TalkingWithHero(eCEntity const* entity)
+{
+    if (!entity) return false;
+    if (entity == talkingWith) return true;
+    if (net::IsHost()) return false;
+    gCInfoManager_PS* manager = Infos();
+    if (!manager || !manager->AccessIsRunning()) return false;
+    gCEntity* npc = manager->GetDialogPartnerNPC();
+    if (npc != entity) return false;
+    return talk_policy::ShouldTrackClientDialogPartner(
+        true, npc->GetPropertySet(eEPropertySetType_NPC) != nullptr,
+        npc == gCSession::GetInstance().GetHero(), remote::IsPuppet(npc));
+}
 
 bool HoldingForPlayer(uint8_t player)
 {

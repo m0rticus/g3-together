@@ -313,6 +313,15 @@ bool Readopt(eCEntity* npc)
 
 bool IsQuestGuide(eCEntity* npc) { return GuidesInQuest(npc); }
 
+bool ClientHolding(eCEntity const* npc)
+{
+    if (!npc || net::IsHost()) return false;
+    auto* self = const_cast<eCEntity*>(npc);
+    if (held.count(Key(self)) != 0) return true;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    return hero && LeaderOf(hero) == self;
+}
+
 void OnWorldChange()
 {
     held.clear();

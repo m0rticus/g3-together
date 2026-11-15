@@ -79,6 +79,32 @@ int main()
     leased.clientHandbackPending = false;
     assert(Decide(leased) == Verdict::Hidden);
 
+    // 6b. Active client dialogue partners and transitioning FollowNpc guides stay Present across authority handoffs,
+    // without flashing never-placed template ghosts or overriding void-despawn / removal.
+    Facts dialogPartner = unmirrored;
+    dialogPartner.clientDialogPartner = true;
+    assert(Decide(dialogPartner) == Verdict::Present);
+    dialogPartner.despawned = true;
+    assert(Decide(dialogPartner) == Verdict::Hidden);
+
+    Facts guideTransition = unmirrored;
+    guideTransition.clientGuideActive = true;
+    // Never-placed template entity waits for host placement before appearing.
+    assert(Decide(guideTransition) == Verdict::Hidden);
+    // Previously vetted client lease relinquished to host for guiding stays Present while host stream warms up.
+    guideTransition.clientPreviouslyVetted = true;
+    assert(Decide(guideTransition) == Verdict::Present);
+    // Placed host mirror actively guiding the client stays Present even across brief stream release.
+    Facts placedGuide = unmirrored;
+    placedGuide.clientGuideActive = true;
+    placedGuide.hostMirrorBound = true;
+    placedGuide.hostMirrorPlaced = true;
+    placedGuide.hostMirrorReleased = true;
+    assert(Decide(placedGuide) == Verdict::Present);
+    // Once guiding ends and the player walks away after stream release drains, normal hiding resumes.
+    placedGuide.clientGuideActive = false;
+    assert(Decide(placedGuide) == Verdict::Hidden);
+
     // 7. Void despawn coordinate classifier and Offer baseline drift gate.
     const float voidPos[3] = {-220000.0f, 100000.0f, 100000.0f};
     const float nearVoid[3] = {-219500.0f, 100250.0f, 99800.0f};

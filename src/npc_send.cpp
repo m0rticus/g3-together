@@ -428,7 +428,17 @@ void Despawn(eCEntity* entity)
     record.sent = net::Now();
     record.flags |= 1;
     record.hitPoints = 0;
+    if (auto* receiver = static_cast<gCDamageReceiver_PS*>(entity->GetPropertySet(eEPropertySetType_DamageReceiver))) {
+        const int32_t maxHp = receiver->GetHitPointsMax();
+        if (maxHp >= 1) record.hitPointsMax = maxHp;
+    }
+    record.aiMode = static_cast<uint8_t>(gEAIMode_Dead);
+    record.partyPlayer = 0;
+    record.partyType = 0;
+    record.waiting = 0;
+    record.guidePlayer = 0;
     record.contact = 0;
+    std::memset(record.motions, 0, sizeof(record.motions));
     const auto& at = entity->GetWorldPosition();
     const auto turn = entity->GetWorldRotation();
     record.position[0] = at.GetX(); record.position[1] = at.GetY(); record.position[2] = at.GetZ();
@@ -439,6 +449,7 @@ void Despawn(eCEntity* entity)
     }
     record.rotation[0] = turn.GetX(); record.rotation[1] = turn.GetY();
     record.rotation[2] = turn.GetZ(); record.rotation[3] = turn.GetW();
+    npcsend::SanitizeCapturedRecord(record);
     last.at = record.sent;
     last.posed = false;
     last.poseFlags = 0;
