@@ -539,6 +539,21 @@ bool AdmitIncomingNpc(net::NpcRecord const& record, GuidKey const& key, uint32_t
         absences.erase(absent);
         world::RequestProcessingUpdate();
     }
+    if (!net::IsHost() && (record.flags & 1) != 0 && npcpresence::IsVoidDespawnPosition(record.position)) {
+        LeaseReleaseMirror(record.guid);
+        absences[key] = record;
+        pendingForces.erase(key);
+        if (eCEntity* live = Resolve(record.guid).GetInstance(); IsNpc(live)) {
+            npclease::RelinquishToHost(live, "host despawned NPC");
+            const bCMatrix pose = body::Pose(*live, record.position, record.rotation);
+            live->SetToWorldMatrix(pose);
+            if (auto* rigid = static_cast<eCRigidBody_PS*>(live->GetPropertySet(eEPropertySetType_RigidBody)))
+                rigid->SetPose(pose);
+            ClearLocalReferencesToDeadMirror(live, nullptr, false, true);
+        }
+        absenceCheckAt = 0;
+        return false;
+    }
     if (!(record.flags & 1)) journal::NewLife(record.guid);
     if (net::IsHost() && existing != mirrors.end()) {
         Mirror const& current = existing->second;

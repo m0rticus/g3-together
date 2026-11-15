@@ -67,7 +67,15 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
     if (net::IsHost()) net::SendDeath(guid, by, by);  // pass it on to everyone else
     const std::string key(reinterpret_cast<char const*>(guid), 16);
     Entity npc(npcs::NpcByGuid(guid));  // an NPC only (Fable 1.7: quest counters ran on any GUID)
-    if (!npc.GetInstance()) return;
+    if (!npc.GetInstance()) {
+        if (!net::IsHost() && key.size() == 16) {
+            Death& d = deaths[key];
+            d.by = by;
+            d.applied = true;
+            d.seenSince = 0;
+        }
+        return;
+    }
     const bool first = deaths.find(key) == deaths.end();
     Death& d = deaths[key];
     // Kill quests count by the victim's name in gCQuest_PS::OnNPCKilled, called from the death script Kill, which
@@ -174,7 +182,22 @@ unsigned Read(FILE* file)
 
 void Clear() { deaths.clear(); }
 
-void OnWorldChange() { alive.clear(); }
+void OnWorldChange()
+{
+    alive.clear();
+    if (!net::IsHost()) deaths.clear();
+}
+
+void SyncToClients()
+{
+    if (!net::IsHost() || !net::Connected()) return;
+    for (auto const& [key, d] : deaths) {
+        if (key.size() != 16) continue;
+        uint8_t guid[16];
+        std::memcpy(guid, key.data(), 16);
+        if (!npcremoval::Suppressed(guid)) net::SendDeath(guid, d.by ? d.by : 1, 0);
+    }
+}
 
 bool Pending(eCEntity const* entity)
 {
@@ -234,16 +257,18 @@ void Tick()
         // 1. Deaths of NPCs this machine simulates go to the host (and on from there).
         auto seen = alive.find(key);
         const bool fromJournal = entry != deaths.end();
-        if (seen != alive.end() && seen->second && dead && !fromJournal && reporting && net::Connected()) {
+        if (seen != alive.end() && seen->second && dead && !fromJournal && reporting) {
             uint8_t guid[16];
             std::memcpy(guid, key.data(), 16);
-            net::SendDeath(guid, net::LocalId(), 0);
-            ++reported;
+            if (net::Connected()) {
+                net::SendDeath(guid, net::LocalId(), 0);
+                ++reported;
+            }
             Death& d = deaths[key];  // recorded here as well, already applied
             d.by = net::LocalId();
             d.applied = true;
             d.name = npc.GetName().GetText();
-            Logf("journal: %s died here; reported", d.name.c_str());
+            Logf("journal: %s died here; %s", d.name.c_str(), net::Connected() ? "reported" : "recorded");
         }
         alive[key] = !dead;
         // 2. A recorded death of an NPC this machine now processes.

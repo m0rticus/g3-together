@@ -487,6 +487,18 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("i < net::LocalId()", shared)
         self.assertIn("i < client", interest)
 
+    def test_host_lease_evaluates_authoritative_position_rejects_ghosts_and_allows_mob_herds(self):
+        host = section(self.host_source, "void ReceiveHost(", "void Receive(uint8_t")
+        client = section(self.client_source, "void ReceiveClient(", "// Which native path")
+        follower = section(self.runtime, "bool FollowerRole(eCEntity* entity)", "npcown::RoleFacts RoleOf(")
+        self.assertIn("gEPartyMemberType_Mob", follower)
+        self.assertIn("HostInterestState(baseline, entry, native, frozen)", host)
+        self.assertIn("SyncOfferedHostState(entry, native, priorState, hadBaseline, frozen)", host)
+        self.assertIn("RejectToClient(from, note, native)", host)
+        self.assertIn("npcs::EnsureHostDespawn(native, note.guid)", host)
+        self.assertIn("note.kind == Kind::Reject", client)
+        self.assertIn("entry.vetted = true", client)
+
     def test_stale_host_state_cannot_authorize_takeover_or_native_death(self):
         takeover = section(self.runtime, "char const* TakeOver(", "void CutToHost(")
         scan = section(self.runtime, "void ScanClient(", "void TickClient(")

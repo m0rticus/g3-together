@@ -116,6 +116,12 @@ eCEntity* AdmitHostSendCandidate(GuidKey const& candidateKey, eCEntity* hero, eC
         guid::CopyEntity(instance, outGuid);
         outKey = Key(outGuid);
     }
+    if (EnsureHostDespawn(instance, outGuid)) {
+        sendNotes[outKey] = {"despawned", net::Now()};
+        streamDiag.Candidate(Drop::Removed);
+        countSkipped(outKey, net::NpcSendDecision::SkippedIrrelevant);
+        return nullptr;
+    }
     if (npclease::SuppressHostPublication(outGuid)) { streamDiag.Candidate(Drop::Lease); return nullptr; }
     const bCVector& w = instance->GetWorldPosition();
     const float where[3] = {w.GetX(), w.GetY(), w.GetZ()};
@@ -311,6 +317,8 @@ void HostTick(void (*sendOwned)(eCEntity*, float const[][3], int))
         namesSent.clear();
         npcplayback::ResetPublishedNames();
         for (auto const& entry : forceHistory) for (auto const& force : entry.second) net::SendRagdoll(force);
+        for (auto const& entry : absences) net::SendNpcs(&entry.second, 1, true);
+        journal::SyncToClients();
     }
     float players[net::MaxPlayers][3];
     int playerCount = 0;
@@ -378,16 +386,44 @@ void ForgetRemoved(uint8_t const guid[16])
         else ++it;
 }
 
+bool IsDespawned(uint8_t const guid[16])
+{
+    if (!guid) return false;
+    const GuidKey key = Key(guid);
+    const auto absent = absences.find(key);
+    if (absent == absences.end()) return false;
+    return !net::IsHost() || static_cast<int32_t>(Incarnation(guid) - absent->second.incarnation) <= 0;
+}
+
+bool EnsureHostDespawn(eCEntity* entity, uint8_t const guid[16])
+{
+    if (!net::IsHost() || !guid || npcremoval::Suppressed(guid)) return false;
+    if (IsDespawned(guid)) return true;
+    if (!IsNpc(entity)) return false;
+    Entity npc(entity);
+    const auto& at = entity->GetWorldPosition();
+    const float pos[3] = {at.GetX(), at.GetY(), at.GetZ()};
+    if (static_cast<int>(npc.NPC.Species) != npcpresence::DespawnedSpecies &&
+        !npcpresence::IsVoidDespawnPosition(pos)) {
+        return false;
+    }
+    Despawn(entity);
+    return true;
+}
+
 void Despawn(eCEntity* entity)
 {
     if (!net::IsHost() || !IsNpc(entity) || npcremoval::Suppressed(entity)) return;
     uint8_t guid[16];
     Guid(entity, guid);
     const GuidKey key = Key(guid);
+    const uint32_t inc = Incarnation(guid);
+    const auto existing = absences.find(key);
+    const bool alreadySent = existing != absences.end() && existing->second.incarnation == inc;
     LastSent& last = lastSent[key];
     auto& record = last.record;
     std::memcpy(record.guid, guid, sizeof(record.guid));
-    record.incarnation = Incarnation(guid);
+    record.incarnation = inc;
     record.sent = net::Now();
     record.flags |= 1;
     record.hitPoints = 0;
@@ -395,14 +431,24 @@ void Despawn(eCEntity* entity)
     const auto& at = entity->GetWorldPosition();
     const auto turn = entity->GetWorldRotation();
     record.position[0] = at.GetX(); record.position[1] = at.GetY(); record.position[2] = at.GetZ();
+    if (!npcpresence::IsVoidDespawnPosition(record.position)) {
+        record.position[0] = npcpresence::VoidDespawnX;
+        record.position[1] = npcpresence::VoidDespawnY;
+        record.position[2] = npcpresence::VoidDespawnZ;
+    }
     record.rotation[0] = turn.GetX(); record.rotation[1] = turn.GetY();
     record.rotation[2] = turn.GetZ(); record.rotation[3] = turn.GetW();
     last.at = record.sent;
     last.posed = false;
     last.poseFlags = 0;
     last.bones.clear();
+    absences[key] = record;
+    corpses.erase(key);
+    sending.erase(key);
+    owned.erase(key);
     forceHistory.erase(key);
-    net::SendNpcs(&record, 1, true);
+    ForgetCorpseGroundAnchor(key);
+    if (!alreadySent) net::SendNpcs(&record, 1, true);
 }
 
 uint32_t Incarnation(uint8_t const guid[16])
@@ -428,6 +474,7 @@ void NewLife(uint8_t const guid[16])
         uint32_t& incarnation = incarnations[key];
         if (!incarnation) incarnation = 1;
         if (++incarnation == 0) ++incarnation;
+        absences.erase(key);
         hostHits.erase(key);
         forceHistory.erase(key);
     }

@@ -7,6 +7,7 @@
 #include "npclease_presentation.h"
 #include "npclease_runtime.h"
 #include "npcremoval.h"
+#include "persist.h"
 #include "talk.h"
 #include "world.h"
 
@@ -33,9 +34,16 @@ npcidentity::Candidate IdentityCandidate(eCEntity* entity)
     if (entity->GetPropertySet(eEPropertySetType_Interaction) &&
         npc.Interaction.GetOwner().GetInstance()) return candidate;
     if (auto* party = static_cast<gCParty_PS*>(entity->GetPropertySet(eEPropertySetType_Party))) {
-        if (npc.Party.GetPartyLeader().GetInstance() || npc.Party.Waiting ||
-            static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) != gEPartyMemberType_None ||
-            party->GetMembers().GetCount()) return candidate;
+        const auto type = static_cast<gEPartyMemberType>(npc.Party.PartyMemberType);
+        const bool playerParty = type != gEPartyMemberType_None && type != gEPartyMemberType_Mob &&
+                                 type != gEPartyMemberType_Slave;
+        bool hasPlayerMember = false;
+        for (GEInt i = 0; i < party->GetMembers().GetCount(); ++i)
+            if (npclease::detail::Player(party->GetMembers()[i].GetEntity())) hasPlayerMember = true;
+        if (npclease::detail::Player(npc.Party.GetPartyLeader().GetInstance()) ||
+            (npc.Party.Waiting && type == gEPartyMemberType_Party) || playerParty || hasPlayerMember) {
+            return candidate;
+        }
     }
     const GuidKey key = Key(candidate.guid.data());
     const auto mirror = mirrors.find(key);
@@ -117,6 +125,119 @@ void LogIdentity(char const* kind, eCEntity* entity, eCEntity* keeper)
                  parts[i].m_strName.GetText(), parts[i].m_bVisible);
     }
 }
+
+void CollectDependentNodes(eCEntity* entity, std::vector<eCEntity*>& out)
+{
+    for (int i = 0; i < entity->GetChildrenCount(); ++i) {
+        auto* child = entity->GetChildAt(i);
+        if (!child || IndependentActor(child)) continue;
+        out.push_back(child);
+        CollectDependentNodes(child, out);
+    }
+}
+
+void RestoreHiddenTree(eCEntity* entity, HiddenClientState const& state)
+{
+    if (!entity || !state.active || RedundantClientEntity(entity)) return;
+    entity->EnableRendering(state.root.rendering ? GETrue : GEFalse);
+    entity->EnablePicking(state.root.picking ? GETrue : GEFalse, GEFalse);
+    entity->EnableCollision(state.root.collision ? GETrue : GEFalse);
+    std::vector<eCEntity*> nodes;
+    CollectDependentNodes(entity, nodes);
+    for (auto* child : nodes) {
+        npcidentity::Guid childId{};
+        Guid(child, childId.data());
+        for (auto const& saved : state.children) {
+            if (saved.guid != childId) continue;
+            child->EnableRendering(saved.rendering ? GETrue : GEFalse);
+            child->EnablePicking(saved.picking ? GETrue : GEFalse, GEFalse);
+            child->EnableCollision(saved.collision ? GETrue : GEFalse);
+            break;
+        }
+    }
+}
+
+void HideClientTree(eCEntity* entity, GuidKey const& key)
+{
+    if (!entity || RedundantClientEntity(entity)) return;
+    auto& state = hiddenClientStates[key];
+    std::vector<eCEntity*> nodes;
+    CollectDependentNodes(entity, nodes);
+    if (!state.active) {
+        state.active = true;
+        Guid(entity, state.root.guid.data());
+        state.root.rendering = entity->IsRenderingEnabled() != GEFalse;
+        state.root.picking = entity->IsPickable() != GEFalse;
+        state.root.collision = entity->GetEntityFlags().m_CollisionEnabled != 0;
+        state.children.clear();
+        for (auto* child : nodes) {
+            HiddenNodeState c{};
+            Guid(child, c.guid.data());
+            c.rendering = child->IsRenderingEnabled() != GEFalse;
+            c.picking = child->IsPickable() != GEFalse;
+            c.collision = child->GetEntityFlags().m_CollisionEnabled != 0;
+            state.children.push_back(c);
+        }
+        ClearLocalReferencesToDeadMirror(entity, nullptr, false, false);
+    } else {
+        for (auto* child : nodes) {
+            npcidentity::Guid childId{};
+            Guid(child, childId.data());
+            const bool known = std::any_of(state.children.begin(), state.children.end(),
+                [&](HiddenNodeState const& s) { return s.guid == childId; });
+            if (!known) {
+                state.children.push_back({childId, child->IsRenderingEnabled() != GEFalse,
+                    child->IsPickable() != GEFalse, child->GetEntityFlags().m_CollisionEnabled != 0});
+            }
+        }
+    }
+    entity->EnableRendering(GEFalse);
+    entity->EnablePicking(GEFalse, GEFalse);
+    entity->EnableCollision(GEFalse);
+    for (auto* child : nodes) {
+        child->EnableRendering(GEFalse);
+        child->EnablePicking(GEFalse, GEFalse);
+        child->EnableCollision(GEFalse);
+    }
+}
+
+npcpresence::Facts PresenceFacts(eCEntity* entity)
+{
+    npcpresence::Facts facts;
+    facts.isHost = net::IsHost();
+    if (!entity) return facts;
+    facts.character = npcplayback::IsCharacter(entity);
+    if (!facts.character) return facts;
+    facts.playerOrPuppet = entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody() ||
+        remote::IsPuppet(entity) || entity->GetPropertySet(eEPropertySetType_PlayerMemory) != nullptr;
+    facts.removed = npcremoval::Suppressed(entity);
+    facts.duplicateQuarantined = RedundantClientEntity(entity);
+    if (facts.isHost || facts.playerOrPuppet || facts.removed || facts.duplicateQuarantined) return facts;
+    uint8_t guid[16];
+    Guid(entity, guid);
+    const GuidKey key = Key(guid);
+    const auto& p = entity->GetWorldPosition();
+    const float pos[3] = {p.GetX(), p.GetY(), p.GetZ()};
+    Entity npc(entity);
+    facts.despawned = IsDespawned(guid) ||
+        static_cast<int>(npc.NPC.Species) == npcpresence::DespawnedSpecies ||
+        npcpresence::IsVoidDespawnPosition(pos);
+    if (const auto m = mirrors.find(key); m != mirrors.end() &&
+        m->second.hostSession == net::WelcomeSerial() && m->second.entity.GetInstance() == entity) {
+        facts.hostMirrorBound = true;
+        facts.hostMirrorDead = (m->second.latest.flags & 1) != 0;
+        facts.hostMirrorPlaced = m->second.havePresentation || m->second.killed || m->second.corpsePlaced;
+        facts.hostMirrorReleased = m->second.released;
+        facts.hostReleasePending = HostReleasePending(guid);
+    }
+    if (const auto c = corpses.find(key); c != corpses.end() &&
+        c->second.entity.GetInstance() == entity && c->second.hostSession == net::WelcomeSerial()) {
+        facts.hostCorpseBound = true;
+    }
+    facts.clientLeaseVetted = npclease::VettedLocalAuthority(entity);
+    facts.clientHandbackPending = npclease::HandbackPending(guid);
+    return facts;
+}
 } // namespace
 
 bool RedundantClientEntity(eCEntity const* entity)
@@ -129,9 +250,18 @@ bool RedundantClientEntity(eCEntity const* entity)
     return identity == found->second.guid;
 }
 
+bool ClientPresent(eCEntity const* entity)
+{
+    if (!entity) return false;
+    if (net::IsHost()) return !npcremoval::Suppressed(entity);
+    if (!net::Connected()) return !npcremoval::Suppressed(entity);
+    return npcpresence::Decide(PresenceFacts(const_cast<eCEntity*>(entity))) == npcpresence::Verdict::Present;
+}
+
 void ReconcileClientEntities()
 {
     if (net::IsHost() || !gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero()) return;
+    detail::ReconcileClientPresence();
     const uint32_t now = net::Now();
     if (identityCensusAt && now - identityCensusAt < 250) return;
     identityCensusAt = now ? now : 1;
@@ -198,11 +328,18 @@ void ReconcileClientEntities()
         if (!seen.count(reinterpret_cast<uintptr_t>(it->first))) it = quarantinedEntities.erase(it);
         else ++it;
     for (auto* entity : redundant) {
+        uint8_t dupGuid[16];
+        Guid(const_cast<eCEntity*>(entity), dupGuid);
+        if (const auto hid = hiddenClientStates.find(Key(dupGuid)); hid != hiddenClientStates.end()) {
+            RestoreHiddenTree(const_cast<eCEntity*>(entity), hid->second);
+            if (Resolve(dupGuid).GetInstance() == entity) hiddenClientStates.erase(hid);
+        }
         const bool first = !RedundantClientEntity(entity);
         if (first) LogIdentity("NPCDUP_QUARANTINE", const_cast<eCEntity*>(entity),
                               Resolve(IdentityCandidate(const_cast<eCEntity*>(entity)).guid.data()).GetInstance());
         QuarantineTree(const_cast<eCEntity*>(entity), const_cast<eCEntity*>(entity));
     }
+    detail::ReconcileClientPresence();
     for (auto const& entry : groups) {
         if (entry.second.size() < 2) continue;
         auto* keeper = Resolve(entry.first).GetInstance();
@@ -372,8 +509,45 @@ bool RelationOfImpl(eCEntity const* entity, RelationInfo& info)
     return true;
 }
 
+void ReconcileClientPresence()
+{
+    if (!gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero() || persist::NativeLoading()) return;
+    auto const* processed = world::ProcessedEntities();
+    if (net::IsHost() || !net::Connected()) {
+        if (!hiddenClientStates.empty() && processed) {
+            for (GEU16 i = 0; i < processed->GetCount(); ++i) {
+                eCEntity* entity = processed->GetAt(i);
+                if (!entity || !npcplayback::IsCharacter(entity)) continue;
+                uint8_t guid[16];
+                Guid(entity, guid);
+                if (const auto it = hiddenClientStates.find(Key(guid)); it != hiddenClientStates.end()) {
+                    RestoreHiddenTree(entity, it->second);
+                    hiddenClientStates.erase(it);
+                }
+            }
+            hiddenClientStates.clear();
+        }
+        return;
+    }
+    if (!processed) return;
+    for (GEU16 i = 0; i < processed->GetCount(); ++i) {
+        eCEntity* entity = processed->GetAt(i);
+        if (!entity || !npcplayback::IsCharacter(entity) || RedundantClientEntity(entity)) continue;
+        uint8_t guid[16];
+        Guid(entity, guid);
+        const GuidKey key = Key(guid);
+        if (npcpresence::Decide(PresenceFacts(entity)) == npcpresence::Verdict::Hidden) {
+            HideClientTree(entity, key);
+        } else if (const auto it = hiddenClientStates.find(key); it != hiddenClientStates.end()) {
+            RestoreHiddenTree(entity, it->second);
+            hiddenClientStates.erase(it);
+        }
+    }
+}
+
 void ResetWorldNpcTables()
 {
+    hiddenClientStates.clear();
     awaitedHits.clear();
     npclease::OnWorldDeactivate();
     playerContact = PlayerContact{};

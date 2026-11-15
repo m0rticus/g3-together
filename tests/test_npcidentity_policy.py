@@ -70,7 +70,7 @@ class NpcIdentityTests(unittest.TestCase):
         candidate = source[source.index("npcidentity::Candidate IdentityCandidate("):
                            source.index("bool IndependentActor(")]
         for required in ("eEPropertySetType_Item", "eEPropertySetType_Magic", "Interaction.GetOwner",
-                         "GetPartyLeader", "partyPlayer", "guidePlayer", "talk::IsHeld"):
+                         "GetPartyLeader", "gEPartyMemberType_Mob", "partyPlayer", "guidePlayer", "talk::IsHeld"):
             self.assertIn(required, candidate)
 
     def test_only_the_bound_pointer_has_host_presentation_and_combat(self):

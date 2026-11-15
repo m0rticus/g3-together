@@ -184,7 +184,8 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
 void TryPlayerBlow(eCEntity* victim)
 {
     eCEntity* hero = remote::ControlledBody();
-    if (!playerContact.ready || !hero || !victim || Entity(victim).IsDead() || npcremoval::Suppressed(victim)) return;
+    if (!playerContact.ready || !hero || !victim || Entity(victim).IsDead() || npcremoval::Suppressed(victim) ||
+        !ClientPresent(victim)) return;
     ++playerSweepTests;
     if (!SweepsBody(victim, playerContact.previousA, playerContact.previousB,
                     playerContact.a, playerContact.b, playerContact.thickness, playerContact.bone == -2)) return;
@@ -956,6 +957,7 @@ void Tick()
     InstallRagdollHook(net::Now());
     PassiveMirrorTick();
     CorpseTick(net::Now());
+    detail::ReconcileClientPresence();
     TickTargetingWatch(net::Now());
 }
 

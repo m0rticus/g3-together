@@ -16,6 +16,8 @@ void OnWorldDeactivate();
 void CaptureCacheInventory();
 bool NewLife(uint8_t const guid[16]);
 bool LocalAuthority(eCEntity const* entity);
+bool VettedLocalAuthority(eCEntity const* entity);
+bool HandbackPending(uint8_t const guid[16]);
 void RelinquishToHost(eCEntity* entity, char const* reason = "role transfer to host");
 // The client drives this NPC natively right now (provisional or host-confirmed). Safe to call with any GUID.
 bool LocalOwner(uint8_t const guid[16]);
@@ -63,7 +65,8 @@ struct Entry {
     bool captureFailed = false;
     bool adopted = false;
     // Local ownership is independent of host confirmation.
-    bool local = false, confirmed = false;
+    bool local = false, confirmed = false, vetted = false, hasOfferedState = false;
+    Checkpoint offeredState{};
     uint32_t ownedAt = 0, yieldedAt = 0, cutAt = 0, hostSeenAt = 0, requestEvery = 500, retryAt = 0;
     char const* cutReason = nullptr;
     eCEntity* ownedEntity = nullptr;
@@ -112,6 +115,9 @@ void Refusal(GuidKey const& key, char const* name, char const* reason);
 void OwnEvent(GuidKey const& key, char const* name, npcown::Event event, char const* detail);
 void OwnEventAlways(GuidKey const& key, char const* name, npcown::Event event, char const* detail);
 bool Exact(Message const& note, Entry const& entry);
+Checkpoint HostInterestState(Checkpoint const& baseline, Entry const& entry, eCEntity* native, bool frozen);
+void SyncOfferedHostState(Entry& entry, eCEntity* native, Checkpoint const& priorState, bool hadBaseline, bool frozen);
+void RejectToClient(uint8_t client, Message const& note, eCEntity* native);
 void ReceiveClient(Message const& note);
 void TickClient(uint32_t now);
 }

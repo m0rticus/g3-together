@@ -84,10 +84,7 @@ bool Player(eCEntity const* entity)
     return entity && (entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody() ||
                       remote::IsPuppet(entity) || entity->GetPropertySet(eEPropertySetType_PlayerMemory));
 }
-bool HostWins(GuidKey const& key)
-{
-    return npcs::HostStreamClaimed(key.data()) && npcs::HostStreamRecords(key.data()) >= 2;
-}
+bool HostWins(GuidKey const& key) { return npcs::HostStreamClaimed(key.data()) && npcs::HostStreamRecords(key.data()) >= 2; }
 bool Running()
 {
     return !ai::ShuttingDown() && !persist::NativeLoading() && !persist::HeroPending() &&
@@ -120,23 +117,23 @@ void SyncGuardHostClaims()
         if (guard.leased && guard.hostClaimed != HostWins(item.first)) PublishGuard(item.first, item.second);
     }
 }
-AuthorityGuard ReadGuard(eCEntity const* entity)
-{
-    if (!entity) return {};
-    return guardStates.Get(Key(entity));
-}
+AuthorityGuard ReadGuard(eCEntity const* entity) { return entity ? guardStates.Get(Key(entity)) : AuthorityGuard{}; }
 // Summons, party members and owned actors follow a player and stay with that player's machine; trade/teach/dialogue/quest
 // actors, immortals, named actors and equipped NPCs are ordinary client citizens.
 bool FollowerRole(eCEntity* entity)
 {
+    if (npcs::CompanionOwner(entity) || npcs::HostTaken(entity)) return true;
     if (entity->GetPropertySet(eEPropertySetType_Interaction) &&
         Entity(entity).Interaction.GetOwner().GetInstance()) return true;
     auto* party = static_cast<gCParty_PS*>(entity->GetPropertySet(eEPropertySetType_Party));
     if (!party) return false;
     Entity npc(entity);
-    return npc.Party.GetPartyLeader().GetInstance() || npc.Party.Waiting ||
-        static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) != gEPartyMemberType_None ||
-        party->GetMembers().GetCount() != 0;
+    const auto type = static_cast<gEPartyMemberType>(npc.Party.PartyMemberType);
+    if (type != gEPartyMemberType_None && type != gEPartyMemberType_Mob && type != gEPartyMemberType_Slave) return true;
+    if (Player(npc.Party.GetPartyLeader().GetInstance()) || (npc.Party.Waiting && type == gEPartyMemberType_Party)) return true;
+    for (GEInt i = 0; i < party->GetMembers().GetCount(); ++i)
+        if (Player(party->GetMembers()[i].GetEntity())) return true;
+    return false;
 }
 
 npcown::RoleFacts RoleOf(eCEntity* entity, bool prototype)
@@ -380,29 +377,32 @@ void ReceiveHost(uint8_t from, Message const& note)
         }
         eCEntity* native = npcs::NpcByGuid(note.guid);
         // Client-first: the client already runs this NPC; its latest checkpoint is the baseline for every class.
-        const Checkpoint baseline = note.state;
+        const Checkpoint baseline = note.state, priorState = entry.lease.state;
+        const bool hadBaseline = entry.hasBaseline;
         const uint8_t priorEffects = entry.lease.state.effects;
+        auto reject = [&](char const* name, char const* why) { Refusal(key, name, why); RejectToClient(from, note, native); };
+        if (npcs::EnsureHostDespawn(native, note.guid)) { reject(note.state.name, "host despawned this NPC"); return; }
         if ((entry.lease.state.dead || (priorEffects & NativeDeath)) && !baseline.dead) {
-            Refusal(key, note.state.name, "host lease recorded this NPC's death"); return;
+            reject(note.state.name, "host lease recorded this NPC's death"); return;
         }
         if (npcremoval::SuppressedUnloaded(note.guid, baseline.name, baseline.position)) {
-            Refusal(key, baseline.name, "authored removal"); return;
+            reject(baseline.name, "authored removal"); return;
         }
         if (native) {
-            if (auto const* why = EligibilityReason(native)) { Refusal(key, note.state.name, why); return; }
+            if (auto const* why = EligibilityReason(native)) { reject(note.state.name, why); return; }
             if (std::memcmp(&native->GetTemplateID().GetCore(), baseline.templateId, 16)) {
-                Refusal(key, note.state.name, "client checkpoint does not match the host instance template"); return;
+                reject(note.state.name, "client checkpoint does not match the host instance template"); return;
             }
             if (!baseline.dead && Entity(native).IsDead()) {
-                Refusal(key, note.state.name, "host instance is already dead"); return;
+                reject(note.state.name, "host instance is already dead"); return;
             }
-        } else if (auto const* why = DiscoveryReason(baseline)) { Refusal(key, note.state.name, why); return; }
+        } else if (auto const* why = DiscoveryReason(baseline)) { reject(note.state.name, why); return; }
         if (!baseline.dead && journal::RecordedDeath(note.guid)) {
-            Refusal(key, note.state.name, "host journal recorded this NPC's death"); return;
+            reject(note.state.name, "host journal recorded this NPC's death"); return;
         }
-        auto interest = InterestOf(baseline, from, native);
+        auto interest = InterestOf(HostInterestState(baseline, entry, native, frozen), from, native);
         interest.hostPresent = interest.hostPresent && npcs::HostCanPresent(note.guid);
-        if (!entry.interest.Delegate(interest, now)) { Refusal(key, note.state.name, DelegateRefusal(interest)); return; }
+        if (!entry.interest.Delegate(interest, now)) { reject(note.state.name, DelegateRefusal(interest)); return; }
         if (native && !npcplayback::GuardForLease(native)) {
             Refusal(key, baseline.name, "native property authority fence unavailable"); return;
         }
@@ -421,6 +421,7 @@ void ReceiveHost(uint8_t from, Message const& note)
             net::SendNpcLease(previousLease.owner, handBack);
         }
         entry.lease.state.effects |= priorEffects;
+        SyncOfferedHostState(entry, native, priorState, hadBaseline, frozen);
         CommitDeath(key, entry);
         entry.world = note.world; entry.echo = note.echo;
         entry.recallAt = 0;
@@ -782,10 +783,7 @@ bool ActiveLeases()
              !(item.second.lease.state.effects & QuestDeath)))) return true;
     return false;
 }
-SaveOverlay Capture()
-{
-    return {};
-}
+SaveOverlay Capture() { return {}; }
 bool Restore(SaveOverlay const&, uint32_t)
 {
     // Legacy client-owned checkpoints must never override the loaded native world.
@@ -794,16 +792,10 @@ bool Restore(SaveOverlay const&, uint32_t)
 }
 bool WriteSnapshot(FILE* file)
 {
-    if (!file) {
-        Log("FAIL npclease: snapshot stream unavailable");
-        return false;
-    }
+    if (!file) { Log("FAIL npclease: snapshot stream unavailable"); return false; }
     return true;
 }
-bool ReadSnapshot(FILE* file, SaveOverlay& overlay)
-{
-    return ReadSaveStream(file, overlay);
-}
+bool ReadSnapshot(FILE* file, SaveOverlay& overlay) { return ReadSaveStream(file, overlay); }
 void RejectSnapshot(char const* reason)
 {
     OnWorldDeactivate();

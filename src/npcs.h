@@ -99,6 +99,9 @@ void RecvOff(LogFn log);  // QA: ignore every NPC snapshot from now on (invarian
 void DeadPoseOff(LogFn log);     // QA negative control: dead mirrors are not laid down
 void DeadPoseReport(LogFn log);  // QA: DEADPOSE line
 void LayDownCorpse(eCEntity* entity);  // a death applied here outside mirroring (journal.cpp): lay the body down like a dead mirror
+bool ClientPresent(eCEntity const* entity);  // client: backed by active host presentation, settled corpse, or vetted lease
+bool IsDespawned(uint8_t const guid[16]);    // void-despawned via Respawn in the current incarnation
+bool EnsureHostDespawn(eCEntity* entity, uint8_t const guid[16]);
 unsigned HoldChanges();  // QA: weapons put into mirrors' hands so far
 bool Claimed(eCEntity const* entity);  // client: taken over by this player
 bool DeadStays();  // an NPC dead on the host stays dead everywhere (playtest 27.10.)

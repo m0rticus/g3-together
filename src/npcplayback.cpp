@@ -922,8 +922,8 @@ void Tick()
             }
             Silence(npc.GetInstance());
             const GuidKey key = EntityKey(npc.GetInstance());
-            if (!npcs::HostPresentationAvailable(npc.GetInstance()) && !npc.IsDead() && !npc.IsDown() &&
-                !npcremoval::Suppressed(npc.GetInstance())) {
+            if (npcs::ClientPresent(npc.GetInstance()) && !npcs::HostPresentationAvailable(npc.GetInstance()) &&
+                !npc.IsDead() && !npc.IsDown() && !npcremoval::Suppressed(npc.GetInstance())) {
                 auto& held = unavailable[key];
                 if (held.entity != npc.GetInstance()) held = Unavailable{};
                 held.entity = npc.GetInstance();

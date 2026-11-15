@@ -7,6 +7,7 @@
 #include "guid_key.h"
 #include "net.h"
 #include "npcidentity_policy.h"
+#include "npcpresence_policy.h"
 #include "npcplayback.h"
 #include "npcs.h"
 #include "npcsend_policy.h"
@@ -209,10 +210,22 @@ struct Mirror {
     unsigned focusWatchChanges = 0;
 };
 
+struct HiddenNodeState {
+    npcidentity::Guid guid{};
+    bool rendering = true, picking = true, collision = true;
+};
+
+struct HiddenClientState {
+    bool active = false;
+    HiddenNodeState root{};
+    std::vector<HiddenNodeState> children;
+};
+
 inline bool fastNpcs = true;
 inline std::unordered_map<GuidKey, LastSent, GuidHash> lastSent;
 inline std::unordered_map<GuidKey, AwaitedHit, GuidHash> awaitedHits;
 inline std::unordered_map<eCEntity const*, QuarantinedEntity> quarantinedEntities;
+inline std::unordered_map<GuidKey, HiddenClientState, GuidHash> hiddenClientStates;
 inline uint32_t identityCensusAt = 0, identityLogAt = 0;
 inline std::unordered_map<GuidKey, npcsend::State, GuidHash> recipientNpcs[net::MaxPlayers];
 inline uint32_t recipientGenerations[net::MaxPlayers] = {};
