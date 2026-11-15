@@ -256,7 +256,7 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         std::memcpy(&header, packet->data, sizeof(header));
         const uint8_t domain = header.kind & story::policy::KindMask;
         const bool snapshot = (header.kind & story::policy::Snapshot) != 0;
-        if (domain < StateQuests || domain > StateWorldClock ||
+        if (domain < StateQuests || domain > StateReputation ||
             ((header.kind & story::policy::End) && (!snapshot || header.count)) ||
             ((header.kind & story::policy::Catchup) && (!snapshot || !header.count || (header.kind & story::policy::End))) ||
             (isHost && snapshot && (header.count || (header.kind & (story::policy::End | story::policy::Catchup))))) return true;

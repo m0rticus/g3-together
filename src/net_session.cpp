@@ -251,7 +251,7 @@ bool StoryHandshake(void const* data, size_t size)
     StatesHeader header{};
     std::memcpy(&header, data, sizeof(header));
     const uint8_t kind = header.kind & story::policy::KindMask;
-    return (header.kind & story::policy::Snapshot) && kind >= StateQuests && kind <= StateWorldClock &&
+    return (header.kind & story::policy::Snapshot) && kind >= StateQuests && kind <= StateReputation &&
            header.count <= MaxStatesPerMessage && size == sizeof(header) + header.count * sizeof(StateEntry) &&
            (!(header.kind & story::policy::End) || !header.count) &&
            (!(header.kind & story::policy::Catchup) || (header.count && !(header.kind & story::policy::End)));

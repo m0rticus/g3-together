@@ -10,12 +10,16 @@
 #include <cstdint>
 
 class eCEntity;
+class gCEnclave_PS;
 
 namespace g3t::enclaves {
 using LogFn = void (*)(char const*);
 void Start();
 void Tick();           // every frame; scans the enclaves every 500 ms
 void OnWorldChange();  // a loaded save: forget what was seen, ask the host again
+void NoteAuthoritativeFame(char const* name, int32_t fame);
+void SendDialogReputationDelta(bool isPolitical, int alignment, char const* enclave, int32_t delta);
+void OnHostEnclaveLiberated(gCEnclave_PS* enclave, char const* name);
 void Report(LogFn log);   // QA: ENCLAVESYNC line
 void SyncOff(LogFn log);  // QA negative control: no reputation sync on this machine
 void KeepLocalOff(LogFn log);                      // QA negative control: host counters overwrite unreported deeds

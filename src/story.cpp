@@ -4,11 +4,13 @@
 #include "body.h"
 #include "combat.h"
 #include "clock.h"
+#include "enclaves.h"
 #include "guide.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "reputation_policy.h"
 #include "story_policy.h"
 
 #include <Game.h>
@@ -67,8 +69,8 @@ struct InitialReplay {
     uint32_t generation = 0;
     bool captured = false;
     uint8_t sent = 0;
-    std::array<States, 5> values;
-    std::array<States, 5> latest;
+    std::array<States, 6> values;
+    std::array<States, 6> latest;
 };
 std::array<InitialReplay, net::MaxPlayers> initialReplays;
 
@@ -93,6 +95,10 @@ void QuestSnapshot(States& states)
         if (gCQuest_PS* quest = static_cast<gCQuest_PS*>(all.AccessAt(i))) states[quest->AccessName().GetText()] = StatusOf(quest);
 }
 
+bool ReputationReady();
+void ReputationSnapshot(States& states);
+bool ReputationApply(char const* name, uint32_t encoded);
+
 // Through the game's own functions where one exists (journal entries, experience), else set directly.
 bool QuestApply(char const* name, uint32_t status)
 {
@@ -100,15 +106,21 @@ bool QuestApply(char const* name, uint32_t status)
     const bCString id(name);
     gCQuest_PS* quest = manager->GetQuest(id);
     if (!quest || StatusOf(quest) == status) return true;
+    States preservedRep;
+    const bool preserveRep = !net::IsHost() && ReputationReady();
+    if (preserveRep) ReputationSnapshot(preservedRep);
     const gEQuestStatus target = static_cast<gEQuestStatus>(status);
     if ((target == gEQuestStatus_Success || target == gEQuestStatus_Failed) && StatusOf(quest) == gEQuestStatus_Open)
         manager->RunQuest(id);
     if (target == gEQuestStatus_Running) manager->RunQuest(id);
     else if (target == gEQuestStatus_Success) manager->SucceedQuest(id);
     else if (target == gEQuestStatus_Failed) manager->FailQuest(id);
-    if (StatusOf(quest) == status) return true;
-    quest->SetStatus(target);
-    return false;
+    const bool nativeHandled = StatusOf(quest) == status;
+    if (!nativeHandled) quest->SetStatus(target);
+    if (preserveRep) {
+        for (auto const& [repKey, repVal] : preservedRep) ReputationApply(repKey.c_str(), repVal);
+    }
+    return nativeHandled;
 }
 
 void QuestRuntimeSnapshot(States& states)
@@ -222,12 +234,70 @@ bool ClockApply(char const* name, uint32_t value)
     net::ClockState state{};
     return value == 1 && policy::ReadClock(name, state) && clock::RestoreAdmission(state);
 }
+
+gCPlayerMemory_PS* HeroMemory()
+{
+    eCEntity* hero = Running() ? gCSession::GetInstance().GetHero() : nullptr;
+    return hero ? static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory)) : nullptr;
+}
+bool ReputationReady() { return HeroMemory() != nullptr && PSEnclave::GetEnclaveCount() > 0; }
+void ReputationSnapshot(States& states)
+{
+    auto* memory = HeroMemory();
+    if (!memory) return;
+    auto const& pol = memory->AccessPoliticalFame();
+    for (size_t i = 0; i < reputation::PoliticalAlignmentCount; ++i) {
+        const int32_t fame = static_cast<GEInt>(i) < pol.GetCount() ? pol.GetAt(static_cast<GEInt>(i)) : 0;
+        states[reputation::PoliticalKey(i)] = reputation::EncodeFame(fame);
+    }
+    const GEInt count = PSEnclave::GetEnclaveCount();
+    for (GEInt i = 0; i < count; ++i) {
+        Entity e = PSEnclave::GetEnclaveAt(i);
+        eCEntity* inst = e.GetInstance();
+        auto* enc = inst ? static_cast<gCEnclave_PS*>(inst->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
+        if (!enc) continue;
+        char const* rawName = e.GetName().GetText();
+        if (rawName && *rawName && std::strlen(rawName) <= 31)
+            states[reputation::EnclaveKey(rawName)] = reputation::EncodeFame(enc->AccessPlayerFame());
+    }
+}
+bool ReputationApply(char const* name, uint32_t encoded)
+{
+    bool isPolitical = false;
+    size_t alignment = 0;
+    std::string enclaveName;
+    if (!name || !reputation::ParseKey(name, isPolitical, alignment, enclaveName)) return false;
+    const int32_t fame = reputation::DecodeFame(encoded);
+    if (isPolitical) {
+        auto* memory = HeroMemory();
+        if (!memory) return false;
+        auto& pol = memory->AccessPoliticalFame();
+        const GEInt oldCount = pol.GetCount();
+        const GEInt needed = static_cast<GEInt>(
+            reputation::RequiredPoliticalArrayCount(oldCount > 0 ? static_cast<size_t>(oldCount) : 0u, alignment, fame));
+        if (oldCount < needed) {
+            pol.SetCount(needed);
+            for (GEInt i = oldCount < 0 ? 0 : oldCount; i < needed; ++i) pol.AccessAt(i) = 0;
+        }
+        if (static_cast<GEInt>(alignment) < pol.GetCount()) pol.AccessAt(static_cast<GEInt>(alignment)) = fame;
+        return true;
+    }
+    Entity e = PSEnclave::GetEnclave(bCString(enclaveName.c_str()));
+    eCEntity* inst = e.GetInstance();
+    auto* enc = inst ? static_cast<gCEnclave_PS*>(inst->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
+    if (!enc) return false;
+    enc->AccessPlayerFame() = fame;
+    enclaves::NoteAuthoritativeFame(enclaveName.c_str(), fame);
+    return true;
+}
+
 Domain domains[] = {
     {net::StateQuests, "quests", &QuestsReady, &QuestSnapshot, &QuestApply},
     {net::StateInfos, "infos", &InfosReady, &InfoSnapshot, &InfoApply},
     {net::StateEvents, "events", &EventsReady, &EventSnapshot, &EventApply},
     {net::StateQuestRuntime, "quest runtime", &QuestsReady, &QuestRuntimeSnapshot, &QuestRuntimeApply},
     {net::StateWorldClock, "world clock", &ClockReady, &ClockSnapshot, &ClockApply},
+    {net::StateReputation, "reputation", &ReputationReady, &ReputationSnapshot, &ReputationApply},
 };
 
 Domain* Find(uint8_t kind)
@@ -294,6 +364,12 @@ bool Entry(Domain& d, std::string const& name, uint32_t value, std::vector<net::
         if (!policy::RuntimeKey(name, quest, field) ||
             !policy::PackRuntime(policy::NameId(quest) + '\x1f' + field, value, sizeof(entry.name), packed)) {
             Logf("story: quest runtime cannot be encoded name=%s; snapshot refused", name.c_str());
+            ++d.skipped; return false;
+        }
+        entry.value = 1;
+    } else if (d.kind == net::StateReputation) {
+        if (!reputation::PackState(name, value, sizeof(entry.name), packed)) {
+            Logf("story: reputation state cannot be encoded name=%s; snapshot refused", name.c_str());
             ++d.skipped; return false;
         }
         entry.value = 1;
@@ -412,6 +488,10 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
         return;
     }
     if ((net::IsHost() && snapshot) || (!net::IsHost() && (!admissionRequested || (snapshot && !catchup && d->baseline.complete)))) return;
+    if (net::IsHost() && d->kind == net::StateReputation) {
+        Logf("story: client reputation state from player=%u refused; host owns reputation", from);
+        return;
+    }
     if (!net::IsHost() && snapshot && !count) {
         if (!end) { d->baseline.Begin(); return; }
         if (!d->baseline.Finish()) return;
@@ -429,13 +509,17 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
             (entries[i].value != 1 || !policy::UnpackRuntime(name, name, value))) {
             Logf("story: malformed quest runtime from player=%u; ignored", from); reject(); return;
         }
+        if (d->kind == net::StateReputation &&
+            (entries[i].value != 1 || !reputation::UnpackState(name, name, value))) {
+            Logf("story: malformed reputation state from player=%u; ignored", from); reject(); return;
+        }
         if (d->kind == net::StateWorldClock) {
             net::ClockState state{};
             if (!snapshot || value > 1 || !policy::ReadClock(name, state)) {
                 Log("story: invalid bootstrap clock; admission retry required"); reject(); return;
             }
         }
-        if (d->kind != net::StateEvents && d->kind != net::StateWorldClock) {
+        if (d->kind != net::StateEvents && d->kind != net::StateWorldClock && d->kind != net::StateReputation) {
             if (!BuildNames()) { reject(); return; }
             std::string id = name, field;
             if (d->kind == net::StateQuestRuntime && !policy::RuntimeKey(name, id, field)) return;
@@ -472,6 +556,7 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
     }
     if (net::IsHost()) {
         // A client changed these: apply, then tell everyone the host's resulting values.
+        if (d->kind == net::StateQuests) FlushReputation();
         for (auto const& entry : decoded) {
             int prevQuestStatus = -1;
             if (d->kind == net::StateQuests && !snapshot) {
@@ -495,6 +580,7 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
             Entry(*d, it->first, it->second, result);
         }
         Send(*d, result);
+        if (d->kind == net::StateQuests) FlushReputation();
         Logf("story: applied %d %s change(s) from player %u", count, d->label, from);
     } else {
         for (auto const& entry : decoded) {
@@ -523,6 +609,7 @@ void Poll(Domain& d)
         return;
     }
     if (d.kind == net::StateWorldClock) return; // Ordinary time sharing remains clock.cpp's existing protocol.
+    if (d.kind == net::StateReputation && !net::IsHost()) return; // Host is sole authority on camp/enclave reputation.
     if (!net::IsHost() && !net::InWorld(net::LocalId())) return;
     States current;
     d.snapshot(current);
@@ -565,12 +652,18 @@ bool AdmissionReady()
     return admissionRequested && admissionApplied;
 }
 bool AdmissionStarted() { return admissionRequested; }
+void FlushReputation()
+{
+    if (disabled || !net::IsHost()) return;
+    if (Domain* d = Find(net::StateReputation)) Poll(*d);
+}
+
 bool FinishAdmission(unsigned char player)
 {
     if (!net::IsHost() || player < 2 || player >= net::MaxPlayers) return false;
     auto& replay = initialReplays[player];
-    if (!replay.captured || replay.sent != 0x1f || replay.generation != net::PeerGeneration(player)) return false;
-    std::array<States, 5> captured;
+    if (!replay.captured || replay.sent != 0x3f || replay.generation != net::PeerGeneration(player)) return false;
+    std::array<States, 6> captured;
     for (Domain& domain : domains) {
         if (!domain.ready()) return false;
         domain.snapshot(captured[domain.kind - 1]);
@@ -578,7 +671,7 @@ bool FinishAdmission(unsigned char player)
     std::unordered_set<std::string> changedQuests;
     for (auto const& entry : policy::Changes(replay.latest[net::StateQuests - 1], captured[net::StateQuests - 1]))
         changedQuests.insert(entry.first);
-    for (uint8_t kind : {net::StateWorldClock, net::StateQuestRuntime, net::StateQuests, net::StateInfos, net::StateEvents}) {
+    for (uint8_t kind : {net::StateWorldClock, net::StateQuestRuntime, net::StateQuests, net::StateReputation, net::StateInfos, net::StateEvents}) {
         Domain& d = *Find(kind);
         States& current = captured[d.kind - 1];
         States delta = policy::Changes(replay.latest[d.kind - 1], current);

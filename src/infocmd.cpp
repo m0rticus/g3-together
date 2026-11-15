@@ -10,6 +10,7 @@
 #include "ai.h"
 #include "body.h"
 #include "downed.h"
+#include "enclaves.h"
 #include "guide.h"
 #include "guide_policy.h"
 #include "arena.h"
@@ -20,6 +21,8 @@
 #include "npcs.h"
 #include "guards.h"
 #include "remote.h"
+#include "reputation_policy.h"
+#include "story.h"
 #include "talk.h"
 
 #include <Game.h>
@@ -39,6 +42,7 @@ bool sharing = true;  // QA negative control
 // Experience is shared by xpshare.cpp (every GiveXP of a hero, whatever its source), not by the dialogs.
 bool givebackPlace = true;  // QA negative control `givebackposoff`
 bool keepCompanions = true;  // QA negative control `storycompanionoff`: a story move takes this machine's companion too
+bool flushHostReputation = false;
 unsigned companionsKept = 0;
 
 // Commands whose result is a state of their first entity (static analysis of IS_Running_ProcessInfo: dialog
@@ -255,9 +259,13 @@ void Apply(net::WorldState const& s, uint8_t from)
     }
     auto* enclave = static_cast<gCEnclave_PS*>(instance->GetPropertySet(eEPropertySetType_Enclave));
     if (s.enclave && enclave) {
+        const int oldStatus = static_cast<int>(static_cast<gEEnclaveStatus const&>(enclave->AccessStatus()));
+        const int newStatus = static_cast<int>(s.enclaveStatus);
         enclave->AccessRaid() = (s.enclave & 2) != 0;
         enclave->AccessRevolution() = (s.enclave & 4) != 0;
         enclave->AccessStatus() = static_cast<gEEnclaveStatus>(s.enclaveStatus);
+        if (net::IsHost() && from != 1 && reputation::ShouldAwardLiberationFame(oldStatus, newStatus))
+            enclaves::OnHostEnclaveLiberated(enclave, e.GetName().GetText());
     }
     const bool mirrored = npcs::IsMirrored(instance);  // its body follows the host's snapshots anyway
     // Review 26.10. (point 8): a story move of this machine's own companion (Gorn following the client while the host,
@@ -455,15 +463,41 @@ void Observe(gCScriptProcessingUnit* spu)
     // The info manager lives on the world entity (World_MCP runs the dialog script); the unit's entity first.
     Entity owner(self);
     PSInfoScriptCommand command;
-    if (owner.GetInstance() && owner.GetInstance()->GetPropertySet(eEPropertySetType_InfoManager)) command = owner.InfoManager.GetCurrentCommand();
-    if (!command.IsValid()) command = Entity::GetWorldEntity().InfoManager.GetCurrentCommand();
+    bool waitingForScript = false;
+    if (owner.GetInstance() && owner.GetInstance()->GetPropertySet(eEPropertySetType_InfoManager)) {
+        command = owner.InfoManager.GetCurrentCommand();
+        waitingForScript = owner.InfoManager.IsWaitingforScript() != GEFalse;
+    }
+    if (!command.IsValid()) {
+        Entity worldEntity = Entity::GetWorldEntity();
+        command = worldEntity.InfoManager.GetCurrentCommand();
+        waitingForScript = worldEntity.InfoManager.IsWaitingforScript() != GEFalse;
+    }
     if (!command.IsValid()) return;
     const Entity e1 = command.GetEntity1(), e2 = command.GetEntity2();
+    if (!waitingForScript && sharing && net::Connected()) {
+        reputation::DialogRepMutation repMutation{};
+        char const* e2Name = (e2.GetInstance() && e2.GetInstance()->GetPropertySet(eEPropertySetType_Enclave))
+                                 ? e2.GetName().GetText()
+                                 : nullptr;
+        if (reputation::ParseDialogReputationCommand(command.GetCommand().GetText(), command.GetID1().GetText(),
+                                                     command.GetID2().GetText(), command.GetTextID().GetText(),
+                                                     e2Name, repMutation)) {
+            if (net::IsHost()) {
+                story::FlushReputation();
+                flushHostReputation = true;
+            } else {
+                enclaves::SendDialogReputationDelta(repMutation.isPolitical, repMutation.alignment,
+                                                    repMutation.enclave.c_str(), repMutation.delta);
+            }
+        }
+    }
     if (!std::strcmp(command.GetCommand().GetText(), "Say") && !std::strcmp(command.GetTextID().GetText(), "INFO_SKALVERAM320060309153144"))
         downed::HelpLineSaid();  // the help option's own line, not just a dialog with the puppet (downed.cpp)
     char key[400];
-    Format(key, "%s|%s|%s|%s|%s", command.GetCommand().GetText(), e1.GetInstance() ? e1.GetName().GetText() : "-",
-              e2.GetInstance() ? e2.GetName().GetText() : "-", command.GetID1().GetText(), command.GetID2().GetText());
+    Format(key, "%s|%s|%s|%s|%s|%s", command.GetCommand().GetText(), e1.GetInstance() ? e1.GetName().GetText() : "-",
+              e2.GetInstance() ? e2.GetName().GetText() : "-", command.GetID1().GetText(), command.GetID2().GetText(),
+              command.GetTextID().GetText());
     if (lastKey == key) return;
     lastKey = key;
     lastText = key;
@@ -518,6 +552,13 @@ void Changed(eCEntity* entity)
 void Tick()
 {
     HookSectorRefresh();
+    if (flushHostReputation) {
+        flushHostReputation = false;
+        story::FlushReputation();
+    }
+    if (gCSession::GetInstance().IsGameRunning()) {
+        if (auto* mgr = gCInfoManager_PS::GetInstance(); !mgr || !mgr->AccessIsRunning()) lastKey.clear();
+    }
     if (!fights.empty()) StartFights();
     if (pending.empty()) return;
     const uint32_t now = net::Now();
@@ -643,5 +684,7 @@ void OnWorldChange()
 {
     fights.clear();
     pending.clear();
+    lastKey.clear();
+    flushHostReputation = false;
 }
 }

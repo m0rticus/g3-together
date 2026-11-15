@@ -330,8 +330,9 @@ void SetWorldStateHandler(WorldStateHandler handler);
 // Named story state (story.cpp), reliable. Host -> all clients: the host's values. Client -> host: values this
 // player changed. Kind flag 0x80 brackets a pre-admission snapshot; empty 0x80 requests/begins it,
 // empty 0xc0 ends it; 0xa0 carries reward-free cutover changes before entry confirmation.
-// Quest/info names use stable IDs; runtime uses named u32 values; domain 5 carries the bootstrap calendar.
-enum : uint8_t { StateQuests = 1, StateInfos = 2, StateEvents = 3, StateQuestRuntime = 4, StateWorldClock = 5 };
+// Quest/info names use stable IDs; runtime uses named u32 values; domain 5 carries the bootstrap calendar;
+// domain 6 carries host-authoritative camp (m_arrPoliticalFame) and enclave (PlayerFame) reputations.
+enum : uint8_t { StateQuests = 1, StateInfos = 2, StateEvents = 3, StateQuestRuntime = 4, StateWorldClock = 5, StateReputation = 6 };
 struct StateEntry {
     uint8_t value;
     char name[63];
@@ -518,7 +519,16 @@ void SetWitnessHandler(WitnessHandler handler);
 // simulates a victim -> the killer's machine (client -> host, host -> that client): EnclaveCredit, a murder by that player
 // for its own counters (crime: added). EnclavePolitical (protocol 56): a political crime of the sender's player (a town it
 // freed; known = gEPoliticalAlignment, fame = how many), for the receiving hero's own memory (enclaves.cpp).
-enum : uint8_t { EnclaveState = 1, EnclaveDelta = 2, EnclaveRequest = 3, EnclaveCredit = 4, EnclavePolitical = 5 };
+// EnclaveRepDelta: client -> host non-quest dialog reputation delta (ModReputPol: empty name + alignment in known;
+// ModReputEnc: enclave name + known = -1; signed delta in fame).
+enum : uint8_t {
+    EnclaveState = 1,
+    EnclaveDelta = 2,
+    EnclaveRequest = 3,
+    EnclaveCredit = 4,
+    EnclavePolitical = 5,
+    EnclaveRepDelta = 6,
+};
 #pragma pack(push, 1)
 struct EnclaveNote {
     uint8_t op = 0;

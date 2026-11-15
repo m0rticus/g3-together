@@ -17,6 +17,7 @@ void PrepareAdmission();
 bool AdmissionStarted();
 bool AdmissionReady();  // all authoritative story/runtime snapshots applied before gameplay
 bool FinishAdmission(unsigned char player);  // host: queue reward-free changes since the immutable initial snapshot
+void FlushReputation();                      // host: immediately push camp/enclave reputation changes to all clients
 using LogFn = void (*)(char const*);
 void Event(char const* action, char const* name, LogFn log);  // QA: event | setevent | clearevent <name>
 void Report(LogFn log);   // QA: one STORY line per kind, then "STORY end"
