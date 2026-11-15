@@ -21,7 +21,6 @@ bool ResumeLeasedCombat(eCEntity* npc, uint8_t aiMode, uint8_t attitude, uint8_t
 
 bool IsCoopParticipant(eCEntity const* entity);
 bool IsSharedCombatHostile(eCEntity const* npc);
-bool ShouldPromoteAttitude(eCEntity const* npc);
 bool MirrorSharesCombatHostility(eCEntity const* npc);
 uint8_t MirrorAttitude(eCEntity const* npc, uint8_t wanted);
 int EffectiveAttitude(eCEntity const* npc, int baseAttitude);

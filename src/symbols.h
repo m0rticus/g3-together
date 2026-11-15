@@ -21,9 +21,10 @@ void CopyRemoteStackWords(uintptr_t esp, uintptr_t (&words)[256], unsigned& coun
 struct ThreadSample {
     uintptr_t eip = 0, esp = 0, ebp = 0;
     uintptr_t words[256] = {};
-    unsigned count = 0;
+    uintptr_t ebpFrames[32] = {};
+    unsigned count = 0, ebpCount = 0;
     bool ok = false, suspended = false, contextOk = false, resumed = true;
     DWORD openError = 0, suspendError = 0, contextError = 0, resumeError = 0;
 };
-bool SampleThreadStack(DWORD id, ThreadSample& sample);
+bool SampleThreadStack(DWORD id, ThreadSample& sample, bool captureEbp = false);
 }

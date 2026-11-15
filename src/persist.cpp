@@ -226,6 +226,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
             Notice(AutoloadAvailable() ? i18n::ClientHostWorldChanged : i18n::ClientChooseNewGame, true);
         }
         entryApproved = autoloadAwaiting = false; // a newer epoch restarts the countdown of an automatic entry not yet started
+        templateFailures = 0; templateFailCode.clear(); templateFailError = 0;
         if (captured.valid || requestPending) Notice(i18n::ClientSaveCanceledByWorld, true);
         captured = {}; requestPending = false; receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
         needsNewHero = false; restoreFailed = false; synced = 0; ownCharacterReady = false; hostAdmissionAck = false;
@@ -791,7 +792,7 @@ void Tick()
     if (needsNewHero && templateHeroFresh && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu) &&
         !restoreFailed && !resetLocalWorld && !templateHold &&
         receivedWelcome == net::WelcomeSerial() && receivedNote.epoch == hostWorld.epoch) {
-        needsNewHero = false; freshLocalHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
+        needsNewHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
         clientRejoin.Left();
         story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
     }
@@ -810,7 +811,7 @@ void Tick()
         if (!containers::RestorePersonal(receivedPersonal))
             Log("WARN persist: client personal container restore degraded; admitting restored character");
         receivedRecord.clear(); receivedPersonal.clear(); ownCharacterReady = true; synced = hostWorld.epoch;
-        freshLocalHero = false; clientRejoin.Left();
+        clientRejoin.Left();
         story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
     }
     if (ownCharacterReady && !net::InWorld(net::LocalId()) && synced == hostWorld.epoch &&

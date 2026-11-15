@@ -287,15 +287,15 @@ void Page(char const* what, LogFn log)
 {
     char line[200];
     gCSession& session = gCSession::GetInstance();
-    gCGUIManager* gui = session.GetGUIManager();
-    if (!gui) { log("REFUSED page: no GUI manager"); return; }
+    gCGUIManager* guiManager = session.GetGUIManager();
+    if (!guiManager) { log("REFUSED page: no GUI manager"); return; }
     GEBool ok = GETrue;
-    if (!std::strcmp(what, "inventory")) ok = gui->OpenInventory();
+    if (!std::strcmp(what, "inventory")) ok = guiManager->OpenInventory();
     else if (!std::strcmp(what, "menu")) session.OpenMenu();
-    else if (!std::strcmp(what, "close")) { ok = gui->ClosePage(); gui->CloseMenu(); }
+    else if (!std::strcmp(what, "close")) { ok = guiManager->ClosePage(); guiManager->CloseMenu(); }
     else if (std::strcmp(what, "state")) { log("REFUSED page: inventory|menu|close|state"); return; }
     Format(line, "PAGE what=%s ok=%d paused=%d active_page=%d", what, ok ? 1 : 0, session.IsPaused() ? 1 : 0,
-              static_cast<int>(gui->GetActivePage()));
+              static_cast<int>(guiManager->GetActivePage()));
     log(line);
 }
 

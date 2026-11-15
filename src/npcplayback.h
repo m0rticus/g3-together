@@ -5,6 +5,7 @@
 #include "npcplayback_hit_policy.h"
 #include <unordered_map>
 
+class bCMatrix;
 class eCEntity;
 
 namespace g3t::npcplayback {
@@ -102,6 +103,7 @@ bool VerifyLocalHitPresentation(eCEntity* entity, State const& state, net::NpcRe
                                 char const* activeLocalClip, bool local, bool echo, float localPhase,
                                 float& maxReplayPhaseError);
 }
+void SetEntityPose(eCEntity* entity, bCMatrix const& pose);
 void Tick();
 void OnWorldDeactivate();
 void ForgetRemoved(uint8_t const guid[16]);

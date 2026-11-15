@@ -12,6 +12,7 @@ class eCEntity;
 namespace g3t::ai {
 namespace detail {
 inline thread_local eCEntity* damageReceiver = nullptr;
+inline thread_local unsigned defeatJudgementDepth = 0;
 }
 
 class DamagePerception {
@@ -26,6 +27,27 @@ public:
 private:
     eCEntity* before;
 };
+
+class DefeatJudgementScope {
+public:
+    explicit DefeatJudgementScope(bool active = true) : active(active)
+    {
+        if (active) ++detail::defeatJudgementDepth;
+    }
+    ~DefeatJudgementScope()
+    {
+        if (active) --detail::defeatJudgementDepth;
+    }
+    DefeatJudgementScope(DefeatJudgementScope const&) = delete;
+    DefeatJudgementScope& operator=(DefeatJudgementScope const&) = delete;
+private:
+    bool active;
+};
+
+inline bool InDefeatJudgement()
+{
+    return detail::defeatJudgementDepth != 0;
+}
 
 inline bool PerceptionBlocked(eCEntity* receiver, bool driven)
 {

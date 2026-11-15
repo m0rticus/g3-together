@@ -251,31 +251,19 @@ ScrubStats ScrubEntityReferences(eCEntity* target, bool removeInstructions, bool
             if (movement) npc.CharacterMovement.StopMovement();
             ++stats.instructionsRemoved;
         }
-        if (current) {
-            if (passive) properties->AccessCurrentTargetEntity().SetEntity(static_cast<eCEntity*>(nullptr));
-            else npc.NPC.SetCurrentTarget(none);
-            ++stats.targetCleared;
-        }
-        if (alternative) {
-            if (passive) properties->AccessAlternativeTargetEntity().SetEntity(static_cast<eCEntity*>(nullptr));
-            else npc.NPC.SetAlternativeTarget(none);
-            ++stats.alternativeCleared;
-        }
-        if (attacker) {
-            if (passive) properties->AccessCurrentAttackerEntity().SetEntity(static_cast<eCEntity*>(nullptr));
-            else npc.NPC.SetCurrentAttacker(none);
-            ++stats.attackerCleared;
-        }
-        if (last) {
-            if (passive) properties->AccessLastAttackerEntity().SetEntity(static_cast<eCEntity*>(nullptr));
-            else npc.NPC.SetLastAttacker(none);
-            ++stats.lastAttackerCleared;
-        }
-        if (spell) {
-            if (passive) properties->AccessSpellTarget().SetEntity(static_cast<eCEntity*>(nullptr));
-            else npc.NPC.SetSpellTarget(none);
-            ++stats.spellTargetCleared;
-        }
+        using NpcScript = std::remove_reference_t<decltype(npc.NPC)>;
+        auto clearSlot = [&](bool matched, eCEntityProxy& (gCNPC_PS::*access)(),
+                             void (NpcScript::*set)(Entity const&), unsigned& counter) {
+            if (!matched) return;
+            if (passive) (properties->*access)().SetEntity(static_cast<eCEntity*>(nullptr));
+            else (npc.NPC.*set)(none);
+            ++counter;
+        };
+        clearSlot(current, &gCNPC_PS::AccessCurrentTargetEntity, &NpcScript::SetCurrentTarget, stats.targetCleared);
+        clearSlot(alternative, &gCNPC_PS::AccessAlternativeTargetEntity, &NpcScript::SetAlternativeTarget, stats.alternativeCleared);
+        clearSlot(attacker, &gCNPC_PS::AccessCurrentAttackerEntity, &NpcScript::SetCurrentAttacker, stats.attackerCleared);
+        clearSlot(last, &gCNPC_PS::AccessLastAttackerEntity, &NpcScript::SetLastAttacker, stats.lastAttackerCleared);
+        clearSlot(spell, &gCNPC_PS::AccessSpellTarget, &NpcScript::SetSpellTarget, stats.spellTargetCleared);
         if (alignment) npc.SetAlignmentTarget(none);
         if (movement && (current || spell || alignment)) npc.SetLookAtTarget(none);
         if (other) spu->SetOtherEntity(nullptr);

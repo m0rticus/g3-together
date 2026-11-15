@@ -10,7 +10,7 @@
 #include <utility>
 
 namespace g3t::infocmd::detail {
-
+namespace {
 std::map<GuidKey, npc_progression_policy::ObservedProgression> observedProgression;
 std::set<GuidKey> syncedNpcs;
 std::map<std::string, bool> syncedSectors;
@@ -35,6 +35,84 @@ void SyncClientBufferEpoch()
             bufferedSectors.clear();
         }
         bufferedEpoch = epoch;
+    }
+}
+
+void ObserveEntityProgression(Entity& e, eCEntity* hero, bool activeDialogPartner)
+{
+    eCEntity* inst = e.GetInstance();
+    if (!inst) return;
+    if (!inst->GetPropertySet(eEPropertySetType_NPC) && !inst->GetPropertySet(eEPropertySetType_Dialog)) return;
+    const bool isHero = inst == hero;
+    const bool isPuppet = remote::IsPuppet(inst);
+    const bool suppressed = npcremoval::Suppressed(inst);
+    if (isHero || isPuppet || suppressed) return;
+    uint8_t guid[16];
+    guid::CopyEntity(inst, guid);
+    const GuidKey key = GuidKeyOf(guid);
+    if (activeDialogPartner) activeDialogNpcs.insert(key);
+    const auto nowObs = CaptureObserved(e);
+    const bool canAuthor = npc_progression_policy::ShouldAuthorProgressionDiff(
+        net::IsHost(), isHero, isPuppet, suppressed,
+        npclease::LocalAuthority(inst), activeDialogPartner || talk::TalkingWithHero(inst));
+    auto it = observedProgression.find(key);
+    if (it == observedProgression.end()) {
+        observedProgression.emplace(key, nowObs);
+        if (!activeDialogPartner && net::IsHost() && npc_progression_policy::IsNonDefaultSeedCandidate(
+                npc_progression_policy::UnpackTalkedToPlayer(nowObs.dialog),
+                npc_progression_policy::UnpackDefeatedByPlayer(nowObs.npc))) {
+            syncedNpcs.insert(key);
+        }
+        return;
+    }
+    if (it->second == nowObs) return;
+    it->second = nowObs;
+    if (!canAuthor) return;
+    if (npc_progression_policy::UnpackTalkedToPlayer(nowObs.dialog))
+        ApplyFriendMemory(e.GetName().GetText());
+    if (net::IsHost()) syncedNpcs.insert(key);
+    if (net::Connected()) QueueImmediateState(guid, true);
+}
+} // namespace
+
+void NoteObservedProgression(GuidKey const& key, npc_progression_policy::ObservedProgression const& obs)
+{
+    observedProgression[key] = obs;
+}
+
+void NoteSyncedNpc(GuidKey const& key) { syncedNpcs.insert(key); }
+
+void NoteSyncedSector(char const* sector, bool enabled)
+{
+    if (sector && *sector) syncedSectors[sector] = enabled;
+}
+
+void BufferClientNpcState(GuidKey const& key, net::WorldState const& s)
+{
+    SyncClientBufferEpoch();
+    bufferedWorldStates[key] = s;
+}
+
+void BufferClientSectorState(char const* sector, bool enabled)
+{
+    if (!sector || !*sector) return;
+    SyncClientBufferEpoch();
+    bufferedSectors[sector] = enabled;
+}
+
+void ResetProgressionState()
+{
+    observedProgression.clear();
+    activeDialogNpcs.clear();
+    wasDialogRunning = false;
+    worldSeeded = false;
+    if (net::IsHost()) {
+        syncedNpcs.clear();
+        syncedSectors.clear();
+    } else {
+        bufferedWorldStates.clear();
+        bufferedSectors.clear();
+        bufferedEpoch = net::WorldEpoch();
     }
 }
 
@@ -127,7 +205,7 @@ void FlushBufferedClientStates()
     SyncClientBufferEpoch();
     for (auto const& [sector, status] : bufferedSectors) {
         world.SetSectorStatus(bCString(sector.c_str()), status);
-        ++sectorsApplied;
+        ++stats.sectorsApplied;
     }
     bufferedSectors.clear();
     for (auto it = bufferedWorldStates.begin(); it != bufferedWorldStates.end();) {
@@ -141,35 +219,18 @@ void FlushBufferedClientStates()
 
 void TrackLocalDialogAndProgression()
 {
-    if (!sharing || !gCSession::GetInstance().IsGameRunning()) return;
+    if (!flags.sharing || !gCSession::GetInstance().IsGameRunning()) return;
     eCEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero) return;
     auto* mgr = gCInfoManager_PS::GetInstance();
     const bool running = mgr && mgr->AccessIsRunning();
     if (running) {
-        auto notePartner = [&](eCEntity* candidate) {
-            if (!candidate || candidate == hero || remote::IsPuppet(candidate)) return;
-            if (!candidate->GetPropertySet(eEPropertySetType_NPC) && !candidate->GetPropertySet(eEPropertySetType_Dialog)) return;
-            uint8_t guid[16];
-            guid::CopyEntity(candidate, guid);
-            const GuidKey key = GuidKeyOf(guid);
-            activeDialogNpcs.insert(key);
-            Entity e(candidate);
-            const auto nowObs = CaptureObserved(e);
-            auto it = observedProgression.find(key);
-            if (it == observedProgression.end()) {
-                observedProgression.emplace(key, nowObs);
-            } else if (it->second != nowObs) {
-                it->second = nowObs;
-                if (npc_progression_policy::UnpackTalkedToPlayer(nowObs.dialog))
-                    ApplyFriendMemory(e.GetName().GetText());
-                if (net::IsHost()) syncedNpcs.insert(key);
-                if (net::Connected()) QueueImmediateState(guid, true);
-            }
-        };
-        notePartner(mgr->GetDialogPartnerNPC());
-        notePartner(mgr->GetCurrentSelf());
-        notePartner(mgr->GetCurrentOther());
+        eCEntity* const candidates[] = {mgr->GetDialogPartnerNPC(), mgr->GetCurrentSelf(), mgr->GetCurrentOther()};
+        for (eCEntity* candidate : candidates) {
+            if (!candidate) continue;
+            Entity partner(candidate);
+            ObserveEntityProgression(partner, hero, true);
+        }
         wasDialogRunning = true;
     } else if (wasDialogRunning) {
         wasDialogRunning = false;
@@ -197,36 +258,7 @@ void TrackLocalDialogAndProgression()
     const bTObjArray<Entity> npcsList = Entity::GetNPCs();
     for (int i = 0; i < npcsList.GetCount(); ++i) {
         Entity npc = npcsList.GetAt(i);
-        eCEntity* inst = npc.GetInstance();
-        if (!inst) continue;
-        const bool isHero = inst == hero;
-        const bool isPuppet = remote::IsPuppet(inst);
-        const bool suppressed = npcremoval::Suppressed(inst);
-        if (isHero || isPuppet || suppressed) continue;
-        uint8_t guid[16];
-        guid::CopyEntity(inst, guid);
-        const GuidKey key = GuidKeyOf(guid);
-        const auto nowObs = CaptureObserved(npc);
-        const bool canAuthor = npc_progression_policy::ShouldAuthorProgressionDiff(
-            net::IsHost(), isHero, isPuppet, suppressed,
-            npclease::LocalAuthority(inst), talk::TalkingWithHero(inst));
-        auto it = observedProgression.find(key);
-        if (it == observedProgression.end()) {
-            observedProgression.emplace(key, nowObs);
-            if (net::IsHost() && npc_progression_policy::IsNonDefaultSeedCandidate(
-                    npc_progression_policy::UnpackTalkedToPlayer(nowObs.dialog),
-                    npc_progression_policy::UnpackDefeatedByPlayer(nowObs.npc))) {
-                syncedNpcs.insert(key);
-            }
-            continue;
-        }
-        if (it->second == nowObs) continue;
-        it->second = nowObs;
-        if (!canAuthor) continue;
-        if (npc_progression_policy::UnpackTalkedToPlayer(nowObs.dialog))
-            ApplyFriendMemory(npc.GetName().GetText());
-        if (net::IsHost()) syncedNpcs.insert(key);
-        if (net::Connected()) QueueImmediateState(guid, true);
+        ObserveEntityProgression(npc, hero, false);
     }
 }
 
@@ -236,7 +268,7 @@ namespace g3t::infocmd {
 void SyncToClients()
 {
     using namespace detail;
-    if (!sharing || !net::IsHost() || !net::Connected() || !gCSession::GetInstance().IsGameRunning()) return;
+    if (!flags.sharing || !net::IsHost() || !net::Connected() || !gCSession::GetInstance().IsGameRunning()) return;
     SeedHostWorldState();
     for (auto const& [sector, status] : syncedSectors) {
         net::WorldState s{};

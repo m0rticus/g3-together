@@ -325,6 +325,18 @@ int main() {
     const float corpsePelvisPos[3] = {3064.0f, 92.0f, 0.0f};
     AdvanceHitKnockback(walkSettleKb, 6548, 6473, 6015, false, false, 0.0f, true, corpsePelvisPos, wsPos);
     assert(!walkSettleKb.active && !walkSettleKb.hasPresentedPos && wsPos[1] == 92.0f);
+
+    // 6) Reliable HitResult arriving after unreliable NpcRecord cleared pendingHit still confirms active knockback,
+    //    while late unqueued rejections or mismatched/already-confirmed sequences are ignored.
+    HitKnockbackState oooKb;
+    StartHitKnockback(oooKb, 21, 7000, 0.615f, 0.538f, authOrigin, dir, 186.3f, 0.0f, 0.615f);
+    assert(ShouldAcceptHitResult(21, oooKb, 21, true));
+    assert(ShouldAcceptHitResult(21, oooKb, 21, false));
+    assert(ShouldAcceptHitResult(0, oooKb, 21, true));   // pendingHit cleared by fast NpcRecord, kb still unconfirmed!
+    assert(!ShouldAcceptHitResult(0, oooKb, 21, false)); // without pendingHit, late refusal is ignored
+    assert(!ShouldAcceptHitResult(0, oooKb, 22, true));  // wrong sequence
+    ConfirmHitKnockback(oooKb, 21, 7030, ReactionStumble, 615, 615, authOrigin, hostGoal84, 83.8f);
+    assert(!ShouldAcceptHitResult(0, oooKb, 21, true));  // already confirmed
     return 0;
 }
 ''', encoding="utf-8")
@@ -419,6 +431,8 @@ int main() {
         self.assertIn("NPCATTACK stage=local-miss", npc_contact)
         # StartLocalHitPresentation must work even when host slot 0 was inactive; Replay must abort before AdvanceHitKnockback.
         self.assertNotIn("!options.active", playback_hit)
+        self.assertIn("state.localOptions = local;", playback_hit)
+        self.assertIn("npcplayback_hit_policy::ShouldAcceptHitResult", npc_contact)
         self.assertLess(playback.index("if (!local && !holdEcho && !havePose) return false;"),
                         playback.index("npcplayback_hit_policy::AdvanceHitKnockback("))
 

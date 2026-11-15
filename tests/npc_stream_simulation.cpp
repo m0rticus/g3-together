@@ -168,7 +168,7 @@ Result Run(Params const& p)
     const double steadyDurationMs = static_cast<double>(steadyTo - steadyFrom);
     std::deque<std::pair<uint32_t, std::pair<size_t, uint32_t>>> acks;  // due, npc, token
     std::vector<uint64_t> windows(p.steadyEndMs / 100 + 2, 0);
-    uint64_t steadyBytes = 0, steadyDatagrams = 0, updates = 0, boneBytes = 0;
+    uint64_t steadyBytes = 0, updates = 0, boneBytes = 0;
     uint32_t dictionaryAckAt = UINT32_MAX;
     bool dictionaryOffered = false, stretchWasRaised[4] = {};
     std::mt19937 loss(7);
@@ -299,7 +299,6 @@ Result Run(Params const& p)
                     n.arrivals.push_back(now + OneWayMs);
                 }
                 ++updates;
-                (void)boneBytes;
             }
             pacer.Poll(now);
         }
@@ -308,11 +307,10 @@ Result Run(Params const& p)
         if (entered) {
             windows[(now - entry) / 100] += wire;
             if (now - entry < 25) result.firstFrameBytes += wire;
-            if (now >= steadyFrom && now < steadyTo) { steadyBytes += wire; steadyDatagrams += datagrams; }
+            if (now >= steadyFrom && now < steadyTo) steadyBytes += wire;
         }
         now = next;
     }
-    (void)steadyDatagrams;
     for (uint64_t w : windows) result.maxWindow100 = std::max(result.maxWindow100, w);
     for (size_t w = 0; w < 15 && w < windows.size(); ++w) result.burstWindow100 = std::max(result.burstWindow100, windows[w]);
     result.bytesPerSecond = steadyBytes * 1000.0 / steadyDurationMs;

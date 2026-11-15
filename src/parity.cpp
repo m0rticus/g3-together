@@ -49,7 +49,7 @@ void AddFile(Fnv& fnv, std::string const& path)
     HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) { fnv.Add("<missing>"); return; }
-    static std::vector<unsigned char> buffer(1 << 20);
+    std::vector<unsigned char> buffer(1 << 18);
     DWORD read = 0;
     while (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read) fnv.Add(buffer.data(), read);
     CloseHandle(file);
@@ -93,15 +93,15 @@ uint64_t HashOptions(std::string const& dir)
          difficulty ? difficulty : "", setup.AlternativeBalancing, setup.AlternativeAI, setup.MinHitDuration, setup.XPModifier,
          setup.QuickLoot, GetConfig().friendlyFire, GetConfig().npcDamage, GetConfig().npcHp);
     strcpy_s(optionsText, "delegation capability / unsupported [Game] keys");
-    static char section[8192];
-    const DWORD n = GetPrivateProfileSectionA("Game", section, sizeof(section), (dir + "\\Ini\\ge3.ini").c_str());
+    std::vector<char> section(8192);
+    const DWORD n = GetPrivateProfileSectionA("Game", section.data(), static_cast<DWORD>(section.size()), (dir + "\\Ini\\ge3.ini").c_str());
     std::vector<std::string> lines;
-    if (n == sizeof(section) - 2) {
+    if (n == section.size() - 2) {
         fnv.Add("<Game section truncated>");
         Log("PARITY [Game] section too large; install identity includes an invalid-section marker");
     }
     unsigned shared = 0, local = 0;
-    for (char const* line = section; line < section + n && *line; line += std::strlen(line) + 1) {
+    for (char const* line = section.data(); line < section.data() + n && *line; line += std::strlen(line) + 1) {
         std::string text(line);
         const auto equals = text.find('=');
         const std::string key = options::policy::LowerTrim(text.substr(0, equals));

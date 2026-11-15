@@ -342,15 +342,21 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
     if (relation::RefuseDownedAttitude(false, true) && RejectDownedTarget(Self(spu, self), target, "attitude-refused")) return gEAttitude_None;
     if (playerAttitudeQueries) return originalAttitude(spu, self, other, args);
     eCEntity* judge = Self(spu, self);
+    const bool suppressPromotion = plainAsk || InDefeatJudgement();
     if (target && target == remote::ControlledBody() && judge && npcs::IsMirrored(judge)) {
         int hostAttitude = 0;
         const bool haveHost = npcs::HostAttitude(judge, hostAttitude);
-        if (relation::MirrorAnswersFromHost(true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
+        const bool sharedMirror = !suppressPromotion && combat_hostility::MirrorSharesCombatHostility(judge);
+        if (!(suppressPromotion && hostAttitude == relation::Hostile) &&
+            relation::MirrorAnswersFromHost(true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
                                            (enclaves::Together() && !fightmem::HasLocalOverride(judge)) ||
-                                               combat_hostility::MirrorSharesCombatHostility(judge)))
-            return combat_hostility::MirrorAttitude(judge, static_cast<uint8_t>(hostAttitude));
+                                               sharedMirror))
+            return suppressPromotion
+                ? static_cast<GEInt>(hostAttitude)
+                : combat_hostility::MirrorAttitude(judge, static_cast<uint8_t>(hostAttitude));
     }
-    const bool promoteCoopTarget = judge && !npcs::IsMirrored(judge) && combat_hostility::IsCoopParticipant(target);
+    const bool promoteCoopTarget = !suppressPromotion && judge && !npcs::IsMirrored(judge) &&
+        combat_hostility::IsCoopParticipant(target);
     auto promote = [&](GEInt base) -> GEInt {
         return promoteCoopTarget ? combat_hostility::EffectiveAttitude(judge, base) : base;
     };

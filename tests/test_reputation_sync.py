@@ -33,6 +33,7 @@ TOUCHED_SRC_FILES = (
     "infocmd.cpp",
     "infocmd_progression.cpp",
     "infocmd_sector.cpp",
+    "infocmd_qa.cpp",
     "net.h",
     "net_messages.cpp",
     "net_session.cpp",
@@ -83,6 +84,7 @@ class ReputationSyncTests(unittest.TestCase):
         )
         self.assertIn("static_assert(AllDomainsSentMask == 0x3f", story_internal)
         self.assertIn("replay.sent != AllDomainsSentMask", story_core)
+        self.assertIn("ShouldResetInitialReplay(", story_core)
         self.assertIn("if (net::IsHost() && d->kind == net::StateReputation)", story_core)
         self.assertIn("if (d.kind == net::StateReputation && !net::IsHost()) return;", story_core)
         self.assertIn("if (d->kind == net::StateQuests) FlushReputation();", story_core)

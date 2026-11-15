@@ -46,7 +46,7 @@ std::string lastSave, lastLoad, campaign, loading;
 std::string hookFailure, pupDigestHex;
 uint8_t localKind = net::KindMenu;
 bool newWorld = false, ownCharacterReady = false, needsNewHero = false, restoreFailed = false;
-bool freshLocalHero = false, resetLocalWorld = false;
+bool resetLocalWorld = false;
 rejoin::State clientRejoin;
 NewGameCommandFn originalNewGameCommand = nullptr;
 NewGameFn originalNewGame = nullptr;
@@ -225,29 +225,48 @@ bool OwnedHook(unsigned char* entry, void* original, void* detour, size_t stolen
         saving::native::Matches(entry + stolen, length - stolen, pattern + stolen * 2);
 }
 
+enum class PeStatus { Ok, Memory, Header, Layout };
+
+PeStatus ValidatePe32Image(unsigned char* image, size_t maxImageSize, IMAGE_NT_HEADERS32*& outNt,
+                           IMAGE_SECTION_HEADER*& outSections)
+{
+    outNt = nullptr;
+    outSections = nullptr;
+    if (!Readable(image, sizeof(IMAGE_DOS_HEADER))) return PeStatus::Memory;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
+        !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32)))
+        return PeStatus::Header;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
+    const size_t size = nt->OptionalHeader.SizeOfImage;
+    auto* sections = IMAGE_FIRST_SECTION(nt);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC || !size ||
+        (maxImageSize && size > maxImageSize) ||
+        !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
+        !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections)))
+        return PeStatus::Layout;
+    outNt = nt;
+    outSections = sections;
+    return PeStatus::Ok;
+}
+
 } // namespace
 
 bool ResolveNative(unsigned char* (&resolved)[5])
 {
     HMODULE game = GetModuleHandleA("Game.dll");
     auto* image = reinterpret_cast<unsigned char*>(game);
-    if (!Readable(image, sizeof(IMAGE_DOS_HEADER))) { Log("persist: unresolved Game.dll; host-managed saves off"); return false; }
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
-        !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32))) {
-        Log("persist: unresolved Game.dll PE header; host-managed saves off");
+    IMAGE_NT_HEADERS32* nt = nullptr;
+    IMAGE_SECTION_HEADER* sections = nullptr;
+    const PeStatus pe = ValidatePe32Image(image, 128u * 1024 * 1024, nt, sections);
+    if (pe != PeStatus::Ok) {
+        Log(pe == PeStatus::Memory ? "persist: unresolved Game.dll; host-managed saves off" :
+            pe == PeStatus::Header ? "persist: unresolved Game.dll PE header; host-managed saves off" :
+                                     "persist: unresolved Game.dll PE layout; host-managed saves off");
         return false;
     }
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
     const size_t size = nt->OptionalHeader.SizeOfImage;
-    auto* sections = IMAGE_FIRST_SECTION(nt);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC || !size || size > 128u * 1024 * 1024 ||
-        !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
-        !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections))) {
-        Log("persist: unresolved Game.dll PE layout; host-managed saves off");
-        return false;
-    }
     char path[MAX_PATH]{};
     GetModuleFileNameA(game, path, MAX_PATH);
     Logf("persist: native module=%s base=%p image_size=%lu timestamp=%08lx",
@@ -377,19 +396,12 @@ bool PupLoadEntry(unsigned char* entry, bool beforeUse)
         return PupRefused(stage, entry, bridge, receiver, beforeUse);
     };
     auto* image = reinterpret_cast<unsigned char*>(pup);
-    if (!Readable(image, sizeof(IMAGE_DOS_HEADER)))
-        return refuse("companion-memory");
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
-        !Readable(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32)))
-        return refuse("companion-header");
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
-    auto* sections = IMAGE_FIRST_SECTION(nt);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
-        !nt->FileHeader.NumberOfSections || nt->FileHeader.NumberOfSections > 96 ||
-        !Readable(sections, nt->FileHeader.NumberOfSections * sizeof(*sections)))
-        return refuse("companion-layout");
+    IMAGE_NT_HEADERS32* nt = nullptr;
+    IMAGE_SECTION_HEADER* sections = nullptr;
+    const PeStatus pe = ValidatePe32Image(image, 0, nt, sections);
+    if (pe != PeStatus::Ok)
+        return refuse(pe == PeStatus::Memory ? "companion-memory" :
+                      pe == PeStatus::Header ? "companion-header" : "companion-layout");
     const uintptr_t imageBase = reinterpret_cast<uintptr_t>(image);
     const uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
     if (receiver < imageBase || receiver - imageBase >= imageSize)
@@ -598,14 +610,6 @@ bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool
     return ok;
 }
 
-void Notice(i18n::Message message, bool bad)
-{
-    auto& game = gCSession::GetInstance();
-    auto* manager = game.GetGUIManager();
-    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(i18n::Text(message));
-    else hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
-}
-
 void NoticeText(wchar_t const* text, hud::Kind kind)
 {
     auto& game = gCSession::GetInstance();
@@ -616,10 +620,12 @@ void NoticeText(wchar_t const* text, hud::Kind kind)
 
 void NoticeText(wchar_t const* text, bool bad)
 {
-    auto& game = gCSession::GetInstance();
-    auto* manager = game.GetGUIManager();
-    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
-    else hud::Message(bad ? hud::Warning : hud::Info, text);
+    NoticeText(text, bad ? hud::Warning : hud::Info);
+}
+
+void Notice(i18n::Message message, bool bad)
+{
+    NoticeText(i18n::Text(message), bad);
 }
 
 void SaveFailure(char const* code)
@@ -688,7 +694,6 @@ void OnWorldActivate()
     if (!loading.empty() || nativeSaveDepth) return;
     if (!net::IsHost()) return; // Only successful HUD.NewGame authorizes a new client hero.
     newWorld = true;
-    freshLocalHero = true;
     current = {};
     campaign.clear();
     ownCharacterReady = false;
@@ -715,7 +720,6 @@ void OnWorldDeactivate()
         net::SetInWorld(net::LocalId(), false);
         if (nativeNewGame || clientRejoin.pending) return;
         clock::OnWorldChange();
-        freshLocalHero = false;
         newWorld = false;
         resetLocalWorld = false;
         entryManual = false;

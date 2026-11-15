@@ -160,8 +160,8 @@ void Trail(long long now, char* text, size_t size)
 {
     size_t length = 0;
     const unsigned count = callCount;
-    for (unsigned i = callCount - count; i < callCount; ++i) {
-        const auto& call = calls[(nextCall + calls.size() - callCount + i) % calls.size()];
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& call = calls[(nextCall + calls.size() - count + i) % calls.size()];
         if (now - call.at > 2000000) continue;
         char caller[80];
         Caller(call.caller, caller, sizeof(caller));
@@ -187,7 +187,7 @@ void Event(char const* kind, char const* stage, Sample const& before, Sample con
     eCEntity* body = remote::ControlledBody();
     Entity player(body);
     const bool routine = body && body->GetPropertySet(eEPropertySetType_ScriptRoutine);
-    char trail[14000] = {};
+    char trail[4096] = {};
     Trail(now, trail, sizeof(trail));
     Logf("movement: event=%s stage=%s frame_gap_ms=%.2f speed_cm_s=%.1f keys_wasd_arrows=%02x foreground=%d "
          "input=%x->%x gui_active=%p->%p gui_focus=%p->%p moving=%d->%d mode=%d->%d ai=%d->%d ani=%d->%d "
@@ -220,11 +220,11 @@ void ObserveBoundary(char const* name)
             ++frameDiscontinuities;
             Event("position-discontinuity", name, boundary, current, now);
         }
-        else if (input) Event("input-change", name, boundary, current, NowUs());
+        else if (input) Event("input-change", name, boundary, current, now);
         else if (beforeVelocity >= 1600.0f && afterVelocity <= 25.0f)
-            Event("velocity-stop", name, boundary, current, NowUs());
+            Event("velocity-stop", name, boundary, current, now);
         else if ((boundary.moving && !current.moving) || boundary.ai != current.ai || boundary.ani != current.ani)
-            Event("state-change", name, boundary, current, NowUs());
+            Event("state-change", name, boundary, current, now);
     }
     boundary = current;
     boundaryAt = now;

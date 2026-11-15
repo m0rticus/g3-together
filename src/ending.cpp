@@ -19,7 +19,7 @@ constexpr uint8_t Kind = 17;
 constexpr uint32_t CheckEvery = 250;   // ms
 constexpr uint32_t TellAfter = 3000;    // ms busy before the player is told the epilogue waits for this hero
 constexpr uint32_t TellAgain = 60000;  // ms between reminders while it waits
-constexpr bool on = true;
+bool on = true;
 std::string announced;  // the epilogue info that started here, by this hero or for another player
 std::string waiting;    // the one another player started, to start here
 uint8_t waitingFrom = 0;
@@ -123,8 +123,20 @@ void OnWorldChange()
     knew = false;
 }
 
-void Report(LogFn) {}
+void Report(LogFn log)
+{
+    char line[256];
+    Format(line, "ENDING on=%d sent=%u received=%u started=%u told=%u refused=%u announced=%s waiting=%s",
+           on ? 1 : 0, sent, received, started, told, refused,
+           announced.empty() ? "-" : announced.c_str(),
+           waiting.empty() ? "-" : waiting.c_str());
+    log(line);
+}
 void Hold(char const*, LogFn) {}
 void Limit(LogFn) {}
-void Off(LogFn) {}
+void Off(LogFn log)
+{
+    on = false;
+    log("ENDINGOFF ok=1");
+}
 }

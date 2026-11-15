@@ -87,21 +87,30 @@ void WorkerRuntime::TransportConfigDiagnostics() const
 void WorkerRuntime::SendDiagnostics(uint32_t now)
 {
     if (CountLinked()) {
-        config::Read current[4];
+        auto readById = [&](int id) {
+            for (unsigned i = 0; i < 4; ++i) {
+                if (config::Settings[i].id == id) return ReadNetworkingConfig(id);
+            }
+            return config::Read{};
+        };
         bool verified = networkingConfigured;
         for (unsigned i = 0; i < 4; ++i) {
-            current[i] = ReadNetworkingConfig(config::Settings[i].id);
+            const auto value = ReadNetworkingConfig(config::Settings[i].id);
             const bool ok = config::Settings[i].exact
-                ? current[i].value == networkingConfig[i].requested
-                : current[i].value >= networkingConfig[i].requested;
-            verified = verified && current[i].Valid() && ok;
+                ? value.value == networkingConfig[i].requested
+                : value.value >= networkingConfig[i].requested;
+            verified = verified && value.Valid() && ok;
         }
+        const auto sendBuf = readById(config::SendBufferSize);
+        const auto rateMin = readById(config::SendRateMin);
+        const auto rateMax = readById(config::SendRateMax);
+        const auto nagle = readById(config::NagleTime);
         Logf("steam-send: config-current scope=global verified=%u connection_config_verified=0 "
              "send_buffer=%d send_buffer_valid=%u send_rate_min=%d send_rate_min_valid=%u "
              "send_rate_max=%d send_rate_max_valid=%u nagle_us=%d nagle_valid=%u action=read-only",
-             verified ? 1u : 0u, current[0].value, current[0].Valid() ? 1u : 0u,
-             current[1].value, current[1].Valid() ? 1u : 0u, current[2].value, current[2].Valid() ? 1u : 0u,
-             current[3].value, current[3].Valid() ? 1u : 0u);
+             verified ? 1u : 0u, sendBuf.value, sendBuf.Valid() ? 1u : 0u,
+             rateMin.value, rateMin.Valid() ? 1u : 0u, rateMax.value, rateMax.Valid() ? 1u : 0u,
+             nagle.value, nagle.Valid() ? 1u : 0u);
         TransportConfigDiagnostics();
     }
     for (auto& r : remotes) {

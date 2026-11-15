@@ -98,9 +98,7 @@ void Tick()
 
 void OnState(uint8_t from, net::WorldState const& s)
 {
-    _GUID raw;
-    std::memcpy(&raw, s.guid, 16);
-    Entity npc = guid::Resolve(raw);
+    Entity npc = guid::Resolve(s.guid);
     eCEntity* instance = npc.GetInstance();
     if (!HasDialog(instance)) return;
     if (npc.Dialog.PickedPocket) { ++already; return; }  // the game never takes the mark back

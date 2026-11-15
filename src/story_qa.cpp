@@ -6,6 +6,7 @@
 #include "log.h"
 #include "npcs.h"
 #include "remote.h"
+#include "trade_policy.h"
 
 #include <cctype>
 #include <cstdio>
@@ -19,7 +20,11 @@ using namespace detail;
 // QA: an NPC by name, or "puppet<id>" for that player's puppet (its template name, PC_Hero, finds the hero itself).
 Entity Named(char const* name)
 {
-    return !std::strncmp(name, "puppet", 6) ? Entity(remote::PuppetOf(std::atoi(name + 6))) : Entity::GetEntity(bCString(name));
+    if (!name || !*name) return Entity();
+    int puppetId = 0;
+    if (std::strncmp(name, "puppet", 6) == 0)
+        return trade_policy::ParsePuppetId(name, net::MaxPlayers, puppetId) ? Entity(remote::PuppetOf(puppetId)) : Entity();
+    return Entity::GetEntity(bCString(name));
 }
 } // namespace
 

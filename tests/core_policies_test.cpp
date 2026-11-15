@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Restored engine-free checks for DamagePerception, processing spheres, replication life/cadence, and GUID codec.
 #include "../src/ai.h"
+#include "../src/focus_diag.h"
+#include "../src/guid_text.h"
+#include "../src/host_frame_diag.h"
 #include "../src/processing.h"
 #include "../src/replication.h"
-#include "../src/guid_text.h"
 
 #include <cassert>
 #include <cstdarg>
@@ -114,6 +116,31 @@ void TestGuidCodec()
     g3t::guid::FormatBytes(bytes, text, sizeof(text));
     assert(std::strcmp(text, "00000000-0000-0000-0000-000000000000") == 0);
 }
+
+void TestFocusDiagAndHostFrameDiag()
+{
+    g3t::focus_diag::Reset();
+    const auto firstUnfocused = g3t::focus_diag::AdvanceFrame(50000u, false, false, true);
+    assert(!firstUnfocused.lost && !firstUnfocused.regained && firstUnfocused.awayMs == 0u);
+    const auto firstFocus = g3t::focus_diag::AdvanceFrame(50500u, true, false, true);
+    assert(firstFocus.regained && firstFocus.awayMs == 0u);
+
+    const auto lost = g3t::focus_diag::AdvanceFrame(51000u, false, false, true);
+    assert(lost.lost);
+    const auto regained = g3t::focus_diag::AdvanceFrame(52350u, true, false, true);
+    assert(regained.regained && regained.awayMs == 1350u);
+
+    g3t::host_frame_diag::Accumulator acc{};
+    const uint32_t startMs = 0xffffd8f0u; // 10,000 ms before uint32 wrap
+    acc.Record(startMs, false, 0, 0, 1000, 500, 200, 100, true);
+    acc.Record(startMs + 5000u, true, 0, 0, 1000, 500, 200, 100, true);
+    assert(!acc.Due(startMs + 9999u, 10000u));
+    const uint32_t wrappedNow = startMs + 10250u; // wraps past 0
+    assert(acc.Due(wrappedNow, 10000u));
+    const auto summary = acc.Drain(wrappedNow);
+    assert(summary.windowMs == 10250u);
+    assert(summary.frames == 2u);
+}
 }
 
 int main()
@@ -122,5 +149,6 @@ int main()
     TestNpcOnlyProcessing();
     TestTerminalCorpseLifeAndCadence();
     TestGuidCodec();
+    TestFocusDiagAndHostFrameDiag();
     return 0;
 }

@@ -22,7 +22,7 @@ target_compile_options(enet PRIVATE /Gz)
 # Codec entry points explicitly use ENET_CALLBACK (__cdecl); its allocator/host calls still match ENet's /Gz ABI.
 target_link_libraries(enet PUBLIC ws2_32 winmm)
 
-add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/guid_text.cpp src/guid.cpp src/config.cpp src/net.cpp src/net_direct.cpp src/net_session.cpp src/net_npc.cpp src/net_npc_pose.cpp src/net_messages.cpp src/npclease_runtime.cpp src/npcwire_bones.cpp src/npcwire_control.cpp src/npcwire_adapter.cpp src/steam.cpp src/lobby.cpp src/snapshot.cpp src/npcplayback.cpp
+add_library(Script_G3Together SHARED src/Script_G3Together.cpp src/log.cpp src/guid_text.cpp src/guid.cpp src/config.cpp src/net.cpp src/net_direct.cpp src/net_session.cpp src/net_metrics.cpp src/net_npc.cpp src/net_npc_pose.cpp src/net_messages.cpp src/npclease_runtime.cpp src/npcwire_bones.cpp src/npcwire_control.cpp src/npcwire_adapter.cpp src/steam.cpp src/lobby.cpp src/snapshot.cpp src/npcplayback.cpp
             src/remote.cpp src/remote_qa.cpp src/body.cpp src/body_qa.cpp src/npcs.cpp src/ai.cpp src/combat.cpp src/story.cpp src/talk.cpp src/items.cpp src/containers.cpp src/explore.cpp src/parity.cpp src/downed.cpp src/hud.cpp src/range.cpp src/journal.cpp src/persist.cpp src/hero.cpp src/clock.cpp src/infocmd.cpp src/transform.cpp src/ranged.cpp src/shot.cpp src/partner.cpp src/summon.cpp src/spells.cpp src/crashlog.cpp src/trace.cpp src/world.cpp src/social.cpp src/enclaves.cpp src/doors.cpp src/dialogaudio.cpp src/offer.cpp src/trade.cpp src/tradeview.cpp src/mapmarks.cpp src/ransack.cpp src/witness.cpp src/guards.cpp src/pickpocket.cpp src/respawn.cpp src/occupancy.cpp src/address.cpp src/fightmem.cpp src/guide.cpp src/arena.cpp src/ending.cpp src/xpshare.cpp src/i18n.cpp src/exports.def)
 target_gothic_script_options(Script_G3Together)
 target_compile_definitions(Script_G3Together PRIVATE G3T_NET_SEPARATE_TUS=1)
@@ -40,7 +40,7 @@ target_sources(Script_G3Together PRIVATE src/combat_claims.cpp src/combat_kill_x
 target_sources(Script_G3Together PRIVATE src/combat_hostility.cpp)
 target_sources(Script_G3Together PRIVATE src/movement.cpp)
 target_sources(Script_G3Together PRIVATE src/options.cpp)
-target_sources(Script_G3Together PRIVATE src/steam_p2p.cpp src/steam_flow.cpp src/steam_legacy_auto.cpp src/steam_diagnostics.cpp)
+target_sources(Script_G3Together PRIVATE src/steam_published.cpp src/steam_p2p.cpp src/steam_flow.cpp src/steam_callbacks.cpp src/steam_legacy_auto.cpp src/steam_diagnostics.cpp)
 target_sources(Script_G3Together PRIVATE
     src/npcwire_pose.cpp
     src/npcplayback_skeleton.cpp
@@ -62,7 +62,10 @@ target_sources(Script_G3Together PRIVATE src/persist_storage.cpp)
 target_sources(Script_G3Together PRIVATE src/persist_client.cpp)
 target_sources(Script_G3Together PRIVATE src/symbols.cpp)
 target_sources(Script_G3Together PRIVATE src/shutdown_watchdog.cpp)
-target_sources(Script_G3Together PRIVATE src/story_domains.cpp src/story_qa.cpp src/infocmd_progression.cpp src/infocmd_sector.cpp)
+target_sources(Script_G3Together PRIVATE
+    src/story_domains.cpp src/story_qa.cpp
+    src/infocmd_progression.cpp src/infocmd_sector.cpp src/infocmd_qa.cpp
+    src/trade_qa.cpp)
 target_sources(Script_G3Together PRIVATE src/worldentry_diag.cpp)
 target_sources(Script_G3Together PRIVATE src/focus_diag.cpp)
 target_sources(Script_G3Together PRIVATE src/explore_watch.cpp src/explore_dialog.cpp src/explore_npc.cpp)
@@ -71,12 +74,15 @@ set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/npcwire_control.cpp
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net_direct.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net_session.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net_metrics.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net_npc.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net_npc_pose.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/net_messages.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam_published.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam_p2p.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam_flow.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam_callbacks.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam_legacy_auto.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/steam_diagnostics.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/focus_diag.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)

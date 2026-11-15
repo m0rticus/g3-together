@@ -91,8 +91,7 @@ bool ApplyPose(eCWrapper_emfx2Actor& actor, NativePose& pose)
         skeleton->mNodes.mLength != pose.count) return pose.valid = false;
     for (auto const& bone : pose.bones) {
         if (bone.index < 0 || bone.index >= skeleton->mNodes.mLength) return pose.valid = false;
-        std::memcpy(reinterpret_cast<unsigned char*>(skeleton->mNodes.mData + bone.index) + 0x44,
-                    &bone.matrix, sizeof(bCMatrix));
+        WriteNodeMatrix(skeleton->mNodes.mData, bone.index, bone.matrix);
     }
     pose.applied = true;
     return true;
@@ -393,11 +392,8 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
         cache.publishedFn = publish;
     }
     bones.resize(static_cast<size_t>(nodes.mLength));
-    auto const* rawNodes = reinterpret_cast<unsigned char const*>(nodes.mData);
-    constexpr size_t NodeStride = sizeof(*nodes.mData);
     for (int i = 0; i < nodes.mLength; ++i) {
-        bCMatrix matrix;
-        std::memcpy(&matrix, rawNodes + static_cast<size_t>(i) * NodeStride + 0x44, sizeof(matrix));
+        const bCMatrix matrix = detail::ReadNodeMatrix(nodes.mData, i);
         const auto transform = detail::TransformOf(matrix, cache.hashes[i]);
         if (!pose::Encode(transform, bones[static_cast<size_t>(i)])) {
             bones.clear();

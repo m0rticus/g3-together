@@ -306,40 +306,38 @@ bool InstallPersonalGuards()
            nativeTransaction && nativeScriptTransfer;
 }
 
-bool PrepareLocalLoot(Entity& entity)
+template <typename GenerateFn>
+bool PreparePersonalInventory(Entity& entity, bool eligible, bool alreadyGenerated, GenerateFn&& generate)
 {
-    if (!IsContainer(entity) || remote::IsPuppet(entity.GetInstance())) return true;
+    if (!eligible || remote::IsPuppet(entity.GetInstance())) return true;
     if (!PersonalAdmitted() || !EnsurePersonal(entity)) return false;
-    if (entity.Inventory.IsGeneratedPlunder()) {
-        RememberPersonal(entity);
-        return true;
-    }
-    if (!entity.Inventory.GeneratePlunderInvFromTreasureSets())
-        Note("containers: no generated personal loot sets for %s", NameOf(entity).c_str());
-    entity.Inventory.SetGeneratedPlunder(GETrue);
-    Note("containers: personal loot generated once for %s", NameOf(entity).c_str());
+    if (!alreadyGenerated) generate();
     RememberPersonal(entity);
     return true;
 }
 
+bool PrepareLocalLoot(Entity& entity)
+{
+    return PreparePersonalInventory(entity, IsContainer(entity), entity.Inventory.IsGeneratedPlunder() != GEFalse, [&] {
+        if (!entity.Inventory.GeneratePlunderInvFromTreasureSets())
+            Note("containers: no generated personal loot sets for %s", NameOf(entity).c_str());
+        entity.Inventory.SetGeneratedPlunder(GETrue);
+        Note("containers: personal loot generated once for %s", NameOf(entity).c_str());
+    });
+}
+
 bool PrepareLocalTrade(Entity& entity)
 {
-    if (!IsTrader(entity) || remote::IsPuppet(entity.GetInstance())) return true;
-    if (!PersonalAdmitted() || !EnsurePersonal(entity)) return false;
-    if (entity.Inventory.IsGeneratedTrade()) {
-        RememberPersonal(entity);
-        return true;
-    }
-    if (!entity.Inventory.GenerateTradeInvFromTreasureSets())
-        Note("containers: no generated personal stock sets for %s", NameOf(entity).c_str());
-    if (static_cast<GEFloat>(entity.Dialog.EndDialogTimestamp) == 0.0f)
-        if (!entity.Inventory.RefreshTradeInvFromTreasureSets())
-            Note("containers: personal stock refresh skipped for %s", NameOf(entity).c_str());
-    if (auto* inv = static_cast<gCInventory_PS*>(entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory)))
-        inv->AccessGeneratedTrade() = GETrue;
-    Note("containers: personal merchant stock prepared for %s", NameOf(entity).c_str());
-    RememberPersonal(entity);
-    return true;
+    return PreparePersonalInventory(entity, IsTrader(entity), entity.Inventory.IsGeneratedTrade() != GEFalse, [&] {
+        if (!entity.Inventory.GenerateTradeInvFromTreasureSets())
+            Note("containers: no generated personal stock sets for %s", NameOf(entity).c_str());
+        if (static_cast<GEFloat>(entity.Dialog.EndDialogTimestamp) == 0.0f)
+            if (!entity.Inventory.RefreshTradeInvFromTreasureSets())
+                Note("containers: personal stock refresh skipped for %s", NameOf(entity).c_str());
+        if (auto* inv = static_cast<gCInventory_PS*>(entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory)))
+            inv->AccessGeneratedTrade() = GETrue;
+        Note("containers: personal merchant stock prepared for %s", NameOf(entity).c_str());
+    });
 }
 
 void LocalInventoryTick()
@@ -469,9 +467,16 @@ void HookQuickLoot()
     std::memcpy(site + 1, &to, 4);
     site[5] = 0x90;
     std::memcpy(installed, site, sizeof(installed));
-    VirtualProtect(site, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    DWORD restoredOld = 0;
+    const bool restored = VirtualProtect(site, 6, old, &restoredOld) != 0;
+    const bool flushed = FlushInstructionCache(GetCurrentProcess(), site, 6) != 0;
     ai::TrackPatch(site, original, installed, sizeof(original), "containers quick loot call");
+    if (!restored || !flushed) {
+        quickHookFailed = true;
+        Logf("FAIL containers: quick loot hook finalize failed restored=%d flushed=%d error=%lu",
+             restored ? 1 : 0, flushed ? 1 : 0, GetLastError());
+        return;
+    }
     quickHooked = true;
     Log("containers: quick loot hook installed");
 }

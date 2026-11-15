@@ -157,24 +157,24 @@ inline bool Valid(Message const& m)
            detail::CstrValidEmptyAllowed(m.state.routine, sizeof(m.state.routine));
 }
 
+namespace detail {
+
+constexpr int64_t SignedDelta32(uint32_t lhs, uint32_t rhs)
+{
+    const uint32_t d = lhs - rhs;
+    return (d & 0x80000000u) ? (int64_t(d) - int64_t(uint64_t(1) << 32)) : int64_t(d);
+}
+
+} // namespace detail
+
 inline bool Reached(uint32_t now, uint32_t deadline)
 {
-    const uint32_t d = now - deadline;
-    if (d & 0x80000000u) {
-        const int64_t signedDiff = int64_t(d) - int64_t(uint64_t(1) << 32);
-        return signedDiff >= 0;
-    }
-    return int64_t(d) >= 0;
+    return detail::SignedDelta32(now, deadline) >= 0;
 }
 
 inline bool Newer(uint32_t next, uint32_t previous)
 {
-    const uint32_t d = next - previous;
-    if (d & 0x80000000u) {
-        const int64_t signedDiff = int64_t(d) - int64_t(uint64_t(1) << 32);
-        return signedDiff > 0;
-    }
-    return int64_t(d) > 0;
+    return detail::SignedDelta32(next, previous) > 0;
 }
 
 namespace detail {

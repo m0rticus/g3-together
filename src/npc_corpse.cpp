@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npc_corpse.h"
+#include "npcplayback_skeleton.h"
 
 #include "ai.h"
 #include "downed.h"
@@ -55,8 +56,7 @@ bool ActorBonesFinite(eCVisualAnimation_PS* animation)
     if (count <= 0) return false;
     auto const* nodes = animation->GetActor()->GetInstance()->mNodes.mData;
     for (int i = 0; i < count; ++i) {
-        bCMatrix local;
-        std::memcpy(&local, reinterpret_cast<unsigned char const*>(nodes + i) + 0x44, sizeof(local));
+        const bCMatrix local = npcplayback::detail::ReadNodeMatrix(nodes, i);
         if (!FiniteMatrix(local, 5000.0f)) return false;
     }
     return true;
@@ -67,9 +67,7 @@ bool EnsureFiniteRagdollPose(Mirror& m, eCEntity* entity, eCVisualAnimation_PS* 
     if (!entity || !animation || !animation->GetActor() || !animation->GetActor()->GetInstance()) return false;
     if (!FiniteMatrix(entity->GetWorldMatrix())) {
         if (m.corpsePose.empty() || !FiniteMatrix(m.corpseRoot)) return false;
-        entity->SetToWorldMatrix(m.corpseRoot);
-        if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-            rigid->SetPose(m.corpseRoot);
+        npcplayback::SetEntityPose(entity, m.corpseRoot);
     }
     if (ActorBonesFinite(animation)) return true;
     if (!m.corpsePose.empty())
@@ -113,9 +111,7 @@ Vec3 ResolveCorpseGroundAnchor(Mirror const& m)
 
 void SetEntityAndRigidPose(eCEntity* entity, bCMatrix const& pose)
 {
-    entity->SetToWorldMatrix(pose);
-    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-        rigid->SetPose(pose);
+    npcplayback::SetEntityPose(entity, pose);
 }
 
 void RequestCorpseRoiUpdate(uint32_t now)
@@ -320,7 +316,7 @@ bool TryApplyForce(Mirror& m, uint32_t now)
     if (!active && m.deathImpulse.Pending()) {
         m.deathImpulse.Choose(ragdoll::Source::Gravity);
         ++ragdollGravityDeaths;
-        std::strcpy(m.presentationSource, "gravity");
+        strcpy_s(m.presentationSource, "gravity");
         Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u source=gravity applied=0 magnitude=0 reason=physics_stopped",
              m.entity.GetName().GetText(), identity, m.latest.incarnation);
     }
@@ -353,7 +349,7 @@ bool TryApplyForce(Mirror& m, uint32_t now)
                  raw.x, raw.y, raw.z, rawOffset.x, rawOffset.y, rawOffset.z, groundOrigin.x, groundOrigin.y, groundOrigin.z);
             it = pending->second.erase(it);
             ++ragdollForcesApplied;
-            std::strcpy(m.presentationSource, "host_force");
+            strcpy_s(m.presentationSource, "host_force");
             applied = true;
         }
         if (pending->second.empty()) pendingForces.erase(pending);
@@ -366,7 +362,7 @@ bool TryApplyForce(Mirror& m, uint32_t now)
 
     if (m.deathImpulse.Choose(ragdoll::Source::Gravity)) {
         ++ragdollGravityDeaths;
-        std::strcpy(m.presentationSource, "gravity");
+        strcpy_s(m.presentationSource, "gravity");
         Logf("npcs: CLIENTRAGDOLL name=%s guid=%s action=force incarnation=%u source=gravity applied=0 magnitude=0",
              m.entity.GetName().GetText(), identity, m.latest.incarnation);
     }
@@ -580,7 +576,7 @@ void LayDown(Mirror& m, uint32_t now)
             m.ragdollPaused = true;
             m.ragdollTryAt = 0;
             m.lieCheckAt = 0;
-            std::strcpy(m.presentationSource, "paused_defer");
+            strcpy_s(m.presentationSource, "paused_defer");
             return;
         }
         auto completeRagdollStart = [&]() {
@@ -591,7 +587,7 @@ void LayDown(Mirror& m, uint32_t now)
                 m.corpsePoseAt = 0;
                 ++m.ragdollStarts;
                 ++ragdollsStarted;
-                std::strcpy(m.presentationSource, RagdollSource(m));
+                strcpy_s(m.presentationSource, RagdollSource(m));
                 Logf("npcs: CLIENTRAGDOLL name=%s action=start source=%s host_force_queued=%d host_force_available=%d fallback=%s",
                      m.entity.GetName().GetText(), m.presentationSource, HostForceQueued(m), HostForceAvailable(m), "gravity");
             }
@@ -607,7 +603,7 @@ void LayDown(Mirror& m, uint32_t now)
             if (!routine) {
                 m.ragdollTryAt = now + 1500;
                 m.lieCheckAt = now + 1500;
-                std::strcpy(m.presentationSource, "not_ready");
+                strcpy_s(m.presentationSource, "not_ready");
                 world::RequestProcessingUpdate();
                 return;
             }
@@ -619,7 +615,7 @@ void LayDown(Mirror& m, uint32_t now)
                 ++ragdollsNotReady;
                 m.ragdollTryAt = now + (m.ragdollFails < 4 ? 250 : 1500);
                 m.lieCheckAt = m.ragdollTryAt;
-                std::strcpy(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+                strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
                 return;
             }
             if (haveActor) m.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
@@ -637,7 +633,7 @@ void LayDown(Mirror& m, uint32_t now)
                 ++ragdollsNotReady;
                 m.ragdollTryAt = now + (m.ragdollFails < 4 ? 250 : 1500);
                 m.lieCheckAt = m.ragdollTryAt;
-                std::strcpy(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+                strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
                 return;
             }
             using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
@@ -660,7 +656,7 @@ void LayDown(Mirror& m, uint32_t now)
             ++ragdollsNotReady;
             m.ragdollTryAt = now + (m.ragdollFails < 4 ? 1500 : 5000);
             m.lieCheckAt = m.ragdollTryAt;
-            std::strcpy(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+            strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
             if (m.ragdollFails <= 3 || m.ragdollFails % 10 == 0) RequestCorpseRoiUpdate(now);
             if (m.ragdollFails <= 2 || m.ragdollFails == 10)
                 Logf("npcs: corpse %s ragdoll physics not ready (try %u); preserving death pose and retrying", m.entity.GetName().GetText(), m.ragdollFails);
@@ -671,7 +667,7 @@ void LayDown(Mirror& m, uint32_t now)
             RequestCorpseRoiUpdate(now);
             m.ragdollTryAt = now + 1500;
             m.lieCheckAt = m.ragdollTryAt;
-            std::strcpy(m.presentationSource, "retry");
+            strcpy_s(m.presentationSource, "retry");
             return;
         }
     }

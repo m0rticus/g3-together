@@ -201,7 +201,8 @@ std::vector<std::string> LearnedSpellsOf(Entity& self)
             StackLearned(inventory, i) != 1) continue;
         const Template item = self.Inventory.GetTemplate(i);
         bCPropertyID const& id = item;
-        out.push_back(Hex(id));
+        std::string hex = Hex(id);
+        if (std::find(out.begin(), out.end(), hex) == out.end()) out.push_back(std::move(hex));
     }
     return out;
 }
@@ -486,20 +487,10 @@ bool SaveRecordImpl(char const* path, saving::Key const& key)
     if (!saving::ValidRecordPose(pose)) { Logf("hero: record %s not written (invalid pose)", path); return false; }
 
     Entity self(hero);
-    auto* memory = static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory));
     codec::ParsedRecord record;
+    char const* invalid = CaptureHeroSnapshot(self, *hero, record) ? nullptr : "an attribute missing or out of range";
     record.key = key;
     record.pose = pose;
-    record.downed = downed::Held() ? 1 : 0;
-    record.level = static_cast<unsigned>(self.NPC.Level);
-    record.levelMax = static_cast<unsigned>(self.NPC.LevelMax);
-    record.xp = static_cast<int>(self.PlayerMemory.XP);
-    record.lpAttribs = static_cast<int>(self.PlayerMemory.LPAttribs);
-    record.lpPerks = static_cast<int>(self.PlayerMemory.LPPerks);
-    record.stacks = Stacks(self);
-    record.spells = LearnedSpellsOf(self);
-    record.quicks = QuickSlotsOf(self);
-    char const* invalid = CaptureAttributes(*memory, record.attrs) ? nullptr : "an attribute missing or out of range";
     if (!invalid) invalid = codec::ValidateStatsAndAttributes(record);
     if (!invalid) invalid = codec::ValidateLogicalContents(record.stacks, record.spells, record.quicks, EngineSchema());
     if (!invalid) invalid = ValidateTemplates(record.stacks, record.spells);
@@ -604,7 +595,6 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
     }
     if (!codec::SameStacks(Stacks(self), parsed.stacks)) return fail("restored inventory does not match the record");
     if (char const* err = ApplyCoreStatsAndAttributes(self, *hero, parsed, true, label)) return fail(err);
-    if (downed::Held()) self.PlayerMemory.SetBaseValue(bCString("HP"), 1);
 
     const saving::RecordPose& pose = parsed.pose;
     if (net::IsHost()) {

@@ -38,8 +38,12 @@ class WorldCollisionReadinessTests(unittest.TestCase):
 
         self.assertIn("InstallDatabaseIndexFix()", world_pvs_cpp)
         self.assertIn("ShouldAttemptRegionRelease", world_pvs_cpp)
+        self.assertIn("LoadPublishedRegions()", world_pvs_cpp)
+        self.assertIn("DrainPrefetcherGroup", world_pvs_cpp)
         self.assertIn("OnExitProcessingRange@eCEntity@@MAEXXZ", world_collision_cpp)
         self.assertIn("CacheOutInternal@eCEntity@@IAEX_N@Z", world_collision_cpp)
+        self.assertIn("HasOtherThreadInFlightLocked(entity, selfThread)", world_collision_cpp)
+        self.assertNotIn("clearCachingOut", world_collision_cpp)
         self.assertIn("eETraceRayHints_TestStaticShapes | eETraceRayHints_IncludeWater", world_collision_cpp)
 
 

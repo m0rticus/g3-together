@@ -35,7 +35,6 @@ char const* const StoryMovers[] = {"Diego", "Gorn", "Milten", "Lester", "Jorn", 
                                    "Lukar", "G3_Varant_01_Braga_NPC_01", "G3_Varant_01_Braga_NPC_02"};
 gFScript originalRefresh = nullptr;
 bool refreshTried = false;
-bool refreshSync = true;  // QA negative control: storymoveoff
 unsigned refreshCalls = 0, refreshSent = 0;
 
 GEInt GE_STDCALL SectorRefresh(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -44,14 +43,14 @@ GEInt GE_STDCALL SectorRefresh(gCScriptProcessingUnit* spu, GELPVoid self, GELPV
     if (!net::IsHost()) return 0;
     struct Before { eCEntity* entity; std::string routine; bCVector position; bCQuaternion rotation; uint8_t companionOf; };
     std::vector<Before> before;
-    const bool passOn = refreshSync && sharing && net::IsHost() && net::Connected();
+    const bool passOn = flags.refreshSync && flags.sharing && net::IsHost() && net::Connected();
     if (passOn) {
         for (char const* name : StoryMovers) {
             Entity e = Entity::GetEntity(bCString(name));
             eCEntity* instance = e.GetInstance();
             auto* nav = instance ? static_cast<gCNavigation_PS*>(instance->GetPropertySet(eEPropertySetType_Navigation)) : nullptr;
             if (nav) before.push_back({instance, nav->AccessRoutine().GetText(), instance->GetWorldPosition(), instance->GetWorldRotation(),
-                                       keepCompanions ? npcs::ClaimedBy(instance) : uint8_t(0)});
+                                       flags.keepCompanions ? npcs::ClaimedBy(instance) : uint8_t(0)});
         }
     }
     const GEInt result = originalRefresh(spu, self, other, args);
@@ -66,7 +65,7 @@ GEInt GE_STDCALL SectorRefresh(gCScriptProcessingUnit* spu, GELPVoid self, GELPV
             // it stays with that player, here as there. Its new routine stays; it goes there once the player lets it go.
             const float rotation[4] = {b.rotation.GetX(), b.rotation.GetY(), b.rotation.GetZ(), b.rotation.GetW()};
             Entity(b.entity).MoveTo(body::Pose(*b.entity, was, rotation));
-            ++companionsKept;
+            ++stats.companionsKept;
             Logf("infocmd: the story moved %s, the companion of player %u; it stays with that player", b.entity->GetName().GetText(),
                  b.companionOf);
             continue;
@@ -101,7 +100,7 @@ void StartFights()
         const int reason = ReasonOf(it->reason, attacker.GetInstance(), target);
         GetScriptAdminExt().CallScript(bCString("AssessTarget"), attacker.GetInstance(), target, reason);
         remote::NoteContact(attacker.GetInstance(), target);
-        ++fightsStarted;
+        ++stats.fightsStarted;
         Logf("infocmd: %s attacks player %u (%s, reason %d) after a dialog", attacker.GetName().GetText(), it->player, it->reason.c_str(), reason);
         it = fights.erase(it);
     }
@@ -130,7 +129,7 @@ bool Join(eCEntity* self, bool join, bool follow, char const* questName)
         net::WorldState s{};
         s.kind = 5;
         guid::CopyEntity(self, s.guid);
-        if (givebackPlace) {  // where it stands here: the host's copy far away stayed where the host last saw it (escortfardiag)
+        if (flags.givebackPlace) {  // where it stands here: the host's copy far away stayed where the host last saw it (escortfardiag)
             const bCVector& p = self->GetWorldPosition();
             s.position[0] = p.GetX(); s.position[1] = p.GetY(); s.position[2] = p.GetZ();
             const bCQuaternion q = self->GetWorldRotation();
@@ -162,70 +161,16 @@ void HookSectorRefresh()
     Logf("infocmd: OnEnclaveSectorRefresh %s", originalRefresh ? "wrapped (the host passes on story moves)" : "could not be wrapped");
 }
 
+RefreshStats GetRefreshStats()
+{
+    return {originalRefresh != nullptr, refreshCalls, refreshSent};
+}
+
 } // namespace g3t::infocmd::detail
 
 namespace g3t::infocmd {
-using namespace detail;
-
-bool TakeOver(eCEntity* target, bool join, bool follow, char const* questName) { return Join(target, join, follow, questName); }
-
-void Off(LogFn log) { sharing = false; log("INFOCMDOFF ok=1"); }
-void StoryCompanionOff(LogFn log) { keepCompanions = false; log("STORYCOMPANIONOFF ok=1"); }
-void GivebackPlaceOff(LogFn log) { givebackPlace = false; log("GIVEBACKPOSOFF ok=1"); }
-void DialogXpOff(LogFn log) { xpshare::Off(log); log("DIALOGXPOFF ok=1"); }
-
-void StoryMoveOff(LogFn log)
+bool TakeOver(eCEntity* target, bool join, bool follow, char const* questName)
 {
-    detail::refreshSync = false;
-    char line[120];
-    Format(line, "STORYMOVEOFF ok=1 calls=%u sent=%u", detail::refreshCalls, detail::refreshSent);
-    log(line);
+    return detail::Join(target, join, follow, questName);
 }
-
-void StoryMoves(LogFn log)
-{
-    char line[120];
-    Format(line, "STORYMOVES hooked=%d calls=%u sent=%u sync=%d companions_kept=%u keep=%d",
-           detail::originalRefresh ? 1 : 0, detail::refreshCalls, detail::refreshSent, detail::refreshSync ? 1 : 0,
-           companionsKept, keepCompanions ? 1 : 0);
-    log(line);
-}
-
-void Report(LogFn log)
-{
-    char line[600];
-    Format(line, "INFOCMD observed=%u distinct=%u sent=%u applied=%u sectors_sent=%u sectors_applied=%u fights_sent=%u fights_started=%u last=%s",
-           observed, distinct, snapshotsSent, snapshotsApplied, sectorsSent, sectorsApplied, fightsSent, fightsStarted, lastText.c_str());
-    log(line);
-}
-
-void JoinQa(char const* argument, LogFn log)
-{
-    char line[200];
-    std::string arg = argument ? argument : "";
-    const size_t cut = arg.rfind('_');
-    if (cut == std::string::npos || net::IsHost()) { log("REFUSED join: use Name_1 or Name_0 on a client"); return; }
-    Entity npc = Entity::GetEntity(bCString(arg.substr(0, cut).c_str()));
-    const bool join = arg.substr(cut + 1) == "1";
-    const bool changed = npc.GetInstance() && Join(npc.GetInstance(), join);
-    Format(line, "JOIN name=%s join=%d found=%d changed=%d", arg.substr(0, cut).c_str(), join ? 1 : 0, npc.GetInstance() ? 1 : 0, changed ? 1 : 0);
-    log(line);
-}
-
-void PartyEnableQa(char const* argument, LogFn log)
-{
-    char line[160];
-    std::string name = argument ? argument : "";
-    const bool mob = name.size() > 4 && name.compare(name.size() - 4, 4, "_mob") == 0;
-    if (mob) name.resize(name.size() - 4);
-    Entity npc = Entity::GetEntity(bCString(name.c_str()));
-    if (!npc.GetInstance()) { log("REFUSED partyenable: no such NPC"); return; }
-    if (mob) npc.Dialog.MobEnabled = GETrue;
-    else npc.Dialog.PartyEnabled = GETrue;
-    Changed(npc.GetInstance());
-    Format(line, "PARTYENABLE name=%s party_enabled=%d mob_enabled=%d", name.c_str(), npc.Dialog.PartyEnabled ? 1 : 0,
-           npc.Dialog.MobEnabled ? 1 : 0);
-    log(line);
-}
-
 } // namespace g3t::infocmd

@@ -57,20 +57,6 @@ std::vector<Pending> pending;
 struct TimedNpcShot { uint8_t from; net::ShotNote note; uint32_t arrived; };
 std::vector<TimedNpcShot> timedNpcShots;
 
-// QA: the latest copies and where they went in their first 1.5 s (relative to where they started, every 100 ms).
-struct Copy {
-    uint32_t netId = 0;
-    uint8_t from = 0;
-    uint8_t guid[16] = {};
-    DWORD at = 0;
-    DWORD next = 0;  // ms after `at` of the next sample
-    bool done = false;
-    bCVector start;
-    char path[400] = "";  // at most 16 samples of 24 chars
-};
-constexpr size_t MaxCopies = 8;
-std::vector<Copy> recent;
-
 template <typename T>
 T* Find(bTValMap<bCString, T*>& map, char const* name)
 {
@@ -284,31 +270,6 @@ void Resolve()
     }
 }
 
-void TraceCopies()
-{
-    const DWORD now = GetTickCount();
-    for (Copy& c : recent) {
-        const DWORD t = now - c.at;
-        if (c.done || t < c.next) continue;
-        c.next = t + 100;
-        if (t > 1500) {
-            c.done = true;
-            continue;
-        }
-        Entity e = ByGuid(c.guid);
-        char point[48];
-        if (!e.GetInstance()) {
-            if (t < 300) continue;  // a fresh copy only shows up a frame later
-            Format(point, "%lu:gone,", t);
-            c.done = true;
-        } else {
-            const bCVector d = e.GetPosition() - c.start;
-            Format(point, "%lu:%.0f_%.0f_%.0f,", t, d.GetX(), d.GetY(), d.GetZ());
-        }
-        strncat_s(c.path, point, _TRUNCATE);
-    }
-}
-
 void SpawnShot(uint8_t from, net::ShotNote const& note)
 {
     ++received;
@@ -402,14 +363,6 @@ void SpawnShot(uint8_t from, net::ShotNote const& note)
     if (npc) ++npcCopies;
     summon::WatchHits();
     ++copies;
-    Copy c;
-    c.netId = note.netId;
-    c.from = from;
-    guid::CopyEntity(copy.GetInstance(), c.guid);
-    c.at = GetTickCount();
-    c.start = bCVector(note.position[0], note.position[1], note.position[2]);
-    if (recent.size() >= MaxCopies) recent.erase(recent.begin());
-    recent.push_back(c);
     Logf("shot: net %08X from player %u: %s copy flies, path %u v %.0f, %u puppet parts excluded", note.netId, from, note.arrow, note.path,
          note.velocity, static_cast<unsigned>(parts.size()));
 }
@@ -441,14 +394,19 @@ void __fastcall HookTouch(void* projectile, void* edx, eCEntity* touched, eCCont
         originalTouch(projectile, edx, touched, contact);
         return;
     }
-    const bool armed = static_cast<unsigned char const*>(projectile)[0x78] != 0;  // OnTouch returns at once if 0
-    const Entity owner = arrow.GetInstance() ? arrow.Interaction.GetOwner() : Entity();
-    const int type = contact ? static_cast<int>(contact->GetCollisionType()) : -1;  // 14 shapes, 100 bones (Animation)
-    char const* bone = type == 100 ? contact->GetBone(0).GetText() : "-";
-    Format(touchLines[touchCount++ % MaxTouchLines], "TOUCH t=%lu arrow=%s owner=%s owner_puppet_of=%d armed=%d touched=%s npc=%d type=%d bone=%s",
-              GetTickCount(), NameOf(arrow), NameOf(owner), owner.GetInstance() ? remote::PuppetOwner(owner.GetInstance()) : 0, armed ? 1 : 0,
-              touched ? Entity(touched).GetName().GetText() : "-", touched && touched->GetPropertySet(eEPropertySetType_NPC) ? 1 : 0, type,
-              bone && *bone ? bone : "-");
+    if (traceTouches) {
+        const bool armed = static_cast<unsigned char const*>(projectile)[0x78] != 0;  // OnTouch returns at once if 0
+        const Entity owner = arrow.GetInstance() ? arrow.Interaction.GetOwner() : Entity();
+        const int type = contact ? static_cast<int>(contact->GetCollisionType()) : -1;  // 14 shapes, 100 bones (Animation)
+        char const* bone = type == 100 ? contact->GetBone(0).GetText() : "-";
+        Format(touchLines[touchCount++ % MaxTouchLines],
+               "TOUCH t=%lu arrow=%s owner=%s owner_puppet_of=%d armed=%d touched=%s npc=%d type=%d bone=%s",
+               GetTickCount(), NameOf(arrow), NameOf(owner),
+               owner.GetInstance() ? remote::PuppetOwner(owner.GetInstance()) : 0, armed ? 1 : 0,
+               touched ? Entity(touched).GetName().GetText() : "-",
+               touched && touched->GetPropertySet(eEPropertySetType_NPC) ? 1 : 0, type,
+               bone && *bone ? bone : "-");
+    }
     const bool npcCopy = NpcReplica(arrow.GetInstance());
     if (npcCopy && touched && touched != remote::ControlledBody() && touched->GetPropertySet(eEPropertySetType_NPC))
         return;  // a visual copy can contact our hero, but shared NPC hits belong to the simulator
@@ -495,7 +453,6 @@ void OnWorldChange()
 {
     timedNpcShots.clear();
     pending.clear();
-    recent.clear();
     npcReplicas.clear();
     npcReplicaContact = false;
     traceTouches = false;
@@ -558,7 +515,6 @@ void Tick()
     }
     Install();
     if (!pending.empty()) Resolve();
-    if (!recent.empty()) TraceCopies();
     for (auto it = npcReplicas.begin(); it != npcReplicas.end();) {
         const auto* guid = reinterpret_cast<uint8_t const*>(it->data());
         it = ByGuid(guid).GetInstance() ? std::next(it) : npcReplicas.erase(it);
@@ -573,15 +529,6 @@ void Report(LogFn log)
               installed, originalShoot != nullptr, magicInstalled, mirror, copyOwner, shots, announced, unresolved, received, copies, noPuppet,
               badTemplate, noSpell, npcAnnounced, npcReceived, npcCopies, contactsReady ? 1 : 0);
     log(line);
-    for (Copy const& c : recent) {
-        Entity e = ByGuid(c.guid);
-        const Entity owner = e.GetInstance() ? e.Interaction.GetOwner() : Entity();
-        Format(line, "SHOTCOPY net=%08X from=%u alive=%d flying=%d group=%d owner=%s owner_puppet_of=%d path=%s", c.netId, c.from,
-                  e.GetInstance() ? 1 : 0, e.GetInstance() && e.Projectile.IsFlying() ? 1 : 0,
-                  e.GetInstance() ? static_cast<int>(e.GetInstance()->GetCollisionGroup()) : -1, NameOf(owner),
-                  owner.GetInstance() ? remote::PuppetOwner(owner.GetInstance()) : 0, c.path);
-        log(line);
-    }
     log("SHOTSTATE end");
 }
 

@@ -14,12 +14,12 @@ int main()
     state.flags = 1;
     state.world = 123;
     state.rotation[3] = 1;
-    std::strcpy(state.name, "Host");
-    std::strcpy(state.heldRight, "It_1H_OrcSlayer_01");
-    std::strcpy(state.heldLeft, "It_Shield_01");
-    std::strcpy(state.armor, "Body_Human_Armor_01");
-    std::strcpy(state.helmet, "It_Helmet_01");
-    std::strcpy(state.look, "PC_Hero");
+    std::snprintf(state.name, sizeof(state.name), "%s", "Host");
+    std::snprintf(state.heldRight, sizeof(state.heldRight), "%s", "It_1H_OrcSlayer_01");
+    std::snprintf(state.heldLeft, sizeof(state.heldLeft), "%s", "It_Shield_01");
+    std::snprintf(state.armor, sizeof(state.armor), "%s", "Body_Human_Armor_01");
+    std::snprintf(state.helmet, sizeof(state.helmet), "%s", "It_Helmet_01");
+    std::snprintf(state.look, sizeof(state.look), "%s", "PC_Hero");
     playerwire::Encoder encoder;
     playerwire::Decoder decoder;
     uint64_t application = 0, enet = 0, steam = 0, ack = 0;
@@ -32,7 +32,7 @@ int main()
         state.actionSeq = static_cast<uint8_t>(tick / 60);
         state.focusNpc = tick / 300 % 2 ? 567 : 123;
         state.targetNpc = tick / 600 % 2 ? 0 : 123;
-        std::strcpy(state.animation, tick / 60 % 2 ? "Walk" : "Stand");
+        std::snprintf(state.animation, sizeof(state.animation), "%s", tick / 60 % 2 ? "Walk" : "Stand");
         playerwire::Packet packet;
         assert(encoder.Plan(state, state.sent, false, packet) == playerwire::Status::Ok);
         net::PlayerState restored;

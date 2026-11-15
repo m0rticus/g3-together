@@ -583,5 +583,34 @@ int main()
     assert(forgedDialogs == 1);
     SetDialogLineHandler(nullptr);
 
+    // Client NPC stream & motion-name messages from non-server peers MUST be rejected,
+    // and host MsgPoseAck MUST require reliable delivery.
+    static unsigned motionNamesReceived = 0;
+    SetNpcHandlers(nullptr, [](uint32_t, char const*) { ++motionNamesReceived; });
+    MotionNameMsg motionMsg{MsgMotionName, HashName("Hum_Test_Ani"), {}};
+    strcpy_s(motionMsg.name, "Hum_Test_Ani");
+    Transmission motionFrame{{}, ENET_PACKET_FLAG_RELIABLE, ChannelDefinitions, &fakePeers[1]};
+    motionFrame.bytes.resize(sizeof(motionMsg));
+    std::memcpy(motionFrame.bytes.data(), &motionMsg, sizeof(motionMsg));
+    Deliver(&fakePeers[1], motionFrame);
+    assert(motionNamesReceived == 0);
+    motionFrame.peer = server;
+    Deliver(server, motionFrame);
+    assert(motionNamesReceived == 1);
+    SetNpcHandlers(nullptr, nullptr);
+
+    isHost = true;
+    localId = 1;
+    worldEpoch = 17;
+    boneGeneration = 3;
+    PoseAckMsg poseAck{MsgPoseAck, worldEpoch, boneGeneration, {}, 1, 1};
+    poseAck.guid[0] = 0x42;
+    const uint64_t rejectedBefore = npcRejected;
+    Transmission ackFrame{{}, 0, ChannelState, peers[2]};
+    ackFrame.bytes.resize(sizeof(poseAck));
+    std::memcpy(ackFrame.bytes.data(), &poseAck, sizeof(poseAck));
+    Deliver(peers[2], ackFrame); // unreliable MsgPoseAck -> rejected before cache lookup
+    assert(npcRejected == rejectedBefore + 1);
+
     host = nullptr;
 }

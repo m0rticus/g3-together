@@ -140,9 +140,9 @@ float Yaw(bCQuaternion const& q)
 void Report()
 {
     gCSession& session = gCSession::GetInstance();
-    gCWorld* world = gCWorld::GetCurrentWorld();
+    gCWorld* currentWorld = gCWorld::GetCurrentWorld();
     eCDynamicEntity* hero = session.GetHero();
-    const bCString worldName = world ? world->GetFileBaseName() : bCString("none");
+    const bCString worldName = currentWorld ? currentWorld->GetFileBaseName() : bCString("none");
     if (!hero || !session.IsGameRunning()) {
         g3t::Logf("frame=%llu world=%s running=%d hero=none", frames, worldName.GetText(), session.IsGameRunning());
         return;
@@ -163,7 +163,7 @@ void Frame()
             lastReport = now;
             Report();
         }
-        if (g3t::GetConfig().host) {
+        if (g3t::GetLocalConfig().host) {
             g3t::host_frame_diag::Summary perf{};
             if (g3t::host_frame_diag::Global().PollHeartbeat(g3t::net::Now(), perf)) {
                 const auto sim = g3t::world::HostSimulationStatus();
@@ -189,7 +189,7 @@ template <typename Fn>
 void TimedStep(char const* name, g3t::host_frame_diag::Phase phase, Fn&& tick)
 {
     g3t::movement::Stage stage(name);
-    const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
+    const long long t0 = g3t::GetLocalConfig().host ? g3t::movement::EntryTime() : 0;
     tick();
     if (t0) g3t::host_frame_diag::Global().AddPhase(phase, t0, g3t::movement::EntryTime());
 }
@@ -201,7 +201,7 @@ struct FrameScope {
         if (run) ++moduleProcessDepth;
         if (run && moduleProcessDepth == 1) {
             g3t::movement::Begin(entered);
-            if (g3t::GetConfig().host) {
+            if (g3t::GetLocalConfig().host) {
                 auto& session = gCSession::GetInstance();
                 const bool inWorld = session.IsGameRunning() && !g3t::persist::NativeLoading() &&
                     !g3t::persist::HeroPending();
@@ -215,9 +215,11 @@ struct FrameScope {
             TimedStep("net flush", g3t::host_frame_diag::Phase::Net, [] { g3t::net::Flush(); });
             Step("persist end", [] { g3t::persist::EndFrame(); });
             if (--moduleProcessDepth == 0) g3t::hud::Tick();
-            if (moduleProcessDepth == 0) g3t::movement::End();
-            if (moduleProcessDepth == 0 && g3t::GetConfig().host)
-                g3t::host_frame_diag::Global().EndFrame(g3t::movement::EntryTime());
+            if (moduleProcessDepth == 0) {
+                g3t::movement::End();
+                if (g3t::GetLocalConfig().host)
+                    g3t::host_frame_diag::Global().EndFrame(g3t::movement::EntryTime());
+            }
         }
     }
     FrameScope(FrameScope const&) = delete;

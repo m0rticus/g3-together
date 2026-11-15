@@ -41,10 +41,17 @@ LONG dumpBusy = 0;
 std::atomic<uint32_t> activeDumpCallers{0};
 DWORD dumpThreadId = 0, dumpWorkerThreadId = 0;
 char dumpDir[MAX_PATH] = {};
-LONG dumps = 0;
+LONG dumps = 0, dumpSequence = 0;
 constexpr LONG MaxFirstChanceDumps = 2;
 LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
+bool filterInstalled = false;
 PVOID vectoredHandler = nullptr;
+
+HMODULE EnsureDbgHelp()
+{
+    static HMODULE module = LoadLibraryA("dbghelp.dll");
+    return module;
+}
 
 struct DbgHelpGuard {
     bool locked = false;
@@ -155,7 +162,7 @@ DWORD WINAPI DumpThread(LPVOID)
         SYSTEMTIME now;
         GetLocalTime(&now);
         char path[MAX_PATH + 64];
-        Format(path, "%sg3together-crash-%02u%02u%02u-%ld.dmp", dumpDir, now.wHour, now.wMinute, now.wSecond, dumps);
+        Format(path, "%sg3together-crash-%02u%02u%02u-%ld.dmp", dumpDir, now.wHour, now.wMinute, now.wSecond, dumpSequence);
         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file != INVALID_HANDLE_VALUE) {
             MINIDUMP_EXCEPTION_INFORMATION exception{dumpThreadId,
@@ -170,14 +177,13 @@ DWORD WINAPI DumpThread(LPVOID)
     }
 }
 
-void Dump(EXCEPTION_POINTERS* info)
+void Dump(EXCEPTION_POINTERS* info, LONG sequence = 0)
 {
     struct CallerGuard {
         CallerGuard() { activeDumpCallers.fetch_add(1, std::memory_order_acq_rel); }
         ~CallerGuard() { activeDumpCallers.fetch_sub(1, std::memory_order_acq_rel); }
     } caller;
     if (!writeDump || !dumpRequest || !dumpDone || ai::ShuttingDown()) return;
-    if (InterlockedCompareExchange(&dumps, 0, 0) < 0) return;
     if (InterlockedCompareExchange(&dumpBusy, 1, 0) != 0) {
         Log("guard: crashlog dump busy; skipping overlapping request");
         return;
@@ -202,6 +208,7 @@ void Dump(EXCEPTION_POINTERS* info)
         Log("guard: crashlog missing exception record/context; dumping without exception");
     }
     dumpThreadId = GetCurrentThreadId();
+    dumpSequence = sequence;
     if (!SetEvent(dumpRequest)) {
         Logf("guard: crashlog dump request failed error=%lu", GetLastError());
         InterlockedExchange(&dumpBusy, 0);
@@ -220,7 +227,7 @@ LONG WINAPI LastChance(EXCEPTION_POINTERS* info)
 {
     if (ai::ShuttingDown() || GetCurrentThreadId() == dumpWorkerThreadId)
         return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
-    if (InterlockedIncrement(&dumps) <= 4) Dump(info);
+    if (const LONG seq = InterlockedIncrement(&dumps); seq <= 4) Dump(info, seq);
     LogEndStep();
     return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -231,7 +238,7 @@ void InstallDumps()
     dumpInstalled = true;
     EnsureDumpDir();
     if (!*dumpDir) { Log("crashlog: no minidumps (game directory unavailable)"); return; }
-    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    HMODULE dbghelp = EnsureDbgHelp();
     writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
     dumpRequest = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     dumpDone = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -240,6 +247,7 @@ void InstallDumps()
         ? CreateThread(nullptr, 256 * 1024, &DumpThread, nullptr, 0, &dumpWorkerThreadId) : nullptr;
     if (!dumpThreadHandle) { writeDump = nullptr; Log("crashlog: no minidumps (dbghelp or thread missing)"); return; }
     previousFilter = SetUnhandledExceptionFilter(&LastChance);
+    filterInstalled = true;
     Logf("crashlog: minidumps on a crash go to %sg3together-crash-*.dmp", dumpDir);
 }
 
@@ -517,7 +525,7 @@ bool Where(uintptr_t address, char* out, size_t size)
 bool WriteProcessDump(char const* path)
 {
     if (!writeDump) {
-        HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+        HMODULE dbghelp = EnsureDbgHelp();
         writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
     }
     if (!writeDump) {
@@ -552,8 +560,10 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     // Drivers can handle their own first-chance exceptions. Dumping those may block graphics teardown.
     // Unhandled exceptions from any module still reach LastChance.
     if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
-    if (GetCurrentThreadId() != dumpWorkerThreadId && InterlockedIncrement(&dumps) <= MaxFirstChanceDumps)
-        Dump(info);  // before anything
+    if (GetCurrentThreadId() != dumpWorkerThreadId) {
+        if (const LONG seq = InterlockedIncrement(&dumps); seq <= MaxFirstChanceDumps)
+            Dump(info, seq);  // before anything
+    }
     LogEndStep();
     // that could fault again
     if (InterlockedIncrement(&logged) > 12) return EXCEPTION_CONTINUE_SEARCH;
@@ -569,11 +579,17 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     char stack[3000] = "CRASH stack";
     size_t lineStart = 0;
     int found = 0;
+    uintptr_t chunk[16]{};
+    unsigned chunkCount = 0, chunkIndex = 0;
     for (int i = 0; i < 4096 && found < 32; ++i) {
-        uintptr_t candidate = 0;
-        if (!symbols::ReadMemory(static_cast<uintptr_t>(c.Esp) + static_cast<size_t>(i) * sizeof(uintptr_t),
-                                 &candidate, sizeof(candidate)))
-            break;
+        if (chunkIndex == chunkCount) {
+            chunkIndex = chunkCount = 0;
+            const uintptr_t addr = static_cast<uintptr_t>(c.Esp) + static_cast<size_t>(i) * sizeof(uintptr_t);
+            if (i + 16 <= 4096 && symbols::ReadMemory(addr, chunk, sizeof(chunk))) chunkCount = 16;
+            else if (symbols::ReadMemory(addr, chunk, sizeof(chunk[0]))) chunkCount = 1;
+            else break;
+        }
+        const uintptr_t candidate = chunk[chunkIndex++];
         char where[240];
         if (!Where(candidate, where, sizeof(where))) continue;
         const size_t need = std::strlen(where) + 2;
@@ -650,7 +666,7 @@ void Install()
     if (installed) return;
     installed = true;
     FindModules();
-    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    HMODULE dbghelp = EnsureDbgHelp();
     undecorate = dbghelp ? reinterpret_cast<UndecorateFn>(GetProcAddress(dbghelp, "UnDecorateSymbolName")) : nullptr;
     if (!vectoredHandler) vectoredHandler = AddVectoredExceptionHandler(1, &OnException);
     Log("crashlog: access violations are logged");
@@ -673,13 +689,10 @@ void BeginShutdown()
         RemoveVectoredExceptionHandler(vectoredHandler);
         vectoredHandler = nullptr;
     }
-    if (previousFilter) {
-        LPTOP_LEVEL_EXCEPTION_FILTER current = SetUnhandledExceptionFilter(&LastChance);
-        if (current == &LastChance) {
-            SetUnhandledExceptionFilter(previousFilter);
-        } else {
-            SetUnhandledExceptionFilter(current);
-        }
+    if (filterInstalled) {
+        filterInstalled = false;
+        LPTOP_LEVEL_EXCEPTION_FILTER current = SetUnhandledExceptionFilter(previousFilter);
+        if (current != &LastChance) SetUnhandledExceptionFilter(current);
         previousFilter = nullptr;
     }
 }
@@ -687,7 +700,6 @@ void BeginShutdown()
 bool Shutdown()
 {
     BeginShutdown();
-    if (dumpStop) SetEvent(dumpStop);
     bool joined = true;
     if (dumpThreadHandle) {
         const DWORD waited = WaitForSingleObject(dumpThreadHandle, 2000);

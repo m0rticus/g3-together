@@ -52,11 +52,6 @@ using detail::Rig;
 using detail::Slots;
 using detail::VisualScope;
 
-struct ProbeSentinel {
-    eCEntity const* target = nullptr;
-};
-constexpr ProbeSentinel probe{};
-
 struct ReceivedPose {
     pose::History history;
     uint32_t arrived = 0, incarnation = 0, intervalMs = 16;
@@ -98,7 +93,6 @@ float maximumReplayPhaseError = 0.0f;
 bool Passive(eCEntity const* entity)
 {
     if (!entity || guards::IsLocalPlayer(entity)) return false;
-    if (entity == probe.target) return true;
     if (!enabled || !IsCharacter(entity)) return false;
     if (entity->GetPropertySet(eEPropertySetType_PlayerMemory) || entity == gCSession::GetInstance().GetHero() ||
         entity == remote::ControlledBody() || remote::IsPuppet(entity)) return false;
@@ -285,6 +279,20 @@ eCResourceDataEntity* NativeMotion(eCEntity* entity, gEAction action, gEPhase ph
     return resource;
 }
 
+void StartExclusiveSlot0Motion(eCVisualAnimation_PS& animation, eCWrapper_emfx2Actor& actor,
+                               eCResourceDataEntity* resource)
+{
+    const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+    PresentationScope scope;
+    for (int i = 0; i < Slots; ++i) {
+        const auto old = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
+        if (actor.HasMotionInstance(old)) animation.StopMotion(old, 0.0f);
+    }
+    animation.SetMotion(slot, resource);
+    resource->ReleaseReference();
+    animation.PlayMotion(slot, nullptr);
+}
+
 bool BootstrapIdle(eCEntity* entity, eCVisualAnimation_PS& animation)
 {
     auto* actor = animation.GetActor();
@@ -297,16 +305,7 @@ bool BootstrapIdle(eCEntity* entity, eCVisualAnimation_PS& animation)
         return IdleFailure(entity, "idle resource is not an evaluable ambient motion");
     }
     const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
-    {
-        PresentationScope scope;
-        for (int i = 0; i < Slots; ++i) {
-            const auto old = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
-            if (actor->HasMotionInstance(old)) animation.StopMotion(old, 0.0f);
-        }
-        animation.SetMotion(slot, resource);
-        resource->ReleaseReference();
-        animation.PlayMotion(slot, nullptr);
-    }
+    StartExclusiveSlot0Motion(animation, *actor, resource);
     if (!actor->HasMotionInstance(slot)) return IdleFailure(entity, "idle motion did not start");
     const float duration = static_cast<float>(actor->GetMaxTime(slot));
     if (!(duration > 0.0f) || !std::isfinite(duration)) return IdleFailure(entity, "idle motion duration invalid");
@@ -343,6 +342,14 @@ bool RememberNativePresentation(eCEntity* entity)
     return RememberPose(entity, npclease::PoseProvenance::Native);
 }
 
+void SetEntityPose(eCEntity* entity, bCMatrix const& pose)
+{
+    if (!entity) return;
+    entity->SetToWorldMatrix(pose);
+    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
+        rigid->SetPose(pose);
+}
+
 bool CosmeticHit(eCEntity* entity, uint32_t swing)
 {
     if (!entity || !swing || !clientMode || !Passive(entity) || npclease::Fenced(entity) ||
@@ -373,16 +380,7 @@ bool CosmeticHit(eCEntity* entity, uint32_t swing)
         return IdleFailure(entity, "cosmetic hit resource is not an evaluable reaction motion");
     }
     const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
-    {
-        PresentationScope scope;
-        for (int i = 0; i < Slots; ++i) {
-            const auto old = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
-            if (actor->HasMotionInstance(old)) animation->StopMotion(old, 0.0f);
-        }
-        animation->SetMotion(slot, resource);
-        resource->ReleaseReference();
-        animation->PlayMotion(slot, nullptr);
-    }
+    StartExclusiveSlot0Motion(*animation, *actor, resource);
     if (!EvaluateIdle(entity, *animation, 1, false) ||
         !RememberPose(entity, npclease::PoseProvenance::Reaction))
         return IdleFailure(entity, "cosmetic hit skeletal evaluation failed");
@@ -504,9 +502,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     }
     bool echo = false;
     const bCMatrix pose = body::Pose(*entity, presentedPosition, record.rotation);
-    entity->SetToWorldMatrix(pose);
-    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-        rigid->SetPose(pose);
+    SetEntityPose(entity, pose);
     actor = animation->GetActor();
     if (!actor) return false;
     animation->ClearLookAtConstraints();
@@ -642,7 +638,7 @@ bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> co
 bool HoldUnavailable(eCEntity* entity, State& callerState)
 {
     if (!entity || !Passive(entity) || npcremoval::Suppressed(entity)) return false;
-    if (npcs::HostPresentationAvailable(entity) || (entity != probe.target && !npcs::ClientPresent(entity))) {
+    if (npcs::HostPresentationAvailable(entity) || !npcs::ClientPresent(entity)) {
         callerState.holding = false;
         ReleaseUnavailable(entity);
         return false;
@@ -683,9 +679,7 @@ bool HoldUnavailable(eCEntity* entity, State& callerState)
     if (animation->GetRagDollEnabled()) animation->StopRagDoll();
     npc.CharacterMovement.StopMovement();
     const auto root = body::Pose(*entity, state.heldPosition, state.heldRotation);
-    entity->SetToWorldMatrix(root);
-    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-        rigid->SetPose(root);
+    SetEntityPose(entity, root);
     if (playbackTick && waiting.evaluatedTick == playbackTick && state.holding) {
         callerState.holding = state.holding;
         return waiting.evaluatedOk;
@@ -702,9 +696,7 @@ bool HoldUnavailable(eCEntity* entity, State& callerState)
         waiting.attempted = now;
         const bool bootstrapped = BootstrapIdle(entity, *animation);
         waiting.retry = !bootstrapped;
-        entity->SetToWorldMatrix(root);
-        if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-            rigid->SetPose(root);
+        SetEntityPose(entity, root);
         if (!bootstrapped) return finish(false);
         found = provenPoses.find(key);
     }
@@ -738,9 +730,7 @@ bool HoldUnavailable(eCEntity* entity, State& callerState)
         state.holding = true;
     }
     found->second.seen = net::Now();
-    entity->SetToWorldMatrix(root);
-    if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
-        rigid->SetPose(root);
+    SetEntityPose(entity, root);
     return finish(ReplayFrozenPose(entity, state, state.heldPose, state.heldFlags));
 }
 

@@ -67,6 +67,60 @@ bool ReadClock(std::string const& text, Clock& out)
     out = clock;
     return true;
 }
+enum class RuntimeField : uint8_t {
+    Year,
+    Day,
+    Hour,
+    CounterCount,
+    CounterElem,
+    InfoEnd,
+};
+
+struct ParsedRuntimeKey {
+    std::string target;
+    RuntimeField field = RuntimeField::Year;
+    uint32_t index = 0;
+};
+
+inline bool ParseRuntimeKey(std::string const& key, ParsedRuntimeKey& out)
+{
+    const size_t split = key.rfind('\x1f');
+    if (split == std::string::npos || !split || split + 1 == key.size()) return false;
+    const std::string part = key.substr(split + 1);
+    RuntimeField parsedField = RuntimeField::Year;
+    uint32_t index = 0;
+    if (part == "y") parsedField = RuntimeField::Year;
+    else if (part == "d") parsedField = RuntimeField::Day;
+    else if (part == "h") parsedField = RuntimeField::Hour;
+    else if (part == "n") parsedField = RuntimeField::CounterCount;
+    else if (part == "i") parsedField = RuntimeField::InfoEnd;
+    else if (part[0] == 'c' && Number(part.substr(1), index) && index < 512) parsedField = RuntimeField::CounterElem;
+    else return false;
+    out.target = key.substr(0, split);
+    out.field = parsedField;
+    out.index = index;
+    return true;
+}
+
+inline char const* RuntimeFieldCode(RuntimeField field) noexcept
+{
+    switch (field) {
+    case RuntimeField::Year: return "y";
+    case RuntimeField::Day: return "d";
+    case RuntimeField::Hour: return "h";
+    case RuntimeField::CounterCount: return "n";
+    case RuntimeField::CounterElem: return "c";
+    case RuntimeField::InfoEnd: return "i";
+    }
+    return "";
+}
+
+inline std::string FormatRuntimeField(ParsedRuntimeKey const& parsed)
+{
+    if (parsed.field == RuntimeField::CounterElem) return "c" + std::to_string(parsed.index);
+    return RuntimeFieldCode(parsed.field);
+}
+
 inline bool RuntimeKey(std::string const& key, std::string& quest, std::string& field)
 {
     const size_t split = key.rfind('\x1f');
@@ -77,6 +131,37 @@ inline bool RuntimeKey(std::string const& key, std::string& quest, std::string& 
         !(part[0] == 'c' && Number(part.substr(1), index) && index < 512)) return false;
     quest = key.substr(0, split); field = part;
     return true;
+}
+
+// Fast wire check for "#<16hex>\x1fn\x1f<count>" so counter lengths sort ahead of elements without heap allocations.
+inline bool IsPackedCounterCount(char const* packed) noexcept
+{
+    if (!packed) return false;
+    const char* first = nullptr;
+    const char* second = nullptr;
+    for (const char* p = packed; *p; ++p) {
+        if (*p == '\x1f') {
+            first = second;
+            second = p;
+        }
+    }
+    return first && second && (second - first == 2) && first[1] == 'n';
+}
+
+template<class States>
+bool IsCounterOutOfBounds(States const& states, ParsedRuntimeKey const& parsed)
+{
+    if (parsed.field != RuntimeField::CounterElem) return false;
+    const auto count = states.find(parsed.target + "\x1fn");
+    return count == states.end() || parsed.index >= count->second;
+}
+
+// Reset a peer's cached admission baseline on a new connection generation OR when that peer already completed a prior
+// admission cycle and re-enters template bootstrap on the same connection (WorldOther manual reload / rejoin).
+constexpr bool ShouldResetInitialReplay(uint32_t recordedGeneration, uint32_t currentGeneration,
+                                        bool finishedPreviousAdmission) noexcept
+{
+    return recordedGeneration != currentGeneration || finishedPreviousAdmission;
 }
 inline bool PackRuntime(std::string const& key, uint32_t value, size_t limit, std::string& out)
 {

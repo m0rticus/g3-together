@@ -185,14 +185,58 @@ public:
         }
     }
 
+    struct CommandClass {
+        Priority priority;
+        bool reliable;
+    };
+
+    static CommandClass ClassifyCommand(EnetCommandView const& view)
+    {
+        const bool reliable = (view.flagsByte & 0x80u) != 0 || view.command == EnetCmdAcknowledge;
+        Priority priority = Priority::Critical;
+        if (view.channel == net::ChannelBulk && view.command >= EnetCmdSendReliable)
+            priority = Priority::Bulk;
+        else if (view.command >= EnetCmdSendReliable &&
+                 (view.channel == net::ChannelPoses || view.channel == net::ChannelPosesAlt ||
+                  (view.channel == net::ChannelNpcs && !reliable)))
+            priority = Priority::Pose;
+        else if (view.channel == net::ChannelDefinitions && view.command >= EnetCmdSendReliable)
+            priority = Priority::Definition;
+        return {priority, reliable};
+    }
+
+    bool EnqueueUnclassified(void const* packet, size_t size, uint32_t now)
+    {
+        // Classification is not transport validation. Keep unknown datagrams
+        // intact and let the receiving ENet endpoint validate them.
+        auto const* bytes = static_cast<uint8_t const*>(packet);
+        Item item;
+        item.bytes.assign(bytes, bytes + size);
+        item.at = now;
+        item.priority = Priority::Bulk;
+        item.parsedEnet = false;
+        queues_[static_cast<unsigned>(Priority::Bulk) * 2 + 1].push_back(std::move(item));
+        bytes_ += size;
+        ++depth_;
+        ++counters.unclassified;
+        counters.plainBytes += size;
+        counters.wireBytes += size;
+        counters.peakDepth = (std::max)(counters.peakDepth, depth_);
+        counters.peakBytes = (std::max)(counters.peakBytes, bytes_);
+        counters.peakAge = (std::max)(counters.peakAge, OldestAge(now));
+        return true;
+    }
+
     bool Push(Codec& codec, void const* packet, size_t size, uint32_t now, EnetPacketParse* result = nullptr)
     {
         if (result) *result = {};
         if (!packet || !size || size > RelayPayloadLimit) return false;
         std::vector<uint8_t> plain;
-        const bool decompressed = codec.DecompressToPlain(packet, size, plain);
+        if (!codec.DecompressToPlain(packet, size, plain))
+            return EnqueueUnclassified(packet, size, now);
         std::array<std::vector<uint8_t>, Classes * 2> groups;
         std::array<std::vector<std::string>, Classes * 2> retransmissions;
+        std::unordered_set<std::string> batchReliable;
         std::array<std::string, Classes * 2> npcKeys;
         std::array<unsigned, Classes * 2> commandCounts{};
         std::array<unsigned, Classes * 2> playerStates{};
@@ -200,35 +244,20 @@ public:
         std::array<size_t, Classes * 2> groupAckBytes{};
         unsigned duplicateCount = 0;
         EnetPacketParse parsed;
-        const bool validEnet = decompressed &&
+        const bool validEnet =
             ForEachEnetCommand(plain.data(), plain.size(), &parsed,
                                [&](std::size_t header, EnetCommandView const& view) {
-                const bool reliable = (view.flagsByte & 0x80u) != 0 || view.command == EnetCmdAcknowledge;
-                Priority priority = Priority::Critical;
-                if (view.channel == net::ChannelBulk && view.command >= EnetCmdSendReliable)
-                    priority = Priority::Bulk;
-                else if (view.command >= EnetCmdSendReliable &&
-                         (view.channel == net::ChannelPoses || view.channel == net::ChannelPosesAlt ||
-                          (view.channel == net::ChannelNpcs && !reliable)))
-                    priority = Priority::Pose;
-                else if (view.channel == net::ChannelDefinitions && view.command >= EnetCmdSendReliable)
-                    priority = Priority::Definition;
+                const auto [priority, reliable] = ClassifyCommand(view);
                 const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
                 if (reliable) {
                     // An ENet retry may be packed beside different commands.
                     // Match the command, not that incidental datagram grouping.
                     std::string key(reinterpret_cast<char const*>(plain.data()), 2);
                     key.append(reinterpret_cast<char const*>(plain.data() + view.offset), view.totalBytes);
-                    if (pendingReliable_.count(key)) {
+                    if (pendingReliable_.count(key) || !batchReliable.insert(key).second) {
                         ++duplicateCount;
                         return;
                     }
-                    for (auto const& batch : retransmissions)
-                        for (auto const& staged : batch)
-                            if (staged == key) {
-                                ++duplicateCount;
-                                return;
-                            }
                     retransmissions[groupId].push_back(std::move(key));
                 }
                 auto& group = groups[groupId];
@@ -256,26 +285,7 @@ public:
                 if (view.command == EnetCmdAcknowledge) groupAckBytes[groupId] += 8;
             }) && !parsed.compressed;
         if (result) *result = parsed;
-        if (!validEnet) {
-            // Classification is not transport validation. Keep unknown datagrams
-            // intact and let the receiving ENet endpoint validate them.
-            auto const* bytes = static_cast<uint8_t const*>(packet);
-            Item item;
-            item.bytes.assign(bytes, bytes + size);
-            item.at = now;
-            item.priority = Priority::Bulk;
-            item.parsedEnet = false;
-            queues_[static_cast<unsigned>(Priority::Bulk) * 2 + 1].push_back(std::move(item));
-            bytes_ += size;
-            ++depth_;
-            ++counters.unclassified;
-            counters.plainBytes += size;
-            counters.wireBytes += size;
-            counters.peakDepth = (std::max)(counters.peakDepth, depth_);
-            counters.peakBytes = (std::max)(counters.peakBytes, bytes_);
-            counters.peakAge = (std::max)(counters.peakAge, OldestAge(now));
-            return true;
-        }
+        if (!validEnet) return EnqueueUnclassified(packet, size, now);
         counters.duplicates += duplicateCount;
         for (unsigned i = 0; i < groups.size(); ++i) {
             for (auto const& key : retransmissions[i]) pendingReliable_.insert(key);

@@ -48,6 +48,7 @@ class PuppetAnimationSyncTests(unittest.TestCase):
             "src/net_direct.cpp",
             "src/net_internal.h",
             "src/net_messages.cpp",
+            "src/net_metrics.cpp",
             "src/net_metrics.h",
             "src/net_npc.cpp",
             "src/net_npc_pose.cpp",

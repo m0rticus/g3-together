@@ -369,16 +369,29 @@ bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
     Save intact;
     const bool recoverable = ReadAll(path, bytes) && saving::store::Decode(bytes, intact);
     const bool nativeOk = originalDelete(self, name);
+    DWORD failure = nativeOk ? 0 : GetLastError();
     const bool gone = !Exists(Path(slot, 0)) && !Exists(Path(slot, 1));
     if (gone && (!Exists(path) || DeleteFileA(path.c_str()))) {
         Logf("persist: host slot deleted slot=%s native_ok=%d", slot.c_str(), nativeOk ? 1 : 0);
         return true;
     }
-    const DWORD failure = GetLastError();
+    std::string errorPath = path;
+    if (gone) {
+        failure = GetLastError();
+    } else if (!failure || failure == ERROR_FILE_NOT_FOUND) {
+        for (int f = 0; f < 2; ++f) {
+            const std::string slotFile = Path(slot, f);
+            if (!Exists(slotFile)) continue;
+            errorPath = slotFile;
+            HANDLE h = CreateFileA(slotFile.c_str(), DELETE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) { failure = GetLastError(); break; }
+            CloseHandle(h);
+        }
+    }
     if (recoverable && !Materialize(slot, intact)) Logf("persist: delete recovery failed slot=%s", slot.c_str());
     Logf("persist: slot deletion failed slot=%s native_ok=%d error=%lu; container retained recoverable=%d",
          slot.c_str(), nativeOk ? 1 : 0, failure, recoverable ? 1 : 0);
-    SaveFailure(saving::store::IoReason({ "delete", path, {}, failure }, "save-delete-failed"));
+    SaveFailure(saving::store::IoReason({ "delete", errorPath, {}, failure }, "save-delete-failed"));
     return false;
 }
 
@@ -441,7 +454,7 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
             Log("WARN persist: clearing personal containers degraded while awaiting fresh hero");
         if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu) && templateHeroFresh) {
             if (!templateCapture.Holding(GetTickCount())) {
-                needsNewHero = false; freshLocalHero = false; ownCharacterReady = true;
+                needsNewHero = false; ownCharacterReady = true;
                 clientRejoin.Left();
                 synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
             }

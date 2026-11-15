@@ -58,8 +58,10 @@ class SteamConnectTests(unittest.TestCase):
             "src/steam_abi.h",
             "src/steam_runtime.h",
             "src/steam.cpp",
+            "src/steam_published.cpp",
             "src/steam_p2p.cpp",
             "src/steam_flow.cpp",
+            "src/steam_callbacks.cpp",
             "src/steam_legacy_auto.cpp",
             "src/steam_diagnostics.cpp",
         )
@@ -69,8 +71,10 @@ class SteamConnectTests(unittest.TestCase):
     def steam_cpp_source(cls):
         parts = (
             "src/steam.cpp",
+            "src/steam_published.cpp",
             "src/steam_p2p.cpp",
             "src/steam_flow.cpp",
+            "src/steam_callbacks.cpp",
             "src/steam_legacy_auto.cpp",
             "src/steam_diagnostics.cpp",
         )
@@ -102,8 +106,10 @@ class SteamConnectTests(unittest.TestCase):
             "src/steam_abi.h",
             "src/steam_runtime.h",
             "src/steam.cpp",
+            "src/steam_published.cpp",
             "src/steam_p2p.cpp",
             "src/steam_flow.cpp",
+            "src/steam_callbacks.cpp",
             "src/steam_legacy_auto.cpp",
             "src/steam_diagnostics.cpp",
         ):
@@ -242,16 +248,19 @@ class SteamConnectTests(unittest.TestCase):
 
     def test_transport_factory_and_link_loss_diagnostics(self):
         net = self.source("src/net.cpp")
+        net_direct = self.source("src/net_direct.cpp")
         steam = self.steam_source()
         start = self.between(net, "bool Start(bool asHost)", "void Service(")
         service = self.between(net, "void Service(", "void Flush()")
         reconnect = self.between(net, "void Reconnect(void (*log)(char const*))", "\n}")
+        connect_helper = self.between(net_direct, "void ConnectClientWithDirectFallback(", "void FinishClientConnectAttempt(")
         self.assertIn("CreateTransportHost(&bindAddress, isHost ? MaxPlayers - 1 : 1, createError)", start)
-        self.assertIn("ConnectTransportHost(host, &target)", service)
-        self.assertIn("ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))", service)
-        self.assertIn("ConnectTransportHost(host, &target)", reconnect)
-        self.assertNotIn("enet_host_create(", net)
-        self.assertNotIn("enet_host_connect(", net)
+        self.assertIn("FinishClientConnectAttempt(", service)
+        self.assertIn("ConnectClientWithDirectFallback(", reconnect)
+        self.assertIn("ConnectTransportHost(host, &target)", connect_helper)
+        self.assertIn("ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))", connect_helper)
+        self.assertNotIn("enet_host_create(", net + net_direct)
+        self.assertNotIn("enet_host_connect(", net + net_direct)
         policy = self.source("src/enet_policy.h")
         for required in ("ChannelDefinitions = 7", "ChannelCount = 8", "Mtu = 1200",
                          "enet_host_create(address, peers, ChannelCount, 0, 0)",

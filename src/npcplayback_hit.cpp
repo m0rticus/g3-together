@@ -226,11 +226,9 @@ void CaptureEntityPoseBlend(eCEntity* entity, State& state, uint32_t now, float 
     }
     auto const& nodes = skeleton->mNodes;
     state.poseBlend.fromTransforms.resize(static_cast<std::size_t>(nodes.mLength));
-    for (int i = 0; i < nodes.mLength; ++i) {
-        bCMatrix matrix;
-        std::memcpy(&matrix, reinterpret_cast<unsigned char const*>(nodes.mData + i) + 0x44, sizeof(matrix));
-        state.poseBlend.fromTransforms[static_cast<std::size_t>(i)] = TransformOf(matrix, 0);
-    }
+    for (int i = 0; i < nodes.mLength; ++i)
+        state.poseBlend.fromTransforms[static_cast<std::size_t>(i)] =
+            TransformOf(ReadNodeMatrix(nodes.mData, i), 0);
     state.poseBlend.skeleton = skeleton;
     state.poseBlend.nodes = nodes.mData;
     state.poseBlend.startedAtMs = now;
@@ -255,9 +253,7 @@ bool EvaluateLocalActorPose(eCEntity* entity, NativePose& outPose)
     outPose.bones.resize(static_cast<std::size_t>(outPose.count));
     for (int i = 0; i < outPose.count; ++i) {
         outPose.bones[static_cast<std::size_t>(i)].index = i;
-        std::memcpy(&outPose.bones[static_cast<std::size_t>(i)].matrix,
-                    reinterpret_cast<unsigned char const*>(skeleton->mNodes.mData + i) + 0x44,
-                    sizeof(bCMatrix));
+        outPose.bones[static_cast<std::size_t>(i)].matrix = ReadNodeMatrix(skeleton->mNodes.mData, i);
     }
     return true;
 }
@@ -363,7 +359,7 @@ bool StartLocalHitPresentation(eCEntity* entity, State& state, char const* motio
     state.localInRecover = false;
     state.localDuration = clipDuration / effectiveSpeed;
     state.localRecoverDuration = recoverDuration;
-    state.localOptions = options;
+    state.localOptions = local;
     strcpy_s(state.localMotion, motion);
     strcpy_s(state.localRecoverMotion, recoverMotion);
     const float stepCm = StartLocalHitKnockback(entity, attacker, state, motion, hit, now);

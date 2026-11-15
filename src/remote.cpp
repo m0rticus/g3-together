@@ -305,8 +305,7 @@ namespace {
 using internal::StackFor;
 using internal::TakeOff;
 
-template <typename P>
-void Hold(P& puppet, char const* right, char const* left, uint32_t now)
+void Hold(Puppet& puppet, char const* right, char const* left, uint32_t now)
 {
     if (!qa.puppetHold) return;
     const bool changed = !puppet.holdChecked || puppet.heldRight != right || puppet.heldLeft != left;

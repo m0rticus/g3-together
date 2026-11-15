@@ -13,7 +13,6 @@ import datetime as dt
 import hashlib
 import json
 import os
-import stat
 import subprocess
 import sys
 import uuid
@@ -26,10 +25,10 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 from _g3copy import (
-    DEFAULT_CLIENT, DEFAULT_HOST, DEFAULT_STEAM, FOLDER_MODULES, KNOWN_FAKE_SHA,
-    NATIVE_SLOTS, SLOT_GENUINE, SLOT_QA, TEST_REALISM_BUNDLE_FILES,
-    canonical as _canonical, is_hard_linked, is_within, overlaps,
-    package_ini_templates, parse_g3t_ini, parse_pe, reject_links as _reject_links,
+    DEFAULT_CLIENT, DEFAULT_HOST, DEFAULT_STEAM, KNOWN_FAKE_SHA,
+    TEST_REALISM_BUNDLE_FILES,
+    canonical as _canonical, is_hard_linked,
+    package_ini_templates, parse_g3t_ini, reject_links as _reject_links,
     sha256, validate_copy_roots,
 )
 
@@ -213,22 +212,9 @@ def check_running_copies(
 def safe_target(root: Path, relative: str) -> Path:
     normalized = validate_relative(relative).replace("/", "\\")
     path = reject_links(root / normalized)
-    if path.exists():
-        info = path.lstat()
-        reparse = getattr(info, "st_file_attributes", 0) & getattr(
-            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-        )
-        if stat.S_ISLNK(info.st_mode) or reparse:
-            raise UpdateError(f"Refusing link/reparse target: {path}")
-        if path.is_file():
-            try:
-                link_count = path.stat(follow_symlinks=False).st_nlink
-            except TypeError:
-                link_count = path.lstat().st_nlink
-            if link_count != 1:
-                raise UpdateError(
-                    f"Refusing hard-linked writable target: {path} nlink={link_count}"
-                )
+    if path.is_file() and is_hard_linked(path):
+        link_count = path.stat(follow_symlinks=False).st_nlink
+        raise UpdateError(f"Refusing hard-linked writable target: {path} nlink={link_count}")
     return path
 
 
@@ -326,19 +312,24 @@ def write_manifest(path: Path, manifest: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def print_plan(entries: list[dict]) -> None:
-    session_id = "default"
+def _resolve_session_id(entries: list[dict], explicit: str | None) -> str:
+    if explicit is not None:
+        return explicit
     for entry in entries:
         if entry["relative_path"] == "g3together.ini":
-            for line in entry["proposed_bytes"].decode("utf-8").splitlines():
-                if line.strip().lower().startswith("session_id"):
-                    session_id = line.split("=", 1)[1].strip()
-                    break
+            ini, _ = parse_g3t_ini(entry["proposed_bytes"].decode("utf-8"))
+            if "session_id" in ini:
+                return ini["session_id"]
             break
+    return "default"
+
+
+def print_plan(entries: list[dict], session_id: str | None = None) -> None:
+    resolved_session = _resolve_session_id(entries, session_id)
     print(
         "LAUNCHER | launch-copies-invite.ps1"
         " (alias; implementation=launch-copies-realism.ps1)"
-        f" | PROFILE=ideal | CONNECTION=invite | SESSION={session_id}"
+        f" | PROFILE=ideal | CONNECTION=invite | SESSION={resolved_session}"
     )
     print("ROOT_ROLE | RELATIVE_PATH | ACTION | KIND | BEFORE_SHA256 | AFTER_SHA256")
     for entry in entries:
@@ -364,6 +355,7 @@ def prepare_manifest(
     transaction_id: str,
     roots: dict[str, Path],
     entries: list[dict],
+    session_id: str | None = None,
 ) -> dict:
     manifest_entries = []
     for index, entry in enumerate(entries):
@@ -379,14 +371,7 @@ def prepare_manifest(
             }
             | {"backup_relative": backup_relative}
         )
-    session_id = "default"
-    for entry in entries:
-        if entry["relative_path"] != "g3together.ini":
-            continue
-        for line in entry["proposed_bytes"].decode("utf-8").splitlines():
-            if line.strip().lower().startswith("session_id"):
-                session_id = line.split("=", 1)[1].strip()
-                break
+    resolved_session = _resolve_session_id(entries, session_id)
     return {
         "schema": 1,
         "transaction_id": transaction_id,
@@ -397,7 +382,7 @@ def prepare_manifest(
         "legacy_launcher": "launch-copies-realism.ps1",
         "launcher_profile": "ideal",
         "connection": "invite",
-        "session_id": session_id,
+        "session_id": resolved_session,
         "files": manifest_entries,
     }
 
@@ -465,11 +450,7 @@ def apply_entries(
                     os.fsync(handle.fileno())
                 if sha256(backup_path) != entry["before_sha256"]:
                     raise UpdateError(f"Independent backup verification failed: {backup_path}")
-                try:
-                    link_count = backup_path.stat(follow_symlinks=False).st_nlink
-                except TypeError:
-                    link_count = backup_path.lstat().st_nlink
-                if link_count != 1:
+                if is_hard_linked(backup_path):
                     raise UpdateError(f"Backup is unexpectedly hard-linked: {backup_path}")
 
             staged_path = transaction_dir / ("replacement-" + uuid.uuid4().hex)
@@ -483,10 +464,10 @@ def apply_entries(
                 raise UpdateError(f"Staged replacement verification failed: {staged_path}")
 
             os.replace(staged_path, target)
+            applied.append(entry)
             fsync_file(target)
             if sha256(target) != entry["after_sha256"]:
                 raise UpdateError(f"Post-replacement verification failed: {target}")
-            applied.append(entry)
 
         manifest["state"] = "committed"
         write_manifest(manifest_path, manifest)
@@ -714,7 +695,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.approved_dll_sha256,
             roles,
         )
-        print_plan(entries)
+        print_plan(entries, args.session_id)
 
         if not args.apply:
             print("DRY-RUN: no target files or directories changed")
@@ -729,7 +710,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         check_running_copies(roots, roles)
         verify_plan_drift(entries)
 
-        manifest = prepare_manifest(transaction_id, roots, entries)
+        manifest = prepare_manifest(transaction_id, roots, entries, args.session_id)
         manifest_path = canonical(args.manifest_out)
         write_manifest(manifest_path, manifest)
         apply_entries(manifest_path, manifest, entries)

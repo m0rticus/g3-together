@@ -157,14 +157,30 @@ struct PublishedPeer
     uint64_t generation = 0;
     char name[24] = {};
     DirectOffer directOffer{};
+    DirectEndpoint verifiedDirect{};
+    bool directPinned = false;
 };
 
-struct DirectEndpointPin
+struct PublishedPeerDiag
 {
-    u64 account = 0;
-    uint64_t generation = 0;
-    DirectEndpoint endpoint{};
-    bool pinned = false;
+    u64 id = 0;
+    bool linked = false;
+    unsigned toEnet = 0, toSteam = 0;
+    int ping = -1;
+    uint32_t pingAgeMs = 0;
+};
+
+struct PublishedDiag
+{
+    bool isHost = false;
+    u64 owner = 0;
+    char sessionId[64] = {};
+    unsigned sendFailures = 0, isolatedDrops = 0;
+    int senderOffset = 0, socketError = 0;
+    double pollGapAvgMs = 0.0;
+    uint32_t pollGapMaxMs = 0, pumpWorkMaxMs = 0;
+    unsigned receiveCaps = 0, forwardCaps = 0, socketFailures = 0, receiveFailures = 0, invalidPongs = 0;
+    PublishedPeerDiag peers[MaxRemotes] = {};
 };
 
 struct Published
@@ -176,16 +192,16 @@ struct Published
     uint32_t pingSampleAt = 0;
     PublishedPeer peers[MaxRemotes] = {};
     char playerName[24] = {};
-    char hostName[64] = {}, error[256] = {}, status[900] = {};
+    char hostName[64] = {}, error[256] = {};
     Connection connection;
     TrafficCounters traffic;
+    PublishedDiag diag;
 };
 
 struct PublishedStore
 {
     std::mutex mutex;
     Published published;
-    DirectEndpointPin directPins[MaxRemotes] = {};
     ClientEnet clientEnet;
     std::vector<RelayDrop> relayDrops;
     std::vector<RelayClose> relayCloses;
@@ -280,8 +296,9 @@ struct WorkerRuntime
     void SendDirectUdpControl(Remote& r);
     void RecordAcceptedItemTraffic(send::Item const& item, std::size_t encodedSize);
     int SubmitSocketEnvelope(Remote& r, void const* data, unsigned size, int flags, uint16_t lane, std::size_t& encodedSize);
+    int SendMessagesEnvelope(u64 to, int flags, int channel, void const* data, unsigned size, std::size_t& encodedSize);
     int RawDataSend(Remote& r, send::Item const& item);
-    int RawSend(u64 to, int flags, int channel, void const* data, unsigned size, send::Item const* preParsedItem = nullptr);
+    int RawControlSend(u64 to, int flags, void const* data, unsigned size);
     void Control(u64 to, char what, bool reliable);
     u64 Sender(char const* message);
     bool UnpackRelayEnvelope(char const* raw, int rawSize, void const*& payload, std::size_t& payloadSize);
@@ -357,5 +374,4 @@ void InvalidatePublishedLocked(PublishedStore& target, bool isHostRole, u64 acco
 extern Api api;
 extern WorkerRuntime rt;
 extern PublishedStore store;
-inline Remote (&remotes)[MaxRemotes] = rt.remotes;
 }

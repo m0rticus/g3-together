@@ -87,6 +87,7 @@ float Distance(eCEntity* a, eCEntity* b)
 // The two rules the game checks for its own player, now for each other player near an NPC that saw nothing else.
 GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalPerceive ? originalPerceive(spu, self, other, args) : 0;
     const GEInt result = originalPerceive(spu, self, other, args);
     if (result || depth || !net::Connected()) return result;
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
@@ -152,6 +153,7 @@ void KeepZone(eCEntity* puppet)
 
 GEInt GE_STDCALL KillIntent(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ai::ShuttingDown()) return originalKill ? originalKill(spu, self, other, args) : 0;
     eCEntity* asked = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     eCEntity* judging = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* puppet = remote::IsPuppet(asked) && !IsLocalPlayer(judging) ? asked : nullptr;

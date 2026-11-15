@@ -190,9 +190,16 @@ void Hook()
     std::memcpy(site + 1, &rel, 4);
     site[5] = 0x90;
     std::memcpy(installed, site, sizeof(installed));
-    VirtualProtect(site, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    DWORD restoredOld = 0;
+    const bool restored = VirtualProtect(site, 6, old, &restoredOld) != 0;
+    const bool flushed = FlushInstructionCache(GetCurrentProcess(), site, 6) != 0;
     ai::TrackPatch(site, original, installed, sizeof(original), "ransack robbery call");
+    if (!restored || !flushed) {
+        hookFailed = true;
+        Logf("ransack: robbery hook finalize failed restored=%d flushed=%d error=%lu",
+             restored ? 1 : 0, flushed ? 1 : 0, GetLastError());
+        return;
+    }
     hooked = true;
     Log("ransack: robbery hook installed");
 }

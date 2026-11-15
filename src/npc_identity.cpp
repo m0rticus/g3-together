@@ -581,9 +581,7 @@ void ResetWorldNpcTables()
     contested.clear();
     hostTaken.clear();
     reclaimed.clear();
-    reclaimPause.clear();
     sentStates.clear();
-    inSphereSince.clear();
     deadOnHost.clear();
     ClearCorpseGroundAnchors();
     lastSent.clear();

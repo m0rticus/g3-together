@@ -65,6 +65,7 @@ State Snapshot()
                 state.phase = ClientSessionPhase();
             }
         } else if (state.host) {
+            bool copyPartnerName = false;
             switch (flow.hostState) {
             case connect::HostFlow::State::Starting:
                 state.phase = Phase::Starting;
@@ -74,33 +75,35 @@ State Snapshot()
                 break;
             case connect::HostFlow::State::Opening:
                 state.phase = Phase::PartnerOpening;
-                strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = true;
                 break;
             case connect::HostFlow::State::Offered:
                 state.phase = Phase::PartnerOffered;
-                strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = true;
                 break;
             case connect::HostFlow::State::Linked:
                 state.phase = Phase::Hosting;
                 CountJoinedClients(state);
                 break;
             }
+            if (copyPartnerName) strncpy_s(state.name, flow.name, _TRUNCATE);
         } else {
+            bool copyPartnerName = false;
             switch (flow.clientState) {
             case connect::ClientFlow::State::Starting:
                 state.phase = Phase::Starting;
                 break;
             case connect::ClientFlow::State::Waiting:
                 state.phase = flow.lobbyInvitePending ? Phase::LobbyInvited : Phase::WaitingInvite;
-                if (flow.lobbyInvitePending) strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = flow.lobbyInvitePending;
                 break;
             case connect::ClientFlow::State::Requesting:
                 state.phase = Phase::Requesting;
-                strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = true;
                 break;
             case connect::ClientFlow::State::Joining:
                 state.phase = state.id ? Phase::Connecting : Phase::Requesting;
-                if (!state.id || !*state.name) strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = !state.id || !*state.name;
                 break;
             case connect::ClientFlow::State::Linked:
                 state.phase = ClientSessionPhase();
@@ -110,18 +113,71 @@ State Snapshot()
                 state.why = flow.why;
                 state.arg = flow.arg;
                 strncpy_s(state.hostSession, flow.hostSession, _TRUNCATE);
-                strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = true;
                 break;
             case connect::ClientFlow::State::Lost:
                 state.phase = Phase::Lost;
-                strncpy_s(state.name, flow.name, _TRUNCATE);
+                copyPartnerName = true;
                 strncpy_s(state.reason, flow.endReason, _TRUNCATE);
                 state.endedImmediately = flow.endedImmediately;
                 break;
             }
+            if (copyPartnerName) strncpy_s(state.name, flow.name, _TRUNCATE);
         }
     }
     return state;
+}
+
+namespace {
+void FormatDeclineReason(State const& state, wchar_t const* name, wchar_t const* session,
+                         wchar_t* reason, size_t reasonWords)
+{
+    wchar_t hostSession[64] = {};
+    MultiByteToWideChar(CP_UTF8, 0, state.hostSession, -1, hostSession, 64);
+    switch (state.why) {
+    case connect::Why::NotInvite:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineNotInvite));
+        break;
+    case connect::Why::SelfInvite:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineSelf));
+        break;
+    case connect::Why::WrongSession:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineSession), name, hostSession, session);
+        break;
+    case connect::Why::WrongProtocol:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::RefusedVersion),
+                     static_cast<unsigned>(saving::Protocol), static_cast<unsigned>(state.arg));
+        break;
+    case connect::Why::Busy:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineBusy), name);
+        break;
+    case connect::Why::NotFriends:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineNotFriends), name);
+        break;
+    case connect::Why::HostError:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineHostError),
+                     name, static_cast<unsigned>(state.arg));
+        break;
+    case connect::Why::NoAnswer:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineNoAnswer), name);
+        break;
+    case connect::Why::Unreachable:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineUnreachable), name);
+        break;
+    case connect::Why::LobbyGone:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineLobbyGone), name);
+        break;
+    case connect::Why::NotG3T:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, i18n::Text(i18n::DeclineNotG3T), name);
+        break;
+    case connect::Why::MetadataTimeout:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineMetadataTimeout));
+        break;
+    case connect::Why::None:
+        _snwprintf_s(reason, reasonWords, _TRUNCATE, L"?");
+        break;
+    }
+}
 }
 
 void Format(State const& state, wchar_t* out, size_t size)
@@ -185,54 +241,10 @@ void Format(State const& state, wchar_t* out, size_t size)
         _snwprintf_s(out, size, _TRUNCATE,
                      i18n::Text(state.endedImmediately ? i18n::LobbyLostImmediate : i18n::LobbyLost), name, reason);
         break;
-    case Phase::Declined: {
-        wchar_t hostSession[64] = {};
-        MultiByteToWideChar(CP_UTF8, 0, state.hostSession, -1, hostSession, 64);
-        switch (state.why) {
-        case connect::Why::NotInvite:
-            _snwprintf_s(reason, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineNotInvite));
-            break;
-        case connect::Why::SelfInvite:
-            _snwprintf_s(reason, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineSelf));
-            break;
-        case connect::Why::WrongSession:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineSession), name, hostSession, session);
-            break;
-        case connect::Why::WrongProtocol:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::RefusedVersion),
-                         static_cast<unsigned>(saving::Protocol), static_cast<unsigned>(state.arg));
-            break;
-        case connect::Why::Busy:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineBusy), name);
-            break;
-        case connect::Why::NotFriends:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineNotFriends), name);
-            break;
-        case connect::Why::HostError:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineHostError), name, static_cast<unsigned>(state.arg));
-            break;
-        case connect::Why::NoAnswer:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineNoAnswer), name);
-            break;
-        case connect::Why::Unreachable:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineUnreachable), name);
-            break;
-        case connect::Why::LobbyGone:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineLobbyGone), name);
-            break;
-        case connect::Why::NotG3T:
-            _snwprintf_s(reason, _TRUNCATE, i18n::Text(i18n::DeclineNotG3T), name);
-            break;
-        case connect::Why::MetadataTimeout:
-            _snwprintf_s(reason, _TRUNCATE, L"%s", i18n::Text(i18n::DeclineMetadataTimeout));
-            break;
-        case connect::Why::None:
-            _snwprintf_s(reason, _TRUNCATE, L"?");
-            break;
-        }
+    case Phase::Declined:
+        FormatDeclineReason(state, name, session, reason, 512);
         _snwprintf_s(out, size, _TRUNCATE, i18n::Text(i18n::LobbyDeclined), reason);
         break;
-    }
     }
     const size_t used = std::wcslen(out);
     if (used < size) _snwprintf_s(out + used, size - used, _TRUNCATE, i18n::Text(i18n::LobbySession), session);

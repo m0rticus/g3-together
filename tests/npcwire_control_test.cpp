@@ -478,6 +478,43 @@ int main() {
     }
     assert(shared.RetainedBaselines(1) == MaxBaselinesPerNpc && shared.RetainedAnchors(1) == 1);
     assert(shared.GetAnchor(1, 1, saved));
+
+    // Full-record baseline and fallback codecs reject non-finite or out-of-range motion/damage floats.
+    Context fullGuard;
+    assert(fullGuard.Reset(S.epoch, S.generation));
+    assert(fullGuard.AddId(S, 1, guid(1)));
+    assert(fullGuard.AdvanceLife(S, 1, 7));
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    auto badDamage = snapshot(1, 1);
+    badDamage.damageMultiplier = qnan;
+    assert(!fullGuard.AddBaseline(S, 1, 1, 1, badDamage));
+    assert(!EncodeFullFallback(fullGuard, 1, badDamage, bytes));
+    auto badSpeed = snapshot(1, 1);
+    badSpeed.motions[0].descriptor.speed = inf;
+    assert(!fullGuard.AddBaseline(S, 1, 1, 1, badSpeed));
+    assert(!EncodeFullFallback(fullGuard, 1, badSpeed, bytes));
+    auto badActivePhase = snapshot(1, 1);
+    badActivePhase.motions[0].phase = 1.25f;
+    assert(!fullGuard.AddBaseline(S, 1, 1, 1, badActivePhase));
+    assert(!EncodeFullFallback(fullGuard, 1, badActivePhase, bytes));
+    auto badWeight = snapshot(1, 1);
+    badWeight.motions[0].weight = 10.5f;
+    assert(!fullGuard.AddBaseline(S, 1, 1, 1, badWeight));
+    assert(!EncodeFullFallback(fullGuard, 1, badWeight, bytes));
+
+    Control validFull = snapshot(1, 1);
+    assert(EncodeFullFallback(fullGuard, 1, validFull, full));
+    const auto fallbackOffset = full.size() - sizeof(WireFullRecord);
+    const std::uint32_t nanBits = 0x7fc00000u;
+    auto corruptFallback = full;
+    std::memcpy(corruptFallback.data() + fallbackOffset + offsetof(WireFullRecord, damageMultiplier),
+                &nanBits, sizeof(nanBits));
+    assert(!DecodeFullFallback(fullGuard, corruptFallback.data(), corruptFallback.size(), decoded));
+    auto corruptBaseline = baseWire;
+    std::memcpy(corruptBaseline.data() + fullOffset + offsetof(WireFullRecord, damageMultiplier),
+                &nanBits, sizeof(nanBits));
+    assert(!DecodeBaseline(fullGuard, corruptBaseline.data(), corruptBaseline.size(), ref));
     for (unsigned token = 18; token <= 33; ++token) {
         sharedBase.baseline = static_cast<std::uint16_t>(token);
         sharedBase.anchor = token;

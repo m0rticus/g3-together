@@ -119,4 +119,16 @@ constexpr bool ShouldAllowDialogPartnerProperty(bool dialogPartner, bool isScrip
     return dialogPartner && (isScriptRoutine || isAnimation || isMovement || isDialog);
 }
 
+// Client MsgTalk is world-gated (Gated(MsgTalk) == true). Only mark a client talk hold as sent once net::Connected()
+// (connected && inWorld) is true, and re-arm whenever admission resets or WelcomeSerial advances.
+constexpr bool ShouldSendClientTalkHold(bool connected, bool holdSent, uint32_t sentWelcome, uint32_t currentWelcome) noexcept
+{
+    return connected && (!holdSent || sentWelcome != currentWelcome);
+}
+
+constexpr bool ShouldReleaseClientTalkHold(bool connected, bool holdSent) noexcept
+{
+    return connected && holdSent;
+}
+
 } // namespace g3t::talk_policy

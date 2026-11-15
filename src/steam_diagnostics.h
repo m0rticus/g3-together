@@ -39,7 +39,8 @@ static_assert(sizeof(ConnectionInfo) == 696 && offsetof(ConnectionInfo, userData
 static_assert(sizeof(SessionStatus) == 120 && offsetof(SessionStatus, queueMicros) == 48,
               "Steam realtime status ABI");
 
-constexpr int Connected = 3, LoopbackBuffers = 4, Relayed = 16;
+constexpr int Connecting = 1, FindingRoute = 2, Connected = 3, LoopbackBuffers = 4;
+constexpr int ClosedByPeer = 4, ProblemDetectedLocally = 5, Relayed = 16;
 constexpr int StunServerList = 103, IceEnable = config::P2PTransportIceEnable, IcePenalty = 105, SdrPenalty = 106;
 constexpr int TimeoutInitial = 24, TimeoutConnected = 25, MtuPacketSize = 32, Unencrypted = 34;
 

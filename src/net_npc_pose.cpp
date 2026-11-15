@@ -27,6 +27,68 @@ uint16_t requestedBoneLayout = 0;
 unsigned boneLayoutLogs = 0, boneAckLogs = 0, boneFullPoseLogs = 0, boneCompactPoseLogs = 0;
 unsigned boneRequestLogs = 0, boneDefinitionFailureLogs = 0;
 
+bool ValidPoseBoneHashes(uint32_t const* values, int length) noexcept
+{
+    constexpr unsigned Slots = static_cast<unsigned>(pose::MaxBones) * 2u;
+    uint32_t seen[Slots] = {};
+    for (int i = 0; i < length; ++i) {
+        const uint32_t hash = values[i];
+        if (!hash) return false;
+        unsigned slot = (hash * 2654435761u) & (Slots - 1u);
+        while (seen[slot] && seen[slot] != hash) slot = (slot + 1u) & (Slots - 1u);
+        if (seen[slot]) return false;
+        seen[slot] = hash;
+    }
+    return true;
+}
+
+bool ValidPoseBones(pose::Bone const* bones, int length) noexcept
+{
+    uint32_t hashes[pose::MaxBones];
+    for (int i = 0; i < length; ++i) hashes[i] = bones[i].name;
+    return ValidPoseBoneHashes(hashes, length);
+}
+
+bool ResolvePoseLayoutId(uint32_t const* hashes, int count, uint16_t& layoutId)
+{
+    layoutId = 0;
+    if (worldEpoch && boneGeneration &&
+        boneLayouts.Reset(worldEpoch, boneGeneration) == bonewire::Status::Ok) {
+        auto status = boneLayouts.FindLayout(hashes, count, layoutId);
+        if (status == bonewire::Status::InvalidArgument) {
+            if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
+            return false;
+        }
+        if (status == bonewire::Status::UnknownLayout) {
+            if (nextBoneLayout < UINT16_MAX) {
+                layoutId = static_cast<uint16_t>(++nextBoneLayout);
+                status = boneLayouts.Register(layoutId, hashes, count);
+                if (status == bonewire::Status::Ok && BoneLog(boneLayoutLogs))
+                    Logf("net: new bone layout=%u bones=%d definition_bytes=%u compact_pose_bytes=%u full_pose_bytes=%u",
+                         static_cast<unsigned>(layoutId), count, static_cast<unsigned>(1 + bonewire::HeaderBytes + bonewire::CountBytes + count * 4),
+                         static_cast<unsigned>(sizeof(BonePosePrefix) + count * bonewire::TransformBytes),
+                         static_cast<unsigned>(3 + count * sizeof(pose::Bone)));
+            } else if (!boneExhaustionLogged) {
+                boneExhaustionLogged = true;
+                Log("net: bone layout IDs exhausted; new layouts use full-hash pose fallback");
+            }
+        }
+        if (status != bonewire::Status::Ok) {
+            if (status != bonewire::Status::UnknownLayout && BoneLog(boneInvalidLogs))
+                Logf("net: bone layout unavailable (%u); using full-hash pose", static_cast<unsigned>(status));
+            layoutId = 0;
+        }
+        return true;
+    }
+    if (!ValidPoseBoneHashes(hashes, count)) {
+        if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
+        return false;
+    }
+    if (BoneLog(boneInvalidLogs))
+        Log("net: bone dictionary has no epoch or generation; using full-hash pose");
+    return true;
+}
+
 void RequestBoneLayout(ENetPeer* peer, uint16_t layoutId)
 {
     const uint32_t now = enet_time_get();
@@ -201,7 +263,11 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         return true;
     }
     if (type == MsgPoseAck) {
-        if (!isHost || packet->dataLength != sizeof(PoseAckMsg)) { ++npcRejected; return true; }
+        if (!isHost || !(packet->flags & ENET_PACKET_FLAG_RELIABLE) ||
+            packet->dataLength != sizeof(PoseAckMsg)) {
+            ++npcRejected;
+            return true;
+        }
         const uint8_t id = PeerSlotOf(peer);
         if (!id) { ++npcRejected; return true; }
         PoseAckMsg ack{};
@@ -251,7 +317,7 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     if (type == MsgNpcs || type == MsgPosedNpc || type == MsgCompactPosedNpc ||
         type == MsgControlBatch || type == MsgControlPose) {
         if (packet->dataLength < sizeof(NpcsHeader)) return true;
-        if (isHost) { ++npcRejected; return true; }
+        if (isHost || peer != server) { ++npcRejected; return true; }
         NpcsHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         if (!header.count || header.count > MaxNpcsPerMessage || header.epoch != worldEpoch || header.owner != 1) {
@@ -354,12 +420,10 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
             }
             bones = reinterpret_cast<pose::Bone const*>(packet->data + recordsSize + sizeof(boneCount) + 2);
             receivedPoseBytes = packet->dataLength - recordsSize;
-            for (int i = 0; i < boneCount; ++i) {
-                if (!bones[i].name) { ++npcRejected; return true; }
-                for (int k = 0; k < i; ++k)
-                    if (bones[k].name == bones[i].name) { ++npcRejected; return true; }
+            if (!ValidPoseBones(bones, boneCount) || !npclease::DecodePoseIntervalWire(intervalMs)) {
+                ++npcRejected;
+                return true;
             }
-            if (!npclease::DecodePoseIntervalWire(intervalMs)) { ++npcRejected; return true; }
         } else if (type == MsgCompactPosedNpc) {
             if (header.count != 1 || packet->dataLength < recordsSize + 2 + bonewire::DeltaHeaderBytes + 1) {
                 ++npcRejected;
@@ -473,7 +537,7 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     if (type == MsgNpcRelease) {
         if (packet->dataLength < sizeof(NpcReleaseHeader)) return true;
-        if (isHost) { ++npcRejected; return true; }
+        if (isHost || peer != server) { ++npcRejected; return true; }
         NpcReleaseHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         if (!header.count || header.count > MaxNpcsPerMessage ||
@@ -499,6 +563,7 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     if (type == MsgMotionName) {
         if (packet->dataLength != sizeof(MotionNameMsg)) return true;
         if (isHost) { Log("net: client NPC motion dictionary publication refused"); return true; }
+        if (peer != server) { ++npcRejected; return true; }
         MotionNameMsg message{};
         std::memcpy(&message, packet->data, sizeof(message));
         message.name[sizeof(message.name) - 1] = '\0';
@@ -529,68 +594,19 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         !npclease::DecodePoseIntervalWire(intervalMs) ||
         (to && (to < 2 || to >= MaxPlayers || !peers[to]))) return false;
 
-    auto validPoseHashes = [](uint32_t const* values, int length) noexcept {
-        constexpr unsigned Slots = static_cast<unsigned>(pose::MaxBones) * 2u;
-        uint32_t seen[Slots] = {};
-        for (int i = 0; i < length; ++i) {
-            const uint32_t hash = values[i];
-            if (!hash) return false;
-            unsigned slot = (hash * 2654435761u) & (Slots - 1u);
-            while (seen[slot] && seen[slot] != hash) slot = (slot + 1u) & (Slots - 1u);
-            if (seen[slot]) return false;
-            seen[slot] = hash;
-        }
-        return true;
-    };
-
     uint32_t hashes[pose::MaxBones];
     for (int i = 0; i < count; ++i) hashes[i] = bones[i].name;
 
     uint16_t layoutId = 0;
-    if (worldEpoch && boneGeneration &&
-        boneLayouts.Reset(worldEpoch, boneGeneration) == bonewire::Status::Ok) {
-        auto status = boneLayouts.FindLayout(hashes, count, layoutId);
-        if (status == bonewire::Status::InvalidArgument) {
-            if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
-            return false;
-        }
-        if (status == bonewire::Status::UnknownLayout) {
-            if (nextBoneLayout < UINT16_MAX) {
-                layoutId = static_cast<uint16_t>(++nextBoneLayout);
-                status = boneLayouts.Register(layoutId, hashes, count);
-                if (status == bonewire::Status::Ok && BoneLog(boneLayoutLogs))
-                    Logf("net: new bone layout=%u bones=%d definition_bytes=%u compact_pose_bytes=%u full_pose_bytes=%u",
-                         static_cast<unsigned>(layoutId), count, static_cast<unsigned>(1 + bonewire::HeaderBytes + bonewire::CountBytes + count * 4),
-                         static_cast<unsigned>(sizeof(BonePosePrefix) + count * bonewire::TransformBytes),
-                         static_cast<unsigned>(3 + count * sizeof(pose::Bone)));
-            } else if (!boneExhaustionLogged) {
-                boneExhaustionLogged = true;
-                Log("net: bone layout IDs exhausted; new layouts use full-hash pose fallback");
-            }
-        }
-        if (status != bonewire::Status::Ok) {
-            if (status != bonewire::Status::UnknownLayout && BoneLog(boneInvalidLogs))
-                Logf("net: bone layout unavailable (%u); using full-hash pose", static_cast<unsigned>(status));
-            layoutId = 0;
-        }
-    } else {
-        if (!validPoseHashes(hashes, count)) {
-            if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
-            return false;
-        }
-        if (BoneLog(boneInvalidLogs))
-            Log("net: bone dictionary has no epoch or generation; using full-hash pose");
-    }
+    if (!ResolvePoseLayoutId(hashes, count, layoutId)) return false;
 
     NpcsHeader header{MsgPosedNpc, 0, enet_time_get(), worldEpoch, 1, 0, 1, 1};
     const auto preparedControl = PrepareControl(record);
     const uint16_t boneCount = static_cast<uint16_t>(count);
     const size_t fullSize = sizeof(header) + sizeof(record) + sizeof(boneCount) + 2 + count * sizeof(*bones);
-    static std::vector<uint8_t> fallbackBuffer, definition, compact, compactMessage, controlPoseMessage, batch;
-    static std::vector<pose::Bone> reconstructed;
-    static std::vector<npcwire::Control> singleControl(1);
-    fallbackBuffer.clear();
-    definition.clear();
+    std::vector<uint8_t> fallbackBuffer, definition, compact, compactMessage, controlPoseMessage, batch;
+    std::vector<pose::Bone> reconstructed;
+    std::vector<npcwire::Control> singleControl(1);
     bool definitionAttempted = false, definitionReady = false;
     bool queued = false;
     const NpcKeyValue npcKey = NpcKey(record.guid);

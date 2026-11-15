@@ -35,6 +35,11 @@ unsigned sameNameStarts = 0, sameNameReplayed = 0;
 
 int motionSeek = -1;
 
+bool MotionSeekEnabled()
+{
+    return motionSeek < 0 ? GetConfig().motionSeek : motionSeek > 0;
+}
+
 uint8_t ActionSeq(eCEntity* entity, ActionClock& clock, char const* shown, uint16_t* elapsedMs)
 {
     if (elapsedMs) *elapsedMs = 0;
@@ -45,7 +50,8 @@ uint8_t ActionSeq(eCEntity* entity, ActionClock& clock, char const* shown, uint1
     auto* animation = entity ? static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation)) : nullptr;
     eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
     const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
-    const double time = actor ? actor->GetPlayTime(slot0) : 0.0;
+    const double rawTime = actor ? actor->GetPlayTime(slot0) : 0.0;
+    const double time = std::isfinite(rawTime) ? rawTime : 0.0;
     const double max = actor ? actor->GetMaxTime(slot0) : 0.0;
     const bool wrapped = !movement::IsLoopingPuppetMotion(shown) && time + 0.05 < clock.time;
     if (strcmp(shown, clock.name) != 0 || wrapped) {
@@ -53,7 +59,7 @@ uint8_t ActionSeq(eCEntity* entity, ActionClock& clock, char const* shown, uint1
         strncpy_s(clock.name, shown, _TRUNCATE);
     }
     clock.time = time;
-    const double unitMs = max > 0.0 ? MotionUnitMs(max) : 1000.0;
+    const double unitMs = (max > 0.0 && std::isfinite(max)) ? MotionUnitMs(max) : 1000.0;
     if (elapsedMs) *elapsedMs = static_cast<uint16_t>(std::clamp(time * unitMs, 0.0, 65535.0));
     return clock.seq;
 }
@@ -65,7 +71,7 @@ uint16_t MotionFraction(eCEntity* entity)
     const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
     if (!actor || !actor->IsMotionRunning(slot0)) return movement::NoMotionFrac;
     const double max = actor->GetMaxTime(slot0);
-    if (!(max > 0.0)) return movement::NoMotionFrac;
+    if (!(max > 0.0) || !std::isfinite(max)) return movement::NoMotionFrac;
     const double part = actor->GetPlayTime(slot0) / max;
     return movement::EncodeRunningMotionFrac(part);
 }
@@ -401,7 +407,7 @@ void FollowSenderOnce(eCEntity* instance, State& state, Target const& target, ui
     if (expected >= max) { ++followSkips[kind][4]; return; }
     ++followSkips[kind][5];
     float lag = static_cast<float>((expected - actor->GetPlayTime(slot0)) * unitMs);
-    const bool on = motionSeek < 0 ? GetConfig().motionSeek : motionSeek > 0;
+    const bool on = MotionSeekEnabled();
     if (on && std::fabs(lag) > SeekOver && static_cast<int32_t>(now - state.seekAt) >= 0) {
         actor->SetPlayTime(slot0, static_cast<float>(expected));
         state.seekAt = now + SeekEvery;
@@ -572,7 +578,7 @@ void DrivePuppetTimeline(Entity& entity, eCEntity* instance, State& state, Targe
         return;
     }
     float lag = movement::PuppetPhaseLagMs(actor->GetPlayTime(slot0), expected, max, unitMs, looping);
-    const bool seekOn = motionSeek < 0 ? GetConfig().motionSeek : motionSeek > 0;
+    const bool seekOn = MotionSeekEnabled();
     const float seekLimit = looping ? 160.0f : SeekOver;
     if (seekOn && std::fabs(lag) > seekLimit && static_cast<int32_t>(now - state.seekAt) >= 0) {
         actor->SetPlayTime(slot0, static_cast<float>(std::clamp(expected, 0.0, maxPlay)));

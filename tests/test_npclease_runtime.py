@@ -377,8 +377,10 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("npclease::ForgetReceivedNpcPoseBefore(records[i].guid, records[i].incarnation, captured)", npcs)
         self.assertIn("npclease::ForgetReceivedNpcPose(identity)", npcs)
         self.assertIn("npclease::SyncMirrorPoseInterval(record.guid, record.incarnation, received.intervalMs)", playback)
+        set_pose = section(playback, "void SetEntityPose(", "bool CosmeticHit(")
+        self.assertIn("entity->SetToWorldMatrix(pose)", set_pose)
         replay = section(playback, "bool Replay(", "bool ReplayFrozenPose(")
-        self.assertLess(replay.index("PreparePose("), replay.index("entity->SetToWorldMatrix(pose)"))
+        self.assertLess(replay.index("PreparePose("), replay.index("SetEntityPose(entity, pose)"))
 
     def test_host_commit_is_conditional_on_native_restart(self):
         host = self.host_only_source[self.host_only_source.index("void TickHost("):]
@@ -522,3 +524,29 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertNotIn("latestTicks", claim)
         self.assertIn("npclease::ReconcileLife(localDeath, m.killed, (shown.flags & 1) != 0)", npcs)
         self.assertIn("NPCRECONCILE", npcs)
+
+    def test_commit_preserves_pre_confirm_death_and_takeover_cuts_are_bounded(self):
+        client = section(self.client_source, "void ReceiveClient(", "// Which native path")
+        commit = section(client, "if (note.kind == Kind::Commit) {", "} else if (note.kind == Kind::Renew)")
+        self.assertIn("locallyDead", commit)
+        self.assertIn("if (!locallyDead)", commit)
+        self.assertIn("Send(key, entry, Kind::State)", commit)
+
+        maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
+        self.assertIn('"tame/control spell"', maintain)
+        self.assertIn("RecallWaitMs", maintain)
+        self.assertIn("now - entry.cutAt >= reclaimWaitMs", maintain)
+
+        relinquish = section(self.client_source, "void RelinquishToHost(", "bool VettedLocalAuthority(")
+        self.assertIn("entry->retryAt = (now ? now : 1) + npcown::CutReclaimMs;", relinquish)
+
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
+        offer = section(host, "if (!entry.lease.Offer(", "if (found == entries.end())")
+        self.assertIn("entry.committed = false;", offer)
+        tick = self.host_only_source[self.host_only_source.index("void TickHost("):]
+        recover = section(tick, "if (entry.lease.Recover(now))", "if (entry.lease.phase == Phase::Dormant")
+        self.assertIn("entry.committed = true;", recover)
+
+        spells = _testbuild.src_text("spells.cpp")
+        self.assertIn("PendingTakeOverExpireMs", spells)
+

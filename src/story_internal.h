@@ -52,11 +52,7 @@ extern bool disabled;
 extern bool fullZeros;
 extern bool reloadReset;
 extern bool chapterSharing;
-extern bool namesReady;
 extern unsigned reloads;
-extern std::unordered_map<std::string, std::string> questNames;
-extern std::unordered_map<std::string, std::string> infoNames;
-extern std::unordered_map<std::string, uint32_t> seenInfoEnds;
 
 bool Running();
 gCQuestManager_PS* Quests();
@@ -66,7 +62,8 @@ bool EventsReady();
 bool ClockApply(char const* name, uint32_t value);
 
 Domain* Find(uint8_t kind);
-bool BuildNames();
+void ResetDomainCaches();
+bool ResolveNamedState(uint8_t domainKind, std::string& ioName, uint32_t value);
 void Track(Domain& d, std::string const& name, uint32_t value);
 
 } // namespace g3t::story::detail

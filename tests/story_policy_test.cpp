@@ -59,4 +59,27 @@ int main()
         parsed = clock;
         assert(!ReadClock(text, parsed) && parsed.year == 2 && parsed.day == 42);
     }
+
+    ParsedRuntimeKey rt{};
+    assert(ParseRuntimeKey("QuestA\x1f" "c511", rt) && rt.target == "QuestA" &&
+           rt.field == RuntimeField::CounterElem && rt.index == 511 && FormatRuntimeField(rt) == "c511");
+    assert(ParseRuntimeKey("InfoA\x1fi", rt) && rt.target == "InfoA" &&
+           rt.field == RuntimeField::InfoEnd && FormatRuntimeField(rt) == "i");
+    assert(!ParseRuntimeKey("QuestA\x1f" "c512", rt));
+
+    std::string packedCount, packedElem;
+    assert(PackRuntime(first + "\x1fn", 3, 63, packedCount) && IsPackedCounterCount(packedCount.c_str()));
+    assert(PackRuntime(first + "\x1f" "c0", 1, 63, packedElem) && !IsPackedCounterCount(packedElem.c_str()));
+    assert(PackRuntime(first + "\x1fi", 99, 63, packedElem) && !IsPackedCounterCount(packedElem.c_str()));
+
+    std::map<std::string, uint32_t> runtimeMap{{"QuestA\x1fn", 2}};
+    assert(ParseRuntimeKey("QuestA\x1f" "c1", rt) && !IsCounterOutOfBounds(runtimeMap, rt));
+    assert(ParseRuntimeKey("QuestA\x1f" "c2", rt) && IsCounterOutOfBounds(runtimeMap, rt));
+    assert(ParseRuntimeKey("Missing\x1f" "c0", rt) && IsCounterOutOfBounds(runtimeMap, rt));
+
+    // Same-connection template reload (WorldOther) must reset InitialReplay after a finished admission, while retries
+    // within the same unfinished admission keep the captured baseline immutable.
+    assert(!ShouldResetInitialReplay(7, 7, false));
+    assert(ShouldResetInitialReplay(7, 7, true));
+    assert(ShouldResetInitialReplay(7, 8, false));
 }

@@ -254,13 +254,16 @@ class DownedPolicyTests(unittest.TestCase):
 
     def test_records_preserve_downed_state_before_restoring_hp(self):
         hero = _testbuild.src_text("hero.cpp")
+        capture = function_body(hero, r"\bbool\s+CaptureHeroSnapshot\s*\(")
+        apply_stats = function_body(hero, r"\bchar\s+const\*\s+ApplyCoreStatsAndAttributes\s*\(")
         save = function_body(hero, r"\bbool\s+SaveRecordImpl\s*\(")
         load = function_body(hero, r"\bbool\s+LoadRecordImpl\s*\(")
-        self.assertIn("record.downed = downed::Held() ? 1 : 0;", save)
-        self.assertIn("codec::EncodeRecord(", save)
+        self.assertIn("out.downed = downed::Held() ? 1 : 0;", capture)
+        self.assertLess(save.index("CaptureHeroSnapshot("), save.index("codec::EncodeRecord("))
         self.assertIn('downed::Restore(savedDowned != 0, "hero-record")', load)
         self.assertLess(load.index("downed::Restore"), load.index("self.Inventory.HoldStacks"))
-        self.assertIn("downed::Held()", load)
+        self.assertLess(load.index("downed::Restore"), load.index("ApplyCoreStatsAndAttributes("))
+        self.assertIn("downed::Held()", apply_stats)
 
     def test_paid_revive_is_bound_to_sender_and_down_episode(self):
         self.assertIn("sequence != life.sequence", self.downed_cpp)

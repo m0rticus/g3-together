@@ -14,7 +14,9 @@ TARGETS = {
     "core_policies": _testbuild.register_target(
         "core_policies",
         [_testbuild.unit(path, includes=(ROOT / "src",)) for path in (
-            ROOT / "tests" / "core_policies_test.cpp", ROOT / "src" / "guid_text.cpp"
+            ROOT / "tests" / "core_policies_test.cpp",
+            ROOT / "src" / "guid_text.cpp",
+            ROOT / "src" / "focus_diag.cpp",
         )],
         msvc_vcvars=False,
     ),

@@ -127,7 +127,7 @@ def win32_tool_environment(build: Path) -> dict[str, str]:
             if isinstance(loaded, dict) and shutil.which("cl", path=loaded.get("PATH") or loaded.get("Path")):
                 cached_base = {str(k): str(v) for k, v in loaded.items()}
                 _WIN32_ENV_MEM_CACHE[cache_key] = cached_base
-        except OSError:
+        except (OSError, ValueError):
             cached_base = None
     if cached_base is not None:
         out = cached_base.copy()

@@ -161,7 +161,7 @@ void WorkerRuntime::SendDirectUdpControl(Remote& r)
     frame[27] = static_cast<uint8_t>(ipCount);
     for (unsigned i = 0; i < ipCount; ++i)
         std::memcpy(frame + 28 + i * 4, &localIps[i], 4);
-    if (RawSend(r.id, SendReliable, ChannelControl, frame, 28 + ipCount * 4) == ResultOk)
+    if (RawControlSend(r.id, SendReliable, frame, 28 + ipCount * 4) == ResultOk)
         r.lastDirectOfferSent = Now() ? Now() : 1;
 }
 
@@ -187,7 +187,7 @@ int WorkerRuntime::SubmitSocketEnvelope(Remote& r, void const* data, unsigned si
     char const* session = GetLocalConfig().sessionId;
     if (!lobby || size > RelayPayloadLimit || !ValidRelaySession(session)) return 2;
     const std::size_t needed = RelayHeaderSize(session) + size;
-    auto* msg = static_cast<OutboundSocketMessage*>(
+    auto* msg = static_cast<SteamNetworkingMessage*>(
         api.AllocateMessage(networkingUtils, static_cast<int>(needed)));
     if (!msg || !msg->data) {
         if (msg) api.MessageRelease(msg);
@@ -208,6 +208,34 @@ int WorkerRuntime::SubmitSocketEnvelope(Remote& r, void const* data, unsigned si
         : numberOrResult < 0 ? static_cast<int>(-numberOrResult) : 2;
 }
 
+int WorkerRuntime::SendMessagesEnvelope(u64 to, int flags, int channel,
+                                        void const* data, unsigned size, std::size_t& encodedSize)
+{
+    char packet[RelayMaxEnvelopeSize];
+    if (!lobby || size > RelayPayloadLimit) {
+        Logf("steam: cannot send relay message (lobby=%llu bytes=%u)", lobby, size);
+        return 2;
+    }
+    if (!RelayEncode(lobby, GetLocalConfig().sessionId, data, size, packet, sizeof(packet), &encodedSize)) {
+        Logf("steam: cannot encode relay message (lobby=%llu bytes=%u)", lobby, size);
+        return 2;
+    }
+    char identity[160];
+    Identity(identity, to);
+    const int result = api.SendToUser(messages, identity, packet, static_cast<unsigned>(encodedSize),
+                                      flags | SendAutoRestart, channel);
+    if (result != ResultOk) {
+        ++sendFailures;
+        const uint32_t now = Now();
+        if (!lastSendFailure || now - lastSendFailure >= 5000) {
+            lastSendFailure = now ? now : 1;
+            Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)",
+                 to, result, channel, size, sendFailures);
+        }
+    }
+    return result;
+}
+
 int WorkerRuntime::RawDataSend(Remote& r, send::Item const& item)
 {
     const unsigned size = static_cast<unsigned>(item.bytes.size());
@@ -215,7 +243,7 @@ int WorkerRuntime::RawDataSend(Remote& r, send::Item const& item)
         std::size_t encodedSize = 0;
         const int result = SubmitSocketEnvelope(r, item.bytes.data(), size, item.Flags(), item.Lane(), encodedSize);
         if (result == ResultOk) {
-            ++r.steamUnreliableOk;
+            ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
             RecordAcceptedItemTraffic(item, encodedSize);
             return ResultOk;
         }
@@ -234,54 +262,31 @@ int WorkerRuntime::RawDataSend(Remote& r, send::Item const& item)
         ClosePeerP2P(r);
         r.lastP2POpenAt = now ? now : 1;
     }
-    return RawSend(r.id, item.Flags(), ChannelData, item.bytes.data(), size, &item);
+    std::size_t encodedSize = 0;
+    const int result = SendMessagesEnvelope(r.id, item.Flags(), ChannelData, item.bytes.data(), size, encodedSize);
+    if (result == ResultOk) {
+        ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
+        RecordAcceptedItemTraffic(item, encodedSize);
+    } else {
+        ++r.steamDataFailed[result >= 0 && result < 128 ? result : 0];
+    }
+    return result;
 }
 
-int WorkerRuntime::RawSend(u64 to, int flags, int channel, void const* data, unsigned size, send::Item const* preParsedItem)
+int WorkerRuntime::RawControlSend(u64 to, int flags, void const* data, unsigned size)
 {
-    char packet[RelayMaxEnvelopeSize];
-    if (!lobby || size > RelayPayloadLimit) {
-        Logf("steam: cannot send relay message (lobby=%llu bytes=%u)", lobby, size);
-        return 2;
-    }
     std::size_t encodedSize = 0;
-    if (!RelayEncode(lobby, GetLocalConfig().sessionId, data, size, packet, sizeof(packet), &encodedSize)) {
-        Logf("steam: cannot encode relay message (lobby=%llu bytes=%u)", lobby, size);
-        return 2;
+    const int result = SendMessagesEnvelope(to, flags | SendNoNagle, ChannelControl, data, size, encodedSize);
+    if (Remote* r = Find(to)) {
+        if (result == ResultOk)
+            ++(flags & SendReliable ? r->steamReliableOk : r->steamUnreliableOk);
+        else
+            ++r->steamControlFailed[result >= 0 && result < 128 ? result : 0];
     }
-    char identity[160];
-    Identity(identity, to);
-    const int result = api.SendToUser(messages, identity, packet, static_cast<unsigned>(encodedSize),
-                                      flags | (channel == ChannelControl ? SendNoNagle : 0) | SendAutoRestart, channel);
-    for (auto& r : remotes) {
-        if (r.id != to) continue;
-        if (result == ResultOk) {
-            ++(flags & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
-        } else {
-            auto& failed = channel == ChannelData ? r.steamDataFailed : r.steamControlFailed;
-            ++failed[result >= 0 && result < 128 ? result : 0];
-        }
-        break;
-    }
-    if (result != ResultOk) {
-        ++sendFailures;
-        const uint32_t now = Now();
-        if (!lastSendFailure || now - lastSendFailure >= 5000) {
-            lastSendFailure = now ? now : 1;
-            Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)",
-                 to, result, channel, size, sendFailures);
-        }
-    } else if (channel == ChannelData && preParsedItem) {
-        RecordAcceptedItemTraffic(*preParsedItem, encodedSize);
-    } else {
+    if (result == ResultOk) {
         ++traffic.txDatagrams;
         traffic.txBytes += size;
         traffic.txEnvelopeBytes += encodedSize;
-        if (channel == ChannelData) {
-            ++traffic.txDataDatagrams;
-            traffic.txDataBytes += size;
-            ++traffic.txEnetParseFailures;
-        }
     }
     return result;
 }
@@ -291,9 +296,9 @@ void WorkerRuntime::Control(u64 to, char what, bool reliable)
     char buffer[9] = {what};
     const double time = PingSeconds();
     std::memcpy(buffer + 1, &time, sizeof(time));
-    const int result = RawSend(to, reliable ? SendReliable : SendUnreliable, ChannelControl, buffer, what == 'P' ? 9 : 1);
+    const int result = RawControlSend(to, reliable ? SendReliable : SendUnreliable, buffer, what == 'P' ? 9 : 1);
     if (what == 'P' && result == ResultOk)
-        for (auto& r : remotes) if (r.id == to) r.ping.Sent(time);
+        if (Remote* r = Find(to)) r->ping.Sent(time);
 }
 
 u64 WorkerRuntime::Sender(char const* message)
@@ -326,7 +331,7 @@ void WorkerRuntime::Receive(int channel)
         if (count < 0) ++receiveFailures;
         if (count <= 0) return;
         for (int i = 0; i < count; ++i) {
-            auto const* msg = static_cast<OutboundSocketMessage const*>(batch[i]);
+            auto const* msg = static_cast<SteamNetworkingMessage const*>(batch[i]);
             char const* data = static_cast<char const*>(msg->data);
             int size = msg->size;
             const u64 from = Sender(static_cast<char const*>(batch[i]));
@@ -370,7 +375,7 @@ void WorkerRuntime::ReceiveP2P()
             if (count < 0) ++receiveFailures;
             if (count <= 0) break;
             for (int i = 0; i < count; ++i) {
-                auto const* msg = static_cast<OutboundSocketMessage const*>(batch[i]);
+                auto const* msg = static_cast<SteamNetworkingMessage const*>(batch[i]);
                 char const* data = static_cast<char const*>(msg->data);
                 const int size = msg->size;
                 void const* payload = nullptr;
@@ -503,7 +508,7 @@ void WorkerRuntime::OnControl(Remote& r, char const* data, int size)
             char pong[9];
             std::memcpy(pong, data, 9);
             pong[0] = 'Q';
-            RawSend(r.id, SendUnreliable, ChannelControl, pong, 9);
+            RawControlSend(r.id, SendUnreliable, pong, 9);
         }
         break;
     case 'Q':
@@ -526,6 +531,7 @@ void WorkerRuntime::OnData(Remote& r, char const* data, int size)
     if (!r.linked || size <= 0) return;
     int sent = 0;
     if (isHost) {
+        if (r.socket == INVALID_SOCKET) return;
         sockaddr_in to{};
         to.sin_family = AF_INET;
         to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -655,7 +661,7 @@ void WorkerRuntime::OnP2PStatusChanged(char const* p, int size)
     const uint32_t conn = statusChanged.conn;
     auto const& info = statusChanged.info;
     const u64 peerId = api.IdentityGetSteamId(info.identity);
-    if (info.state == 1 && isHost && listenSocketP2P && info.listenSocket == listenSocketP2P) {
+    if (info.state == diagnostics::Connecting && isHost && listenSocketP2P && info.listenSocket == listenSocketP2P) {
         Remote* r = lobby && peerId && (InLobby(peerId) || Find(peerId)) ? Get(peerId) : nullptr;
         if (!r) {
             api.CloseConnection(sockets, conn, 0, "unauthorized peer", 0);
@@ -688,7 +694,7 @@ void WorkerRuntime::OnP2PStatusChanged(char const* p, int size)
                  peerId, conn, r->p2pLanesConfigured ? LaneCount : 0u,
                  (info.flags & diagnostics::Relayed) ? 1u : 0u);
         }
-    } else if (info.state == 4 || info.state == 5) {
+    } else if (info.state == diagnostics::ClosedByPeer || info.state == diagnostics::ProblemDetectedLocally) {
         if (Remote* r = Find(peerId); r && r->p2pConn == conn) {
             Logf("steam-send: P2P lane session closed peer=%llu conn=%u state=%d reason=%d",
                  peerId, conn, info.state, info.endReason);

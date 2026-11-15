@@ -59,8 +59,6 @@ struct Track
     int count = 0;
     int32_t offset = 0;
     bool haveOffset = false;
-    int32_t windowMin = 0, lastWindowMin = 0;
-    uint32_t windowAt = 0;
     uint8_t lastCase = 0;
     unsigned underruns = 0;
     uint32_t serial = 1;

@@ -449,18 +449,14 @@ void DeadPoseReport(LogFn log)
     log(line);
 }
 
-void WalkingReport(char const* guid, LogFn log)
+void WalkingReport(char const* guidText, LogFn log)
 {
-    unsigned d1 = 0, d2 = 0, d3 = 0, bytes[8] = {};
-    if (!guid || std::sscanf(guid, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3,
-                             &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4], &bytes[5], &bytes[6], &bytes[7]) != 11) {
+    uint8_t raw[16] = {};
+    if (!guidText || !guid::ParseExact(guidText, raw)) {
         log("WALKING refused: bad GUID");
         return;
     }
-    _GUID raw{};
-    raw.Data1 = d1; raw.Data2 = static_cast<unsigned short>(d2); raw.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) raw.Data4[i] = static_cast<unsigned char>(bytes[i]);
-    const GuidKey key = ToGuidKey(reinterpret_cast<uint8_t const*>(&raw));
+    const GuidKey key = ToGuidKey(raw);
     const auto found = mirrors.find(key);
     if (found == mirrors.end()) { log("WALKING refused: not a mirrored NPC"); return; }
     Mirror const& m = found->second;
@@ -495,20 +491,11 @@ void BadRecord(LogFn log)
 void ClaimRecord(char const* text, LogFn log)
 {
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    unsigned d1, d2, d3, b[8];
-    if (!hero || net::IsHost() || !text ||
-        sscanf_s(text, "%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X", &d1, &d2, &d3,
-                 &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11) {
+    net::NpcRecord record{};
+    if (!hero || net::IsHost() || !text || !guid::ParseExact(text, record.guid)) {
         log("REFUSED claimrecord: client with a hero, <GUID>");
         return;
     }
-    _GUID raw;
-    raw.Data1 = d1;
-    raw.Data2 = static_cast<unsigned short>(d2);
-    raw.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) raw.Data4[i] = static_cast<unsigned char>(b[i]);
-    net::NpcRecord record{};
-    std::memcpy(record.guid, &raw, 16);
     const bCVector& p = hero->GetWorldPosition();
     record.position[0] = p.GetX() + 200.0f;
     record.position[1] = p.GetY();

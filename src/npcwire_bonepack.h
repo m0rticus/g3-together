@@ -343,11 +343,6 @@ inline bool PoseExtractQuat(pose::Bone const& bone, PoseQuat& result)
     return true;
 }
 
-inline int32_t PoseQuatMatrix(int64_t numerator)
-{
-    return PoseRoundSignedDivide(numerator, 16384 * 16384);
-}
-
 inline bool PoseQuatToBone(PoseQuat const& quat, pose::Bone const& source, pose::Bone& target)
 {
     constexpr int64_t scale = 16384;

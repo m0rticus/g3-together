@@ -82,8 +82,8 @@ void NativeLoad(char const* name, LogFn log)
     if (!getter || !load) { log("REFUSED nativeload: Game.dll does not match this build"); return; }
     const bCString slot(name);
     // Loading a slot that does not exist stops the session and leaves the game hanging: check first.
-    gCWorld* world = gCWorld::GetCurrentWorld();
-    if (!world || !world->ExistsSaveGame(slot)) { Format(line, "NATIVELOAD name=%s ok=0 exists=0", name); log(line); return; }
+    gCWorld* currentWorld = gCWorld::GetCurrentWorld();
+    if (!currentWorld || !currentWorld->ExistsSaveGame(slot)) { Format(line, "NATIVELOAD name=%s ok=0 exists=0", name); log(line); return; }
     Format(line, "NATIVELOAD name=%s calling=1", name);
     log(line);
     const bool ok = load(getter(), &slot);

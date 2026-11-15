@@ -11,7 +11,7 @@
 namespace g3t::hero::codec {
 
 inline constexpr int QuickSlots = 16;
-inline constexpr size_t MaxRecordBytes = 4 * 1024 * 1024;
+inline constexpr size_t MaxRecordBytes = saving::HeroMaxRecordBytes;
 inline constexpr size_t MaxRecordEntries = 100000;
 
 struct Stack {

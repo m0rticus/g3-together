@@ -170,6 +170,7 @@ void ReceiveHost(uint8_t from, Message const& note)
         if (!entry.lease.Offer(from, net::PeerGeneration(from), ++authoritySerial, now, baseline)) {
             entry.lease = previousLease; --authoritySerial; ++refused; return;
         }
+        entry.committed = false;
         if (frozen && previousLease.owner != from && CurrentPeer(previousLease.owner, previousLease.generation)) {
             handBack.owner = 1; handBack.generation = 0;
             handBack.epoch = entry.lease.epoch; handBack.echo = now;
@@ -210,6 +211,7 @@ void ReceiveHost(uint8_t from, Message const& note)
     }
     if (note.kind == Kind::Prepared) {
         if (entry.lease.Prepared(note.epoch, now)) {
+            entry.committed = false;
             entry.echo = note.echo;
             Send(key, entry, Kind::Commit);
             ++granted;
@@ -314,6 +316,7 @@ void TickHost(uint32_t now)
         if (entry.lease.Recover(now)) {
             ++recovered;
             if (prior == Phase::Offering) {
+                entry.committed = true;
                 auto abort = Control(key, entry, Kind::Abort);
                 abort.owner = previousOwner;
                 abort.generation = previousGeneration;

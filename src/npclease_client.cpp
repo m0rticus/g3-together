@@ -254,7 +254,6 @@ void ReceiveClient(Message const& note)
         entry.presentationFloor = note.echo;
         entry.hasPresentationFloor = true;
         entry.yieldedAt = now ? now : 1;
-        entry.unavailableAt = 0;
         entry.window.Reset(note.epoch);
         entry.echo = now;
         PublishGuard(key, entry);
@@ -270,19 +269,26 @@ void ReceiveClient(Message const& note)
         if (entry.lease.phase == Phase::Host && note.owner == 1) { Send(key, entry, Kind::Ack); return; }
         if (!entry.local || entry.cut) { ++refused; return; }
         if (!entry.confirmed) {
+            const bool locallyDead = entry.lease.state.dead != 0 || (entry.lease.state.effects & NativeDeath) != 0;
             bool ready = true;
             if (entry.hasOfferedState) {
-                entry.lease.state = entry.offeredState;
                 entry.hasOfferedState = false;
-                eCEntity* entity = npcs::NpcByGuid(note.guid);
-                ready = entity && NativeReady(entity) && Activate(entity, entry, note.guid);
-                if (!ready) entry.ownedEntity = nullptr;
+                if (!locallyDead) {
+                    entry.lease.state = entry.offeredState;
+                    eCEntity* entity = npcs::NpcByGuid(note.guid);
+                    ready = entity && NativeReady(entity) && Activate(entity, entry, note.guid);
+                    if (!ready) entry.ownedEntity = nullptr;
+                }
             }
             entry.window.Commit(note.epoch, now); // telemetry only; ownership never depends on the window
             entry.confirmed = true; entry.prepared = false;
             if (ready) { entry.vetted = true; entry.vettedInSession = true; }
             entry.hostSeenAt = now;
             combat_hostility::OnClientLeaseConfirmed(note.guid);
+            if (locallyDead && ++entry.lease.revision != 0) {
+                entry.echo = now;
+                if (Send(key, entry, Kind::State)) { entry.lastState = now; ++stateSent; }
+            }
             char detail[80];
             std::snprintf(detail, sizeof(detail), "epoch=%u life=%u", entry.lease.epoch, entry.lease.incarnation);
             OwnEvent(key, entry.lease.state.name, npcown::Event::Confirmed, detail);
@@ -373,7 +379,6 @@ char const* TakeOver(eCEntity* entity, GuidKey const& key, uint32_t now)
     entry.vetted = false; entry.hasOfferedState = false;
     entry.cut = false; entry.recallAt = 0; entry.captureFailed = false;
     entry.hasPresentationFloor = false; entry.presentationFloor = 0;
-    entry.ownedAt = now ? now : 1;
     entry.ownedEntity = entity;
     entry.lastRequest = 0; entry.requestEvery = 500; entry.hostSeenAt = 0; entry.silentLogged = false;
     entry.cutReason = nullptr;
@@ -459,8 +464,10 @@ void MaintainOwners(uint32_t now)
         auto* entity = npcs::NpcByGuid(key.data());
         if (entry.cut && !entry.local) {
             // Hand-back pending: the host commits from the cut state; if it cannot (not loaded near the host) the NPC lives on.
-            if (entity && (!entry.cutReason || std::strcmp(entry.cutReason, "tame/control spell")) &&
-                now - entry.cutAt >= npcown::CutReclaimMs && !npcs::HostStreamClaimed(key.data()) &&
+            const uint32_t reclaimWaitMs = (entry.cutReason && !std::strcmp(entry.cutReason, "tame/control spell"))
+                ? RecallWaitMs
+                : npcown::CutReclaimMs;
+            if (entity && now - entry.cutAt >= reclaimWaitMs && !npcs::HostStreamClaimed(key.data()) &&
                 npcown::AcquisitionTimely(npcs::HostStreamDelay(), net::RoundTrip(1)) &&
                 !persist::CheckpointBusy() && !SharedWithOtherClient(entity)) {
                 const bool wasVetted = entry.vetted && entry.world == net::WorldEpoch();
@@ -642,7 +649,6 @@ void ScanClient(uint32_t now)
             ++snap.hostStreamed;
             refusals.Forget(key);
             waiting.Forget(key);
-            if (found != entries.end() && found->second.lease.phase == Phase::Host) found->second.unavailableAt = 0;
             continue;
         case npcown::Verdict::Wait:
             ++snap.waiting;
@@ -724,6 +730,11 @@ void RelinquishToHost(eCEntity* entity, char const* reason)
     if (captured) state.effects |= entry->lease.state.effects;
     if (!entry->confirmed || !captured) ReleaseLocal(key, *entry, entity, true);
     else CutToHost(key, *entry, entity, &state, reason, net::Now());
+    if (!entry->cut) {
+        const uint32_t now = net::Now();
+        entry->yieldedAt = now ? now : 1;
+        entry->retryAt = (now ? now : 1) + npcown::CutReclaimMs;
+    }
 }
 bool VettedLocalAuthority(eCEntity const* entity)
 {

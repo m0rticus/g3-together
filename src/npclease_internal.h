@@ -18,7 +18,6 @@ struct Entry {
     uint32_t previousGeneration = 0;
     uint32_t appliedRevision = 0;
     uint32_t presentationFloor = 0;
-    uint32_t unavailableAt = 0;
     uint32_t lastHit = 0;
     uint32_t rangeChangedAt = 0, processableChangedAt = 0;
     eCEntity* observedEntity = nullptr;
@@ -33,7 +32,7 @@ struct Entry {
     // Local ownership is independent of host confirmation.
     bool local = false, confirmed = false, vetted = false, vettedInSession = false, hasOfferedState = false;
     Checkpoint offeredState{};
-    uint32_t ownedAt = 0, yieldedAt = 0, cutAt = 0, handbackUntil = 0, hostSeenAt = 0, requestEvery = 500, retryAt = 0;
+    uint32_t yieldedAt = 0, cutAt = 0, handbackUntil = 0, hostSeenAt = 0, requestEvery = 500, retryAt = 0;
     char const* cutReason = nullptr;
     eCEntity* ownedEntity = nullptr;
     bool silentLogged = false;

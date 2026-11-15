@@ -14,8 +14,13 @@
 #include "../src/log.h"
 #include "../src/saving_policy.h"
 
-#define G3T_REALISM_SOURCE 1
 #include "../src/steam.cpp"
+#include "../src/steam_published.cpp"
+#include "../src/steam_p2p.cpp"
+#include "../src/steam_flow.cpp"
+#include "../src/steam_callbacks.cpp"
+#include "../src/steam_legacy_auto.cpp"
+#include "../src/steam_diagnostics.cpp"
 
 #include <cassert>
 #include <cstdarg>
@@ -27,11 +32,9 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 extern "C" void* ENET_CALLBACK enet_malloc(size_t size) { return std::malloc(size); }
 extern "C" void ENET_CALLBACK enet_free(void* memory) { std::free(memory); }
 extern "C" void ENET_CALLBACK enet_host_compress(ENetHost*, ENetCompressor const*) {}
-
 namespace {
 g3t::Config g_testConfig;
 std::vector<std::string> g_logs;
@@ -111,6 +114,8 @@ unsigned g_flushes = 0;
 unsigned g_closedConns = 0;
 unsigned g_connectP2PCalls = 0;
 unsigned g_lockedConfigWriteAttempts = 0;
+unsigned g_acceptedSessions = 0;
+std::vector<u64> g_leftLobbies;
 u64 g_lobbyMember = 0;
 std::map<int, int32_t> g_globalConfig;
 std::map<std::pair<uint32_t, int>, int32_t> g_listenSocketConfig;
@@ -404,7 +409,8 @@ int TEST_CALL FakeMemberCount(void*, u64) { return g_lobbyMember ? 1 : 0; }
 u64 TEST_CALL FakeMemberByIndex(void*, u64, int) { return g_lobbyMember; }
 u64 TEST_CALL FakeCreateLobby(void*, int, int) { return 9001; }
 sbool TEST_CALL FakeSetRichPresence(void*, char const*, char const*) { return 1; }
-void TEST_CALL FakeLeaveLobby(void*, u64) {}
+void TEST_CALL FakeLeaveLobby(void*, u64 lobby) { g_leftLobbies.push_back(lobby); }
+sbool TEST_CALL FakeAcceptSession(void*, void const*) { ++g_acceptedSessions; return 1; }
 sbool TEST_CALL FakeCloseSession(void*, void const*) { return 1; }
 
 int DummyHandle = 1;
@@ -422,6 +428,8 @@ void ResetHarness()
     g_closedConns = 0;
     g_connectP2PCalls = 0;
     g_lockedConfigWriteAttempts = 0;
+    g_acceptedSessions = 0;
+    g_leftLobbies.clear();
     g_lobbyMember = 0;
     g_globalConfig.clear();
     g_listenSocketConfig.clear();
@@ -472,11 +480,11 @@ void ResetHarness()
     api.CreateLobby = &FakeCreateLobby;
     api.SetRichPresence = &FakeSetRichPresence;
     api.LeaveLobby = &FakeLeaveLobby;
+    api.AcceptSession = &FakeAcceptSession;
     api.CloseSession = &FakeCloseSession;
 
     std::lock_guard<std::mutex> lock(store.mutex);
     store.published = Published{};
-    for (auto& pin : store.directPins) pin = DirectEndpointPin{};
     store.relayDrops.clear();
     store.relayCloses.clear();
 }
@@ -541,14 +549,12 @@ void TestZeroCopyV012LanesAndMessagesFallback()
     assert(rt.UnpackRelayEnvelope(reinterpret_cast<char const*>(g_socketSends[0].bytes.data()),
                                   static_cast<int>(g_socketSends[0].bytes.size()), unwrapped, unwrappedLen));
     assert(unwrappedLen > 0);
-
     // Non-retryable SendMessages failure must close P2P, keep Remote linked, and fall back to Messages immediately!
     g_socketSends.clear();
     g_failSendMessages = true;
     auto fallbackPkt = MakeUnreliableEnetDatagram(g3t::net::ChannelState, 3, {3, 99});
     assert(rt.QueueDatagram(*r, fallbackPkt.data(), static_cast<unsigned>(fallbackPkt.size())));
     rt.DrainDatagrams(*r);
-
     assert(r->linked);
     assert(r->p2pConn == 0 && !r->p2pConnected);
     assert(g_closedConns == 1);
@@ -556,7 +562,6 @@ void TestZeroCopyV012LanesAndMessagesFallback()
     assert(g_messageSends[0].peer == peerId);
     assert(g_messageSends[0].channel == ChannelData);
     assert(LogsContain("falling back to Messages"));
-
     // Cooldown prevents immediate ConnectP2P spam on client right after close.
     rt.isHost = false;
     rt.OpenClientP2P(*r);
@@ -593,7 +598,7 @@ void TestActiveV012SendDiagnosticsVsMessagesFallback()
 void TestDirectCandidateFilteringAndReflexivePort()
 {
     ResetHarness();
-    SetEnvironmentVariableA("G3T_DIRECT_ALLOW_LOOPBACK", "0");
+    SetEnvironmentVariableA("G3T_DIRECT_UDP_ALLOW_LOOPBACK", "0");
 
     uint32_t ipZero = 0;
     uint32_t ipLoop = htonl(INADDR_LOOPBACK);
@@ -946,6 +951,37 @@ void TestRealSteamConfigScopesOnHostAndClient()
     assert((g_connConfig[{501u, config::SendRateMin}] == config::MinRateCapacity));
     assert((g_connConfig[{501u, config::SendRateMax}] == config::MaxRateCapacity));
 }
+
+void TestCallbackBoundsAndDuplicateLobbyCleanup()
+{
+    ResetHarness();
+    const u64 peerId = 76561198000000006ULL;
+    g_lobbyMember = peerId;
+    rt.lobby = 9001;
+    Remote* r = rt.Get(peerId);
+    r->linked = true;
+    r->relayPort = 27999;
+    rt.Publish();
+    assert(IsPeerRelay(27999) && !IsPeerRelay(0) && !IsPeerRelay(28000));
+    assert(PeerId(27999) == peerId && PeerId(0) == 0 && PeerId(28000) == 0);
+
+    struct LobbyCreatedWire { int result; int pad; u64 lobby; } extra{ResultOk, 0, 9002};
+    rt.OnLobbyCreated(reinterpret_cast<char const*>(&extra), sizeof(extra));
+    assert(rt.lobby == 9001 && g_leftLobbies.size() == 1 && g_leftLobbies[0] == 9002);
+
+    char truncated[SteamIdentityBytes - 1] = {};
+    FakeIdentitySetSteamId(truncated, peerId);
+    rt.OnCallback(CbSessionRequest, nullptr, SteamIdentityBytes);
+    rt.OnCallback(CbSessionRequest, truncated, sizeof(truncated));
+    assert(g_acceptedSessions == 0);
+    struct TruncatedFailed { char id[SteamIdentityBytes - 4]; int reason; } badFail{};
+    rt.OnCallback(CbSessionFailed, nullptr, SteamIdentityBytes + 4);
+    rt.OnCallback(CbSessionFailed, reinterpret_cast<char const*>(&badFail), sizeof(badFail));
+    assert(r->linked);
+    g_logs.clear();
+    Status(&g3t::Log);
+    assert(LogsContain("STEAMSTATUS app=39500 ready=1"));
+}
 }
 
 int main()
@@ -957,6 +993,7 @@ int main()
     TestDirectEndpointPinningAndInviteRejoinGenerationRotation();
     TestClientForwardPortFilter();
     TestRealSteamConfigScopesOnHostAndClient();
-    std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, mismatched-gen handshake, endpoint pinning, rejoin rotation, port filtering and real Steam config scopes passed");
+    TestCallbackBoundsAndDuplicateLobbyCleanup();
+    std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, mismatched-gen handshake, endpoint pinning, rejoin rotation, port filtering, real Steam config scopes and callback bounds passed");
     return 0;
 }

@@ -111,6 +111,35 @@ class CombatHostilityContractTests(unittest.TestCase):
         claims = source("combat_claims.cpp")
         self.assertIn("combat_hostility::SyncHostNpc(target.GetInstance());", claims)
 
+    def test_defeat_judgement_and_knockout_bypass_combat_hostility_promotion(self):
+        ai_h = source("ai.h")
+        self.assertIn("class DefeatJudgementScope", ai_h)
+        self.assertIn("inline bool InDefeatJudgement()", ai_h)
+
+        ai = source("ai.cpp")
+        filt = between(ai, "GEInt GE_STDCALL FilterAttitude(", "GEInt GE_STDCALL FilterContinue(")
+        self.assertIn("const bool suppressPromotion = plainAsk || InDefeatJudgement();", filt)
+        self.assertIn("!suppressPromotion && judge && !npcs::IsMirrored(judge)", filt)
+
+        combat_cpp = source("combat.cpp")
+        judge_fn = between(combat_cpp, "GEInt Judge(", "GEInt GE_STDCALL JudgeLogical(")
+        self.assertIn("ai::DefeatJudgementScope defeatJudgement(which <= 2);", judge_fn)
+        judge_dmg = between(combat_cpp, "GEInt JudgeDamage(", "GEInt GameHit(")
+        self.assertIn("ai::DefeatJudgementScope defeatJudgement;", judge_dmg)
+
+        claims = source("combat_claims.cpp")
+        hostile_to_claimant = between(claims, "bool HostileToClaimant(", "void OnNpcHit(")
+        self.assertIn("ai::TryPlayerAttitude(victim.GetInstance(), claimant, attitude)", hostile_to_claimant)
+        self.assertIn("ai::PlainAttitude(victim.GetInstance(), claimant)", hostile_to_claimant)
+        self.assertNotIn('CallScript("GetAttitude"', hostile_to_claimant)
+        on_hit = between(claims, "void OnHitNpc(", "void OnHitPlayer(")
+        self.assertIn("contact.melee != net::NotMelee", on_hit)
+
+    def test_arena_handles_client_leased_opponents_and_fences_host_state(self):
+        arena = source("arena.cpp")
+        self.assertIn("npclease::LocalAuthority(npc)", arena)
+        self.assertIn("npclease::Fenced(npc.GetInstance())", arena)
+
     def test_touched_src_files_under_1000_lines(self):
         touched = (
             "relation_policy.h", "combat_hostility.h", "combat_hostility.cpp",

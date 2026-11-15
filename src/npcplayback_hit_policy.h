@@ -430,6 +430,16 @@ inline bool KnockbackMatchesHostRecord(HitKnockbackState const& kb, uint16_t ack
            recordHitSequence == kb.hitSequence;
 }
 
+// A reliable HitResult can arrive after an unreliable NpcRecord with the
+// same hitSequence already cleared pendingHit. Accept it when it matches either
+// pendingHit or an unconfirmed active knockback for that sequence.
+inline bool ShouldAcceptHitResult(uint16_t pendingHit, HitKnockbackState const& kb, uint16_t seq, bool accepted)
+{
+    if (seq == 0) return false;
+    if (pendingHit != 0 && pendingHit == seq) return true;
+    return accepted && kb.active && kb.hitSequence == seq && !kb.hostConfirmed;
+}
+
 inline void StartHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uint32_t nowMs,
                               float hitDurationSec, float recoverDurationSec,
                               float const anchorPos[3], float const dirXZ[2],

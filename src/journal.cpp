@@ -145,6 +145,14 @@ void Apply(Entity& npc, Death& d)
     ++appliedCount;
     Logf("journal: applied the death of %s (player %u's region): dead=%d", d.name.c_str(), d.by, npc.IsDead() ? 1 : 0);
 }
+
+void SettlePendingDeath(Entity& npc, Death& d, uint32_t now)
+{
+    if (d.applied) return;
+    if (npc.IsDead()) { d.applied = true; return; }
+    if (!d.seenSince) { d.seenSince = now; return; }
+    if (now - d.seenSince >= SettleTime) Apply(npc, d);
+}
 }
 
 void Start() { net::SetDeathHandler(&OnDeath); }
@@ -321,9 +329,7 @@ void Tick()
                 ApplyUnprocessedClientDeath(npc, guid);
                 continue;
             }
-            if (npc.IsDead()) { d.applied = true; continue; }
-            if (!d.seenSince) { d.seenSince = now; continue; }
-            if (now - d.seenSince >= SettleTime) Apply(npc, d);
+            SettlePendingDeath(npc, d, now);
         }
         return;
     }
@@ -363,10 +369,7 @@ void Tick()
         alive[key] = !dead;
         // 2. A recorded death of an NPC this machine now processes.
         if (entry != deaths.end() && dead && entry->second.questPending) { entry->second.questPending = false; CountQuest(npc); }
-        if (entry == deaths.end() || entry->second.applied) continue;
-        if (dead) { entry->second.applied = true; continue; }
-        if (!entry->second.seenSince) { entry->second.seenSince = now; continue; }
-        if (now - entry->second.seenSince >= SettleTime) Apply(npc, entry->second);
+        if (entry != deaths.end()) SettlePendingDeath(npc, entry->second, now);
     }
 }
 

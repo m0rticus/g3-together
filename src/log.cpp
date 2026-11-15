@@ -54,7 +54,7 @@ void Log(const char* text)
     const DWORD start = GetTickCount();
     while (!lock.owns_lock() && GetTickCount() - start < 50) {
         SwitchToThread();
-        lock.try_lock();
+        if (lock.try_lock()) break;
     }
     if (!lock.owns_lock()) {
         EmergencyLog(text);

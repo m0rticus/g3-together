@@ -301,6 +301,50 @@ static void SendReliableProbe(ENetPeer* peer, unsigned char fill, uint32_t seq, 
         enet_peer_send(peer, 1, packet);
 }
 
+static void BuildStressPosePayload(unsigned char (&payload)[1200], bool compressible, uint64_t entityIndex,
+                                   uint32_t sequence, uint64_t nowTicks, uint16_t boneCount, std::mt19937& rng)
+{
+    payload[0] = 39; // MsgPosedNpc: recognized full-hash NPC pose
+    if (!compressible) {
+        for (size_t i = 1; i < sizeof(payload); ++i)
+            payload[i] = static_cast<unsigned char>(rng() & 0xffu);
+        return;
+    }
+    std::memset(payload + 1, 0, sizeof(payload) - 1);
+    const uint64_t key = 0x1000000000000000ULL | (entityIndex + 1);
+    const uint32_t sent = static_cast<uint32_t>(nowTicks & 0xffffffffu);
+    const uint32_t epoch = 1, generation = 1, publication = sequence;
+    std::memcpy(payload + 1, &sequence, 4);
+    std::memcpy(payload + 5, &sent, 4);
+    std::memcpy(payload + 9, &epoch, 4);
+    std::memcpy(payload + 13, &generation, 4);
+    std::memcpy(payload + 17, &publication, 4);
+    payload[21] = 1;
+    payload[22] = 1;
+
+    g3t::net::NpcRecord record{};
+    for (unsigned i = 0; i < 16; ++i)
+        record.guid[i] = static_cast<uint8_t>((key >> (8 * (i & 7))) ^ (i * 37u));
+    record.position[0] = static_cast<float>((entityIndex % 17) * 100.0f);
+    record.position[1] = 0.0f;
+    record.position[2] = static_cast<float>((entityIndex % 29) * 100.0f);
+    record.incarnation = 1;
+    record.partyPlayer = static_cast<uint8_t>((entityIndex % 7) + 1);
+    record.sent = sent;
+    std::memcpy(payload + 23, &record, sizeof(record));
+
+    size_t at = 23 + sizeof(record);
+    std::memcpy(payload + at, &boneCount, 2);
+    at += 2;
+    payload[at++] = 0;
+    payload[at++] = 16;
+    for (uint16_t i = 0; i < boneCount && at + 28 <= sizeof(payload); ++i) {
+        const uint32_t boneName = 0x10000000u + static_cast<uint32_t>(i + 1);
+        std::memcpy(payload + at, &boneName, 4);
+        at += 28;
+    }
+}
+
 struct CallbackObservation
 {
     uint64_t callback504Count = 0;
@@ -508,23 +552,19 @@ extern "C" int __cdecl main(int argc, char** argv)
     typedef int (FAKE_STEAM_CDECL *GetAbiInfo)(FakeSteamAbiInfoV1*, uint32_t);
     typedef int (FAKE_STEAM_CDECL *GetStats)(uint64_t, FakeSteamStatsV1*, uint32_t);
     typedef int (FAKE_STEAM_CDECL *GetConfig)(FakeSteamConfigV1*, uint32_t);
-    auto getAbiInfo = reinterpret_cast<GetAbiInfo>(
-        GetProcAddress(markerModule, "FakeSteam_GetAbiInfoV1"));
-    auto getStatsMarker = reinterpret_cast<GetStats>(
-        GetProcAddress(markerModule, "FakeSteam_GetStatsV1"));
-    auto getConfigMarker = reinterpret_cast<GetConfig>(
-        GetProcAddress(markerModule, "FakeSteam_GetConfigV1"));
+    typedef void (FAKE_STEAM_CDECL *InjectRichJoin)(uint64_t, char const*, uint32_t);
+    auto getAbiInfo = reinterpret_cast<GetAbiInfo>(GetProcAddress(markerModule, "FakeSteam_GetAbiInfoV1"));
+    auto getStatsMarker = reinterpret_cast<GetStats>(GetProcAddress(markerModule, "FakeSteam_GetStatsV1"));
+    auto getConfigMarker = reinterpret_cast<GetConfig>(GetProcAddress(markerModule, "FakeSteam_GetConfigV1"));
+    auto injectRichJoin = reinterpret_cast<InjectRichJoin>(GetProcAddress(markerModule, "FakeSteam_InjectRichJoinV1"));
     if (!getAbiInfo || !getStatsMarker || !getConfigMarker) {
-        std::fprintf(stderr,
-                     "ERROR: G3T_REALISM_FAKE_DLL lacks the required FakeSteam V1 diagnostics exports\n");
+        std::fprintf(stderr, "ERROR: G3T_REALISM_FAKE_DLL lacks the required FakeSteam V1 diagnostics exports\n");
         FreeLibrary(markerModule);
         return 2;
     }
     FakeSteamAbiInfoV1 abi{};
-    if (getAbiInfo(&abi, sizeof(abi)) != 1 ||
-        abi.structBytes != sizeof(abi) || abi.abiVersion != 1 ||
-        abi.steamnetIdentityBytes != 136 || abi.steamnetIdentityIdOffset != 8 ||
-        abi.steamnetMessageSenderOffset != 12) {
+    if (getAbiInfo(&abi, sizeof(abi)) != 1 || abi.structBytes != sizeof(abi) || abi.abiVersion != 1 ||
+        abi.steamnetIdentityBytes != 136 || abi.steamnetIdentityIdOffset != 8 || abi.steamnetMessageSenderOffset != 12) {
         std::fprintf(stderr, "ERROR: G3T_REALISM_FAKE_DLL did not provide the required ABI marker\n");
         FreeLibrary(markerModule);
         return 2;
@@ -534,9 +574,9 @@ extern "C" int __cdecl main(int argc, char** argv)
         FreeLibrary(markerModule);
         return 2;
     }
-
     if (enet_initialize() != 0) {
         std::fprintf(stderr, "ENet initialization failed\n");
+        FreeLibrary(markerModule);
         return 2;
     }
 
@@ -547,8 +587,7 @@ extern "C" int __cdecl main(int argc, char** argv)
     g3t::probeConfig.networkBudgetKib = 256;
     g3t::probeConfig.sendRate = 30;
     std::memcpy(g3t::probeConfig.sessionId, args.session,
-                (std::min)(sizeof(g3t::probeConfig.sessionId) - 1,
-                           std::strlen(args.session)));
+                (std::min)(sizeof(g3t::probeConfig.sessionId) - 1, std::strlen(args.session)));
     g3t::probeConfig.sessionId[sizeof(g3t::probeConfig.sessionId) - 1] = '\0';
     g3t::probeConfig.steamLobby[0] = '\0';
     g3t::probeConfig.steamHost[0] = '\0';
@@ -561,154 +600,82 @@ extern "C" int __cdecl main(int argc, char** argv)
     if (!enet) {
         std::fprintf(stderr, "ENet host failed: %s\n", enetError ? enetError : "unknown");
         enet_deinitialize();
+        FreeLibrary(markerModule);
         return 2;
     }
 
     ENetAddress bound{};
     enet_socket_get_address(enet->socket, &bound);
     const uint16_t enetPort = bound.port ? bound.port : enet->address.port;
+    const bool fakeConfigured = realismFake[0] != '\0';
 
-    char fakeDll[MAX_PATH] = {};
-    GetEnvironmentVariableA("G3T_STEAM_DLL", fakeDll, sizeof(fakeDll));
-    bool fakeConfigured = fakeDll[0] != '\0';
-
-    if (!g3t::steam::Start(args.host, enetPort)) {
+    if (!g3t::steam::Start(args.host, enetPort))
         std::fprintf(stderr, "steam::Start failed: %s\n", g3t::steam::Error());
-    }
     char fakeJoinFriend[128] = {}, fakeJoinConnect[512] = {};
     GetEnvironmentVariableA("G3T_FAKESTEAM_JOIN_FRIEND", fakeJoinFriend, sizeof(fakeJoinFriend));
     GetEnvironmentVariableA("G3T_FAKESTEAM_JOIN_CONNECT", fakeJoinConnect, sizeof(fakeJoinConnect));
-    HMODULE fakeModule = fakeDll[0] ? LoadLibraryExA(fakeDll, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) : nullptr;
-    typedef void (FAKE_STEAM_CDECL *InjectRichJoin)(uint64_t, char const*, uint32_t);
-    InjectRichJoin injectRichJoin = fakeModule
-        ? reinterpret_cast<InjectRichJoin>(GetProcAddress(fakeModule, "FakeSteam_InjectRichJoinV1"))
-        : nullptr;
     bool rejoinInjected = false;
 
     ENetPeer* peer = nullptr;
-    bool enetConnectStarted = false;
-    bool enetConnected = false;
-    bool enetDisconnected = false;
-    uint64_t startedTicks = QpcTicks();
-    uint64_t lobbyEnterTicks = 0, hostLinkTicks = 0, enetConnectTicks = 0;
-    uint32_t linkLostCount = 0, rejoinCount = 0;
-    uint64_t enetConnectCount = 0, steamLinkCount = 0;
-    uint64_t offeredBytes = 0, receivedAppBytes = 0;
-    uint64_t offeredPackets = 0, receivedPackets = 0;
-    uint64_t stressPosePackets = 0;
-    uint64_t stressPoseEntityKeys = 64;
-    uint64_t stressPosePayloadBytes = 1200;
-    uint64_t stressPoseBoneCount = 24;
+    bool enetConnectStarted = false, enetConnected = false, enetDisconnected = false;
+    bool sawLobbyEnter = false, sawHostLink = false, leaveSent = false, sawLinkAtLeastOnce = false, playerProbeSent = false;
+    uint64_t startedTicks = QpcTicks(), lastPollTicks = startedTicks;
+    uint64_t lobbyEnterTicks = 0, hostLinkTicks = 0, enetConnectTicks = 0, stressStartedTicks = 0, recoveryPhaseStartTicks = 0;
+    uint32_t linkLostCount = 0, rejoinCount = 0, rejoinEligibleMs = 0, stressDurationMs = 0, peakOutstanding = 0, rttMaximum = 0;
+    uint64_t enetConnectCount = 0, steamLinkCount = 0, offeredBytes = 0, receivedAppBytes = 0, offeredPackets = 0, receivedPackets = 0;
+    uint64_t stressPosePackets = 0, stressPoseEntityKeys = 64, stressPosePayloadBytes = 1200, stressPoseBoneCount = 24;
     uint64_t exactReliableSent = 0, exactReliableReceived = 0, exactReliableMismatch = 0;
     RttSamples channel0Rtt, channel1Rtt, playerProbeRtt, recoveredCriticalRtt;
     std::vector<uint32_t> enetRtt;
-    uint32_t rttMaximum = 0;
     uint64_t firstNativeConnectHeader = g3t::steam::EnetCommandHeaderSize(ENET_PROTOCOL_COMMAND_CONNECT);
     uint64_t firstNativeVerifyHeader = g3t::steam::EnetCommandHeaderSize(ENET_PROTOCOL_COMMAND_VERIFY_CONNECT);
-    uint64_t connectPackets = 0, verifyPackets = 0;
-    uint64_t nativeOutboundFrames = 0, nativeOutboundCompressedFrames = 0;
+    uint64_t connectPackets = 0, verifyPackets = 0, nativeOutboundFrames = 0, nativeOutboundCompressedFrames = 0;
     uint64_t nativeOutboundConnectFrames = 0, nativeOutboundVerifyFrames = 0;
-    uint64_t nativeOutboundCompressedConnectFrames = 0;
-    uint64_t nativeOutboundCompressedVerifyFrames = 0;
-    uint32_t nativeObservedConnectHeader = 0, nativeObservedVerifyHeader = 0;
-    bool sawLobbyEnter = false;
-    bool sawHostLink = false;
-    bool leaveSent = false;
-    bool sawLinkAtLeastOnce = false;
-    uint32_t rejoinEligibleMs = 0;
-
-    uint64_t stressAccumulated = 0;
-    uint64_t stressSequence = 0;
-    std::mt19937 stressRandom(0x47335431u);
-    uint64_t channel0Sequence = 0, channel1Sequence = 0, exactSequence = 0;
+    uint64_t nativeOutboundCompressedConnectFrames = 0, nativeOutboundCompressedVerifyFrames = 0;
+    uint32_t nativeObservedConnectHeader = 0, nativeObservedVerifyHeader = 0, peakProductQueueAgeMs = 0;
+    uint64_t stressAccumulated = 0, stressSequence = 0, channel0Sequence = 0, channel1Sequence = 0, exactSequence = 0;
     uint64_t lastStressMs = 0, lastChannel1Ms = 0, lastExactMs = 0, lastPlayerProbeMs = 0;
-    bool playerProbeSent = false;
-    uint64_t lastPollTicks = startedTicks;
-    uint64_t stressStartedTicks = 0;
-    uint32_t stressDurationMs = 0;
-    uint64_t recoveryPhaseStartTicks = 0;
-    uint32_t peakOutstanding = 0;
-    std::vector<std::pair<uint32_t, uint64_t>> outstandingSamples;
-    std::vector<std::pair<uint32_t, uint64_t>> productQueueBytesSamples;
-    uint64_t previousPlainQueueBytes = 0, previousWireQueueBytes = 0;
-    uint64_t cumulativePlainQueueBytes = 0, cumulativeWireQueueBytes = 0;
+    std::mt19937 stressRandom(0x47335431u);
+    std::vector<std::pair<uint32_t, uint64_t>> outstandingSamples, productQueueBytesSamples;
+    uint64_t previousPlainQueueBytes = 0, previousWireQueueBytes = 0, cumulativePlainQueueBytes = 0, cumulativeWireQueueBytes = 0;
     size_t peakProductQueueBytes = 0, peakProductQueueDepth = 0;
-    uint32_t peakProductQueueAgeMs = 0;
     g3t::steam::send::Codec nativeCodec;
     std::vector<uint8_t> nativePlain;
     bool startReady = g3t::steam::Ready();
 
     while (true) {
-        const uint64_t nowTicks = QpcTicks();
-        const uint64_t elapsedTicks = nowTicks - startedTicks;
+        const uint64_t nowTicks = QpcTicks(), elapsedTicks = nowTicks - startedTicks;
         const uint32_t elapsedMs = static_cast<uint32_t>(std::min<uint64_t>(elapsedTicks * 1000ULL / static_cast<uint64_t>(QpcFrequency()), UINT32_MAX));
         const uint32_t pollElapsed = static_cast<uint32_t>((nowTicks - lastPollTicks) * 1000ULL / static_cast<uint64_t>(QpcFrequency()));
-
         g3t::steam::Pump();
-
-        const uint64_t lobby = g3t::steam::LobbyId();
-        if (lobby && !sawLobbyEnter) {
-            sawLobbyEnter = true;
-            lobbyEnterTicks = nowTicks;
-        }
-
+        if (g3t::steam::LobbyId() && !sawLobbyEnter) { sawLobbyEnter = true; lobbyEnterTicks = nowTicks; }
         if (args.host) {
-            if (!g3t::steam::LinkedCount())
-                sawHostLink = false;
-            if (g3t::steam::LinkedCount() > 0 && !sawHostLink) {
-                sawHostLink = true;
-                hostLinkTicks = nowTicks;
-                ++steamLinkCount;
-            }
+            if (!g3t::steam::LinkedCount()) sawHostLink = false;
+            if (g3t::steam::LinkedCount() > 0 && !sawHostLink) { sawHostLink = true; hostLinkTicks = nowTicks; ++steamLinkCount; }
         } else if (g3t::steam::HostLinked() && !sawHostLink) {
-            if (sawLinkAtLeastOnce && !recoveryPhaseStartTicks)
-                recoveryPhaseStartTicks = nowTicks;
-            sawHostLink = true;
-            sawLinkAtLeastOnce = true;
-            hostLinkTicks = nowTicks;
-            ++steamLinkCount;
+            if (sawLinkAtLeastOnce && !recoveryPhaseStartTicks) recoveryPhaseStartTicks = nowTicks;
+            sawHostLink = sawLinkAtLeastOnce = true; hostLinkTicks = nowTicks; ++steamLinkCount;
         }
-
         if (!args.host && sawHostLink && !g3t::steam::HostLinked()) {
             ++linkLostCount;
-            if (peer && peer->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_disconnect(peer, 0);
-            }
-            peer = nullptr;
-            enetConnectStarted = false;
-            enetConnected = false;
-            sawHostLink = false;
-            if (rejoinEligibleMs == 0)
-                rejoinEligibleMs = elapsedMs;
+            if (peer && peer->state == ENET_PEER_STATE_CONNECTED) enet_peer_disconnect(peer, 0);
+            peer = nullptr; enetConnectStarted = enetConnected = sawHostLink = false;
+            if (rejoinEligibleMs == 0) rejoinEligibleMs = elapsedMs;
         }
-
-        if (!args.host && g3t::steam::HostLinked() && !enetConnectStarted &&
-            std::strcmp(args.scenario, "metadata") != 0) {
+        if (!args.host && g3t::steam::HostLinked() && !enetConnectStarted && std::strcmp(args.scenario, "metadata") != 0) {
             enetConnectStarted = true;
-            ENetAddress relay{};
-            enet_address_set_host(&relay, "127.0.0.1");
-            relay.port = g3t::steam::RelayPort();
+            ENetAddress relay{}; enet_address_set_host(&relay, "127.0.0.1"); relay.port = g3t::steam::RelayPort();
             peer = enet_host_connect(enet, &relay, 8, 0);
-            if (!peer) {
-                enetConnectStarted = false;
-            }
+            if (!peer) enetConnectStarted = false;
         }
 
         ENetEvent event{};
         if (enet_host_service(enet, &event, 1) > 0) {
             if (event.type == ENET_EVENT_TYPE_CONNECT) {
-                peer = event.peer;
-                enetConnected = true;
-                ++enetConnectCount;
-                if (enetConnectCount >= 2)
-                    recoveryPhaseStartTicks = nowTicks;
-                enetConnectTicks = nowTicks;
-                event.peer->data = reinterpret_cast<void*>(1);
-                if (!stressStartedTicks) {
-                    stressStartedTicks = nowTicks;
-                    stressAccumulated = 0;
-                    lastStressMs = 0;
-                }
+                peer = event.peer; enetConnected = true; ++enetConnectCount;
+                if (enetConnectCount >= 2) recoveryPhaseStartTicks = nowTicks;
+                enetConnectTicks = nowTicks; event.peer->data = reinterpret_cast<void*>(1);
+                if (!stressStartedTicks) { stressStartedTicks = nowTicks; stressAccumulated = 0; lastStressMs = 0; }
             } else if (event.type == ENET_EVENT_TYPE_RECEIVE) {
                 unsigned char const* data = event.packet->data;
                 size_t size = event.packet->dataLength;
@@ -716,62 +683,40 @@ extern "C" int __cdecl main(int argc, char** argv)
                     unsigned char tag = data[0];
                     uint32_t seq = ReadU32(data + 4);
                     uint64_t sent = ReadU64(data + 8);
-                    if (tag == 39) {
-                        if (!args.host) {
-                            ++receivedPackets;
-                            receivedAppBytes += size;
-                        }
-                    } else if (tag == 3 && data[1] == 0xC2) {
-                        if (!args.host) {
-                            unsigned char echo[64] = {};
-                            echo[0] = 3;
-                            echo[1] = 0xC3;
-                            WriteU32(echo + 4, seq);
-                            WriteU64(echo + 8, sent);
-                            ENetPacket* packet = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
-                            if (packet) enet_peer_send(event.peer, 0, packet);
-                        }
-                    } else if (tag == 3 && data[1] == 0xC3) {
-                        if (args.host) playerProbeRtt.Add(sent, nowTicks);
-                    } else if (tag == 0xA1) {
-                        if (size >= 64) {
-                            unsigned char echo[64];
-                            std::memcpy(echo, data, 64);
-                            echo[0] = 0xB1;
-                            ENetPacket* packet = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_RELIABLE);
-                            if (packet) enet_peer_send(event.peer, 1, packet);
-                            channel1Sequence = seq + 1;
-                        }
+                    if (tag == 39 && !args.host) { ++receivedPackets; receivedAppBytes += size; }
+                    else if (tag == 3 && data[1] == 0xC2 && !args.host) {
+                        unsigned char echo[64] = {3, 0xC3};
+                        WriteU32(echo + 4, seq); WriteU64(echo + 8, sent);
+                        if (ENetPacket* pkt = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT))
+                            enet_peer_send(event.peer, 0, pkt);
+                    } else if (tag == 3 && data[1] == 0xC3 && args.host) playerProbeRtt.Add(sent, nowTicks);
+                    else if (tag == 0xA1 && size >= 64) {
+                        unsigned char echo[64]; std::memcpy(echo, data, 64); echo[0] = 0xB1;
+                        if (ENetPacket* pkt = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_RELIABLE))
+                            enet_peer_send(event.peer, 1, pkt);
+                        channel1Sequence = seq + 1;
                     } else if (tag == 0xB1) {
                         channel1Rtt.Add(sent, nowTicks);
-                        if (recoveryPhaseStartTicks && sent >= recoveryPhaseStartTicks)
-                            recoveredCriticalRtt.Add(sent, nowTicks);
+                        if (recoveryPhaseStartTicks && sent >= recoveryPhaseStartTicks) recoveredCriticalRtt.Add(sent, nowTicks);
                     } else if (tag == 0xD1 || tag == 0xD2) {
                         if (tag == 0xD1) {
                             unsigned char echo[256] = {};
                             if (size >= sizeof(echo)) std::memcpy(echo, data, sizeof(echo));
                             echo[0] = 0xD2;
-                            if (ENetPacket* packet = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_RELIABLE))
-                                enet_peer_send(event.peer, 1, packet);
+                            if (ENetPacket* pkt = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_RELIABLE))
+                                enet_peer_send(event.peer, 1, pkt);
                         }
                         if (((tag == 0xD1 && !args.host) || (tag == 0xD2 && args.host)) && size >= 256) {
                             ++exactReliableReceived;
-                            unsigned char expected[256];
-                            BuildExactPayload(expected, tag, seq, sent);
-                            if (std::memcmp(expected, data, sizeof(expected)) != 0)
-                                ++exactReliableMismatch;
+                            unsigned char expected[256]; BuildExactPayload(expected, tag, seq, sent);
+                            if (std::memcmp(expected, data, sizeof(expected)) != 0) ++exactReliableMismatch;
                         }
                     }
                 }
                 enet_packet_destroy(event.packet);
             } else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
-                enetDisconnected = true;
-                ++linkLostCount;
-                if (peer == event.peer) {
-                    peer = nullptr;
-                    enetConnectStarted = false;
-                    enetConnected = false;
-                }
+                enetDisconnected = true; ++linkLostCount;
+                if (peer == event.peer) { peer = nullptr; enetConnectStarted = enetConnected = false; }
             }
         }
         enet_host_flush(enet);
@@ -816,81 +761,12 @@ extern "C" int __cdecl main(int argc, char** argv)
                     stressAccumulated += args.appBps * delta;
                     while (stressAccumulated >= 1200u * 1000u) {
                         unsigned char payload[1200];
-                        std::memset(payload, 0, sizeof(payload));
-
-                    const uint64_t entityIndex =
-                        (stressSequence++ % stressPoseEntityKeys);
-                    uint64_t key = 0x1000000000000000ULL |
-                                   (entityIndex + 1);
-
-                    payload[0] = 39; // MsgPosedNpc: recognized full-hash NPC pose
-                    uint32_t sequence = static_cast<uint32_t>(++channel0Sequence);
-                    uint32_t sent = static_cast<uint32_t>(nowTicks & 0xffffffffu);
-                    uint32_t epoch = 1;
-                    uint32_t generation = 1;
-                    uint32_t publication = sequence;
-                    std::memcpy(payload + 1, &sequence, 4);
-                    std::memcpy(payload + 5, &sent, 4);
-                    std::memcpy(payload + 9, &epoch, 4);
-                    std::memcpy(payload + 13, &generation, 4);
-                    std::memcpy(payload + 17, &publication, 4);
-                    payload[21] = 1;
-                    payload[22] = 1;
-
-                    g3t::net::NpcRecord record{};
-                    for (unsigned i = 0; i < 16; ++i)
-                        record.guid[i] = static_cast<uint8_t>(
-                            (key >> (8 * (i & 7))) ^ (i * 37u));
-                    record.position[0] = static_cast<float>(
-                        (entityIndex % 17) * 100.0f);
-                    record.position[1] = 0.0f;
-                    record.position[2] = static_cast<float>(
-                        (entityIndex % 29) * 100.0f);
-                    record.flags = 0;
-                    record.incarnation = 1;
-                    record.partyPlayer = static_cast<uint8_t>(
-                        (entityIndex % 7) + 1);
-                    record.sent = sent;
-
-                    std::memcpy(payload + 23, &record, sizeof(record));
-                    size_t at = 23 + sizeof(record);
-                    uint16_t boneCount = static_cast<uint16_t>(stressPoseBoneCount);
-                    std::memcpy(payload + at, &boneCount, 2);
-                    at += 2;
-                    payload[at++] = 0; // pose flags
-                    payload[at++] = 16; // intervalMs
-
-                    for (uint16_t i = 0; i < boneCount && at + 28 <= sizeof(payload); ++i) {
-                        uint32_t boneName = 0x10000000u +
-                                            static_cast<uint32_t>(i + 1);
-                        std::memcpy(payload + at, &boneName, 4);
-                        at += 4;
-                        for (int k = 0; k < 12; ++k) {
-                            int16_t value = 0;
-                            if (std::strcmp(args.profile, "compressible") != 0) {
-                                value = static_cast<int16_t>(
-                                    stressRandom() & 0xffffu);
-                            }
-                            std::memcpy(payload + at, &value, 2);
-                            at += 2;
-                        }
-                    }
-
-                    for (; at < sizeof(payload); ++at) {
-                        if (std::strcmp(args.profile, "compressible") == 0)
-                            payload[at] = 0;
-                        else {
-                            payload[at] = static_cast<unsigned char>(
-                                stressRandom() & 0xffu);
-                        }
-                    }
-                    if (std::strcmp(args.profile, "compressible") != 0) {
-                        for (size_t i = 1; i < sizeof(payload); ++i)
-                            payload[i] = static_cast<unsigned char>(
-                                stressRandom() & 0xffu);
-                    }
-                    ENetPacket* packet = enet_packet_create(payload, sizeof(payload),
-                                                           ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
+                        BuildStressPosePayload(payload, std::strcmp(args.profile, "compressible") == 0,
+                                               stressSequence++ % stressPoseEntityKeys,
+                                               static_cast<uint32_t>(++channel0Sequence), nowTicks,
+                                               static_cast<uint16_t>(stressPoseBoneCount), stressRandom);
+                        ENetPacket* packet = enet_packet_create(payload, sizeof(payload),
+                                                                ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
                         if (packet && enet_peer_send(peer, 4, packet) == 0) {
                             ++offeredPackets;
                             ++stressPosePackets;
@@ -903,20 +779,16 @@ extern "C" int __cdecl main(int argc, char** argv)
                 if (!playerProbeSent || nowMs - lastPlayerProbeMs >= 500) {
                     playerProbeSent = true;
                     lastPlayerProbeMs = static_cast<uint32_t>(nowMs);
-                    unsigned char payload[120] = {};
-                    payload[0] = 3;
-                    payload[1] = 0xC2;
+                    unsigned char payload[120] = {3, 0xC2};
                     WriteU32(payload + 4, static_cast<uint32_t>(++channel0Sequence));
                     WriteU64(payload + 8, nowTicks);
                     if (ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT))
                         enet_peer_send(peer, 0, packet);
                 }
-
                 if (nowMs - lastChannel1Ms >= 100) {
                     lastChannel1Ms = nowMs;
                     SendReliableProbe(peer, 0x31, static_cast<uint32_t>(++channel1Sequence), nowTicks);
                 }
-
                 if (nowMs - lastExactMs >= 500) {
                     lastExactMs = nowMs;
                     unsigned char payload[256];
@@ -927,58 +799,39 @@ extern "C" int __cdecl main(int argc, char** argv)
                     }
                 }
             }
-
             if (!args.host && pollElapsed >= 1 && elapsedMs - lastChannel1Ms >= 100) {
                 lastChannel1Ms = elapsedMs;
                 SendReliableProbe(peer, 0x32, static_cast<uint32_t>(++channel1Sequence), nowTicks);
             }
         }
-
         if (peer && args.leaveMs && elapsedMs >= args.leaveMs && !leaveSent) {
             leaveSent = true;
             g3t::steam::RequestClientDisconnect();
             enet_peer_disconnect(peer, 0);
         }
-        const bool recoveryScenario =
-            std::strcmp(args.scenario, "rejoin") == 0 ||
-            std::strcmp(args.scenario, "bad") == 0;
-        const uint32_t recoveryDelayMs =
-            std::strcmp(args.scenario, "bad") == 0 ? 3500 : 1000;
-        if (!args.host && recoveryScenario &&
-            rejoinEligibleMs &&
-            elapsedMs >= rejoinEligibleMs + recoveryDelayMs &&
-            !rejoinInjected && injectRichJoin &&
-            fakeJoinFriend[0] && fakeJoinConnect[0]) {
+        const bool recoveryScenario = std::strcmp(args.scenario, "rejoin") == 0 || std::strcmp(args.scenario, "bad") == 0;
+        const uint32_t recoveryDelayMs = std::strcmp(args.scenario, "bad") == 0 ? 3500 : 1000;
+        if (!args.host && recoveryScenario && rejoinEligibleMs && elapsedMs >= rejoinEligibleMs + recoveryDelayMs &&
+            !rejoinInjected && injectRichJoin && fakeJoinFriend[0] && fakeJoinConnect[0]) {
             injectRichJoin(std::strtoull(fakeJoinFriend, nullptr, 10), fakeJoinConnect, 0);
             rejoinInjected = true;
             ++rejoinCount;
             recoveryPhaseStartTicks = nowTicks;
         }
-
         const uint64_t outstanding = offeredBytes > receivedAppBytes ? offeredBytes - receivedAppBytes : 0;
         if (outstanding > peakOutstanding) peakOutstanding = static_cast<uint32_t>(std::min<uint64_t>(outstanding, UINT32_MAX));
         if (outstandingSamples.empty() || elapsedMs - outstandingSamples.back().first >= 100)
             outstandingSamples.push_back({elapsedMs, outstanding});
-
-        if (productQueueBytesSamples.empty() ||
-            elapsedMs - productQueueBytesSamples.back().first >= 100) {
+        if (productQueueBytesSamples.empty() || elapsedMs - productQueueBytesSamples.back().first >= 100) {
             ProductQueueSnapshot queue = ReadProductQueue();
             peakProductQueueBytes = (std::max)(peakProductQueueBytes, queue.peakBytes);
             peakProductQueueDepth = (std::max)(peakProductQueueDepth, queue.peakDepth);
             peakProductQueueAgeMs = (std::max)(peakProductQueueAgeMs, queue.peakAgeMs);
-            if (queue.plainBytes >= previousPlainQueueBytes)
-                cumulativePlainQueueBytes += queue.plainBytes - previousPlainQueueBytes;
-            else
-                cumulativePlainQueueBytes += queue.plainBytes;
-            if (queue.wireBytes >= previousWireQueueBytes)
-                cumulativeWireQueueBytes += queue.wireBytes - previousWireQueueBytes;
-            else
-                cumulativeWireQueueBytes += queue.wireBytes;
+            cumulativePlainQueueBytes += queue.plainBytes >= previousPlainQueueBytes ? queue.plainBytes - previousPlainQueueBytes : queue.plainBytes;
+            cumulativeWireQueueBytes += queue.wireBytes >= previousWireQueueBytes ? queue.wireBytes - previousWireQueueBytes : queue.wireBytes;
             previousPlainQueueBytes = queue.plainBytes;
             previousWireQueueBytes = queue.wireBytes;
-            if (productQueueBytesSamples.empty() ||
-                elapsedMs - productQueueBytesSamples.back().first >= 100)
-                productQueueBytesSamples.push_back({elapsedMs, queue.bytes});
+            productQueueBytesSamples.push_back({elapsedMs, queue.bytes});
         }
 
         const uint64_t activeTicks = stressStartedTicks ? nowTicks - stressStartedTicks : elapsedTicks;
@@ -1024,59 +877,31 @@ extern "C" int __cdecl main(int argc, char** argv)
 
     FakeSteamStatsV1 fakeStats{};
     FakeSteamConfigV1 fakeConfig{};
-    bool fakeStatsAvailable = false;
-    bool fakeConfigAvailable = false;
-    int fakeStatsAbiReturn = -1;
-    int fakeConfigAbiReturn = -1;
-    if (markerModule) {
-        typedef int (FAKE_STEAM_CDECL *GetStatsV1)(uint64_t, FakeSteamStatsV1*, uint32_t);
-        typedef int (FAKE_STEAM_CDECL *GetConfigV1)(FakeSteamConfigV1*, uint32_t);
-        auto getStats = reinterpret_cast<GetStatsV1>(
-            GetProcAddress(markerModule, "FakeSteam_GetStatsV1"));
-        auto getConfig = reinterpret_cast<GetConfigV1>(
-            GetProcAddress(markerModule, "FakeSteam_GetConfigV1"));
-        if (getStats &&
-            (fakeStatsAbiReturn = getStats(0, &fakeStats, sizeof(fakeStats))) == 1 &&
-            fakeStats.abiVersion == 1 &&
-            fakeStats.structBytes == sizeof(fakeStats))
-            fakeStatsAvailable = true;
-        if (getConfig &&
-            (fakeConfigAbiReturn = getConfig(&fakeConfig, sizeof(fakeConfig))) == 1 &&
-            fakeConfig.abiVersion == 1 &&
-            fakeConfig.structBytes == sizeof(fakeConfig))
-            fakeConfigAvailable = true;
-    }
+    const int fakeStatsAbiReturn = getStatsMarker ? getStatsMarker(0, &fakeStats, sizeof(fakeStats)) : -1;
+    const int fakeConfigAbiReturn = getConfigMarker ? getConfigMarker(&fakeConfig, sizeof(fakeConfig)) : -1;
+    const bool fakeStatsAvailable = fakeStatsAbiReturn == 1 && fakeStats.abiVersion == 1 && fakeStats.structBytes == sizeof(fakeStats);
+    const bool fakeConfigAvailable = fakeConfigAbiReturn == 1 && fakeConfig.abiVersion == 1 && fakeConfig.structBytes == sizeof(fakeConfig);
     const uint32_t finalLinkedCount = g3t::steam::LinkedCount();
     const int finalPing = g3t::steam::Ping();
     const std::string finalError = g3t::steam::Error();
     g3t::steam::Stop();
     enet_host_destroy(enet);
     enet_deinitialize();
-    if (fakeModule) FreeLibrary(fakeModule);
-    if (markerModule) FreeLibrary(markerModule);
+    FreeLibrary(markerModule);
 
     const uint64_t runSeconds = args.seconds;
+    const bool isCompressible = std::strcmp(args.profile, "compressible") == 0;
     std::ostringstream json;
-    json << '{'
-         << "\"schema\":1"
-         << ",\"role\":\"" << JsonEscape(args.role) << '\"'
-         << ",\"profile\":\"" << JsonEscape(args.profile) << '\"'
-         << ",\"source_root\":\"" << JsonEscape(args.sourceRoot) << '\"'
-         << ",\"session\":\"" << JsonEscape(args.session) << '\"'
-         << ",\"seconds\":" << runSeconds
-         << ",\"app_bps_requested\":" << args.appBps
+    json << "{\"schema\":1,\"role\":\"" << JsonEscape(args.role) << "\",\"profile\":\"" << JsonEscape(args.profile)
+         << "\",\"source_root\":\"" << JsonEscape(args.sourceRoot) << "\",\"session\":\"" << JsonEscape(args.session)
+         << "\",\"seconds\":" << runSeconds << ",\"app_bps_requested\":" << args.appBps
          << ",\"physical_bps_requested\":" << args.physicalBps
          << ",\"stress_offer_started\":" << (stressStartedTicks ? "true" : "false")
          << ",\"stress_offer_duration_ms\":" << stressDurationMs
-         << ",\"stress_offer_bps_observed\":" << (stressDurationMs
-             ? static_cast<uint64_t>(offeredBytes * 1000ULL / stressDurationMs)
-             : 0ULL)
-         << ",\"host_id\":" << args.hostId
-         << ",\"client_id\":" << args.clientId
-         << ",\"seeded_bypass\":" << (args.seeded ? "true" : "false")
-         << ",\"enet_port\":" << enetPort
-         << ",\"fake_configured\":" << (fakeConfigured ? "true" : "false")
-         << ",\"ready\":" << (startReady ? "true" : "false")
+         << ",\"stress_offer_bps_observed\":" << (stressDurationMs ? static_cast<uint64_t>(offeredBytes * 1000ULL / stressDurationMs) : 0ULL)
+         << ",\"host_id\":" << args.hostId << ",\"client_id\":" << args.clientId
+         << ",\"seeded_bypass\":" << (args.seeded ? "true" : "false") << ",\"enet_port\":" << enetPort
+         << ",\"fake_configured\":" << (fakeConfigured ? "true" : "false") << ",\"ready\":" << (startReady ? "true" : "false")
          << ",\"lobby_enter_observed\":" << (sawLobbyEnter ? "true" : "false")
          << ",\"host_link_observed\":" << (sawHostLink ? "true" : "false")
          << ",\"lobby_enter_ms\":" << (sawLobbyEnter ? TicksMs(lobbyEnterTicks - startedTicks) : 0.0)
@@ -1084,8 +909,7 @@ extern "C" int __cdecl main(int argc, char** argv)
          << ",\"lobby_to_link_ms\":" << lobbyDelayMs
          << ",\"callback504_count_actual\":" << callbackSnapshot.callback504Count
          << ",\"callback504_lobby\":" << callbackSnapshot.callback504Lobby
-         << ",\"callback504_delivered_ms\":" << (callbackSnapshot.callback504Ticks
-             ? TicksMs(callbackSnapshot.callback504Ticks - startedTicks) : 0.0)
+         << ",\"callback504_delivered_ms\":" << (callbackSnapshot.callback504Ticks ? TicksMs(callbackSnapshot.callback504Ticks - startedTicks) : 0.0)
          << ",\"callback504_tag_empty\":" << (callbackSnapshot.callback504TagEmpty ? "true" : "false")
          << ",\"callback504_session_empty\":" << (callbackSnapshot.callback504SessionEmpty ? "true" : "false")
          << ",\"callback504_tag\":\"" << JsonEscape(callbackSnapshot.callback504Tag) << '\"'
@@ -1093,24 +917,16 @@ extern "C" int __cdecl main(int argc, char** argv)
          << ",\"callback505_count_actual\":" << callbackSnapshot.callback505Count
          << ",\"session_failed_callbacks\":" << callbackSnapshot.callback1252Count
          << ",\"lobby_enter_callback_observed\":" << (callbackSnapshot.callback504Count > 0 ? "true" : "false")
-         << ",\"metadata_empty_at_lobby_enter\":" << (callbackSnapshot.callback504Count > 0 &&
-                                                         callbackSnapshot.callback504TagEmpty &&
-                                                         callbackSnapshot.callback504SessionEmpty ? "true" : "false")
+         << ",\"metadata_empty_at_lobby_enter\":" << (callbackSnapshot.callback504Count > 0 && callbackSnapshot.callback504TagEmpty && callbackSnapshot.callback504SessionEmpty ? "true" : "false")
          << ",\"metadata_update_callback_observed\":" << (callbackSnapshot.callback505Count > 0 ? "true" : "false")
-         << ",\"enet_connect_count\":" << enetConnectCount
-         << ",\"steam_link_count\":" << steamLinkCount
+         << ",\"enet_connect_count\":" << enetConnectCount << ",\"steam_link_count\":" << steamLinkCount
          << ",\"recovered_echo_samples\":" << recoveredCriticalRtt.values.size()
-         << ",\"enet_connected\":" << (enetConnected ? "true" : "false")
-         << ",\"enet_connect_ms\":" << enetConnectMs
-         << ",\"enet_disconnected\":" << (enetDisconnected ? "true" : "false")
-         << ",\"linked_count\":" << finalLinkedCount
-         << ",\"steam_ping_ms\":" << finalPing
-         << ",\"link_lost_count\":" << linkLostCount
-         << ",\"rejoin_count\":" << rejoinCount
+         << ",\"enet_connected\":" << (enetConnected ? "true" : "false") << ",\"enet_connect_ms\":" << enetConnectMs
+         << ",\"enet_disconnected\":" << (enetDisconnected ? "true" : "false") << ",\"linked_count\":" << finalLinkedCount
+         << ",\"steam_ping_ms\":" << finalPing << ",\"link_lost_count\":" << linkLostCount << ",\"rejoin_count\":" << rejoinCount
          << ",\"native_connect_header_size\":" << firstNativeConnectHeader
          << ",\"native_verify_header_size\":" << firstNativeVerifyHeader
-         << ",\"connect_packets_observed\":" << connectPackets
-         << ",\"verify_packets_observed\":" << verifyPackets
+         << ",\"connect_packets_observed\":" << connectPackets << ",\"verify_packets_observed\":" << verifyPackets
          << ",\"native_outbound_frames\":" << nativeOutboundFrames
          << ",\"native_outbound_compressed_frames\":" << nativeOutboundCompressedFrames
          << ",\"native_outbound_connect_frames\":" << nativeOutboundConnectFrames
@@ -1119,27 +935,17 @@ extern "C" int __cdecl main(int argc, char** argv)
          << ",\"native_outbound_compressed_verify_frames\":" << nativeOutboundCompressedVerifyFrames
          << ",\"native_observed_connect_header\":" << nativeObservedConnectHeader
          << ",\"native_observed_verify_header\":" << nativeObservedVerifyHeader
-         << ",\"channel0_app_offered_bytes\":" << offeredBytes
-         << ",\"channel0_app_received_bytes\":" << receivedAppBytes
-         << ",\"channel0_app_offered_packets\":" << offeredPackets
-         << ",\"channel0_app_received_packets\":" << receivedPackets
-         << ",\"stress_pose_packets\":" << stressPosePackets
-         << ",\"stress_pose_opcode\":" << 39
-         << ",\"stress_pose_layout\":\""
-         << (std::strcmp(args.profile, "compressible") == 0
-                 ? "full-hash-NpcRecord" : "opaque-pose-priority-load")
-         << "\""
-         << ",\"stress_pose_channel\":" << 4
-         << ",\"stress_pose_entity_population\":"
-         << (std::strcmp(args.profile, "compressible") == 0 ? stressPoseEntityKeys : 0)
-         << ",\"stress_pose_bone_count\":"
-         << (std::strcmp(args.profile, "compressible") == 0 ? stressPoseBoneCount : 0)
+         << ",\"channel0_app_offered_bytes\":" << offeredBytes << ",\"channel0_app_received_bytes\":" << receivedAppBytes
+         << ",\"channel0_app_offered_packets\":" << offeredPackets << ",\"channel0_app_received_packets\":" << receivedPackets
+         << ",\"stress_pose_packets\":" << stressPosePackets << ",\"stress_pose_opcode\":39"
+         << ",\"stress_pose_layout\":\"" << (isCompressible ? "full-hash-NpcRecord" : "opaque-pose-priority-load") << "\""
+         << ",\"stress_pose_channel\":4,\"stress_pose_entity_population\":" << (isCompressible ? stressPoseEntityKeys : 0)
+         << ",\"stress_pose_bone_count\":" << (isCompressible ? stressPoseBoneCount : 0)
          << ",\"stress_pose_payload_bytes\":" << stressPosePayloadBytes
          << ",\"channel0_outstanding_bytes\":" << (offeredBytes > receivedAppBytes ? offeredBytes - receivedAppBytes : 0)
          << ",\"channel0_peak_outstanding_bytes\":" << peakOutstanding
          << ",\"channel0_outstanding_slope_bytes_per_second\":" << slope
-         << ",\"product_queue_bytes\":" << finalQueue.bytes
-         << ",\"product_queue_depth\":" << finalQueue.depth
+         << ",\"product_queue_bytes\":" << finalQueue.bytes << ",\"product_queue_depth\":" << finalQueue.depth
          << ",\"product_queue_oldest_ms\":" << finalQueue.oldestMs
          << ",\"product_queue_peak_bytes\":" << peakProductQueueBytes
          << ",\"product_queue_peak_depth\":" << peakProductQueueDepth
@@ -1148,18 +954,13 @@ extern "C" int __cdecl main(int argc, char** argv)
          << ",\"exact_reliable_payloads_sent\":" << exactReliableSent
          << ",\"exact_reliable_payloads_received\":" << exactReliableReceived
          << ",\"exact_reliable_payload_mismatch\":" << exactReliableMismatch
-         << ",\"rtt_enet_p50_ms\":" << Percentile(enetRtt, 0.50)
-         << ",\"rtt_enet_p95_ms\":" << Percentile(enetRtt, 0.95)
-         << ",\"rtt_enet_max_ms\":" << rttMaximum
-         << ",\"rtt_enet_samples\":" << enetRtt.size()
-         << ',' << channel0Rtt.Json("channel0_echo")
-         << ',' << channel1Rtt.Json("channel1_echo")
+         << ",\"rtt_enet_p50_ms\":" << Percentile(enetRtt, 0.50) << ",\"rtt_enet_p95_ms\":" << Percentile(enetRtt, 0.95)
+         << ",\"rtt_enet_max_ms\":" << rttMaximum << ",\"rtt_enet_samples\":" << enetRtt.size()
+         << ',' << channel0Rtt.Json("channel0_echo") << ',' << channel1Rtt.Json("channel1_echo")
          << ',' << playerProbeRtt.Json("player_opcode3_echo")
-         << ",\"steam_plain_tx_bytes\":" << plainTx
-         << ",\"steam_wire_tx_bytes\":" << wireTx
+         << ",\"steam_plain_tx_bytes\":" << plainTx << ",\"steam_wire_tx_bytes\":" << wireTx
          << ",\"compression_ratio_plain_over_wire\":" << compressionRatio
-         << ",\"steam_tx_datagrams\":" << traffic.txDatagrams
-         << ",\"steam_rx_datagrams\":" << traffic.rxDatagrams
+         << ",\"steam_tx_datagrams\":" << traffic.txDatagrams << ",\"steam_rx_datagrams\":" << traffic.rxDatagrams
          << ",\"fake_stats_available\":" << (fakeStatsAvailable ? "true" : "false")
          << ",\"fake_stats_abi_return\":" << fakeStatsAbiReturn
          << ",\"fake_stats_struct_bytes_received\":" << fakeStats.structBytes
@@ -1171,10 +972,8 @@ extern "C" int __cdecl main(int argc, char** argv)
          << ",\"fake_config_struct_bytes_received\":" << fakeConfig.structBytes
          << ",\"fake_config_struct_bytes_expected\":" << sizeof(fakeConfig)
          << ",\"fake_config\":" << (fakeConfigAvailable ? FakeConfigJson(fakeConfig) : "{\"available\":false}")
-         << ",\"sampled_before_stop\":true"
-         << ",\"queue_sample_thread\":\"production-worker-before-native-wait\""
-         << ",\"error\":\"" << JsonEscape(finalError.c_str()) << '\"'
-         << '}';
+         << ",\"sampled_before_stop\":true,\"queue_sample_thread\":\"production-worker-before-native-wait\""
+         << ",\"error\":\"" << JsonEscape(finalError.c_str()) << "\"}";
 
     if (args.out[0]) {
         std::ofstream file(args.out, std::ios::binary | std::ios::trunc);

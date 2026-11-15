@@ -157,9 +157,7 @@ void Tick()
     scanned = every != nullptr;
     for (GEU16 i = 0; every && i < every->GetCount(); ++i) {
         eCEntity* entity = every->GetAt(i);
-        if (!entity || (!entity->GetPropertySet(eEPropertySetType_Door) && !entity->GetPropertySet(eEPropertySetType_Lock))) continue;
-        if (entity->GetPropertySet(eEPropertySetType_NPC) || entity->GetPropertySet(eEPropertySetType_Item)) continue;
-        if (containers::IsPersonalInventory(entity)) continue;
+        if (!Shared(entity)) continue;
         ++count;
         uint8_t guid[16];
         GuidOf(entity, guid);
@@ -247,8 +245,10 @@ void OnState(uint8_t from, net::WorldState const& s)
     wanted[key] = want;
     if (s.npcClass & Baseline) { baselines.insert(key); requested.erase(key); }
     seen[key] = want;  // so that applying it is not taken for a change made here
-    if (net::IsHost()) changed[key] = want;
-    if (net::IsHost()) net::SendWorldState(s, from);
+    if (net::IsHost()) {
+        changed[key] = want;
+        net::SendWorldState(s, from);
+    }
 }
 
 void OnWorldChange()

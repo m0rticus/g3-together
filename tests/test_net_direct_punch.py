@@ -26,6 +26,7 @@ NET_SEPARATE_UNITS = tuple(
         "src/net.cpp",
         "src/net_direct.cpp",
         "src/net_session.cpp",
+        "src/net_metrics.cpp",
         "src/net_npc.cpp",
         "src/net_npc_pose.cpp",
         "src/net_messages.cpp",

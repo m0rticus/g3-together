@@ -36,12 +36,17 @@ TOUCHED_SRC_FILES = (
     "infocmd.cpp",
     "infocmd_progression.cpp",
     "infocmd_sector.cpp",
+    "infocmd_qa.cpp",
     "guide.h",
     "guide.cpp",
     "story_internal.h",
     "story.cpp",
     "story_domains.cpp",
     "story_qa.cpp",
+    "trade_policy.h",
+    "trade_internal.h",
+    "trade.cpp",
+    "trade_qa.cpp",
 )
 
 
@@ -64,9 +69,11 @@ class TalkAndGuidePolicyTests(unittest.TestCase):
         self.assertNotIn("nextLook", talk)
 
         # Release on EndTalk erases the hold BEFORE ContinueRoutine so newly started guides see !talk::IsHeld.
+        erase_helper = talk[talk.index("EraseAndReleaseHold("):talk.index("bool PlayHeldGesture(")]
+        self.assertLess(erase_helper.index("holds.erase(it)"), erase_helper.index("Release(ended)"))
         on_talk = talk[talk.index("void OnTalk("):talk.index("void Start()")]
         end_branch = on_talk[on_talk.index("} else if (it != holds.end()"):]
-        self.assertLess(end_branch.index("holds.erase(it)"), end_branch.index("Release(ended)"))
+        self.assertIn("EraseAndReleaseHold(it)", end_branch)
 
         # Routine and Script hooks suppress Acting player spoofing while held in talk, and Play forwards slot-0 partner motions
         # while allowing local gesture/facial/facing animation on the client's active dialogue partner without Replay fighting it.
@@ -82,9 +89,11 @@ class TalkAndGuidePolicyTests(unittest.TestCase):
         self.assertIn("talk_policy::PuppetRoutineTask(true, held, false, body::IdleTask())", remote)
         self.assertIn("talk_policy::PuppetRoutineTask(false, held, holdingTalk, body::IdleTask())", remote)
 
-        # talk.cpp tracks active client dialog by GUID across frames, re-syncs SendTalk across WelcomeSerial, and checks AssessTalk symmetrically.
+        # talk.cpp tracks active client dialog by GUID across frames, gates MsgTalk on net::Connected(),
+        # re-syncs SendTalk across WelcomeSerial, and checks AssessTalk symmetrically.
         self.assertNotIn("talkingWith", talk)
-        self.assertIn("talkingWelcome != net::WelcomeSerial()", talk)
+        self.assertNotIn("net::Joined()", talk)
+        self.assertIn("talk_policy::ShouldSendClientTalkHold(connected, talkHoldSent, talkingWelcome, net::WelcomeSerial())", talk)
         self.assertIn("HoldOf(addressedNpc)", talk)
 
         # Host routes WorldState kind 15 to talk::OnGesture without broadcasting it as an authoritative snapshot.

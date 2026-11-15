@@ -153,12 +153,16 @@ inline constexpr int P2PVirtualPort = 1;
 inline constexpr int LaneCount = 4;
 inline constexpr int LobbyFriendsOnly = 1;
 inline constexpr int FriendFlagImmediate = 4;
+inline constexpr int FriendRelationshipFriend = 3;
+inline constexpr int SteamIdentityBytes = 136;
+inline constexpr uint32_t LobbyEnterResponseSuccess = 1u;
+inline constexpr uint32_t LobbyChatMemberLeftMask = 0x1eu;
 inline constexpr uint32_t GothicAppId = 39500;
 inline constexpr char LobbyTag[] = "g3together";
 inline constexpr char LobbyVersion[] = "3";
 
 #pragma pack(push, 8)
-struct OutboundSocketMessage
+struct SteamNetworkingMessage
 {
     void* data = nullptr;
     int32_t size = 0;
@@ -175,14 +179,23 @@ struct OutboundSocketMessage
     uint16_t lane = 0;
     uint16_t pad = 0;
 };
+using OutboundSocketMessage = SteamNetworkingMessage;
 static_assert(sizeof(void*) != 4 ||
-              (offsetof(OutboundSocketMessage, data) == 0 &&
-               offsetof(OutboundSocketMessage, size) == 4 &&
-               offsetof(OutboundSocketMessage, identityPeer) == 12 &&
-               offsetof(OutboundSocketMessage, release) == 0xb4 &&
-               offsetof(OutboundSocketMessage, flags) == 0xbc &&
-               offsetof(OutboundSocketMessage, lane) == 0xc8),
+              (offsetof(SteamNetworkingMessage, data) == 0 &&
+               offsetof(SteamNetworkingMessage, size) == 4 &&
+               offsetof(SteamNetworkingMessage, identityPeer) == 12 &&
+               offsetof(SteamNetworkingMessage, release) == 0xb4 &&
+               offsetof(SteamNetworkingMessage, flags) == 0xbc &&
+               offsetof(SteamNetworkingMessage, lane) == 0xc8),
               "SteamNetworkingMessage_t 32-bit ABI mismatch");
+
+struct RichJoinRequestedParam
+{
+    u64 friendId = 0;
+    char connect[256] = {};
+};
+static_assert(offsetof(RichJoinRequestedParam, connect) == 8,
+              "GameRichPresenceJoinRequested_t ABI mismatch");
 
 struct DispatchCallbackMsg
 {

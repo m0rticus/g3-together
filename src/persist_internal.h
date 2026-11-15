@@ -115,7 +115,7 @@ extern std::string lastSave, lastLoad, campaign, loading;
 extern std::string hookFailure, pupDigestHex;
 extern uint8_t localKind;
 extern bool newWorld, ownCharacterReady, needsNewHero, restoreFailed;
-extern bool freshLocalHero, resetLocalWorld;
+extern bool resetLocalWorld;
 extern rejoin::State clientRejoin;
 extern NewGameCommandFn originalNewGameCommand;
 extern NewGameFn originalNewGame;

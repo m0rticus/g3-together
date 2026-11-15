@@ -55,7 +55,7 @@ void CopyRemoteStackWords(uintptr_t esp, uintptr_t (&words)[256], unsigned& coun
     }
 }
 
-bool SampleThreadStack(DWORD id, ThreadSample& sample)
+bool SampleThreadStack(DWORD id, ThreadSample& sample, bool captureEbp)
 {
     sample = ThreadSample{};
     HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id);
@@ -75,6 +75,16 @@ bool SampleThreadStack(DWORD id, ThreadSample& sample)
         sample.esp = context.Esp;
         sample.ebp = context.Ebp;
         CopyRemoteStackWords(sample.esp, sample.words, sample.count);
+        if (captureEbp) {
+            uintptr_t ebp = sample.ebp;
+            for (unsigned i = 0; i < 32 && ebp; ++i) {
+                uintptr_t pair[2] = {};
+                if (!ReadMemory(ebp, pair, sizeof(pair)) || !pair[1]) break;
+                sample.ebpFrames[sample.ebpCount++] = pair[1];
+                if (!pair[0] || pair[0] == ebp) break;
+                ebp = pair[0];
+            }
+        }
         sample.ok = true;
     } else sample.contextError = GetLastError();
     sample.resumed = ResumeThread(thread) != static_cast<DWORD>(-1);

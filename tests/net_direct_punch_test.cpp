@@ -331,12 +331,13 @@ void TestDirectPunchRoleValidationAndEndpointLock()
     assert(!directSessions[0].inboundVerified);
     assert(registeredEndpoints.empty());
 
-    // 1b) Invalid / loopback / multicast / broadcast / relay-port source addresses MUST be rejected even with a valid client-role probe.
+    // 1b) Invalid / loopback / link-local / multicast / broadcast / relay-port source addresses MUST be rejected even with a valid client-role probe.
     socketSent.clear();
     auto clientProbe = MakePunchPacket(offer.cookie, 0x03u, 2u);
     for (ENetAddress badAddr : {ENetAddress{0x0100007fu, 41000}, ENetAddress{0x0100007fu, 30001},
-                                ENetAddress{0u, 41000}, ENetAddress{0xffffffffu, 41000},
-                                ENetAddress{0x010000e0u, 41000}, ENetAddress{0x0201A8C0u, 0}}) {
+                                ENetAddress{0x0201fea9u, 41000}, ENetAddress{0u, 41000},
+                                ENetAddress{0xffffffffu, 41000}, ENetAddress{0x010000e0u, 41000},
+                                ENetAddress{0x0201A8C0u, 0}}) {
         assert(InjectDatagram(badAddr, clientProbe) == 1);
         assert(!directSessions[0].inboundVerified);
         assert(socketSent.empty());
@@ -529,7 +530,8 @@ void TestMsgGoodsValidationBeforeRelay()
     sGoodsHandled = 0;
     SetGoodsHandler([](uint8_t, uint64_t, uint32_t, int32_t, GoodsEntry const*, int) { ++sGoodsHandled; });
 
-    auto sendGoodsFromSlot2 = [&](int32_t amount, uint16_t quality, uint32_t serial) {
+    auto sendGoodsFromSlot2 = [&](int32_t amount, uint16_t quality, uint32_t serial,
+                                  enet_uint32 flags = ENET_PACKET_FLAG_RELIABLE) {
         GoodsHeader hdr{MsgGoods, 2, uint64_t(worldEpoch), serial, 50, 1};
         GoodsEntry entry{};
         strcpy_s(entry.name, "ItMw_1H_Sword_01");
@@ -542,28 +544,34 @@ void TestMsgGoodsValidationBeforeRelay()
         ev.type = ENET_EVENT_TYPE_RECEIVE;
         ev.peer = peers[2];
         ev.channelID = ChannelReliable;
-        ev.packet = enet_packet_create(raw.data(), raw.size(), ENET_PACKET_FLAG_RELIABLE);
+        ev.packet = enet_packet_create(raw.data(), raw.size(), flags);
         pendingEvents.push_back(ev);
         PlayerState local{};
         Tick(local, false);
     };
 
     peerSent.clear();
+    // Unreliable MsgGoods MUST be rejected even with valid entries!
+    sendGoodsFromSlot2(3, 1, 1, 0);
+    assert(sGoodsHandled == 0);
+    assert(goodsCache[2].empty());
+    for (auto const& pkt : peerSent) assert(pkt.bytes.empty() || pkt.bytes[0] != MsgGoods);
+
     // Invalid amount (0) -> MUST NOT relay to peer 3 and MUST NOT populate goodsCache[2]!
-    sendGoodsFromSlot2(0, 0, 1);
+    sendGoodsFromSlot2(0, 0, 2);
     assert(sGoodsHandled == 0);
     assert(goodsCache[2].empty());
     for (auto const& pkt : peerSent) assert(pkt.bytes.empty() || pkt.bytes[0] != MsgGoods);
 
     // Invalid quality (>= 1024) -> MUST NOT relay to peer 3 and MUST NOT populate goodsCache[2]!
-    sendGoodsFromSlot2(1, 1024, 2);
+    sendGoodsFromSlot2(1, 1024, 3);
     assert(sGoodsHandled == 0);
     assert(goodsCache[2].empty());
     for (auto const& pkt : peerSent) assert(pkt.bytes.empty() || pkt.bytes[0] != MsgGoods);
 
     // Valid entry -> relayed to peer 3 AND cached in goodsCache[2] AND delivered to local handler!
     peerSent.clear();
-    sendGoodsFromSlot2(3, 1, 3);
+    sendGoodsFromSlot2(3, 1, 4);
     assert(sGoodsHandled == 1);
     assert(!goodsCache[2].empty());
     unsigned goodsRelays = 0;

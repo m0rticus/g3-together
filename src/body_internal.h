@@ -17,6 +17,7 @@ extern bool lagMsUnit;
 extern unsigned combatTargets[2];
 extern unsigned followSkips[2][6];
 extern unsigned otherNamesLogged[2];
+bool MotionSeekEnabled();
 
 inline constexpr double MotionUnitMs(double maxTime) noexcept
 {

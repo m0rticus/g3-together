@@ -202,7 +202,7 @@ class ClientMovementTests(unittest.TestCase):
         self.assertLess(frame.index("g3t::net::Flush()"), frame.index("g3t::persist::EndFrame()"))
         self.assertLess(frame.index("g3t::hud::Tick()"), frame.index("g3t::movement::End()"))
         self.assertIn("moduleProcessDepth == 1", self.module)
-        self.assertIn("if (moduleProcessDepth == 0) g3t::movement::End()", frame)
+        self.assertRegex(frame, r"if\s*\(\s*moduleProcessDepth\s*==\s*0\s*\)\s*\{\s*g3t::movement::End\(\);")
 
     def test_existing_task_and_mode_hooks_record_before_any_rejection(self):
         for signature, record, gate in (

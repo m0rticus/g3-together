@@ -26,11 +26,14 @@ struct GraphicsSites {
     uintptr_t nativeWait = 0;
     uint32_t conditionReturn = 0, driverReturn = 0, deviceReturn = 0;
 };
+struct GraphicsSnapshot {
+    shutdown::GraphicsWait wait{};
+    bool matched = false;
+    char const* status = "not sampled";
+    DWORD error = 0;
+};
 GraphicsSites graphicsSites;
-shutdown::GraphicsWait lastGraphicsWait;
-bool lastGraphicsMatched = false;
-char const* lastGraphicsSample = "not sampled";
-DWORD lastGraphicsError = 0;
+GraphicsSnapshot lastGraphics;
 
 struct WatchdogModule {
     DWORD_PTR base;
@@ -95,19 +98,19 @@ GraphicsSites FindGraphicsSites()
 
 bool SampleGraphicsWait(shutdown::GraphicsWait& wait)
 {
-    lastGraphicsError = 0;
-    lastGraphicsSample = "unsupported signatures";
+    lastGraphics.error = 0;
+    lastGraphics.status = "unsupported signatures";
     if (!graphicsSites.nativeWait) return false;
     HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, graphicsSites.thread);
     if (!thread) {
-        lastGraphicsSample = "OpenThread failed";
-        lastGraphicsError = GetLastError();
+        lastGraphics.status = "OpenThread failed";
+        lastGraphics.error = GetLastError();
         return false;
     }
     const DWORD suspended = SuspendThread(thread);
     if (suspended == static_cast<DWORD>(-1)) {
-        lastGraphicsSample = "SuspendThread failed";
-        lastGraphicsError = GetLastError();
+        lastGraphics.status = "SuspendThread failed";
+        lastGraphics.error = GetLastError();
         CloseHandle(thread);
         return false;
     }
@@ -116,23 +119,23 @@ bool SampleGraphicsWait(shutdown::GraphicsWait& wait)
     uint32_t stack[1024]{}, objectWords[22]{};
     SIZE_T read = 0;
     const bool captured = GetThreadContext(thread, &context) != FALSE;
-    lastGraphicsSample = captured ? "outside verified native wait" : "GetThreadContext failed";
-    if (!captured) lastGraphicsError = GetLastError();
+    lastGraphics.status = captured ? "outside verified native wait" : "GetThreadContext failed";
+    if (!captured) lastGraphics.error = GetLastError();
     bool matched = !suspended && captured && context.Eip == graphicsSites.nativeWait + 0xc;
-    if (suspended) lastGraphicsSample = "thread was already suspended";
+    if (suspended) lastGraphics.status = "thread was already suspended";
     if (matched) {
         const BOOL stackRead = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
                                                  stack, sizeof(stack), &read);
-        if (!stackRead) lastGraphicsError = GetLastError();
+        if (!stackRead) lastGraphics.error = GetLastError();
         const uint32_t object = shutdown::WaitingObject(stack, read / sizeof(stack[0]),
             graphicsSites.conditionReturn, graphicsSites.driverReturn, graphicsSites.deviceReturn);
-        lastGraphicsSample = object ? "driver counters unreadable" : "nested wait stack not matched";
+        lastGraphics.status = object ? "driver counters unreadable" : "nested wait stack not matched";
         matched = object && symbols::ReadMemory(object, objectWords, sizeof(objectWords));
         if (matched) {
-            lastGraphicsSample = "verified native graphics wait";
+            lastGraphics.status = "verified native graphics wait";
             wait = {object, objectWords[0x48 / 4], objectWords[0x50 / 4], objectWords[0x54 / 4]};
         } else if (object) {
-            lastGraphicsError = GetLastError();
+            lastGraphics.error = GetLastError();
         }
     }
     // No logging, allocation, engine access or termination while the main thread is suspended.
@@ -141,8 +144,8 @@ bool SampleGraphicsWait(shutdown::GraphicsWait& wait)
     CloseHandle(thread);
     if (resumed == static_cast<DWORD>(-1)) {
         Logf("shutdown watchdog: main thread resume failed error=%lu; fast exit disabled", error);
-        lastGraphicsSample = "ResumeThread failed";
-        lastGraphicsError = error;
+        lastGraphics.status = "ResumeThread failed";
+        lastGraphics.error = error;
         fastExitReady.store(false);
         return false;
     }
@@ -186,9 +189,9 @@ void WriteWatchdogText(char const* path)
                  "STACK_NOTE candidate_word entries are raw stack values, not unwound frames\n",
            now.wHour, now.wMinute, now.wSecond, GetCurrentProcessId(), GetCurrentThreadId(),
            graphicsSites.thread, preShutdownFinished.load() ? 1 : 0, fastExitReady.load() ? 1 : 0,
-           graphicsSites.nativeWait ? 1 : 0, lastGraphicsMatched ? 1 : 0, lastGraphicsWait.object,
-           lastGraphicsWait.completed, lastGraphicsWait.produced, lastGraphicsWait.retired,
-           lastGraphicsSample, lastGraphicsError);
+           graphicsSites.nativeWait ? 1 : 0, lastGraphics.matched ? 1 : 0, lastGraphics.wait.object,
+           lastGraphics.wait.completed, lastGraphics.wait.produced, lastGraphics.wait.retired,
+           lastGraphics.status, lastGraphics.error);
     WriteText(text, line);
 
     WatchdogModule watchModules[128] = {};
@@ -237,80 +240,48 @@ void WriteWatchdogText(char const* path)
     for (BOOL ok = Thread32First(threadSnapshot, &thread); ok; ok = Thread32Next(threadSnapshot, &thread)) {
         if (thread.th32OwnerProcessID != GetCurrentProcessId() || thread.th32ThreadID == GetCurrentThreadId()) continue;
         const DWORD tid = thread.th32ThreadID;
-        HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
-        if (!handle) {
-            Format(line, "THREAD id=%lu CONTEXT failed=OpenThread error=%lu\n", tid, GetLastError());
+        symbols::ThreadSample sample{};
+        symbols::SampleThreadStack(tid, sample, true);
+        if (!sample.suspended) {
+            Format(line, "THREAD id=%lu CONTEXT failed=%s error=%lu\n", tid,
+                   sample.openError ? "OpenThread" : "SuspendThread",
+                   sample.openError ? sample.openError : sample.suspendError);
             WriteText(text, line);
             continue;
         }
-        if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
-            Format(line, "THREAD id=%lu CONTEXT failed=SuspendThread error=%lu\n", tid, GetLastError());
-            WriteText(text, line);
-            CloseHandle(handle);
-            continue;
-        }
-        CONTEXT context{};
-        context.ContextFlags = CONTEXT_FULL;
-        const bool contextOk = GetThreadContext(handle, &context) != FALSE;
-        const DWORD contextError = contextOk ? 0 : GetLastError();
-        unsigned char stackBytes[4096];
-        SIZE_T read = 0;
-        DWORD ebpFrames[32] = {};
-        unsigned ebpCount = 0;
-        if (contextOk) {
-            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
-                                   stackBytes, sizeof(stackBytes), &read))
-                read = 0;
-            DWORD ebp = context.Ebp;
-            for (unsigned i = 0; i < 32 && ebp; ++i) {
-                DWORD pair[2] = {};
-                if (!symbols::ReadMemory(ebp, pair, sizeof(pair)) || !pair[1]) break;
-                ebpFrames[ebpCount++] = pair[1];
-                if (!pair[0] || pair[0] == ebp) break;
-                ebp = pair[0];
-            }
-        }
-        const bool resumed = ResumeThread(handle) != static_cast<DWORD>(-1);
-        const DWORD resumeError = resumed ? 0 : GetLastError();
-        CloseHandle(handle);
-
-        if (!contextOk) {
-            Format(line, "THREAD id=%lu CONTEXT failed=GetThreadContext error=%lu\n", tid, contextError);
+        if (!sample.contextOk) {
+            Format(line, "THREAD id=%lu CONTEXT failed=GetThreadContext error=%lu\n", tid, sample.contextError);
             WriteText(text, line);
         } else {
             char where[300];
-            WatchdogWhere(watchModules, moduleCount, context.Eip, where, sizeof(where));
-            Format(line, "THREAD id=%lu EIP=%08lX ESP=%08lX EBP=%08lX\n"
-                         "THREAD id=%lu frame=eip address=%08lX module+offset=%s\n",
-                   tid, context.Eip, context.Esp, context.Ebp, tid, context.Eip, where);
+            WatchdogWhere(watchModules, moduleCount, sample.eip, where, sizeof(where));
+            Format(line, "THREAD id=%lu EIP=%08IX ESP=%08IX EBP=%08IX\n"
+                         "THREAD id=%lu frame=eip address=%08IX module+offset=%s\n",
+                   tid, sample.eip, sample.esp, sample.ebp, tid, sample.eip, where);
             WriteText(text, line);
 
-            if (read >= sizeof(DWORD)) {
-                unsigned frame = 0;
-                for (SIZE_T i = 0; i + sizeof(DWORD) <= read && frame < 64; i += sizeof(DWORD)) {
-                    DWORD_PTR address = 0;
-                    std::memcpy(&address, stackBytes + i, sizeof(DWORD));
-                    WatchdogWhere(watchModules, moduleCount, address, where, sizeof(where));
-                    if (!std::strcmp(where, "unknown")) continue;
-                    Format(line, "THREAD id=%lu candidate_word=%u address=%08IX module+offset=%s\n",
-                           tid, static_cast<unsigned>(i / sizeof(DWORD)), address, where);
-                    ++frame;
-                    WriteText(text, line);
-                }
+            unsigned frame = 0;
+            for (unsigned i = 0; i < sample.count && frame < 64; ++i) {
+                WatchdogWhere(watchModules, moduleCount, sample.words[i], where, sizeof(where));
+                if (!std::strcmp(where, "unknown")) continue;
+                Format(line, "THREAD id=%lu candidate_word=%u address=%08IX module+offset=%s\n",
+                       tid, i, sample.words[i], where);
+                ++frame;
+                WriteText(text, line);
             }
 
             unsigned ebpFrame = 0;
-            for (unsigned i = 0; i < ebpCount; ++i) {
-                WatchdogWhere(watchModules, moduleCount, ebpFrames[i], where, sizeof(where));
+            for (unsigned i = 0; i < sample.ebpCount; ++i) {
+                WatchdogWhere(watchModules, moduleCount, sample.ebpFrames[i], where, sizeof(where));
                 if (std::strcmp(where, "unknown")) {
-                    Format(line, "THREAD id=%lu ebp-frame=%u address=%08lX module+offset=%s\n",
-                           tid, ebpFrame++, ebpFrames[i], where);
+                    Format(line, "THREAD id=%lu ebp-frame=%u address=%08IX module+offset=%s\n",
+                           tid, ebpFrame++, sample.ebpFrames[i], where);
                     WriteText(text, line);
                 }
             }
         }
-        if (!resumed) {
-            Format(line, "THREAD id=%lu RESUME failed=ResumeThread error=%lu\n", tid, resumeError);
+        if (!sample.resumed) {
+            Format(line, "THREAD id=%lu RESUME failed=ResumeThread error=%lu\n", tid, sample.resumeError);
             WriteText(text, line);
         }
     }
@@ -337,13 +308,13 @@ DWORD WINAPI WatchdogThread(LPVOID)
         const uint32_t now = GetTickCount();
         const bool finished = preShutdownFinished.load();
         const uint32_t finishedAt = preShutdownAt.load();
-        lastGraphicsMatched = finished && fastExitReady.load() && SampleGraphicsWait(lastGraphicsWait);
-        if (exit.Observe(now, finished && fastExitReady.load(), finishedAt, lastGraphicsMatched, lastGraphicsWait)) {
+        lastGraphics.matched = finished && fastExitReady.load() && SampleGraphicsWait(lastGraphics.wait);
+        if (exit.Observe(now, finished && fastExitReady.load(), finishedAt, lastGraphics.matched, lastGraphics.wait)) {
             Logf("shutdown: native DX9/AMD Release stalled after cleanup thread=%lu object=%08x "
                  "completed=%u target=%u; exiting process without DLL detach",
-                 graphicsSites.thread, lastGraphicsWait.object, lastGraphicsWait.completed,
-                 lastGraphicsWait.produced > lastGraphicsWait.retired
-                     ? lastGraphicsWait.produced - lastGraphicsWait.retired
+                 graphicsSites.thread, lastGraphics.wait.object, lastGraphics.wait.completed,
+                 lastGraphics.wait.produced > lastGraphics.wait.retired
+                     ? lastGraphics.wait.produced - lastGraphics.wait.retired
                      : 0u);
             // ExitProcess runs DLL detach, which can wait on a driver lock held by
             // a terminated thread. Our world/save/transport cleanup already returned.

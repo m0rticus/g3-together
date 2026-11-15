@@ -251,5 +251,24 @@ int main()
         assert(sharedHeroEntity.cached && sharedHeroEntity.databases == 0x1 && sharedHeroEntity.releases == 0);
         assert(CountSlotEntities(mainPrefetcher.valid.size(), [&](size_t i) { return mainPrefetcher.valid[i]; },
                              &mainPrefetcher.permanent, 1, scanCell) == 0);
+
+        // Multi-region regression: retiring slot 1 when sibling remote region (slot 2) also cached an entity with
+        // databases = 0x6 (slot 1 | slot 2) in siblingPrefetcher must clear slot 1 from siblingPrefetcher too.
+        Prefetcher region1Prefetcher, siblingPrefetcher, multiMainPrefetcher;
+        Entity region1Only{0x2}, sharedBetweenRemotes{0x6};
+        Cell siblingCell{6000, 0x6, {&region1Only, &sharedBetweenRemotes}};
+        siblingPrefetcher.valid.push_back(&siblingCell);
+        std::array<Prefetcher*, 2> siblings{&siblingPrefetcher, nullptr};
+        assert(CountSlotEntities(siblingPrefetcher.valid.size(), [&](size_t i) { return siblingPrefetcher.valid[i]; },
+                                 &siblingPrefetcher.permanent, 1, scanCell) == 2);
+        assert(!DrainPrefetcherGroup(&region1Prefetcher, siblings.data(), siblings.size(), multiMainPrefetcher, db, 32,
+                                     drainPrefetcher));
+        assert(DrainPrefetcherGroup(&region1Prefetcher, siblings.data(), siblings.size(), multiMainPrefetcher, db, 1,
+                                    drainPrefetcher));
+        assert(region1Prefetcher.cleared == 1 && siblingPrefetcher.cleared == 1 && multiMainPrefetcher.cleared == 1);
+        assert(!region1Only.cached && region1Only.databases == 0 && region1Only.releases == 1);
+        assert(sharedBetweenRemotes.cached && sharedBetweenRemotes.databases == 0x4 && sharedBetweenRemotes.releases == 0);
+        assert(CountSlotEntities(siblingPrefetcher.valid.size(), [&](size_t i) { return siblingPrefetcher.valid[i]; },
+                                 &siblingPrefetcher.permanent, 1, scanCell) == 0);
     }
 }

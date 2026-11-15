@@ -9,6 +9,7 @@
 #include "downed.h"
 #include "log.h"
 #include "npclease_runtime.h"
+#include "npcplayback_hit_policy.h"
 #include "npcremoval.h"
 
 #include <Windows.h>
@@ -525,22 +526,31 @@ void OnHitResult(net::HitResult const& result)
     const auto found = mirrors.find(key);
     if (found == mirrors.end()) return;
     Mirror& m = found->second;
-    if (!m.replay.pendingHit || static_cast<uint16_t>(result.sequence) != m.replay.pendingHit) return;
-    if (m.killed || (m.latest.flags & 3) != 0 || m.entity.IsDead() || m.entity.IsDown()) {
+    const uint16_t seq = static_cast<uint16_t>(result.sequence);
+    const bool matchesPending = m.replay.pendingHit != 0 && m.replay.pendingHit == seq;
+    if (!npcplayback_hit_policy::ShouldAcceptHitResult(
+            m.replay.pendingHit, m.replay.knockback, seq, result.accepted))
+        return;
+    eCEntity* entity = m.entity.GetInstance();
+    if (!entity || m.killed || (m.latest.flags & 3) != 0 || m.entity.IsDead() || m.entity.IsDown()) {
         npcplayback::ResetLocalHitState(m.replay);
         return;
     }
     if (!result.accepted) {
-        npcplayback::CancelLocalHit(m.replay, net::Now(), m.entity.GetInstance());
+        if (!matchesPending) return;
+        npcplayback::CancelLocalHit(m.replay, net::Now(), entity);
         m.replay.initialized = false;
         Logf("npcs: host refused hit %u on %s; authoritative state retained", result.sequence, m.entity.GetName().GetText());
     } else if (result.incarnation == m.latest.incarnation) {
+        if (matchesPending) m.replay.pendingHit = 0;
         const uint32_t ackNow = net::Now();
-        m.replay.acknowledgedHit = static_cast<uint16_t>(result.sequence);
-        m.replay.acknowledgedAt = result.processedAt ? result.processedAt : 1;
+        if (!m.replay.acknowledgedHit || static_cast<int16_t>(seq - m.replay.acknowledgedHit) >= 0) {
+            m.replay.acknowledgedHit = seq;
+            m.replay.acknowledgedAt = result.processedAt ? result.processedAt : 1;
+        }
         npcplayback::ConfirmLocalHitKnockback(m.replay, result, ackNow);
         Logf("combat: NPCHITSYNC stage=host-ack npc=%s hit=%u accepted=1 host_reaction=%u host_step_cm=%.1f processed_at=%u",
-             m.entity.GetInstance() ? m.entity.GetName().GetText() : "(unloaded)", result.sequence,
+             m.entity.GetName().GetText(), result.sequence,
              result.hostReaction, result.stepCm, m.replay.acknowledgedAt);
     }
 }

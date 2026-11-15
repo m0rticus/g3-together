@@ -201,6 +201,19 @@ class ClientRejoinTests(unittest.TestCase):
         activate = function_body(source, r"\bvoid\s+OnWorldActivate\s*\(")
         self.assertIn("if (!net::IsHost()) return;", activate)
 
+    def test_first_entry_fallback_and_host_load_failure_budget(self):
+        source = persist_source()
+        transition = function_body(source, r"\bbool\s+ProcessClientTransition\s*\(")
+        self.assertIn("if (plan.route == R::FirstEntry) {", transition)
+        self.assertLess(transition.index("if (plan.route == R::FirstEntry) {"),
+                        transition.index("if (plan.route == R::Template) {"))
+        self.assertIn("return FirstEntryNow(now);", transition)
+        ended = function_body(source, r"\bvoid\s+TemplateEnded\s*\(")
+        self.assertIn("if (job == TemplateJob::HostLoad) ++templateFailures;", ended)
+        self.assertNotIn("if (origin == tpl::Origin::World) ++templateFailures;", ended)
+        on_world = function_body(source, r"\bvoid\s+OnWorld\s*\(")
+        self.assertIn("templateFailures = 0;", on_world)
+
 
 if __name__ == "__main__":
     unittest.main()

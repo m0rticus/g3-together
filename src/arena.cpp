@@ -5,6 +5,7 @@
 #include "infocmd.h"
 #include "log.h"
 #include "net.h"
+#include "npclease_runtime.h"
 #include "npcs.h"
 #include "guards.h"
 #include "remote.h"
@@ -36,7 +37,7 @@ gFScript original = nullptr;
 bool installed = false, native = false;
 DWORD lastTry = 0;
 bool on = true;  // QA negative control: arenasyncoff
-struct Held { std::string name; std::string arena; bool started = false; unsigned tries = 0; uint8_t player = 0; };
+struct Held { std::string name; std::string arena; bool started = false; unsigned tries = 0; uint8_t player = 0; bool leased = false; };
 constexpr unsigned MaxTries = 20;  // half seconds
 std::unordered_map<std::string, Held> held;  // GUID -> opponent taken over here
 uint32_t nextCheck = 0;
@@ -96,7 +97,15 @@ bool Busy(Entity& npc)
 void Take(eCEntity* npc, eCEntity* arena)
 {
     const std::string key = Key(npc);
-    if (held.count(key) || !npcs::IsMirrored(npc) || npcs::Claimed(npc) || npcs::HostTaken(npc)) return;  // simulated here already
+    if (held.count(key)) return;
+    if (!net::IsHost() && npclease::LocalAuthority(npc)) {
+        Entity e(npc);
+        held[key] = {e.GetName().GetText(), arena ? Entity(arena).GetName().GetText() : "", false, 0, 0, true};
+        ++taken;
+        Logf("arena: running client-leased %s locally for this player's fight", e.GetName().GetText());
+        return;
+    }
+    if (!npcs::IsMirrored(npc) || npcs::Claimed(npc) || npcs::HostTaken(npc)) return;  // simulated here already
     if (net::IsHost() ? !npcs::HostTake(npc) : !infocmd::TakeOver(npc, true, false)) return;
     Entity e(npc);
     held[key] = {e.GetName().GetText(), arena ? Entity(arena).GetName().GetText() : ""};
@@ -110,7 +119,7 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* arena = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     ++sent;
-    if (!net::IsHost() && npc && net::Connected()) {
+    if (!net::IsHost() && npc && net::Connected() && !npclease::LocalAuthority(npc) && !npcs::Claimed(npc)) {
         net::WorldState request{};
         request.kind = 20;
         const eCEntityProxy proxy(npc);
@@ -133,6 +142,10 @@ void OnState(uint8_t from, net::WorldState const& state)
     eCEntity* actor = remote::PuppetOf(from);
     if (!npc.GetInstance() || !place.GetInstance() || !actor || !original) {
         Log("arena: remote arena request refused: missing opponent, arena, player or native entry");
+        return;
+    }
+    if (npclease::Fenced(npc.GetInstance())) {
+        Log("arena: remote arena request refused: opponent fenced by client lease");
         return;
     }
     const std::string key = Key(npc.GetInstance());
@@ -172,7 +185,9 @@ void Tick()
         eCEntity* npc = e.GetInstance();
         if (!npc) { ++it; continue; }  // not loaded here now; kept until it is
         Held& h = it->second;
-        const bool ours = net::IsHost() ? (h.player > 1 || npcs::HostTaken(npc)) : npcs::Claimed(npc);
+        const bool leasedHere = !net::IsHost() && h.leased && npclease::LocalAuthority(npc);
+        const bool claimedHere = !net::IsHost() && npcs::Claimed(npc);
+        const bool ours = net::IsHost() ? (h.player > 1 || npcs::HostTaken(npc)) : (leasedHere || claimedHere);
         guards::Acting context(h.player > 1 ? remote::PuppetOf(h.player) : nullptr);
         if (ours && !h.started && !Fights(npc) && h.tries < MaxTries) { ++h.tries; ++it; continue; }
         if (ours && !h.started && h.tries < MaxTries && Fights(npc) && !std::strstr(e.Routine.GetCurrentTask().GetText(), "ZS_Talk")) {
@@ -193,10 +208,10 @@ void Tick()
         if (ours && (Fights(npc) || Busy(e))) { ++it; continue; }
         if (ours) {
             if (net::IsHost()) { npcs::SetContext(npc, 0); npcs::HostRelease(npc); }
-            else infocmd::TakeOver(npc, false);
+            else if (claimedHere) infocmd::TakeOver(npc, false);
             ++given;
             Logf("arena: %s's fight is over (task %s); %s", it->second.name.c_str(), e.Routine.GetCurrentTask().GetText(),
-                 net::IsHost() ? "the usual simulation rules again" : "given back to the host");
+                 (net::IsHost() || leasedHere) ? "the usual simulation rules again" : "given back to the host");
         }
         it = held.erase(it);  // or the host took it back (a revoked claim)
     }

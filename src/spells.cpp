@@ -73,9 +73,10 @@ unsigned nativeCastsHooked = 0;
 using GetNpcsFn = bTObjArray<Entity>(GE_STDCALL*)();
 GetNpcsFn originalGetNpcs = nullptr;
 thread_local eCEntity* areaCaster = nullptr;
+constexpr uint32_t PendingTakeOverExpireMs = 5000;
 struct PendingTakeOver {
     uint8_t from, guid[16];
-    uint32_t generation, world;
+    uint32_t generation, world, queuedAt;
     int index;
     int32_t args;
 };
@@ -328,8 +329,18 @@ void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_
     const bool at = known && Specs[index].kind == AroundCasterAt;
     if (known && Specs[index].kind == TakeOver && puppet &&
         (!target.GetInstance() || npclease::Fenced(target.GetInstance()) || npcs::IsMirrored(target.GetInstance()))) {
+        const uint32_t queuedAt = net::Now() ? net::Now() : 1;
+        for (auto& existing : pendingTakeOvers) {
+            if (existing.from == from && existing.generation == net::PeerGeneration(from) &&
+                existing.world == net::WorldEpoch() && std::memcmp(existing.guid, guid, sizeof(existing.guid)) == 0) {
+                existing.queuedAt = queuedAt;
+                existing.index = index;
+                existing.args = args;
+                return;
+            }
+        }
         if (pendingTakeOvers.size() >= 512) { ++npcRefused; return; }
-        PendingTakeOver pending{from, {}, net::PeerGeneration(from), net::WorldEpoch(), index, args};
+        PendingTakeOver pending{from, {}, net::PeerGeneration(from), net::WorldEpoch(), queuedAt, index, args};
         std::memcpy(pending.guid, guid, sizeof(pending.guid));
         pendingTakeOvers.push_back(pending);
         return;
@@ -380,10 +391,17 @@ void Start()
 void Tick()
 {
     if (!tickTried && GetModuleHandleA("Script_Game.dll")) InstallTick();
+    const uint32_t netNow = net::Now();
     for (size_t i = 0; i < pendingTakeOvers.size();) {
         const auto pending = pendingTakeOvers[i];
         if (!net::IsHost() || pending.world != net::WorldEpoch() || !net::PeerJoined(pending.from) ||
             net::PeerGeneration(pending.from) != pending.generation) {
+            pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
+            continue;
+        }
+        if (pending.queuedAt && static_cast<uint32_t>(netNow - pending.queuedAt) >= PendingTakeOverExpireMs) {
+            ++npcRefused;
+            Logf("spells: deferred %s from player %u expired (target unavailable on host)", Specs[pending.index].name, pending.from);
             pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
             continue;
         }

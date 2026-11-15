@@ -37,6 +37,7 @@ bool IsValidDirectPunchEndpoint(ENetAddress const& addr)
     uint8_t octets[4] = {};
     std::memcpy(octets, &addr.host, sizeof(octets));
     if (octets[0] == 0 || octets[0] >= 224) return false;
+    if (octets[0] == 169 && octets[1] == 254) return false;
     if (octets[0] == 127) {
         if (!AllowDirectPunchLoopback()) return false;
         if (octets[1] == 0 && octets[2] == 0 && octets[3] == 0) return false;
@@ -212,15 +213,18 @@ bool ClientPunchWaiting(DirectPunchSession const* direct, uint32_t now)
            (now - startedAt < DirectPunchTimeoutMs);
 }
 
-void FinishClientConnectAttempt(DirectPunchSession* direct, bool useDirect, uint32_t now)
+void ConnectClientWithDirectFallback(DirectPunchSession* direct, bool& useDirect, ENetAddress& connectTo, bool logFallback)
 {
-    lastConnectAttempt = now;
-    ENetAddress connectTo = useDirect ? direct->verifiedAddress : target;
+    useDirect = direct && direct->bidirectionalVerified && !direct->directFailed;
+    connectTo = useDirect ? direct->verifiedAddress : target;
+    server = useDirect
+        ? ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))
+        : ConnectTransportHost(host, &target);
     if (useDirect && !server) {
         direct->directFailed = true;
         direct->connectStarted = false;
         direct->endpointLocked = false;
-        if (!direct->fallbackLogged) {
+        if (logFallback && !direct->fallbackLogged) {
             direct->fallbackLogged = true;
             Log("net: direct UDP connect setup failed; falling back to Steam relay");
         }
@@ -231,6 +235,13 @@ void FinishClientConnectAttempt(DirectPunchSession* direct, bool useDirect, uint
         direct->connectStarted = useDirect && server != nullptr;
         if (direct->connectStarted) direct->endpointLocked = true;
     }
+}
+
+void FinishClientConnectAttempt(DirectPunchSession* direct, bool useDirect, uint32_t now)
+{
+    lastConnectAttempt = now;
+    ENetAddress connectTo = target;
+    ConnectClientWithDirectFallback(direct, useDirect, connectTo, true);
     steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
                                now - startedAt, server ? "" : "ENet connect refused (no free peer)");
     Logf("enet: connect request role=client channels=%u compress=off route=%s port=%u result=%s state=%s elapsed_ms=%u",

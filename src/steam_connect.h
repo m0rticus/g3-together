@@ -263,7 +263,7 @@ inline bool IsFrame(void const* data, size_t size)
 // Strict: exact fields, single spaces, printable ASCII, nothing after the last field.
 inline bool DecodeFrame(void const* data, size_t size, Frame* out)
 {
-    if (!IsFrame(data, size) || size > FrameMax || size < FramePrefixSize + 2) return false;
+    if (!out || !IsFrame(data, size)) return false;
     char text[FrameMax + 1];
     std::memcpy(text, data, size);
     text[size] = '\0';

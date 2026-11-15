@@ -88,7 +88,9 @@ class ClientPositionAuthorityTests(unittest.TestCase):
             function = function_body(body, rf"\b(?:void|bool)\s+{name}\s*\(")
             self.assertLess(function.index("guards::RejectRemoteWrite"), function.index(writer), name)
         passive = function_body(self.source("npcplayback.cpp"), r"\bbool\s+Passive\s*\(")
-        self.assertLess(passive.index("guards::IsLocalPlayer"), passive.index("entity == probe.target"))
+        self.assertLess(passive.index("guards::IsLocalPlayer"),
+                        passive.index("entity == gCSession::GetInstance().GetHero()"))
+        self.assertIn("remote::ControlledBody()", passive)
         remote = self.source("remote.cpp")
         for name, writer in (("Despawn", "puppet.entity.Party"),
                              ("UpdatePuppet", "puppet.entity = Entity::Spawn")):

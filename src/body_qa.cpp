@@ -97,7 +97,7 @@ void MotionTime(eCEntity* entity, void (*log)(char const*))
 void MotionLagReport(void (*log)(char const*))
 {
     char line[220];
-    const bool on = motionSeek < 0 ? GetConfig().motionSeek : motionSeek > 0;
+    const bool on = MotionSeekEnabled();
     for (int kind = 0; kind < 2; ++kind) {
         std::vector<float> behind = motionLags[kind], off;
         for (float lag : behind) off.push_back(std::fabs(lag));

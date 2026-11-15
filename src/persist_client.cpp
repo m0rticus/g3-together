@@ -99,7 +99,7 @@ rejoin::tmpl::Plan EntryPlan(bool quiet)
     return plan;
 }
 
-bool ClientQuietNow() { return rejoin::State{}.Waiting(ClientBoundary()) == rejoin::Wait::None; }
+bool ClientQuietNow() { return rejoin::Waiting(ClientBoundary()) == rejoin::Wait::None; }
 
 void TemplateImpossible(rejoin::tmpl::Plan plan)
 {
@@ -387,7 +387,6 @@ void QueueClientReturn()
     recordWaitSince = 0; recordWaitGaveUp = false;
     clientRejoin.Queue();
     resetLocalWorld = true;
-    freshLocalHero = false;
     hostAdmissionAck = false;
     net::SetInWorld(net::LocalId(), false);
 }
@@ -432,7 +431,7 @@ bool __stdcall NewGameDetour(void* self)
     ++nativeLoadDepth;
     nativeNewGame = true;
     ownCharacterReady = false; hostAdmissionAck = false; synced = 0;
-    freshLocalHero = false; newWorld = false;
+    newWorld = false;
     net::SetInWorld(net::LocalId(), false);
     worldCleanup();
     clock::OnWorldChange();
@@ -442,7 +441,7 @@ bool __stdcall NewGameDetour(void* self)
     nativeNewGame = false;
     --nativeLoadDepth;
     clientRejoin.Started(ok);
-    freshLocalHero = ok; newWorld = ok;
+    newWorld = ok;
     resetLocalWorld = false;
     if (!ok) {
         restoreFailed = true;
@@ -561,7 +560,7 @@ void TemplateEnded(uint32_t now)
     RemoveTemplate("rollback");
     templateFailCode = tpl::FailName(fail);
     templateFailError = templateIoError;
-    if (origin == tpl::Origin::World) ++templateFailures;
+    if (job == TemplateJob::HostLoad) ++templateFailures;
     bool notify = false;
     if (job == TemplateJob::FirstEntry) {
         templateCapture.Failed(now);
@@ -643,7 +642,7 @@ bool TemplateBackgroundDue(uint32_t now)
     eCEntity* hero = game.GetHero();
     if (!hero || !game.IsGameRunning() || !ownCharacterReady || !net::InWorld(net::LocalId()) || clientRejoin.pending ||
         needsNewHero || NativeSaveReason() || requestPending || captured.valid || !trade::ReadyForSave() ||
-        rejoin::State{}.Waiting(ClientBoundary()) != rejoin::Wait::None) return false;
+        rejoin::Waiting(ClientBoundary()) != rejoin::Wait::None) return false;
     return static_cast<gEAniState>(Entity(hero).Routine.AniState) == gEAniState_Stand;
 }
 
@@ -737,7 +736,7 @@ static void EnterTemplateWorld(uint32_t queuedAt)
     worldCleanup(); // Every puppet/mirror/lease/camera reference is released while the old entities are valid.
     clock::OnWorldChange();
     ownCharacterReady = false; hostAdmissionAck = false; synced = 0;
-    localKind = net::KindMenu; freshLocalHero = false; newWorld = false; resetLocalWorld = false;
+    localKind = net::KindMenu; newWorld = false; resetLocalWorld = false;
     receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; receivedWelcome = 0;
     needsNewHero = false; restoreFailed = false;
     templateCapture.Done();
@@ -754,7 +753,7 @@ static void EnterTemplateWorld(uint32_t queuedAt)
     --nativeLoadDepth;
     const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
     clientRejoin.Started(ok);
-    freshLocalHero = ok; newWorld = ok; resetLocalWorld = false;
+    newWorld = ok; resetLocalWorld = false;
     requestCharacterAgain = true;
     restoreFailed = !ok;
     Logf("persist: client enter state=%s hud_ok=%d lower_calls=%u lower_ok=%d elapsed_ms=%u player=%p running=%d",
@@ -792,7 +791,7 @@ bool ProcessClientTransition()
     if (clientRejoin.pending && !queuedAt) queuedAt = now ? now : 1;
     auto& game = gCSession::GetInstance();
     const rejoin::Boundary boundary = ClientBoundary();
-    const bool quiet = rejoin::State{}.Waiting(boundary) == rejoin::Wait::None;
+    const bool quiet = rejoin::Waiting(boundary) == rejoin::Wait::None;
     if (templatePublish.Active()) {
         TemplatePoll(now);
         return false;
@@ -836,6 +835,19 @@ bool ProcessClientTransition()
     }
     createWaitSince = 0;
     const uint32_t startedAt = queuedAt;
+    if (plan.route == R::FirstEntry) {
+        const bool manualEntry = entryManual;
+        entryManual = entryApproved = autoloadAwaiting = false;
+        queuedAt = 0;
+        recordWaitSince = 0; recordWaitGaveUp = false;
+        clientRejoin.Retired();
+        rejoinWait = rejoin::Wait::None;
+        if (manualEntry) {
+            if (void* files = FileManager(true)) NewGameDetour(files);
+            return clientRejoin.fresh && !clientRejoin.failed;
+        }
+        return FirstEntryNow(now);
+    }
     if (plan.route == R::Template) {
         if (TemplateState(true).health != rejoin::tmpl::Health::Valid) {
             RemoveTemplate("deep-check-failed");

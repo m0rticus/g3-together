@@ -8,6 +8,23 @@ namespace g3t::npclease {
 struct Interest {
     bool sameWorld = true, ready = true, eligible = true, conflict = false, hostPresent = true;
     float hostDistance = 0, clientDistance = 0, hostRoi = 8000;
+
+    bool ValidMetrics() const
+    {
+        return std::isfinite(hostDistance) && std::isfinite(clientDistance) &&
+               std::isfinite(hostRoi) && hostRoi >= 0 &&
+               hostDistance >= 0 && clientDistance >= 0;
+    }
+
+    bool EligibleState() const
+    {
+        return sameWorld && ready && eligible && !conflict;
+    }
+
+    float FarRadius() const
+    {
+        return hostRoi + 2000.0f > 12000.0f ? hostRoi + 2000.0f : 12000.0f;
+    }
 };
 
 struct Eligibility {
@@ -17,18 +34,14 @@ struct Eligibility {
 
     bool Delegate(Interest const& interest, uint32_t now)
     {
-        if (!interest.sameWorld || !interest.ready || !interest.eligible || interest.conflict ||
-            !std::isfinite(interest.hostDistance) || !std::isfinite(interest.clientDistance) ||
-            !std::isfinite(interest.hostRoi) || interest.hostRoi < 0 ||
-            interest.hostDistance < 0 || interest.clientDistance < 0) {
+        if (!interest.EligibleState() || !interest.ValidMetrics()) {
             farSince = 0;
             farHeld = false;
             dwellActive = false;
             return false;
         }
 
-        const float farRadius = interest.hostRoi + 2000.0f > 12000.0f ?
-                                interest.hostRoi + 2000.0f : 12000.0f;
+        const float farRadius = interest.FarRadius();
         const float recallRadius = farRadius - 2000.0f;
 
         if (farHeld && interest.hostPresent && interest.hostDistance <= recallRadius) {
@@ -71,14 +84,9 @@ struct Eligibility {
 
     bool Recall(Interest const& interest) const
     {
-        if (!std::isfinite(interest.hostDistance) || !std::isfinite(interest.clientDistance) ||
-            !std::isfinite(interest.hostRoi) || interest.hostRoi < 0 ||
-            interest.hostDistance < 0 || interest.clientDistance < 0) return true;
-        if (!interest.sameWorld || !interest.ready || !interest.eligible || interest.conflict) return true;
+        if (!interest.ValidMetrics() || !interest.EligibleState()) return true;
         if (!interest.hostPresent) return false;
-        const float farRadius = interest.hostRoi + 2000.0f > 12000.0f ?
-                                interest.hostRoi + 2000.0f : 12000.0f;
-        return interest.hostDistance <= farRadius - 2000.0f;
+        return interest.hostDistance <= interest.FarRadius() - 2000.0f;
     }
 };
 
@@ -127,20 +135,25 @@ struct Lease {
         return true;
     }
 
-    bool AcceptState(uint8_t client, uint32_t peerGeneration, uint32_t authorityEpoch,
-                     uint32_t life, uint32_t nextRevision, Checkpoint const& value)
+    bool CanAcceptClientState(uint8_t client, uint32_t peerGeneration, uint32_t authorityEpoch,
+                              uint32_t life, Checkpoint const& value) const
     {
         if ((phase != Phase::Client && phase != Phase::Recalling) ||
             client != owner || peerGeneration != generation ||
             authorityEpoch != epoch || life != incarnation || !Valid(value)) return false;
         if (state.dead && !value.dead) return false;
-        if ((state.effects & static_cast<uint8_t>(~value.effects)) != 0) return false;
+        return (state.effects & static_cast<uint8_t>(~value.effects)) == 0;
+    }
+
+    bool AcceptState(uint8_t client, uint32_t peerGeneration, uint32_t authorityEpoch,
+                     uint32_t life, uint32_t nextRevision, Checkpoint const& value)
+    {
+        if (!CanAcceptClientState(client, peerGeneration, authorityEpoch, life, value)) return false;
         if (Newer(nextRevision, revision)) {
             revision = nextRevision;
             state = value;
             return true;
         }
-        if (nextRevision == revision && detail::ExactState(state, value)) return false;
         return false;
     }
 
@@ -155,11 +168,7 @@ struct Lease {
     bool Cut(uint8_t client, uint32_t peerGeneration, uint32_t authorityEpoch,
              uint32_t life, uint32_t nextRevision, Checkpoint const& value)
     {
-        if ((phase != Phase::Client && phase != Phase::Recalling) ||
-            client != owner || peerGeneration != generation ||
-            authorityEpoch != epoch || life != incarnation || !Valid(value)) return false;
-        if (state.dead && !value.dead) return false;
-        if ((state.effects & static_cast<uint8_t>(~value.effects)) != 0) return false;
+        if (!CanAcceptClientState(client, peerGeneration, authorityEpoch, life, value)) return false;
 
         if (Newer(nextRevision, revision)) {
             revision = nextRevision;
@@ -242,6 +251,30 @@ constexpr uint32_t OverlayVersion = 2, LegacyOverlayVersion = 1;
 constexpr uint32_t LegacySavedWireSize = 16u + 4u + 4u + 4u + sizeof(Checkpoint);
 constexpr uint32_t SavedWireSize = LegacySavedWireSize + 1u;
 
+inline uint32_t Crc32Update(uint32_t crc, uint8_t const* bytes, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return crc;
+}
+
+inline uint32_t OverlayCrc32(uint8_t const* bytes, size_t size)
+{
+    uint32_t crc = 0xffffffffu;
+    crc = Crc32Update(crc, bytes, 16);
+    crc = Crc32Update(crc, bytes + 20, size - 20);
+    return crc ^ 0xffffffffu;
+}
+
+inline bool ValidSavedEntry(Saved const& saved)
+{
+    return GuidNonzero(saved.guid) && saved.incarnation && saved.epoch &&
+           saved.adopted <= 1 && Valid(saved.state);
+}
+
 } // namespace detail
 
 inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& output)
@@ -251,8 +284,7 @@ inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& outp
 
     for (size_t i = 0; i < overlay.size(); ++i) {
         const Saved& saved = overlay[i];
-        if (!detail::GuidNonzero(saved.guid) || !saved.incarnation || !saved.epoch ||
-            saved.adopted > 1 || !Valid(saved.state)) return false;
+        if (!detail::ValidSavedEntry(saved)) return false;
         for (size_t j = 0; j < i; ++j)
             if (std::memcmp(saved.guid, overlay[j].guid, 16) == 0) return false;
     }
@@ -275,19 +307,7 @@ inline bool EncodeOverlay(SaveOverlay const& overlay, std::vector<uint8_t>& outp
         encoded[offset++] = saved.adopted;
     }
 
-    uint32_t combined = 0xffffffffu;
-    for (size_t i = 0; i < 16; ++i) {
-        combined ^= encoded[i];
-        for (int bit = 0; bit < 8; ++bit)
-            combined = (combined >> 1) ^ (0xedb88320u & (0u - (combined & 1u)));
-    }
-    for (size_t i = 20; i < encoded.size(); ++i) {
-        combined ^= encoded[i];
-        for (int bit = 0; bit < 8; ++bit)
-            combined = (combined >> 1) ^ (0xedb88320u & (0u - (combined & 1u)));
-    }
-    combined ^= 0xffffffffu;
-    detail::Put32(encoded, 16, combined);
+    detail::Put32(encoded, 16, detail::OverlayCrc32(encoded.data(), encoded.size()));
     output.swap(encoded);
     return true;
 }
@@ -307,19 +327,7 @@ inline bool DecodeOverlay(uint8_t const* data, size_t size, SaveOverlay& output)
     if (payloadSize != uint64_t(count) * rowSize) return false;
     if (size != size_t(20) + size_t(payloadSize)) return false;
 
-    uint32_t combined = 0xffffffffu;
-    for (size_t i = 0; i < 16; ++i) {
-        combined ^= data[i];
-        for (int bit = 0; bit < 8; ++bit)
-            combined = (combined >> 1) ^ (0xedb88320u & (0u - (combined & 1u)));
-    }
-    for (size_t i = 20; i < size; ++i) {
-        combined ^= data[i];
-        for (int bit = 0; bit < 8; ++bit)
-            combined = (combined >> 1) ^ (0xedb88320u & (0u - (combined & 1u)));
-    }
-    combined ^= 0xffffffffu;
-    if (combined != detail::Get32(data + 16)) return false;
+    if (detail::OverlayCrc32(data, size) != detail::Get32(data + 16)) return false;
 
     SaveOverlay decoded;
     decoded.reserve(count);
@@ -332,8 +340,7 @@ inline bool DecodeOverlay(uint8_t const* data, size_t size, SaveOverlay& output)
         saved.revision = detail::Get32(data + offset); offset += 4;
         offset = detail::ReadCheckpoint(data, offset, saved.state);
         if (version == detail::OverlayVersion) saved.adopted = data[offset++];
-        if (!detail::GuidNonzero(saved.guid) || !saved.incarnation || !saved.epoch ||
-            saved.adopted > 1 || !Valid(saved.state)) return false;
+        if (!detail::ValidSavedEntry(saved)) return false;
         for (Saved const& prior : decoded)
             if (std::memcmp(prior.guid, saved.guid, 16) == 0) return false;
         decoded.push_back(saved);

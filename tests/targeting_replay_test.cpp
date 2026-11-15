@@ -69,6 +69,18 @@ void Order()
     shown = At(track, 5000);
     assert(shown.motion.combatTarget == 0 && shown.motion.aiMode == 9 && shown.motion.flags == 1);
 }
+
+void SpanZeroCap()
+{
+    Track track;
+    track.predictive = false;
+    Feed(track, Position, Rotation, 1000, 1000, 1, Fighting(0x11111111, 4));
+    for (uint32_t i = 0; i < 700; ++i) {
+        const uint32_t target = (i & 1u) ? 0x22222222u : 0x33333333u;
+        Feed(track, Position, Rotation, 1000, 1000 + i + 1, 1, Fighting(target, 4));
+    }
+    assert(PendingEvents(track) == 512u);
+}
 }
 
 int main(int argc, char** argv)
@@ -76,5 +88,6 @@ int main(int argc, char** argv)
     assert(argc == 2);
     if (!std::strcmp(argv[1], "timeline")) Timeline();
     else if (!std::strcmp(argv[1], "order")) Order();
+    else if (!std::strcmp(argv[1], "span_zero_cap")) SpanZeroCap();
     else return 2;
 }

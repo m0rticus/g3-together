@@ -69,6 +69,23 @@ bool DrainDualPrefetchers(Prefetcher* privatePrefetcher, Prefetcher& mainPrefetc
     return drainPrefetcher(mainPrefetcher, database, index);
 }
 
+template<class Prefetcher, class Database, class DrainPrefetcher>
+bool DrainPrefetcherGroup(Prefetcher* privatePrefetcher, Prefetcher* const* siblingPrefetchers,
+                          std::size_t siblingCount, Prefetcher& mainPrefetcher, Database& database, uint32_t index,
+                          DrainPrefetcher drainPrefetcher)
+{
+    if (index == 0xffffffffu) return true;
+    if (index >= 32) return false;
+    if (privatePrefetcher && !drainPrefetcher(*privatePrefetcher, database, index)) return false;
+    for (std::size_t i = 0; i < siblingCount; ++i) {
+        auto* sibling = siblingPrefetchers ? siblingPrefetchers[i] : nullptr;
+        if (sibling && sibling != privatePrefetcher && sibling != &mainPrefetcher &&
+            !drainPrefetcher(*sibling, database, index))
+            return false;
+    }
+    return drainPrefetcher(mainPrefetcher, database, index);
+}
+
 template<class Operations>
 bool Retire(Operations& operations)
 {

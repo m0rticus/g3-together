@@ -257,6 +257,45 @@ class TestCopyUpdateTests(unittest.TestCase):
                     process_reader=lambda: [],
                 )
 
+    def test_post_replace_fsync_failure_rolls_back_mutated_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            roots = self.make_roots(base)
+            existing_ini = roots["host"] / "g3together.ini"
+            existing_ini.write_bytes(b"role = host\nsession_id = original\n")
+            fake = base / "fake_steam_api.dll"
+            fake.write_bytes(b"synthetic fake")
+            approved = hashlib.sha256(fake.read_bytes()).hexdigest()
+            transaction_id, entries = updater.build_plan(
+                roots,
+                fake,
+                "pair-red",
+                approved,
+                ("host",),
+            )
+            manifest = updater.prepare_manifest(transaction_id, roots, entries, "pair-red")
+            manifest_path = base / "transaction.json"
+            updater.write_manifest(manifest_path, manifest)
+
+            real_fsync = updater.fsync_file
+            target_ini = roots["host"] / "g3together.ini"
+
+            def fail_on_ini_fsync(path: Path) -> None:
+                if path == target_ini and b"pair-red" in path.read_bytes():
+                    raise OSError("simulated post-replace fsync failure")
+                real_fsync(path)
+
+            updater.fsync_file = fail_on_ini_fsync
+            try:
+                with self.assertRaisesRegex(updater.UpdateError, "simulated post-replace fsync failure"):
+                    updater.apply_entries(manifest_path, manifest, entries)
+            finally:
+                updater.fsync_file = real_fsync
+
+            self.assertEqual(existing_ini.read_bytes(), b"role = host\nsession_id = original\n")
+            loaded = updater.load_manifest(manifest_path)
+            self.assertEqual(loaded["state"], "failed")
+
     def test_unknown_fake_hash_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

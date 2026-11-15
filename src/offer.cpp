@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "offer.h"
 
+#include "guid.h"
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
 #include "persist.h"
 #include "trade.h"
+#include "trade_policy.h"
 #include "trade_replay.h"
 
 #include <Game.h>
@@ -21,7 +23,6 @@
 
 namespace g3t::offer {
 namespace {
-constexpr int MaxAmount = 1000000, MaxGold = 10000000;
 constexpr unsigned AnyQuality = ~0u;
 ResultFn resultHandler = nullptr;
 uint32_t nextSerial = 0;
@@ -42,7 +43,7 @@ Template Of(uint8_t const id[16])
 {
     _GUID raw;
     std::memcpy(&raw, id, 16);
-    return Template(bCPropertyID(bCGuid(raw)));
+    return Template(guid::Property(raw));
 }
 
 bool Same(Entity& self, int stack, Template const& item, unsigned quality = AnyQuality)
@@ -99,18 +100,17 @@ bool Apply(net::OfferNote const& note)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero || !gCSession::GetInstance().IsGameRunning() || note.sellerEpoch != trade::Epoch() ||
         !note.buyerEpoch || !note.serial || note.acknowledge || (!note.count && !note.gold) ||
-        note.gold < -MaxGold || note.gold > MaxGold) return false;
+        note.gold < -trade_policy::MaxGoldAmount || note.gold > trade_policy::MaxGoldAmount) return false;
     Entity self(hero);
-    const Template gold("It_Gold");
+    const Template gold(trade_policy::GoldTemplateName);
     std::map<std::string, bool> unique;
     for (int i = 0; i < note.count; ++i) {
         auto const& entry = note.entries[i];
         const Template item = Of(entry.item);
-        const std::string key(reinterpret_cast<char const*>(&entry), 16);
-        const std::string stack = key + std::to_string(entry.quality);
+        const std::string stack = trade_policy::StackKeyBytes(entry.item, entry.quality);
         if (!item.IsValid() || static_cast<bCPropertyID const&>(item) == static_cast<bCPropertyID const&>(gold) ||
-            !entry.amount || entry.amount < -MaxAmount || entry.amount > MaxAmount || entry.quality >= 1024 ||
-            !unique.emplace(stack, true).second) return false;
+            !entry.amount || entry.amount < -trade_policy::MaxStackAmount || entry.amount > trade_policy::MaxStackAmount ||
+            entry.quality >= trade_policy::MaxQuality || !unique.emplace(stack, true).second) return false;
         // Validate metadata even for a deposit, not only stacks already in this inventory.
         eCTemplateEntityProxy proxy;
         proxy.SetEntity(static_cast<bCPropertyID const&>(item));
@@ -260,7 +260,7 @@ bool Reserve(net::OfferNote const& note)
             return false;
         }
     }
-    if (note.gold < 0 && Take(self, Template("It_Gold"), AnyQuality, -note.gold, steps) != -note.gold) {
+    if (note.gold < 0 && Take(self, Template(trade_policy::GoldTemplateName), AnyQuality, -note.gold, steps) != -note.gold) {
         Undo(self, steps);
         return false;
     }
@@ -284,7 +284,8 @@ bool Deliver(net::OfferNote const& note, bool accepted)
         if (accepted ? entry.amount > 0 : entry.amount < 0)
             ok = give(Of(entry.item), entry.quality, accepted ? entry.amount : -entry.amount);
     }
-    if (ok && (accepted ? note.gold > 0 : note.gold < 0)) ok = give(Template("It_Gold"), 0, accepted ? note.gold : -note.gold);
+    if (ok && (accepted ? note.gold > 0 : note.gold < 0))
+        ok = give(Template(trade_policy::GoldTemplateName), 0, accepted ? note.gold : -note.gold);
     if (!ok) {
         Undo(self, steps);
         hud::Message(hud::Warning, i18n::Text(i18n::TradeRestoreFailed));
@@ -356,7 +357,7 @@ void AddCommand(char const* argument, LogFn log)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     const Template item(cut == std::string::npos ? "" : arg.substr(0, cut).c_str());
     const int amount = cut == std::string::npos ? 0 : std::atoi(arg.substr(cut + 1).c_str());
-    if (!hero || !item.IsValid() || amount < 1 || amount > MaxAmount) { log("REFUSED heroadd: <name>_<amount>"); return; }
+    if (!hero || !item.IsValid() || amount < 1 || amount > trade_policy::MaxStackAmount) { log("REFUSED heroadd: <name>_<amount>"); return; }
     Entity self(hero);
     char line[160];
     Format(line, "HEROADD name=%s amount=%d stack=%d", arg.substr(0, cut).c_str(), amount, self.Inventory.CreateItems(item, 0, amount));

@@ -121,150 +121,12 @@ unsigned __stdcall TransportThread(void*)
     }
     return 0;
 }
-
-bool ReadPeerIdentityLocked(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    if (!store.published.ready || !rt.isHost || !port) return false;
-    for (int i = 0; i < MaxRemotes; ++i) {
-        auto const& peer = store.published.peers[i];
-        if (peer.port == port && peer.account) {
-            account = peer.account;
-            generation = peer.generation;
-            strcpy_s(name, peer.name);
-            return true;
-        }
-    }
-    return false;
-}
-
-bool ReadDirectPeerIdentityLocked(uint32_t hostIpv4, uint16_t port, uint64_t& account,
-                                  char (&name)[24], uint64_t& generation, uint32_t* expectedTag)
-{
-    if (!store.published.ready || !rt.isHost || !hostIpv4 || !port) return false;
-    for (auto const& pin : store.directPins) {
-        if (!pin.pinned || !pin.account || !pin.generation) continue;
-        if (pin.endpoint.hostIpv4 != hostIpv4 || pin.endpoint.port != port) continue;
-        for (auto const& peer : store.published.peers) {
-            if (peer.account != pin.account || peer.generation != pin.generation) continue;
-            account = peer.account;
-            generation = peer.generation;
-            strcpy_s(name, peer.name);
-            if (expectedTag) *expectedTag = CookieTag(peer.directOffer.cookie);
-            return true;
-        }
-    }
-    return false;
-}
-
-void CancelPendingRelayCloseLocked(uint64_t account, uint64_t generation)
-{
-    store.relayCloses.erase(std::remove_if(store.relayCloses.begin(), store.relayCloses.end(),
-        [account, generation](RelayClose const& request) {
-            return request.account == account && request.generation == generation;
-        }), store.relayCloses.end());
-}
-}
-
-void InvalidatePublishedLocked(PublishedStore& target, bool isHostRole, u64 account, uint64_t generation)
-{
-    for (int i = 0; i < MaxRemotes; ++i) {
-        auto& peer = target.published.peers[i];
-        if (peer.account != account || peer.generation != generation) continue;
-        peer = PublishedPeer{};
-        if (isHostRole && target.published.linked > 0) --target.published.linked;
-    }
-    for (auto& pin : target.directPins)
-        if (pin.account == account && pin.generation == generation)
-            pin = DirectEndpointPin{};
-    if (!isHostRole && target.published.hostGeneration == generation) {
-        target.published.hostLinked = false;
-        target.published.hostGeneration = 0;
-    }
 }
 
 void WorkerRuntime::Identity(char (&buffer)[160], u64 id) const
 {
     std::memset(buffer, 0, sizeof(buffer));
     api.IdentitySetSteamId(buffer, id);
-}
-
-void WorkerRuntime::Publish()
-{
-    Published next;
-    const uint32_t now = Now();
-    next.ready = ready;
-    next.lobby = lobby;
-    next.linked = CountLinked();
-    next.traffic = traffic;
-    strcpy_s(next.playerName, playerName);
-    next.traffic.envelopeBytes = static_cast<uint32_t>(RelayHeaderSize(GetLocalConfig().sessionId));
-    for (auto const& r : remotes)
-        if (r.linked && r.ping.Value(now) > next.ping) {
-            next.ping = r.ping.Value(now);
-            next.pingSampleAt = r.ping.sampledAt;
-        }
-    strcpy_s(next.hostName, hostName);
-    strcpy_s(next.error, error);
-    FillConnection(next.connection);
-    size_t statusPos = 0;
-    auto appendStatus = [&](char const* fmt, ...) {
-        if (statusPos + 1 >= sizeof(next.status)) return;
-        va_list args;
-        va_start(args, fmt);
-        const int written = std::vsnprintf(next.status + statusPos, sizeof(next.status) - statusPos, fmt, args);
-        va_end(args);
-        if (written > 0)
-            statusPos = (std::min)(statusPos + static_cast<size_t>(written), sizeof(next.status) - 1);
-    };
-    appendStatus("STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d "
-                 "send_failures=%u offset=%d error=%s session_id=%s isolated_drops=%u "
-                 "poll_timer=%s poll_gap_avg_ms=%.2f poll_gap_max_ms=%u pump_work_max_ms=%u receive_caps=%u forward_caps=%u "
-                 "socket_failures=%u socket_error=%d receive_failures=%u invalid_pongs=%u",
-                 GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, next.linked, next.ping,
-                 sendFailures, senderOffset, *error ? error : "-", GetLocalConfig().sessionId, isolatedDrops,
-                 store.pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum,
-                 receiveCaps, forwardCaps, socketFailures, socketError, receiveFailures, invalidPongs);
-    appendStatus(" connect_mode=%s connect_state=%s why=%s",
-                 connectionMode == connect::Mode::Auto ? "auto" : "invite",
-                 isHost ? connect::StateName(hostFlow.state()) : connect::StateName(clientFlow.state()),
-                 isHost ? "-" : connect::WhyName(clientFlow.why()));
-    for (int i = 0; i < MaxRemotes; ++i) {
-        auto const& r = remotes[i];
-        if (!r.id) continue;
-        if (r.linked) {
-            auto& peer = next.peers[i];
-            peer.port = r.relayPort;
-            peer.account = r.id;
-            peer.generation = r.generation;
-            strcpy_s(peer.name, r.name);
-            if (directUdpEnabled && r.haveDirectCookie) {
-                auto& offer = peer.directOffer;
-                offer.account = r.id;
-                offer.generation = r.generation;
-                std::memcpy(offer.cookie, r.directCookie, sizeof(offer.cookie));
-                offer.candidateCount = r.directCandidateCount;
-                for (unsigned c = 0; c < r.directCandidateCount && c < 8; ++c)
-                    offer.candidates[c] = r.directCandidates[c];
-                offer.ready = r.directReady && r.directCandidateCount != 0;
-            }
-        }
-        if (!isHost && r.id == owner) {
-            next.hostLinked = r.linked;
-            if (r.linked) next.hostGeneration = r.generation;
-        }
-        appendStatus(" peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
-                     r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
-                     r.ping.milliseconds < 0 ? 0u : now - r.ping.sampledAt);
-    }
-    std::lock_guard<std::mutex> lock(store.mutex);
-    for (auto& pin : store.directPins) {
-        if (!pin.pinned) continue;
-        bool active = false;
-        for (auto const& peer : next.peers)
-            if (peer.account == pin.account && peer.generation == pin.generation) { active = true; break; }
-        if (!active) pin = DirectEndpointPin{};
-    }
-    store.published = next;
 }
 
 bool WorkerRuntime::Fail(char const* text)
@@ -524,8 +386,7 @@ bool Start(bool host, unsigned short port)
         Logf("steam: relay on 127.0.0.1:%u%s", rt.relayPort, rt.wantedLobby ? " (steam_lobby set)" : "");
         rt.clientFlow.Configure(rt.me, session);
         rt.clientFlow.Ready();
-        auto StartupAccept = [&] { rt.StartupAccept(); };
-        StartupAccept();
+        rt.StartupAccept();
     }
     store.stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     store.wakeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -552,122 +413,6 @@ bool Start(bool host, unsigned short port)
     Logf("steam: independent transport worker poll_ms=%u timer=%s; ping=QPC control RTT",
          latency::RelayPollMs, store.pollTimer ? "highres" : "legacy");
     return true;
-}
-
-unsigned short RelayPort() { return rt.relayPort; }
-
-bool IsPeerRelay(unsigned short port)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    if (!store.published.ready || !rt.isHost || !port) return false;
-    for (auto const& peer : store.published.peers)
-        if (peer.port == port) return true;
-    return false;
-}
-
-uint64_t PeerId(unsigned short port)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    if (!store.published.ready || !rt.isHost || !port) return 0;
-    for (auto const& peer : store.published.peers)
-        if (peer.port == port) return peer.account;
-    return 0;
-}
-
-bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24])
-{
-    uint64_t generation = 0;
-    return PeerIdentity(port, account, name, generation);
-}
-
-bool PeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return ReadPeerIdentityLocked(port, account, name, generation);
-}
-
-bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    if (!ReadPeerIdentityLocked(port, account, name, generation) || account == rt.me) return false;
-    CancelPendingRelayCloseLocked(account, generation);
-    return true;
-}
-
-std::vector<DirectOffer> DirectOffers()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    std::vector<DirectOffer> result;
-    if (!store.published.ready) return result;
-    for (auto const& peer : store.published.peers)
-        if (peer.directOffer.account && peer.directOffer.generation)
-            result.push_back(peer.directOffer);
-    return result;
-}
-
-void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t hostIpv4, uint16_t port)
-{
-    if (!account || !generation || !IsValidDirectCandidateEndpoint(hostIpv4, port, AllowDirectLoopback()))
-        return;
-    std::lock_guard<std::mutex> lock(store.mutex);
-    bool peerActive = false;
-    for (auto const& peer : store.published.peers)
-        if (peer.account == account && peer.generation == generation) { peerActive = true; break; }
-    if (!peerActive) return;
-    for (auto& pin : store.directPins) {
-        if (!pin.pinned || pin.account != account || pin.generation != generation) continue;
-        if (pin.endpoint.hostIpv4 == hostIpv4 && pin.endpoint.port == port) return;
-        Logf("steam: refusing direct endpoint rebind for peer=%llu gen=%llu",
-             static_cast<unsigned long long>(account), static_cast<unsigned long long>(generation));
-        return;
-    }
-    for (auto& pin : store.directPins) {
-        if (pin.pinned) continue;
-        pin.account = account;
-        pin.generation = generation;
-        pin.endpoint = DirectEndpoint{hostIpv4, port};
-        pin.pinned = true;
-        return;
-    }
-}
-
-bool DirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint64_t& account,
-                        char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, nullptr);
-}
-
-bool ClaimDirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint32_t connectTag,
-                             uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    uint32_t expectedTag = 0;
-    if (!ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, &expectedTag) ||
-        account == rt.me || !expectedTag || connectTag != expectedTag)
-        return false;
-    CancelPendingRelayCloseLocked(account, generation);
-    return true;
-}
-
-std::vector<RelayDrop> TakeRelayDrops()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    std::vector<RelayDrop> result;
-    result.swap(store.relayDrops);
-    return result;
-}
-
-void RequestHostRelayClose(uint64_t account, uint64_t generation, char const* reason)
-{
-    if (!account || !generation) return;
-    {
-        std::lock_guard<std::mutex> lock(store.mutex);
-        RelayClose close{account, generation, {}};
-        strncpy_s(close.reason, reason, _TRUNCATE);
-        store.relayCloses.push_back(close);
-    }
-    if (store.wakeEvent) SetEvent(store.wakeEvent);
 }
 
 void Pump() { if (store.wakeEvent) SetEvent(store.wakeEvent); }
@@ -716,105 +461,12 @@ void Stop()
         store.relayCloses.clear();
         store.clientEnet = {};
         store.disconnectRequested.store(false);
-        for (auto& pin : store.directPins) pin = DirectEndpointPin{};
         store.published = Published{};
     }
-}
-
-bool Ready() { std::lock_guard<std::mutex> lock(store.mutex); return store.published.ready; }
-uint64_t LobbyId() { std::lock_guard<std::mutex> lock(store.mutex); return store.published.lobby; }
-char const* PlayerName()
-{
-    thread_local char copy[24];
-    std::lock_guard<std::mutex> lock(store.mutex);
-    strcpy_s(copy, store.published.playerName);
-    return copy;
-}
-uint64_t PlayerId() { return rt.me; }
-int Ping()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return store.published.ping >= 0 && Now() - store.published.pingSampleAt < latency::PingExpiryMs
-        ? store.published.ping : -1;
-}
-char const* Error()
-{
-    thread_local char copy[sizeof(rt.error)];
-    std::lock_guard<std::mutex> lock(store.mutex);
-    strcpy_s(copy, store.published.error);
-    return copy;
-}
-char const* HostName()
-{
-    thread_local char copy[sizeof(rt.hostName)];
-    std::lock_guard<std::mutex> lock(store.mutex);
-    strcpy_s(copy, store.published.hostName);
-    return copy;
-}
-
-bool HostLinked()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return store.published.hostLinked;
-}
-
-uint64_t HostRelayGeneration()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return store.published.hostGeneration;
-}
-
-bool RequestClientDisconnect()
-{
-    if (rt.isHost || rt.connectionMode != connect::Mode::Invite) return false;
-    store.disconnectRequested.store(true);
-    if (store.wakeEvent) SetEvent(store.wakeEvent);
-    return true;
-}
-
-void NoteClientEnetState(unsigned state, unsigned event, uint32_t data, uint32_t elapsedMs, char const* reason)
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    store.clientEnet.state = state;
-    store.clientEnet.event = event;
-    store.clientEnet.data = data;
-    store.clientEnet.elapsedMs = elapsedMs;
-    store.clientEnet.sampledAt = Now();
-    strncpy_s(store.clientEnet.reason, reason, _TRUNCATE);
-}
-
-Connection Flow()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return store.published.connection;
-}
-
-int LinkedCount()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return store.published.linked;
-}
-
-TrafficCounters Traffic()
-{
-    std::lock_guard<std::mutex> lock(store.mutex);
-    return store.published.traffic;
-}
-
-void Status(void (*log)(char const*))
-{
-    char line[sizeof(store.published.status)];
-    {
-        std::lock_guard<std::mutex> lock(store.mutex);
-        strcpy_s(line, store.published.status);
-    }
-    log(line);
 }
 }
 
 #ifdef G3T_REALISM_SOURCE
-#include "steam_p2p.cpp"
-#include "steam_flow.cpp"
-#include "steam_legacy_auto.cpp"
-#include "steam_diagnostics.cpp"
+#include "steam_published.cpp"
+#include "steam_callbacks.cpp"
 #endif

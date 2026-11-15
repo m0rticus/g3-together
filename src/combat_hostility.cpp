@@ -486,14 +486,6 @@ bool IsSharedCombatHostile(eCEntity const* npc)
     return relation::ActiveSharedCombatHostility(BuildInput(npc));
 }
 
-bool ShouldPromoteAttitude(eCEntity const* npc)
-{
-    if (!ValidNpc(npc) || npcs::IsMirrored(npc)) return false;
-    const relation::SharedCombatInput in = BuildInput(npc);
-    return in.storedAttitude != relation::Predator && in.storedAttitude != relation::Panic &&
-           relation::ActiveSharedCombatHostility(in);
-}
-
 bool MirrorSharesCombatHostility(eCEntity const* npc)
 {
     if (!ValidNpc(npc) || !npcs::IsMirrored(npc)) return false;

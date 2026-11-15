@@ -12,7 +12,6 @@ constexpr int P2PTransportIceEnable = 104, IceEnableAll = 7;
 constexpr int32_t BufferCapacity = 256 * 1024;
 constexpr int32_t MinRateCapacity = 1 * 1024 * 1024;
 constexpr int32_t MaxRateCapacity = 8 * 1024 * 1024;
-constexpr int32_t Capacity = MaxRateCapacity;
 
 struct Setting {
     int id;

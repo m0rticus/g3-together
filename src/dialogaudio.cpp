@@ -100,16 +100,6 @@ uint8_t optionsFrom = 0;      // listener: whose menu shows here (0: none)
 unsigned optionsSent = 0, optionsShown = 0;
 char lastOptions[160] = "-";
 
-void GuidOf(eCEntity* entity, uint8_t out[16])
-{
-    guid::CopyEntity(entity, out);
-}
-
-eCEntity* Resolve(uint8_t const rawGuid[16])
-{
-    return guid::Resolve(rawGuid).GetInstance();
-}
-
 gCInfoManager_PS* Infos() { return gCSession::GetInstance().IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr; }
 
 bool OwnDialog()
@@ -204,7 +194,7 @@ void TickMenu()
     eCEntity* partner = manager ? reinterpret_cast<eCEntity*>(manager->GetDialogPartnerNPC()) : nullptr;
     if (partner) {
         note.speakerKind = net::DialogSpeakerNpc;
-        GuidOf(partner, note.speaker);
+        guid::CopyEntity(partner, note.speaker);
     }
     if (ids.empty()) {
         note.kind = net::DialogOptionsGone;
@@ -242,7 +232,7 @@ void OnLocalLine(gCScriptProcessingUnit* spu, bCString const& sample)
         note.speakerKind = net::DialogSpeakerPlayer;
     } else {
         note.speakerKind = net::DialogSpeakerNpc;
-        GuidOf(speaker, note.speaker);
+        guid::CopyEntity(speaker, note.speaker);
     }
     strncpy_s(note.sample, sample.GetText(), _TRUNCATE);
     TextIdOf(speaker, note.sample, note.text, sizeof(note.text));
@@ -251,7 +241,7 @@ void OnLocalLine(gCScriptProcessingUnit* spu, bCString const& sample)
     strncpy_s(lastSample, note.sample, _TRUNCATE);
     speaking = {};
     speaking.lineId = note.lineId;
-    GuidOf(speaker, speaking.speaker);
+    guid::CopyEntity(speaker, speaking.speaker);
     speaking.since = GetTickCount();
     Logf("dialogaudio: line %u by %s sent: %s", note.lineId, speaker->GetName().GetText(), note.sample);
 }
@@ -293,10 +283,10 @@ float Distance(eCEntity* a, eCEntity* b)
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-eCEntity* SpeakerOf(uint8_t from, uint8_t kind, uint8_t const guid[16])
+eCEntity* SpeakerOf(uint8_t from, uint8_t kind, uint8_t const rawGuid[16])
 {
     if (kind == net::DialogSpeakerPlayer) return remote::PuppetOf(from);
-    if (kind == net::DialogSpeakerNpc) return Resolve(guid);
+    if (kind == net::DialogSpeakerNpc) return guid::Resolve(rawGuid).GetInstance();
     return nullptr;
 }
 
@@ -333,7 +323,7 @@ void ShowMenu(uint8_t from)
 {
     Menu const& menu = menus[from];
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    eCEntity* npc = menu.speakerKind == net::DialogSpeakerNpc ? Resolve(menu.speaker) : nullptr;
+    eCEntity* npc = menu.speakerKind == net::DialogSpeakerNpc ? guid::Resolve(menu.speaker).GetInstance() : nullptr;
     eCEntity* puppet = remote::PuppetOf(from);
     eCEntity* at = npc ? npc : puppet;
     if (!options || !hero || !puppet || !at || OwnDialog() || Distance(hero, at) > StartRange) return;
@@ -448,7 +438,7 @@ void TickSpeaking()
     }
     // A short grace after the start; then the line is over when the speaker's output stops (finished, skipped, or a
     // full stop), whichever way it ended.
-    eCEntity* speaker = Resolve(speaking.speaker);
+    eCEntity* speaker = guid::Resolve(speaking.speaker).GetInstance();
     auto* routine = speaker ? static_cast<gCScriptRoutine_PS*>(speaker->GetPropertySet(eEPropertySetType_ScriptRoutine)) : nullptr;
     if (GetTickCount() - speaking.since > 300 && (!routine || !routine->GetSPU().IsOutputPlaying())) SendEnd(1);
 }

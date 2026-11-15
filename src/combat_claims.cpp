@@ -162,9 +162,11 @@ bool KnocksOut(Entity& npc)
 bool HostileToClaimant(Entity& victim, eCEntity* claimant)
 {
     if (!victim.GetInstance() || !claimant || !remote::IsPuppet(claimant)) return false;
+    int attitude = gEAttitude_None;
+    if (ai::TryPlayerAttitude(victim.GetInstance(), claimant, attitude) && attitude != gEAttitude_Panic)
+        return attitude == gEAttitude_Hostile || attitude == gEAttitude_Predator;
     guards::Acting player(claimant);
-    GEInt attitude = CallScript("GetAttitude", victim.GetInstance(), claimant, 0);
-    if (attitude == gEAttitude_Panic) attitude = ai::PlainAttitude(victim.GetInstance(), claimant);
+    attitude = ai::PlainAttitude(victim.GetInstance(), claimant);
     return attitude == gEAttitude_Hostile || attitude == gEAttitude_Predator;
 }
 
@@ -402,9 +404,11 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     }
     if (!finishing) {
         const bool hostileToClaimant = HostileToClaimant(target, attacker);
-        // As the game decided on the sender's machine; a hit judged there as neither (that machine's copy had more hit points
-        // left) by the species rule.
-        if (!hostileToClaimant && (outcome == net::HitKnockOut || (outcome == net::HitUnjudged && KnocksOut(target)))) {
+        // As the game decided on the sender's machine; non-finishing melee on a non-hostile human or orc always knocks out,
+        // even if the sender's copy had more hit points left or stale combat state.
+        if (!hostileToClaimant &&
+            (outcome == net::HitKnockOut ||
+             ((outcome == net::HitUnjudged || contact.melee != net::NotMelee) && KnocksOut(target)))) {
             // The game's way, as in the bout above: ZS_Unconscious runs Defeat(CurrentAttacker, victim). The puppet as attacker;
             // remote.cpp lets go of it when the puppet goes. The experience on the sender's machine, once per victim (OnKilled).
             eCEntity* victim = target.GetInstance();

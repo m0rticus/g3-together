@@ -5,6 +5,7 @@
 
 #include "net.h"
 #include "enet_policy.h"
+#include "guid_key.h"
 #include "latency.h"
 #include "net_metrics.h"
 #include "npcwire_adapter.h"
@@ -230,27 +231,12 @@ inline uint32_t ControlWire32(uint8_t const* data)
     return static_cast<uint32_t>(BoneWire16(data)) | (static_cast<uint32_t>(BoneWire16(data + 2)) << 16);
 }
 
-using NpcKeyValue = std::array<uint8_t, 16>;
-
-struct NpcKeyHash {
-    size_t operator()(NpcKeyValue const& key) const noexcept
-    {
-        uint64_t a = 0, b = 0;
-        std::memcpy(&a, key.data(), sizeof(a));
-        std::memcpy(&b, key.data() + sizeof(a), sizeof(b));
-        uint64_t mixed = a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
-        mixed ^= mixed >> 33;
-        mixed *= 0xff51afd7ed558ccdull;
-        mixed ^= mixed >> 33;
-        return static_cast<size_t>(mixed);
-    }
-};
+using NpcKeyValue = GuidKey;
+using NpcKeyHash = GuidHash;
 
 inline NpcKeyValue NpcKey(uint8_t const* guid) noexcept
 {
-    NpcKeyValue key{};
-    std::memcpy(key.data(), guid, key.size());
-    return key;
+    return ToGuidKey(guid);
 }
 
 inline uint32_t DirectCookieTag(uint8_t const cookie[16])
@@ -375,6 +361,7 @@ unsigned ClientCount();
 void LeavePeer(ENetPeer* peer, char const* reason, bool disconnect);
 DirectPunchSession* FindClientDirectSession();
 bool ClientPunchWaiting(DirectPunchSession const* direct, uint32_t now);
+void ConnectClientWithDirectFallback(DirectPunchSession* direct, bool& useDirect, ENetAddress& connectTo, bool logFallback);
 void FinishClientConnectAttempt(DirectPunchSession* direct, bool useDirect, uint32_t now);
 void CloseClientLink();
 void HandleHello(ENetPeer* peer, bool exactSize, uint16_t version, char const* name, uint64_t const* parityItems);

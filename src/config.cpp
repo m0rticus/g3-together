@@ -92,7 +92,7 @@ Config const& LoadConfig()
         Trim(key);
         Trim(value);
         if (!_stricmp(key, "ardea_remove_npcs") && std::strlen(equals + 1) >= sizeof(value)) {
-            Log("config: ardea_remove_npcs is too long; keeping previous setting");
+            Log("config: ardea_remove_npcs is too long; using default setting");
             continue;
         }
         if (!_stricmp(key, "role")) next.host = _stricmp(value, "client") != 0;
@@ -204,7 +204,7 @@ Config const& LoadConfig()
         }
         else if (!_stricmp(key, "ardea_remove_npcs")) {
             if (!npcremoval::policy::ParseNames(value, next.ardeaRemoveNpcs))
-                Logf("config: invalid ardea_remove_npcs '%s'; use Goblin,Ogre or an empty value; keeping previous setting", value);
+                Logf("config: invalid ardea_remove_npcs '%s'; use Goblin,Ogre or an empty value; using default setting", value);
         }
         else if (!_stricmp(key, "npc_authority_fallback")) {
             if (!_stricmp(value, "on")) next.npcAuthorityFallback = true;

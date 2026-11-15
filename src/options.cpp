@@ -11,13 +11,16 @@
 #include <Game.h>
 #include <Windows.h>
 #include <intrin.h>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <mutex>
 
 namespace g3t::options {
 namespace {
 policy::Session session;
+std::atomic<bool> sessionActive{false};
 bool installed = false;
 std::wstring hint;
 std::mutex sessionMutex;
@@ -28,6 +31,43 @@ using StringFn = GEBool (__thiscall*)(eCConfigFile const*, bCString const&, bCSt
 StringFn originalString = nullptr;
 uintptr_t gameBase = 0;
 thread_local unsigned hostNpcJudgement = 0;
+
+bool ReadableBytes(void const* address, size_t size)
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    if (!start || size > UINTPTR_MAX - start) return false;
+    const uintptr_t end = start + size;
+    for (uintptr_t at = start; at < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void const*>(at), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        const DWORD protect = info.Protect & 0xff;
+        if ((info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            (protect != PAGE_READONLY && protect != PAGE_READWRITE && protect != PAGE_WRITECOPY &&
+             protect != PAGE_EXECUTE_READ && protect != PAGE_EXECUTE_READWRITE && protect != PAGE_EXECUTE_WRITECOPY))
+            return false;
+        const uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (next <= at) return false;
+        at = next;
+    }
+    return true;
+}
+
+bool ModuleHasRange(HMODULE module, size_t offset, size_t size)
+{
+    auto const* image = reinterpret_cast<unsigned char const*>(module);
+    if (!ReadableBytes(image, sizeof(IMAGE_DOS_HEADER))) return false;
+    auto const* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
+        !ReadableBytes(image + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS32)))
+        return false;
+    auto const* nt = reinterpret_cast<IMAGE_NT_HEADERS32 const*>(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        return false;
+    const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+    return offset <= imageSize && size <= imageSize - offset && ReadableBytes(image + offset, size);
+}
 
 eSSetupEngine const& LocalSetup()
 {
@@ -68,11 +108,13 @@ void Append(std::wstring& text, wchar_t const* value)
     text += value;
 }
 
-void Summary(unsigned changed)
+void Summary(unsigned changed, policy::Snapshot const& s)
 {
-    hint.clear();
-    if (!changed) return;
-    auto const& s = session.host;
+    if (!changed) {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        hint.clear();
+        return;
+    }
     std::wstring list;
     wchar_t part[180] = {};
     auto number = [&](unsigned bit, i18n::Message message, auto value) {
@@ -95,8 +137,11 @@ void Summary(unsigned changed)
     wchar_t difficulty[64] = {}, text[900] = {};
     MultiByteToWideChar(CP_UTF8, 0, LocalSetup().Difficulty.GetText(), -1, difficulty, 64);
     _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::OptionsAdopted), list.c_str(), difficulty);
-    hint = text;
-    hud::Message(hud::Good, hint.c_str());
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        hint = text;
+    }
+    hud::Message(hud::Good, text);
     char utf8[2400] = {};
     WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof(utf8), nullptr, nullptr);
     Logf("options: %s", utf8);
@@ -106,19 +151,21 @@ void Summary(unsigned changed)
 bool Install()
 {
     if (installed) return true;
-    auto* engine = reinterpret_cast<unsigned char*>(GetModuleHandleA("Engine.dll"));
-    void* game = GetModuleHandleA("Game.dll");
-    auto* entry = engine ? reinterpret_cast<unsigned char*>(GetProcAddress(reinterpret_cast<HMODULE>(engine),
+    HMODULE engineModule = GetModuleHandleA("Engine.dll");
+    HMODULE gameModule = GetModuleHandleA("Game.dll");
+    void* game = gameModule;
+    auto* entry = engineModule ? reinterpret_cast<unsigned char*>(GetProcAddress(engineModule,
         "?GetEngineSetup@eCApplication@@QBEABUeSSetupEngine@@XZ")) : nullptr;
     const unsigned char getter[] = {0x8d, 0x81, 0x98, 0, 0, 0, 0xc3};
-    if (!game || !entry || std::memcmp(entry, getter, sizeof(getter))) {
+    if (!game || !entry || !ReadableBytes(entry, sizeof(getter)) || std::memcmp(entry, getter, sizeof(getter))) {
         Log("options: native setup getter unavailable/changed; host balancing delegation cannot start");
         return false;
     }
     gameBase = reinterpret_cast<uintptr_t>(game);
     // Verify the one getter-based writer before allowing an overlay there.
     const unsigned char writer[] = {0x0f, 0xb6, 0x80, 0xea, 0x01, 0, 0, 0x50};
-    if (std::memcmp(reinterpret_cast<void*>(gameBase + 0x90b0e), writer, sizeof(writer))) {
+    if (!ModuleHasRange(gameModule, 0x90b0e, sizeof(writer)) ||
+        std::memcmp(reinterpret_cast<void const*>(gameBase + 0x90b0e), writer, sizeof(writer))) {
         Log("options: native setup serialization site changed; delegation cannot start");
         return false;
     }
@@ -171,20 +218,24 @@ bool Adopt(policy::Snapshot const& host, uint32_t epoch)
         return false;
     }
     const auto local = Capture();
-    const bool same = session.active && !policy::Differences(session.host, host) && session.epoch == epoch;
-    if (same) return true;
+    const bool running = gCSession::GetInstance().IsGameRunning();
     const unsigned changed = policy::Differences(local, host);
-    const unsigned newValues = session.active ? policy::Differences(session.host, host) : changed;
-    if (session.active && epoch && session.epoch == epoch && newValues) {
-        Log("options: host changed balancing without a new world epoch; adoption refused");
-        return false;
-    }
-    if (policy::NeedsEntry(newValues, gCSession::GetInstance().IsGameRunning())) reentry = true;
+    unsigned newValues = changed;
+    policy::Snapshot original{};
     {
         std::lock_guard<std::mutex> lock(sessionMutex);
+        const bool same = session.active && !policy::Differences(session.host, host) && session.epoch == epoch;
+        if (same) return true;
+        newValues = session.active ? policy::Differences(session.host, host) : changed;
+        if (session.active && epoch && session.epoch == epoch && newValues) {
+            Log("options: host changed balancing without a new world epoch; adoption refused");
+            return false;
+        }
         if (!session.Adopt(local, host, epoch)) return false;
+        sessionActive.store(session.active, std::memory_order_release);
+        original = session.original;
     }
-    auto const& original = session.original;
+    if (policy::NeedsEntry(newValues, running)) reentry = true;
     Logf("options: epoch=%08x option=alternative_balancing host=%u original=%u effective=%u source=host/getter",
          epoch, host.balancing, original.balancing, host.balancing);
     Logf("options: epoch=%08x option=alternative_ai host=%u original=%u effective=%u source=host/getter",
@@ -205,7 +256,7 @@ bool Adopt(policy::Snapshot const& host, uint32_t epoch)
          epoch, host.difficulty, LocalSetup().Difficulty.GetText(), LocalSetup().Difficulty.GetText());
     Logf("options: epoch=%08x option=quick_loot host=%u original=%u effective=%u source=local/kept",
          epoch, host.quickLoot, LocalSetup().QuickLoot, LocalSetup().QuickLoot);
-    if (newValues) Summary(changed);
+    if (newValues) Summary(changed, host);
     return true;
 }
 
@@ -214,6 +265,7 @@ void Restore()
     std::lock_guard<std::mutex> lock(sessionMutex);
     if (session.active) Log("options: restored local readers source=local disk_writes=0");
     session.Restore();
+    sessionActive.store(false, std::memory_order_release);
     hint.clear();
     reentry = false;
 }
@@ -225,7 +277,16 @@ void ApplyMod(Config& config)
     policy::ApplyMod(config, session.host);
 }
 
-wchar_t const* Hint() { return hint.empty() ? nullptr : hint.c_str(); }
+wchar_t const* Hint()
+{
+    thread_local std::wstring copy;
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        if (hint.empty()) return nullptr;
+        copy = hint;
+    }
+    return copy.c_str();
+}
 bool WorldAnnounced()
 {
     if (!reentry) return true;
@@ -241,7 +302,7 @@ bool WorldAnnounced()
     reentry = false;
     return true;
 }
-NpcJudgement::NpcJudgement(bool hostPresented) : entered(session.active && hostPresented)
+NpcJudgement::NpcJudgement(bool hostPresented) : entered(sessionActive.load(std::memory_order_acquire) && hostPresented)
 {
     if (entered) ++hostNpcJudgement;
 }

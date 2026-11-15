@@ -8,10 +8,26 @@
 #include <Script.h>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace g3t::npcplayback::detail {
+
+// Native emfx2Node stores its local bone bCMatrix at byte offset +0x44 in CP 1.75.
+template <typename Node>
+inline bCMatrix ReadNodeMatrix(Node const* nodes, int index)
+{
+    bCMatrix matrix;
+    std::memcpy(&matrix, reinterpret_cast<unsigned char const*>(nodes + index) + 0x44, sizeof(matrix));
+    return matrix;
+}
+
+template <typename Node>
+inline void WriteNodeMatrix(Node* nodes, int index, bCMatrix const& matrix)
+{
+    std::memcpy(reinterpret_cast<unsigned char*>(nodes + index) + 0x44, &matrix, sizeof(matrix));
+}
 
 constexpr int Slots = 8;
 // Engine 1.75's actor PlayMotion reads seven 32-bit words. The SDK declares this descriptor without storage.

@@ -52,6 +52,13 @@ inline bool NewGameAllowed(bool worldEntered) { return !worldEntered; }
 struct Boundary {
     bool nativeBusy = false, nested = false, savePending = false, interaction = false;
 };
+inline Wait Waiting(Boundary const& boundary)
+{
+    if (boundary.nativeBusy || boundary.nested) return Wait::Native;
+    if (boundary.savePending) return Wait::Save;
+    if (boundary.interaction) return Wait::Interaction;
+    return Wait::None;
+}
 struct State {
     bool pending = false;
     bool fresh = false;
@@ -61,13 +68,7 @@ struct State {
     void Retired() { pending = false; fresh = false; }
     void Started(bool ok) { fresh = ok; failed = !ok; }
     void Left() { fresh = false; }
-    Wait Waiting(Boundary const& boundary) const
-    {
-        if (boundary.nativeBusy || boundary.nested) return Wait::Native;
-        if (boundary.savePending) return Wait::Save;
-        if (boundary.interaction) return Wait::Interaction;
-        return Wait::None;
-    }
+    Wait Waiting(Boundary const& boundary) const { return rejoin::Waiting(boundary); }
     bool CanRetire(Boundary const& boundary) const { return pending && Waiting(boundary) == Wait::None; }
     bool CanUseFresh(bool running, bool hostReady) const { return fresh && !pending && !failed && running && hostReady; }
 };

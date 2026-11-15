@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace g3t::world::pvs {
@@ -41,6 +42,24 @@ struct RemoteRegionState {
     uint32_t retryAt = 0;
 };
 
+struct PublishedRegion {
+    eCPVSPrefetcher3* prefetcher = nullptr;
+    uint32_t dbIndex = 0xffffffffu;
+};
+
+struct PublishedSnapshot {
+    std::array<PublishedRegion, 32> items{};
+    std::size_t count = 0;
+};
+
+std::mutex& PublishedRegionsMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+PublishedSnapshot publishedRegions;
+
 std::vector<RemoteRegionState> hostRegions;
 unsigned regionLogs = 0;
 std::atomic<unsigned> regionOwners{0};
@@ -54,14 +73,35 @@ bool freeIndexPatched = false;
 
 using CacheOutFn = GEBool(__fastcall*)(eCPVSPrefetcher3*, void*, eCEntity*);
 CacheOutFn originalCacheOut = nullptr;
-unsigned remoteEntityEvictions = 0;
+std::atomic<unsigned> remoteEntityEvictions{0};
 using ContextCacheOutFn = GEBool(__stdcall*)(eCGeometrySpatialContext*);
 using ContextCallbackGetter = ContextCacheOutFn(__thiscall*)(eCPVSPrefetcher3 const*);
 ContextCallbackGetter getContextCallback = nullptr;
 std::atomic<ContextCacheOutFn> previousContextCallback{nullptr};
 eCPVSPrefetcher3* contextCacheOwner = nullptr;
-unsigned contextsRetained = 0;
-bool contextRefreshPending = false;
+std::atomic<unsigned> contextsRetained{0};
+std::atomic<bool> contextRefreshPending{false};
+
+PublishedSnapshot LoadPublishedRegions()
+{
+    std::lock_guard<std::mutex> lock(PublishedRegionsMutex());
+    return publishedRegions;
+}
+
+void PublishActiveRegions(RemoteRegionState const* retiring = nullptr)
+{
+    PublishedSnapshot next;
+    for (auto const& region : hostRegions) {
+        if (&region == retiring || !region.camera || !region.prefetcher) continue;
+        if (next.count >= next.items.size()) break;
+        next.items[next.count++] = {
+            region.prefetcher.get(),
+            region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex(),
+        };
+    }
+    std::lock_guard<std::mutex> lock(PublishedRegionsMutex());
+    publishedRegions = next;
+}
 
 using DestroyEntityFn = void(__fastcall*)(eCEntity*, void*);
 DestroyEntityFn originalDestroyEntity = nullptr;
@@ -89,20 +129,22 @@ uint32_t EntityDatabases(eCEntity const* entity)
     return databases;
 }
 
-bool RemoteJobsPending()
+bool RemoteJobsPending(PublishedSnapshot const& snapshot)
 {
-    for (auto& region : hostRegions)
-        if (region.prefetcher && region.prefetcher->IsJobRunning()) return true;
+    for (std::size_t i = 0; i < snapshot.count; ++i)
+        if (snapshot.items[i].prefetcher && snapshot.items[i].prefetcher->IsJobRunning()) return true;
     return false;
 }
 
-bool NeedsContext(RemoteRegionState& region, bCBox const& context)
+bool NeedsContext(eCPVSPrefetcher3& prefetcher, bCBox const& context)
 {
-    if (!region.camera || !region.prefetcher) return false;
+    ScopedCellLock lock;
     bTSmallArray<eCPVSCellItem*> cells;
-    region.prefetcher->GetAllValidCells(cells);
+    prefetcher.GetAllValidCells(cells);
     for (GEU16 i = 0; i < cells.GetCount(); ++i) {
-        auto const& cell = cells.GetAt(i)->GetCellBox();
+        auto* cellItem = cells.GetAt(i);
+        if (!cellItem) continue;
+        auto const& cell = cellItem->GetCellBox();
         if (context.GetMax().GetX() >= cell.GetMin().GetX() - cell.GetWidth() &&
             context.GetMin().GetX() <= cell.GetMax().GetX() + cell.GetWidth() &&
             context.GetMax().GetZ() >= cell.GetMin().GetZ() - cell.GetDepth() &&
@@ -118,13 +160,18 @@ GEBool __stdcall MayReleaseContext(eCGeometrySpatialContext* context)
         if (regionOwners.load()) return GEFalse;
         return previous ? previous(context) : GETrue;
     }
-    if (RemoteJobsPending()) {
-        contextRefreshPending = true;
-        ++contextsRetained;
+    const PublishedSnapshot snapshot = LoadPublishedRegions();
+    if (RemoteJobsPending(snapshot)) {
+        contextRefreshPending.store(true, std::memory_order_relaxed);
+        contextsRetained.fetch_add(1, std::memory_order_relaxed);
         return GEFalse;
     }
-    for (auto& region : hostRegions)
-        if (NeedsContext(region, context->GetContextBox())) { ++contextsRetained; return GEFalse; }
+    for (std::size_t i = 0; i < snapshot.count; ++i) {
+        if (snapshot.items[i].prefetcher && NeedsContext(*snapshot.items[i].prefetcher, context->GetContextBox())) {
+            contextsRetained.fetch_add(1, std::memory_order_relaxed);
+            return GEFalse;
+        }
+    }
     return previous ? previous(context) : GETrue;
 }
 
@@ -160,7 +207,7 @@ void RestoreContextOwnership()
     else Log("WARN world: spatial-context callback changed externally; not overwriting it");
     contextCacheOwner = nullptr;
     previousContextCallback = nullptr;
-    contextRefreshPending = false;
+    contextRefreshPending.store(false, std::memory_order_relaxed);
 }
 
 void EvictFromPrefetcher(eCPVSPrefetcher3& prefetcher, eCEntity* entity, uint32_t index)
@@ -174,33 +221,40 @@ void EvictFromPrefetcher(eCPVSPrefetcher3& prefetcher, eCEntity* entity, uint32_
         auto* cell = cells.GetAt(i);
         if (cell && cell != permanent && cell->ExistsEntity(entity)) {
             cell->CacheOutEntity(entity, index);
-            ++remoteEntityEvictions;
+            remoteEntityEvictions.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (permanent && permanent->ExistsEntity(entity)) {
         permanent->CacheOutEntity(entity, index);
-        ++remoteEntityEvictions;
+        remoteEntityEvictions.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-void EvictRemoteEntity(RemoteRegionState& region, eCEntity* entity, eCPVSPrefetcher3* alsoFrom = nullptr)
+void EvictPublishedSlot(PublishedSnapshot const& snapshot, eCPVSPrefetcher3* mainPrefetcher, eCEntity* entity,
+                        uint32_t dbIndex)
 {
-    if (!region.camera || !region.prefetcher || !entity) return;
-    const uint32_t index = region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex();
-    if (index >= 32) return;
-    EvictFromPrefetcher(*region.prefetcher, entity, index);
-    if (alsoFrom && alsoFrom != region.prefetcher.get()) EvictFromPrefetcher(*alsoFrom, entity, index);
+    if (!entity || dbIndex >= 32) return;
+    for (std::size_t i = 0; i < snapshot.count; ++i) {
+        if (snapshot.items[i].prefetcher) EvictFromPrefetcher(*snapshot.items[i].prefetcher, entity, dbIndex);
+    }
+    if (mainPrefetcher) EvictFromPrefetcher(*mainPrefetcher, entity, dbIndex);
 }
 
 GEBool __fastcall CacheOut(eCPVSPrefetcher3* self, void* edx, eCEntity* entity)
 {
     auto* renderer = RenderAdmin();
-    if (renderer && self == &renderer->GetPVSPrefetcher3()) {
-        for (auto& region : hostRegions) EvictRemoteEntity(region, entity);
+    auto* mainPrefetcher = renderer ? &renderer->GetPVSPrefetcher3() : nullptr;
+    const PublishedSnapshot snapshot = LoadPublishedRegions();
+    if (mainPrefetcher && self == mainPrefetcher) {
+        for (std::size_t i = 0; i < snapshot.count; ++i)
+            EvictPublishedSlot(snapshot, nullptr, entity, snapshot.items[i].dbIndex);
     } else {
-        auto* mainPrefetcher = renderer ? &renderer->GetPVSPrefetcher3() : nullptr;
-        for (auto& region : hostRegions)
-            if (self == region.prefetcher.get()) { EvictRemoteEntity(region, entity, mainPrefetcher); return GETrue; }
+        for (std::size_t i = 0; i < snapshot.count; ++i) {
+            if (self == snapshot.items[i].prefetcher) {
+                EvictPublishedSlot(snapshot, mainPrefetcher, entity, snapshot.items[i].dbIndex);
+                return GETrue;
+            }
+        }
     }
     return originalCacheOut(self, edx, entity);
 }
@@ -326,12 +380,16 @@ void LogRegion(RemoteRegionState const& region, char const* phase)
 struct RegionRetirement {
     RemoteRegionState& region;
     eCRenderSystemAdmin& renderer;
+    std::vector<eCPVSPrefetcher3*> siblingPrefetchers;
 
     bool CompleteJobs()
     {
         if (region.prefetcher) {
             region.prefetcher->EnablePrefetcher(GEFalse);
             if (!CompletePrefetcher(*region.prefetcher, "retired remote")) return false;
+        }
+        for (eCPVSPrefetcher3* sibling : siblingPrefetchers) {
+            if (sibling && !CompletePrefetcher(*sibling, "sibling remote")) return false;
         }
         return CompletePrefetcher(renderer.GetPVSPrefetcher3(), "main renderer");
     }
@@ -355,15 +413,16 @@ struct RegionRetirement {
             ScopedCellLock lock;
             bTSmallArray<eCPVSCellItem*> cells;
             prefetcher.GetAllValidCells(cells);
-            // Release every grid and permanent cell on both prefetchers BEFORE losing the registered database slot index.
+            // Release every grid and permanent cell across active prefetchers BEFORE losing the registered database slot index.
             if (!retirement::DrainSlots(cells.GetCount(), [&](std::size_t i) { return cells.GetAt(static_cast<GEU16>(i)); },
                                         prefetcher.GetNonDeactivationCell(), slot))
                 return false;
             prefetcher.ClearCells(db);
             return true;
         };
-        return retirement::DrainDualPrefetchers(region.prefetcher.get(), renderer.GetPVSPrefetcher3(), database, index,
-                                                drainPrefetcher);
+        return retirement::DrainPrefetcherGroup(region.prefetcher.get(), siblingPrefetchers.data(),
+                                                siblingPrefetchers.size(), renderer.GetPVSPrefetcher3(), database,
+                                                index, drainPrefetcher);
     }
     bool CellsEmpty()
     {
@@ -371,10 +430,14 @@ struct RegionRetirement {
         const uint32_t index = region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex();
         const auto privateCells = Inventory(region.prefetcher.get());
         const std::size_t privateSlot = index < 32 ? SlotEntityCount(region.prefetcher.get(), index) : 0;
+        std::size_t siblingSlot = 0;
+        if (index < 32) {
+            for (eCPVSPrefetcher3* sibling : siblingPrefetchers) siblingSlot += SlotEntityCount(sibling, index);
+        }
         const std::size_t mainSlot = index < 32 ? SlotEntityCount(&renderer.GetPVSPrefetcher3(), index) : 0;
-        if (privateCells.Empty() && privateSlot == 0 && mainSlot == 0) return true;
-        Logf("FAIL world: PVS slot %u still owns entities (private=%u/%u private_slot=%zu main_slot=%zu); database/camera/prefetcher preserved",
-             index, privateCells.statics, privateCells.dynamics, privateSlot, mainSlot);
+        if (privateCells.Empty() && privateSlot == 0 && siblingSlot == 0 && mainSlot == 0) return true;
+        Logf("FAIL world: PVS slot %u still owns entities (private=%u/%u private_slot=%zu sibling_slot=%zu main_slot=%zu); database/camera/prefetcher preserved",
+             index, privateCells.statics, privateCells.dynamics, privateSlot, siblingSlot, mainSlot);
         return false;
     }
     bool Unregister()
@@ -390,6 +453,7 @@ struct RegionRetirement {
     }
     void DestroyOwners()
     {
+        PublishActiveRegions(&region);
         region.camera.reset();
         region.prefetcher.reset();
         if (!renderer.FlushThreadQueues()) Log("FAIL world: remote camera destruction queues did not flush");
@@ -405,7 +469,12 @@ void ReleaseRegion(RemoteRegionState& region)
     auto* renderer = RenderAdmin();
     bool retired = false;
     if (renderer && region.camera) {
-        RegionRetirement operations{region, *renderer};
+        std::vector<eCPVSPrefetcher3*> siblings;
+        siblings.reserve(hostRegions.size());
+        for (auto const& other : hostRegions) {
+            if (&other != &region && other.prefetcher) siblings.push_back(other.prefetcher.get());
+        }
+        RegionRetirement operations{region, *renderer, std::move(siblings)};
         retired = retirement::Retire(operations);
     } else Log("FAIL world: remote retirement has no render administration or camera");
     if (!retired) {
@@ -413,7 +482,7 @@ void ReleaseRegion(RemoteRegionState& region)
         region.retryAt = net::Now() + 5000;
         Log("FAIL world: retirement unsafe; no owner destroyed");
     } else Log("world-cache: retired remote slot before destroying camera/prefetcher");
-    contextRefreshPending = true;
+    contextRefreshPending.store(true, std::memory_order_relaxed);
 }
 
 bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
@@ -459,6 +528,7 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
         region.prefetcher = std::move(prefetcher);
         regionOwners.fetch_add(1);
         region.radius = 0.0f;
+        PublishActiveRegions();
         Logf("world: remote simulation region created (database %u) for a player %.0f,%.0f,%.0f radius %.0f cm",
              region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex(), at[0], at[1], at[2], radius);
     }
@@ -469,7 +539,7 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
             Logf("world: remote simulation region moved to %.0f,%.0f,%.0f radius %.0f cm (%u frames)", at[0], at[1], at[2], radius,
                  region.frames);
         }
-        contextRefreshPending = true;
+        contextRefreshPending.store(true, std::memory_order_relaxed);
         region.camera->SetClipDepth(bCVector2(1.0f, radius));
         region.camera->SetPosition(bCVector(at[0], at[1], at[2]));
         auto& database = region.camera->GetFrustumDatabase();
@@ -542,9 +612,9 @@ std::size_t ActiveRegionCount() { return hostRegions.size(); }
 
 void RefreshContexts()
 {
-    if (!contextRefreshPending || RemoteJobsPending()) return;
+    if (!contextRefreshPending.load(std::memory_order_relaxed) || RemoteJobsPending(LoadPublishedRegions())) return;
     eCApplication::GetInstance().GetCurrentCamera().GetFrustumDatabase().ForcePrefetch();
-    contextRefreshPending = false;
+    contextRefreshPending.store(false, std::memory_order_relaxed);
 }
 
 namespace {
@@ -622,12 +692,14 @@ void SyncActiveRegions(std::vector<AnchorGroup> const& groups)
     for (size_t i = groups.size(); i < hostRegions.size(); ++i)
         if (hostRegions[i].camera || hostRegions[i].prefetcher) retained = i + 1;
     hostRegions.resize(retained);
+    PublishActiveRegions();
     for (size_t id = 0; id < groups.size(); ++id) {
         float centre[3];
         for (int k = 0; k < 3; ++k) centre[k] = (groups[id].low[k] + groups[id].high[k]) * 0.5f;
         const float radius = GetConfig().hostRoi + body::Distance(groups[id].low.data(), groups[id].high.data()) * 0.5f + 1500.0f;
         PlaceRegion(hostRegions[id], centre, radius);
     }
+    PublishActiveRegions();
 }
 
 void UpdateReadySimulationAnchors(eCPVSPrefetcher3& mainPrefetcher, std::vector<size_t> const& anchorGroups)
@@ -679,6 +751,7 @@ void RetireHostRegions()
     simulationAnchors.clear();
     readySimulationAnchors.clear();
     anchorsCheckedAt = 0;
+    PublishActiveRegions();
     if (hostRegions.empty()) RestoreContextOwnership();
 }
 

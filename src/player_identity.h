@@ -79,12 +79,12 @@ struct Companions {
             owner.summoned = tag == "summon64";
             if (!(input >> token) || token != "1" || !(input >> hex >> token) ||
                 !SteamId(token, owner.account) || input >> extra) return Row::Invalid;
-            candidates.insert(owner.account);
         } else {
             if (!(input >> hex) || input.get() != ' ' || !std::getline(input, owner.legacyName) ||
                 !Label(owner.legacyName)) return Row::Invalid;
         }
         if (!Guid(hex, key) || !owners.emplace(key, owner).second) return Row::Invalid;
+        if (owner.account) candidates.insert(owner.account);
         return Row::Accepted;
     }
     std::string Write() const

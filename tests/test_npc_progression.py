@@ -26,6 +26,7 @@ TOUCHED_PROGRESSION_FILES = (
     "infocmd.cpp",
     "infocmd_progression.cpp",
     "infocmd_sector.cpp",
+    "infocmd_qa.cpp",
     "journal.cpp",
     "story_policy.h",
     "story_internal.h",
@@ -92,9 +93,10 @@ class NpcProgressionSyncTests(unittest.TestCase):
         self.assertIn("if (!Processed(npc.GetInstance())) {", journal)
 
         # Repeatable timed info cooldowns (gCInfo_PS::m_uEndTimestamp) replicate through StateQuestRuntime field "i".
-        self.assertIn('part != "i"', story_policy)
-        self.assertIn('field == "i"', story)
+        self.assertIn("RuntimeField::InfoEnd", story_policy)
+        self.assertIn("RuntimeField::InfoEnd", story)
         self.assertIn("info->m_uEndTimestamp", story)
+        self.assertIn("ResetDomainCaches()", story)
 
     def test_touched_files_stay_under_line_limits(self):
         for name in TOUCHED_PROGRESSION_FILES:

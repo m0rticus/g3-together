@@ -50,9 +50,8 @@ partner_key = PAGEDOWN
 # An empty value disables this host-only rule. Quest creatures and other regions are unaffected.
 # ardea_remove_npcs = Goblin,Ogre
 # spheres (default): the host runs the world in a sphere of host_roi around each player, so the NPCs near the other player
-# stay on this PC (up to the host's view distance). elastic: one sphere around both players instead. off: each PC runs its
-# own surroundings (before 0.7.0).
-# host_sim = off
+# stay on this PC (up to the host's view distance).
+# host_sim = spheres
 # auto (default) shows the other player where they probably are now, not where their last state came from (a little ahead
 # along their movement); off as before. Each player decides for their own screen.
 # puppet_lead = off

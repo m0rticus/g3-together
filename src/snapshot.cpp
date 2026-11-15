@@ -15,6 +15,14 @@ unsigned sampledBetween = 0, sampledAhead = 0, sampledHeld = 0, sampledOldest = 
 namespace {
 constexpr uint32_t OffsetWindow = 2000;
 constexpr uint32_t RestartAfter = 1500;
+constexpr std::size_t MaxPendingEvents = 512u;
+
+void PushPendingEvent(Track& track, Track::Snap const& snap)
+{
+    track.pendingEvents.push_back(snap);
+    while (track.pendingEvents.size() > MaxPendingEvents)
+        track.pendingEvents.pop_front();
+}
 
 bool EventChanged(Track const& track, MotionState const& a, MotionState const& b)
 {
@@ -186,7 +194,7 @@ void Interpolate(Track const& track, Track::Snap const& a, Track::Snap const& b,
     const int32_t span = static_cast<int32_t>(b.sent - a.sent);
     const float fraction = std::clamp(static_cast<float>(static_cast<int32_t>(render - a.sent)) / span, 0.0f, 1.0f);
     const bool holdPreDeath = ragdoll::ShouldHoldPreDeathTransform(
-        a.motion.flags, a.movementMode, b.motion.flags, b.movementMode, fraction);
+        a.motion.flags, static_cast<uint8_t>(a.movementMode), b.motion.flags, static_cast<uint8_t>(b.movementMode), fraction);
     const float poseFraction = holdPreDeath ? 0.0f : fraction;
     for (int k = 0; k < 3; ++k) position[k] = a.position[k] + (b.position[k] - a.position[k]) * poseFraction;
     float dot = 0.0f, length = 0.0f;
@@ -262,12 +270,12 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
             Track::Snap& state = track.snaps[track.count - 1];
             const bool edge = EventChanged(track, state.motion, motion);
             if (edge && !track.haveRenderTime && track.count == 1 && track.pendingEvents.empty())
-                track.pendingEvents.push_back(state);
+                PushPendingEvent(track, state);
             std::memcpy(state.position, position, sizeof(state.position));
             std::memcpy(state.rotation, rotation, sizeof(state.rotation));
             state.movementMode = movementMode;
             state.motion = motion;
-            if (edge) track.pendingEvents.push_back(state);
+            if (edge) PushPendingEvent(track, state);
             else if (!track.pendingEvents.empty() && track.pendingEvents.back().sent == sent)
                 track.pendingEvents.back() = state;
             return;
@@ -316,8 +324,7 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
     track.lastArrived = arrived;
     const int32_t offset = static_cast<int32_t>(arrived - sent);
     if (!track.haveOffset) {
-        track.offset = track.windowMin = track.lastWindowMin = offset;
-        track.windowAt = arrived;
+        track.offset = offset;
         track.haveOffset = true;
     } else if (static_cast<int32_t>(static_cast<uint32_t>(offset) - static_cast<uint32_t>(track.offset)) < 0) {
         // The lifetime minimum is a clock reference, not a moving network queue.
@@ -345,8 +352,6 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
         }
         for (int i = 1; i < SnapshotCount; ++i) track.snaps[i - 1] = track.snaps[i];
         --track.count;
-        while (track.pendingEvents.size() > 512u)
-            track.pendingEvents.pop_front();
     }
     const bool edge = track.count && EventChanged(track, track.snaps[track.count - 1].motion, motion);
     Track::Snap& state = track.snaps[track.count++];
@@ -356,7 +361,7 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
     std::memcpy(state.position, position, sizeof(state.position));
     std::memcpy(state.rotation, rotation, sizeof(state.rotation));
     track.lastQuietHold = track.quietHold;
-    if (edge) track.pendingEvents.push_back(state);
+    if (edge) PushPendingEvent(track, state);
 }
 
 namespace {
@@ -430,6 +435,39 @@ bool SamplePlayer(Track& track, Track::Snap const& newest, uint32_t now, uint32_
     Describe(out, newest, speed, newest.sent + static_cast<uint32_t>(canPredict ? ahead : 0));
     return predicted;
 }
+
+bool FinalizeSample(Track& track, uint32_t now, uint32_t render, bool counted, bool predicted,
+                    bool eventPresentation, float position[3], Presentation const& out)
+{
+    if (!counted) return true;
+    if (track.predictive) {
+        const bool moving = out.movementMode != 1 && out.motion.locomotion && !(out.motion.flags & 0x1eu);
+        if (!moving || eventPresentation) track.playerReconciling = false;
+        else if (track.havePlayerPosition && track.playerWasPredicted && !predicted)
+            track.playerReconciling = true;
+        if (track.playerReconciling) {
+            // Ease back from the bounded prediction when delayed samples resume.
+            const int32_t elapsed = static_cast<int32_t>(now - track.lastPlayerNow);
+            const float distance = Distance(track.lastPlayerPosition, position);
+            const float step = MaximumTravelSpeed * static_cast<float>(std::clamp(elapsed, 0, 1000)) / 1000.0f;
+            if (distance > step && distance > 0.0f) {
+                for (int k = 0; k < 3; ++k)
+                    position[k] = track.lastPlayerPosition[k] +
+                                  (position[k] - track.lastPlayerPosition[k]) * step / distance;
+            } else track.playerReconciling = false;
+        }
+        std::memcpy(track.lastPlayerPosition, position, sizeof(track.lastPlayerPosition));
+        track.lastPlayerNow = now;
+        track.havePlayerPosition = true;
+        track.playerWasPredicted = predicted;
+    }
+    track.presentedMotion = out.motion;
+    track.havePresentedMotion = true;
+    if (track.haveRetained && static_cast<int32_t>(render - track.snaps[0].sent) >= 0 &&
+        (track.pendingEvents.empty() || static_cast<int32_t>(track.pendingEvents.front().sent - track.snaps[0].sent) >= 0))
+        track.haveRetained = false;
+    return true;
+}
 }
 
 bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], int32_t shift, bool counted, Presentation* presentation)
@@ -440,40 +478,7 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
     const uint32_t render = RenderTime(track, now, shift, counted);
     Presentation local;
     Presentation* out = presentation ? presentation : &local;
-    bool predicted = false, eventPresentation = false;
-    auto done = [&]() {
-        if (counted) {
-            if (track.predictive) {
-                const bool moving = out->movementMode != 1 && out->motion.locomotion && !(out->motion.flags & 0x1eu);
-                if (!moving || eventPresentation) track.playerReconciling = false;
-                else if (track.havePlayerPosition && track.playerWasPredicted && !predicted)
-                    track.playerReconciling = true;
-                if (track.playerReconciling) {
-                    // Ease back from the bounded prediction when delayed samples resume.
-                    const int32_t elapsed = static_cast<int32_t>(now - track.lastPlayerNow);
-                    const float distance = Distance(track.lastPlayerPosition, position);
-                    const float step = MaximumTravelSpeed * static_cast<float>(std::clamp(elapsed, 0, 1000)) / 1000.0f;
-                    if (distance > step && distance > 0.0f) {
-                        for (int k = 0; k < 3; ++k)
-                            position[k] = track.lastPlayerPosition[k] +
-                                          (position[k] - track.lastPlayerPosition[k]) * step / distance;
-                    } else track.playerReconciling = false;
-                }
-                std::memcpy(track.lastPlayerPosition, position, sizeof(track.lastPlayerPosition));
-                track.lastPlayerNow = now;
-                track.havePlayerPosition = true;
-                track.playerWasPredicted = predicted;
-            }
-            track.presentedMotion = out->motion;
-            track.havePresentedMotion = true;
-            if (track.haveRetained && static_cast<int32_t>(render - track.snaps[0].sent) >= 0 &&
-                (track.pendingEvents.empty() || static_cast<int32_t>(track.pendingEvents.front().sent - track.snaps[0].sent) >= 0))
-                track.haveRetained = false;
-        }
-        return true;
-    };
     if (!track.pendingEvents.empty() && static_cast<int32_t>(render - track.pendingEvents.front().sent) >= 0) {
-        eventPresentation = true;
         Track::Snap const event = track.pendingEvents.front();
         std::memcpy(position, event.position, sizeof(event.position));
         std::memcpy(rotation, event.rotation, sizeof(event.rotation));
@@ -485,13 +490,14 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
             ++sampledBetween;
             track.lastCase = 1;
         }
-        return done();
+        return FinalizeSample(track, now, render, counted, false, true, position, *out);
     }
     Track::Snap const& newest = track.snaps[track.count - 1];
     if (static_cast<int32_t>(render - newest.sent) >= 0) {
+        bool predicted = false;
         if (!track.predictive) SampleNpc(track, newest, now, shift, counted, position, rotation, out);
         else predicted = SamplePlayer(track, newest, now, render, shift, counted, position, rotation, out);
-        return done();
+        return FinalizeSample(track, now, render, counted, predicted, false, position, *out);
     }
     for (int i = track.count - 1; i > 0; --i) {
         Track::Snap const& a = track.snaps[i - 1];
@@ -499,7 +505,7 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
         if (static_cast<int32_t>(render - a.sent) < 0) continue;
         Interpolate(track, a, b, render, position, rotation, out);
         if (counted) ++sampledBetween, track.lastCase = 1;
-        return done();
+        return FinalizeSample(track, now, render, counted, false, false, position, *out);
     }
     if (track.haveRetained && static_cast<int32_t>(render - track.retained.sent) >= 0) {
         Track::Snap const* next = &track.snaps[0];
@@ -509,7 +515,7 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
         if (static_cast<int32_t>(next->sent - track.retained.sent) > 0) {
             Interpolate(track, track.retained, *next, render, position, rotation, out);
             if (counted) ++sampledBetween, track.lastCase = 1;
-            return done();
+            return FinalizeSample(track, now, render, counted, false, false, position, *out);
         }
     }
     if (counted) ++sampledOldest, track.lastCase = 4;
@@ -517,7 +523,7 @@ bool Sample(Track& track, uint32_t now, float position[3], float rotation[4], in
     std::memcpy(position, oldest.position, sizeof(oldest.position));
     std::memcpy(rotation, oldest.rotation, sizeof(oldest.rotation));
     Describe(out, oldest, 0.0f, oldest.sent);
-    return done();
+    return FinalizeSample(track, now, render, counted, false, false, position, *out);
 }
 
 int32_t PlaybackDelay(Track const& track) { return track.delayMs; }

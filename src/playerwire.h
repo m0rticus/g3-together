@@ -45,14 +45,18 @@ struct Packet {
 
 namespace detail {
 
-inline bool finiteAndLimited(const net::PlayerState& state) {
-    if (state.id < 1 || state.id > 7) return false;
-    if (state.gold < 0) return false;
+inline bool finiteCoordsAndRotation(const net::PlayerState& state) {
     for (float value : state.position)
         if (!std::isfinite(value) || std::fabs(value) > 1.0e7f) return false;
     for (float value : state.rotation)
         if (!std::isfinite(value) || std::fabs(value) > 2.0f) return false;
     return true;
+}
+
+inline bool finiteAndLimited(const net::PlayerState& state) {
+    if (state.id < 1 || state.id > 7) return false;
+    if (state.gold < 0) return false;
+    return finiteCoordsAndRotation(state);
 }
 
 struct Writer {
@@ -178,12 +182,6 @@ constexpr StringField StringFields[] = {
      [](const net::PlayerState& s) -> const char* { return s.look; },
      [](net::PlayerState& s) -> char* { return s.look; }},
 };
-
-inline bool sameMetadata(const net::PlayerState& a, const net::PlayerState& b) {
-    for (const StringField& field : StringFields)
-        if (!sameCString(field.read(a), field.read(b), field.capacity)) return false;
-    return a.focusNpc == b.focusNpc && a.targetNpc == b.targetNpc;
-}
 
 inline std::uint16_t metadataMask(const net::PlayerState& baseline, const net::PlayerState& state) {
     std::uint16_t mask = 0;
@@ -354,10 +352,7 @@ public:
             return Status::Invalid;
         if ((full == FullFlag) ? (mask != MetadataMask) : ((mask & ~MetadataMask) != 0))
             return Status::Invalid;
-        for (float component : value.position)
-            if (!std::isfinite(component) || std::fabs(component) > 1.0e7f) return Status::Invalid;
-        for (float component : value.rotation)
-            if (!std::isfinite(component) || std::fabs(component) > 2.0f) return Status::Invalid;
+        if (!detail::finiteCoordsAndRotation(value)) return Status::Invalid;
         if (goldBits > static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)()))
             return Status::Invalid;
 
@@ -402,30 +397,11 @@ public:
             if (revision != revision_ + 1u) return Status::NeedKeyframe;
         }
 
-        net::PlayerState next = currentState_;
-        next.id = id;
-        next.sequence = sequence;
-        next.sent = sent;
-        next.world = world;
-        next.position[0] = value.position[0];
-        next.position[1] = value.position[1];
-        next.position[2] = value.position[2];
-        next.rotation[0] = value.rotation[0];
-        next.rotation[1] = value.rotation[1];
-        next.rotation[2] = value.rotation[2];
-        next.rotation[3] = value.rotation[3];
-        next.flags = value.flags;
-        next.movementMode = value.movementMode;
-        next.aniState = value.aniState;
-        next.gold = value.gold;
-        next.actionSeq = value.actionSeq;
-        next.actionMs = value.actionMs;
-        next.motionFrac = value.motionFrac;
-        next.downedSequence = value.downedSequence;
-
+        net::PlayerState next = value;
+        next.focusNpc = (mask & FocusNpc) ? metadata.focusNpc : currentState_.focusNpc;
+        next.targetNpc = (mask & TargetNpc) ? metadata.targetNpc : currentState_.targetNpc;
+        detail::copyStrings(MetadataMask & ~mask, currentState_, next);
         detail::copyStrings(mask, metadata, next);
-        if (mask & FocusNpc) next.focusNpc = metadata.focusNpc;
-        if (mask & TargetNpc) next.targetNpc = metadata.targetNpc;
 
         if (mask != 0) revision_ = revision;
         sequence_ = sequence;

@@ -134,7 +134,7 @@ class InteractionImmunityTests(unittest.TestCase):
 
     def test_host_rejects_damage_before_relay_and_local_sender_before_send(self):
         receive = self.sources["net"]
-        receive = receive[receive.index("} else if (type == MsgHitPlayer"):receive.index("} else if (type == MsgStates")]
+        receive = receive[receive.index("} else if (type == MsgHitPlayer"):receive.index("} else if (type == MsgGoods")]
         self.assertLess(receive.index("downed::PlayerInteractionFlags(message.to)"),
                         receive.index("Send(peers[message.to]"))
         send = self.body("net", r"\bvoid\s+SendHitPlayer\s*\(")

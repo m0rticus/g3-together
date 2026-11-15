@@ -26,7 +26,7 @@ struct StoredNpc {
 };
 
 struct State {
-    bool known = false, focused = false, paused = false, watching = false, baselineReady = false;
+    bool known = false, focused = false, paused = false, watching = false, baselineReady = false, lostKnown = false;
     uint32_t frameAt = 0, lostAt = 0, resumedAt = 0, sampledAt = 0;
     unsigned serial = 0, replacements = 0, details = 0, resourceResets = 0, resourceRestores = 0;
     std::vector<StoredNpc> previous;
@@ -58,7 +58,7 @@ StoredNpc const* FindPrevious(GuidKey const& key)
 
 void Reset()
 {
-    state.known = state.focused = state.paused = state.watching = state.baselineReady = false;
+    state.known = state.focused = state.paused = state.watching = state.baselineReady = state.lostKnown = false;
     state.frameAt = state.lostAt = state.resumedAt = state.sampledAt = 0;
     state.serial = state.replacements = state.details = state.resourceResets = state.resourceRestores = 0;
     state.previous.clear();
@@ -77,10 +77,13 @@ Header AdvanceFrame(uint32_t now, bool focused, bool paused, bool inWorld)
     header.resumed = state.known && state.paused && !paused;
     header.longGap = state.known && header.gap >= 1000;
     const bool pauseEdge = state.known && !state.paused && paused;
-    if (header.lost) state.lostAt = now;
+    if (header.lost) {
+        state.lostAt = now;
+        state.lostKnown = true;
+    }
     if (header.lost || header.regained || header.resumed || header.longGap) {
         header.serial = ++state.serial;
-        header.awayMs = header.regained ? now - state.lostAt : 0;
+        header.awayMs = (header.regained && state.lostKnown) ? now - state.lostAt : 0;
         if (header.regained || header.resumed || header.longGap) {
             state.watching = true;
             state.resumedAt = now;

@@ -270,6 +270,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         ++foreignJudged[kind];
 
     }
+    ai::DefeatJudgementScope defeatJudgement(which <= 2);
     if (victim.Routine.AniState != gEAniState_Parade) return observed(judge[which](spu, self, other, args));
     const bool puppet = remote::PuppetOwner(victim.GetInstance());
     const bool mirror = npcs::IsMirrored(victim.GetInstance()) && attacker && (attacker == hero || attacker == remote::ControlledBody());
@@ -531,6 +532,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 // The weapon's damage type is None outside a swing (the game sets it for the swing); set it for this hit.
 GEInt JudgeDamage(Entity& victim, eCEntity* source, int* pending, bool apply)
 {
+    ai::DefeatJudgementScope defeatJudgement;
     Entity weapon(source);
     const bool armed = source && source->GetPropertySet(eEPropertySetType_Damage);
     const gEDamageType type = armed ? static_cast<gEDamageType>(weapon.Damage.DamageType) : gEDamageType_None;

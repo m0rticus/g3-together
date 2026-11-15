@@ -652,7 +652,7 @@ def _read_meta_warnings(meta_path: Path) -> list[str]:
     if meta_path.is_file():
         try:
             return json.loads(meta_path.read_text(encoding="utf-8")).get("warnings", [])
-        except OSError:
+        except (OSError, ValueError):
             pass
     return []
 
@@ -823,22 +823,11 @@ class NativeTarget:
     def build(self) -> BuildResult:
         if self._registered and len(_REGISTERED_TARGETS) > 1 and _BATCH_WARMED_UP_TO < len(_REGISTERED_TARGETS):
             warm_registered_targets()
+        else:
+            _build_targets((self,))
         if self._deferred_exc is not None:
             raise self._deferred_exc
-        if self._result is not None and self._result.executable.is_file():
-            return self._result
-        tc, obj_plans, exe_path, meta_path, exe_key = self._prepare()
-        if exe_path.is_file():
-            self._result = self._link(tc, obj_plans, exe_path, meta_path, exe_key, [])
-            return self._result
-        missing = [p for p in obj_plans if not p.obj_path.is_file()]
-        if len(missing) == 1:
-            _compile_object(missing[0])
-        elif len(missing) > 1:
-            with ThreadPoolExecutor(max_workers=min(len(missing), MAX_BUILD_WORKERS)) as pool:
-                for fut in [pool.submit(_compile_object, p) for p in missing]:
-                    fut.result()
-        self._result = self._link(tc, obj_plans, exe_path, meta_path, exe_key, [_read_obj_warn(p.obj_path) for p in obj_plans])
+        assert self._result is not None
         return self._result
 
     def executable(self) -> Path:
@@ -860,20 +849,16 @@ def register_target(name: str, sources: Sequence[SourceUnit | str | Path], **kwa
     return NativeTarget(name, sources, **kwargs)
 
 
-def warm_registered_targets() -> None:
-    """Compile all unique missing .o/.obj files and link all missing .exe targets in parallel."""
-    global _BATCH_WARMED_UP_TO
-    with _CACHE_LOCK:
-        if _BATCH_WARMED_UP_TO >= len(_REGISTERED_TARGETS):
-            return
-        batch = list(_REGISTERED_TARGETS[_BATCH_WARMED_UP_TO:])
-        _BATCH_WARMED_UP_TO = len(_REGISTERED_TARGETS)
-
+def _build_targets(batch: Sequence[NativeTarget]) -> None:
     _ensure_cache_dirs()
     prepared: list[tuple[NativeTarget, ResolvedToolchain, list[_ObjectPlan], Path, Path, str]] = []
     unique_objs: dict[str, _ObjectPlan] = {}
 
     for target in batch:
+        if target._deferred_exc is not None:
+            continue
+        if target._result is not None and target._result.executable.is_file():
+            continue
         try:
             tc, obj_plans, exe_path, meta_path, exe_key = target._prepare()
         except BaseException as exc:
@@ -891,7 +876,13 @@ def warm_registered_targets() -> None:
         return
 
     obj_errors: dict[str, BaseException] = {}
-    if unique_objs:
+    if len(unique_objs) == 1:
+        key, plan = next(iter(unique_objs.items()))
+        try:
+            _compile_object(plan)
+        except BaseException as exc:
+            obj_errors[key] = exc
+    elif unique_objs:
         with ThreadPoolExecutor(max_workers=min(len(unique_objs), MAX_BUILD_WORKERS)) as pool:
             fut_to_key = {
                 pool.submit(_compile_object, plan): key for key, plan in unique_objs.items()
@@ -912,7 +903,13 @@ def warm_registered_targets() -> None:
         outputs = [_read_obj_warn(p.obj_path) for p in obj_plans]
         linkable.append((target, tc, obj_plans, exe_path, meta_path, exe_key, outputs))
 
-    if linkable:
+    if len(linkable) == 1:
+        target, tc, obj_plans, exe_path, meta_path, exe_key, outputs = linkable[0]
+        try:
+            target._result = target._link(tc, obj_plans, exe_path, meta_path, exe_key, outputs)
+        except BaseException as exc:
+            target._deferred_exc = exc
+    elif linkable:
         with ThreadPoolExecutor(max_workers=min(len(linkable), MAX_BUILD_WORKERS)) as pool:
             fut_to_target = {
                 pool.submit(target._link, tc, obj_plans, exe_path, meta_path, exe_key, outputs): target
@@ -924,6 +921,17 @@ def warm_registered_targets() -> None:
                     target._result = fut.result()
                 except BaseException as exc:
                     target._deferred_exc = exc
+
+
+def warm_registered_targets() -> None:
+    """Compile all unique missing .o/.obj files and link all missing .exe targets in parallel."""
+    global _BATCH_WARMED_UP_TO
+    with _CACHE_LOCK:
+        if _BATCH_WARMED_UP_TO >= len(_REGISTERED_TARGETS):
+            return
+        batch = list(_REGISTERED_TARGETS[_BATCH_WARMED_UP_TO:])
+        _BATCH_WARMED_UP_TO = len(_REGISTERED_TARGETS)
+    _build_targets(batch)
 
 
 # ---------------------------------------------------------------------------

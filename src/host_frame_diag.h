@@ -88,7 +88,8 @@ class Accumulator {
     {
         Summary out{};
         if (!started_ || !frames_) return out;
-        const uint32_t elapsedMs = nowMs >= startedAtMs_ ? (nowMs - startedAtMs_) : 0u;
+        const int32_t rawElapsed = static_cast<int32_t>(nowMs - startedAtMs_);
+        const uint32_t elapsedMs = rawElapsed > 0 ? static_cast<uint32_t>(rawElapsed) : 0u;
         const double spanMs = frameSumUs_ > 0 ? ToMs(frameSumUs_) : static_cast<double>(elapsedMs);
         out.windowMs = elapsedMs;
         out.frames = frames_;

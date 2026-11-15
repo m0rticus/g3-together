@@ -99,6 +99,7 @@ inline bool ParseCombatMove(char const* name, int& action, char* phase, size_t s
 
 inline uint16_t EncodeRunningMotionFrac(double part)
 {
+    if (!std::isfinite(part)) return NoMotionFrac;
     return static_cast<uint16_t>(std::clamp(part, 0.0, 1.0) * static_cast<double>(MaxRunningMotionFrac) + 0.5);
 }
 

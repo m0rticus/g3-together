@@ -131,21 +131,26 @@ bool sameDescriptor(const MotionDescriptor& a, const MotionDescriptor& b) {
            sameFloat(a.intro, b.intro) && sameFloat(a.extro, b.extro) && a.blend == b.blend &&
            a.options == b.options;
 }
-constexpr std::uint8_t MotionFieldWidths[] = {
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 1, 4, 4
-};
+
+#define NPCWIRE_MOTION_FIELDS(X) \
+    X(0, descriptor.name, 4) X(1, descriptor.instance, 4) \
+    X(2, descriptor.speed, 4) X(3, descriptor.intro, 4) X(4, descriptor.extro, 4) \
+    X(5, descriptor.blend, 4) \
+    X(6, descriptor.options[0], 4) X(7, descriptor.options[1], 4) \
+    X(8, descriptor.options[2], 4) X(9, descriptor.options[3], 4) \
+    X(10, descriptor.options[4], 4) X(11, descriptor.options[5], 4) \
+    X(12, descriptor.options[6], 4) X(13, active, 1)
+
+#define MOTION_WIDTH(bit, field, width) width,
+constexpr std::uint8_t MotionFieldWidths[] = { NPCWIRE_MOTION_FIELDS(MOTION_WIDTH) 4, 4 };
+#undef MOTION_WIDTH
+
 std::uint16_t motionFieldMask(const Motion& current, const Motion& baseline) {
     std::uint16_t mask = 0;
-    if (current.descriptor.name != baseline.descriptor.name) mask |= std::uint16_t{1} << 0;
-    if (current.descriptor.instance != baseline.descriptor.instance) mask |= std::uint16_t{1} << 1;
-    if (!sameFloat(current.descriptor.speed, baseline.descriptor.speed)) mask |= std::uint16_t{1} << 2;
-    if (!sameFloat(current.descriptor.intro, baseline.descriptor.intro)) mask |= std::uint16_t{1} << 3;
-    if (!sameFloat(current.descriptor.extro, baseline.descriptor.extro)) mask |= std::uint16_t{1} << 4;
-    if (current.descriptor.blend != baseline.descriptor.blend) mask |= std::uint16_t{1} << 5;
-    for (unsigned i = 0; i < 7; ++i)
-        if (current.descriptor.options[i] != baseline.descriptor.options[i])
-            mask |= std::uint16_t{1} << (6 + i);
-    if (current.active != baseline.active) mask |= std::uint16_t{1} << 13;
+#define MOTION_COMPARE(bit, field, width) \
+    if (!sameMetadataValue(current.field, baseline.field)) mask |= std::uint16_t{1} << bit;
+    NPCWIRE_MOTION_FIELDS(MOTION_COMPARE)
+#undef MOTION_COMPARE
     if (!(current.active & 1u)) {
         if (!sameFloat(current.phase, baseline.phase)) mask |= std::uint16_t{1} << 14;
         if (!sameFloat(current.weight, baseline.weight)) mask |= std::uint16_t{1} << 15;
@@ -172,43 +177,24 @@ bool validFullMotion(const Motion& m, std::uint8_t slots, unsigned slot) {
     return true;
 }
 void writeMotionFields(Writer& w, const Motion& m, std::uint16_t mask) {
-    if (mask & (std::uint16_t{1} << 0)) w.u32(m.descriptor.name);
-    if (mask & (std::uint16_t{1} << 1)) w.u32(m.descriptor.instance);
-    if (mask & (std::uint16_t{1} << 2)) w.f32(m.descriptor.speed);
-    if (mask & (std::uint16_t{1} << 3)) w.f32(m.descriptor.intro);
-    if (mask & (std::uint16_t{1} << 4)) w.f32(m.descriptor.extro);
-    if (mask & (std::uint16_t{1} << 5)) w.u32(static_cast<std::uint32_t>(m.descriptor.blend));
-    for (unsigned i = 0; i < 7; ++i)
-        if (mask & (std::uint16_t{1} << (6 + i))) w.u32(m.descriptor.options[i]);
-    if (mask & (std::uint16_t{1} << 13)) w.u8(m.active);
+#define MOTION_WRITE(bit, field, width) \
+    if (mask & (std::uint16_t{1} << bit)) writeMetadataValue(w, m.field);
+    NPCWIRE_MOTION_FIELDS(MOTION_WRITE)
+#undef MOTION_WRITE
     if (mask & (std::uint16_t{1} << 14)) w.f32(m.phase);
     if (mask & (std::uint16_t{1} << 15)) w.f32(m.weight);
 }
 bool readMotionFields(Reader& r, Motion& m, std::uint16_t mask) {
-    if (mask & (std::uint16_t{1} << 0)) m.descriptor.name = r.u32();
-    if (mask & (std::uint16_t{1} << 1)) m.descriptor.instance = r.u32();
-    if (mask & (std::uint16_t{1} << 2)) m.descriptor.speed = r.f32();
-    if (mask & (std::uint16_t{1} << 3)) m.descriptor.intro = r.f32();
-    if (mask & (std::uint16_t{1} << 4)) m.descriptor.extro = r.f32();
-    if (mask & (std::uint16_t{1} << 5)) m.descriptor.blend = signed32(r.u32());
-    for (unsigned i = 0; i < 7; ++i)
-        if (mask & (std::uint16_t{1} << (6 + i))) m.descriptor.options[i] = r.u32();
-    if (mask & (std::uint16_t{1} << 13)) m.active = r.u8();
-    if (mask & (std::uint16_t{1} << 14)) m.phase = r.f32();
-    if (mask & (std::uint16_t{1} << 15)) m.weight = r.f32();
-    if (!r.ok) return false;
-    if (mask & (std::uint16_t{1} << 2))
-        if (!std::isfinite(m.descriptor.speed)) return false;
-    if (mask & (std::uint16_t{1} << 3))
-        if (!std::isfinite(m.descriptor.intro)) return false;
-    if (mask & (std::uint16_t{1} << 4))
-        if (!std::isfinite(m.descriptor.extro)) return false;
-    if (mask & (std::uint16_t{1} << 14))
-        if (!std::isfinite(m.phase)) return false;
-    if (mask & (std::uint16_t{1} << 15))
-        if (!std::isfinite(m.weight) || m.weight < 0.0f || m.weight > 10.0f) return false;
-    return true;
+#define MOTION_READ(bit, field, width) \
+    if ((mask & (std::uint16_t{1} << bit)) && !readMetadataValue(r, m.field)) return false;
+    NPCWIRE_MOTION_FIELDS(MOTION_READ)
+#undef MOTION_READ
+    if ((mask & (std::uint16_t{1} << 14)) && !readMetadataValue(r, m.phase)) return false;
+    if ((mask & (std::uint16_t{1} << 15)) &&
+        (!readMetadataValue(r, m.weight) || m.weight < 0.0f || m.weight > 10.0f)) return false;
+    return r.ok;
 }
+#undef NPCWIRE_MOTION_FIELDS
 std::uint8_t activeMask(const Control& v) {
     std::uint8_t result = 0;
     for (unsigned i = 0; i < MotionSlots; ++i)
@@ -226,7 +212,7 @@ bool validAnchor(const Anchor& anchor) {
     return true;
 }
 bool writeFull(Writer& w, const Control& v) {
-    if (!std::holds_alternative<Quaternion>(v.rotation)) return false;
+    if (!std::holds_alternative<Quaternion>(v.rotation) || !std::isfinite(v.damageMultiplier)) return false;
     std::array<float, 3> position{};
     for (unsigned i = 0; i < 3; ++i) {
         if (!std::isfinite(v.position[i]) ||
@@ -236,6 +222,9 @@ bool writeFull(Writer& w, const Control& v) {
     }
     const auto& quaternion = std::get<Quaternion>(v.rotation).components;
     for (float x : quaternion) if (!std::isfinite(x)) return false;
+    const auto slots = activeMask(v);
+    for (unsigned i = 0; i < MotionSlots; ++i)
+        if (!validFullMotion(v.motions[i], slots, i)) return false;
     for (auto x : v.guid) w.u8(x);
     for (auto x : position) w.f32(x);
     for (auto x : quaternion) w.f32(x);
@@ -277,8 +266,10 @@ bool readFull(Reader& r, Control& output) {
         for (auto& x : m.descriptor.options) x = r.u32();
         m.active = r.u8();
     }
-    if (!r.ok) return false;
+    if (!r.ok || !std::isfinite(v.damageMultiplier)) return false;
     v.slots = activeMask(v);
+    for (unsigned i = 0; i < MotionSlots; ++i)
+        if (!validFullMotion(v.motions[i], v.slots, i)) return false;
     output = v;
     return true;
 }

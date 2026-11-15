@@ -160,6 +160,23 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
     return 0;
 }
 
+bool MaintainStationaryTalk(Entity& npc, eCEntity* speaker, bool fullStopOnRepacify)
+{
+    if (npc.IsDown() || static_cast<int>(npc.Routine.AIMode) == talk_policy::AiModeCombat) return false;
+    if (npc.NPC.GetCurrentTarget().GetInstance() != speaker) npc.NPC.SetCurrentTarget(Entity(speaker));
+    if (talk_policy::ShouldStopHeldLocomotion(static_cast<int>(npc.CharacterMovement.GetMovementMode())))
+        npc.CharacterMovement.StopMovement();
+    npc.SetAlignmentTarget(Entity(speaker));
+    npc.SetLookAtTarget(Entity(speaker));
+    if (!talk_policy::ShouldRepacifyHeldTalk(npc.IsDead(), npc.IsDown(), static_cast<int>(npc.Routine.AIMode),
+                                             npc.Routine.GetCurrentTask().GetText()))
+        return false;
+    if (fullStopOnRepacify) npc.Routine.FullStop();
+    npc.Routine.AIMode = gEAIMode_Talk;
+    npc.Routine.SetTask(bCString("ZS_Talk"));
+    return true;
+}
+
 void EnterStationaryTalk(Hold& hold, eCEntity* speaker)
 {
     hold.entity.NPC.SetCurrentTarget(Entity(speaker));
@@ -171,6 +188,17 @@ void EnterStationaryTalk(Hold& hold, eCEntity* speaker)
     hold.entity.Routine.SetTask(bCString("ZS_Talk"));
 }
 
+eCEntity* CurrentClientPartner(eCEntity* hero)
+{
+    gCInfoManager_PS* manager = Infos();
+    if (!manager || !manager->AccessIsRunning()) return nullptr;
+    gCEntity* npc = manager->GetDialogPartnerNPC();
+    if (!npc || !talk_policy::ShouldTrackClientDialogPartner(
+                    true, npc->GetPropertySet(eEPropertySetType_NPC) != nullptr, npc == hero, remote::IsPuppet(npc)))
+        return nullptr;
+    return npc;
+}
+
 bool ClientPartnerCanAnimateTalk(eCEntity* partner)
 {
     if (!partner || !npcplayback::IsPassive(partner)) return false;
@@ -180,21 +208,7 @@ bool ClientPartnerCanAnimateTalk(eCEntity* partner)
     return talk_policy::ShouldYieldMirrorToLocalTalk(true, npcs::DiedOnHost(partner), combat ? combat->flags : 0u);
 }
 
-void SyncStationaryClientPartner(Entity& npc, eCEntity* hero)
-{
-    if (npc.NPC.GetCurrentTarget().GetInstance() != hero) npc.NPC.SetCurrentTarget(Entity(hero));
-    if (talk_policy::ShouldStopHeldLocomotion(static_cast<int>(npc.CharacterMovement.GetMovementMode())))
-        npc.CharacterMovement.StopMovement();
-    npc.SetAlignmentTarget(Entity(hero));
-    npc.SetLookAtTarget(Entity(hero));
-    if (talk_policy::ShouldRepacifyHeldTalk(npc.IsDead(), npc.IsDown(), static_cast<int>(npc.Routine.AIMode),
-                                            npc.Routine.GetCurrentTask().GetText())) {
-        npc.Routine.AIMode = gEAIMode_Talk;
-        npc.Routine.SetTask(bCString("ZS_Talk"));
-    }
-}
-
-void UnpausePartnerSlot0(eCEntity* partner, eCEntity* hero, bool stopUpperSlots)
+void SyncClientPartner(eCEntity* partner, eCEntity* hero, bool stopUpperSlots)
 {
     if (!hero || !ClientPartnerCanAnimateTalk(partner)) return;
     if (auto* animation = static_cast<eCVisualAnimation_PS*>(partner->GetPropertySet(eEPropertySetType_Animation))) {
@@ -211,17 +225,7 @@ void UnpausePartnerSlot0(eCEntity* partner, eCEntity* hero, bool stopUpperSlots)
         }
     }
     Entity npc(partner);
-    SyncStationaryClientPartner(npc, hero);
-}
-
-void PrepareClientPartner(eCEntity* partner, eCEntity* hero)
-{
-    UnpausePartnerSlot0(partner, hero, true);
-}
-
-void MaintainClientPartner(eCEntity* partner, eCEntity* hero)
-{
-    UnpausePartnerSlot0(partner, hero, false);
+    MaintainStationaryTalk(npc, hero, false);
 }
 
 void ReleaseClientPartner(eCEntity* partner, uint8_t const guid[16])
@@ -273,9 +277,7 @@ void OnTalk(uint8_t from, bool begin, uint8_t const guid[16])
         Logf("talk: holding %s for player %u", npc.GetName().GetText(), from);
     } else if (it != holds.end() && it->second.player == from &&
                it->second.generation == net::PeerGeneration(from)) {
-        Hold ended = std::move(it->second);
-        holds.erase(it);
-        Release(ended);
+        EraseAndReleaseHold(it);
         Logf("talk: player %u ended its NPC dialog", from);
     }
 }
@@ -348,38 +350,21 @@ void Tick()
                 it = EraseAndReleaseHold(it);
                 continue;
             }
-            const int aiMode = static_cast<int>(hold.entity.Routine.AIMode);
-            if (!hold.entity.IsDown() && aiMode != talk_policy::AiModeCombat) {
-                if (hold.entity.NPC.GetCurrentTarget().GetInstance() != speaker)
-                    hold.entity.NPC.SetCurrentTarget(Entity(speaker));
-                if (talk_policy::ShouldStopHeldLocomotion(static_cast<int>(hold.entity.CharacterMovement.GetMovementMode())))
-                    hold.entity.CharacterMovement.StopMovement();
-                hold.entity.SetAlignmentTarget(Entity(speaker));
-                hold.entity.SetLookAtTarget(Entity(speaker));
-                if (talk_policy::ShouldRepacifyHeldTalk(hold.entity.IsDead(), hold.entity.IsDown(), aiMode,
-                                                        hold.entity.Routine.GetCurrentTask().GetText())) {
-                    EnterStationaryTalk(hold, speaker);
-                    ++repacified;
-                }
-                if (hold.pendingGesture && PlayHeldGesture(hold, hold.pendingGesture))
-                    hold.pendingGesture = 0;
-            }
+            if (MaintainStationaryTalk(hold.entity, speaker, true)) ++repacified;
+            if (!hold.entity.IsDown() && static_cast<int>(hold.entity.Routine.AIMode) != talk_policy::AiModeCombat &&
+                hold.pendingGesture && PlayHeldGesture(hold, hold.pendingGesture))
+                hold.pendingGesture = 0;
             ++it;
         }
         return;
     }
-    gCInfoManager_PS* manager = Infos();
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    eCEntity* partner = nullptr;
-    if (manager && manager->AccessIsRunning()) {
-        gCEntity* npc = manager->GetDialogPartnerNPC();
-        if (npc && talk_policy::ShouldTrackClientDialogPartner(
-                       true, npc->GetPropertySet(eEPropertySetType_NPC) != nullptr, npc == hero, remote::IsPuppet(npc)))
-            partner = npc;
-    }
+    eCEntity* partner = CurrentClientPartner(hero);
+    const bool connected = net::Connected();
+    if (!connected) talkHoldSent = false;
     if (talkingActive && partner && SameGuid(partner, talkingGuid)) {
-        MaintainClientPartner(partner, hero);
-        if (net::Joined() && (!talkHoldSent || talkingWelcome != net::WelcomeSerial())) {
+        SyncClientPartner(partner, hero, false);
+        if (talk_policy::ShouldSendClientTalkHold(connected, talkHoldSent, talkingWelcome, net::WelcomeSerial())) {
             net::SendTalk(true, talkingGuid);
             talkingWelcome = net::WelcomeSerial();
             talkHoldSent = true;
@@ -390,7 +375,7 @@ void Tick()
         uint8_t previousGuid[16] = {};
         std::memcpy(previousGuid, talkingGuid, sizeof(previousGuid));
         ReleaseClientPartner(npcs::NpcByGuid(previousGuid), previousGuid);
-        if (talkHoldSent && net::Joined()) net::SendTalk(false, previousGuid);
+        if (talk_policy::ShouldReleaseClientTalkHold(connected, talkHoldSent)) net::SendTalk(false, previousGuid);
         talkingActive = false;
         talkHoldSent = false;
         talkingWelcome = 0;
@@ -400,8 +385,8 @@ void Tick()
     if (partner) {
         guid::CopyEntity(partner, talkingGuid);
         talkingActive = true;
-        PrepareClientPartner(partner, hero);
-        if (net::Joined()) {
+        SyncClientPartner(partner, hero, true);
+        if (talk_policy::ShouldSendClientTalkHold(connected, false, talkingWelcome, net::WelcomeSerial())) {
             net::SendTalk(true, talkingGuid);
             talkingWelcome = net::WelcomeSerial();
             talkHoldSent = true;
@@ -422,13 +407,7 @@ bool TalkingWithHero(eCEntity const* entity)
 {
     if (!entity || net::IsHost()) return false;
     if (talkingActive && SameGuid(entity, talkingGuid)) return true;
-    gCInfoManager_PS* manager = Infos();
-    if (!manager || !manager->AccessIsRunning()) return false;
-    gCEntity* npc = manager->GetDialogPartnerNPC();
-    if (npc != entity) return false;
-    return talk_policy::ShouldTrackClientDialogPartner(
-        true, npc->GetPropertySet(eEPropertySetType_NPC) != nullptr,
-        npc == gCSession::GetInstance().GetHero(), remote::IsPuppet(npc));
+    return CurrentClientPartner(gCSession::GetInstance().GetHero()) == entity;
 }
 
 bool HoldingForPlayer(uint8_t player)

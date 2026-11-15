@@ -60,6 +60,16 @@ void TestTalkHoldMaintenanceAndSilencing()
     assert(!ShouldTrackClientDialogPartner(true, false, false, false));
     assert(!ShouldTrackClientDialogPartner(true, true, true, false));
     assert(!ShouldTrackClientDialogPartner(true, true, false, true));
+
+    // Client MsgTalk connects through net::Connected() (world-gated), not net::Joined() (pre-world),
+    // and re-sends once WelcomeSerial advances or after a WorldEpoch gap clears holdSent.
+    assert(!ShouldSendClientTalkHold(false, false, 0, 1));
+    assert(ShouldSendClientTalkHold(true, false, 0, 1));
+    assert(!ShouldSendClientTalkHold(true, true, 1, 1));
+    assert(ShouldSendClientTalkHold(true, true, 1, 2));
+    assert(ShouldReleaseClientTalkHold(true, true));
+    assert(!ShouldReleaseClientTalkHold(true, false));
+    assert(!ShouldReleaseClientTalkHold(false, true));
 }
 
 void TestTalkGestures()

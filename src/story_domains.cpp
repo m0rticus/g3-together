@@ -14,6 +14,10 @@ namespace {
 // PlayerMemory.PlayerKnows); other dialogs check them. Shared like quests, so that every hero knows what one
 // learned (the client's Diego dialog set Diego_WarIsLost on the client's hero only; stage H exploration).
 std::unordered_map<std::string, uint8_t> everSeen;  // events that were set at some point: 0 once cleared
+bool namesReady = false;
+std::unordered_map<std::string, std::string> questNames;
+std::unordered_map<std::string, std::string> infoNames;
+std::unordered_map<std::string, uint32_t> seenInfoEnds;
 
 bool QuestsReady() { return Quests() != nullptr; }
 
@@ -134,35 +138,40 @@ void QuestRuntimeSnapshot(States& states)
 
 bool QuestRuntimeApply(char const* name, uint32_t value)
 {
-    std::string id, field;
-    if (!policy::RuntimeKey(name, id, field)) return false;
-    if (field == "i") {
+    policy::ParsedRuntimeKey parsed;
+    if (!name || !policy::ParseRuntimeKey(name, parsed)) return false;
+    if (parsed.field == policy::RuntimeField::InfoEnd) {
         auto* mgr = Infos();
-        auto* info = mgr ? mgr->GetInfo(bCString(id.c_str())) : nullptr;
+        auto* info = mgr ? mgr->GetInfo(bCString(parsed.target.c_str())) : nullptr;
         if (!info) return false;
         info->m_uEndTimestamp = value;
         seenInfoEnds[name] = value;
         return true;
     }
-    auto* quest = Quests()->GetQuest(bCString(id.c_str()));
+    auto* quest = Quests()->GetQuest(bCString(parsed.target.c_str()));
     if (!quest) return false;
-    if (field == "y") quest->AccessActivationTime_Year() = value;
-    else if (field == "d") quest->AccessActivationTime_Day() = value;
-    else if (field == "h") quest->AccessActivationTime_Hour() = value;
-    else {
+    switch (parsed.field) {
+    case policy::RuntimeField::Year: quest->AccessActivationTime_Year() = value; return true;
+    case policy::RuntimeField::Day: quest->AccessActivationTime_Day() = value; return true;
+    case policy::RuntimeField::Hour: quest->AccessActivationTime_Hour() = value; return true;
+    case policy::RuntimeField::CounterCount: {
+        if (value > 512) return false;
         auto& counters = quest->AccessDeliveryCounter();
-        if (field == "n") {
-            if (value > 512) return false;
-            const int previous = counters.GetCount();
-            counters.SetCount(static_cast<int>(value));
-            for (int i = previous; i < counters.GetCount(); ++i) counters.AccessAt(i) = 0;
-        } else {
-            uint32_t index = 0;
-            if (!policy::Number(field.substr(1), index) || index >= static_cast<uint32_t>(counters.GetCount())) return false;
-            counters.AccessAt(static_cast<int>(index)) = static_cast<GEI32>(value);
-        }
+        const int previous = counters.GetCount();
+        counters.SetCount(static_cast<int>(value));
+        for (int i = previous; i < counters.GetCount(); ++i) counters.AccessAt(i) = 0;
+        return true;
     }
-    return true;
+    case policy::RuntimeField::CounterElem: {
+        auto& counters = quest->AccessDeliveryCounter();
+        if (parsed.index >= static_cast<uint32_t>(counters.GetCount())) return false;
+        counters.AccessAt(static_cast<int>(parsed.index)) = static_cast<GEI32>(value);
+        return true;
+    }
+    case policy::RuntimeField::InfoEnd:
+        break;
+    }
+    return false;
 }
 
 bool InfosReady() { return Infos() != nullptr; }
@@ -219,13 +228,35 @@ void ClockSnapshot(States& states)
     net::ClockState state{};
     if (clock::CaptureAdmission(state)) states[policy::ClockText(state)] = 1;
 }
+bool BuildNames()
+{
+    if (namesReady) return true;
+    if (!QuestsReady() || !InfosReady()) return false;
+    questNames.clear();
+    infoNames.clear();
+    auto add = [](auto& names, char const* name) {
+        const std::string id = policy::NameId(name);
+        const auto found = names.find(id);
+        if (found != names.end() && found->second != name) {
+            Logf("story: name identity collision id=%s; admission refused", id.c_str());
+            return false;
+        }
+        names[id] = name;
+        return true;
+    };
+    auto& quests = Quests()->AccessQuests();
+    auto& infos = Infos()->AccessInfos();
+    if (!quests.GetCount() || !infos.GetCount()) return false;
+    for (int i = 0; i < quests.GetCount(); ++i)
+        if (auto* q = static_cast<gCQuest_PS*>(quests.AccessAt(i)); q && !add(questNames, q->AccessName().GetText())) return false;
+    for (int i = 0; i < infos.GetCount(); ++i)
+        if (auto* info = infos.AccessAt(i); info && !add(infoNames, info->AccessName().GetText())) return false;
+    namesReady = true;
+    return true;
+}
 } // namespace
 
 bool chapterSharing = true;
-bool namesReady = false;
-std::unordered_map<std::string, std::string> questNames;
-std::unordered_map<std::string, std::string> infoNames;
-std::unordered_map<std::string, uint32_t> seenInfoEnds;
 
 bool Running() { return gCSession::GetInstance().IsGameRunning(); }
 gCQuestManager_PS* Quests() { return Running() ? gCQuestManager_PS::GetInstance() : nullptr; }
@@ -256,39 +287,52 @@ Domain* Find(uint8_t kind)
     return nullptr;
 }
 
+void ResetDomainCaches()
+{
+    namesReady = false;
+    questNames.clear();
+    infoNames.clear();
+    seenInfoEnds.clear();
+    everSeen.clear();
+}
+
+bool ResolveNamedState(uint8_t domainKind, std::string& ioName, uint32_t value)
+{
+    if (!BuildNames()) return false;
+    policy::ParsedRuntimeKey parsed;
+    std::string id = ioName;
+    bool useInfos = domainKind == net::StateInfos;
+    if (domainKind == net::StateQuestRuntime) {
+        if (!policy::ParseRuntimeKey(ioName, parsed)) return false;
+        id = parsed.target;
+        useInfos = parsed.field == policy::RuntimeField::InfoEnd;
+    }
+    auto const& names = useInfos ? infoNames : questNames;
+    const auto found = names.find(id);
+    if (found == names.end()) {
+        Logf("story: unknown named-state identity=%s kind=%u; snapshot refused", id.c_str(), domainKind);
+        return false;
+    }
+    if (domainKind == net::StateQuestRuntime) {
+        if ((parsed.field == policy::RuntimeField::CounterCount && value > 512) ||
+            (parsed.field == policy::RuntimeField::Hour && value > 23)) {
+            Logf("story: invalid quest runtime field=%s value=%u; snapshot refused",
+                 policy::FormatRuntimeField(parsed).c_str(), value);
+            return false;
+        }
+        ioName = found->second + '\x1f' + policy::FormatRuntimeField(parsed);
+        return true;
+    }
+    ioName = found->second;
+    return true;
+}
+
 void Track(Domain& d, std::string const& name, uint32_t value)
 {
     if (!net::IsHost()) return;
     auto it = d.known.find(name);
     if (value) d.zeroed.erase(name);
     else if (it != d.known.end() && it->second) d.zeroed.insert(name);
-}
-
-bool BuildNames()
-{
-    if (namesReady) return true;
-    if (!QuestsReady() || !InfosReady()) return false;
-    questNames.clear();
-    infoNames.clear();
-    auto add = [](auto& names, char const* name) {
-        const std::string id = policy::NameId(name);
-        const auto found = names.find(id);
-        if (found != names.end() && found->second != name) {
-            Logf("story: name identity collision id=%s; admission refused", id.c_str());
-            return false;
-        }
-        names[id] = name;
-        return true;
-    };
-    auto& quests = Quests()->AccessQuests();
-    auto& infos = Infos()->AccessInfos();
-    if (!quests.GetCount() || !infos.GetCount()) return false;
-    for (int i = 0; i < quests.GetCount(); ++i)
-        if (auto* q = static_cast<gCQuest_PS*>(quests.AccessAt(i)); q && !add(questNames, q->AccessName().GetText())) return false;
-    for (int i = 0; i < infos.GetCount(); ++i)
-        if (auto* info = infos.AccessAt(i); info && !add(infoNames, info->AccessName().GetText())) return false;
-    namesReady = true;
-    return true;
 }
 
 } // namespace g3t::story::detail

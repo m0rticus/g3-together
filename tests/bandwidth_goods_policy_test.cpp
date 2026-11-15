@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/goods_schedule.h"
 #include "../src/net_metrics.h"
+#include "../src/trade_policy.h"
 
 #include <cassert>
 #include <cstdint>
@@ -77,4 +78,34 @@ int main()
         for (auto const& line : lines) if (line.find(token) != std::string::npos) ++found;
         assert(found == 1);
     }
+
+    // Trade stack-key encoding and strict QA suffix/puppet-ID parsers.
+    uint8_t guidA[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const std::string keyA0 = g3t::trade_policy::StackKeyBytes(guidA, 0);
+    const std::string keyA7 = g3t::trade_policy::StackKeyBytes(guidA, 7);
+    assert(keyA0.size() == 18 && keyA7.size() == 18 && keyA0 != keyA7);
+    assert(g3t::trade_policy::StackQuality(keyA0) == 0);
+    assert(g3t::trade_policy::StackQuality(keyA7) == 7);
+    assert(g3t::trade_policy::StackQuality(std::string("short")) == 0);
+
+    std::string item = "It_1H_Bastardsword-q12";
+    int quality = -1;
+    assert(g3t::trade_policy::ParseQualitySuffix(item, quality) && item == "It_1H_Bastardsword" && quality == 12);
+    item = "It_Gold";
+    assert(g3t::trade_policy::ParseQualitySuffix(item, quality) && item == "It_Gold" && quality == -1);
+    item = "It_1H_Bastardsword-qabc";
+    assert(!g3t::trade_policy::ParseQualitySuffix(item, quality));
+    item = "It_1H_Bastardsword-q";
+    assert(!g3t::trade_policy::ParseQualitySuffix(item, quality));
+    item = "It_1H_Bastardsword-q1024";
+    assert(!g3t::trade_policy::ParseQualitySuffix(item, quality));
+
+    int puppetId = 0;
+    assert(g3t::trade_policy::ParsePuppetId("puppet2", 16, puppetId) && puppetId == 2);
+    assert(!g3t::trade_policy::ParsePuppetId("puppet0", 16, puppetId));
+    assert(!g3t::trade_policy::ParsePuppetId("puppet16", 16, puppetId));
+    assert(!g3t::trade_policy::ParsePuppetId("puppet", 16, puppetId));
+    assert(!g3t::trade_policy::ParsePuppetId("puppet2x", 16, puppetId));
+    assert(!g3t::trade_policy::ParsePuppetId("Diego", 16, puppetId));
+    assert(!g3t::trade_policy::ParsePuppetId(nullptr, 16, puppetId));
 }

@@ -52,6 +52,9 @@ int main()
     assert(renamed.owners.at(guid).account == player && renamed.labels.at(player) == "New Name");
     assert(renamed.Write().find("companion64 1 ") != std::string::npos);
     assert(renamed.Read("companion64 1 " + Hex(guid) + " " + std::to_string(other)) == Row::Invalid);
+    assert(renamed.candidates.count(other) == 0);
+    assert(renamed.Read("companion64 1 bad " + std::to_string(other)) == Row::Invalid);
+    assert(renamed.candidates.count(other) == 0);
 
     Companions legacy;
     legacy.host = host;

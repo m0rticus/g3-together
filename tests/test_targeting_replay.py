@@ -43,6 +43,9 @@ class TargetingReplayTests(unittest.TestCase):
     def test_out_of_order_packets_cannot_restore_an_old_opponent_after_death(self):
         self.run_case("order")
 
+    def test_same_timestamp_edge_burst_caps_pending_events(self):
+        self.run_case("span_zero_cap")
+
     def test_native_target_uses_presented_not_latest_opponent(self):
         source = _testbuild.src_text("npcs.cpp")
         policy = _testbuild.src_text("npcsend_policy.h")

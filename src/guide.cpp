@@ -37,10 +37,10 @@ constexpr uint32_t JoinWatch = 5000;  // ms
 bool on = true;  // QA negative control: guidesyncoff
 unsigned guidesTaken = 0, followersTaken = 0, given = 0, readopted = 0, joinsStarted = 0;
 
-std::string Key(eCEntity* entity)
+std::string Key(eCEntity const* entity)
 {
     uint8_t raw[16] = {};
-    guid::CopyEntity(entity, raw);
+    guid::CopyEntity(const_cast<eCEntity*>(entity), raw);
     return std::string(reinterpret_cast<char const*>(raw), 16);
 }
 
@@ -147,6 +147,108 @@ void Take(eCEntity* npc, Kind kind, char const* questName = nullptr)
     Logf("guide: took over %s (it %s this player, quest=%s), task %s", e.GetName().GetText(), kind == Guide ? "guides" : "follows",
          resolvedQuest ? resolvedQuest : "-", e.Routine.GetCurrentTask().GetText());
 }
+void TickJoinedFollowers(eCEntity* hero, uint32_t now)
+{
+    for (auto it = joined.begin(); it != joined.end();) {
+        Entity e = Resolve(it->first);
+        eCEntity* npc = e.GetInstance();
+        if (npc && LeaderOf(npc) == hero) {
+            if (npcs::IsMirrored(npc) || npclease::LocalAuthority(npc)) {
+                if (net::Connected()) Take(npc, Follower);  // follows through the companion path
+            } else {
+                // Simulated here: what JoinPlayer true does after JoinPlayerSlavery (re/findings/party-members.md).
+                e.Routine.FullStop();
+                e.Routine.SetTask(bCString("ZS_FollowPlayer"));
+                ++joinsStarted;
+                Logf("guide: %s joined this player and follows", e.GetName().GetText());
+            }
+            it = joined.erase(it);
+        } else if (static_cast<int32_t>(now - it->second) > 0) {
+            it = joined.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void TickClientFollowQuests(eCEntity* hero)
+{
+    if (net::IsHost() || !net::InWorld(net::LocalId())) return;
+    for (auto relIt = awaitingHostRelease.begin(); relIt != awaitingHostRelease.end();) {
+        Entity e = Resolve(*relIt);
+        eCEntity* npc = e.GetInstance();
+        net::NpcRecord const* combat = npc ? npcs::CombatRecord(npc) : nullptr;
+        const bool hostStillEchoesLocal = combat && combat->guidePlayer == net::LocalId();
+        if (!hostStillEchoesLocal && LeaderOf(hero) != npc) relIt = awaitingHostRelease.erase(relIt);
+        else ++relIt;
+    }
+    gCQuestManager_PS* manager = gCQuestManager_PS::GetInstance();
+    if (!manager) return;
+    auto& quests = manager->AccessQuests();
+    for (GEInt qi = 0; qi < quests.GetCount(); ++qi) {
+        auto* quest = static_cast<gCQuest_PS*>(quests.AccessAt(qi));
+        if (!quest || quest->GetType().GetValue() != gEQuestType_FollowNpc) continue;
+        char const* qName = quest->AccessName().GetText();
+        if (!qName || !*qName) continue;
+        const int cur = quest->GetStatus().GetValue();
+        auto prevIt = observedQuestStatus.find(qName);
+        const int prev = prevIt == observedQuestStatus.end() ? static_cast<int>(gEQuestStatus_Open) : prevIt->second;
+        const bool fromHost = hostSyncedRunning.count(qName) != 0;
+        if (guide_policy::ShouldClaimLocalFollowQuest(
+                false, net::Connected(), quest->GetType().GetValue(), prev, cur, fromHost)) {
+            eCEntity* deliveryNpc = FirstResolvedDeliveryNpc(quest);
+            if (!deliveryNpc) continue;
+            observedQuestStatus[qName] = cur;
+            if (hero->GetPropertySet(eEPropertySetType_Party) && LeaderOf(hero) != deliveryNpc)
+                Entity(hero).Party.SetPartyLeader(Entity(deliveryNpc));
+            Take(deliveryNpc, Guide, qName);
+        } else {
+            observedQuestStatus[qName] = cur;
+            if (cur != gEQuestStatus_Running) hostSyncedRunning.erase(qName);
+        }
+    }
+}
+
+void TickHeldGuides(eCEntity* hero)
+{
+    if (eCEntity* npc = LeaderOf(hero); npc && npc != hero && (npcs::IsMirrored(npc) || npclease::LocalAuthority(npc))) {
+        char const* runningQuest = QuestGuidedBy(npc);
+        const std::string key = Key(npc);
+        net::NpcRecord const* combat = !net::IsHost() ? npcs::CombatRecord(npc) : nullptr;
+        const bool hostEchoesLocal = combat && combat->guidePlayer == net::LocalId();
+        const bool awaitingRelease = !net::IsHost() && awaitingHostRelease.count(key) != 0;
+        if (guide_policy::ShouldAdoptHeroLeaderAsGuide(net::IsHost(), runningQuest != nullptr, hostEchoesLocal, awaitingRelease)) {
+            Take(npc, Guide, runningQuest);
+        } else if (awaitingRelease && hero->GetPropertySet(eEPropertySetType_Party)) {
+            Entity(hero).Party.SetPartyLeader(Entity());
+        }
+    }
+    // Given back once the relation ends: StopGuidePlayer at the destination, the slave's delivery, a dismissal.
+    for (auto it = held.begin(); it != held.end();) {
+        Entity e = Resolve(it->first);
+        eCEntity* npc = e.GetInstance();
+        if (!npc) { ++it; continue; }  // not loaded here now; kept until it is
+        const bool ours = net::IsHost() ? npcs::HostTaken(npc) : npcs::Claimed(npc);
+        const bool questStillRunning = it->second.questName.empty() || IsQuestStillRunning(it->second.questName);
+        const bool holds = it->second.kind == Guide ? (LeaderOf(hero) == npc && questStillRunning) : (LeaderOf(npc) == hero);
+        if (holds && ours) { ++it; continue; }
+        if (it->second.kind == Guide && !questStillRunning && hero->GetPropertySet(eEPropertySetType_Party) &&
+            LeaderOf(hero) == npc)
+            Entity(hero).Party.SetPartyLeader(Entity());
+        if (ours) {
+            if (net::IsHost()) {
+                npcs::HostRelease(npc);
+            } else {
+                if (it->second.kind == Guide) awaitingHostRelease.insert(it->first);
+                infocmd::TakeOver(npc, false);
+            }
+            ++given;
+            Logf("guide: %s no longer %s this player; %s", it->second.name.c_str(), it->second.kind == Guide ? "guides" : "follows",
+                 net::IsHost() ? "the usual simulation rules again" : "given back to the host");
+        }
+        it = held.erase(it);  // or the host took it back (a revoked claim)
+    }
+}
 }
 
 void Joined(eCEntity* npc)
@@ -195,99 +297,10 @@ void Tick()
     const uint32_t now = net::Now();
     eCEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero) return;
-    for (auto it = joined.begin(); it != joined.end();) {
-        Entity e = Resolve(it->first);
-        eCEntity* npc = e.GetInstance();
-        if (npc && LeaderOf(npc) == hero) {
-            if (npcs::IsMirrored(npc) || npclease::LocalAuthority(npc)) {
-                if (net::Connected()) Take(npc, Follower);  // follows through the companion path
-            } else {
-                // Simulated here: what JoinPlayer true does after JoinPlayerSlavery (re/findings/party-members.md).
-                e.Routine.FullStop();
-                e.Routine.SetTask(bCString("ZS_FollowPlayer"));
-                ++joinsStarted;
-                Logf("guide: %s joined this player and follows", e.GetName().GetText());
-            }
-            it = joined.erase(it);
-        } else if (static_cast<int32_t>(now - it->second) > 0) {
-            it = joined.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    TickJoinedFollowers(hero, now);
     if (!net::Connected()) return;
-    if (!net::IsHost() && net::InWorld(net::LocalId())) {
-        for (auto relIt = awaitingHostRelease.begin(); relIt != awaitingHostRelease.end();) {
-            Entity e = Resolve(*relIt);
-            eCEntity* npc = e.GetInstance();
-            net::NpcRecord const* combat = npc ? npcs::CombatRecord(npc) : nullptr;
-            const bool hostStillEchoesLocal = combat && combat->guidePlayer == net::LocalId();
-            if (!hostStillEchoesLocal && LeaderOf(hero) != npc) relIt = awaitingHostRelease.erase(relIt);
-            else ++relIt;
-        }
-        if (gCQuestManager_PS* manager = gCQuestManager_PS::GetInstance()) {
-            auto& quests = manager->AccessQuests();
-            for (GEInt qi = 0; qi < quests.GetCount(); ++qi) {
-                auto* quest = static_cast<gCQuest_PS*>(quests.AccessAt(qi));
-                if (!quest || quest->GetType().GetValue() != gEQuestType_FollowNpc) continue;
-                char const* qName = quest->AccessName().GetText();
-                if (!qName || !*qName) continue;
-                const int cur = quest->GetStatus().GetValue();
-                auto prevIt = observedQuestStatus.find(qName);
-                const int prev = prevIt == observedQuestStatus.end() ? static_cast<int>(gEQuestStatus_Open) : prevIt->second;
-                const bool fromHost = hostSyncedRunning.count(qName) != 0;
-                if (guide_policy::ShouldClaimLocalFollowQuest(
-                        false, net::Connected(), quest->GetType().GetValue(), prev, cur, fromHost)) {
-                    eCEntity* deliveryNpc = FirstResolvedDeliveryNpc(quest);
-                    if (!deliveryNpc) continue;
-                    observedQuestStatus[qName] = cur;
-                    if (hero->GetPropertySet(eEPropertySetType_Party) && LeaderOf(hero) != deliveryNpc)
-                        Entity(hero).Party.SetPartyLeader(Entity(deliveryNpc));
-                    Take(deliveryNpc, Guide, qName);
-                } else {
-                    observedQuestStatus[qName] = cur;
-                    if (cur != gEQuestStatus_Running) hostSyncedRunning.erase(qName);
-                }
-            }
-        }
-    }
-    if (eCEntity* npc = LeaderOf(hero); npc && npc != hero && (npcs::IsMirrored(npc) || npclease::LocalAuthority(npc))) {
-        char const* runningQuest = QuestGuidedBy(npc);
-        const std::string key = Key(npc);
-        net::NpcRecord const* combat = !net::IsHost() ? npcs::CombatRecord(npc) : nullptr;
-        const bool hostEchoesLocal = combat && combat->guidePlayer == net::LocalId();
-        const bool awaitingRelease = !net::IsHost() && awaitingHostRelease.count(key) != 0;
-        if (guide_policy::ShouldAdoptHeroLeaderAsGuide(net::IsHost(), runningQuest != nullptr, hostEchoesLocal, awaitingRelease)) {
-            Take(npc, Guide, runningQuest);
-        } else if (awaitingRelease && hero->GetPropertySet(eEPropertySetType_Party)) {
-            Entity(hero).Party.SetPartyLeader(Entity());
-        }
-    }
-    // Given back once the relation ends: StopGuidePlayer at the destination, the slave's delivery, a dismissal.
-    for (auto it = held.begin(); it != held.end();) {
-        Entity e = Resolve(it->first);
-        eCEntity* npc = e.GetInstance();
-        if (!npc) { ++it; continue; }  // not loaded here now; kept until it is
-        const bool ours = net::IsHost() ? npcs::HostTaken(npc) : npcs::Claimed(npc);
-        const bool questStillRunning = it->second.questName.empty() || IsQuestStillRunning(it->second.questName);
-        const bool holds = it->second.kind == Guide ? (LeaderOf(hero) == npc && questStillRunning) : (LeaderOf(npc) == hero);
-        if (holds && ours) { ++it; continue; }
-        if (it->second.kind == Guide && !questStillRunning && hero->GetPropertySet(eEPropertySetType_Party) &&
-            LeaderOf(hero) == npc)
-            Entity(hero).Party.SetPartyLeader(Entity());
-        if (ours) {
-            if (net::IsHost()) {
-                npcs::HostRelease(npc);
-            } else {
-                if (it->second.kind == Guide) awaitingHostRelease.insert(it->first);
-                infocmd::TakeOver(npc, false);
-            }
-            ++given;
-            Logf("guide: %s no longer %s this player; %s", it->second.name.c_str(), it->second.kind == Guide ? "guides" : "follows",
-                 net::IsHost() ? "the usual simulation rules again" : "given back to the host");
-        }
-        it = held.erase(it);  // or the host took it back (a revoked claim)
-    }
+    TickClientFollowQuests(hero);
+    TickHeldGuides(hero);
 }
 
 bool Readopt(eCEntity* npc)
@@ -319,12 +332,11 @@ bool IsQuestGuide(eCEntity* npc) { return GuidesInQuest(npc); }
 bool ClientHolding(eCEntity const* npc)
 {
     if (!npc || net::IsHost()) return false;
-    auto* self = const_cast<eCEntity*>(npc);
-    const std::string key = Key(self);
+    const std::string key = Key(npc);
     if (held.count(key) != 0) return true;
     if (awaitingHostRelease.count(key) != 0) return false;
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    return hero && LeaderOf(hero) == self;
+    return hero && LeaderOf(hero) == npc;
 }
 
 void OnWorldChange()

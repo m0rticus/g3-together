@@ -15,9 +15,6 @@
 namespace g3t::net::internal {
 
 namespace {
-bool rttLog = true;
-enet_uint32 lastRttLog = 0;
-
 template <typename Msg>
 bool UnpackFixed(ENetPacket const* packet, Msg& out)
 {
@@ -30,6 +27,21 @@ template <size_t N>
 void ClampCString(char (&buffer)[N])
 {
     buffer[N - 1] = '\0';
+}
+
+bool UnpackContentEntries(ENetPacket const* packet, size_t headerSize, uint8_t count, ContentEntry (&entries)[MaxContentEntries])
+{
+    if (count > MaxContentEntries || packet->dataLength != headerSize + count * sizeof(ContentEntry)) return false;
+    if (count) std::memcpy(entries, packet->data + headerSize, count * sizeof(ContentEntry));
+    for (uint8_t i = 0; i < count; ++i) ClampCString(entries[i].name);
+    return true;
+}
+
+void SendClientOrTarget(void const* data, size_t size, uint8_t to)
+{
+    if (!isHost) SendToServer(data, size, ChannelReliable, true);
+    else if (to == 0) SendBroadcast(data, size, ChannelReliable, true);
+    else if (to > 1 && to < MaxPlayers) SendToPeer(data, size, ChannelReliable, true, to);
 }
 
 template <typename Msg>
@@ -52,29 +64,6 @@ bool RelayClientBroadcast(ENetPeer* peer, Msg& message, uint8_t channel = Channe
     for (uint8_t i = 2; i < MaxPlayers; ++i)
         if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), channel, true);
     return true;
-}
-
-void RttLine(ENetPeer* peer, char const* who, char* out, size_t size)
-{
-    auto const& poses = peer->channels[ChannelPoses];
-    auto const& alt = peer->channels[ChannelPosesAlt];
-    Format(out, size, "net: rtt=%u ms (+-%u) loss=%.1f%% sent=%u lost=%u throttle=%u/%u to %s "
-                     "pose_send=%u/%u,%u/%u pose_recv=%u/%u,%u/%u waiting_bytes=%u "
-                     "transport_max_rtt_ms=%d service_gap_avg_ms=%.2f service_gap_max_ms=%u "
-                     "enqueue_flush_avg_ms=%.2f enqueue_flush_max_ms=%u service_caps=%u service_errors=%u "
-                     "queued_commands=%u reliable_queued=%u reliable_inflight=%u reliable_bytes=%u",
-           peer->roundTripTime, peer->roundTripTimeVariance,
-           peer->packetLoss * 100.0 / ENET_PEER_PACKET_LOSS_SCALE, peer->packetsSent, peer->packetsLost,
-           peer->packetThrottle, ENET_PEER_PACKET_THROTTLE_SCALE, who,
-           poses.outgoingReliableSequenceNumber, poses.outgoingUnreliableSequenceNumber,
-           alt.outgoingReliableSequenceNumber, alt.outgoingUnreliableSequenceNumber,
-           poses.incomingReliableSequenceNumber, poses.incomingUnreliableSequenceNumber,
-           alt.incomingReliableSequenceNumber, alt.incomingUnreliableSequenceNumber,
-           static_cast<unsigned>(peer->totalWaitingData), steam::Ping(),
-           serviceGaps.Average(), serviceGaps.maximum, enqueueDelays.Average(), enqueueDelays.maximum, serviceCaps, serviceErrors,
-           static_cast<unsigned>(enet_list_size(&peer->outgoingCommands)),
-           static_cast<unsigned>(enet_list_size(&peer->outgoingSendReliableCommands)),
-           static_cast<unsigned>(enet_list_size(&peer->sentReliableCommands)), peer->reliableDataInTransit);
 }
 
 bool QueueStates(uint8_t to, uint8_t kind, StateEntry const* entries, int count)
@@ -101,116 +90,6 @@ bool QueueStates(uint8_t to, uint8_t kind, StateEntry const* entries, int count)
     return true;
 }
 } // namespace
-
-void RttLog()
-{
-    if (!rttLog) return;
-    const enet_uint32 now = enet_time_get();
-    if (now - lastRttLog < 5000) return;
-    lastRttLog = now;
-    char line[900];
-    if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i)
-            if (peers[i] && peers[i]->state == ENET_PEER_STATE_CONNECTED) {
-                RttLine(peers[i], PeerName(i), line, sizeof(line));
-                Log(line);
-            }
-    } else if (server && connected) {
-        RttLine(server, "host", line, sizeof(line));
-        Log(line);
-    }
-    serviceGaps = {};
-    enqueueDelays = {};
-}
-
-void EmitBandwidthDetails(uint32_t elapsed, uint32_t sentData, uint32_t sentPackets,
-                          uint32_t receivedData, uint32_t receivedPackets,
-                          uint32_t lastSentData, uint32_t lastSentPackets,
-                          uint32_t lastReceivedData, uint32_t lastReceivedPackets,
-                          steam::TrafficCounters const& traffic,
-                          steam::TrafficCounters const& lastSteamTraffic)
-{
-    const double perSecond = 1000.0 / elapsed;
-    const uint64_t steamPackets = traffic.txDatagrams - lastSteamTraffic.txDatagrams;
-    const uint64_t steamBytes = traffic.txBytes - lastSteamTraffic.txBytes;
-    const uint64_t framingBytes = traffic.txEnvelopeBytes - lastSteamTraffic.txEnvelopeBytes;
-    const uint64_t enetHeaderBytes = traffic.txEnetProtocolBytes - lastSteamTraffic.txEnetProtocolBytes;
-    const uint64_t enetAckBytes = traffic.txEnetAckBytes - lastSteamTraffic.txEnetAckBytes;
-    Logf("net: bandwidth role=%s window_ms=%u enet_loopback_tx_packets_bytes=%u/%u enet_loopback_rx_packets_bytes=%u/%u "
-         "npc_per_s=considered:%.1f,sent:%.1f,unchanged:%.1f,far:%.1f,irrelevant:%.1f,send_failed:%.1f,paced:%.1f",
-         isHost ? "host" : "client", elapsed, sentPackets - lastSentPackets, sentData - lastSentData,
-         receivedPackets - lastReceivedPackets, receivedData - lastReceivedData,
-         bandwidth.considered * perSecond, bandwidth.sent * perSecond, bandwidth.skippedUnchanged * perSecond,
-         bandwidth.skippedFar * perSecond, bandwidth.skippedIrrelevant * perSecond, bandwidth.sendFailed * perSecond,
-         bandwidth.skippedPaced * perSecond);
-    const uint64_t updates = bandwidth.poseKeys + bandwidth.poseDeltas;
-    if (isHost)
-        Logf("npc-converge: ordered_setup_poses=%llu ordered_setup_controls=%llu reliable_anchors=%llu "
-             "control_baselines=%u control_acks=%u "
-             "baseline_policy=life-only pose_ack_policy=anchor-only",
-             static_cast<unsigned long long>(npcOrderedSetupPoses),
-             static_cast<unsigned long long>(npcOrderedSetupControls),
-             static_cast<unsigned long long>(npcAnchorsSent), npcControlCreated, npcControlAckAccepted);
-    else
-        Logf("npc-converge: received_anchors=%llu pose_ack_policy=anchor-only",
-             static_cast<unsigned long long>(npcAnchorsReceived));
-    Logf("net: pose bandwidth tier_per_s=fast:%.1f,ordinary:%.1f,slow:%.1f tier_bytes_per_s=%.0f,%.0f,%.0f "
-         "bone_bytes_per_update=%.1f bones_per_update=%.1f keys=%llu deltas=%llu acks=%llu ack_misses=%llu "
-         "reference_misses=%llu decode_failures=%llu",
-         bandwidth.tierUpdates[0] * perSecond, bandwidth.tierUpdates[1] * perSecond, bandwidth.tierUpdates[2] * perSecond,
-         bandwidth.tierBytes[0] * perSecond, bandwidth.tierBytes[1] * perSecond, bandwidth.tierBytes[2] * perSecond,
-         updates ? double(bandwidth.poseBytes) / updates : 0.0, updates ? double(bandwidth.poseBones) / updates : 0.0,
-         static_cast<unsigned long long>(bandwidth.poseKeys), static_cast<unsigned long long>(bandwidth.poseDeltas),
-         static_cast<unsigned long long>(bandwidth.poseAcks), static_cast<unsigned long long>(bandwidth.poseAckMisses),
-         static_cast<unsigned long long>(bandwidth.poseReferenceMisses), static_cast<unsigned long long>(bandwidth.poseDecodeFailures));
-    const double perUpdate = updates ? 1.0 / updates : 0.0;
-    const double basisError = isHost ? double(bandwidth.poseMaxBasisError) : bandwidth.poseRigidBones ? 2.0 : 0.0;
-    const double rotationBound = bandwidth.poseRigidBones ? bonewire::PoseRotationBoundDegrees(basisError) : 0;
-    Logf("net: pose components bytes_per_update=header:%.1f,mask:%.1f,rotation:%.1f,translation:%.1f,padding:%.1f,control:%.1f,outer:%.1f "
-         "included_bones_per_delta=%.1f predictive=%llu rigid_bones_per_update=%.1f "
-         "host_observed_basis_error_q12=%d rotation_error_bound_deg=%.4f origin_error_cm=0 skin_200cm_error_bound_cm=%.4f",
-         bandwidth.poseHeaderBytes * perUpdate, bandwidth.poseMaskBits * perUpdate / 8.0,
-         bandwidth.poseRotationBits * perUpdate / 8.0, bandwidth.poseTranslationBits * perUpdate / 8.0,
-         bandwidth.posePaddingBits * perUpdate / 8.0,
-         bandwidth.poseControlBytes * perUpdate, bandwidth.poseOuterBytes * perUpdate,
-         bandwidth.poseDeltas ? double(bandwidth.poseIncludedDeltaBones) / bandwidth.poseDeltas : 0.0,
-         static_cast<unsigned long long>(bandwidth.posePredictiveUpdates), bandwidth.poseRigidBones * perUpdate,
-         isHost ? static_cast<int>(bandwidth.poseMaxBasisError) : -1, rotationBound, basisError * 600.0 / 4096.0);
-    Logf("net: bandwidth rates enet_tx_datagrams_per_s=%.1f enet_tx_bytes_per_s=%.1f "
-         "steam_api_tx_datagrams_per_s=%.1f steam_api_tx_bytes_per_s=%.1f tx_total_bytes_per_s=%.1f "
-         "tx_enet_relay_MB_per_s=%.3f relay_header_bytes_per_s=%.1f relay_header_pct=%.2f",
-         (sentPackets - lastSentPackets) * perSecond, (sentData - lastSentData) * perSecond,
-         steamPackets * perSecond, steamBytes * perSecond, framingBytes * perSecond,
-         ((sentData - lastSentData) + (framingBytes - steamBytes)) * perSecond / 1000000.0,
-         (framingBytes - steamBytes) * perSecond,
-         steamBytes ? 100.0 * (framingBytes - steamBytes) / steamBytes : 0.0);
-    Logf("net: bandwidth overhead enet_header_bytes_per_s=%.1f enet_ack_bytes_per_s=%.1f "
-         "protocol_overhead_pct=%.2f enet_parse_failures=%llu enet_unparsed_datagrams=%llu",
-         enetHeaderBytes * perSecond, enetAckBytes * perSecond,
-         steamBytes ? 100.0 * ((framingBytes - steamBytes) + enetHeaderBytes) / steamBytes : 0.0,
-         static_cast<unsigned long long>(traffic.txEnetParseFailures - lastSteamTraffic.txEnetParseFailures),
-         static_cast<unsigned long long>(traffic.txEnetUnparsedDatagrams - lastSteamTraffic.txEnetUnparsedDatagrams));
-    for (size_t i = 0; i < host->peerCount; ++i) {
-        ENetPeer& peer = host->peers[i];
-        if (peer.state != ENET_PEER_STATE_CONNECTED) continue;
-        auto const snapshot = peerBudgets[i].Snapshot();
-        Logf("net: valve peer=%u npc_stretch_permille=%u level=%u signals=%u queue_bytes=%u offered_bytes_per_s=%llu "
-             "reliable_inflight=%u rtt_ms=%u base_rtt_ms=%u throttle=%u transitions=%u",
-             isHost ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer.data)) : 1u, snapshot.stretchPermille,
-             static_cast<unsigned>(snapshot.pressure), static_cast<unsigned>(snapshot.signals),
-             static_cast<unsigned>(snapshot.queueBytes), static_cast<unsigned long long>(snapshot.offeredBytesPerSecond),
-             peer.reliableDataInTransit, peer.roundTripTime, snapshot.baseRttMs, peer.packetThrottle,
-             snapshot.pressureTransitions);
-        Logf("steam-send: enet peer=%u throttle=%u/%u rtt_ms=%u reliable_inflight_bytes=%u "
-             "queued_commands=%u reliable_queued_commands=%u reliable_sent_commands=%u "
-             "reliability_owner=ENet steam_channels_are_not_lanes=1",
-             isHost ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(peer.data)) : 1u,
-             peer.packetThrottle, ENET_PEER_PACKET_THROTTLE_SCALE, peer.roundTripTime, peer.reliableDataInTransit,
-             static_cast<unsigned>(enet_list_size(&peer.outgoingCommands)),
-             static_cast<unsigned>(enet_list_size(&peer.outgoingSendReliableCommands)),
-             static_cast<unsigned>(enet_list_size(&peer.sentReliableCommands)));
-    }
-}
 
 bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
 {
@@ -410,7 +289,7 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         if (message.note.count > MaxOfferEntries ||
             packet->dataLength != OfferHeaderSize + message.note.count * sizeof(OfferEntry)) return true;
         std::memcpy(&message, packet->data, packet->dataLength);
-        for (auto& entry : message.note.entries) ClampCString(entry.name);
+        for (uint16_t i = 0; i < message.note.count; ++i) ClampCString(message.note.entries[i].name);
         if (isHost) {
             message.note.buyer = PeerSlotOf(peer);
             if (!message.note.buyer) return true;
@@ -456,14 +335,9 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         if (isHost || !connected || peer != server || packet->dataLength < sizeof(ContentsHeader)) return true;
         ContentsHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
-        if (header.count <= MaxContentEntries &&
-            packet->dataLength == sizeof(header) + header.count * sizeof(ContentEntry) &&
-            handlers.contents) {
-            ContentEntry entries[MaxContentEntries];
-            if (header.count) std::memcpy(entries, packet->data + sizeof(header), header.count * sizeof(ContentEntry));
-            for (int i = 0; i < header.count; ++i) ClampCString(entries[i].name);
+        ContentEntry entries[MaxContentEntries];
+        if (UnpackContentEntries(packet, sizeof(header), header.count, entries) && handlers.contents)
             handlers.contents(header.guid, entries, header.count);
-        }
         return true;
     }
     case MsgContainerTx: {
@@ -471,14 +345,9 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         TxHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         const uint8_t from = PeerSlotOf(peer);
-        if (header.count <= MaxContentEntries &&
-            packet->dataLength == sizeof(header) + header.count * sizeof(ContentEntry) &&
-            handlers.tx && from) {
-            ContentEntry entries[MaxContentEntries];
-            if (header.count) std::memcpy(entries, packet->data + sizeof(header), header.count * sizeof(ContentEntry));
-            for (int i = 0; i < header.count; ++i) ClampCString(entries[i].name);
+        ContentEntry entries[MaxContentEntries];
+        if (from && UnpackContentEntries(packet, sizeof(header), header.count, entries) && handlers.tx)
             handlers.tx(from, header.guid, header.seq, entries, header.count);
-        }
         return true;
     }
     case MsgTxResult: {
@@ -577,12 +446,6 @@ uint32_t NextDeedId()
 
 void SetSendRate(int hz) { sendRate = hz < 20 ? 20 : hz > 60 ? 60 : hz; }
 
-void SetBandwidthBudget(uint32_t bytesPerSecond)
-{
-    budgetRate = (std::clamp)(bytesPerSecond, 64u * 1024, 4096u * 1024);
-    if (host) for (size_t i = 0; i < host->peerCount; ++i) ResetBudget(&host->peers[i]);
-}
-
 uint32_t RemoteStateAgeMs(uint8_t player)
 {
     return player < MaxPlayers && remotes[player].connected && InWorld(player)
@@ -597,19 +460,6 @@ uint32_t RemoteFocusNpc(uint8_t player)
 uint32_t RemoteTargetNpc(uint8_t player)
 {
     return RemoteStateAgeMs(player) < 1000 ? remotes[player].latest.targetNpc : 0;
-}
-
-BudgetSnapshot PeerBandwidth(uint8_t to)
-{
-    ENetPeer* peer = isHost ? (to < MaxPlayers ? peers[to] : nullptr) : server;
-    return host && peer && PeerIndex(peer) < MaxPlayers ? peerBudgets[PeerIndex(peer)].Snapshot() : BudgetSnapshot{};
-}
-
-uint32_t NpcStretchPermille(uint8_t to)
-{
-    ENetPeer* peer = isHost ? (to < MaxPlayers ? peers[to] : nullptr) : server;
-    return host && peer && peer->state == ENET_PEER_STATE_CONNECTED && PeerIndex(peer) < MaxPlayers
-        ? peerBudgets[PeerIndex(peer)].NpcStretchPermille() : PeerBudget::StretchNormal;
 }
 
 void SetHitHandlers(HitNpcHandler npc, HitPlayerHandler player)
@@ -755,10 +605,8 @@ void SendWatch(uint8_t const guid[16])
 void SendItem(ItemNote const& note, uint8_t to)
 {
     if (!host) return;
-    ItemMsg message{MsgItem, note};
-    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
-    else if (to == 0) SendBroadcast(&message, sizeof(message), ChannelReliable, true);
-    else if (to > 1 && to < MaxPlayers) SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
+    const ItemMsg message{MsgItem, note};
+    SendClientOrTarget(&message, sizeof(message), to);
 }
 
 void SendNpcSpell(uint8_t to, char const* script, uint8_t const npcGuid[16], int32_t args)
@@ -774,9 +622,7 @@ void SendEnclave(EnclaveNote const& note, uint8_t to)
 {
     if (!host) return;
     const EnclaveMsg message{MsgEnclave, note};
-    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
-    else if (to == 0) SendBroadcast(&message, sizeof(message), ChannelReliable, true);
-    else if (to > 1 && to < MaxPlayers) SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
+    SendClientOrTarget(&message, sizeof(message), to);
 }
 
 void SendPlayerSpell(uint8_t to, char const* script)
@@ -798,9 +644,7 @@ void SendWitness(uint8_t to, WitnessNote const& note)
 {
     if (!host || to == localId || to >= MaxPlayers) return;
     const WitnessMsg message{MsgWitness, localId, to, note};
-    if (!isHost) SendToServer(&message, sizeof(message), ChannelReliable, true);
-    else if (to == 0) SendBroadcast(&message, sizeof(message), ChannelReliable, true);
-    else if (to > 1 && to < MaxPlayers) SendToPeer(&message, sizeof(message), ChannelReliable, true, to);
+    SendClientOrTarget(&message, sizeof(message), to);
 }
 
 void SendShot(ShotNote const& note)
@@ -829,18 +673,20 @@ void SendDialogLine(DialogLineNote const& note)
 
 bool SendOffer(OfferNote const& note)
 {
-    if (!host || note.seller == 0 || note.seller >= MaxPlayers || note.seller == localId) return false;
-    OfferMsg message{MsgOffer, note};
-    message.note.buyer = localId;
-    if (note.count > MaxOfferEntries) return false;
+    if (!host || note.seller == 0 || note.seller >= MaxPlayers || note.seller == localId ||
+        note.count > MaxOfferEntries) return false;
     const size_t size = OfferHeaderSize + note.count * sizeof(OfferEntry);
+    uint8_t buffer[sizeof(OfferMsg)];
+    buffer[0] = MsgOffer;
+    std::memcpy(buffer + 1, &note, size - 1);
+    reinterpret_cast<OfferMsg*>(buffer)->note.buyer = localId;
     if (!isHost) {
         if (!server || !connected) return false;
-        SendToServer(&message, size, ChannelReliable, true);
+        SendToServer(buffer, size, ChannelReliable, true);
         return true;
     }
     if (!peers[note.seller] || !InWorld(note.seller)) return false;
-    SendToPeer(&message, size, ChannelReliable, true, note.seller);
+    SendToPeer(buffer, size, ChannelReliable, true, note.seller);
     return true;
 }
 
@@ -872,37 +718,5 @@ void SendTalk(bool begin, uint8_t const guid[16])
 
 bool SendStates(uint8_t kind, StateEntry const* entries, int count) { return QueueStates(0, kind, entries, count); }
 bool SendStatesTo(uint8_t to, uint8_t kind, StateEntry const* entries, int count) { return QueueStates(to, kind, entries, count); }
-
-void Stats(void (*log)(char const*))
-{
-    char line[900];
-    int n = 0;
-    if (isHost) {
-        for (uint8_t i = 2; i < MaxPlayers; ++i)
-            if (peers[i] && peers[i]->state == ENET_PEER_STATE_CONNECTED) {
-                RttLine(peers[i], PeerName(i), line, sizeof(line));
-                log(line + 5);
-                ++n;
-            }
-    } else if (server && connected) {
-        RttLine(server, "host", line, sizeof(line));
-        log(line + 5);
-        ++n;
-    }
-    Format(line, "NETSTATS peers=%d rtt_log=%d", n, rttLog ? 1 : 0);
-    log(line);
-}
-
-void RttLogOff(void (*log)(char const*))
-{
-    rttLog = false;
-    log("SWITCH rttlogoff ok=1");
-}
-
-uint32_t RoundTrip(uint8_t player)
-{
-    ENetPeer* peer = isHost ? (player < MaxPlayers ? peers[player] : nullptr) : (connected ? server : nullptr);
-    return peer && peer->state == ENET_PEER_STATE_CONNECTED ? peer->roundTripTime : 0;
-}
 
 } // namespace g3t::net

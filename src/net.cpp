@@ -166,11 +166,13 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
     if (!host || !peer || (size && !data)) return false;
     if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !XpHandshake(data, size) &&
         !(reliable && (StoryHandshake(data, size) || DoorHandshake(data, size))) && !Open(peer)) { ++gatedOut; return false; }
+    const size_t peerIdx = PeerIndex(peer);
+    if (peerIdx >= MaxPlayers) return false;
     const BudgetClass priority = SendPriority(size ? static_cast<uint8_t const*>(data)[0] : 0, reliable);
     const uint64_t charge = BudgetCharge(size, peer->mtu, relayEnvelopeBytes, host->checksum ? 4 : 0);
-    PeerBudget& budget = peerBudgets[PeerIndex(peer)];
+    PeerBudget& budget = peerBudgets[peerIdx];
     if (channel == ChannelPoses && !reliable) {
-        PoseRoute& route = poseRoutes[peer - host->peers];
+        PoseRoute& route = poseRoutes[peerIdx];
         uint8_t active = route.alt ? ChannelPosesAlt : ChannelPoses;
         if (peer->channels[active].outgoingUnreliableSequenceNumber >= PoseEpochLimit) {
             const uint8_t next = route.alt ? ChannelPoses : ChannelPosesAlt;
@@ -376,6 +378,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         return;
     } else if (type == MsgHitNpc && packet->dataLength == sizeof(HitNpcMsg)) {
         if (!isHost) { Log("net: client NPC hit publication refused"); return; }
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         HitNpcMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         message.from = PeerSlotOf(peer);
@@ -392,6 +395,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             handlers.hitNpc(message.from, message.guid, message.delta, message.weapon, message.npc, message.outcome, message.seen,
                             message.reaction, message.sequence, message.incarnation, message.contact);
     } else if (type == MsgHitPlayer && packet->dataLength == sizeof(HitPlayerMsg)) {
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         HitPlayerMsg message{};
         std::memcpy(&message, packet->data, sizeof(message));
         if (message.delta < -1000000 || message.delta > 0) return;
@@ -413,9 +417,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         if (handlers.hitPlayer)
             handlers.hitPlayer(message.delta, message.attacker, message.attackerPlayer, message.meansToKill != 0);
-    } else if (type == MsgStates) {
-        HandleGameplayMessage(peer, packet, type);
     } else if (type == MsgGoods && packet->dataLength >= sizeof(GoodsHeader)) {
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && (!connected || peer != server))) return;
         GoodsHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         if (header.count > MaxGoodsEntries || packet->dataLength != sizeof(header) + header.count * sizeof(GoodsEntry) || header.gold < 0)
@@ -750,15 +753,16 @@ void Service(PlayerState const& local, bool haveLocal)
                 enet_peer_reset(event.peer);
                 break;
             }
-            if (PeerIndex(event.peer) < MaxPlayers)
-                peerConnectData[PeerIndex(event.peer)] = event.data;
+            if (const size_t peerIdx = PeerIndex(event.peer); peerIdx < MaxPlayers) {
+                peerConnectData[peerIdx] = event.data;
+                poseRoutes[peerIdx] = PoseRoute{};
+            }
             enet_peer_timeout(event.peer, G3T_PEER_TIMEOUT_LIMIT,
                               G3T_PEER_TIMEOUT_MINIMUM_MS, G3T_PEER_TIMEOUT_MAXIMUM_MS);
             enet_peer_throttle_configure(event.peer, 5000, 0, 0);
             event.peer->data = nullptr;
             ResetBudget(event.peer);
             if (!isHost) for (auto& sender : playerSenders[1]) sender = {};
-            poseRoutes[event.peer - host->peers] = PoseRoute{};
             if (!isHost) {
                 everConnected = true;
                 Hello hello{MsgHello, helloVersion ? helloVersion : ProtocolVersion, {}, {}};
@@ -819,13 +823,8 @@ void Service(PlayerState const& local, bool haveLocal)
     SyncClientSteamLink(now);
     if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {
         DirectPunchSession* direct = FindClientDirectSession();
-        if (!ClientPunchWaiting(direct, now)) {
-            const bool useDirect = direct && direct->bidirectionalVerified && !direct->directFailed;
-            server = useDirect
-                ? ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))
-                : ConnectTransportHost(host, &target);
-            FinishClientConnectAttempt(direct, useDirect, now);
-        }
+        if (!ClientPunchWaiting(direct, now))
+            FinishClientConnectAttempt(direct, false, now);
     }
     UpdateBudgets(now);
     if (connected) {
@@ -925,22 +924,9 @@ void Reconnect(void (*log)(char const*))
     lastActivitySend = 0;
     for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
     DirectPunchSession* direct = FindClientDirectSession();
-    bool useDirect = direct && direct->bidirectionalVerified && !direct->directFailed;
-    ENetAddress connectTo = useDirect ? direct->verifiedAddress : target;
-    server = useDirect
-        ? ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))
-        : ConnectTransportHost(host, &target);
-    if (useDirect && !server) {
-        direct->directFailed = true;
-        direct->connectStarted = false;
-        direct->endpointLocked = false;
-        useDirect = false;
-        connectTo = target;
-        server = ConnectTransportHost(host, &target);
-    } else if (direct) {
-        direct->connectStarted = useDirect && server != nullptr;
-        if (direct->connectStarted) direct->endpointLocked = true;
-    }
+    bool useDirect = false;
+    ENetAddress connectTo = target;
+    ConnectClientWithDirectFallback(direct, useDirect, connectTo, false);
     lastConnectAttempt = enet_time_get();
     steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
                                startedAt ? lastConnectAttempt - startedAt : 0, server ? "" : "ENet QA reconnect refused");
@@ -955,6 +941,7 @@ void Reconnect(void (*log)(char const*))
 #ifndef G3T_NET_SEPARATE_TUS
 #include "net_direct.cpp"
 #include "net_session.cpp"
+#include "net_metrics.cpp"
 #include "net_npc.cpp"
 #include "net_npc_pose.cpp"
 #include "net_messages.cpp"

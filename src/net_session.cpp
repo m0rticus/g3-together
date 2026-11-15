@@ -76,16 +76,6 @@ uint32_t queuedAt = 0, lastServiceAt = 0;
 uint32_t peerConnectData[MaxPlayers] = {};
 PoseRoute poseRoutes[MaxPlayers] = {};
 
-namespace {
-uint32_t QueueBytes(ENetList const& list)
-{
-    uint64_t bytes = 0;
-    for (auto* node = list.sentinel.next; node != &list.sentinel; node = node->next)
-        bytes += reinterpret_cast<ENetOutgoingCommand const*>(node)->fragmentLength;
-    return static_cast<uint32_t>((std::min)(bytes, uint64_t(UINT32_MAX)));
-}
-} // namespace
-
 void ClearPeerPlayerTables(uint8_t id)
 {
     if (id >= MaxPlayers) return;
@@ -99,40 +89,6 @@ void ClearAllPlayerTables()
 {
     for (auto& senders : playerSenders) for (auto& sender : senders) sender = {};
     for (auto& forced : forcePlayerFull) for (auto& flag : forced) flag = false;
-}
-
-BudgetClass SendPriority(uint8_t kind, bool reliable)
-{
-    if (reliable) return BudgetClass::GameplayReliable;
-    if (kind == MsgState) return BudgetClass::PlayerState;
-    return BudgetClass::NpcActive;
-}
-
-void UpdateBudgets(uint32_t now)
-{
-    for (size_t i = 0; i < host->peerCount; ++i) {
-        ENetPeer const& peer = host->peers[i];
-        if (peer.state != ENET_PEER_STATE_CONNECTED) continue;
-        BudgetTelemetry sample;
-        const uint64_t queued = uint64_t(QueueBytes(peer.outgoingCommands)) + QueueBytes(peer.outgoingSendReliableCommands);
-        sample.queuedPayloadBytes = static_cast<uint32_t>((std::min)(queued, uint64_t(UINT32_MAX)));
-        sample.reliableInFlightBytes = peer.reliableDataInTransit;
-        sample.reliableWindowBytes = (std::max)(peer.mtu, peer.packetThrottle * peer.windowSize / ENET_PEER_PACKET_THROTTLE_SCALE);
-        sample.rttMs = peer.roundTripTime;
-        sample.throttle = peer.packetThrottle;
-        sample.validRtt = peer.lastReceiveTime != 0 && peer.packetsSent >= 32;
-        if (peer.packetsLost != budgetLastLost[i]) {
-            budgetLastLost[i] = peer.packetsLost;
-            budgetLossAt[i] = now;
-        }
-        sample.packetsSent = peer.packetsSent;
-        sample.packetsLost = peer.packetsLost;
-        sample.lossPermille = peer.packetsSent >= 32
-            ? static_cast<uint32_t>((std::min)(uint64_t(1000), uint64_t(peer.packetsLost) * 1000 / peer.packetsSent)) : 0;
-        sample.validLoss = peer.packetsSent >= 32;
-        sample.retrySampleAt = budgetLossAt[i];
-        peerBudgets[i].Advance(now, sample);
-    }
 }
 
 bool StoryHandshake(void const* data, size_t size)
@@ -196,9 +152,7 @@ bool Sane(PlayerState& state)
     state.helmet[sizeof(state.helmet) - 1] = 0;
     state.look[sizeof(state.look) - 1] = 0;
     if (state.gold < 0) state.gold = 0;
-    for (float v : state.position) if (!std::isfinite(v) || std::fabs(v) > 1e7f) return false;
-    for (float v : state.rotation) if (!std::isfinite(v) || std::fabs(v) > 2.0f) return false;
-    return true;
+    return playerwire::detail::finiteCoordsAndRotation(state);
 }
 
 unsigned ClientCount()
@@ -334,7 +288,13 @@ void ProcessRelayDrops()
     }
 }
 
-size_t PeerIndex(ENetPeer const* peer) { return static_cast<size_t>(peer - host->peers); }
+size_t PeerIndex(ENetPeer const* peer)
+{
+    if (!host || !peer || !host->peers || peer < host->peers) return MaxPlayers;
+    const size_t limit = host->peerCount ? (std::min)(host->peerCount, size_t(MaxPlayers)) : size_t(MaxPlayers);
+    const size_t index = static_cast<size_t>(peer - host->peers);
+    return index < limit ? index : MaxPlayers;
+}
 
 uint8_t PeerSlotOf(ENetPeer const* peer)
 {
@@ -345,25 +305,14 @@ uint8_t PeerSlotOf(ENetPeer const* peer)
 
 uint8_t DestinationId(ENetPeer const* peer)
 {
-    return isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
-}
-
-void ResetBudget(ENetPeer* peer)
-{
-    BudgetConfig config;
-    config.bytesPerSecond = budgetRate;
-    config.mtuBytes = peer->mtu;
-    config.envelopeBytes = relayEnvelopeBytes;
-    config.checksumBytes = host->checksum ? 4 : 0;
-    peerBudgets[PeerIndex(peer)].Reset(enet_time_get(), config);
-    budgetLossAt[PeerIndex(peer)] = budgetLastLost[PeerIndex(peer)] = 0;
+    return isHost ? PeerSlotOf(peer) : 1;
 }
 
 bool Open(ENetPeer* peer)
 {
     if (!isHost) return inWorld;
-    const uintptr_t id = reinterpret_cast<uintptr_t>(peer->data);
-    return id > 1 && id < MaxPlayers && clientInWorld[id];
+    const uint8_t id = PeerSlotOf(peer);
+    return id != 0 && clientInWorld[id];
 }
 
 void SendToServer(void const* data, size_t size, uint8_t channel, bool reliable)

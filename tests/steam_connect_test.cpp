@@ -610,7 +610,6 @@ void Frames()
     assert(!DecodeFrame(packet, packetSize, &frame));
 }
 
-// The decode check runs normally; define the macro for the failing IsFrame regression.
 void RelayPrefixCollision()
 {
     unsigned char packet[256] = {};
@@ -621,13 +620,9 @@ void RelayPrefixCollision()
     assert(g3t::steam::RelayDecode(packet, size, lobby, "default", nullptr, nullptr));
     Frame frame;
     assert(!DecodeFrame(packet, size, &frame));
-#ifdef TEST_KNOWN_RELAY_PREFIX_COLLISION
     assert(!IsFrame(packet, size));
-#endif
 }
 
-// Opt-in failing regression; the normal suite remains runnable against the current header.
-#ifdef TEST_KNOWN_TRUNCATED_TOKEN
 void TruncatedToken()
 {
     // The complete lobby ID is 12, but a truncated token must never be accepted as ID 1.
@@ -636,7 +631,6 @@ void TruncatedToken()
     assert((target.kind == Target::Kind::None && target.malformed) ||
            (target.kind == Target::Kind::Lobby && target.id == 12 && !target.malformed));
 }
-#endif
 
 unsigned SendJoin(C const& client, H& host, uint64_t clientId, bool friendOk,
                   char const* hostSession, unsigned clientProtocol, unsigned hostProtocol, uint32_t now)
@@ -922,9 +916,7 @@ int main()
     Simulation();
     MetadataReplication();
     SupersessionAndWrap();
-#ifdef TEST_KNOWN_TRUNCATED_TOKEN
     TruncatedToken();
-#endif
     std::cout << "Parser, wire and end-to-end scenarios passed\n";
     return 0;
 }

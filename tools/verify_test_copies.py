@@ -185,9 +185,9 @@ def verify_native_slots(
     roots: dict[str, Path],
     audit: dict,
 ) -> tuple[list[list[str]], list[str]]:
+    del audit
     rows: list[list[str]] = []
     failures: list[str] = []
-    inventory = {row[0]: row for row in audit["hash_inventory"]["rows"]}
 
     for relative, offset in NATIVE_SLOTS.items():
         for role in ("host", "client"):

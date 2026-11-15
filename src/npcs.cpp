@@ -528,6 +528,18 @@ void KeepHostAttitude(Mirror& m, uint8_t wanted, char const* via)
     m.attitudeWritten = wanted;
 }
 
+void RecordMirrorFirstDeath(Mirror& m, net::NpcRecord const& record, uint32_t now)
+{
+    if (m.deathLogged) return;
+    m.fallbackGraceUntil = now ? now + 500 : 501;
+    m.focusWatchUntil = now ? now + 5000 : 5001;
+    m.focusWatchLogged = false;
+    strcpy_s(m.presentationSource, RagdollSource(m));
+    if (record.hitPlayer)
+        std::snprintf(m.killerAttribution, sizeof(m.killerAttribution), "reported_player_%u", record.hitPlayer);
+    LogClientDeath(m, record, now);
+}
+
 void PassiveMirrorTick()
 {
     if (net::IsHost()) return;
@@ -591,15 +603,7 @@ void PassiveMirrorTick()
                 m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
                     m.deathReferencesCleared != m.entity.GetInstance());
                 m.deathReferencesCleared = m.entity.GetInstance();
-                if (!m.deathLogged) {
-                    m.fallbackGraceUntil = now ? now + 500 : 501;
-                    m.focusWatchUntil = now ? now + 5000 : 5001;
-                    m.focusWatchLogged = false;
-                    std::strcpy(m.presentationSource, RagdollSource(m));
-                    if (m.latest.hitPlayer)
-                        std::snprintf(m.killerAttribution, sizeof(m.killerAttribution), "reported_player_%u", m.latest.hitPlayer);
-                    LogClientDeath(m, m.latest, now);
-                }
+                RecordMirrorFirstDeath(m, m.latest, now);
                 PresentDeadMirror(it->first, m, m.latest, now);
             } else if (m.latest.flags & 2) {
                 if (auto* routine = static_cast<gCScriptRoutine_PS*>(
@@ -656,15 +660,7 @@ void PassiveMirrorTick()
                 m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);
                 m.deathReferencesCleared = m.entity.GetInstance();
             }
-            if (!m.deathLogged) {
-                m.fallbackGraceUntil = now ? now + 500 : 501;
-                m.focusWatchUntil = now ? now + 5000 : 5001;
-                m.focusWatchLogged = false;
-                std::strcpy(m.presentationSource, RagdollSource(m));
-                if (shown.hitPlayer)
-                    std::snprintf(m.killerAttribution, sizeof(m.killerAttribution), "reported_player_%u", shown.hitPlayer);
-                LogClientDeath(m, shown, now);
-            }
+            RecordMirrorFirstDeath(m, shown, now);
         } else if (!m.killed) {
             m.deathReferencesCleared = nullptr;
         }
