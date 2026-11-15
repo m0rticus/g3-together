@@ -4,6 +4,7 @@
 // with the other players and shows them as puppets.
 #include "ai.h"
 #include "combat.h"
+#include "combat_hostility.h"
 #include "net.h"
 #include "npcremoval.h"
 #include "story.h"
@@ -268,6 +269,7 @@ class Module : public eCEngineComponentBase
             {"NPC cleanup / replication reset", &g3t::npcs::OnWorldDeactivate},
             {"Ardea removal cleanup", &g3t::npcremoval::OnWorldDeactivate},
             {"combat cleanup", &g3t::combat::OnWorldChange},
+            {"combat hostility cleanup", &g3t::combat_hostility::OnWorldChange},
             {"shot cleanup", &g3t::shot::OnWorldChange},
             {"summon cleanup", &g3t::summon::OnWorldChange},
             {"fight memory cleanup", &g3t::fightmem::OnWorldChange},

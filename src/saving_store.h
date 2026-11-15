@@ -16,7 +16,10 @@
 
 namespace g3t::saving::store {
 using Bytes = std::vector<uint8_t>;
-constexpr uint32_t Version = 3, Limit = 128u * 1024 * 1024;
+inline constexpr uint8_t Magic[8] = {'G', '3', 'T', 'S', 'A', 'V', 'E', '\0'};
+constexpr uint32_t Version = 4, MinReaderVersion = 4, Limit = 128u * 1024 * 1024;
+constexpr size_t HeaderSize = 112, SectionHeaderSize = 28;
+constexpr uint32_t SectionRequired = 0, SectionOptional = 1;
 constexpr uint32_t CharacterLimit = 256u * 1024, ExtensionLimit = 1024u * 1024;
 constexpr uint32_t NativeHeader = 1, NativeWorld = 2, Journal = 3, Character = 4, Personal = 5, Extension = 256;
 constexpr uint32_t PlayerLimit = 20 + CharacterLimit + personal::Limit;
@@ -24,10 +27,12 @@ struct Block {
     uint32_t type = 0, version = 0;
     uint64_t account = 0;
     Bytes bytes;
+    uint32_t flags = 0;
 };
 struct Save {
     Key key;
     std::vector<Block> blocks;
+    uint32_t schemaVersion = Version, minReaderVersion = MinReaderVersion;
 };
 struct LegacyManifest {
     Key key;
@@ -60,42 +65,29 @@ inline bool ParseLegacy(Bytes const& bytes, LegacyManifest& out)
     return true;
 }
 
-inline uint32_t CrcByte(uint32_t crc, uint8_t byte)
-{
-    crc ^= byte;
-    for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320u : 0);
-    return crc;
-}
-inline uint32_t Crc(uint8_t const* data, size_t size)
-{
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < size; ++i) {
-        crc = CrcByte(crc, data[i]);
-    }
-    return crc ^ 0xffffffffu;
-}
+inline uint32_t CrcByte(uint32_t crc, uint8_t byte) { return saving::CrcByte(crc, byte); }
+inline uint32_t Crc(uint8_t const* data, size_t size) { return saving::Crc32(data, size); }
 inline uint32_t Crc(Bytes const& bytes) { return Crc(bytes.data(), bytes.size()); }
+inline uint32_t LegacyContainerCrc(Bytes const& bytes)
+{
+    return Crc32Zeroed(bytes.data(), bytes.size(), 16, 4);
+}
 inline uint32_t ContainerCrc(Bytes const& bytes)
 {
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < bytes.size(); ++i) crc = CrcByte(crc, i >= 16 && i < 20 ? 0 : bytes[i]);
-    return crc ^ 0xffffffffu;
+    return Crc32Zeroed(bytes.data(), bytes.size(), 24, 4);
 }
-inline void Put(Bytes& bytes, uint64_t value, unsigned count)
-{
-    for (unsigned i = 0; i < count; ++i) bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
-}
+inline void Put(Bytes& bytes, uint64_t value, unsigned count) { PutLe(bytes, value, count); }
 inline bool Get(Bytes const& bytes, size_t& at, uint64_t& value, unsigned count)
 {
-    if (at > bytes.size() || count > bytes.size() - at) return false;
-    value = 0;
-    for (unsigned i = 0; i < count; ++i) value |= uint64_t(bytes[at++]) << (8 * i);
-    return true;
+    return GetLe(bytes.data(), bytes.size(), at, value, count);
 }
-inline bool HeroKey(Bytes const& bytes, Key& key)
+inline bool HeroKey(Bytes const& bytes, Key& key, uint32_t* outVersion = nullptr)
 {
-    if (bytes.empty() || bytes.size() > CharacterLimit ||
-        std::find(bytes.begin(), bytes.end(), uint8_t(0)) != bytes.end()) return false;
+    if (bytes.empty() || bytes.size() > CharacterLimit) return false;
+    if (IsHeroBinaryMagic(bytes.data(), bytes.size())) {
+        return InspectHeroBinary(bytes.data(), bytes.size(), key, outVersion);
+    }
+    if (std::find(bytes.begin(), bytes.end(), uint8_t(0)) != bytes.end()) return false;
     std::istringstream input(std::string(bytes.begin(), bytes.end()));
     std::string lines[3];
     for (auto& line : lines) {
@@ -103,7 +95,9 @@ inline bool HeroKey(Bytes const& bytes, Key& key)
         if (!line.empty() && line.back() == '\r') line.pop_back();
     }
     RecordPose pose;
-    return ParseRecordMetadata(lines[0], lines[1], lines[2], nullptr, key, pose);
+    if (!ParseRecordMetadata(lines[0], lines[1], lines[2], nullptr, key, pose)) return false;
+    if (outVersion) *outVersion = 4;
+    return true;
 }
 inline bool PackPlayer(Bytes const& hero, Bytes const& state, Bytes& out)
 {
@@ -136,6 +130,7 @@ inline bool UnpackPlayer(Bytes const& bytes, Bytes& hero, Bytes& state)
 }
 inline bool Rebind(Bytes& bytes, Key const& key)
 {
+    if (IsHeroBinaryMagic(bytes.data(), bytes.size())) return RebindHeroBinary(bytes, key);
     Key previous;
     if (!Valid(key) || !HeroKey(bytes, previous) || !SameCharacter(previous, key)) return false;
     std::string text(bytes.begin(), bytes.end());
@@ -156,20 +151,22 @@ inline void Set(Save& save, Block block)
         if (b.type == block.type && b.account == block.account) { b = std::move(block); return; }
     save.blocks.push_back(std::move(block));
 }
-inline bool ValidSave(Save const& save)
+inline bool ValidSave(Save const& save, uint32_t containerVersion = Version)
 {
     if (!Valid(save.key) || save.blocks.size() > 64) return false;
     unsigned accounts = 0;
-    uint64_t total = 96;
+    uint64_t total = HeaderSize;
     for (size_t i = 0; i < save.blocks.size(); ++i) {
         auto const& b = save.blocks[i];
-        total += 24 + b.bytes.size();
+        total += SectionHeaderSize + b.bytes.size();
         if (total > Limit || !b.version) return false;
         for (size_t j = 0; j < i; ++j)
             if (save.blocks[j].type == b.type && save.blocks[j].account == b.account) return false;
         if (b.type == Character) {
             Key hero;
-            if (++accounts > 8 || b.version != 4 || !b.account || !HeroKey(b.bytes, hero) ||
+            uint32_t heroVer = 0;
+            if (++accounts > 8 || !b.account || !HeroKey(b.bytes, hero, &heroVer) ||
+                b.version != heroVer || heroVer < 4 ||
                 !Exact(hero, {save.key.world, save.key.save, b.account})) return false;
         } else if (b.type == Personal) {
             personal::Snapshot snapshot;
@@ -179,28 +176,40 @@ inline bool ValidSave(Save const& save)
             if (b.account || b.version != 1 || b.bytes.empty() || b.bytes.size() > 64u * 1024 * 1024) return false;
         } else if (b.type == Journal) {
             if (b.account || b.version != 1 || b.bytes.size() > ExtensionLimit) return false;
-        } else if (b.type < Extension || b.account || b.bytes.size() > ExtensionLimit) return false;
+        } else if (b.type >= Extension) {
+            if (b.account || b.bytes.size() > ExtensionLimit) return false;
+        } else if ((b.flags & SectionOptional) != 0) {
+            if (b.bytes.size() > ExtensionLimit) return false;
+        } else {
+            return false;
+        }
     }
-    return Find(save, NativeHeader) && Find(save, NativeWorld) && Find(save, Journal) &&
-           Find(save, Character, save.key.player);
+    return Find(save, NativeHeader) && Find(save, NativeWorld) &&
+           (containerVersion == 2 || Find(save, Journal)) && Find(save, Character, save.key.player);
 }
 inline bool Encode(Save const& save, Bytes& out)
 {
-    if (!ValidSave(save)) return false;
+    if (!ValidSave(save, Version)) return false;
     Bytes payload;
     for (auto const& b : save.blocks) {
-        Put(payload, b.type, 4); Put(payload, b.version, 4); Put(payload, b.account, 8);
-        Put(payload, b.bytes.size(), 4); Put(payload, Crc(b.bytes), 4);
+        Put(payload, b.type, 4); Put(payload, b.version, 4); Put(payload, b.flags, 4);
+        Put(payload, b.account, 8); Put(payload, b.bytes.size(), 4); Put(payload, Crc(b.bytes), 4);
         payload.insert(payload.end(), b.bytes.begin(), b.bytes.end());
     }
-    Bytes result{'G','3','T','S','A','V','E','3'};
-    Put(result, Version, 4); Put(result, payload.size(), 4); Put(result, 0, 4);
+    if (HeaderSize + payload.size() > Limit) return false;
+    Bytes result(Magic, Magic + sizeof(Magic));
+    Put(result, Version, 4); Put(result, MinReaderVersion, 4);
+    Put(result, HeaderSize, 4); Put(result, payload.size(), 4);
+    Put(result, 0, 4); // containerCrc placeholder [24..28)
+    Put(result, 0, 4); // flags
     result.insert(result.end(), save.key.world.begin(), save.key.world.end());
     result.insert(result.end(), save.key.save.begin(), save.key.save.end());
     Put(result, save.key.player, 8); Put(result, save.blocks.size(), 4);
+    const uint32_t headerCrc = Crc32Zeroed(result.data(), 108, 24, 4);
+    Put(result, headerCrc, 4);
     result.insert(result.end(), payload.begin(), payload.end());
     const uint32_t checksum = ContainerCrc(result);
-    for (unsigned i = 0; i < 4; ++i) result[16 + i] = static_cast<uint8_t>(checksum >> (8 * i));
+    PutLeAt(result.data() + 24, checksum, 4);
     out = std::move(result);
     return true;
 }
@@ -209,31 +218,124 @@ inline bool Modern(Bytes const& bytes)
     // Recognize damaged/truncated modern headers too; never downgrade them to a native save.
     return bytes.size() >= 4 && std::memcmp(bytes.data(), "G3TS", 4) == 0;
 }
-inline bool Decode(Bytes const& bytes, Save& out)
+inline bool DecodeLegacyContainer(Bytes const& bytes, uint32_t expectedVersion, Save& out, char const** reason)
 {
-    if (bytes.size() < 96 || bytes.size() > Limit || std::memcmp(bytes.data(), "G3TSAVE3", 8)) return false;
+    if (bytes.size() < 96 || bytes.size() > Limit) { if (reason) *reason = "truncated"; return false; }
     size_t at = 8;
     uint64_t version = 0, length = 0, crc = 0, count = 0;
-    if (!Get(bytes, at, version, 4) || version != Version || !Get(bytes, at, length, 4) ||
-        !Get(bytes, at, crc, 4) || length != bytes.size() - 96 ||
-        crc != ContainerCrc(bytes)) return false;
+    if (!Get(bytes, at, version, 4) || version != expectedVersion || !Get(bytes, at, length, 4) ||
+        !Get(bytes, at, crc, 4) || length != bytes.size() - 96 || crc != LegacyContainerCrc(bytes)) {
+        if (reason) *reason = "header-or-crc";
+        return false;
+    }
     Save result;
+    result.schemaVersion = expectedVersion;
+    result.minReaderVersion = expectedVersion;
     result.key.world.assign(bytes.begin() + 20, bytes.begin() + 52);
     result.key.save.assign(bytes.begin() + 52, bytes.begin() + 84);
     at = 84;
-    if (!Get(bytes, at, result.key.player, 8) || !Get(bytes, at, count, 4) || count > 64) return false;
+    if (!Get(bytes, at, result.key.player, 8) || !Get(bytes, at, count, 4) || count > 64) {
+        if (reason) *reason = "header";
+        return false;
+    }
     for (uint64_t i = 0; i < count; ++i) {
         Block b;
         uint64_t type = 0, blockVersion = 0, size = 0, checksum = 0;
         if (!Get(bytes, at, type, 4) || !Get(bytes, at, blockVersion, 4) || !Get(bytes, at, b.account, 8) ||
-            !Get(bytes, at, size, 4) || !Get(bytes, at, checksum, 4) || size > bytes.size() - at) return false;
+            !Get(bytes, at, size, 4) || !Get(bytes, at, checksum, 4) || size > bytes.size() - at) {
+            if (reason) *reason = "section-bounds";
+            return false;
+        }
         b.type = static_cast<uint32_t>(type); b.version = static_cast<uint32_t>(blockVersion);
-        if (checksum != Crc(bytes.data() + at, static_cast<size_t>(size))) return false;
+        if (checksum != Crc(bytes.data() + at, static_cast<size_t>(size))) {
+            if (reason) *reason = "section-crc";
+            return false;
+        }
         b.bytes.assign(bytes.begin() + at, bytes.begin() + at + static_cast<size_t>(size));
         at += static_cast<size_t>(size);
         result.blocks.push_back(std::move(b));
     }
-    if (at != bytes.size() || !ValidSave(result)) return false;
+    if (at != bytes.size() || !ValidSave(result, expectedVersion)) {
+        if (reason) *reason = "invalid-save";
+        return false;
+    }
+    out = std::move(result);
+    return true;
+}
+inline bool Decode(Bytes const& bytes, Save& out, char const** reason = nullptr)
+{
+    if (reason) *reason = nullptr;
+    if (bytes.size() > Limit) { if (reason) *reason = "too-large"; return false; }
+    if (bytes.size() >= 8 && std::memcmp(bytes.data(), "G3TSAVE3", 8) == 0) {
+        return DecodeLegacyContainer(bytes, 3, out, reason);
+    }
+    if (bytes.size() >= 8 && std::memcmp(bytes.data(), "G3TSAVE2", 8) == 0) {
+        return DecodeLegacyContainer(bytes, 2, out, reason);
+    }
+    if (bytes.size() < HeaderSize || std::memcmp(bytes.data(), Magic, sizeof(Magic)) != 0) {
+        if (reason) *reason = "header";
+        return false;
+    }
+    size_t at = 8;
+    uint64_t schema = 0, minReader = 0, headerSize = 0, length = 0, crc = 0, flags = 0, count = 0, headerCrc = 0;
+    if (!Get(bytes, at, schema, 4) || !Get(bytes, at, minReader, 4) ||
+        !Get(bytes, at, headerSize, 4) || !Get(bytes, at, length, 4) ||
+        !Get(bytes, at, crc, 4) || !Get(bytes, at, flags, 4)) {
+        if (reason) *reason = "truncated";
+        return false;
+    }
+    if (schema < Version || minReader == 0 || minReader > Version || minReader > schema) {
+        if (reason) *reason = "unsupported-version";
+        return false;
+    }
+    if (headerSize < HeaderSize || headerSize > bytes.size() || length != bytes.size() - headerSize) {
+        if (reason) *reason = "header-bounds";
+        return false;
+    }
+    Save result;
+    result.schemaVersion = static_cast<uint32_t>(schema);
+    result.minReaderVersion = static_cast<uint32_t>(minReader);
+    result.key.world.assign(bytes.begin() + 32, bytes.begin() + 64);
+    result.key.save.assign(bytes.begin() + 64, bytes.begin() + 96);
+    at = 96;
+    if (!Get(bytes, at, result.key.player, 8) || !Get(bytes, at, count, 4) ||
+        !Get(bytes, at, headerCrc, 4) || count > 64) {
+        if (reason) *reason = "header";
+        return false;
+    }
+    if (headerCrc != Crc32Zeroed(bytes.data(), 108, 24, 4)) {
+        if (reason) *reason = "header-crc";
+        return false;
+    }
+    if (crc != ContainerCrc(bytes)) {
+        if (reason) *reason = "container-crc";
+        return false;
+    }
+    at = static_cast<size_t>(headerSize);
+    for (uint64_t i = 0; i < count; ++i) {
+        Block b;
+        uint64_t type = 0, blockVersion = 0, secFlags = 0, size = 0, checksum = 0;
+        if (!Get(bytes, at, type, 4) || !Get(bytes, at, blockVersion, 4) || !Get(bytes, at, secFlags, 4) ||
+            !Get(bytes, at, b.account, 8) || !Get(bytes, at, size, 4) || !Get(bytes, at, checksum, 4) ||
+            size > bytes.size() - at) {
+            if (reason) *reason = "section-bounds";
+            return false;
+        }
+        b.type = static_cast<uint32_t>(type);
+        b.version = static_cast<uint32_t>(blockVersion);
+        b.flags = static_cast<uint32_t>(secFlags);
+        if (checksum != Crc(bytes.data() + at, static_cast<size_t>(size))) {
+            if (reason) *reason = "section-crc";
+            return false;
+        }
+        b.bytes.assign(bytes.begin() + at, bytes.begin() + at + static_cast<size_t>(size));
+        at += static_cast<size_t>(size);
+        result.blocks.push_back(std::move(b));
+    }
+    if (at != bytes.size() || !ValidSave(result, Version)) {
+        if (reason) *reason = "invalid-save";
+        return false;
+    }
     out = std::move(result);
     return true;
 }

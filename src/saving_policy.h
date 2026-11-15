@@ -14,6 +14,93 @@
 namespace g3t::saving {
 constexpr uint16_t Protocol = 79;
 
+inline constexpr uint8_t HeroMagic[8] = {'G', '3', 'T', 'H', 'E', 'R', 'O', '\0'};
+inline constexpr uint32_t HeroSchemaVersion = 5;
+inline constexpr uint32_t HeroMinReaderVersion = 5;
+inline constexpr size_t HeroHeaderSize = 48;
+inline constexpr size_t HeroSectionHeaderSize = 16;
+inline constexpr uint32_t HeroSectionRequired = 0;
+inline constexpr uint32_t HeroSectionOptional = 1;
+inline constexpr uint32_t HeroSecIdentity = 1;
+inline constexpr uint32_t HeroSecPose = 2;
+inline constexpr uint32_t HeroSecState = 3;
+inline constexpr uint32_t HeroSecAttributes = 4;
+inline constexpr uint32_t HeroSecInventory = 5;
+inline constexpr uint32_t HeroSecSpells = 6;
+inline constexpr uint32_t HeroSecQuickSlots = 7;
+inline constexpr uint32_t HeroSecExtension = 256;
+inline constexpr size_t HeroMaxRecordBytes = 4 * 1024 * 1024;
+inline constexpr size_t HeroMaxExtraSections = 64;
+inline constexpr size_t HeroRecordCrcOffset = 24;
+inline constexpr size_t HeroHeaderCrcOffset = 44;
+inline constexpr size_t HeroSectionCrcOffset = 12;
+inline constexpr size_t HeroIdentityPayloadBytes = 72;
+inline constexpr size_t HeroIdentitySaveOffset = 32;
+inline constexpr size_t HeroIdentityPlayerOffset = 64;
+inline constexpr size_t HeroPosePayloadBytes = 28;
+inline constexpr uint32_t HeroAllCoreSectionsMask =
+    (1u << HeroSecIdentity) | (1u << HeroSecPose) | (1u << HeroSecState) | (1u << HeroSecAttributes) |
+    (1u << HeroSecInventory) | (1u << HeroSecSpells) | (1u << HeroSecQuickSlots);
+
+inline uint32_t CrcByte(uint32_t crc, uint8_t byte)
+{
+    crc ^= byte;
+    for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320u : 0);
+    return crc;
+}
+
+inline uint32_t Crc32(uint8_t const* data, size_t size)
+{
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < size; ++i) crc = CrcByte(crc, data[i]);
+    return crc ^ 0xffffffffu;
+}
+
+inline uint32_t Crc32Zeroed(uint8_t const* data, size_t size, size_t zeroStart, size_t zeroLen)
+{
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < size; ++i) {
+        const uint8_t b = (i >= zeroStart && i < zeroStart + zeroLen) ? 0 : data[i];
+        crc = CrcByte(crc, b);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+inline void PutLe(std::vector<uint8_t>& out, uint64_t value, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
+}
+
+inline void PutLeAt(uint8_t* dst, uint64_t value, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i) dst[i] = static_cast<uint8_t>(value >> (8 * i));
+}
+
+inline bool GetLe(uint8_t const* data, size_t size, size_t& at, uint64_t& value, unsigned count)
+{
+    if (at > size || count > size - at) return false;
+    value = 0;
+    for (unsigned i = 0; i < count; ++i) value |= uint64_t(data[at++]) << (8 * i);
+    return true;
+}
+
+inline void PutF32(std::vector<uint8_t>& out, float value)
+{
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    PutLe(out, bits, 4);
+}
+
+inline bool GetF32(uint8_t const* data, size_t size, size_t& at, float& value)
+{
+    uint64_t raw = 0;
+    if (!GetLe(data, size, at, raw, 4)) return false;
+    const uint32_t bits = static_cast<uint32_t>(raw);
+    std::memcpy(&value, &bits, sizeof(value));
+    return true;
+}
+
 inline bool Id(std::string const& value)
 {
     return value.size() == 32 && value.find_first_not_of("0123456789abcdef") == std::string::npos;
@@ -101,6 +188,41 @@ inline bool ValidRecordPose(RecordPose const& pose)
         length += v * v;
     }
     return length >= 0.99f && length <= 1.01f;
+}
+
+// Engine MoveTo snaps character capsules to ground/geometry and strips non-yaw tilt (pitch/roll).
+// Allow bounded capsule/floor settlement and verify yaw alignment (with 3D fallback near vertical pitch).
+inline bool PoseRestored(RecordPose const& target, RecordPose const& actual)
+{
+    for (float v : target.position) if (!std::isfinite(v)) return false;
+    for (float v : target.rotation) if (!std::isfinite(v)) return false;
+    for (float v : actual.position) if (!std::isfinite(v)) return false;
+    for (float v : actual.rotation) if (!std::isfinite(v)) return false;
+    const float qLen2 = actual.rotation[0] * actual.rotation[0] + actual.rotation[1] * actual.rotation[1] +
+                        actual.rotation[2] * actual.rotation[2] + actual.rotation[3] * actual.rotation[3];
+    if (qLen2 < 1e-6f) return false;
+
+    const float dx = actual.position[0] - target.position[0];
+    const float dy = actual.position[1] - target.position[1];
+    const float dz = actual.position[2] - target.position[2];
+    if (dx * dx + dz * dz > 200.0f * 200.0f || std::fabs(dy) > 300.0f) return false;
+
+    auto horizForward = [](float const q[4], float& fx, float& fz) {
+        const float x = q[0], y = q[1], z = q[2], w = q[3];
+        fx = 2.0f * (x * z + w * y);
+        fz = 1.0f - 2.0f * (x * x + y * y);
+        return fx * fx + fz * fz;
+    };
+    float tx = 0.0f, tz = 0.0f, ax = 0.0f, az = 0.0f;
+    const float tLen2 = horizForward(target.rotation, tx, tz);
+    const float aLen2 = horizForward(actual.rotation, ax, az);
+    if (tLen2 >= 1e-4f && aLen2 >= 1e-4f) {
+        const float yawCos = (tx * ax + tz * az) / std::sqrt(tLen2 * aLen2);
+        return std::isfinite(yawCos) && yawCos >= 0.95f;
+    }
+    const float dot = actual.rotation[0] * target.rotation[0] + actual.rotation[1] * target.rotation[1] +
+                      actual.rotation[2] * target.rotation[2] + actual.rotation[3] * target.rotation[3];
+    return std::isfinite(dot) && std::fabs(dot) >= 0.90f;
 }
 
 namespace detail {
@@ -217,6 +339,138 @@ inline bool LegacyRecordAttribute(std::string const& tag, int32_t base, int32_t 
     }
     if (!ValidRecordAttribute(candidate)) return false;
     attr = candidate;
+    return true;
+}
+
+inline bool IsHeroBinaryMagic(uint8_t const* data, size_t size)
+{
+    return data && size >= sizeof(HeroMagic) && std::memcmp(data, HeroMagic, sizeof(HeroMagic)) == 0;
+}
+
+struct HeroBinarySectionSpan {
+    uint32_t type = 0;
+    uint32_t flags = 0;
+    size_t headerOffset = 0;
+    size_t payloadOffset = 0;
+    size_t size = 0;
+};
+
+struct HeroBinaryEnvelope {
+    uint32_t schemaVersion = 0;
+    uint32_t minReaderVersion = 0;
+    Key key;
+    RecordPose pose;
+    size_t identityHeaderOffset = 0;
+    size_t identityPayloadOffset = 0;
+    std::vector<HeroBinarySectionSpan> sections;
+};
+
+inline char const* ParseHeroBinaryEnvelope(uint8_t const* data, size_t size, HeroBinaryEnvelope& out)
+{
+    if (!IsHeroBinaryMagic(data, size) || size < HeroHeaderSize || size > HeroMaxRecordBytes)
+        return "damaged or truncated binary hero record";
+    size_t at = sizeof(HeroMagic);
+    uint64_t schema = 0, minReader = 0, headerSize = 0, payloadLength = 0, recCrc = 0, flags = 0, sectionCount = 0;
+    uint64_t reserved = 0, headerCrc = 0;
+    if (!GetLe(data, size, at, schema, 4) || !GetLe(data, size, at, minReader, 4) ||
+        !GetLe(data, size, at, headerSize, 4) || !GetLe(data, size, at, payloadLength, 4) ||
+        !GetLe(data, size, at, recCrc, 4) || !GetLe(data, size, at, flags, 4) ||
+        !GetLe(data, size, at, sectionCount, 4) || !GetLe(data, size, at, reserved, 8) ||
+        !GetLe(data, size, at, headerCrc, 4))
+        return "damaged or truncated binary hero record";
+    if (schema < HeroSchemaVersion || minReader == 0 || minReader > HeroSchemaVersion || minReader > schema)
+        return "hero record requires a newer reader version";
+    if (headerSize < HeroHeaderSize || headerSize > size || payloadLength != size - headerSize ||
+        sectionCount > HeroMaxExtraSections + 8)
+        return "damaged or truncated binary hero record";
+    if (headerCrc != Crc32Zeroed(data, HeroHeaderCrcOffset, HeroRecordCrcOffset, 4))
+        return "hero record header checksum mismatch";
+    if (recCrc != Crc32Zeroed(data, size, HeroRecordCrcOffset, 4))
+        return "hero record checksum mismatch";
+
+    HeroBinaryEnvelope parsed;
+    parsed.schemaVersion = static_cast<uint32_t>(schema);
+    parsed.minReaderVersion = static_cast<uint32_t>(minReader);
+    parsed.sections.reserve(static_cast<size_t>(sectionCount));
+
+    at = static_cast<size_t>(headerSize);
+    uint32_t seenCoreMask = 0;
+    std::vector<uint32_t> seenExtraTypes;
+    for (uint64_t i = 0; i < sectionCount; ++i) {
+        const size_t secHeader = at;
+        uint64_t type = 0, secFlags = 0, secSize = 0, secCrc = 0;
+        if (!GetLe(data, size, at, type, 4) || !GetLe(data, size, at, secFlags, 4) ||
+            !GetLe(data, size, at, secSize, 4) || !GetLe(data, size, at, secCrc, 4) ||
+            secSize > size - at)
+            return "damaged or truncated binary hero section";
+        const size_t payloadBytes = static_cast<size_t>(secSize);
+        if (secCrc != Crc32(data + at, payloadBytes))
+            return "hero section checksum mismatch";
+        if (type >= HeroSecIdentity && type <= HeroSecQuickSlots) {
+            const uint32_t bit = 1u << static_cast<unsigned>(type);
+            if (seenCoreMask & bit) return "duplicate hero record section";
+            seenCoreMask |= bit;
+        } else if ((secFlags & HeroSectionOptional) != 0) {
+            for (uint32_t seen : seenExtraTypes) {
+                if (seen == static_cast<uint32_t>(type)) return "too many or duplicate optional hero sections";
+            }
+            if (seenExtraTypes.size() >= HeroMaxExtraSections) return "too many or duplicate optional hero sections";
+            seenExtraTypes.push_back(static_cast<uint32_t>(type));
+        } else {
+            return "unsupported required hero section";
+        }
+        if (type == HeroSecIdentity) {
+            if (payloadBytes != HeroIdentityPayloadBytes) return "invalid or mismatched identity or pose";
+            parsed.key.world.assign(reinterpret_cast<char const*>(data + at), HeroIdentitySaveOffset);
+            parsed.key.save.assign(reinterpret_cast<char const*>(data + at + HeroIdentitySaveOffset),
+                                   HeroIdentitySaveOffset);
+            size_t playerAt = at + HeroIdentityPlayerOffset;
+            if (!GetLe(data, size, playerAt, parsed.key.player, 8) || !Valid(parsed.key))
+                return "invalid or mismatched identity or pose";
+            parsed.identityPayloadOffset = at;
+            parsed.identityHeaderOffset = secHeader;
+        } else if (type == HeroSecPose) {
+            if (payloadBytes != HeroPosePayloadBytes) return "invalid or mismatched identity or pose";
+            size_t poseAt = at;
+            for (int j = 0; j < 3; ++j)
+                if (!GetF32(data, size, poseAt, parsed.pose.position[j])) return "invalid or mismatched identity or pose";
+            for (int j = 0; j < 4; ++j)
+                if (!GetF32(data, size, poseAt, parsed.pose.rotation[j])) return "invalid or mismatched identity or pose";
+            if (!ValidRecordPose(parsed.pose)) return "invalid or mismatched identity or pose";
+        }
+        parsed.sections.push_back({static_cast<uint32_t>(type), static_cast<uint32_t>(secFlags), secHeader, at,
+                                   payloadBytes});
+        at += payloadBytes;
+    }
+    if (at != size) return "trailing data in binary hero record";
+    if ((seenCoreMask & HeroAllCoreSectionsMask) != HeroAllCoreSectionsMask) return "missing required hero section";
+    out = std::move(parsed);
+    return nullptr;
+}
+
+inline bool InspectHeroBinary(uint8_t const* data, size_t size, Key& key, uint32_t* outSchemaVersion = nullptr,
+                              size_t* outIdentityPayloadOffset = nullptr, size_t* outIdentityHeaderOffset = nullptr)
+{
+    HeroBinaryEnvelope env;
+    if (ParseHeroBinaryEnvelope(data, size, env) != nullptr) return false;
+    key = std::move(env.key);
+    if (outSchemaVersion) *outSchemaVersion = env.schemaVersion;
+    if (outIdentityPayloadOffset) *outIdentityPayloadOffset = env.identityPayloadOffset;
+    if (outIdentityHeaderOffset) *outIdentityHeaderOffset = env.identityHeaderOffset;
+    return true;
+}
+
+inline bool RebindHeroBinary(std::vector<uint8_t>& bytes, Key const& key)
+{
+    Key previous;
+    size_t idPayload = 0, idHeader = 0;
+    if (!Valid(key) || !InspectHeroBinary(bytes.data(), bytes.size(), previous, nullptr, &idPayload, &idHeader) ||
+        !SameCharacter(previous, key)) return false;
+    std::memcpy(bytes.data() + idPayload + HeroIdentitySaveOffset, key.save.data(), HeroIdentitySaveOffset);
+    const uint32_t secCrc = Crc32(bytes.data() + idPayload, HeroIdentityPayloadBytes);
+    PutLeAt(bytes.data() + idHeader + HeroSectionCrcOffset, secCrc, 4);
+    const uint32_t recCrc = Crc32Zeroed(bytes.data(), bytes.size(), HeroRecordCrcOffset, 4);
+    PutLeAt(bytes.data() + HeroRecordCrcOffset, recCrc, 4);
     return true;
 }
 }

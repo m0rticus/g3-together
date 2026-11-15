@@ -16,6 +16,7 @@ void OnWorldDeactivate();
 void CaptureCacheInventory();
 bool NewLife(uint8_t const guid[16]);
 bool LocalAuthority(eCEntity const* entity);
+bool LeasedCombatHostile(eCEntity const* entity);
 bool VettedLocalAuthority(eCEntity const* entity);
 bool HandbackPending(uint8_t const guid[16]);
 bool PreviouslyVetted(uint8_t const guid[16]);

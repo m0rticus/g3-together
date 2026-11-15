@@ -12,6 +12,7 @@
 
 #include "ai.h"
 #include "body.h"
+#include "combat_hostility.h"
 #include "config.h"
 #include "guid.h"
 #include "journal.h"
@@ -147,9 +148,7 @@ bool TransferableStatus(Checkpoint const& state)
 }
 uint8_t TargetPlayer(eCEntity* target)
 {
-    if (!target) return 0;
-    if (target == remote::ControlledBody() || target == gCSession::GetInstance().GetHero()) return net::LocalId();
-    return static_cast<uint8_t>(remote::PuppetOwner(target));
+    return combat_hostility::CoopTargetPlayer(target);
 }
 
 void Refusal(GuidKey const& key, char const* name, char const* reason)
@@ -236,6 +235,7 @@ void ReleaseLocal(GuidKey const& key, Entry& entry, eCEntity* entity, bool stop)
     entry.lease.phase = Phase::Host;
     entry.window.Reset(entry.lease.epoch);
     entry.ownedEntity = nullptr;
+    if (wasLocal) combat_hostility::ClearClientLeasedNpc(key.data());
     PublishGuard(key, entry);
     if (wasLocal && stop) Stop(entity);
 }
@@ -455,6 +455,7 @@ void CutToHost(GuidKey const& key, Entry& entry, eCEntity* entity, Checkpoint co
     if (state) entry.lease.state = *state;
     ++entry.lease.revision; entry.echo = now;
     entry.nativeActivated = false; entry.confirmed = false; entry.ownedEntity = nullptr;
+    combat_hostility::ClearClientLeasedNpc(key.data());
     PublishGuard(key, entry);
     Diagnostic("frozen", key, entry, why);
     char detail[200];
@@ -535,6 +536,7 @@ void MaintainOwners(uint32_t now)
         }
         ObserveProcessing(entry, entity, now);
         const auto readiness = Readiness(entity, entry, now);
+        combat_hostility::SyncClientLeasedNpc(entity);
         Entity npc(entity);
         Checkpoint state = entry.lease.state;
         const bool captured = CaptureNative(entity, state, true);
@@ -583,7 +585,9 @@ void MaintainOwners(uint32_t now)
         ObserveReaction(key, entry, npc, now);
         const bool event = captured && (state.hp != entry.lease.state.hp || state.dead != entry.lease.state.dead ||
             state.attitude != entry.lease.state.attitude || state.status != entry.lease.state.status ||
-            state.defeated != entry.lease.state.defeated);
+            state.defeated != entry.lease.state.defeated || state.aiMode != entry.lease.state.aiMode ||
+            state.attackReason != entry.lease.state.attackReason ||
+            state.targetPlayer != entry.lease.state.targetPlayer);
         const bool settledDead = state.dead && (entry.lease.state.effects & QuestDeath);
         if (captured && (event || (!settledDead && now - entry.lastState >= StateMs))) {
             entry.lease.state = state;

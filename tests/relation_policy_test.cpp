@@ -245,5 +245,127 @@ int main()
         assert(NearestCount == 6u);
         assert(Unset == 0xFFu);
     }
+
+    // Shared combat hostility promotes neutral/friendly/angry combatants against co-op participants,
+    // preserves Panic/Predator, excludes companions, bouts, downed/dead NPCs, and unrelated fights,
+    // and clears cleanly once combat ends.
+    {
+        SharedCombatInput in;
+        in.aiMode = 3;
+        in.targetsCoopSide = true;
+        int const bases[] = {None, Friendly, Neutral, Angry, Hostile};
+        for (int base : bases) {
+            in.storedAttitude = base;
+            assert(ActiveSharedCombatHostility(in));
+            assert(EffectiveAttitude(base, in) == Hostile);
+        }
+        in.storedAttitude = Panic;
+        assert(EffectiveAttitude(Panic, in) == Panic);
+        in.storedAttitude = Predator;
+        assert(EffectiveAttitude(Predator, in) == Predator);
+
+        // Duel and arena bouts stay isolated to the duelists.
+        in.storedAttitude = Neutral;
+        in.attackReason = 17;
+        assert(!ActiveSharedCombatHostility(in));
+        assert(EffectiveAttitude(Neutral, in) == Neutral);
+        in.attackReason = 18;
+        assert(!ActiveSharedCombatHostility(in));
+        in.attackReason = 9;
+
+        // Companions and players/puppets never turn hostile toward the co-op side.
+        in.role = CombatRole::CoopCompanion;
+        assert(!ActiveSharedCombatHostility(in));
+        in.role = CombatRole::PlayerOrPuppet;
+        assert(!ActiveSharedCombatHostility(in));
+        in.role = CombatRole::OrdinaryNpc;
+
+        // Unrelated NPC-vs-NPC combat (e.g., rebel vs wild boar) stays neutral.
+        in.targetsCoopSide = false;
+        assert(!ActiveSharedCombatHostility(in));
+        assert(EffectiveAttitude(Neutral, in) == Neutral);
+
+        // Client-leased engagement and explicit peer sync replicate hostility in both directions.
+        in.clientLeasedEngagement = true;
+        assert(ActiveSharedCombatHostility(in));
+        assert(EffectiveAttitude(Friendly, in) == Hostile);
+        in.clientLeasedEngagement = false;
+        in.syncedSharedHostile = true;
+        assert(ActiveSharedCombatHostility(in));
+        in.mirrored = true;
+        in.aiMode = 0;
+        assert(ActiveSharedCombatHostility(in));
+
+        // Knockdown, death, and returning out of combat clear shared combat hostility.
+        in.mirrored = false;
+        in.syncedSharedHostile = false;
+        in.targetsCoopSide = true;
+        assert(!ActiveSharedCombatHostility(in));
+        in.combatState = 1;
+        assert(ActiveSharedCombatHostility(in));
+        in.down = true;
+        assert(!ActiveSharedCombatHostility(in));
+        in.down = false;
+        in.alive = false;
+        assert(!ActiveSharedCombatHostility(in));
+    }
+
+    // Weapon-drawn focus priority overrides allow immediate mid-combat targeting on both host and client.
+    {
+        FocusPriorityInput fi;
+        fi.combatTask = true;
+        fi.sharedHostile = true;
+        fi.attitude = Friendly;
+        assert(CombatFocusPriorityOverride(fi) == 3);
+        fi.attitude = Neutral;
+        assert(CombatFocusPriorityOverride(fi) == 3);
+
+        // Client mirrors in combat whose CurrentTarget is None on the local entity still resolve priority 3.
+        fi.sharedHostile = false;
+        fi.mirrored = true;
+        fi.inCombat = true;
+        fi.attitude = Hostile;
+        assert(CombatFocusPriorityOverride(fi) == 3);
+        fi.attitude = Neutral;
+        fi.targetsCoopSide = true;
+        assert(CombatFocusPriorityOverride(fi) == 3);
+
+        // Normal stance, companions, bouts, downed, dead, and non-combat neutrals defer to vanilla.
+        fi.sharedHostile = true;
+        fi.combatTask = false;
+        assert(CombatFocusPriorityOverride(fi) == -1);
+        fi.combatTask = true;
+        fi.role = CombatRole::CoopCompanion;
+        assert(CombatFocusPriorityOverride(fi) == -1);
+        fi.role = CombatRole::OrdinaryNpc;
+        fi.outsideBout = true;
+        assert(CombatFocusPriorityOverride(fi) == -1);
+        fi.outsideBout = false;
+        fi.down = true;
+        assert(CombatFocusPriorityOverride(fi) == -1);
+        fi.down = false;
+        fi.alive = false;
+        assert(CombatFocusPriorityOverride(fi) == -1);
+    }
+
+    // Shared combat hostility suppresses false TruthDiffers/Unapplied warnings and works in all reputation modes.
+    {
+        assert(MirrorSharesCombatHostility(true, true, true, Hostile, true, false));
+        assert(MirrorSharesCombatHostility(true, true, false, Unset, false, true));
+        assert(!MirrorSharesCombatHostility(true, true, true, Neutral, false, false));
+        assert(!MirrorSharesCombatHostility(false, true, true, Hostile, true, true));
+
+        Observation obs;
+        obs.alive = true;
+        obs.stored = Hostile;
+        obs.truth = Neutral;
+        obs.sharedHostile = true;
+        assert(Mismatches(obs) == 0u);
+        obs.mirrorBound = true;
+        obs.applied = Hostile;
+        obs.hostAttitude = Neutral;
+        obs.shown = Neutral;
+        assert(Mismatches(obs) == 0u);
+    }
     return 0;
 }

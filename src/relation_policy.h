@@ -95,12 +95,83 @@ inline bool MirrorAnswersFromHost(bool mirrored, bool currentHostSession, bool h
     return mirrored && currentHostSession && haveRecord && ValidAttitude(hostAttitude) && sharedAttitudeValid;
 }
 
+inline bool MirrorSharesCombatHostility(bool mirrored, bool currentHostSession, bool haveRecord,
+                                        uint8_t hostAttitude, bool inCombat, bool remoteSharedHostile)
+{
+    return mirrored && currentHostSession &&
+           (remoteSharedHostile || (haveRecord && hostAttitude == Hostile && inCombat));
+}
+
+enum class CombatRole : uint8_t { OrdinaryNpc, PlayerOrPuppet, CoopCompanion };
+
+struct SharedCombatInput {
+    bool alive = true;
+    bool down = false;
+    CombatRole role = CombatRole::OrdinaryNpc;
+    int storedAttitude = None;
+    int aiMode = 0;            // gEAIMode_Combat == 3
+    uint32_t combatState = 0;  // gCNPC_PS.CombatState != 0
+    int lastFight = 0;         // gELastFightAgainstPlayer_Running == 4
+    int attackReason = 0;      // Duel == 17, Arena == 18
+    bool targetsCoopSide = false;
+    bool clientLeasedEngagement = false;
+    bool syncedSharedHostile = false;
+    bool mirrored = false;
+};
+
+inline bool BoutAttackReason(int attackReason)
+{
+    return attackReason == 17 || attackReason == 18;
+}
+
+inline bool ActiveSharedCombatHostility(SharedCombatInput const& in)
+{
+    if (!in.alive || in.down || in.role != CombatRole::OrdinaryNpc) return false;
+    if (BoutAttackReason(in.attackReason)) return false;
+    const bool inCombat = in.aiMode == 3 || in.combatState != 0 || in.lastFight == 4;
+    if (in.mirrored && in.syncedSharedHostile) return true;
+    if (in.clientLeasedEngagement && (inCombat || in.syncedSharedHostile)) return true;
+    return inCombat && (in.targetsCoopSide || in.syncedSharedHostile);
+}
+
+inline int EffectiveAttitude(int baseAttitude, SharedCombatInput const& in)
+{
+    if (!ActiveSharedCombatHostility(in)) return baseAttitude;
+    if (baseAttitude == Hostile || baseAttitude == Predator || baseAttitude == Panic) return baseAttitude;
+    return Hostile;
+}
+
+struct FocusPriorityInput {
+    bool alive = true;
+    bool down = false;
+    bool combatTask = false;
+    bool mirrored = false;
+    bool sharedHostile = false;
+    bool targetsCoopSide = false;
+    bool inCombat = false;
+    bool outsideBout = false;
+    CombatRole role = CombatRole::OrdinaryNpc;
+    int attitude = None;
+};
+
+inline int CombatFocusPriorityOverride(FocusPriorityInput const& in)
+{
+    if (!in.alive || in.down || !in.combatTask || in.role != CombatRole::OrdinaryNpc || in.outsideBout)
+        return -1;
+    if (in.sharedHostile) return 3;
+    if (in.mirrored && in.inCombat &&
+        (in.attitude == Hostile || in.attitude == Predator || in.targetsCoopSide))
+        return 3;
+    return -1;
+}
+
 enum Mismatch : unsigned { Drift = 1, Unapplied = 2, StaleNone = 4, Unsent = 8, TruthDiffers = 16 };
 
 struct Observation {
     bool mirrorBound = false;  // client: driven from the host's records
     bool alive = true;
     bool ledByRemote = false;
+    bool sharedHostile = false;
     int stored = -1;           // gCNPC_PS.AttitudeToPlayer2 now
     int truth = -1;            // unfiltered GetAttitude(npc, local player); -1 unknown
     int hostAttitude = -1;     // client: latest attitude the host sent
@@ -115,12 +186,13 @@ inline unsigned Mismatches(Observation const& o)
     unsigned bits = 0;
     if (o.mirrorBound) {
         if (o.applied >= 0 && o.stored != o.applied) bits |= Drift;
-        if (o.hostAttitude >= 0 && o.stored != o.hostAttitude && o.stored != o.shown) bits |= Unapplied;
+        if (o.hostAttitude >= 0 && o.stored != o.hostAttitude && o.stored != o.shown && !o.sharedHostile) bits |= Unapplied;
         return bits;
     }
     if (o.alive && o.stored == None && o.truth > None) bits |= StaleNone;
     if (o.sent >= 0 && o.stored != o.sent && o.sentAgeMs >= 1000) bits |= Unsent;
-    if (!o.ledByRemote && o.alive && o.truth > None && o.stored > None && o.stored != o.truth) bits |= TruthDiffers;
+    if (!o.ledByRemote && !o.sharedHostile && o.alive && o.truth > None && o.stored > None && o.stored != o.truth)
+        bits |= TruthDiffers;
     return bits;
 }
 

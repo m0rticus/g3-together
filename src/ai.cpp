@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ai.h"
 
+#include "combat_hostility.h"
+
 #include "log.h"
 #include "npcs.h"
 #include "remote.h"
 #include "talk.h"
+#include "talk_policy.h"
 #include "items.h"
 #include "downed.h"
 #include "downed_policy.h"
@@ -169,15 +172,15 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
     guards::LocalPlayer localPlayer(guards::IsLocalPlayer(self));
     if (downed::GuardState(self, name)) return GEFalse;
-    if (npcplayback::IsPassive(self)) { ++skipped; return GEFalse; }
+    // A mirrored NPC in a dialog with this client's hero runs its talk states, info scripts, and _AI_* gesture/facing helpers.
+    const bool talking = talk_policy::ShouldAllowPassiveTalkScript(talk::TalkingWithHero(self), name);
+    if (npcplayback::IsPassive(self) && !talking) { ++skipped; return GEFalse; }
     if (npc_targets::ReleaseDownedTargets(self, "state-release", spu)) return GEFalse;
     // A mirrored NPC runs its death state only once the host reported it dead (npcs.cpp sets it then);
     // the client's own hit judgement must not decide that.
     const bool dying = (strncmp(name, "ZS_Dead", 7) == 0 || strncmp(name, "ZS_RagDollDead", 14) == 0) && npcs::DiedOnHost(self);
     // Our own blow's stagger on a mirror runs as the game's state (the client's hit feels as it does in single-player).
     const bool reacting = Driven(self) && npcs::LocalReaction(self, name);
-    // A mirrored NPC in a dialog with this client's hero runs its talk states (facing, gestures).
-    const bool talking = (strcmp(name, "ZS_Talk") == 0 || strcmp(name, "ZS_Talk_Loop") == 0) && talk::TalkingWithHero(self);
     // The idle task of a mirror plays its standing motions every frame and replaced every attack the owner sent
     // (first human test: the client saw 11 attack motions where the host played 147); it waits while one plays.
     const bool acting = strcmp(name, IdleTaskName) == 0 &&
@@ -319,22 +322,28 @@ GEInt FocusNameAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     int hostAttitude = 0;
     const bool mirrored = judge && npcs::IsMirrored(judge);
     const bool haveHost = mirrored && npcs::HostAttitude(judge, hostAttitude);
+    const bool sharedMirror = mirrored && combat_hostility::MirrorSharesCombatHostility(judge);
     if (relation::MirrorAnswersFromHost(mirrored, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
-                                       enclaves::Together() && !fightmem::HasLocalOverride(judge))) {
+                                       (enclaves::Together() && !fightmem::HasLocalOverride(judge)) || sharedMirror)) {
         ++relationMirrorAnswered;
         return hostAttitude;
     }
+    auto promote = [&](GEInt base) -> GEInt {
+        return (judge && combat_hostility::ShouldPromoteAttitude(judge))
+                   ? combat_hostility::EffectiveAttitude(judge, base)
+                   : base;
+    };
     eCEntity* actor = guards::CurrentActor();
     if (judge && relation::FocusNameContext(actor != nullptr, actor && LedByRemotePlayer(judge)) == relation::Context::LocalPlayer) {
         ++relationScopeCleared;
         guards::LocalPlayer local(true);
         Entity player(remote::ControlledBody());
         if (player.GetInstance() && player.GetInstance() != judge)
-            return originalAttitude(spu, self, &player, args);
+            return promote(originalAttitude(spu, self, &player, args));
     }
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (HostNpc(judge) && downed::CombatUnavailable(target)) ++relationDownedAllowed;
-    return originalAttitude(spu, self, other, args);
+    return promote(originalAttitude(spu, self, other, args));
 }
 GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
@@ -349,15 +358,22 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
         int hostAttitude = 0;
         const bool haveHost = npcs::HostAttitude(judge, hostAttitude);
         if (relation::MirrorAnswersFromHost(true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
-                                           enclaves::Together() && !fightmem::HasLocalOverride(judge)))
+                                           (enclaves::Together() && !fightmem::HasLocalOverride(judge)) ||
+                                               combat_hostility::MirrorSharesCombatHostility(judge)))
             return hostAttitude;
     }
+    const bool promoteCoopTarget = judge && !npcs::IsMirrored(judge) && target &&
+                                   (target == gCSession::GetInstance().GetHero() ||
+                                    target == remote::ControlledBody() || remote::IsPuppet(target)) &&
+                                   combat_hostility::ShouldPromoteAttitude(judge);
+    auto promote = [&](GEInt base) -> GEInt {
+        return promoteCoopTarget ? combat_hostility::EffectiveAttitude(judge, base) : base;
+    };
     if (target && remote::IsPuppet(target)) {
         ++attitudeAsked;
-        eCEntity* judge = Self(spu, self);
         remote::NoteContact(judge, target);
         // A scoped remote player must remain the same player for GetPlayer, IsPlayer and attitude checks.
-        if (guards::CurrentActor() == target) return originalAttitude(spu, self, other, args);
+        if (guards::CurrentActor() == target) return promote(originalAttitude(spu, self, other, args));
         eCEntity* hero = gCSession::GetInstance().GetHero();
         if (attitudeOn && !plainAsk && hero && judge && judge != hero && !Driven(judge)) {
             // GetAttitude answers Panic when self flees and its current target is other. With the hero in place of
@@ -366,7 +382,7 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
             if (fleeKeep && judge->GetPropertySet(eEPropertySetType_NPC) && npc.Routine.AIMode == gEAIMode_Flee &&
                 npc.NPC.GetCurrentTarget().GetInstance() == target) {
                 ++attitudeFleeKept;
-                return originalAttitude(spu, self, other, args);
+                return promote(originalAttitude(spu, self, other, args));
             }
             ++attitudeRedirected;
             Entity asHero(hero);
@@ -374,10 +390,10 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
             redirectedFor = target;
             const GEInt result = originalAttitude(spu, self, &asHero, args);
             redirectedFor = before;
-            return result;
+            return promote(result);
         }
     }
-    return originalAttitude(spu, self, other, args);
+    return promote(originalAttitude(spu, self, other, args));
 }
 GEInt GE_STDCALL FilterContinue(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {

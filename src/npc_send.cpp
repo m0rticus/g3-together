@@ -6,6 +6,7 @@
 #include "combat.h"
 #include "combat_timing.h"
 #include "guide_policy.h"
+#include "infocmd.h"
 #include "journal.h"
 #include "log.h"
 #include "net_metrics.h"
@@ -320,7 +321,10 @@ void HostTick(void (*sendOwned)(eCEntity*, float const[][3], int))
         for (auto const& entry : forceHistory) for (auto const& force : entry.second) net::SendRagdoll(force);
         for (auto const& entry : absences) net::SendNpcs(&entry.second, 1, true);
         journal::SyncToClients();
+        infocmd::SyncToClients();
     }
+    static uint32_t syncedWorldGen[net::MaxPlayers] = {};
+    static uint32_t syncedWorldId[net::MaxPlayers] = {};
     float players[net::MaxPlayers][3];
     int playerCount = 0;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
@@ -333,17 +337,29 @@ void HostTick(void (*sendOwned)(eCEntity*, float const[][3], int))
     }
     net::Remote const* remotes = net::Remotes();
     bool anyClient = false;
+    bool needWorldSync = false;
     for (int id = 2; id < net::MaxPlayers; ++id) {
         const uint32_t generation = net::PeerGeneration(static_cast<uint8_t>(id));
         if (!net::InWorld(static_cast<uint8_t>(id)) || !remotes[id].connected || recipientGenerations[id] != generation) {
             recipientNpcs[id].clear();
             recipientGenerations[id] = generation;
             initialPacers[id].Reset();
+            syncedWorldGen[id] = 0;
+            syncedWorldId[id] = 0;
         }
         if (!remotes[id].connected) { joinedAt[id] = 0; continue; }
         anyClient = true;
         if (!(remotes[id].latest.flags & 1) || remotes[id].latest.world != remote::CurrentWorld()) continue;
+        if (syncedWorldGen[id] != generation || syncedWorldId[id] != remotes[id].latest.world) {
+            syncedWorldGen[id] = generation;
+            syncedWorldId[id] = remotes[id].latest.world;
+            needWorldSync = true;
+        }
         std::memcpy(players[playerCount++], remotes[id].latest.position, sizeof(float) * 3);
+    }
+    if (needWorldSync) {
+        journal::SyncToClients();
+        infocmd::SyncToClients();
     }
     if (!anyClient || !playerCount) return;
     if (!captureStartedAt) captureStartedAt = now ? now : 1;

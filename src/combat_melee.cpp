@@ -2,6 +2,7 @@
 #include "combat_internal.h"
 #include "ai.h"
 #include "body.h"
+#include "combat_hostility.h"
 #include "config.h"
 #include "hud.h"
 #include "guards.h"
@@ -226,6 +227,8 @@ MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, ne
         result.decision = "attitude-unavailable";
         return result;
     }
+    v.attitude = combat_hostility::EffectiveAttitude(victim, v.attitude);
+    result.relation = combat_hostility::EffectiveAttitude(victim, result.relation);
     v.relation = result.relation;
     if (!v.combat && v.hasFocus && !v.focused && !v.targetsPlayer && !v.partyMember &&
         !ai::TryPlayerAttitude(result.focus, claimant, v.focusRelation)) {
@@ -384,7 +387,8 @@ bool LocalBlow(eCEntity* attacker)
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(attacker), &kind);
     int pending = 0;
-    if (MeansToKill(attacker, body)) downed::NoteBlow();
+    if (downed::IsLethalHeroAttacker(attacker)) downed::NoteBlow();
+    else downed::ClearBlow();
     auto stamina = [&]() {
         return HasPlayerMemory(body) ? self.PlayerMemory.GetStaminaPoints()
             : HasDamageReceiver(body) ? static_cast<int>(self.DamageReceiver.StaminaPoints) : -1;

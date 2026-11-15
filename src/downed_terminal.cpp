@@ -344,10 +344,41 @@ bool AllOthersDown(net::Remote const* remotes, uint32_t now)
     return present;
 }
 
+EndDecision HostWipeDecision(bool localHeldOrTerminal, net::Remote const* remotes, PeerLifeState const* peers,
+                             uint32_t now, uint32_t& aloneSince)
+{
+    WipeParticipant participants[net::MaxPlayers]{};
+    int count = 0;
+    for (int i = 2; i < net::MaxPlayers; ++i) {
+        net::Remote const& r = remotes[i];
+        if (!r.connected) continue;
+        const Availability state = HelperState(r, now);
+        const bool inFlight = peers[i].reviveInFlightSeq != 0 &&
+                              peers[i].reviveInFlightSeq == r.activity.downedSequence &&
+                              (r.activity.flags & 8) != 0 &&
+                              static_cast<int32_t>(peers[i].reviveInFlightUntil - now) > 0;
+        participants[count++] = {true, net::InWorld(static_cast<uint8_t>(i)), state, inFlight};
+    }
+    return DecideHostWipe(localHeldOrTerminal, participants, count, now, aloneSince);
+}
+
+void BroadcastHostWipe()
+{
+    if (!net::IsHost()) return;
+    net::WorldState wipe{};
+    wipe.kind = 21;
+    const uint32_t epoch = net::WorldEpoch();
+    std::memcpy(wipe.guid, &epoch, sizeof(epoch));
+    net::SendWorldState(wipe, 0);
+    net::Flush();
+    Logf("downed: host broadcast atomic party wipe epoch=%08x", epoch);
+}
+
 char const* HelperReason(Availability state)
 {
     switch (state) {
     case Availability::Able: return "able";
+    case Availability::Unconscious: return "unconscious";
     case Availability::Down: return "down-or-dead";
     case Availability::Disconnected: return "disconnected";
     case Availability::Unknown: return "no-activity";

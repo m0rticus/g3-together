@@ -105,7 +105,7 @@ std::string RandomId()
 std::string CharacterPath()
 {
     const std::string folder = Folder();
-    return folder.empty() ? std::string() : folder + "g3t-character-" + std::to_string(steam::PlayerId()) + "-local.txt";
+    return folder.empty() ? std::string() : folder + "g3t-character-" + std::to_string(steam::PlayerId()) + "-local.g3thero";
 }
 
 bool ValidateCharacter(Bytes const& bytes, saving::Key const& key)
@@ -411,10 +411,13 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
             member.account != key.player || net::PeerAccount(from) != key.player) return;
         if (member.ready) return;
         Bytes hero, state;
-        if (!saving::store::UnpackPlayer(bytes, hero, state) || !ValidateCharacter(hero, key)) {
+        saving::Key embedded;
+        uint32_t heroVersion = 0;
+        if (!saving::store::UnpackPlayer(bytes, hero, state) || !ValidateCharacter(hero, key) ||
+            !saving::store::HeroKey(hero, embedded, &heroVersion)) {
             CancelSave("character-record"); return;
         }
-        saving::store::Set(savingManifest, {saving::store::Character, 4, key.player, std::move(hero)});
+        saving::store::Set(savingManifest, {saving::store::Character, heroVersion, key.player, std::move(hero)});
         saving::store::Set(savingManifest, {saving::store::Personal, 1, key.player, std::move(state)});
         operation.Accept(from, net::PeerGeneration(from), key.player, note.epoch);
         Logf("persist: character received save=%s account=%llu bytes=%zu all_ready=%d",
@@ -527,8 +530,10 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     }
     const bool managed = saving::store::Modern(bytes);
     if (managed) {
-        if (!saving::store::Decode(bytes, save)) {
-            Logf("persist: load refused slot=%s reason=container-format bytes=%zu", slot.c_str(), bytes.size());
+        char const* decodeReason = nullptr;
+        if (!saving::store::Decode(bytes, save, &decodeReason)) {
+            Logf("persist: load refused slot=%s reason=container-format detail=%s bytes=%zu",
+                 slot.c_str(), decodeReason ? decodeReason : "-", bytes.size());
             Notice(i18n::SaveDamaged, true); return false;
         }
         auto const* own = saving::store::Find(save, saving::store::Character, steam::PlayerId());
@@ -558,8 +563,9 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
         LogIo(markerError); SaveFailure(saving::store::IoReason(markerError, "cache-publish-failed")); return false;
     }
     if (self != FileManager(true)) { SaveFailure("native-load"); return false; }
-    Logf("persist: load validated slot=%s managed=%d sidecar=%d save=%s blocks=%zu", slot.c_str(),
-         managed ? 1 : 0, hasSidecar ? 1 : 0, save.key.save.c_str(), save.blocks.size());
+    Logf("persist: load validated slot=%s managed=%d sidecar=%d schema=%u min_reader=%u save=%s blocks=%zu",
+         slot.c_str(), managed ? 1 : 0, hasSidecar ? 1 : 0, save.schemaVersion, save.minReaderVersion,
+         save.key.save.c_str(), save.blocks.size());
     CancelSave("canceled-load");
     lastLoad = slot; loading = slot; current = std::move(save); campaign = slot;
     localKind = net::KindMenu; ownCharacterReady = false; restoreFailed = false;

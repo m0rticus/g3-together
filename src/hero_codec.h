@@ -4,6 +4,7 @@
 #include "saving_policy.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,12 @@ struct Schema {
     int spellbookCategory = 9;
 };
 
+struct ExtraSection {
+    uint32_t type = 0;
+    uint32_t flags = 0;
+    std::vector<uint8_t> bytes;
+};
+
 struct ParsedRecord {
     saving::Key key;
     saving::RecordPose pose;
@@ -49,11 +56,15 @@ struct ParsedRecord {
     std::vector<Stack> stacks;
     std::vector<std::string> spells;
     std::vector<Quick> quicks;
+    uint32_t schemaVersion = saving::HeroSchemaVersion;
+    uint32_t minReaderVersion = saving::HeroMinReaderVersion;
+    std::vector<ExtraSection> extraSections;
 };
 
 char const* const* AttributeTags(size_t& count);
 char const* ValidateLogicalContents(std::vector<Stack> const& stacks, std::vector<std::string> const& spells,
                                     std::vector<Quick> const& quicks, Schema const& schema);
+char const* EncodeRecord(ParsedRecord const& record, Schema const& schema, std::vector<uint8_t>& out);
 char const* ParseBoundRecord(char const* data, size_t size, saving::Key const& expected,
                              Schema const& schema, ParsedRecord& out);
 bool SameStacks(std::vector<Stack> const& a, std::vector<Stack> const& b);

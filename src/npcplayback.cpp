@@ -924,7 +924,7 @@ void Tick()
             Silence(npc.GetInstance());
             const GuidKey key = EntityKey(npc.GetInstance());
             if (npcs::ClientPresent(npc.GetInstance()) && !npcs::HostPresentationAvailable(npc.GetInstance()) &&
-                !npc.IsDead() && !npc.IsDown() && !npcremoval::Suppressed(npc.GetInstance())) {
+                !talk::TalkingWithHero(npc.GetInstance()) && !npc.IsDead() && !npc.IsDown() && !npcremoval::Suppressed(npc.GetInstance())) {
                 auto& held = unavailable[key];
                 if (held.entity != npc.GetInstance()) held = Unavailable{};
                 held.entity = npc.GetInstance();
@@ -962,7 +962,7 @@ bool TaskBlocked(gCScriptRoutine_PS* self, bCString const& task)
 {
     eCEntity* entity = self->GetEntity();
     if (downed::RejectReaction(entity, task.GetText(), "routine-task")) return true;
-    if (!Passive(entity) || task.GetLength() == 0) return false;
+    if (!Passive(entity) || task.GetLength() == 0 || talk::AllowPassiveTalkTask(entity, task.GetText())) return false;
     RecordBlockedTaskVerdict(entity, task.GetText());
     return true;
 }

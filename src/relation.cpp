@@ -2,6 +2,7 @@
 #include "relation.h"
 
 #include "ai.h"
+#include "combat_hostility.h"
 #include "downed.h"
 #include "enclaves.h"
 #include "fightmem.h"
@@ -104,7 +105,10 @@ View Inspect(eCEntity* entity, bool wantTruth)
         if (ai::LocalAttitude(entity, truth)) v.truth = truth;
     }
     Observation& o = v.observation;
-    o.mirrorBound = v.info.mirrored && v.info.bound && enclaves::Together() && !fightmem::HasLocalOverride(entity);
+    o.sharedHostile = combat_hostility::IsSharedCombatHostile(entity);
+    o.mirrorBound = v.info.mirrored && v.info.bound &&
+                    ((enclaves::Together() && !fightmem::HasLocalOverride(entity)) ||
+                     combat_hostility::MirrorSharesCombatHostility(entity));
     o.alive = v.alive;
     const uint8_t owner = npcs::CompanionOwner(entity);
     o.ledByRemote = owner && owner != net::LocalId();
@@ -228,6 +232,7 @@ void Watch()
 void Tick()
 {
     if (ai::ShuttingDown() || !gCSession::GetInstance().IsGameRunning()) return;
+    combat_hostility::Tick();
     eCEntity* hero = remote::ControlledBody();
     if (!hero) return;
     if (!net::IsHost()) {
@@ -235,7 +240,8 @@ void Tick()
         for (int i = 0; i < all.GetCount(); ++i) {
             eCEntity* npc = all.GetAt(i).GetInstance();
             if (!Eligible(npc) || !npcs::IsMirrored(npc) ||
-                (enclaves::Together() && !fightmem::HasLocalOverride(npc))) continue;
+                (enclaves::Together() && !fightmem::HasLocalOverride(npc)) ||
+                combat_hostility::MirrorSharesCombatHostility(npc)) continue;
             int local = -1;
             if (ai::LocalAttitude(npc, local) && ValidAttitude(local) && Stored(npc) != local)
                 Entity(npc).NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(local);

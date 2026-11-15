@@ -180,6 +180,7 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
     peers[i].payment.MarkPaid(r.latest.downedSequence);
     peers[i].hinted = false;
     SendToPlayer(8, i, r.latest.downedSequence);
+    NoteReviveSent(i, r.latest.downedSequence);
     swprintf_s(text, i18n::Text(i18n::HelpedUpWithPotion), name);
     hud::Message(hud::Good, text);
     Logf("downed: helped player %d up, paid %s sequence=%u source=help-line", i, *potion ? potion : "nothing", r.latest.downedSequence);
@@ -396,6 +397,7 @@ void WatchBlows(Entity& hero, uint32_t now)
     if (before < 0 || hp >= before || !net::Connected()) return;
     eCEntity* attacker = hero.NPC.GetCurrentAttacker().GetInstance();
     if (!attacker || remote::IsPuppet(attacker) || !attacker->GetPropertySet(eEPropertySetType_NPC)) return;
-    if (GetScriptAdminExt().CallScript(bCString("HasAttackReasonToKill"), attacker, hero.GetInstance(), 0)) lethalBlowAt = now ? now : 1;
+    if (IsLethalNpcAttacker(attacker, hero)) lethalBlowAt = now ? now : 1;
+    else lethalBlowAt = 0;
 }
 }

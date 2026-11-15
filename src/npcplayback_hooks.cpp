@@ -72,8 +72,8 @@ std::array<PropertyTable, 128> propertyTables;
 std::atomic<unsigned> propertyTableCount{0};
 std::mutex propertyTableMutex;
 
-// The one NPC our hero is talking to: its script routine runs here so the dialog speaks the NPC's lines and waits for them as
-// the game does. The host still simulates it; tasks, movement and animation stay blocked and its pose comes from the host.
+// The one NPC our hero is talking to: while in stationary talk on the client, its local script routine, animation, facial
+// lip-sync, and in-place facing run smoothly for gCInfoManager_PS while slot-0 gestures are also forwarded to the host.
 bool DialogPartner(eCEntity const* entity) { return entity && talk::TalkingWithHero(entity); }
 
 bool SafeNativeProperty(eEPropertySetType type)
@@ -124,8 +124,13 @@ void PropertyDispatch(eCEntityPropertySet* self, void* edx, unsigned phase)
         return;
     }
     const eEPropertySetType type = self->GetPropertySetType();
-    const bool partnerRoutine = type == eEPropertySetType_ScriptRoutine && DialogPartner(self->GetEntity());
-    if (!partnerRoutine && IsPassive(self->GetEntity()) &&
+    const bool partnerProperty = talk_policy::ShouldAllowDialogPartnerProperty(
+        DialogPartner(self->GetEntity()),
+        type == eEPropertySetType_ScriptRoutine,
+        type == eEPropertySetType_Animation,
+        type == eEPropertySetType_CharacterMovement,
+        type == eEPropertySetType_Dialog);
+    if (!partnerProperty && IsPassive(self->GetEntity()) &&
         !SafeNativeProperty(type) && !(updatingVisual && type == eEPropertySetType_Animation)) {
         ++counters.blockedProperties;
         return;
@@ -251,14 +256,14 @@ void __fastcall Routine(eCEntityPropertySet* self, void* edx)
 void __fastcall Movement(eCEntityPropertySet* self, void* edx)
 {
     if (ai::ShuttingDown()) { if (originalMovement) originalMovement(self, edx); return; }
-    if (IsPassive(self->GetEntity())) { ++counters.blockedMovement; return; }
+    if (IsPassive(self->GetEntity()) && !DialogPartner(self->GetEntity())) { ++counters.blockedMovement; return; }
     originalMovement(self, edx);
 }
 
 void __fastcall MovementUpdated(eCEntityPropertySet* self, void* edx)
 {
     if (ai::ShuttingDown()) { if (originalMovementUpdated) originalMovementUpdated(self, edx); return; }
-    if (IsPassive(self->GetEntity())) { ++counters.blockedMovement; return; }
+    if (IsPassive(self->GetEntity()) && !DialogPartner(self->GetEntity())) { ++counters.blockedMovement; return; }
     originalMovementUpdated(self, edx);
 }
 
@@ -293,10 +298,13 @@ void __fastcall Play(eCVisualAnimation_PS* self, void* edx, eCWrapper_emfx2Actor
     if (ai::ShuttingDown()) { if (originalPlay) originalPlay(self, edx, slot, options); return; }
     eCEntity* entity = self->GetEntity();
     if (!presenting && IsPassive(entity)) {
-        if (DialogPartner(entity) && static_cast<int>(slot) == 0)
-            talk::OnPartnerMotion(entity, self->GetMotionDesc(slot).GetMotionFilename().GetText());
-        ++counters.blockedAnimations;
-        return;
+        if (DialogPartner(entity)) {
+            if (static_cast<int>(slot) == 0)
+                talk::OnPartnerMotion(entity, self->GetMotionDesc(slot).GetMotionFilename().GetText());
+        } else {
+            ++counters.blockedAnimations;
+            return;
+        }
     }
     originalPlay(self, edx, slot, options);
 }
@@ -305,7 +313,7 @@ void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2
                           eCWrapper_emfx2Motion& motion, eCWrapper_emfx2Motion::eSMotionDesc* options)
 {
     if (ai::ShuttingDown()) { if (originalActorPlay) originalActorPlay(self, edx, slot, motion, options); return; }
-    if (!presenting && updatingVisual && IsPassive(visualEntity)) {
+    if (!presenting && updatingVisual && IsPassive(visualEntity) && !DialogPartner(visualEntity)) {
         ++counters.blockedAnimations;
         return;
     }
@@ -326,7 +334,7 @@ void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2
 
 bool CanonicalFacial(eCVisualAnimationFactory* factory)
 {
-    auto* animation = updatingVisual && IsPassive(visualEntity) ? Animation(visualEntity) : nullptr;
+    auto* animation = updatingVisual && IsPassive(visualEntity) && !DialogPartner(visualEntity) ? Animation(visualEntity) : nullptr;
     return animation && !animation->GetRagDollEnabled() && &animation->GetAnimationFactory() == factory;
 }
 
@@ -347,7 +355,7 @@ GEBool __fastcall FacialStop(eCVisualAnimationFactory* self, void* edx)
 void __fastcall StopMotion(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2Actor::eEMotionType slot, float blend)
 {
     if (ai::ShuttingDown()) { if (originalStop) originalStop(self, edx, slot, blend); return; }
-    auto* visual = updatingVisual && IsPassive(visualEntity) ? Animation(visualEntity) : nullptr;
+    auto* visual = updatingVisual && IsPassive(visualEntity) && !DialogPartner(visualEntity) ? Animation(visualEntity) : nullptr;
     if (!presenting && visual && !visual->GetRagDollEnabled()) { ++counters.blockedAnimations; return; }
     originalStop(self, edx, slot, blend);
 }

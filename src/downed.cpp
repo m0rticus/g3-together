@@ -4,11 +4,13 @@
 #include "player_immunity.h"
 #include "ai.h"
 #include "body.h"
+#include "combat_hostility.h"
 #include "crashlog.h"
 #include "hud.h"
 #include "i18n.h"
 #include "items.h"
 #include "log.h"
+#include "npcs.h"
 #include "persist.h"
 #include "remote.h"
 #include "movement.h"
@@ -33,6 +35,12 @@ auto& nativeNoted = life.nativeNoted;
 auto& recoveryUnknownNoted = life.recoveryUnknownNoted;
 auto& nativeTerminalKills = life.nativeTerminalKills;
 auto& nativeTerminalKillChecked = life.nativeTerminalKillChecked;
+auto& lastJudgedHitValid = life.lastJudgedHitValid;
+auto& lastJudgedLethal = life.lastJudgedLethal;
+auto& lastJudgedHitAt = life.lastJudgedHitAt;
+auto& lastJudgedSpecies = life.lastJudgedSpecies;
+auto& lastJudgedReason = life.lastJudgedReason;
+auto& lastJudgedAttackerName = life.lastJudgedAttackerName;
 auto& terminalTask = life.terminalTask;
 auto& inHand = life.inHand;
 auto& wasDown = life.wasDown;
@@ -49,6 +57,7 @@ auto& revives = life.revives;
 char const* const KnockOutTask = "ZS_LieKnockDown";
 void SyncStates() {
     auto const* remotes = net::Remotes();
+    const uint32_t now = net::Now();
     for (int i = 0; i < net::MaxPlayers; ++i) {
         auto& peer = peers[i];
         const uint32_t generation = net::PeerGeneration(static_cast<uint8_t>(i));
@@ -59,6 +68,15 @@ void SyncStates() {
             const uint8_t flags = remotes[i].latest.flags;
             peer.payment.ObservePlayerState((flags & 1) != 0 && (flags & 14) == 0,
                                             remotes[i].latest.downedSequence);
+        }
+        if (peer.reviveInFlightSeq &&
+            (!remotes[i].connected ||
+             (remotes[i].activity.known &&
+              ((remotes[i].activity.flags & 8) == 0 ||
+               remotes[i].activity.downedSequence != peer.reviveInFlightSeq)) ||
+             static_cast<int32_t>(now - peer.reviveInFlightUntil) >= 0)) {
+            peer.reviveInFlightSeq = 0;
+            peer.reviveInFlightUntil = 0;
         }
     }
 }
@@ -209,17 +227,74 @@ void CancelAlone(char const* source)
     aloneSince = 0;
 }
 
+bool IsLethalNpcAttacker(eCEntity* attacker, Entity& hero)
+{
+    if (!attacker || attacker == hero.GetInstance() || remote::IsPuppet(attacker) ||
+        !attacker->GetPropertySet(eEPropertySetType_NPC))
+        return true;
+    Entity npc(attacker);
+    const int species = static_cast<int>(npc.NPC.Species);
+    const bool humanoid = IsHumanoidSpecies(species);
+    const int attackReason = static_cast<int>(npc.NPC.AttackReason);
+    int attitude = 0;
+    if (npcs::IsMirrored(attacker)) {
+        if (combat_hostility::MirrorSharesCombatHostility(attacker)) {
+            if (!ai::LocalAttitude(attacker, attitude)) npcs::HostAttitude(attacker, attitude);
+        } else if (!npcs::HostAttitude(attacker, attitude)) {
+            ai::LocalAttitude(attacker, attitude);
+        }
+    } else {
+        ai::LocalAttitude(attacker, attitude);
+    }
+    const bool meansToKill =
+        GetScriptAdminExt().CallScript(bCString("HasAttackReasonToKill"), attacker, hero.GetInstance(), 0) != 0;
+    return IsLethalDefeat(true, humanoid, meansToKill, attackReason, attitude);
+}
+
 bool RedirectDeath(eCEntity* self, char const* state)
 {
     if (life.terminal || !self || self != gCSession::GetInstance().GetHero()) return false;
     if (std::strcmp(state, "ZS_Dead") != 0 && std::strcmp(state, "ZS_RagDollDead") != 0) return false;
     if (RejectHarm(self, nullptr, "redirect-death")) return true;
     Entity hero(self);
+    const uint32_t now = net::Now();
+    bool lethalDefeat = true;
+    char const* attackerName = "-";
+    int attackerSpecies = -1, attackerReason = -1;
+    if (!life.held && !persist::HeroPending()) {
+        if (lastJudgedHitValid && now - lastJudgedHitAt < 1500) {
+            lastJudgedHitValid = false;
+            lethalDefeat = lastJudgedLethal;
+            attackerName = lastJudgedAttackerName.empty() ? "-" : lastJudgedAttackerName.c_str();
+            attackerSpecies = lastJudgedSpecies;
+            attackerReason = lastJudgedReason;
+        } else {
+            lastJudgedHitValid = false;
+            eCEntity* attacker = hero.NPC.GetCurrentAttacker().GetInstance();
+            if (attacker && attacker != self && !remote::IsPuppet(attacker) &&
+                attacker->GetPropertySet(eEPropertySetType_NPC)) {
+                Entity npc(attacker);
+                lethalDefeat = IsLethalNpcAttacker(attacker, hero);
+                attackerName = npc.GetName().GetText();
+                attackerSpecies = static_cast<int>(npc.NPC.Species);
+                attackerReason = static_cast<int>(npc.NPC.AttackReason);
+            }
+        }
+    }
     hero.Routine.FullStop();
     hero.Routine.SetTask(bCString(KnockOutTask));
+    if (!lethalDefeat) {
+        lethal = false;
+        lethalSeenDown = false;
+        lethalBlowAt = 0;
+        nativeNoted = false;
+        Logf("downed: non-lethal defeat (%s) by %s (species=%d reason=%d); staying in native unconsciousness (hp=%d)",
+             state, attackerName, attackerSpecies, attackerReason, hero.PlayerMemory.GetHitPoints());
+        return true;
+    }
     lethal = life.held || !persist::HeroPending();
     lethalSeenDown = false;
-    lethalAt = net::Now();
+    lethalAt = now;
     if (!persist::HeroPending()) Hold("redirect-death", state);
     ++redirects;
     Logf("downed: hero would die (%s), knocked out instead (hp=%d)", state, hero.PlayerMemory.GetHitPoints());
@@ -334,6 +409,12 @@ void Tick()
         CancelAlone("hero-restore");
         return;
     }
+    if (!net::IsHost() && life.pendingHostWipeEpoch && life.pendingHostWipeEpoch == net::WorldEpoch() &&
+        net::InWorld(net::LocalId())) {
+        life.pendingHostWipeEpoch = 0;
+        Die(hero, "host-wipe");
+        return;
+    }
     if (LocalInteractionFlags()) {
         lastHp = hero.PlayerMemory.GetHitPoints();
         lethalBlowAt = 0;
@@ -412,20 +493,27 @@ void Tick()
         return;
     }
 
-    bool helpPossible = false;
-    for (int i = 1; i < net::MaxPlayers; ++i)
-        if (i != self && Able(remotes[i], now)) helpPossible = true;
-    const uint32_t before = aloneSince;
-    const EndDecision decision = DecideEnd(helpPossible, AllOthersDown(remotes, now), now, aloneSince);
-    if (before && !aloneSince) LogHelpers(&hero, "alone-cancel", now);
-    if (!before && aloneSince) LogHelpers(&hero, "alone-start", now);
-    if (decision == EndDecision::AllDown) {
-        Die(hero, "all-down");
-        return;
-    }
-    if (decision == EndDecision::AloneGrace) {
-        LogHelpers(&hero, "alone-expiry", now);
-        Die(hero, "alone-grace");
+    if (net::IsHost()) {
+        const uint32_t before = aloneSince;
+        const EndDecision decision = HostWipeDecision(life.held || life.terminal, remotes, peers, now, aloneSince);
+        if (before && !aloneSince) LogHelpers(&hero, "alone-cancel", now);
+        if (!before && aloneSince) LogHelpers(&hero, "alone-start", now);
+        if (decision == EndDecision::AllDown) {
+            BroadcastHostWipe();
+            Die(hero, "all-down");
+            return;
+        }
+        if (decision == EndDecision::AloneGrace) {
+            LogHelpers(&hero, "alone-expiry", now);
+            if (net::Connected()) BroadcastHostWipe();
+            Die(hero, "alone-grace");
+        }
+    } else {
+        const EndDecision decision = DecideClientEnd(net::Connected(), false, now, aloneSince);
+        if (decision == EndDecision::AloneGrace) {
+            LogHelpers(&hero, "alone-expiry", now);
+            Die(hero, "alone-grace");
+        }
     }
 }
 
@@ -433,9 +521,10 @@ void Revived(int byPlayer, uint32_t sequence)
 {
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
+    const bool wipePending = !net::IsHost() && life.pendingHostWipeEpoch && life.pendingHostWipeEpoch == net::WorldEpoch();
     const bool helper = byPlayer > 0 && byPlayer < net::MaxPlayers && byPlayer != net::LocalId() &&
                         Able(net::Remotes()[byPlayer], net::Now());
-    if (!helper || !life.held || !sequence || sequence != life.sequence || life.terminal ||
+    if (!helper || !life.held || !sequence || sequence != life.sequence || life.terminal || wipePending ||
         !instance || !session.IsGameRunning() || persist::HeroPending()) {
         Logf("downed: revive refused player=%u helper=%d sequence=%u current=%u held=%d terminal=%d reason=stale-or-ineligible",
              net::LocalId(), byPlayer, sequence, life.sequence, life.held ? 1 : 0, life.terminal ? 1 : 0);
@@ -547,6 +636,79 @@ void NoteBlow()
 {
     if (LocalInteractionFlags()) return;
     lethalBlowAt = net::Now() ? net::Now() : 1;
+}
+
+void ClearBlow()
+{
+    lethalBlowAt = 0;
+}
+
+bool IsLethalHeroAttacker(eCEntity* attacker)
+{
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero || !attacker || attacker == hero || remote::IsPuppet(attacker) ||
+        !attacker->GetPropertySet(eEPropertySetType_NPC))
+        return true;
+    return IsLethalNpcAttacker(attacker, Entity(hero));
+}
+
+void ClearHeroJudgedHit()
+{
+    lastJudgedHitValid = false;
+}
+
+void NoteHeroJudgedHit(eCEntity* attacker, bool applied)
+{
+    if (!applied) {
+        lastJudgedHitValid = false;
+        return;
+    }
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero) return;
+    const uint32_t now = net::Now();
+    lastJudgedHitValid = true;
+    lastJudgedHitAt = now ? now : 1;
+    if (!attacker || attacker == hero || remote::IsPuppet(attacker) ||
+        !attacker->GetPropertySet(eEPropertySetType_NPC)) {
+        lastJudgedLethal = true;
+        lastJudgedSpecies = -1;
+        lastJudgedReason = -1;
+        lastJudgedAttackerName = attacker ? Entity(attacker).GetName().GetText() : "-";
+        return;
+    }
+    Entity npc(attacker);
+    Entity localHero(hero);
+    lastJudgedLethal = IsLethalNpcAttacker(attacker, localHero);
+    lastJudgedSpecies = static_cast<int>(npc.NPC.Species);
+    lastJudgedReason = static_cast<int>(npc.NPC.AttackReason);
+    lastJudgedAttackerName = npc.GetName().GetText();
+}
+
+void NoteReviveSent(int targetPlayer, uint32_t sequence)
+{
+    if (!net::IsHost() || targetPlayer < 2 || targetPlayer >= net::MaxPlayers || !sequence) return;
+    peers[targetPlayer].reviveInFlightSeq = sequence;
+    peers[targetPlayer].reviveInFlightUntil = net::Now() + 2000;
+}
+
+void HostWipe(uint32_t epoch)
+{
+    if (net::IsHost() || !epoch || epoch != net::WorldEpoch()) {
+        Logf("downed: host wipe ignored role=%s epoch=%08x local_epoch=%08x",
+             net::IsHost() ? "host" : "client", epoch, net::WorldEpoch());
+        return;
+    }
+    life.pendingHostWipeEpoch = epoch;
+    gCSession& session = gCSession::GetInstance();
+    eCDynamicEntity* instance = session.GetHero();
+    if (!instance || !session.IsGameRunning() || persist::NativeLoading() ||
+        persist::HeroPending() || !net::InWorld(net::LocalId())) {
+        Logf("downed: host wipe deferred epoch=%08x", epoch);
+        return;
+    }
+    Entity hero(instance);
+    life.pendingHostWipeEpoch = 0;
+    Die(hero, "host-wipe");
 }
 
 bool NativeDown()

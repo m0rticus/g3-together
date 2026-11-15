@@ -12,15 +12,18 @@ struct LocalLifeState : Life {
     HeldConvergence convergence;
     bool maintainingHp = false, lethal = false, lethalSeenDown = false, nativeNoted = false;
     bool recoveryUnknownNoted = false, wasDown = false, nativeTerminalKillChecked = false;
+    bool lastJudgedHitValid = false, lastJudgedLethal = true;
     uint32_t lethalAt = 0, lethalBlowAt = 0, aloneSince = 0, pendingReviveSequence = 0;
+    uint32_t pendingHostWipeEpoch = 0, lastJudgedHitAt = 0;
     uint32_t terminalAt = 0, terminalSampleAt = 0, terminalMutationAt = 0, helpSaidAt = 0, lastOffer = 0;
     uint32_t lastCorrection = 0, lastStandRefusal = 0;
     int lastHp = -1, revivedBy = 0, terminalHp = -1, terminalAi = -1, terminalMovement = -1;
+    int lastJudgedSpecies = -1, lastJudgedReason = -1;
     unsigned redirects = 0, revives = 0, deaths = 0, potionsPaid = 0, refusedNoPotion = 0;
     unsigned nativeLethal = 0, terminalStateEntries = 0, terminalStateReturns = 0, nativeTerminalKills = 0;
     unsigned terminalMutations = 0, transitions = 0, corrections = 0, standRefusals = 0;
     unsigned helpNotSaid = 0, optionsOffered = 0, optionsChosen = 0;
-    std::string terminalTask, terminalState, inHand[2];
+    std::string terminalTask, terminalState, lastJudgedAttackerName, inHand[2];
 
     void Reset(bool preserveHeld = false) {
         const bool waiting = preserveHeld && held;
@@ -33,6 +36,7 @@ struct LocalLifeState : Life {
 };
 struct PeerLifeState {
     RevivePaymentSlot payment;
+    uint32_t reviveInFlightSeq = 0, reviveInFlightUntil = 0;
     bool told = false, toldDead = false, hinted = false, helpStarted = false;
     void Reset() { *this = PeerLifeState{}; }
 };
@@ -70,6 +74,9 @@ bool RejectHeldTransition(eCEntity*, char const*, char const*);
 Availability HelperState(net::Remote const&, uint32_t);
 bool Able(net::Remote const&, uint32_t);
 bool AllOthersDown(net::Remote const*, uint32_t);
+EndDecision HostWipeDecision(bool, net::Remote const*, PeerLifeState const*, uint32_t, uint32_t&);
+void BroadcastHostWipe();
+bool IsLethalNpcAttacker(eCEntity*, Entity&);
 bool PartnerPresent(net::Remote const*, uint32_t);
 void LogHelpers(Entity*, char const*, uint32_t);
 void Die(Entity&, char const*);

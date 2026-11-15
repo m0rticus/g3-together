@@ -73,7 +73,7 @@ inline bool RuntimeKey(std::string const& key, std::string& quest, std::string& 
     if (split == std::string::npos || !split || split + 1 == key.size()) return false;
     const std::string part = key.substr(split + 1);
     uint32_t index = 0;
-    if (part != "y" && part != "d" && part != "h" && part != "n" &&
+    if (part != "y" && part != "d" && part != "h" && part != "n" && part != "i" &&
         !(part[0] == 'c' && Number(part.substr(1), index) && index < 512)) return false;
     quest = key.substr(0, split); field = part;
     return true;

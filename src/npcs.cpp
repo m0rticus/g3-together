@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "combat.h"
+#include "combat_hostility.h"
 #include "combat_timing.h"
 #include "downed.h"
 #include "journal.h"
@@ -163,6 +164,7 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         const bCQuaternion q = instance->GetWorldRotation();
         r.rotation[0] = q.GetX(); r.rotation[1] = q.GetY(); r.rotation[2] = q.GetZ(); r.rotation[3] = q.GetW();
         Entity self(instance);
+        combat_hostility::SyncHostNpc(instance);
         r.attitude = relation::Outgoing(instance, !self.IsDead());
         eCEntity* combatTarget = self.NPC.GetCurrentTarget().GetInstance();
         if (combatTarget && !remote::IsPuppet(combatTarget) && combatTarget != controlled &&
@@ -579,6 +581,7 @@ void KeepHostAttitude(Mirror& m, uint8_t wanted, char const* via)
     eCEntity* instance = m.entity.GetInstance();
     auto* properties = instance ? static_cast<gCNPC_PS*>(instance->GetPropertySet(eEPropertySetType_NPC)) : nullptr;
     if (!properties) return;
+    wanted = combat_hostility::MirrorAttitude(instance, wanted);
     const int stored = static_cast<int>(static_cast<gEAttitude>(m.entity.NPC.AttitudeToPlayer2));
     const relation::Apply apply = relation::ApplyHost(stored, wanted, m.attitudeWritten);
     if (apply == relation::Apply::Ignore) return;
@@ -628,8 +631,7 @@ void PassiveMirrorTick()
                 m.body.aiMode = static_cast<int>(static_cast<gEAIMode>(m.entity.Routine.AIMode));
             }
             m.body.pacified = true;
-            m.defeatedBefore = m.entity.NPC.DefeatedByPlayer;
-            m.entity.NPC.DefeatedByPlayer = GETrue;
+            m.defeatedBefore = m.entity.NPC.DefeatedByPlayer != GEFalse;
             m.guarded = true;
         }
         if (m.killed && (m.latest.flags & 1)) {
@@ -678,7 +680,7 @@ void PassiveMirrorTick()
                 }
                 if (!m.replay.initialized)
                     m.replayReady = npcplayback::Replay(m.entity.GetInstance(), m.replay, m.latest, &MotionNameOf, now);
-            } else {
+            } else if (!YieldMirrorForClientTalk(m, m.latest.flags, now)) {
                 npcplayback::HoldUnavailable(m.entity.GetInstance(), m.replay);
             }
             ++it;
@@ -745,12 +747,17 @@ void PassiveMirrorTick()
             ++it;
             continue;
         }
+        m.attitudeShown = shown.attitude;
+        KeepHostAttitude(m, shown.attitude, "shown");
+        auto* receiver = static_cast<gCDamageReceiver_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver));
+        receiver->AccessHitPointsMax() = shown.hitPointsMax;
+        receiver->AccessHitPoints() = m.killed ? 0 : shown.hitPoints;
+        SyncMirrorPartyAndGuide(it->first, m, shown);
+        if (!m.killed && YieldMirrorForClientTalk(m, shown.flags, now)) { ++it; continue; }
         routine->AccessAIMode().AccessValue() = m.killed ? gEAIMode_Dead : static_cast<gEAIMode>(shown.aiMode);
         routine->AccessAction().AccessValue() = static_cast<gEAction>(shown.action);
         auto* npcProperties = static_cast<gCNPC_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC));
         npcProperties->AccessAttackReason().AccessValue() = static_cast<gEAttackReason>(shown.attackReason);
-        m.attitudeShown = shown.attitude;
-        KeepHostAttitude(m, shown.attitude, "shown");
         m.shownCombatTarget = shown.combatTarget;
         const uint8_t target = (shown.flags >> 3) & 7;
         eCEntity* opponent = nullptr;
@@ -763,10 +770,6 @@ void PassiveMirrorTick()
         }
         m.unresolvedCombatTarget = !m.killed && shown.combatTarget && !opponent ? shown.combatTarget : 0;
         npcProperties->AccessCurrentTargetEntity().SetEntity(opponent);
-        auto* receiver = static_cast<gCDamageReceiver_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver));
-        receiver->AccessHitPointsMax() = shown.hitPointsMax;
-        receiver->AccessHitPoints() = m.killed ? 0 : shown.hitPoints;
-        SyncMirrorPartyAndGuide(it->first, m, shown);
         routine->AccessAniState().AccessValue() = static_cast<gEAniState>(shown.aniState);
         if (m.killed) {
             PresentDeadMirror(it->first, m, shown, now);
@@ -962,13 +965,3 @@ void Tick()
 }
 
 } // namespace g3t::npcs
-
-namespace g3t::npclease {
-void SyncMirrorPoseInterval(uint8_t const guid[16], uint32_t incarnation, uint32_t intervalMs)
-{
-    if (!guid || net::IsHost()) return;
-    if (const auto found = npcs::detail::mirrors.find(npcs::detail::Key(guid));
-        found != npcs::detail::mirrors.end() && found->second.latestTicks && found->second.latest.incarnation == incarnation)
-        body::SetPoseInterval(found->second.body.track, intervalMs);
-}
-} // namespace g3t::npclease

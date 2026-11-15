@@ -128,6 +128,7 @@ struct Mirror {
     uint32_t ownerGeneration = 0, hostSession = 0;
     bool guarded = false;
     bool defeatedBefore = false;
+    bool inClientTalk = false;
     body::State body;
     npcplayback::State replay;
     bool replayReady = false;

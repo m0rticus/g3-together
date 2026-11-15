@@ -5,6 +5,7 @@
 #include "body.h"
 #include "downed.h"
 #include "log.h"
+#include "net.h"
 #include "saving_policy.h"
 
 #include <Game.h>
@@ -384,7 +385,7 @@ void RollbackHeroSnapshot(Entity& self, eCDynamicEntity& hero, codec::ParsedReco
         ApplyAttributes(*memory, backup.attrs);
     if (downed::Held()) self.PlayerMemory.SetBaseValue(bCString("HP"), 1);
     ApplySpellAndQuick(self, "rollback", backup.spells, backup.quicks);
-    if (saving::ValidRecordPose(backup.pose))
+    if (!net::IsHost() && saving::ValidRecordPose(backup.pose))
         self.MoveTo(body::Pose(hero, backup.pose.position, backup.pose.rotation));
 }
 
@@ -444,38 +445,33 @@ bool SaveRecordImpl(char const* path, saving::Key const& key)
     if (!CaptureAttributes(*memory, attrs)) invalid = "an attribute missing or out of range";
     if (invalid) { Logf("hero: record %s not written (%s)", path, invalid); return false; }
 
+    codec::ParsedRecord record;
+    record.key = key;
+    record.pose = pose;
+    record.downed = downed::Held() ? 1 : 0;
+    record.level = level;
+    record.levelMax = levelMax;
+    record.xp = xp;
+    record.lpAttribs = lpa;
+    record.lpPerks = lpp;
+    record.attrs = std::move(attrs);
+    record.stacks = std::move(stacks);
+    record.spells = std::move(spells);
+    record.quicks = std::move(quick);
+
+    std::vector<uint8_t> encoded;
+    if (char const* encodeErr = codec::EncodeRecord(record, EngineSchema(), encoded)) {
+        Logf("hero: record %s not written (%s)", path, encodeErr);
+        return false;
+    }
+
     const std::string temp = std::string(path) + ".tmp";
     FILE* file = nullptr;
-    if (fopen_s(&file, temp.c_str(), "w") || !file) {
+    if (fopen_s(&file, temp.c_str(), "wb") || !file) {
         Logf("hero: record %s not written (cannot open temporary file)", path);
         return false;
     }
-    bool ok = fprintf(file, "G3THERO 4\n") > 0;
-    ok = ok && fprintf(file, "identity %s %s %llu\n", key.world.c_str(), key.save.c_str(),
-                       static_cast<unsigned long long>(key.player)) > 0;
-    ok = ok && fprintf(file, "pose %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
-                       pose.position[0], pose.position[1], pose.position[2],
-                       pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]) > 0;
-    ok = ok && fprintf(file, "downed %d\n", downed::Held() ? 1 : 0) > 0;
-    ok = ok && fprintf(file, "level %u %u\n", level, levelMax) > 0;
-    ok = ok && fprintf(file, "xp %d\nlp %d %d\n", xp, lpa, lpp) > 0;
-    for (auto const& attr : attrs)
-        ok = ok && (saving::StatTag(attr.tag)
-                        ? fprintf(file, "attr %s %d %d %d %d\n", attr.tag.c_str(), attr.base, attr.modifier,
-                                  attr.baseMaximum, attr.maximumModifier)
-                        : fprintf(file, "attr %s %d %d\n", attr.tag.c_str(), attr.base, attr.modifier)) > 0;
-    for (Stack const& s : stacks)
-        ok = ok && (s.category == gEItemCategory_Skill
-                        ? fprintf(file, "stack %s %d %u %d %d %d\n",
-                                  s.id.c_str(), s.amount, s.quality, s.slot, s.category, s.learned)
-                        : fprintf(file, "stack %s %d %u %d %d\n",
-                                  s.id.c_str(), s.amount, s.quality, s.slot, s.category)) > 0;
-    for (std::string const& id : spells)
-        ok = ok && fprintf(file, "spell %s\n", id.c_str()) > 0;
-    for (Quick const& q : quick)
-        ok = ok && fprintf(file, "quick %d %s %u\n", q.slot, q.id.c_str(), q.quality) > 0;
-    ok = ok && fprintf(file, "quick_end %zu %zu\n", spells.size(), quick.size()) > 0;
-    ok = ok && fprintf(file, "end %zu\n", stacks.size()) > 0;
+    bool ok = !encoded.empty() && std::fwrite(encoded.data(), 1, encoded.size(), file) == encoded.size();
     ok = fflush(file) == 0 && ok;
     ok = _commit(_fileno(file)) == 0 && ok;
     ok = fclose(file) == 0 && ok;
@@ -485,9 +481,11 @@ bool SaveRecordImpl(char const* path, saving::Key const& key)
         Logf("hero: record %s not written; the one before stays", path);
         return false;
     }
-    Logf("hero: bound record written world=%s save=%s player=%llu level=%u xp=%d lp=%d/%d stacks=%zu spells=%zu quick=%zu",
-         key.world.c_str(), key.save.c_str(), static_cast<unsigned long long>(key.player),
-         level, xp, lpa, lpp, stacks.size(), spells.size(), quick.size());
+    Logf("hero: bound record written version=%u min_reader=%u world=%s save=%s player=%llu level=%u xp=%d lp=%d/%d stacks=%zu spells=%zu quick=%zu bytes=%zu crc=%08x",
+         record.schemaVersion, record.minReaderVersion, key.world.c_str(), key.save.c_str(),
+         static_cast<unsigned long long>(key.player), level, xp, lpa, lpp,
+         record.stacks.size(), record.spells.size(), record.quicks.size(),
+         encoded.size(), saving::Crc32(encoded.data(), encoded.size()));
     return true;
 }
 
@@ -523,7 +521,8 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
         return false;
     }
     if (validateOnly) {
-        Logf("hero: record validated version=4 world=%s save=%s player=%llu stacks=%zu spells=%zu quick=%zu",
+        Logf("hero: record validated version=%u min_reader=%u world=%s save=%s player=%llu stacks=%zu spells=%zu quick=%zu",
+             parsed.schemaVersion, parsed.minReaderVersion,
              parsed.key.world.c_str(), parsed.key.save.c_str(),
              static_cast<unsigned long long>(parsed.key.player),
              parsed.stacks.size(), parsed.spells.size(), parsed.quicks.size());
@@ -634,17 +633,30 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
         !AttributesMatch(*memory, parsed.attrs, downed::Held()))
         return fail("restored character stats do not match the record");
 
-    self.MoveTo(body::Pose(*hero, pose.position, pose.rotation));
-    const bCVector& p = hero->GetWorldPosition();
-    const bCQuaternion q = hero->GetWorldRotation();
-    const float dx = p.GetX() - pose.position[0], dy = p.GetY() - pose.position[1], dz = p.GetZ() - pose.position[2];
-    const float dot = q.GetX() * pose.rotation[0] + q.GetY() * pose.rotation[1] +
-                      q.GetZ() * pose.rotation[2] + q.GetW() * pose.rotation[3];
-    if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz) || dx * dx + dy * dy + dz * dz > 1.0f ||
-        !std::isfinite(dot) || std::fabs(dot) < 0.99f) return fail("pose could not be restored");
+    if (net::IsHost()) {
+        const bCVector& p = hero->GetWorldPosition();
+        const bCQuaternion q = hero->GetWorldRotation();
+        const saving::RecordPose actual{{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+        if (!saving::PoseRestored(pose, actual)) {
+            Logf("hero: host load preserving native .g3savcpdat placement native=(%.1f,%.1f,%.1f) record=(%.1f,%.1f,%.1f)",
+                 actual.position[0], actual.position[1], actual.position[2],
+                 pose.position[0], pose.position[1], pose.position[2]);
+        }
+    } else {
+        self.MoveTo(body::Pose(*hero, pose.position, pose.rotation));
+        const bCVector& p = hero->GetWorldPosition();
+        const bCQuaternion q = hero->GetWorldRotation();
+        const saving::RecordPose actual{{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+        if (!saving::PoseRestored(pose, actual)) return fail("pose could not be restored");
+        const float dx = actual.position[0] - pose.position[0], dy = actual.position[1] - pose.position[1],
+                    dz = actual.position[2] - pose.position[2];
+        if (dx * dx + dy * dy + dz * dz > 1.0f) {
+            Logf("hero: pose adjusted by engine dpos=(%.1f,%.1f,%.1f)", dx, dy, dz);
+        }
+    }
 
-    Logf("hero: bound record applied world=%s save=%s player=%llu level=%u xp=%d stacks=%zu skills=%zu/%u/%u/%u",
-         parsed.key.world.c_str(), parsed.key.save.c_str(),
+    Logf("hero: bound record applied version=%u world=%s save=%s player=%llu level=%u xp=%d stacks=%zu skills=%zu/%u/%u/%u",
+         parsed.schemaVersion, parsed.key.world.c_str(), parsed.key.save.c_str(),
          static_cast<unsigned long long>(parsed.key.player), parsed.level, parsed.xp,
          parsed.stacks.size(), recordSkills.size(), skillsTaught, skillsUnlearned, skillsRemoved);
     return true;

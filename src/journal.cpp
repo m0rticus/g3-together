@@ -31,7 +31,9 @@ bool reporting = true;
 unsigned reported = 0, received = 0, appliedCount = 0;
 bool questCounting = true;  // QA negative control: QuestCountOff
 unsigned questKills = 0;
+bool worldSeeded = false;
 uint32_t lastScan = 0;
+uint32_t deathsEpoch = 0;
 constexpr uint32_t ScanInterval = 250;
 // An NPC entering the processing range is reset by the game (OnEnterProcessingRange: hit points to maximum,
 // routine); apply only after that has run.
@@ -60,9 +62,33 @@ void CountQuest(Entity& npc)
     }
 }
 
+void SyncClientEpoch()
+{
+    if (net::IsHost()) return;
+    const uint32_t epoch = net::WorldEpoch();
+    if (!net::Connected()) {
+        deaths.clear();
+        deathsEpoch = 0;
+    } else if (epoch && deathsEpoch != epoch) {
+        if (deathsEpoch) deaths.clear();
+        deathsEpoch = epoch;
+    }
+}
+
+void ApplyUnprocessedClientDeath(Entity& npc, uint8_t const guid[16])
+{
+    if (!npc.IsDead()) {
+        npc.NPC.DefeatedByPlayer = GETrue;
+        npc.DamageReceiver.HitPoints = 0;
+        npc.Routine.AIMode = gEAIMode_Dead;
+        npcs::SyncDefeatedByPlayer(guid, true);
+    }
+}
+
 void OnDeath(uint8_t by, uint8_t const guid[16])
 {
     if (npcremoval::Suppressed(guid)) return;
+    SyncClientEpoch();
     ++received;
     if (net::IsHost()) net::SendDeath(guid, by, by);  // pass it on to everyone else
     const std::string key(reinterpret_cast<char const*>(guid), 16);
@@ -71,7 +97,7 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
         if (!net::IsHost() && key.size() == 16) {
             Death& d = deaths[key];
             d.by = by;
-            d.applied = true;
+            d.applied = false;
             d.seenSince = 0;
         }
         return;
@@ -93,6 +119,8 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
     d.name = npc.GetName().GetText();
     d.applied = npc.IsDead();
     d.seenSince = 0;
+    if (!net::IsHost() && !d.applied && !Processed(npc.GetInstance()))
+        ApplyUnprocessedClientDeath(npc, guid);
     Logf("journal: %s died in player %u's region; %s here", d.name.c_str(), by, d.applied ? "already dead" : "pending");
 }
 
@@ -180,17 +208,52 @@ unsigned Read(FILE* file)
     return n;
 }
 
-void Clear() { deaths.clear(); }
+void Clear()
+{
+    deaths.clear();
+    deathsEpoch = 0;
+}
+
+void SeedWorldDeaths()
+{
+    if (worldSeeded || !net::IsHost() || !gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero())
+        return;
+    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
+    if (!scene) return;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    auto& nodes = scene->m_mapEntities.GetNodes();
+    for (GEInt i = 0; i < nodes.GetCount(); ++i) {
+        for (auto* node = nodes[i]; node; node = node->m_pNext) {
+            eCEntity* raw = node->m_Element;
+            if (!raw || raw == hero || remote::IsPuppet(raw) || npcremoval::Suppressed(raw)) continue;
+            if (!raw->GetPropertySet(eEPropertySetType_NPC) || !raw->GetPropertySet(eEPropertySetType_ScriptRoutine) ||
+                !raw->GetPropertySet(eEPropertySetType_DamageReceiver)) continue;
+            Entity npc(raw);
+            if (!npc.IsDead()) continue;
+            const std::string key = Key(raw);
+            if (deaths.find(key) != deaths.end()) continue;
+            Death d{};
+            d.by = 1;
+            d.applied = true;
+            d.name = npc.GetName().GetText();
+            deaths.emplace(key, std::move(d));
+        }
+    }
+    worldSeeded = true;
+}
 
 void OnWorldChange()
 {
     alive.clear();
+    worldSeeded = false;
     if (!net::IsHost()) deaths.clear();
+    deathsEpoch = net::WorldEpoch();
 }
 
 void SyncToClients()
 {
     if (!net::IsHost() || !net::Connected()) return;
+    SeedWorldDeaths();
     for (auto const& [key, d] : deaths) {
         if (key.size() != 16) continue;
         uint8_t guid[16];
@@ -230,14 +293,33 @@ void NewLife(eCEntity const* entity)
 
 void Tick()
 {
-    // Restore campaign deaths only on the authority. Clients get life/HP/poses from the NPC timeline.
-    if (!net::IsHost()) return;
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* hero = session.GetHero();
     if (!hero || !session.IsGameRunning()) return;
     const uint32_t now = net::Now();
     if (now - lastScan < ScanInterval) return;
     lastScan = now;
+    if (!net::IsHost()) {
+        SyncClientEpoch();
+        for (auto& [key, d] : deaths) {
+            if (d.applied || key.size() != 16) continue;
+            uint8_t guid[16];
+            std::memcpy(guid, key.data(), 16);
+            Entity npc(npcs::NpcByGuid(guid));
+            if (!npc.GetInstance() || npcremoval::Suppressed(npc.GetInstance()) || npcs::IsMirrored(npc.GetInstance())) continue;
+            if (d.name.empty()) d.name = npc.GetName().GetText();
+            if (!Processed(npc.GetInstance())) {
+                d.seenSince = 0;
+                ApplyUnprocessedClientDeath(npc, guid);
+                continue;
+            }
+            if (npc.IsDead()) { d.applied = true; continue; }
+            if (!d.seenSince) { d.seenSince = now; continue; }
+            if (now - d.seenSince >= SettleTime) Apply(npc, d);
+        }
+        return;
+    }
+    SeedWorldDeaths();
     const bTObjArray<Entity> all = Entity::GetNPCs();
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity npc = all.GetAt(i);

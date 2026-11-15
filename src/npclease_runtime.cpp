@@ -12,6 +12,7 @@
 #include "ai.h"
 #include "body.h"
 #include "combat.h"
+#include "combat_hostility.h"
 #include "config.h"
 #include "guards.h"
 #include "guid.h"
@@ -274,15 +275,11 @@ bool Activate(eCEntity* entity, Entry& entry, uint8_t const identity[16])
         return true;
     }
     npc.Routine.AIMode = gEAIMode_Abandoned;
-    if (entry.lease.state.targetPlayer) {
-        auto* target = entry.lease.state.targetPlayer == net::LocalId() ? remote::ControlledBody() :
-            remote::PuppetOf(entry.lease.state.targetPlayer);
-        if (target) {
-            npc.NPC.SetCurrentTarget(Entity(target));
-            if (remote::IsPuppet(target)) remote::NoteContact(entity, target);
-        }
-    }
-    npc.Routine.ContinueRoutine();
+    eCEntity* target = entry.lease.state.targetPlayer == net::LocalId() ? remote::ControlledBody()
+        : (entry.lease.state.targetPlayer ? remote::PuppetOf(entry.lease.state.targetPlayer) : nullptr);
+    if (target) { npc.NPC.SetCurrentTarget(Entity(target)); if (remote::IsPuppet(target)) remote::NoteContact(entity, target); }
+    const auto& s = entry.lease.state;
+    if (!combat_hostility::ResumeLeasedCombat(entity, s.aiMode, s.attitude, s.attackReason, target)) npc.Routine.ContinueRoutine();
     return true;
 }
 Interest InterestOf(Checkpoint const& state, uint8_t client, eCEntity* hostNpc)
@@ -687,6 +684,15 @@ using namespace detail;
 bool LocalAuthority(eCEntity const* entity)
 {
     return ReadGuard(entity).Local(net::Now());
+}
+bool LeasedCombatHostile(eCEntity const* entity)
+{
+    const auto found = (net::IsHost() && entity) ? entries.find(Key(entity)) : entries.end();
+    if (found == entries.end()) return false;
+    const auto& l = found->second.lease;
+    return (l.phase == Phase::Client || l.phase == Phase::Recalling || l.phase == Phase::Frozen) && !l.state.dead &&
+           l.state.aiMode == gEAIMode_Combat && l.state.attackReason != gEAttackReason_Duel &&
+           l.state.attackReason != gEAttackReason_Arena && (l.state.attitude == gEAttitude_Hostile || l.state.targetPlayer);
 }
 bool ProcessingAuthority(eCEntity const* entity)
 {

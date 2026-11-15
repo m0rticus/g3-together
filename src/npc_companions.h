@@ -13,6 +13,7 @@ void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const
 void PackMotionFromRecord(body::MotionState& motion, net::NpcRecord const& r);
 void CopyMotionToRecord(net::NpcRecord& shown, body::Presentation const& presentation);
 void SyncMirrorPartyAndGuide(GuidKey const& key, Mirror& m, net::NpcRecord const& shown);
+bool YieldMirrorForClientTalk(Mirror& m, uint8_t flags, uint32_t now);
 void DropMirror(GuidKey const& key);
 void SendRevoke(GuidKey const& key, uint8_t player);
 void RefreshCompanionIdentity();

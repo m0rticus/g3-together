@@ -87,4 +87,36 @@ constexpr bool ShouldAcceptGestureOnHost(bool isHost, bool holdValid, uint8_t ho
     return isHost && holdValid && holdPlayer != 0 && holdPlayer == fromPlayer && !isDead && !isDown && aiMode != AiModeCombat;
 }
 
+// While a client's hero is actively talking to a live, non-downed, non-combat passive mirror, yield host pose/motion
+// replay so local ZS_Talk, Say gestures, facial lip-sync, and hero-facing run smoothly without fighting Replay.
+constexpr bool ShouldYieldMirrorToLocalTalk(bool talkingWithHero, bool killedOnHost, uint8_t hostFlags) noexcept
+{
+    return talkingWithHero && !killedOnHost && (hostFlags & 7u) == 0u;
+}
+
+// Allow local talk states, info scripts, and _AI_* helper functions on the client's active dialogue partner while keeping
+// combat, death, flee, and ambient wandering states fenced.
+inline bool ShouldAllowPassiveTalkScript(bool talkingWithHero, char const* scriptName) noexcept
+{
+    if (!talkingWithHero || !scriptName || !*scriptName) return false;
+    return std::strcmp(scriptName, "ZS_Talk") == 0 ||
+           std::strcmp(scriptName, "ZS_Talk_Loop") == 0 ||
+           std::strncmp(scriptName, "IS_", 3) == 0 ||
+           std::strncmp(scriptName, "_AI_", 4) == 0;
+}
+
+// Allow AssessTalk and client talk maintenance to enter "ZS_Talk" on the client's passive dialogue partner.
+inline bool ShouldAllowPassiveTalkTask(bool talkingWithHero, bool assessingHeroTalk, char const* taskName) noexcept
+{
+    return (talkingWithHero || assessingHeroTalk) && taskName && std::strcmp(taskName, "ZS_Talk") == 0;
+}
+
+// Allow native ScriptRoutine, Animation, CharacterMovement, and Dialog property sets to tick on the client's active
+// dialogue partner so gesture motions, facial lip-sync, LookAt constraints, and in-place facing advance smoothly.
+constexpr bool ShouldAllowDialogPartnerProperty(bool dialogPartner, bool isScriptRoutine, bool isAnimation,
+                                                bool isMovement, bool isDialog) noexcept
+{
+    return dialogPartner && (isScriptRoutine || isAnimation || isMovement || isDialog);
+}
+
 } // namespace g3t::talk_policy

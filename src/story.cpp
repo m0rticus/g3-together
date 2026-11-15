@@ -123,6 +123,8 @@ bool QuestApply(char const* name, uint32_t status)
     return nativeHandled;
 }
 
+std::unordered_map<std::string, uint32_t> seenInfoEnds;
+
 void QuestRuntimeSnapshot(States& states)
 {
     auto& all = Quests()->AccessQuests();
@@ -138,11 +140,27 @@ void QuestRuntimeSnapshot(States& states)
         for (int c = 0; c < counters.GetCount(); ++c)
             states[key + "c" + std::to_string(c)] = static_cast<uint32_t>(counters.AccessAt(c));
     }
+    for (auto& entry : seenInfoEnds) entry.second = 0;
+    if (auto* mgr = Running() ? gCInfoManager_PS::GetInstance() : nullptr) {
+        auto& infos = mgr->AccessInfos();
+        for (int i = 0; i < infos.GetCount(); ++i)
+            if (auto* info = infos.AccessAt(i); info && info->m_uEndTimestamp)
+                seenInfoEnds[std::string(info->AccessName().GetText()) + "\x1fi"] = info->m_uEndTimestamp;
+    }
+    for (auto const& entry : seenInfoEnds) states[entry.first] = entry.second;
 }
 bool QuestRuntimeApply(char const* name, uint32_t value)
 {
     std::string id, field;
     if (!policy::RuntimeKey(name, id, field)) return false;
+    if (field == "i") {
+        auto* mgr = Running() ? gCInfoManager_PS::GetInstance() : nullptr;
+        auto* info = mgr ? mgr->GetInfo(bCString(id.c_str())) : nullptr;
+        if (!info) return false;
+        info->m_uEndTimestamp = value;
+        seenInfoEnds[name] = value;
+        return true;
+    }
     auto* quest = Quests()->GetQuest(bCString(id.c_str()));
     if (!quest) return false;
     if (field == "y") quest->AccessActivationTime_Year() = value;
@@ -522,8 +540,8 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
         if (d->kind != net::StateEvents && d->kind != net::StateWorldClock && d->kind != net::StateReputation) {
             if (!BuildNames()) { reject(); return; }
             std::string id = name, field;
-            if (d->kind == net::StateQuestRuntime && !policy::RuntimeKey(name, id, field)) return;
-            auto const& names = d->kind == net::StateInfos ? infoNames : questNames;
+            if (d->kind == net::StateQuestRuntime && !policy::RuntimeKey(name, id, field)) { reject(); return; }
+            auto const& names = (d->kind == net::StateInfos || field == "i") ? infoNames : questNames;
             auto found = names.find(id);
             if (found == names.end()) {
                 Logf("story: unknown named-state identity=%s kind=%u; snapshot refused", id.c_str(), d->kind); reject(); return;
@@ -711,6 +729,7 @@ bool FinishAdmission(unsigned char player)
 void OnWorldChange()
 {
     namesReady = false;
+    seenInfoEnds.clear();
     initialReplays = {};
     if (!reloadReset || net::IsHost()) return;
     admissionRequested = false;

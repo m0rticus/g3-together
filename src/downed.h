@@ -38,6 +38,12 @@ void LogCombatDecision(eCEntity* npc, eCEntity* player, char const* decision, bo
 uint32_t Sequence();      // zero while not waiting; carried by player state and paid revive requests
 void Restore(bool waiting, char const* source); // saves may restore a downed life, never release an existing one
 void NoteBlow();         // combat.cpp: a blow on the local hero came from an NPC that means to kill (judged on its owner's machine)
+void ClearBlow();
+bool IsLethalHeroAttacker(eCEntity* attacker);
+void NoteHeroJudgedHit(eCEntity* attacker, bool applied);
+void ClearHeroJudgedHit();
+void NoteReviveSent(int targetPlayer, uint32_t sequence);
+void HostWipe(uint32_t epoch);
 bool NativeDown();       // ... or knocked out by the game's own rules (a guard, a duel): it stands up by itself; a winner may rob it
 bool ObserveDeathState(eCEntity* self, bool entered, bool successful = true); // false refuses duplicate native entry
 void HelpLineSaid();  // infocmd.cpp: the line "Ich werde dir helfen." of the help option is being spoken

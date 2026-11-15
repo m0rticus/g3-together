@@ -2,6 +2,7 @@
 #include "combat_internal.h"
 #include "combat_retarget_policy.h"
 #include "ai.h"
+#include "combat_hostility.h"
 #include "enclaves.h"
 #include "hud.h"
 #include "guards.h"
@@ -538,6 +539,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             }
             if (plan.runImmediateAssessAgressor) React(target, attacker);
         }
+        combat_hostility::SyncHostNpc(target.GetInstance());
         const uint8_t effectiveReaction =
             (!target.IsDead() && !target.IsDown()) ? Reaction(target) : static_cast<uint8_t>(net::HitNoReaction);
         npcplayback::EstimateHostHitKnockback(target.GetInstance(), attacker, effectiveReaction, reply.result);

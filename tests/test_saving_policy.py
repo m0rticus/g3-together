@@ -184,6 +184,149 @@ int main()
     ],
 )
 
+HERO_CODEC_V5_TARGET = _testbuild.register_target(
+    "hero-codec-v5",
+    [
+        _testbuild.unit("src/hero_codec.cpp", std="c++17", warnings="strict"),
+        _testbuild.inline_unit(
+            "hero_codec_v5",
+            r'''
+#include "hero_codec.h"
+#include "saving_store.h"
+#include <cassert>
+#include <cstring>
+#include <string>
+#include <vector>
+
+int main()
+{
+    using namespace g3t::hero::codec;
+    using namespace g3t::saving;
+
+    const Key hostKey{"07c4959c878d0258fcad8b2d2af97409", "e0037c47a774b7683e887822e481ad11", 76561198068674551ULL};
+    const Key clientKey{"07c4959c878d0258fcad8b2d2af97409", "e0037c47a774b7683e887822e481ad11", 76561198273277479ULL};
+    Schema schema{0, 15, 16, 10, 9};
+
+    ParsedRecord rec;
+    rec.key = hostKey;
+    rec.pose = {{88320.2f, 5127.7f, -10964.0f}, {0.0f, 1.0f, 0.0f, -0.008f}};
+    rec.downed = 1;
+    rec.level = 12;
+    rec.levelMax = 14;
+    rec.xp = 15400;
+    rec.lpAttribs = 25;
+    rec.lpPerks = 3;
+    size_t tagCount = 0;
+    char const* const* tags = AttributeTags(tagCount);
+    for (size_t i = 0; i < tagCount; ++i) {
+        RecordAttribute a;
+        a.tag = tags[i];
+        a.base = 100 + static_cast<int32_t>(i);
+        a.modifier = 5;
+        if (StatTag(a.tag)) { a.baseMaximum = 200; a.maximumModifier = 10; }
+        rec.attrs.push_back(a);
+    }
+    const std::string sword = "11112222333344445555666677778888";
+    const std::string spell = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const std::string perk = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    rec.stacks = {
+        {sword, 1, 0, 1, 2, -1},
+        {spell, 1, 0, 0, 9, -1},
+        {perk, 1, 0, 0, 10, 1},
+    };
+    rec.spells = {spell};
+    rec.quicks = {{2, sword, 0}};
+    rec.extraSections = {{300, HeroSectionOptional, {9, 8, 7, 6}}};
+
+    std::vector<uint8_t> bin;
+    assert(EncodeRecord(rec, schema, bin) == nullptr);
+    assert(bin.size() >= HeroHeaderSize && std::memcmp(bin.data(), "G3THERO\0", 8) == 0);
+
+    Key inspectedKey;
+    uint32_t inspectedVer = 0;
+    assert(store::HeroKey(bin, inspectedKey, &inspectedVer));
+    assert(inspectedVer == 5 && Exact(inspectedKey, hostKey));
+
+    ParsedRecord parsed;
+    assert(ParseBoundRecord(reinterpret_cast<char const*>(bin.data()), bin.size(), hostKey, schema, parsed) == nullptr);
+    assert(parsed.schemaVersion == 5 && parsed.minReaderVersion == 5);
+    assert(parsed.downed == 1 && parsed.level == 12 && parsed.xp == 15400);
+    assert(parsed.stacks.size() == 3 && parsed.spells.size() == 1 && parsed.quicks.size() == 1);
+    assert(parsed.extraSections.size() == 1 && parsed.extraSections[0].type == 300 &&
+           parsed.extraSections[0].bytes == std::vector<uint8_t>({9, 8, 7, 6}));
+
+    const std::string nextSave = "fedcba9876543210fedcba9876543210";
+    std::vector<uint8_t> rebound = bin;
+    assert(store::Rebind(rebound, {hostKey.world, nextSave, hostKey.player}));
+    ParsedRecord reboundParsed;
+    assert(ParseBoundRecord(reinterpret_cast<char const*>(rebound.data()), rebound.size(),
+                            {hostKey.world, nextSave, hostKey.player}, schema, reboundParsed) == nullptr);
+    assert(reboundParsed.extraSections.size() == 1 &&
+           reboundParsed.extraSections[0].bytes == std::vector<uint8_t>({9, 8, 7, 6}));
+
+    std::vector<uint8_t> future = bin;
+    PutLeAt(future.data() + 8, 6, 4);
+    PutLeAt(future.data() + 12, 5, 4);
+    PutLeAt(future.data() + 16, 56, 4);
+    future.insert(future.begin() + 48, 8, 0x55);
+    PutLeAt(future.data() + 44, Crc32Zeroed(future.data(), 44, 24, 4), 4);
+    PutLeAt(future.data() + 24, Crc32Zeroed(future.data(), future.size(), 24, 4), 4);
+    ParsedRecord futureParsed;
+    assert(ParseBoundRecord(reinterpret_cast<char const*>(future.data()), future.size(), hostKey, schema, futureParsed) == nullptr);
+    assert(futureParsed.schemaVersion == 6 && futureParsed.minReaderVersion == 5);
+
+    auto breaking = future;
+    PutLeAt(breaking.data() + 12, 6, 4);
+    PutLeAt(breaking.data() + 44, Crc32Zeroed(breaking.data(), 44, 24, 4), 4);
+    PutLeAt(breaking.data() + 24, Crc32Zeroed(breaking.data(), breaking.size(), 24, 4), 4);
+    assert(ParseBoundRecord(reinterpret_cast<char const*>(breaking.data()), breaking.size(), hostKey, schema, futureParsed) != nullptr);
+
+    for (size_t offset : {size_t(8), size_t(24), size_t(44), size_t(52), bin.size() - 1}) {
+        auto corrupt = bin;
+        corrupt[offset] ^= 0x80;
+        assert(ParseBoundRecord(reinterpret_cast<char const*>(corrupt.data()), corrupt.size(), hostKey, schema, futureParsed) != nullptr);
+        assert(!store::HeroKey(corrupt, inspectedKey));
+    }
+    auto truncated = bin;
+    truncated.pop_back();
+    assert(ParseBoundRecord(reinterpret_cast<char const*>(truncated.data()), truncated.size(), hostKey, schema, futureParsed) != nullptr);
+
+    std::string legacyHeroText = "G3THERO 4\nidentity " + clientKey.world + " " + clientKey.save + " " +
+        std::to_string(clientKey.player) + "\npose 100 200 300 0 0 0 1\ndowned 0\nlevel 2 2\nxp 100\nlp 0 0\n";
+    for (size_t i = 0; i < tagCount; ++i) {
+        std::string const tag = tags[i];
+        legacyHeroText += StatTag(tag) ? "attr " + tag + " 50 0 100 0\n" : "attr " + tag + " 50 0\n";
+    }
+    legacyHeroText += "quick_end 0 0\nend 0\n";
+    std::vector<uint8_t> legacyHero(legacyHeroText.begin(), legacyHeroText.end());
+
+    store::Save mixed;
+    mixed.key = hostKey;
+    store::Set(mixed, {store::NativeHeader, 1, 0, {1, 2, 3}});
+    store::Set(mixed, {store::NativeWorld, 1, 0, {4, 5, 6}});
+    store::Set(mixed, {store::Journal, 1, 0, {'d','o','w','n','e','d',' ','0','\n'}});
+    store::Set(mixed, {store::Character, 5, hostKey.player, bin});
+    store::Set(mixed, {store::Character, 4, clientKey.player, legacyHero});
+    std::vector<uint8_t> containerBytes;
+    assert(store::Encode(mixed, containerBytes));
+    store::Save decodedMixed;
+    assert(store::Decode(containerBytes, decodedMixed));
+    assert(store::Find(decodedMixed, store::Character, hostKey.player)->version == 5);
+    assert(store::Find(decodedMixed, store::Character, clientKey.player)->version == 4);
+
+    ParsedRecord legacyParsed;
+    assert(ParseBoundRecord(reinterpret_cast<char const*>(legacyHero.data()), legacyHero.size(), clientKey, schema, legacyParsed) == nullptr);
+    assert(legacyParsed.schemaVersion == 4 && legacyParsed.minReaderVersion == 4);
+    return 0;
+}
+''',
+            includes=[ROOT / "src"],
+            std="c++17",
+            warnings="strict",
+        ),
+    ],
+)
+
 COOP_ENVELOPE_TARGET = _testbuild.register_target(
     "saving-coop-envelope",
     [_testbuild.inline_unit(
@@ -517,6 +660,23 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("xpshare::OnWorldChange();", apply_fn)
         on_world = function_body(self.persist, r"\bvoid\s+OnWorld\s*\(")
         self.assertIn("combat::OnWorldChange(); xpshare::OnWorldChange();", on_world)
+
+    def test_versioned_hero_record_and_pose_restoration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = HERO_CODEC_V5_TARGET.run(cwd=folder)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        load_hero = function_body(self.hero, r"\bbool\s+LoadRecordImpl\s*\(")
+        self.assertIn("if (net::IsHost())", load_hero)
+        self.assertLess(load_hero.index("if (net::IsHost())"),
+                        load_hero.index("self.MoveTo(body::Pose(*hero, pose.position, pose.rotation))"))
+        self.assertIn("saving::PoseRestored(pose, actual)", load_hero)
+        self.assertNotIn("dx * dx + dy * dy + dz * dz > 1.0f ||", load_hero)
+
+        save_now = function_body(self.persist, r"\bvoid\s+CALLBACK\s+SaveNow\s*\(")
+        self.assertIn("saving::store::HeroKey(hero, heroKey, &heroVersion)", save_now)
+        on_char = function_body(self.persist, r"\bvoid\s+OnCharacter\s*\(")
+        self.assertIn("saving::store::HeroKey(hero, embedded, &heroVersion)", on_char)
 
 
 if __name__ == "__main__":

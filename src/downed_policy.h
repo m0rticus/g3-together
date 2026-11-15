@@ -220,7 +220,7 @@ inline bool StopTargetInstruction(uint32_t bindings)
 constexpr uint32_t ActivityStaleMs = 5000;
 constexpr uint32_t AbsenceGraceMs = 5000;
 
-enum class Availability { Able, Down, Disconnected, Unknown, Stale, NotPlaying };
+enum class Availability { Able, Unconscious, Down, Disconnected, Unknown, Stale, NotPlaying };
 
 inline Availability HelperAvailability(bool connected, bool known, uint32_t arrived, uint8_t flags, uint32_t now)
 {
@@ -228,12 +228,19 @@ inline Availability HelperAvailability(bool connected, bool known, uint32_t arri
     if (!known) return Availability::Unknown;
     if (now - arrived >= ActivityStaleMs) return Availability::Stale;
     if (!(flags & 1)) return Availability::NotPlaying;
-    return flags & 14 ? Availability::Down : Availability::Able;
+    if (flags & 12) return Availability::Down;
+    return (flags & 2) ? Availability::Unconscious : Availability::Able;
 }
 
 inline bool Playing(Availability availability)
 {
-    return availability == Availability::Able || availability == Availability::Down;
+    return availability == Availability::Able || availability == Availability::Unconscious ||
+           availability == Availability::Down;
+}
+
+inline bool AliveInWorld(Availability availability)
+{
+    return availability == Availability::Able || availability == Availability::Unconscious;
 }
 
 enum class EndDecision { Wait, AllDown, AloneGrace };
@@ -248,6 +255,77 @@ inline EndDecision DecideEnd(bool helperAble, bool allOthersDown, uint32_t now, 
     if (!aloneSince) aloneSince = now ? now : 1;
     return static_cast<int32_t>(now - aloneSince) >= static_cast<int32_t>(AbsenceGraceMs)
         ? EndDecision::AloneGrace : EndDecision::Wait;
+}
+
+struct WipeParticipant
+{
+    bool connected = false;
+    bool inWorld = false;
+    Availability state = Availability::Disconnected;
+    bool reviveInFlight = false;
+};
+
+inline EndDecision DecideHostWipe(bool localHeldOrTerminal, WipeParticipant const* others, int count,
+                                  uint32_t now, uint32_t& aloneSince)
+{
+    if (!localHeldOrTerminal) {
+        aloneSince = 0;
+        return EndDecision::Wait;
+    }
+    bool anyInWorld = false;
+    bool anyAlive = false;
+    bool allInWorldDown = true;
+    for (int i = 0; i < count; ++i) {
+        auto const& p = others[i];
+        if (!p.connected) continue;
+        if (AliveInWorld(p.state)) anyAlive = true;
+        if (!p.inWorld) continue;
+        anyInWorld = true;
+        if (p.state != Availability::Down || p.reviveInFlight) allInWorldDown = false;
+    }
+    if (anyInWorld) {
+        aloneSince = 0;
+        return allInWorldDown ? EndDecision::AllDown : EndDecision::Wait;
+    }
+    return DecideEnd(anyAlive, false, now, aloneSince);
+}
+
+inline EndDecision DecideClientEnd(bool connected, bool hostWipeOrdered, uint32_t now, uint32_t& aloneSince)
+{
+    if (hostWipeOrdered) {
+        aloneSince = 0;
+        return EndDecision::AllDown;
+    }
+    if (connected) {
+        aloneSince = 0;
+        return EndDecision::Wait;
+    }
+    return DecideEnd(false, false, now, aloneSince);
+}
+
+constexpr bool IsHumanoidSpecies(int species)
+{
+    return species == 0 || species == 5;
+}
+
+constexpr bool LethalAttackReason(int attackReason)
+{
+    return attackReason == 12 || attackReason == 13 || attackReason == 19 || attackReason == 20;
+}
+
+constexpr bool NonLethalAttackReason(int attackReason)
+{
+    return (attackReason >= 1 && attackReason <= 9) || attackReason == 15 ||
+           attackReason == 16 || attackReason == 17 || attackReason == 18;
+}
+
+constexpr bool IsLethalDefeat(bool hasNpcAttacker, bool humanoid, bool hasAttackReasonToKill,
+                              int attackReason, int attitude)
+{
+    if (!hasNpcAttacker || !humanoid) return true;
+    if (hasAttackReasonToKill || LethalAttackReason(attackReason)) return true;
+    if (NonLethalAttackReason(attackReason)) return false;
+    return attitude == 4;
 }
 
 // Native animation, HP and loaded alive snapshots are not authority to release a downed life.

@@ -18,6 +18,7 @@ void ReconcileClientEntities();
 bool RedundantClientEntity(eCEntity const* entity);
 void LeaseBaseline(eCEntity* entity, char* routine, size_t capacity, uint8_t& defeated);
 void LeaseReleaseMirror(uint8_t const guid[16]);
+void SyncDefeatedByPlayer(uint8_t const guid[16], bool defeated);
 bool HostPresentationAvailable(eCEntity const* entity);
 // Freshness of the host's stream for this GUID, independent of whether a mirror is bound to a live entity. A client-owned NPC
 // is never bound to a mirror, so this is how it learns that the host is presenting it (the host wins; the client yields).
@@ -81,6 +82,7 @@ void StoryMoved(uint8_t const guid[16], float const position[3], float const rot
 void Revoked(uint8_t const guid[16]);  // client: the host refused or ended our claim
 void Rebind(uint8_t const guid[16]);   // look this mirror's GUID up again (its copy was just given that GUID: summon.cpp)
 void Foreign(uint8_t const guid[16]);  // an NPC here that another machine simulates: never send it as ours (a copy)
+void OnClientTalkEnded(uint8_t const guid[16]);
 void Adopt(uint8_t const guid[16]);    // client: a companion from the host's save is ours again
 // Host: SteamID64 ownership; legacy name rows are preserved until safely migrated.
 unsigned WriteCompanions(FILE* file);

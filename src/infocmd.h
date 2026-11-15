@@ -5,7 +5,7 @@
 // the host and from there to everyone, and replayed on each machine.
 #pragma once
 
-struct gCScriptProcessingUnit;
+class gCScriptProcessingUnit;
 class eCEntity;
 
 namespace g3t::infocmd {
@@ -14,6 +14,7 @@ void Start();
 void Observe(gCScriptProcessingUnit* spu);
 void Tick();                     // once per frame: sends the states read after commands
 void OnWorldChange();            // a world (or save) was left: pending fights and states are dropped
+void SyncToClients();            // host: send non-default NPC progression and sector states to joining/in-world clients
 void Changed(eCEntity* entity);  // QA: as if a dialog command had changed this entity
 using LogFn = void (*)(char const*);
 void Report(LogFn log);   // QA: INFOCMD line

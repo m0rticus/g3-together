@@ -729,6 +729,12 @@ void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown)
         m.entity.Inventory.HoldStacks(StackOf(m.entity, shown.heldLeft), StackOf(m.entity, shown.heldRight));
         ++holdChanges;
     }
+    for (gESlot slot : {gESlot_RightHand, gESlot_LeftHand}) {
+        Entity held = m.entity.Inventory.GetItemFromSlot(slot);
+        if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&
+            held.Interaction.GetOwner().GetInstance() != m.entity.GetInstance())
+            held.Interaction.SetOwner(m.entity);
+    }
     if (auto name = motionNames.find(shown.motions[0].name); name != motionNames.end())
         LearnSkeleton(m, name->second.c_str());
     Entity damageSource = m.entity.Inventory.GetItemFromSlot(gESlot_RightHand);
@@ -788,3 +794,13 @@ bool MirrorFightsHeroImpl()
 } // namespace detail
 
 } // namespace g3t::npcs
+
+namespace g3t::npclease {
+void SyncMirrorPoseInterval(uint8_t const guid[16], uint32_t incarnation, uint32_t intervalMs)
+{
+    if (!guid || net::IsHost()) return;
+    if (const auto found = npcs::detail::mirrors.find(npcs::detail::Key(guid));
+        found != npcs::detail::mirrors.end() && found->second.latestTicks && found->second.latest.incarnation == incarnation)
+        body::SetPoseInterval(found->second.body.track, intervalMs);
+}
+} // namespace g3t::npclease

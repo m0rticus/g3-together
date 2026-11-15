@@ -84,17 +84,20 @@ int main(int argc, char** argv)
     assert(Decode(encoded, decoded));
     Bytes roundTrip;
     assert(Encode(decoded, roundTrip) && roundTrip == encoded); // Unknown extension preserved exactly.
+    assert(decoded.schemaVersion == Version && decoded.minReaderVersion == MinReaderVersion);
+    assert(std::memcmp(encoded.data(), "G3TSAVE\0", 8) == 0);
     const Bytes previous = encoded;
     auto swappedOwner = encoded;
-    swappedOwner[84] = 12; // Existing client account: semantic checks alone would allow this header corruption.
+    swappedOwner[96] = 12; // Existing client account: semantic checks alone would allow this header corruption.
     assert(!Decode(swappedOwner, decoded));
-    for (size_t n : {size_t(0), size_t(4), size_t(95), encoded.size() - 1}) {
+    for (size_t n : {size_t(0), size_t(4), size_t(95), size_t(111), encoded.size() - 1}) {
         Bytes cut(encoded.begin(), encoded.begin() + n);
         Save out = decoded;
         assert(!Decode(cut, out) && out.blocks.size() == decoded.blocks.size());
     }
     assert(Modern(Bytes{'G','3','T','S'})); // Damaged modern save never falls through to native migration.
-    for (size_t at : {size_t(8), size_t(12), size_t(16), size_t(20), size_t(84), size_t(92), encoded.size() - 1}) {
+    for (size_t at : {size_t(8), size_t(12), size_t(16), size_t(20), size_t(24), size_t(28),
+                      size_t(32), size_t(96), size_t(104), size_t(108), encoded.size() - 1}) {
         auto corrupt = encoded;
         corrupt[at] ^= 0xff;
         Save out;
@@ -103,6 +106,79 @@ int main(int argc, char** argv)
     auto trailing = encoded;
     trailing.push_back(0);
     assert(!Decode(trailing, decoded));
+
+    // Forward-compatible optional section (even below Extension=256) and minor-compatible future header.
+    {
+        Save withOptional = save;
+        withOptional.blocks.push_back({7, 2, 0, {11, 22, 33, 44}, SectionOptional});
+        Bytes optEncoded;
+        Save optDecoded;
+        assert(Encode(withOptional, optEncoded) && Decode(optEncoded, optDecoded));
+        assert(Find(optDecoded, 7) && Find(optDecoded, 7)->bytes == Bytes({11, 22, 33, 44}));
+        assert(Find(optDecoded, 7)->flags == SectionOptional);
+
+        // Simulate minor-compatible schemaVersion=5, minReaderVersion=4 with an extended 120-byte header.
+        Bytes future = optEncoded;
+        PutLeAt(future.data() + 8, 5, 4);   // schemaVersion = 5
+        PutLeAt(future.data() + 12, 4, 4);  // minReaderVersion = 4
+        PutLeAt(future.data() + 16, 120, 4); // headerSize = 120
+        future.insert(future.begin() + 112, 8, 0xaa);
+        PutLeAt(future.data() + 108, Crc32Zeroed(future.data(), 108, 24, 4), 4);
+        PutLeAt(future.data() + 24, ContainerCrc(future), 4);
+        Save futureDecoded;
+        assert(Decode(future, futureDecoded));
+        assert(futureDecoded.schemaVersion == 5 && futureDecoded.minReaderVersion == 4);
+        assert(Find(futureDecoded, 7) && Find(futureDecoded, 7)->bytes == Bytes({11, 22, 33, 44}));
+
+        // Breaking minReaderVersion = 5 must be rejected by v4 reader.
+        auto breaking = future;
+        PutLeAt(breaking.data() + 12, 5, 4);
+        PutLeAt(breaking.data() + 108, Crc32Zeroed(breaking.data(), 108, 24, 4), 4);
+        PutLeAt(breaking.data() + 24, ContainerCrc(breaking), 4);
+        assert(!Decode(breaking, futureDecoded));
+
+        // Unknown required section (flags=0, type < Extension) must be rejected.
+        Save badRequired = save;
+        badRequired.blocks.push_back({7, 1, 0, {1, 2}, SectionRequired});
+        Bytes badOut;
+        assert(!Encode(badRequired, badOut));
+    }
+
+    // Backward-compatible readers for legacy G3TSAVE3 and G3TSAVE2 binary containers.
+    auto makeLegacyContainer = [](char const* magic8, uint32_t ver, Save const& s) {
+        Bytes payload;
+        for (auto const& b : s.blocks) {
+            Put(payload, b.type, 4); Put(payload, b.version, 4); Put(payload, b.account, 8);
+            Put(payload, b.bytes.size(), 4); Put(payload, Crc(b.bytes), 4);
+            payload.insert(payload.end(), b.bytes.begin(), b.bytes.end());
+        }
+        Bytes result(magic8, magic8 + 8);
+        Put(result, ver, 4); Put(result, payload.size(), 4); Put(result, 0, 4);
+        result.insert(result.end(), s.key.world.begin(), s.key.world.end());
+        result.insert(result.end(), s.key.save.begin(), s.key.save.end());
+        Put(result, s.key.player, 8); Put(result, s.blocks.size(), 4);
+        result.insert(result.end(), payload.begin(), payload.end());
+        const uint32_t crc = LegacyContainerCrc(result);
+        PutLeAt(result.data() + 16, crc, 4);
+        return result;
+    };
+    {
+        const Bytes v3Bytes = makeLegacyContainer("G3TSAVE3", 3, save);
+        Save v3Loaded;
+        assert(Modern(v3Bytes) && Decode(v3Bytes, v3Loaded));
+        assert(v3Loaded.schemaVersion == 3 && v3Loaded.minReaderVersion == 3);
+        assert(Exact(v3Loaded.key, host) && v3Loaded.blocks.size() == save.blocks.size());
+        Bytes upgraded;
+        assert(Encode(v3Loaded, upgraded) && std::memcmp(upgraded.data(), "G3TSAVE\0", 8) == 0);
+
+        Save v2Save{host, {{NativeHeader, 1, 0, Bytes(16, 1)}, {NativeWorld, 1, 0, Bytes(32, 2)},
+                           {Character, 4, 11, Hero(host)}}};
+        const Bytes v2Bytes = makeLegacyContainer("G3TSAVE2", 2, v2Save);
+        Save v2Loaded;
+        assert(Modern(v2Bytes) && Decode(v2Bytes, v2Loaded));
+        assert(v2Loaded.schemaVersion == 2 && v2Loaded.minReaderVersion == 2);
+        assert(Exact(v2Loaded.key, host) && Find(v2Loaded, Character, 11)->bytes == v2Save.blocks[2].bytes);
+    }
     auto invalid = save;
     invalid.blocks.push_back(invalid.blocks.back());
     assert(!Encode(invalid, encoded)); // Duplicate extension.

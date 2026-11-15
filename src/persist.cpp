@@ -269,7 +269,10 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         if (!manager || !writing) { CancelSave("native-hooks"); return; }
         Bytes hero, state;
         if (!CaptureCharacter(savingManifest.key, hero)) { CancelSave("character-write"); return; }
-        saving::store::Set(savingManifest, {saving::store::Character, 4, steam::PlayerId(), std::move(hero)});
+        saving::Key heroKey;
+        uint32_t heroVersion = 0;
+        if (!saving::store::HeroKey(hero, heroKey, &heroVersion)) { CancelSave("character-write"); return; }
+        saving::store::Set(savingManifest, {saving::store::Character, heroVersion, steam::PlayerId(), std::move(hero)});
         if (!CapturePersonalWithFallback(steam::PlayerId(), state)) { CancelSave("personal-record"); return; }
         saving::store::Set(savingManifest, {saving::store::Personal, 1, steam::PlayerId(), std::move(state)});
         if (!CaptureJournal(state)) { CancelSave("journal-write"); return; }
@@ -330,8 +333,9 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
     current = savingManifest;
     lastSave = requestedSlot;
     // Saving is not a world change: do not reset epochs, admission, or the client's live character.
-    Logf("persist: host container published save=%s slot=%s bytes=%zu records=%zu menu_ok=%d network_world_bytes=0",
-         current.key.save.c_str(), requestedSlot.c_str(), encoded.size(), current.blocks.size(), 1);
+    Logf("persist: host container published schema=%u min_reader=%u save=%s slot=%s bytes=%zu records=%zu menu_ok=%d network_world_bytes=0",
+         current.schemaVersion, current.minReaderVersion, current.key.save.c_str(), requestedSlot.c_str(),
+         encoded.size(), current.blocks.size(), 1);
     FinishSave(true, "durable host container");
 }
 void* RetainedImage(void* manager)

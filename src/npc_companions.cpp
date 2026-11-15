@@ -16,6 +16,7 @@
 #include "npcremoval.h"
 #include "steam.h"
 #include "talk.h"
+#include "talk_policy.h"
 #include "world.h"
 
 #include <algorithm>
@@ -207,10 +208,38 @@ void ClaimTick(uint32_t now)
     }
 }
 
+void FinishClientTalkMirror(Mirror& m, uint32_t now)
+{
+    if (!m.inClientTalk) return;
+    m.inClientTalk = false;
+    std::memset(m.replay.instances, 0, sizeof(m.replay.instances));
+    if (m.entity.GetInstance() && !m.killed)
+        npcplayback::detail::CaptureEntityPoseBlend(m.entity.GetInstance(), m.replay, now ? now : 1u, 0.18f);
+}
+
+bool YieldMirrorForClientTalk(Mirror& m, uint8_t flags, uint32_t now)
+{
+    if (talk_policy::ShouldYieldMirrorToLocalTalk(talk::TalkingWithHero(m.entity.GetInstance()), m.killed, flags)) {
+        m.inClientTalk = true;
+        m.replayReady = false;
+        return true;
+    }
+    if (m.inClientTalk) FinishClientTalkMirror(m, now);
+    return false;
+}
+
 } // namespace g3t::npcs::detail
 
 namespace g3t::npcs {
 using namespace detail;
+
+void OnClientTalkEnded(uint8_t const guid[16])
+{
+    if (!guid || net::IsHost()) return;
+    const auto it = mirrors.find(Key(guid));
+    if (it == mirrors.end()) return;
+    FinishClientTalkMirror(it->second, net::Now());
+}
 
 void Claim(eCEntity* entity)
 {
@@ -576,6 +605,17 @@ void ClearCompanions()
     companionIdentity = {};
     identityWarnings.clear();
     offered.clear();
+}
+
+void SyncDefeatedByPlayer(uint8_t const guid[16], bool defeated)
+{
+    if (!guid) return;
+    const auto it = detail::mirrors.find(detail::Key(guid));
+    if (it == detail::mirrors.end()) return;
+    it->second.defeatedBefore = defeated;
+    if (!net::IsHost() && it->second.entity.GetInstance() &&
+        it->second.entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC))
+        it->second.entity.NPC.DefeatedByPlayer = defeated ? GETrue : GEFalse;
 }
 
 void CompanionAccounts(std::vector<uint64_t> const& accounts)

@@ -97,6 +97,42 @@ void TestTalkGestures()
     assert(!ShouldAcceptGestureOnHost(true, true, 2, 2, true, false, AiModeTalk));
     assert(!ShouldAcceptGestureOnHost(true, true, 2, 2, false, true, AiModeTalk));
     assert(!ShouldAcceptGestureOnHost(true, true, 2, 2, false, false, AiModeCombat));
+
+    // Client passive mirror yields pose/motion replay to local dialogue animation only while live, upright, and out of combat.
+    assert(ShouldYieldMirrorToLocalTalk(true, false, 0u));
+    assert(ShouldYieldMirrorToLocalTalk(true, false, 8u));  // non-life/combat upper flags don't block talk animation
+    assert(!ShouldYieldMirrorToLocalTalk(false, false, 0u));
+    assert(!ShouldYieldMirrorToLocalTalk(true, true, 0u));
+    assert(!ShouldYieldMirrorToLocalTalk(true, false, 1u));  // dead on host
+    assert(!ShouldYieldMirrorToLocalTalk(true, false, 2u));  // down on host
+    assert(!ShouldYieldMirrorToLocalTalk(true, false, 4u));  // in combat on host
+
+    // Passive dialogue partner runs ZS_Talk, ZS_Talk_Loop, IS_* info scripts, and _AI_* gesture/facing helpers locally.
+    assert(ShouldAllowPassiveTalkScript(true, "ZS_Talk"));
+    assert(ShouldAllowPassiveTalkScript(true, "ZS_Talk_Loop"));
+    assert(ShouldAllowPassiveTalkScript(true, "IS_Running_ProcessInfo"));
+    assert(ShouldAllowPassiveTalkScript(true, "_AI_HoldInventoryItems"));
+    assert(ShouldAllowPassiveTalkScript(true, "_AI_PlayAni"));
+    assert(!ShouldAllowPassiveTalkScript(true, "ZS_Attack"));
+    assert(!ShouldAllowPassiveTalkScript(true, "ZS_HangAround_DoNothing"));
+    assert(!ShouldAllowPassiveTalkScript(false, "ZS_Talk"));
+    assert(!ShouldAllowPassiveTalkScript(true, ""));
+    assert(!ShouldAllowPassiveTalkScript(true, nullptr));
+
+    // Allow entering ZS_Talk both during AssessTalk (before InfoManager.IsRunning flips true) and during active dialogue.
+    assert(ShouldAllowPassiveTalkTask(true, false, "ZS_Talk"));
+    assert(ShouldAllowPassiveTalkTask(false, true, "ZS_Talk"));
+    assert(!ShouldAllowPassiveTalkTask(false, false, "ZS_Talk"));
+    assert(!ShouldAllowPassiveTalkTask(true, true, "ZS_Attack"));
+    assert(!ShouldAllowPassiveTalkTask(true, true, nullptr));
+
+    // Allow ScriptRoutine, Animation, CharacterMovement, and Dialog property ticks on the active dialogue partner only.
+    assert(ShouldAllowDialogPartnerProperty(true, true, false, false, false));
+    assert(ShouldAllowDialogPartnerProperty(true, false, true, false, false));
+    assert(ShouldAllowDialogPartnerProperty(true, false, false, true, false));
+    assert(ShouldAllowDialogPartnerProperty(true, false, false, false, true));
+    assert(!ShouldAllowDialogPartnerProperty(true, false, false, false, false));
+    assert(!ShouldAllowDialogPartnerProperty(false, true, true, true, true));
 }
 
 void TestGuideClaimAndDestinationPolicy()

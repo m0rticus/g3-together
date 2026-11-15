@@ -459,6 +459,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         std::memcpy(&message, packet->data, sizeof(message));
         message.state.routine[sizeof(message.state.routine) - 1] = 0;
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if (isHost && message.state.kind != 19 && !ClientWorldStateKind(message.state.kind)) return;
         if (isHost && (message.state.kind == 8 || message.state.kind == 9))
             message.state.npcClass = from;
         if (message.state.kind == 19) {
@@ -665,7 +666,7 @@ void SendWorldState(WorldState const& state, uint8_t except)
         if (connected && server) Send(server, &message, sizeof(message), ChannelReliable, true);
         return;
     }
-    if (!host || (!isHost && state.kind != 8 && state.kind != 9 && state.kind != 10)) return;
+    if (!host || (!isHost && !ClientWorldStateKind(state.kind))) return;
     SendBroadcastExcept(&message, sizeof(message), ChannelReliable, true, except);
 }
 

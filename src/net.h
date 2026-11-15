@@ -303,14 +303,23 @@ void SetClockHandler(ClockHandler handler);
 // kind 8/9: downed.cpp (guard=target, npcClass=helper, first four guid bytes=target's downedSequence);
 // kind 10: a door or lock (doors.cpp: guard = open, alignment = locked, npcClass bits 1 door, 2 lock); kind 16: client to host,
 // player `guard` asks for NPC guid that has an important info for its hero (address.cpp); kind 18: for player `guard`, NPC
-// guid now remembers its fight with that player as `npc` (LastFightAgainstPlayer, fightmem.cpp).
+// guid now remembers its fight with that player as `npc` (LastFightAgainstPlayer, fightmem.cpp);
+// kind 21: downed.cpp (host -> all clients: authoritative atomic party wipe for worldEpoch in first 4 bytes of guid);
+// kind 23: combat_hostility.cpp (bidirectional mid-combat hostility transition, guid = NPC, npc = active, guard = player, npcClass = reason).
 // Client: to the host; host: to every client except `except`.
+constexpr bool ClientWorldStateKind(uint8_t kind) noexcept
+{
+    // Host-only kinds: 6 (claim refused), 7 (save companion), 14 (obsolete), 21 (atomic party wipe).
+    // Kind 19 (XP share handshake) has its own dedicated path.
+    return (kind >= 1 && kind <= 5) || (kind >= 8 && kind <= 10) || kind == 12 || kind == 13 ||
+           (kind >= 15 && kind <= 18) || kind == 20 || kind == 22 || kind == 23;
+}
 #pragma pack(push, 1)
 struct WorldState {
     uint8_t kind = 0;
     uint8_t guid[16] = {};
-    uint8_t dialog = 0;     // bits: teach, trade, party, mob, slavery; 0x80: has a dialog
-    uint8_t npc = 0;        // 1: has the NPC fields below
+    uint8_t dialog = 0;     // bits: teach, trade, party, mob, slavery, 0x20 talked; 0x80: has a dialog
+    uint8_t npc = 0;        // bit 0: has NPC fields below; bit 1: has defeated; bit 2: DefeatedByPlayer
     uint8_t guard = 0, npcClass = 0, alignment = 0, immortal = 0;
     uint8_t enclave = 0;    // bits: has an enclave, raid, revolution
     uint8_t enclaveStatus = 0;

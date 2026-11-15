@@ -19,7 +19,10 @@ int main()
     const std::string original = first + '\x1f' + "c511";
     assert(PackRuntime(original, UINT32_MAX, 63, packed));
     assert(UnpackRuntime(packed, key, value) && key == original && value == UINT32_MAX);
-    for (auto field : {"c512", "c-1", "c", "z", ""}) {
+    const std::string infoEndTs = first + '\x1f' + "i";
+    assert(PackRuntime(infoEndTs, 123456u, 63, packed));
+    assert(UnpackRuntime(packed, key, value) && key == infoEndTs && value == 123456u);
+    for (auto field : {"c512", "c-1", "c", "i0", "ix", "z", ""}) {
         key = "unchanged";
         assert(!PackRuntime(first + '\x1f' + field, 1, 63, key) && key == "unchanged");
     }

@@ -8,6 +8,7 @@
 #include "i18n.h"
 #include "log.h"
 #include "net.h"
+#include "npcplayback.h"
 #include "npcs.h"
 #include "remote.h"
 
@@ -24,6 +25,7 @@ namespace g3t::talk {
 namespace {
 // Client: the NPC our hero is talking to.
 eCEntity* talkingWith = nullptr;
+eCEntity* assessingTalkNpc = nullptr;
 uint8_t talkingGuid[16] = {};
 unsigned begins = 0, ends = 0;
 
@@ -116,11 +118,16 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* talker = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     Hold const* hold = net::IsHost() && !holdDisabled ? HoldOf(npc) : nullptr;
-    if (!hold || !talker || talker != gCSession::GetInstance().GetHero()) {
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hold || !talker || talker != hero) {
         // AssessTalk accepts either player/NPC order; observe the real call, never assess speculatively at focus.
         eCEntity* puppet = remote::IsPuppet(npc) ? npc : remote::IsPuppet(talker) ? talker : nullptr;
         if (remote::IsHeldPuppet(puppet)) remote::LogPuppetInteraction(puppet, "talk-attempt", -1);
+        eCEntity* prevAssessing = assessingTalkNpc;
+        if (!net::IsHost() && hero && (npc == hero || talker == hero))
+            assessingTalkNpc = (npc == hero) ? talker : npc;
         const GEInt result = originalAssessTalk(spu, self, other, args);
+        assessingTalkNpc = prevAssessing;
         if (remote::IsHeldPuppet(puppet)) remote::LogPuppetInteraction(puppet, "talk-assessed", result);
         return result;
     }
@@ -147,6 +154,72 @@ void EnterStationaryTalk(Hold& hold, eCEntity* speaker)
     hold.entity.Routine.FullStop();
     hold.entity.Routine.AIMode = gEAIMode_Talk;
     hold.entity.Routine.SetTask(bCString("ZS_Talk"));
+}
+
+bool ClientPartnerCanAnimateTalk(eCEntity* partner)
+{
+    if (!partner || !npcplayback::IsPassive(partner)) return false;
+    Entity npc(partner);
+    if (!npc.GetInstance() || npc.IsDead() || npc.IsDown()) return false;
+    net::NpcRecord const* combat = npcs::CombatRecord(partner);
+    return talk_policy::ShouldYieldMirrorToLocalTalk(true, npcs::DiedOnHost(partner), combat ? combat->flags : 0u);
+}
+
+void SyncStationaryClientPartner(Entity& npc, eCEntity* hero)
+{
+    if (npc.NPC.GetCurrentTarget().GetInstance() != hero) npc.NPC.SetCurrentTarget(Entity(hero));
+    if (talk_policy::ShouldStopHeldLocomotion(static_cast<int>(npc.CharacterMovement.GetMovementMode())))
+        npc.CharacterMovement.StopMovement();
+    npc.SetAlignmentTarget(Entity(hero));
+    npc.SetLookAtTarget(Entity(hero));
+    if (talk_policy::ShouldRepacifyHeldTalk(npc.IsDead(), npc.IsDown(), static_cast<int>(npc.Routine.AIMode),
+                                            npc.Routine.GetCurrentTask().GetText())) {
+        npc.Routine.AIMode = gEAIMode_Talk;
+        npc.Routine.SetTask(bCString("ZS_Talk"));
+    }
+}
+
+void PrepareClientPartner(eCEntity* partner, eCEntity* hero)
+{
+    if (!hero || !ClientPartnerCanAnimateTalk(partner)) return;
+    if (auto* animation = static_cast<eCVisualAnimation_PS*>(partner->GetPropertySet(eEPropertySetType_Animation))) {
+        if (auto* actor = animation->GetActor()) {
+            const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+            actor->SetPlaySpeed(slot0, 1.0f);
+            actor->PauseMotion(GEFalse, slot0);
+            for (int i = 1; i < net::NpcMotionSlots; ++i) {
+                const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(i);
+                if (actor->HasMotionInstance(slot)) animation->StopMotion(slot, 0.15f);
+            }
+        }
+    }
+    Entity npc(partner);
+    SyncStationaryClientPartner(npc, hero);
+}
+
+void MaintainClientPartner(eCEntity* partner, eCEntity* hero)
+{
+    if (!hero || !ClientPartnerCanAnimateTalk(partner)) return;
+    if (auto* animation = static_cast<eCVisualAnimation_PS*>(partner->GetPropertySet(eEPropertySetType_Animation))) {
+        if (auto* actor = animation->GetActor()) {
+            const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+            actor->PauseMotion(GEFalse, slot0);
+        }
+    }
+    Entity npc(partner);
+    SyncStationaryClientPartner(npc, hero);
+}
+
+void ReleaseClientPartner(eCEntity* partner, uint8_t const guid[16])
+{
+    npcs::OnClientTalkEnded(guid);
+    if (!partner || !npcplayback::IsPassive(partner)) return;
+    Entity npc(partner);
+    if (npc.GetInstance() && !npc.IsDead()) {
+        npc.SetAlignmentTarget(Entity());
+        npc.SetLookAtTarget(Entity());
+    }
+    npcplayback::Silence(partner);
 }
 
 void OnTalk(uint8_t from, bool begin, uint8_t const guid[16])
@@ -296,17 +369,31 @@ void Tick()
                        true, npc->GetPropertySet(eEPropertySetType_NPC) != nullptr, npc == hero, remote::IsPuppet(npc)))
             partner = npc;
     }
-    if (partner == talkingWith) return;
-    if (talkingWith) {
-        net::SendTalk(false, talkingGuid);
+    if (partner == talkingWith) {
+        if (talkingWith) MaintainClientPartner(talkingWith, hero);
+        return;
+    }
+    eCEntity* previousPartner = talkingWith;
+    uint8_t previousGuid[16] = {};
+    std::memcpy(previousGuid, talkingGuid, sizeof(previousGuid));
+    talkingWith = partner;
+    if (previousPartner) {
+        ReleaseClientPartner(previousPartner, previousGuid);
+        net::SendTalk(false, previousGuid);
         ++ends;
     }
-    talkingWith = partner;
     if (partner) {
         Guid(partner, talkingGuid);
+        PrepareClientPartner(partner, hero);
         net::SendTalk(true, talkingGuid);
         ++begins;
     }
+}
+
+bool AllowPassiveTalkTask(eCEntity const* entity, char const* task)
+{
+    if (!entity || net::IsHost()) return false;
+    return talk_policy::ShouldAllowPassiveTalkTask(TalkingWithHero(entity), entity == assessingTalkNpc, task);
 }
 
 bool TalkingWithHero(eCEntity const* entity)
@@ -343,6 +430,7 @@ void OnWorldChange()
 {
     holds.clear();
     talkingWith = nullptr;
+    assessingTalkNpc = nullptr;
     gestureNamesSent.clear();
 }
 

@@ -262,9 +262,13 @@ void RealUnavailableAndAllDown()
         assert(DecideEnd(false, false, 5099, alone) == EndDecision::Wait);
         assert(DecideEnd(false, false, 5100, alone) == EndDecision::AloneGrace);
     }
-    for (uint8_t flags : {uint8_t(3), uint8_t(5), uint8_t(9), uint8_t(11), uint8_t(19)}) {
+    for (uint8_t flags : {uint8_t(3), uint8_t(19)}) {
+        const auto unconscious = HelperAvailability(true, true, 100, flags, 100);
+        assert(unconscious == Availability::Unconscious && Playing(unconscious) && AliveInWorld(unconscious));
+    }
+    for (uint8_t flags : {uint8_t(5), uint8_t(9), uint8_t(11), uint8_t(13), uint8_t(25)}) {
         const auto down = HelperAvailability(true, true, 100, flags, 100);
-        assert(down == Availability::Down && Playing(down));
+        assert(down == Availability::Down && Playing(down) && !AliveInWorld(down));
         uint32_t alone = 0;
         assert(DecideEnd(false, true, 100, alone) == EndDecision::AllDown && !alone);
         assert(DecideEnd(true, true, 100, alone) == EndDecision::Wait); // another alive candidate wins
@@ -391,6 +395,61 @@ void RevivePaymentSlotAcrossDisconnectAndRejoin()
     assert(slot.NeedsPayment(1));
 }
 
+void NonLethalDefeatAndAtomicHostWipe()
+{
+    using namespace g3t::downed;
+    // Humanoid non-lethal brawl/duel/reaction knockdowns stay native unconsciousness; monsters, fall, and lethal
+    // reasons enter revive-required Hold.
+    assert(IsLethalDefeat(false, false, false, 0, 0));
+    assert(IsLethalDefeat(false, true, false, 9, 2));
+    assert(IsLethalDefeat(true, false, false, 9, 2)); // monster
+    assert(!IsLethalDefeat(true, true, false, 9, 2)); // ReactToDamage brawl
+    assert(!IsLethalDefeat(true, true, false, 7, 3)); // Angry
+    assert(!IsLethalDefeat(true, true, false, 17, 2)); // Duel
+    assert(!IsLethalDefeat(true, true, false, 18, 2)); // Arena
+    assert(!IsLethalDefeat(true, true, false, 0, 2)); // Neutral cleared reason
+    assert(IsLethalDefeat(true, true, true, 9, 2)); // HasAttackReasonToKill override
+    for (int reason : {12, 13, 19, 20}) {
+        assert(IsLethalDefeat(true, true, false, reason, 2)); // Enemy / Murder / Revolution / Kill
+    }
+    assert(IsLethalDefeat(true, true, false, 0, 4)); // Hostile without brawl reason
+
+    // Host-authoritative atomic wipe: temporary unconsciousness (held=0) never counts toward wipe,
+    // and connected clients never wipe unilaterally.
+    uint32_t alone = 0;
+    WipeParticipant unconsciousClient{true, true, Availability::Unconscious, false};
+    assert(DecideHostWipe(false, &unconsciousClient, 1, 1000, alone) == EndDecision::Wait);
+    assert(DecideHostWipe(true, &unconsciousClient, 1, 1000, alone) == EndDecision::Wait && alone == 0);
+    assert(DecideHostWipe(true, &unconsciousClient, 1, 20000, alone) == EndDecision::Wait && alone == 0);
+
+    WipeParticipant heldClient{true, true, Availability::Down, false};
+    assert(DecideHostWipe(false, &heldClient, 1, 1000, alone) == EndDecision::Wait); // host alive/unconscious -> no wipe
+    assert(DecideHostWipe(true, &heldClient, 1, 1000, alone) == EndDecision::AllDown); // both lethally held -> wipe
+
+    WipeParticipant mixed[2] = {heldClient, unconsciousClient};
+    assert(DecideHostWipe(true, mixed, 2, 1000, alone) == EndDecision::Wait && alone == 0);
+    mixed[1].state = Availability::NotPlaying; // in-world client paused in menu cannot be left alive on host wipe
+    assert(DecideHostWipe(true, mixed, 2, 10000, alone) == EndDecision::Wait && alone == 0);
+    mixed[1].state = Availability::Down;
+    mixed[1].reviveInFlight = true; // wait while a paid revive is in flight
+    assert(DecideHostWipe(true, mixed, 2, 10000, alone) == EndDecision::Wait);
+    mixed[1].reviveInFlight = false;
+    assert(DecideHostWipe(true, mixed, 2, 10000, alone) == EndDecision::AllDown);
+
+    // Solo host (no in-world clients) still expires after AbsenceGraceMs.
+    alone = 0;
+    assert(DecideHostWipe(true, nullptr, 0, 1000, alone) == EndDecision::Wait && alone == 1000);
+    assert(DecideHostWipe(true, nullptr, 0, 6000, alone) == EndDecision::AloneGrace);
+
+    // Connected client never dies unilaterally, only on host wipe order; disconnected falls back to AloneGrace.
+    alone = 0;
+    assert(DecideClientEnd(true, false, 1000, alone) == EndDecision::Wait && alone == 0);
+    assert(DecideClientEnd(true, false, 20000, alone) == EndDecision::Wait && alone == 0);
+    assert(DecideClientEnd(true, true, 20000, alone) == EndDecision::AllDown && alone == 0);
+    assert(DecideClientEnd(false, false, 1000, alone) == EndDecision::Wait && alone == 1000);
+    assert(DecideClientEnd(false, false, 6000, alone) == EndDecision::AloneGrace);
+}
+
 int main()
 {
     StickyAndRevive();
@@ -403,5 +462,6 @@ int main()
     ActivityOrderingAndTimerWrap();
     HeldEntryConvergence();
     RevivePaymentSlotAcrossDisconnectAndRejoin();
+    NonLethalDefeatAndAtomicHostWipe();
     return 0;
 }

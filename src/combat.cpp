@@ -239,7 +239,17 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     ai::DamagePerception perception(playerHitMirror ? victim.GetInstance() : nullptr);
     const bool leaseHit = npclease::LocalAuthority(victim.GetInstance());
     const int leaseHp = leaseHit ? HitPoints(victim) : 0;
+    static thread_local int heroJudgeDepth = 0;
+    const bool trackHeroJudge = which <= 2 && localVictim;
+    if (trackHeroJudge) {
+        ++heroJudgeDepth;
+        downed::NoteHeroJudgedHit(attacker, true);
+    }
     auto observed = [&](GEInt result) {
+        if (trackHeroJudge) {
+            --heroJudgeDepth;
+            if (!result) downed::ClearHeroJudgedHit();
+        }
         if (leaseHit) npclease::NoteHit(victim.GetInstance(), attacker, Judgements[which], leaseHp, HitPoints(victim));
         if (attacker && (attacker == hero || attacker == remote::ControlledBody()) && npcs::IsMirrored(victim.GetInstance())) {
             ++clientJudgements;
@@ -337,6 +347,15 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         return original(spu, self, other, args);
     }
     if (IgnoreFriendlyHit(recipient.GetInstance(), Attacker(spu, other))) return GETrue;
+    if (recipient.GetInstance() &&
+        (recipient.GetInstance() == gCSession::GetInstance().GetHero() ||
+         recipient.GetInstance() == remote::ControlledBody())) {
+        eCEntity* hitAttacker = Attacker(spu, other);
+        if (!hitAttacker || hitAttacker == recipient.GetInstance() || remote::IsPuppet(hitAttacker) ||
+            !hitAttacker->GetPropertySet(eEPropertySetType_NPC)) {
+            downed::NoteHeroJudgedHit(hitAttacker, true);
+        }
+    }
     if (forwarded) {
         if (heroForward) {  // a hit on our hero judged here with the other machine's attacker
             Entity hit = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);

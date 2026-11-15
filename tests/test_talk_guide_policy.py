@@ -62,10 +62,15 @@ class TalkAndGuidePolicyTests(unittest.TestCase):
         end_branch = on_talk[on_talk.index("} else if (it != holds.end()"):]
         self.assertLess(end_branch.index("holds.erase(it)"), end_branch.index("Release(ended)"))
 
-        # Routine and Script hooks suppress Acting player spoofing while held in talk, and Play forwards slot-0 partner motions.
+        # Routine and Script hooks suppress Acting player spoofing while held in talk, and Play forwards slot-0 partner motions
+        # while allowing local gesture/facial/facing animation on the client's active dialogue partner without Replay fighting it.
         self.assertIn("talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity))", hooks)
         self.assertIn("talk::OnPartnerMotion(entity, self->GetMotionDesc(slot).GetMotionFilename().GetText())", hooks)
+        self.assertIn("talk_policy::ShouldAllowDialogPartnerProperty(", hooks)
         self.assertIn("talk_policy::ShouldSilencePassiveRoutine(Passive(entity), talk::TalkingWithHero(entity))", playback)
+        self.assertIn("talk::AllowPassiveTalkTask(entity, task.GetText())", playback)
+        self.assertIn("YieldMirrorForClientTalk(", _testbuild.src_text("npcs.cpp"))
+        self.assertIn("talk_policy::ShouldAllowPassiveTalkScript(talk::TalkingWithHero(self), name)", _testbuild.src_text("ai.cpp"))
 
         # Puppet exposes ZS_Talk after body::Drive while holding an NPC in talk without triggering Drive repacification.
         self.assertIn("talk_policy::PuppetRoutineTask(true, held, false, body::IdleTask())", remote)
