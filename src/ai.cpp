@@ -347,7 +347,8 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
         int hostAttitude = 0;
         const bool haveHost = npcs::HostAttitude(judge, hostAttitude);
         const bool sharedMirror = !suppressPromotion && combat_hostility::MirrorSharesCombatHostility(judge);
-        if (!(suppressPromotion && hostAttitude == relation::Hostile) &&
+        if (!(suppressPromotion &&
+              (hostAttitude == relation::Hostile || hostAttitude == relation::Angry)) &&
             relation::MirrorAnswersFromHost(true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
                                            (enclaves::Together() && !fightmem::HasLocalOverride(judge)) ||
                                                sharedMirror))

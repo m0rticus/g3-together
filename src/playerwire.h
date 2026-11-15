@@ -15,7 +15,7 @@ namespace g3t::playerwire {
 
 constexpr std::uint8_t Version = 1;
 constexpr std::uint8_t FullFlag = 1;
-constexpr std::uint16_t MetadataMask = 0x03ffu;
+constexpr std::uint16_t MetadataMask = 0x3fffu;
 constexpr std::uint16_t StringName = 1u << 0;
 constexpr std::uint16_t StringAnimation = 1u << 1;
 constexpr std::uint16_t StringHeldRight = 1u << 2;
@@ -26,6 +26,10 @@ constexpr std::uint16_t StringHelmet = 1u << 6;
 constexpr std::uint16_t StringLook = 1u << 7;
 constexpr std::uint16_t FocusNpc = 1u << 8;
 constexpr std::uint16_t TargetNpc = 1u << 9;
+constexpr std::uint16_t StringOverlay0 = 1u << 10;
+constexpr std::uint16_t StringOverlay1 = 1u << 11;
+constexpr std::uint16_t StringWeaponAnim = 1u << 12;
+constexpr std::uint16_t OverlayMeta = 1u << 13;
 constexpr std::size_t FixedBytes = 65;
 constexpr std::uint32_t FullKeyframeMs = 5000;
 
@@ -181,6 +185,15 @@ constexpr StringField StringFields[] = {
     {StringLook, sizeof(net::PlayerState::look),
      [](const net::PlayerState& s) -> const char* { return s.look; },
      [](net::PlayerState& s) -> char* { return s.look; }},
+    {StringOverlay0, sizeof(net::PlayerState::overlayAnim0),
+     [](const net::PlayerState& s) -> const char* { return s.overlayAnim0; },
+     [](net::PlayerState& s) -> char* { return s.overlayAnim0; }},
+    {StringOverlay1, sizeof(net::PlayerState::overlayAnim1),
+     [](const net::PlayerState& s) -> const char* { return s.overlayAnim1; },
+     [](net::PlayerState& s) -> char* { return s.overlayAnim1; }},
+    {StringWeaponAnim, sizeof(net::PlayerState::weaponAnim),
+     [](const net::PlayerState& s) -> const char* { return s.weaponAnim; },
+     [](net::PlayerState& s) -> char* { return s.weaponAnim; }},
 };
 
 inline std::uint16_t metadataMask(const net::PlayerState& baseline, const net::PlayerState& state) {
@@ -189,6 +202,7 @@ inline std::uint16_t metadataMask(const net::PlayerState& baseline, const net::P
         if (!sameCString(field.read(baseline), field.read(state), field.capacity)) mask |= field.bit;
     if (baseline.focusNpc != state.focusNpc) mask |= FocusNpc;
     if (baseline.targetNpc != state.targetNpc) mask |= TargetNpc;
+    if (baseline.overlayMeta != state.overlayMeta) mask |= OverlayMeta;
     return mask;
 }
 
@@ -219,6 +233,7 @@ inline void writeMetadata(Writer& writer, const net::PlayerState& state, std::ui
         if (mask & field.bit) writeString(writer, field.read(state), field.capacity);
     if (mask & FocusNpc) writer.u32(state.focusNpc);
     if (mask & TargetNpc) writer.u32(state.targetNpc);
+    if (mask & OverlayMeta) writer.u32(state.overlayMeta);
 }
 
 inline bool validStrings(const net::PlayerState& state) {
@@ -366,6 +381,7 @@ public:
         if (!detail::readStrings(reader, mask, metadata)) return Status::Invalid;
         if (mask & FocusNpc) metadata.focusNpc = reader.u32();
         if (mask & TargetNpc) metadata.targetNpc = reader.u32();
+        if (mask & OverlayMeta) metadata.overlayMeta = reader.u32();
         if (!reader.ok || reader.offset != size) return Status::Invalid;
 
         if (full == FullFlag) {
@@ -376,6 +392,7 @@ public:
 
             value.focusNpc = metadata.focusNpc;
             value.targetNpc = metadata.targetNpc;
+            value.overlayMeta = metadata.overlayMeta;
             detail::copyStrings(MetadataMask, metadata, value);
 
             currentState_ = value;
@@ -400,6 +417,7 @@ public:
         net::PlayerState next = value;
         next.focusNpc = (mask & FocusNpc) ? metadata.focusNpc : currentState_.focusNpc;
         next.targetNpc = (mask & TargetNpc) ? metadata.targetNpc : currentState_.targetNpc;
+        next.overlayMeta = (mask & OverlayMeta) ? metadata.overlayMeta : currentState_.overlayMeta;
         detail::copyStrings(MetadataMask & ~mask, currentState_, next);
         detail::copyStrings(mask, metadata, next);
 

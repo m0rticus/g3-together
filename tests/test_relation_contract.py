@@ -145,6 +145,30 @@ class RelationContractTests(unittest.TestCase):
         self.assertLess(frame.index("g3t::fightmem::Tick()"), frame.index("g3t::relation::Tick()"))
         self.assertIn("src/relation.cpp", _testbuild.cached_text(ROOT / "CMakeLists.txt"))
 
+    def test_guard_kill_intent_and_enclave_crime_clearance_contracts(self):
+        guards_h = source("guards.h")
+        self.assertIn("bool MeansToKill(eCEntity* npc, eCEntity* playerTarget);", guards_h)
+
+        guards = source("guards.cpp")
+        kill_intent = between(guards, "GEInt GE_STDCALL KillIntent(", "gFScriptAICallback originalOnZone")
+        self.assertIn("LocalPlayer local(!puppet && IsLocalPlayer(asked));", kill_intent)
+        self.assertIn("npcs::CompanionOwner(asked)", kill_intent)
+        means = between(guards, "bool MeansToKill(", "static void WatchZones()")
+        self.assertIn("LocalPlayer local(!puppet);", means)
+        self.assertIn("Acting acting(puppet, false);", means)
+
+        enclaves = source("enclaves.cpp")
+        send_delta = between(enclaves, "void SendDelta(", "void SettlePending()")
+        self.assertIn("d.known = now.known != before.known ? now.known : -1;", send_delta)
+        self.assertIn("d.suspect[i] = now.suspect[i] != before.suspect[i] ? now.suspect[i] : -1;", send_delta)
+        on_note = between(enclaves, "void OnNote(", "void Start()")
+        self.assertIn("if (note.known == gEPlayerCrime_None) c.known = gEPlayerCrime_None;", on_note)
+        self.assertIn("if (note.suspect[i] == 0) c.suspect[i] = 0;", on_note)
+
+        relation = source("relation.cpp")
+        tick = between(relation, "void Tick()", "uint8_t Outgoing(")
+        self.assertIn("ValidAttitude(local) && local > None", tick)
+
     def test_wire_and_pose_codecs_are_untouched(self):
         for name in ("npcwire_pose.h", "npcwire_bonepack.h"):
             self.assertNotIn("relation", source(name))

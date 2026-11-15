@@ -45,6 +45,12 @@ class WorldCollisionReadinessTests(unittest.TestCase):
         self.assertIn("HasOtherThreadInFlightLocked(entity, selfThread)", world_collision_cpp)
         self.assertNotIn("clearCachingOut", world_collision_cpp)
         self.assertIn("eETraceRayHints_TestStaticShapes | eETraceRayHints_IncludeWater", world_collision_cpp)
+        self.assertIn("LocalGroundSupportDropCm", world_collision_cpp)
+        self.assertIn("-(GroundRayUpCm + LocalGroundSupportDropCm)", world_collision_cpp)
+        self.assertIn("BoxContainsXZ(entry.cellBox, cand.pos[0], cand.pos[2], NpcColumnMarginCm)", world_collision_cpp)
+        self.assertIn("IsSolidLocalStaticShape(state) && !state.hasPhysicObject", world_collision_cpp)
+        self.assertIn("wasReady || !cand.anyCoveringJobRunning", world_collision_cpp)
+        self.assertIn("!persist::NativeLoading() && !persist::HeroPending()", world_cpp)
 
 
 if __name__ == "__main__":

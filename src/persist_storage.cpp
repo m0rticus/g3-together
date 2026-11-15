@@ -180,6 +180,7 @@ bool ApplyCharacter(Bytes const& bytes, saving::Key const& key)
         ++recordsApplied;
         combat::OnWorldChange();
         xpshare::OnWorldChange();
+        if (!net::IsHost()) xpshare::OnClientRecordRestored(true);
     }
     return ok;
 }
@@ -286,7 +287,13 @@ void FinishSave(bool ok, char const* why)
     operation = {};
     nativeSaved = false;
     CleanupStaging();
-    if (ok) Notice(i18n::SaveComplete); else SaveFailure(why);
+    if (ok) {
+        xpshare::CommitSaveCapture();
+        Notice(i18n::SaveComplete);
+    } else {
+        xpshare::CancelSaveCapture();
+        SaveFailure(why);
+    }
 }
 
 void CancelSave(char const* why) { FinishSave(false, why); }
@@ -455,6 +462,7 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
         if (clientRejoin.CanUseFresh(gCSession::GetInstance().IsGameRunning(), hostWorld.kind != net::KindMenu) && templateHeroFresh) {
             if (!templateCapture.Holding(GetTickCount())) {
                 needsNewHero = false; ownCharacterReady = true;
+                xpshare::OnClientRecordRestored(false);
                 clientRejoin.Left();
                 synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
             }
@@ -694,6 +702,7 @@ void HostTick(uint32_t now)
             client.recordSent = epoch;
             client.hasSavedPose = hasSavedPose;
             client.savedPose = hasSavedPose ? recordPose : saving::RecordPose{};
+            xpshare::PreparePeerAdmissionOrigin(i, generation, record != nullptr);
         }
     }
 }

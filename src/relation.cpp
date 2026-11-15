@@ -27,6 +27,14 @@
 
 namespace g3t::relation {
 namespace {
+static_assert(None == gEAttitude_None);
+static_assert(Friendly == gEAttitude_Friendly);
+static_assert(Neutral == gEAttitude_Neutral);
+static_assert(Angry == gEAttitude_Angry);
+static_assert(Hostile == gEAttitude_Hostile);
+static_assert(Predator == gEAttitude_Predator);
+static_assert(Panic == gEAttitude_Panic);
+
 constexpr float NearCm = 6000.0f;
 constexpr unsigned MismatchLinesPerReport = 12;
 
@@ -243,7 +251,7 @@ void Tick()
                 (enclaves::Together() && !fightmem::HasLocalOverride(npc)) ||
                 combat_hostility::MirrorSharesCombatHostility(npc)) continue;
             int local = -1;
-            if (ai::LocalAttitude(npc, local) && ValidAttitude(local) && Stored(npc) != local)
+            if (ai::LocalAttitude(npc, local) && ValidAttitude(local) && local > None && Stored(npc) != local)
                 Entity(npc).NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(local);
         }
     }

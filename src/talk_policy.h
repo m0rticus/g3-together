@@ -9,9 +9,35 @@
 namespace g3t::talk_policy {
 
 constexpr int AiModeCombat = 3;      // gEAIMode_Combat
+constexpr int AiModeFlee = 4;        // gEAIMode_Flee
 constexpr int AiModeTalk = 6;        // gEAIMode_Talk
 constexpr int MoveModeSneak = 2;     // gECharMovementMode_Sneak
 constexpr int MoveModeSprint = 5;    // gECharMovementMode_Sprint
+
+constexpr int AniStateDummy0 = 0;         // gEAniState_Dummy0
+constexpr int AniStateDummy1 = 1;         // gEAniState_Dummy1
+constexpr int AniStateStand = 2;          // gEAniState_Stand
+constexpr int AniStateKneel = 5;          // gEAniState_Kneel
+constexpr int AniStateSitGround = 6;      // gEAniState_SitGround
+constexpr int AniStateSitStool = 7;       // gEAniState_SitStool
+constexpr int AniStateSitBench = 8;       // gEAniState_SitBench
+constexpr int AniStateSitThrone = 9;      // gEAniState_SitThrone
+constexpr int AniStateSleepBed = 10;      // gEAniState_SleepBed
+constexpr int AniStateSleepGround = 11;   // gEAniState_SleepGround
+constexpr int AniStateTalkStand = 22;     // gEAniState_TalkStand
+constexpr int AniStateTalkSitGround = 23; // gEAniState_TalkSitGround
+constexpr int AniStateTalkSitStool = 24;  // gEAniState_TalkSitStool
+constexpr int AniStateTalkSitBench = 25;  // gEAniState_TalkSitBench
+constexpr int AniStateTalkSitThrone = 26; // gEAniState_TalkSitThrone
+
+constexpr int PoseNone = 0;   // gEPose_None
+constexpr int PoseP0 = 1;     // gEPose_P0
+constexpr int PoseCount = 25;
+
+constexpr int UseTypeNone = 0;    // gEUseType_None
+constexpr int UseTypeTorch = 24;  // gEUseType_Torch
+
+constexpr uint32_t PendingClientTalkWindowMs = 4000u;
 
 // Native Script_Game.dll ZS_Talk (0x10024ff0) and ZS_Talk_Loop (0x10025870) exit immediately via ContinueRoutine()
 // when target == Entity::GetPlayer() and !PSInfoManager::IsRunning(). While the host holds an NPC in dialogue for a
@@ -38,8 +64,124 @@ constexpr bool ShouldStopHeldLocomotion(int movementMode) noexcept
 // Re-enter ZS_Talk whenever a live, non-combat, non-downed held NPC drops out of gEAIMode_Talk or "ZS_Talk".
 inline bool ShouldRepacifyHeldTalk(bool isDead, bool isDown, int aiMode, char const* currentTask) noexcept
 {
-    if (isDead || isDown || aiMode == AiModeCombat) return false;
+    if (isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee) return false;
     return aiMode != AiModeTalk || !currentTask || std::strcmp(currentTask, "ZS_Talk") != 0;
+}
+
+constexpr bool IsSeatedTalkAniState(int aniState) noexcept
+{
+    return (aniState >= AniStateSitGround && aniState <= AniStateSitThrone) ||
+           (aniState >= AniStateTalkSitGround && aniState <= AniStateTalkSitThrone);
+}
+
+// Native ZS_Talk (0x1002562c) aligns standing NPCs to the speaker via SetAlignmentTarget, while seated/sleeping NPCs
+// keep their bench/stool/throne root orientation and track the speaker via head LookAt only.
+constexpr bool ShouldAlignTalkBodyToSpeaker(int aniState) noexcept
+{
+    return !IsSeatedTalkAniState(aniState) && aniState != AniStateSleepBed && aniState != AniStateSleepGround;
+}
+
+// Passive mirrors replay .xmot clips directly on emfx2Actor without updating Routine.AniState or NPC.PrimaryPose.
+// Infer the partner's posture from its active slot-0 clip before ZS_Talk / _AI_Say_Ex calls Entity::GetAni.
+inline int InferDialogPartnerAniState(char const* slot0Motion, int currentAniState) noexcept
+{
+    if (slot0Motion && *slot0Motion && std::strcmp(slot0Motion, "<fault>") != 0) {
+        // StandUp / GetUp clips start from _Sit*_ or _Sleep*_ in their prefix (e.g.
+        // Hero_SitGround_None_None_P0_StandUp_End_N_Fwd_00_%.xmot) and leave the NPC standing.
+        if (std::strstr(slot0Motion, "_StandUp_") || std::strstr(slot0Motion, "_GetUp_"))
+            return AniStateStand;
+        if (std::strstr(slot0Motion, "_SitBench_")) return AniStateSitBench;
+        if (std::strstr(slot0Motion, "_SitStool_")) return AniStateSitStool;
+        if (std::strstr(slot0Motion, "_SitGround_")) return AniStateSitGround;
+        if (std::strstr(slot0Motion, "_SitThrone_")) return AniStateSitThrone;
+        if (std::strstr(slot0Motion, "_Kneel_")) return AniStateKneel;
+        if (std::strstr(slot0Motion, "_SleepBed_")) return AniStateSleepBed;
+        if (std::strstr(slot0Motion, "_SleepGround_")) return AniStateSleepGround;
+        if (std::strstr(slot0Motion, "_Stand_") || std::strstr(slot0Motion, "_Move_") ||
+            std::strstr(slot0Motion, "_Turn_"))
+            return AniStateStand;
+    }
+    if (currentAniState == AniStateTalkSitGround) return AniStateSitGround;
+    if (currentAniState == AniStateTalkSitStool) return AniStateSitStool;
+    if (currentAniState == AniStateTalkSitBench) return AniStateSitBench;
+    if (currentAniState == AniStateTalkSitThrone) return AniStateSitThrone;
+    if (currentAniState == AniStateTalkStand) return AniStateStand;
+    if (currentAniState >= AniStateKneel && currentAniState <= AniStateSleepGround) return currentAniState;
+    return AniStateStand;
+}
+
+// Every *_Say_* clip in _compiledAnimation.pak uses P0 (gEPose_P0 = 1). Passive mirrors that never ran StartPlayAni
+// still hold gEPose_None (0), causing Entity::GetAniEx to format "*_None_Say_*" (missing animation, frozen hands).
+constexpr int NormalizeDialogPrimaryPose(int currentPose, bool emptyOrTorchHands) noexcept
+{
+    if (emptyOrTorchHands || currentPose <= PoseNone || currentPose >= PoseCount) return PoseP0;
+    return currentPose;
+}
+
+// Seated *_Say_Ambient_* clips exist only for None_None; standing ZS_Talk (0x10002dd0) also clears all held items
+// except a right-hand torch. Clear ambient bench props (meat, cup, bread, bowl, smoke) up front so frame-1 Say works.
+constexpr bool ShouldClearHeldItemsForTalk(int aniState, int leftUseType, int rightUseType) noexcept
+{
+    if (IsSeatedTalkAniState(aniState))
+        return leftUseType != UseTypeNone || rightUseType != UseTypeNone;
+    return leftUseType != UseTypeNone || (rightUseType != UseTypeNone && rightUseType != UseTypeTorch);
+}
+
+inline bool IsStandUpMotion(char const* motion) noexcept
+{
+    return motion && std::strstr(motion, "_StandUp_") != nullptr;
+}
+
+// ai::FilterState binds guards::Acting(StateActor) inside ZS_Talk, causing host ZS_Talk to see !PSInfoManager::IsRunning()
+// and call ContinueRoutine() every tick. Block ContinueRoutine and non-reaction task exits while the host holds the NPC.
+inline bool ShouldBlockHeldTalkEvent(bool isHost, bool heldInTalk, bool isDead, bool isDown,
+                                     int aiMode, char const* eventName) noexcept
+{
+    if (!isHost || !heldInTalk || isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee) return false;
+    return eventName && std::strcmp(eventName, "ContinueRoutine") == 0;
+}
+
+inline bool ShouldBindActingPlayerForEvent(bool isHost, bool heldInTalk, char const* eventName) noexcept
+{
+    if (!isHost || heldInTalk || !eventName || !*eventName) return false;
+    return std::strcmp(eventName, "ContinueRoutine") == 0 ||
+           std::strcmp(eventName, "OnGuidePlayer") == 0 ||
+           std::strcmp(eventName, "OnFollowPlayer") == 0;
+}
+
+inline bool IsAllowedHeldTalkTask(char const* taskName) noexcept
+{
+    if (!taskName || !*taskName) return true;
+    return std::strcmp(taskName, "ZS_Talk") == 0 ||
+           std::strcmp(taskName, "ZS_Attack") == 0 ||
+           std::strcmp(taskName, "ZS_Flee") == 0 ||
+           std::strcmp(taskName, "ZS_Dead") == 0 ||
+           std::strcmp(taskName, "ZS_Unconscious") == 0 ||
+           std::strcmp(taskName, "ZS_SitKnockDown") == 0 ||
+           std::strncmp(taskName, "ZS_Assess", 9) == 0 ||
+           std::strncmp(taskName, "ZS_Lie", 6) == 0 ||
+           std::strncmp(taskName, "ZS_RagDoll", 10) == 0 ||
+           std::strncmp(taskName, "ZS_Stumble", 10) == 0 ||
+           std::strncmp(taskName, "ZS_QuickStumble", 15) == 0 ||
+           std::strncmp(taskName, "ZS_ParadeStumble", 16) == 0 ||
+           std::strncmp(taskName, "ZS_QuickParadeStumble", 21) == 0 ||
+           std::strncmp(taskName, "ZS_HeavyParadeStumble", 21) == 0 ||
+           std::strncmp(taskName, "ZS_PierceStumble", 16) == 0;
+}
+
+inline bool ShouldBlockHeldTalkTask(bool isHost, bool heldInTalk, bool isDead, bool isDown,
+                                    int aiMode, char const* taskName) noexcept
+{
+    if (!isHost || !heldInTalk || isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee) return false;
+    return taskName && *taskName && !IsAllowedHeldTalkTask(taskName);
+}
+
+// AssessTalk enters ZS_Talk several frames before Hero's ZS_Talk calls PSInfoManager::Start. Keep the addressed
+// partner recognized across that startup window so Silence() and Replay do not wipe ZS_Talk before the first Say line.
+constexpr bool ShouldKeepPendingClientTalk(bool pendingActive, bool dialogRunning, bool heroValidAndAlive,
+                                           uint32_t nowMs, uint32_t untilMs) noexcept
+{
+    return pendingActive && !dialogRunning && heroValidAndAlive && static_cast<int32_t>(untilMs - nowMs) > 0;
 }
 
 // Passive mirrors clear residual task/state names except for the client's active dialogue partner, whose local script

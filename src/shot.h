@@ -14,6 +14,8 @@ void Start();
 void OnWorldChange();
 bool NpcReplica(eCEntity const* entity);
 bool InNpcReplicaContact();
+bool PlayerReplica(eCEntity const* entity);
+bool InPlayerReplicaContact();
 void Tick();  // once per frame, after QA (a QA shot is re-aimed there first): installs the hook, announces new arrows
 using LogFn = void (*)(char const*);
 void NpcCast(char const* argument, LogFn log);  // QA: GUID_spell-item, a real NPC projectile cast at the other player

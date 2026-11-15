@@ -52,4 +52,6 @@ bool PlayerContextReady();  // both native GetPlayer/IsPlayer imports were redir
 
 // ai.cpp, before an AI state of `self` runs: the puppet it reacts to when that state follows the player, else none.
 eCEntity* StateActor(eCEntity* self, char const* state);
+// Read-only HasAttackReasonToKill query against a local player body or remote puppet without leaking Acting scope.
+bool MeansToKill(eCEntity* npc, eCEntity* playerTarget);
 }

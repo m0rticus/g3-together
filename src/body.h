@@ -147,6 +147,7 @@ struct Target
     int motionFrac = -1;      // protocol 59: how far the sender's slot 0 had played (0..65535 of its length), -1 none
     uint32_t motionAgeMs = 0; // how old that is now: since the state arrived plus half the round trip
     bool timeline = false;   // authoritative interpolated pose; keep the animation/controller instead of MoveTo resets
+    bool keepOverlays = false; // preserve active upper-body overlay slots (1..7) across slot-0 locomotion switches
     uint32_t presentationSerial = 0;
 };
 // Display step 3 (review 28.10.): numbers each start of an action motion (not _Move_, not _Ambient_) on slot 0, a restart of the

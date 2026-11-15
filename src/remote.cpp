@@ -26,6 +26,7 @@
 #include "npcplayback.h"
 #include "pose.h"
 #include "movement.h"
+#include "ranged.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -95,6 +96,7 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
         puppet.terminalPose.clear();
         puppet.terminalPoseFlags = 0;
         puppet.terminalReplay = npcplayback::State{};
+        ranged::ClearPuppetOverlay(puppet.entity.GetInstance());
     }
     auto remember = [&](char const* name) {
         if (!*name) return uint32_t(0);
@@ -106,6 +108,9 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
     const uint32_t animHash = remember(state.animation);
     const uint32_t rightHash = remember(state.heldRight);
     const uint32_t leftHash = remember(state.heldLeft);
+    const uint32_t overlay0Hash = remember(state.overlayAnim0);
+    const uint32_t overlay1Hash = remember(state.overlayAnim1);
+    const uint32_t weaponAnimHash = remember(state.weaponAnim);
     const bool continuous = movement::IsContinuousPuppetMotion(state.animation);
     body::MotionState motion;
     motion.motion = continuous ? 0u : animHash;
@@ -122,6 +127,11 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
     sample.motion = animHash;
     sample.heldRight = rightHash;
     sample.heldLeft = leftHash;
+    sample.overlayAnim0 = overlay0Hash;
+    sample.overlayAnim1 = overlay1Hash;
+    sample.weaponAnim = weaponAnimHash;
+    sample.overlayMeta = state.overlayMeta;
+    sample.overlayHot = ranged_anim::UnpackOverlayHot(state.flags, state.overlayMeta, state.gold, state.actionMs);
     sample.motionFrac = state.motionFrac;
     sample.movementMode = state.movementMode;
     sample.aniState = state.aniState;
@@ -173,6 +183,7 @@ bool LocalState(net::PlayerState& state)
     static body::ActionClock heroClock;  // protocol 58: each start of an action motion numbered
     state.actionSeq = body::ActionSeq(hero, heroClock, state.animation, &state.actionMs);
     state.motionFrac = body::MotionFraction(hero);  // protocol 59
+    ranged::CaptureHeroOverlay(hero, state);
     Entity self(hero);
     auto npcHash = [](eCEntity* entity) {
         if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return uint32_t(0);
@@ -317,7 +328,7 @@ void Hold(Puppet& puppet, char const* right, char const* left, uint32_t now)
     const std::string haveRight = inRight.GetInstance() ? inRight.GetName().GetText() : "";
     const std::string haveLeft = inLeft.GetInstance() ? inLeft.GetName().GetText() : "";
     if (haveRight == right && haveLeft == left) return;
-    puppet.entity.Inventory.HoldStacks(StackFor(puppet.entity, left), StackFor(puppet.entity, right));
+    ranged::SyncPuppetHands(puppet.entity.GetInstance(), right, left, puppet.heldRight, puppet.heldLeft);
 }
 
 constexpr gESlot WornSlots[2] = {gESlot_Body, gESlot_Helmet};
@@ -350,6 +361,7 @@ void Despawn(int id, char const* reason)
     Puppet& puppet = puppets[id];
     if (!puppet.spawned) return;
     eCEntity* entity = puppet.entity.GetInstance();
+    ranged::ClearPuppetOverlay(entity);
     if (guards::RejectRemoteWrite(entity, "remote::Despawn")) { puppet = Puppet{}; return; }
     gCWorld* current = gCWorld::GetCurrentWorld();
     if (entity && current && puppet.world == CurrentWorld()) {
@@ -433,6 +445,7 @@ void StartPuppetTerminal(Puppet& puppet, int id, eCEntity const& hero, uint32_t 
     puppet.terminalTryAt = now ? now + 250 : 251;
     puppet.downedSequence = 0;
     eCEntity* entity = puppet.entity.GetInstance();
+    ranged::ClearPuppetOverlay(entity);
     if (!entity) return;
 
     std::vector<pose::Bone> captured;
@@ -606,6 +619,12 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     };
     char const* wantedRight = remote.latest.heldRight;
     char const* wantedLeft = remote.latest.heldLeft;
+    char const* wantedOverlay0 = remote.latest.overlayAnim0;
+    char const* wantedOverlay1 = remote.latest.overlayAnim1;
+    char const* wantedWeaponAnim = remote.latest.weaponAnim;
+    uint32_t wantedOverlayMeta = remote.latest.overlayMeta;
+    ranged_anim::OverlayHot wantedOverlayHot = ranged_anim::UnpackOverlayHot(
+        remote.latest.flags, remote.latest.overlayMeta, remote.latest.gold, remote.latest.actionMs);
     if (timeline) {
         if (body::Sample(puppet.body.track, now, shownAt, shownTurn, -presentationDelay, true, &presentation)) {
             presented = true;
@@ -632,6 +651,11 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
                 target.motionAgeMs = sampledAgeMs;
                 wantedRight = nameOf(sampledMotion.heldRight);
                 wantedLeft = nameOf(sampledMotion.heldLeft);
+                wantedOverlay0 = nameOf(sampledMotion.overlayAnim0);
+                wantedOverlay1 = nameOf(sampledMotion.overlayAnim1);
+                wantedWeaponAnim = nameOf(sampledMotion.weaponAnim);
+                wantedOverlayMeta = sampledMotion.overlayMeta;
+                wantedOverlayHot = sampledMotion.overlayHot;
             }
             target.goal = body::Sample(puppet.body.track, now, smoothGoal, goalTurn, body::GoalAhead - presentationDelay, false)
                           ? smoothGoal : shownAt;
@@ -702,6 +726,8 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     puppet.downedSequence = held ? remote.latest.downedSequence : 0;
     puppet.body.combatMoves = qa.puppetCombat;
+    const bool applyOverlays = !held && !*remote.latest.shape && wantedOverlayMeta != 0;
+    target.keepOverlays = applyOverlays;
     auto* puppetRoutine = static_cast<gCScriptRoutine_PS*>(
         puppet.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
     if (puppetRoutine) {
@@ -710,6 +736,12 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
             puppetRoutine->AccessCurrentTask() = bCString(preTask);
     }
     body::Drive(puppet.entity, puppet.body, target, now);
+    if (applyOverlays) {
+        ranged::PresentPuppetOverlay(puppet.entity.GetInstance(), wantedOverlay0, wantedOverlay1,
+                                     wantedWeaponAnim, wantedOverlayMeta, wantedOverlayHot);
+    } else {
+        ranged::ClearPuppetOverlay(puppet.entity.GetInstance());
+    }
     if (puppetRoutine) {
         const bool holdingTalk = talk::HoldingForPlayer(static_cast<uint8_t>(id));
         char const* postTask = talk_policy::PuppetRoutineTask(false, held, holdingTalk, body::IdleTask());
@@ -838,6 +870,7 @@ void Start()
 
 void OnWorldDeactivate()
 {
+    ranged::ResetPuppetOverlays();
     for (auto& puppet : puppets) puppet = Puppet{};
     for (auto& pending : departed) pending = false;
     for (auto& set : contacts) set.clear();

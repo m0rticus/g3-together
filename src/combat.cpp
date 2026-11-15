@@ -6,17 +6,19 @@
 #include "body.h"
 
 #include "config.h"
-#include "hud.h"
 #include "downed.h"
+#include "enclaves.h"
 #include "guid.h"
+#include "hud.h"
 #include "log.h"
 #include "melee_policy.h"
 #include "net.h"
-#include "npcs.h"
 #include "npclease_runtime.h"
 #include "npcplayback.h"
+#include "npcs.h"
 #include "remote.h"
 #include "shot.h"
+#include "witness.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -72,6 +74,19 @@ int HitPoints(Entity& entity)
 bool HasDamageReceiver(eCEntity* entity) { return entity && entity->GetPropertySet(eEPropertySetType_DamageReceiver); }
 
 int Pending(Entity& entity) { return HasDamageReceiver(entity.GetInstance()) ? static_cast<int>(entity.DamageReceiver.DamageAmount) : 0; }
+
+bool AllowsPlayerReplicaDamage(eCEntity const* victim)
+{
+    return !net::IsHost() && victim && victim != gCSession::GetInstance().GetHero() &&
+           victim != remote::ControlledBody() && !remote::IsPuppet(victim) &&
+           victim->GetPropertySet(eEPropertySetType_NPC) && npclease::LocalAuthority(victim);
+}
+
+bool BlocksPlayerReplica(eCEntity const* victim, eCEntity const* source)
+{
+    return !forwarded && (shot::InPlayerReplicaContact() || shot::PlayerReplica(source)) &&
+           !AllowsPlayerReplicaDamage(victim);
+}
 
 bool RejectDownedHit(eCEntity* victim, eCEntity* attacker, char const* entry)
 {
@@ -192,6 +207,10 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         }
     }
     if (ai::ShuttingDown()) return judge[which] ? judge[which](spu, self, other, args) : 0;
+    if (BlocksPlayerReplica(victim.GetInstance(), source)) {
+        ++foreignSkipped;
+        return 0;
+    }
     if (IsPuppetMeleeJudgement(victim.GetInstance(), attacker, source)) {
         ++foreignSkipped;
         return 0;
@@ -343,6 +362,11 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (shot::InNpcReplicaContact()) {
         if (recipient.GetInstance() != remote::ControlledBody()) return GETrue;
     }
+    eCEntity* rawSource = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (!forwarded && (shot::InPlayerReplicaContact() || shot::PlayerReplica(rawSource)) &&
+        !AllowsPlayerReplicaDamage(recipient.GetInstance())) {
+        return GETrue;
+    }
     if (args >= 0) {
         if (npcs::IsMirrored(recipient.GetInstance())) return GETrue;
         return original(spu, self, other, args);
@@ -393,9 +417,32 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         ++localNpcHits;
         return CallOriginalAndLog(spu, self, other, Scaled(instance, attacker, args));
     }
-    if (attacker && attacker != hero && (remote::IsPuppet(attacker) || mirroredNpc)) {
+    const bool remoteArrowOnLeasedNpc = source && shot::PlayerReplica(source) && AllowsPlayerReplicaDamage(instance);
+    if (attacker && attacker != hero && (remote::IsPuppet(attacker) || mirroredNpc) && !remoteArrowOnLeasedNpc) {
         ++dropped;
         return GETrue;
+    }
+    if (remoteArrowOnLeasedNpc) {
+        const int32_t scaled = Scaled(instance, attacker, args);
+        if (scaled >= 0) return GETrue;
+        if (HitPoints(victim) + scaled > 0) return CallOriginalAndLog(spu, self, other, scaled);
+        const GEInt res = CallOriginalAndLog(spu, self, other, -HitPoints(victim));
+        if (!victim.IsDead() && !victim.IsDown()) {
+            if (Outcome(victim) == net::HitKnockOut) {
+                victim.NPC.SetCurrentAttacker(Entity(attacker));
+                victim.Routine.FullStop();
+                victim.Routine.SetTask(bCString("ZS_Unconscious"));
+                witness::KnockOutSeen(instance, attacker);
+            } else {
+                uint8_t guid[16];
+                Guid(instance, guid);
+                if (const int killerPlayer = remote::PuppetOwner(attacker); killerPlayer > 0)
+                    enclaves::NoteRemoteKill(guid, static_cast<uint8_t>(killerPlayer), attacker);
+                witness::MurderSeen(instance, attacker);
+                CallScript("OnCheatKill", instance, instance, 0);
+            }
+        }
+        return res;
     }
     // 2. A hit on an NPC simulated elsewhere goes to its owner, who applies it (and kills); the result comes back
     //    through mirroring. Our hero's hits, and our own NPCs' hits (fights where two players' regions meet).
@@ -406,9 +453,10 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         !npclease::LocalAuthority(instance) && npcs::CompanionOwner(instance) != net::LocalId() &&
         !IsLocalMelee(localMeleeActor, source)) {
         uint8_t identity[16]; Guid(instance, identity);
-        if (!npcs::Incarnation(identity) && !npcs::SeenAt(instance)) owner = 1;
+        if (npcs::Incarnation(identity) || !npcs::SeenAt(instance)) owner = 1;
     }
     if (owner) {
+        if (net::IsHost() && owner > 1) return GETrue;
         if (attacker && attacker != hero && attacker->GetPropertySet(eEPropertySetType_NPC)) {
             uint8_t guid[16], npc[16], flags[16] = {};
             Guid(instance, guid);
@@ -424,9 +472,10 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         if (attacker != hero) { ++dropped; return GETrue; }
         uint8_t guid[16], weapon[16] = {};
         Guid(instance, guid);
-        // The weapon in the right hand, so that the owner can judge a lethal hit with the same weapon.
+        // Held weapon (right hand for melee, left hand for bow/crossbow once the arrow has left the right hand).
         Entity player(hero);
-        const GEInt held = player.Inventory.FindStackIndex(gESlot_RightHand);
+        GEInt held = player.Inventory.FindStackIndex(gESlot_RightHand);
+        if (held < 0) held = player.Inventory.FindStackIndex(gESlot_LeftHand);
         if (held >= 0) {
             const Template item = player.Inventory.GetTemplate(held);
             bCPropertyID const& id = item;
@@ -494,14 +543,14 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     }
     // 4. A hit on another player's puppet: that player's real hero takes it, judged on that player's machine
     //    against its own hero (armour, stumble, knock-out), so the attacker goes along.
-    if (const int owner = remote::PuppetOwner(instance)) {
+    if (const int puppetOwner = remote::PuppetOwner(instance)) {
         if (attacker && attacker != hero) remote::NoteContact(attacker, instance);
         // A hit on a puppet is not evidence that the remote hero was hit in that player's game.
         if (attacker && attacker != hero) {
             if (net::IsHost() && body::LocallyAttacking(attacker))
                 Logf("combat: NPCATTACK stage=host-contact npc=%s player=%d instance=%u host_judged=%u "
                      "phase=%.4f puppet_block=%d damage_forwarded=0 compensation_ms=0 authority=defender-local",
-                     Entity(attacker).GetName().GetText(), owner, npcplayback::MotionInstance(attacker), net::Now(),
+                     Entity(attacker).GetName().GetText(), puppetOwner, npcplayback::MotionInstance(attacker), net::Now(),
                      body::SwingProgress(attacker), InParadeMode(instance) ? 1 : 0);
             return GETrue;
         }
@@ -509,7 +558,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         uint8_t attackerPlayer = 0;
         if (attacker && attacker == hero) attackerPlayer = net::LocalId();
         else if (attacker) Guid(attacker, guid);
-        net::SendHitPlayer(static_cast<uint8_t>(owner), args, guid, attackerPlayer, MeansToKill(attacker, instance));
+        net::SendHitPlayer(static_cast<uint8_t>(puppetOwner), args, guid, attackerPlayer, MeansToKill(attacker, instance));
         ++playerHitsSent;
         return GETrue;
     }
@@ -536,7 +585,14 @@ GEInt JudgeDamage(Entity& victim, eCEntity* source, int* pending, bool apply)
     Entity weapon(source);
     const bool armed = source && source->GetPropertySet(eEPropertySetType_Damage);
     const gEDamageType type = armed ? static_cast<gEDamageType>(weapon.Damage.DamageType) : gEDamageType_None;
-    if (armed && type == gEDamageType_None) weapon.Damage.DamageType = gEDamageType_Blade;
+    if (armed && type == gEDamageType_None) {
+        const gEUseType use = source->GetPropertySet(eEPropertySetType_Interaction)
+                                  ? static_cast<gEUseType>(weapon.Interaction.UseType)
+                                  : gEUseType_None;
+        weapon.Damage.DamageType = (use == gEUseType_Bow || use == gEUseType_CrossBow)
+                                       ? gEDamageType_Missile
+                                       : gEDamageType_Blade;
+    }
     victim.DamageReceiver.DamageAmount = 0;
     const GEInt result = CallScript("OnDamage", victim.GetInstance(), source, 0);
     *pending = Pending(victim);
@@ -565,6 +621,8 @@ GEInt GE_STDCALL TouchDamage(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoi
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     eCEntity* source = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     GroundProbe ground(victim, source, "OnTouchDamage");
+    if (BlocksPlayerReplica(victim, source))
+        return 0;
     if (RejectDownedHit(victim, source, "OnTouchDamage")) return 0;
     return originalTouchDamage(spu, self, other, args);
 }
@@ -603,9 +661,28 @@ eCEntity* DamageSource(eCDynamicEntity* hero, char const** name)
 {
     Entity weapon = Entity(hero).Inventory.GetItemFromSlot(gESlot_RightHand);
     if (!weapon.GetInstance()) weapon = Entity(hero).GetWeapon(GEFalse);
+    if (!weapon.GetInstance()) {
+        Entity left = Entity(hero).Inventory.GetItemFromSlot(gESlot_LeftHand);
+        if (left.GetInstance() && left.GetInstance()->GetPropertySet(eEPropertySetType_Damage)) weapon = left;
+    }
     *name = weapon.GetInstance() ? "weapon" : "hands";
     return weapon.GetInstance() ? weapon.GetInstance() : hero;
 }
+}
+bool ProjectileHit(eCEntity* victim, eCEntity* projectile)
+{
+    if (!victim || !projectile || ai::ShuttingDown()) return false;
+    const unsigned beforeClaims = claimsSent + npcHitsSent + playerHitsSent;
+    Entity target(victim);
+    const int beforeHp = HitPoints(target);
+    if (originalTouchDamage || Find(GetScriptAdminExt().GetScripts(), "OnTouchDamage")) {
+        CallScript("OnTouchDamage", projectile, victim, 0);
+    } else {
+        int pending = 0;
+        GameHit(target, projectile, &pending);
+    }
+    const unsigned afterClaims = claimsSent + npcHitsSent + playerHitsSent;
+    return afterClaims != beforeClaims || HitPoints(target) < beforeHp;
 }
 void Start()
 {

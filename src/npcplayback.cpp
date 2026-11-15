@@ -903,6 +903,10 @@ bool TaskBlocked(gCScriptRoutine_PS* self, bCString const& task)
 {
     eCEntity* entity = self->GetEntity();
     if (downed::RejectReaction(entity, task.GetText(), "routine-task")) return true;
+    if (talk::BlockHeldTalkTask(entity, task.GetText())) {
+        RecordBlockedTaskVerdict(entity, task.GetText());
+        return true;
+    }
     if (!Passive(entity) || task.GetLength() == 0 || talk::AllowPassiveTalkTask(entity, task.GetText())) return false;
     RecordBlockedTaskVerdict(entity, task.GetText());
     return true;

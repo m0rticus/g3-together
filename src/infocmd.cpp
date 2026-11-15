@@ -10,6 +10,7 @@
 #include "enclaves.h"
 #include "ending.h"
 #include "fightmem.h"
+#include "guards.h"
 #include "guide.h"
 #include "guide_policy.h"
 #include "log.h"
@@ -162,6 +163,9 @@ void ApplyNpcSnapshot(net::WorldState const& s, uint8_t from)
             if (mirrored) nav->AccessRoutine() = bCString(s.routine);
             else e.Navigation.SetRoutine(bCString(s.routine));
             if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(mirrored, talk::IsHeld(instance))) {
+                const uint8_t actingPlayer = guide_policy::GuideRoutineActingPlayer(
+                    net::IsHost(), false, npcs::ContextPlayer(instance));
+                guards::Acting context(actingPlayer > 1 ? remote::PuppetOf(actingPlayer) : nullptr);
                 e.Routine.FullStop();
                 e.Routine.ContinueRoutine();
             }

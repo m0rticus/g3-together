@@ -62,7 +62,7 @@ void TickClientSaveRound(uint32_t now)
     }
     if (captured.valid) {
         if (captured.welcome != net::WelcomeSerial() || captured.note.epoch != hostWorld.epoch || now - captured.started > 15000) {
-            captured.valid = false; captured.bytes.clear(); SaveFailure("result-timeout");
+            captured.valid = false; captured.bytes.clear(); xpshare::CancelSaveCapture(); SaveFailure("result-timeout");
         } else if (!captured.queued && static_cast<int32_t>(now - captured.nextTry) >= 0) {
             captured.nextTry = now + 500;
             captured.queued = SendRecord(1, net::CharacterCapture, {captured.note.world, captured.note.save, steam::PlayerId()}, captured.bytes);
@@ -228,7 +228,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
         entryApproved = autoloadAwaiting = false; // a newer epoch restarts the countdown of an automatic entry not yet started
         templateFailures = 0; templateFailCode.clear(); templateFailError = 0;
         if (captured.valid || requestPending) Notice(i18n::ClientSaveCanceledByWorld, true);
-        captured = {}; requestPending = false; receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
+        captured = {}; requestPending = false; xpshare::CancelSaveCapture(); receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {};
         needsNewHero = false; restoreFailed = false; synced = 0; ownCharacterReady = false; hostAdmissionAck = false;
         nextAdmissionTry = 0;
         net::SetInWorld(net::LocalId(), false);
@@ -474,6 +474,7 @@ bool StartSave(char const* name)
     }
     saveWindow = eCApplication::GetInstance().GetHandle();
     if (!saveWindow || !SetTimer(saveWindow, SaveTimer, 30, &SaveNow)) { CancelSave("timer"); return false; }
+    xpshare::BeginSaveCapture();
     PrepareSaveThumbnail();
     Logf("persist: host save requested world=%s save=%s slot=%s epoch=%08x", savingManifest.key.world.c_str(),
          savingManifest.key.save.c_str(), name, epoch);
@@ -553,13 +554,20 @@ void OnSave(uint8_t from, net::SaveNote const& note)
             strncpy_s(answer.name, reason, _TRUNCATE); QueueReply(1, answer); SaveFailure(reason); return;
         }
         captured = {note, std::move(bytes), net::WelcomeSerial(), GetTickCount(), GetTickCount() + 500, true};
+        xpshare::BeginSaveCapture();
         captured.queued = SendRecord(1, net::CharacterCapture, key, captured.bytes);
     } else if (note.op == net::SaveResult || note.op == net::SaveCancel) {
         if (!((captured.welcome == net::WelcomeSerial() && captured.note.save == std::string(note.save)) ||
               (requestPending && requested.save == std::string(note.save)))) return;
         captured = {}; requestPending = false;
         Logf("persist: host save result save=%s ok=%u reason=%s", note.save, note.ok, note.name);
-        if (note.ok) Notice(i18n::SaveComplete); else SaveFailure(note.name);
+        if (note.ok) {
+            xpshare::CommitSaveCapture();
+            Notice(i18n::SaveComplete);
+        } else {
+            xpshare::CancelSaveCapture();
+            SaveFailure(note.name);
+        }
     }
 }
 void StatusHints()
@@ -793,6 +801,7 @@ void Tick()
         !restoreFailed && !resetLocalWorld && !templateHold &&
         receivedWelcome == net::WelcomeSerial() && receivedNote.epoch == hostWorld.epoch) {
         needsNewHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
+        xpshare::OnClientRecordRestored(false);
         clientRejoin.Left();
         story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
     }

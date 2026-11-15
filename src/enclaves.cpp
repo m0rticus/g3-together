@@ -201,12 +201,16 @@ void SendState(std::string const& name, Counters const& c, uint8_t to)
     ++sent;
 }
 
-// Client: what this player's deeds changed since the last look. Counts and fame as additions; acknowledgements and
-// the known crime as the new values (the host keeps the higher).
+// Client: what this player's deeds changed since the last look. Counts and fame as additions; changed acknowledgements
+// and known crime as the new values (-1 when unchanged so the host preserves higher unrelated values while honouring a reset to None).
 void SendDelta(std::string const& name, Counters const& before, Counters const& now)
 {
     Counters d = now;
-    for (int i = 0; i < Crimes; ++i) d.crime[i] = now.crime[i] - before.crime[i];
+    for (int i = 0; i < Crimes; ++i) {
+        d.crime[i] = now.crime[i] - before.crime[i];
+        d.suspect[i] = now.suspect[i] != before.suspect[i] ? now.suspect[i] : -1;
+    }
+    d.known = now.known != before.known ? now.known : -1;
     d.fame = now.fame - before.fame;
     Pending p{name, Note(net::EnclaveDelta, name, d), GetTickCount(), items::Returned(), items::TakesBegun(), items::TakesDone()};
     if (d.crime[gEPlayerCrime_Theft] > 0) {  // wait: the take this theft was counted for may go to someone else
@@ -329,9 +333,12 @@ void OnNote(uint8_t from, net::EnclaveNote const& note)
         Counters c = Read(enclave);
         for (int i = 0; i < Crimes; ++i) {
             c.crime[i] += note.crime[i];
-            if (note.suspect[i] > c.suspect[i]) c.suspect[i] = note.suspect[i];
+            if (c.crime[i] < 0) c.crime[i] = 0;
+            if (note.suspect[i] == 0) c.suspect[i] = 0;
+            else if (note.suspect[i] > c.suspect[i]) c.suspect[i] = note.suspect[i];
         }
-        if (note.known > c.known) c.known = note.known;
+        if (note.known == gEPlayerCrime_None) c.known = gEPlayerCrime_None;
+        else if (note.known > c.known && note.known < Crimes) c.known = note.known;
         if (clientFame) c.fame += note.fame;
         Write(e, c);
         const std::string name(note.name);

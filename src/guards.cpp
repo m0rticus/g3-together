@@ -157,6 +157,12 @@ GEInt GE_STDCALL KillIntent(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
     eCEntity* asked = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     eCEntity* judging = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* puppet = remote::IsPuppet(asked) && !IsLocalPlayer(judging) ? asked : nullptr;
+    if (!puppet && asked && !IsLocalPlayer(asked) && !IsLocalPlayer(judging)) {
+        const uint8_t companionOwner = npcs::CompanionOwner(asked);
+        if (companionOwner && companionOwner != net::LocalId())
+            puppet = remote::PuppetOf(companionOwner);
+    }
+    LocalPlayer local(!puppet && IsLocalPlayer(asked));
     KeepZone(puppet);
     Acting acting(puppet);
     const GEInt result = originalKill(spu, self, other, args);
@@ -323,6 +329,32 @@ eCEntity* StateActor(eCEntity* self, char const* state)
     if (target && remote::IsPuppet(target)) return target;
     eCEntity* attacker = Entity(self).NPC.GetCurrentAttacker().GetInstance();
     return (attacker && remote::IsPuppet(attacker)) ? attacker : nullptr;
+}
+
+bool MeansToKill(eCEntity* npc, eCEntity* playerTarget)
+{
+    static thread_local bool querying = false;
+    if (querying || ai::ShuttingDown() || !npc || !playerTarget || npc == playerTarget ||
+        !npc->GetPropertySet(eEPropertySetType_NPC) || IsLocalPlayer(npc))
+        return false;
+    eCEntity* puppet = remote::IsPuppet(playerTarget) ? playerTarget : nullptr;
+    if (!puppet && !IsLocalPlayer(playerTarget)) return false;
+    querying = true;
+    GEInt result = 0;
+    {
+        LocalPlayer local(!puppet);
+        KeepZone(puppet);
+        Acting acting(puppet, false);
+        if (originalKill) {
+            Entity selfEntity(npc);
+            Entity otherEntity(playerTarget);
+            result = originalKill(nullptr, &selfEntity, &otherEntity, 0);
+        } else {
+            result = GetScriptAdminExt().CallScript(bCString("HasAttackReasonToKill"), npc, playerTarget, 0);
+        }
+    }
+    querying = false;
+    return result != 0;
 }
 
 static void WatchZones()

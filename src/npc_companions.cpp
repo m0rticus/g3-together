@@ -446,10 +446,10 @@ eCEntity* ResolveQuestGuideDestination(Entity const& npc, char const* questName)
     };
     if (questName && *questName) {
         if (gCQuest_PS* quest = manager->GetQuest(bCString(questName))) {
-            if (quest->GetType().GetValue() == gEQuestType_FollowNpc &&
-                quest->GetStatus().GetValue() == gEQuestStatus_Open)
+            const int qType = quest->GetType().GetValue();
+            if (guide_policy::ShouldStartOpenFollowQuestOnGuide(qType, quest->GetStatus().GetValue()))
                 manager->RunQuest(bCString(questName));
-            if (quest->GetStatus().GetValue() == gEQuestStatus_Running)
+            if (guide_policy::ShouldResolveNamedFollowQuestDestination(qType, quest->GetStatus().GetValue()))
                 return resolveFromQuest(quest);
         }
     }
@@ -475,10 +475,8 @@ bool Guide(uint8_t const guid[16], uint8_t player, char const* questName)
     if (!npc.GetInstance() || !actor) { Log("npcs: guide request refused: missing NPC or player"); return false; }
     SetContext(npc.GetInstance(), player);
     eCEntity* destination = ResolveQuestGuideDestination(npc, questName);
-    {
-        guards::Acting context(player == net::LocalId() ? nullptr : actor);
-        GetScriptAdminExt().CallScript(bCString("StartGuidePlayer"), npc.GetInstance(), destination, 0);
-    }
+    guards::Acting context(player == net::LocalId() ? nullptr : actor);
+    GetScriptAdminExt().CallScript(bCString("StartGuidePlayer"), npc.GetInstance(), destination, 0);
     if (actor->GetPropertySet(eEPropertySetType_Party))
         Entity(actor).Party.SetPartyLeader(npc);
     if (npc.GetInstance()->GetPropertySet(eEPropertySetType_Navigation)) {
@@ -488,13 +486,14 @@ bool Guide(uint8_t const guid[16], uint8_t player, char const* questName)
             npc.Navigation.SetCurrentDestinationPoint(destEntity);
         }
     }
-    if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(false, talk::IsHeld(npc.GetInstance()))) {
+    const bool heldInTalk = talk::IsHeld(npc.GetInstance());
+    if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(false, heldInTalk)) {
         npc.Routine.FullStop();
         npc.Routine.ContinueRoutine();
     }
-    Logf("npcs: %s guides player %u toward %s (held_in_talk=%d)", npc.GetName().GetText(), player,
+    Logf("npcs: %s guides player %u toward %s (held_in_talk=%d, task=%s)", npc.GetName().GetText(), player,
          destination ? Entity(destination).GetName().GetText() : "(quest-routine)",
-         talk::IsHeld(npc.GetInstance()) ? 1 : 0);
+         heldInTalk ? 1 : 0, npc.Routine.GetCurrentTask().GetText());
     return true;
 }
 

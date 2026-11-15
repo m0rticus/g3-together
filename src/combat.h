@@ -15,5 +15,6 @@ bool LocalBlow(eCEntity* attacker);
 char const* LastLocalBlowRejectReason();
 bool PlayerBlow(eCEntity* victim);
 bool LethalHit(eCEntity* victim);
+bool ProjectileHit(eCEntity* victim, eCEntity* projectile);
 void ResolveKillXp(eCEntity* victim, eCEntity* killer, bool wasDefeated = false);
 }

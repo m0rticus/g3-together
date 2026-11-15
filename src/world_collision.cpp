@@ -191,10 +191,14 @@ struct NpcCandidate {
     unsigned coveringCells = 0;
     unsigned coveringStaticEntities = 0;
     bool coveringJobRunning = false;
+    bool anyCoveringJobRunning = false;
     bool hasUncachedLocalStatic = false;
+    bool hasMissingSolidPhysic = false;
     bool allLocalRange1Pinned = true;
     std::vector<eCEntity*> localRange1Statics;
 };
+
+constexpr float LocalGroundSupportDropCm = 350.0f;
 
 struct IndexedStatic {
     eCEntity* entity = nullptr;
@@ -319,16 +323,23 @@ void GatherSphereCandidates(std::vector<eCPVSPrefetcher3*> const& prefetchers, p
                 } else if (NeedsPinnedLocalPhysicObject(state)) {
                     desiredPinned.insert(item.entity);
                     cand.localRange1Statics.push_back(item.entity);
+                } else if (IsSolidLocalStaticShape(state) && !state.hasPhysicObject) {
+                    cand.hasMissingSolidPhysic = true;
                 }
             }
         };
 
         bool anyCoveringReady = false;
         for (IndexedCell& entry : gridCells) {
-            if (!BoxContainsXZ(entry.cellBox, cand.pos[0], cand.pos[2], 0.0f)) continue;
-            ++cand.coveringCells;
-            cand.coveringStaticEntities += entry.totalStatics;
-            if (!entry.jobRunning) anyCoveringReady = true;
+            const bool coversCenter = BoxContainsXZ(entry.cellBox, cand.pos[0], cand.pos[2], 0.0f);
+            const bool overlapsColumn = coversCenter || BoxContainsXZ(entry.cellBox, cand.pos[0], cand.pos[2], NpcColumnMarginCm);
+            if (!overlapsColumn) continue;
+            if (entry.jobRunning) cand.anyCoveringJobRunning = true;
+            if (coversCenter) {
+                ++cand.coveringCells;
+                cand.coveringStaticEntities += entry.totalStatics;
+                if (!entry.jobRunning) anyCoveringReady = true;
+            }
             inspectLocalStatics(entry);
         }
         cand.coveringJobRunning = cand.coveringCells > 0 && !anyCoveringReady;
@@ -409,12 +420,13 @@ void SyncPinnedPhysicObjects(std::unordered_set<eCEntity*> const& desiredPinned,
 }
 
 void EvaluateCandidateReadiness(std::vector<NpcCandidate> const& candidates, bool readyHooks,
+                                std::vector<eCEntity const*> const& previousReady,
                                 std::vector<eCEntity const*>& readyNow,
                                 std::vector<std::pair<uintptr_t, bool>>& readinessSnapshot)
 {
     auto& physics = eCPhysicsScene::GetInstance();
     const GEU32 rayHints = eETraceRayHints_TestStaticShapes | eETraceRayHints_IncludeWater;
-    const bCVector rayDir(0.0f, GroundRayDownCm, 0.0f);
+    const bCVector rayDir(0.0f, -(GroundRayUpCm + LocalGroundSupportDropCm), 0.0f);
 
     readyNow.clear();
     readinessSnapshot.clear();
@@ -422,19 +434,21 @@ void EvaluateCandidateReadiness(std::vector<NpcCandidate> const& candidates, boo
     readinessSnapshot.reserve(candidates.size());
 
     for (NpcCandidate const& cand : candidates) {
+        const bool wasReady = std::binary_search(previousReady.begin(), previousReady.end(), cand.entity);
         NpcCollisionGateInput gate;
         gate.hooksReady = readyHooks;
         gate.coveringCells = cand.coveringCells;
         gate.coveringStaticEntities = cand.coveringStaticEntities;
         gate.coveringJobRunning = cand.coveringJobRunning;
-        gate.hasUncachedLocalStatic = cand.hasUncachedLocalStatic;
+        gate.hasUncachedLocalStatic = cand.hasUncachedLocalStatic || cand.hasMissingSolidPhysic;
         gate.allLocalRange1Pinned = cand.allLocalRange1Pinned;
-        if (gate.coveringCells > 0 && !(gate.coveringJobRunning && gate.coveringStaticEntities == 0) &&
+        if ((wasReady || !cand.anyCoveringJobRunning) &&
+            gate.coveringCells > 0 && !(gate.coveringJobRunning && gate.coveringStaticEntities == 0) &&
             !gate.hasUncachedLocalStatic && gate.allLocalRange1Pinned) {
             const bCVector origin(cand.pos[0], cand.pos[1] + GroundRayUpCm, cand.pos[2]);
             gate.hasStaticGroundSupport = physics.TraceRayNearestHit(origin, rayDir, nullptr, rayHints) != GEFalse;
         }
-        const bool ready = EvaluateNpcCollisionReady(gate);
+        const bool ready = EvaluateNpcCollisionReady(gate) && (wasReady || !cand.anyCoveringJobRunning);
         if (ready) readyNow.push_back(cand.entity);
         readinessSnapshot.push_back({reinterpret_cast<uintptr_t>(cand.entity), ready});
     }
@@ -498,9 +512,15 @@ bool SyncSphereStaticCollision(eCEntityAdmin* admin, processing::Sphere const* s
     GatherSphereCandidates(prefetchers, spheres, sphereCount, desiredPinned, candidates);
     SyncPinnedPhysicObjects(desiredPinned, candidates);
 
+    std::vector<eCEntity const*> previousReady;
+    {
+        std::lock_guard<std::mutex> lock(Mutex());
+        previousReady = readyRemoteNpcs;
+    }
+
     std::vector<eCEntity const*> readyNow;
     std::vector<std::pair<uintptr_t, bool>> readinessSnapshot;
-    EvaluateCandidateReadiness(candidates, readyHooks, readyNow, readinessSnapshot);
+    EvaluateCandidateReadiness(candidates, readyHooks, previousReady, readyNow, readinessSnapshot);
 
     std::lock_guard<std::mutex> lock(Mutex());
     const bool changed = DidReadinessChange(lastSphereReadiness, readinessSnapshot);

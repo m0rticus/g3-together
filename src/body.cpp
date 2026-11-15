@@ -494,7 +494,7 @@ void DrivePuppetTimeline(Entity& entity, eCEntity* instance, State& state, Targe
     const bool sameClip = std::strcmp(target.motion, state.playing) == 0 && std::strcmp(currentSlot, fileName) == 0;
     const bool needStart = !sameClip || seqRestart || (looping && !actor->IsMotionRunning(slot0));
     if (needStart) {
-        entity.StopPlayAni();
+        if (!target.keepOverlays) entity.StopPlayAni();
         if (gCScriptRoutine_PS* routine = RoutineOf(instance)) {
             routine->AIStopPlayAnimation();
             routine->AIStopCombatMove();
@@ -504,9 +504,11 @@ void DrivePuppetTimeline(Entity& entity, eCEntity* instance, State& state, Targe
         if (auto* resource = desc.GetMotion()) {
             const float blendSec = discontinuity ? 0.0f : (trackedAction ? 0.10f : 0.14f);
             if (blendSec > 0.0f) actor->SwitchFadeOut(slot0, GEFalse, blendSec);
-            for (int extra = 1; extra <= 3; ++extra) {
-                const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(extra);
-                if (actor->IsMotionRunning(slot)) animation->StopMotion(slot, blendSec);
+            if (!target.keepOverlays) {
+                for (int extra = 1; extra <= 3; ++extra) {
+                    const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(extra);
+                    if (actor->IsMotionRunning(slot)) animation->StopMotion(slot, blendSec);
+                }
             }
             struct MotionPlayDesc {
                 float blendInTime;

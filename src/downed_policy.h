@@ -410,4 +410,27 @@ struct Life
         deathFinished = false;
     }
 };
+
+// Stale non-lethal NPC hits must not turn an attackerless/environmental death into native unconsciousness.
+inline bool UseJudgedHitForDeathRedirect(bool judgedValid, bool judgedLethal, bool hasCurrentNpcAttacker)
+{
+    return judgedValid && (judgedLethal || hasCurrentNpcAttacker);
+}
+
+// Game.dll gCQuest_PS::OnNPCDefeated+0x1b0 dereferences hero->NPC.CurrentAttacker without a null check
+// for active Arena (5) and Sparring (12) quests in Running (1) state.
+constexpr bool SafeQuestDefeatNeedsAttackerGuard(bool targetIsLocalHero, int questType, int questStatus, bool hasAttacker)
+{
+    return targetIsLocalHero && !hasAttacker && questStatus == 1 && (questType == 5 || questType == 12);
+}
+
+inline bool SafeDefeatNeedsHeroFallback(bool targetIsLocalHero, bool hasAttacker, bool questGuardInstalled)
+{
+    return targetIsLocalHero && !hasAttacker && !questGuardInstalled;
+}
+
+inline bool ShouldClearDefeatWinner(bool hasWinner, bool sameAsLoser)
+{
+    return hasWinner && sameAsLoser;
+}
 }

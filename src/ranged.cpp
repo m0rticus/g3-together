@@ -5,6 +5,8 @@
 #include "body.h"
 #include "log.h"
 #include "guid.h"
+#include "movement_policy.h"
+#include "npcplayback_hooks.h"
 #include "remote.h"
 #include "summon.h"
 #include "world.h"
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 namespace g3t::ranged {
@@ -596,4 +599,4 @@ void Flying(LogFn log)
     Format(line, "FLYING projectiles=%d first=%s at=%s meteors=%d", projectiles, first, where, meteors);
     log(line);
 }
-}
+} // namespace g3t::ranged

@@ -678,6 +678,16 @@ class SavingPolicyTests(unittest.TestCase):
         on_char = function_body(self.persist, r"\bvoid\s+OnCharacter\s*\(")
         self.assertIn("saving::store::HeroKey(hero, embedded, &heroVersion)", on_char)
 
+        host_tick = function_body(self.persist, r"\bvoid\s+HostTick\s*\(")
+        self.assertIn("xpshare::PreparePeerAdmissionOrigin(i, generation, record != nullptr);", host_tick)
+        start_save = function_body(self.persist, r"\bbool\s+StartSave\s*\(")
+        self.assertIn("xpshare::BeginSaveCapture();", start_save)
+        finish_save = function_body(self.persist, r"\bvoid\s+FinishSave\s*\(")
+        self.assertIn("xpshare::CommitSaveCapture();", finish_save)
+        self.assertIn("xpshare::CancelSaveCapture();", finish_save)
+        apply_fn = function_body(self.persist, r"\bbool\s+ApplyCharacter\s*\(")
+        self.assertIn("xpshare::OnClientRecordRestored(true);", apply_fn)
+
 
 if __name__ == "__main__":
     unittest.main()

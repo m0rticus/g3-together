@@ -140,14 +140,44 @@ class CombatHostilityContractTests(unittest.TestCase):
         self.assertIn("npclease::LocalAuthority(npc)", arena)
         self.assertIn("npclease::Fenced(npc.GetInstance())", arena)
 
+    def test_nonlethal_orange_vs_lethal_red_hostility_and_restoration(self):
+        policy = source("relation_policy.h")
+        self.assertIn("HumanoidCombatSpecies(", policy)
+        self.assertIn("IsLethalSharedCombat(", policy)
+        self.assertIn("return in.lethal ? Hostile : Angry;", policy)
+
+        ch = source("combat_hostility.cpp")
+        self.assertIn("RemoteNonLethal = 1", ch)
+        self.assertIn("RemoteLethal = 2", ch)
+        self.assertIn("relation::IsLethalSharedCombat(", ch)
+        self.assertIn("guards::MeansToKill(", ch)
+        self.assertIn("in.lethal ? RemoteLethal : RemoteNonLethal", ch)
+
+        eff = between(ch, "int EffectiveAttitude(eCEntity const* npc, int baseAttitude)", "bool FocusPriorityHooked()")
+        self.assertIn("promotedNpcs.insert(KeyOf(npc));", eff)
+
+        imported = between(ch, "void NoteImportedAttitude(", "void OnState(")
+        self.assertIn("importedAttitude != relation::Angry", imported)
+
+        resume = between(ch, "bool ResumeLeasedCombat(", "bool IsCoopParticipant(")
+        self.assertIn("attitude == relation::Hostile || attitude == relation::Angry", resume)
+
+        mirror = between(ch, "uint8_t MirrorAttitude(", "int EffectiveAttitude(")
+        self.assertIn("!enclaves::Together() || fightmem::HasLocalOverride(mutableNpc)", mirror)
+        self.assertIn("relation::EffectiveAttitude(base, in)", mirror)
+
+        ai = source("ai.cpp")
+        filt = between(ai, "GEInt GE_STDCALL FilterAttitude(", "GEInt GE_STDCALL FilterContinue(")
+        self.assertIn("hostAttitude == relation::Hostile || hostAttitude == relation::Angry", filt)
+
     def test_touched_src_files_under_1000_lines(self):
         touched = (
             "relation_policy.h", "combat_hostility.h", "combat_hostility.cpp",
             "relation.cpp", "ai.cpp", "ai_diag.cpp", "enclaves.cpp", "enclaves_murder.cpp",
-            "enclaves_qa.cpp", "npcs.cpp", "npclease_runtime.h", "npclease_internal.h",
-            "npclease_runtime.cpp", "npclease_host.cpp", "npclease_client.cpp",
-            "combat.cpp", "combat_melee.cpp", "combat_claims.cpp", "combat_kill_xp.cpp",
-            "downed.cpp", "infocmd.cpp", "Script_G3Together.cpp",
+            "enclaves_qa.cpp", "guards.h", "guards.cpp", "npcs.cpp", "npclease_runtime.h",
+            "npclease_internal.h", "npclease_runtime.cpp", "npclease_host.cpp",
+            "npclease_client.cpp", "combat.cpp", "combat_melee.cpp", "combat_claims.cpp",
+            "combat_kill_xp.cpp", "downed.cpp", "infocmd.cpp", "Script_G3Together.cpp",
         )
         for name in touched:
             lines = len(source(name).splitlines())

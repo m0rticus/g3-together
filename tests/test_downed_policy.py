@@ -683,6 +683,21 @@ class DownedPolicyTests(unittest.TestCase):
                       "partner_world=", "partner_epoch=", "distance_cm=", "zone=not-sent", "reject="):
             self.assertIn(field, log)
 
+    def test_attackerless_death_redirect_ignores_stale_brawl_and_clears_hazards(self):
+        redirect = function_body(self.downed_cpp, r"\bbool\s+RedirectDeath\s*\(")
+        self.assertIn("UseJudgedHitForDeathRedirect(", redirect)
+        self.assertIn("if (currentAttacker == self)", redirect)
+        self.assertIn("hero.NPC.SetCurrentAttacker(clearAttacker);", redirect)
+        self.assertIn("gEStatusEffect_Burning", redirect)
+        self.assertIn("gEStatusEffect_Poisoned", redirect)
+        self.assertIn("hero.Effect.StopEffect(GETrue);", redirect)
+        self.assertLess(redirect.index("if (currentAttacker == self)"),
+                        redirect.index("hero.Routine.SetTask(bCString(KnockOutTask));"))
+        self.assertLess(redirect.index("if (!lethalDefeat)"),
+                        redirect.index("gEStatusEffect_Burning"))
+        self.assertLess(redirect.index("hero.Effect.StopEffect(GETrue);"),
+                        redirect.index('Hold("redirect-death", state);'))
+
 
 if __name__ == "__main__":
     unittest.main()

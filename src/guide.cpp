@@ -3,12 +3,14 @@
 #include "guide_policy.h"
 
 #include "guid.h"
+#include "guards.h"
 #include "infocmd.h"
 #include "log.h"
 #include "net.h"
 #include "npclease_runtime.h"
 #include "npcs.h"
 #include "remote.h"
+#include "talk.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -21,6 +23,14 @@
 
 namespace g3t::guide {
 namespace {
+static_assert(guide_policy::QuestStatusOpen == gEQuestStatus_Open);
+static_assert(guide_policy::QuestStatusRunning == gEQuestStatus_Running);
+static_assert(guide_policy::QuestStatusFailed == gEQuestStatus_Failed);
+static_assert(guide_policy::QuestStatusObsolete == gEQuestStatus_Obsolete);
+static_assert(guide_policy::QuestStatusCancelled == gEQuestStatus_Cancelled);
+static_assert(guide_policy::QuestStatusLost == gEQuestStatus_Lost);
+static_assert(guide_policy::QuestTypeFollowNpc == gEQuestType_FollowNpc);
+
 // Static analysis (re/out/p8-check-20261024-c.c, p8-decompiled.c): StartGuidePlayer (Script_Game 0xa9110) sets
 // GetPlayer().Party.Leader = the guide; SelectRoutineTask (0xa9440) chooses ZS_GuidePlayer only when the local hero's
 // leader is the NPC, ZS_FollowPlayer only when the NPC's leader is the local hero; ZS_GuidePlayer_Wait measures the
@@ -116,6 +126,9 @@ eCEntity* QuestDestinationForNpc(eCEntity* npc)
 // SelectRoutineTask makes it ZS_GuidePlayer.
 void StartGuiding(Entity& npc)
 {
+    const uint8_t actingPlayer = guide_policy::GuideRoutineActingPlayer(
+        net::IsHost(), talk::IsHeld(npc.GetInstance()), npcs::ContextPlayer(npc.GetInstance()));
+    guards::Acting context(actingPlayer > 1 ? remote::PuppetOf(actingPlayer) : nullptr);
     npc.Routine.FullStop();
     npc.Routine.ContinueRoutine();
 }

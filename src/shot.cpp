@@ -7,8 +7,11 @@
 #include "guid.h"
 #include "log.h"
 #include "net.h"
+#include "npclease_runtime.h"
+#include "npcplayback.h"
 #include "npcs.h"
 #include "remote.h"
+#include "shot_sweep.h"
 #include "summon.h"
 
 #include <Game.h>
@@ -34,12 +37,23 @@ bool mirror = true;     // QA negative control: MirrorOff
 bool copyOwner = true;  // QA negative control: CopyHeroOff (the copy belongs to our own hero, as a naive copy would)
 uint32_t counter = 0;
 unsigned shots = 0, announced = 0, unresolved = 0, received = 0, copies = 0, noPuppet = 0, badTemplate = 0, noSpell = 0;
-unsigned npcAnnounced = 0, npcReceived = 0, npcCopies = 0;
+unsigned npcAnnounced = 0, npcReceived = 0, npcCopies = 0, sweptHits = 0;
 std::unordered_set<std::string> npcReplicas;
+std::unordered_set<std::string> playerReplicas;
 thread_local bool npcReplicaContact = false;
+thread_local bool playerReplicaContact = false;
 bool contactsReady = false;
 bool traceTouches = false;
 void InstallTouch();
+
+struct TrackedLocalShot {
+    uint8_t guid[16] = {};
+    float prevPos[3] = {};
+    DWORD startedAt = 0;
+};
+std::vector<TrackedLocalShot> trackedLocalShots;
+DWORD localShotWatchUntil = 0;
+float lastLocalShootChest[3] = {};
 
 // Our own shot, waiting for its arrow to show up among the world's entities (it does a frame after Shoot spawned it).
 // It is announced a frame after that, as it then flies (a QA shot is re-aimed in the frame it shows up).
@@ -71,6 +85,17 @@ Entity ByGuid(uint8_t const id[16])
 }
 
 char const* NameOf(Entity const& e) { return e.GetInstance() ? e.GetName().GetText() : "-"; }
+
+// Game.dll gCProjectile_PS stores its armed/active contact byte at +0x78; OnTouch returns immediately when 0.
+bool IsProjectileArmed(eCEntityPropertySet const* ps)
+{
+    return ps && reinterpret_cast<unsigned char const*>(ps)[0x78] != 0;
+}
+
+void DisarmProjectile(eCEntityPropertySet* ps)
+{
+    if (ps) reinterpret_cast<unsigned char*>(ps)[0x78] = 0;
+}
 
 bool OwnCaster(eCEntity* caster)
 {
@@ -151,7 +176,18 @@ GEInt GE_STDCALL HookShoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid 
         p.before = ArrowsOf(shooter);
         p.since = GetTickCount();
     }
+    const bool localShooter = shooter && shooter == remote::ControlledBody();
+    if (localShooter) {
+        const bCVector pos = shooter->GetWorldPosition();
+        lastLocalShootChest[0] = pos.GetX();
+        lastLocalShootChest[1] = pos.GetY() + 135.0f;
+        lastLocalShootChest[2] = pos.GetZ();
+    }
     const GEInt result = originalShoot(spu, self, other, args);
+    if (localShooter) {
+        const DWORD now = GetTickCount();
+        localShotWatchUntil = (now ? now : 1) + 3000;
+    }
     if (own) pending.push_back(std::move(p));
     return result;
 }
@@ -177,7 +213,18 @@ GEInt GE_STDCALL WrapMagicProjectile(gCScriptProcessingUnit* spu, GELPVoid self,
         const Entity spell = Entity(caster).Interaction.GetSpell();
         if (spell.GetInstance()) strncpy_s(p.spell, spell.GetName().GetText(), _TRUNCATE);
     }
+    const bool localCaster = caster && caster == remote::ControlledBody();
+    if (localCaster) {
+        const bCVector pos = caster->GetWorldPosition();
+        lastLocalShootChest[0] = pos.GetX();
+        lastLocalShootChest[1] = pos.GetY() + 135.0f;
+        lastLocalShootChest[2] = pos.GetZ();
+    }
     const GEInt result = originalMagicProjectile(spu, self, other, args);
+    if (localCaster) {
+        const DWORD now = GetTickCount();
+        localShotWatchUntil = (now ? now : 1) + 3000;
+    }
     if (own) {
         pending.push_back(std::move(p));
         summon::WatchHits();
@@ -358,6 +405,10 @@ void SpawnShot(uint8_t from, net::ShotNote const& note)
         npcReplicas.emplace(reinterpret_cast<char const*>(id), 16);
         if (*note.spell && !haveSpell)
             Logf("shot: NPC projectile %08X has no local spell metadata for %s", note.netId, note.spell);
+    } else if (copyOwner) {
+        uint8_t id[16];
+        guid::CopyEntity(copy.GetInstance(), id);
+        playerReplicas.emplace(reinterpret_cast<char const*>(id), 16);
     }
     copy.Projectile.Shoot();
     if (npc) ++npcCopies;
@@ -390,12 +441,12 @@ void __fastcall HookTouch(void* projectile, void* edx, eCEntity* touched, eCCont
     auto* set = static_cast<eCEntityPropertySet*>(projectile);
     Entity arrow(set->GetEntity());
     if (combat::IgnoreFriendlyHit(touched, arrow.GetInstance())) return;
-    if (npcReplicas.empty() && !traceTouches) {
+    if (npcReplicas.empty() && playerReplicas.empty() && !traceTouches) {
         originalTouch(projectile, edx, touched, contact);
         return;
     }
     if (traceTouches) {
-        const bool armed = static_cast<unsigned char const*>(projectile)[0x78] != 0;  // OnTouch returns at once if 0
+        const bool armed = IsProjectileArmed(set);  // OnTouch returns at once if 0
         const Entity owner = arrow.GetInstance() ? arrow.Interaction.GetOwner() : Entity();
         const int type = contact ? static_cast<int>(contact->GetCollisionType()) : -1;  // 14 shapes, 100 bones (Animation)
         char const* bone = type == 100 ? contact->GetBone(0).GetText() : "-";
@@ -408,13 +459,23 @@ void __fastcall HookTouch(void* projectile, void* edx, eCEntity* touched, eCCont
                bone && *bone ? bone : "-");
     }
     const bool npcCopy = NpcReplica(arrow.GetInstance());
+    const bool playerCopy = !npcCopy && PlayerReplica(arrow.GetInstance());
     if (npcCopy && touched && touched != remote::ControlledBody() && touched->GetPropertySet(eEPropertySetType_NPC))
         return;  // a visual copy can contact our hero, but shared NPC hits belong to the simulator
     struct ContactScope {
-        bool before;
-        explicit ContactScope(bool npc) : before(npcReplicaContact) { npcReplicaContact = before || npc; }
-        ~ContactScope() { npcReplicaContact = before; }
-    } scope(npcCopy);
+        bool beforeNpc;
+        bool beforePlayer;
+        ContactScope(bool npc, bool player) : beforeNpc(npcReplicaContact), beforePlayer(playerReplicaContact)
+        {
+            npcReplicaContact = beforeNpc || npc;
+            playerReplicaContact = beforePlayer || player;
+        }
+        ~ContactScope()
+        {
+            npcReplicaContact = beforeNpc;
+            playerReplicaContact = beforePlayer;
+        }
+    } scope(npcCopy, playerCopy);
     originalTouch(projectile, edx, touched, contact);
 }
 
@@ -435,7 +496,198 @@ void InstallTouch()
         Log(originalTouch ? "shot: projectile contacts hooked" : "shot: projectile contacts NOT hooked");
     }
 }
+
+bool IsNonBarrierEntity(eCEntity* hit)
+{
+    return hit && (hit->GetPropertySet(eEPropertySetType_NPC) ||
+                   hit->GetPropertySet(eEPropertySetType_PlayerMemory) ||
+                   hit->GetPropertySet(eEPropertySetType_CharacterMovement) ||
+                   hit->GetPropertySet(eEPropertySetType_Item) ||
+                   hit->GetPropertySet(eEPropertySetType_Projectile));
 }
+
+float StaticBarrierFraction(eCEntity* shooter, bCVector const& from, bCVector const& to)
+{
+    const bCVector delta = to - from;
+    const float length = delta.GetMagnitude();
+    if (!(length > 2.0f) || !std::isfinite(length)) return 1.0f;
+    auto& physics = eCPhysicsScene::GetInstance();
+    const GEU32 hints = eETraceRayHints_TestStaticShapes | eETraceRayHints_Distance |
+                        eETraceRayHints_IncludeCollisionGroup17;
+    if (!physics.TraceRayAllHits(from, delta, shooter, hints)) return 1.0f;
+    auto const& report = physics.GetQueryReport();
+    float best = length;
+    bool blocked = false;
+    const int count = std::min(report.m_arrHitEntity.GetCount(), report.m_arrDistance.GetCount());
+    for (int i = 0; i < count; ++i) {
+        const float dist = report.m_arrDistance[i];
+        if (!(dist > 0.0f) || !(dist < best) || !std::isfinite(dist)) continue;
+        eCEntity* hit = report.m_arrHitEntity[i];
+        if (IsNonBarrierEntity(hit)) continue;
+        best = dist;
+        blocked = true;
+    }
+    return blocked ? std::clamp(best / length, 0.0f, 1.0f) : 1.0f;
+}
+
+void FlushPendingShot(eCEntity* arrowInstance)
+{
+    if (!arrowInstance) return;
+    eCEntity* controlled = remote::ControlledBody();
+    for (size_t i = 0; i < pending.size(); ++i) {
+        Pending const& p = pending[i];
+        if (p.shooter != controlled) continue;
+        if (std::find(p.before.begin(), p.before.end(), arrowInstance) != p.before.end()) continue;
+        Announce(p, Entity(arrowInstance));
+        pending.erase(pending.begin() + i);
+        return;
+    }
+}
+
+void DiscoverLocalProjectiles(DWORD now)
+{
+    if (!localShotWatchUntil || static_cast<long>(localShotWatchUntil - now) < 0) {
+        localShotWatchUntil = 0;
+        return;
+    }
+    eCEntity* controlled = remote::ControlledBody();
+    if (!controlled) {
+        localShotWatchUntil = 0;
+        return;
+    }
+    for (eCEntity* e : ArrowsOf(controlled)) {
+        if (!e || NpcReplica(e) || PlayerReplica(e)) continue;
+        auto* projPs = e->GetPropertySet(eEPropertySetType_Projectile);
+        if (!IsProjectileArmed(projPs)) continue;
+        Entity arrow(e);
+        if (!arrow.Projectile.IsFlying()) continue;
+        uint8_t id[16];
+        guid::CopyEntity(e, id);
+        bool known = false;
+        for (TrackedLocalShot const& tracked : trackedLocalShots) {
+            if (std::memcmp(tracked.guid, id, 16) == 0) { known = true; break; }
+        }
+        if (known) continue;
+        const bCVector posVec = e->GetWorldPosition();
+        const bCVector dirVec = static_cast<bCVector>(arrow.Projectile.TargetDirection);
+        const float cur[3] = {posVec.GetX(), posVec.GetY(), posVec.GetZ()};
+        const float dir[3] = {dirVec.GetX(), dirVec.GetY(), dirVec.GetZ()};
+        TrackedLocalShot item{};
+        std::memcpy(item.guid, id, 16);
+        shot_sweep::SeedLaunchOrigin(lastLocalShootChest, cur, dir, item.prevPos);
+        item.startedAt = now ? now : 1;
+        trackedLocalShots.push_back(item);
+    }
+}
+
+void SweepLocalProjectiles()
+{
+    if (net::IsHost() || !net::Connected() || !gCSession::GetInstance().IsGameRunning()) {
+        trackedLocalShots.clear();
+        localShotWatchUntil = 0;
+        return;
+    }
+    const DWORD now = GetTickCount();
+    DiscoverLocalProjectiles(now);
+    if (trackedLocalShots.empty()) return;
+
+    struct CandidateNpc {
+        eCEntity* entity = nullptr;
+        shot_sweep::Cylinder cyl{};
+    };
+    std::vector<CandidateNpc> candidates;
+    bool builtCandidates = false;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    eCEntity* controlled = remote::ControlledBody();
+
+    auto ensureCandidates = [&]() {
+        if (builtCandidates) return;
+        builtCandidates = true;
+        const bTObjArray<Entity> all = Entity::GetEntities();
+        for (int i = 0; i < all.GetCount(); ++i) {
+            Entity npc = all.GetAt(i);
+            eCEntity* e = npc.GetInstance();
+            if (!e || e == hero || e == controlled || remote::IsPuppet(e)) continue;
+            if (!e->GetPropertySet(eEPropertySetType_NPC)) continue;
+            if (npclease::LocalAuthority(e) || npclease::Fenced(e)) continue;
+            if (npc.IsDead() || npc.IsDown()) continue;
+            const bCVector posVec = e->GetWorldPosition();
+            bCBox const& box = e->GetWorldNodeBoundary();
+            const bCVector& low = box.GetMin();
+            const bCVector& high = box.GetMax();
+            auto* move = static_cast<gCCharacterMovement_PS*>(e->GetPropertySet(eEPropertySetType_CharacterMovement));
+            const float pos[3] = {posVec.GetX(), posVec.GetY(), posVec.GetZ()};
+            const float bMin[3] = {low.GetX(), low.GetY(), low.GetZ()};
+            const float bMax[3] = {high.GetX(), high.GetY(), high.GetZ()};
+            CandidateNpc cand{};
+            cand.entity = e;
+            cand.cyl = shot_sweep::BuildTargetCylinder(pos, bMin, bMax, move ? move->GetCharacterHeight() : 0.0f);
+            if (cand.cyl.radius > 0.0f) candidates.push_back(cand);
+        }
+    };
+
+    for (auto it = trackedLocalShots.begin(); it != trackedLocalShots.end();) {
+        Entity arrow = ByGuid(it->guid);
+        eCEntity* instance = arrow.GetInstance();
+        if (!instance || now - it->startedAt > 12000) {
+            it = trackedLocalShots.erase(it);
+            continue;
+        }
+        auto* projPs = instance->GetPropertySet(eEPropertySetType_Projectile);
+        if (!IsProjectileArmed(projPs) || !arrow.Projectile.IsFlying()) {
+            it = trackedLocalShots.erase(it);
+            continue;
+        }
+        const bCVector curVec = instance->GetWorldPosition();
+        const float cur[3] = {curVec.GetX(), curVec.GetY(), curVec.GetZ()};
+        const float dx = cur[0] - it->prevPos[0], dy = cur[1] - it->prevPos[1], dz = cur[2] - it->prevPos[2];
+        if (dx * dx + dy * dy + dz * dz < 0.25f) {
+            ++it;
+            continue;
+        }
+        ensureCandidates();
+        const bCVector prevVec(it->prevPos[0], it->prevPos[1], it->prevPos[2]);
+        const float maxWallT = StaticBarrierFraction(controlled, prevVec, curVec);
+        float bestT = maxWallT;
+        float bestHit[3] = {};
+        eCEntity* bestNpc = nullptr;
+        for (CandidateNpc const& cand : candidates) {
+            if (combat::IgnoreFriendlyHit(cand.entity, instance)) continue;
+            float hitT = 1.0f;
+            float hitPt[3] = {};
+            if (shot_sweep::SweepSegmentCylinder(it->prevPos, cur, cand.cyl, 6.0f, hitT, hitPt) && hitT <= bestT) {
+                bestT = hitT;
+                std::memcpy(bestHit, hitPt, sizeof(bestHit));
+                bestNpc = cand.entity;
+            }
+        }
+        if (bestNpc) {
+            const std::string arrowName = NameOf(arrow);
+            bCMatrix pose = instance->GetWorldMatrix();
+            // Place at pre-step launch origin before FlushPendingShot so 3+ player replicas spawn in front of bestNpc.
+            pose.AccessTranslation() = prevVec;
+            arrow.MoveTo(pose);
+            FlushPendingShot(instance);
+            pose.AccessTranslation() = bCVector(bestHit[0], bestHit[1], bestHit[2]);
+            arrow.MoveTo(pose);
+            const bool applied = combat::ProjectileHit(bestNpc, instance);
+            Entity liveArrow = ByGuid(it->guid);
+            if (eCEntity* liveInstance = liveArrow.GetInstance()) {
+                DisarmProjectile(liveInstance->GetPropertySet(eEPropertySetType_Projectile));
+                liveInstance->EnableCollision(GEFalse);
+                liveArrow.Kill();
+            }
+            ++sweptHits;
+            Logf("shot: swept %s hit passive NPC %s (applied=%d)", arrowName.c_str(), NameOf(Entity(bestNpc)),
+                 applied ? 1 : 0);
+            it = trackedLocalShots.erase(it);
+            continue;
+        }
+        std::memcpy(it->prevPos, cur, sizeof(it->prevPos));
+        ++it;
+    }
+}
+} // namespace
 
 void Start() { net::SetShotHandler(&OnShot); }
 
@@ -449,12 +701,26 @@ bool NpcReplica(eCEntity const* entity)
 
 bool InNpcReplicaContact() { return npcReplicaContact; }
 
+bool PlayerReplica(eCEntity const* entity)
+{
+    if (!entity) return false;
+    uint8_t id[16];
+    guid::CopyEntity(const_cast<eCEntity*>(entity), id);
+    return playerReplicas.count(std::string(reinterpret_cast<char const*>(id), 16)) != 0;
+}
+
+bool InPlayerReplicaContact() { return playerReplicaContact; }
+
 void OnWorldChange()
 {
     timedNpcShots.clear();
     pending.clear();
     npcReplicas.clear();
+    playerReplicas.clear();
+    trackedLocalShots.clear();
+    localShotWatchUntil = 0;
     npcReplicaContact = false;
+    playerReplicaContact = false;
     traceTouches = false;
 }
 
@@ -515,9 +781,14 @@ void Tick()
     }
     Install();
     if (!pending.empty()) Resolve();
+    SweepLocalProjectiles();
     for (auto it = npcReplicas.begin(); it != npcReplicas.end();) {
         const auto* guid = reinterpret_cast<uint8_t const*>(it->data());
         it = ByGuid(guid).GetInstance() ? std::next(it) : npcReplicas.erase(it);
+    }
+    for (auto it = playerReplicas.begin(); it != playerReplicas.end();) {
+        const auto* guid = reinterpret_cast<uint8_t const*>(it->data());
+        it = ByGuid(guid).GetInstance() ? std::next(it) : playerReplicas.erase(it);
     }
 }
 
@@ -525,9 +796,9 @@ void Report(LogFn log)
 {
     char line[600];
     Format(line, "SHOTSTATE installed=%d hooked=%d magic=%d mirror=%d copy_owner=%d shots=%u announced=%u unresolved=%u received=%u copies=%u "
-                    "no_puppet=%u bad_template=%u no_spell=%u npc_announced=%u npc_received=%u npc_copies=%u contacts_ready=%d",
+                    "no_puppet=%u bad_template=%u no_spell=%u npc_announced=%u npc_received=%u npc_copies=%u swept_hits=%u contacts_ready=%d",
               installed, originalShoot != nullptr, magicInstalled, mirror, copyOwner, shots, announced, unresolved, received, copies, noPuppet,
-              badTemplate, noSpell, npcAnnounced, npcReceived, npcCopies, contactsReady ? 1 : 0);
+              badTemplate, noSpell, npcAnnounced, npcReceived, npcCopies, sweptHits, contactsReady ? 1 : 0);
     log(line);
     log("SHOTSTATE end");
 }

@@ -10,6 +10,7 @@
 #include "net.h"
 #include "npclease_runtime.h"
 #include "npcremoval.h"
+#include "persist.h"
 #include "processing.h"
 #include "remote.h"
 #include "world_retirement.h"
@@ -270,7 +271,8 @@ void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
     float const* at = camera ? reinterpret_cast<float const*>(reinterpret_cast<char const*>(camera) + 0x8c) : nullptr;
     const float step = *Field(admin, 0x40);
     elasticActive = false;
-    if (spheresHooked && at && net::IsHost() && gCSession::GetInstance().IsGameRunning()) {
+    if (spheresHooked && at && net::IsHost() && gCSession::GetInstance().IsGameRunning() &&
+        !persist::NativeLoading() && !persist::HeroPending()) {
         if (GetConfig().hostRoi > *Field(admin, 0x10)) {
             std::memcpy(wanted[n].at, at, sizeof(wanted[n].at));
             wanted[n++].radius = GetConfig().hostRoi + step;

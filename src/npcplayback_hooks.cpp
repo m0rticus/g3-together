@@ -289,6 +289,15 @@ GEInt __fastcall EventScript(gCScriptAdmin* self, void* edx, bCString const& nam
         if (!std::strcmp(event, "OnTick")) ++counters.blockedNpcTicks;
         return 0;
     }
+    if (talk::BlockHeldTalkEvent(receiver, event)) {
+        ++counters.blockedEvents;
+        return 0;
+    }
+    const bool bindPlayer = talk_policy::ShouldBindActingPlayerForEvent(net::IsHost(), talk::IsHeld(receiver), event);
+    const uint8_t player = bindPlayer
+        ? talk_policy::EffectiveActingPlayer(true, false, npcs::ContextPlayer(receiver))
+        : 0;
+    guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
     return originalEventScript(self, edx, name, receiver, other, args);
 }
 
@@ -297,16 +306,13 @@ void __fastcall Play(eCVisualAnimation_PS* self, void* edx, eCWrapper_emfx2Actor
 {
     if (ai::ShuttingDown()) { if (originalPlay) originalPlay(self, edx, slot, options); return; }
     eCEntity* entity = self->GetEntity();
-    if (!presenting && IsPassive(entity)) {
-        if (DialogPartner(entity)) {
-            if (static_cast<int>(slot) == 0)
-                talk::OnPartnerMotion(entity, self->GetMotionDesc(slot).GetMotionFilename().GetText());
-        } else {
-            ++counters.blockedAnimations;
-            return;
-        }
+    if (!presenting && IsPassive(entity) && !DialogPartner(entity)) {
+        ++counters.blockedAnimations;
+        return;
     }
     originalPlay(self, edx, slot, options);
+    if (!presenting && IsPassive(entity) && DialogPartner(entity) && static_cast<int>(slot) == 0)
+        talk::OnPartnerMotion(entity, self->GetMotionDesc(slot).GetMotionFilename().GetText());
 }
 
 void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2Actor::eEMotionType slot,

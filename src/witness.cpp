@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "witness.h"
+#include "witness_policy.h"
 
 #include "ai.h"
 #include "enclaves.h"
@@ -20,6 +21,13 @@
 
 namespace g3t::witness {
 namespace {
+static_assert(policy::AimRoutine == gEAIMode_Routine);
+static_assert(policy::AimFlee == gEAIMode_Flee);
+static_assert(policy::AimTalk == gEAIMode_Talk);
+static_assert(policy::AimDown == gEAIMode_Down);
+static_assert(policy::AimDead == gEAIMode_Dead);
+static_assert(policy::AimAbandoned == gEAIMode_Abandoned);
+
 // AssessTarget (Script_Game.dll 0x31470) is where a witness decides: AssessTakeItem calls it directly with the attack reason
 // Theft (C re/findings/social-crime-identity-c.md 2.), as other perceptions do with theirs; it remembers the crime
 // (MemorizePlayerCrime, only for the local player) and sets the NPC's target and task. A mirror's task does not run (ai.cpp),
@@ -115,23 +123,49 @@ GEInt SendWithMirrors(gFScript original, gCScriptProcessingUnit* spu, GELPVoid s
     eCEntity* thing = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     eCEntity* hero = gCSession::GetInstance().GetHero();
     if (!mirrorsPerceive || !enabled || !hero || (actor != hero && thing != hero) || !net::Connected()) return original(spu, self, other, args);
-    std::vector<eCEntity*> opened;
+    struct OpenedMirror {
+        eCEntity* body;
+        gEAIMode savedMode;
+        bCString savedTask;
+        bool openMode;
+        bool openTask;
+    };
+    std::vector<OpenedMirror> opened;
     const bCVector& at = hero->GetWorldPosition();
     const bTObjArray<Entity> all = Entity::GetNPCs();
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity npc = all.GetAt(i);
         eCEntity* body = npc.GetInstance();
-        if (!body || body == hero || !npcs::IsMirrored(body) || !body->GetPropertySet(eEPropertySetType_NPC) || npc.IsDead() || npc.IsDown()) continue;
-        const bCVector& p = body->GetWorldPosition();
+        auto* routine = body ? static_cast<gCScriptRoutine_PS*>(body->GetPropertySet(eEPropertySetType_ScriptRoutine)) : nullptr;
+        const bool hasProps = body && body->GetPropertySet(eEPropertySetType_NPC) && routine;
+        const bCVector& p = body ? body->GetWorldPosition() : at;
         const float dx = p.GetX() - at.GetX(), dy = p.GetY() - at.GetY(), dz = p.GetZ() - at.GetZ();
-        if (dx * dx + dy * dy + dz * dz > 2000.0f * 2000.0f || npc.Routine.AIMode != gEAIMode_Abandoned) continue;
-        npc.Routine.AIMode = gEAIMode_Routine;
-        opened.push_back(body);
+        const gEAIMode mode = routine ? routine->GetAIMode() : gEAIMode_Dead;
+        const bCString savedTask = routine ? routine->GetCurrentTask() : bCString();
+        const auto plan = policy::PlanMirrorPerception(
+            body && npcs::IsMirrored(body),
+            !body || body == hero || remote::IsPuppet(body),
+            hasProps,
+            !body || npc.IsDead() || npc.IsDown(),
+            dx * dx + dy * dy + dz * dz,
+            static_cast<int>(mode),
+            !savedTask.GetLength(),
+            savedTask.Contains("ZS_Unconscious") != GEFalse);
+        if (!plan.eligible) continue;
+        // Mirrors are silenced by npcplayback::Silence (empty CurrentTask) and may also hold AIMode Abandoned;
+        // Script_Game's perception gate (0x31c80) rejects both, so open them just for this perception pass.
+        if (plan.openMode) routine->AccessAIMode().AccessValue() = gEAIMode_Routine;
+        if (plan.openTask) routine->AccessCurrentTask() = bCString("ZS_HangAround_DoNothing");
+        opened.push_back({body, mode, savedTask, plan.openMode, plan.openTask});
     }
     const GEInt result = original(spu, self, other, args);
-    for (eCEntity* body : opened) {
-        Entity npc(body);
-        npc.Routine.AIMode = gEAIMode_Abandoned;  // still a mirror: pacified again (body.cpp)
+    for (OpenedMirror const& entry : opened) {
+        auto* routine = entry.body
+            ? static_cast<gCScriptRoutine_PS*>(entry.body->GetPropertySet(eEPropertySetType_ScriptRoutine))
+            : nullptr;
+        if (!routine) continue;
+        if (entry.openMode) routine->AccessAIMode().AccessValue() = entry.savedMode;
+        if (entry.openTask) routine->AccessCurrentTask() = entry.savedTask;
     }
     ++perceptionsOpened;
     mirrorsOpened += static_cast<unsigned>(opened.size());
@@ -206,7 +240,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     ++seen;
     net::WitnessNote note;
     GuidOf(npc, note.npc);
-    if (const uint8_t owner = npcs::OwnerOf(npc)) {
+    if (const uint8_t owner = policy::ResolveWitnessOwner(npcs::OwnerOf(npc), net::IsHost(), npcs::IsMirrored(npc))) {
         note.op = net::WitnessSaw;
         note.value = args;
         net::SendWitness(owner, note);
@@ -214,7 +248,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         Logf("witness: %s saw this player's crime (reason %d); player %u runs it and lets it react", witness.GetName().GetText(), args, owner);
     }
     const int after = LastCrime(npc);
-    if (enclaves::Together() && after > before) {
+    if (policy::ShouldSendWitnessHolds(enabled, enclaves::Together(), before, after)) {
         note.op = net::WitnessHolds;
         note.value = after;
         net::SendWitness(0, note);
@@ -259,7 +293,7 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
         const int after = LastCrime(npc);
         Logf("witness: %s judged this player (reason %d) on player %u's machine: result %d, crime %d -> %d, task %s%s", witness.GetName().GetText(),
              note.value, from, result, before, after, witness.Routine.GetCurrentTask().GetText(), npcs::IsMirrored(npc) ? " (mirror)" : "");
-        if (enclaves::Together() && after > before) {
+        if (policy::ShouldSendWitnessHolds(enabled, enclaves::Together(), before, after)) {
             net::WitnessNote hold;
             hold.op = net::WitnessHolds;
             std::memcpy(hold.npc, note.npc, 16);
@@ -268,9 +302,16 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
             ++holdsSent;
         }
     } else if (note.op == net::WitnessHolds) {
-        if (note.value > LastCrime(npc) && note.value < gEPlayerCrime_Count) SetLastCrime(npc, note.value);
-        ++holdsApplied;
-        Logf("witness: %s holds crime %d against player %u; together: against this player too", witness.GetName().GetText(), note.value, from);
+        if (!enabled || !enclaves::Together() || witness.IsDead()) {
+            ++refused;
+            return;
+        }
+        if (policy::ShouldApplyWitnessHolds(enabled, enclaves::Together(), witness.IsDead() != GEFalse,
+                                            note.value, LastCrime(npc), gEPlayerCrime_Count)) {
+            SetLastCrime(npc, note.value);
+            ++holdsApplied;
+            Logf("witness: %s holds crime %d against player %u; together: against this player too", witness.GetName().GetText(), note.value, from);
+        }
     }
 }
 }

@@ -2,6 +2,8 @@
 // Share future earned XP through admission-bound cumulative counters; never lift individually saved totals.
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace g3t::net { struct WorldState; }
@@ -138,12 +140,121 @@ struct PeerLink : Receiver {
         if (ackedNonce == outgoing.nonce) ackedSentEarned = streamEarned;
     }
 };
+
+template <size_t MaxPeers>
+struct EpochLedger {
+    std::array<uint32_t, MaxPeers> earned{};
+    std::array<uint32_t, MaxPeers> saved{};
+    std::array<uint32_t, MaxPeers> pendingSave{};
+    bool savePending = false;
+
+    void Reset()
+    {
+        earned.fill(0);
+        saved.fill(0);
+        pendingSave.fill(0);
+        savePending = false;
+    }
+    void Add(uint8_t id, uint32_t amount)
+    {
+        if (id < MaxPeers) earned[id] += amount;
+    }
+    void BeginSave()
+    {
+        pendingSave = earned;
+        savePending = true;
+    }
+    void CommitSave()
+    {
+        if (savePending) saved = pendingSave;
+        pendingSave.fill(0);
+        savePending = false;
+    }
+    void CancelSave()
+    {
+        pendingSave.fill(0);
+        savePending = false;
+    }
+    uint32_t RelayedSince(uint8_t recipient, std::array<uint32_t, MaxPeers> const& baseline) const
+    {
+        uint32_t total = 0;
+        for (size_t id = 2; id < MaxPeers; ++id) {
+            if (id != recipient && earned[id] > baseline[id]) total += earned[id] - baseline[id];
+        }
+        return total;
+    }
+};
+
+template <size_t MaxPeers>
+struct AdmissionBaseline {
+    bool valid = false;
+    uint32_t generation = 0;
+    std::array<uint32_t, MaxPeers> byPeer{};
+};
+
+struct ClientReconnectState {
+    bool hasSavedOrigin = false;
+    bool savePending = false;
+    uint32_t appliedFromHost = 0;
+    uint32_t savedFromHost = 0;
+    uint32_t pendingSaveFromHost = 0;
+    uint32_t reconnectSkip = 0;
+
+    void Reset() { *this = ClientReconnectState{}; }
+    void SetHasSavedOrigin(bool saved) { hasSavedOrigin = saved; }
+    void BeginSave()
+    {
+        pendingSaveFromHost = appliedFromHost;
+        savePending = true;
+    }
+    void CommitSave()
+    {
+        if (savePending) savedFromHost = pendingSaveFromHost;
+        hasSavedOrigin = true;
+        reconnectSkip = 0;
+        pendingSaveFromHost = 0;
+        savePending = false;
+    }
+    void CancelSave()
+    {
+        pendingSaveFromHost = 0;
+        savePending = false;
+    }
+    void OnReconnect()
+    {
+        if (hasSavedOrigin && appliedFromHost > savedFromHost)
+            reconnectSkip = appliedFromHost - savedFromHost;
+        else
+            reconnectSkip = 0;
+    }
+    uint32_t FilterHostGain(uint32_t gain)
+    {
+        if (gain == 0) return 0;
+        if (reconnectSkip > 0) {
+            const uint32_t skip = gain < reconnectSkip ? gain : reconnectSkip;
+            gain -= skip;
+            reconnectSkip -= skip;
+        }
+        appliedFromHost += gain;
+        return gain;
+    }
+};
+
+inline bool ShouldSuppressKillGiveXp(bool shuttingDown, bool hasEarner, bool victimIsNpc)
+{
+    return !shuttingDown && !hasEarner && victimIsNpc;
+}
 }
 
 void Tick();                                  // sends this machine's total, applies what is waiting
 void NoteGiveXp(int gained);                  // spells.cpp: the game's GiveXP raised the local hero's experience by this much
 void OnState(net::WorldState const& s);       // kind 19: another player's total
 void OnWorldChange();                         // reset sharing counters, retaining the loaded hero's own XP/level
+void BeginSaveCapture();
+void CommitSaveCapture();
+void CancelSaveCapture();
+void PreparePeerAdmissionOrigin(uint8_t id, uint32_t generation, bool hasSavedRecord);
+void OnClientRecordRestored(bool hasSavedRecord);
 using LogFn = void (*)(char const*);
 void Report(LogFn log);                       // QA: XPSHARE line
 void Off(LogFn log);                          // QA negative control (dialogxpoff): experience stays with whoever earned it

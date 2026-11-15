@@ -6,9 +6,36 @@
 
 namespace g3t::guide_policy {
 
-constexpr int QuestStatusOpen = 0;     // gEQuestStatus_Open
-constexpr int QuestStatusRunning = 1;  // gEQuestStatus_Running
-constexpr int QuestTypeFollowNpc = 7;  // gEQuestType_FollowNpc
+constexpr int QuestStatusOpen = 0;       // gEQuestStatus_Open
+constexpr int QuestStatusRunning = 1;    // gEQuestStatus_Running
+constexpr int QuestStatusFailed = 3;     // gEQuestStatus_Failed
+constexpr int QuestStatusObsolete = 4;   // gEQuestStatus_Obsolete
+constexpr int QuestStatusCancelled = 5;  // gEQuestStatus_Cancelled
+constexpr int QuestStatusLost = 6;       // gEQuestStatus_Lost
+constexpr int QuestTypeFollowNpc = 7;    // gEQuestType_FollowNpc
+
+constexpr bool ShouldStartOpenFollowQuestOnGuide(int questType, int questStatus) noexcept
+{
+    return questType == QuestTypeFollowNpc && questStatus == QuestStatusOpen;
+}
+
+// When a client explicitly names the FollowNpc quest it is starting (e.g. Gorn_ShowReddock), resolve that quest's
+// DestinationEntity even if the host's quest log already marked it Running or Succeeded for another player earlier.
+constexpr bool ShouldResolveNamedFollowQuestDestination(int questType, int questStatus) noexcept
+{
+    return questType == QuestTypeFollowNpc && questStatus != QuestStatusFailed &&
+           questStatus != QuestStatusObsolete && questStatus != QuestStatusCancelled &&
+           questStatus != QuestStatusLost;
+}
+
+// Script_Game.dll ContinueRoutine (0xa5ea0) invokes SelectRoutineDestination (0xa7050) and SelectRoutineTask (0xa9440),
+// both of which compare Entity::GetPlayer().Party.GetPartyLeader() == self. Without binding Entity::GetPlayer() to the
+// guided remote puppet, SelectRoutineDestination overwrites CurrentDestinationPoint (FP_Reddock) back to the NPC's
+// ambient routine point and SelectRoutineTask falls through to ZS_HangAround instead of ZS_GuidePlayer.
+constexpr uint8_t GuideRoutineActingPlayer(bool isHost, bool heldInTalk, uint8_t contextPlayer) noexcept
+{
+    return (isHost && !heldInTalk && contextPlayer > 1) ? contextPlayer : 0;
+}
 
 // Game.dll gCInfo_PS::OnEndInfo (0x101c1270) skips StartGuidePlayer when the FollowNpc quest's DestinationEntity
 // (e.g. "Reddock" while talking to Gorn in Ardea) is not resolved in the client's local entity cache, leaving

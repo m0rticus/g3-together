@@ -15,6 +15,8 @@ void OnGesture(uint8_t from, uint8_t const guid[16], uint32_t motion, float cons
 void OnPartnerMotion(eCEntity* partner, char const* motion);  // client: forward slot-0 talk gesture immediately
 bool TalkingWithHero(eCEntity const* entity);  // client: this mirrored NPC is in a dialog with our hero
 bool AllowPassiveTalkTask(eCEntity const* entity, char const* task);  // client: allow ZS_Talk on hero's dialog partner
+bool BlockHeldTalkEvent(eCEntity const* entity, char const* eventName); // host: block ContinueRoutine while held in talk
+bool BlockHeldTalkTask(eCEntity const* entity, char const* task);     // host: block wandering task exits while held in talk
 bool IsHeld(eCEntity const* entity);           // host: held for a remote player's dialog
 bool HoldingForPlayer(uint8_t player);         // host: player currently holds an NPC in dialog
 bool InGesture(eCEntity const* entity);        // host: a held NPC plays a gesture of the client's dialog now

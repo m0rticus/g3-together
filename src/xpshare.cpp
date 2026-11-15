@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "xpshare.h"
 
+#include "ai.h"
 #include "guards.h"
 #include "log.h"
 #include "net.h"
@@ -8,6 +9,7 @@
 #include <Game.h>
 #include <Script.h>
 #include <Windows.h>
+#include <intrin.h>
 #include <cstdio>
 #include <cstring>
 
@@ -28,8 +30,85 @@ struct Peer : counter::PeerLink {
     DWORD at = 0;
 };
 Peer peers[net::MaxPlayers + 1];
+counter::EpochLedger<net::MaxPlayers> ledger;
+counter::AdmissionBaseline<net::MaxPlayers> pendingOrigins[net::MaxPlayers];
+counter::ClientReconnectState clientReconnect;
+bool killGiveXpGuardTried = false;
+constexpr uintptr_t GiveXpRva = 0x4e160;
+uintptr_t scriptGameBase = 0;
+gFScript originalGiveXpTarget = nullptr;
 unsigned sent = 0, received = 0, gainsApplied = 0, lifts = 0, queued = 0, repaired = 0;
 int appliedTotal = 0;
+
+GEInt GE_STDCALL GuardUnattributedDeathGiveXp(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+{
+    gFScript original = originalGiveXpTarget;
+    if (!original) {
+        auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleA("Script_Game.dll"));
+        original = base ? reinterpret_cast<gFScript>(base + GiveXpRva) : nullptr;
+        if (!original) return 0;
+    }
+    eCEntity* victim = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+    eCEntity* earner = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    if (counter::ShouldSuppressKillGiveXp(ai::ShuttingDown(), earner != nullptr,
+                                          victim && victim->GetPropertySet(eEPropertySetType_NPC))) {
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) - scriptGameBase;
+        static unsigned suppressed = 0;
+        if (++suppressed <= 40)
+            Logf("xpshare: suppressed unattributed death GiveXP self=%s other=- value=%d caller=SG+0x%x",
+                 Entity(victim).GetName().GetText(), args, static_cast<unsigned>(caller));
+        return 0;
+    }
+    return original(spu, self, other, args);
+}
+
+bool PatchCallSite(unsigned char* call, unsigned char const* target, unsigned char const* prefix, size_t prefixLen,
+                   char const* label)
+{
+    int32_t displacement = 0;
+    std::memcpy(&displacement, call + 1, sizeof(displacement));
+    if (std::memcmp(call - prefixLen, prefix, prefixLen) != 0 || call[0] != 0xe8 ||
+        call + 5 + displacement != target) {
+        Logf("xpshare: %s call site signature did not match; unattributed death XP guard skipped", label);
+        return false;
+    }
+    unsigned char before[5], after[5];
+    std::memcpy(before, call, sizeof(before));
+    DWORD old = 0;
+    if (!VirtualProtect(call, sizeof(before), PAGE_EXECUTE_READWRITE, &old)) {
+        Logf("xpshare: %s call site patch failed (error %lu)", label, GetLastError());
+        return false;
+    }
+    const int32_t nextDisp = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(&GuardUnattributedDeathGiveXp) - reinterpret_cast<intptr_t>(call + 5));
+    std::memcpy(call + 1, &nextDisp, sizeof(nextDisp));
+    std::memcpy(after, call, sizeof(after));
+    DWORD unused = 0;
+    VirtualProtect(call, sizeof(before), old, &unused);
+    FlushInstructionCache(GetCurrentProcess(), call, sizeof(before));
+    ai::TrackPatch(call, before, after, sizeof(before), label);
+    return true;
+}
+
+void EnsureUnattributedXpGuard()
+{
+    if (killGiveXpGuardTried) return;
+    HMODULE module = GetModuleHandleA("Script_Game.dll");
+    if (!module) return;
+    killGiveXpGuardTried = true;
+    auto* base = reinterpret_cast<unsigned char*>(module);
+    scriptGameBase = reinterpret_cast<uintptr_t>(base);
+    originalGiveXpTarget = reinterpret_cast<gFScript>(base + GiveXpRva);
+    static const unsigned char killPrefix[] = {
+        0x75, 0x2e, 0x8b, 0x75, 0x08, 0x6a, 0xff, 0x8d, 0x84, 0x24, 0xdc, 0x00, 0x00, 0x00, 0x50, 0x8d, 0x4c, 0x24, 0x38, 0x51, 0x56
+    };
+    static const unsigned char defeatPrefix[] = {
+        0x75, 0x29, 0x6a, 0xff, 0x8d, 0x84, 0x24, 0xc4, 0x00, 0x00, 0x00, 0x50, 0x8d, 0x4c, 0x24, 0x20, 0x51, 0x57
+    };
+    const bool killOk = PatchCallSite(base + 0x1c2b3, base + GiveXpRva, killPrefix, sizeof(killPrefix), "xpshare Kill->GiveXP");
+    const bool defeatOk = PatchCallSite(base + 0x27834, base + GiveXpRva, defeatPrefix, sizeof(defeatPrefix), "xpshare Defeat->GiveXP");
+    Logf("xpshare: unattributed death GiveXP guard Kill=%d Defeat=%d", killOk ? 1 : 0, defeatOk ? 1 : 0);
+}
 
 bool SessionReady()
 {
@@ -40,6 +119,8 @@ bool SyncPeerGeneration(uint8_t id)
 {
     const bool joined = net::IsHost() ? net::PeerJoined(id) : (id == 1 && net::Joined());
     const uint32_t generation = net::IsHost() ? net::PeerGeneration(id) : net::WelcomeSerial();
+    if (!net::IsHost() && id == 1 && joined && peers[id].generation != generation)
+        clientReconnect.OnReconnect();
     return peers[id].SyncGeneration(joined, generation);
 }
 
@@ -170,7 +251,15 @@ void PrepareAdmissions(DWORD now)
             peer.wasInWorld = true;
             uint32_t stream = 0;
             while (!stream) stream = nonce ^ (++streamSerial * 2654435761u);
-            peer.outgoing.Begin(stream, earned);
+            auto const& origin = pendingOrigins[id];
+            if (net::IsHost() && origin.valid && origin.generation == peer.generation) {
+                peer.outgoing.Begin(stream, origin.byPeer[1]);
+                const uint32_t missedRelay = ledger.RelayedSince(id, origin.byPeer);
+                if (missedRelay > 0) peer.outgoing.Relay(missedRelay);
+                pendingOrigins[id] = {};
+            } else {
+                peer.outgoing.Begin(stream, earned);
+            }
             peer.ResetAdmissionHandshake();
         }
         if (peer.ShouldSendBaseline(now) && SendBaselineTo(id, now)) {
@@ -189,6 +278,7 @@ void NoteGiveXp(int gained)
     // Capture a new peer's origin before adding its first future reward.
     PrepareAdmissions(now);
     earned += static_cast<uint32_t>(gained);
+    ledger.Add(net::LocalId(), static_cast<uint32_t>(gained));
     Logf("xpshare: the hero earned %d (%u in all)", gained, earned);
     SendLive(now, false);
 }
@@ -240,9 +330,11 @@ void OnState(net::WorldState const& s)
         if (SendRequestTo(from)) net::Flush();
         return;
     }
-    const uint32_t gain = peer.Take(theirNonce, theirEarned, MaxGain);
+    uint32_t gain = peer.Take(theirNonce, theirEarned, MaxGain);
+    if (!net::IsHost() && from == 1) gain = clientReconnect.FilterHostGain(gain);
     if (gain > 0) {
         if (net::IsHost()) {
+            ledger.Add(from, gain);
             PrepareAdmissions(now);
             for (uint8_t other = 2; other < net::MaxPlayers; ++other) {
                 if (other != from && peers[other].wasInWorld && peers[other].outgoing.nonce)
@@ -265,10 +357,46 @@ void OnWorldChange()
     nonce = GetTickCount() ^ (GetCurrentProcessId() << 16) ^ (++worldSerial * 2654435761u);
     if (!nonce) nonce = 1;
     for (auto& peer : peers) peer = Peer{};
+    ledger.Reset();
+    for (auto& origin : pendingOrigins) origin = {};
+    clientReconnect.Reset();
+}
+
+void BeginSaveCapture()
+{
+    if (net::IsHost()) ledger.BeginSave();
+    else clientReconnect.BeginSave();
+}
+
+void CommitSaveCapture()
+{
+    if (net::IsHost()) ledger.CommitSave();
+    else clientReconnect.CommitSave();
+}
+
+void CancelSaveCapture()
+{
+    if (net::IsHost()) ledger.CancelSave();
+    else clientReconnect.CancelSave();
+}
+
+void PreparePeerAdmissionOrigin(uint8_t id, uint32_t generation, bool hasSavedRecord)
+{
+    if (!net::IsHost() || id < 2 || id >= net::MaxPlayers || !generation) return;
+    SyncPeerGeneration(id);
+    pendingOrigins[id].valid = true;
+    pendingOrigins[id].generation = generation;
+    pendingOrigins[id].byPeer = hasSavedRecord ? ledger.saved : ledger.earned;
+}
+
+void OnClientRecordRestored(bool hasSavedRecord)
+{
+    if (!net::IsHost()) clientReconnect.SetHasSavedOrigin(hasSavedRecord);
 }
 
 void Tick()
 {
+    EnsureUnattributedXpGuard();
     if (!enabled) return;
     eCDynamicEntity* hero = Hero();
     if (!nonce) nonce = GetTickCount() ^ (GetCurrentProcessId() << 16) ^ 0x9e3779b9u;

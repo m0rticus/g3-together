@@ -96,10 +96,42 @@ inline bool MirrorAnswersFromHost(bool mirrored, bool currentHostSession, bool h
 }
 
 inline bool MirrorSharesCombatHostility(bool mirrored, bool currentHostSession, bool haveRecord,
-                                        uint8_t hostAttitude, bool inCombat, bool remoteSharedHostile)
+                                        uint8_t hostAttitude, bool inCombat, bool remoteSharedHostile,
+                                        bool targetsCoopSide = false)
 {
     return mirrored && currentHostSession &&
-           (remoteSharedHostile || (haveRecord && hostAttitude == Hostile && inCombat));
+           (remoteSharedHostile ||
+            (haveRecord && inCombat &&
+             (targetsCoopSide || hostAttitude == Hostile || hostAttitude == Predator)));
+}
+
+// Humanoid combat species in Gothic 3 CP 1.75 (gESpecies_Human == 0, gESpecies_Orc == 5) use non-lethal knockouts
+// (Angry / orange) unless a lethal attack reason, lethal security zone, or hostile faction applies. Non-humanoid
+// creatures and monsters always fight to the death (Hostile / red).
+inline bool HumanoidCombatSpecies(int species)
+{
+    return species == 0 || species == 5;
+}
+
+// gEAttackReason values that always mean lethal intent (Enemy=12, Murder=13, Revolution=19, Kill=20).
+inline bool LethalCombatAttackReason(int attackReason)
+{
+    return attackReason == 12 || attackReason == 13 || attackReason == 19 || attackReason == 20;
+}
+
+// Non-lethal gEAttackReason values (brawls, warnings, property crimes, and arena/duel bouts).
+inline bool NonLethalCombatAttackReason(int attackReason)
+{
+    return (attackReason >= 1 && attackReason <= 9) || attackReason == 15 || attackReason == 16 ||
+           attackReason == 17 || attackReason == 18;
+}
+
+inline bool IsLethalSharedCombat(bool humanoid, bool hasAttackReasonToKill, int attackReason,
+                                 int unpromotedAttitude, bool remoteLethal = false)
+{
+    if (!humanoid || remoteLethal || hasAttackReasonToKill || LethalCombatAttackReason(attackReason))
+        return true;
+    return unpromotedAttitude == Hostile || unpromotedAttitude == Predator;
 }
 
 enum class CombatRole : uint8_t { OrdinaryNpc, PlayerOrPuppet, CoopCompanion };
@@ -117,6 +149,7 @@ struct SharedCombatInput {
     bool clientLeasedEngagement = false;
     bool syncedSharedHostile = false;
     bool mirrored = false;
+    bool lethal = true;        // callers set from IsLethalSharedCombat; non-lethal combat promotes to Angry (orange)
 };
 
 inline bool BoutAttackReason(int attackReason)
@@ -138,7 +171,7 @@ inline int EffectiveAttitude(int baseAttitude, SharedCombatInput const& in)
 {
     if (!ActiveSharedCombatHostility(in)) return baseAttitude;
     if (baseAttitude == Hostile || baseAttitude == Predator || baseAttitude == Panic) return baseAttitude;
-    return Hostile;
+    return in.lethal ? Hostile : Angry;
 }
 
 struct FocusPriorityInput {

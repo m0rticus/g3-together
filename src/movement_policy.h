@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "ranged_anim.h"
+
 namespace g3t::movement {
 inline unsigned GapBucket(uint64_t us)
 {
@@ -162,6 +164,11 @@ struct PuppetMotionSample {
     uint8_t aniState = 0;
     uint8_t actionSeq = 0;
     bool looping = false;
+    uint32_t overlayAnim0 = 0;
+    uint32_t overlayAnim1 = 0;
+    uint32_t weaponAnim = 0;
+    uint32_t overlayMeta = 0;
+    ranged_anim::OverlayHot overlayHot{};
 };
 
 struct PuppetMotionHistory {
@@ -220,14 +227,16 @@ struct PuppetMotionHistory {
                 ageMsOut = 0;
                 return true;
             }
+            const float t = std::clamp(static_cast<float>(num) / static_cast<float>(span), 0.0f, 1.0f);
+            out = a;
+            out.overlayHot = ranged_anim::InterpolateOverlayHot(
+                a.overlayMeta, a.overlayAnim0, a.overlayAnim1, a.weaponAnim, a.overlayHot,
+                b.overlayMeta, b.overlayAnim0, b.overlayAnim1, b.weaponAnim, b.overlayHot, t);
             if (a.motion == b.motion && a.motion != 0 && (a.looping || a.actionSeq == b.actionSeq)) {
-                out = a;
-                const float t = std::clamp(static_cast<float>(num) / static_cast<float>(span), 0.0f, 1.0f);
                 out.motionFrac = InterpolateMotionFrac(a.motionFrac, b.motionFrac, t, a.looping);
                 ageMsOut = (a.motionFrac < NoMotionFrac && b.motionFrac < NoMotionFrac) ? 0u : static_cast<uint32_t>(num);
                 return true;
             }
-            out = a;
             ageMsOut = static_cast<uint32_t>(num);
             return true;
         }

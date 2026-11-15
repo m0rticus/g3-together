@@ -266,8 +266,11 @@ bool RedirectDeath(eCEntity* self, char const* state)
     bool lethalDefeat = true;
     char const* attackerName = "-";
     int attackerSpecies = -1, attackerReason = -1;
+    eCEntity* currentAttacker = hero.NPC.GetCurrentAttacker().GetInstance();
+    const bool hasNpcAttacker = IsNpcAttacker(currentAttacker, self);
     if (!life.held && !persist::HeroPending()) {
-        if (lastJudgedHitValid && now - lastJudgedHitAt < 1500) {
+        if (UseJudgedHitForDeathRedirect(lastJudgedHitValid && now - lastJudgedHitAt < 1500,
+                                         lastJudgedLethal, hasNpcAttacker)) {
             lastJudgedHitValid = false;
             lethalDefeat = lastJudgedLethal;
             attackerName = lastJudgedAttackerName.empty() ? "-" : lastJudgedAttackerName.c_str();
@@ -275,15 +278,19 @@ bool RedirectDeath(eCEntity* self, char const* state)
             attackerReason = lastJudgedReason;
         } else {
             lastJudgedHitValid = false;
-            eCEntity* attacker = hero.NPC.GetCurrentAttacker().GetInstance();
-            if (IsNpcAttacker(attacker, self)) {
-                Entity npc(attacker);
-                lethalDefeat = IsLethalNpcAttacker(attacker, hero);
+            if (hasNpcAttacker) {
+                Entity npc(currentAttacker);
+                lethalDefeat = IsLethalNpcAttacker(currentAttacker, hero);
                 attackerName = npc.GetName().GetText();
                 attackerSpecies = static_cast<int>(npc.NPC.Species);
                 attackerReason = static_cast<int>(npc.NPC.AttackReason);
             }
         }
+    }
+    if (currentAttacker == self) {
+        Entity clearAttacker;
+        hero.NPC.SetCurrentAttacker(clearAttacker);
+        currentAttacker = nullptr;
     }
     hero.Routine.FullStop();
     hero.Routine.SetTask(bCString(KnockOutTask));
@@ -298,12 +305,16 @@ bool RedirectDeath(eCEntity* self, char const* state)
              state, attackerName, attackerSpecies, attackerReason, hero.PlayerMemory.GetHitPoints());
         return true;
     }
+    hero.NPC.EnableStatusEffects(static_cast<GEInt>(gEStatusEffect_Burning), GEFalse);
+    hero.NPC.EnableStatusEffects(static_cast<GEInt>(gEStatusEffect_Poisoned), GEFalse);
+    hero.Effect.StopEffect(GETrue);
     lethal = life.held || !persist::HeroPending();
     lethalSeenDown = false;
     lethalAt = now;
     if (!persist::HeroPending()) Hold("redirect-death", state);
     ++redirects;
-    Logf("downed: hero would die (%s), knocked out instead (hp=%d)", state, hero.PlayerMemory.GetHitPoints());
+    Logf("downed: hero would die (%s), knocked out instead (hp=%d attacker=%s)", state,
+         hero.PlayerMemory.GetHitPoints(), attackerName);
     return true;
 }
 
@@ -654,7 +665,8 @@ bool IsLethalHeroAttacker(eCEntity* attacker)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero || !IsNpcAttacker(attacker, hero))
         return true;
-    return IsLethalNpcAttacker(attacker, Entity(hero));
+    Entity heroEntity(hero);
+    return IsLethalNpcAttacker(attacker, heroEntity);
 }
 
 void ClearHeroJudgedHit()

@@ -2,6 +2,7 @@
 #include "fightmem.h"
 
 #include "ai.h"
+#include "downed_policy.h"
 #include "guards.h"
 #include "log.h"
 #include "net.h"
@@ -20,6 +21,11 @@
 
 namespace g3t::fightmem {
 namespace {
+static_assert(downed::IsHumanoidSpecies(gESpecies_Human) && downed::IsHumanoidSpecies(gESpecies_Orc));
+static_assert(!downed::IsHumanoidSpecies(gESpecies_Skeleton));
+static_assert(downed::SafeQuestDefeatNeedsAttackerGuard(true, gEQuestType_Arena, gEQuestStatus_Running, false));
+static_assert(downed::SafeQuestDefeatNeedsAttackerGuard(true, gEQuestType_Sparring, gEQuestStatus_Running, false));
+
 constexpr uint8_t Kind = 18;  // net::WorldState kind (17: the epilogue, ending.cpp): guard = the player it is about, npc = LastFightAgainstPlayer
 bool on = true;               // QA negative control: fightmemoff
 bool apart = true;            // QA negative control (grudgeoff): the NPC keeps what it remembers of another player, no grudge
@@ -32,8 +38,12 @@ unsigned upsetAsked = 0, upsets = 0, forgotten = 0;
 
 using Script = GEInt(GE_STDCALL*)(gCScriptProcessingUnit*, GELPVoid, GELPVoid, GEInt);
 using Callback = GEBool(GE_STDCALL*)(gCScriptProcessingUnit*);
+using QuestDefeatedFn = void(__fastcall*)(gCQuest_PS*, void*, eCEntity const*);
 Script originalSound = nullptr, originalDefeated = nullptr, originalDefeat = nullptr, originalCancel = nullptr;
 Callback originalWatch = nullptr;
+QuestDefeatedFn originalQuestDefeated = nullptr;
+bool questDefeatAttempted = false;
+unsigned questDefeatSkipped = 0;
 
 eCEntity* Of(gCScriptProcessingUnit* spu, GELPVoid entity, bool self)
 {
@@ -174,15 +184,73 @@ GEInt GE_STDCALL Defeated(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
     return result;
 }
 
+void __fastcall QuestDefeated(gCQuest_PS* self, void* edx, eCEntity const* entity)
+{
+    if (ai::ShuttingDown()) {
+        if (originalQuestDefeated) originalQuestDefeated(self, edx, entity);
+        return;
+    }
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (self && entity && hero && entity == hero) {
+        const int questType = static_cast<int>(self->GetType().GetValue());
+        const int questStatus = static_cast<int>(self->GetStatus().GetValue());
+        const bool hasAttacker = AttackerOf(hero) != nullptr;
+        if (downed::SafeQuestDefeatNeedsAttackerGuard(true, questType, questStatus, hasAttacker)) {
+            if (++questDefeatSkipped <= 40)
+                Logf("fightmem: skipped gCQuest_PS::OnNPCDefeated for attackerless hero (quest=%s type=%d status=%d)",
+                     self->GetName().GetText(), questType, questStatus);
+            return;
+        }
+    }
+    originalQuestDefeated(self, edx, entity);
+}
+
+void InstallQuestDefeatGuard()
+{
+    if (originalQuestDefeated || questDefeatAttempted || ai::ShuttingDown()) return;
+    HMODULE engineGame = GetModuleHandleA("Game.dll");
+    if (!engineGame) return;
+    questDefeatAttempted = true;
+    auto* entry = reinterpret_cast<unsigned char*>(
+        GetProcAddress(engineGame, "?OnNPCDefeated@gCQuest_PS@@QAEXABVeCEntity@@@Z"));
+    static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
+    if (!entry || std::memcmp(entry, prologue, sizeof(prologue)) != 0) {
+        Log("fightmem: ANOMALY gCQuest_PS::OnNPCDefeated prologue mismatch; fallback Defeat guard active");
+        return;
+    }
+    originalQuestDefeated = reinterpret_cast<QuestDefeatedFn>(
+        ai::JumpTo(entry, reinterpret_cast<void*>(&QuestDefeated), sizeof(prologue)));
+}
+
 GEInt GE_STDCALL Defeat(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalDefeat ? originalDefeat(spu, self, other, args) : 0;
+    InstallQuestDefeatGuard();
     eCEntity* a = Of(spu, self, true);
     eCEntity* b = Of(spu, other, false);
-    eCEntity* puppet = PuppetFor(a, {a, b});
-    const Memory first = Read(a), second = Read(b);
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    const bool targetIsHero = b && hero && b == hero;
+    if (targetIsHero) {
+        const bool hasAttacker = AttackerOf(hero) != nullptr;
+        if (downed::SafeDefeatNeedsHeroFallback(true, hasAttacker, originalQuestDefeated != nullptr)) {
+            Entity victim(hero);
+            victim.NPC.EnableStatusEffects(static_cast<GEInt>(gEStatusEffect_Poisoned), GEFalse);
+            victim.Effect.StopEffect(GETrue);
+            victim.Inventory.HoldStacks(-1, -1);
+            victim.Routine.AIMode = gEAIMode_Down;
+            victim.NPC.CombatState = 0;
+            victim.NPC.AttackReason = gEAttackReason_None;
+            Logf("fightmem: safe fallback Defeat for attackerless hero (%s)", victim.GetName().GetText());
+            return 1;
+        }
+    }
+    Entity none;
+    GELPVoid winnerArg = downed::ShouldClearDefeatWinner(a != nullptr, a == b) ? &none : self;
+    eCEntity* effectiveWinner = winnerArg == &none ? nullptr : a;
+    eCEntity* puppet = PuppetFor(effectiveWinner, {effectiveWinner, b});
+    const Memory first = Read(effectiveWinner), second = Read(b);
     guards::Acting acting(puppet);
-    const GEInt result = originalDefeat(spu, self, other, args);
+    const GEInt result = originalDefeat(spu, winnerArg, other, args);
     if (puppet) {
         ++ends;
         Pass(first, puppet, "defeat");
@@ -256,8 +324,10 @@ void Tick()
     originalDefeat = Hook<Script>(game, 0x27510, reinterpret_cast<void*>(&Defeat));      // Defeat
     originalCancel = Hook<Script>(game, 0x1a4d0, reinterpret_cast<void*>(&Cancel));      // CancelAttack
     originalWatch = Hook<Callback>(game, 0x27e40, reinterpret_cast<void*>(&Watch));      // OnWatchFight
-    Logf("fightmem: AssessFightSound %d, AssessDefeat %d, Defeat %d, CancelAttack %d, OnWatchFight %d", originalSound != nullptr,
-         originalDefeated != nullptr, originalDefeat != nullptr, originalCancel != nullptr, originalWatch != nullptr);
+    InstallQuestDefeatGuard();
+    Logf("fightmem: AssessFightSound %d, AssessDefeat %d, Defeat %d, CancelAttack %d, OnWatchFight %d, QuestDefeat %d",
+         originalSound != nullptr, originalDefeated != nullptr, originalDefeat != nullptr, originalCancel != nullptr,
+         originalWatch != nullptr, originalQuestDefeated != nullptr);
 }
 
 bool StumbleReactionState(char const* state)

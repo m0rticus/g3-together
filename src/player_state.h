@@ -49,6 +49,10 @@ struct PlayerState
     uint16_t motionFrac = 65535;
     uint32_t downedSequence = 0; // the owning player's current downed life; paid revives must echo it
     uint32_t focusNpc = 0, targetNpc = 0; // GUID HashGuid references, 0 = no NPC
+    char overlayAnim0[96] = {};  // active upper-body emfx2 overlay motion 0 (slots 1..7)
+    char overlayAnim1[96] = {};  // active upper-body emfx2 overlay motion 1 (slots 1..7)
+    char weaponAnim[96] = {};    // active left-hand weapon motion (e.g. <Bow>_PowerRaise_00 / <CrossBow>_Cock_00)
+    uint32_t overlayMeta = 0;    // packed ranged_anim::OverlayMeta (0 when no overlay/weapon motion is active)
 };
 #pragma pack(pop)
 
