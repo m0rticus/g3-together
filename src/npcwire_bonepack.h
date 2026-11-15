@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace g3t::npcwire::bones {
 
@@ -167,16 +170,33 @@ inline uint32_t PoseRiceCost(uint32_t value, unsigned k, unsigned rawWidth)
         : quotient + 1u + k;
 }
 
+inline unsigned PoseBitWidth(uint32_t value) noexcept
+{
+    if (!value) return 0;
+#if defined(_MSC_VER)
+    unsigned long index = 0;
+    _BitScanReverse(&index, value);
+    return static_cast<unsigned>(index + 1);
+#elif defined(__GNUC__) || defined(__clang__)
+    return static_cast<unsigned>(32 - __builtin_clz(value));
+#else
+    unsigned width = 0;
+    for (uint32_t bits = value; bits; bits >>= 1) ++width;
+    return width;
+#endif
+}
+
 // Exact 21-bit-escape cost selection. Nonzero quotients below the escape
 // threshold occupy at most four k values; larger k values share a zero count.
 struct PoseRiceParameters {
     uint64_t savings[16]{};
     uint32_t widths[33]{};
+    uint32_t count = 0;
 
     void Add(uint32_t value)
     {
-        unsigned width = 0;
-        for (uint32_t bits = value; bits; bits >>= 1) ++width;
+        ++count;
+        const unsigned width = PoseBitWidth(value);
         ++widths[width];
         for (unsigned k = width > 4 ? width - 4 : 0; k < width && k < 16; ++k) {
             const uint32_t quotient = value >> k;
@@ -184,7 +204,7 @@ struct PoseRiceParameters {
         }
     }
 
-    unsigned Best() const
+    unsigned Best(std::size_t& outBits) const
     {
         uint32_t zeros = 0;
         uint64_t bestSaving = 0;
@@ -194,7 +214,14 @@ struct PoseRiceParameters {
             const uint64_t saving = savings[k] + uint64_t(zeros) * (36 - k);
             if (saving > bestSaving) { bestSaving = saving; best = k; }
         }
+        outBits = static_cast<std::size_t>(uint64_t(count) * 37u - bestSaving);
         return best;
+    }
+
+    unsigned Best() const
+    {
+        std::size_t ignored = 0;
+        return Best(ignored);
     }
 };
 

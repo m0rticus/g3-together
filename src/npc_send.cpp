@@ -59,9 +59,14 @@ void PrepareHostSendFrame(std::vector<npcsend_candidates::GuidCandidate> const& 
     for (size_t i = 0; i < candidates.size(); ++i) {
         if (!npcsend_candidates::Eligible(candidates[i])) continue;
         if (i < firstProcessed) ++interactionNpcs;
-        else { ++processedNpcs; out.processedKeys.insert(candidates[i].key); }
+        else ++processedNpcs;
     }
     streamDiag.Candidates(interactionNpcs, processedNpcs, candidateKeyCount, processedCount);
+    for (uint8_t player = 1; player < net::MaxPlayers; ++player) {
+        eCEntity* actor = player == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(player);
+        if (actor && actor->GetPropertySet(eEPropertySetType_Party))
+            out.partyLeaderOf[player] = Entity(actor).Party.GetPartyLeader().GetInstance();
+    }
     net::Remote const* remotes = net::Remotes();
     for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
         if (!remotes[id].connected) continue;
@@ -85,20 +90,35 @@ eCEntity* AdmitHostSendCandidate(GuidKey const& candidateKey, eCEntity* hero, eC
             if (net::InWorld(id) && remotes[id].connected && !recipientNpcs[id].count(key))
                 net::RecordNpcSendDecision(decision);
     };
-    Entity npc = guid::Resolve(candidateKey.data());
-    eCEntity* instance = npc.GetInstance();
+    eCEntity* instance = nullptr;
+    bool fromProcessing = false;
+    bool haveCachedGuid = false;
+    if (const auto cached = frame.entities.find(candidateKey); cached != frame.entities.end()) {
+        fromProcessing = cached->second.fromProcessed;
+        if (!cached->second.ambiguous && cached->second.instance) {
+            instance = cached->second.instance;
+            std::memcpy(outGuid, candidateKey.data(), 16);
+            outKey = candidateKey;
+            haveCachedGuid = true;
+        }
+    }
+    if (!haveCachedGuid) {
+        Entity npc = guid::Resolve(candidateKey.data());
+        instance = npc.GetInstance();
+    }
     if (!instance) { streamDiag.Candidate(Drop::Unresolved); return nullptr; }
     if (instance == hero || remote::IsPuppet(instance) || instance == controlled) {
         streamDiag.Candidate(Drop::Hero);
         return nullptr;
     }
     if (npcremoval::Suppressed(instance)) { streamDiag.Candidate(Drop::Removed); return nullptr; }
-    guid::CopyEntity(instance, outGuid);
-    outKey = Key(outGuid);
+    if (!haveCachedGuid) {
+        guid::CopyEntity(instance, outGuid);
+        outKey = Key(outGuid);
+    }
     if (npclease::SuppressHostPublication(outGuid)) { streamDiag.Candidate(Drop::Lease); return nullptr; }
     const bCVector& w = instance->GetWorldPosition();
     const float where[3] = {w.GetX(), w.GetY(), w.GetZ()};
-    const bool fromProcessing = frame.processedKeys.count(candidateKey) != 0;
     for (uint8_t id = 2; id < net::MaxPlayers; ++id)
         if (frame.recipientHere[id])
             streamDiag.Reach(id, body::Distance(where, remotes[id].latest.position), fromProcessing,
@@ -268,13 +288,15 @@ void FinishOwnedTick(eCEntity* hero, float const players[][3], int playerCount)
         }
     }
     if (streamDiag.Due(net::Now())) {
+        const uint32_t now = net::Now();
         npcstream_diag::Context context;
         context.hostValid = hero != nullptr && playerCount > 0;
         if (context.hostValid) std::memcpy(context.hostAt, players[0], sizeof(context.hostAt));
         context.mode = GetConfig().hostSimSpheres ? "spheres" : GetConfig().hostSimElastic ? "elastic" : "off";
         context.roiCm = GetConfig().hostRoi;
         context.sim = world::HostSimulationStatus();
-        streamDiag.Flush(net::Now(), context, [](char const* line) { Log(line); });
+        context.perf = host_frame_diag::Global().TakeStreamSummary(now);
+        streamDiag.Flush(now, context, [](char const* line) { Log(line); });
     }
 }
 
@@ -287,6 +309,7 @@ void HostTick(void (*sendOwned)(eCEntity*, float const[][3], int))
     if (net::JoinCount() != knownJoins) {
         knownJoins = net::JoinCount();
         namesSent.clear();
+        npcplayback::ResetPublishedNames();
         for (auto const& entry : forceHistory) for (auto const& force : entry.second) net::SendRagdoll(force);
     }
     float players[net::MaxPlayers][3];
@@ -542,7 +565,8 @@ bool CheckHostSendRange(eCEntity* instance, GuidKey const& key, float const at[3
     return true;
 }
 
-void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& key, net::NpcRecord& r,
+void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& key,
+                              eCEntity* const partyLeaderOf[net::MaxPlayers], net::NpcRecord& r,
                               std::vector<pose::Bone>& bones, uint8_t& poseFlags, bool& posed, bool& moving)
 {
     r.movementMode = static_cast<uint8_t>(self.CharacterMovement.GetMovementMode());
@@ -553,9 +577,7 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
         r.waiting = self.Party.Waiting ? 1 : 0;
     }
     for (uint8_t player = 1; player < net::MaxPlayers; ++player) {
-        eCEntity* actor = player == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(player);
-        if (actor && actor->GetPropertySet(eEPropertySetType_Party) && Entity(actor).Party.GetPartyLeader().GetInstance() == instance)
-            r.guidePlayer = player;
+        if (partyLeaderOf[player] == instance) r.guidePlayer = player;
     }
     if (self.IsDead() && (r.movementMode == gECharMovementMode_RagDollDead ||
                           !std::strncmp(self.Routine.GetCurrentTask().GetText(), "ZS_RagDollDead", 14)))
@@ -566,7 +588,9 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
     r.aiMode = static_cast<uint8_t>(body::AIModeOf(instance));
     r.action = static_cast<uint8_t>(static_cast<gEAction>(self.Routine.Action));
     r.attackReason = static_cast<uint8_t>(static_cast<gEAttackReason>(self.NPC.AttackReason));
-    Entity damageSource = self.Inventory.GetItemFromSlot(gESlot_RightHand);
+    const Entity heldRight = self.Inventory.GetItemFromSlot(gESlot_RightHand);
+    const Entity heldLeft = self.Inventory.GetItemFromSlot(gESlot_LeftHand);
+    Entity damageSource = heldRight;
     if (!damageSource.GetInstance() || !damageSource.GetInstance()->GetPropertySet(eEPropertySetType_Damage)) damageSource = self;
     if (damageSource.GetInstance()->GetPropertySet(eEPropertySetType_Damage)) {
         r.damageType = static_cast<uint8_t>(static_cast<gEDamageType>(damageSource.Damage.DamageType));
@@ -583,13 +607,15 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
     }
     const bool parrying = r.aniState == gEAniState_Parade && combat::InParadeMode(instance);
     if (parrying) r.flags |= 64;
-    r.heldRight = HeldHash(self, gESlot_RightHand);
-    r.heldLeft = HeldHash(self, gESlot_LeftHand);
-    for (gESlot slot : {gESlot_RightHand, gESlot_LeftHand}) {
-        const Entity held = self.Inventory.GetItemFromSlot(slot);
-        if (!held.GetInstance()) continue;
-        const uint32_t hash = net::HashName(held.GetName().GetText());
-        if (namesSent.insert(hash).second) net::SendMotionName(hash, held.GetName().GetText());
+    if (heldRight.GetInstance()) {
+        const char* rightName = heldRight.GetName().GetText();
+        r.heldRight = net::HashName(rightName);
+        if (namesSent.insert(r.heldRight).second) net::SendMotionName(r.heldRight, rightName);
+    }
+    if (heldLeft.GetInstance()) {
+        const char* leftName = heldLeft.GetName().GetText();
+        r.heldLeft = net::HashName(leftName);
+        if (namesSent.insert(r.heldLeft).second) net::SendMotionName(r.heldLeft, leftName);
     }
     char motion[96] = {};
     if (body::CurrentMotion(instance, motion, sizeof(motion)) && *motion) {

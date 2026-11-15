@@ -19,6 +19,7 @@
 #include "replication.h"
 #include "steam.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -227,9 +228,27 @@ inline uint32_t ControlWire32(uint8_t const* data)
     return static_cast<uint32_t>(BoneWire16(data)) | (static_cast<uint32_t>(BoneWire16(data + 2)) << 16);
 }
 
-inline std::string NpcKey(uint8_t const* guid)
+using NpcKeyValue = std::array<uint8_t, 16>;
+
+struct NpcKeyHash {
+    size_t operator()(NpcKeyValue const& key) const noexcept
+    {
+        uint64_t a = 0, b = 0;
+        std::memcpy(&a, key.data(), sizeof(a));
+        std::memcpy(&b, key.data() + sizeof(a), sizeof(b));
+        uint64_t mixed = a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
+        mixed ^= mixed >> 33;
+        mixed *= 0xff51afd7ed558ccdull;
+        mixed ^= mixed >> 33;
+        return static_cast<size_t>(mixed);
+    }
+};
+
+inline NpcKeyValue NpcKey(uint8_t const* guid) noexcept
 {
-    return std::string(reinterpret_cast<char const*>(guid), 16);
+    NpcKeyValue key{};
+    std::memcpy(key.data(), guid, key.size());
+    return key;
 }
 
 inline uint32_t DirectCookieTag(uint8_t const cookie[16])
@@ -316,21 +335,21 @@ struct PreparedControl {
 extern uint32_t npcSequence;
 extern uint32_t npcPublication;
 extern std::unordered_map<std::string, replication::Sequence> npcOrigins[MaxPlayers];
-extern std::unordered_map<std::string, replication::ReplicaOrder> npcPublications;
+extern std::unordered_map<NpcKeyValue, replication::ReplicaOrder, NpcKeyHash> npcPublications;
 extern unsigned poseSent, poseReceived, poseSendFailed;
 extern unsigned npcAccepted, npcRejected, npcStale;
 extern unsigned controlErrors, npcControlFallback;
 extern npcwire::Context controlSender, controlReceiver;
 extern uint32_t receivedControlGeneration;
 extern bonewire::Dictionary boneLayouts;
-extern std::unordered_map<std::string, bonewire::PoseCache> sentPoses[MaxPlayers], decodedPoses;
+extern std::unordered_map<NpcKeyValue, bonewire::PoseCache, NpcKeyHash> sentPoses[MaxPlayers], decodedPoses;
 extern uint64_t boneGeneration, receivedBoneGeneration;
 extern uint32_t nextBoneLayout;
 extern std::unordered_map<uint16_t, uint32_t> boneOffered[MaxPlayers];
 extern std::unordered_set<uint16_t> boneAcknowledged[MaxPlayers];
 extern bool boneExhaustionLogged;
 extern unsigned boneInvalidLogs, boneFallbackFailureLogs;
-extern std::unordered_map<std::string, ControlState> controlStates;
+extern std::unordered_map<NpcKeyValue, ControlState, NpcKeyHash> controlStates;
 extern unsigned npcControlCreated, npcControlAckAccepted;
 extern uint64_t npcOrderedSetupPoses, npcOrderedSetupControls, npcAnchorsSent, npcAnchorsReceived;
 
@@ -389,7 +408,7 @@ void ResetNpcCountersOnStart();
 bool SendFullNpc(ENetPeer* peer, NpcRecord const& record, bool reliable);
 void HandleControlId(ENetPeer* peer, ENetPacket const* packet);
 bool HandleControlSignal(ENetPeer* peer, ENetPacket* packet, uint8_t& peerId,
-                         std::unordered_map<std::string, ControlState>::const_iterator& state);
+                         decltype(controlStates)::const_iterator& state);
 bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type);
 
 bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type);

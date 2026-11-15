@@ -4,6 +4,7 @@
 // is sent, and nothing here limits, delays or drops any NPC traffic.
 #pragma once
 
+#include "host_frame_diag.h"
 #include "hostsim_status.h"
 
 #include <cmath>
@@ -36,6 +37,7 @@ struct Context {
     char const* mode = "spheres";
     float roiCm = 0.0f;
     world::HostSimStatus sim;
+    host_frame_diag::Summary perf{};
 };
 
 class Window {
@@ -169,7 +171,10 @@ class Window {
                                   Name(static_cast<Drop>(i)), PerSecond(total[i], windowMs));
             any = true;
         }
-        if (!any && used > 0 && static_cast<size_t>(used) < size) std::snprintf(out + used, size - static_cast<size_t>(used), "-");
+        if (!any && used > 0 && static_cast<size_t>(used) < size)
+            used += std::snprintf(out + used, size - static_cast<size_t>(used), "-");
+        if (context.perf.frames && used > 0 && static_cast<size_t>(used) < size)
+            host_frame_diag::FormatFields(out + used, size - static_cast<size_t>(used), context.perf);
     }
 };
 }

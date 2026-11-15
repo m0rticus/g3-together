@@ -34,9 +34,11 @@ inline bool Encode(Transform const& source, Bone& target)
     Bone result;
     result.name = source.name;
     for (int i = 0; i < 12; ++i) {
-        const float value = std::round(source.values[i] * (i < 9 ? BasisScale : PositionScale));
-        if (!std::isfinite(value) || value < -32768.0f || value > 32767.0f) return false;
-        result.values[i] = static_cast<int16_t>(value);
+        const float scaled = source.values[i] * (i < 9 ? BasisScale : PositionScale);
+        // Rejects NaN, +-Inf, and values whose half-away-from-zero rounding exceeds int16_t.
+        if (!(scaled > -32768.5f && scaled < 32767.5f)) return false;
+        const int rounded = static_cast<int>(static_cast<double>(scaled) + (scaled >= 0.0f ? 0.5 : -0.5));
+        result.values[i] = static_cast<int16_t>(rounded);
     }
     target = result;
     return true;

@@ -52,14 +52,16 @@ static void RiceAndIntegerBounds()
         }
         unsigned best = 0;
         for (unsigned k = 1; k < 16; ++k) if (costs[k] < costs[best]) best = k;
-        assert(parameters.Best() == best);
+        std::size_t bestBits = 0;
+        assert(parameters.Best(bestBits) == best && bestBits == costs[best]);
     }
     for (uint32_t value = 0; value <= 262140; ++value) {
         PoseRiceParameters parameters; parameters.Add(value);
         unsigned best = 0;
         for (unsigned k = 1; k < 16; ++k)
             if (PoseRiceCost(value, k, 21) < PoseRiceCost(value, best, 21)) best = k;
-        assert(parameters.Best() == best);
+        std::size_t bestBits = 0;
+        assert(parameters.Best(bestBits) == best && bestBits == PoseRiceCost(value, best, 21));
         PoseRiceWriter writer;
         writer.Put(value & 7, 3); writer.Rice(value, best, 21); writer.Align();
         PoseRiceReader reader{writer.bytes};
@@ -76,6 +78,25 @@ static void RiceAndIntegerBounds()
     for (int value = -32768; value <= 32767; ++value) {
         auto value16 = static_cast<int16_t>(value);
         assert(PoseUnzigZag(PoseZigZag(value16)) == value16);
+    }
+    {
+        pose::Transform t{};
+        t.name = 42;
+        t.values[0] = 0.5f / pose::BasisScale;
+        t.values[1] = -0.5f / pose::BasisScale;
+        t.values[2] = 32767.49f / pose::BasisScale;
+        t.values[3] = -32768.49f / pose::BasisScale;
+        t.values[9] = 0.5f / pose::PositionScale;
+        t.values[10] = -0.5f / pose::PositionScale;
+        pose::Bone encoded{};
+        assert(pose::Encode(t, encoded));
+        assert(encoded.values[0] == 1 && encoded.values[1] == -1);
+        assert(encoded.values[2] == 32767 && encoded.values[3] == -32768);
+        assert(encoded.values[9] == 1 && encoded.values[10] == -1);
+        t.values[0] = NAN;
+        assert(!pose::Encode(t, encoded));
+        t.values[0] = 32768.0f / pose::BasisScale;
+        assert(!pose::Encode(t, encoded));
     }
 }
 

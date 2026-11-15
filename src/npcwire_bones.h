@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace g3t::npcwire::bones {
@@ -87,6 +88,7 @@ public:
     // dictionary is installed, allowing a request after a structurally valid
     // but early pose; bones changes only on Ok. The caller must fence epoch.
     // All other output arguments change only on Ok.
+    Status ValidatePose(uint16_t layoutId, pose::Bone const* bones, std::size_t count) const;
     Status EncodePose(uint16_t layoutId, pose::Bone const* bones, std::size_t count,
                       std::vector<uint8_t>& message) const;
     Status DecodePose(uint8_t const* data, std::size_t size, std::vector<pose::Bone>& bones,
@@ -96,6 +98,7 @@ private:
     uint32_t world_ = 0;
     uint64_t generation_ = 0;
     std::map<uint16_t, std::vector<uint32_t>> layouts_;
+    std::unordered_map<uint64_t, std::vector<uint16_t>> byDigest_;
 };
 
 // Requests carry no generation: a host can answer after a same-epoch reset.

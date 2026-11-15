@@ -21,11 +21,14 @@ struct SourceSkeleton {
     std::string actorName;
     std::vector<std::string> names;
     std::vector<uint32_t> hashes;
+    uint64_t publishedEpoch = 0;
+    PublishName publishedFn = nullptr;
     uint32_t seen = 0;
     bool valid = false;
 };
 
 std::unordered_map<eCWrapper_emfx2Actor*, SourceSkeleton> sourceSkeletons;
+uint64_t publishedNameEpoch = 1;
 
 } // namespace
 
@@ -258,11 +261,17 @@ void PruneSkeletonCache(uint32_t now)
 void ClearSkeletonCache()
 {
     sourceSkeletons.clear();
+    ++publishedNameEpoch;
 }
 
 } // namespace g3t::npcplayback::detail
 
 namespace g3t::npcplayback {
+
+void ResetPublishedNames()
+{
+    ++detail::publishedNameEpoch;
+}
 
 bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flags, PublishName publish)
 {
@@ -287,6 +296,8 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
         cache.actorName = actor->GetActorName().GetText();
         cache.names.clear();
         cache.hashes.clear();
+        cache.publishedEpoch = 0;
+        cache.publishedFn = nullptr;
         cache.valid = true;
         for (int i = 0; i < nodes.mLength; ++i) {
             cache.names.emplace_back(actor->GetName(nodes.mData + i).GetText());
@@ -297,17 +308,23 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
         if (!cache.valid) Logf("npcplayback: %s has ambiguous bone names", entity->GetName().GetText());
     }
     if (!cache.valid) return false;
+    if (publish && (cache.publishedEpoch != detail::publishedNameEpoch || cache.publishedFn != publish)) {
+        for (int i = 0; i < nodes.mLength; ++i) publish(cache.hashes[i], cache.names[i].c_str());
+        cache.publishedEpoch = detail::publishedNameEpoch;
+        cache.publishedFn = publish;
+    }
+    bones.resize(static_cast<size_t>(nodes.mLength));
+    auto const* rawNodes = reinterpret_cast<unsigned char const*>(nodes.mData);
+    constexpr size_t NodeStride = sizeof(*nodes.mData);
     for (int i = 0; i < nodes.mLength; ++i) {
-        if (publish) publish(cache.hashes[i], cache.names[i].c_str());
         bCMatrix matrix;
-        std::memcpy(&matrix, reinterpret_cast<unsigned char const*>(nodes.mData + i) + 0x44, sizeof(matrix));
+        std::memcpy(&matrix, rawNodes + static_cast<size_t>(i) * NodeStride + 0x44, sizeof(matrix));
         const auto transform = detail::TransformOf(matrix, cache.hashes[i]);
-        pose::Bone bone;
-        if (!pose::Encode(transform, bone)) {
+        if (!pose::Encode(transform, bones[static_cast<size_t>(i)])) {
+            bones.clear();
             Logf("npcplayback: %s bone %d is outside the canonical pose encoding", entity->GetName().GetText(), i);
             return false;
         }
-        bones.push_back(bone);
     }
     return true;
 }

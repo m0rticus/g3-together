@@ -382,6 +382,7 @@ void ResetWorldNpcTables()
     absences.clear();
     absenceCheckAt = 0;
     namesSent.clear();
+    npcplayback::ResetPublishedNames();
     claimedBy.clear();
     directedBy.clear();
     claimSeen.clear();

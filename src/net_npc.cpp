@@ -13,12 +13,12 @@ namespace g3t::net::internal {
 uint32_t npcSequence = 0;
 uint32_t npcPublication = 0;
 std::unordered_map<std::string, replication::Sequence> npcOrigins[MaxPlayers];
-std::unordered_map<std::string, replication::ReplicaOrder> npcPublications;
+std::unordered_map<NpcKeyValue, replication::ReplicaOrder, NpcKeyHash> npcPublications;
 unsigned npcAccepted = 0, npcRejected = 0, npcStale = 0;
 unsigned controlErrors = 0, npcControlFallback = 0;
 npcwire::Context controlSender, controlReceiver;
 uint32_t receivedControlGeneration = 0;
-std::unordered_map<std::string, ControlState> controlStates;
+std::unordered_map<NpcKeyValue, ControlState, NpcKeyHash> controlStates;
 unsigned npcControlCreated = 0, npcControlAckAccepted = 0;
 uint64_t npcOrderedSetupPoses = 0, npcOrderedSetupControls = 0, npcAnchorsSent = 0, npcAnchorsReceived = 0;
 
@@ -26,7 +26,7 @@ namespace {
 uint32_t controlGeneration = 0, nextControlId = 0;
 uint32_t nextControlOffer = 0;
 bool controlGenerationExhausted = false, controlIdExhaustedLogged = false;
-std::unordered_map<uint16_t, std::string> controlKeys;
+std::unordered_map<uint16_t, NpcKeyValue> controlKeys;
 std::unordered_map<uint16_t, ControlOffer> controlOffered[MaxPlayers];
 std::unordered_map<uint16_t, npcwire::BaselineRef> controlAcknowledged[MaxPlayers];
 uint32_t requestedControlAt = 0, requestedControlGeneration = 0;
@@ -120,7 +120,7 @@ PreparedControl PrepareControl(NpcRecord const& record, bool forceBaseline)
     }
     npcwire::Control full;
     if (!npcwire::FromNpcRecord(record, 0, 0, true, full)) return result;
-    const std::string key = NpcKey(record.guid);
+    const NpcKeyValue key = NpcKey(record.guid);
     auto found = controlStates.find(key);
     if (found == controlStates.end()) {
         if (nextControlId >= UINT16_MAX) {
@@ -196,11 +196,13 @@ PreparedControl PrepareControl(NpcRecord const& record, bool forceBaseline)
     state.latest = record;
     result.ref = state.current;
     result.value = std::move(dynamic);
-    std::vector<uint8_t> encoded;
+    static std::vector<uint8_t> encoded;
+    encoded.clear();
     result.encodable = npcwire::EncodeRecord(controlSender, result.value, encoded);
     if (!result.encodable &&
         npcwire::FromNpcRecord(record, state.current.anchor, state.current.baseline, true, result.value)) {
         result.exact = true;
+        encoded.clear();
         result.encodable = npcwire::EncodeRecord(controlSender, result.value, encoded, true);
     }
     return result;
@@ -537,7 +539,7 @@ bool OnNpcBaselineAck(uint8_t peerId, npcwire::Signal const& signal)
 }
 
 bool OnNpcResync(uint8_t peerId, npcwire::Signal const& signal, uint8_t& peerIdOut,
-                 std::unordered_map<std::string, ControlState>::const_iterator& stateOut)
+                 decltype(controlStates)::const_iterator& stateOut)
 {
     const auto key = controlKeys.find(signal.reference.id);
     if (key == controlKeys.end()) { ++npcRejected; return false; }
@@ -591,7 +593,7 @@ bool OnNpcResync(uint8_t peerId, npcwire::Signal const& signal, uint8_t& peerIdO
 } // namespace
 
 bool HandleControlSignal(ENetPeer* peer, ENetPacket* packet, uint8_t& peerIdOut,
-                         std::unordered_map<std::string, ControlState>::const_iterator& stateOut)
+                         decltype(controlStates)::const_iterator& stateOut)
 {
     if (!isHost || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return false; }
     const uint8_t peerId = PeerSlotOf(peer);

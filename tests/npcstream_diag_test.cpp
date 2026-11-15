@@ -224,5 +224,45 @@ int main()
         CHECK(capture.lines[0].size() == 1535);
         CHECK(Has(capture.lines[0], "npc-stream: recipient=2 "));
     }
+
+    {
+        g3t::host_frame_diag::Runtime perfRuntime;
+        perfRuntime.BeginFrame(100000, 100, true, true);
+        perfRuntime.AddPhase(g3t::host_frame_diag::Phase::World, 100000, 100500);
+        perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Net, 100500, 101200);
+        perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Npcs, 101200, 104200);
+        perfRuntime.EndFrame(105000);
+
+        perfRuntime.BeginFrame(125000, 5100, false, true);
+        perfRuntime.AddPhase(g3t::host_frame_diag::Phase::World, 125000, 125500);
+        perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Net, 125500, 126300);
+        perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Npcs, 126300, 131300);
+        perfRuntime.EndFrame(132000);
+
+        g3t::host_frame_diag::Summary hb{};
+        CHECK(perfRuntime.PollHeartbeat(5100, hb));
+        CHECK(hb.frames == 2 && hb.focusedPct == 50);
+        char hbLine[512] = {};
+        g3t::host_frame_diag::FormatHeartbeat(hbLine, sizeof(hbLine), hb, 2, 1876);
+        const std::string heartbeatText(hbLine);
+        CHECK(Has(heartbeatText, "HEARTBEAT host-perf: window_ms=5000 frames=2 spheres=2 processed=1876"));
+        CHECK(Has(heartbeatText, "fps=40.0 focused_pct=50 frame_ms=25.00/25.00 engine_ms=20.00/20.00"));
+        CHECK(Has(heartbeatText, "mod_ms=6.00/7.00 mod_npcs_ms=4.00/5.00 mod_net_ms=0.75 mod_world_ms=0.50"));
+
+        Context perfContext = context;
+        perfContext.perf = perfRuntime.TakeStreamSummary(5100);
+        Window window;
+        Capture capture;
+        window.BeginTick(100);
+        window.Player(2, true, true, 10, client);
+        window.Sent(2);
+        window.Flush(5100, perfContext, [&](char const* line) { capture.Receive(line); });
+        CHECK(capture.terminated && capture.lines.size() == 1);
+        CHECK(Has(capture.lines[0], "fps=40.0 focused_pct=50 frame_ms=25.00/25.00 engine_ms=20.00/20.00"));
+        CHECK(Has(capture.lines[0], "mod_npcs_ms=4.00/5.00 mod_net_ms=0.75 mod_world_ms=0.50"));
+
+        perfRuntime.Reset();
+        CHECK(!perfRuntime.PollHeartbeat(12000, hb));
+    }
     return 0;
 }

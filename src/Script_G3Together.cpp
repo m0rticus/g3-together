@@ -54,6 +54,7 @@
 #include "body.h"
 #include "guid.h"
 #include "focus_diag.h"
+#include "host_frame_diag.h"
 
 #include <Game.h>
 #include <Windows.h>
@@ -161,6 +162,15 @@ void Frame()
             lastReport = now;
             Report();
         }
+        if (g3t::GetConfig().host) {
+            g3t::host_frame_diag::Summary perf{};
+            if (g3t::host_frame_diag::Global().PollHeartbeat(g3t::net::Now(), perf)) {
+                const auto sim = g3t::world::HostSimulationStatus();
+                char line[512] = {};
+                g3t::host_frame_diag::FormatHeartbeat(line, sizeof(line), perf, sim.spheres, sim.processed);
+                g3t::Log(line);
+            }
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         faulted = true;
         g3t::Log("FAIL exception in frame callback; mod disabled for this session");
@@ -172,14 +182,26 @@ struct FrameScope {
     FrameScope() : entered(g3t::movement::EntryTime()), run(g3t::persist::BeginFrame())
     {
         if (run) ++moduleProcessDepth;
-        if (run && moduleProcessDepth == 1) g3t::movement::Begin(entered);
+        if (run && moduleProcessDepth == 1) {
+            g3t::movement::Begin(entered);
+            if (g3t::GetConfig().host) {
+                auto& session = gCSession::GetInstance();
+                const bool inWorld = session.IsGameRunning() && !g3t::persist::NativeLoading() &&
+                    !g3t::persist::HeroPending();
+                g3t::host_frame_diag::Global().BeginFrame(entered, g3t::net::Now(), g3t::partner::Focused(), inWorld);
+            }
+        }
     }
     ~FrameScope()
     {
         if (run) {
             {
                 g3t::movement::Stage stage("net flush");
+                const long long flushStart = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
                 g3t::net::Flush();
+                if (flushStart)
+                    g3t::host_frame_diag::Global().AddPhase(
+                        g3t::host_frame_diag::Phase::Net, flushStart, g3t::movement::EntryTime());
             }
             {
                 g3t::movement::Stage stage("persist end");
@@ -187,6 +209,8 @@ struct FrameScope {
             }
             if (--moduleProcessDepth == 0) g3t::hud::Tick();
             if (moduleProcessDepth == 0) g3t::movement::End();
+            if (moduleProcessDepth == 0 && g3t::GetConfig().host)
+                g3t::host_frame_diag::Global().EndFrame(g3t::movement::EntryTime());
         }
     }
     FrameScope(FrameScope const&) = delete;
@@ -273,6 +297,7 @@ class Module : public eCEngineComponentBase
         ForgetStep("clock cleanup", &g3t::clock::OnWorldChange);
         ForgetStep("HUD observation cleanup", &g3t::hud::OnWorldChange);
         ForgetStep("movement observation cleanup", &g3t::movement::OnWorldChange);
+        g3t::host_frame_diag::Global().Reset();
         {
             g3t::crashlog::WorldEntryScope operation("downed cleanup");
             g3t::downed::OnWorldChange();
@@ -378,14 +403,21 @@ class Module : public eCEngineComponentBase
             return;
         }
         Step("crashlog", &g3t::crashlog::Tick);
-        { g3t::movement::Stage stage("world"); g3t::world::Tick(); }
+        {
+            g3t::movement::Stage stage("world");
+            const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
+            g3t::world::Tick();
+            if (t0) g3t::host_frame_diag::Global().AddPhase(g3t::host_frame_diag::Phase::World, t0, g3t::movement::EntryTime());
+        }
         Step("NPC removal", &g3t::npcremoval::Tick);
         { g3t::movement::Stage stage("NPC identity"); g3t::npcs::ReconcileClientEntities(); }
         { g3t::movement::Stage stage("NPC playback"); g3t::npcplayback::Tick(); }
         {
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
             g3t::movement::Stage stage("remote / ENet service");
+            const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
             g3t::remote::Tick();
+            if (t0) g3t::host_frame_diag::Global().AddPhase(g3t::host_frame_diag::Phase::Net, t0, g3t::movement::EntryTime());
         }
         if (g3t::persist::ClientTransitionPending()) {
             g3t::persist::Tick();
@@ -395,7 +427,12 @@ class Module : public eCEngineComponentBase
             return;
         }
         { g3t::movement::Stage stage("AI"); g3t::ai::Tick(); }
-        { g3t::movement::Stage stage("NPC / lease"); g3t::npcs::Tick(); }
+        {
+            g3t::movement::Stage stage("NPC / lease");
+            const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
+            g3t::npcs::Tick();
+            if (t0) g3t::host_frame_diag::Global().AddPhase(g3t::host_frame_diag::Phase::Npcs, t0, g3t::movement::EntryTime());
+        }
         { g3t::movement::Stage stage("combat"); g3t::combat::Tick(); }
         constexpr NamedCall beforeDowned[] = {
             {"summon", &g3t::summon::Tick},

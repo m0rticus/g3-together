@@ -77,6 +77,7 @@ void ReleaseUnavailable(eCEntity* entity);
 bool ReleaseNativePresentation(eCEntity* entity);
 bool Capture(eCEntity* entity, net::NpcRecord& record, PublishName publish);
 bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flags, PublishName publish);
+void ResetPublishedNames();
 uint32_t PoseInterval(net::NpcRecord const& record);
 bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindName names, uint32_t now);
 bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> const& bones, uint8_t flags);

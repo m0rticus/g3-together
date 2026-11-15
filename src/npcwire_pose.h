@@ -132,15 +132,15 @@ class PoseCache {
 
     static void EncodeMode1Sparse(uint16_t layout, Frame const& base,
                                   pose::Bone const* bones, size_t count,
-                                  std::vector<uint8_t>& result, bool& resultKey,
-                                  PoseStats& resultStats);
+                                  std::size_t& bestSize, std::vector<uint8_t>& result,
+                                  bool& resultKey, PoseStats& resultStats);
     static void EncodeMode2And3(uint16_t layout, Frame const& recent, Frame const* olderCandidate,
                                 pose::Bone const* bones, size_t count, uint32_t now,
-                                std::vector<uint8_t>& result, bool& resultKey,
-                                PoseStats& resultStats);
+                                std::size_t& bestSize, std::vector<uint8_t>& result,
+                                bool& resultKey, PoseStats& resultStats);
     static void EncodeMode4(uint16_t layout, Frame const& recent, Frame const* olderCandidate,
                             pose::Bone const* bones, size_t count, uint32_t now,
-                            std::vector<uint8_t>& result, bool& resultKey,
+                            std::size_t& bestSize, std::vector<uint8_t>& result, bool& resultKey,
                             std::vector<pose::Bone>& reconstructed, PoseStats& resultStats);
     Status EncodeCompactImpl(Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
                              pose::Bone const* bones, size_t count, uint32_t now,

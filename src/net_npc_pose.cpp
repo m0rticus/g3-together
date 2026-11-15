@@ -12,7 +12,7 @@ namespace g3t::net::internal {
 
 unsigned poseSent = 0, poseReceived = 0, poseSendFailed = 0;
 bonewire::Dictionary boneLayouts;
-std::unordered_map<std::string, bonewire::PoseCache> sentPoses[MaxPlayers], decodedPoses;
+std::unordered_map<NpcKeyValue, bonewire::PoseCache, NpcKeyHash> sentPoses[MaxPlayers], decodedPoses;
 uint64_t boneGeneration = 0, receivedBoneGeneration = 0;
 uint32_t nextBoneLayout = 0;
 std::unordered_map<uint16_t, uint32_t> boneOffered[MaxPlayers];
@@ -330,12 +330,12 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
                 boneCount = static_cast<uint16_t>(decodedBones.size());
             }
             std::vector<npcwire::Control> acceptedControls;
-            const bool skipSequenceAdvance = poseAnchor ||
-                (poseEssential && !controlRecords.empty() &&
-                 npcPublications.count(NpcKey(controlRecords.front().guid)) &&
-                 npcPublications[NpcKey(controlRecords.front().guid)].publication.initialized &&
-                 !npcwire::Newer(header.publication,
-                                 npcPublications[NpcKey(controlRecords.front().guid)].publication.latest));
+            bool skipSequenceAdvance = poseAnchor;
+            if (!skipSequenceAdvance && poseEssential && !controlRecords.empty()) {
+                const auto pub = npcPublications.find(NpcKey(controlRecords.front().guid));
+                skipSequenceAdvance = pub != npcPublications.end() && pub->second.publication.initialized &&
+                    !npcwire::Newer(header.publication, pub->second.publication.latest);
+            }
             if (!skipSequenceAdvance &&
                 !npcwire::DecodeBatch(controlReceiver, acceptedBatch.data(), acceptedBatch.size(), acceptedControls)) {
                 ++npcRejected;
@@ -392,7 +392,7 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
             for (int i = 0; i < recordCount; ++i) {
                 NpcRecord const& record = records[i];
                 if (!SaneNpc(record)) { ++npcRejected; continue; }
-                const std::string key = NpcKey(record.guid);
+                const NpcKeyValue key = NpcKey(record.guid);
                 if (bones && poseLayout && poseAnchor) {
                     if (!decodedPoses[key].Store(header.publication, record.incarnation, poseLayout, poseFlags,
                                                  bones, boneCount, enet_time_get(), true, true)) {
@@ -486,7 +486,7 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         int count = 0;
         for (int i = 0; i < header.count; ++i) {
             uint8_t const* guid = packet->data + sizeof(header) + i * 16;
-            const std::string key = NpcKey(guid);
+            const NpcKeyValue key = NpcKey(guid);
             if (!npcPublications[key].Release(header.owner, header.publication)) { ++npcStale; continue; }
             decodedPoses.erase(key);
             std::memcpy(guids + count++ * 16, guid, 16);
@@ -528,18 +528,32 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
     if (!host || !isHost || !bones || count <= 0 || count > pose::MaxBones || (poseFlags & ~pose::Facial) ||
         !npclease::DecodePoseIntervalWire(intervalMs) ||
         (to && (to < 2 || to >= MaxPlayers || !peers[to]))) return false;
-    uint32_t hashes[pose::MaxBones], sorted[pose::MaxBones];
-    for (int i = 0; i < count; ++i) hashes[i] = sorted[i] = bones[i].name;
-    std::sort(sorted, sorted + count);
-    if (!sorted[0] || std::adjacent_find(sorted, sorted + count) != sorted + count) {
-        if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
-        return false;
-    }
+
+    auto validPoseHashes = [](uint32_t const* values, int length) noexcept {
+        constexpr unsigned Slots = static_cast<unsigned>(pose::MaxBones) * 2u;
+        uint32_t seen[Slots] = {};
+        for (int i = 0; i < length; ++i) {
+            const uint32_t hash = values[i];
+            if (!hash) return false;
+            unsigned slot = (hash * 2654435761u) & (Slots - 1u);
+            while (seen[slot] && seen[slot] != hash) slot = (slot + 1u) & (Slots - 1u);
+            if (seen[slot]) return false;
+            seen[slot] = hash;
+        }
+        return true;
+    };
+
+    uint32_t hashes[pose::MaxBones];
+    for (int i = 0; i < count; ++i) hashes[i] = bones[i].name;
 
     uint16_t layoutId = 0;
     if (worldEpoch && boneGeneration &&
         boneLayouts.Reset(worldEpoch, boneGeneration) == bonewire::Status::Ok) {
         auto status = boneLayouts.FindLayout(hashes, count, layoutId);
+        if (status == bonewire::Status::InvalidArgument) {
+            if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
+            return false;
+        }
         if (status == bonewire::Status::UnknownLayout) {
             if (nextBoneLayout < UINT16_MAX) {
                 layoutId = static_cast<uint16_t>(++nextBoneLayout);
@@ -559,17 +573,27 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                 Logf("net: bone layout unavailable (%u); using full-hash pose", static_cast<unsigned>(status));
             layoutId = 0;
         }
-    } else if (BoneLog(boneInvalidLogs)) {
-        Log("net: bone dictionary has no epoch or generation; using full-hash pose");
+    } else {
+        if (!validPoseHashes(hashes, count)) {
+            if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
+            return false;
+        }
+        if (BoneLog(boneInvalidLogs))
+            Log("net: bone dictionary has no epoch or generation; using full-hash pose");
     }
 
     NpcsHeader header{MsgPosedNpc, 0, enet_time_get(), worldEpoch, 1, 0, 1, 1};
     const auto preparedControl = PrepareControl(record);
     const uint16_t boneCount = static_cast<uint16_t>(count);
     const size_t fullSize = sizeof(header) + sizeof(record) + sizeof(boneCount) + 2 + count * sizeof(*bones);
-    std::vector<uint8_t> fallbackBuffer, definition, compactMessage, controlPoseMessage;
+    static std::vector<uint8_t> fallbackBuffer, definition, compact, compactMessage, controlPoseMessage, batch;
+    static std::vector<pose::Bone> reconstructed;
+    static std::vector<npcwire::Control> singleControl(1);
+    fallbackBuffer.clear();
+    definition.clear();
     bool definitionAttempted = false, definitionReady = false;
     bool queued = false;
+    const NpcKeyValue npcKey = NpcKey(record.guid);
 
     for (uint8_t i = 2; i < MaxPlayers; ++i) {
         if (to && i != to) continue;
@@ -598,14 +622,12 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         bool compactReady = layoutId && (dictionaryReady || boneOffered[i].count(layoutId));
         bool poseKey = true;
         bonewire::PoseStats poseStats{};
-        std::vector<pose::Bone> reconstructed;
         compactMessage.clear();
         controlPoseMessage.clear();
-        auto& poseCache = sentPoses[i][NpcKey(record.guid)];
+        auto& poseCache = sentPoses[i][npcKey];
         const bool anchor = compactReady &&
             poseCache.AnchorDue(record.sent, record.incarnation, layoutId, poseFlags);
         if (compactReady) {
-            std::vector<uint8_t> compact;
             const auto status = poseCache.EncodeCompact(boneLayouts, layoutId, record.incarnation, poseFlags, bones, count,
                                                         record.sent, compact, poseKey, reconstructed, &poseStats, anchor);
             if (status == bonewire::Status::Ok) {
@@ -626,25 +648,28 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         }
         compactReady = compactReady && !compactMessage.empty();
         if (compactReady && ControlQueued(i, preparedControl)) {
-            std::vector<uint8_t> batch;
-            auto value = preparedControl.value;
+            batch.clear();
+            auto& value = singleControl[0];
+            value = preparedControl.value;
             const bool exact = reliable || preparedControl.exact;
             const bool converted = !exact ||
                 npcwire::FromNpcRecord(record, preparedControl.ref.anchor, preparedControl.ref.baseline, true, value);
-            const std::vector<npcwire::Control> values{value};
-            if (converted && npcwire::EncodeBatch(controlSender, header.publication, values, batch, exact) &&
+            if (converted && npcwire::EncodeBatch(controlSender, header.publication, singleControl, batch, exact) &&
                 batch.size() <= UINT16_MAX) {
                 NpcsHeader controlHeader = header;
                 controlHeader.type = MsgControlPose;
-                controlPoseMessage.resize(sizeof(header) + 2);
-                std::memcpy(controlPoseMessage.data(), &controlHeader, sizeof(controlHeader));
                 const size_t controlBytes = batch.size() - sizeof(npcwire::WireBatchHeader) + 4;
+                const size_t poseSectionBytes = compactMessage.size() - sizeof(header) - sizeof(record);
+                controlPoseMessage.resize(sizeof(header) + 2 + controlBytes + poseSectionBytes);
+                std::memcpy(controlPoseMessage.data(), &controlHeader, sizeof(controlHeader));
                 controlPoseMessage[sizeof(header)] = static_cast<uint8_t>(controlBytes);
                 controlPoseMessage[sizeof(header) + 1] = static_cast<uint8_t>(controlBytes >> 8);
-                controlPoseMessage.insert(controlPoseMessage.end(), batch.begin() + 8, batch.begin() + 12);
-                controlPoseMessage.insert(controlPoseMessage.end(), batch.begin() + sizeof(npcwire::WireBatchHeader), batch.end());
-                controlPoseMessage.insert(controlPoseMessage.end(),
-                    compactMessage.begin() + sizeof(header) + sizeof(record), compactMessage.end());
+                uint8_t* dst = controlPoseMessage.data() + sizeof(header) + 2;
+                std::memcpy(dst, batch.data() + 8, 4);
+                std::memcpy(dst + 4, batch.data() + sizeof(npcwire::WireBatchHeader),
+                            batch.size() - sizeof(npcwire::WireBatchHeader));
+                std::memcpy(dst + controlBytes, compactMessage.data() + sizeof(header) + sizeof(record),
+                            poseSectionBytes);
             } else if (BoneLog(controlErrors)) {
                 Log("npc-converge: compact posed control encode failed; retaining full control with the pose");
             }

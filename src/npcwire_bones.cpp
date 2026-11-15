@@ -78,10 +78,28 @@ bool ValidCount(std::size_t count)
 bool ValidHashes(uint32_t const* hashes, std::size_t count)
 {
     if (!hashes || !ValidCount(count)) return false;
-    uint32_t sorted[pose::MaxBones];
-    std::copy(hashes, hashes + count, sorted);
-    std::sort(sorted, sorted + count);
-    return sorted[0] && std::adjacent_find(sorted, sorted + count) == sorted + count;
+    constexpr unsigned Slots = static_cast<unsigned>(pose::MaxBones) * 2u;
+    static_assert((Slots & (Slots - 1u)) == 0, "power-of-two slot count");
+    uint32_t seen[Slots] = {};
+    for (std::size_t i = 0; i < count; ++i) {
+        const uint32_t hash = hashes[i];
+        if (!hash) return false;
+        unsigned slot = (hash * 2654435761u) & (Slots - 1u);
+        while (seen[slot] && seen[slot] != hash) slot = (slot + 1u) & (Slots - 1u);
+        if (seen[slot]) return false;
+        seen[slot] = hash;
+    }
+    return true;
+}
+
+uint64_t DigestHashes(uint32_t const* hashes, std::size_t count) noexcept
+{
+    uint64_t digest = 14695981039346656037ull ^ static_cast<uint64_t>(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        digest ^= static_cast<uint64_t>(hashes[i]);
+        digest *= 1099511628211ull;
+    }
+    return digest;
 }
 
 bool ReadCount(uint8_t const* data, std::size_t size, std::size_t stride, std::size_t& count)
@@ -98,6 +116,7 @@ Status Dictionary::Reset(uint32_t world, uint64_t generation)
     if (!world || !generation) return Status::InvalidArgument;
     if (world != world_ || generation != generation_) {
         layouts_.clear();
+        byDigest_.clear();
         world_ = world;
         generation_ = generation;
     }
@@ -107,6 +126,7 @@ Status Dictionary::Reset(uint32_t world, uint64_t generation)
 void Dictionary::Clear()
 {
     layouts_.clear();
+    byDigest_.clear();
     world_ = 0;
     generation_ = 0;
 }
@@ -122,21 +142,27 @@ Status Dictionary::Register(uint16_t layoutId, uint32_t const* hashes, std::size
             ? Status::Ok : Status::Conflict;
     }
     layouts_.emplace(layoutId, std::vector<uint32_t>(hashes, hashes + count));
+    auto& ids = byDigest_[DigestHashes(hashes, count)];
+    ids.insert(std::lower_bound(ids.begin(), ids.end(), layoutId), layoutId);
     return Status::Ok;
 }
 
 Status Dictionary::FindLayout(uint32_t const* hashes, std::size_t count, uint16_t& layoutId) const
 {
     if (!world_ || !generation_) return Status::NotInitialized;
-    if (!ValidHashes(hashes, count)) return Status::InvalidArgument;
-    for (const auto& layout : layouts_) {
-        if (layout.second.size() == count &&
-            std::equal(layout.second.begin(), layout.second.end(), hashes)) {
-            layoutId = layout.first;
-            return Status::Ok;
+    if (!hashes || !ValidCount(count)) return Status::InvalidArgument;
+    const auto bucket = byDigest_.find(DigestHashes(hashes, count));
+    if (bucket != byDigest_.end()) {
+        for (uint16_t id : bucket->second) {
+            const auto it = layouts_.find(id);
+            if (it != layouts_.end() && it->second.size() == count &&
+                std::equal(it->second.begin(), it->second.end(), hashes)) {
+                layoutId = id;
+                return Status::Ok;
+            }
         }
     }
-    return Status::UnknownLayout;
+    return ValidHashes(hashes, count) ? Status::UnknownLayout : Status::InvalidArgument;
 }
 
 bool Dictionary::HasLayout(uint16_t layoutId) const
@@ -230,8 +256,7 @@ Status Dictionary::RespondToRequest(uint8_t const* data, std::size_t size,
     return EncodeDictionary(Get16(data + 4), message);
 }
 
-Status Dictionary::EncodePose(uint16_t layoutId, pose::Bone const* bones, std::size_t count,
-                              std::vector<uint8_t>& message) const
+Status Dictionary::ValidatePose(uint16_t layoutId, pose::Bone const* bones, std::size_t count) const
 {
     if (!world_ || !generation_) return Status::NotInitialized;
     if (!layoutId || !bones || !ValidCount(count)) return Status::InvalidArgument;
@@ -240,6 +265,14 @@ Status Dictionary::EncodePose(uint16_t layoutId, pose::Bone const* bones, std::s
     if (layout->second.size() != count) return Status::Conflict;
     for (std::size_t i = 0; i < count; ++i)
         if (bones[i].name != layout->second[i]) return Status::Conflict;
+    return Status::Ok;
+}
+
+Status Dictionary::EncodePose(uint16_t layoutId, pose::Bone const* bones, std::size_t count,
+                              std::vector<uint8_t>& message) const
+{
+    const Status status = ValidatePose(layoutId, bones, count);
+    if (status != Status::Ok) return status;
     std::vector<uint8_t> result;
     result.reserve(sizeof(PoseHeader) + count * TransformBytes);
     Put16(result, layoutId);

@@ -330,12 +330,13 @@ inline Result Evaluate(State& state, Input const& in)
         return {Decision::Semantic, tier, essential};
     const uint32_t elapsed = in.now - state.sentAt;
     const uint32_t stretch = in.stretchPermille;
+    if (elapsed >= Stretched(KeyframeMs, stretch)) return {Decision::Keyframe, tier};
     const uint32_t interval = Stretched(Interval(tier), stretch);
     const bool due = in.now - state.idealAt >= interval;
+    if (!due && elapsed < KeepaliveMs) return {Decision::Wait, tier};
     const bool semantic = detail::SemanticRecord(state.record, *in.record);
-    const bool changed = semantic || detail::DynamicChanged(state, in);
-    if (elapsed >= Stretched(KeyframeMs, stretch)) return {Decision::Keyframe, tier};
     if (due && semantic) return {Decision::Semantic, tier};
+    const bool changed = semantic || detail::DynamicChanged(state, in);
     if (due && changed) return {Decision::Changed, tier};
     if (!changed && elapsed >= KeepaliveMs) return {Decision::Keyframe, tier};
     return {Decision::Wait, tier};

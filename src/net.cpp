@@ -379,7 +379,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         HandleControlId(peer, packet);
     } else if (type == MsgControlSignal) {
         uint8_t peerId = 0;
-        std::unordered_map<std::string, ControlState>::const_iterator state;
+        decltype(controlStates)::const_iterator state;
         if (HandleControlSignal(peer, packet, peerId, state))
             SendFullNpc(peers[peerId], state->second.latest, true);
     } else if (type == MsgBoneDictionary) {
