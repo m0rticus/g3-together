@@ -688,6 +688,36 @@ EnterResult EnterHostWorld(char const* reason)
     return EnterResult::Queued;
 }
 
+static void HandleTransitionWait(rejoin::tmpl::Plan const& plan, uint32_t now, uint32_t& queuedAt,
+                                 uint32_t& createWaitSince)
+{
+    using namespace detail;
+    if (plan.why == rejoin::tmpl::Block::Record) {
+        if (!recordWaitSince) recordWaitSince = now ? now : 1;
+        if (now - recordWaitSince >= 12000 && !recordWaitGaveUp) {
+            recordWaitGaveUp = true;
+            Logf("template: record wait gave up after %u ms; entering without the host's answer", now - recordWaitSince);
+        }
+        return;
+    }
+    if (plan.why != rejoin::tmpl::Block::NotQuiet) { createWaitSince = 0; return; }
+    if (!createWaitSince) createWaitSince = now ? now : 1;
+    if (now - createWaitSince < 8000) return;
+    const char* reason = NativeSaveReason();
+    templateFailCode = reason ? reason : "not-running";
+    templateFailError = 0;
+    createWaitSince = 0;
+    entryManual = entryApproved = false;
+    const uint32_t startedAt = queuedAt;
+    queuedAt = 0;
+    clientRejoin.Retired();
+    clientRejoin.failed = true;
+    rejoinWait = rejoin::Wait::None;
+    Logf("persist: client enter state=failed reason=template-save-refused detail=%s elapsed_ms=%u",
+         templateFailCode.c_str(), now - startedAt);
+    TemplateNotify(templateFailCode.c_str(), 0);
+}
+
 // The engine's own LoadGame of the client template: the only supported way to replace a loaded world.
 static void EnterTemplateWorld(uint32_t queuedAt)
 {
@@ -801,30 +831,7 @@ bool ProcessClientTransition()
         return true;
     }
     if (plan.route == R::Wait) {
-        if (plan.why == rejoin::tmpl::Block::Record) {
-            if (!recordWaitSince) recordWaitSince = now ? now : 1;
-            if (now - recordWaitSince >= 12000 && !recordWaitGaveUp) {
-                recordWaitGaveUp = true;
-                Logf("template: record wait gave up after %u ms; entering without the host's answer", now - recordWaitSince);
-            }
-            return false;
-        }
-        if (plan.why != rejoin::tmpl::Block::NotQuiet) { createWaitSince = 0; return false; }
-        if (!createWaitSince) createWaitSince = now ? now : 1;
-        if (now - createWaitSince < 8000) return false;
-        const char* reason = NativeSaveReason();
-        templateFailCode = reason ? reason : "not-running";
-        templateFailError = 0;
-        createWaitSince = 0;
-        entryManual = entryApproved = false;
-        const uint32_t startedAt = queuedAt;
-        queuedAt = 0;
-        clientRejoin.Retired();
-        clientRejoin.failed = true;
-        rejoinWait = rejoin::Wait::None;
-        Logf("persist: client enter state=failed reason=template-save-refused detail=%s elapsed_ms=%u", templateFailCode.c_str(),
-             now - startedAt);
-        TemplateNotify(templateFailCode.c_str(), 0);
+        HandleTransitionWait(plan, now, queuedAt, createWaitSince);
         return false;
     }
     createWaitSince = 0;

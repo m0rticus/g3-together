@@ -20,6 +20,47 @@ static Bytes Hero(Key const& key)
         std::to_string(key.player) + "\npose 1 2 3 0 0 0 1\ndowned 0\nend 0\n";
     return Bytes(text.begin(), text.end());
 }
+static Bytes BinaryHero(Key const& key, float px, float py, float pz)
+{
+    auto addSec = [](Bytes& body, uint32_t type, Bytes const& secPayload) {
+        Put(body, type, 4);
+        Put(body, 0, 4);
+        Put(body, secPayload.size(), 4);
+        Put(body, Crc(secPayload), 4);
+        body.insert(body.end(), secPayload.begin(), secPayload.end());
+    };
+    Bytes idSec(key.world.begin(), key.world.end());
+    idSec.insert(idSec.end(), key.save.begin(), key.save.end());
+    Put(idSec, key.player, 8);
+    Bytes poseSec;
+    PutF32(poseSec, px); PutF32(poseSec, py); PutF32(poseSec, pz);
+    PutF32(poseSec, 0.f); PutF32(poseSec, 0.f); PutF32(poseSec, 0.f); PutF32(poseSec, 1.f);
+    Bytes stateSec(24, 0);
+    Bytes countZero(4, 0);
+    Bytes sections;
+    addSec(sections, HeroSecIdentity, idSec);
+    addSec(sections, HeroSecPose, poseSec);
+    addSec(sections, HeroSecState, stateSec);
+    addSec(sections, HeroSecAttributes, countZero);
+    addSec(sections, HeroSecInventory, countZero);
+    addSec(sections, HeroSecSpells, countZero);
+    addSec(sections, HeroSecQuickSlots, countZero);
+
+    Bytes out(HeroMagic, HeroMagic + 8);
+    Put(out, HeroSchemaVersion, 4);
+    Put(out, HeroMinReaderVersion, 4);
+    Put(out, HeroHeaderSize, 4);
+    Put(out, sections.size(), 4);
+    Put(out, 0, 4); // record CRC placeholder
+    Put(out, 0, 4); // flags
+    Put(out, 7, 4); // sectionCount
+    Put(out, 0, 8); // reserved
+    Put(out, 0, 4); // header CRC placeholder
+    out.insert(out.end(), sections.begin(), sections.end());
+    PutLeAt(out.data() + HeroHeaderCrcOffset, Crc32Zeroed(out.data(), HeroHeaderCrcOffset, HeroRecordCrcOffset, 4), 4);
+    PutLeAt(out.data() + HeroRecordCrcOffset, Crc32Zeroed(out.data(), out.size(), HeroRecordCrcOffset, 4), 4);
+    return out;
+}
 
 int main(int argc, char** argv)
 {
@@ -202,6 +243,14 @@ int main(int argc, char** argv)
     assert(Rebind(absent, next));
     Key rebound;
     assert(HeroKey(absent, rebound) && Exact(rebound, next));
+    RecordPose textPose;
+    assert(HeroPose(absent, rebound, textPose) && Exact(rebound, next) && ValidRecordPose(textPose) &&
+           textPose.position[0] == 1.f && textPose.position[1] == 2.f && textPose.position[2] == 3.f);
+    const Bytes binHero = BinaryHero(next, -12500.5f, 340.25f, 8900.f);
+    RecordPose binPose;
+    Key binKey;
+    assert(HeroPose(binHero, binKey, binPose) && Exact(binKey, next) && ValidRecordPose(binPose) &&
+           binPose.position[0] == -12500.5f && binPose.position[1] == 340.25f && binPose.position[2] == 8900.f);
     assert(!Rebind(absent, {host.world, next.save, 13}));
     assert(!Rebind(absent, {std::string(32, 'd'), next.save, 12}));
     assert(Crc(Bytes{'1','2','3','4','5','6','7','8','9'}) == 0xcbf43926);

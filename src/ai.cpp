@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ai.h"
+#include "ai_internal.h"
 
 #include "combat_hostility.h"
 
@@ -38,12 +39,32 @@
 #include <vector>
 #include <utility>
 
-namespace g3t::patch {
-bool PatchImportFromDll(HMODULE, char const*, char const*, void const*, void const**);
-}
-
-
 namespace g3t::ai {
+namespace detail {
+// The game's script ContinueRoutine (Script_Game.dll 0x100a5ea0) ends a reaction (stumble, slide) and hands the body
+// to SelectRoutineTask (0x100a9440): for a puppet that set ZS_HangAround every frame for ~3 s, which our driver undid
+// every frame, and the puppet turned on the spot (stage2 red 2 of 20; trace with call chains and scriptfind, 20.10.).
+// A player's puppet has no routine: its life is the player's.
+gFScript originalContinue = nullptr;
+bool continueBlock = true;  // QA negative control: ContinueRoutineOn
+unsigned continueBlocked = 0, continueRun = 0;
+unsigned playerSpectatorRefused = 0, heroPerceptionBlocked = 0;
+// The script GetCombatMoveLength (Script_Game.dll 0xaa270), called by name from sAICombatMoveStart with other unset,
+// binds the SPU's other (the fight's saved target) into a wrapper before answering from self's species and the action
+// alone. A stale target crashed AttachTo there (Script.dll 0x13ea3, ~1 s after an orc died in the raid; 20.10.
+// 22:56, re/findings/attachto-guard-c.md). Hand it an empty wrapper so it never touches that target.
+gFScript originalMoveLength = nullptr;
+bool moveLengthGuard = true;  // QA negative control: movelengthoff
+unsigned moveLengthCalls = 0, moveLengthSanitized = 0, moveLengthUnknown = 0;
+bool attitudeOn = true;  // QA negative control: attitudeoff
+bool fleeKeep = true;    // QA negative control: fleekeepoff
+// QA aicount: how often AI states or functions whose name starts with the prefix ran, by the local hero and by anyone else.
+std::string countPrefix;
+std::unordered_map<std::string, std::pair<unsigned, unsigned>> counted;
+std::unordered_map<std::string, gFScriptAIState> originalStates;
+std::unordered_map<std::string, gFScriptAIFunction> originalFunctions;
+} // namespace detail
+using namespace detail;
 namespace {
 char const* const Name = "CanReceivePerceptionFrom";
 bool installed = false;
@@ -52,47 +73,18 @@ DWORD lastTry = 0;
 unsigned blocked = 0;
 gFScript originalScript = nullptr;
 gFScriptAICallback originalCallback = nullptr;
-// The game's script ContinueRoutine (Script_Game.dll 0x100a5ea0) ends a reaction (stumble, slide) and hands the body
-// to SelectRoutineTask (0x100a9440): for a puppet that set ZS_HangAround every frame for ~3 s, which our driver undid
-// every frame, and the puppet turned on the spot (stage2 red 2 of 20; trace with call chains and scriptfind, 20.10.).
-// A player's puppet has no routine: its life is the player's.
-gFScript originalContinue = nullptr;
 gFScript originalPlayerKeys = nullptr;
-bool continueBlock = true;  // QA negative control: ContinueRoutineOn
-unsigned continueBlocked = 0, continueRun = 0;
-// The script GetCombatMoveLength (Script_Game.dll 0xaa270), called by name from sAICombatMoveStart with other unset,
-// binds the SPU's other (the fight's saved target) into a wrapper before answering from self's species and the action
-// alone. A stale target crashed AttachTo there (Script.dll 0x13ea3, ~1 s after an orc died in the raid; 20.10.
-// 22:56, re/findings/attachto-guard-c.md). Hand it an empty wrapper so it never touches that target.
-gFScript originalMoveLength = nullptr;
 bool moveLengthSearched = false;
-bool moveLengthGuard = true;  // QA negative control: movelengthoff
-unsigned moveLengthCalls = 0, moveLengthSanitized = 0, moveLengthUnknown = 0;
 bool statesWrapped = false;
 unsigned skipped = 0;
-// QA aicount: how often AI states or functions whose name starts with the prefix ran, by the local hero and by anyone else.
-std::string countPrefix;
-std::unordered_map<std::string, std::pair<unsigned, unsigned>> counted;
 unsigned unknown = 0;  // calls whose stack top named no wrapped state: must stay 0
 unsigned wrapped = 0;
-std::unordered_map<std::string, gFScriptAIState> originalStates;
-std::unordered_map<std::string, gFScriptAIFunction> originalFunctions;
 char const* const IdleTaskName = "ZS_HangAround_DoNothing";
 // NPC reactions that only a villager has: watching a fight (and walking to a spot to watch it), applauding, observing a
 // suspect, reacting to a weapon or a zone, small talk. A player body that runs one of them is a bug (2 Nov. play session:
 // the host's hero stood in OnWatchFight, spectated a fight and applauded a death); it is put back on its routine.
 bool SpectatorState(char const* name);
-unsigned playerSpectatorRefused = 0, heroPerceptionBlocked = 0;
 std::unordered_map<std::string, unsigned> playerStatesSeen;  // the first run of each state by the player body, for the log
-
-// The SDK's gCScriptAdminExt::GetScript* call bTValMap::GetAt(key), which dereferences null for a missing
-// name (it crashed the first lookup of an unregistered name). Look up safely instead.
-template <typename T>
-T* Find(bTValMap<bCString, T*>& map, char const* name)
-{
-    T* found = nullptr;
-    return map.GetAt(bCString(name), found) ? found : nullptr;
-}
 bool Driven(eCEntity* entity)
 {
     return entity && (remote::IsPuppet(entity) || npcs::IsMirrored(entity) || (!net::IsHost() && talk::IsHeld(entity)));
@@ -252,8 +244,6 @@ void WrapStates(gCScriptAdminExt& admin);
 // Here a puppet counts as the local hero: whoever is hostile to the hero is hostile to the puppet.
 gFScript originalAttitude = nullptr;
 bool attitudeInstalled = false;
-bool attitudeOn = true;  // QA negative control: attitudeoff
-bool fleeKeep = true;    // QA negative control: fleekeepoff
 unsigned attitudeAsked = 0, attitudeRedirected = 0, attitudeFleeKept = 0;
 
 bool attitudeNative = false;
@@ -326,12 +316,10 @@ GEInt FocusNameAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (relation::MirrorAnswersFromHost(mirrored, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
                                        (enclaves::Together() && !fightmem::HasLocalOverride(judge)) || sharedMirror)) {
         ++relationMirrorAnswered;
-        return hostAttitude;
+        return combat_hostility::MirrorAttitude(judge, static_cast<uint8_t>(hostAttitude));
     }
     auto promote = [&](GEInt base) -> GEInt {
-        return (judge && combat_hostility::ShouldPromoteAttitude(judge))
-                   ? combat_hostility::EffectiveAttitude(judge, base)
-                   : base;
+        return judge ? combat_hostility::EffectiveAttitude(judge, base) : base;
     };
     eCEntity* actor = guards::CurrentActor();
     if (judge && relation::FocusNameContext(actor != nullptr, actor && LedByRemotePlayer(judge)) == relation::Context::LocalPlayer) {
@@ -360,12 +348,9 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
         if (relation::MirrorAnswersFromHost(true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
                                            (enclaves::Together() && !fightmem::HasLocalOverride(judge)) ||
                                                combat_hostility::MirrorSharesCombatHostility(judge)))
-            return hostAttitude;
+            return combat_hostility::MirrorAttitude(judge, static_cast<uint8_t>(hostAttitude));
     }
-    const bool promoteCoopTarget = judge && !npcs::IsMirrored(judge) && target &&
-                                   (target == gCSession::GetInstance().GetHero() ||
-                                    target == remote::ControlledBody() || remote::IsPuppet(target)) &&
-                                   combat_hostility::ShouldPromoteAttitude(judge);
+    const bool promoteCoopTarget = judge && !npcs::IsMirrored(judge) && combat_hostility::IsCoopParticipant(target);
     auto promote = [&](GEInt base) -> GEInt {
         return promoteCoopTarget ? combat_hostility::EffectiveAttitude(judge, base) : base;
     };
@@ -749,177 +734,5 @@ bool TryPlayerAttitude(eCEntity* self, eCEntity* player, int& attitude)
     attitude = static_cast<int>(originalAttitude(nullptr, &npc, &claimant, 0));
     return true;
 }
-
-void AttitudeOff(void (*log)(char const*))
-{
-    attitudeOn = false;
-    log("ATTITUDEOFF puppets are judged as ordinary NPCs again");
-}
-void FleeKeepOff(void (*log)(char const*))
-{
-    fleeKeep = false;
-    log("FLEEKEEPOFF an NPC fleeing from a puppet judges the hero instead");
 }
 
-void ContinueRoutineReport(void (*log)(char const*))
-{
-    char line[200];
-    Format(line, "CONTINUEROUTINE wrapped=%d block=%d blocked=%u run=%u player_spectator_refused=%u hero_perception_blocked=%u", originalContinue != nullptr, continueBlock ? 1 : 0,
-              continueBlocked, continueRun, playerSpectatorRefused, heroPerceptionBlocked);
-    log(line);
-}
-void ContinueRoutineOn(void (*log)(char const*))
-{
-    continueBlock = false;
-    log("CONTINUEROUTINEON ok=1");
-}
-void MoveLengthReport(void (*log)(char const*))
-{
-    char line[160];
-    Format(line, "MOVELENGTH wrapped=%d guard=%d calls=%u sanitized=%u unknown=%u", originalMoveLength != nullptr,
-              moveLengthGuard ? 1 : 0, moveLengthCalls, moveLengthSanitized, moveLengthUnknown);
-    log(line);
-}
-void MoveLengthOff(void (*log)(char const*))
-{
-    moveLengthGuard = false;
-    log("MOVELENGTHOFF ok=1");
-}
-
-void Count(char const* names, void (*log)(char const*))
-{
-    // A name prefix: count those from now on (and start again); empty: show the counts.
-    if (names && *names) {
-        counted.clear();
-        countPrefix = names;
-    }
-    char line[200];
-    for (auto const& entry : counted) {
-        Format(line, "AICOUNT name=%s hero=%u others=%u", entry.first.c_str(), entry.second.first, entry.second.second);
-        log(line);
-    }
-    log("AICOUNT end");
-}
-
-void FindByRva(char const* rvaHex, void (*log)(char const*))
-{
-    gCScriptAdminExt& admin = GetScriptAdminExt();
-    HMODULE game = GetModuleHandleA("Script_Game.dll");
-    const uintptr_t want = reinterpret_cast<uintptr_t>(game) + std::strtoul(rvaHex, nullptr, 16);
-    char line[200];
-    unsigned found = 0;
-    auto check = [&](char const* table, char const* name, void const* fn) {
-        if (reinterpret_cast<uintptr_t>(fn) != want) return;
-        Format(line, "SCRIPTFIND rva=%s table=%s name=%s", rvaHex, table, name);
-        log(line);
-        ++found;
-    };
-    GE_MAP_FOR_EACH (name, script, admin.GetScripts())
-        if (script) check("script", name.GetText(), reinterpret_cast<void const*>(script->m_funcScript));
-    GE_MAP_FOR_EACH (name, callback, admin.GetScriptAICallbacks())
-        if (callback) check("callback", name.GetText(), reinterpret_cast<void const*>(callback->m_funcScriptAICallback));
-    GE_MAP_FOR_EACH (name, routine, admin.GetScriptAIRoutines())
-        if (routine) check("routine", name.GetText(), reinterpret_cast<void const*>(routine->m_funcScriptAIRoutine));
-    for (auto const& entry : originalStates) check("state", entry.first.c_str(), reinterpret_cast<void const*>(entry.second));
-    for (auto const& entry : originalFunctions) check("function", entry.first.c_str(), reinterpret_cast<void const*>(entry.second));
-    Format(line, "SCRIPTFIND end rva=%s found=%u", rvaHex, found);
-    log(line);
-}
-
-void Describe(char const* name, void (*log)(char const*))
-{
-    gCScriptAdminExt& admin = GetScriptAdminExt();
-    char line[200];
-    Format(line, "SCRIPTINFO name=%s script=%d callback=%d state=%d function=%d routine=%d", name,
-              Find(admin.GetScripts(), name) != nullptr, Find(admin.GetScriptAICallbacks(), name) != nullptr,
-              Find(admin.GetScriptAIStates(), name) != nullptr, Find(admin.GetScriptAIFunctions(), name) != nullptr,
-              Find(admin.GetScriptAIRoutines(), name) != nullptr);
-    log(line);
-    // AI states and functions: the original entry (ours is wrapped around it).
-    void* target = nullptr;
-    if (auto it = originalStates.find(name); it != originalStates.end()) target = reinterpret_cast<void*>(it->second);
-    else if (auto it2 = originalFunctions.find(name); it2 != originalFunctions.end()) target = reinterpret_cast<void*>(it2->second);
-    if (target) {
-        HMODULE owner = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCSTR>(target), &owner);
-        char file[MAX_PATH] = {};
-        if (owner) GetModuleFileNameA(owner, file, MAX_PATH);
-        char const* base = strrchr(file, '\\');
-        Format(line, "SCRIPTINFO address name=%s module=%s rva=%#lx", name, base ? base + 1 : file,
-                  static_cast<unsigned long>(reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(owner)));
-        log(line);
-    }
-    if (gSScript* script = Find(admin.GetScripts(), name)) {
-        HMODULE owner = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(script->m_funcScript), &owner);
-        char file[MAX_PATH] = {};
-        if (owner) GetModuleFileNameA(owner, file, MAX_PATH);
-        char const* base = strrchr(file, '\\');
-        Format(line, "SCRIPTINFO address name=%s module=%s rva=%#lx", name, base ? base + 1 : file,
-                  static_cast<unsigned long>(reinterpret_cast<uintptr_t>(script->m_funcScript) - reinterpret_cast<uintptr_t>(owner)));
-        log(line);
-    }
-}
-
-// QA diagnostic: every registered script, AI callback, state, function and routine whose name contains text.
-void ListNames(char const* text, void (*log)(char const*))
-{
-    gCScriptAdminExt& admin = GetScriptAdminExt();
-    char line[200];
-    auto scan = [&](char const* kind, auto& map) {
-        GE_MAP_FOR_EACH (name, entry, map)
-        {
-            if (!entry || !strstr(name.GetText(), text)) continue;
-            Format(line, "NAME kind=%s name=%s", kind, name.GetText());
-            log(line);
-        }
-    };
-    scan("script", admin.GetScripts());
-    scan("callback", admin.GetScriptAICallbacks());
-    scan("state", admin.GetScriptAIStates());
-    scan("function", admin.GetScriptAIFunctions());
-    scan("routine", admin.GetScriptAIRoutines());
-    log("NAMES end");
-}
-
-// QA, for the inventory of what the game can do: every registered script, AI callback, state, function and routine
-// with the module and RVA of its function and the source file the game registered it from (m_strSource).
-void DumpNames(char const* path, void (*log)(char const*))
-{
-    FILE* file = nullptr;
-    if (fopen_s(&file, path, "wb") || !file) { log("SCRIPTDUMP refused cannot write the file"); return; }
-    std::fputs("kind\tname\tmodule\trva\tsource\r\n", file);
-    gCScriptAdminExt& admin = GetScriptAdminExt();
-    int count = 0;
-    auto dump = [&](char const* kind, auto& map, auto function) {
-        GE_MAP_FOR_EACH (name, entry, map)
-        {
-            if (!entry) continue;
-            void const* code = reinterpret_cast<void const*>(entry->*function);
-            HMODULE module = nullptr;
-            char moduleName[MAX_PATH] = "-";
-            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               static_cast<LPCSTR>(code), &module);
-            if (module) {
-                GetModuleFileNameA(module, moduleName, sizeof(moduleName));
-                if (char const* slash = std::strrchr(moduleName, '\\')) std::memmove(moduleName, slash + 1, std::strlen(slash));
-            }
-            const uintptr_t rva = module ? reinterpret_cast<uintptr_t>(code) - reinterpret_cast<uintptr_t>(module) : 0;
-            std::fprintf(file, "%s\t%s\t%s\t%#x\t%s\r\n", kind, name.GetText(), moduleName, static_cast<unsigned>(rva),
-                         entry->m_strSource.GetText());
-            ++count;
-        }
-    };
-    dump("script", admin.GetScripts(), &gSScript::m_funcScript);
-    dump("callback", admin.GetScriptAICallbacks(), &gSScriptAICallback::m_funcScriptAICallback);
-    dump("state", admin.GetScriptAIStates(), &gSScriptAIState::m_funcScriptAIState);
-    dump("function", admin.GetScriptAIFunctions(), &gSScriptAIFunction::m_funcScriptAIFunction);
-    dump("routine", admin.GetScriptAIRoutines(), &gSScriptAIRoutine::m_funcScriptAIRoutine);
-    std::fclose(file);
-    char line[120];
-    Format(line, "SCRIPTDUMP count=%d", count);
-    log(line);
-}
-}

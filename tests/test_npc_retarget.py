@@ -67,8 +67,8 @@ class NpcRetargetTests(unittest.TestCase):
 
     def test_publication_after_release_and_passive_mirror_target_timeline(self):
         script = _testbuild.src_text("Script_G3Together.cpp")
-        self.assertLess(script.index("g3t::remote::Tick()"), script.index("g3t::ai::Tick()"))
-        self.assertLess(script.index("g3t::ai::Tick()"), script.index("g3t::npcs::Tick()"))
+        self.assertLess(script.index("&g3t::remote::Tick"), script.index("&g3t::ai::Tick"))
+        self.assertLess(script.index("&g3t::ai::Tick"), script.index("&g3t::npcs::Tick"))
         npcs = _testbuild.src_text("npcs.cpp")
         for required in ("self.NPC.GetCurrentTarget()", "r.combatTarget = net::HashGuid(targetGuid)",
                          "shown.combatTarget = presentation.motion.combatTarget",

@@ -7,6 +7,7 @@
 #include "net.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -189,7 +190,7 @@ bool PrepareTransforms(eCEntity* entity, eCVisualAnimation_PS& animation, State&
     }
     auto* actor = animation.GetActor();
     auto* skeleton = actor ? actor->GetInstance() : nullptr;
-    if (!skeleton || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096) return false;
+    if (!skeleton || !skeleton->mNodes.mData || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096) return false;
     auto const& nodes = skeleton->mNodes;
     result.instance = skeleton;
     result.nodes = nodes.mData;
@@ -251,6 +252,71 @@ bool PresentMotion(eCVisualAnimation_PS& animation, eCWrapper_emfx2Actor& actor,
     return true;
 }
 
+bool IdleResourceName(char const* name)
+{
+    if (!name || !*name) return false;
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return (lower.find("ambient") != std::string::npos || lower.find("idle") != std::string::npos) &&
+           lower.find("combat") == std::string::npos && lower.find("hit") == std::string::npos &&
+           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos &&
+           lower.find("stumble") == std::string::npos;
+}
+
+bool ReactionResourceName(char const* name)
+{
+    if (!name || !*name) return false;
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return (lower.find("stumble") != std::string::npos || lower.find("hit") != std::string::npos) &&
+           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos;
+}
+
+eCResourceDataEntity* QueryNativeMotion(eCEntity* entity, gEAction action, gEPhase phase, bool reaction,
+                                        std::string* lastCandidate, char const** failureReason)
+{
+    auto* admin = dynamic_cast<eCAnimationAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCAnimationAdmin")));
+    if (!admin) {
+        if (failureReason) *failureReason = "native animation administration unavailable";
+        return nullptr;
+    }
+    Entity npc(entity);
+    bCString extension;
+    eCResourceAnimationMotion_PS::GetNativeFileExt(extension);
+    // GetAni fixes native direction/primary pose; GetAniName would insert the supplied direction verbatim.
+    auto tryCurrentStance = [&]() -> eCResourceDataEntity* {
+        for (auto const& stem : {npc.GetAni(action, phase),
+                                npc.GetAni(action, gEUseType_None, gEUseType_None, phase)}) {
+            if (!stem.GetLength()) continue;
+            bCString varied(stem);
+            admin->GetAniVariation(varied);
+            for (auto const& candidate : {varied, stem}) {
+                bCString name(candidate);
+                name += extension;
+                const bool accepted = reaction ? ReactionResourceName(name.GetText()) : IdleResourceName(name.GetText());
+                if (!accepted) continue;
+                if (lastCandidate) *lastCandidate = name.GetText();
+                if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate))
+                    return resource;
+            }
+        }
+        return nullptr;
+    };
+    if (auto* resource = tryCurrentStance()) return resource;
+    // NPCs lingering in gEAniState_Parade (e.g. Hamlar with None_Staff) can resolve to an invalid .fxm parade descriptor;
+    // fall back to gEAniState_Stand for the probe so idle/reaction bootstrap stays valid and keeps contacts active.
+    if (npc.Routine.AniState == gEAniState_Parade) {
+        const gEAniState savedStance = npc.Routine.AniState;
+        npc.Routine.AniState = gEAniState_Stand;
+        auto* fallback = tryCurrentStance();
+        npc.Routine.AniState = savedStance;
+        if (fallback) return fallback;
+    }
+    return nullptr;
+}
+
 void PruneSkeletonCache(uint32_t now)
 {
     for (auto it = sourceSkeletons.begin(); it != sourceSkeletons.end();)
@@ -278,7 +344,7 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
     auto* animation = detail::Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     auto* skeleton = actor ? actor->GetInstance() : nullptr;
-    if (!skeleton) return false;
+    if (!skeleton || !skeleton->mNodes.mData) return false;
     flags = animation->GetAnimationFactory().IsFacialAnimationStarted() ? pose::Facial : 0;
     auto const& nodes = skeleton->mNodes;
     if (nodes.mLength <= 0 || nodes.mLength > pose::MaxBones) {
@@ -296,13 +362,26 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
         cache.actorName = actor->GetActorName().GetText();
         cache.names.clear();
         cache.hashes.clear();
+        cache.names.reserve(static_cast<size_t>(nodes.mLength));
+        cache.hashes.reserve(static_cast<size_t>(nodes.mLength));
         cache.publishedEpoch = 0;
         cache.publishedFn = nullptr;
         cache.valid = true;
+        static_assert(pose::MaxBones <= 256, "Open-addressed hash table assumes <= 256 bones");
+        uint32_t seenHashes[512] = {};
+        bool seenOccupied[512] = {};
         for (int i = 0; i < nodes.mLength; ++i) {
             cache.names.emplace_back(actor->GetName(nodes.mData + i).GetText());
             const auto hash = net::HashName(cache.names.back().c_str());
-            if (std::find(cache.hashes.begin(), cache.hashes.end(), hash) != cache.hashes.end()) cache.valid = false;
+            size_t slot = hash & 511u;
+            while (seenOccupied[slot]) {
+                if (seenHashes[slot] == hash) { cache.valid = false; break; }
+                slot = (slot + 1) & 511u;
+            }
+            if (!seenOccupied[slot]) {
+                seenOccupied[slot] = true;
+                seenHashes[slot] = hash;
+            }
             cache.hashes.push_back(hash);
         }
         if (!cache.valid) Logf("npcplayback: %s has ambiguous bone names", entity->GetName().GetText());

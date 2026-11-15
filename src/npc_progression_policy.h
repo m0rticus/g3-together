@@ -132,4 +132,26 @@ inline constexpr bool ShouldAuthorProgressionDiff(bool isHost, bool isHero, bool
     return clientLocalAuthority || clientDialogPartner;
 }
 
+// On dialog close, publish an immediate progression state only if at least one observed progression flag actually
+// changed (e.g. TalkedToPlayer flipped true in EndInfoManager) or the NPC had no prior observation and carries
+// non-default state. Opening and immediately closing a dialogue with an already-talked NPC sends nothing.
+inline constexpr bool ShouldPublishDialogCloseProgression(bool hadPriorObservation,
+                                                          ObservedProgression const& prior,
+                                                          ObservedProgression const& current) noexcept
+{
+    if (!hadPriorObservation) {
+        return IsNonDefaultSeedCandidate(UnpackTalkedToPlayer(current.dialog),
+                                         UnpackDefeatedByPlayer(current.npc));
+    }
+    return prior != current;
+}
+
+// Only the host and explicit dialog state commands (e.g. SetRoutine, SetSleepingPoint) own Navigation.Routine.
+// Passive client progression diffs (TalkedToPlayer on dialog close, DefeatedByPlayer on knockout) leave s.routine
+// empty so a client mirror with a stale routine never overwrites the host's authoritative routine.
+inline constexpr bool ShouldIncludeRoutineInSnapshot(bool isHost, bool explicitCommandOrSync) noexcept
+{
+    return isHost || explicitCommandOrSync;
+}
+
 } // namespace g3t::npc_progression_policy

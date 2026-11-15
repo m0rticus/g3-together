@@ -27,7 +27,7 @@ class CombatKillRewardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_kill_claim_reward_and_givexp_wiring(self):
-        claims = _testbuild.src_text("combat_claims.cpp")
+        claims = _testbuild.src_text("combat_claims.cpp") + "\n" + _testbuild.src_text("combat_kill_xp.cpp")
         combat = _testbuild.src_text("combat.cpp")
         spells = _testbuild.src_text("spells.cpp")
 
@@ -38,7 +38,7 @@ class CombatKillRewardTests(unittest.TestCase):
         self.assertIn("net::Flush();", reward_body)
 
         confirm_start = claims.index("void ConfirmKills()")
-        confirm_end = claims.index("// The species the game knocks out", confirm_start)
+        confirm_end = claims.index("// Client: this player's hit killed a host NPC", confirm_start)
         confirm_body = claims[confirm_start:confirm_end]
         self.assertNotIn("now - it->due", confirm_body)
         self.assertNotIn("now + 250", confirm_body)
@@ -63,7 +63,7 @@ class CombatKillRewardTests(unittest.TestCase):
         )
 
     def test_host_kill_local_player_guard_and_shared_defeat_wiring(self):
-        claims = _testbuild.src_text("combat_claims.cpp")
+        claims = _testbuild.src_text("combat_claims.cpp") + "\n" + _testbuild.src_text("combat_kill_xp.cpp")
         spells = _testbuild.src_text("spells.cpp")
         npclease = _testbuild.src_text("npclease_runtime.cpp")
 

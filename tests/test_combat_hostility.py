@@ -62,12 +62,15 @@ class CombatHostilityContractTests(unittest.TestCase):
 
         ai = source("ai.cpp")
         self.assertIn("combat_hostility::MirrorSharesCombatHostility(judge)", ai)
-        self.assertIn("combat_hostility::ShouldPromoteAttitude(judge)", ai)
+        self.assertIn("combat_hostility::MirrorAttitude(judge,", ai)
+        self.assertIn("combat_hostility::IsCoopParticipant(target)", ai)
         self.assertIn("combat_hostility::EffectiveAttitude(judge,", ai)
 
         net_cpp = source("net.cpp")
         self.assertIn("ClientWorldStateKind(state.kind)", net_cpp)
-        self.assertIn("npclease::RemoteOwner(npc) != from", ch)
+        self.assertIn("npclease::RemoteOwner(state.guid) != from", ch)
+        self.assertIn("patch::IsPatchedByUs(", ch)
+        self.assertIn("RestorePromotedEntityAttitude(", ch)
 
         npcs = source("npcs.cpp")
         self.assertIn("combat_hostility::SyncHostNpc(instance);", npcs)
@@ -85,13 +88,17 @@ class CombatHostilityContractTests(unittest.TestCase):
     def test_bidirectional_client_lease_and_melee_integration(self):
         lease_rt = source("npclease_runtime.cpp")
         self.assertIn("bool LeasedCombatHostile(eCEntity const* entity)", lease_rt)
-        activate = between(lease_rt, "bool Activate(", "Interest InterestOf(")
+        activate = between(lease_rt, "bool Activate(", "bool CurrentPeer(")
         self.assertIn("ResumeLeasedCombat(", activate)
+
+        admission = source("npclease_admission.h")
+        self.assertIn("combat_hostility::NoteImportedAttitude(entity, state.attitude);", admission)
 
         lease_client = source("npclease_client.cpp")
         self.assertIn("combat_hostility::CoopTargetPlayer(target)", lease_client)
         self.assertIn("combat_hostility::SyncClientLeasedNpc(entity);", lease_client)
         self.assertIn("combat_hostility::ClearClientLeasedNpc(key.data());", lease_client)
+        self.assertIn("combat_hostility::OnClientLeaseConfirmed(note.guid);", lease_client)
         self.assertIn("state.aiMode != entry.lease.state.aiMode", lease_client)
         self.assertIn("state.targetPlayer != entry.lease.state.targetPlayer", lease_client)
 
@@ -99,6 +106,7 @@ class CombatHostilityContractTests(unittest.TestCase):
         judge = between(melee, "MeleeVerdict JudgeMelee(", "void LogMelee(")
         self.assertIn("combat_hostility::EffectiveAttitude(victim, v.attitude)", judge)
         self.assertIn("combat_hostility::EffectiveAttitude(victim, result.relation)", judge)
+        self.assertIn("combat_hostility::EffectiveAttitude(result.focus, v.focusRelation)", judge)
 
         claims = source("combat_claims.cpp")
         self.assertIn("combat_hostility::SyncHostNpc(target.GetInstance());", claims)
@@ -106,9 +114,11 @@ class CombatHostilityContractTests(unittest.TestCase):
     def test_touched_src_files_under_1000_lines(self):
         touched = (
             "relation_policy.h", "combat_hostility.h", "combat_hostility.cpp",
-            "relation.cpp", "ai.cpp", "npcs.cpp", "npclease_runtime.h",
-            "npclease_runtime.cpp", "npclease_client.cpp", "combat_melee.cpp",
-            "combat_claims.cpp", "infocmd.cpp", "Script_G3Together.cpp",
+            "relation.cpp", "ai.cpp", "ai_diag.cpp", "enclaves.cpp", "enclaves_murder.cpp",
+            "enclaves_qa.cpp", "npcs.cpp", "npclease_runtime.h", "npclease_internal.h",
+            "npclease_runtime.cpp", "npclease_host.cpp", "npclease_client.cpp",
+            "combat.cpp", "combat_melee.cpp", "combat_claims.cpp", "combat_kill_xp.cpp",
+            "downed.cpp", "infocmd.cpp", "Script_G3Together.cpp",
         )
         for name in touched:
             lines = len(source(name).splitlines())

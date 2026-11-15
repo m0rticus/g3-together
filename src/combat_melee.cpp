@@ -228,12 +228,16 @@ MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, ne
         return result;
     }
     v.attitude = combat_hostility::EffectiveAttitude(victim, v.attitude);
+    v.focusAttitude = combat_hostility::EffectiveAttitude(result.focus, v.focusAttitude);
+    v.targetAttitude = combat_hostility::EffectiveAttitude(opponent, v.targetAttitude);
     result.relation = combat_hostility::EffectiveAttitude(victim, result.relation);
     v.relation = result.relation;
-    if (!v.combat && v.hasFocus && !v.focused && !v.targetsPlayer && !v.partyMember &&
-        !ai::TryPlayerAttitude(result.focus, claimant, v.focusRelation)) {
-        result.decision = "focus-attitude-unavailable";
-        return result;
+    if (!v.combat && v.hasFocus && !v.focused && !v.targetsPlayer && !v.partyMember) {
+        if (!ai::TryPlayerAttitude(result.focus, claimant, v.focusRelation)) {
+            result.decision = "focus-attitude-unavailable";
+            return result;
+        }
+        v.focusRelation = combat_hostility::EffectiveAttitude(result.focus, v.focusRelation);
     }
     result.relationsKnown = true;
     Entity npc(victim);

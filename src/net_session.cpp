@@ -77,25 +77,6 @@ uint32_t peerConnectData[MaxPlayers] = {};
 PoseRoute poseRoutes[MaxPlayers] = {};
 
 namespace {
-bool ConstantTimeCookieEqual(uint8_t const a[16], uint8_t const b[16])
-{
-    uint8_t diff = 0;
-    for (size_t i = 0; i < 16; ++i) diff |= static_cast<uint8_t>(a[i] ^ b[i]);
-    return diff == 0;
-}
-
-void SendDirectPunchPacket(ENetAddress const& to, uint8_t const cookie[16], uint8_t flags)
-{
-    if (!host || host->socket == ENET_SOCKET_NULL || !to.host || !to.port) return;
-    uint8_t packet[DirectPunchBytes] = {};
-    std::memcpy(packet, "G3TPUNCH", 8);
-    std::memcpy(packet + 8, cookie, 16);
-    packet[24] = flags;
-    packet[25] = isHost ? 1u : 2u;
-    ENetBuffer buf{sizeof(packet), packet};
-    enet_socket_send(host->socket, &to, &buf, 1);
-}
-
 uint32_t QueueBytes(ENetList const& list)
 {
     uint64_t bytes = 0;
@@ -105,110 +86,19 @@ uint32_t QueueBytes(ENetList const& list)
 }
 } // namespace
 
-int ENET_CALLBACK InterceptTransportPacket(ENetHost* currentHost, ENetEvent*)
+void ClearPeerPlayerTables(uint8_t id)
 {
-    if (!currentHost || !currentHost->receivedData) return 0;
-    const ENetAddress from = currentHost->receivedAddress;
-    const size_t length = currentHost->receivedDataLength;
-    const uint8_t* data = currentHost->receivedData;
-    const bool isRelayPort = from.host == target.host &&
-        (isHost ? steam::IsPeerRelay(from.port) : from.port == target.port);
-    if (length == DirectPunchBytes && std::memcmp(data, "G3TPUNCH", 8) == 0) {
-        const uint8_t expectedPeerRole = isHost ? 2u : 1u;
-        if (data[25] != expectedPeerRole) return 1;
-        const uint8_t flags = data[24];
-        for (auto& session : directSessions) {
-            if (!session.account || !session.generation || session.directFailed) continue;
-            if (!ConstantTimeCookieEqual(data + 8, session.cookie)) continue;
-            const bool sameEndpoint = session.inboundVerified &&
-                session.verifiedAddress.host == from.host &&
-                session.verifiedAddress.port == from.port;
-            if (session.endpointLocked && !sameEndpoint) return 1;
-            if (!sameEndpoint) {
-                session.inboundVerified = true;
-                session.verifiedAddress = from;
-                steam::RegisterDirectPeerEndpoint(session.account, session.generation, from.host, from.port);
-            }
-            if (flags & 0x02u) session.bidirectionalVerified = true;
-            if (flags & 0x01u) SendDirectPunchPacket(from, session.cookie, 0x02u);
-            return 1;
-        }
-        return 1;
-    }
-    if (isRelayPort) return 0;
-    for (auto const& session : directSessions) {
-        if (!session.account || !session.inboundVerified || session.directFailed) continue;
-        if (session.verifiedAddress.host == from.host && session.verifiedAddress.port == from.port)
-            return 0;
-    }
-    // Drop unauthenticated external UDP packets before ENet protocol handling.
-    return 1;
+    if (id >= MaxPlayers) return;
+    for (auto& sender : playerSenders[id]) sender = {};
+    for (auto& senders : playerSenders) senders[id] = {};
+    for (auto& forced : forcePlayerFull[id]) forced = false;
+    for (auto& forced : forcePlayerFull) forced[id] = false;
 }
 
-bool PeerRelayOrDirect(ENetPeer const* peer)
+void ClearAllPlayerTables()
 {
-    if (!peer) return false;
-    if (peer->address.host == target.host && steam::IsPeerRelay(peer->address.port))
-        return true;
-    uint64_t account = 0, generation = 0;
-    char name[24] = {};
-    return steam::DirectPeerIdentity(peer->address.host, peer->address.port, account, name, generation);
-}
-
-bool ClaimAuthenticatedPeerIdentity(ENetPeer const* peer, uint64_t& account, char (&name)[24], uint64_t& generation)
-{
-    if (!peer) return false;
-    if (peer->address.host == target.host && steam::ClaimPeerIdentity(peer->address.port, account, name, generation))
-        return true;
-    const size_t idx = PeerIndex(peer);
-    const uint32_t connectTag = idx < MaxPlayers ? peerConnectData[idx] : 0;
-    if (!steam::ClaimDirectPeerIdentity(peer->address.host, peer->address.port, connectTag, account, name, generation))
-        return false;
-    for (auto& session : directSessions)
-        if (session.account == account && session.generation == generation)
-            session.endpointLocked = true;
-    return true;
-}
-
-void SyncDirectSessions(uint32_t now)
-{
-    const auto offers = steam::DirectOffers();
-    for (auto& s : directSessions) {
-        bool stillPresent = false;
-        for (auto const& o : offers)
-            if (o.account == s.account && o.generation == s.generation) { stillPresent = true; break; }
-        if (!stillPresent) s = DirectPunchSession{};
-    }
-    for (auto const& offer : offers) {
-        DirectPunchSession* slot = nullptr;
-        for (auto& s : directSessions)
-            if (s.account == offer.account && s.generation == offer.generation) { slot = &s; break; }
-        if (!slot) {
-            for (auto& s : directSessions)
-                if (!s.account) { slot = &s; break; }
-        }
-        if (!slot) continue;
-        if (!slot->account) {
-            slot->account = offer.account;
-            slot->generation = offer.generation;
-            slot->startedAt = now ? now : 1;
-        }
-        std::memcpy(slot->cookie, offer.cookie, 16);
-        slot->candidateCount = offer.candidateCount;
-        for (unsigned i = 0; i < offer.candidateCount && i < 8; ++i)
-            slot->candidates[i] = offer.candidates[i];
-        slot->ready = offer.ready;
-    }
-    for (auto& s : directSessions) {
-        if (!s.account || !s.ready || s.bidirectionalVerified || s.directFailed) continue;
-        if (now - s.startedAt >= DirectPunchTimeoutMs) continue;
-        if (s.lastProbeAt && now - s.lastProbeAt < DirectPunchIntervalMs) continue;
-        s.lastProbeAt = now ? now : 1;
-        for (unsigned i = 0; i < s.candidateCount && i < 8; ++i) {
-            ENetAddress to{s.candidates[i].hostIpv4, s.candidates[i].port};
-            SendDirectPunchPacket(to, s.cookie, s.inboundVerified ? 0x03u : 0x01u);
-        }
-    }
+    for (auto& senders : playerSenders) for (auto& sender : senders) sender = {};
+    for (auto& forced : forcePlayerFull) for (auto& flag : forced) flag = false;
 }
 
 BudgetClass SendPriority(uint8_t kind, bool reliable)
@@ -370,6 +260,8 @@ void HandleHello(ENetPeer* peer, bool exactSize, uint16_t version, char const* n
     peers[id] = peer;
     peerAccounts[id] = account;
     peerRelayGenerations[id] = relayGeneration;
+    if (peer->address.host != target.host)
+        LockDirectSessionEndpoint(account, relayGeneration, true);
     rememberedSlots[account] = id;
     for (auto& sender : playerSenders[id]) sender = {};
     for (auto& forced : forcePlayerFull[id]) forced = false;
@@ -387,8 +279,8 @@ void HandleHello(ENetPeer* peer, bool exactSize, uint16_t version, char const* n
 
 void HandleSaveMessage(ENetPeer* peer, ENetPacket const* packet)
 {
-    const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
-    if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && (!connected || peer != server))) return;
+    const uint8_t from = isHost ? PeerSlotOf(peer) : 1;
+    if ((isHost && !from) || (!isHost && (!connected || peer != server))) return;
     if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
     SaveMsg message{};
     std::memcpy(&message, packet->data, sizeof(message));
@@ -400,23 +292,6 @@ void HandleSaveMessage(ENetPeer* peer, ENetPacket const* packet)
     const bool pendingCancel = isHost && note.op == SaveCancel && !*note.world;
     if (!note.epoch || !saving::Id(note.save) || (!pendingCancel && !saving::Id(note.world))) return;
     if (handlers.save) handlers.save(from, note);
-}
-
-void MarkDirectConnectFailed()
-{
-    for (auto& s : directSessions) {
-        if (s.account && s.generation == hostRelayGeneration && s.connectStarted && !s.directFailed) {
-            s.directFailed = true;
-            s.connectStarted = false;
-            s.endpointLocked = false;
-            lastConnectAttempt = enet_time_get() - 3001;
-            if (!s.fallbackLogged) {
-                s.fallbackLogged = true;
-                Log("net: direct UDP connection failed; falling back to Steam relay");
-            }
-            break;
-        }
-    }
 }
 
 bool StartFailed(char const* reason)
@@ -509,52 +384,11 @@ void SendBroadcast(void const* data, size_t size, uint8_t channel, bool reliable
         if (peers[i]) Send(peers[i], data, size, channel, reliable);
 }
 
-DirectPunchSession* FindClientDirectSession()
+void SendBroadcastExcept(void const* data, size_t size, uint8_t channel, bool reliable, uint8_t except)
 {
-    for (auto& s : directSessions)
-        if (s.account && s.generation == hostRelayGeneration) return &s;
-    return nullptr;
-}
-
-bool ClientPunchWaiting(DirectPunchSession const* direct, uint32_t now)
-{
-    return direct && !direct->bidirectionalVerified && !direct->directFailed &&
-           (now - startedAt < DirectPunchTimeoutMs);
-}
-
-void FinishClientConnectAttempt(DirectPunchSession* direct, bool useDirect, uint32_t now)
-{
-    lastConnectAttempt = now;
-    ENetAddress connectTo = useDirect ? direct->verifiedAddress : target;
-    if (useDirect && !server) {
-        direct->directFailed = true;
-        direct->connectStarted = false;
-        direct->endpointLocked = false;
-        if (!direct->fallbackLogged) {
-            direct->fallbackLogged = true;
-            Log("net: direct UDP connect setup failed; falling back to Steam relay");
-        }
-        useDirect = false;
-        connectTo = target;
-        server = ConnectTransportHost(host, &target);
-    } else if (direct) {
-        direct->connectStarted = useDirect && server != nullptr;
-        if (direct->connectStarted) direct->endpointLocked = true;
-    }
-    steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,
-                               now - startedAt, server ? "" : "ENet connect refused (no free peer)");
-    Logf("enet: connect request role=client channels=%u compress=off route=%s port=%u result=%s state=%s elapsed_ms=%u",
-         ChannelCount, useDirect ? "direct-udp" : "steam-relay", connectTo.port, server ? "pending" : "refused",
-         EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED), now - startedAt);
-    if (!connectLogged) {
-        if (useDirect)
-            Logf("net: direct UDP hole-punch verified (port %u); connecting natively (zero relay overhead)", connectTo.port);
-        else
-            Logf("net: connecting over Steam (relay 127.0.0.1:%u): %s", target.port, server ? "pending" : "failed");
-    } else {
-        Log(server ? "net: reconnecting" : "net: reconnect failed");
-    }
-    connectLogged = true;
+    if (!isHost) { SendToServer(data, size, channel, reliable); return; }
+    for (uint8_t i = 2; i < MaxPlayers; ++i)
+        if (peers[i] && i != except) Send(peers[i], data, size, channel, reliable);
 }
 
 void CloseClientLink()

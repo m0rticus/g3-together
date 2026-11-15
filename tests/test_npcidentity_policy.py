@@ -33,7 +33,7 @@ class NpcIdentityTests(unittest.TestCase):
 
     def test_reconciliation_runs_before_passive_playback(self):
         frame = _testbuild.src_text("Script_G3Together.cpp")
-        self.assertLess(frame.index("npcs::ReconcileClientEntities()"), frame.index("npcplayback::Tick()"))
+        self.assertLess(frame.index("npcs::ReconcileClientEntities"), frame.index("npcplayback::Tick"))
         playback = _testbuild.src_text("npcplayback.cpp")
         tick = playback[playback.index("void Tick()"):]
         self.assertLess(tick.index("RedundantClientEntity(entity)"), tick.index("HoldUnavailable("))

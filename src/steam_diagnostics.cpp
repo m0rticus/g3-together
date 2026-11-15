@@ -8,13 +8,16 @@
 #include <cstring>
 
 namespace g3t::steam {
-config::Read WorkerRuntime::ReadNetworkingConfig(int id) const
+config::Read WorkerRuntime::ReadNetworkingConfig(int id, int scope, intptr_t handle) const
 {
     config::Read read;
     if (!networkingUtils || !api.GetConfigValue) return read;
     size_t size = sizeof(read.value);
-    read.result = api.GetConfigValue(networkingUtils, id, config::GlobalScope, 0, &read.type, &read.value, &size);
-    if (size != sizeof(read.value)) read.type = 0;
+    read.result = api.GetConfigValue(networkingUtils, id, scope, handle, &read.type, &read.value, &size);
+    if (size != sizeof(read.value)) {
+        read.type = 0;
+        read.result = -1;
+    }
     return read;
 }
 
@@ -175,18 +178,23 @@ void WorkerRuntime::SendDiagnostics(uint32_t now)
             Logf("steam: path peer=%llu transport=unknown available=0 reason=status-export-unavailable", r.id);
             Logf("steam-send: session peer=%llu available=0 reason=status-export-unavailable", r.id);
         }
-        for (unsigned result = 0; result < 128; ++result)
-            if (r.steamFailed[result])
+        for (unsigned result = 0; result < 128; ++result) {
+            const uint64_t dataFailed = (std::max)(c.failed[result], r.steamDataFailed[result]);
+            const uint64_t controlFailed = r.steamControlFailed[result];
+            const uint64_t totalFailed = dataFailed + controlFailed;
+            if (totalFailed)
                 Logf("steam-send: peer=%llu result=%u failed_datagrams=%llu data_failed=%llu control_failed=%llu "
                      "data_action=%s control_action=control-flow-retry",
-                     r.id, result, r.steamFailed[result], c.failed[result], r.steamFailed[result] - c.failed[result],
+                     r.id, result, totalFailed, dataFailed, controlFailed,
                      send::Retryable(static_cast<int>(result)) ? "retained-for-retry" : "fallback-messages-or-close-session");
+        }
         r.pending.counters = {};
         r.pending.counters.peakDepth = r.pending.Depth();
         r.pending.counters.peakBytes = r.pending.Bytes();
         r.pending.counters.peakAge = r.pending.OldestAge(now);
         r.steamReliableOk = r.steamUnreliableOk = 0;
-        std::memset(r.steamFailed, 0, sizeof(r.steamFailed));
+        std::memset(r.steamDataFailed, 0, sizeof(r.steamDataFailed));
+        std::memset(r.steamControlFailed, 0, sizeof(r.steamControlFailed));
     }
 }
 }

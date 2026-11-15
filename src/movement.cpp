@@ -376,12 +376,14 @@ void Begin(long long entered)
     Install();
     const long long now = NowUs();
     frameAt = entered; sampledAt = now; activeFrame = true; phase = "module";
-    admissionMax = std::max(admissionMax, static_cast<uint64_t>(now - entered));
+    if (now > entered) admissionMax = std::max(admissionMax, static_cast<uint64_t>(now - entered));
     const Sample current = Capture();
-    if (previous.body && current.body == previous.body && previousAt && now > previousAt) {
-        const auto gap = static_cast<uint64_t>(entered - previousAt);
+    if (previous.body && current.body == previous.body && previousAt && now > previousAt &&
+        previousSampleAt && now > previousSampleAt) {
+        const auto gap = entered > previousAt ? static_cast<uint64_t>(entered - previousAt) : 0ull;
         ++gaps[GapBucket(gap)]; gapMax = std::max(gapMax, gap);
-        if (previousEnd) engineMax = std::max(engineMax, static_cast<uint64_t>(entered - previousEnd));
+        if (previousEnd && entered > previousEnd)
+            engineMax = std::max(engineMax, static_cast<uint64_t>(entered - previousEnd));
         const float dx = current.position[0] - previous.position[0], dz = current.position[2] - previous.position[2];
         speed = std::sqrt(dx * dx + dz * dz) * 1000000.0f / static_cast<float>(now - previousSampleAt);
         const bool eligible = (current.input & 7u) == 7u && partner::Focused() && !gCSession::GetInstance().IsPaused() &&

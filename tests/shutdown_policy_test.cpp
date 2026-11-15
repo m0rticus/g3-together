@@ -43,6 +43,7 @@ int main()
 
     GraphicsWait wait{0x069ede40, 2, 5, 1};
     assert(wait.Pending());
+    assert(!(GraphicsWait{0x069ede40, 0, 1, 2}.Pending()));
     ExitPolicy normal;
     assert(!normal.Observe(0, true, 0, true, wait));
     assert(!normal.Observe(GraphicsStallMs, true, 0, true, wait));

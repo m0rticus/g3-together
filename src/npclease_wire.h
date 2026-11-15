@@ -179,12 +179,17 @@ inline bool Newer(uint32_t next, uint32_t previous)
 
 namespace detail {
 
-inline void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value)
+inline void Put32(uint8_t* bytes, size_t offset, uint32_t value)
 {
     bytes[offset] = static_cast<uint8_t>(value);
     bytes[offset + 1] = static_cast<uint8_t>(value >> 8);
     bytes[offset + 2] = static_cast<uint8_t>(value >> 16);
     bytes[offset + 3] = static_cast<uint8_t>(value >> 24);
+}
+
+inline void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value)
+{
+    Put32(bytes.data(), offset, value);
 }
 
 inline uint32_t Get32(uint8_t const* bytes)
@@ -195,10 +200,15 @@ inline uint32_t Get32(uint8_t const* bytes)
            (uint32_t(bytes[3]) << 24);
 }
 
-inline void Put16(std::vector<uint8_t>& bytes, size_t offset, uint16_t value)
+inline void Put16(uint8_t* bytes, size_t offset, uint16_t value)
 {
     bytes[offset] = static_cast<uint8_t>(value);
     bytes[offset + 1] = static_cast<uint8_t>(value >> 8);
+}
+
+inline void Put16(std::vector<uint8_t>& bytes, size_t offset, uint16_t value)
+{
+    Put16(bytes.data(), offset, value);
 }
 
 inline uint16_t Get16(uint8_t const* bytes)
@@ -206,9 +216,14 @@ inline uint16_t Get16(uint8_t const* bytes)
     return static_cast<uint16_t>(uint16_t(bytes[0]) | (uint16_t(bytes[1]) << 8));
 }
 
-inline void PutI32(std::vector<uint8_t>& bytes, size_t offset, int32_t value)
+inline void PutI32(uint8_t* bytes, size_t offset, int32_t value)
 {
     Put32(bytes, offset, static_cast<uint32_t>(value));
+}
+
+inline void PutI32(std::vector<uint8_t>& bytes, size_t offset, int32_t value)
+{
+    PutI32(bytes.data(), offset, value);
 }
 
 inline int32_t GetI32(uint8_t const* bytes)
@@ -219,11 +234,16 @@ inline int32_t GetI32(uint8_t const* bytes)
     return result;
 }
 
-inline void PutF32(std::vector<uint8_t>& bytes, size_t offset, float value)
+inline void PutF32(uint8_t* bytes, size_t offset, float value)
 {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
     Put32(bytes, offset, bits);
+}
+
+inline void PutF32(std::vector<uint8_t>& bytes, size_t offset, float value)
+{
+    PutF32(bytes.data(), offset, value);
 }
 
 inline float GetF32(uint8_t const* bytes)
@@ -245,9 +265,9 @@ inline uint32_t Crc32(uint8_t const* data, size_t size)
     return crc ^ 0xffffffffu;
 }
 
-inline size_t WriteCheckpoint(std::vector<uint8_t>& bytes, size_t offset, Checkpoint const& c)
+inline size_t WriteCheckpoint(uint8_t* bytes, size_t offset, Checkpoint const& c)
 {
-    std::memcpy(bytes.data() + offset, c.templateId, 16);
+    std::memcpy(bytes + offset, c.templateId, 16);
     offset += 16;
     for (float v : c.position) { PutF32(bytes, offset, v); offset += 4; }
     for (float v : c.rotation) { PutF32(bytes, offset, v); offset += 4; }
@@ -259,11 +279,16 @@ inline size_t WriteCheckpoint(std::vector<uint8_t>& bytes, size_t offset, Checkp
     for (uint8_t v : { c.dead, c.defeated, c.attitude, c.aiMode, c.action,
                        c.attackReason, c.effects, c.busy })
     { bytes[offset++] = v; }
-    std::memcpy(bytes.data() + offset, c.name, 64); offset += 64;
-    std::memcpy(bytes.data() + offset, c.routine, 64); offset += 64;
+    std::memcpy(bytes + offset, c.name, 64); offset += 64;
+    std::memcpy(bytes + offset, c.routine, 64); offset += 64;
     bytes[offset++] = c.targetPlayer;
     for (uint32_t v : c.statusAge) { Put32(bytes, offset, v); offset += 4; }
     return offset;
+}
+
+inline size_t WriteCheckpoint(std::vector<uint8_t>& bytes, size_t offset, Checkpoint const& c)
+{
+    return WriteCheckpoint(bytes.data(), offset, c);
 }
 
 inline size_t ReadCheckpoint(uint8_t const* data, size_t offset, Checkpoint& c)
@@ -327,10 +352,10 @@ inline bool EncodeMessage(Message const& message, std::vector<uint8_t>& output)
     if (message.kind == Kind::Renew) {
         encoded[MessageHeaderWireSize] = message.state.effects;
     } else if (message.kind == Kind::State) {
-        std::vector<uint8_t> state(sizeof(Checkpoint));
+        uint8_t state[sizeof(Checkpoint)]{};
         detail::WriteCheckpoint(state, 0, message.state);
-        std::memcpy(encoded.data() + MessageHeaderWireSize, state.data(), 84);
-        std::memcpy(encoded.data() + MessageHeaderWireSize + 84, state.data() + 212, 21);
+        std::memcpy(encoded.data() + MessageHeaderWireSize, state, 84);
+        std::memcpy(encoded.data() + MessageHeaderWireSize + 84, state + 212, 21);
     } else {
         detail::WriteCheckpoint(encoded, MessageHeaderWireSize, message.state);
     }
@@ -361,10 +386,10 @@ inline bool DecodeMessage(uint8_t const* data, size_t size, Message& output)
         decoded.state.effects = data[MessageHeaderWireSize];
         if (!Valid(decoded)) return false;
     } else if (decoded.kind == Kind::State) {
-        std::vector<uint8_t> state(sizeof(Checkpoint), 0);
-        std::memcpy(state.data(), data + MessageHeaderWireSize, 84);
-        std::memcpy(state.data() + 212, data + MessageHeaderWireSize + 84, 21);
-        detail::ReadCheckpoint(state.data(), 0, decoded.state);
+        uint8_t state[sizeof(Checkpoint)]{};
+        std::memcpy(state, data + MessageHeaderWireSize, 84);
+        std::memcpy(state + 212, data + MessageHeaderWireSize + 84, 21);
+        detail::ReadCheckpoint(state, 0, decoded.state);
         if (!ValidStateFields(decoded.state)) return false;
     } else {
         detail::ReadCheckpoint(data, MessageHeaderWireSize, decoded.state);

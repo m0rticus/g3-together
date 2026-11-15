@@ -143,6 +143,11 @@ inline bool ImmediateInitial(Input const& in)
 }
 
 namespace detail {
+constexpr uint8_t MaxPartyType = 8, MaxAttitude = 8, MaxAiMode = 11, MaxAttackReason = 21, MaxDamageType = 7;
+constexpr int32_t MaxHitPointsAbs = 1000000;
+constexpr float MaxDamageMultiplier = 1000.0f, MaxPositionCm = 1e7f;
+constexpr float MaxMotionSpeed = 100.0f, MaxMotionWeight = 10.0f, MaxMotionBlendMs = 100000.0f;
+
 inline bool Valid(Input const& in)
 {
     if (!in.record || !std::isfinite(in.distanceCm) || in.distanceCm < 0 ||
@@ -152,12 +157,14 @@ inline bool Valid(Input const& in)
         (!in.boneCount && in.poseFlags)) return false;
     auto const& r = *in.record;
     if (!r.incarnation || r.hitPlayer >= net::MaxPlayers || r.guidePlayer >= net::MaxPlayers ||
-        r.partyPlayer >= net::MaxPlayers || r.partyType > 8 || r.waiting > 1 || r.contact > 1 ||
-        r.attitude > 8 || r.aiMode > 11 || r.attackReason > 21 || r.damageType > 7 ||
-        r.damageAmount < -1000000 || r.damageAmount > 1000000 ||
-        r.hitPoints < -1000000 || r.hitPoints > 1000000 || r.hitPointsMax < 1 || r.hitPointsMax > 1000000 ||
-        !std::isfinite(r.damageMultiplier) || std::fabs(r.damageMultiplier) > 1000.0f) return false;
-    for (float v : r.position) if (!std::isfinite(v) || std::fabs(v) > 1e7f) return false;
+        r.partyPlayer >= net::MaxPlayers || r.partyType > MaxPartyType || r.waiting > 1 || r.contact > 1 ||
+        r.attitude > MaxAttitude || r.aiMode > MaxAiMode || r.attackReason > MaxAttackReason ||
+        r.damageType > MaxDamageType ||
+        r.damageAmount < -MaxHitPointsAbs || r.damageAmount > MaxHitPointsAbs ||
+        r.hitPoints < -MaxHitPointsAbs || r.hitPoints > MaxHitPointsAbs ||
+        r.hitPointsMax < 1 || r.hitPointsMax > MaxHitPointsAbs ||
+        !std::isfinite(r.damageMultiplier) || std::fabs(r.damageMultiplier) > MaxDamageMultiplier) return false;
+    for (float v : r.position) if (!std::isfinite(v) || std::fabs(v) > MaxPositionCm) return false;
     double length = 0;
     for (float v : r.rotation) {
         if (!std::isfinite(v) || std::fabs(v) > 2.0f) return false;
@@ -168,10 +175,10 @@ inline bool Valid(Input const& in)
         if ((m.active & ~3u) || (m.active && !(m.active & 1u)) ||
             (m.active && (!m.name || !m.instance)) ||
             !std::isfinite(m.phase) || m.phase < 0 || m.phase > 1 ||
-            !std::isfinite(m.speed) || std::fabs(m.speed) > 100 ||
-            !std::isfinite(m.weight) || m.weight < 0 || m.weight > 10 ||
-            !std::isfinite(m.intro) || m.intro < 0 || m.intro > 100000 ||
-            !std::isfinite(m.extro) || m.extro < 0 || m.extro > 100000) return false;
+            !std::isfinite(m.speed) || std::fabs(m.speed) > MaxMotionSpeed ||
+            !std::isfinite(m.weight) || m.weight < 0 || m.weight > MaxMotionWeight ||
+            !std::isfinite(m.intro) || m.intro < 0 || m.intro > MaxMotionBlendMs ||
+            !std::isfinite(m.extro) || m.extro < 0 || m.extro > MaxMotionBlendMs) return false;
     }
     constexpr unsigned NameSlots = pose::MaxBones * 2;
     static_assert((NameSlots & (NameSlots - 1)) == 0, "bone name table must have power-of-two capacity");
@@ -391,24 +398,25 @@ inline void SanitizeCapturedRecord(net::NpcRecord& r)
     if (r.hitPlayer >= net::MaxPlayers) r.hitPlayer = 0;
     if (r.guidePlayer >= net::MaxPlayers) r.guidePlayer = 0;
     if (r.partyPlayer >= net::MaxPlayers) r.partyPlayer = 0;
-    if (r.partyType > 8) r.partyType = 0;
+    if (r.partyType > detail::MaxPartyType) r.partyType = 0;
     if (r.waiting > 1) r.waiting = 1;
     if (r.contact > 1) r.contact = 1;
-    if (r.attitude > 8) r.attitude = 0;
-    if (r.aiMode > 11) r.aiMode = 0;
-    if (r.attackReason > 21) r.attackReason = 0;
-    if (r.damageType > 7) r.damageType = 0;
-    if (r.damageAmount < -1000000) r.damageAmount = -1000000;
-    else if (r.damageAmount > 1000000) r.damageAmount = 1000000;
-    if (r.hitPoints < -1000000) r.hitPoints = -1000000;
-    else if (r.hitPoints > 1000000) r.hitPoints = 1000000;
+    if (r.attitude > detail::MaxAttitude) r.attitude = 0;
+    if (r.aiMode > detail::MaxAiMode) r.aiMode = 0;
+    if (r.attackReason > detail::MaxAttackReason) r.attackReason = 0;
+    if (r.damageType > detail::MaxDamageType) r.damageType = 0;
+    if (r.damageAmount < -detail::MaxHitPointsAbs) r.damageAmount = -detail::MaxHitPointsAbs;
+    else if (r.damageAmount > detail::MaxHitPointsAbs) r.damageAmount = detail::MaxHitPointsAbs;
+    if (r.hitPoints < -detail::MaxHitPointsAbs) r.hitPoints = -detail::MaxHitPointsAbs;
+    else if (r.hitPoints > detail::MaxHitPointsAbs) r.hitPoints = detail::MaxHitPointsAbs;
     if (r.hitPointsMax < 1) r.hitPointsMax = 1;
-    else if (r.hitPointsMax > 1000000) r.hitPointsMax = 1000000;
-    if (!std::isfinite(r.damageMultiplier) || std::fabs(r.damageMultiplier) > 1000.0f) r.damageMultiplier = 1.0f;
+    else if (r.hitPointsMax > detail::MaxHitPointsAbs) r.hitPointsMax = detail::MaxHitPointsAbs;
+    if (!std::isfinite(r.damageMultiplier) || std::fabs(r.damageMultiplier) > detail::MaxDamageMultiplier)
+        r.damageMultiplier = 1.0f;
     for (float& v : r.position) {
         if (!std::isfinite(v)) v = 0.0f;
-        else if (v < -1e7f) v = -1e7f;
-        else if (v > 1e7f) v = 1e7f;
+        else if (v < -detail::MaxPositionCm) v = -detail::MaxPositionCm;
+        else if (v > detail::MaxPositionCm) v = detail::MaxPositionCm;
     }
     double lengthSq = 0.0;
     bool finiteRot = true;
@@ -432,14 +440,14 @@ inline void SanitizeCapturedRecord(net::NpcRecord& r)
         if (!std::isfinite(m.phase) || m.phase < 0.0f) m.phase = 0.0f;
         else if (m.phase > 1.0f) m.phase = 1.0f;
         if (!std::isfinite(m.speed)) m.speed = 0.0f;
-        else if (m.speed < -100.0f) m.speed = -100.0f;
-        else if (m.speed > 100.0f) m.speed = 100.0f;
+        else if (m.speed < -detail::MaxMotionSpeed) m.speed = -detail::MaxMotionSpeed;
+        else if (m.speed > detail::MaxMotionSpeed) m.speed = detail::MaxMotionSpeed;
         if (!std::isfinite(m.weight) || m.weight < 0.0f) m.weight = 0.0f;
-        else if (m.weight > 10.0f) m.weight = 10.0f;
+        else if (m.weight > detail::MaxMotionWeight) m.weight = detail::MaxMotionWeight;
         if (!std::isfinite(m.intro) || m.intro < 0.0f) m.intro = 0.0f;
-        else if (m.intro > 100000.0f) m.intro = 100000.0f;
+        else if (m.intro > detail::MaxMotionBlendMs) m.intro = detail::MaxMotionBlendMs;
         if (!std::isfinite(m.extro) || m.extro < 0.0f) m.extro = 0.0f;
-        else if (m.extro > 100000.0f) m.extro = 100000.0f;
+        else if (m.extro > detail::MaxMotionBlendMs) m.extro = detail::MaxMotionBlendMs;
     }
 }
 

@@ -2,6 +2,7 @@
 #include "journal.h"
 #include "npcremoval.h"
 
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -41,8 +42,9 @@ constexpr uint32_t SettleTime = 700;
 
 std::string Key(eCEntity const* entity)
 {
-    const eCEntityProxy proxy(const_cast<eCEntity*>(entity));
-    return std::string(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
+    uint8_t raw[16] = {};
+    guid::CopyEntity(const_cast<eCEntity*>(entity), raw);
+    return std::string(reinterpret_cast<char const*>(raw), 16);
 }
 
 bool Processed(eCEntity const* entity)
@@ -162,7 +164,13 @@ bool LeaseDeath(eCEntity* entity, unsigned char owner)
     Death death;
     death.by = owner; death.applied = true; death.name = npc.GetName().GetText();
     deaths.emplace(key, death); // guard native quest callbacks before entering them
-    CountQuest(npc);
+    if (questCounting) CountQuest(npc);
+    if (reporting && net::Connected()) {
+        uint8_t rawGuid[16];
+        guid::CopyEntity(entity, rawGuid);
+        net::SendDeath(rawGuid, owner, owner);
+        ++reported;
+    }
     return true;
 }
 

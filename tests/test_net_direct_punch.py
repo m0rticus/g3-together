@@ -24,6 +24,7 @@ NET_SEPARATE_UNITS = tuple(
     )
     for source in (
         "src/net.cpp",
+        "src/net_direct.cpp",
         "src/net_session.cpp",
         "src/net_npc.cpp",
         "src/net_npc_pose.cpp",

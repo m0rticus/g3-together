@@ -522,18 +522,26 @@ void ReconcileClientPresence()
     if (!gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero() || persist::NativeLoading()) return;
     auto const* processed = world::ProcessedEntities();
     if (net::IsHost() || !net::Connected()) {
-        if (!hiddenClientStates.empty() && processed) {
-            for (GEU16 i = 0; i < processed->GetCount(); ++i) {
-                eCEntity* entity = processed->GetAt(i);
-                if (!entity || !npcplayback::IsCharacter(entity)) continue;
-                uint8_t guid[16];
-                Guid(entity, guid);
-                if (const auto it = hiddenClientStates.find(Key(guid)); it != hiddenClientStates.end()) {
-                    RestoreHiddenTree(entity, it->second);
-                    hiddenClientStates.erase(it);
+        for (auto it = hiddenClientStates.begin(); it != hiddenClientStates.end();) {
+            eCEntity* entity = Resolve(it->first).GetInstance();
+            if (!entity && processed) {
+                for (GEU16 i = 0; i < processed->GetCount(); ++i) {
+                    eCEntity* candidate = processed->GetAt(i);
+                    if (!candidate || !npcplayback::IsCharacter(candidate)) continue;
+                    uint8_t guid[16];
+                    Guid(candidate, guid);
+                    if (Key(guid) == it->first) {
+                        entity = candidate;
+                        break;
+                    }
                 }
             }
-            hiddenClientStates.clear();
+            if (entity) {
+                RestoreHiddenTree(entity, it->second);
+                it = hiddenClientStates.erase(it);
+            } else {
+                ++it;
+            }
         }
         return;
     }

@@ -110,6 +110,8 @@ int main(int argc, char** argv)
         {id('c'), {Kind::Corpse, GeneratedPlunder, {{id('d'), 7, 42, Stock::Normal}}}}
     };
     assert(Encode(input, bytes));
+    assert(bytes.size() == HeaderBytes + EncodedRowBytes(input.at(id('a'))) + EncodedRowBytes(input.at(id('b'))) +
+                               EncodedRowBytes(input.at(id('c'))));
     assert(Decode(bytes, round) && round.size() == 3);
     assert(round.at(id('b')).stacks[0].item == id('a'));
     Bytes again;
@@ -133,6 +135,15 @@ int main(int argc, char** argv)
     bad = bytes; u32(bad, 68, MaxAmount + 1); invalid(bad);
     bad = bytes; u32(bad, 72, MaxQuality + 1); invalid(bad);
     bad = bytes; bad[76] = 1; invalid(bad);
+    // Claiming MaxStacks in a 32-byte row must fail cleanly without reading past the buffer end.
+    Bytes claimedMaxStacks(HeaderBytes + RowHeaderBytes, 0);
+    std::memcpy(claimedMaxStacks.data(), "G3TPERS1", 8);
+    u32(claimedMaxStacks, 8, 1);
+    std::fill(claimedMaxStacks.begin() + 12, claimedMaxStacks.begin() + 28, 'm');
+    claimedMaxStacks[28] = static_cast<uint8_t>(Kind::Chest);
+    claimedMaxStacks[30] = static_cast<uint8_t>(MaxStacks & 0xff);
+    claimedMaxStacks[31] = static_cast<uint8_t>((MaxStacks >> 8) & 0xff);
+    invalid(claimedMaxStacks);
     invalid(Bytes(Limit + 1, 0));
     Snapshot broken = input;
     broken.at(id('b')).stacks[0].amount = 0;

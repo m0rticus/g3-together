@@ -184,7 +184,7 @@ void AppendPersonal(saving::personal::Snapshot& snapshot)
 {
     for (auto const& key : consumed) {
         saving::personal::Inventory row;
-        row.kind = static_cast<decltype(row.kind)>(4);
+        row.kind = saving::personal::Kind::GroundTaken;
         snapshot[key] = std::move(row);
     }
 }
@@ -192,7 +192,7 @@ bool RestorePersonal(saving::personal::Snapshot const& snapshot)
 {
     consumed.clear(); denied.clear(); taking = false; carriedBefore.clear();
     for (auto const& entry : snapshot)
-        if (static_cast<uint8_t>(entry.second.kind) == 4) consumed.insert(entry.first);
+        if (entry.second.kind == saving::personal::Kind::GroundTaken) consumed.insert(entry.first);
     TickPersonal();
     return true;
 }

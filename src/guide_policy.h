@@ -90,4 +90,17 @@ constexpr uint8_t ResolveCompanionOwner(uint8_t activeClaimOwner, uint8_t active
     return savedIdentityOwner;
 }
 
+// A client's Hero.Party.PartyLeader can be populated either locally by StartGuidePlayer or by SyncMirrorPartyAndGuide
+// applying an incoming NpcRecord with guidePlayer == localPlayer. After a FollowNpc quest finishes and the client sends
+// release (kind=5), in-flight NpcRecords still carry guidePlayer == localPlayer until the host's updated stream arrives.
+// Never re-adopt a mirror as an untethered (questless) guide from host-echoed guidePlayer state or while awaiting host
+// release clearance; only adopt when a FollowNpc quest is actively Running or StartGuidePlayer ran locally ahead of host ack.
+constexpr bool ShouldAdoptHeroLeaderAsGuide(bool isHost, bool hasRunningFollowQuest,
+                                            bool hostEchoesLocalGuide, bool awaitingHostRelease) noexcept
+{
+    if (isHost) return true;
+    if (hasRunningFollowQuest) return true;
+    return !hostEchoesLocalGuide && !awaitingHostRelease;
+}
+
 } // namespace g3t::guide_policy

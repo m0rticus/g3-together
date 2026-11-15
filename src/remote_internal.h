@@ -3,6 +3,7 @@
 
 #include "remote.h"
 #include "body.h"
+#include "guid_key.h"
 #include "movement_policy.h"
 #include "net.h"
 #include "npcplayback.h"
@@ -22,7 +23,7 @@ struct Puppet
     bool spawned = false;
     std::string heldRight, heldLeft;
     uint32_t holdChecked = 0;
-    std::string heldItems[2];
+    GuidKey heldItems[2] = {};
     uint32_t dropChecked = 0;
     uint32_t wearChecked = 0;
     uint32_t world = 0;

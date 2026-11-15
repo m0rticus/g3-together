@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import unittest
@@ -193,10 +194,10 @@ class ClientMovementTests(unittest.TestCase):
 
     def test_frame_order_and_complete_tick_stage_coverage(self):
         process = function_body(self.module, r"\bvoid\s+Process\s*\(\s*\)\s+override")
-        self.assertLess(process.index("g3t::remote::Tick()"), process.index("g3t::ai::Tick()"))
-        self.assertLess(process.index("g3t::ai::Tick()"), process.index("g3t::npcs::Tick()"))
+        self.assertLess(process.index("&g3t::remote::Tick"), process.index("&g3t::ai::Tick"))
+        self.assertLess(process.index("&g3t::ai::Tick"), process.index("&g3t::npcs::Tick"))
         for name in ("NPC / lease", "NPC playback", "remote / ENet service", "combat", "downed", "world", "persist"):
-            self.assertIn(f'Stage stage("{name}")', process)
+            self.assertRegex(process, rf'(?:Stage\s+stage|(?:Timed)?Step)\s*\(\s*"{re.escape(name)}"')
         frame = function_body(self.module, r"~FrameScope\s*\(")
         self.assertLess(frame.index("g3t::net::Flush()"), frame.index("g3t::persist::EndFrame()"))
         self.assertLess(frame.index("g3t::hud::Tick()"), frame.index("g3t::movement::End()"))

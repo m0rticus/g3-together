@@ -62,6 +62,7 @@ struct ParsedRecord {
 };
 
 char const* const* AttributeTags(size_t& count);
+char const* ValidateStatsAndAttributes(ParsedRecord const& candidate);
 char const* ValidateLogicalContents(std::vector<Stack> const& stacks, std::vector<std::string> const& spells,
                                     std::vector<Quick> const& quicks, Schema const& schema);
 char const* EncodeRecord(ParsedRecord const& record, Schema const& schema, std::vector<uint8_t>& out);

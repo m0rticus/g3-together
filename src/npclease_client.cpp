@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "npclease_runtime.h"
-#include "npclease_client.h"
+#include "npclease_internal.h"
 #include "npclease_save.h"
-#include "npclease_guards.h"
 #include "npclease_presentation.h"
 #define G3T_NPCLEASE_NATIVE_RUNTIME
 #include "npclease_admission.h"
 #undef G3T_NPCLEASE_NATIVE_RUNTIME
-#include "npcown_policy.h"
 #include "npcpresence_policy.h"
 
 #include "ai.h"
@@ -60,47 +57,6 @@ bool Exact(Message const& note, Entry const& entry)
         note.owner == entry.lease.owner &&
         !std::memcmp(note.state.templateId, entry.lease.state.templateId, 16) &&
         !std::strcmp(note.state.name, entry.lease.state.name);
-}
-Checkpoint HostInterestState(Checkpoint const& baseline, Entry const& entry, eCEntity* native, bool frozen)
-{
-    Checkpoint probe = baseline;
-    if (frozen) return probe;
-    if (native) {
-        const auto& p = native->GetWorldPosition();
-        probe.position[0] = p.GetX(); probe.position[1] = p.GetY(); probe.position[2] = p.GetZ();
-    } else if (entry.hasBaseline) {
-        std::memcpy(probe.position, entry.lease.state.position, sizeof(probe.position));
-    }
-    return probe;
-}
-void SyncOfferedHostState(Entry& entry, eCEntity* native, Checkpoint const& priorState, bool hadBaseline, bool frozen)
-{
-    if (frozen) return;
-    const uint8_t effects = entry.lease.state.effects;
-    if (native) {
-        Checkpoint hostState = entry.lease.state;
-        if (CaptureNative(native, hostState)) {
-            hostState.effects |= effects;
-            entry.lease.state = hostState;
-        }
-    } else if (hadBaseline) {
-        Checkpoint saved = priorState;
-        saved.effects |= effects;
-        entry.lease.state = saved;
-    }
-}
-void RejectToClient(uint8_t client, Message const& note, eCEntity* native)
-{
-    if (client < 2 || client >= net::MaxPlayers || !net::InWorld(client)) return;
-    Message reply;
-    reply.kind = Kind::Reject;
-    reply.world = note.world;
-    reply.owner = client;
-    reply.incarnation = native ? npcs::Incarnation(note.guid) : (note.incarnation ? note.incarnation : 1);
-    if (!reply.incarnation) reply.incarnation = 1;
-    reply.echo = note.echo;
-    std::memcpy(reply.guid, note.guid, 16);
-    net::SendNpcLease(client, reply);
 }
 bool CapacityAvailable()
 {
@@ -326,6 +282,7 @@ void ReceiveClient(Message const& note)
             entry.confirmed = true; entry.prepared = false;
             if (ready) { entry.vetted = true; entry.vettedInSession = true; }
             entry.hostSeenAt = now;
+            combat_hostility::OnClientLeaseConfirmed(note.guid);
             char detail[80];
             std::snprintf(detail, sizeof(detail), "epoch=%u life=%u", entry.lease.epoch, entry.lease.incarnation);
             OwnEvent(key, entry.lease.state.name, npcown::Event::Confirmed, detail);

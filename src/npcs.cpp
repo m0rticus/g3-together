@@ -37,18 +37,6 @@ namespace g3t::npcs {
 namespace {
 using namespace detail;
 
-bool Changed(net::NpcRecord const& a, net::NpcRecord const& b)
-{
-    float d = 0.0f;
-    for (int k = 0; k < 3; ++k) d += (a.position[k] - b.position[k]) * (a.position[k] - b.position[k]);
-    float q = 0.0f;
-    for (int k = 0; k < 4; ++k) q += std::fabs(a.rotation[k] - b.rotation[k]);
-    return d > 4.0f || q > 0.002f || a.motion != b.motion || a.flags != b.flags || a.hitPoints != b.hitPoints ||
-           a.aniState != b.aniState || a.movementMode != b.movementMode || a.heldRight != b.heldRight || a.heldLeft != b.heldLeft ||
-           a.motions[0].instance != b.motions[0].instance || a.hitPointsMax != b.hitPointsMax || a.partyPlayer != b.partyPlayer ||
-           a.aiMode != b.aiMode || a.combatTarget != b.combatTarget;
-}
-
 int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint8_t owner, uint32_t generation)
 {
     if (net::IsHost() || owner != 1) return 0;
@@ -267,65 +255,6 @@ void TryLocalBlow(Mirror& m, net::NpcRecord const& shown, uint32_t now)
 }
 
 void MirrorTick() {}
-
-using Vec3 = ragdoll::Vector;
-using AddForceFn = void(__fastcall*)(void* self, void* edx, Vec3 force, Vec3 at);
-AddForceFn originalAddForce = nullptr;
-
-void __fastcall HookAddForce(void* self, void* edx, Vec3 force, Vec3 at)
-{
-    if (!ai::ShuttingDown()) {
-        auto* set = self ? *static_cast<eCEntityPropertySet**>(self) : nullptr;
-        eCEntity* entity = set ? set->GetEntity() : nullptr;
-        if (downed::RejectHarm(entity, nullptr, "AddForceAtPos")) return;
-        if (npcplayback::IsPassive(entity)) return;
-        originalAddForce(self, edx, force, at);
-        if (!net::IsHost() || !entity || !net::Connected() || !entity->GetPropertySet(eEPropertySetType_NPC)) return;
-        if (entity == gCSession::GetInstance().GetHero() || remote::IsPuppet(entity)) return;
-        auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
-        if (!animation || !animation->GetRagDollEnabled()) return;
-        uint8_t guid[16];
-        Guid(entity, guid);
-        if (mirrors.count(Key(guid))) return;
-        net::RagdollNote note;
-        std::memcpy(note.guid, guid, 16);
-        if (++forceSequence == 0) ++forceSequence;
-        note.sequence = forceSequence;
-        note.incarnation = npcs::Incarnation(guid);
-        note.sent = net::Now();
-        const bCVector& position = entity->GetWorldPosition();
-        const Vec3 relative = ragdoll::RelativePoint(at, {position.GetX(), position.GetY(), position.GetZ()});
-        note.at[0] = relative.x, note.at[1] = relative.y, note.at[2] = relative.z;
-        note.force[0] = force.x, note.force[1] = force.y, note.force[2] = force.z;
-        auto& history = forceHistory[Key(guid)];
-        if (history.size() == 64) {
-            history.erase(history.begin());
-            Log("npcs: pruned the oldest historical ragdoll impulse; the live impulse is still published");
-        }
-        history.push_back(note);
-        net::SendRagdoll(note);
-        if (++ragdollForcesSent <= 20)
-            Logf("npcs: ragdoll force of %s sent: at %.0f/%.0f/%.0f (relative), force %.0f/%.0f/%.0f", Entity(entity).GetName().GetText(), note.at[0],
-                 note.at[1], note.at[2], force.x, force.y, force.z);
-        return;
-    }
-    if (originalAddForce) originalAddForce(self, edx, force, at);
-}
-
-void InstallRagdollHook(uint32_t now)
-{
-    static bool done = false;
-    static uint32_t lastTry = 0;
-    if (done || now - lastTry < 1000) return;
-    lastTry = now;
-    HMODULE game = GetModuleHandleA("Script_Game.dll");
-    if (!game) return;
-    done = true;
-    originalAddForce = reinterpret_cast<AddForceFn>(
-        ai::PatchImport(game, "Script.dll", "?AddForceAtPos@PSAnimation@@QAEXVbCVector@@0@Z", reinterpret_cast<void*>(&HookAddForce)));
-    ragdollHookInstalled = originalAddForce != nullptr;
-    Log(originalAddForce ? "npcs: ragdoll forces hooked" : "npcs: ragdoll forces NOT hooked (the script DLL does not import AddForceAtPos)");
-}
 
 NpcOpponents IndexNpcOpponents()
 {
@@ -680,7 +609,7 @@ void PassiveMirrorTick()
                 }
                 if (!m.replay.initialized)
                     m.replayReady = npcplayback::Replay(m.entity.GetInstance(), m.replay, m.latest, &MotionNameOf, now);
-            } else if (!YieldMirrorForClientTalk(m, m.latest.flags, now)) {
+            } else if (!YieldMirrorForClientTalk(m, m.latest.flags, now) && ClientPresent(m.entity.GetInstance())) {
                 npcplayback::HoldUnavailable(m.entity.GetInstance(), m.replay);
             }
             ++it;
@@ -938,7 +867,6 @@ void OnWorldDeactivate()
 
 void Start()
 {
-    (void)&Changed;
     (void)&MirrorTick;
     net::SetNpcHandlers(&OnNpcs, &OnMotionName);
     net::SetNpcReleaseHandler(&OnRelease);

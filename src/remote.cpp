@@ -85,6 +85,7 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
         puppet.heldRight.clear();
         puppet.heldLeft.clear();
         puppet.holdChecked = 0;
+        puppet.downedSequence = 0;
         puppet.presentationNames.clear();
         puppet.terminal = false;
         puppet.terminalInitialized = false;
@@ -134,13 +135,13 @@ bool LocalState(net::PlayerState& state)
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* own = session.GetHero();
     state.world = CurrentWorld();
-    if (!own || !session.IsGameRunning()) { state.flags = 64; return false; }
-    if (persist::HeroPending()) { state.flags = 32; return false; }
+    if (!own || !session.IsGameRunning()) { state.flags = net::PlayerFlags::MenuOrNoHero; return false; }
+    if (persist::HeroPending()) { state.flags = net::PlayerFlags::Loading; return false; }
     if (qa.badStates) {
         state.position[0] = std::nanf("");
         std::memset(state.name, 'X', sizeof(state.name));
         std::memset(state.shape, 'Y', sizeof(state.shape));
-        state.flags = 1;
+        state.flags = net::PlayerFlags::InGame;
         return true;
     }
     // Transformed, the player controls a creature and the hero's own body stays hidden where the spell was cast
@@ -160,9 +161,10 @@ bool LocalState(net::PlayerState& state)
     // bit 1: knocked out, bit 2: dead, bit 3: waiting for help (an intercepted death, downed.cpp), bit 4: knocked out by
     // the game's own rules, with the gold a robber would find (ransack.cpp)
     const bool robbable = downed::NativeDown();
-    state.flags = 1 | (Entity(own).IsDown() ? 2 : 0) |
-                  ((Entity(own).IsDead() || downed::Terminal()) ? 4 : 0) |
-                  (downed::Held() ? 8 : 0) | (robbable ? 16 : 0) | downed::LocalInteractionFlags();
+    state.flags = net::PlayerFlags::InGame | (Entity(own).IsDown() ? net::PlayerFlags::KnockedOut : 0) |
+                  ((Entity(own).IsDead() || downed::Terminal()) ? net::PlayerFlags::Dead : 0) |
+                  (downed::Held() ? net::PlayerFlags::Held : 0) |
+                  (robbable ? net::PlayerFlags::Robbable : 0) | downed::LocalInteractionFlags();
     state.downedSequence = downed::Sequence();
     state.gold = robbable ? Entity(own).Inventory.GetItemAmount(Template("It_Gold")) : 0;
     state.movementMode = static_cast<uint8_t>(Entity(hero).CharacterMovement.GetMovementMode());
@@ -198,16 +200,18 @@ bool LocalState(net::PlayerState& state)
 // GUID, taken while the NPC was in hand. Forget clears the puppet out of exactly these, looked up again by GUID: its
 // walk through Entity::GetNPCs() met a freed NPC still in that list, a per-frame copy of raw entity pointers (access
 // violation while the host saved, run 20261022-080317; re/findings/save-forget-npclist-c.md).
-std::unordered_set<std::string> contacts[net::MaxPlayers];
+std::unordered_set<GuidKey, GuidHash> contacts[net::MaxPlayers];
 unsigned contactsNoted = 0, contactsLookedUp = 0, contactsGone = 0;
 
-std::string KeyOf(eCEntity* entity)
+GuidKey KeyOf(eCEntity* entity)
 {
     const eCEntityProxy proxy(entity);
-    return std::string(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
+    GuidKey key{};
+    std::memcpy(key.data(), &proxy.GetEntityID().GetCore(), 16);
+    return key;
 }
 
-Entity ByKey(std::string const& key)
+Entity ByKey(GuidKey const& key)
 {
     _GUID raw;
     std::memcpy(&raw, key.data(), 16);
@@ -261,23 +265,18 @@ void NoDrop(Puppet& puppet, uint32_t now)
     if (!qa.puppetNoDrop || static_cast<int32_t>(now - puppet.dropChecked) < 250) return;
     puppet.dropChecked = now;
     for (int i = 0; i < 2; ++i) {
-        std::string& key = puppet.heldItems[i];
-        if (key.size() == 16) {
-            _GUID raw;
-            std::memcpy(&raw, key.data(), 16);
-            Entity item = Entity(bCPropertyID(bCGuid(raw)));
+        GuidKey& key = puppet.heldItems[i];
+        if (!IsZeroGuid(key)) {
+            Entity item = ByKey(key);
             if (item.GetInstance() && item.IsItem() && !item.GetOwner().GetInstance()) {
                 Logf("remote: %s fell from a puppet's hand; removed (its player's own copy counts)", item.GetName().GetText());
                 item.Decay();
                 ++puppetDropsRemoved;
             }
         }
-        key.clear();
+        key = {};
         const Entity held = puppet.entity.Inventory.GetItemFromSlot(i ? gESlot_LeftHand : gESlot_RightHand);
-        if (held.GetInstance()) {
-            const eCEntityProxy proxy(held.GetInstance());
-            key.assign(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
-        }
+        if (held.GetInstance()) key = KeyOf(held.GetInstance());
     }
 }
 }
@@ -482,13 +481,14 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     const int32_t activityAge = static_cast<int32_t>(now - remote.activity.ticks);
     const bool heldOwner = remote.activity.known && activityAge >= 0 &&
                            static_cast<uint32_t>(activityAge) < downed::ActivityStaleMs &&
-                           (remote.activity.flags & 8) && (remote.latest.flags & 8) &&
+                           (remote.activity.flags & net::PlayerFlags::Held) &&
+                           (remote.latest.flags & net::PlayerFlags::Held) &&
                            remote.activity.downedSequence &&
                            remote.activity.downedSequence == remote.latest.downedSequence &&
                            remote.activity.world == remote.latest.world;
     const bool fresh = remote.connected && remote.latestTicks &&
                        (static_cast<int32_t>(now - remote.latestTicks) < 15000 || heldOwner);
-    const bool sameWorld = (remote.latest.flags & 1) && remote.latest.world == CurrentWorld();
+    const bool sameWorld = (remote.latest.flags & net::PlayerFlags::InGame) && remote.latest.world == CurrentWorld();
     if (!fresh || !sameWorld) {
         Despawn(id, !fresh ? "no recent state" : "other world");
         return;
@@ -549,7 +549,7 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     // Trading between players (owner 23.10.): addressed, a puppet offers the game's own trade option ("Zeig mir deine
     // Ware!"), which opens the trade window with it (trade.cpp, offer.cpp). Checked like the name.
     puppet.entity.Dialog.TradeEnabled = trade::Available() ? GETrue : GEFalse;
-    const bool dead = (remote.latest.flags & 4) != 0;
+    const bool dead = (remote.latest.flags & net::PlayerFlags::Dead) != 0;
     if (dead && !puppet.terminal) {
         StartPuppetTerminal(puppet, id, hero, now);
     }
@@ -687,6 +687,9 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
         if ((!std::strstr(target.motion, "_Lie") && !std::strstr(target.motion, "KnockDown")) ||
             std::strstr(target.motion, "GetUp") || std::strstr(target.motion, "StandUp"))
             target.motion = "";
+        target.actionSeq = remote.latest.actionSeq;
+        target.motionFrac = *target.motion ? remote.latest.motionFrac : movement::NoMotionFrac;
+        target.motionAgeMs = now - remote.latestTicks + roundTrip / 2;
         target.smooth = false;
         target.timeline = true;
         target.presentationSerial = puppet.body.track.serial;

@@ -538,4 +538,63 @@ bool Switch(char const* action, LogFn log)
     return false;
 }
 
+namespace detail {
+
+void LogDeathFocus(eCEntity* dead, eCEntity* body, char const* phase, uint32_t elapsed, bool removed)
+{
+    if (!body) return;
+    Entity local(body);
+    auto* focus = static_cast<gCFocus_PS*>(body->GetPropertySet(eEPropertySetType_Focus));
+    auto* routine = static_cast<gCScriptRoutine_PS*>(body->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    auto* animation = static_cast<eCVisualAnimation_PS*>(body->GetPropertySet(eEPropertySetType_Animation));
+    const bool npc = body->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    Entity selected = focus ? local.Focus.GetFocusEntity() : Entity();
+    Entity target = npc ? local.NPC.GetCurrentTarget() : Entity();
+    Entity alignment = body->GetPropertySet(eEPropertySetType_CharacterMovement) ? local.GetAlignmentTarget() : Entity();
+    const bCString task = routine ? local.Routine.GetCurrentTask() : bCString("-");
+    const bCString state = routine ? local.Routine.GetCurrentState() : bCString("-");
+    const int priority = selected.GetInstance()
+        ? GetScriptAdminExt().CallScript(bCString("GetFocusEntityPriority"), selected.GetInstance(), nullptr, 0) : 0;
+    const bool focusDead = selected.GetInstance() &&
+        selected.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine) && selected.IsDead();
+    Logf("npcs: DEATHFOCUS dead=%.64s instance=%p phase=%s elapsed_ms=%u body=%p hero_dead=%d task=%.48s state=%.48s action=%d ani=%d combat_state=%lu mode=%d locked=%d focus=%.64s focus_ptr=%p focus_dead=%d script_priority=%d target=%.64s target_ptr=%p alignment=%.64s alignment_ptr=%p autoaim=%d autoaim_target=%p",
+         removed ? "(removed)" : dead->GetName().GetText(), dead, phase, elapsed, body,
+         routine && local.IsDead() ? 1 : 0, task.GetText(), state.GetText(),
+         routine ? static_cast<int>(local.Routine.Action) : -1,
+         routine ? static_cast<int>(local.Routine.AniState) : -1,
+         npc ? static_cast<unsigned long>(local.NPC.CombatState) : 0,
+         focus ? static_cast<int>(focus->GetCurrentMode().GetValue()) : -1, focus && focus->GetFocusLocked() ? 1 : 0,
+         selected.GetInstance() ? selected.GetName().GetText() : "-", selected.GetInstance(),
+         focusDead ? 1 : 0, priority,
+         target.GetInstance() ? target.GetName().GetText() : "-", target.GetInstance(),
+         alignment.GetInstance() ? alignment.GetName().GetText() : "-", alignment.GetInstance(),
+         animation && animation->IsAutoAimingEnabled() ? 1 : 0, AutoAimTarget(animation));
+}
+
+void TickDeathFocusWatch(Mirror& m, uint32_t now)
+{
+    if (!m.focusWatchUntil || net::IsHost()) return;
+    eCEntity* hero = remote::ControlledBody();
+    if (!hero) hero = gCSession::GetInstance().GetHero();
+    if (!hero) return;
+    const uint32_t elapsed = now - (m.focusWatchUntil - 5000);
+    eCEntity* selected = hero->GetPropertySet(eEPropertySetType_Focus)
+        ? Entity(hero).Focus.GetFocusEntity().GetInstance() : nullptr;
+    if (static_cast<int32_t>(now - m.focusWatchUntil) >= 0) {
+        LogDeathFocus(m.entity.GetInstance(), hero, "settled", elapsed);
+        m.focusWatchUntil = 0;
+    } else if (!m.focusWatchLogged) {
+        if (!elapsed) return;
+        LogDeathFocus(m.entity.GetInstance(), hero, "next_frame", elapsed);
+        m.focusWatchLogged = true;
+        m.focusWatchChanges = 0;
+    } else if (selected != m.watchedFocus && m.focusWatchChanges < 4) {
+        LogDeathFocus(m.entity.GetInstance(), hero, "changed", elapsed);
+        ++m.focusWatchChanges;
+    }
+    m.watchedFocus = selected;
+}
+
+} // namespace detail
+
 } // namespace g3t::npcs

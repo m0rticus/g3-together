@@ -370,13 +370,17 @@ class PersonalStoreTests(unittest.TestCase):
         for marker in ("TransferPersonalItems", "TransferPersonalStack", "TransferPersonalAll",
                        "TransferPersonalTransaction", "PerformPersonalTransaction", "TransferPersonalScript"):
             self.assertIn(marker, containers_source)
+        guard_helper = part(containers_source, "GEBool GuardedInventoryTransfer(", "GEBool __fastcall TransferPersonalItems(")
+        self.assertIn("!PersonalPlayerTransfer(", guard_helper)
+        self.assertIn("PersonalMutation mutation;", guard_helper)
         transfers = part(containers_source, "GEBool __fastcall TransferPersonalItems(", "GEBool __fastcall BeginPersonalTrade(")
-        self.assertEqual(transfers.count("!PersonalPlayerTransfer("), 6)
-        self.assertEqual(transfers.count("PersonalMutation mutation;"), 6)
-        ready = part(containers_source, "bool PersonalHooksReady()", "bool CapturePersonal(")
+        self.assertEqual(transfers.count("return GuardedInventoryTransfer("), 6)
+        ready_helper = part(containers_source, "bool AreAllPersonalHooksReady()", "bool InstallAccessGuards()")
         for marker in ("nativeTransferItems", "nativeTransferStack", "nativeTransferAll",
                        "nativeTransferTransaction", "nativeTransaction", "nativeScriptTransfer"):
-            self.assertIn(marker, ready)
+            self.assertIn(marker, ready_helper)
+        ready = part(containers_source, "bool PersonalHooksReady()", "bool CapturePersonal(")
+        self.assertIn("AreAllPersonalHooksReady()", ready)
         tick = containers_source[containers_source.index("void Tick()"):]
         self.assertIn("items::TickPersonal()", tick)
         self.assertIn("PersonalPass(false)", tick)

@@ -10,9 +10,6 @@
 #include <vector>
 
 #include "player_state.h"
-#ifndef G3T_PLAYERWIRE_HAS_PLAYERSTATE
-#include "net.h"
-#endif
 
 namespace g3t::playerwire {
 
@@ -148,28 +145,50 @@ inline bool sameCString(const char* a, const char* b, std::size_t capacity) {
     return lengthA == lengthB && std::memcmp(a, b, lengthA) == 0;
 }
 
+struct StringField {
+    std::uint16_t bit;
+    std::size_t capacity;
+    const char* (*read)(const net::PlayerState&);
+    char* (*write)(net::PlayerState&);
+};
+
+constexpr StringField StringFields[] = {
+    {StringName, sizeof(net::PlayerState::name),
+     [](const net::PlayerState& s) -> const char* { return s.name; },
+     [](net::PlayerState& s) -> char* { return s.name; }},
+    {StringAnimation, sizeof(net::PlayerState::animation),
+     [](const net::PlayerState& s) -> const char* { return s.animation; },
+     [](net::PlayerState& s) -> char* { return s.animation; }},
+    {StringHeldRight, sizeof(net::PlayerState::heldRight),
+     [](const net::PlayerState& s) -> const char* { return s.heldRight; },
+     [](net::PlayerState& s) -> char* { return s.heldRight; }},
+    {StringHeldLeft, sizeof(net::PlayerState::heldLeft),
+     [](const net::PlayerState& s) -> const char* { return s.heldLeft; },
+     [](net::PlayerState& s) -> char* { return s.heldLeft; }},
+    {StringShape, sizeof(net::PlayerState::shape),
+     [](const net::PlayerState& s) -> const char* { return s.shape; },
+     [](net::PlayerState& s) -> char* { return s.shape; }},
+    {StringArmor, sizeof(net::PlayerState::armor),
+     [](const net::PlayerState& s) -> const char* { return s.armor; },
+     [](net::PlayerState& s) -> char* { return s.armor; }},
+    {StringHelmet, sizeof(net::PlayerState::helmet),
+     [](const net::PlayerState& s) -> const char* { return s.helmet; },
+     [](net::PlayerState& s) -> char* { return s.helmet; }},
+    {StringLook, sizeof(net::PlayerState::look),
+     [](const net::PlayerState& s) -> const char* { return s.look; },
+     [](net::PlayerState& s) -> char* { return s.look; }},
+};
+
 inline bool sameMetadata(const net::PlayerState& a, const net::PlayerState& b) {
-    return sameCString(a.name, b.name, sizeof(a.name)) &&
-           sameCString(a.animation, b.animation, sizeof(a.animation)) &&
-           sameCString(a.heldRight, b.heldRight, sizeof(a.heldRight)) &&
-           sameCString(a.heldLeft, b.heldLeft, sizeof(a.heldLeft)) &&
-           sameCString(a.shape, b.shape, sizeof(a.shape)) &&
-           sameCString(a.armor, b.armor, sizeof(a.armor)) &&
-           sameCString(a.helmet, b.helmet, sizeof(a.helmet)) &&
-           sameCString(a.look, b.look, sizeof(a.look)) &&
-           a.focusNpc == b.focusNpc && a.targetNpc == b.targetNpc;
+    for (const StringField& field : StringFields)
+        if (!sameCString(field.read(a), field.read(b), field.capacity)) return false;
+    return a.focusNpc == b.focusNpc && a.targetNpc == b.targetNpc;
 }
 
 inline std::uint16_t metadataMask(const net::PlayerState& baseline, const net::PlayerState& state) {
     std::uint16_t mask = 0;
-    if (!sameCString(baseline.name, state.name, sizeof(state.name))) mask |= StringName;
-    if (!sameCString(baseline.animation, state.animation, sizeof(state.animation))) mask |= StringAnimation;
-    if (!sameCString(baseline.heldRight, state.heldRight, sizeof(state.heldRight))) mask |= StringHeldRight;
-    if (!sameCString(baseline.heldLeft, state.heldLeft, sizeof(state.heldLeft))) mask |= StringHeldLeft;
-    if (!sameCString(baseline.shape, state.shape, sizeof(state.shape))) mask |= StringShape;
-    if (!sameCString(baseline.armor, state.armor, sizeof(state.armor))) mask |= StringArmor;
-    if (!sameCString(baseline.helmet, state.helmet, sizeof(state.helmet))) mask |= StringHelmet;
-    if (!sameCString(baseline.look, state.look, sizeof(state.look))) mask |= StringLook;
+    for (const StringField& field : StringFields)
+        if (!sameCString(field.read(baseline), field.read(state), field.capacity)) mask |= field.bit;
     if (baseline.focusNpc != state.focusNpc) mask |= FocusNpc;
     if (baseline.targetNpc != state.targetNpc) mask |= TargetNpc;
     return mask;
@@ -198,27 +217,27 @@ inline void writeFixed(Writer& writer, const net::PlayerState& state,
 }
 
 inline void writeMetadata(Writer& writer, const net::PlayerState& state, std::uint16_t mask) {
-    if (mask & StringName) writeString(writer, state.name, sizeof(state.name));
-    if (mask & StringAnimation) writeString(writer, state.animation, sizeof(state.animation));
-    if (mask & StringHeldRight) writeString(writer, state.heldRight, sizeof(state.heldRight));
-    if (mask & StringHeldLeft) writeString(writer, state.heldLeft, sizeof(state.heldLeft));
-    if (mask & StringShape) writeString(writer, state.shape, sizeof(state.shape));
-    if (mask & StringArmor) writeString(writer, state.armor, sizeof(state.armor));
-    if (mask & StringHelmet) writeString(writer, state.helmet, sizeof(state.helmet));
-    if (mask & StringLook) writeString(writer, state.look, sizeof(state.look));
+    for (const StringField& field : StringFields)
+        if (mask & field.bit) writeString(writer, field.read(state), field.capacity);
     if (mask & FocusNpc) writer.u32(state.focusNpc);
     if (mask & TargetNpc) writer.u32(state.targetNpc);
 }
 
 inline bool validStrings(const net::PlayerState& state) {
-    return stringValid(state.name, sizeof(state.name)) &&
-           stringValid(state.animation, sizeof(state.animation)) &&
-           stringValid(state.heldRight, sizeof(state.heldRight)) &&
-           stringValid(state.heldLeft, sizeof(state.heldLeft)) &&
-           stringValid(state.shape, sizeof(state.shape)) &&
-           stringValid(state.armor, sizeof(state.armor)) &&
-           stringValid(state.helmet, sizeof(state.helmet)) &&
-           stringValid(state.look, sizeof(state.look));
+    for (const StringField& field : StringFields)
+        if (!stringValid(field.read(state), field.capacity)) return false;
+    return true;
+}
+
+inline bool readStrings(Reader& reader, std::uint16_t mask, net::PlayerState& metadata) {
+    for (const StringField& field : StringFields)
+        if ((mask & field.bit) && !readString(reader, field.write(metadata), field.capacity)) return false;
+    return true;
+}
+
+inline void copyStrings(std::uint16_t mask, const net::PlayerState& src, net::PlayerState& dst) {
+    for (const StringField& field : StringFields)
+        if (mask & field.bit) std::memcpy(field.write(dst), field.read(src), field.capacity);
 }
 
 inline bool newer(std::uint32_t value, std::uint32_t previous) {
@@ -349,14 +368,7 @@ public:
         value.gold = static_cast<std::int32_t>(goldBits);
 
         net::PlayerState metadata{};
-        if (mask & StringName && !detail::readString(reader, metadata.name, sizeof(metadata.name))) return Status::Invalid;
-        if (mask & StringAnimation && !detail::readString(reader, metadata.animation, sizeof(metadata.animation))) return Status::Invalid;
-        if (mask & StringHeldRight && !detail::readString(reader, metadata.heldRight, sizeof(metadata.heldRight))) return Status::Invalid;
-        if (mask & StringHeldLeft && !detail::readString(reader, metadata.heldLeft, sizeof(metadata.heldLeft))) return Status::Invalid;
-        if (mask & StringShape && !detail::readString(reader, metadata.shape, sizeof(metadata.shape))) return Status::Invalid;
-        if (mask & StringArmor && !detail::readString(reader, metadata.armor, sizeof(metadata.armor))) return Status::Invalid;
-        if (mask & StringHelmet && !detail::readString(reader, metadata.helmet, sizeof(metadata.helmet))) return Status::Invalid;
-        if (mask & StringLook && !detail::readString(reader, metadata.look, sizeof(metadata.look))) return Status::Invalid;
+        if (!detail::readStrings(reader, mask, metadata)) return Status::Invalid;
         if (mask & FocusNpc) metadata.focusNpc = reader.u32();
         if (mask & TargetNpc) metadata.targetNpc = reader.u32();
         if (!reader.ok || reader.offset != size) return Status::Invalid;
@@ -369,14 +381,7 @@ public:
 
             value.focusNpc = metadata.focusNpc;
             value.targetNpc = metadata.targetNpc;
-            std::memcpy(value.name, metadata.name, sizeof(value.name));
-            std::memcpy(value.animation, metadata.animation, sizeof(value.animation));
-            std::memcpy(value.heldRight, metadata.heldRight, sizeof(value.heldRight));
-            std::memcpy(value.heldLeft, metadata.heldLeft, sizeof(value.heldLeft));
-            std::memcpy(value.shape, metadata.shape, sizeof(value.shape));
-            std::memcpy(value.armor, metadata.armor, sizeof(value.armor));
-            std::memcpy(value.helmet, metadata.helmet, sizeof(value.helmet));
-            std::memcpy(value.look, metadata.look, sizeof(value.look));
+            detail::copyStrings(MetadataMask, metadata, value);
 
             currentState_ = value;
             hasKeyframe_ = true;
@@ -418,14 +423,7 @@ public:
         next.motionFrac = value.motionFrac;
         next.downedSequence = value.downedSequence;
 
-        if (mask & StringName) std::memcpy(next.name, metadata.name, sizeof(next.name));
-        if (mask & StringAnimation) std::memcpy(next.animation, metadata.animation, sizeof(next.animation));
-        if (mask & StringHeldRight) std::memcpy(next.heldRight, metadata.heldRight, sizeof(next.heldRight));
-        if (mask & StringHeldLeft) std::memcpy(next.heldLeft, metadata.heldLeft, sizeof(next.heldLeft));
-        if (mask & StringShape) std::memcpy(next.shape, metadata.shape, sizeof(next.shape));
-        if (mask & StringArmor) std::memcpy(next.armor, metadata.armor, sizeof(next.armor));
-        if (mask & StringHelmet) std::memcpy(next.helmet, metadata.helmet, sizeof(next.helmet));
-        if (mask & StringLook) std::memcpy(next.look, metadata.look, sizeof(next.look));
+        detail::copyStrings(mask, metadata, next);
         if (mask & FocusNpc) next.focusNpc = metadata.focusNpc;
         if (mask & TargetNpc) next.targetNpc = metadata.targetNpc;
 

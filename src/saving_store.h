@@ -81,11 +81,11 @@ inline bool Get(Bytes const& bytes, size_t& at, uint64_t& value, unsigned count)
 {
     return GetLe(bytes.data(), bytes.size(), at, value, count);
 }
-inline bool HeroKey(Bytes const& bytes, Key& key, uint32_t* outVersion = nullptr)
+inline bool HeroPose(Bytes const& bytes, Key& key, RecordPose& pose, uint32_t* outVersion = nullptr)
 {
     if (bytes.empty() || bytes.size() > CharacterLimit) return false;
     if (IsHeroBinaryMagic(bytes.data(), bytes.size())) {
-        return InspectHeroBinary(bytes.data(), bytes.size(), key, outVersion);
+        return InspectHeroBinary(bytes.data(), bytes.size(), key, outVersion, nullptr, nullptr, &pose);
     }
     if (std::find(bytes.begin(), bytes.end(), uint8_t(0)) != bytes.end()) return false;
     std::istringstream input(std::string(bytes.begin(), bytes.end()));
@@ -94,10 +94,14 @@ inline bool HeroKey(Bytes const& bytes, Key& key, uint32_t* outVersion = nullptr
         if (!std::getline(input, line)) return false;
         if (!line.empty() && line.back() == '\r') line.pop_back();
     }
-    RecordPose pose;
     if (!ParseRecordMetadata(lines[0], lines[1], lines[2], nullptr, key, pose)) return false;
     if (outVersion) *outVersion = 4;
     return true;
+}
+inline bool HeroKey(Bytes const& bytes, Key& key, uint32_t* outVersion = nullptr)
+{
+    RecordPose pose;
+    return HeroPose(bytes, key, pose, outVersion);
 }
 inline bool PackPlayer(Bytes const& hero, Bytes const& state, Bytes& out)
 {
@@ -218,6 +222,32 @@ inline bool Modern(Bytes const& bytes)
     // Recognize damaged/truncated modern headers too; never downgrade them to a native save.
     return bytes.size() >= 4 && std::memcmp(bytes.data(), "G3TS", 4) == 0;
 }
+inline bool DecodeSections(Bytes const& bytes, size_t& at, uint64_t count, bool hasFlags, Save& result,
+                           char const** reason)
+{
+    result.blocks.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        Block b;
+        uint64_t type = 0, blockVersion = 0, secFlags = 0, size = 0, checksum = 0;
+        if (!Get(bytes, at, type, 4) || !Get(bytes, at, blockVersion, 4) ||
+            (hasFlags && !Get(bytes, at, secFlags, 4)) || !Get(bytes, at, b.account, 8) ||
+            !Get(bytes, at, size, 4) || !Get(bytes, at, checksum, 4) || size > bytes.size() - at) {
+            if (reason) *reason = "section-bounds";
+            return false;
+        }
+        b.type = static_cast<uint32_t>(type);
+        b.version = static_cast<uint32_t>(blockVersion);
+        b.flags = static_cast<uint32_t>(secFlags);
+        if (checksum != Crc(bytes.data() + at, static_cast<size_t>(size))) {
+            if (reason) *reason = "section-crc";
+            return false;
+        }
+        b.bytes.assign(bytes.begin() + at, bytes.begin() + at + static_cast<size_t>(size));
+        at += static_cast<size_t>(size);
+        result.blocks.push_back(std::move(b));
+    }
+    return true;
+}
 inline bool DecodeLegacyContainer(Bytes const& bytes, uint32_t expectedVersion, Save& out, char const** reason)
 {
     if (bytes.size() < 96 || bytes.size() > Limit) { if (reason) *reason = "truncated"; return false; }
@@ -238,23 +268,7 @@ inline bool DecodeLegacyContainer(Bytes const& bytes, uint32_t expectedVersion, 
         if (reason) *reason = "header";
         return false;
     }
-    for (uint64_t i = 0; i < count; ++i) {
-        Block b;
-        uint64_t type = 0, blockVersion = 0, size = 0, checksum = 0;
-        if (!Get(bytes, at, type, 4) || !Get(bytes, at, blockVersion, 4) || !Get(bytes, at, b.account, 8) ||
-            !Get(bytes, at, size, 4) || !Get(bytes, at, checksum, 4) || size > bytes.size() - at) {
-            if (reason) *reason = "section-bounds";
-            return false;
-        }
-        b.type = static_cast<uint32_t>(type); b.version = static_cast<uint32_t>(blockVersion);
-        if (checksum != Crc(bytes.data() + at, static_cast<size_t>(size))) {
-            if (reason) *reason = "section-crc";
-            return false;
-        }
-        b.bytes.assign(bytes.begin() + at, bytes.begin() + at + static_cast<size_t>(size));
-        at += static_cast<size_t>(size);
-        result.blocks.push_back(std::move(b));
-    }
+    if (!DecodeSections(bytes, at, count, false, result, reason)) return false;
     if (at != bytes.size() || !ValidSave(result, expectedVersion)) {
         if (reason) *reason = "invalid-save";
         return false;
@@ -312,26 +326,7 @@ inline bool Decode(Bytes const& bytes, Save& out, char const** reason = nullptr)
         return false;
     }
     at = static_cast<size_t>(headerSize);
-    for (uint64_t i = 0; i < count; ++i) {
-        Block b;
-        uint64_t type = 0, blockVersion = 0, secFlags = 0, size = 0, checksum = 0;
-        if (!Get(bytes, at, type, 4) || !Get(bytes, at, blockVersion, 4) || !Get(bytes, at, secFlags, 4) ||
-            !Get(bytes, at, b.account, 8) || !Get(bytes, at, size, 4) || !Get(bytes, at, checksum, 4) ||
-            size > bytes.size() - at) {
-            if (reason) *reason = "section-bounds";
-            return false;
-        }
-        b.type = static_cast<uint32_t>(type);
-        b.version = static_cast<uint32_t>(blockVersion);
-        b.flags = static_cast<uint32_t>(secFlags);
-        if (checksum != Crc(bytes.data() + at, static_cast<size_t>(size))) {
-            if (reason) *reason = "section-crc";
-            return false;
-        }
-        b.bytes.assign(bytes.begin() + at, bytes.begin() + at + static_cast<size_t>(size));
-        at += static_cast<size_t>(size);
-        result.blocks.push_back(std::move(b));
-    }
+    if (!DecodeSections(bytes, at, count, true, result, reason)) return false;
     if (at != bytes.size() || !ValidSave(result, Version)) {
         if (reason) *reason = "invalid-save";
         return false;

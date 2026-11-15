@@ -5,8 +5,6 @@
 
 namespace g3t::npcs::detail {
 
-void NoteTakeover(GuidKey const& key, net::NpcRecord const& record, uint8_t owner);
-bool Contested(GuidKey const& key, uint8_t owner);
 bool AdmitIncomingNpc(net::NpcRecord const& record, GuidKey const& key, uint32_t captured,
                       uint8_t owner, uint32_t now);
 void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const& record, bool sameOwner);

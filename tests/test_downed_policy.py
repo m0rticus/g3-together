@@ -21,8 +21,8 @@ SCRIPT_CPP = ROOT / "src" / "Script_G3Together.cpp"
 
 SPLIT_SIBLINGS = (
     (ROOT / "src" / "downed.cpp", (ROOT / "src" / "downed_terminal.cpp", ROOT / "src" / "player_immunity.cpp")),
-    (ROOT / "src" / "combat.cpp", (ROOT / "src" / "combat_melee.cpp", ROOT / "src" / "combat_claims.cpp")),
-    (ROOT / "src" / "ai.cpp", (ROOT / "src" / "npc_targets.cpp", ROOT / "src" / "patch.cpp")),
+    (ROOT / "src" / "combat.cpp", (ROOT / "src" / "combat_melee.cpp", ROOT / "src" / "combat_claims.cpp", ROOT / "src" / "combat_kill_xp.cpp")),
+    (ROOT / "src" / "ai.cpp", (ROOT / "src" / "npc_targets.cpp", ROOT / "src" / "patch.cpp", ROOT / "src" / "ai_diag.cpp")),
 )
 
 
@@ -301,7 +301,8 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("(kind >= 8 && kind <= 10)", allow_fn)
         self.assertIn("kind == 23", allow_fn)
         self.assertNotIn("kind == 21", allow_fn)
-        broadcast_body = function_body(net, r"\bvoid\s+SendBroadcastExcept\s*\(")
+        net_session = _testbuild.src_text("net_session.cpp")
+        broadcast_body = function_body(net_session, r"\bvoid\s+SendBroadcastExcept\s*\(")
         self.assertIn("if (!isHost) { SendToServer(data, size, channel, reliable); return; }", broadcast_body)
         self.assertIn("if (peers[i] && i != except) Send(peers[i], data, size, channel, reliable);", broadcast_body)
 
@@ -384,8 +385,8 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("crash dump success profile=%s", dump)
         self.assertIn("crash dump write failed profile=%s", dump)
         self.assertIn("crash dump write failed", dump)
-        self.assertIn("WriteDump(file, dumpExceptionCopied ? &exception : nullptr);", crash)
-        self.assertIn("WriteDump(file, nullptr);", crash)
+        self.assertIn("WriteDump(file, dumpExceptionCopied ? &exception : nullptr, true);", crash)
+        self.assertIn("WriteDump(file, nullptr, false);", crash)
 
     def test_dump_worker_owns_exception_context_and_busy_admission(self):
         crash = _testbuild.src_text("crashlog.cpp")
@@ -576,7 +577,12 @@ class DownedPolicyTests(unittest.TestCase):
         redirect = function_body(self.downed_cpp, r"\bbool\s+RedirectDeath\s*\(")
         self.assertIn("IsLethalNpcAttacker(", redirect)
         self.assertIn("if (!lethalDefeat)", redirect)
+        non_lethal = function_body(redirect, r"\bif\s*\(\s*!lethalDefeat\s*\)")
+        self.assertIn("hero.Routine.AIMode = gEAIMode_Down;", non_lethal)
         self.assertLess(redirect.index("if (!lethalDefeat)"), redirect.index('Hold("redirect-death", state)'))
+        combat = _testbuild.src_text("combat.cpp")
+        self.assertIn("const bool localHeroJudge = which < 2 && localVictim;", combat)
+        self.assertIn("const bool trackHeroJudge = localHeroJudge && heroJudgeDepth == 0;", combat)
         able = function_body(self.downed_cpp, r"\bbool\s+Able\s*\(")
         present = function_body(self.downed_cpp, r"\bbool\s+Present\s*\(")
         self.assertIn("HelperState(r, now) == Availability::Able", able)

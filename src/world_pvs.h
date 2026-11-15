@@ -8,6 +8,14 @@
 #include "hostsim_status.h"
 
 namespace g3t::world::pvs {
+struct ScopedCellLock {
+    bCCriticalSectionWin32& lock = eCPVSCellItem::GetCriticalSection();
+    ScopedCellLock() { lock.Acquire(); }
+    ~ScopedCellLock() { lock.Release(); }
+    ScopedCellLock(ScopedCellLock const&) = delete;
+    ScopedCellLock& operator=(ScopedCellLock const&) = delete;
+};
+
 bool GatePaused();
 bool InstallDatabaseIndexFix();
 std::vector<std::array<float, 3>> const& SimulationAnchors();

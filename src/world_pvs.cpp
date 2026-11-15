@@ -10,6 +10,7 @@
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
+#include "persist.h"
 #include "remote.h"
 #include "world_collision.h"
 #include "world_collision_policy.h"
@@ -164,6 +165,7 @@ void RestoreContextOwnership()
 
 void EvictFromPrefetcher(eCPVSPrefetcher3& prefetcher, eCEntity* entity, uint32_t index)
 {
+    ScopedCellLock lock;
     prefetcher.RemoveNewAddedEntity(entity);
     bTSmallArray<eCPVSCellItem*> cells;
     prefetcher.GetAllValidCells(cells);
@@ -255,15 +257,9 @@ struct CellInventory {
     bool Empty() const { return !statics && !dynamics; }
 };
 
-struct CellLock {
-    bCCriticalSectionWin32& lock = eCPVSCellItem::GetCriticalSection();
-    CellLock() { lock.Acquire(); }
-    ~CellLock() { lock.Release(); }
-};
-
 bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3])
 {
-    CellLock lock;
+    ScopedCellLock lock;
     bTSmallArray<eCPVSCellItem*> cells;
     prefetcher.GetAllValidCells(cells);
     auto* permanent = prefetcher.GetNonDeactivationCell();
@@ -282,7 +278,7 @@ CellInventory Inventory(eCPVSPrefetcher3* prefetcher)
 {
     CellInventory result;
     if (!prefetcher) return result;
-    CellLock lock;
+    ScopedCellLock lock;
     bTSmallArray<eCPVSCellItem*> cells;
     prefetcher->GetAllValidCells(cells);
     result.permanent = prefetcher->GetNonDeactivationCell();
@@ -301,7 +297,7 @@ CellInventory Inventory(eCPVSPrefetcher3* prefetcher)
 std::size_t SlotEntityCount(eCPVSPrefetcher3* prefetcher, uint32_t index)
 {
     if (!prefetcher || index >= 32) return 0;
-    CellLock lock;
+    ScopedCellLock lock;
     bTSmallArray<eCPVSCellItem*> cells;
     prefetcher->GetAllValidCells(cells);
     auto scanCell = [](eCPVSCellItem const& cell, uint32_t bit) {
@@ -356,6 +352,7 @@ struct RegionRetirement {
         }
         database.RefreshFrustumData();
         auto drainPrefetcher = [](eCPVSPrefetcher3& prefetcher, eCFrustumDatabase& db, uint32_t slot) {
+            ScopedCellLock lock;
             bTSmallArray<eCPVSCellItem*> cells;
             prefetcher.GetAllValidCells(cells);
             // Release every grid and permanent cell on both prefetchers BEFORE losing the registered database slot index.
@@ -550,49 +547,53 @@ void RefreshContexts()
     contextRefreshPending = false;
 }
 
-void TickHostRegions()
+namespace {
+struct AnchorGroup {
+    std::array<float, 3> low, high;
+};
+
+void RefreshSimulationAnchors()
 {
-    auto* renderer = RenderAdmin();
-    if (!renderer) return;
-    auto const& camera = eCApplication::GetInstance().GetCurrentCamera();
-    const bCVector& p = camera.GetPosition();
-    const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
-    if (!anchorsCheckedAt || net::Now() - anchorsCheckedAt >= 250) {
-        anchorsCheckedAt = net::Now();
-        simulationAnchors.clear();
-        auto add = [](bCVector const& position) {
-            simulationAnchors.push_back({position.GetX(), position.GetY(), position.GetZ()});
-        };
-        auto const* remotes = net::Remotes();
-        for (int id = 2; id < net::MaxPlayers; ++id) {
-            auto const& peer = remotes[id];
-            if (peer.connected && (peer.latest.flags & 1) && peer.latest.world == remote::CurrentWorld())
-                simulationAnchors.push_back({peer.latest.position[0], peer.latest.position[1], peer.latest.position[2]});
-        }
-        std::vector<eCEntity*> guides;
-        for (int id = 1; id < net::MaxPlayers; ++id) {
-            eCEntity* player = id == 1 ? remote::ControlledBody() : remote::PuppetOf(static_cast<uint8_t>(id));
-            if (!player || !player->GetPropertySet(eEPropertySetType_Party)) continue;
-            if (auto* guide = Entity(player).Party.GetPartyLeader().GetInstance()) guides.push_back(guide);
-        }
-        const auto all = Entity::GetNPCs();
-        for (int i = 0; i < all.GetCount(); ++i) {
-            Entity npc = all.GetAt(i);
-            eCEntity* entity = npc.GetInstance();
-            if (!entity || entity->GetPropertySet(eEPropertySetType_PlayerMemory) || remote::IsPuppet(entity)) continue;
-            if (std::find(guides.begin(), guides.end(), entity) != guides.end()) { add(entity->GetWorldPosition()); continue; }
-            if (!entity->GetPropertySet(eEPropertySetType_Party) || npc.Party.Waiting) continue;
-            if (entity->GetPropertySet(eEPropertySetType_DamageReceiver) && npc.DamageReceiver.HitPoints <= 0) continue;
-            const uint8_t owner = npcs::CompanionOwner(entity);
-            if (owner == 1 || (owner > 1 && remotes[owner].connected && net::InWorld(owner))) add(entity->GetWorldPosition());
-        }
+    if (anchorsCheckedAt && net::Now() - anchorsCheckedAt < 250) return;
+    anchorsCheckedAt = net::Now();
+    simulationAnchors.clear();
+    auto add = [](bCVector const& position) {
+        simulationAnchors.push_back({position.GetX(), position.GetY(), position.GetZ()});
+    };
+    auto const* remotes = net::Remotes();
+    for (int id = 2; id < net::MaxPlayers; ++id) {
+        auto const& peer = remotes[id];
+        if (peer.connected && (peer.latest.flags & 1) && peer.latest.world == remote::CurrentWorld())
+            simulationAnchors.push_back({peer.latest.position[0], peer.latest.position[1], peer.latest.position[2]});
     }
-    struct Group { std::array<float, 3> low, high; };
-    std::vector<Group> groups;
-    std::vector<size_t> anchorGroups(simulationAnchors.size(), static_cast<size_t>(-1));
+    persist::AppendPendingAdmissionAnchors(simulationAnchors);
+    std::vector<eCEntity*> guides;
+    for (int id = 1; id < net::MaxPlayers; ++id) {
+        eCEntity* player = id == 1 ? remote::ControlledBody() : remote::PuppetOf(static_cast<uint8_t>(id));
+        if (!player || !player->GetPropertySet(eEPropertySetType_Party)) continue;
+        if (auto* guide = Entity(player).Party.GetPartyLeader().GetInstance()) guides.push_back(guide);
+    }
+    const auto all = Entity::GetNPCs();
+    for (int i = 0; i < all.GetCount(); ++i) {
+        Entity npc = all.GetAt(i);
+        eCEntity* entity = npc.GetInstance();
+        if (!entity || entity->GetPropertySet(eEPropertySetType_PlayerMemory) || remote::IsPuppet(entity)) continue;
+        if (std::find(guides.begin(), guides.end(), entity) != guides.end()) { add(entity->GetWorldPosition()); continue; }
+        if (!entity->GetPropertySet(eEPropertySetType_Party) || npc.Party.Waiting) continue;
+        if (entity->GetPropertySet(eEPropertySetType_DamageReceiver) && npc.DamageReceiver.HitPoints <= 0) continue;
+        const uint8_t owner = npcs::CompanionOwner(entity);
+        if (owner == 1 || (owner > 1 && remotes[owner].connected && net::InWorld(owner))) add(entity->GetWorldPosition());
+    }
+}
+
+void ClusterAnchorGroups(float const here[3], float mainFarClip, std::vector<AnchorGroup>& groups,
+                         std::vector<size_t>& anchorGroups)
+{
+    groups.clear();
+    anchorGroups.assign(simulationAnchors.size(), static_cast<size_t>(-1));
     for (size_t idx = 0; idx < simulationAnchors.size(); ++idx) {
         auto const& anchor = simulationAnchors[idx];
-        if (body::Distance(here, anchor.data()) + GetConfig().hostRoi + 1000.0f < camera.GetClipDepth().GetY()) continue;
+        if (body::Distance(here, anchor.data()) + GetConfig().hostRoi + 1000.0f < mainFarClip) continue;
         size_t group = groups.size();
         for (size_t previous = 0; previous < groups.size(); ++previous) {
             float centre[3];
@@ -609,6 +610,10 @@ void TickHostRegions()
         }
         anchorGroups[idx] = group;
     }
+}
+
+void SyncActiveRegions(std::vector<AnchorGroup> const& groups)
+{
     for (size_t i = groups.size(); i < hostRegions.size(); ++i) {
         if (collision::ShouldAttemptRegionRelease(hostRegions[i].failed, net::Now(), hostRegions[i].retryAt))
             ReleaseRegion(hostRegions[i]);
@@ -618,15 +623,17 @@ void TickHostRegions()
         if (hostRegions[i].camera || hostRegions[i].prefetcher) retained = i + 1;
     hostRegions.resize(retained);
     for (size_t id = 0; id < groups.size(); ++id) {
-        auto& region = hostRegions[id];
         float centre[3];
         for (int k = 0; k < 3; ++k) centre[k] = (groups[id].low[k] + groups[id].high[k]) * 0.5f;
         const float radius = GetConfig().hostRoi + body::Distance(groups[id].low.data(), groups[id].high.data()) * 0.5f + 1500.0f;
-        PlaceRegion(region, centre, radius);
+        PlaceRegion(hostRegions[id], centre, radius);
     }
+}
+
+void UpdateReadySimulationAnchors(eCPVSPrefetcher3& mainPrefetcher, std::vector<size_t> const& anchorGroups)
+{
     readySimulationAnchors.clear();
     readySimulationAnchors.reserve(simulationAnchors.size());
-    auto& mainPrefetcher = renderer->GetPVSPrefetcher3();
     for (size_t idx = 0; idx < simulationAnchors.size(); ++idx) {
         auto const& anchor = simulationAnchors[idx];
         const size_t group = anchorGroups[idx];
@@ -642,6 +649,22 @@ void TickHostRegions()
         if (collision::ShouldIncludeSimulationAnchor(withinMain, mainReady, remoteReady))
             readySimulationAnchors.push_back(anchor);
     }
+}
+} // namespace
+
+void TickHostRegions()
+{
+    auto* renderer = RenderAdmin();
+    if (!renderer) return;
+    auto const& camera = eCApplication::GetInstance().GetCurrentCamera();
+    const bCVector& p = camera.GetPosition();
+    const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
+    RefreshSimulationAnchors();
+    std::vector<AnchorGroup> groups;
+    std::vector<size_t> anchorGroups;
+    ClusterAnchorGroups(here, camera.GetClipDepth().GetY(), groups, anchorGroups);
+    SyncActiveRegions(groups);
+    UpdateReadySimulationAnchors(renderer->GetPVSPrefetcher3(), anchorGroups);
 }
 
 void RetireHostRegions()

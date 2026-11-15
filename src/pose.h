@@ -200,13 +200,14 @@ public:
         if (frames.empty() || frames.front().incarnation != incarnation ||
             static_cast<int32_t>(sent - frames.front().sent) < 0 ||
             static_cast<int32_t>(sent - frames.back().sent) > 0) return false;
+        const auto it = std::lower_bound(
+            frames.begin() + 1, frames.end(), sent,
+            [](Frame const& frame, uint32_t target) { return static_cast<int32_t>(target - frame.sent) > 0; });
         const Frame* a = &frames.back();
         const Frame* b = a;
-        for (size_t i = 1; i < frames.size(); ++i) {
-            if (static_cast<int32_t>(sent - frames[i].sent) > 0) continue;
-            a = &frames[i - 1];
-            b = &frames[i];
-            break;
+        if (it != frames.end()) {
+            a = &*(it - 1);
+            b = &*it;
         }
         const uint32_t span = b->sent - a->sent;
         const float fraction = span ? static_cast<float>(sent - a->sent) / span : 0.0f;

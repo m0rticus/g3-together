@@ -103,6 +103,18 @@ void TestFriendMemoryMappingAndLocalProgressionDetection()
     assert(ShouldAuthorProgressionDiff(false, false, false, false, true, false));
     assert(ShouldAuthorProgressionDiff(false, false, false, false, false, true));
     assert(!ShouldAuthorProgressionDiff(false, false, false, false, false, false));
+
+    // Client dialog-close progression sends only fire when ObservedProgression actually changed, and progression-only
+    // client snapshots omit Routine.CurrentTask so passive mirror ZS_Talk never overwrites host NPC routines.
+    assert(ShouldPublishDialogCloseProgression(true, base, talked));
+    assert(ShouldPublishDialogCloseProgression(false, ObservedProgression{}, talked));
+    assert(!ShouldPublishDialogCloseProgression(true, base, base));
+    assert(!ShouldPublishDialogCloseProgression(false, ObservedProgression{}, ObservedProgression{}));
+
+    assert(ShouldIncludeRoutineInSnapshot(true, true));
+    assert(ShouldIncludeRoutineInSnapshot(true, false));
+    assert(ShouldIncludeRoutineInSnapshot(false, true));
+    assert(!ShouldIncludeRoutineInSnapshot(false, false));
 }
 
 } // namespace

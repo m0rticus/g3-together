@@ -8,10 +8,12 @@
 #include <Script.h>
 #include <Windows.h>
 #include <string>
+#include <unordered_set>
 
 namespace g3t::combat::detail {
 extern bool installed;
 extern thread_local bool forwarded, heroForward;
+extern std::unordered_set<std::string> killedHere;
 extern unsigned kills, xpAwarded, claimsSent, claimsApplied, playerHitsSent, playerHitsTaken;
 extern unsigned hostJudgedClaimsSent, hostContactJudgements, localMeleeRefused, duplicateClaimsIgnored;
 extern unsigned npcHitsSent, npcHitsApplied, npcKills, npcHitsUnresolved, partyKills, reactionsStarted;
@@ -50,4 +52,8 @@ bool IsHostSimulatedNpc(eCEntity* victim);
 GEInt JudgeDamage(Entity& victim, eCEntity* source, int* pending, bool apply = false);
 GEInt GameHit(Entity& victim, eCEntity* source, int* pending);
 eCEntity* DamageSource(eCDynamicEntity* hero, char const** name);
+uint8_t Outcome(Entity& victim);
+void RewardKill(uint8_t player, uint8_t const guid[16]);
+void Expect(uint8_t const guid[16], uint8_t rewardPlayer = 0, bool clearDefeatedOnUndo = false);
+void ClearKillXp();
 }

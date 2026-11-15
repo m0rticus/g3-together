@@ -5,6 +5,7 @@
 #include "log.h"
 #include "npcs.h"
 #include "remote.h"
+#include "symbols.h"
 
 #include <Engine.h>
 #include <Game.h>
@@ -50,17 +51,8 @@ bool Wanted(eCEntity* entity)
 // "Game.dll+0x16abb0" for a code address.
 void Caller(void* address, char* text, size_t size)
 {
-    HMODULE module = nullptr;
-    char name[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCSTR>(address), &module) && module) {
-        GetModuleFileNameA(module, name, MAX_PATH);
-        char const* base = std::strrchr(name, '\\');
-        Format(text, size, "%s+0x%x", base ? base + 1 : name,
-                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)));
-    } else {
+    if (!symbols::DescribeImageAddress(reinterpret_cast<uintptr_t>(address), text, size))
         Format(text, size, "%p", address);
-    }
 }
 
 void Write(char const* kind, eCEntity* entity, char const* what, void* caller)

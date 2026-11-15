@@ -551,5 +551,37 @@ int main()
     }
     SetHitResultHandler(nullptr);
     transmissions.clear();
+
+    // Unjoined ENetPeers (spoofed peer->data != active peers[slot]) must be rejected by PeerSlotOf,
+    // and client handlers must ignore server frames while connected == false.
+    ENetPeer unjoinedPeer = fakePeers[0];
+    unjoinedPeer.data = reinterpret_cast<void*>(uintptr_t(2)); // claims slot 2, but peers[2] == &fakePeers[0]
+    isHost = true;
+    localId = 1;
+    clientInWorld[2] = clientInWorld[3] = true;
+    static unsigned forgedDialogs = 0;
+    SetDialogLineHandler([](uint8_t, DialogLineNote const&) { ++forgedDialogs; });
+    DialogLineMsg dlg{MsgDialogLine, 2, {}};
+    dlg.note.kind = DialogLineStart;
+    strcpy_s(dlg.note.text, "Info_Test");
+    Transmission dlgFrame{{}, ENET_PACKET_FLAG_RELIABLE, ChannelReliable, &unjoinedPeer};
+    dlgFrame.bytes.resize(sizeof(dlg));
+    std::memcpy(dlgFrame.bytes.data(), &dlg, sizeof(dlg));
+    Deliver(&unjoinedPeer, dlgFrame);
+    assert(forgedDialogs == 0 && transmissions.empty());
+
+    isHost = false;
+    localId = 2;
+    connected = false;
+    inWorld = true;
+    dlg.from = 1;
+    std::memcpy(dlgFrame.bytes.data(), &dlg, sizeof(dlg));
+    Deliver(server, dlgFrame);
+    assert(forgedDialogs == 0);
+    connected = true;
+    Deliver(server, dlgFrame);
+    assert(forgedDialogs == 1);
+    SetDialogLineHandler(nullptr);
+
     host = nullptr;
 }

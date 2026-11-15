@@ -25,8 +25,6 @@ constexpr uint8_t PredicateSignature[32] = {
 using VisibleFn = GEBool (__fastcall *)(void*, void*, int);
 
 VisibleFn originalVisible = nullptr;
-unsigned char* predicate = nullptr;
-unsigned char* trampoline = nullptr;
 uintptr_t tradeListVTable = 0;
 uint8_t originalBytes[Stolen] = {};
 bool installed = false;
@@ -112,9 +110,7 @@ void Install()
         return;
     }
 
-    predicate = target;
-    trampoline = static_cast<unsigned char*>(installedTrampoline);
-    originalVisible = reinterpret_cast<VisibleFn>(trampoline);
+    originalVisible = reinterpret_cast<VisibleFn>(installedTrampoline);
     tradeListVTable = reinterpret_cast<uintptr_t>(base + TradeListVTableRva);
     installed = true;
     Log("trade: native local player-trade grid visibility hook installed");

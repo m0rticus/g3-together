@@ -91,18 +91,24 @@ void Gain(int amount)
     else { waiting += amount; ++queued; }
 }
 
+net::WorldState MakeXpPacket(uint8_t dialog, uint32_t streamNonce = 0, uint32_t relative = 0, uint32_t total = 0)
+{
+    net::WorldState s{};
+    s.kind = 19;
+    s.dialog = dialog;
+    s.npcClass = net::LocalId();
+    std::memcpy(s.guid, &streamNonce, 4);
+    std::memcpy(s.guid + 4, &relative, 4);
+    std::memcpy(s.guid + 8, &total, 4);
+    return s;
+}
+
 bool SendBaselineTo(uint8_t to, DWORD now)
 {
     eCDynamicEntity* hero = Hero();
     if (!hero || !SessionReady() || !peers[to].outgoing.nonce) return false;
-    net::WorldState s{};
-    s.kind = 19;
-    s.dialog = counter::Baseline;
-    s.npcClass = net::LocalId();
     const uint32_t total = static_cast<uint32_t>(Experience(hero) > 0 ? Experience(hero) : 0);
-    std::memcpy(s.guid, &peers[to].outgoing.nonce, 4);
-    std::memcpy(s.guid + 4, &counter::BaselineEarned, 4);
-    std::memcpy(s.guid + 8, &total, 4);
+    const net::WorldState s = MakeXpPacket(counter::Baseline, peers[to].outgoing.nonce, counter::BaselineEarned, total);
     if (!net::SendWorldStateTo(to, s)) return false;
     peers[to].MarkBaselineSent(now);
     return true;
@@ -111,22 +117,13 @@ bool SendBaselineTo(uint8_t to, DWORD now)
 bool SendAckTo(uint8_t to, uint32_t theirNonce)
 {
     if (!SessionReady()) return false;
-    net::WorldState s{};
-    s.kind = 19;
-    s.dialog = counter::Ack;
-    s.npcClass = net::LocalId();
-    std::memcpy(s.guid, &theirNonce, 4);
-    return net::SendWorldStateTo(to, s);
+    return net::SendWorldStateTo(to, MakeXpPacket(counter::Ack, theirNonce));
 }
 
 bool SendRequestTo(uint8_t to)
 {
     if (!SessionReady()) return false;
-    net::WorldState s{};
-    s.kind = 19;
-    s.dialog = counter::Request;
-    s.npcClass = net::LocalId();
-    return net::SendWorldStateTo(to, s);
+    return net::SendWorldStateTo(to, MakeXpPacket(counter::Request));
 }
 
 void SendLive(DWORD now = GetTickCount(), bool heartbeatDue = false)
@@ -142,14 +139,8 @@ void SendLive(DWORD now = GetTickCount(), bool heartbeatDue = false)
         const counter::OutboundPlan plan = peer.PlanLive(earned, now, heartbeatDue);
         if (!plan.sendLive) continue;
         if (plan.sendBaseline && !SendBaselineTo(id, now)) continue;
-        net::WorldState s{};
-        s.kind = 19;
-        s.npcClass = net::LocalId();
-        s.dialog = counter::Live;
         const uint32_t relative = peer.outgoing.Total(earned);
-        std::memcpy(s.guid, &peer.outgoing.nonce, 4);
-        std::memcpy(s.guid + 4, &relative, 4);
-        std::memcpy(s.guid + 8, &total, 4);
+        const net::WorldState s = MakeXpPacket(counter::Live, peer.outgoing.nonce, relative, total);
         if (net::SendWorldStateTo(id, s)) {
             peer.MarkLiveSent(earned, now, plan.sendBaseline);
             ++sent;

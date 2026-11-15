@@ -35,20 +35,23 @@ void ClampCString(char (&buffer)[N])
 template <typename Msg>
 bool RelayClientUnicast(ENetPeer* peer, Msg& message, uint8_t to, uint8_t channel = ChannelReliable)
 {
-    message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-    if (to > 1 && to < MaxPlayers && peers[to]) {
-        Send(peers[to], &message, sizeof(message), channel, true);
+    message.from = PeerSlotOf(peer);
+    if (!message.from) return true;
+    if (to > 1 && to < MaxPlayers) {
+        if (peers[to] && to != message.from) Send(peers[to], &message, sizeof(message), channel, true);
         return true;
     }
     return false;
 }
 
 template <typename Msg>
-void RelayClientBroadcast(ENetPeer* peer, Msg& message, uint8_t channel = ChannelReliable)
+bool RelayClientBroadcast(ENetPeer* peer, Msg& message, uint8_t channel = ChannelReliable)
 {
-    message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+    message.from = PeerSlotOf(peer);
+    if (!message.from) return false;
     for (uint8_t i = 2; i < MaxPlayers; ++i)
         if (peers[i] && i != message.from) Send(peers[i], &message, sizeof(message), channel, true);
+    return true;
 }
 
 void RttLine(ENetPeer* peer, char const* who, char* out, size_t size)
@@ -225,9 +228,12 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         if (handlers.npcLease) handlers.npcLease(from, note);
         return true;
     }
+    case MsgSave:
+        if (packet->dataLength == sizeof(SaveMsg)) HandleSaveMessage(peer, packet);
+        return true;
     case MsgHitResult: {
         HitResultMsg message{};
-        if (isHost) return true;
+        if (isHost || !connected || peer != server) return true;
         if (packet->dataLength == LegacyHitResultMsgSize) {
             std::memcpy(&message, packet->data, LegacyHitResultMsgSize);
             message.result.knockbackValid = 0;
@@ -275,60 +281,67 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     case MsgTalk: {
         TalkMsg message{};
         if (!isHost || !UnpackFixed(packet, message)) return true;
-        const uint8_t from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        const uint8_t from = PeerSlotOf(peer);
         if (handlers.talk && from) handlers.talk(from, message.begin != 0, message.guid);
         return true;
     }
     case MsgSummon: {
         SummonMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         ClampCString(message.note.spellItem);
         ClampCString(message.note.spawn);
         if (message.note.epoch != worldEpoch || message.note.ownerPlayer >= MaxPlayers) return true;
         if (isHost) {
-            message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+            message.from = PeerSlotOf(peer);
+            if (!message.from) return true;
             if (message.note.op == SummonCreature) { Log("net: client NPC spawn publication refused"); return true; }
             if (message.note.op == SummonCreatureRequest) message.note.ownerPlayer = message.from;
             else RelayClientBroadcast(peer, message);
+        } else if (!message.from || message.from >= MaxPlayers) {
+            return true;
         }
         if (handlers.summon && message.from) handlers.summon(message.from, message.note);
         return true;
     }
     case MsgEnclave: {
         EnclaveMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         ClampCString(message.note.name);
-        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        const uint8_t from = isHost ? PeerSlotOf(peer) : 1;
         if (handlers.enclave && from) handlers.enclave(from, message.note);
         return true;
     }
     case MsgPlayerSpell: {
         PlayerSpellMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         ClampCString(message.script);
         if (isHost && RelayClientUnicast(peer, message, message.to)) return true;
-        if (handlers.playerSpell && message.from && message.to == localId)
+        if (handlers.playerSpell && message.from && message.from < MaxPlayers && message.to == localId)
             handlers.playerSpell(message.from, message.script);
         return true;
     }
     case MsgRansack: {
         RansackMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         if (isHost && RelayClientUnicast(peer, message, message.to)) return true;
-        if (handlers.ransack && message.from && message.to == localId)
+        if (handlers.ransack && message.from && message.from < MaxPlayers && message.to == localId)
             handlers.ransack(message.from, message.note);
         return true;
     }
     case MsgWitness: {
         WitnessMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         if (isHost) {
-            message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+            message.from = PeerSlotOf(peer);
+            if (!message.from) return true;
             if (message.to > 1 && message.to < MaxPlayers) {
-                if (peers[message.to]) Send(peers[message.to], &message, sizeof(message), ChannelReliable, true);
+                if (peers[message.to] && message.to != message.from)
+                    Send(peers[message.to], &message, sizeof(message), ChannelReliable, true);
                 return true;
             }
             if (message.to == 0) RelayClientBroadcast(peer, message);
+        } else if (!message.from || message.from >= MaxPlayers) {
+            return true;
         }
         if (handlers.witness && message.from && (message.to == 0 || message.to == localId))
             handlers.witness(message.from, message.note);
@@ -336,16 +349,16 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     case MsgNpcSpell: {
         NpcSpellMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         ClampCString(message.script);
         if (isHost && RelayClientUnicast(peer, message, message.to)) return true;
-        if (handlers.npcSpell && message.from && message.to == localId)
+        if (handlers.npcSpell && message.from && message.from < MaxPlayers && message.to == localId)
             handlers.npcSpell(message.from, message.script, message.target, message.args);
         return true;
     }
     case MsgShot: {
         ShotMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         static const uint8_t none[16] = {};
         if (isHost && std::memcmp(message.note.caster, none, 16)) {
             Log("net: client NPC projectile publication refused");
@@ -358,7 +371,11 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
             Log("net: stale or invalid projectile refused");
             return true;
         }
-        if (isHost) RelayClientBroadcast(peer, message, ChannelCombat);
+        if (isHost) {
+            if (!RelayClientBroadcast(peer, message, ChannelCombat)) return true;
+        } else if (!message.from || message.from >= MaxPlayers) {
+            return true;
+        }
         if (handlers.shot && message.from) handlers.shot(message.from, message.note);
         return true;
     }
@@ -366,6 +383,7 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         RagdollMsg message{};
         if (!UnpackFixed(packet, message)) return true;
         if (isHost) { Log("net: client NPC force publication refused"); return true; }
+        if (!connected || peer != server) return true;
         if (message.note.epoch != worldEpoch || !message.note.sequence || !message.note.incarnation) return true;
         for (float v : message.note.at) if (!std::isfinite(v) || std::fabs(v) > 1e7f) return true;
         for (float v : message.note.force) if (!std::isfinite(v) || std::fabs(v) > 1e9f) return true;
@@ -374,15 +392,19 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     case MsgDialogLine: {
         DialogLineMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         ClampCString(message.note.sample);
         ClampCString(message.note.text);
-        if (isHost) RelayClientBroadcast(peer, message);
+        if (isHost) {
+            if (!RelayClientBroadcast(peer, message)) return true;
+        } else if (!message.from || message.from >= MaxPlayers) {
+            return true;
+        }
         if (handlers.dialogLine && message.from) handlers.dialogLine(message.from, message.note);
         return true;
     }
     case MsgOffer: {
-        if (packet->dataLength < OfferHeaderSize) return true;
+        if (packet->dataLength < OfferHeaderSize || (!isHost && (!connected || peer != server))) return true;
         OfferMsg message{};
         std::memcpy(&message, packet->data, OfferHeaderSize);
         if (message.note.count > MaxOfferEntries ||
@@ -390,14 +412,15 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         std::memcpy(&message, packet->data, packet->dataLength);
         for (auto& entry : message.note.entries) ClampCString(entry.name);
         if (isHost) {
-            message.note.buyer = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+            message.note.buyer = PeerSlotOf(peer);
+            if (!message.note.buyer) return true;
             if (message.note.seller != 1) {
                 const uint8_t to = message.note.seller;
                 if (to > 1 && to < MaxPlayers && peers[to] && to != message.note.buyer)
                     Send(peers[to], &message, packet->dataLength, ChannelReliable, true);
                 return true;
             }
-        } else if (message.note.seller != localId) {
+        } else if (message.note.seller != localId || !message.note.buyer || message.note.buyer >= MaxPlayers) {
             return true;
         }
         if (handlers.offer && message.note.buyer) handlers.offer(message.note);
@@ -405,16 +428,17 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     case MsgOfferResult: {
         OfferResultMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         if (isHost) {
-            message.note.seller = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+            message.note.seller = PeerSlotOf(peer);
+            if (!message.note.seller) return true;
             if (message.note.buyer != 1) {
                 const uint8_t to = message.note.buyer;
                 if (to > 1 && to < MaxPlayers && peers[to] && to != message.note.seller)
                     Send(peers[to], &message, sizeof(message), ChannelReliable, true);
                 return true;
             }
-        } else if (message.note.buyer != localId) {
+        } else if (message.note.buyer != localId || !message.note.seller || message.note.seller >= MaxPlayers) {
             return true;
         }
         if (handlers.offerResult && message.note.seller) handlers.offerResult(message.note);
@@ -422,14 +446,14 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     case MsgItem: {
         ItemMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || (!isHost && (!connected || peer != server))) return true;
         ClampCString(message.note.name);
-        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        const uint8_t from = isHost ? PeerSlotOf(peer) : 1;
         if (handlers.item && from) handlers.item(from, message.note);
         return true;
     }
     case MsgContents: {
-        if (isHost || packet->dataLength < sizeof(ContentsHeader)) return true;
+        if (isHost || !connected || peer != server || packet->dataLength < sizeof(ContentsHeader)) return true;
         ContentsHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         if (header.count <= MaxContentEntries &&
@@ -446,7 +470,7 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         if (!isHost || packet->dataLength < sizeof(TxHeader)) return true;
         TxHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
-        const uint8_t from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        const uint8_t from = PeerSlotOf(peer);
         if (header.count <= MaxContentEntries &&
             packet->dataLength == sizeof(header) + header.count * sizeof(ContentEntry) &&
             handlers.tx && from) {
@@ -459,39 +483,39 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     case MsgTxResult: {
         TxResultMsg message{};
-        if (isHost || !UnpackFixed(packet, message)) return true;
+        if (isHost || !connected || peer != server || !UnpackFixed(packet, message)) return true;
         if (handlers.txResult) handlers.txResult(message.guid, message.seq, message.ok != 0);
         return true;
     }
     case MsgWatch: {
         WatchMsg message{};
         if (!isHost || !UnpackFixed(packet, message)) return true;
-        const uint8_t from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        const uint8_t from = PeerSlotOf(peer);
         if (handlers.watch && from) handlers.watch(from, message.guid);
         return true;
     }
     case MsgClock: {
         ClockMsg message{};
-        if (!UnpackFixed(packet, message)) return true;
+        if (!UnpackFixed(packet, message) || isHost || !connected || peer != server) return true;
         if (handlers.clock) handlers.clock(message.state);
         return true;
     }
     case MsgDeath: {
         DeathMsg message{};
-        if (isHost || !UnpackFixed(packet, message)) return true;
+        if (isHost || !connected || peer != server || !UnpackFixed(packet, message)) return true;
         if (handlers.death && message.by && message.by < MaxPlayers) handlers.death(message.by, message.guid);
         return true;
     }
     case MsgKilled: {
         KilledMsg message{};
-        if (isHost || !UnpackFixed(packet, message)) return true;
+        if (isHost || !connected || peer != server || !UnpackFixed(packet, message)) return true;
         if (message.to == localId && message.epoch == worldEpoch && message.incarnation && handlers.killed)
             handlers.killed(message.guid, message.incarnation);
         return true;
     }
     case MsgLeave: {
         Leave leave{};
-        if (isHost || !UnpackFixed(packet, leave)) return true;
+        if (isHost || !connected || peer != server || !UnpackFixed(packet, leave)) return true;
         Logf("net: player %u left", leave.id);
         if (leave.id && leave.id < MaxPlayers && remotes[leave.id].connected && handlers.peerLeft)
             handlers.peerLeft(leave.id, remotes[leave.id].latest.name);

@@ -28,7 +28,7 @@ inline bool DriverWaitSite(uint8_t const* code, size_t size)
 
 struct GraphicsWait {
     uint32_t object = 0, completed = 0, produced = 0, retired = 0;
-    bool Pending() const { return completed < produced - retired; }
+    bool Pending() const { return produced > retired && completed < produced - retired; }
     bool operator==(GraphicsWait const& other) const
     {
         return object == other.object && completed == other.completed &&

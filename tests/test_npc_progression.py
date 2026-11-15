@@ -22,10 +22,16 @@ NPC_PROGRESSION_POLICY_TARGET = _testbuild.register_target(
 TOUCHED_PROGRESSION_FILES = (
     "npc_progression_policy.h",
     "infocmd.h",
+    "infocmd_internal.h",
     "infocmd.cpp",
+    "infocmd_progression.cpp",
+    "infocmd_sector.cpp",
     "journal.cpp",
     "story_policy.h",
+    "story_internal.h",
     "story.cpp",
+    "story_domains.cpp",
+    "story_qa.cpp",
     "npc_send.cpp",
     "npcs.h",
     "npcs.cpp",
@@ -40,7 +46,10 @@ class NpcProgressionSyncTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_cross_town_talked_defeated_and_friend_memory_wiring(self):
-        infocmd = _testbuild.src_text("infocmd.cpp")
+        infocmd_core = _testbuild.src_text("infocmd.cpp")
+        infocmd_prog = _testbuild.src_text("infocmd_progression.cpp")
+        infocmd_sector = _testbuild.src_text("infocmd_sector.cpp")
+        infocmd = "\n".join((infocmd_core, infocmd_prog, infocmd_sector))
         npc_send = _testbuild.src_text("npc_send.cpp")
         npcs = _testbuild.src_text("npcs.cpp")
         companions = _testbuild.src_text("npc_companions.cpp")
@@ -53,6 +62,8 @@ class NpcProgressionSyncTests(unittest.TestCase):
         self.assertIn("npc_progression_policy::MergeHostDialog(", infocmd)
         self.assertIn("npc_progression_policy::MergeHostNpcFlags(", infocmd)
         self.assertIn("npc_progression_policy::FriendMemoryForName(", infocmd)
+        self.assertIn("npc_progression_policy::ShouldIncludeRoutineInSnapshot(", infocmd_core)
+        self.assertIn("npc_progression_policy::ShouldPublishDialogCloseProgression(", infocmd_prog)
 
         # Active local dialogs and native OnDelivery/OnEndInfo/knockout mutations publish WorldState without rate caps.
         self.assertNotIn("ProgressionScanInterval", infocmd)
@@ -69,7 +80,9 @@ class NpcProgressionSyncTests(unittest.TestCase):
     def test_distant_npc_death_and_info_timestamp_sync_wiring(self):
         journal = _testbuild.src_text("journal.cpp")
         story_policy = _testbuild.src_text("story_policy.h")
-        story = _testbuild.src_text("story.cpp")
+        story = "\n".join(
+            _testbuild.src_text(name) for name in ("story_domains.cpp", "story.cpp", "story_qa.cpp")
+        )
 
         # Distant out-of-ROI NPC deaths apply immediately to unloaded/unstreamed gCNPC_PS / gCDamageReceiver_PS / gCScriptRoutine_PS.
         self.assertIn("SeedWorldDeaths()", journal)

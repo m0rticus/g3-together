@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "saving_binary.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -14,8 +16,11 @@
 namespace g3t::saving::personal {
 using Bytes = std::vector<uint8_t>;
 
+constexpr size_t HeaderBytes = 12;
+constexpr size_t RowHeaderBytes = 20;
+constexpr size_t StackBytes = 25;
 constexpr size_t Limit = 1024 * 1024;
-constexpr size_t MaxRows = (Limit - 12) / 20;
+constexpr size_t MaxRows = (Limit - HeaderBytes) / RowHeaderBytes;
 constexpr size_t MaxInventoryRows = 4096;
 constexpr size_t MaxStacks = 512;
 constexpr uint32_t MaxAmount = 1000000;
@@ -159,20 +164,27 @@ inline bool Valid(Inventory const& row)
     return true;
 }
 
-inline void Put(Bytes& out, uint32_t value, unsigned count)
+inline constexpr size_t EncodedRowBytes(size_t stackCount)
 {
-    for (unsigned i = 0; i < count; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
+    return RowHeaderBytes + StackBytes * stackCount;
 }
+
+inline size_t EncodedRowBytes(Inventory const& row)
+{
+    return EncodedRowBytes(row.stacks.size());
+}
+
+inline void Put(Bytes& out, uint32_t value, unsigned count) { saving::PutLe(out, value, count); }
 
 inline bool Encode(Snapshot const& snapshot, Bytes& output)
 {
     if (snapshot.size() > MaxRows) return false;
-    size_t size = 12;
+    size_t size = HeaderBytes;
     size_t inventories = 0;
     for (auto const& entry : snapshot) {
         if (!Id(entry.first) || !Valid(entry.second)) return false;
         if (entry.second.kind != Kind::GroundTaken && ++inventories > MaxInventoryRows) return false;
-        size += 20 + 25 * entry.second.stacks.size();
+        size += EncodedRowBytes(entry.second);
         if (size > Limit) return false;
     }
     Bytes out;
@@ -206,34 +218,37 @@ inline bool Encode(Snapshot const& snapshot, Bytes& output)
 inline bool Decode(Bytes const& bytes, Snapshot& output)
 {
     static constexpr uint8_t magic[] = {'G','3','T','P','E','R','S','1'};
-    if (bytes.size() < 12 || bytes.size() > Limit || !std::equal(magic, magic + 8, bytes.begin())) return false;
+    if (bytes.size() < HeaderBytes || bytes.size() > Limit || !std::equal(magic, magic + 8, bytes.begin())) return false;
     size_t pos = 8;
-    auto read = [&](unsigned count) {
-        uint32_t value = 0;
-        for (unsigned i = 0; i < count; ++i) value |= static_cast<uint32_t>(bytes[pos++]) << (8 * i);
-        return value;
+    auto read = [&](uint32_t& out, unsigned count) {
+        uint64_t raw = 0;
+        if (!saving::GetLe(bytes.data(), bytes.size(), pos, raw, count)) return false;
+        out = static_cast<uint32_t>(raw);
+        return true;
     };
-    const uint32_t count = read(4);
-    if (count > MaxRows || count > (bytes.size() - pos) / 20) return false;
+    uint32_t count = 0;
+    if (!read(count, 4) || count > MaxRows || count > (bytes.size() - pos) / RowHeaderBytes) return false;
     Snapshot result;
     size_t inventories = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        if (bytes.size() - pos < 20) return false;
+        if (bytes.size() - pos < RowHeaderBytes) return false;
         std::string id(reinterpret_cast<char const*>(bytes.data() + pos), 16);
         pos += 16;
+        uint32_t kindRaw = 0, flagsRaw = 0, stacks = 0;
+        if (!read(kindRaw, 1) || !read(flagsRaw, 1) || !read(stacks, 2)) return false;
         Inventory row;
-        row.kind = static_cast<Kind>(read(1));
-        row.flags = static_cast<uint8_t>(read(1));
-        const uint32_t stacks = read(2);
-        if (stacks > MaxStacks || stacks > (bytes.size() - pos) / 25) return false;
+        row.kind = static_cast<Kind>(kindRaw);
+        row.flags = static_cast<uint8_t>(flagsRaw);
+        if (stacks > MaxStacks || stacks > (bytes.size() - pos) / StackBytes) return false;
         row.stacks.reserve(stacks);
         for (uint32_t j = 0; j < stacks; ++j) {
+            if (bytes.size() - pos < StackBytes) return false;
             Stack stack;
             stack.item.assign(reinterpret_cast<char const*>(bytes.data() + pos), 16);
             pos += 16;
-            stack.amount = read(4);
-            stack.quality = read(4);
-            stack.type = static_cast<Stock>(read(1));
+            uint32_t typeRaw = 0;
+            if (!read(stack.amount, 4) || !read(stack.quality, 4) || !read(typeRaw, 1)) return false;
+            stack.type = static_cast<Stock>(typeRaw);
             row.stacks.push_back(std::move(stack));
         }
         if (!Id(id) || !Valid(row)) return false;

@@ -476,6 +476,7 @@ void ResetHarness()
 
     std::lock_guard<std::mutex> lock(store.mutex);
     store.published = Published{};
+    for (auto& pin : store.directPins) pin = DirectEndpointPin{};
     store.relayDrops.clear();
     store.relayCloses.clear();
 }
@@ -598,12 +599,15 @@ void TestDirectCandidateFilteringAndReflexivePort()
     uint32_t ipLoop = htonl(INADDR_LOOPBACK);
     uint32_t ipMulticast = htonl((239u << 24) | 1u);
     uint32_t ipBroadcast = 0xffffffffu;
+    uint32_t ipLinkLocal = 0;
+    inet_pton(AF_INET, "169.254.42.7", &ipLinkLocal);
     uint32_t ipPublic = 0;
     inet_pton(AF_INET, "198.51.100.7", &ipPublic);
 
     assert(!IsValidDirectCandidateEndpoint(ipZero, 27016, true));
     assert(!IsValidDirectCandidateEndpoint(ipMulticast, 27016, true));
     assert(!IsValidDirectCandidateEndpoint(ipBroadcast, 27016, true));
+    assert(!IsValidDirectCandidateEndpoint(ipLinkLocal, 27016, true));
     assert(!IsValidDirectCandidateEndpoint(ipPublic, 0, true));
     assert(!IsValidDirectCandidateEndpoint(ipLoop, 27016, false));
     assert(IsValidDirectCandidateEndpoint(ipLoop, 27016, true));
@@ -653,12 +657,105 @@ void TestDirectCandidateFilteringAndReflexivePort()
     assert(r->directCandidates[1].hostIpv4 == expectedReflexive);
     assert(r->directCandidates[1].port == 27016);
     assert(r->directReady);
+
+    // Even when 8 local/virtual NICs fill all 8 slots, the Steam-observed reflexive IPv4 replaces slot 7 instead of dropping!
+    char uFull[28 + 8 * 4] = {};
+    uFull[0] = 'U';
+    std::memcpy(uFull + 1, &r->generation, 8);
+    std::memcpy(uFull + 9, r->directCookie, 16);
+    std::memcpy(uFull + 25, &peerPort, 2);
+    uFull[27] = 8;
+    for (unsigned i = 0; i < 8; ++i) {
+        uint32_t nicIp = htonl((10u << 24) | (0u << 16) | (i << 8) | 2u);
+        std::memcpy(uFull + 28 + i * 4, &nicIp, 4);
+    }
+    rt.OnControl(*r, uFull, sizeof(uFull));
+    assert(r->directCandidateCount == 8);
+    assert(r->directCandidates[7].hostIpv4 == expectedReflexive);
+    assert(r->directCandidates[7].port == 27016);
+}
+
+void TestDirectUdpHandshakeAcrossMismatchedGenerations()
+{
+    ResetHarness();
+    SetEnvironmentVariableA("G3T_DIRECT_UDP_ALLOW_LOOPBACK", "1");
+
+    const u64 hostId = 76561198000000001ULL;
+    const u64 clientId = 76561198000000002ULL;
+
+    // Step 1: Host has rotated generations (gen = 5) and sends its 'U' offer to the client.
+    rt.isHost = true;
+    rt.me = hostId;
+    rt.lobby = 9001;
+    rt.enetPort = 27015;
+    rt.nextRelayGeneration = 4;
+    Remote* hostView = rt.Get(clientId);
+    assert(hostView && hostView->generation == 5);
+    hostView->linked = true;
+    hostView->haveDirectCookie = true;
+    hostView->directOfferGeneration = hostView->generation;
+    for (unsigned i = 0; i < 16; ++i) hostView->directCookie[i] = static_cast<uint8_t>(0x30 + i);
+    g_messageSends.clear();
+    rt.SendDirectUdpControl(*hostView);
+    assert(g_messageSends.size() == 1);
+    void const* hostPayload = nullptr;
+    std::size_t hostPayloadBytes = 0;
+    assert(RelayDecode(g_messageSends[0].bytes.data(), g_messageSends[0].bytes.size(),
+                       9001, "thermos-sec1", &hostPayload, &hostPayloadBytes));
+    const std::vector<char> hostU(static_cast<char const*>(hostPayload),
+                                  static_cast<char const*>(hostPayload) + hostPayloadBytes);
+
+    // Step 2: Fresh client runtime (local Remote::generation == 1 != 5) receives host's 'U' and sends its 'U' reply.
+    WorkerRuntime savedHost = std::move(rt);
+    rt.Reset();
+    rt.nextRelayGeneration = 0;
+    rt.ready = true;
+    rt.isHost = false;
+    rt.me = clientId;
+    rt.owner = hostId;
+    rt.lobby = 9001;
+    rt.enetPort = 27016;
+    rt.directUdpEnabled = true;
+    rt.sockets = &DummyHandle;
+    rt.messages = &DummyHandle;
+    rt.friends = &DummyHandle;
+    rt.matchmaking = &DummyHandle;
+    rt.networkingUtils = &DummyHandle;
+    Remote* clientView = rt.Get(hostId);
+    assert(clientView && clientView->generation == 1);
+    clientView->linked = true;
+    g_messageSends.clear();
+    rt.OnControl(*clientView, hostU.data(), static_cast<int>(hostU.size()));
+    assert(clientView->haveDirectCookie && clientView->directOfferGeneration == 5 && clientView->directReady);
+    rt.Publish();
+    const auto clientOffers = DirectOffers();
+    assert(clientOffers.size() == 1 && clientOffers[0].generation == 1 && clientOffers[0].ready);
+    assert(HostRelayGeneration() == 1);
+    assert(g_messageSends.size() == 1);
+    void const* clientPayload = nullptr;
+    std::size_t clientPayloadBytes = 0;
+    assert(RelayDecode(g_messageSends[0].bytes.data(), g_messageSends[0].bytes.size(),
+                       9001, "thermos-sec1", &clientPayload, &clientPayloadBytes));
+    const std::vector<char> clientU(static_cast<char const*>(clientPayload),
+                                    static_cast<char const*>(clientPayload) + clientPayloadBytes);
+
+    // Step 3: Host (Remote::generation == 5) receives client's 'U' reply and MUST authenticate it and become directReady!
+    rt = std::move(savedHost);
+    Remote* restoredHostView = rt.Find(clientId);
+    assert(restoredHostView && !restoredHostView->directReady);
+    rt.OnControl(*restoredHostView, clientU.data(), static_cast<int>(clientU.size()));
+    assert(restoredHostView->directReady && restoredHostView->directPeerPort == 27016);
+    rt.Publish();
+    const auto hostOffers = DirectOffers();
+    assert(hostOffers.size() == 1 && hostOffers[0].generation == 5 && hostOffers[0].ready);
+
+    SetEnvironmentVariableA("G3T_DIRECT_UDP_ALLOW_LOOPBACK", "0");
 }
 
 void TestDirectEndpointPinningAndInviteRejoinGenerationRotation()
 {
     ResetHarness();
-    SetEnvironmentVariableA("G3T_DIRECT_ALLOW_LOOPBACK", "0");
+    SetEnvironmentVariableA("G3T_DIRECT_UDP_ALLOW_LOOPBACK", "0");
 
     const u64 clientId = 76561198000000004ULL;
     g_lobbyMember = clientId;
@@ -856,9 +953,10 @@ int main()
     TestZeroCopyV012LanesAndMessagesFallback();
     TestActiveV012SendDiagnosticsVsMessagesFallback();
     TestDirectCandidateFilteringAndReflexivePort();
+    TestDirectUdpHandshakeAcrossMismatchedGenerations();
     TestDirectEndpointPinningAndInviteRejoinGenerationRotation();
     TestClientForwardPortFilter();
     TestRealSteamConfigScopesOnHostAndClient();
-    std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, endpoint pinning, rejoin rotation, port filtering and real Steam config scopes passed");
+    std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, mismatched-gen handshake, endpoint pinning, rejoin rotation, port filtering and real Steam config scopes passed");
     return 0;
 }

@@ -2,6 +2,7 @@
 #pragma once
 
 #ifdef G3T_NPCLEASE_NATIVE_RUNTIME
+#include "combat_hostility.h"
 #include "guid.h"
 #include "npclease.h"
 #include "npcs.h"
@@ -85,6 +86,7 @@ inline void ImportNativeFields(eCEntity* entity, Checkpoint const& state, bool w
     npc.DamageReceiver.ManaPointsMax = state.maxMana; npc.DamageReceiver.ManaPoints = state.mana;
     npc.DamageReceiver.StaminaPointsMax = state.maxStamina; npc.DamageReceiver.StaminaPoints = state.stamina;
     npc.NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(state.attitude);
+    combat_hostility::NoteImportedAttitude(entity, state.attitude);
     npc.NPC.Level = state.level;
     npc.NPC.AttackReason = static_cast<gEAttackReason>(state.attackReason);
     npc.NPC.DefeatedByPlayer = state.defeated != 0;

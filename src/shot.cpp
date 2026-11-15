@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "body.h"
 #include "combat.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -77,19 +78,10 @@ T* Find(bTValMap<bCString, T*>& map, char const* name)
     return map.GetAt(bCString(name), found) ? found : nullptr;
 }
 
-void Guid(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
-Entity ByGuid(uint8_t const guid[16])
+Entity ByGuid(uint8_t const id[16])
 {
     static const uint8_t none[16] = {};
-    if (!std::memcmp(guid, none, 16)) return Entity();
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    return Entity(bCPropertyID(bCGuid(raw)));
+    return std::memcmp(id, none, 16) ? guid::Resolve(id) : Entity();
 }
 
 char const* NameOf(Entity const& e) { return e.GetInstance() ? e.GetName().GetText() : "-"; }
@@ -168,7 +160,7 @@ GEInt GE_STDCALL HookShoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid 
     if (own) {
         ++shots;
         p.shooter = shooter;
-        if (target) Guid(target, p.target);
+        if (target) guid::CopyEntity(target, p.target);
         p.targetPlayer = TargetPlayer(target);
         p.before = ArrowsOf(shooter);
         p.since = GetTickCount();
@@ -191,7 +183,7 @@ GEInt GE_STDCALL WrapMagicProjectile(gCScriptProcessingUnit* spu, GELPVoid self,
     if (own) {
         ++shots;
         p.shooter = caster;
-        if (target) Guid(target, p.target);
+        if (target) guid::CopyEntity(target, p.target);
         p.targetPlayer = TargetPlayer(target);
         p.before = ArrowsOf(caster);
         p.since = GetTickCount();
@@ -245,7 +237,7 @@ void Announce(Pending const& p, Entity arrow)
     note.netId = (static_cast<uint32_t>(net::LocalId()) << 24) | (++counter & 0xFFFFFF);
     std::memcpy(note.target, p.target, 16);
     note.targetPlayer = p.targetPlayer;
-    if (p.shooter != remote::ControlledBody()) Guid(p.shooter, note.caster);
+    if (p.shooter != remote::ControlledBody()) guid::CopyEntity(p.shooter, note.caster);
     strncpy_s(note.spell, p.spell, _TRUNCATE);
     note.sent = net::Now();
     const bCVector at = arrow.GetPosition();
@@ -400,9 +392,9 @@ void SpawnShot(uint8_t from, net::ShotNote const& note)
         else ++noSpell;
     }
     if (npc) {
-        uint8_t guid[16];
-        Guid(copy.GetInstance(), guid);
-        npcReplicas.emplace(reinterpret_cast<char const*>(guid), 16);
+        uint8_t id[16];
+        guid::CopyEntity(copy.GetInstance(), id);
+        npcReplicas.emplace(reinterpret_cast<char const*>(id), 16);
         if (*note.spell && !haveSpell)
             Logf("shot: NPC projectile %08X has no local spell metadata for %s", note.netId, note.spell);
     }
@@ -413,7 +405,7 @@ void SpawnShot(uint8_t from, net::ShotNote const& note)
     Copy c;
     c.netId = note.netId;
     c.from = from;
-    Guid(copy.GetInstance(), c.guid);
+    guid::CopyEntity(copy.GetInstance(), c.guid);
     c.at = GetTickCount();
     c.start = bCVector(note.position[0], note.position[1], note.position[2]);
     if (recent.size() >= MaxCopies) recent.erase(recent.begin());
@@ -492,9 +484,9 @@ void Start() { net::SetShotHandler(&OnShot); }
 bool NpcReplica(eCEntity const* entity)
 {
     if (!entity) return false;
-    const eCEntityProxy proxy(const_cast<eCEntity*>(entity));
-    const std::string guid(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
-    return npcReplicas.count(guid) != 0;
+    uint8_t id[16];
+    guid::CopyEntity(const_cast<eCEntity*>(entity), id);
+    return npcReplicas.count(std::string(reinterpret_cast<char const*>(id), 16)) != 0;
 }
 
 bool InNpcReplicaContact() { return npcReplicaContact; }
@@ -513,19 +505,14 @@ void NpcCast(char const* argument, LogFn log)
 {
     const size_t length = argument ? std::strlen(argument) : 0;
     if (length <= 37 || argument[36] != '_') { log("REFUSED npccast: need GUID_spell-item"); return; }
-    unsigned long d1 = 0;
-    unsigned d2 = 0, d3 = 0, bytes[8] = {};
     char text[37] = {};
     std::memcpy(text, argument, 36);
-    if (sscanf_s(text, "%8lx-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d1, &d2, &d3,
-                 &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4], &bytes[5], &bytes[6], &bytes[7]) != 11) {
+    _GUID raw{};
+    if (!guid::ParseExact(text, raw)) {
         log("REFUSED npccast: invalid NPC GUID");
         return;
     }
-    _GUID raw{};
-    raw.Data1 = d1; raw.Data2 = static_cast<unsigned short>(d2); raw.Data3 = static_cast<unsigned short>(d3);
-    for (int i = 0; i < 8; ++i) raw.Data4[i] = static_cast<unsigned char>(bytes[i]);
-    Entity caster = Entity(bCPropertyID(bCGuid(raw)));
+    Entity caster = guid::Resolve(raw);
     eCEntity* target = remote::PuppetOf(net::IsHost() ? 2 : 1);
     const Template item(argument + 37);
     if (!caster.GetInstance() || !caster.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ||

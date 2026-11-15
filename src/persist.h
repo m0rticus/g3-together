@@ -2,10 +2,12 @@
 // Host-owned saves. Clients exchange only their account-bound character, never native world files.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
 namespace g3t::persist {
+void AppendPendingAdmissionAnchors(std::vector<std::array<float, 3>>& out);
 void Install();          // once the game DLLs are loaded; refuses (and logs) on any other build
 void* SaveTarget();      // the game's SaveGame entry (checked before hooking), nullptr if not hooked
 void* LoadTarget();

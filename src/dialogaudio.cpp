@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "config.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "remote.h"
@@ -101,15 +102,12 @@ char lastOptions[160] = "-";
 
 void GuidOf(eCEntity* entity, uint8_t out[16])
 {
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
+    guid::CopyEntity(entity, out);
 }
 
-eCEntity* Resolve(uint8_t const guid[16])
+eCEntity* Resolve(uint8_t const rawGuid[16])
 {
-    _GUID raw;
-    std::memcpy(&raw, guid, 16);
-    return Entity(bCPropertyID(bCGuid(raw))).GetInstance();
+    return guid::Resolve(rawGuid).GetInstance();
 }
 
 gCInfoManager_PS* Infos() { return gCSession::GetInstance().IsGameRunning() ? gCInfoManager_PS::GetInstance() : nullptr; }

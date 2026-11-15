@@ -18,23 +18,28 @@ enum class Priority : unsigned { Critical, Definition, Pose, Bulk, Count };
 constexpr unsigned Classes = static_cast<unsigned>(Priority::Count);
 constexpr uint32_t MaxUnreliablePoseAgeMs = 250;
 constexpr size_t MaxUnreliablePoseBytes = 128 * 1024;
+constexpr uint8_t WireMsgPlayerState = 3;
+constexpr uint8_t WireMsgPosedNpc = 39;
+constexpr uint8_t WireMsgCompactPosedNpc = 44;
+constexpr uint8_t WireMsgControlPose = 49;
+constexpr size_t WireNpcsHeaderBytes = 23;
 
 inline bool Retryable(int result) { return result == LimitExceeded || result == Ignored; }
 
 inline std::string ExtractNpcPoseKey(uint8_t const* payload, size_t size)
 {
-    if (!payload || size < 31) return {};
+    if (!payload || size < WireNpcsHeaderBytes + 8) return {};
     const uint8_t type = payload[0];
     // NpcsHeader is 23 bytes: MsgPosedNpc(39) and MsgCompactPosedNpc(44) follow with NpcRecord::guid[16].
-    if ((type == 39 || type == 44) && size >= 23 + 16) {
+    if ((type == WireMsgPosedNpc || type == WireMsgCompactPosedNpc) && size >= WireNpcsHeaderBytes + 16) {
         std::string key(1, 'G');
-        key.append(reinterpret_cast<char const*>(payload + 23), 16);
+        key.append(reinterpret_cast<char const*>(payload + WireNpcsHeaderBytes), 16);
         return key;
     }
     // MsgControlPose(49): NpcsHeader(23) + controlBytes(2) + generation(4) + WireControl::id(2).
-    if (type == 49 && size >= 23 + 2 + 4 + 2) {
+    if (type == WireMsgControlPose && size >= WireNpcsHeaderBytes + 2 + 4 + 2) {
         std::string key(1, 'C');
-        key.append(reinterpret_cast<char const*>(payload + 25), 6);
+        key.append(reinterpret_cast<char const*>(payload + WireNpcsHeaderBytes + 2), 6);
         return key;
     }
     return {};
@@ -198,15 +203,15 @@ public:
         const bool validEnet = decompressed &&
             ForEachEnetCommand(plain.data(), plain.size(), &parsed,
                                [&](std::size_t header, EnetCommandView const& view) {
-                const bool reliable = (view.flagsByte & 0x80u) != 0 || view.command == 1;
+                const bool reliable = (view.flagsByte & 0x80u) != 0 || view.command == EnetCmdAcknowledge;
                 Priority priority = Priority::Critical;
-                if (view.channel == net::ChannelBulk && view.command >= 6)
+                if (view.channel == net::ChannelBulk && view.command >= EnetCmdSendReliable)
                     priority = Priority::Bulk;
-                else if (view.command >= 6 &&
+                else if (view.command >= EnetCmdSendReliable &&
                          (view.channel == net::ChannelPoses || view.channel == net::ChannelPosesAlt ||
                           (view.channel == net::ChannelNpcs && !reliable)))
                     priority = Priority::Pose;
-                else if (view.channel == net::ChannelDefinitions && view.command >= 6)
+                else if (view.channel == net::ChannelDefinitions && view.command >= EnetCmdSendReliable)
                     priority = Priority::Definition;
                 const unsigned groupId = static_cast<unsigned>(priority) * 2 + (reliable ? 0 : 1);
                 if (reliable) {
@@ -227,10 +232,12 @@ public:
                     retransmissions[groupId].push_back(std::move(key));
                 }
                 auto& group = groups[groupId];
-                if ((view.command == 6 || view.command == 7) && view.channel == net::ChannelState &&
-                    view.payloadBytes > 0 && view.payload[0] == 3)
+                if ((view.command == EnetCmdSendReliable || view.command == EnetCmdSendUnreliable) &&
+                    view.channel == net::ChannelState &&
+                    view.payloadBytes > 0 && view.payload[0] == WireMsgPlayerState)
                     ++playerStates[groupId];
-                if (!reliable && priority == Priority::Pose && view.command == 7 && view.payloadBytes > 0) {
+                if (!reliable && priority == Priority::Pose && view.command == EnetCmdSendUnreliable &&
+                    view.payloadBytes > 0) {
                     if (++commandCounts[groupId] == 1)
                         npcKeys[groupId] = ExtractNpcPoseKey(view.payload, view.payloadBytes);
                     else
@@ -246,7 +253,7 @@ public:
                 group.insert(group.end(), plain.begin() + view.offset,
                              plain.begin() + view.offset + view.totalBytes);
                 groupProtocolBytes[groupId] += view.headerBytes;
-                if (view.command == 1) groupAckBytes[groupId] += 8;
+                if (view.command == EnetCmdAcknowledge) groupAckBytes[groupId] += 8;
             }) && !parsed.compressed;
         if (result) *result = parsed;
         if (!validEnet) {

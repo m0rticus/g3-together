@@ -2,13 +2,16 @@
 #include "npc_contact.h"
 #include "npc_corpse.h"
 
+#include "ai.h"
 #include "combat.h"
 #include "combat_timing.h"
 #include "contact.h"
+#include "downed.h"
 #include "log.h"
 #include "npclease_runtime.h"
 #include "npcremoval.h"
 
+#include <Windows.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -265,9 +268,11 @@ bool PresentedContactPoints(Entity& entity, uint32_t heldRight, float a[3], floa
     const bCVector& origin = entity.GetInstance()->GetWorldPosition();
     float farthest = -1e20f;
     bone = -1;
-    const int bones = actor->GetInstance()->mNodes.mLength;
-    if (bones <= 0 || bones > 4096) return false;
-    for (int i = 0; i < std::min(bones, 128); ++i) {
+    auto* skeleton = actor->GetInstance();
+    if (!skeleton->mNodes.mData) return false;
+    const int boneLimit = ragdoll::ClampedBoneCount(skeleton->mNodes.mLength, 128);
+    if (boneLimit <= 0) return false;
+    for (int i = 0; i < boneLimit; ++i) {
         bCMatrix at;
         if (!animation->GetBoneMatrix(i, at)) break;
         const bCVector delta = at.GetTranslation() - origin;
@@ -789,6 +794,67 @@ bool MirrorFightsHeroImpl()
     fightSeenAny += any;
     fightSeenUs += us;
     return false;
+}
+
+namespace {
+using RagdollVec3 = ragdoll::Vector;
+using AddForceFn = void(__fastcall*)(void* self, void* edx, RagdollVec3 force, RagdollVec3 at);
+AddForceFn originalAddForce = nullptr;
+
+void __fastcall HookAddForce(void* self, void* edx, RagdollVec3 force, RagdollVec3 at)
+{
+    if (!ai::ShuttingDown()) {
+        auto* set = self ? *static_cast<eCEntityPropertySet**>(self) : nullptr;
+        eCEntity* entity = set ? set->GetEntity() : nullptr;
+        if (downed::RejectHarm(entity, nullptr, "AddForceAtPos")) return;
+        if (npcplayback::IsPassive(entity)) return;
+        originalAddForce(self, edx, force, at);
+        if (!net::IsHost() || !entity || !net::Connected() || !entity->GetPropertySet(eEPropertySetType_NPC)) return;
+        if (entity == gCSession::GetInstance().GetHero() || remote::IsPuppet(entity)) return;
+        auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
+        if (!animation || !animation->GetRagDollEnabled()) return;
+        uint8_t guid[16];
+        Guid(entity, guid);
+        if (mirrors.count(Key(guid))) return;
+        net::RagdollNote note;
+        std::memcpy(note.guid, guid, 16);
+        if (++forceSequence == 0) ++forceSequence;
+        note.sequence = forceSequence;
+        note.incarnation = npcs::Incarnation(guid);
+        note.sent = net::Now();
+        const bCVector& position = entity->GetWorldPosition();
+        const RagdollVec3 relative = ragdoll::RelativePoint(at, {position.GetX(), position.GetY(), position.GetZ()});
+        note.at[0] = relative.x, note.at[1] = relative.y, note.at[2] = relative.z;
+        note.force[0] = force.x, note.force[1] = force.y, note.force[2] = force.z;
+        auto& history = forceHistory[Key(guid)];
+        if (history.size() == 64) {
+            history.erase(history.begin());
+            Log("npcs: pruned the oldest historical ragdoll impulse; the live impulse is still published");
+        }
+        history.push_back(note);
+        net::SendRagdoll(note);
+        if (++ragdollForcesSent <= 20)
+            Logf("npcs: ragdoll force of %s sent: at %.0f/%.0f/%.0f (relative), force %.0f/%.0f/%.0f",
+                 Entity(entity).GetName().GetText(), note.at[0], note.at[1], note.at[2], force.x, force.y, force.z);
+        return;
+    }
+    if (originalAddForce) originalAddForce(self, edx, force, at);
+}
+} // namespace
+
+void InstallRagdollHook(uint32_t now)
+{
+    static bool done = false;
+    static uint32_t lastTry = 0;
+    if (done || now - lastTry < 1000) return;
+    lastTry = now;
+    HMODULE game = GetModuleHandleA("Script_Game.dll");
+    if (!game) return;
+    done = true;
+    originalAddForce = reinterpret_cast<AddForceFn>(
+        ai::PatchImport(game, "Script.dll", "?AddForceAtPos@PSAnimation@@QAEXVbCVector@@0@Z", reinterpret_cast<void*>(&HookAddForce)));
+    ragdollHookInstalled = originalAddForce != nullptr;
+    Log(originalAddForce ? "npcs: ragdoll forces hooked" : "npcs: ragdoll forces NOT hooked (the script DLL does not import AddForceAtPos)");
 }
 
 } // namespace detail

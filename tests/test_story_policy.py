@@ -27,22 +27,28 @@ class StoryRestorationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_atomic_reward_free_admission_wiring(self):
-        story = _testbuild.src_text("story.cpp")
+        story_core = _testbuild.src_text("story.cpp")
+        story_domains = _testbuild.src_text("story_domains.cpp")
+        story = story_domains + "\n" + story_core
         persist = _testbuild.src_text("persist.cpp")
-        commit = story[story.index("bool CommitBaselines()"):story.index("void OnStates(")]
+        commit = story_core[story_core.index("bool CommitBaselines()"):story_core.index("void OnStates(")]
         self.assertLess(commit.index("!d.baseline.complete"), commit.index("Apply(runtime"))
-        self.assertIn("quest->AccessStatus() = static_cast<gEQuestStatus>(value)", story)
+        self.assertIn("clockDomain.baseline = {}", commit)
+        self.assertIn("clockDomain.nextRequest = 0", commit)
+        self.assertIn("quest->AccessStatus() = static_cast<gEQuestStatus>(value)", story_core)
         self.assertIn("story::AdmissionReady() && doors::AdmissionReady()", persist)
         self.assertIn("!doors::SettleForSave()", persist)
         self.assertIn("StateQuestRuntime", story)
-        self.assertIn("Apply(*d, entry.first.c_str(), entry.second, catchup)", story)
-        self.assertIn("domain.snapshot(replay.values[domain.kind - 1])", story)
-        self.assertIn("States delta = policy::Changes(replay.latest[d.kind - 1], current)", story)
+        self.assertIn("Apply(*d, entry.first.c_str(), entry.second, catchup)", story_core)
+        self.assertIn("domain.snapshot(replay.values[domain.kind - 1])", story_core)
+        self.assertIn("States delta = policy::Changes(replay.latest[d.kind - 1], current)", story_core)
         self.assertIn("StateWorldClock", story)
-        self.assertIn("clock::RestoreAdmission(state)", story)
+        self.assertIn("clock::RestoreAdmission(state)", story_domains)
         self.assertIn("ready && hostAdmissionAck", persist)
         self.assertIn("answer.flags = net::WorldEntryConfirmed", persist)
         self.assertIn("!story::FinishAdmission(from) || !doors::FinishAdmission(from)", persist)
+        for name in ("story_internal.h", "story.cpp", "story_domains.cpp", "story_qa.cpp"):
+            self.assertLess(len(_testbuild.src_text(name).splitlines()), 1000, name)
 
     def test_bootstrap_does_not_require_its_own_admission_gate(self):
         story = _testbuild.src_text("story.cpp")

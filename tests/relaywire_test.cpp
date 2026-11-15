@@ -84,6 +84,12 @@ int main()
     assert(!RelayDecode(malformedMarker, 10, lobby, sessionDefault, &out, &outSize));
     malformedMarker[8] = 0xff;
     assert(!RelayDecode(malformedMarker, 10, lobby, sessionDefault, &out, &outSize));
+    // Reserved bit 6 (0x40) must also be rejected even when session bytes match expectedSession.
+    std::memcpy(malformedMarker + 9, sessionDefault, 7);
+    malformedMarker[8] = 0xc7;
+    assert(!RelayDecode(malformedMarker, 9 + 7, lobby, sessionDefault, &out, &outSize));
+    malformedMarker[8] = 0xc1;
+    assert(!RelayDecode(malformedMarker, 10, lobby, "a", &out, &outSize));
 
     for (char const* invalid : {"", "bad!", "bad session", "slash/name", "A."}) {
         assert(!RelayEncode(lobby, invalid, payload, 1, packet, sizeof(packet), &encodedSize));

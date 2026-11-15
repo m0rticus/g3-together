@@ -50,11 +50,7 @@ constexpr char const* StageNames[] = {
 
 void EnsureWatchdogDir()
 {
-    if (*watchdogDir) return;
-    if (!symbols::GameDir(watchdogDir) && !GetCurrentDirectoryA(MAX_PATH, watchdogDir))
-        watchdogDir[0] = '\0';
-    const size_t length = std::strlen(watchdogDir);
-    if (length && watchdogDir[length - 1] != '\\') strcat_s(watchdogDir, "\\");
+    symbols::EnsureGameDir(watchdogDir);
 }
 
 GraphicsSites FindGraphicsSites()
@@ -255,8 +251,31 @@ void WriteWatchdogText(char const* path)
         }
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
-        if (!GetThreadContext(handle, &context)) {
-            Format(line, "THREAD id=%lu CONTEXT failed=GetThreadContext error=%lu\n", tid, GetLastError());
+        const bool contextOk = GetThreadContext(handle, &context) != FALSE;
+        const DWORD contextError = contextOk ? 0 : GetLastError();
+        unsigned char stackBytes[4096];
+        SIZE_T read = 0;
+        DWORD ebpFrames[32] = {};
+        unsigned ebpCount = 0;
+        if (contextOk) {
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
+                                   stackBytes, sizeof(stackBytes), &read))
+                read = 0;
+            DWORD ebp = context.Ebp;
+            for (unsigned i = 0; i < 32 && ebp; ++i) {
+                DWORD pair[2] = {};
+                if (!symbols::ReadMemory(ebp, pair, sizeof(pair)) || !pair[1]) break;
+                ebpFrames[ebpCount++] = pair[1];
+                if (!pair[0] || pair[0] == ebp) break;
+                ebp = pair[0];
+            }
+        }
+        const bool resumed = ResumeThread(handle) != static_cast<DWORD>(-1);
+        const DWORD resumeError = resumed ? 0 : GetLastError();
+        CloseHandle(handle);
+
+        if (!contextOk) {
+            Format(line, "THREAD id=%lu CONTEXT failed=GetThreadContext error=%lu\n", tid, contextError);
             WriteText(text, line);
         } else {
             char where[300];
@@ -266,13 +285,10 @@ void WriteWatchdogText(char const* path)
                    tid, context.Eip, context.Esp, context.Ebp, tid, context.Eip, where);
             WriteText(text, line);
 
-            unsigned char stackBytes[4096];
-            SIZE_T read = 0;
-            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
-                                  stackBytes, sizeof(stackBytes), &read) && read >= sizeof(DWORD)) {
+            if (read >= sizeof(DWORD)) {
                 unsigned frame = 0;
                 for (SIZE_T i = 0; i + sizeof(DWORD) <= read && frame < 64; i += sizeof(DWORD)) {
-                    DWORD_PTR address;
+                    DWORD_PTR address = 0;
                     std::memcpy(&address, stackBytes + i, sizeof(DWORD));
                     WatchdogWhere(watchModules, moduleCount, address, where, sizeof(where));
                     if (!std::strcmp(where, "unknown")) continue;
@@ -283,26 +299,20 @@ void WriteWatchdogText(char const* path)
                 }
             }
 
-            DWORD ebp = context.Ebp;
             unsigned ebpFrame = 0;
-            for (unsigned i = 0; i < 32 && ebp; ++i) {
-                DWORD pair[2] = {};
-                if (!symbols::ReadMemory(ebp, pair, sizeof(pair)) || !pair[1]) break;
-                WatchdogWhere(watchModules, moduleCount, pair[1], where, sizeof(where));
+            for (unsigned i = 0; i < ebpCount; ++i) {
+                WatchdogWhere(watchModules, moduleCount, ebpFrames[i], where, sizeof(where));
                 if (std::strcmp(where, "unknown")) {
                     Format(line, "THREAD id=%lu ebp-frame=%u address=%08lX module+offset=%s\n",
-                           tid, ebpFrame++, pair[1], where);
+                           tid, ebpFrame++, ebpFrames[i], where);
                     WriteText(text, line);
                 }
-                if (!pair[0] || pair[0] == ebp) break;
-                ebp = pair[0];
             }
         }
-        if (ResumeThread(handle) == static_cast<DWORD>(-1)) {
-            Format(line, "THREAD id=%lu RESUME failed=ResumeThread error=%lu\n", tid, GetLastError());
+        if (!resumed) {
+            Format(line, "THREAD id=%lu RESUME failed=ResumeThread error=%lu\n", tid, resumeError);
             WriteText(text, line);
         }
-        CloseHandle(handle);
     }
     CloseHandle(threadSnapshot);
     CloseHandle(text);
@@ -332,7 +342,9 @@ DWORD WINAPI WatchdogThread(LPVOID)
             Logf("shutdown: native DX9/AMD Release stalled after cleanup thread=%lu object=%08x "
                  "completed=%u target=%u; exiting process without DLL detach",
                  graphicsSites.thread, lastGraphicsWait.object, lastGraphicsWait.completed,
-                 lastGraphicsWait.produced - lastGraphicsWait.retired);
+                 lastGraphicsWait.produced > lastGraphicsWait.retired
+                     ? lastGraphicsWait.produced - lastGraphicsWait.retired
+                     : 0u);
             // ExitProcess runs DLL detach, which can wait on a driver lock held by
             // a terminated thread. Our world/save/transport cleanup already returned.
             if (!TerminateProcess(GetCurrentProcess(), 0)) {

@@ -140,71 +140,56 @@ GEBool __fastcall RefreshPersonalTrade(gCInventory_PS* inventory, void* edx)
     return nativeRefreshTrade(inventory, edx);
 }
 
+template <typename Call>
+GEBool GuardedInventoryTransfer(gCInventory_PS* from, gCInventory_PS* to, Call&& call)
+{
+    if (ai::ShuttingDown() || !PersonalPlayerTransfer(from, to)) return call();
+    PersonalMutation mutation;
+    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
+    return call();
+}
+
 GEBool __fastcall TransferPersonalItems(gCInventory_PS* from, void* edx, gCInventory_PS* to,
                                        GEInt stack, GEInt amount, gEStackType type)
 {
     if (!nativeTransferItems) return GEFalse;
-    if (ai::ShuttingDown()) return nativeTransferItems(from, edx, to, stack, amount, type);
-    if (!PersonalPlayerTransfer(from, to)) return nativeTransferItems(from, edx, to, stack, amount, type);
-    PersonalMutation mutation;
-    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
-    return nativeTransferItems(from, edx, to, stack, amount, type);
+    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferItems(from, edx, to, stack, amount, type); });
 }
 
 GEBool __fastcall TransferPersonalStack(gCInventory_PS* from, void* edx, gCInventory_PS* to,
                                        GEInt stack, gEStackType type)
 {
     if (!nativeTransferStack) return GEFalse;
-    if (ai::ShuttingDown()) return nativeTransferStack(from, edx, to, stack, type);
-    if (!PersonalPlayerTransfer(from, to)) return nativeTransferStack(from, edx, to, stack, type);
-    PersonalMutation mutation;
-    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
-    return nativeTransferStack(from, edx, to, stack, type);
+    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferStack(from, edx, to, stack, type); });
 }
 
 GEBool __fastcall TransferPersonalAll(gCInventory_PS* from, void* edx, gCInventory_PS* to, gEStackType type)
 {
     if (!nativeTransferAll) return GEFalse;
-    if (ai::ShuttingDown()) return nativeTransferAll(from, edx, to, type);
-    if (!PersonalPlayerTransfer(from, to)) return nativeTransferAll(from, edx, to, type);
-    PersonalMutation mutation;
-    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
-    return nativeTransferAll(from, edx, to, type);
+    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferAll(from, edx, to, type); });
 }
 
 GEBool __fastcall TransferPersonalTransaction(gCInventory_PS* from, void* edx, gCInventory_PS* to, gEStackType type)
 {
     if (!nativeTransferTransaction) return GEFalse;
-    if (ai::ShuttingDown()) return nativeTransferTransaction(from, edx, to, type);
-    if (!PersonalPlayerTransfer(from, to)) return nativeTransferTransaction(from, edx, to, type);
-    PersonalMutation mutation;
-    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
-    return nativeTransferTransaction(from, edx, to, type);
+    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferTransaction(from, edx, to, type); });
 }
 
 GEBool __fastcall PerformPersonalTransaction(gCInventory_PS* from, void* edx, gCInventory_PS* to,
                                             gEStackType fromType, gEStackType toType)
 {
     if (!nativeTransaction) return GEFalse;
-    if (ai::ShuttingDown()) return nativeTransaction(from, edx, to, fromType, toType);
-    if (!PersonalPlayerTransfer(from, to)) return nativeTransaction(from, edx, to, fromType, toType);
-    PersonalMutation mutation;
-    if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
-    return nativeTransaction(from, edx, to, fromType, toType);
+    return GuardedInventoryTransfer(from, to, [&] { return nativeTransaction(from, edx, to, fromType, toType); });
 }
 
 GEBool __fastcall TransferPersonalScript(PSInventory* from, void* edx, GEInt stack, GEInt amount, Entity& to)
 {
     if (!nativeScriptTransfer) return GEFalse;
-    if (ai::ShuttingDown()) return nativeScriptTransfer(from, edx, stack, amount, to);
     auto* property = from ? reinterpret_cast<EntityPropertySet*>(from)->m_pEngineEntityPropertySet : nullptr;
     auto* inventory = property ? static_cast<gCInventory_PS*>(property) : nullptr;
     auto* target = to.GetInstance()
         ? static_cast<gCInventory_PS*>(to.GetInstance()->GetPropertySet(eEPropertySetType_Inventory)) : nullptr;
-    if (!PersonalPlayerTransfer(inventory, target)) return nativeScriptTransfer(from, edx, stack, amount, to);
-    PersonalMutation mutation;
-    if (!mutation.Enter(inventory) || !mutation.Enter(target)) return GEFalse;
-    return nativeScriptTransfer(from, edx, stack, amount, to);
+    return GuardedInventoryTransfer(inventory, target, [&] { return nativeScriptTransfer(from, edx, stack, amount, to); });
 }
 
 GEBool __fastcall BeginPersonalTrade(gCGUIManager* manager, void* edx, eCEntity* partner)
@@ -501,6 +486,14 @@ void IgnoreContents(uint8_t const*, net::ContentEntry const*, int) { IgnoreShare
 void IgnoreTransaction(uint8_t, uint8_t const*, uint32_t, net::ContentEntry const*, int) { IgnoreSharedInventory("transaction"); }
 void IgnoreResult(uint8_t const*, uint32_t, bool) { IgnoreSharedInventory("transaction result"); }
 void IgnoreWatch(uint8_t, uint8_t const*) { IgnoreSharedInventory("inventory watch"); }
+
+bool AreAllPersonalHooksReady()
+{
+    return !ai::ShuttingDown() && hooked && nativeLootGuard && quickHooked && nativePlunder && nativeTrade &&
+           nativeRefreshTrade && nativeBeginTrade && personalStateHooks && nativeTransferItems &&
+           nativeTransferStack && nativeTransferAll && nativeTransferTransaction && nativeTransaction &&
+           nativeScriptTransfer;
+}
 } // namespace
 
 void Start()
@@ -556,34 +549,23 @@ bool InstallAccessGuards()
     }
     if (!quickHooked && !quickHookFailed) HookQuickLoot();
     InstallPersonalGuards();
-    return PersonalHooksReady();
+    return AreAllPersonalHooksReady();
 }
 
 bool PersonalHooksReady()
 {
-    static bool installing = false;
-    auto ready = []() {
-        return !ai::ShuttingDown() && hooked && nativeLootGuard && quickHooked && nativePlunder && nativeTrade &&
-               nativeRefreshTrade && nativeBeginTrade && personalStateHooks && nativeTransferItems &&
-               nativeTransferStack && nativeTransferAll && nativeTransferTransaction && nativeTransaction && nativeScriptTransfer;
-    };
-    if (ready()) return true;
-    if (!installing && !ai::ShuttingDown() && gCSession::GetInstance().IsGameRunning()) {
-        installing = true;
-        InstallAccessGuards();
-        installing = false;
-    }
-    return ready();
+    if (AreAllPersonalHooksReady()) return true;
+    return !ai::ShuttingDown() && gCSession::GetInstance().IsGameRunning() && InstallAccessGuards();
 }
 
 bool CapturePersonal(std::vector<uint8_t>& out)
 {
-    return ledger::Capture(out, &InstallAccessGuards);
+    return ledger::Capture(out, &PersonalHooksReady);
 }
 
 bool RestorePersonal(std::vector<uint8_t> const& bytes)
 {
-    return ledger::Restore(bytes, &InstallAccessGuards);
+    return ledger::Restore(bytes, &PersonalHooksReady);
 }
 
 void Tick()

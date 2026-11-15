@@ -19,7 +19,7 @@ FOLDER_MODULES = ("Game.dll", "Engine.dll", "SharedBase.dll", "Dialogs.dll",
 NATIVE_SLOTS = dict(zip(FOLDER_MODULES, (0x32F2E6, 0x4C0706, 0x9796C, 0x34874, 0x90DCC, 0x6E8F6)))
 SLOT_QA = b"g3qa32.dll\x00\x00"
 SLOT_GENUINE = b"SHELL32.dll\x00"
-STEAM_DLL_SHA256 = "2c2dc5db39ebad2fe2db326ed95fd3ffdf5fb8230157a994fa0edcc42a8b1ce7"
+STEAM_DLL_SHA256 = "fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da"
 KNOWN_FAKE_SHA = "a3c85cda223e4bef581440f2f50da419e6d6c1218ee78cc2ebdbc88a998e13f3"
 TEST_REALISM_BUNDLE_FILES = tuple("G3Together/test-realism/" + name for name in (
     "fake_steam_api.dll", "fake_steam_diag.h", "fake_steam_abi.h",

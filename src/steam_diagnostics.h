@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "steam_config.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -38,7 +40,7 @@ static_assert(sizeof(SessionStatus) == 120 && offsetof(SessionStatus, queueMicro
               "Steam realtime status ABI");
 
 constexpr int Connected = 3, LoopbackBuffers = 4, Relayed = 16;
-constexpr int StunServerList = 103, IceEnable = 104, IcePenalty = 105, SdrPenalty = 106;
+constexpr int StunServerList = 103, IceEnable = config::P2PTransportIceEnable, IcePenalty = 105, SdrPenalty = 106;
 constexpr int TimeoutInitial = 24, TimeoutConnected = 25, MtuPacketSize = 32, Unencrypted = 34;
 
 inline bool HasRemoteAddress(ConnectionInfo const& info)

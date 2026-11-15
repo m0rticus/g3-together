@@ -67,44 +67,31 @@ def _key_lock(key: str) -> threading.Lock:
 
 
 def _ensure_cache_dirs() -> None:
-    OBJ_DIR.mkdir(parents=True, exist_ok=True)
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-    GEN_DIR.mkdir(parents=True, exist_ok=True)
-    ENV_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (OBJ_DIR, BIN_DIR, GEN_DIR, ENV_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Cached file / source / PE readers
-# ---------------------------------------------------------------------------
+def _stat_cached(cache: dict, key: str, path: Path, loader):
+    st = path.stat()
+    mtime_ns, size = st.st_mtime_ns, st.st_size
+    with _CACHE_LOCK:
+        hit = cache.get(key)
+        if hit is not None and hit[0] == mtime_ns and hit[1] == size:
+            return hit[2]
+    val = loader(path, mtime_ns, size)
+    with _CACHE_LOCK:
+        cache[key] = (mtime_ns, size, val)
+    return val
+
 
 def cached_bytes(path: str | Path) -> bytes:
     p = Path(path)
-    key = _norm_key(p)
-    st = p.stat()
-    mtime_ns, size = st.st_mtime_ns, st.st_size
-    with _CACHE_LOCK:
-        hit = _BYTES_CACHE.get(key)
-        if hit is not None and hit[0] == mtime_ns and hit[1] == size:
-            return hit[2]
-    data = p.read_bytes()
-    with _CACHE_LOCK:
-        _BYTES_CACHE[key] = (mtime_ns, size, data)
-    return data
+    return _stat_cached(_BYTES_CACHE, _norm_key(p), p, lambda fp, _m, _s: fp.read_bytes())
 
 
 def cached_text(path: str | Path, encoding: str = "utf-8") -> str:
     p = Path(path)
-    key = f"{_norm_key(p)}::{encoding}"
-    st = p.stat()
-    mtime_ns, size = st.st_mtime_ns, st.st_size
-    with _CACHE_LOCK:
-        hit = _TEXT_CACHE.get(key)
-        if hit is not None and hit[0] == mtime_ns and hit[1] == size:
-            return hit[2]
-    text = p.read_text(encoding=encoding)
-    with _CACHE_LOCK:
-        _TEXT_CACHE[key] = (mtime_ns, size, text)
-    return text
+    return _stat_cached(_TEXT_CACHE, f"{_norm_key(p)}::{encoding}", p, lambda fp, _m, _s: fp.read_text(encoding=encoding))
 
 
 def src_text(name: str) -> str:
@@ -114,24 +101,19 @@ def src_text(name: str) -> str:
 def cached_sha256(path: str | Path) -> str:
     p = Path(path)
     key = _norm_key(p)
-    st = p.stat()
-    mtime_ns, size = st.st_mtime_ns, st.st_size
-    with _CACHE_LOCK:
-        hit = _SHA256_CACHE.get(key)
-        if hit is not None and hit[0] == mtime_ns and hit[1] == size:
-            return hit[2]
-        bytes_hit = _BYTES_CACHE.get(key)
-    if bytes_hit is not None and bytes_hit[0] == mtime_ns and bytes_hit[1] == size:
-        digest = hashlib.sha256(bytes_hit[2]).hexdigest()
-    else:
+
+    def _load(fp: Path, mtime_ns: int, size: int) -> str:
+        with _CACHE_LOCK:
+            bytes_hit = _BYTES_CACHE.get(key)
+        if bytes_hit is not None and bytes_hit[0] == mtime_ns and bytes_hit[1] == size:
+            return hashlib.sha256(bytes_hit[2]).hexdigest()
         h = hashlib.sha256()
-        with p.open("rb") as handle:
+        with fp.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 h.update(chunk)
-        digest = h.hexdigest()
-    with _CACHE_LOCK:
-        _SHA256_CACHE[key] = (mtime_ns, size, digest)
-    return digest
+        return h.hexdigest()
+
+    return _stat_cached(_SHA256_CACHE, key, p, _load)
 
 
 class CachedPe:
@@ -152,15 +134,9 @@ class CachedPe:
         self.base = self.u32(optional + 28)
         self.image_base = self.base
         count_dirs = self.u32(optional + 92)
-        self.export_rva, self.export_size = (
-            (self.u32(optional + 96), self.u32(optional + 100)) if count_dirs > 0 else (0, 0)
-        )
-        self.import_rva, self.import_size = (
-            (self.u32(optional + 104), self.u32(optional + 108)) if count_dirs > 1 else (0, 0)
-        )
-        self.reloc_rva, self.reloc_size = (
-            (self.u32(optional + 136), self.u32(optional + 140)) if count_dirs > 5 else (0, 0)
-        )
+        self.export_rva, self.export_size = (self.u32(optional + 96), self.u32(optional + 100)) if count_dirs > 0 else (0, 0)
+        self.import_rva, self.import_size = (self.u32(optional + 104), self.u32(optional + 108)) if count_dirs > 1 else (0, 0)
+        self.reloc_rva, self.reloc_size = (self.u32(optional + 136), self.u32(optional + 140)) if count_dirs > 5 else (0, 0)
         section_table = optional + opt_size
         sec_count = self.u16(pe + 6)
         self.sections: list[tuple[int, int, int, int]] = []
@@ -217,11 +193,7 @@ class CachedPe:
             return self._exports_cache
         directory = self.offset(self.export_rva, 40)
         function_count, name_count = self.u32(directory + 20), self.u32(directory + 24)
-        functions, names, ordinals = (
-            self.u32(directory + 28),
-            self.u32(directory + 32),
-            self.u32(directory + 36),
-        )
+        functions, names, ordinals = self.u32(directory + 28), self.u32(directory + 32), self.u32(directory + 36)
         found: dict[str, int] = {}
         for i in range(name_count):
             name_rva = self.u32(self.offset(names + 4 * i, 4))
@@ -302,22 +274,8 @@ class CachedPe:
 
 def cached_pe(path: str | Path) -> CachedPe:
     p = Path(path)
-    key = _norm_key(p)
-    st = p.stat()
-    mtime_ns, size = st.st_mtime_ns, st.st_size
-    with _CACHE_LOCK:
-        hit = _PE_CACHE.get(key)
-        if hit is not None and hit[0] == mtime_ns and hit[1] == size:
-            return hit[2]
-    pe = CachedPe(p)
-    with _CACHE_LOCK:
-        _PE_CACHE[key] = (mtime_ns, size, pe)
-    return pe
+    return _stat_cached(_PE_CACHE, _norm_key(p), p, lambda fp, _m, _s: CachedPe(fp))
 
-
-# ---------------------------------------------------------------------------
-# Transitive #include dependency hashing
-# ---------------------------------------------------------------------------
 
 def _file_meta(path: Path) -> tuple[str, tuple[tuple[bool, str], ...]]:
     key = _norm_key(path)
@@ -344,43 +302,28 @@ def _file_meta(path: Path) -> tuple[str, tuple[tuple[bool, str], ...]]:
 
 
 def _resolve_include(
-    including_dir: Path,
-    is_angled: bool,
-    inc_path: str,
-    include_dirs: Sequence[Path],
-    inc_dirs_key: tuple[str, ...] = (),
+    including_dir: Path, is_angled: bool, inc_path: str, include_dirs: Sequence[Path], inc_dirs_key: tuple[str, ...] = ()
 ) -> Path | None:
     cache_key = (_norm_key(including_dir), is_angled, inc_path, inc_dirs_key)
     with _CACHE_LOCK:
         if cache_key in _INCLUDE_RESOLVE_CACHE:
             return _INCLUDE_RESOLVE_CACHE[cache_key]
     found: Path | None = None
-    if not is_angled:
-        cand = including_dir / inc_path
+    search_dirs = include_dirs if is_angled else (including_dir, *include_dirs)
+    for inc_dir in search_dirs:
+        cand = inc_dir / inc_path
         try:
             if cand.is_file():
                 found = Path(os.path.abspath(cand))
+                break
         except OSError:
-            pass
-    if found is None:
-        for inc_dir in include_dirs:
-            cand = inc_dir / inc_path
-            try:
-                if cand.is_file():
-                    found = Path(os.path.abspath(cand))
-                    break
-            except OSError:
-                continue
+            continue
     with _CACHE_LOCK:
         _INCLUDE_RESOLVE_CACHE[cache_key] = found
     return found
 
 
-def transitive_source_digest(
-    root_source: Path,
-    include_dirs: Sequence[Path],
-    extra_deps: Sequence[Path] = (),
-) -> str:
+def transitive_source_digest(root_source: Path, include_dirs: Sequence[Path], extra_deps: Sequence[Path] = ()) -> str:
     abs_root = Path(os.path.abspath(root_source))
     norm_root = _norm_key(abs_root)
     resolved_includes = tuple(Path(os.path.abspath(p)) for p in include_dirs)
@@ -411,20 +354,13 @@ def transitive_source_digest(
                 queue.append(target)
     hasher = hashlib.sha256()
     for norm in sorted(visited):
-        hasher.update(norm.encode("utf-8"))
-        hasher.update(b"\0")
-        hasher.update(visited[norm].encode("ascii"))
-        hasher.update(b"\n")
+        hasher.update(f"{norm}\0{visited[norm]}\n".encode("utf-8"))
     digest = hasher.hexdigest()
     if in_repo:
         with _CACHE_LOCK:
             _TRANSITIVE_DIGEST_CACHE[td_key] = digest
     return digest
 
-
-# ---------------------------------------------------------------------------
-# Toolchain resolution
-# ---------------------------------------------------------------------------
 
 def win32_cl_environment(temp_dir: Path | None = None) -> dict[str, str]:
     global _WIN32_BASE_ENV_CACHE
@@ -465,7 +401,7 @@ class ResolvedToolchain:
 
 
 def resolve_toolchain(
-    kind: str = "cxx",  # "cxx", "c", "win32_cl"
+    kind: str = "cxx",
     *,
     allow_msvc: bool = True,
     msvc_vcvars: bool = True,
@@ -474,11 +410,7 @@ def resolve_toolchain(
     skip_message: str = "C/C++ compiler required",
 ) -> ResolvedToolchain:
     tc_cache_key = (
-        kind,
-        allow_msvc,
-        msvc_vcvars,
-        respect_env,
-        needs_c,
+        kind, allow_msvc, msvc_vcvars, respect_env, needs_c,
         os.environ.get("CC", "") if respect_env else "",
         os.environ.get("CXX", "") if respect_env else "",
     )
@@ -487,16 +419,28 @@ def resolve_toolchain(
         if cached_tc is not None:
             return cached_tc
     resolved = _resolve_toolchain_uncached(
-        kind,
-        allow_msvc=allow_msvc,
-        msvc_vcvars=msvc_vcvars,
-        respect_env=respect_env,
-        needs_c=needs_c,
-        skip_message=skip_message,
+        kind, allow_msvc=allow_msvc, msvc_vcvars=msvc_vcvars,
+        respect_env=respect_env, needs_c=needs_c, skip_message=skip_message,
     )
     with _CACHE_LOCK:
         _TOOLCHAIN_CACHE[tc_cache_key] = resolved
     return resolved
+
+
+def _resolve_msvc_fallback(msvc_vcvars: bool) -> ResolvedToolchain | None:
+    cl = shutil.which("cl")
+    env = os.environ.copy()
+    arch = "host"
+    if not cl and msvc_vcvars and os.name == "nt":
+        try:
+            env = win32_cl_environment()
+            cl = shutil.which("cl.exe", path=env.get("PATH") or env.get("Path"))
+            arch = "win32_x86"
+        except RuntimeError:
+            cl = None
+    if cl:
+        return ResolvedToolchain("msvc", arch, cl, cl, env, f"msvc:{arch}:{_compiler_signature(cl)}")
+    return None
 
 
 def _resolve_toolchain_uncached(
@@ -515,88 +459,45 @@ def _resolve_toolchain_uncached(
         cl = shutil.which("cl.exe", path=env.get("PATH") or env.get("Path"))
         if not cl:
             raise RuntimeError("Win32 compiler not found after vcvars32")
-        sig = f"msvc:win32_x86:{_compiler_signature(cl)}"
-        return ResolvedToolchain("msvc", "win32_x86", cl, cl, env, sig)
+        return ResolvedToolchain("msvc", "win32_x86", cl, cl, env, f"msvc:win32_x86:{_compiler_signature(cl)}")
 
     if kind == "c":
-        candidates: list[str] = []
-        if respect_env and os.environ.get("CC"):
-            candidates.append(os.environ["CC"])
-        candidates.extend(["clang", "gcc"])
+        candidates = ([os.environ["CC"]] if respect_env and os.environ.get("CC") else []) + ["clang", "gcc"]
         for cand in candidates:
             found = shutil.which(cand)
             if found and Path(found).stem.lower() != "cl":
-                sig = f"gnu:host:{_compiler_signature(found)}"
-                return ResolvedToolchain("gnu", "host", None, found, os.environ.copy(), sig)
-        if allow_msvc:
-            cl = shutil.which("cl")
-            env = os.environ.copy()
-            arch = "host"
-            if not cl and msvc_vcvars and os.name == "nt":
-                try:
-                    env = win32_cl_environment()
-                    cl = shutil.which("cl.exe", path=env.get("PATH") or env.get("Path"))
-                    arch = "win32_x86"
-                except RuntimeError:
-                    cl = None
-            if cl:
-                sig = f"msvc:{arch}:{_compiler_signature(cl)}"
-                return ResolvedToolchain("msvc", arch, cl, cl, env, sig)
+                return ResolvedToolchain("gnu", "host", None, found, os.environ.copy(), f"gnu:host:{_compiler_signature(found)}")
+        if allow_msvc and (msvc_tc := _resolve_msvc_fallback(msvc_vcvars)) is not None:
+            return msvc_tc
         raise unittest.SkipTest(skip_message)
 
-    # kind == "cxx"
-    cxx_candidates: list[str] = []
-    if respect_env and os.environ.get("CXX"):
-        cxx_candidates.append(os.environ["CXX"])
-    cxx_candidates.extend(["clang++", "g++"])
+    cxx_candidates = ([os.environ["CXX"]] if respect_env and os.environ.get("CXX") else []) + ["clang++", "g++"]
     for cand in cxx_candidates:
         found = shutil.which(cand)
-        if found:
-            stem = Path(found).stem.lower()
-            if stem == "cl":
-                if not allow_msvc:
-                    continue
-                sig = f"msvc:host:{_compiler_signature(found)}"
-                return ResolvedToolchain("msvc", "host", found, found, os.environ.copy(), sig)
-            cc: str | None = None
-            if needs_c:
-                if respect_env and os.environ.get("CC"):
-                    cc = shutil.which(os.environ["CC"]) or os.environ["CC"]
-                else:
-                    c_stem = "clang" if "clang" in stem else "gcc"
-                    sibling = Path(found).with_name(c_stem + (".exe" if os.name == "nt" else ""))
-                    if sibling.is_file():
-                        cc = str(sibling)
-                    else:
-                        cc = shutil.which(c_stem)
-                if not cc:
-                    raise unittest.SkipTest("Companion C compiler required")
-            sig_parts = [f"gnu:host:{_compiler_signature(found)}"]
-            if cc:
-                sig_parts.append(_compiler_signature(cc))
-            return ResolvedToolchain("gnu", "host", found, cc, os.environ.copy(), "|".join(sig_parts))
+        if not found:
+            continue
+        stem = Path(found).stem.lower()
+        if stem == "cl":
+            if not allow_msvc:
+                continue
+            return ResolvedToolchain("msvc", "host", found, found, os.environ.copy(), f"msvc:host:{_compiler_signature(found)}")
+        cc: str | None = None
+        if needs_c:
+            if respect_env and os.environ.get("CC"):
+                cc = shutil.which(os.environ["CC"]) or os.environ["CC"]
+            else:
+                c_stem = "clang" if "clang" in stem else "gcc"
+                sibling = Path(found).with_name(c_stem + (".exe" if os.name == "nt" else ""))
+                cc = str(sibling) if sibling.is_file() else shutil.which(c_stem)
+            if not cc:
+                raise unittest.SkipTest("Companion C compiler required")
+        sig_parts = [f"gnu:host:{_compiler_signature(found)}", *([_compiler_signature(cc)] if cc else [])]
+        return ResolvedToolchain("gnu", "host", found, cc, os.environ.copy(), "|".join(sig_parts))
 
-    if allow_msvc:
-        cl = shutil.which("cl")
-        env = os.environ.copy()
-        arch = "host"
-        if not cl and msvc_vcvars and os.name == "nt":
-            try:
-                env = win32_cl_environment()
-                cl = shutil.which("cl.exe", path=env.get("PATH") or env.get("Path"))
-                arch = "win32_x86"
-            except RuntimeError:
-                cl = None
-        if cl:
-            sig = f"msvc:{arch}:{_compiler_signature(cl)}"
-            return ResolvedToolchain("msvc", arch, cl, cl, env, sig)
-
+    if allow_msvc and (msvc_tc := _resolve_msvc_fallback(msvc_vcvars)) is not None:
+        return msvc_tc
     raise unittest.SkipTest(skip_message)
 
-
-# ---------------------------------------------------------------------------
-# Declarative SourceUnit & NativeTarget + Parallel Build Engine
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class SourceUnit:
@@ -641,70 +542,36 @@ class SourceUnit:
         return "c" if name.lower().endswith(".c") else "c++"
 
 
+def _resolve_paths(items: Sequence[str | Path]) -> tuple[Path, ...]:
+    return tuple((ROOT / i if not Path(i).is_absolute() else Path(i)).resolve() for i in items)
+
+
 def unit(
-    source: str | Path,
-    *,
-    lang: str | None = None,
-    std: str | None = None,
-    opt: str | None = "-O2",
-    warnings: str = "strict",
-    pedantic: bool = False,
-    stdcall_gz: bool = False,
-    defines: Sequence[str] = (),
-    includes: Sequence[str | Path] = (),
-    extra_gnu_flags: Sequence[str] = (),
-    extra_cxx_gnu: Sequence[str] = (),
-    extra_msvc_flags: Sequence[str] = (),
-    extra_deps: Sequence[str | Path] = (),
+    source: str | Path, *, lang: str | None = None, std: str | None = None,
+    opt: str | None = "-O2", warnings: str = "strict", pedantic: bool = False,
+    stdcall_gz: bool = False, defines: Sequence[str] = (), includes: Sequence[str | Path] = (),
+    extra_gnu_flags: Sequence[str] = (), extra_cxx_gnu: Sequence[str] = (),
+    extra_msvc_flags: Sequence[str] = (), extra_deps: Sequence[str | Path] = (),
 ) -> SourceUnit:
     p = Path(source)
-    if not p.is_absolute():
-        p = ROOT / p
-    inc = tuple((ROOT / i if not Path(i).is_absolute() else Path(i)).resolve() for i in includes)
-    deps = tuple((ROOT / d if not Path(d).is_absolute() else Path(d)).resolve() for d in extra_deps)
-    gnu_flags = (*extra_gnu_flags, *extra_cxx_gnu)
     return SourceUnit(
-        path=p.resolve(),
-        lang=lang,
-        std=std,
-        opt=opt,
-        warnings=warnings,
-        pedantic=pedantic,
-        stdcall_gz=stdcall_gz,
-        defines=tuple(defines),
-        includes=inc,
-        extra_gnu_flags=gnu_flags,
-        extra_msvc_flags=tuple(extra_msvc_flags),
-        extra_deps=deps,
+        path=(ROOT / p if not p.is_absolute() else p).resolve(),
+        lang=lang, std=std, opt=opt, warnings=warnings, pedantic=pedantic, stdcall_gz=stdcall_gz,
+        defines=tuple(defines), includes=_resolve_paths(includes),
+        extra_gnu_flags=(*extra_gnu_flags, *extra_cxx_gnu),
+        extra_msvc_flags=tuple(extra_msvc_flags), extra_deps=_resolve_paths(extra_deps),
     )
 
 
 def inline_unit(
-    name: str,
-    code: str,
-    *,
-    lang: str = "c++",
-    std: str | None = "c++17",
-    opt: str | None = "-O2",
-    warnings: str = "strict",
-    pedantic: bool = False,
-    defines: Sequence[str] = (),
-    includes: Sequence[str | Path] = (),
-    extra_deps: Sequence[str | Path] = (),
+    name: str, code: str, *, lang: str = "c++", std: str | None = "c++17",
+    opt: str | None = "-O2", warnings: str = "strict", pedantic: bool = False,
+    defines: Sequence[str] = (), includes: Sequence[str | Path] = (), extra_deps: Sequence[str | Path] = (),
 ) -> SourceUnit:
-    inc = tuple((ROOT / i if not Path(i).is_absolute() else Path(i)).resolve() for i in includes)
-    deps = tuple((ROOT / d if not Path(d).is_absolute() else Path(d)).resolve() for d in extra_deps)
     return SourceUnit(
-        inline_name=name,
-        inline_code=code,
-        lang=lang,
-        std=std,
-        opt=opt,
-        warnings=warnings,
-        pedantic=pedantic,
-        defines=tuple(defines),
-        includes=inc,
-        extra_deps=deps,
+        inline_name=name, inline_code=code, lang=lang, std=std, opt=opt,
+        warnings=warnings, pedantic=pedantic, defines=tuple(defines),
+        includes=_resolve_paths(includes), extra_deps=_resolve_paths(extra_deps),
     )
 
 
@@ -728,63 +595,40 @@ def _plan_object(tc: ResolvedToolchain, su: SourceUnit, pthread_mode: str | None
 
     src_digest = transitive_source_digest(src_path, default_inc, su.extra_deps)
 
-    use_pthread = (
-        pthread_mode == "always" or (pthread_mode == "posix" and os.name != "nt")
-    )
-
+    use_pthread = pthread_mode == "always" or (pthread_mode == "posix" and os.name != "nt")
+    compiler = tc.cc if lang == "c" else tc.cxx
+    assert compiler is not None
     if tc.family == "gnu":
-        compiler = tc.cc if lang == "c" else tc.cxx
-        assert compiler is not None
-        std = su.std or ("c11" if lang == "c" else "c++17")
-        cmd = [compiler, "-c", f"-std={std}"]
-        if su.warnings == "strict":
-            cmd.extend(["-Wall", "-Wextra", "-Werror"])
-        elif su.warnings == "warn":
-            cmd.extend(["-Wall", "-Wextra"])
+        cmd = [compiler, "-c", f"-std={su.std or ('c11' if lang == 'c' else 'c++17')}"]
+        if su.warnings in ("strict", "warn"):
+            cmd.extend(["-Wall", "-Wextra", *(["-Werror"] if su.warnings == "strict" else [])])
         if su.pedantic:
             cmd.append("-pedantic")
         if su.opt:
             cmd.append(su.opt)
         if use_pthread:
             cmd.append("-pthread")
-        cmd.extend(su.extra_gnu_flags)
-        for d in su.defines:
-            cmd.append(f"-D{d}")
+        cmd.extend([*su.extra_gnu_flags, *(f"-D{d}" for d in su.defines)])
         for inc in default_inc:
             cmd.extend(["-I", str(inc)])
         ext = ".o"
     else:
-        compiler = tc.cc if lang == "c" else tc.cxx
-        assert compiler is not None
         cmd = [compiler, "/nologo", "/TC" if lang == "c" else "/TP", "/c"]
         if lang == "c++":
-            std = su.std or "c++17"
-            cmd.extend([f"/std:{std}", "/EHsc"])
+            cmd.extend([f"/std:{su.std or 'c++17'}", "/EHsc"])
         if su.stdcall_gz:
             cmd.append("/Gz")
         if su.opt:
             cmd.append("/O2" if su.opt == "-O2" else su.opt)
         if su.warnings == "strict":
             cmd.extend(["/W4", "/WX"])
-        elif su.warnings == "warn":
-            cmd.append("/W4")
-        elif su.warnings == "w3":
-            cmd.append("/W3")
-        cmd.extend(su.extra_msvc_flags)
-        for d in su.defines:
-            cmd.append(f"/D{d}")
-        for inc in default_inc:
-            cmd.append(f"/I{inc}")
+        elif su.warnings in ("warn", "w3"):
+            cmd.append("/W4" if su.warnings == "warn" else "/W3")
+        cmd.extend([*su.extra_msvc_flags, *(f"/D{d}" for d in su.defines), *(f"/I{inc}" for inc in default_inc)])
         ext = ".obj"
 
     key_payload = json.dumps(
-        {
-            "schema": CACHE_SCHEMA_VERSION,
-            "tc": tc.signature,
-            "lang": lang,
-            "flags": cmd[1:],
-            "src_digest": src_digest,
-        },
+        {"schema": CACHE_SCHEMA_VERSION, "tc": tc.signature, "lang": lang, "flags": cmd[1:], "src_digest": src_digest},
         sort_keys=True,
     )
     obj_key = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
@@ -798,12 +642,19 @@ def _obj_warn_path(obj_path: Path) -> Path:
 
 def _read_obj_warn(obj_path: Path) -> str:
     wp = _obj_warn_path(obj_path)
-    if wp.is_file():
+    try:
+        return wp.read_text(encoding="utf-8") if wp.is_file() else ""
+    except OSError:
+        return ""
+
+
+def _read_meta_warnings(meta_path: Path) -> list[str]:
+    if meta_path.is_file():
         try:
-            return wp.read_text(encoding="utf-8")
+            return json.loads(meta_path.read_text(encoding="utf-8")).get("warnings", [])
         except OSError:
-            return ""
-    return ""
+            pass
+    return []
 
 
 def _compile_object(plan: _ObjectPlan) -> str:
@@ -855,26 +706,13 @@ class BuildResult:
 
 class NativeTarget:
     def __init__(
-        self,
-        name: str,
-        sources: Sequence[SourceUnit | str | Path],
-        *,
-        toolchain: str = "auto",  # "auto", "cxx", "c", "win32_cl"
-        opt: str | None = "-O2",
-        warnings: str = "strict",
-        pedantic: bool = False,
-        stdcall_gz: bool = False,
-        defines: Sequence[str] = (),
-        includes: Sequence[str | Path] = (),
-        libs: Sequence[str] = (),
-        libs_windows_only: bool = True,
-        pthread: str | None = None,  # None, "always", "posix"
-        extra_link_gnu: Sequence[str] = (),
-        allow_msvc: bool = True,
-        msvc_vcvars: bool = True,
-        respect_env: bool = True,
-        skip_message: str = "C/C++17 compiler required",
-        register: bool = True,
+        self, name: str, sources: Sequence[SourceUnit | str | Path], *,
+        toolchain: str = "auto", opt: str | None = "-O2", warnings: str = "strict",
+        pedantic: bool = False, stdcall_gz: bool = False, defines: Sequence[str] = (),
+        includes: Sequence[str | Path] = (), libs: Sequence[str] = (), libs_windows_only: bool = True,
+        pthread: str | None = None, extra_link_gnu: Sequence[str] = (), allow_msvc: bool = True,
+        msvc_vcvars: bool = True, respect_env: bool = True,
+        skip_message: str = "C/C++17 compiler required", register: bool = True,
     ):
         self.name = name
         self.toolchain_kind = toolchain
@@ -882,28 +720,16 @@ class NativeTarget:
         self.libs_windows_only = libs_windows_only
         self.pthread = pthread
         self.extra_link_gnu = tuple(extra_link_gnu)
-        self.allow_msvc = allow_msvc
-        self.msvc_vcvars = msvc_vcvars
-        self.respect_env = respect_env
+        self.allow_msvc, self.msvc_vcvars, self.respect_env = allow_msvc, msvc_vcvars, respect_env
         self.skip_message = skip_message
 
-        normalized_units: list[SourceUnit] = []
-        for s in sources:
-            if isinstance(s, SourceUnit):
-                normalized_units.append(s)
-            else:
-                normalized_units.append(
-                    unit(
-                        s,
-                        opt=opt,
-                        warnings=warnings,
-                        pedantic=pedantic,
-                        stdcall_gz=stdcall_gz,
-                        defines=defines,
-                        includes=includes,
-                    )
-                )
-        self.units = tuple(normalized_units)
+        self.units = tuple(
+            s if isinstance(s, SourceUnit) else unit(
+                s, opt=opt, warnings=warnings, pedantic=pedantic,
+                stdcall_gz=stdcall_gz, defines=defines, includes=includes,
+            )
+            for s in sources
+        )
         self._registered = bool(register)
         self._result: BuildResult | None = None
         self._deferred_exc: BaseException | None = None
@@ -915,62 +741,33 @@ class NativeTarget:
         has_cxx = any(u.effective_lang() == "c++" for u in self.units)
         tc_kind = ("c" if (has_c and not has_cxx) else "cxx") if self.toolchain_kind == "auto" else self.toolchain_kind
         tc = resolve_toolchain(
-            tc_kind,
-            allow_msvc=self.allow_msvc,
-            msvc_vcvars=self.msvc_vcvars,
-            respect_env=self.respect_env,
-            needs_c=(has_c and has_cxx),
-            skip_message=self.skip_message,
+            tc_kind, allow_msvc=self.allow_msvc, msvc_vcvars=self.msvc_vcvars,
+            respect_env=self.respect_env, needs_c=(has_c and has_cxx), skip_message=self.skip_message,
         )
         obj_plans = [_plan_object(tc, u, self.pthread) for u in self.units]
         exe_suffix = ".exe" if os.name == "nt" else ""
         key_payload = json.dumps(
             {
-                "schema": CACHE_SCHEMA_VERSION,
-                "tc": tc.signature,
-                "objs": [p.key for p in obj_plans],
-                "libs": self.libs,
-                "libs_win": self.libs_windows_only,
-                "pthread": self.pthread,
-                "link_gnu": self.extra_link_gnu,
-                "has_cxx": has_cxx,
+                "schema": CACHE_SCHEMA_VERSION, "tc": tc.signature,
+                "objs": [p.key for p in obj_plans], "libs": self.libs,
+                "libs_win": self.libs_windows_only, "pthread": self.pthread,
+                "link_gnu": self.extra_link_gnu, "has_cxx": has_cxx,
             },
             sort_keys=True,
         )
         exe_key = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
         exe_path = BIN_DIR / f"{self.name}-{exe_key[:20]}{exe_suffix}"
-        meta_path = BIN_DIR / f"{exe_path.name}.meta.json"
-        return tc, obj_plans, exe_path, meta_path, exe_key
+        return tc, obj_plans, exe_path, BIN_DIR / f"{exe_path.name}.meta.json", exe_key
 
     def _link(
-        self,
-        tc: ResolvedToolchain,
-        obj_plans: list[_ObjectPlan],
-        exe_path: Path,
-        meta_path: Path,
-        exe_key: str,
-        compile_outputs: list[str],
+        self, tc: ResolvedToolchain, obj_plans: list[_ObjectPlan],
+        exe_path: Path, meta_path: Path, exe_key: str, compile_outputs: list[str],
     ) -> BuildResult:
         if exe_path.is_file():
-            warnings: list[str] = []
-            if meta_path.is_file():
-                try:
-                    warnings = json.loads(meta_path.read_text(encoding="utf-8")).get("warnings", [])
-                except OSError:
-                    pass
-            return BuildResult(exe_path, tc.env, warnings)
-
-        lock = _key_lock(f"exe:{exe_key}")
-        with lock:
+            return BuildResult(exe_path, tc.env, _read_meta_warnings(meta_path))
+        with _key_lock(f"exe:{exe_key}"):
             if exe_path.is_file():
-                warnings = []
-                if meta_path.is_file():
-                    try:
-                        warnings = json.loads(meta_path.read_text(encoding="utf-8")).get("warnings", [])
-                    except OSError:
-                        pass
-                return BuildResult(exe_path, tc.env, warnings)
-
+                return BuildResult(exe_path, tc.env, _read_meta_warnings(meta_path))
             _ensure_cache_dirs()
             has_cxx = any(u.effective_lang() == "c++" for u in self.units)
             use_libs = self.libs if (not self.libs_windows_only or os.name == "nt") else ()
@@ -1024,11 +821,7 @@ class NativeTarget:
                 shutil.rmtree(link_scratch, ignore_errors=True)
 
     def build(self) -> BuildResult:
-        if (
-            self._registered
-            and len(_REGISTERED_TARGETS) > 1
-            and _BATCH_WARMED_UP_TO < len(_REGISTERED_TARGETS)
-        ):
+        if self._registered and len(_REGISTERED_TARGETS) > 1 and _BATCH_WARMED_UP_TO < len(_REGISTERED_TARGETS):
             warm_registered_targets()
         if self._deferred_exc is not None:
             raise self._deferred_exc
@@ -1036,44 +829,29 @@ class NativeTarget:
             return self._result
         tc, obj_plans, exe_path, meta_path, exe_key = self._prepare()
         if exe_path.is_file():
-            res = self._link(tc, obj_plans, exe_path, meta_path, exe_key, [])
-            self._result = res
-            return res
+            self._result = self._link(tc, obj_plans, exe_path, meta_path, exe_key, [])
+            return self._result
         missing = [p for p in obj_plans if not p.obj_path.is_file()]
         if len(missing) == 1:
             _compile_object(missing[0])
         elif len(missing) > 1:
             with ThreadPoolExecutor(max_workers=min(len(missing), MAX_BUILD_WORKERS)) as pool:
-                futs = [pool.submit(_compile_object, p) for p in missing]
-                for fut in futs:
+                for fut in [pool.submit(_compile_object, p) for p in missing]:
                     fut.result()
-        compile_outputs = [_read_obj_warn(p.obj_path) for p in obj_plans]
-        res = self._link(tc, obj_plans, exe_path, meta_path, exe_key, compile_outputs)
-        self._result = res
-        return res
+        self._result = self._link(tc, obj_plans, exe_path, meta_path, exe_key, [_read_obj_warn(p.obj_path) for p in obj_plans])
+        return self._result
 
     def executable(self) -> Path:
         return self.build().executable
 
     def run(
-        self,
-        args: Sequence[str] = (),
-        *,
-        cwd: str | Path | None = None,
-        env: dict[str, str] | None = None,
-        timeout: float = 60,
-        check: bool = False,
+        self, args: Sequence[str] = (), *, cwd: str | Path | None = None,
+        env: dict[str, str] | None = None, timeout: float = 60, check: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         built = self.build()
-        run_env = built.env.copy() if env is None else env
         return subprocess.run(
-            [str(built.executable), *(str(a) for a in args)],
-            cwd=str(cwd or ROOT),
-            env=run_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=check,
+            [str(built.executable), *(str(a) for a in args)], cwd=str(cwd or ROOT),
+            env=(built.env.copy() if env is None else env), capture_output=True, text=True, timeout=timeout, check=check,
         )
 
 
@@ -1158,64 +936,26 @@ ENET_DIR = ROOT / "thirdparty" / "enet"
 ENET_INCLUDE_DIR = ENET_DIR / "include"
 ENET_INCLUDE = ENET_INCLUDE_DIR
 
-ENET_C_FILES: tuple[str, ...] = (
-    "callbacks.c",
-    "compress.c",
-    "host.c",
-    "list.c",
-    "packet.c",
-    "peer.c",
-    "protocol.c",
-    "win32.c",
-)
+ENET_C_FILES: tuple[str, ...] = ("callbacks.c", "compress.c", "host.c", "list.c", "packet.c", "peer.c", "protocol.c", "win32.c")
 
 NPCWIRE_BONES_UNIT: SourceUnit = unit("src/npcwire_bones.cpp", opt="-O2", warnings="strict", includes=(SRC_DIR,))
 NPCWIRE_CONTROL_UNIT: SourceUnit = unit("src/npcwire_control.cpp", opt="-O2", warnings="strict", includes=(SRC_DIR,))
 NPCWIRE_ADAPTER_UNIT: SourceUnit = unit("src/npcwire_adapter.cpp", opt="-O2", warnings="strict", includes=(SRC_DIR,))
-
-NPCWIRE_UNITS: tuple[SourceUnit, ...] = (
-    NPCWIRE_BONES_UNIT,
-    NPCWIRE_CONTROL_UNIT,
-    NPCWIRE_ADAPTER_UNIT,
-)
-
-SNAPSHOT_UNIT: SourceUnit = unit(
-    "src/snapshot.cpp", opt="-O2", warnings="strict", includes=(SRC_DIR,)
-)
-
-ENET_COMPRESS_UNIT: SourceUnit = unit(
-    "thirdparty/enet/compress.c",
-    lang="c",
-    opt="-O2",
-    warnings="none",
-    includes=(ENET_INCLUDE_DIR,),
-)
+NPCWIRE_UNITS: tuple[SourceUnit, ...] = (NPCWIRE_BONES_UNIT, NPCWIRE_CONTROL_UNIT, NPCWIRE_ADAPTER_UNIT)
+SNAPSHOT_UNIT: SourceUnit = unit("src/snapshot.cpp", opt="-O2", warnings="strict", includes=(SRC_DIR,))
+ENET_COMPRESS_UNIT: SourceUnit = unit("thirdparty/enet/compress.c", lang="c", opt="-O2", warnings="none", includes=(ENET_INCLUDE_DIR,))
 
 
 def enet_units(
-    *,
-    exclude: Iterable[str] = (),
-    opt: str | None = "-O2",
-    warnings: str = "none",
-    stdcall_gz: bool = False,
-    defines: Sequence[str] = (),
-    extra_gnu_flags: Sequence[str] = (),
+    *, exclude: Iterable[str] = (), opt: str | None = "-O2", warnings: str = "none",
+    stdcall_gz: bool = False, defines: Sequence[str] = (), extra_gnu_flags: Sequence[str] = (),
     source_root: Path | None = None,
 ) -> tuple[SourceUnit, ...]:
     excluded = set(exclude)
     base = (source_root or ROOT) / "thirdparty" / "enet"
-    inc = base / "include"
+    inc = (base / "include",)
     return tuple(
-        unit(
-            base / name,
-            lang="c",
-            opt=opt,
-            warnings=warnings,
-            stdcall_gz=stdcall_gz,
-            defines=defines,
-            includes=(inc,),
-            extra_gnu_flags=extra_gnu_flags,
-        )
+        unit(base / name, lang="c", opt=opt, warnings=warnings, stdcall_gz=stdcall_gz, defines=defines, includes=inc, extra_gnu_flags=extra_gnu_flags)
         for name in ENET_C_FILES
         if name not in excluded
     )

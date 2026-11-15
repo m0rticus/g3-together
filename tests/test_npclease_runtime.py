@@ -22,15 +22,18 @@ def section(source, start, end):
 class NpcLeaseRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.host_source = _testbuild.src_text("npclease_runtime.cpp")
+        cls.core_source = _testbuild.src_text("npclease_runtime.cpp")
+        cls.host_only_source = _testbuild.src_text("npclease_host.cpp")
+        cls.host_source = cls.core_source + "\n" + cls.host_only_source
         cls.client_source = _testbuild.src_text("npclease_client.cpp")
         cls.runtime = cls.host_source + "\n" + cls.client_source
         cls.policy = _testbuild.src_text("npcown_policy.h")
 
     def test_split_translation_units_are_bounded(self):
-        self.assertLess(len(self.host_source.splitlines()), 880)
+        self.assertLess(len(self.core_source.splitlines()), 800)
+        self.assertLess(len(self.host_only_source.splitlines()), 800)
         self.assertLess(len(self.client_source.splitlines()), 800)
-        self.assertIn("void ReceiveHost(", self.host_source)
+        self.assertIn("void ReceiveHost(", self.host_only_source)
         self.assertIn("void TickClient(", self.client_source)
         client_header = _testbuild.src_text("npclease_client.h")
         self.assertNotIn("<Game.h>", client_header)
@@ -51,7 +54,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("npc.DamageReceiver.HitPoints = 0", death)
         self.assertIn("npc.Routine.AIMode = gEAIMode_Dead", death)
         self.assertIn("journal::LeaseDeath(entity", death)
-        host = section(self.host_source, "void ReceiveHost(", "void Receive(uint8_t")
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
         self.assertIn("const uint8_t priorEffects = entry.lease.state.effects", host)
         self.assertIn("entry.lease.state.effects |= priorEffects", host)
         self.assertLess(host.index("entry.lease.state.effects |= priorEffects"),
@@ -90,7 +93,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("proxy.GetEntity()", discovery)
         self.assertIn("eEPropertySetType_NPC", discovery)
         self.assertIn("EligibilityReason(prototype, state.name, true)", discovery)
-        host = section(self.runtime, "void ReceiveHost(", "void Receive(uint8_t")
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
         adopt = section(host, "if (note.kind == Kind::Request || note.kind == Kind::Adopt)", "if (found == entries.end())")
         self.assertIn("DiscoveryReason(baseline)", adopt)
         self.assertIn("native ? npcs::Incarnation(note.guid) : note.incarnation", adopt)
@@ -101,7 +104,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertLess(adopt.index("Stop(native)"), adopt.index("Send(key, entry, Kind::Offer)"))
 
     def test_activation_imports_before_native_restart(self):
-        activate = section(self.runtime, "bool Activate(", "Interest InterestOf(")
+        activate = section(self.core_source, "bool Activate(", "bool CurrentPeer(")
         self.assertLess(activate.index("PublishGuard("), activate.index("npcs::LeaseReleaseMirror("))
         self.assertLess(activate.index("Import(entity"), activate.index("npc.Routine.ContinueRoutine()"))
         self.assertLess(activate.index("entry.nativeActivated = true"), activate.index("ReleaseNativePresentation"))
@@ -137,7 +140,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("PeerCurrent(net::PeerJoined(player), net::PeerGeneration(player), generation)", current)
         send = section(self.runtime, "bool Send(", "void Diagnostic(")
         self.assertIn("net::IsHost() && !CurrentPeer(entry.lease.owner, entry.lease.generation)", send)
-        host = section(self.host_source, "void TickHost(", "\n}\nusing namespace detail;")
+        host = self.host_only_source[self.host_only_source.index("void TickHost("):]
         self.assertIn("const bool ownerGone = !CurrentPeer(entry.lease.owner, entry.lease.generation)", host)
         self.assertIn("if (CurrentPeer(client, generation))", host)
         self.assertIn("if (CurrentPeer(previousOwner, previousGeneration))", host)
@@ -205,7 +208,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
 
     def test_takeover_is_fenced_before_registration_and_handshake(self):
         takeover = section(self.runtime, "char const* TakeOver(", "void CutToHost(")
-        activate = section(self.runtime, "bool Activate(", "Interest InterestOf(")
+        activate = section(self.core_source, "bool Activate(", "bool CurrentPeer(")
         maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
         self.assertLess(takeover.index("Activate(entity, entry, key.data())"),
                         takeover.index("RegisterProcessing(key, entry, entity)"))
@@ -343,12 +346,12 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("if (entry->confirmed && Send(Key(victim), *entry, Kind::State))", kill)
         quest = section(self.runtime, "GEBool __fastcall Quest(", "GEInt GE_STDCALL Kill(")
         self.assertIn("ownerDeath == &victim) return GEFalse", quest)
-        death = section(self.runtime, "void CommitDeath(", "void ReceiveHost(")
+        death = section(self.host_only_source, "void CommitDeath(", "void ReceiveHost(")
         self.assertIn("entry.lease.state.effects & NativeDeath", death)
         self.assertIn("entry.lease.state.effects & QuestDeath", death)
         self.assertIn("journal::LeaseDeath(entity, entry.lease.owner)", death)
         self.assertIn("CommitEffect(entry.lease.state, QuestDeath)", death)
-        host = section(self.runtime, "void ReceiveHost(", "void Receive(uint8_t")
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
         self.assertIn("CommitDeath(key, entry)", host)
 
     def test_late_pre_handoff_samples_cannot_roll_back_the_cut(self):
@@ -378,7 +381,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertLess(replay.index("PreparePose("), replay.index("entity->SetToWorldMatrix(pose)"))
 
     def test_host_commit_is_conditional_on_native_restart(self):
-        host = section(self.host_source, "void TickHost(", "\n}\nusing namespace detail;")
+        host = self.host_only_source[self.host_only_source.index("void TickHost("):]
         frozen = section(host, "if (entry.lease.phase == Phase::Frozen)", "const auto prior")
         self.assertLess(frozen.index("Import(entity, entry.lease.state)"), frozen.index("HandBack("))
         self.assertLess(frozen.index("if (Activate(entity"), frozen.index("Kind::Commit"))
@@ -404,7 +407,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
             self.assertNotIn(obsolete, role + follower)
 
     def test_adopt_uses_client_baseline_for_all_classes(self):
-        host = section(self.runtime, "void ReceiveHost(", "void Receive(uint8_t")
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
         adopt = section(host, "if (note.kind == Kind::Request || note.kind == Kind::Adopt)", "if (found == entries.end())")
         self.assertIn("const Checkpoint baseline = note.state", adopt)
         self.assertIn("EligibilityReason(native)", adopt)
@@ -457,10 +460,10 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertLess(maintain.index("entry.lease.state = state"), maintain.index("Send(key, entry, Kind::Adopt)"))
 
     def test_review_hardening_keeps_owners_alive_and_hand_back_loss_free(self):
-        host = section(self.host_source, "void ReceiveHost(", "void Receive(uint8_t")
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
         client = section(self.client_source, "void ReceiveClient(", "// Which native path")
         maintain = section(self.runtime, "void MaintainOwners(", "void ScanClient(")
-        interest = section(self.host_source, "Interest InterestOf(", "bool CurrentPeer(")
+        interest = section(self.host_only_source, "Interest InterestOf(", "Checkpoint HostInterestState(")
         capture = section(self.runtime, "bool CaptureNative(", "void Stop(")
         shared = section(self.runtime, "bool SharedWithOtherClient(", "// Reaction logging")
         # A live client keeps its epoch through host pauses/checkpoints: the deadline renews regardless of Running().
@@ -475,7 +478,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         # Local terminal death cannot overrule host authority; one stray record still cannot revoke an established owner.
         self.assertNotIn("terminalDeath", maintain)
         self.assertIn("facts.hostPresenting = HostWins(key)", maintain)
-        wins = section(self.host_source, "bool HostWins(", "bool Running(")
+        wins = section(self.core_source, "bool HostWins(", "bool Running(")
         self.assertIn("npcs::HostStreamRecords(key.data()) >= 2", wins)
         # Native dialogue is busy and blocks a forced recall cut.
         self.assertIn("gEAIMode_Talk", capture)
@@ -488,7 +491,7 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("i < client", interest)
 
     def test_host_lease_evaluates_authoritative_position_rejects_ghosts_and_allows_mob_herds(self):
-        host = section(self.host_source, "void ReceiveHost(", "void Receive(uint8_t")
+        host = section(self.host_only_source, "void ReceiveHost(", "void TickHost(")
         client = section(self.client_source, "void ReceiveClient(", "// Which native path")
         follower = section(self.runtime, "bool FollowerRole(eCEntity* entity)", "npcown::RoleFacts RoleOf(")
         self.assertIn("gEPartyMemberType_Mob", follower)

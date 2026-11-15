@@ -40,11 +40,14 @@ using detail::ActorProcess;
 using detail::Animation;
 using detail::ApplyPose;
 using detail::FullPose;
+using detail::IdleResourceName;
 using detail::NativePose;
 using detail::NativePoseScope;
 using detail::PrepareTransforms;
 using detail::PresentMotion;
 using detail::PresentationScope;
+using detail::QueryNativeMotion;
+using detail::ReactionResourceName;
 using detail::Rig;
 using detail::Slots;
 using detail::VisualScope;
@@ -241,28 +244,6 @@ bool RememberPose(eCEntity* entity, npclease::PoseProvenance provenance)
     return true;
 }
 
-bool IdleResourceName(char const* name)
-{
-    if (!name || !*name) return false;
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return (lower.find("ambient") != std::string::npos || lower.find("idle") != std::string::npos) &&
-           lower.find("combat") == std::string::npos && lower.find("hit") == std::string::npos &&
-           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos &&
-           lower.find("stumble") == std::string::npos;
-}
-
-bool ReactionResourceName(char const* name)
-{
-    if (!name || !*name) return false;
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return (lower.find("stumble") != std::string::npos || lower.find("hit") != std::string::npos) &&
-           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos;
-}
-
 bool EvaluateIdle(eCEntity* entity, eCVisualAnimation_PS& animation, uint32_t elapsed, bool loop = true)
 {
     auto* actor = animation.GetActor();
@@ -297,41 +278,11 @@ bool IdleFailure(eCEntity* entity, char const* reason)
 
 eCResourceDataEntity* NativeMotion(eCEntity* entity, gEAction action, gEPhase phase, bool reaction = false)
 {
-    auto* admin = dynamic_cast<eCAnimationAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCAnimationAdmin")));
-    if (!admin) { IdleFailure(entity, "native animation administration unavailable"); return nullptr; }
-    Entity npc(entity);
-    bCString extension;
-    eCResourceAnimationMotion_PS::GetNativeFileExt(extension);
-    // GetAni fixes native direction/primary pose; GetAniName would insert the supplied direction verbatim.
-    auto tryCurrentStance = [&]() -> eCResourceDataEntity* {
-        for (auto const& stem : {npc.GetAni(action, phase),
-                                npc.GetAni(action, gEUseType_None, gEUseType_None, phase)}) {
-            if (!stem.GetLength()) continue;
-            bCString varied(stem);
-            admin->GetAniVariation(varied);
-            for (auto const& candidate : {varied, stem}) {
-                bCString name(candidate);
-                name += extension;
-                const bool accepted = reaction ? ReactionResourceName(name.GetText()) : IdleResourceName(name.GetText());
-                if (!accepted) continue;
-                unavailable[EntityKey(entity)].candidate = name.GetText();
-                if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate))
-                    return resource;
-            }
-        }
-        return nullptr;
-    };
-    if (auto* resource = tryCurrentStance()) return resource;
-    // NPCs lingering in gEAniState_Parade (e.g. Hamlar with None_Staff) can resolve to an invalid .fxm parade descriptor;
-    // fall back to gEAniState_Stand for the probe so idle/reaction bootstrap stays valid and keeps contacts active.
-    if (npc.Routine.AniState == gEAniState_Parade) {
-        const gEAniState savedStance = npc.Routine.AniState;
-        npc.Routine.AniState = gEAniState_Stand;
-        auto* fallback = tryCurrentStance();
-        npc.Routine.AniState = savedStance;
-        if (fallback) return fallback;
-    }
-    return nullptr;
+    auto& waiting = unavailable[EntityKey(entity)];
+    char const* failureReason = nullptr;
+    auto* resource = QueryNativeMotion(entity, action, phase, reaction, &waiting.candidate, &failureReason);
+    if (!resource && failureReason) IdleFailure(entity, failureReason);
+    return resource;
 }
 
 bool BootstrapIdle(eCEntity* entity, eCVisualAnimation_PS& animation)
@@ -505,6 +456,10 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     NativePose hostPose;
     const bool havePose = PreparePose(entity, *animation, state, record, names, hostPose);
     const float hostFirstPhase = record.motions[0].active ? record.motions[0].phase : 0.0f;
+    const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
+        local, *state.localMotion != '\0', firstSuppressed, localAge, localStep.totalDurationSec,
+        havePose, hostFirstPhase, slot0OwnRecoverEcho);
+    if (!local && !holdEcho && !havePose) return false;
     const uint32_t knockbackAckAt = state.acknowledgedHit == state.knockback.hitSequence ? state.acknowledgedAt : 0;
     const bool matchKnockback =
         npcplayback_hit_policy::KnockbackMatchesHostRecord(state.knockback, state.acknowledgedHit, record.hitSequence);
@@ -517,9 +472,6 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         state.knockback, now, record.sent, knockbackAckAt,
         slot0OwnImpactEcho && matchKnockback, slot0OwnRecoverEcho && matchKnockback, hostFirstPhase,
         (record.flags & 3) != 0, record.position, presentedPosition, hostClipStepCm);
-    const bool holdEcho = npcplayback_hit_policy::HoldSuppressedImpact(
-        local, *state.localMotion != '\0', firstSuppressed, localAge, localStep.totalDurationSec,
-        havePose, hostFirstPhase, slot0OwnRecoverEcho);
     if (local && localStep.stage == npcplayback_hit_policy::LocalStumbleStage::Recover && !state.localInRecover) {
         if (state.initialized)
             detail::CaptureEntityPoseBlend(entity, state, now, npcplayback_hit_policy::HitRecoverBlendSeconds);
@@ -551,7 +503,6 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         state.localInRecover = false;
     }
     bool echo = false;
-    if (!local && !holdEcho && !havePose) return false;
     const bCMatrix pose = body::Pose(*entity, presentedPosition, record.rotation);
     entity->SetToWorldMatrix(pose);
     if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
@@ -691,7 +642,7 @@ bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> co
 bool HoldUnavailable(eCEntity* entity, State& callerState)
 {
     if (!entity || !Passive(entity) || npcremoval::Suppressed(entity)) return false;
-    if (npcs::HostPresentationAvailable(entity)) {
+    if (npcs::HostPresentationAvailable(entity) || (entity != probe.target && !npcs::ClientPresent(entity))) {
         callerState.holding = false;
         ReleaseUnavailable(entity);
         return false;

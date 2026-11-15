@@ -72,19 +72,18 @@ struct BandwidthCounters {
     }
 };
 
-template <typename Emit>
-void ForEachKindLine(BandwidthCounters const& counters, Emit emit)
+template <typename FormatEntry, typename Emit>
+void EmitKindLines(BandwidthCounters const& counters, char const* header, FormatEntry formatEntry, Emit emit)
 {
-    char line[760] = "net: bandwidth kinds id=tx_packets/bytes,rx_packets/bytes";
+    char line[760];
+    std::snprintf(line, sizeof(line), "%s", header);
     size_t used = std::strlen(line);
     const size_t prefix = used;
     for (unsigned kind = 0; kind < 256; ++kind) {
         auto const& c = counters.kinds[kind];
         if (!c.txPackets && !c.rxPackets) continue;
         char entry[128];
-        const int length = std::snprintf(entry, sizeof(entry), " %u=%llu/%llu,%llu/%llu", kind,
-            static_cast<unsigned long long>(c.txPackets), static_cast<unsigned long long>(c.txBytes),
-            static_cast<unsigned long long>(c.rxPackets), static_cast<unsigned long long>(c.rxBytes));
+        const int length = formatEntry(kind, c, entry, sizeof(entry));
         if (length <= 0 || static_cast<size_t>(length) >= sizeof(entry)) continue;
         if (used + static_cast<size_t>(length) >= sizeof(line)) {
             emit(line);
@@ -98,29 +97,25 @@ void ForEachKindLine(BandwidthCounters const& counters, Emit emit)
 }
 
 template <typename Emit>
+void ForEachKindLine(BandwidthCounters const& counters, Emit emit)
+{
+    EmitKindLines(counters, "net: bandwidth kinds id=tx_packets/bytes,rx_packets/bytes",
+        [](unsigned kind, PacketCounts const& c, char* entry, size_t size) {
+            return std::snprintf(entry, size, " %u=%llu/%llu,%llu/%llu", kind,
+                static_cast<unsigned long long>(c.txPackets), static_cast<unsigned long long>(c.txBytes),
+                static_cast<unsigned long long>(c.rxPackets), static_cast<unsigned long long>(c.rxBytes));
+        }, emit);
+}
+
+template <typename Emit>
 void ForEachKindRateLine(BandwidthCounters const& counters, double perSecond, Emit emit)
 {
-    char line[760] = "net: bandwidth kind_bps id=txBps/rxBps";
-    size_t used = std::strlen(line);
-    const size_t prefix = used;
     const double scale = std::isfinite(perSecond) && perSecond >= 0.0 ? perSecond : 0.0;
-    for (unsigned kind = 0; kind < 256; ++kind) {
-        auto const& c = counters.kinds[kind];
-        if (!c.txPackets && !c.rxPackets) continue;
-        char entry[128];
-        const double txBps = static_cast<double>(c.txBytes) * scale;
-        const double rxBps = static_cast<double>(c.rxBytes) * scale;
-        const int length = std::snprintf(entry, sizeof(entry), " %u=%.1f/%.1f", kind, txBps, rxBps);
-        if (length <= 0 || static_cast<size_t>(length) >= sizeof(entry)) continue;
-        if (used + static_cast<size_t>(length) >= sizeof(line)) {
-            emit(line);
-            line[prefix] = '\0';
-            used = prefix;
-        }
-        std::memcpy(line + used, entry, static_cast<size_t>(length) + 1);
-        used += static_cast<size_t>(length);
-    }
-    if (used != prefix) emit(line);
+    EmitKindLines(counters, "net: bandwidth kind_bps id=txBps/rxBps",
+        [scale](unsigned kind, PacketCounts const& c, char* entry, size_t size) {
+            return std::snprintf(entry, size, " %u=%.1f/%.1f", kind,
+                static_cast<double>(c.txBytes) * scale, static_cast<double>(c.rxBytes) * scale);
+        }, emit);
 }
 }
 }

@@ -33,22 +33,54 @@
 
 namespace g3t::persist::detail {
 
+namespace {
+char const* CommonSaveSessionReason(gCSession& session, void*& outControlled)
+{
+    outControlled = nullptr;
+    if (!session.IsGameRunning() || !session.GetHero()) return "not-running";
+    if (session.GetPlayer() != session.GetHero()) return "control";
+    gCWorld* world = gCWorld::GetCurrentWorld();
+    if (!world || !world->GetWorldEntity()) return "world";
+    if (Folder().empty()) return "folder";
+    // IsSaveAllowed/StopControlNPC in the verified CP image share this controlled-NPC slot.
+    std::memcpy(&outControlled, reinterpret_cast<unsigned char const*>(&session) + 0x28, sizeof(outControlled));
+    return nullptr;
+}
+
+void TickClientSaveRound(uint32_t now)
+{
+    if (requestPending) {
+        if (requestWelcome != net::WelcomeSerial() || requested.epoch != hostWorld.epoch || now - requestStarted > 10000) {
+            if (requestWelcome == net::WelcomeSerial() && requested.epoch == hostWorld.epoch) {
+                auto cancel = requested; cancel.op = net::SaveCancel; cancel.ok = 0; cancel.world[0] = 0;
+                strncpy_s(cancel.name, "request-timeout", _TRUNCATE); QueueReply(1, cancel);
+            }
+            requestPending = false; SaveFailure("request-timeout");
+        } else if (static_cast<int32_t>(now - requestRetry) >= 0) {
+            requestRetry = now + 500; net::SendSave(1, requested);
+        }
+    }
+    if (captured.valid) {
+        if (captured.welcome != net::WelcomeSerial() || captured.note.epoch != hostWorld.epoch || now - captured.started > 15000) {
+            captured.valid = false; captured.bytes.clear(); SaveFailure("result-timeout");
+        } else if (!captured.queued && static_cast<int32_t>(now - captured.nextTry) >= 0) {
+            captured.nextTry = now + 500;
+            captured.queued = SendRecord(1, net::CharacterCapture, {captured.note.world, captured.note.save, steam::PlayerId()}, captured.bytes);
+        }
+    }
+}
+} // namespace
+
 char const* NativeSaveReason()
 {
     if (!eCApplication::IsInitialised()) return "not-running";
     if (nativeLoadDepth || nativeSaveDepth || !loading.empty()) return "loading";
     gCSession& session = gCSession::GetInstance();
-    if (!session.IsGameRunning() || !session.GetHero()) return "not-running";
-    if (session.GetPlayer() != session.GetHero()) return "control";
     if (downed::Held() || downed::NativeDown()) return "downed";
-    gCWorld* world = gCWorld::GetCurrentWorld();
-    if (!world || !world->GetWorldEntity()) return "world";
+    void* controlled = nullptr;
+    if (char const* reason = CommonSaveSessionReason(session, controlled)) return reason;
     gCInfoManager_PS* infos = gCInfoManager_PS::GetInstance();
     if (!infos) return "world";
-    if (Folder().empty()) return "folder";
-    // IsSaveAllowed/StopControlNPC in the verified CP image share this controlled-NPC slot.
-    void* controlled = nullptr;
-    std::memcpy(&controlled, reinterpret_cast<unsigned char const*>(&session) + 0x28, sizeof(controlled));
     Entity self(session.GetHero());
     char const* reason = saving::NativeSaveRefusal(infos->GetIsRunning() != GEFalse, controlled != nullptr,
                                                   self.IsDead(), self.NPC.DefeatedByPlayer != GEFalse);
@@ -60,13 +92,8 @@ char const* ClientSaveReason()
     if (!eCApplication::IsInitialised()) return "not-running";
     if (nativeLoadDepth || nativeSaveDepth || !loading.empty()) return "loading";
     gCSession& session = gCSession::GetInstance();
-    if (!session.IsGameRunning() || !session.GetHero()) return "not-running";
-    if (session.GetPlayer() != session.GetHero()) return "control";
-    gCWorld* world = gCWorld::GetCurrentWorld();
-    if (!world || !world->GetWorldEntity()) return "world";
-    if (Folder().empty()) return "folder";
     void* controlled = nullptr;
-    std::memcpy(&controlled, reinterpret_cast<unsigned char const*>(&session) + 0x28, sizeof(controlled));
+    if (char const* reason = CommonSaveSessionReason(session, controlled)) return reason;
     if (controlled != nullptr) return "control";
     Entity self(session.GetHero());
     if (self.IsDead() && !downed::Held()) return "dead";
@@ -122,47 +149,6 @@ bool __fastcall WorldSaveDetour(gCWorld* self, void*, bCString const& name, eCGf
     return SaveDetour(nullptr, &name);
 }
 
-void Notice(i18n::Message message, bool bad)
-{
-    auto& game = gCSession::GetInstance();
-    auto* manager = game.GetGUIManager();
-    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(i18n::Text(message));
-    else hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
-}
-void NoticeText(wchar_t const* text, hud::Kind kind)
-{
-    auto& game = gCSession::GetInstance();
-    auto* manager = game.GetGUIManager();
-    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
-    else hud::Message(kind, text);
-}
-void NoticeText(wchar_t const* text, bool bad)
-{
-    auto& game = gCSession::GetInstance();
-    auto* manager = game.GetGUIManager();
-    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
-    else hud::Message(bad ? hud::Warning : hud::Info, text);
-}
-void SaveFailure(char const* code)
-{
-    lastSaveFailure = code;
-    Logf("persist: save refusal reason=%s player=%llu host=%d active=%d", code, steam::PlayerId(),
-         net::IsHost() ? 1 : 0, operation.active ? 1 : 0);
-    wchar_t text[500]{};
-    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SaveFailureReason), i18n::SaveReason(code));
-    if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
-    else hud::MenuLine(text);
-}
-void ClientRestoreFailure(char const* code)
-{
-    Logf("persist: client character restore failed reason=%s campaign=%s save=%s player=%llu", code,
-         *hostWorld.campaign ? hostWorld.campaign : "-", receivedNote.save, steam::PlayerId());
-    wchar_t label[80] = {}, text[500] = {};
-    if (*hostWorld.campaign) MultiByteToWideChar(CP_UTF8, 0, hostWorld.campaign, -1, label, 79);
-    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::RecordRefusedWaiting), *label ? label : i18n::SaveReason(code));
-    NoticeText(text, true);
-}
-
 void Evaluate()
 {
     if (net::IsHost() || !net::Joined() || !hostWorld.epoch || hostWorld.kind == net::KindMenu) return;
@@ -193,6 +179,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
                 if (clients[from].ready != epoch && (!story::FinishAdmission(from) || !doors::FinishAdmission(from))) return;
                 const bool first = clients[from].ready != epoch;
                 clients[from].ready = epoch;
+                clients[from].hasSavedPose = false;
                 net::SetInWorld(from, true); // One-shot NPC/motion replays are now behind the client's applied cutover.
                 if (first) {
                     Logf("persist: admission confirmed peer=%u account=%llu epoch=%08x baselines=1", from, net::PeerAccount(from), epoch);
@@ -216,6 +203,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
             if (note.op == net::WorldOther) {
                 clients[from].ready = clients[from].recordSent = clients[from].cutover = 0;
                 clients[from].nextTry = 0;
+                clients[from].hasSavedPose = false;
             }
         }
         return;
@@ -710,17 +698,6 @@ namespace g3t::persist {
 
 using namespace detail;
 
-bool BeginFrame()
-{
-    if (nativeLoadDepth || nativeSaveDepth) {
-        ++loadFrames;
-        crashlog::WorldEntryWait(nativeLoadDepth ? "native HUD.LoadGame return" : "native save return");
-        return false;
-    }
-    ++processDepth; return true;
-}
-void EndFrame() { if (processDepth) --processDepth; }
-bool NativeLoading() { return nativeLoadDepth != 0; }
 bool PrepareShutdown()
 {
     if (nativeLoadDepth || nativeSaveDepth) {
@@ -745,38 +722,6 @@ bool PrepareShutdown()
     receivedPersonal.clear();
     Log("persist: shutdown cooperative transfers cancelled; committed saves unchanged");
     return true;
-}
-bool HeroPending()
-{
-    // A client whose hooks are off can never be admitted: it is pending forever, never "playing as if admitted".
-    return (pairedEnabled || !net::IsHost()) &&
-           (NativeLoading() || clientRejoin.pending || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
-                             (!net::IsHost() && !net::InWorld(net::LocalId()) &&
-                              (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady())));
-}
-void OnWorldActivate()
-{
-    if (!loading.empty() || nativeSaveDepth) return;
-    if (!net::IsHost()) return; // Only successful HUD.NewGame authorizes a new client hero.
-    newWorld = true;
-    freshLocalHero = true;
-    if (net::IsHost()) { current = {}; campaign.clear(); ownCharacterReady = false; localKind = net::KindMenu; clock::OnWorldChange(); NewEpoch(); }
-}
-void OnWorldDeactivate()
-{
-    if (!loading.empty() || nativeSaveDepth) return;
-    ownCharacterReady = false; localKind = net::KindMenu;
-    if (net::IsHost()) { current = {}; campaign.clear(); clock::OnWorldChange(); NewEpoch(); }
-    else {
-        net::SetInWorld(net::LocalId(), false);
-        if (nativeNewGame || clientRejoin.pending) return;
-        clock::OnWorldChange();
-        freshLocalHero = false; newWorld = false; resetLocalWorld = false;
-        clientRejoin.Left();
-        receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; receivedWelcome = 0;
-        synced = 0; hostAdmissionAck = false; needsNewHero = false; restoreFailed = false;
-        requestCharacterAgain = true;
-    }
 }
 void Tick()
 {
@@ -836,25 +781,7 @@ void Tick()
             synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
         }
     }
-    if (requestPending) {
-        if (requestWelcome != net::WelcomeSerial() || requested.epoch != hostWorld.epoch || now - requestStarted > 10000) {
-            if (requestWelcome == net::WelcomeSerial() && requested.epoch == hostWorld.epoch) {
-                auto cancel = requested; cancel.op = net::SaveCancel; cancel.ok = 0; cancel.world[0] = 0;
-                strncpy_s(cancel.name, "request-timeout", _TRUNCATE); QueueReply(1, cancel);
-            }
-            requestPending = false; SaveFailure("request-timeout");
-        } else if (static_cast<int32_t>(now - requestRetry) >= 0) {
-            requestRetry = now + 500; net::SendSave(1, requested);
-        }
-    }
-    if (captured.valid) {
-        if (captured.welcome != net::WelcomeSerial() || captured.note.epoch != hostWorld.epoch || now - captured.started > 15000) {
-            captured.valid = false; captured.bytes.clear(); SaveFailure("result-timeout");
-        } else if (!captured.queued && static_cast<int32_t>(now - captured.nextTry) >= 0) {
-            captured.nextTry = now + 500;
-            captured.queued = SendRecord(1, net::CharacterCapture, {captured.note.world, captured.note.save, steam::PlayerId()}, captured.bytes);
-        }
-    }
+    TickClientSaveRound(now);
     if (clientRejoin.pending) return;
     if (requestCharacterAgain && hostWorld.epoch && hostWorld.kind != net::KindMenu) {
         net::WorldNote answer{};
@@ -946,5 +873,4 @@ void Install()
     Logf("persist: host-managed save UI hooked GUI.HandleMessage=%p Menu.NewSaveSlotCall=%p Session.IsSaveAllowed=%p HUD.CaptureSaveImage=%p",
          uiEntries[0], uiEntries[2] + 6, uiEntries[3], uiEntries[4]);
 }
-bool CheckpointBusy() { return operation.active || captured.valid || requestPending || nativeSaveDepth; }
 } // namespace g3t::persist

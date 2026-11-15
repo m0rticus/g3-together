@@ -330,6 +330,7 @@ extern PoseRoute poseRoutes[MaxPlayers];
 struct PreparedControl {
     npcwire::Control value{};
     npcwire::BaselineRef ref{};
+    std::vector<uint8_t> encoded{};
     bool available = false, encodable = false, exact = false;
 };
 
@@ -358,7 +359,11 @@ extern uint64_t npcOrderedSetupPoses, npcOrderedSetupControls, npcAnchorsSent, n
 int ENET_CALLBACK InterceptTransportPacket(ENetHost* currentHost, ENetEvent*);
 bool PeerRelayOrDirect(ENetPeer const* peer);
 bool ClaimAuthenticatedPeerIdentity(ENetPeer const* peer, uint64_t& account, char (&name)[24], uint64_t& generation);
+void LockDirectSessionEndpoint(uint64_t account, uint64_t generation, bool locked);
 void SyncDirectSessions(uint32_t now);
+void SyncClientSteamLink(uint32_t now);
+void ClearPeerPlayerTables(uint8_t id);
+void ClearAllPlayerTables();
 BudgetClass SendPriority(uint8_t kind, bool reliable);
 void UpdateBudgets(uint32_t now);
 bool StoryHandshake(void const* data, size_t size);

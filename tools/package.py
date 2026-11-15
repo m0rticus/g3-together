@@ -10,11 +10,15 @@ Steam is the only supported transport; without that DLL the setup must download 
 import hashlib
 import argparse
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-STEAM_DLL_SHA256 = 'fdafb7c65ec7d4182b42bf92cc8671c68e4dc547cc6e613899d2618a47eb65da'
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from _g3copy import STEAM_DLL_SHA256
 
 HOST_INI = """# G3 Together: this player hosts the campaign.
 # This package speaks protocol 79 with convergent NPC streams: both players need this same package.

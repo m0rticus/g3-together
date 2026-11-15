@@ -189,10 +189,6 @@ struct Mirror {
     uint8_t attitudeWritten = 0xFF;
     uint8_t attitudeShown = 0xFF;
     unsigned attitudeDrifts = 0;
-    uint32_t staggerSuppressUntil = 0;
-    bool forcePending = false;
-    float forceAt[3] = {}, force[3] = {};
-    uint32_t forceWhen = 0;
     eCEntity* deathReferencesCleared = nullptr;
     unsigned deathClearCount = 0, deathCombatStopCount = 0;
     bool deathLogged = false;

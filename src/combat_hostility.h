@@ -12,11 +12,14 @@ namespace g3t::combat_hostility {
 void Tick();
 void SyncHostNpc(eCEntity* npc);
 void SyncClientLeasedNpc(eCEntity* npc);
+void OnClientLeaseConfirmed(uint8_t const guid[16]);
 void ClearClientLeasedNpc(uint8_t const guid[16]);
+void NoteImportedAttitude(eCEntity* npc, uint8_t importedAttitude);
 void OnState(uint8_t from, net::WorldState const& state);
 void OnWorldChange();
 bool ResumeLeasedCombat(eCEntity* npc, uint8_t aiMode, uint8_t attitude, uint8_t attackReason, eCEntity* target);
 
+bool IsCoopParticipant(eCEntity const* entity);
 bool IsSharedCombatHostile(eCEntity const* npc);
 bool ShouldPromoteAttitude(eCEntity const* npc);
 bool MirrorSharesCombatHostility(eCEntity const* npc);

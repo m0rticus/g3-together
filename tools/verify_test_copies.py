@@ -23,7 +23,7 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 from _g3copy import (
     DEFAULT_CLIENT, DEFAULT_HOST, DEFAULT_STEAM, FOLDER_MODULES, KNOWN_FAKE_SHA,
-    NATIVE_SLOTS, SLOT_GENUINE, SLOT_QA, STEAM_DLL_SHA256, TEST_REALISM_BUNDLE_FILES,
+    NATIVE_SLOTS, SLOT_GENUINE, SLOT_QA, TEST_REALISM_BUNDLE_FILES,
     canonical as _canonical, is_hard_linked, is_within, overlaps,
     package_ini_templates, parse_g3t_ini, parse_pe, reject_links as _reject_links,
     sha256, validate_copy_roots,

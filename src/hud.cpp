@@ -199,6 +199,7 @@ void SampleDue(DWORD now)
 
 void Message(Kind kind, wchar_t const* text)
 {
+    if (!text) text = L"";
     std::lock_guard<std::mutex> lock(noticeMutex);
     pending.push_back({kind, text});
 }
@@ -234,11 +235,7 @@ void Tick()
         const Snapshot after = Capture();
         char utf8[700] = {};
         WideCharToMultiByte(CP_UTF8, 0, notice.text.c_str(), -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
-        unsigned serial = 0;
-        {
-            std::lock_guard<std::mutex> lock(noticeMutex);
-            serial = ++count;
-        }
+        const unsigned serial = ++count;
         Logf("hud: [%d] %s", static_cast<int>(notice.kind), utf8);
         Logf("hud-motion: notice=%u kind=%d role=%s phase=before %s",
              serial, static_cast<int>(notice.kind), net::IsHost() ? "host" : "client", before.text.c_str());

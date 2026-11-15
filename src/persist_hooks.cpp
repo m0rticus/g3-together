@@ -3,9 +3,12 @@
 #include "persist_internal.h"
 
 #include "ai.h"
+#include "clock.h"
 #include "crashlog.h"
+#include "doors.h"
 #include "log.h"
 #include "steam.h"
+#include "story.h"
 
 #include <bcrypt.h>
 #include <algorithm>
@@ -87,14 +90,11 @@ std::vector<ExtensionEntry> extensions;
 uint32_t restoreAt = 0, receivedWelcome = 0;
 Bytes receivedRecord, receivedPersonal;
 net::CharacterNote receivedNote{};
-rejoin::tmpl::Report templateReport;
-uint32_t templateCheckedAt = 0;
-uint64_t templateVerified = 0;
 rejoin::tmpl::Publish templatePublish;
 rejoin::tmpl::Background templateBackground;
 TemplateJob templateJob = TemplateJob::None;
 unsigned templateFailures = 0, templateAttempts = 0;
-std::string templateFailCode, templateSettleShown, templateImpossibleCode;
+std::string templateFailCode, templateSettleShown;
 uint32_t templateFailError = 0, templateIoError = 0, templateNextRecover = 0;
 
 namespace {
@@ -598,9 +598,139 @@ bool __fastcall WorldLoadDetour(gCWorld* self, void*, bCString const& name, bool
     return ok;
 }
 
+void Notice(i18n::Message message, bool bad)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(i18n::Text(message));
+    else hud::Message(bad ? hud::Warning : hud::Info, i18n::Text(message));
+}
+
+void NoticeText(wchar_t const* text, hud::Kind kind)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
+    else hud::Message(kind, text);
+}
+
+void NoticeText(wchar_t const* text, bool bad)
+{
+    auto& game = gCSession::GetInstance();
+    auto* manager = game.GetGUIManager();
+    if (!game.IsGameRunning() || (manager && manager->IsMenuOpen())) hud::MenuLine(text);
+    else hud::Message(bad ? hud::Warning : hud::Info, text);
+}
+
+void SaveFailure(char const* code)
+{
+    lastSaveFailure = code;
+    Logf("persist: save refusal reason=%s player=%llu host=%d active=%d", code, steam::PlayerId(),
+         net::IsHost() ? 1 : 0, operation.active ? 1 : 0);
+    wchar_t text[500]{};
+    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::SaveFailureReason), i18n::SaveReason(code));
+    if (gCSession::GetInstance().IsGameRunning()) hud::Message(hud::Warning, text);
+    else hud::MenuLine(text);
+}
+
+void ClientRestoreFailure(char const* code)
+{
+    Logf("persist: client character restore failed reason=%s campaign=%s save=%s player=%llu", code,
+         *hostWorld.campaign ? hostWorld.campaign : "-", receivedNote.save, steam::PlayerId());
+    wchar_t label[80] = {}, text[500] = {};
+    if (*hostWorld.campaign) MultiByteToWideChar(CP_UTF8, 0, hostWorld.campaign, -1, label, 79);
+    _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::RecordRefusedWaiting), *label ? label : i18n::SaveReason(code));
+    NoticeText(text, true);
+}
+
 } // namespace g3t::persist::detail
 
 namespace g3t::persist {
-void* SaveTarget() { return detail::saveTarget; }
-void* LoadTarget() { return detail::loadTarget; }
+using namespace detail;
+
+void* SaveTarget() { return saveTarget; }
+void* LoadTarget() { return loadTarget; }
+
+bool BeginFrame()
+{
+    if (nativeLoadDepth || nativeSaveDepth) {
+        ++loadFrames;
+        crashlog::WorldEntryWait(nativeLoadDepth ? "native HUD.LoadGame return" : "native save return");
+        return false;
+    }
+    ++processDepth;
+    return true;
+}
+
+void EndFrame()
+{
+    if (processDepth) --processDepth;
+}
+
+bool NativeLoading() { return nativeLoadDepth != 0; }
+
+bool CheckpointBusy()
+{
+    return operation.active || captured.valid || requestPending || nativeSaveDepth;
+}
+
+bool HeroPending()
+{
+    // A client whose hooks are off can never be admitted: it is pending forever, never "playing as if admitted".
+    return (pairedEnabled || !net::IsHost()) &&
+           (NativeLoading() || clientRejoin.pending || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
+                             (!net::IsHost() && !net::InWorld(net::LocalId()) &&
+                              (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady())));
+}
+
+void OnWorldActivate()
+{
+    if (!loading.empty() || nativeSaveDepth) return;
+    if (!net::IsHost()) return; // Only successful HUD.NewGame authorizes a new client hero.
+    newWorld = true;
+    freshLocalHero = true;
+    current = {};
+    campaign.clear();
+    ownCharacterReady = false;
+    needsNewHero = false;
+    restoreFailed = false;
+    localKind = net::KindMenu;
+    clock::OnWorldChange();
+    NewEpoch();
+}
+
+void OnWorldDeactivate()
+{
+    if (!loading.empty() || nativeSaveDepth) return;
+    ownCharacterReady = false;
+    localKind = net::KindMenu;
+    if (net::IsHost()) {
+        current = {};
+        campaign.clear();
+        needsNewHero = false;
+        restoreFailed = false;
+        clock::OnWorldChange();
+        NewEpoch();
+    } else {
+        net::SetInWorld(net::LocalId(), false);
+        if (nativeNewGame || clientRejoin.pending) return;
+        clock::OnWorldChange();
+        freshLocalHero = false;
+        newWorld = false;
+        resetLocalWorld = false;
+        entryManual = false;
+        entryApproved = false;
+        autoloadAwaiting = false;
+        clientRejoin.Left();
+        receivedRecord.clear();
+        receivedPersonal.clear();
+        receivedNote = {};
+        receivedWelcome = 0;
+        synced = 0;
+        hostAdmissionAck = false;
+        needsNewHero = false;
+        restoreFailed = false;
+        requestCharacterAgain = true;
+    }
+}
 } // namespace g3t::persist

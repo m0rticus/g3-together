@@ -78,11 +78,36 @@ void WorkerRuntime::RecordClientEnd(char const* why, connect::ClientFlow::State 
          clientFlow.arg(), lobby, relayPort, r ? r->generation : 0, r ? r->toEnet : 0, r ? r->toSteam : 0);
 }
 
+void WorkerRuntime::ReleaseRemote(Remote& r, char const* dropReason, bool sendBye, bool closeSession)
+{
+    if (!r.id) return;
+    if ((isHost && (r.relayPort || r.linked)) || (!isHost && r.id == owner && r.linked)) {
+        RelayDrop drop;
+        drop.account = r.id;
+        drop.generation = r.generation;
+        drop.port = r.relayPort;
+        strncpy_s(drop.reason, dropReason, _TRUNCATE);
+        std::lock_guard<std::mutex> lock(store.mutex);
+        InvalidatePublishedLocked(store, isHost, drop.account, drop.generation);
+        store.relayDrops.push_back(drop);
+    }
+    if (sendBye) Control(r.id, 'B', true);
+    ClosePeerP2P(r);
+    if (closeSession) {
+        char identity[160];
+        Identity(identity, r.id);
+        api.CloseSession(messages, identity);
+    }
+    if (r.socket != INVALID_SOCKET) closesocket(r.socket);
+    r = Remote{};
+}
+
 void WorkerRuntime::Drop(Remote* r, char const* why)
 {
     if (!r || !r->id) return;
     const u64 id = r->id;
-    if (!isHost && id == owner) RecordClientEnd(why, clientFlow.state());
+    const bool wasHost = !isHost && id == owner;
+    if (wasHost) RecordClientEnd(why, clientFlow.state());
     if (isHost)
         Logf("connect: host link ended: peer=%llu reason=%s steam_state=%s elapsed_ms=%u "
              "stage=%s lobby_callback=%u lobby_flags=0x%x enet_port=%u relay_port=%u to_enet=%u to_steam=%u",
@@ -93,23 +118,7 @@ void WorkerRuntime::Drop(Remote* r, char const* why)
         Logf("steam-send: peer=%llu action=close-session pending_datagrams=%zu pending_bytes=%zu reason=%s",
              id, r->pending.Depth(), r->pending.Bytes(), why);
     Logf("steam: %llu dropped (%s; %u datagrams to ENet, %u to Steam)", r->id, why, r->toEnet, r->toSteam);
-    if ((isHost && r->relayPort) || (!isHost && r->id == owner && r->linked)) {
-        RelayDrop drop;
-        drop.account = id;
-        drop.generation = r->generation;
-        drop.port = r->relayPort;
-        strncpy_s(drop.reason, why, _TRUNCATE);
-        std::lock_guard<std::mutex> lock(store.mutex);
-        InvalidatePublishedLocked(store, isHost, drop.account, drop.generation);
-        store.relayDrops.push_back(drop);
-    }
-    ClosePeerP2P(*r);
-    char identity[160];
-    Identity(identity, r->id);
-    api.CloseSession(messages, identity);
-    if (r->socket != INVALID_SOCKET) closesocket(r->socket);
-    const bool wasHost = !isHost && r->id == owner;
-    *r = Remote{};
+    ReleaseRemote(*r, why, false, true);
     if (wasHost) LeaveLobby();
     if (connectionMode != connect::Mode::Invite) return;
     if (wasHost) OnClientLinkLost(id, why);
@@ -122,37 +131,7 @@ void WorkerRuntime::RotatePartnerForRejoin(u64 id)
     if (!r || !r->id) return;
     Logf("connect: rotating relay generation for rejoining partner=%llu prev_gen=%llu relay_port=%u",
          id, static_cast<unsigned long long>(r->generation), static_cast<unsigned>(r->relayPort));
-    if (r->relayPort || r->linked) {
-        RelayDrop drop;
-        drop.account = r->id;
-        drop.generation = r->generation;
-        drop.port = r->relayPort;
-        strcpy_s(drop.reason, "partner rejoined");
-        std::lock_guard<std::mutex> lock(store.mutex);
-        InvalidatePublishedLocked(store, isHost, drop.account, drop.generation);
-        store.relayDrops.push_back(drop);
-    }
-    ClosePeerP2P(*r);
-    if (r->socket != INVALID_SOCKET) closesocket(r->socket);
-    *r = Remote{};
-}
-
-void WorkerRuntime::Skip(u64 id, uint32_t forMs)
-{
-    Skipped* slot = &skipped[0];
-    for (auto& s : skipped) {
-        if (s.lobby == id) { slot = &s; break; }
-        if (!s.lobby || (s.until && static_cast<int32_t>(s.until - slot->until) < 0)) slot = &s;
-    }
-    slot->lobby = id;
-    slot->until = forMs ? (Now() + forMs) | 1 : 0;
-}
-
-bool WorkerRuntime::IsSkipped(u64 id) const
-{
-    for (auto const& s : skipped)
-        if (s.lobby == id) return !s.until || static_cast<int32_t>(s.until - Now()) > 0;
-    return false;
+    ReleaseRemote(*r, "partner rejoined", false, false);
 }
 
 bool WorkerRuntime::CreateLobby()
@@ -166,16 +145,6 @@ bool WorkerRuntime::CreateLobby()
     }
     Logf("connect: CreateLobby called (friends-only, %d members); waiting for Steam's answer", members);
     return true;
-}
-
-void WorkerRuntime::CreateLobbyAuto()
-{
-    if (!CreateLobby()) {
-        strcpy_s(error, "Steam rejected the lobby creation request");
-        Logf("steam: %s", error);
-        return;
-    }
-    Log("steam: creating a friends-only lobby");
 }
 
 void WorkerRuntime::Join(u64 id, char const* why)
@@ -213,25 +182,8 @@ void WorkerRuntime::LeaveLobby()
     if (!lobby) return;
     if (!isHost && owner) RecordClientEnd("local lobby closed", clientFlow.state());
     for (auto& r : remotes)
-        if (r.id && (isHost || r.id == owner)) {
-            if ((isHost && r.relayPort) || (!isHost && r.id == owner && r.linked)) {
-                RelayDrop drop;
-                drop.account = r.id;
-                drop.generation = r.generation;
-                drop.port = r.relayPort;
-                strcpy_s(drop.reason, "lobby closed");
-                std::lock_guard<std::mutex> lock(store.mutex);
-                InvalidatePublishedLocked(store, isHost, drop.account, drop.generation);
-                store.relayDrops.push_back(drop);
-            }
-            Control(r.id, 'B', true);
-            ClosePeerP2P(r);
-            char identity[160];
-            Identity(identity, r.id);
-            api.CloseSession(messages, identity);
-            if (r.socket != INVALID_SOCKET) closesocket(r.socket);
-            r = Remote{};
-        }
+        if (r.id && (isHost || r.id == owner))
+            ReleaseRemote(r, "lobby closed", true, true);
     api.LeaveLobby(matchmaking, lobby);
     if (isHost && connectionMode == connect::Mode::Auto) {
         api.SetRichPresence(friends, "connect", "");
@@ -650,21 +602,15 @@ void WorkerRuntime::HostTick()
     if (!connectPublished && now - lastPresence > 5000) PublishPresence();
 }
 
-void WorkerRuntime::ParseLegacyConnect(char const* text)
-{
-    char const* key = text ? std::strstr(text, "+connect_lobby ") : nullptr;
-    if (key) pendingLobby = _strtoui64(key + 15, nullptr, 10);
-}
-
 void WorkerRuntime::StartupAccept()
 {
     char const* line = GetCommandLineA();
     Logf("connect: command line: %.300s", line ? line : "");
+    const connect::Target target = connect::ParseConnect(line);
     if (connectionMode == connect::Mode::Auto) {
-        ParseLegacyConnect(line);
+        if (target.kind == connect::Target::Kind::Lobby) pendingLobby = target.id;
         return;
     }
-    const connect::Target target = connect::ParseConnect(line);
     if (target.kind != connect::Target::Kind::None || target.malformed) {
         OnAccepted(connect::ClientFlow::Source::CommandLine, "Steam started the game with a connect string",
                    target.kind == connect::Target::Kind::Host ? target.id : 0, line);
@@ -905,55 +851,6 @@ void WorkerRuntime::OnCallback(int callback, char const* p, int size)
         break;
     default:
         break;
-    }
-}
-
-void WorkerRuntime::Search()
-{
-    if (candidateLobby) return;
-    if (lobby) {
-        if (!owner && Now() - joinedAt > JoinWaitMs) {
-            Logf("steam: lobby %llu did not answer the join; trying others", lobby);
-            RecordClientEnd("Steam lobby did not answer JoinLobby", clientFlow.state());
-            Skip(lobby, 30000);
-            api.LeaveLobby(matchmaking, lobby);
-            lobby = 0;
-        }
-        return;
-    }
-    if (pendingLobby) {
-        const u64 id = pendingLobby;
-        pendingLobby = 0;
-        InspectLobby(id, "accepted through Steam");
-        return;
-    }
-    if (Now() - lastScan < ScanMs) return;
-    lastScan = Now();
-    if (wantedLobby) {
-        if (!IsSkipped(wantedLobby)) InspectLobby(wantedLobby, "steam_lobby");
-        else if (!wantedWaitLogged) {
-            wantedWaitLogged = true;
-            Logf("steam: steam_lobby %llu refused or did not answer; waiting for it (no other host)", wantedLobby);
-        }
-        return;
-    }
-    char const* wantedHost = GetLocalConfig().steamHost;
-    const int count = api.FriendCount(friends, FriendFlagImmediate);
-    for (int i = 0; i < count; ++i) {
-        const u64 id = api.FriendByIndex(friends, i, FriendFlagImmediate);
-        FriendGameInfoParam info{};
-        if (!api.FriendGamePlayed(friends, id, &info) || (info.game & 0xffffff) != GothicAppId || !info.lobby) continue;
-        if (IsSkipped(info.lobby)) continue;
-        char const* name = Text(api.FriendPersonaName(friends, id));
-        uint64_t wantedId = 0;
-        if (*wantedHost && (identity::SteamId(wantedHost, wantedId) ? id != wantedId : _stricmp(name, wantedHost) != 0)) continue;
-        InspectLobby(info.lobby, *name ? name : "a friend");
-        return;
-    }
-    if (!searchLogged) {
-        Logf("steam: no friend hosting a G3 Together game yet%s%s; looking every %u s",
-             *wantedHost ? " named " : "", wantedHost, ScanMs / 1000);
-        searchLogged = true;
     }
 }
 }

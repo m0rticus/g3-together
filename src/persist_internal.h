@@ -52,6 +52,8 @@ struct Client {
     uint32_t generation = 0, ready = 0, recordSent = 0, nextTry = 0, cutover = 0;
     uint32_t waitingSince = 0;
     bool told = false;
+    bool hasSavedPose = false;
+    saving::RecordPose savedPose{};
 };
 
 struct Captured {

@@ -53,15 +53,21 @@ class NpcLeasePresentationTests(unittest.TestCase):
 
     def test_idle_bootstrap_is_evaluated_and_script_free(self):
         source = _testbuild.src_text("npcplayback.cpp")
+        skeleton = _testbuild.src_text("npcplayback_skeleton.cpp")
         idle = source[source.index("eCResourceDataEntity* NativeMotion("):source.index("bool CosmeticHit(")]
+        query = skeleton[skeleton.index("eCResourceDataEntity* QueryNativeMotion("):skeleton.index("void PruneSkeletonCache(")]
+        self.assertIn("QueryNativeMotion(", idle)
         for required in ("npc.GetAni(action, phase)", "GetAniVariation",
-                         "QueryMotionDataEntity", "gEUseType_None", "EvaluateIdle(",
-                         "gEAction_Ambient, gEPhase_Loop", "PoseProvenance::Idle"):
+                         "QueryMotionDataEntity", "gEUseType_None"):
+            self.assertIn(required, query)
+        for required in ("EvaluateIdle(", "gEAction_Ambient, gEPhase_Loop", "PoseProvenance::Idle"):
             self.assertIn(required, idle)
         for forbidden in ("ContinueRoutine", "sAIPlayAni", "SetTask", "Movement", "OnPreProcess",
                           "UpdatePresentation("):
             self.assertNotIn(forbidden, idle)
+            self.assertNotIn(forbidden, query)
         self.assertNotIn('direction("None")', idle)
+        self.assertNotIn('direction("None")', query)
         replay = source[source.index("bool Replay("):source.index("bool ReplayFrozenPose(")]
         self.assertIn("!hostPose.evaluated || !hostPose.applied || !hostPose.valid", replay)
         self.assertIn("PoseProvenance::Canonical", replay)

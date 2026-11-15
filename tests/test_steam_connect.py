@@ -60,6 +60,7 @@ class SteamConnectTests(unittest.TestCase):
             "src/steam.cpp",
             "src/steam_p2p.cpp",
             "src/steam_flow.cpp",
+            "src/steam_legacy_auto.cpp",
             "src/steam_diagnostics.cpp",
         )
         return "\n".join(cls.source(part) for part in parts)
@@ -70,6 +71,7 @@ class SteamConnectTests(unittest.TestCase):
             "src/steam.cpp",
             "src/steam_p2p.cpp",
             "src/steam_flow.cpp",
+            "src/steam_legacy_auto.cpp",
             "src/steam_diagnostics.cpp",
         )
         return "\n".join(cls.source(part) for part in parts)
@@ -102,6 +104,7 @@ class SteamConnectTests(unittest.TestCase):
             "src/steam.cpp",
             "src/steam_p2p.cpp",
             "src/steam_flow.cpp",
+            "src/steam_legacy_auto.cpp",
             "src/steam_diagnostics.cpp",
         ):
             line_count = len(self.source(part).splitlines())
@@ -165,10 +168,14 @@ class SteamConnectTests(unittest.TestCase):
         # ENet: connects only while the Steam link is up, never from Start.
         net_start = self.between(net, "bool Start(bool asHost)", "void Service(")
         self.assertNotIn("enet_host_connect", net_start)
+        net_direct = self.source("src/net_direct.cpp")
         service = self.between(net, "void Service(", "void Flush()")
-        self.assertIn("steamLinked", service)
+        self.assertIn("SyncDirectSessions(", service)
+        self.assertIn("SyncClientSteamLink(", service)
         self.assertIn("!isHost && !server && !refused && steamLinked", service)
-        self.assertIn("steam::HostRelayGeneration()", service)
+        sync_link = self.function_body(net_direct, "void SyncClientSteamLink(")
+        self.assertIn("steamLinked", sync_link)
+        self.assertIn("steam::HostRelayGeneration()", sync_link)
         # Nothing reconnects by itself: once ENet was up, losing it ends the Steam link (the player accepts again).
         self.assertIn("steam::RequestClientDisconnect()", service)
         self.assertIn("everConnected && steam::RequestClientDisconnect()", service)

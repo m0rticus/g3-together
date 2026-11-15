@@ -32,10 +32,16 @@ TOUCHED_SRC_FILES = (
     "npc_companions.cpp",
     "npc_send.cpp",
     "infocmd.h",
+    "infocmd_internal.h",
     "infocmd.cpp",
+    "infocmd_progression.cpp",
+    "infocmd_sector.cpp",
     "guide.h",
     "guide.cpp",
+    "story_internal.h",
     "story.cpp",
+    "story_domains.cpp",
+    "story_qa.cpp",
 )
 
 
@@ -76,6 +82,11 @@ class TalkAndGuidePolicyTests(unittest.TestCase):
         self.assertIn("talk_policy::PuppetRoutineTask(true, held, false, body::IdleTask())", remote)
         self.assertIn("talk_policy::PuppetRoutineTask(false, held, holdingTalk, body::IdleTask())", remote)
 
+        # talk.cpp tracks active client dialog by GUID across frames, re-syncs SendTalk across WelcomeSerial, and checks AssessTalk symmetrically.
+        self.assertNotIn("talkingWith", talk)
+        self.assertIn("talkingWelcome != net::WelcomeSerial()", talk)
+        self.assertIn("HoldOf(addressedNpc)", talk)
+
         # Host routes WorldState kind 15 to talk::OnGesture without broadcasting it as an authoritative snapshot.
         world_state = infocmd[infocmd.index("void OnWorldState("):infocmd.index("void Send(")]
         self.assertIn("if (s.kind == 15)", world_state)
@@ -84,9 +95,15 @@ class TalkAndGuidePolicyTests(unittest.TestCase):
     def test_client_follow_quest_guide_and_routine_transition_wiring(self):
         companions = _testbuild.src_text("npc_companions.cpp")
         npc_send = _testbuild.src_text("npc_send.cpp")
-        infocmd = _testbuild.src_text("infocmd.cpp")
+        infocmd = "\n".join(
+            _testbuild.src_text(name)
+            for name in ("infocmd.cpp", "infocmd_progression.cpp", "infocmd_sector.cpp")
+        )
         guide = _testbuild.src_text("guide.cpp")
-        story = _testbuild.src_text("story.cpp")
+        story = "\n".join(
+            _testbuild.src_text(name)
+            for name in ("story_domains.cpp", "story.cpp", "story_qa.cpp")
+        )
 
         # StartGuidePlayer on host resolves the quest's destination point, never passing actor as the destination.
         guide_fn = companions[companions.index("bool Guide("):companions.index("uint8_t ClaimedBy(")]
@@ -103,6 +120,8 @@ class TalkAndGuidePolicyTests(unittest.TestCase):
         self.assertNotIn("nextCheck", guide)
         self.assertIn("guide_policy::ShouldClaimLocalFollowQuest(", guide)
         self.assertIn("guide_policy::ShouldHostAutoGuideFromQuestSync(", guide)
+        self.assertIn("guide_policy::ShouldAdoptHeroLeaderAsGuide(", guide)
+        self.assertIn("awaitingHostRelease", guide)
 
         # story.cpp feeds baseline/synced quest states to NoteQuestStatusFromHost and client quest deltas to OnClientFollowQuestRunning.
         self.assertIn("guide::NoteQuestStatusFromHost(", story)

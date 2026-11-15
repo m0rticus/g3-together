@@ -196,14 +196,13 @@ PreparedControl PrepareControl(NpcRecord const& record, bool forceBaseline)
     state.latest = record;
     result.ref = state.current;
     result.value = std::move(dynamic);
-    static std::vector<uint8_t> encoded;
-    encoded.clear();
-    result.encodable = npcwire::EncodeRecord(controlSender, result.value, encoded);
+    result.encoded.clear();
+    result.encodable = npcwire::EncodeRecord(controlSender, result.value, result.encoded);
     if (!result.encodable &&
         npcwire::FromNpcRecord(record, state.current.anchor, state.current.baseline, true, result.value)) {
         result.exact = true;
-        encoded.clear();
-        result.encodable = npcwire::EncodeRecord(controlSender, result.value, encoded, true);
+        result.encoded.clear();
+        result.encodable = npcwire::EncodeRecord(controlSender, result.value, result.encoded, true);
     }
     return result;
 }
@@ -706,10 +705,8 @@ bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable)
         NpcRecord record = records[i];
         if (!record.sent) record.sent = enet_time_get();
         const auto prepared = PrepareControl(record);
-        std::vector<uint8_t> encoded;
         const bool encodable = prepared.encodable &&
-            npcwire::EncodeRecord(controlSender, prepared.value, encoded, prepared.exact) &&
-            sizeof(NpcsHeader) + sizeof(npcwire::WireBatchHeader) + encoded.size() <= NpcDatagramBudget;
+            sizeof(NpcsHeader) + sizeof(npcwire::WireBatchHeader) + prepared.encoded.size() <= NpcDatagramBudget;
         for (uint8_t peerId = 2; peerId < MaxPlayers; ++peerId) {
             if (to && peerId != to) continue;
             if (!peers[peerId] || !clientInWorld[peerId]) continue;
@@ -725,12 +722,12 @@ bool SendNpcsTo(uint8_t to, NpcRecord const* records, int count, bool reliable)
                 queued = sent || queued;
                 continue;
             }
-            if (batch.bytes + encoded.size() > NpcDatagramBudget ||
+            if (batch.bytes + prepared.encoded.size() > NpcDatagramBudget ||
                 (!batch.values.empty() && batch.exact != prepared.exact) ||
                 std::find(batch.ids.begin(), batch.ids.end(), prepared.ref.id) != batch.ids.end())
                 queued = FlushControls(peerId, batch) || queued;
             batch.exact = prepared.exact;
-            batch.bytes += encoded.size();
+            batch.bytes += prepared.encoded.size();
             batch.values.push_back(prepared.value);
             batch.originals.push_back(record);
             batch.ids.push_back(prepared.ref.id);

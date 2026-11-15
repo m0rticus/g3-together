@@ -167,7 +167,7 @@ bool PersonalReadyForRestore(Bytes const& bytes)
     saving::personal::Snapshot snapshot;
     if (!saving::personal::Decode(bytes, snapshot)) return false;
     for (auto const& entry : snapshot)
-        if (static_cast<uint8_t>(entry.second.kind) != 4) return false;
+        if (entry.second.kind != saving::personal::Kind::GroundTaken) return false;
     return true;
 }
 
@@ -614,6 +614,8 @@ void NewEpoch()
         clients[i].ready = clients[i].recordSent = clients[i].cutover = clients[i].nextTry = 0;
         clients[i].waitingSince = GetTickCount();
         clients[i].told = false;
+        clients[i].hasSavedPose = false;
+        clients[i].savedPose = {};
         net::SetInWorld(i, false);
         if (!net::PeerJoined(i)) continue;
         net::WorldNote notice{};
@@ -663,6 +665,10 @@ void HostTick(uint32_t now)
         }
         auto const* record = saving::store::Find(current, saving::store::Character, account);
         Bytes envelope, state;
+        saving::Key recordKey;
+        saving::RecordPose recordPose;
+        const bool hasSavedPose = record && saving::store::HeroPose(record->bytes, recordKey, recordPose) &&
+                                  saving::ValidRecordPose(recordPose);
         if (record) {
             auto const* personal = saving::store::Find(current, saving::store::Personal, account);
             saving::personal::Snapshot snapshot;
@@ -671,11 +677,28 @@ void HostTick(uint32_t now)
             if (!saving::store::PackPlayer(record->bytes, state, envelope)) { SaveFailure("character-record"); return; }
         }
         if (SendRecord(i, net::CharacterRestore, {current.key.world, current.key.save, account},
-                       envelope)) client.recordSent = epoch;
+                       envelope)) {
+            client.recordSent = epoch;
+            client.hasSavedPose = hasSavedPose;
+            client.savedPose = hasSavedPose ? recordPose : saving::RecordPose{};
+        }
     }
 }
 
 } // namespace g3t::persist::detail
+
+namespace g3t::persist {
+void AppendPendingAdmissionAnchors(std::vector<std::array<float, 3>>& out)
+{
+    using namespace detail;
+    if (!net::IsHost() || !epoch || !ownCharacterReady || !loading.empty() || restoreFailed) return;
+    for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
+        auto const& client = clients[i];
+        if (!net::PeerJoined(i) || net::InWorld(i) || client.recordSent != epoch || !client.hasSavedPose) continue;
+        out.push_back({client.savedPose.position[0], client.savedPose.position[1], client.savedPose.position[2]});
+    }
+}
+} // namespace g3t::persist
 
 namespace g3t::persist::SaveExtensions {
 bool Register(char const* name, uint32_t type, uint32_t version, Capture capture, Restore restore)

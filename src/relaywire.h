@@ -24,9 +24,7 @@ inline bool ValidRelaySession(char const* session)
 inline std::size_t RelayHeaderSize(char const* session)
 {
     if (!ValidRelaySession(session)) return 0;
-    std::size_t length = 0;
-    while (session[length]) ++length;
-    return RelayLobbySize + RelayMarkerSize + length;
+    return RelayLobbySize + RelayMarkerSize + std::strlen(session);
 }
 
 inline bool RelayEncode(std::uint64_t lobby, char const* session,
@@ -46,9 +44,7 @@ inline bool RelayEncode(std::uint64_t lobby, char const* session,
     for (std::size_t i = 0; i < RelayLobbySize; ++i)
         out[i] = static_cast<unsigned char>(lobby >> (8 * i));
     out[RelayLobbySize] = static_cast<unsigned char>(0x80u | sessionSize);
-    for (std::size_t i = 0; i < sessionSize; ++i)
-        out[RelayLobbySize + RelayMarkerSize + i] =
-            static_cast<unsigned char>(static_cast<unsigned char>(session[i]));
+    std::memcpy(out + RelayLobbySize + RelayMarkerSize, session, sessionSize);
     if (payloadSize)
         std::memcpy(out + headerSize, payload, payloadSize);
     if (encodedSize) *encodedSize = headerSize + payloadSize;
@@ -71,7 +67,7 @@ inline bool RelayDecode(void const* packet, std::size_t packetSize,
         lobby |= static_cast<std::uint64_t>(in[i]) << (8 * i);
     if (!lobby || lobby != expectedLobby) return false;
     unsigned marker = in[RelayLobbySize];
-    if ((marker & 0x80u) == 0) return false;
+    if ((marker & 0xc0u) != 0x80u) return false;
     std::size_t sessionSize = marker & 0x3fu;
     if (!sessionSize || sessionSize > RelayMaxSessionSize) return false;
     std::size_t headerSize = RelayLobbySize + RelayMarkerSize + sessionSize;
@@ -82,8 +78,7 @@ inline bool RelayDecode(void const* packet, std::size_t packetSize,
               (c >= '0' && c <= '9') || c == '_' || c == '-'))
             return false;
     }
-    std::size_t expectedSize = 0;
-    while (expectedSession[expectedSize]) ++expectedSize;
+    std::size_t const expectedSize = std::strlen(expectedSession);
     if (sessionSize != expectedSize ||
         std::memcmp(in + RelayLobbySize + RelayMarkerSize,
                     expectedSession, sessionSize) != 0)
@@ -92,6 +87,13 @@ inline bool RelayDecode(void const* packet, std::size_t packetSize,
     if (payloadSize) *payloadSize = packetSize - headerSize;
     return true;
 }
+
+constexpr unsigned EnetCmdAcknowledge = 1;
+constexpr unsigned EnetCmdSendReliable = 6;
+constexpr unsigned EnetCmdSendUnreliable = 7;
+constexpr unsigned EnetCmdSendFragment = 8;
+constexpr unsigned EnetCmdSendUnsequenced = 9;
+constexpr unsigned EnetCmdSendUnreliableFragment = 12;
 
 struct EnetPacketParse
 {
@@ -169,9 +171,10 @@ inline bool ForEachEnetCommand(void const* packet, std::size_t packetSize,
         if (packetSize - offset < headerBytes) return false;
 
         std::size_t payloadSize = 0;
-        if (command == 6) {
+        if (command == EnetCmdSendReliable) {
             payloadSize = RelayReadUint16(data + offset + 4);
-        } else if (command == 7 || command == 8 || command == 9 || command == 12) {
+        } else if (command == EnetCmdSendUnreliable || command == EnetCmdSendFragment ||
+                   command == EnetCmdSendUnsequenced || command == EnetCmdSendUnreliableFragment) {
             payloadSize = RelayReadUint16(data + offset + 6);
         }
         std::size_t commandSize = headerBytes + payloadSize;
@@ -179,7 +182,7 @@ inline bool ForEachEnetCommand(void const* packet, std::size_t packetSize,
         if (packetSize - offset < commandSize) return false;
 
         parsed.protocolBytes += headerBytes;
-        if (command == 1) parsed.ackBytes += 8;
+        if (command == EnetCmdAcknowledge) parsed.ackBytes += 8;
         EnetCommandView view{
             offset,
             headerBytes,

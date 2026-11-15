@@ -338,9 +338,9 @@ int main()
         fi.role = CombatRole::CoopCompanion;
         assert(CombatFocusPriorityOverride(fi) == -1);
         fi.role = CombatRole::OrdinaryNpc;
-        fi.outsideBout = true;
+        fi.inBout = true;
         assert(CombatFocusPriorityOverride(fi) == -1);
-        fi.outsideBout = false;
+        fi.inBout = false;
         fi.down = true;
         assert(CombatFocusPriorityOverride(fi) == -1);
         fi.down = false;

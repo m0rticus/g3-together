@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npcwire_control.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <set>
 #include <utility>
 
 namespace g3t::npcwire {
@@ -37,6 +37,24 @@ struct Reader {
     }
     float f32() { const auto u = u32(); float v; std::memcpy(&v, &u, 4); return v; }
 };
+void writeBatchHeader(Writer& w, char kind, std::uint32_t epoch, std::uint32_t generation,
+                      std::uint32_t sequence, std::uint16_t count) {
+    w.u8('N'); w.u8(static_cast<std::uint8_t>(kind)); w.u8(1); w.u8(0);
+    w.u32(epoch); w.u32(generation); w.u32(sequence); w.u16(count);
+}
+bool readBatchHeader(Reader& r, char expectedKind, Stream& stream, std::uint32_t& sequence, std::uint16_t& count) {
+    const auto magic1 = r.u8(), magic2 = r.u8(), version = r.u8(), reserved = r.u8();
+    stream = Stream{r.u32(), r.u32()};
+    sequence = r.u32();
+    count = r.u16();
+    return r.ok && magic1 == 'N' && (expectedKind == 0 || magic2 == static_cast<std::uint8_t>(expectedKind)) &&
+           version == 1 && !reserved;
+}
+bool appendUniqueId(std::vector<std::uint16_t>& seen, std::uint16_t id) {
+    if (std::find(seen.begin(), seen.end(), id) != seen.end()) return false;
+    seen.push_back(id);
+    return true;
+}
 std::int32_t signed32(std::uint32_t u) {
     return u <= 0x7fffffffu ? static_cast<std::int32_t>(u)
                             : -1 - static_cast<std::int32_t>(0xffffffffu - u);
@@ -680,14 +698,14 @@ bool EncodeBatch(const Context& c, std::uint32_t sequence, const std::vector<Con
                  std::vector<std::uint8_t>& output, bool exact) {
     if (!c.ready_ || values.empty() || values.size() > 0xffffu) return false;
     Writer w;
-    w.u8('N'); w.u8('C'); w.u8(1); w.u8(0);
-    w.u32(c.epoch_); w.u32(c.generation_); w.u32(sequence);
-    w.u16(static_cast<std::uint16_t>(values.size()));
-    std::set<std::uint16_t> seen;
+    writeBatchHeader(w, 'C', c.epoch_, c.generation_, sequence, static_cast<std::uint16_t>(values.size()));
+    std::vector<std::uint16_t> seen;
+    seen.reserve(values.size());
+    std::vector<std::uint8_t> record;
     for (const auto& value : values) {
         std::uint16_t id;
-        std::vector<std::uint8_t> record;
-        if (!c.FindId(value.guid, id) || !seen.insert(id).second || !EncodeRecord(c, value, record, exact) ||
+        record.clear();
+        if (!c.FindId(value.guid, id) || !appendUniqueId(seen, id) || !EncodeRecord(c, value, record, exact) ||
             record.size() > MaxBatchBytes - w.data.size()) return false;
         w.data.insert(w.data.end(), record.begin(), record.end());
     }
@@ -697,21 +715,20 @@ bool EncodeBatch(const Context& c, std::uint32_t sequence, const std::vector<Con
 bool DecodeBatch(Context& c, const std::uint8_t* bytes, std::size_t size, std::vector<Control>& output) {
     if (!c.ready_ || !bytes || size < sizeof(WireBatchHeader) || size > MaxBatchBytes) return false;
     Reader r{bytes, size};
-    const auto magic1 = r.u8(), magic2 = r.u8(), version = r.u8(), reserved = r.u8();
-    const auto epoch = r.u32(), generation = r.u32(), sequence = r.u32();
-    const auto count = r.u16();
-    if (!r.ok || magic1 != 'N' || magic2 != 'C' || version != 1 || reserved ||
-        epoch != c.epoch_ || generation != c.generation_ || !count ||
+    Stream stream{}; std::uint32_t sequence = 0; std::uint16_t count = 0;
+    if (!readBatchHeader(r, 'C', stream, sequence, count) || !c.Matches(stream) || !count ||
         count > (size - sizeof(WireBatchHeader)) / sizeof(WireControl)) return false;
     std::vector<Control> decoded;
-    std::set<std::uint16_t> seen;
+    decoded.reserve(count);
+    std::vector<std::uint16_t> seen;
+    seen.reserve(count);
     for (unsigned i = 0; i < count; ++i) {
         const auto* start = bytes + r.offset;
         std::size_t length = 0;
         if (!RecordBytes(start, size - r.offset, length)) return false;
         Control v;
         std::uint16_t id;
-        if (!DecodeRecord(c, start, length, v) || !c.FindId(v.guid, id) || !seen.insert(id).second) return false;
+        if (!DecodeRecord(c, start, length, v) || !c.FindId(v.guid, id) || !appendUniqueId(seen, id)) return false;
         const auto previous = c.sequences_.find(id);
         if (previous != c.sequences_.end() && !Newer(sequence, previous->second)) return false;
         decoded.push_back(v); r.offset += length;
@@ -728,8 +745,7 @@ bool EncodeFullFallback(const Context& c, std::uint32_t sequence, const Control&
     const auto life = c.lives_.find(id);
     if (life == c.lives_.end() || life->second != v.incarnation) return false;
     Writer w;
-    w.u8('N'); w.u8('F'); w.u8(1); w.u8(0);
-    w.u32(c.epoch_); w.u32(c.generation_); w.u32(sequence); w.u16(1);
+    writeBatchHeader(w, 'F', c.epoch_, c.generation_, sequence, 1);
     if (!writeFull(w, v) || w.data.size() != sizeof(WireBatchHeader) + sizeof(WireFullRecord) ||
         w.data.size() > MaxBatchBytes) return false;
     output = std::move(w.data); return true;
@@ -739,11 +755,8 @@ bool DecodeFullFallback(Context& c, const std::uint8_t* bytes, std::size_t size,
     if (!c.ready_ || !bytes || size != sizeof(WireBatchHeader) + sizeof(WireFullRecord) ||
         size > MaxBatchBytes) return false;
     Reader r{bytes, size};
-    const auto magic1 = r.u8(), magic2 = r.u8(), version = r.u8(), reserved = r.u8();
-    const auto epoch = r.u32(), generation = r.u32(), sequence = r.u32();
-    const auto count = r.u16();
-    if (magic1 != 'N' || magic2 != 'F' || version != 1 || reserved ||
-        epoch != c.epoch_ || generation != c.generation_ || count != 1) return false;
+    Stream stream{}; std::uint32_t sequence = 0; std::uint16_t count = 0;
+    if (!readBatchHeader(r, 'F', stream, sequence, count) || !c.Matches(stream) || count != 1) return false;
     Control v;
     if (!readFull(r, v)) return false;
     std::uint16_t id;
@@ -760,20 +773,19 @@ bool EncodeId(const Context& c, std::uint32_t sequence, std::uint16_t id, std::v
     Guid guid;
     if (!c.ready_ || !c.FindGuid(id, guid)) return false;
     Writer w;
-    w.u8('N'); w.u8('I'); w.u8(1); w.u8(0); w.u32(c.epoch_); w.u32(c.generation_);
-    w.u32(sequence); w.u16(1); w.u16(id);
+    writeBatchHeader(w, 'I', c.epoch_, c.generation_, sequence, 1);
+    w.u16(id);
     for (auto x : guid) w.u8(x);
     output = std::move(w.data); return true;
 }
 bool DecodeId(Context& c, const std::uint8_t* bytes, std::size_t size, std::uint16_t& output) {
     if (!bytes || size != sizeof(WireBatchHeader) + sizeof(WireIdEntry) || size > MaxBatchBytes) return false;
     Reader r{bytes, size};
-    const auto magic1 = r.u8(), magic2 = r.u8(), version = r.u8(), reserved = r.u8();
-    const Stream stream{r.u32(), r.u32()};
-    r.u32(); const auto count = r.u16(); const auto id = r.u16();
+    Stream stream{}; std::uint32_t sequence = 0; std::uint16_t count = 0;
+    if (!readBatchHeader(r, 'I', stream, sequence, count)) return false;
+    const auto id = r.u16();
     Guid guid; for (auto& x : guid) x = r.u8();
-    if (!r.ok || r.offset != size || magic1 != 'N' || magic2 != 'I' || version != 1 || reserved ||
-        count != 1 || !c.AddId(stream, id, guid)) return false;
+    if (!r.ok || r.offset != size || count != 1 || !c.AddId(stream, id, guid)) return false;
     output = id; return true;
 }
 bool EncodeBaseline(const Context& c, std::uint32_t sequence, std::uint16_t id, std::uint16_t token,
@@ -783,8 +795,8 @@ bool EncodeBaseline(const Context& c, std::uint32_t sequence, std::uint16_t id, 
     if (!c.ready_ || life == c.lives_.end() || baseline == c.baselines_.end() ||
         baseline->second.life != life->second) return false;
     Writer w;
-    w.u8('N'); w.u8('B'); w.u8(1); w.u8(0); w.u32(c.epoch_); w.u32(c.generation_);
-    w.u32(sequence); w.u16(1); w.u16(id); w.u32(baseline->second.anchor); w.u16(token);
+    writeBatchHeader(w, 'B', c.epoch_, c.generation_, sequence, 1);
+    w.u16(id); w.u32(baseline->second.anchor); w.u16(token);
     w.data.insert(w.data.end(), baseline->second.bytes.begin(), baseline->second.bytes.end());
     if (w.data.size() != sizeof(WireBatchHeader) + sizeof(WireBaselinePrefix) + sizeof(WireFullRecord) ||
         w.data.size() > MaxBatchBytes) return false;
@@ -794,12 +806,11 @@ bool DecodeBaseline(Context& c, const std::uint8_t* bytes, std::size_t size, Bas
     if (!bytes || size != sizeof(WireBatchHeader) + sizeof(WireBaselinePrefix) + sizeof(WireFullRecord) ||
         size > MaxBatchBytes) return false;
     Reader r{bytes, size};
-    const auto magic1 = r.u8(), magic2 = r.u8(), version = r.u8(), reserved = r.u8();
-    const Stream stream{r.u32(), r.u32()};
-    r.u32(); const auto count = r.u16(); const auto id = r.u16();
+    Stream stream{}; std::uint32_t sequence = 0; std::uint16_t count = 0;
+    if (!readBatchHeader(r, 'B', stream, sequence, count) || count != 1 || !c.Matches(stream)) return false;
+    const auto id = r.u16();
     const auto anchor = r.u32(); const auto token = r.u16();
-    if (!r.ok || magic1 != 'N' || magic2 != 'B' || version != 1 || reserved || count != 1 ||
-        !c.Matches(stream) || !id || !anchor || !token || !c.ids_.count(id)) return false;
+    if (!r.ok || !id || !anchor || !token || !c.ids_.count(id)) return false;
     const auto* payload = bytes + r.offset;
     Control snapshot;
     if (!readFull(r, snapshot) || r.offset != size ||
@@ -820,22 +831,21 @@ bool EncodeSignal(const Context& c, std::uint32_t sequence, const Signal& signal
             base->second.anchor != ref.anchor) return false;
     } else if (signal.kind != SignalKind::Resync || reason < 1 || reason > 4) return false;
     Writer w;
-    w.u8('N'); w.u8(signal.kind == SignalKind::Ack ? 'A' : 'R'); w.u8(1); w.u8(0);
-    w.u32(c.epoch_); w.u32(c.generation_); w.u32(sequence); w.u16(1);
+    writeBatchHeader(w, signal.kind == SignalKind::Ack ? 'A' : 'R', c.epoch_, c.generation_, sequence, 1);
     w.u16(ref.id); w.u32(ref.incarnation); w.u32(ref.anchor); w.u16(ref.baseline); w.u8(reason);
     output = std::move(w.data); return true;
 }
 bool DecodeSignal(const Context& c, const std::uint8_t* bytes, std::size_t size, Signal& output) {
     if (!bytes || size != sizeof(WireBatchHeader) + sizeof(WireSignal) || size > MaxBatchBytes) return false;
     Reader r{bytes, size};
-    const auto magic1 = r.u8(), magic2 = r.u8(), version = r.u8(), reserved = r.u8();
-    const Stream stream{r.u32(), r.u32()};
+    const auto magic2 = bytes[1];
+    Stream stream{}; std::uint32_t sequence = 0; std::uint16_t count = 0;
+    if (!readBatchHeader(r, 0, stream, sequence, count) || count != 1 || !c.Matches(stream)) return false;
     Signal s;
-    s.sequence = r.u32(); const auto count = r.u16();
+    s.sequence = sequence;
     s.reference.id = r.u16(); s.reference.incarnation = r.u32(); s.reference.anchor = r.u32();
     s.reference.baseline = r.u16(); const auto reason = r.u8();
-    if (!r.ok || r.offset != size || magic1 != 'N' || version != 1 || reserved || count != 1 ||
-        !c.Matches(stream) || !s.reference.id) return false;
+    if (!r.ok || r.offset != size || !s.reference.id) return false;
     if (magic2 == 'A') {
         s.kind = SignalKind::Ack;
         const auto life = c.lives_.find(s.reference.id);

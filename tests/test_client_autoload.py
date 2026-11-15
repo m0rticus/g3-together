@@ -120,7 +120,7 @@ class ClientAutoloadTests(unittest.TestCase):
         self.assertIn("bool clientAutoload = true;", source("src/config.h"))
         config_cpp = source("src/config.cpp")
         self.assertIn('"client_autoload"', config_cpp)
-        self.assertIn('config.clientAutoload = _stricmp(value, "off") != 0;', config_cpp)
+        self.assertIn('next.clientAutoload = _stricmp(value, "off") != 0;', config_cpp)
         package = source("tools/package.py")
         self.assertIn("client_autoload", package.split("CLIENT_INI", 1)[1])
         self.assertIn("client_autoload", package.split("HOST_INI", 1)[1].split("CLIENT_INI", 1)[0])

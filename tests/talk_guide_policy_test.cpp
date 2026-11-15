@@ -202,6 +202,15 @@ void TestGuideWireMultiplexRoutineDeferralAndOwnerPriority()
     assert(ResolveCompanionOwner(0, 0, 2, 1) == 2);
     assert(ResolveCompanionOwner(0, 0, 0, 1) == 1);
     assert(ResolveCompanionOwner(0, 0, 0, 0) == 0);
+
+    // Client Hero.Party.PartyLeader re-stamped by in-flight NpcRecord after FollowNpc quest completion must NOT
+    // re-adopt the guide as a questless/permanent guide, while active Running quests and fresh local StartGuidePlayer still adopt.
+    assert(ShouldAdoptHeroLeaderAsGuide(true, false, true, true));
+    assert(ShouldAdoptHeroLeaderAsGuide(false, true, true, false));
+    assert(ShouldAdoptHeroLeaderAsGuide(false, false, false, false));
+    assert(!ShouldAdoptHeroLeaderAsGuide(false, false, true, false));
+    assert(!ShouldAdoptHeroLeaderAsGuide(false, false, false, true));
+    assert(!ShouldAdoptHeroLeaderAsGuide(false, false, true, true));
 }
 
 } // namespace

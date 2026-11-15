@@ -31,12 +31,14 @@ void LogEndStep()
 using DumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
                              PMINIDUMP_CALLBACK_INFORMATION);
 DumpFn writeDump = nullptr;
+SRWLOCK dbghelpLock = SRWLOCK_INIT;
 HANDLE dumpRequest = nullptr, dumpDone = nullptr, dumpStop = nullptr, dumpThreadHandle = nullptr;
 EXCEPTION_RECORD dumpExceptionRecord{};
 CONTEXT dumpContext{};
 EXCEPTION_POINTERS dumpExceptionPointers{};
 bool dumpExceptionCopied = false;
 LONG dumpBusy = 0;
+std::atomic<uint32_t> activeDumpCallers{0};
 DWORD dumpThreadId = 0, dumpWorkerThreadId = 0;
 char dumpDir[MAX_PATH] = {};
 LONG dumps = 0;
@@ -44,17 +46,36 @@ constexpr LONG MaxFirstChanceDumps = 2;
 LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
 PVOID vectoredHandler = nullptr;
 
+struct DbgHelpGuard {
+    bool locked = false;
+    explicit DbgHelpGuard(bool wait)
+    {
+        if (wait) {
+            AcquireSRWLockExclusive(&dbghelpLock);
+            locked = true;
+        } else {
+            locked = TryAcquireSRWLockExclusive(&dbghelpLock) != FALSE;
+        }
+    }
+    ~DbgHelpGuard()
+    {
+        if (locked) ReleaseSRWLockExclusive(&dbghelpLock);
+    }
+};
+
 void EnsureDumpDir()
 {
-    if (*dumpDir) return;
-    if (!symbols::GameDir(dumpDir) && !GetCurrentDirectoryA(MAX_PATH, dumpDir)) dumpDir[0] = '\0';
-    const size_t length = std::strlen(dumpDir);
-    if (length && dumpDir[length - 1] != '\\') strcat_s(dumpDir, "\\");
+    symbols::EnsureGameDir(dumpDir);
 }
 
-bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception)
+bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception, bool waitLock)
 {
     if (!writeDump) { Log("crashlog: crash dump writer unavailable"); return false; }
+    DbgHelpGuard guard(waitLock);
+    if (!guard.locked) {
+        Log("crashlog: dbghelp busy; skipping concurrent dump");
+        return false;
+    }
     const LARGE_INTEGER start{};
     auto rewind = [&]() {
         if (!SetFilePointerEx(file, start, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) {
@@ -139,7 +160,7 @@ DWORD WINAPI DumpThread(LPVOID)
         if (file != INVALID_HANDLE_VALUE) {
             MINIDUMP_EXCEPTION_INFORMATION exception{dumpThreadId,
                                                      dumpExceptionCopied ? &dumpExceptionPointers : nullptr, FALSE};
-            WriteDump(file, dumpExceptionCopied ? &exception : nullptr);
+            WriteDump(file, dumpExceptionCopied ? &exception : nullptr, true);
             CloseHandle(file);
         } else {
             Logf("crashlog: crash dump create failed error=%lu", GetLastError());
@@ -151,7 +172,11 @@ DWORD WINAPI DumpThread(LPVOID)
 
 void Dump(EXCEPTION_POINTERS* info)
 {
-    if (!writeDump || !dumpRequest || ai::ShuttingDown()) return;
+    struct CallerGuard {
+        CallerGuard() { activeDumpCallers.fetch_add(1, std::memory_order_acq_rel); }
+        ~CallerGuard() { activeDumpCallers.fetch_sub(1, std::memory_order_acq_rel); }
+    } caller;
+    if (!writeDump || !dumpRequest || !dumpDone || ai::ShuttingDown()) return;
     if (InterlockedCompareExchange(&dumps, 0, 0) < 0) return;
     if (InterlockedCompareExchange(&dumpBusy, 1, 0) != 0) {
         Log("guard: crashlog dump busy; skipping overlapping request");
@@ -301,9 +326,18 @@ char const* NearestKnownSymbol(Module const& m, uintptr_t rva, uintptr_t* start)
     return best;
 }
 
+bool ModuleMapped(Module const& m)
+{
+    if (!m.base || m.size < sizeof(IMAGE_DOS_HEADER)) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(m.base), &mbi, sizeof(mbi))) return false;
+    return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+           reinterpret_cast<uintptr_t>(mbi.AllocationBase) == m.base;
+}
+
 IMAGE_NT_HEADERS const* Headers(Module const& m)
 {
-    if (!m.base || m.size < sizeof(IMAGE_DOS_HEADER)) return nullptr;
+    if (!ModuleMapped(m)) return nullptr;
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(m.base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
         !RvaRange(m, static_cast<uintptr_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS)))
@@ -395,11 +429,23 @@ void FindModules()
 {
     for (ModuleSlot& m : modules) {
         HMODULE h = GetModuleHandleA(m.name);
-        if (!h) continue;
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(h);
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS const*>(reinterpret_cast<unsigned char const*>(h) + dos->e_lfanew);
-        m.size.store(nt->OptionalHeader.SizeOfImage, std::memory_order_relaxed);
-        m.base.store(reinterpret_cast<uintptr_t>(h), std::memory_order_release);
+        if (!h) {
+            m.base.store(0, std::memory_order_release);
+            m.size.store(0, std::memory_order_relaxed);
+            continue;
+        }
+        const uintptr_t base = reinterpret_cast<uintptr_t>(h);
+        IMAGE_DOS_HEADER dos{};
+        IMAGE_NT_HEADERS nt{};
+        if (!symbols::ReadMemory(base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+            !symbols::ReadMemory(base + static_cast<uintptr_t>(dos.e_lfanew), &nt, sizeof(nt)) ||
+            nt.Signature != IMAGE_NT_SIGNATURE) {
+            m.base.store(0, std::memory_order_release);
+            m.size.store(0, std::memory_order_relaxed);
+            continue;
+        }
+        m.size.store(nt.OptionalHeader.SizeOfImage, std::memory_order_relaxed);
+        m.base.store(base, std::memory_order_release);
     }
     if (!knownSymbolCount) FindKnownSymbols();
 }
@@ -457,7 +503,10 @@ bool Where(uintptr_t address, char* out, size_t size)
             }
             if (!name) return true;
             char plain[160];
-            if (*name == '?' && undecorate && undecorate(name, plain, sizeof(plain), UndnameNameOnly)) name = plain;
+            if (*name == '?' && undecorate) {
+                DbgHelpGuard guard(false);
+                if (guard.locked && undecorate(name, plain, sizeof(plain), UndnameNameOnly)) name = plain;
+            }
             Format(out + length, size - length, " (%s %s+%#x)", kind, name, static_cast<unsigned>(rva - start));
             return true;
         }
@@ -480,7 +529,7 @@ bool WriteProcessDump(char const* path)
         Logf("shutdown watchdog: dmp create failed error=%lu", GetLastError());
         return false;
     }
-    const bool ok = WriteDump(file, nullptr);
+    const bool ok = WriteDump(file, nullptr, false);
     CloseHandle(file);
     return ok;
 }
@@ -545,39 +594,13 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-void SampleThread(DWORD id, symbols::ThreadSample& sample)
-{
-    sample = symbols::ThreadSample{};
-    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id);
-    if (!thread) { sample.openError = GetLastError(); return; }
-    if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
-        sample.suspendError = GetLastError();
-        CloseHandle(thread);
-        return;
-    }
-    sample.suspended = true;
-    CONTEXT context{};
-    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-    sample.contextOk = GetThreadContext(thread, &context) != FALSE;
-    if (sample.contextOk) {
-        sample.eip = context.Eip;
-        sample.esp = context.Esp;
-        sample.ebp = context.Ebp;
-        symbols::CopyRemoteStackWords(sample.esp, sample.words, sample.count);
-        sample.ok = true;
-    } else sample.contextError = GetLastError();
-    sample.resumed = ResumeThread(thread) != static_cast<DWORD>(-1);
-    if (!sample.resumed) sample.resumeError = GetLastError();
-    CloseHandle(thread);
-}
-
 // A native call that never returns leaves no dump (a hang is not a crash): say where the main thread is standing.
 void LogMainThread(char const* operation)
 {
     WorldEntryState state;
     const DWORD id = ReadWorldEntry(state) ? static_cast<DWORD>(state.threadId) : 0;
     symbols::ThreadSample sample;
-    if (id) SampleThread(id, sample);
+    if (id) symbols::SampleThreadStack(id, sample);
     if (!sample.ok || !sample.resumed) {
         Logf("world-entry: main thread stack unavailable operation=%s thread=%lu", operation ? operation : "-", id);
         return;
@@ -646,7 +669,6 @@ void Tick()
 void BeginShutdown()
 {
     if (dumpStop) SetEvent(dumpStop);
-    if (dumpDone) SetEvent(dumpDone);
     if (vectoredHandler) {
         RemoveVectoredExceptionHandler(vectoredHandler);
         vectoredHandler = nullptr;
@@ -679,7 +701,7 @@ bool Shutdown()
             dumpThreadHandle = nullptr;
         }
     }
-    if (!joined) return false;
+    if (!joined || activeDumpCallers.load(std::memory_order_acquire) != 0) return false;
     if (dumpRequest) { CloseHandle(dumpRequest); dumpRequest = nullptr; }
     if (dumpDone) { CloseHandle(dumpDone); dumpDone = nullptr; }
     if (dumpStop) { CloseHandle(dumpStop); dumpStop = nullptr; }

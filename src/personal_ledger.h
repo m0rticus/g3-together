@@ -38,9 +38,11 @@ bool TrackPersonalFocus();
 bool PersonalPass(bool capture, std::set<std::string>* attempted = nullptr);
 bool FlushPersonalObservers();
 
+using AccessGuardFn = bool (*)();
+
 void Reset();
-bool Capture(std::vector<uint8_t>& out, bool (*installAccessGuards)());
-bool Restore(std::vector<uint8_t> const& bytes, bool (*installAccessGuards)());
+bool Capture(std::vector<uint8_t>& out, AccessGuardFn installAccessGuards);
+bool Restore(std::vector<uint8_t> const& bytes, AccessGuardFn installAccessGuards);
 
 class PersonalMutation {
 public:

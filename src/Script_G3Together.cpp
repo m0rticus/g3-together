@@ -178,6 +178,22 @@ void Frame()
     }
 }
 
+template <typename Fn>
+void Step(char const* name, Fn&& tick)
+{
+    g3t::movement::Stage stage(name);
+    tick();
+}
+
+template <typename Fn>
+void TimedStep(char const* name, g3t::host_frame_diag::Phase phase, Fn&& tick)
+{
+    g3t::movement::Stage stage(name);
+    const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
+    tick();
+    if (t0) g3t::host_frame_diag::Global().AddPhase(phase, t0, g3t::movement::EntryTime());
+}
+
 // One frame of the module for persist (BeginFrame/EndFrame), closed on every way out of Process.
 struct FrameScope {
     FrameScope() : entered(g3t::movement::EntryTime()), run(g3t::persist::BeginFrame())
@@ -196,18 +212,8 @@ struct FrameScope {
     ~FrameScope()
     {
         if (run) {
-            {
-                g3t::movement::Stage stage("net flush");
-                const long long flushStart = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
-                g3t::net::Flush();
-                if (flushStart)
-                    g3t::host_frame_diag::Global().AddPhase(
-                        g3t::host_frame_diag::Phase::Net, flushStart, g3t::movement::EntryTime());
-            }
-            {
-                g3t::movement::Stage stage("persist end");
-                g3t::persist::EndFrame();
-            }
+            TimedStep("net flush", g3t::host_frame_diag::Phase::Net, [] { g3t::net::Flush(); });
+            Step("persist end", [] { g3t::persist::EndFrame(); });
             if (--moduleProcessDepth == 0) g3t::hud::Tick();
             if (moduleProcessDepth == 0) g3t::movement::End();
             if (moduleProcessDepth == 0 && g3t::GetConfig().host)
@@ -219,12 +225,6 @@ struct FrameScope {
     const long long entered;
     const bool run;
 };
-
-void Step(char const* name, void (*tick)())
-{
-    g3t::movement::Stage stage(name);
-    tick();
-}
 
 // The engine's own extension point: a module registered with eCModuleAdmin gets Process()
 // every frame and world activation/shutdown callbacks.
@@ -405,21 +405,13 @@ class Module : public eCEngineComponentBase
             return;
         }
         Step("crashlog", &g3t::crashlog::Tick);
-        {
-            g3t::movement::Stage stage("world");
-            const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
-            g3t::world::Tick();
-            if (t0) g3t::host_frame_diag::Global().AddPhase(g3t::host_frame_diag::Phase::World, t0, g3t::movement::EntryTime());
-        }
+        TimedStep("world", g3t::host_frame_diag::Phase::World, &g3t::world::Tick);
         Step("NPC removal", &g3t::npcremoval::Tick);
-        { g3t::movement::Stage stage("NPC identity"); g3t::npcs::ReconcileClientEntities(); }
-        { g3t::movement::Stage stage("NPC playback"); g3t::npcplayback::Tick(); }
+        Step("NPC identity", &g3t::npcs::ReconcileClientEntities);
+        Step("NPC playback", &g3t::npcplayback::Tick);
         {
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
-            g3t::movement::Stage stage("remote / ENet service");
-            const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
-            g3t::remote::Tick();
-            if (t0) g3t::host_frame_diag::Global().AddPhase(g3t::host_frame_diag::Phase::Net, t0, g3t::movement::EntryTime());
+            TimedStep("remote / ENet service", g3t::host_frame_diag::Phase::Net, &g3t::remote::Tick);
         }
         if (g3t::persist::ClientTransitionPending()) {
             g3t::persist::Tick();
@@ -428,14 +420,9 @@ class Module : public eCEngineComponentBase
             g3t::offer::Tick();
             return;
         }
-        { g3t::movement::Stage stage("AI"); g3t::ai::Tick(); }
-        {
-            g3t::movement::Stage stage("NPC / lease");
-            const long long t0 = g3t::GetConfig().host ? g3t::movement::EntryTime() : 0;
-            g3t::npcs::Tick();
-            if (t0) g3t::host_frame_diag::Global().AddPhase(g3t::host_frame_diag::Phase::Npcs, t0, g3t::movement::EntryTime());
-        }
-        { g3t::movement::Stage stage("combat"); g3t::combat::Tick(); }
+        Step("AI", &g3t::ai::Tick);
+        TimedStep("NPC / lease", g3t::host_frame_diag::Phase::Npcs, &g3t::npcs::Tick);
+        Step("combat", &g3t::combat::Tick);
         constexpr NamedCall beforeDowned[] = {
             {"summon", &g3t::summon::Tick},
             {"story", &g3t::story::Tick},

@@ -85,6 +85,7 @@ inline bool IsValidDirectCandidateEndpoint(uint32_t netIpv4, uint16_t hostPort, 
     const uint32_t hostOrder = ntohl(netIpv4);
     const uint8_t first = static_cast<uint8_t>(hostOrder >> 24);
     if (first == 0 || first >= 224) return false;  // reject 0.0.0.0/8, multicast (224/4), and reserved/broadcast (240/4)
+    if ((hostOrder & 0xffff0000u) == 0xa9fe0000u) return false;  // reject IPv4 link-local (169.254.0.0/16)
     if (first == 127) {
         if (!allowLoopback) return false;
         const uint32_t hostPart = hostOrder & 0x00ffffffu;
@@ -120,6 +121,7 @@ struct Remote
     uint32_t lastP2POpenAt = 0;
     bool p2pConnected = false, p2pLanesConfigured = false;
     bool haveDirectCookie = false, directReady = false;
+    uint64_t directOfferGeneration = 0;
     uint8_t directCookie[16] = {};
     DirectEndpoint directCandidates[8] = {};
     unsigned directCandidateCount = 0;
@@ -127,7 +129,8 @@ struct Remote
     uint32_t lastDirectOfferSent = 0;
     unsigned toEnet = 0, toSteam = 0;
     send::Queue pending;
-    uint64_t steamReliableOk = 0, steamUnreliableOk = 0, steamFailed[128] = {};
+    uint64_t steamReliableOk = 0, steamUnreliableOk = 0;
+    uint64_t steamDataFailed[128] = {}, steamControlFailed[128] = {};
 };
 
 struct Skipped { u64 lobby = 0; uint32_t until = 0; };
@@ -154,8 +157,14 @@ struct PublishedPeer
     uint64_t generation = 0;
     char name[24] = {};
     DirectOffer directOffer{};
-    DirectEndpoint verifiedDirect{};
-    bool directPinned = false;
+};
+
+struct DirectEndpointPin
+{
+    u64 account = 0;
+    uint64_t generation = 0;
+    DirectEndpoint endpoint{};
+    bool pinned = false;
 };
 
 struct Published
@@ -176,6 +185,7 @@ struct PublishedStore
 {
     std::mutex mutex;
     Published published;
+    DirectEndpointPin directPins[MaxRemotes] = {};
     ClientEnet clientEnet;
     std::vector<RelayDrop> relayDrops;
     std::vector<RelayClose> relayCloses;
@@ -283,13 +293,14 @@ struct WorkerRuntime
     void DrainDatagrams(Remote& r);
     void Forward();
 
-    // Lobby, invite/auto flow & callbacks (steam_flow.cpp)
+    // Lobby, invite flow & callbacks (steam_flow.cpp & steam_legacy_auto.cpp)
     Remote* Find(u64 id);
     Remote* Get(u64 id);
     int CountLinked() const;
     bool InLobby(u64 id) const;
     void ResetClientEnd();
     void RecordClientEnd(char const* why, connect::ClientFlow::State before);
+    void ReleaseRemote(Remote& r, char const* dropReason, bool sendBye, bool closeSession);
     void Drop(Remote* r, char const* why);
     void RotatePartnerForRejoin(u64 id);
     void Skip(u64 id, uint32_t forMs);
@@ -323,7 +334,6 @@ struct WorkerRuntime
     void OnHostLinkLost(u64 id, char const* why);
     void ClientTick();
     void HostTick();
-    void ParseLegacyConnect(char const* text);
     void StartupAccept();
     void FillConnection(Connection& out);
     void OnLobbyCreated(char const* p, int size);
@@ -332,14 +342,15 @@ struct WorkerRuntime
     void Search();
 
     // Networking config & diagnostics (steam_diagnostics.cpp)
-    config::Read ReadNetworkingConfig(int id) const;
+    config::Read ReadNetworkingConfig(int id, int scope = config::GlobalScope, intptr_t handle = 0) const;
     bool ConfigureNetworking();
     void TransportConfigDiagnostics() const;
     void SendDiagnostics(uint32_t now);
 };
 
 SOCKET LoopbackSocket(unsigned short* port);
-void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port, bool allowLoopback = AllowDirectLoopback());
+void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port,
+                        bool allowLoopback = AllowDirectLoopback(), bool replaceLastIfFull = false);
 unsigned GatherLocalIpv4s(uint32_t (&out)[8], bool allowLoopback = AllowDirectLoopback());
 void InvalidatePublishedLocked(PublishedStore& target, bool isHostRole, u64 account, uint64_t generation);
 

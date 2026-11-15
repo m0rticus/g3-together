@@ -22,11 +22,17 @@ REPUTATION_POLICY_TARGET = _testbuild.register_target(
 
 TOUCHED_SRC_FILES = (
     "reputation_policy.h",
+    "story_internal.h",
     "story.cpp",
+    "story_domains.cpp",
+    "story_qa.cpp",
     "story.h",
     "enclaves.cpp",
     "enclaves.h",
+    "infocmd_internal.h",
     "infocmd.cpp",
+    "infocmd_progression.cpp",
+    "infocmd_sector.cpp",
     "net.h",
     "net_messages.cpp",
     "net_session.cpp",
@@ -51,9 +57,15 @@ class ReputationSyncTests(unittest.TestCase):
         net_h = _testbuild.src_text("net.h")
         net_messages = _testbuild.src_text("net_messages.cpp")
         net_session = _testbuild.src_text("net_session.cpp")
-        story = _testbuild.src_text("story.cpp")
+        story_internal = _testbuild.src_text("story_internal.h")
+        story_domains = _testbuild.src_text("story_domains.cpp")
+        story_core = _testbuild.src_text("story.cpp")
+        story = "\n".join((story_internal, story_domains, story_core))
         enclaves = _testbuild.src_text("enclaves.cpp")
-        infocmd = _testbuild.src_text("infocmd.cpp")
+        infocmd = "\n".join(
+            _testbuild.src_text(name)
+            for name in ("infocmd.cpp", "infocmd_progression.cpp", "infocmd_sector.cpp")
+        )
         saving_policy = _testbuild.src_text("saving_policy.h")
 
         # Wire protocol constants & pre-admission StoryHandshake admission.
@@ -64,13 +76,17 @@ class ReputationSyncTests(unittest.TestCase):
         self.assertIn("Protocol = 79", saving_policy)
 
         # Story domain ordering, pre-admission cutover mask 0x3f, client QuestApply fame guard, and host quest flush.
-        self.assertIn('{net::StateReputation, "reputation", &ReputationReady, &ReputationSnapshot, &ReputationApply}', story)
-        self.assertLess(story.index('net::StateQuests, "quests"'), story.index('net::StateReputation, "reputation"'))
-        self.assertIn("replay.sent != 0x3f", story)
-        self.assertIn("if (net::IsHost() && d->kind == net::StateReputation)", story)
-        self.assertIn("if (d.kind == net::StateReputation && !net::IsHost()) return;", story)
-        self.assertIn("if (d->kind == net::StateQuests) FlushReputation();", story)
-        quest_apply = story[story.index("bool QuestApply("):story.index("void QuestRuntimeSnapshot(")]
+        self.assertIn('{net::StateReputation, "reputation", &ReputationReady, &ReputationSnapshot, &ReputationApply}', story_domains)
+        self.assertLess(
+            story_domains.index('net::StateQuests, "quests"'),
+            story_domains.index('net::StateReputation, "reputation"'),
+        )
+        self.assertIn("static_assert(AllDomainsSentMask == 0x3f", story_internal)
+        self.assertIn("replay.sent != AllDomainsSentMask", story_core)
+        self.assertIn("if (net::IsHost() && d->kind == net::StateReputation)", story_core)
+        self.assertIn("if (d.kind == net::StateReputation && !net::IsHost()) return;", story_core)
+        self.assertIn("if (d->kind == net::StateQuests) FlushReputation();", story_core)
+        quest_apply = story_domains[story_domains.index("bool QuestApply("):story_domains.index("void QuestRuntimeSnapshot(")]
         self.assertIn("const bool preserveRep = !net::IsHost() && ReputationReady();", quest_apply)
         self.assertIn("ReputationApply(repKey.c_str(), repVal);", quest_apply)
 

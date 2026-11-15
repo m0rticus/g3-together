@@ -204,14 +204,24 @@ def sample(pid: int) -> str:
         context = Wow64Context()
         context.ContextFlags = WOW64_CONTEXT_FULL
         stack = b""
+        context_ok = False
+        failure = ""
         if kernel.Wow64SuspendThread(thread) not in (-1, 0xFFFFFFFF):
             try:
                 if kernel.Wow64GetThreadContext(thread, ctypes.byref(context)):
+                    context_ok = True
                     stack = read_stack(process, context.Esp, kernel)
+                else:
+                    failure = f"context-failed error={ctypes.get_last_error()}"
             finally:
                 kernel.ResumeThread(thread)
+        else:
+            failure = f"suspend-failed error={ctypes.get_last_error()}"
         born = created(thread, kernel)
         kernel.CloseHandle(thread)
+        if not context_ok:
+            blocks.append((born, f"thread {tid} {failure}"))
+            continue
         frames = []
         for at in range(0, len(stack) - 3, 4):
             value = int.from_bytes(stack[at:at + 4], "little")
@@ -224,7 +234,7 @@ def sample(pid: int) -> str:
             f"thread {tid} eip={where(context.Eip, mods) or hex(context.Eip)} "
             f"esp={context.Esp:#x} ebp={context.Ebp:#x}"
         )
-        blocks.append((born, head + "\n" + "\n".join(frames)))
+        blocks.append((born, head + ("\n" + "\n".join(frames) if frames else "")))
     kernel.CloseHandle(process)
     return (
         f"hangstack: process {pid}, {len(blocks)} threads, {len(mods)} modules; oldest thread first\n"

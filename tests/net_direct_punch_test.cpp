@@ -220,12 +220,11 @@ std::vector<RelayDrop> TakeRelayDrops() { return {}; }
 std::vector<DirectOffer> DirectOffers() { return fakeDirectOffers; }
 void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t hostIp, uint16_t port)
 {
-    for (auto& ep : registeredEndpoints) {
-        if (ep.account == account && ep.generation == generation) {
-            ep.host = hostIp;
-            ep.port = port;
-            return;
-        }
+    if (!hostIp || hostIp == 0xffffffffu || !port) return;
+    const uint8_t firstOctet = static_cast<uint8_t>(hostIp & 0xffu);
+    if (firstOctet == 0 || firstOctet >= 224) return;
+    for (auto const& ep : registeredEndpoints) {
+        if (ep.account == account && ep.generation == generation) return;
     }
     registeredEndpoints.push_back({account, generation, hostIp, port, 0});
 }
@@ -332,9 +331,19 @@ void TestDirectPunchRoleValidationAndEndpointLock()
     assert(!directSessions[0].inboundVerified);
     assert(registeredEndpoints.empty());
 
-    // 2) Legitimate client-role (role == 2) packet verifies the endpoint and sends ACK (0x02).
+    // 1b) Invalid / loopback / multicast / broadcast / relay-port source addresses MUST be rejected even with a valid client-role probe.
     socketSent.clear();
     auto clientProbe = MakePunchPacket(offer.cookie, 0x03u, 2u);
+    for (ENetAddress badAddr : {ENetAddress{0x0100007fu, 41000}, ENetAddress{0x0100007fu, 30001},
+                                ENetAddress{0u, 41000}, ENetAddress{0xffffffffu, 41000},
+                                ENetAddress{0x010000e0u, 41000}, ENetAddress{0x0201A8C0u, 0}}) {
+        assert(InjectDatagram(badAddr, clientProbe) == 1);
+        assert(!directSessions[0].inboundVerified);
+        assert(socketSent.empty());
+        assert(registeredEndpoints.empty());
+    }
+
+    // 2) Legitimate client-role (role == 2) packet verifies the endpoint and sends ACK (0x02).
     const ENetAddress legitimateAddr{0x0201A8C0u, 41000};
     assert(InjectDatagram(legitimateAddr, clientProbe) == 1);
     assert(directSessions[0].inboundVerified);
@@ -342,6 +351,13 @@ void TestDirectPunchRoleValidationAndEndpointLock()
     assert(directSessions[0].verifiedAddress.host == legitimateAddr.host);
     assert(directSessions[0].verifiedAddress.port == legitimateAddr.port);
     assert(socketSent.size() == 1 && socketSent[0].bytes[24] == 0x02u && socketSent[0].bytes[25] == 1u);
+
+    // 2b) Pre-connect first-endpoint pinning: before ClaimAuthenticatedPeerIdentity runs, a replayed probe from
+    // another address MUST NOT migrate verifiedAddress away from the first verified endpoint!
+    auto preConnectHijack = MakePunchPacket(offer.cookie, 0x03u, 2u);
+    assert(InjectDatagram({0x5555A8C0u, 51111}, preConnectHijack) == 1);
+    assert(directSessions[0].verifiedAddress.host == legitimateAddr.host);
+    assert(directSessions[0].verifiedAddress.port == legitimateAddr.port);
 
     // Non-punch ENet traffic from verifiedAddress passes intercept (0), while spoofed IP is dropped (1).
     std::vector<uint8_t> enetPayload = {0x01, 0x02, 0x03, 0x04};
@@ -367,13 +383,37 @@ void TestDirectPunchRoleValidationAndEndpointLock()
     assert(InjectDatagram(hijackAddr, enetPayload) == 1);
     assert(InjectDatagram(legitimateAddr, enetPayload) == 0);
 
-    // 4) LeavePeer unlocks the session endpoint.
-    peers[2] = &fakePeersStorage[0];
-    fakePeersStorage[0].data = reinterpret_cast<void*>(uintptr_t(2));
+    // 3b) Direct peer replacing an older relay slot in HandleHello keeps endpointLocked set after LeavePeer drops the old peer.
+    ENetPeer& oldRelayPeer = fakePeersStorage[1];
+    oldRelayPeer.state = ENET_PEER_STATE_CONNECTED;
+    oldRelayPeer.address = {0x0100007fu, 30001};
+    oldRelayPeer.data = reinterpret_cast<void*>(uintptr_t(2));
+    peers[2] = &oldRelayPeer;
     peerAccounts[2] = 2001ull;
     peerRelayGenerations[2] = 77ull;
+    fakePeersStorage[0].state = ENET_PEER_STATE_CONNECTED;
+    fakePeersStorage[0].data = nullptr;
+    HandleHello(&fakePeersStorage[0], true, g3t::saving::Protocol, "DirectPeer", g3t::parity::Local());
+    assert(peers[2] == &fakePeersStorage[0]);
+    assert(directSessions[0].endpointLocked);
+
+    // 4) LeavePeer unlocks the session endpoint and broadcasts MsgLeave on ChannelState.
+    peerSent.clear();
+    peers[3] = &fakePeersStorage[2];
+    fakePeersStorage[2].state = ENET_PEER_STATE_CONNECTED;
+    fakePeersStorage[2].data = reinterpret_cast<void*>(uintptr_t(3));
     LeavePeer(&fakePeersStorage[0], "test-leave", true);
     assert(!directSessions[0].endpointLocked);
+    bool leaveOnStateChannel = false;
+    for (auto const& pkt : peerSent) {
+        if (!pkt.bytes.empty() && pkt.bytes[0] == MsgLeave) {
+            assert(pkt.channel == ChannelState);
+            assert((pkt.flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+            leaveOnStateChannel = true;
+        }
+    }
+    assert(leaveOnStateChannel);
+    peers[3] = nullptr;
 
     Stop();
 }

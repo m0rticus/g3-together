@@ -101,14 +101,15 @@ bool IncomingCombatAt(Track const& track, uint32_t sent)
 uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
 {
     const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
+    const int32_t rawDelta = static_cast<int32_t>(now - track.renderNow);
+    const uint32_t elapsed = rawDelta > 0 ? static_cast<uint32_t>(rawDelta) : 0u;
     if (!counted) {
         uint32_t result = !track.haveRenderTime ? desired
-            : track.renderSent + (now - track.renderNow) + static_cast<uint32_t>(shift - track.renderShift);
+            : track.renderSent + elapsed + static_cast<uint32_t>(shift - track.renderShift);
         if (!track.pendingEvents.empty() && static_cast<int32_t>(result - track.pendingEvents.front().sent) >= 0)
             result = track.pendingEvents.front().sent;
         return result;
     }
-    const uint32_t elapsed = now - track.renderNow;
     const bool hadRenderTime = track.haveRenderTime;
     const uint32_t previousRender = track.renderSent;
     track.combatClockProtected = IncomingCombatAt(track, track.haveRenderTime ? track.renderSent : desired);
@@ -148,17 +149,9 @@ uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
             ? previousRender : boundary;
         track.fractionalAdvance = 0.0;
     }
-    if (track.combatClockProtected &&
+    // Normal display clocks and incoming-combat windup holds both stop at the newest complete snapshot.
+    if ((track.combatClockProtected || shift <= 0) &&
         static_cast<int32_t>(track.renderSent - track.snaps[track.count - 1].sent) > 0) {
-        // Do not accumulate invisible time while an incoming windup's pose is held.
-        const uint32_t newest = track.snaps[track.count - 1].sent;
-        track.renderSent = hadRenderTime && static_cast<int32_t>(previousRender - newest) > 0
-            ? previousRender : newest;
-        track.fractionalAdvance = 0.0;
-    }
-    // Normal display clocks stop at the newest complete snapshot. Prediction uses
-    // a separate, bounded lead below, so a stall cannot consume unseen events.
-    if (shift <= 0 && static_cast<int32_t>(track.renderSent - track.snaps[track.count - 1].sent) > 0) {
         const uint32_t newest = track.snaps[track.count - 1].sent;
         track.renderSent = hadRenderTime && static_cast<int32_t>(previousRender - newest) > 0 ? previousRender : newest;
         track.fractionalAdvance = 0.0;

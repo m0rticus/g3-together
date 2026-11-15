@@ -240,16 +240,16 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     const bool leaseHit = npclease::LocalAuthority(victim.GetInstance());
     const int leaseHp = leaseHit ? HitPoints(victim) : 0;
     static thread_local int heroJudgeDepth = 0;
-    const bool trackHeroJudge = which <= 2 && localVictim;
-    if (trackHeroJudge) {
-        ++heroJudgeDepth;
-        downed::NoteHeroJudgedHit(attacker, true);
-    }
+    const bool localHeroJudge = which < 2 && localVictim;
+    const bool trackHeroJudge = localHeroJudge && heroJudgeDepth == 0;
+    struct HeroJudgeDepth {
+        bool active;
+        explicit HeroJudgeDepth(bool on) : active(on) { if (active) ++heroJudgeDepth; }
+        ~HeroJudgeDepth() { if (active) --heroJudgeDepth; }
+    } judgeDepth(localHeroJudge);
+    if (trackHeroJudge) downed::NoteHeroJudgedHit(attacker, true);
     auto observed = [&](GEInt result) {
-        if (trackHeroJudge) {
-            --heroJudgeDepth;
-            if (!result) downed::ClearHeroJudgedHit();
-        }
+        if (trackHeroJudge && !result) downed::ClearHeroJudgedHit();
         if (leaseHit) npclease::NoteHit(victim.GetInstance(), attacker, Judgements[which], leaseHp, HitPoints(victim));
         if (attacker && (attacker == hero || attacker == remote::ControlledBody()) && npcs::IsMirrored(victim.GetInstance())) {
             ++clientJudgements;

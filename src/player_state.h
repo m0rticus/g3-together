@@ -4,6 +4,17 @@
 #include <cstdint>
 
 namespace g3t::net {
+namespace PlayerFlags {
+constexpr uint8_t InGame = 1u << 0;
+constexpr uint8_t KnockedOut = 1u << 1;
+constexpr uint8_t Dead = 1u << 2;
+constexpr uint8_t Held = 1u << 3;
+constexpr uint8_t Robbable = 1u << 4;
+// When InGame is clear (activity-only states):
+constexpr uint8_t Loading = 1u << 5;
+constexpr uint8_t MenuOrNoHero = 1u << 6;
+}
+
 #pragma pack(push, 1)
 struct PlayerState
 {

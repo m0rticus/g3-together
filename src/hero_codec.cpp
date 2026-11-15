@@ -20,28 +20,6 @@ bool ParseInteger(std::string const& text, T& value)
     return result.ec == std::errc() && result.ptr == text.data() + text.size();
 }
 
-char const* ValidateStatsAndAttributes(ParsedRecord const& candidate)
-{
-    if (candidate.downed != 0 && candidate.downed != 1) return "invalid downed state";
-    if (candidate.level > 1000 || candidate.levelMax > 1000 ||
-        candidate.xp < 0 || candidate.xp > 100000000 ||
-        candidate.lpAttribs < 0 || candidate.lpAttribs > 100000 ||
-        candidate.lpPerks < 0 || candidate.lpPerks > 100000) {
-        return "level, experience or learn points out of range";
-    }
-    for (char const* tag : kTags) {
-        if (std::count_if(candidate.attrs.begin(), candidate.attrs.end(),
-                          [tag](saving::RecordAttribute const& at) { return at.tag == tag; }) != 1) {
-            return "an attribute missing or twice";
-        }
-    }
-    if (candidate.attrs.size() != sizeof(kTags) / sizeof(kTags[0])) return "an attribute this record does not know";
-    for (auto const& at : candidate.attrs) {
-        if (!saving::ValidRecordAttribute(at)) return "an attribute out of range";
-    }
-    return nullptr;
-}
-
 void AppendSection(std::vector<uint8_t>& payload, uint32_t type, uint32_t flags, std::vector<uint8_t> const& data)
 {
     saving::PutLe(payload, type, 4);
@@ -218,6 +196,28 @@ char const* const* AttributeTags(size_t& count)
 {
     count = sizeof(kTags) / sizeof(kTags[0]);
     return kTags;
+}
+
+char const* ValidateStatsAndAttributes(ParsedRecord const& candidate)
+{
+    if (candidate.downed != 0 && candidate.downed != 1) return "invalid downed state";
+    if (candidate.level > 1000 || candidate.levelMax > 1000 ||
+        candidate.xp < 0 || candidate.xp > 100000000 ||
+        candidate.lpAttribs < 0 || candidate.lpAttribs > 100000 ||
+        candidate.lpPerks < 0 || candidate.lpPerks > 100000) {
+        return "level, experience or learn points out of range";
+    }
+    for (char const* tag : kTags) {
+        if (std::count_if(candidate.attrs.begin(), candidate.attrs.end(),
+                          [tag](saving::RecordAttribute const& at) { return at.tag == tag; }) != 1) {
+            return "an attribute missing or twice";
+        }
+    }
+    if (candidate.attrs.size() != sizeof(kTags) / sizeof(kTags[0])) return "an attribute this record does not know";
+    for (auto const& at : candidate.attrs) {
+        if (!saving::ValidRecordAttribute(at)) return "an attribute out of range";
+    }
+    return nullptr;
 }
 
 char const* ValidateLogicalContents(std::vector<Stack> const& stacks, std::vector<std::string> const& spells,
@@ -449,22 +449,8 @@ char const* ParseBoundRecord(char const* data, size_t size, saving::Key const& e
     if (declaredStacks != candidate.stacks.size()) return "fewer stacks than the end line names";
     if (declaredSpells != candidate.spells.size() || declaredQuick != candidate.quicks.size())
         return "the quick_end counts do not match the inline spell and quick lines";
-    if (candidate.level > 1000 || candidate.levelMax > 1000 ||
-        candidate.xp < 0 || candidate.xp > 100000000 ||
-        candidate.lpAttribs < 0 || candidate.lpAttribs > 100000 ||
-        candidate.lpPerks < 0 || candidate.lpPerks > 100000) {
-        return "level, experience or learn points out of range";
-    }
-    for (char const* tag : kTags) {
-        if (std::count_if(candidate.attrs.begin(), candidate.attrs.end(),
-                          [tag](saving::RecordAttribute const& at) { return at.tag == tag; }) != 1) {
-            return "an attribute missing or twice";
-        }
-    }
-    if (candidate.attrs.size() != sizeof(kTags) / sizeof(kTags[0])) return "an attribute this record does not know";
-    for (auto const& at : candidate.attrs) {
-        if (!saving::ValidRecordAttribute(at)) return "an attribute out of range";
-    }
+    refused = ValidateStatsAndAttributes(candidate);
+    if (refused) return refused;
     refused = ValidateLogicalContents(candidate.stacks, candidate.spells, candidate.quicks, schema);
     if (refused) return refused;
 

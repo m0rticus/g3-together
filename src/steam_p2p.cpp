@@ -27,18 +27,15 @@ SOCKET LoopbackSocket(unsigned short* port)
     local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int size = sizeof(local);
     u_long nonBlocking = 1;
-    constexpr int RelayBuffer = 4 * 1024 * 1024;
-    DWORD off = FALSE, bytes = 0;
-    constexpr DWORD UdpConnReset = 0x9800000C;  // SIO_UDP_CONNRESET
     if (bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0 || ioctlsocket(s, FIONBIO, &nonBlocking) != 0 ||
         getsockname(s, reinterpret_cast<sockaddr*>(&local), &size) != 0 ||
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char const*>(&RelayBuffer), sizeof(RelayBuffer)) != 0 ||
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char const*>(&RelayBuffer), sizeof(RelayBuffer)) != 0) {
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char const*>(&net::PoseBurstBuffer), sizeof(net::PoseBurstBuffer)) != 0 ||
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char const*>(&net::PoseBurstBuffer), sizeof(net::PoseBurstBuffer)) != 0) {
         Logf("steam: cannot configure the owned loopback relay socket (WSA %d)", WSAGetLastError());
         closesocket(s);
         return INVALID_SOCKET;
     }
-    WSAIoctl(s, UdpConnReset, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
+    net::DisableWindowsUdpConnReset(s);
     if (port) *port = ntohs(local.sin_port);
     return s;
 }
@@ -76,13 +73,17 @@ unsigned GatherLocalIpv4s(uint32_t (&out)[8], bool allowLoopback)
     return count;
 }
 
-void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port, bool allowLoopback)
+void AddDirectCandidate(Remote& r, uint32_t netIpv4, uint16_t port, bool allowLoopback, bool replaceLastIfFull)
 {
-    if (!IsValidDirectCandidateEndpoint(netIpv4, port, allowLoopback) || r.directCandidateCount >= 8) return;
+    if (!IsValidDirectCandidateEndpoint(netIpv4, port, allowLoopback)) return;
     for (unsigned i = 0; i < r.directCandidateCount; ++i)
         if (r.directCandidates[i].hostIpv4 == netIpv4 && r.directCandidates[i].port == port)
             return;
-    r.directCandidates[r.directCandidateCount++] = DirectEndpoint{netIpv4, port};
+    if (r.directCandidateCount < 8) {
+        r.directCandidates[r.directCandidateCount++] = DirectEndpoint{netIpv4, port};
+    } else if (replaceLastIfFull) {
+        r.directCandidates[7] = DirectEndpoint{netIpv4, port};
+    }
 }
 
 void WorkerRuntime::ConfigureSocketOptions(int scope, intptr_t handle)
@@ -90,22 +91,15 @@ void WorkerRuntime::ConfigureSocketOptions(int scope, intptr_t handle)
     if (!networkingUtils || !api.SetConfigValue || !handle ||
         (scope != config::ListenSocketScope && scope != config::ConnectionScope))
         return;
-    auto readScoped = [&](int id) {
-        config::Read read;
-        if (!api.GetConfigValue) return read;
-        size_t size = sizeof(read.value);
-        read.result = api.GetConfigValue(networkingUtils, id, scope, handle, &read.type, &read.value, &size);
-        if (size != sizeof(read.value)) read.result = -1;
-        return read;
-    };
+    auto readScoped = [&](int id) { return ReadNetworkingConfig(id, scope, handle); };
     auto writeScoped = [&](int id, int32_t value) {
         return api.SetConfigValue(networkingUtils, id, scope, handle, config::Int32, &value) != 0;
     };
     const config::Read iceBefore = readScoped(config::P2PTransportIceEnable);
     if (scope == config::ListenSocketScope || !iceBefore.Valid() || iceBefore.value != config::IceEnableAll)
         writeScoped(config::P2PTransportIceEnable, config::IceEnableAll);
-    for (size_t i = 0; i < 3; ++i) {
-        auto const& setting = config::Settings[i];
+    for (auto const& setting : config::Settings) {
+        if (!setting.capacity && !setting.exact) continue;  // preserve-default settings (e.g. NagleTime)
         if (api.GetConfigValue) {
             const config::Applied applied = config::Apply(setting, readScoped, writeScoped);
             if (!applied.before.Valid()) writeScoped(setting.id, setting.capacity);
@@ -155,12 +149,13 @@ void WorkerRuntime::OpenClientP2P(Remote& r)
 
 void WorkerRuntime::SendDirectUdpControl(Remote& r)
 {
-    if (!directUdpEnabled || !enetPort || !r.haveDirectCookie) return;
+    const uint64_t wireGen = isHost ? r.generation : r.directOfferGeneration;
+    if (!directUdpEnabled || !enetPort || !r.haveDirectCookie || !wireGen) return;
     uint32_t localIps[8] = {};
     const unsigned ipCount = GatherLocalIpv4s(localIps);
     uint8_t frame[60] = {};
     frame[0] = 'U';
-    std::memcpy(frame + 1, &r.generation, 8);
+    std::memcpy(frame + 1, &wireGen, 8);
     std::memcpy(frame + 9, r.directCookie, 16);
     std::memcpy(frame + 25, &enetPort, 2);
     frame[27] = static_cast<uint8_t>(ipCount);
@@ -220,11 +215,11 @@ int WorkerRuntime::RawDataSend(Remote& r, send::Item const& item)
         std::size_t encodedSize = 0;
         const int result = SubmitSocketEnvelope(r, item.bytes.data(), size, item.Flags(), item.Lane(), encodedSize);
         if (result == ResultOk) {
-            ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
+            ++r.steamUnreliableOk;
             RecordAcceptedItemTraffic(item, encodedSize);
             return ResultOk;
         }
-        ++r.steamFailed[result >= 0 && result < 128 ? result : 0];
+        ++r.steamDataFailed[result >= 0 && result < 128 ? result : 0];
         ++sendFailures;
         const uint32_t now = Now();
         if (!lastSendFailure || now - lastSendFailure >= 5000) {
@@ -260,8 +255,12 @@ int WorkerRuntime::RawSend(u64 to, int flags, int channel, void const* data, uns
                                       flags | (channel == ChannelControl ? SendNoNagle : 0) | SendAutoRestart, channel);
     for (auto& r : remotes) {
         if (r.id != to) continue;
-        if (result == ResultOk) ++(flags & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
-        else ++r.steamFailed[result >= 0 && result < 128 ? result : 0];
+        if (result == ResultOk) {
+            ++(flags & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
+        } else {
+            auto& failed = channel == ChannelData ? r.steamDataFailed : r.steamControlFailed;
+            ++failed[result >= 0 && result < 128 ? result : 0];
+        }
         break;
     }
     if (result != ResultOk) {
@@ -272,34 +271,17 @@ int WorkerRuntime::RawSend(u64 to, int flags, int channel, void const* data, uns
             Logf("steam: message to %llu failed (result=%d channel=%d bytes=%u failures=%u)",
                  to, result, channel, size, sendFailures);
         }
-    } else if (channel == ChannelData) {
-        if (preParsedItem) {
-            RecordAcceptedItemTraffic(*preParsedItem, encodedSize);
-        } else {
-            ++traffic.txDatagrams;
-            traffic.txBytes += size;
-            traffic.txEnvelopeBytes += encodedSize;
-            ++traffic.txDataDatagrams;
-            traffic.txDataBytes += size;
-            auto const* bytes = static_cast<uint8_t const*>(data);
-            EnetPacketParse enet;
-            if (size >= 2 && !(bytes[0] & 0x40u) && ParseEnetDataPacket(bytes, size, &enet)) {
-                traffic.txEnetProtocolBytes += enet.protocolBytes;
-                traffic.txEnetAckBytes += enet.ackBytes;
-            } else {
-                std::vector<uint8_t> plain;
-                if (sendCodec && sendCodec->Decode(data, size, plain, &enet) && enet.valid) {
-                    traffic.txEnetProtocolBytes += enet.protocolBytes;
-                    traffic.txEnetAckBytes += enet.ackBytes;
-                } else {
-                    ++traffic.txEnetParseFailures;
-                }
-            }
-        }
+    } else if (channel == ChannelData && preParsedItem) {
+        RecordAcceptedItemTraffic(*preParsedItem, encodedSize);
     } else {
         ++traffic.txDatagrams;
         traffic.txBytes += size;
         traffic.txEnvelopeBytes += encodedSize;
+        if (channel == ChannelData) {
+            ++traffic.txDataDatagrams;
+            traffic.txDataBytes += size;
+            ++traffic.txEnetParseFailures;
+        }
     }
     return result;
 }
@@ -439,6 +421,7 @@ void WorkerRuntime::OnControl(Remote& r, char const* data, int size)
                 if (BCryptGenRandom(nullptr, r.directCookie, sizeof(r.directCookie),
                                     BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
                     r.haveDirectCookie = true;
+                    r.directOfferGeneration = r.generation;
                 }
             }
         }
@@ -472,13 +455,14 @@ void WorkerRuntime::OnControl(Remote& r, char const* data, int size)
         std::memcpy(&offerGen, data + 1, 8);
         std::memcpy(cookie, data + 9, 16);
         std::memcpy(&peerPort, data + 25, 2);
-        if (!peerPort) break;
+        if (!peerPort || !offerGen) break;
         if (isHost) {
             if (!r.linked || !r.haveDirectCookie || offerGen != r.generation ||
                 std::memcmp(cookie, r.directCookie, 16) != 0)
                 break;
         } else {
             if (r.id != owner) break;
+            r.directOfferGeneration = offerGen;
             std::memcpy(r.directCookie, cookie, 16);
             r.haveDirectCookie = true;
         }
@@ -498,7 +482,7 @@ void WorkerRuntime::OnControl(Remote& r, char const* data, int size)
             if (api.GetSessionConnectionInfo(messages, identity, &info, &status) == diagnostics::Connected) {
                 uint32_t reflexiveIp = 0;
                 if (ExtractReflexiveIpv4(info, reflexiveIp, allowLoopback))
-                    AddDirectCandidate(r, reflexiveIp, peerPort, allowLoopback);
+                    AddDirectCandidate(r, reflexiveIp, peerPort, allowLoopback, true);
             }
         }
         if (r.p2pConn && r.p2pConnected && api.GetConnectionInfo) {
@@ -506,7 +490,7 @@ void WorkerRuntime::OnControl(Remote& r, char const* data, int size)
             uint32_t reflexiveIp = 0;
             if (api.GetConnectionInfo(sockets, r.p2pConn, &info) &&
                 ExtractReflexiveIpv4(info, reflexiveIp, allowLoopback))
-                AddDirectCandidate(r, reflexiveIp, peerPort, allowLoopback);
+                AddDirectCandidate(r, reflexiveIp, peerPort, allowLoopback, true);
         }
         r.directReady = r.directCandidateCount != 0;
         if (!isHost && r.haveDirectCookie) SendDirectUdpControl(r);
@@ -626,53 +610,41 @@ void WorkerRuntime::DrainDatagrams(Remote& r)
 void WorkerRuntime::Forward()
 {
     char datagram[4096];
-    sockaddr_in from{};
-    int fromSize = sizeof(from);
+    auto pumpSocket = [&](SOCKET s, Remote* peer, bool captureClientEndpoint) {
+        for (int n = 0; n < 256; ++n) {
+            sockaddr_in from{};
+            int fromSize = sizeof(from);
+            const int size = recvfrom(s, datagram, sizeof(datagram), 0,
+                                      reinterpret_cast<sockaddr*>(&from), &fromSize);
+            if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
+            if (size <= 0) {
+                if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+                    ++socketFailures;
+                    socketError = WSAGetLastError();
+                }
+                break;
+            }
+            if ((isHost || enetPort) && ntohs(from.sin_port) != enetPort) continue;
+            if (captureClientEndpoint) {
+                enetAddress = from;
+                haveEnetAddress = true;
+            }
+            if (!peer || !peer->linked) continue;
+            if (!QueueDatagram(*peer, datagram, static_cast<unsigned>(size))) break;
+            if (n == 255) ++forwardCaps;
+        }
+        if (peer && peer->linked) DrainDatagrams(*peer);
+    };
     if (isHost) {
         for (auto& r : remotes) {
             if (!r.linked || r.socket == INVALID_SOCKET) continue;
-            for (int n = 0; n < 256; ++n) {
-                fromSize = sizeof(from);
-                const int size = recvfrom(r.socket, datagram, sizeof(datagram), 0,
-                                          reinterpret_cast<sockaddr*>(&from), &fromSize);
-                if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
-                if (size <= 0) {
-                    if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-                        ++socketFailures;
-                        socketError = WSAGetLastError();
-                    }
-                    break;
-                }
-                if (ntohs(from.sin_port) != enetPort) continue;
-                if (!QueueDatagram(r, datagram, static_cast<unsigned>(size))) break;
-                if (n == 255) ++forwardCaps;
-            }
-            if (r.linked) DrainDatagrams(r);
+            pumpSocket(r.socket, &r, false);
         }
         return;
     }
     if (relay == INVALID_SOCKET) return;
     Remote* host = owner ? Find(owner) : nullptr;
-    for (int n = 0; n < 256; ++n) {
-        fromSize = sizeof(from);
-        const int size = recvfrom(relay, datagram, sizeof(datagram), 0,
-                                  reinterpret_cast<sockaddr*>(&from), &fromSize);
-        if (size < 0 && WSAGetLastError() == WSAECONNRESET) continue;
-        if (size <= 0) {
-            if (size < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-                ++socketFailures;
-                socketError = WSAGetLastError();
-            }
-            break;
-        }
-        if (enetPort && ntohs(from.sin_port) != enetPort) continue;
-        enetAddress = from;
-        haveEnetAddress = true;
-        if (!host || !host->linked) continue;
-        if (!QueueDatagram(*host, datagram, static_cast<unsigned>(size))) break;
-        if (n == 255) ++forwardCaps;
-    }
-    if (host && host->linked) DrainDatagrams(*host);
+    pumpSocket(relay, host, true);
 }
 
 void WorkerRuntime::OnP2PStatusChanged(char const* p, int size)
@@ -709,7 +681,7 @@ void WorkerRuntime::OnP2PStatusChanged(char const* p, int size)
             uint32_t reflexiveIp = 0;
             const bool allowLoopback = AllowDirectLoopback();
             if (r->directPeerPort && ExtractReflexiveIpv4(info, reflexiveIp, allowLoopback)) {
-                AddDirectCandidate(*r, reflexiveIp, r->directPeerPort, allowLoopback);
+                AddDirectCandidate(*r, reflexiveIp, r->directPeerPort, allowLoopback, true);
                 r->directReady = r->directCandidateCount != 0;
             }
             Logf("steam-send: P2P lane session connected peer=%llu conn=%u lanes=%u relayed=%u",

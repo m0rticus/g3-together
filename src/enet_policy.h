@@ -7,6 +7,7 @@
 
 namespace g3t::net {
 constexpr enet_uint32 Mtu = 1200;
+constexpr int PoseBurstBuffer = 4 * 1024 * 1024;
 enum : uint8_t {
     ChannelState = 0, ChannelReliable = 1, ChannelNpcs = 2, ChannelCombat = 3,
     ChannelPoses = 4, ChannelPosesAlt = 5, ChannelBulk = 6, ChannelDefinitions = 7, ChannelCount = 8
@@ -49,7 +50,6 @@ inline ENetHost* CreateTransportHost(ENetAddress const* address, size_t peers, c
 #ifdef _WIN32
     DisableWindowsUdpConnReset(host->socket);
 #endif
-    constexpr int PoseBurstBuffer = 4 * 1024 * 1024;
     if (!error && (enet_socket_set_option(host->socket, ENET_SOCKOPT_RCVBUF, PoseBurstBuffer) < 0 ||
                   enet_socket_set_option(host->socket, ENET_SOCKOPT_SNDBUF, PoseBurstBuffer) < 0))
         error = "cannot configure the owned ENet socket for canonical pose bursts";

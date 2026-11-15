@@ -27,16 +27,6 @@ static_assert(npcplayback_hit_policy::PoseP2 == static_cast<int>(gEPose_P2));
 static_assert(npcplayback_hit_policy::PoseP3 == static_cast<int>(gEPose_P3));
 
 namespace {
-bool ReactionMotionResourceName(char const* name)
-{
-    if (!name || !*name) return false;
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return (lower.find("stumble") != std::string::npos || lower.find("hit") != std::string::npos) &&
-           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos;
-}
-
 bool KnockbackNonBarrierEntity(eCEntity* hit, eCEntity* self)
 {
     if (!hit) return false;
@@ -229,7 +219,8 @@ void CaptureEntityPoseBlend(eCEntity* entity, State& state, uint32_t now, float 
     auto* animation = Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     auto* skeleton = actor ? actor->GetInstance() : nullptr;
-    if (!skeleton || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096 || !(durationSec > 0.001f)) {
+    if (!skeleton || !skeleton->mNodes.mData || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096 ||
+        !(durationSec > 0.001f)) {
         state.poseBlend.active = false;
         return;
     }
@@ -255,7 +246,7 @@ bool EvaluateLocalActorPose(eCEntity* entity, NativePose& outPose)
     if (!entity || !actor || !actor->GetInstance() || !originalActorProcess) return false;
     originalActorProcess(actor, nullptr, entity->GetWorldMatrix(), GETrue, GEFalse, 0.0f);
     auto* skeleton = actor->GetInstance();
-    if (!skeleton || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096) return false;
+    if (!skeleton || !skeleton->mNodes.mData || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096) return false;
     outPose.instance = skeleton;
     outPose.nodes = skeleton->mNodes.mData;
     outPose.count = skeleton->mNodes.mLength;
@@ -340,7 +331,7 @@ float StartLocalHitKnockback(eCEntity* entity, eCEntity const* attacker, State& 
 bool StartLocalHitPresentation(eCEntity* entity, State& state, char const* motion, net::NpcMotion const& options,
                                uint32_t hit, uint32_t now, float playSpeed, eCEntity const* attacker, uint8_t reaction)
 {
-    if (!entity || !motion || !*motion || !hit || !options.active || !IsPassive(entity)) return false;
+    if (!entity || !motion || !*motion || !hit || !IsPassive(entity)) return false;
     if (Entity(entity).IsDead() || Entity(entity).IsDown()) return false;
     auto* animation = Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
@@ -499,7 +490,7 @@ bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reacti
                 for (auto const& candidate : {varied, stem}) {
                     bCString name(candidate);
                     name += extension;
-                    if (!ReactionMotionResourceName(name.GetText())) continue;
+                    if (!detail::ReactionResourceName(name.GetText())) continue;
                     if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate)) {
                         if (resource->SearchResourcePropertySet()) {
                             matchedAction = action;

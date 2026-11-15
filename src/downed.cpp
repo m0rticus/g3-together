@@ -227,10 +227,15 @@ void CancelAlone(char const* source)
     aloneSince = 0;
 }
 
+bool IsNpcAttacker(eCEntity const* attacker, eCEntity const* self)
+{
+    return attacker && attacker != self && !remote::IsPuppet(attacker) &&
+           attacker->GetPropertySet(eEPropertySetType_NPC);
+}
+
 bool IsLethalNpcAttacker(eCEntity* attacker, Entity& hero)
 {
-    if (!attacker || attacker == hero.GetInstance() || remote::IsPuppet(attacker) ||
-        !attacker->GetPropertySet(eEPropertySetType_NPC))
+    if (!IsNpcAttacker(attacker, hero.GetInstance()))
         return true;
     Entity npc(attacker);
     const int species = static_cast<int>(npc.NPC.Species);
@@ -271,8 +276,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
         } else {
             lastJudgedHitValid = false;
             eCEntity* attacker = hero.NPC.GetCurrentAttacker().GetInstance();
-            if (attacker && attacker != self && !remote::IsPuppet(attacker) &&
-                attacker->GetPropertySet(eEPropertySetType_NPC)) {
+            if (IsNpcAttacker(attacker, self)) {
                 Entity npc(attacker);
                 lethalDefeat = IsLethalNpcAttacker(attacker, hero);
                 attackerName = npc.GetName().GetText();
@@ -284,6 +288,8 @@ bool RedirectDeath(eCEntity* self, char const* state)
     hero.Routine.FullStop();
     hero.Routine.SetTask(bCString(KnockOutTask));
     if (!lethalDefeat) {
+        MaintainHp maintenance;
+        hero.Routine.AIMode = gEAIMode_Down;
         lethal = false;
         lethalSeenDown = false;
         lethalBlowAt = 0;
@@ -646,8 +652,7 @@ void ClearBlow()
 bool IsLethalHeroAttacker(eCEntity* attacker)
 {
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || !attacker || attacker == hero || remote::IsPuppet(attacker) ||
-        !attacker->GetPropertySet(eEPropertySetType_NPC))
+    if (!hero || !IsNpcAttacker(attacker, hero))
         return true;
     return IsLethalNpcAttacker(attacker, Entity(hero));
 }
@@ -668,8 +673,7 @@ void NoteHeroJudgedHit(eCEntity* attacker, bool applied)
     const uint32_t now = net::Now();
     lastJudgedHitValid = true;
     lastJudgedHitAt = now ? now : 1;
-    if (!attacker || attacker == hero || remote::IsPuppet(attacker) ||
-        !attacker->GetPropertySet(eEPropertySetType_NPC)) {
+    if (!IsNpcAttacker(attacker, hero)) {
         lastJudgedLethal = true;
         lastJudgedSpecies = -1;
         lastJudgedReason = -1;

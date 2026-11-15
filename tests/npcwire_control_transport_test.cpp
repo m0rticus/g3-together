@@ -121,43 +121,24 @@ int main()
     // Old wire versions receive a refusal, never a welcome.
     Hello oldHello{};
     oldHello.type = MsgHello;
-    oldHello.version = 72;
     std::memcpy(oldHello.name, "old client", 11);
     Transmission oldHandshake;
     oldHandshake.bytes.resize(sizeof(oldHello));
-    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
     oldHandshake.flags = ENET_PACKET_FLAG_RELIABLE;
     fakePeers[1].data = nullptr;
-    transmissions.clear();
-    Deliver(&fakePeers[1], oldHandshake);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
     RefusedMsg refusal{};
-    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 72, host 79") != nullptr);
-    assert(!fakePeers[1].data && !peers[3]);
-    oldHello.version = 73;
-    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
-    transmissions.clear();
-    Deliver(&fakePeers[1], oldHandshake);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
-    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 73, host 79") != nullptr);
-    assert(!fakePeers[1].data && !peers[3]);
-    oldHello.version = 76;
-    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
-    transmissions.clear();
-    Deliver(&fakePeers[1], oldHandshake);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
-    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 76, host 79") != nullptr);
-    assert(!fakePeers[1].data && !peers[3]);
-    oldHello.version = 77;
-    std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
-    transmissions.clear();
-    Deliver(&fakePeers[1], oldHandshake);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
-    std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
-    assert(std::strstr(refusal.reason, "protocol 77, host 79") != nullptr);
+    for (uint32_t ver : {72u, 73u, 76u, 77u}) {
+        oldHello.version = ver;
+        std::memcpy(oldHandshake.bytes.data(), &oldHello, sizeof(oldHello));
+        transmissions.clear();
+        Deliver(&fakePeers[1], oldHandshake);
+        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
+        std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
+        char expected[32];
+        std::snprintf(expected, sizeof(expected), "protocol %u, host 79", ver);
+        assert(std::strstr(refusal.reason, expected) != nullptr);
+        assert(!fakePeers[1].data && !peers[3]);
+    }
     assert(!fakePeers[1].data && !peers[3]);
     fakePeers[1].data = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
     transmissions.clear();
@@ -219,100 +200,75 @@ int main()
     for (auto const& packet : batches) Deliver(&fakePeer, packet);
     assert(receivedRecords.size() == MaxNpcsPerMessage);
 
+    auto sendHostBatch = [&](NpcRecord const* recs, int n, bool reliable = false) {
+        isHost = true;
+        transmissions.clear();
+        SendNpcs(recs, n, reliable);
+        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+        return transmissions[0];
+    };
+    auto deliverClient = [&](Transmission const& pkt) {
+        transmissions.clear();
+        isHost = false;
+        Deliver(&fakePeer, pkt);
+    };
+
     // Reordering a mixed batch must not discard the still-new NPC merely
     // because another NPC already arrived in a newer packet.
-    isHost = true;
-    transmissions.clear();
-    SendNpcs(records, 2, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
-    const auto mixedOlder = transmissions[0];
-    transmissions.clear();
-    SendNpcs(records, 1, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
-    const auto oneNewer = transmissions[0];
-    transmissions.clear();
+    const auto mixedOlder = sendHostBatch(records, 2);
+    const auto oneNewer = sendHostBatch(records, 1);
     receivedRecords.clear();
-    isHost = false;
-    Deliver(&fakePeer, oneNewer);
+    deliverClient(oneNewer);
     Deliver(&fakePeer, mixedOlder);
     assert(receivedRecords.size() == 2);
     assert(receivedRecords[0].guid[0] == records[0].guid[0] &&
            receivedRecords[1].guid[0] == records[1].guid[0]);
 
     // Scalar changes stay compact and exact against the named baseline.
-    isHost = true;
-    transmissions.clear();
     records[0].hitPoints = 60;
     records[0].combatTarget = 0x87654321;
     records[0].action = 8;
-    SendNpcs(records, 1, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
-    const auto scalarPacket = transmissions[0];
-    transmissions.clear();
-    isHost = false;
-    Deliver(&fakePeer, scalarPacket);
+    const auto scalarPacket = sendHostBatch(records, 1);
+    deliverClient(scalarPacket);
     assert(receivedRecords.back().hitPoints == 60 && receivedRecords.back().combatTarget == 0x87654321 &&
            receivedRecords.back().action == 8);
-    isHost = true;
+
     // Reliable publication is bit-exact without repeating descriptor tables.
     records[0].position[0] += 0.123456f;
     records[0].motions[0].phase = 0.123456f;
     records[0].motions[0].weight = 0.654321f;
-    transmissions.clear();
-    SendNpcs(records, 1, true);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch &&
-           (transmissions[0].flags & ENET_PACKET_FLAG_RELIABLE));
-    const auto exactPacket = transmissions[0];
-    assert(exactPacket.channel == ChannelDefinitions &&
-           exactPacket.bytes[0] == MsgControlBatch);
-    transmissions.clear();
-    isHost = false;
-    Deliver(&fakePeer, exactPacket);
+    const auto exactPacket = sendHostBatch(records, 1, true);
+    assert(exactPacket.channel == ChannelDefinitions && (exactPacket.flags & ENET_PACKET_FLAG_RELIABLE));
+    deliverClient(exactPacket);
     assert(std::memcmp(&receivedRecords.back(), &records[0], sizeof(NpcRecord)) == 0);
-    isHost = true;
 
     // A changed immutable motion descriptor uses a relative motion override,
     // without replacing the named baseline or life.
-    transmissions.clear();
     records[0].motions[0].speed = 1.6f;
-    SendNpcs(records, 1, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
-    const auto changedCompact = transmissions[0];
+    const auto changedCompact = sendHostBatch(records, 1);
     const auto key = NpcKey(records[0].guid);
     const uint16_t token = controlStates.at(key).nextBaseline;
-    transmissions.clear();
-    isHost = false;
-    Deliver(&fakePeer, changedCompact);
-    assert(receivedRecords.back().hitPoints == 60);
-    assert(receivedRecords.back().motions[0].speed == 1.6f);
-    isHost = true;
+    deliverClient(changedCompact);
+    assert(receivedRecords.back().hitPoints == 60 && receivedRecords.back().motions[0].speed == 1.6f);
 
     // Extended active weight uses exact compact motion ticks without churning baselines.
     records[0].motions[0].weight = 2.0f;
+    Transmission lastWeight{};
     for (int i = 0; i < 10; ++i) {
-        transmissions.clear();
-        SendNpcs(records, 1, false);
-        assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
+        lastWeight = sendHostBatch(records, 1);
         assert(controlStates.at(key).nextBaseline == token);
     }
-    isHost = false;
-    Deliver(&fakePeer, transmissions[0]);
+    deliverClient(lastWeight);
     assert(receivedRecords.back().motions[0].weight == 2.0f);
-    isHost = true;
     records[0].motions[0].weight = 0.7f;
     records[0].position[0] += 40000.0f;
-    transmissions.clear();
-    SendNpcs(records, 1, false);
+    (void)sendHostBatch(records, 1);
     assert(controlStates.at(key).nextBaseline == token);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
 
     // Client rejoin loses its tables: the compact packet requests the ID and
     // the host resends the ID, baseline and latest gameplay record reliably.
     NpcRecord fresh = records[1];
-    transmissions.clear();
-    SendNpcs(&fresh, 1, false);
-    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlBatch);
-    const auto early = transmissions[0];
+    const auto early = sendHostBatch(&fresh, 1);
     transmissions.clear();
     isHost = false;
     SetInWorld(2, false);

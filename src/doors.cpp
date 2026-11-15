@@ -296,9 +296,11 @@ bool SettleForSave()
         _GUID raw;
         std::memcpy(&raw, entry->first.data(), 16);
         Entity object{bCPropertyID(bCGuid(raw))};
-        if (!Shared(object.GetInstance())) return false;
-        if (!Same(Read(object.GetInstance()), entry->second)) Apply(object.GetInstance(), entry->second);
-        if (!Same(Read(object.GetInstance()), entry->second)) return false;
+        eCEntity* instance = object.GetInstance();
+        if (!instance) { ++entry; continue; }
+        if (!Shared(instance)) { entry = wanted.erase(entry); continue; }
+        if (!Same(Read(instance), entry->second)) Apply(instance, entry->second);
+        if (!Same(Read(instance), entry->second)) return false;
         seen[entry->first] = entry->second;
         entry = wanted.erase(entry);
     }

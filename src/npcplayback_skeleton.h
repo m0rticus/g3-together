@@ -5,8 +5,10 @@
 #include "npclease_presentation.h"
 
 #include <Game.h>
+#include <Script.h>
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace g3t::npcplayback::detail {
@@ -64,6 +66,10 @@ bool PrepareTransforms(eCEntity* entity, eCVisualAnimation_PS& animation, State&
                        FindName names, NativePose& result);
 bool PresentMotion(eCVisualAnimation_PS& animation, eCWrapper_emfx2Actor& actor, int index,
                    char const* name, net::NpcMotion const& motion, bool restart);
+bool IdleResourceName(char const* name);
+bool ReactionResourceName(char const* name);
+eCResourceDataEntity* QueryNativeMotion(eCEntity* entity, gEAction action, gEPhase phase, bool reaction,
+                                        std::string* lastCandidate, char const** failureReason);
 
 void PruneSkeletonCache(uint32_t now);
 void ClearSkeletonCache();

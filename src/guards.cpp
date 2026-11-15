@@ -160,9 +160,8 @@ GEInt GE_STDCALL KillIntent(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
     const GEInt result = originalKill(spu, self, other, args);
     if (puppet) {
         ++killAsked;
-        eCEntity* judge = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
-        if (judge && judge->GetPropertySet(eEPropertySetType_NPC) && killAsked <= 40) {
-            Entity npc(judge);
+        if (judging && judging->GetPropertySet(eEPropertySetType_NPC) && killAsked <= 40) {
+            Entity npc(judging);
             Entity zone = Entity(puppet).GetZone();
             Logf("guards: %s means to kill a puppet: %d (attack reason %d, its target %s, puppet in %s, security %d)", npc.GetName().GetText(),
                  static_cast<int>(result), static_cast<int>(npc.NPC.AttackReason),
@@ -357,27 +356,30 @@ void Tick()
         static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
         auto* kill = reinterpret_cast<unsigned char*>(game) + 0x103b0;
         if (!std::memcmp(kill, prologue, sizeof(prologue))) originalKill = reinterpret_cast<gFScript>(ai::JumpTo(kill, reinterpret_cast<void*>(&KillIntent)));
+        struct CallbackHook {
+            char const* name;
+            gFScriptAICallback replacement;
+            gFScriptAICallback* original;
+            char const* label;
+        };
+        const CallbackHook hooks[] = {
+            {"OnReactToZone", &OnZone, &originalOnZone, "guards OnReactToZone callback"},
+            {"OnReactToWeapon", &OnWeapon, &originalOnWeapon, "guards OnReactToWeapon callback"},
+            {"OnAnimalSleep", &OnAnimalSleep, &originalOnSleep, "guards OnAnimalSleep callback"},
+        };
         GE_MAP_FOR_EACH (name, callback, GetScriptAdminExt().GetScriptAICallbacks())
         {
             if (!callback || !callback->m_funcScriptAICallback) continue;
-            if (!std::strcmp(name.GetText(), "OnReactToZone") && callback->m_funcScriptAICallback != &OnZone) {
-                originalOnZone = callback->m_funcScriptAICallback;
-                callback->m_funcScriptAICallback = &OnZone;
+            for (auto const& hook : hooks) {
+                if (std::strcmp(name.GetText(), hook.name) != 0 ||
+                    callback->m_funcScriptAICallback == hook.replacement)
+                    continue;
+                *hook.original = callback->m_funcScriptAICallback;
+                callback->m_funcScriptAICallback = hook.replacement;
                 ai::TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
-                                 reinterpret_cast<void*>(originalOnZone),
-                                 reinterpret_cast<void*>(&OnZone), "guards OnReactToZone callback");
-            } else if (!std::strcmp(name.GetText(), "OnReactToWeapon") && callback->m_funcScriptAICallback != &OnWeapon) {
-                originalOnWeapon = callback->m_funcScriptAICallback;
-                callback->m_funcScriptAICallback = &OnWeapon;
-                ai::TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
-                                 reinterpret_cast<void*>(originalOnWeapon),
-                                 reinterpret_cast<void*>(&OnWeapon), "guards OnReactToWeapon callback");
-            } else if (!std::strcmp(name.GetText(), "OnAnimalSleep") && callback->m_funcScriptAICallback != &OnAnimalSleep) {
-                originalOnSleep = callback->m_funcScriptAICallback;
-                callback->m_funcScriptAICallback = &OnAnimalSleep;
-                ai::TrackPointer(reinterpret_cast<void*>(&callback->m_funcScriptAICallback),
-                                 reinterpret_cast<void*>(originalOnSleep),
-                                 reinterpret_cast<void*>(&OnAnimalSleep), "guards OnAnimalSleep callback");
+                                 reinterpret_cast<void*>(*hook.original),
+                                 reinterpret_cast<void*>(hook.replacement), hook.label);
+                break;
             }
         }
     }

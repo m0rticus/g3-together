@@ -41,29 +41,29 @@ inline bool Eligible(GuidCandidate const& candidate) noexcept
            !candidate.player && !candidate.controlled && !candidate.puppet;
 }
 
-inline std::vector<std::string> Union(std::vector<Candidate> const& candidates)
+namespace detail {
+template <typename CandidateT, typename KeyT, typename HashT = std::hash<KeyT>>
+std::vector<KeyT> UnionImpl(std::vector<CandidateT> const& candidates)
 {
-    std::vector<std::string> result;
+    std::vector<KeyT> result;
     result.reserve(candidates.size());
-    std::unordered_set<std::string> seen;
+    std::unordered_set<KeyT, HashT> seen;
     seen.reserve(candidates.size());
-    for (Candidate const& candidate : candidates) {
+    for (CandidateT const& candidate : candidates) {
         if (!Eligible(candidate) || !seen.insert(candidate.key).second) continue;
         result.push_back(candidate.key);
     }
     return result;
 }
+} // namespace detail
+
+inline std::vector<std::string> Union(std::vector<Candidate> const& candidates)
+{
+    return detail::UnionImpl<Candidate, std::string>(candidates);
+}
 
 inline std::vector<GuidKey> Union(std::vector<GuidCandidate> const& candidates)
 {
-    std::vector<GuidKey> result;
-    result.reserve(candidates.size());
-    std::unordered_set<GuidKey, GuidHash> seen;
-    seen.reserve(candidates.size());
-    for (GuidCandidate const& candidate : candidates) {
-        if (!Eligible(candidate) || !seen.insert(candidate.key).second) continue;
-        result.push_back(candidate.key);
-    }
-    return result;
+    return detail::UnionImpl<GuidCandidate, GuidKey, GuidHash>(candidates);
 }
 }

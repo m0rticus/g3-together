@@ -38,7 +38,7 @@ struct ObserverState final : gCInventoryListener {
 
 namespace {
 personal::Snapshot personalLedger;
-size_t personalLedgerBytes = 12;
+size_t personalLedgerBytes = personal::HeaderBytes;
 std::set<std::string> personalPending;
 std::set<std::string> personalErrors;
 std::set<std::string> personalRestoreErrors;
@@ -434,8 +434,10 @@ bool EnsurePersonal(Entity& entity)
     if (!ApplyPersonal(entity, row->second)) {
         if (personalRestoreErrors.insert(key).second)
             Logf("WARN containers: personal restore skipped for %s; keeping live inventory", NameOf(entity).c_str());
-        const size_t removedBytes = 20 + 25 * row->second.stacks.size();
-        personalLedgerBytes = personalLedgerBytes > 12 + removedBytes ? personalLedgerBytes - removedBytes : 12;
+        const size_t removedBytes = personal::EncodedRowBytes(row->second);
+        personalLedgerBytes = personalLedgerBytes > personal::HeaderBytes + removedBytes
+            ? personalLedgerBytes - removedBytes
+            : personal::HeaderBytes;
         personalLedger.erase(row);
         personalPending.erase(pending);
         ObservePersonal(entity);
@@ -469,8 +471,8 @@ bool RememberPersonal(Entity& entity)
         return false;
     }
     auto old = personalLedger.find(key);
-    const size_t oldSize = old == personalLedger.end() ? 0 : 20 + 25 * old->second.stacks.size();
-    const size_t newSize = 20 + 25 * row.stacks.size();
+    const size_t oldSize = old == personalLedger.end() ? 0 : personal::EncodedRowBytes(old->second);
+    const size_t newSize = personal::EncodedRowBytes(row);
     if ((old == personalLedger.end() && personalLedger.size() >= personal::MaxInventoryRows) ||
         personalLedgerBytes - oldSize + newSize > personal::Limit) {
         observer->changes.Refreshed();
@@ -555,7 +557,7 @@ void Reset()
     RetirePersonalObservers();
     items::OnWorldChange();
     personalLedger.clear();
-    personalLedgerBytes = 12;
+    personalLedgerBytes = personal::HeaderBytes;
     personalPending.clear();
     personalErrors.clear();
     personalRestoreErrors.clear();
@@ -566,7 +568,7 @@ void Reset()
     seenPersonalTradePage.clear();
 }
 
-bool Capture(std::vector<uint8_t>& out, bool (*installAccessGuards)())
+bool Capture(std::vector<uint8_t>& out, AccessGuardFn installAccessGuards)
 {
     if (!PersonalAdmitted() || !installAccessGuards || !installAccessGuards()) {
         Log("FAIL containers: personal capture refused: admission or access guard unavailable");
@@ -587,11 +589,11 @@ bool Capture(std::vector<uint8_t>& out, bool (*installAccessGuards)())
         if (EnsurePersonal(entity) && personalLedger.count(key)) RememberPersonal(entity);
     }
     personal::Snapshot combined;
-    size_t encodedBytes = 12;
+    size_t encodedBytes = personal::HeaderBytes;
     size_t inventories = 0;
     for (auto const& entry : personalLedger) {
         if (!personal::Id(entry.first) || !personal::Valid(entry.second)) continue;
-        const size_t rowBytes = 20 + 25 * entry.second.stacks.size();
+        const size_t rowBytes = personal::EncodedRowBytes(entry.second);
         if (inventories >= personal::MaxInventoryRows || combined.size() >= personal::MaxRows ||
             encodedBytes + rowBytes > personal::Limit) break;
         if (combined.emplace(entry).second) {
@@ -604,8 +606,8 @@ bool Capture(std::vector<uint8_t>& out, bool (*installAccessGuards)())
     for (auto const& entry : ground) {
         if (!personal::Id(entry.first) || entry.second.kind != personal::Kind::GroundTaken ||
             !personal::Valid(entry.second) || combined.count(entry.first)) continue;
-        if (combined.size() >= personal::MaxRows || encodedBytes + 20 > personal::Limit) break;
-        if (combined.emplace(entry).second) encodedBytes += 20;
+        if (combined.size() >= personal::MaxRows || encodedBytes + personal::RowHeaderBytes > personal::Limit) break;
+        if (combined.emplace(entry).second) encodedBytes += personal::RowHeaderBytes;
     }
     if (!personal::Encode(combined, out)) {
         Log("FAIL containers: personal snapshot encoding failed");
@@ -614,7 +616,7 @@ bool Capture(std::vector<uint8_t>& out, bool (*installAccessGuards)())
     return true;
 }
 
-bool Restore(std::vector<uint8_t> const& bytes, bool (*installAccessGuards)())
+bool Restore(std::vector<uint8_t> const& bytes, AccessGuardFn installAccessGuards)
 {
     personal::Snapshot snapshot;
     if (!bytes.empty() && !personal::Decode(bytes, snapshot)) {
@@ -632,8 +634,8 @@ bool Restore(std::vector<uint8_t> const& bytes, bool (*installAccessGuards)())
     }
     RetirePersonalObservers();
     personalLedger.swap(snapshot);
-    personalLedgerBytes = 12;
-    for (auto const& entry : personalLedger) personalLedgerBytes += 20 + 25 * entry.second.stacks.size();
+    personalLedgerBytes = personal::HeaderBytes;
+    for (auto const& entry : personalLedger) personalLedgerBytes += personal::EncodedRowBytes(entry.second);
     personalPending.clear();
     personalErrors.clear();
     personalRestoreErrors.clear();

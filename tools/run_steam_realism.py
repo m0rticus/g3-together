@@ -108,11 +108,26 @@ def build_peer(source_root, output_dir, fake_dll, header):
         includes=(source_root / "src", include_enet, header_dir),
         extra_deps=(source_cpp, header.resolve()),
     )
+    steam_split_units = [
+        _testbuild.unit(
+            split_cpp,
+            lang="c++",
+            std="c++17",
+            opt="-O2",
+            warnings="w3",
+            stdcall_gz=True,
+            defines=common_defs,
+            includes=(source_root / "src", include_enet),
+        )
+        for name in ("steam_p2p.cpp", "steam_flow.cpp", "steam_legacy_auto.cpp", "steam_diagnostics.cpp")
+        for split_cpp in ((source_root / "src" / name).resolve(),)
+        if split_cpp.is_file()
+    ]
     target = _testbuild.NativeTarget(
         "steam_realism_peer",
-        [peer_unit, *c_units],
+        [peer_unit, *steam_split_units, *c_units],
         toolchain="win32_cl",
-        libs=("ws2_32", "winmm"),
+        libs=("ws2_32", "winmm", "bcrypt"),
         register=False,
     )
     built = target.build()
@@ -372,11 +387,215 @@ def measured_load_reasons(metrics, expected_bps):
     return reasons
 
 
+def _eval_compressed_connect(hm, cm, merge):
+    hc = merge.get("native_connect_header_size", 0)
+    hv = merge.get("native_verify_header_size", 0)
+    observed_connect = merge.get("native_observed_connect_header", 0)
+    observed_verify = merge.get("native_observed_verify_header", 0)
+    outbound_connect = merge.get("native_outbound_connect_frames", 0)
+    outbound_verify = merge.get("native_outbound_verify_frames", 0)
+    if outbound_connect == 0 or observed_connect != 48:
+        return "NOT_REACHED", ["actual native 48-byte CONNECT was not emitted"]
+    if hc != 48:
+        return "FAIL", ["native ENet CONNECT classifier is " + str(hc) + " bytes, expected real48"]
+    if hv != 44:
+        return "FAIL", ["native ENet VERIFY_CONNECT classifier is " + str(hv) + " bytes, expected real44"]
+    hs, cs = hm.get("fake_stats") or {}, cm.get("fake_stats") or {}
+    if max(hs.get("callback504_count", 0), cs.get("callback504_count", 0)) == 0:
+        return "FAIL", ["no LobbyEnter callback504"]
+    if outbound_verify == 0:
+        return "FAIL", [
+            "actual native CONNECT was emitted but no VERIFY completed",
+            f"connect_frames={outbound_connect} verify_frames={outbound_verify}",
+        ]
+    if observed_verify != 44:
+        return "FAIL", [
+            "captured native command header mismatch",
+            f"CONNECT={observed_connect} VERIFY_CONNECT={observed_verify}",
+        ]
+    if not (hm.get("host_link_observed") and cm.get("host_link_observed") and
+            hm.get("enet_connected") and cm.get("enet_connected")):
+        return "FAIL", ["actual native CONNECT did not complete the real Steam/ENet handshake"]
+    return "PASS", ["native 48-byte CONNECT and 44-byte VERIFY_CONNECT"]
+
+
+def _eval_metadata(hm, cm, _merge):
+    hc, cc = hm.get("fake_config") or {}, cm.get("fake_config") or {}
+    delay = max(hc.get("metadata_delay_ms", 0), cc.get("metadata_delay_ms", 0))
+    hs, cs = hm.get("fake_stats") or {}, cm.get("fake_stats") or {}
+    callbacks504 = max(hs.get("callback504_count", 0), cs.get("callback504_count", 0))
+    linked = hm.get("host_link_observed") and cm.get("host_link_observed")
+    if delay != 300:
+        return "FAIL", ["metadata delay was not 300ms"]
+    if callbacks504 == 0:
+        return "FAIL", ["LobbyEnter callback504 was not observed"]
+    if not cm.get("lobby_enter_callback_observed"):
+        return "NOT_REACHED", ["no actual delivered client LobbyEnter callback"]
+    if not cm.get("metadata_empty_at_lobby_enter"):
+        return "FAIL", ["fixture did not expose empty metadata after LobbyEnter"]
+    if not cm.get("metadata_update_callback_observed"):
+        return "FAIL", ["empty metadata at actual LobbyEnter was not recovered through LobbyDataUpdate"]
+    if not linked:
+        return "FAIL", ["metadata Steam H/W link/hello/welcome progress was not observed"]
+    if cm.get("lobby_to_link_ms", hm.get("lobby_to_link_ms", 0)) + 1 < delay:
+        return "FAIL", ["Steam H/W link occurred before the 300ms metadata delay"]
+    return "PASS", ["metadata delay was observed after LobbyEnter and before Steam H/W link"]
+
+
+def _eval_connect(_hm, _cm, merge):
+    mismatch = merge.get("exact_reliable_payload_mismatch", 0)
+    sent = merge.get("exact_reliable_payloads_sent", 0)
+    received = merge.get("exact_reliable_payloads_received", 0)
+    if mismatch != 0:
+        return "FAIL", ["exact reliable payload mismatch=" + str(mismatch)]
+    if sent == 0:
+        return "NOT_REACHED", [
+            "real ENet exact reliable payload echo coverage was incomplete",
+            f"sent={sent} received={received}",
+        ]
+    if received == 0:
+        return "FAIL", ["connected peers sent real reliable payloads but none were delivered"]
+    return "PASS", [
+        "accepted synthetic command-line invite; both Steam links and both ENet peers connected",
+        f"exact reliable payload sent={sent} received={received}",
+    ]
+
+
+def _has_typical_profile(hm, cm):
+    for peer in (hm, cm):
+        cfg = peer.get("fake_config") or {}
+        if cfg.get("profile") != "steam-typical" or cfg.get("physical_rate_bps") != 262144 or cfg.get("nodelay_policy") != 0:
+            return False
+    return True
+
+
+def _eval_load_case(name, hm, cm, merge):
+    expected_bps = 400000
+    if name == "steady-load":
+        expected_bps = hm.get("app_bps_requested")
+        if isinstance(expected_bps, bool) or not isinstance(expected_bps, int) or expected_bps <= 0:
+            return "FAIL", ["steady-load has no explicit positive offered rate"]
+    reasons = measured_load_reasons(merge, expected_bps)
+    if reasons:
+        return "NOT_REACHED", reasons
+    if not _has_typical_profile(hm, cm):
+        return "FAIL", ["saturation did not use the stated typical physical profile"]
+    reasons = bounded_traffic_reasons(merge)
+    if merge.get("product_queue_slope_bytes_per_second", float("inf")) > 1024:
+        reasons.append("measured retained queue grows by more than 1024 B/s")
+    if merge.get("product_queue_bytes", float("inf")) > 262144:
+        reasons.append("measured final retained queue exceeds 256 KiB")
+    if merge.get("product_queue_oldest_ms", float("inf")) > 1000:
+        reasons.append("measured oldest retained datagram exceeds one second")
+    if merge.get("rtt_enet_p95_ms", float("inf")) > 1000:
+        reasons.append("measured native ENet RTT p95 exceeds one second")
+    refusals = sum((peer.get("fake_stats") or {}).get("result25_count", 0) for peer in (hm, cm))
+    if name == "saturation" and not refusals:
+        reasons.append("finite-buffer result25 path was not exercised")
+    if reasons:
+        return "FAIL", reasons
+    return "PASS", [
+        "measured 60-second offered load, retained backlog and critical latency are bounded",
+        f"offered_application_bps={expected_bps} result25={refusals}",
+    ]
+
+
+def _eval_bad(hm, cm, merge):
+    hs, cs = hm.get("fake_stats") or {}, cm.get("fake_stats") or {}
+    config = (hm.get("fake_config") or {}) or (cm.get("fake_config") or {})
+    if config.get("physical_rate_bps") != 102400:
+        return "FAIL", ["bad profile physical rate is not 102400 B/s"]
+    if config.get("loss_permille", 0) < 20:
+        return "FAIL", ["bad profile loss is not 2%"]
+    if config.get("jitter_ms", 0) < 150:
+        return "FAIL", ["bad profile jitter spike is not 150ms"]
+    if config.get("queue_delay_ms") != 2000:
+        return "FAIL", ["bad profile queue-delay fixture is not two seconds"]
+    reasons = bounded_traffic_reasons(merge, 2500, 5000)
+    if not hs.get("dropped_data_packets", 0) + cs.get("dropped_data_packets", 0):
+        reasons.append("configured loss never actually dropped a datagram")
+    if not hm.get("session_failed_callbacks", 0) + cm.get("session_failed_callbacks", 0):
+        reasons.append("no actual delivered session-failure callback")
+    if not hs.get("queue_delay_events", 0) + cs.get("queue_delay_events", 0):
+        reasons.append("no actual bufferbloat delay was exercised")
+    if max(hs.get("max_queue_delay_ms", 0), cs.get("max_queue_delay_ms", 0)) < 2000:
+        reasons.append("actual bufferbloat delay did not reach two seconds")
+    if cm.get("enet_connect_count", 0) < 2:
+        reasons.append("no second successful native ENet connection")
+    if not cm.get("recovered_echo_samples", 0):
+        reasons.append("no payload reply on the restored connection")
+    return ("FAIL", reasons) if reasons else (
+        "PASS", ["observed loss, session failure and bounded post-reconnect payload replies"])
+
+
+def _eval_rejoin(_hm, cm, _merge):
+    if cm.get("rejoin_count", 0) == 0:
+        return "FAIL", ["renewed accepted invite/rejoin was not injected"]
+    if cm.get("link_lost_count", 0) == 0:
+        return "FAIL", ["client leave/disconnect was not observed"]
+    if cm.get("enet_connect_count", 0) < 2 or cm.get("steam_link_count", 0) < 2:
+        return "FAIL", ["renewed ENet link did not reconnect"]
+    if not cm.get("recovered_echo_samples", 0):
+        return "FAIL", ["no payload reply after rejoining"]
+    return "PASS", ["client leave and renewed accepted invite/rejoin completed"]
+
+
+def _eval_compressible(hm, cm, merge):
+    if not _has_typical_profile(hm, cm):
+        return "FAIL", ["compressible workload did not use the stated typical physical profile"]
+    plain, wire = hm.get("steam_plain_tx_bytes"), hm.get("steam_wire_tx_bytes")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0
+           for v in (plain, wire)):
+        return "FAIL", ["no valid host application/wire traffic counters"]
+    ratio = plain / wire
+    if ratio < 1.1:
+        return "FAIL", ["host workload did not demonstrate real compression"]
+    reasons = measured_load_reasons(merge, 400000) + bounded_traffic_reasons(merge)
+    if reasons:
+        return "FAIL", reasons
+    if merge.get("product_queue_bytes", float("inf")) > 262144:
+        return "FAIL", ["compressible workload retained more than 256 KiB"]
+    if merge.get("product_queue_slope_bytes_per_second", float("inf")) > 1024:
+        return "FAIL", ["compressible workload retained queue keeps growing"]
+    if merge.get("product_queue_oldest_ms", float("inf")) > 1000:
+        return "FAIL", ["compressible workload retained a datagram for more than one second"]
+    return "PASS", [
+        "compressible 400000 B/s app case reports separate wire/app rates",
+        "host_plain_wire_ratio=" + str(ratio),
+    ]
+
+
+def _eval_refusal41(hm, cm, merge):
+    hs, cs = hm.get("fake_stats") or {}, cm.get("fake_stats") or {}
+    hc, cc = hm.get("fake_config") or {}, cm.get("fake_config") or {}
+    config = hc if hc.get("nodelay_policy") is not None else cc
+    if config.get("nodelay_policy") != 1:
+        return "FAIL", ["strict-no-delay-reject fixture was not active"]
+    if max(hs.get("result41_count", 0), cs.get("result41_count", 0)) == 0:
+        return "FAIL", ["no real flat-API result41 refusal was observed"]
+    if merge.get("exact_reliable_payload_mismatch", 0):
+        return "FAIL", ["strict-refusal exact payload mismatch"]
+    reasons = bounded_traffic_reasons(merge)
+    if reasons:
+        return "FAIL", reasons
+    return "PASS", ["synthetic 41 fixture: queue/41 handling, not Valve NoDelay behavior"]
+
+
+_CONNECTED_EVALUATORS = {
+    "connect": _eval_connect,
+    "saturation": lambda hm, cm, m: _eval_load_case("saturation", hm, cm, m),
+    "steady-load": lambda hm, cm, m: _eval_load_case("steady-load", hm, cm, m),
+    "bad": _eval_bad,
+    "rejoin": _eval_rejoin,
+    "compressible": _eval_compressible,
+    "refusal41": _eval_refusal41,
+}
+
+
 def evaluate_case(name, host, client, merge):
     if host.get("timed_out") or client.get("timed_out"):
         return "NOT_REACHED", ["process timeout"]
-    hm = host.get("metrics") or {}
-    cm = client.get("metrics") or {}
+    hm, cm = host.get("metrics") or {}, client.get("metrics") or {}
     if not hm or not cm:
         return "NOT_REACHED", ["peer metrics unavailable"]
     if "__metrics_error__" in hm or "__metrics_error__" in cm:
@@ -414,85 +633,9 @@ def evaluate_case(name, host, client, merge):
                     return "FAIL", [role + ": required numeric metric unavailable: " + key]
 
     if name == "compressed-connect":
-        hc = merge.get("native_connect_header_size", 0)
-        hv = merge.get("native_verify_header_size", 0)
-        observed_connect = merge.get("native_observed_connect_header", 0)
-        observed_verify = merge.get("native_observed_verify_header", 0)
-        outbound_connect = merge.get("native_outbound_connect_frames", 0)
-        outbound_verify = merge.get("native_outbound_verify_frames", 0)
-        compressed_connect = merge.get(
-            "native_outbound_compressed_connect_frames", 0)
-        compressed_verify = merge.get(
-            "native_outbound_compressed_verify_frames", 0)
-        if outbound_connect == 0 or observed_connect != 48:
-            return "NOT_REACHED", ["actual native 48-byte CONNECT was not emitted"]
-        if hc != 48:
-            return "FAIL", [
-                "native ENet CONNECT classifier is " + str(hc) +
-                " bytes, expected real48"
-            ]
-        if hv != 44:
-            return "FAIL", [
-                "native ENet VERIFY_CONNECT classifier is " + str(hv) +
-                " bytes, expected real44"
-            ]
-        hs = hm.get("fake_stats") or {}
-        cs = cm.get("fake_stats") or {}
-        if max(hs.get("callback504_count", 0),
-               cs.get("callback504_count", 0)) == 0:
-            return "FAIL", ["no LobbyEnter callback504"]
-        if outbound_connect == 0 or outbound_verify == 0:
-            return "FAIL", [
-                "actual native CONNECT was emitted but no VERIFY completed",
-                "connect_frames=" + str(outbound_connect) +
-                " verify_frames=" + str(outbound_verify),
-            ]
-        if observed_connect != 48 or observed_verify != 44:
-            return "FAIL", [
-                "captured native command header mismatch",
-                "CONNECT=" + str(observed_connect) +
-                " VERIFY_CONNECT=" + str(observed_verify),
-            ]
-        linked = hm.get("host_link_observed") and cm.get("host_link_observed")
-        connected = hm.get("enet_connected") and cm.get("enet_connected")
-        if not linked or not connected:
-            return "FAIL", [
-                "actual native CONNECT did not complete the real Steam/ENet handshake"
-            ]
-        return "PASS", [
-            "native 48-byte CONNECT and 44-byte VERIFY_CONNECT"
-        ]
-
+        return _eval_compressed_connect(hm, cm, merge)
     if name == "metadata":
-        hc = hm.get("fake_config") or {}
-        cc = cm.get("fake_config") or {}
-        delay = max(hc.get("metadata_delay_ms", 0), cc.get("metadata_delay_ms", 0))
-        hs = hm.get("fake_stats") or {}
-        cs = cm.get("fake_stats") or {}
-        callbacks504 = max(hs.get("callback504_count", 0),
-                           cs.get("callback504_count", 0))
-        linked = hm.get("host_link_observed") and cm.get("host_link_observed")
-        if delay != 300:
-            return "FAIL", ["metadata delay was not 300ms"]
-        if callbacks504 == 0:
-            return "FAIL", ["LobbyEnter callback504 was not observed"]
-        if not cm.get("lobby_enter_callback_observed"):
-            return "NOT_REACHED", ["no actual delivered client LobbyEnter callback"]
-        if not cm.get("metadata_empty_at_lobby_enter"):
-            return "FAIL", ["fixture did not expose empty metadata after LobbyEnter"]
-        if not cm.get("metadata_update_callback_observed"):
-            return "FAIL", ["empty metadata at actual LobbyEnter was not recovered through LobbyDataUpdate"]
-        if not linked:
-            return "FAIL", [
-                "metadata Steam H/W link/hello/welcome progress was not observed"
-            ]
-        lobby_to_link = cm.get("lobby_to_link_ms",
-                               hm.get("lobby_to_link_ms", 0))
-        if lobby_to_link + 1 < delay:
-            return "FAIL", ["Steam H/W link occurred before the 300ms metadata delay"]
-        return "PASS", [
-            "metadata delay was observed after LobbyEnter and before Steam H/W link"
-        ]
+        return _eval_metadata(hm, cm, merge)
 
     linked = hm.get("host_link_observed") and cm.get("host_link_observed")
     connected = hm.get("enet_connected") and cm.get("enet_connected")
@@ -502,159 +645,10 @@ def evaluate_case(name, host, client, merge):
         if name in ("bad", "rejoin") and (
                 hm.get("enet_connect_count", 0) or cm.get("enet_connect_count", 0)):
             return "FAIL", ["initial native connection completed but recovery did not complete"]
-        return "NOT_REACHED", [
-            "real Steam hello/welcome/ENet handshake did not complete"
-        ]
+        return "NOT_REACHED", ["real Steam hello/welcome/ENet handshake did not complete"]
 
-    if name == "connect":
-        mismatch = merge.get("exact_reliable_payload_mismatch", 0)
-        sent = merge.get("exact_reliable_payloads_sent", 0)
-        received = merge.get("exact_reliable_payloads_received", 0)
-        if mismatch != 0:
-            return "FAIL", ["exact reliable payload mismatch=" + str(mismatch)]
-        if sent == 0:
-            return "NOT_REACHED", [
-                "real ENet exact reliable payload echo coverage was incomplete",
-                "sent=" + str(sent) + " received=" + str(received),
-            ]
-        if received == 0:
-            return "FAIL", ["connected peers sent real reliable payloads but none were delivered"]
-        return "PASS", [
-            "accepted synthetic command-line invite; both Steam links and both ENet peers connected",
-            "exact reliable payload sent=" + str(sent) +
-            " received=" + str(received),
-        ]
-
-    if name in ("saturation", "steady-load"):
-        expected_bps = 400000
-        if name == "steady-load":
-            expected_bps = hm.get("app_bps_requested")
-            if (isinstance(expected_bps, bool) or
-                    not isinstance(expected_bps, int) or expected_bps <= 0):
-                return "FAIL", ["steady-load has no explicit positive offered rate"]
-        reasons = measured_load_reasons(merge, expected_bps)
-        if reasons:
-            return "NOT_REACHED", reasons
-        for peer in (hm, cm):
-            config = peer.get("fake_config") or {}
-            if (config.get("profile") != "steam-typical" or
-                    config.get("physical_rate_bps") != 262144 or
-                    config.get("nodelay_policy") != 0):
-                return "FAIL", ["saturation did not use the stated typical physical profile"]
-        reasons = bounded_traffic_reasons(merge)
-        if merge.get("product_queue_slope_bytes_per_second", float("inf")) > 1024:
-            reasons.append("measured retained queue grows by more than 1024 B/s")
-        if merge.get("product_queue_bytes", float("inf")) > 262144:
-            reasons.append("measured final retained queue exceeds 256 KiB")
-        if merge.get("product_queue_oldest_ms", float("inf")) > 1000:
-            reasons.append("measured oldest retained datagram exceeds one second")
-        if merge.get("rtt_enet_p95_ms", float("inf")) > 1000:
-            reasons.append("measured native ENet RTT p95 exceeds one second")
-        refusals = sum((peer.get("fake_stats") or {}).get("result25_count", 0)
-                       for peer in (hm, cm))
-        if name == "saturation" and not refusals:
-            reasons.append("finite-buffer result25 path was not exercised")
-        return ("FAIL", reasons) if reasons else (
-            "PASS", [
-                "measured 60-second offered load, retained backlog and critical latency are bounded",
-                "offered_application_bps=" + str(expected_bps) +
-                " result25=" + str(refusals),
-            ])
-
-    if name == "bad":
-        hs = hm.get("fake_stats") or {}
-        cs = cm.get("fake_stats") or {}
-        hfc = hm.get("fake_config") or {}
-        cfc = cm.get("fake_config") or {}
-        config = hfc if hfc else cfc
-        if config.get("physical_rate_bps") != 102400:
-            return "FAIL", ["bad profile physical rate is not 102400 B/s"]
-        if config.get("loss_permille", 0) < 20:
-            return "FAIL", ["bad profile loss is not 2%"]
-        if config.get("jitter_ms", 0) < 150:
-            return "FAIL", ["bad profile jitter spike is not 150ms"]
-        if config.get("queue_delay_ms") != 2000:
-            return "FAIL", ["bad profile queue-delay fixture is not two seconds"]
-        reasons = bounded_traffic_reasons(merge, 2500, 5000)
-        if not hs.get("dropped_data_packets", 0) + cs.get("dropped_data_packets", 0):
-            reasons.append("configured loss never actually dropped a datagram")
-        if not hm.get("session_failed_callbacks", 0) + cm.get("session_failed_callbacks", 0):
-            reasons.append("no actual delivered session-failure callback")
-        if not hs.get("queue_delay_events", 0) + cs.get("queue_delay_events", 0):
-            reasons.append("no actual bufferbloat delay was exercised")
-        if max(hs.get("max_queue_delay_ms", 0), cs.get("max_queue_delay_ms", 0)) < 2000:
-            reasons.append("actual bufferbloat delay did not reach two seconds")
-        if cm.get("enet_connect_count", 0) < 2:
-            reasons.append("no second successful native ENet connection")
-        if not cm.get("recovered_echo_samples", 0):
-            reasons.append("no payload reply on the restored connection")
-        return ("FAIL", reasons) if reasons else (
-            "PASS", ["observed loss, session failure and bounded post-reconnect payload replies"])
-
-    if name == "rejoin":
-        rejoin = cm.get("rejoin_count", 0)
-        if rejoin == 0:
-            return "FAIL", ["renewed accepted invite/rejoin was not injected"]
-        if cm.get("link_lost_count", 0) == 0:
-            return "FAIL", ["client leave/disconnect was not observed"]
-        if cm.get("enet_connect_count", 0) < 2 or cm.get("steam_link_count", 0) < 2:
-            return "FAIL", ["renewed ENet link did not reconnect"]
-        if not cm.get("recovered_echo_samples", 0):
-            return "FAIL", ["no payload reply after rejoining"]
-        return "PASS", ["client leave and renewed accepted invite/rejoin completed"]
-
-    if name == "compressible":
-        for peer in (hm, cm):
-            config = peer.get("fake_config") or {}
-            if (config.get("profile") != "steam-typical" or
-                    config.get("physical_rate_bps") != 262144 or
-                    config.get("nodelay_policy") != 0):
-                return "FAIL", ["compressible workload did not use the stated typical physical profile"]
-        plain = hm.get("steam_plain_tx_bytes")
-        wire = hm.get("steam_wire_tx_bytes")
-        if any(isinstance(value, bool) or
-               not isinstance(value, (int, float)) or
-               not math.isfinite(value) or value <= 0
-               for value in (plain, wire)):
-            return "FAIL", ["no valid host application/wire traffic counters"]
-        ratio = plain / wire
-        if ratio < 1.1:
-            return "FAIL", ["host workload did not demonstrate real compression"]
-        reasons = measured_load_reasons(merge, 400000)
-        reasons += bounded_traffic_reasons(merge)
-        if reasons:
-            return "FAIL", reasons
-        if merge.get("product_queue_bytes", float("inf")) > 262144:
-            return "FAIL", ["compressible workload retained more than 256 KiB"]
-        if merge.get("product_queue_slope_bytes_per_second", float("inf")) > 1024:
-            return "FAIL", ["compressible workload retained queue keeps growing"]
-        if merge.get("product_queue_oldest_ms", float("inf")) > 1000:
-            return "FAIL", ["compressible workload retained a datagram for more than one second"]
-        return "PASS", [
-            "compressible 400000 B/s app case reports separate wire/app rates",
-            "host_plain_wire_ratio=" + str(ratio),
-        ]
-
-    if name == "refusal41":
-        hs = hm.get("fake_stats") or {}
-        cs = cm.get("fake_stats") or {}
-        hc = hm.get("fake_config") or {}
-        cc = cm.get("fake_config") or {}
-        config = hc if hc.get("nodelay_policy") is not None else cc
-        count41 = max(hs.get("result41_count", 0), cs.get("result41_count", 0))
-        if config.get("nodelay_policy") != 1:
-            return "FAIL", ["strict-no-delay-reject fixture was not active"]
-        if count41 == 0:
-            return "FAIL", ["no real flat-API result41 refusal was observed"]
-        exactMismatch = merge.get("exact_reliable_payload_mismatch", 0)
-        if exactMismatch:
-            return "FAIL", ["strict-refusal exact payload mismatch"]
-        reasons = bounded_traffic_reasons(merge)
-        if reasons:
-            return "FAIL", reasons
-        return "PASS", ["synthetic 41 fixture: queue/41 handling, not Valve NoDelay behavior"]
-
-    return "NOT_REACHED", ["unknown scenario"]
+    evaluator = _CONNECTED_EVALUATORS.get(name)
+    return evaluator(hm, cm, merge) if evaluator else ("NOT_REACHED", ["unknown scenario"])
 
 
 def main():

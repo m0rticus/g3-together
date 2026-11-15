@@ -149,15 +149,13 @@ void LeavePeer(ENetPeer* peer, char const* reason, bool disconnect)
     char name[24];
     strncpy_s(name, remotes[id].latest.name, _TRUNCATE);
     peer->data = nullptr;
-    for (auto& session : directSessions)
-        if (session.account == account && session.generation == relayGeneration)
-            session.endpointLocked = false;
     if (disconnect) enet_peer_disconnect_now(peer, 0);
     Drop(id);
+    LockDirectSessionEndpoint(account, relayGeneration, false);
     if (!disconnect) steam::RequestHostRelayClose(account, relayGeneration, reason);
     const Leave leave{MsgLeave, id};
     for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i]) Send(peers[i], &leave, sizeof(leave), ChannelReliable, true);
+        if (peers[i]) Send(peers[i], &leave, sizeof(leave), ChannelState, true);
     Logf("peer: leave slot=%u steamid=%llu reason=%s clients=%u->%u",
          id, account, reason, before, ClientCount());
     if (handlers.peerLeft) handlers.peerLeft(id, name);
@@ -208,13 +206,6 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
     return true;
 }
 
-void SendBroadcastExcept(void const* data, size_t size, uint8_t channel, bool reliable, uint8_t except)
-{
-    if (!isHost) { SendToServer(data, size, channel, reliable); return; }
-    for (uint8_t i = 2; i < MaxPlayers; ++i)
-        if (peers[i] && i != except) Send(peers[i], data, size, channel, reliable);
-}
-
 void Drop(uint8_t id)
 {
     if (id == 0 || id >= MaxPlayers) return;
@@ -223,10 +214,7 @@ void Drop(uint8_t id)
     remotes[id] = Remote{};
     playerReceivers[id] = {};
     playerRequestAt[id] = 0;
-    for (auto& sender : playerSenders[id]) sender = {};
-    for (auto& senders : playerSenders) senders[id] = {};
-    for (auto& forced : forcePlayerFull[id]) forced = false;
-    for (auto& forced : forcePlayerFull) forced[id] = false;
+    ClearPeerPlayerTables(id);
     peers[id] = nullptr;
     peerAccounts[id] = 0;
     peerRelayGenerations[id] = 0;
@@ -336,7 +324,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             Log("net: compact player state has an invalid header");
             return;
         }
-        if (isHost) player = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        if (isHost) player = PeerSlotOf(peer);
         if (!player || player >= MaxPlayers || player == localId) return;
         PlayerState state;
         const auto status = playerReceivers[player].Decode(packet->data + 1, packet->dataLength - 1, state, player);
@@ -371,9 +359,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
                (packet->flags & ENET_PACKET_FLAG_RELIABLE)) {
         PlayerResyncMsg request{};
         std::memcpy(&request, packet->data, sizeof(request));
-        const uint8_t to = DestinationId(peer);
+        const uint8_t to = isHost ? PeerSlotOf(peer) : 1;
         if (!to || to >= MaxPlayers || !request.player || request.player >= MaxPlayers ||
-            (!isHost && (peer != server || request.player != localId))) return;
+            (!isHost && (!connected || peer != server || request.player != localId))) return;
         forcePlayerFull[to][request.player] = true;
     } else if (type == MsgControlId) {
         HandleControlId(peer, packet);
@@ -390,7 +378,7 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         if (!isHost) { Log("net: client NPC hit publication refused"); return; }
         HitNpcMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
-        message.from = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        message.from = PeerSlotOf(peer);
         static const uint8_t zero[16] = {};
         if (message.from < 2 || message.from >= MaxPlayers || message.to != 1 ||
             message.epoch != worldEpoch || !message.sequence ||
@@ -407,8 +395,13 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         HitPlayerMsg message{};
         std::memcpy(&message, packet->data, sizeof(message));
         if (message.delta < -1000000 || message.delta > 0) return;
-        if (isHost && message.attackerPlayer)
-            message.attackerPlayer = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
+        if (isHost) {
+            const uint8_t from = PeerSlotOf(peer);
+            if (!from || !message.to || message.to >= MaxPlayers || message.to == from) return;
+            if (message.attackerPlayer) message.attackerPlayer = from;
+        } else if (!connected || peer != server || message.to != localId) {
+            return;
+        }
         if (isHost && downed::PlayerInteractionFlags(message.to)) {
             Logf("net: player hit refused target=%u reason=%s", message.to,
                  downed::InteractionReason(downed::PlayerInteractionFlags(message.to)));
@@ -454,11 +447,12 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         if (handlers.goods) handlers.goods(header.player, header.epoch, header.serial, header.gold, entries, header.count);
     } else if (type == MsgWorldState && packet->dataLength == sizeof(WorldStateMsg)) {
-        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && peer != server)) return;
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && (!connected || peer != server))) return;
         WorldStateMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         message.state.routine[sizeof(message.state.routine) - 1] = 0;
         const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
+        if (isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) return;
         if (isHost && message.state.kind != 19 && !ClientWorldStateKind(message.state.kind)) return;
         if (isHost && (message.state.kind == 8 || message.state.kind == 9))
             message.state.npcClass = from;
@@ -493,8 +487,6 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             return;
         }
         if (handlers.character) handlers.character(from, note, bytes);
-    } else if (type == MsgSave && packet->dataLength == sizeof(SaveMsg)) {
-        HandleSaveMessage(peer, packet);
     } else if (HandleGameplayMessage(peer, packet, type)) {
         return;
     } else if (type == MsgWorld && (packet->dataLength == sizeof(WorldMsg) || packet->dataLength == sizeof(HostWorldMsg))) {
@@ -546,8 +538,7 @@ void SetInWorld(uint8_t id, bool in)
         if (inWorld == in) return;
         inWorld = in;
         if (!in) for (auto& receiver : playerReceivers) receiver = {};
-        for (auto& senders : playerSenders) for (auto& sender : senders) sender = {};
-        for (auto& forced : forcePlayerFull) for (auto& flag : forced) flag = false;
+        ClearAllPlayerTables();
         if (!in) {
             for (uint8_t i = 0; i < MaxPlayers; ++i) ClearPresentation(i);
             ClearClientNpcTables();
@@ -573,10 +564,7 @@ void SetInWorld(uint8_t id, bool in)
     }
     clientInWorld[id] = in;
     playerReceivers[id] = {};
-    for (auto& sender : playerSenders[id]) sender = {};
-    for (auto& senders : playerSenders) senders[id] = {};
-    for (auto& forced : forcePlayerFull[id]) forced = false;
-    for (auto& forced : forcePlayerFull) forced[id] = false;
+    ClearPeerPlayerTables(id);
     if (in) {
         ++joins;
         for (uint8_t from = 2; from < MaxPlayers; ++from)
@@ -828,29 +816,7 @@ void Service(PlayerState const& local, bool haveLocal)
              !isHost && startedAt ? enet_time_get() - startedAt : 0);
     FlushGoodsReplays();
     const uint32_t now = enet_time_get();
-    if (!isHost) {
-        const uint64_t publishedGeneration = steam::HostRelayGeneration();
-        const bool published = publishedGeneration != 0;
-        if (!published) linkEnding = false;
-        const bool linked = published && !linkEnding;
-        if (linked && !steamLinked) {
-            steamLinked = true;
-            hostRelayGeneration = publishedGeneration;
-            connectLogged = false;
-            refused = false;
-            refusalReason[0] = '\0';
-            everConnected = false;
-            startedAt = now;
-            lastConnectAttempt = now - 3001;
-            Log("net: the Steam link to the host is up; ENet connects through the relay");
-        } else if (!linked && steamLinked) {
-            const auto flow = steam::Flow();
-            Logf("enet: relay closed role=client reason=%s state=%s elapsed_ms=%u",
-                 flow.endReason[0] ? flow.endReason : "relay no longer published",
-                 EnetPeerStateName(server ? server->state : ENET_PEER_STATE_DISCONNECTED), now - startedAt);
-            CloseClientLink();
-        }
-    }
+    SyncClientSteamLink(now);
     if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {
         DirectPunchSession* direct = FindClientDirectSession();
         if (!ClientPunchWaiting(direct, now)) {
@@ -958,15 +924,20 @@ void Reconnect(void (*log)(char const*))
     activitySent = false;
     lastActivitySend = 0;
     for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
-    DirectPunchSession* direct = nullptr;
-    for (auto& s : directSessions)
-        if (s.account && s.generation == hostRelayGeneration) { direct = &s; break; }
-    const bool useDirect = direct && direct->bidirectionalVerified && !direct->directFailed;
-    const ENetAddress connectTo = useDirect ? direct->verifiedAddress : target;
+    DirectPunchSession* direct = FindClientDirectSession();
+    bool useDirect = direct && direct->bidirectionalVerified && !direct->directFailed;
+    ENetAddress connectTo = useDirect ? direct->verifiedAddress : target;
     server = useDirect
         ? ConnectTransportHost(host, &direct->verifiedAddress, DirectCookieTag(direct->cookie))
         : ConnectTransportHost(host, &target);
-    if (direct) {
+    if (useDirect && !server) {
+        direct->directFailed = true;
+        direct->connectStarted = false;
+        direct->endpointLocked = false;
+        useDirect = false;
+        connectTo = target;
+        server = ConnectTransportHost(host, &target);
+    } else if (direct) {
         direct->connectStarted = useDirect && server != nullptr;
         if (direct->connectStarted) direct->endpointLocked = true;
     }
@@ -982,6 +953,7 @@ void Reconnect(void (*log)(char const*))
 } // namespace g3t::net
 
 #ifndef G3T_NET_SEPARATE_TUS
+#include "net_direct.cpp"
 #include "net_session.cpp"
 #include "net_npc.cpp"
 #include "net_npc_pose.cpp"

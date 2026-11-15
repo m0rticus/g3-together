@@ -417,6 +417,10 @@ int main() {
         self.assertIn("npcplayback_hit_policy::HostHitStampExpired", npc_send)
         self.assertIn("NPCHITSYNC stage=host-ack", npc_contact)
         self.assertIn("NPCATTACK stage=local-miss", npc_contact)
+        # StartLocalHitPresentation must work even when host slot 0 was inactive; Replay must abort before AdvanceHitKnockback.
+        self.assertNotIn("!options.active", playback_hit)
+        self.assertLess(playback.index("if (!local && !holdEcho && !havePose) return false;"),
+                        playback.index("npcplayback_hit_policy::AdvanceHitKnockback("))
 
 
 if __name__ == "__main__":

@@ -329,11 +329,25 @@ class NpcCorpseTests(unittest.TestCase):
         self.assertIn("!FiniteMatrix(entity->GetWorldMatrix()) || !ActorBonesFinite(animation)", capture)
 
     def test_corpse_ground_anchors_clear_across_world_lease_and_life_transitions(self):
-        self.assertIn("ClearCorpseGroundAnchors()", _testbuild.src_text("npc_identity.cpp"))
+        identity_cpp = _testbuild.src_text("npc_identity.cpp")
+        contact_cpp = _testbuild.src_text("npc_contact.cpp")
+        self.assertIn("ClearCorpseGroundAnchors()", identity_cpp)
         self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npcs.cpp"))
-        self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npc_contact.cpp"))
+        self.assertIn("ForgetCorpseGroundAnchor(key)", contact_cpp)
         self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npc_companions.cpp"))
         self.assertIn("ForgetCorpseGroundAnchor(key)", _testbuild.src_text("npc_send.cpp"))
+        # Journal corpses bind hostSession = net::WelcomeSerial() so PresenceFacts keeps them visible.
+        lay_corpse = section(self.corpse_cpp, "void LayDownCorpse(", "} // namespace g3t::npcs")
+        self.assertIn("c.hostSession = net::WelcomeSerial();", lay_corpse)
+        self.assertIn("existing->second.hostSession = net::WelcomeSerial();", lay_corpse)
+        corpse_tick = section(self.corpse_cpp, "void CorpseTick(", "void ForgetCorpseGroundAnchor(")
+        self.assertIn("c.hostSession = net::WelcomeSerial();", corpse_tick)
+        # PresentedContactPoints clamps mNodes.mLength via ragdoll::ClampedBoneCount(..., 128) to avoid off-by-one GetBoneMatrix overread.
+        self.assertIn("ragdoll::ClampedBoneCount(skeleton->mNodes.mLength, 128)", contact_cpp)
+        # Disconnect/host presence reconciliation restores hidden entries via hiddenClientStates without wiping out-of-ROI states.
+        reconcile = section(identity_cpp, "void ReconcileClientPresence()", "void ResetWorldNpcTables()")
+        self.assertNotIn("hiddenClientStates.clear()", reconcile)
+        self.assertIn("for (auto it = hiddenClientStates.begin(); it != hiddenClientStates.end();)", reconcile)
 
 
 if __name__ == "__main__":

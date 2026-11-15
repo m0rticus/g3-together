@@ -141,17 +141,27 @@ bool ReadDirectPeerIdentityLocked(uint32_t hostIpv4, uint16_t port, uint64_t& ac
                                   char (&name)[24], uint64_t& generation, uint32_t* expectedTag)
 {
     if (!store.published.ready || !rt.isHost || !hostIpv4 || !port) return false;
-    for (int i = 0; i < MaxRemotes; ++i) {
-        auto const& peer = store.published.peers[i];
-        if (!peer.account || !peer.directPinned) continue;
-        if (peer.verifiedDirect.hostIpv4 != hostIpv4 || peer.verifiedDirect.port != port) continue;
-        account = peer.account;
-        generation = peer.generation;
-        strcpy_s(name, peer.name);
-        if (expectedTag) *expectedTag = CookieTag(peer.directOffer.cookie);
-        return true;
+    for (auto const& pin : store.directPins) {
+        if (!pin.pinned || !pin.account || !pin.generation) continue;
+        if (pin.endpoint.hostIpv4 != hostIpv4 || pin.endpoint.port != port) continue;
+        for (auto const& peer : store.published.peers) {
+            if (peer.account != pin.account || peer.generation != pin.generation) continue;
+            account = peer.account;
+            generation = peer.generation;
+            strcpy_s(name, peer.name);
+            if (expectedTag) *expectedTag = CookieTag(peer.directOffer.cookie);
+            return true;
+        }
     }
     return false;
+}
+
+void CancelPendingRelayCloseLocked(uint64_t account, uint64_t generation)
+{
+    store.relayCloses.erase(std::remove_if(store.relayCloses.begin(), store.relayCloses.end(),
+        [account, generation](RelayClose const& request) {
+            return request.account == account && request.generation == generation;
+        }), store.relayCloses.end());
 }
 }
 
@@ -163,6 +173,9 @@ void InvalidatePublishedLocked(PublishedStore& target, bool isHostRole, u64 acco
         peer = PublishedPeer{};
         if (isHostRole && target.published.linked > 0) --target.published.linked;
     }
+    for (auto& pin : target.directPins)
+        if (pin.account == account && pin.generation == generation)
+            pin = DirectEndpointPin{};
     if (!isHostRole && target.published.hostGeneration == generation) {
         target.published.hostLinked = false;
         target.published.hostGeneration = 0;
@@ -193,18 +206,28 @@ void WorkerRuntime::Publish()
     strcpy_s(next.hostName, hostName);
     strcpy_s(next.error, error);
     FillConnection(next.connection);
-    int n = Format(next.status, "STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d "
-                   "send_failures=%u offset=%d error=%s session_id=%s isolated_drops=%u "
-                   "poll_timer=%s poll_gap_avg_ms=%.2f poll_gap_max_ms=%u pump_work_max_ms=%u receive_caps=%u forward_caps=%u "
-                   "socket_failures=%u socket_error=%d receive_failures=%u invalid_pongs=%u",
-                   GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, next.linked, next.ping,
-                   sendFailures, senderOffset, *error ? error : "-", GetLocalConfig().sessionId, isolatedDrops,
-                   store.pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum,
-                   receiveCaps, forwardCaps, socketFailures, socketError, receiveFailures, invalidPongs);
-    n += Format(next.status + n, sizeof(next.status) - n, " connect_mode=%s connect_state=%s why=%s",
-                connectionMode == connect::Mode::Auto ? "auto" : "invite",
-                isHost ? connect::StateName(hostFlow.state()) : connect::StateName(clientFlow.state()),
-                isHost ? "-" : connect::WhyName(clientFlow.why()));
+    size_t statusPos = 0;
+    auto appendStatus = [&](char const* fmt, ...) {
+        if (statusPos + 1 >= sizeof(next.status)) return;
+        va_list args;
+        va_start(args, fmt);
+        const int written = std::vsnprintf(next.status + statusPos, sizeof(next.status) - statusPos, fmt, args);
+        va_end(args);
+        if (written > 0)
+            statusPos = (std::min)(statusPos + static_cast<size_t>(written), sizeof(next.status) - 1);
+    };
+    appendStatus("STEAMSTATUS app=%u ready=%d role=%s lobby=%llu owner=%llu host=%s linked=%d ping=%d "
+                 "send_failures=%u offset=%d error=%s session_id=%s isolated_drops=%u "
+                 "poll_timer=%s poll_gap_avg_ms=%.2f poll_gap_max_ms=%u pump_work_max_ms=%u receive_caps=%u forward_caps=%u "
+                 "socket_failures=%u socket_error=%d receive_failures=%u invalid_pongs=%u",
+                 GothicAppId, ready ? 1 : 0, isHost ? "host" : "client", lobby, owner, hostName, next.linked, next.ping,
+                 sendFailures, senderOffset, *error ? error : "-", GetLocalConfig().sessionId, isolatedDrops,
+                 store.pollTimer ? "highres" : "legacy", pollGaps.Average(), pollGaps.maximum, pumpWork.maximum,
+                 receiveCaps, forwardCaps, socketFailures, socketError, receiveFailures, invalidPongs);
+    appendStatus(" connect_mode=%s connect_state=%s why=%s",
+                 connectionMode == connect::Mode::Auto ? "auto" : "invite",
+                 isHost ? connect::StateName(hostFlow.state()) : connect::StateName(clientFlow.state()),
+                 isHost ? "-" : connect::WhyName(clientFlow.why()));
     for (int i = 0; i < MaxRemotes; ++i) {
         auto const& r = remotes[i];
         if (!r.id) continue;
@@ -229,19 +252,17 @@ void WorkerRuntime::Publish()
             next.hostLinked = r.linked;
             if (r.linked) next.hostGeneration = r.generation;
         }
-        n += Format(next.status + n, sizeof(next.status) - n, " peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
-                    r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
-                    r.ping.milliseconds < 0 ? 0u : now - r.ping.sampledAt);
+        appendStatus(" peer=%llu:%d:%u:%u:%d ping_age_ms=%u", r.id,
+                     r.linked ? 1 : 0, r.toEnet, r.toSteam, r.ping.Value(now),
+                     r.ping.milliseconds < 0 ? 0u : now - r.ping.sampledAt);
     }
     std::lock_guard<std::mutex> lock(store.mutex);
-    for (int i = 0; i < MaxRemotes; ++i) {
-        auto const& prev = store.published.peers[i];
-        auto& cur = next.peers[i];
-        if (cur.account && cur.generation && prev.directPinned &&
-            prev.account == cur.account && prev.generation == cur.generation) {
-            cur.verifiedDirect = prev.verifiedDirect;
-            cur.directPinned = true;
-        }
+    for (auto& pin : store.directPins) {
+        if (!pin.pinned) continue;
+        bool active = false;
+        for (auto const& peer : next.peers)
+            if (peer.account == pin.account && peer.generation == pin.generation) { active = true; break; }
+        if (!active) pin = DirectEndpointPin{};
     }
     store.published = next;
 }
@@ -569,10 +590,7 @@ bool ClaimPeerIdentity(unsigned short port, uint64_t& account, char (&name)[24],
 {
     std::lock_guard<std::mutex> lock(store.mutex);
     if (!ReadPeerIdentityLocked(port, account, name, generation) || account == rt.me) return false;
-    store.relayCloses.erase(std::remove_if(store.relayCloses.begin(), store.relayCloses.end(),
-        [account, generation](RelayClose const& request) {
-            return request.account == account && request.generation == generation;
-        }), store.relayCloses.end());
+    CancelPendingRelayCloseLocked(account, generation);
     return true;
 }
 
@@ -592,17 +610,23 @@ void RegisterDirectPeerEndpoint(uint64_t account, uint64_t generation, uint32_t 
     if (!account || !generation || !IsValidDirectCandidateEndpoint(hostIpv4, port, AllowDirectLoopback()))
         return;
     std::lock_guard<std::mutex> lock(store.mutex);
-    for (int i = 0; i < MaxRemotes; ++i) {
-        auto& peer = store.published.peers[i];
-        if (peer.account != account || peer.generation != generation) continue;
-        if (peer.directPinned) {
-            if (peer.verifiedDirect.hostIpv4 == hostIpv4 && peer.verifiedDirect.port == port) return;
-            Logf("steam: refusing direct endpoint rebind for peer=%llu gen=%llu",
-                 static_cast<unsigned long long>(account), static_cast<unsigned long long>(generation));
-            return;
-        }
-        peer.verifiedDirect = DirectEndpoint{hostIpv4, port};
-        peer.directPinned = true;
+    bool peerActive = false;
+    for (auto const& peer : store.published.peers)
+        if (peer.account == account && peer.generation == generation) { peerActive = true; break; }
+    if (!peerActive) return;
+    for (auto& pin : store.directPins) {
+        if (!pin.pinned || pin.account != account || pin.generation != generation) continue;
+        if (pin.endpoint.hostIpv4 == hostIpv4 && pin.endpoint.port == port) return;
+        Logf("steam: refusing direct endpoint rebind for peer=%llu gen=%llu",
+             static_cast<unsigned long long>(account), static_cast<unsigned long long>(generation));
+        return;
+    }
+    for (auto& pin : store.directPins) {
+        if (pin.pinned) continue;
+        pin.account = account;
+        pin.generation = generation;
+        pin.endpoint = DirectEndpoint{hostIpv4, port};
+        pin.pinned = true;
         return;
     }
 }
@@ -622,10 +646,7 @@ bool ClaimDirectPeerIdentity(uint32_t hostIpv4, uint16_t port, uint32_t connectT
     if (!ReadDirectPeerIdentityLocked(hostIpv4, port, account, name, generation, &expectedTag) ||
         account == rt.me || !expectedTag || connectTag != expectedTag)
         return false;
-    store.relayCloses.erase(std::remove_if(store.relayCloses.begin(), store.relayCloses.end(),
-        [account, generation](RelayClose const& request) {
-            return request.account == account && request.generation == generation;
-        }), store.relayCloses.end());
+    CancelPendingRelayCloseLocked(account, generation);
     return true;
 }
 
@@ -695,6 +716,7 @@ void Stop()
         store.relayCloses.clear();
         store.clientEnet = {};
         store.disconnectRequested.store(false);
+        for (auto& pin : store.directPins) pin = DirectEndpointPin{};
         store.published = Published{};
     }
 }
@@ -793,5 +815,6 @@ void Status(void (*log)(char const*))
 #ifdef G3T_REALISM_SOURCE
 #include "steam_p2p.cpp"
 #include "steam_flow.cpp"
+#include "steam_legacy_auto.cpp"
 #include "steam_diagnostics.cpp"
 #endif

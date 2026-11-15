@@ -10,6 +10,7 @@
 #include "npclease_runtime.h"
 #include "npcremoval.h"
 #include "npcs.h"
+#include "patch.h"
 #include "relation_policy.h"
 #include "remote.h"
 #include "world.h"
@@ -38,9 +39,16 @@ gFScript originalFocusPriority = nullptr;
 bool focusPrioritySearched = false;
 bool focusPriorityNative = false;
 
-std::unordered_set<eCEntity const*> promotedNpcs;
+std::unordered_set<GuidKey, KeyHash> promotedNpcs;
 std::unordered_map<GuidKey, uint8_t, KeyHash> sentState;
 std::unordered_map<GuidKey, std::array<bool, net::MaxPlayers>, KeyHash> remoteHostile;
+
+GuidKey KeyOf(uint8_t const guid[16])
+{
+    GuidKey key{};
+    if (guid) std::memcpy(key.data(), guid, 16);
+    return key;
+}
 
 GuidKey KeyOf(eCEntity const* npc)
 {
@@ -89,7 +97,8 @@ uint8_t CoopCompanionOwner(eCEntity const* entity)
     if (controlled && controlled != hero && controlled->GetPropertySet(eEPropertySetType_Party) &&
         Entity(controlled).Party.GetPartyLeader().GetInstance() == entity)
         return LocalCoopId();
-    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+    for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
+        if (id == LocalCoopId()) continue;
         eCEntity* puppet = remote::PuppetOf(id);
         if (puppet && puppet->GetPropertySet(eEPropertySetType_Party) &&
             Entity(puppet).Party.GetPartyLeader().GetInstance() == entity)
@@ -102,16 +111,6 @@ uint8_t CoopOwnerOf(eCEntity const* entity)
 {
     if (const uint8_t player = CoopPlayerOfEntity(entity)) return player;
     return CoopCompanionOwner(entity);
-}
-
-bool IsCoopCompanion(eCEntity const* entity)
-{
-    return CoopPlayerOfEntity(entity) == 0 && CoopCompanionOwner(entity) != 0;
-}
-
-bool IsCoopParticipant(eCEntity const* entity)
-{
-    return CoopOwnerOf(entity) != 0;
 }
 
 relation::CombatRole RoleOf(eCEntity const* entity)
@@ -216,6 +215,16 @@ void PublishTransition(GuidKey const& key, bool active, int attackReason)
     net::SendWorldState(s, 0);
 }
 
+void RestorePromotedEntityAttitude(eCEntity* npc, GuidKey const& key)
+{
+    if (promotedNpcs.erase(key) == 0 || !ValidNpc(npc)) return;
+    Entity self(npc);
+    if (self.IsDead()) return;
+    int truth = -1;
+    if (ai::LocalAttitude(npc, truth) && relation::ValidAttitude(truth) && truth > relation::None)
+        self.NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(truth);
+}
+
 void SyncNativeEntity(eCEntity* npc)
 {
     if (!ValidNpc(npc) || npcs::IsMirrored(npc)) return;
@@ -230,20 +239,17 @@ void SyncNativeEntity(eCEntity* npc)
     const bool hostileNow = relation::ActiveSharedCombatHostility(in);
 
     if (hostileNow) {
-        promotedNpcs.insert(npc);
         if (in.storedAttitude != relation::Hostile && in.storedAttitude != relation::Predator &&
-            in.storedAttitude != relation::Panic)
+            in.storedAttitude != relation::Panic) {
+            promotedNpcs.insert(key);
             Entity(npc).NPC.AttitudeToPlayer2 = gEAttitude_Hostile;
+        }
         if (net::IsHost() || npclease::LocalAuthority(npc))
             PublishTransition(key, true, in.attackReason);
         return;
     }
 
-    if (promotedNpcs.erase(npc) > 0) {
-        int truth = -1;
-        if (ai::LocalAttitude(npc, truth) && relation::ValidAttitude(truth) && truth > relation::None)
-            Entity(npc).NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(truth);
-    }
+    RestorePromotedEntityAttitude(npc, key);
     if (net::IsHost() || npclease::LocalAuthority(npc))
         PublishTransition(key, false, 0);
 }
@@ -281,7 +287,7 @@ GEInt GE_STDCALL FilterFocusEntityPriority(gCScriptProcessingUnit* spu, GELPVoid
         fi.targetsCoopSide = sc.targetsCoopSide;
         fi.inCombat = sc.aiMode == gEAIMode_Combat || sc.combatState != 0 ||
                       sc.lastFight == gELastFightAgainstPlayer_Running;
-        fi.outsideBout = relation::BoutAttackReason(sc.attackReason);
+        fi.inBout = relation::BoutAttackReason(sc.attackReason);
         fi.role = sc.role;
         fi.attitude = sc.storedAttitude;
         const int overridePriority = relation::CombatFocusPriorityOverride(fi);
@@ -305,9 +311,14 @@ void InstallHooks()
     HMODULE module = GetModuleHandleA("Script_Game.dll");
     auto* code = module ? reinterpret_cast<unsigned char*>(module) + FocusPriorityRva : nullptr;
     static const unsigned char head[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8, 0x81, 0xec, 0xfc, 0x03, 0x00, 0x00};
-    if (code && reinterpret_cast<void*>(native) == code && !std::memcmp(code, head, sizeof(head))) {
-        if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(&FilterFocusEntityPriority))) {
-            originalFocusPriority = reinterpret_cast<gFScript>(trampoline);
+    if (code && reinterpret_cast<void*>(native) == code &&
+        (!std::memcmp(code, head, sizeof(head)) || patch::IsPatchedByUs(code, head, 6))) {
+        if (!std::memcmp(code, head, sizeof(head))) {
+            if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(&FilterFocusEntityPriority))) {
+                originalFocusPriority = reinterpret_cast<gFScript>(trampoline);
+                focusPriorityNative = true;
+            }
+        } else {
             focusPriorityNative = true;
         }
     }
@@ -373,12 +384,36 @@ void SyncClientLeasedNpc(eCEntity* npc)
     SyncNativeEntity(npc);
 }
 
+void OnClientLeaseConfirmed(uint8_t const guid[16])
+{
+    if (net::IsHost() || !guid || ai::ShuttingDown()) return;
+    sentState.erase(KeyOf(guid));
+    if (eCEntity* npc = npcs::NpcByGuid(guid))
+        SyncClientLeasedNpc(npc);
+}
+
 void ClearClientLeasedNpc(uint8_t const guid[16])
 {
     if (net::IsHost() || !guid) return;
-    GuidKey key{};
-    std::memcpy(key.data(), guid, 16);
+    const GuidKey key = KeyOf(guid);
+    RestorePromotedEntityAttitude(npcs::NpcByGuid(guid), key);
     PublishTransition(key, false, 0);
+}
+
+void NoteImportedAttitude(eCEntity* npc, uint8_t importedAttitude)
+{
+    if (!ValidNpc(npc)) return;
+    const GuidKey key = KeyOf(npc);
+    if (importedAttitude != relation::Hostile || Entity(npc).IsDead()) {
+        promotedNpcs.erase(key);
+        return;
+    }
+    int truth = -1;
+    if (ai::LocalAttitude(npc, truth) && relation::ValidAttitude(truth) &&
+        truth > relation::None && truth != relation::Hostile &&
+        truth != relation::Predator && truth != relation::Panic) {
+        promotedNpcs.insert(key);
+    }
 }
 
 void OnState(uint8_t from, net::WorldState const& state)
@@ -386,10 +421,14 @@ void OnState(uint8_t from, net::WorldState const& state)
     if (state.kind != WorldStateKind) return;
     uint8_t sender = 0;
     const bool active = state.npc != 0;
+    const GuidKey key = KeyOf(state.guid);
     if (net::IsHost()) {
         if (from < 2 || from >= net::MaxPlayers) return;
         if (active) {
-            if (eCEntity* npc = npcs::NpcByGuid(state.guid); npc && npclease::RemoteOwner(npc) != from) return;
+            if (npclease::RemoteOwner(state.guid) != from) return;
+        } else {
+            auto const existing = remoteHostile.find(key);
+            if (existing == remoteHostile.end() || !existing->second[from]) return;
         }
         sender = from;
     } else {
@@ -397,8 +436,6 @@ void OnState(uint8_t from, net::WorldState const& state)
         sender = (state.guard >= 1 && state.guard < net::MaxPlayers) ? state.guard : uint8_t(1);
         if (sender == net::LocalId()) return;
     }
-    GuidKey key{};
-    std::memcpy(key.data(), state.guid, 16);
     if (active) {
         remoteHostile[key][sender] = true;
     } else {
@@ -414,7 +451,8 @@ void OnState(uint8_t from, net::WorldState const& state)
         net::WorldState relayed = state;
         relayed.guard = from;
         net::SendWorldState(relayed, from);
-        if (eCEntity* npc = npcs::NpcByGuid(state.guid)) SyncNativeEntity(npc);
+        if (eCEntity* npc = npcs::NpcByGuid(state.guid); npc && !npclease::Fenced(npc))
+            SyncNativeEntity(npc);
     }
 }
 
@@ -428,11 +466,19 @@ void OnWorldChange()
 bool ResumeLeasedCombat(eCEntity* npc, uint8_t aiMode, uint8_t attitude, uint8_t attackReason, eCEntity* target)
 {
     if (!npc || aiMode != gEAIMode_Combat || relation::BoutAttackReason(attackReason) || !target) return false;
-    if (attitude == relation::Hostile) Entity(npc).NPC.AttitudeToPlayer2 = gEAttitude_Hostile;
+    if (attitude == relation::Hostile) {
+        NoteImportedAttitude(npc, attitude);
+        Entity(npc).NPC.AttitudeToPlayer2 = gEAttitude_Hostile;
+    }
     const int reason = attackReason ? attackReason : static_cast<int>(gEAttackReason_ReactToDamage);
     guards::Acting player(remote::IsPuppet(target) ? target : nullptr, false);
     GetScriptAdminExt().CallScript(bCString("AssessTarget"), npc, target, reason);
     return true;
+}
+
+bool IsCoopParticipant(eCEntity const* entity)
+{
+    return CoopOwnerOf(entity) != 0;
 }
 
 bool IsSharedCombatHostile(eCEntity const* npc)
@@ -479,6 +525,7 @@ bool FocusPriorityHooked()
 
 uint8_t CoopTargetPlayer(eCEntity* target)
 {
+    if (!net::IsHost() && !net::LocalId()) return 0;
     return CoopOwnerOf(target);
 }
 

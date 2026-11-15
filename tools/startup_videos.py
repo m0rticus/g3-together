@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import stat
 import sys
 import tempfile
 from pathlib import Path
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from _g3copy import is_hard_linked, reject_links
 
 
 BACKUP_SUFFIX = ".g3t-manual-video-backup"
@@ -23,7 +27,7 @@ def check_files(paths: tuple[Path, ...]) -> None:
         if path.exists():
             if not path.is_file():
                 raise RuntimeError(f"Expected a file: {path}")
-            if path.stat(follow_symlinks=False).st_nlink != 1:
+            if is_hard_linked(path):
                 raise RuntimeError(f"Hard-linked file is not allowed (would mutate shared install): {path}")
 
 
@@ -39,16 +43,7 @@ def atomic_write(path: Path, data: bytes) -> None:
 
 
 def reject_redirect(path: Path) -> None:
-    path = Path(path)
-    for part in (path, *path.parents):
-        if not part.exists() and not part.is_symlink():
-            continue
-        info = part.lstat()
-        reparse = getattr(info, "st_file_attributes", 0) & getattr(
-            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-        )
-        if stat.S_ISLNK(info.st_mode) or reparse:
-            raise RuntimeError(f"Link or reparse point is not allowed: {part}")
+    reject_links(Path(path), RuntimeError)
 
 
 def disable(root: Path) -> None:

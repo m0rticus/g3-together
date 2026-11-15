@@ -38,12 +38,6 @@ std::unordered_set<eCEntity*> cachingOutStatics;
 std::vector<eCEntity const*> readyRemoteNpcs;
 std::vector<std::pair<uintptr_t, bool>> lastSphereReadiness;
 
-struct CellLock {
-    bCCriticalSectionWin32& lock = eCPVSCellItem::GetCriticalSection();
-    CellLock() { lock.Acquire(); }
-    ~CellLock() { lock.Release(); }
-};
-
 StaticShapeState ReadStaticShapeState(eCEntity* entity)
 {
     StaticShapeState state;
@@ -71,24 +65,29 @@ void __fastcall OnExitProcessingRangeDetour(eCEntity* entity, void* edx)
 {
     originalExitRange(entity, edx);
     if (!entity || ai::ShuttingDown() || pvs::GatePaused()) return;
-    std::lock_guard<std::mutex> lock(Mutex());
-    const bool isPinned = pinnedStatics.find(entity) != pinnedStatics.end();
-    if (!isPinned) return;
-    const bool isCachingOut = cachingOutStatics.find(entity) != cachingOutStatics.end();
-    if (ShouldRestorePinnedOnExitRange(isPinned, isCachingOut, ReadStaticShapeState(entity)))
-        entity->CreatePhysicObject();
+    bool shouldRestore = false;
+    {
+        std::lock_guard<std::mutex> lock(Mutex());
+        const bool isPinned = pinnedStatics.find(entity) != pinnedStatics.end();
+        if (!isPinned) return;
+        const bool isCachingOut = cachingOutStatics.find(entity) != cachingOutStatics.end();
+        shouldRestore = ShouldRestorePinnedOnExitRange(isPinned, isCachingOut, ReadStaticShapeState(entity));
+    }
+    if (shouldRestore) entity->CreatePhysicObject();
 }
 
 void __fastcall CacheOutInternalDetour(eCEntity* entity, void* edx, GEBool direct)
 {
     bool tracked = false;
+    bool shouldDestroy = false;
     if (entity && !entity->GetEntityFlags().Dynamic) {
         std::lock_guard<std::mutex> lock(Mutex());
         cachingOutStatics.insert(entity);
         tracked = true;
-        if (pinnedStatics.erase(entity) > 0 && ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity)))
-            entity->DestroyPhysicObject();
+        shouldDestroy = pinnedStatics.erase(entity) > 0 &&
+                        ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity));
     }
+    if (shouldDestroy) entity->DestroyPhysicObject();
     originalCacheOutInternal(entity, edx, direct);
     if (tracked) {
         std::lock_guard<std::mutex> lock(Mutex());
@@ -96,15 +95,22 @@ void __fastcall CacheOutInternalDetour(eCEntity* entity, void* edx, GEBool direc
     }
 }
 
-void UnpinAllLocked()
+void UnpinAllOutsideLock(bool clearCachingOut = false)
 {
-    for (eCEntity* entity : pinnedStatics) {
-        if (entity && cachingOutStatics.find(entity) == cachingOutStatics.end() &&
-            ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity))) {
-            entity->DestroyPhysicObject();
+    std::vector<eCEntity*> toDestroy;
+    {
+        std::lock_guard<std::mutex> lock(Mutex());
+        toDestroy.reserve(pinnedStatics.size());
+        for (eCEntity* entity : pinnedStatics) {
+            if (entity && cachingOutStatics.find(entity) == cachingOutStatics.end() &&
+                ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity))) {
+                toDestroy.push_back(entity);
+            }
         }
+        pinnedStatics.clear();
+        if (clearCachingOut) cachingOutStatics.clear();
     }
-    pinnedStatics.clear();
+    for (eCEntity* entity : toDestroy) entity->DestroyPhysicObject();
 }
 
 bool IntersectsAnySphere(float const box[6], processing::Sphere const* spheres, int sphereCount, float margin)
@@ -136,6 +142,207 @@ struct GridCellRef {
     eCPVSCellItem* cell = nullptr;
     bool jobRunning = false;
 };
+
+void CollectPrefetcherCells(std::vector<eCPVSPrefetcher3*> const& prefetchers, std::vector<GridCellRef>& gridCells,
+                            std::vector<eCPVSCellItem*>& permanentCells)
+{
+    for (eCPVSPrefetcher3* prefetcher : prefetchers) {
+        if (!prefetcher) continue;
+        const bool running = prefetcher->IsJobRunning() != GEFalse;
+        auto* permanent = prefetcher->GetNonDeactivationCell();
+        if (permanent && std::find(permanentCells.begin(), permanentCells.end(), permanent) == permanentCells.end())
+            permanentCells.push_back(permanent);
+        bTSmallArray<eCPVSCellItem*> cells;
+        prefetcher->GetAllValidCells(cells);
+        for (GEU16 i = 0; i < cells.GetCount(); ++i) {
+            eCPVSCellItem* cell = cells.GetAt(i);
+            if (!cell || cell == permanent) continue;
+            auto it = std::find_if(gridCells.begin(), gridCells.end(),
+                                   [cell](GridCellRef const& ref) { return ref.cell == cell; });
+            if (it == gridCells.end()) gridCells.push_back({cell, running});
+            else it->jobRunning = it->jobRunning && running;
+        }
+    }
+}
+
+void GatherSphereCandidates(std::vector<eCPVSPrefetcher3*> const& prefetchers, processing::Sphere const* spheres,
+                            int sphereCount, std::unordered_set<eCEntity*>& desiredPinned,
+                            std::vector<NpcCandidate>& candidates)
+{
+    pvs::ScopedCellLock cellLock;
+    std::vector<GridCellRef> gridCells;
+    std::vector<eCPVSCellItem*> permanentCells;
+    CollectPrefetcherCells(prefetchers, gridCells, permanentCells);
+
+    std::vector<eCEntity*> candidateEntities;
+    auto scanCellEntities = [&](eCPVSCellItem* cell, bool isPermanent) {
+        auto const* cellBox = reinterpret_cast<float const*>(&cell->GetCellBox());
+        if (!isPermanent && !IntersectsAnyCircleXZ(cellBox, spheres, sphereCount, StaticCollisionMarginCm))
+            return;
+        auto const& statics = cell->GetStaticEntities();
+        for (GEU16 i = 0; i < statics.GetCount(); ++i) {
+            eCEntity* entity = statics.GetAt(i);
+            if (!entity) continue;
+            auto const* box = reinterpret_cast<float const*>(&entity->GetWorldNodeBoundary());
+            if (!IntersectsAnySphere(box, spheres, sphereCount, StaticCollisionMarginCm)) continue;
+            if (ShouldPinStaticCollision(ReadStaticShapeState(entity)))
+                desiredPinned.insert(entity);
+        }
+        auto const& dynamics = cell->GetDynamicEntities();
+        for (GEU16 i = 0; i < dynamics.GetCount(); ++i) {
+            eCEntity* entity = dynamics.GetAt(i);
+            if (!entity || entity->IsKilled() || !entity->IsEnabled()) continue;
+            if (npcremoval::ExcludeFromProcessing(entity)) continue;
+            if (!entity->GetPropertySet(eEPropertySetType_NPC)) continue;
+            bCBox const& bounds = entity->GetWorldNodeBoundary();
+            if (!processing::IncludesNpc(false, true, reinterpret_cast<float const*>(&bounds), spheres, sphereCount))
+                continue;
+            candidateEntities.push_back(entity);
+        }
+    };
+
+    for (GridCellRef const& entry : gridCells) scanCellEntities(entry.cell, false);
+    for (eCPVSCellItem* permanent : permanentCells) scanCellEntities(permanent, true);
+
+    std::sort(candidateEntities.begin(), candidateEntities.end());
+    candidateEntities.erase(std::unique(candidateEntities.begin(), candidateEntities.end()), candidateEntities.end());
+    candidates.reserve(candidateEntities.size());
+
+    for (eCEntity* npc : candidateEntities) {
+        NpcCandidate cand;
+        cand.entity = npc;
+        bCVector const& wp = npc->GetWorldPosition();
+        cand.pos[0] = wp.GetX();
+        cand.pos[1] = wp.GetY();
+        cand.pos[2] = wp.GetZ();
+
+        auto inspectLocalStatics = [&](eCPVSCellItem* cell) {
+            auto const& statics = cell->GetStaticEntities();
+            for (GEU16 i = 0; i < statics.GetCount(); ++i) {
+                eCEntity* staticEnt = statics.GetAt(i);
+                if (!staticEnt) continue;
+                auto const* sbox = reinterpret_cast<float const*>(&staticEnt->GetWorldNodeBoundary());
+                if (!BoxOverlapsSupportColumn(sbox, cand.pos[0], cand.pos[1], cand.pos[2], NpcColumnMarginCm))
+                    continue;
+                const StaticShapeState state = ReadStaticShapeState(staticEnt);
+                if (IsUncachedLocalStaticBlocker(state)) {
+                    cand.hasUncachedLocalStatic = true;
+                } else if (NeedsPinnedLocalPhysicObject(state)) {
+                    desiredPinned.insert(staticEnt);
+                    cand.localRange1Statics.push_back(staticEnt);
+                }
+            }
+        };
+
+        bool anyCoveringReady = false;
+        for (GridCellRef const& entry : gridCells) {
+            auto const* cellBox = reinterpret_cast<float const*>(&entry.cell->GetCellBox());
+            if (!BoxContainsXZ(cellBox, cand.pos[0], cand.pos[2], 0.0f)) continue;
+            ++cand.coveringCells;
+            cand.coveringStaticEntities += entry.cell->GetStaticEntities().GetCount();
+            if (!entry.jobRunning) anyCoveringReady = true;
+            inspectLocalStatics(entry.cell);
+        }
+        cand.coveringJobRunning = cand.coveringCells > 0 && !anyCoveringReady;
+        for (eCPVSCellItem* permanent : permanentCells) inspectLocalStatics(permanent);
+        candidates.push_back(std::move(cand));
+    }
+}
+
+void SyncPinnedPhysicObjects(std::unordered_set<eCEntity*> const& desiredPinned,
+                             std::vector<NpcCandidate>& candidates)
+{
+    std::vector<eCEntity*> toDestroy;
+    std::vector<eCEntity*> toCreate;
+    {
+        std::lock_guard<std::mutex> lock(Mutex());
+        for (auto it = pinnedStatics.begin(); it != pinnedStatics.end();) {
+            eCEntity* entity = *it;
+            if (desiredPinned.find(entity) == desiredPinned.end()) {
+                if (entity && cachingOutStatics.find(entity) == cachingOutStatics.end() &&
+                    ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity))) {
+                    toDestroy.push_back(entity);
+                }
+                it = pinnedStatics.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (eCEntity* entity : desiredPinned) {
+            if (!entity || cachingOutStatics.find(entity) != cachingOutStatics.end()) continue;
+            const StaticShapeState state = ReadStaticShapeState(entity);
+            if (!ShouldPinStaticCollision(state)) continue;
+            pinnedStatics.insert(entity);
+            if (!state.hasPhysicObject) toCreate.push_back(entity);
+        }
+    }
+    for (eCEntity* entity : toDestroy) entity->DestroyPhysicObject();
+    for (eCEntity* entity : toCreate) {
+        bool createAllowed = false;
+        {
+            std::lock_guard<std::mutex> lock(Mutex());
+            createAllowed = pinnedStatics.find(entity) != pinnedStatics.end() &&
+                            cachingOutStatics.find(entity) == cachingOutStatics.end() &&
+                            ShouldPinStaticCollision(ReadStaticShapeState(entity));
+        }
+        if (!createAllowed) continue;
+        entity->CreatePhysicObject();
+        bool destroyAfterRace = false;
+        {
+            std::lock_guard<std::mutex> lock(Mutex());
+            if (cachingOutStatics.find(entity) != cachingOutStatics.end() ||
+                pinnedStatics.find(entity) == pinnedStatics.end()) {
+                destroyAfterRace = ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity));
+            }
+        }
+        if (destroyAfterRace) entity->DestroyPhysicObject();
+    }
+    std::lock_guard<std::mutex> lock(Mutex());
+    for (NpcCandidate& cand : candidates) {
+        for (eCEntity* staticEnt : cand.localRange1Statics) {
+            if (!staticEnt || cachingOutStatics.find(staticEnt) != cachingOutStatics.end() ||
+                staticEnt->GetPhysicObject() == nullptr) {
+                cand.allLocalRange1Pinned = false;
+                break;
+            }
+        }
+    }
+}
+
+void EvaluateCandidateReadiness(std::vector<NpcCandidate> const& candidates, bool readyHooks,
+                                std::vector<eCEntity const*>& readyNow,
+                                std::vector<std::pair<uintptr_t, bool>>& readinessSnapshot)
+{
+    auto& physics = eCPhysicsScene::GetInstance();
+    const GEU32 rayHints = eETraceRayHints_TestStaticShapes | eETraceRayHints_IncludeWater;
+    const bCVector rayDir(0.0f, GroundRayDownCm, 0.0f);
+
+    readyNow.clear();
+    readinessSnapshot.clear();
+    readyNow.reserve(candidates.size());
+    readinessSnapshot.reserve(candidates.size());
+
+    for (NpcCandidate const& cand : candidates) {
+        NpcCollisionGateInput gate;
+        gate.hooksReady = readyHooks;
+        gate.coveringCells = cand.coveringCells;
+        gate.coveringStaticEntities = cand.coveringStaticEntities;
+        gate.coveringJobRunning = cand.coveringJobRunning;
+        gate.hasUncachedLocalStatic = cand.hasUncachedLocalStatic;
+        gate.allLocalRange1Pinned = cand.allLocalRange1Pinned;
+        if (gate.coveringCells > 0 && !(gate.coveringJobRunning && gate.coveringStaticEntities == 0) &&
+            !gate.hasUncachedLocalStatic && gate.allLocalRange1Pinned) {
+            const bCVector origin(cand.pos[0], cand.pos[1] + GroundRayUpCm, cand.pos[2]);
+            gate.hasStaticGroundSupport = physics.TraceRayNearestHit(origin, rayDir, nullptr, rayHints) != GEFalse;
+        }
+        const bool ready = EvaluateNpcCollisionReady(gate);
+        if (ready) readyNow.push_back(cand.entity);
+        readinessSnapshot.push_back({reinterpret_cast<uintptr_t>(cand.entity), ready});
+    }
+
+    std::sort(readyNow.begin(), readyNow.end());
+    std::sort(readinessSnapshot.begin(), readinessSnapshot.end());
+}
 }
 
 bool EnsureHooksInstalled()
@@ -168,8 +375,8 @@ bool EnsureHooksInstalled()
 bool SyncSphereStaticCollision(eCEntityAdmin* admin, processing::Sphere const* spheres, int sphereCount)
 {
     if (!admin || sphereCount <= 0 || !spheres || pvs::GatePaused() || ai::ShuttingDown()) {
+        UnpinAllOutsideLock(false);
         std::lock_guard<std::mutex> lock(Mutex());
-        UnpinAllLocked();
         const bool hadReady = !readyRemoteNpcs.empty() || !lastSphereReadiness.empty();
         readyRemoteNpcs.clear();
         lastSphereReadiness.clear();
@@ -177,8 +384,8 @@ bool SyncSphereStaticCollision(eCEntityAdmin* admin, processing::Sphere const* s
     }
     const bool readyHooks = EnsureHooksInstalled();
     if (!readyHooks) {
+        UnpinAllOutsideLock(false);
         std::lock_guard<std::mutex> lock(Mutex());
-        UnpinAllLocked();
         readyRemoteNpcs.clear();
         lastSphereReadiness.clear();
         return false;
@@ -189,164 +396,12 @@ bool SyncSphereStaticCollision(eCEntityAdmin* admin, processing::Sphere const* s
 
     std::unordered_set<eCEntity*> desiredPinned;
     std::vector<NpcCandidate> candidates;
-    {
-        CellLock cellLock;
-        std::vector<GridCellRef> gridCells;
-        std::vector<eCPVSCellItem*> permanentCells;
-        for (eCPVSPrefetcher3* prefetcher : prefetchers) {
-            if (!prefetcher) continue;
-            const bool running = prefetcher->IsJobRunning() != GEFalse;
-            auto* permanent = prefetcher->GetNonDeactivationCell();
-            if (permanent && std::find(permanentCells.begin(), permanentCells.end(), permanent) == permanentCells.end())
-                permanentCells.push_back(permanent);
-            bTSmallArray<eCPVSCellItem*> cells;
-            prefetcher->GetAllValidCells(cells);
-            for (GEU16 i = 0; i < cells.GetCount(); ++i) {
-                eCPVSCellItem* cell = cells.GetAt(i);
-                if (!cell || cell == permanent) continue;
-                auto it = std::find_if(gridCells.begin(), gridCells.end(),
-                                       [cell](GridCellRef const& ref) { return ref.cell == cell; });
-                if (it == gridCells.end()) gridCells.push_back({cell, running});
-                else it->jobRunning = it->jobRunning && running;
-            }
-        }
-
-        std::vector<eCEntity*> candidateEntities;
-        auto scanCellEntities = [&](eCPVSCellItem* cell, bool isPermanent) {
-            auto const* cellBox = reinterpret_cast<float const*>(&cell->GetCellBox());
-            if (!isPermanent && !IntersectsAnyCircleXZ(cellBox, spheres, sphereCount, StaticCollisionMarginCm))
-                return;
-            auto const& statics = cell->GetStaticEntities();
-            for (GEU16 i = 0; i < statics.GetCount(); ++i) {
-                eCEntity* entity = statics.GetAt(i);
-                if (!entity) continue;
-                auto const* box = reinterpret_cast<float const*>(&entity->GetWorldNodeBoundary());
-                if (!IntersectsAnySphere(box, spheres, sphereCount, StaticCollisionMarginCm)) continue;
-                if (ShouldPinStaticCollision(ReadStaticShapeState(entity)))
-                    desiredPinned.insert(entity);
-            }
-            auto const& dynamics = cell->GetDynamicEntities();
-            for (GEU16 i = 0; i < dynamics.GetCount(); ++i) {
-                eCEntity* entity = dynamics.GetAt(i);
-                if (!entity || entity->IsKilled() || !entity->IsEnabled()) continue;
-                if (npcremoval::ExcludeFromProcessing(entity)) continue;
-                if (!entity->GetPropertySet(eEPropertySetType_NPC)) continue;
-                bCBox const& bounds = entity->GetWorldNodeBoundary();
-                if (!processing::IncludesNpc(false, true, reinterpret_cast<float const*>(&bounds), spheres, sphereCount))
-                    continue;
-                candidateEntities.push_back(entity);
-            }
-        };
-
-        for (GridCellRef const& entry : gridCells) scanCellEntities(entry.cell, false);
-        for (eCPVSCellItem* permanent : permanentCells) scanCellEntities(permanent, true);
-
-        std::sort(candidateEntities.begin(), candidateEntities.end());
-        candidateEntities.erase(std::unique(candidateEntities.begin(), candidateEntities.end()), candidateEntities.end());
-        candidates.reserve(candidateEntities.size());
-
-        for (eCEntity* npc : candidateEntities) {
-            NpcCandidate cand;
-            cand.entity = npc;
-            bCVector const& wp = npc->GetWorldPosition();
-            cand.pos[0] = wp.GetX();
-            cand.pos[1] = wp.GetY();
-            cand.pos[2] = wp.GetZ();
-
-            auto inspectLocalStatics = [&](eCPVSCellItem* cell) {
-                auto const& statics = cell->GetStaticEntities();
-                for (GEU16 i = 0; i < statics.GetCount(); ++i) {
-                    eCEntity* staticEnt = statics.GetAt(i);
-                    if (!staticEnt) continue;
-                    auto const* sbox = reinterpret_cast<float const*>(&staticEnt->GetWorldNodeBoundary());
-                    if (!BoxOverlapsSupportColumn(sbox, cand.pos[0], cand.pos[1], cand.pos[2], NpcColumnMarginCm))
-                        continue;
-                    const StaticShapeState state = ReadStaticShapeState(staticEnt);
-                    if (IsUncachedLocalStaticBlocker(state)) {
-                        cand.hasUncachedLocalStatic = true;
-                    } else if (NeedsPinnedLocalPhysicObject(state)) {
-                        desiredPinned.insert(staticEnt);
-                        cand.localRange1Statics.push_back(staticEnt);
-                    }
-                }
-            };
-
-            bool anyCoveringReady = false;
-            for (GridCellRef const& entry : gridCells) {
-                auto const* cellBox = reinterpret_cast<float const*>(&entry.cell->GetCellBox());
-                if (!BoxContainsXZ(cellBox, cand.pos[0], cand.pos[2], 0.0f)) continue;
-                ++cand.coveringCells;
-                cand.coveringStaticEntities += entry.cell->GetStaticEntities().GetCount();
-                if (!entry.jobRunning) anyCoveringReady = true;
-                inspectLocalStatics(entry.cell);
-            }
-            cand.coveringJobRunning = cand.coveringCells > 0 && !anyCoveringReady;
-            for (eCPVSCellItem* permanent : permanentCells) inspectLocalStatics(permanent);
-            candidates.push_back(std::move(cand));
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(Mutex());
-        for (auto it = pinnedStatics.begin(); it != pinnedStatics.end();) {
-            eCEntity* entity = *it;
-            if (desiredPinned.find(entity) == desiredPinned.end()) {
-                if (entity && cachingOutStatics.find(entity) == cachingOutStatics.end() &&
-                    ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity))) {
-                    entity->DestroyPhysicObject();
-                }
-                it = pinnedStatics.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        for (eCEntity* entity : desiredPinned) {
-            if (!entity || cachingOutStatics.find(entity) != cachingOutStatics.end()) continue;
-            const StaticShapeState state = ReadStaticShapeState(entity);
-            if (!ShouldPinStaticCollision(state)) continue;
-            pinnedStatics.insert(entity);
-            if (!state.hasPhysicObject) entity->CreatePhysicObject();
-        }
-        for (NpcCandidate& cand : candidates) {
-            for (eCEntity* staticEnt : cand.localRange1Statics) {
-                if (!staticEnt || cachingOutStatics.find(staticEnt) != cachingOutStatics.end() ||
-                    staticEnt->GetPhysicObject() == nullptr) {
-                    cand.allLocalRange1Pinned = false;
-                    break;
-                }
-            }
-        }
-    }
-
-    auto& physics = eCPhysicsScene::GetInstance();
-    const GEU32 rayHints = eETraceRayHints_TestStaticShapes | eETraceRayHints_IncludeWater;
-    const bCVector rayDir(0.0f, GroundRayDownCm, 0.0f);
+    GatherSphereCandidates(prefetchers, spheres, sphereCount, desiredPinned, candidates);
+    SyncPinnedPhysicObjects(desiredPinned, candidates);
 
     std::vector<eCEntity const*> readyNow;
     std::vector<std::pair<uintptr_t, bool>> readinessSnapshot;
-    readyNow.reserve(candidates.size());
-    readinessSnapshot.reserve(candidates.size());
-
-    for (NpcCandidate const& cand : candidates) {
-        NpcCollisionGateInput gate;
-        gate.hooksReady = readyHooks;
-        gate.coveringCells = cand.coveringCells;
-        gate.coveringStaticEntities = cand.coveringStaticEntities;
-        gate.coveringJobRunning = cand.coveringJobRunning;
-        gate.hasUncachedLocalStatic = cand.hasUncachedLocalStatic;
-        gate.allLocalRange1Pinned = cand.allLocalRange1Pinned;
-        if (gate.coveringCells > 0 && !(gate.coveringJobRunning && gate.coveringStaticEntities == 0) &&
-            !gate.hasUncachedLocalStatic && gate.allLocalRange1Pinned) {
-            const bCVector origin(cand.pos[0], cand.pos[1] + GroundRayUpCm, cand.pos[2]);
-            gate.hasStaticGroundSupport = physics.TraceRayNearestHit(origin, rayDir, nullptr, rayHints) != GEFalse;
-        }
-        const bool ready = EvaluateNpcCollisionReady(gate);
-        if (ready) readyNow.push_back(cand.entity);
-        readinessSnapshot.push_back({reinterpret_cast<uintptr_t>(cand.entity), ready});
-    }
-
-    std::sort(readyNow.begin(), readyNow.end());
-    std::sort(readinessSnapshot.begin(), readinessSnapshot.end());
+    EvaluateCandidateReadiness(candidates, readyHooks, readyNow, readinessSnapshot);
 
     std::lock_guard<std::mutex> lock(Mutex());
     const bool changed = DidReadinessChange(lastSphereReadiness, readinessSnapshot);
@@ -380,9 +435,8 @@ void OnEntityDestroyed(eCEntity* entity)
 
 void Retire()
 {
+    UnpinAllOutsideLock(true);
     std::lock_guard<std::mutex> lock(Mutex());
-    UnpinAllLocked();
-    cachingOutStatics.clear();
     readyRemoteNpcs.clear();
     lastSphereReadiness.clear();
 }

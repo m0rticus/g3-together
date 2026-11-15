@@ -34,5 +34,6 @@ void ReconcileMirrorAlive(GuidKey const& key, Mirror& m);
 void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown);
 void RecordMirrorWalkTelemetry(Mirror& m, net::NpcRecord const& shown, uint32_t now);
 bool MirrorFightsHeroImpl();
+void InstallRagdollHook(uint32_t now);
 
 } // namespace g3t::npcs::detail

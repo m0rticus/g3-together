@@ -184,7 +184,8 @@ class ClientRejoinTests(unittest.TestCase):
         self.assertIn("world-entry: main thread stack operation=", source)
         poll = source.split("void PollWorldEntry()", 1)[1].split("void EndStep", 1)[0]
         self.assertLess(poll.index("LogMainThread(operation.name)"), poll.index("still waiting for"))
-        sample = source.split("void SampleThread(", 1)[1].split("// A native call that never returns", 1)[0]
+        symbols = _testbuild.src_text("symbols.cpp")
+        sample = symbols.split("bool SampleThreadStack(", 1)[1]
         self.assertLess(sample.index("SuspendThread"), sample.index("ResumeThread"))
         for forbidden in ("Logf", "Where(", "new ", "std::string", "malloc"):
             self.assertNotIn(forbidden, sample)

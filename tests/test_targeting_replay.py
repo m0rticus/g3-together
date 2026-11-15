@@ -45,9 +45,13 @@ class TargetingReplayTests(unittest.TestCase):
 
     def test_native_target_uses_presented_not_latest_opponent(self):
         source = _testbuild.src_text("npcs.cpp")
+        policy = _testbuild.src_text("npcsend_policy.h")
         self.assertIn("motion.combatTarget = records[i].combatTarget;", source)
         self.assertIn("shown.combatTarget = presentation.motion.combatTarget;", source)
-        self.assertIn("a.aiMode != b.aiMode || a.combatTarget != b.combatTarget", source)
+        self.assertIn("a.aiMode != b.aiMode", policy)
+        self.assertIn("a.combatTarget != b.combatTarget", policy)
+        self.assertIn("sent.aiMode != current.aiMode", policy)
+        self.assertIn("sent.combatTarget != current.combatTarget", policy)
 
     def test_production_diagnostic_observes_without_selecting_or_mutating(self):
         source = _testbuild.src_text("npcs.cpp")

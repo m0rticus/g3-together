@@ -19,9 +19,6 @@ static DWORD WINAPI ObservedWorkerWait(DWORD, HANDLE const*, BOOL, DWORD);
 #include "steam_send.h"
 #include "fake_steam_diag.h"
 
-#include <winsock2.h>
-#include <windows.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -218,12 +215,19 @@ std::string JsonEscape(std::string const& value)
     return out.str();
 }
 
-std::string HexBytes(unsigned char const* data, size_t size)
+double LinearSlopePerSecond(std::vector<std::pair<uint32_t, uint64_t>> const& samples)
 {
-    std::ostringstream out;
-    out << std::hex << std::setfill('0');
-    for (size_t i = 0; i < size; ++i) out << std::setw(2) << static_cast<unsigned>(data[i]);
-    return out.str();
+    if (samples.size() < 2) return 0.0;
+    const double n = static_cast<double>(samples.size());
+    double sx = 0.0, sy = 0.0, sxy = 0.0, sx2 = 0.0;
+    for (auto const& sample : samples) {
+        sx += sample.first;
+        sy += sample.second;
+        sxy += static_cast<double>(sample.first) * sample.second;
+        sx2 += static_cast<double>(sample.first) * sample.first;
+    }
+    const double denominator = n * sx2 - sx * sx;
+    return denominator != 0.0 ? (n * sxy - sx * sy) / denominator * 1000.0 : 0.0;
 }
 
 struct RttSamples
@@ -276,11 +280,25 @@ static void WriteU64(unsigned char* p, uint64_t v)
     for (unsigned i = 0; i < 8; ++i) p[i] = static_cast<unsigned char>(v >> (8 * i));
 }
 
-static uint64_t EnvU64(char const* name, uint64_t fallback)
+static void BuildExactPayload(unsigned char (&out)[256], unsigned char tag, uint32_t seq, uint64_t sent)
 {
-    char value[128] = {};
-    if (!GetEnvironmentVariableA(name, value, sizeof(value))) return fallback;
-    return std::strtoull(value, nullptr, 10);
+    std::memset(out, 0, sizeof(out));
+    out[0] = tag;
+    WriteU32(out + 4, seq);
+    WriteU64(out + 8, sent);
+    for (size_t i = 16; i < sizeof(out); ++i)
+        out[i] = static_cast<unsigned char>((i * 37u + seq) & 0xffu);
+}
+
+static void SendReliableProbe(ENetPeer* peer, unsigned char fill, uint32_t seq, uint64_t sent)
+{
+    unsigned char payload[64];
+    std::memset(payload, fill, sizeof(payload));
+    payload[0] = 0xA1;
+    WriteU32(payload + 4, seq);
+    WriteU64(payload + 8, sent);
+    if (ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_RELIABLE))
+        enet_peer_send(peer, 1, packet);
 }
 
 struct CallbackObservation
@@ -366,14 +384,6 @@ static unsigned char __cdecl ObservedDispatchResult(
     return found;
 }
 
-static size_t RealNativeEnetCommandHeader(unsigned command)
-{
-    static constexpr size_t sizes[] = {
-        0, 8, 48, 44, 8, 4, 6, 8, 24, 8, 12, 16, 24
-    };
-    return command < sizeof(sizes) / sizeof(sizes[0]) ? sizes[command] : 0;
-}
-
 static FARPROC WINAPI ObservedGetProcAddress(HMODULE module, LPCSTR name)
 {
     FARPROC address = GetProcAddress(module, name);
@@ -391,15 +401,9 @@ static FARPROC WINAPI ObservedGetProcAddress(HMODULE module, LPCSTR name)
 static unsigned RealNativeEnetFirstCommand(
     unsigned char const* frame, size_t size)
 {
-    if (!frame || size < 2) return 0;
-    const unsigned flags =
-        (static_cast<unsigned>(frame[0]) << 8) |
-        static_cast<unsigned>(frame[1]);
-    const size_t header = (flags & 0x8000u) ? 4u : 2u;
-    if (size <= header) return 0;
-    if ((frame[0] & 0x40u) != 0)
-        return 0;
-    return frame[header] & ENET_PROTOCOL_COMMAND_MASK;
+    if (!frame || size < 2 || (frame[0] & 0x40u) != 0) return 0;
+    const size_t header = (frame[0] & 0x80u) ? 4u : 2u;
+    return size > header ? (frame[header] & ENET_PROTOCOL_COMMAND_MASK) : 0u;
 }
 
 struct ProductQueueSnapshot
@@ -421,18 +425,15 @@ static DWORD WINAPI ObservedWorkerWait(DWORD count, HANDLE const* handles,
                                       BOOL all, DWORD timeout)
 {
     ProductQueueSnapshot snapshot;
-    for (auto const& remote : g3t::steam::remotes) {
+    const uint32_t now = g3t::steam::Now();
+    for (auto const& remote : g3t::steam::rt.remotes) {
         if (!remote.id) continue;
         snapshot.bytes += remote.pending.Bytes();
         snapshot.depth += remote.pending.Depth();
-        snapshot.oldestMs = (std::max)(snapshot.oldestMs,
-                                       remote.pending.OldestAge(g3t::steam::Now()));
-        snapshot.peakBytes = (std::max)(snapshot.peakBytes,
-                                        remote.pending.Bytes());
-        snapshot.peakDepth = (std::max)(snapshot.peakDepth,
-                                        remote.pending.Depth());
-        snapshot.peakAgeMs = (std::max)(snapshot.peakAgeMs,
-                                        remote.pending.OldestAge(g3t::steam::Now()));
+        snapshot.oldestMs = (std::max)(snapshot.oldestMs, remote.pending.OldestAge(now));
+        snapshot.peakBytes = (std::max)(snapshot.peakBytes, remote.pending.Bytes());
+        snapshot.peakDepth = (std::max)(snapshot.peakDepth, remote.pending.Depth());
+        snapshot.peakAgeMs = (std::max)(snapshot.peakAgeMs, remote.pending.OldestAge(now));
         snapshot.plainBytes += remote.pending.counters.plainBytes;
         snapshot.wireBytes += remote.pending.counters.wireBytes;
     }
@@ -449,32 +450,42 @@ static ProductQueueSnapshot ReadProductQueue()
     return queueObservation;
 }
 
-class NativeFrameDecoder
+static std::string FakeStatsJson(FakeSteamStatsV1 const& s)
 {
-    void* coder_ = enet_range_coder_create();
-public:
-    ~NativeFrameDecoder() { if (coder_) enet_range_coder_destroy(coder_); }
-    bool Decode(std::vector<unsigned char> const& frame,
-                std::vector<unsigned char>& plain)
-    {
-        if (!coder_ || frame.size() < 2) return false;
-        const size_t header = frame[0] & 0x80u ? 4 : 2;
-        if (frame.size() <= header) return false;
-        if (!(frame[0] & 0x40u)) {
-            plain = frame;
-            return true;
-        }
-        plain.resize(g3t::steam::RelayPayloadLimit);
-        std::memcpy(plain.data(), frame.data(), header);
-        const size_t length = enet_range_coder_decompress(
-            coder_, frame.data() + header, frame.size() - header,
-            plain.data() + header, plain.size() - header);
-        if (!length) return false;
-        plain.resize(header + length);
-        plain[0] &= ~0x40u;
-        return true;
-    }
-};
+    std::ostringstream o;
+    o << "{\"pending_bytes\":" << s.pendingBytes << ",\"max_pending\":" << s.maxPending
+      << ",\"pending_reliable\":" << s.pendingReliable << ",\"pending_unreliable\":" << s.pendingUnreliable
+      << ",\"sent_unacked\":" << s.sentUnacked << ",\"accepted_messages\":" << s.acceptedMessages
+      << ",\"accepted_bytes\":" << s.acceptedBytes << ",\"result25_count\":" << s.result25Count
+      << ",\"result41_count\":" << s.result41Count << ",\"wire_bytes\":" << s.wireBytes
+      << ",\"wire_packets\":" << s.wirePackets << ",\"delivered_bytes\":" << s.deliveredBytes
+      << ",\"delivered_messages\":" << s.deliveredMessages << ",\"dropped_data_packets\":" << s.droppedDataPackets
+      << ",\"dropped_ack_packets\":" << s.droppedAckPackets << ",\"reliable_retries\":" << s.reliableRetries
+      << ",\"duplicate_messages\":" << s.duplicateMessages << ",\"session_starts\":" << s.sessionStarts
+      << ",\"session_failures\":" << s.sessionFailures << ",\"session_restarts\":" << s.sessionRestarts
+      << ",\"current_queue_age_ms\":" << s.currentQueueAgeMs << ",\"max_queue_age_ms\":" << s.maxQueueAgeMs
+      << ",\"callback333_count\":" << s.callback333Count << ",\"callback337_count\":" << s.callback337Count
+      << ",\"callback504_count\":" << s.callback504Count << ",\"callback505_count\":" << s.callback505Count
+      << ",\"callback506_count\":" << s.callback506Count << ",\"callback703_count\":" << s.callback703Count
+      << ",\"callback1251_count\":" << s.callback1251Count << ",\"callback1252_count\":" << s.callback1252Count
+      << ",\"requested_nodelay_count\":" << s.requestedNoDelayCount << ",\"effective_reliable_count\":" << s.effectiveReliableCount
+      << ",\"queue_delay_events\":" << s.queueDelayEvents << ",\"max_queue_delay_ms\":" << s.maxQueueDelayMs << '}';
+    return o.str();
+}
+
+static std::string FakeConfigJson(FakeSteamConfigV1 const& c)
+{
+    std::ostringstream o;
+    o << "{\"profile\":\"" << JsonEscape(c.profile) << "\",\"physical_rate_bps\":" << c.physicalRateBps
+      << ",\"latency_ms\":" << c.latencyMs << ",\"jitter_ms\":" << c.jitterMs
+      << ",\"loss_permille\":" << c.lossPermille << ",\"ack_loss_permille\":" << c.ackLossPermille
+      << ",\"setup_ms\":" << c.setupMs << ",\"metadata_delay_ms\":" << c.metadataDelayMs
+      << ",\"reconnect_ms\":" << c.reconnectMs << ",\"outage_ms\":" << c.outageMs
+      << ",\"nodelay_policy\":" << c.nodelayPolicy << ",\"queue_delay_ms\":" << c.queueDelayMs
+      << ",\"queue_delay_period_ms\":" << c.queueDelayPeriodMs << ",\"queue_delay_window_ms\":" << c.queueDelayWindowMs
+      << ",\"queue_delay_phase_ms\":" << c.queueDelayPhaseMs << ",\"queue_delay_enabled\":" << c.queueDelayEnabled << '}';
+    return o.str();
+}
 }
 
 extern "C" int __cdecl main(int argc, char** argv)
@@ -546,22 +557,12 @@ extern "C" int __cdecl main(int argc, char** argv)
     enet_address_set_host(&address, "127.0.0.1");
     address.port = args.enetPort;
     char const* enetError = nullptr;
-    ENetHost* enet = enet_host_create(&address, 32, 8, 0, 0);
+    ENetHost* enet = g3t::net::CreateTransportHost(&address, 32, enetError);
     if (!enet) {
-        enetError = "loopback ENet socket could not be created";
-        std::fprintf(stderr, "ENet host failed: %s\n", enetError);
+        std::fprintf(stderr, "ENet host failed: %s\n", enetError ? enetError : "unknown");
         enet_deinitialize();
         return 2;
     }
-    if (enet_host_compress_with_range_coder(enet) != 0) {
-        enet_host_destroy(enet);
-        std::fprintf(stderr, "ENet host failed: range coder allocation failed\n");
-        enet_deinitialize();
-        return 2;
-    }
-    enet->mtu = 1200;
-    enet_socket_set_option(enet->socket, ENET_SOCKOPT_RCVBUF, 4 * 1024 * 1024);
-    enet_socket_set_option(enet->socket, ENET_SOCKOPT_SNDBUF, 4 * 1024 * 1024);
 
     ENetAddress bound{};
     enet_socket_get_address(enet->socket, &bound);
@@ -575,30 +576,19 @@ extern "C" int __cdecl main(int argc, char** argv)
         std::fprintf(stderr, "steam::Start failed: %s\n", g3t::steam::Error());
     }
     char fakeJoinFriend[128] = {}, fakeJoinConnect[512] = {};
-    uint32_t fakeJoinDelay = 0;
     GetEnvironmentVariableA("G3T_FAKESTEAM_JOIN_FRIEND", fakeJoinFriend, sizeof(fakeJoinFriend));
     GetEnvironmentVariableA("G3T_FAKESTEAM_JOIN_CONNECT", fakeJoinConnect, sizeof(fakeJoinConnect));
-    char fakeJoinDelayText[32] = {};
-    if (GetEnvironmentVariableA("G3T_FAKESTEAM_JOIN_DELAY_MS", fakeJoinDelayText, sizeof(fakeJoinDelayText)))
-        fakeJoinDelay = std::strtoul(fakeJoinDelayText, nullptr, 10);
     HMODULE fakeModule = fakeDll[0] ? LoadLibraryExA(fakeDll, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) : nullptr;
     typedef void (FAKE_STEAM_CDECL *InjectRichJoin)(uint64_t, char const*, uint32_t);
     InjectRichJoin injectRichJoin = fakeModule
         ? reinterpret_cast<InjectRichJoin>(GetProcAddress(fakeModule, "FakeSteam_InjectRichJoinV1"))
         : nullptr;
     bool rejoinInjected = false;
-    uint32_t reconnectMs = 0;
-    {
-        char reconnectText[32] = {};
-        if (GetEnvironmentVariableA("G3T_FAKESTEAM_RECONNECT_MS", reconnectText, sizeof(reconnectText)))
-            reconnectMs = std::strtoul(reconnectText, nullptr, 10);
-    }
 
     ENetPeer* peer = nullptr;
     bool enetConnectStarted = false;
     bool enetConnected = false;
     bool enetDisconnected = false;
-    uint32_t enetConnectState = 0, enetEvent = 0, enetEventData = 0;
     uint64_t startedTicks = QpcTicks();
     uint64_t lobbyEnterTicks = 0, hostLinkTicks = 0, enetConnectTicks = 0;
     uint32_t linkLostCount = 0, rejoinCount = 0;
@@ -613,8 +603,8 @@ extern "C" int __cdecl main(int argc, char** argv)
     RttSamples channel0Rtt, channel1Rtt, playerProbeRtt, recoveredCriticalRtt;
     std::vector<uint32_t> enetRtt;
     uint32_t rttMaximum = 0;
-    uint64_t firstNativeConnectHeader = RealNativeEnetCommandHeader(ENET_PROTOCOL_COMMAND_CONNECT);
-    uint64_t firstNativeVerifyHeader = RealNativeEnetCommandHeader(ENET_PROTOCOL_COMMAND_VERIFY_CONNECT);
+    uint64_t firstNativeConnectHeader = g3t::steam::EnetCommandHeaderSize(ENET_PROTOCOL_COMMAND_CONNECT);
+    uint64_t firstNativeVerifyHeader = g3t::steam::EnetCommandHeaderSize(ENET_PROTOCOL_COMMAND_VERIFY_CONNECT);
     uint64_t connectPackets = 0, verifyPackets = 0;
     uint64_t nativeOutboundFrames = 0, nativeOutboundCompressedFrames = 0;
     uint64_t nativeOutboundConnectFrames = 0, nativeOutboundVerifyFrames = 0;
@@ -635,11 +625,8 @@ extern "C" int __cdecl main(int argc, char** argv)
     bool playerProbeSent = false;
     uint64_t lastPollTicks = startedTicks;
     uint64_t stressStartedTicks = 0;
-    uint64_t stressEndedTicks = 0;
     uint32_t stressDurationMs = 0;
     uint64_t recoveryPhaseStartTicks = 0;
-    uint32_t runElapsedMs = 0;
-    uint64_t endedTicks = startedTicks;
     uint32_t peakOutstanding = 0;
     std::vector<std::pair<uint32_t, uint64_t>> outstandingSamples;
     std::vector<std::pair<uint32_t, uint64_t>> productQueueBytesSamples;
@@ -647,14 +634,14 @@ extern "C" int __cdecl main(int argc, char** argv)
     uint64_t cumulativePlainQueueBytes = 0, cumulativeWireQueueBytes = 0;
     size_t peakProductQueueBytes = 0, peakProductQueueDepth = 0;
     uint32_t peakProductQueueAgeMs = 0;
-    NativeFrameDecoder nativeCodec;
+    g3t::steam::send::Codec nativeCodec;
+    std::vector<uint8_t> nativePlain;
     bool startReady = g3t::steam::Ready();
 
     while (true) {
         const uint64_t nowTicks = QpcTicks();
         const uint64_t elapsedTicks = nowTicks - startedTicks;
         const uint32_t elapsedMs = static_cast<uint32_t>(std::min<uint64_t>(elapsedTicks * 1000ULL / static_cast<uint64_t>(QpcFrequency()), UINT32_MAX));
-        runElapsedMs = elapsedMs;
         const uint32_t pollElapsed = static_cast<uint32_t>((nowTicks - lastPollTicks) * 1000ULL / static_cast<uint64_t>(QpcFrequency()));
 
         g3t::steam::Pump();
@@ -716,7 +703,6 @@ extern "C" int __cdecl main(int argc, char** argv)
                 if (enetConnectCount >= 2)
                     recoveryPhaseStartTicks = nowTicks;
                 enetConnectTicks = nowTicks;
-                enetConnectState = peer->state;
                 event.peer->data = reinterpret_cast<void*>(1);
                 if (!stressStartedTicks) {
                     stressStartedTicks = nowTicks;
@@ -760,39 +746,18 @@ extern "C" int __cdecl main(int argc, char** argv)
                         channel1Rtt.Add(sent, nowTicks);
                         if (recoveryPhaseStartTicks && sent >= recoveryPhaseStartTicks)
                             recoveredCriticalRtt.Add(sent, nowTicks);
-                    } else if (tag == 0xD1) {
-                        unsigned char echo[256];
-                        if (size >= sizeof(echo)) std::memcpy(echo, data, sizeof(echo));
-                        else std::memset(echo, 0, sizeof(echo));
-                        echo[0] = 0xD2;
-                        ENetPacket* packet = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_RELIABLE);
-                        if (packet) enet_peer_send(event.peer, 1, packet);
-                        if (!args.host && size >= sizeof(echo)) {
-                            ++exactReliableReceived;
-                            unsigned char expected[256];
-                            std::memset(expected, 0, sizeof(expected));
-                            expected[0] = 0xD1;
-                            const uint32_t seq1 = ReadU32(data + 4);
-                            const uint64_t sent1 = ReadU64(data + 8);
-                            WriteU32(expected + 4, seq1);
-                            WriteU64(expected + 8, sent1);
-                            for (size_t i = 16; i < sizeof(expected); ++i)
-                                expected[i] = static_cast<unsigned char>((i * 37u + seq1) & 0xffu);
-                            if (std::memcmp(expected, data, sizeof(expected)) != 0)
-                                ++exactReliableMismatch;
+                    } else if (tag == 0xD1 || tag == 0xD2) {
+                        if (tag == 0xD1) {
+                            unsigned char echo[256] = {};
+                            if (size >= sizeof(echo)) std::memcpy(echo, data, sizeof(echo));
+                            echo[0] = 0xD2;
+                            if (ENetPacket* packet = enet_packet_create(echo, sizeof(echo), ENET_PACKET_FLAG_RELIABLE))
+                                enet_peer_send(event.peer, 1, packet);
                         }
-                    } else if (tag == 0xD2) {
-                        if (args.host && size >= 256) {
+                        if (((tag == 0xD1 && !args.host) || (tag == 0xD2 && args.host)) && size >= 256) {
                             ++exactReliableReceived;
                             unsigned char expected[256];
-                            std::memset(expected, 0, sizeof(expected));
-                            expected[0] = 0xD2;
-                            const uint32_t seq1 = ReadU32(data + 4);
-                            const uint64_t sent1 = ReadU64(data + 8);
-                            WriteU32(expected + 4, seq1);
-                            WriteU64(expected + 8, sent1);
-                            for (size_t i = 16; i < sizeof(expected); ++i)
-                                expected[i] = static_cast<unsigned char>((i * 37u + seq1) & 0xffu);
+                            BuildExactPayload(expected, tag, seq, sent);
                             if (std::memcmp(expected, data, sizeof(expected)) != 0)
                                 ++exactReliableMismatch;
                         }
@@ -802,9 +767,6 @@ extern "C" int __cdecl main(int argc, char** argv)
             } else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
                 enetDisconnected = true;
                 ++linkLostCount;
-                enetEvent = static_cast<unsigned>(ENET_EVENT_TYPE_DISCONNECT);
-                enetEventData = event.data;
-                enetConnectState = event.peer ? event.peer->state : ENET_PEER_STATE_DISCONNECTED;
                 if (peer == event.peer) {
                     peer = nullptr;
                     enetConnectStarted = false;
@@ -821,27 +783,22 @@ extern "C" int __cdecl main(int argc, char** argv)
         }
         for (auto const& frame : outbound) {
             ++nativeOutboundFrames;
-            const bool compressed = frame.size() >= 2 &&
-                                    (frame[0] & 0x40u) != 0;
+            const bool compressed = frame.size() >= 2 && (frame[0] & 0x40u) != 0;
             nativeOutboundCompressedFrames += compressed ? 1 : 0;
-            std::vector<unsigned char> plain;
-            if (!nativeCodec.Decode(frame, plain))
+            if (!nativeCodec.DecompressToPlain(frame.data(), frame.size(), nativePlain))
                 continue;
-            const unsigned firstCommand = RealNativeEnetFirstCommand(
-                plain.data(), plain.size());
+            const unsigned firstCommand = RealNativeEnetFirstCommand(nativePlain.data(), nativePlain.size());
             if (firstCommand == ENET_PROTOCOL_COMMAND_CONNECT) {
                 ++nativeOutboundConnectFrames;
                 nativeOutboundCompressedConnectFrames += compressed ? 1 : 0;
-                nativeObservedConnectHeader =
-                    static_cast<uint32_t>(
-                        RealNativeEnetCommandHeader(ENET_PROTOCOL_COMMAND_CONNECT));
+                nativeObservedConnectHeader = static_cast<uint32_t>(
+                    g3t::steam::EnetCommandHeaderSize(ENET_PROTOCOL_COMMAND_CONNECT));
             }
             if (firstCommand == ENET_PROTOCOL_COMMAND_VERIFY_CONNECT) {
                 ++nativeOutboundVerifyFrames;
                 nativeOutboundCompressedVerifyFrames += compressed ? 1 : 0;
-                nativeObservedVerifyHeader =
-                    static_cast<uint32_t>(
-                        RealNativeEnetCommandHeader(ENET_PROTOCOL_COMMAND_VERIFY_CONNECT));
+                nativeObservedVerifyHeader = static_cast<uint32_t>(
+                    g3t::steam::EnetCommandHeaderSize(ENET_PROTOCOL_COMMAND_VERIFY_CONNECT));
             }
         }
 
@@ -943,7 +900,7 @@ extern "C" int __cdecl main(int argc, char** argv)
                     }
                 }
 
-                if (!playerProbeSent) {
+                if (!playerProbeSent || nowMs - lastPlayerProbeMs >= 500) {
                     playerProbeSent = true;
                     lastPlayerProbeMs = static_cast<uint32_t>(nowMs);
                     unsigned char payload[120] = {};
@@ -951,45 +908,20 @@ extern "C" int __cdecl main(int argc, char** argv)
                     payload[1] = 0xC2;
                     WriteU32(payload + 4, static_cast<uint32_t>(++channel0Sequence));
                     WriteU64(payload + 8, nowTicks);
-                    ENetPacket* packet = enet_packet_create(
-                        payload, sizeof(payload),
-                        ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
-                    if (packet) enet_peer_send(peer, 0, packet);
-                } else if (nowMs - lastPlayerProbeMs >= 500) {
-                    lastPlayerProbeMs = static_cast<uint32_t>(nowMs);
-                    unsigned char payload[120] = {};
-                    payload[0] = 3;
-                    payload[1] = 0xC2;
-                    WriteU32(payload + 4, static_cast<uint32_t>(++channel0Sequence));
-                    WriteU64(payload + 8, nowTicks);
-                    ENetPacket* packet = enet_packet_create(
-                        payload, sizeof(payload),
-                        ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
-                    if (packet) enet_peer_send(peer, 0, packet);
+                    if (ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT))
+                        enet_peer_send(peer, 0, packet);
                 }
 
                 if (nowMs - lastChannel1Ms >= 100) {
                     lastChannel1Ms = nowMs;
-                    unsigned char payload[64];
-                    std::memset(payload, 0x31, sizeof(payload));
-                    payload[0] = 0xA1;
-                    WriteU32(payload + 4, static_cast<uint32_t>(++channel1Sequence));
-                    WriteU64(payload + 8, nowTicks);
-                    ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_RELIABLE);
-                    if (packet) enet_peer_send(peer, 1, packet);
+                    SendReliableProbe(peer, 0x31, static_cast<uint32_t>(++channel1Sequence), nowTicks);
                 }
 
                 if (nowMs - lastExactMs >= 500) {
                     lastExactMs = nowMs;
                     unsigned char payload[256];
-                    std::memset(payload, 0, sizeof(payload));
-                    payload[0] = 0xD1;
-                    WriteU32(payload + 4, static_cast<uint32_t>(++exactSequence));
-                    WriteU64(payload + 8, nowTicks);
-                    for (size_t i = 16; i < sizeof(payload); ++i)
-                        payload[i] = static_cast<unsigned char>((i * 37u + exactSequence) & 0xffu);
-                    ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_RELIABLE);
-                    if (packet) {
+                    BuildExactPayload(payload, 0xD1, static_cast<uint32_t>(++exactSequence), nowTicks);
+                    if (ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_RELIABLE)) {
                         ++exactReliableSent;
                         enet_peer_send(peer, 1, packet);
                     }
@@ -998,13 +930,7 @@ extern "C" int __cdecl main(int argc, char** argv)
 
             if (!args.host && pollElapsed >= 1 && elapsedMs - lastChannel1Ms >= 100) {
                 lastChannel1Ms = elapsedMs;
-                unsigned char payload[64];
-                std::memset(payload, 0x32, sizeof(payload));
-                payload[0] = 0xA1;
-                WriteU32(payload + 4, static_cast<uint32_t>(++channel1Sequence));
-                WriteU64(payload + 8, nowTicks);
-                ENetPacket* packet = enet_packet_create(payload, sizeof(payload), ENET_PACKET_FLAG_RELIABLE);
-                if (packet) enet_peer_send(peer, 1, packet);
+                SendReliableProbe(peer, 0x32, static_cast<uint32_t>(++channel1Sequence), nowTicks);
             }
         }
 
@@ -1059,7 +985,6 @@ extern "C" int __cdecl main(int argc, char** argv)
         const uint32_t activeElapsedMs = static_cast<uint32_t>(
             std::min<uint64_t>(activeTicks * 1000ULL /
                                static_cast<uint64_t>(QpcFrequency()), UINT32_MAX));
-        runElapsedMs = activeElapsedMs;
         const bool connectionTimedOut =
             std::strcmp(args.scenario, "metadata") != 0 &&
             !stressStartedTicks && elapsedMs >= 10000;
@@ -1070,7 +995,6 @@ extern "C" int __cdecl main(int argc, char** argv)
                 if (enet_host_service(enet, &event, 10) > 0 && event.type == ENET_EVENT_TYPE_DISCONNECT) break;
                 enet_host_flush(enet);
             }
-            endedTicks = nowTicks;
             break;
         }
     }
@@ -1082,20 +1006,7 @@ extern "C" int __cdecl main(int argc, char** argv)
     const uint64_t plainTx = cumulativePlainQueueBytes;
     const uint64_t wireTx = cumulativeWireQueueBytes;
     const double compressionRatio = wireTx ? static_cast<double>(plainTx) / static_cast<double>(wireTx) : 0.0;
-    double productQueueSlope = 0.0;
-    if (productQueueBytesSamples.size() >= 2) {
-        const double n = static_cast<double>(productQueueBytesSamples.size());
-        double sx = 0.0, sy = 0.0, sxy = 0.0, sx2 = 0.0;
-        for (auto const& sample : productQueueBytesSamples) {
-            sx += sample.first;
-            sy += sample.second;
-            sxy += static_cast<double>(sample.first) * sample.second;
-            sx2 += static_cast<double>(sample.first) * sample.first;
-        }
-        const double denominator = n * sx2 - sx * sx;
-        if (denominator != 0.0)
-            productQueueSlope = (n * sxy - sx * sy) / denominator * 1000.0;
-    }
+    const double productQueueSlope = LinearSlopePerSecond(productQueueBytesSamples);
 
     g3t::steam::TrafficCounters traffic = g3t::steam::Traffic();
     CallbackObservation callbackSnapshot;
@@ -1109,20 +1020,7 @@ extern "C" int __cdecl main(int argc, char** argv)
         ? TicksMs(hostLinkTicks - callbackSnapshot.callback504Ticks) : 0.0;
     const double enetConnectMs = sawHostLink && enetConnectTicks
         ? TicksMs(enetConnectTicks - startedTicks) : 0.0;
-
-    double slope = 0.0;
-    if (outstandingSamples.size() >= 2) {
-        const double n = static_cast<double>(outstandingSamples.size());
-        double sx = 0.0, sy = 0.0, sxy = 0.0, sx2 = 0.0;
-        for (auto const& sample : outstandingSamples) {
-            sx += sample.first;
-            sy += sample.second;
-            sxy += static_cast<double>(sample.first) * sample.second;
-            sx2 += static_cast<double>(sample.first) * sample.first;
-        }
-        const double denominator = n * sx2 - sx * sx;
-        if (denominator != 0.0) slope = (n * sxy - sx * sy) / denominator * 1000.0;
-    }
+    const double slope = LinearSlopePerSecond(outstandingSamples);
 
     FakeSteamStatsV1 fakeStats{};
     FakeSteamConfigV1 fakeConfig{};
@@ -1149,11 +1047,13 @@ extern "C" int __cdecl main(int argc, char** argv)
             fakeConfigAvailable = true;
     }
     const uint32_t finalLinkedCount = g3t::steam::LinkedCount();
-    const uint32_t finalPing = g3t::steam::Ping();
+    const int finalPing = g3t::steam::Ping();
     const std::string finalError = g3t::steam::Error();
     g3t::steam::Stop();
     enet_host_destroy(enet);
     enet_deinitialize();
+    if (fakeModule) FreeLibrary(fakeModule);
+    if (markerModule) FreeLibrary(markerModule);
 
     const uint64_t runSeconds = args.seconds;
     std::ostringstream json;
@@ -1265,66 +1165,12 @@ extern "C" int __cdecl main(int argc, char** argv)
          << ",\"fake_stats_struct_bytes_received\":" << fakeStats.structBytes
          << ",\"fake_stats_struct_bytes_expected\":" << sizeof(fakeStats)
          << ",\"fake_stats_abi_version_received\":" << fakeStats.abiVersion
-         << ",\"fake_stats\":" << (fakeStatsAvailable
-             ? ("{\"pending_bytes\":" + std::to_string(fakeStats.pendingBytes) +
-                ",\"max_pending\":" + std::to_string(fakeStats.maxPending) +
-                ",\"pending_reliable\":" + std::to_string(fakeStats.pendingReliable) +
-                ",\"pending_unreliable\":" + std::to_string(fakeStats.pendingUnreliable) +
-                ",\"sent_unacked\":" + std::to_string(fakeStats.sentUnacked) +
-                ",\"accepted_messages\":" + std::to_string(fakeStats.acceptedMessages) +
-                ",\"accepted_bytes\":" + std::to_string(fakeStats.acceptedBytes) +
-                ",\"result25_count\":" + std::to_string(fakeStats.result25Count) +
-                ",\"result41_count\":" + std::to_string(fakeStats.result41Count) +
-                ",\"wire_bytes\":" + std::to_string(fakeStats.wireBytes) +
-                ",\"wire_packets\":" + std::to_string(fakeStats.wirePackets) +
-                ",\"delivered_bytes\":" + std::to_string(fakeStats.deliveredBytes) +
-                ",\"delivered_messages\":" + std::to_string(fakeStats.deliveredMessages) +
-                ",\"dropped_data_packets\":" + std::to_string(fakeStats.droppedDataPackets) +
-                ",\"dropped_ack_packets\":" + std::to_string(fakeStats.droppedAckPackets) +
-                ",\"reliable_retries\":" + std::to_string(fakeStats.reliableRetries) +
-                ",\"duplicate_messages\":" + std::to_string(fakeStats.duplicateMessages) +
-                ",\"session_starts\":" + std::to_string(fakeStats.sessionStarts) +
-                ",\"session_failures\":" + std::to_string(fakeStats.sessionFailures) +
-                ",\"session_restarts\":" + std::to_string(fakeStats.sessionRestarts) +
-                ",\"current_queue_age_ms\":" + std::to_string(fakeStats.currentQueueAgeMs) +
-                ",\"max_queue_age_ms\":" + std::to_string(fakeStats.maxQueueAgeMs) +
-                ",\"callback333_count\":" + std::to_string(fakeStats.callback333Count) +
-                ",\"callback337_count\":" + std::to_string(fakeStats.callback337Count) +
-                ",\"callback504_count\":" + std::to_string(fakeStats.callback504Count) +
-                ",\"callback505_count\":" + std::to_string(fakeStats.callback505Count) +
-                ",\"callback506_count\":" + std::to_string(fakeStats.callback506Count) +
-                ",\"callback703_count\":" + std::to_string(fakeStats.callback703Count) +
-                ",\"callback1251_count\":" + std::to_string(fakeStats.callback1251Count) +
-                ",\"callback1252_count\":" + std::to_string(fakeStats.callback1252Count) +
-                ",\"requested_nodelay_count\":" + std::to_string(fakeStats.requestedNoDelayCount) +
-                ",\"effective_reliable_count\":" + std::to_string(fakeStats.effectiveReliableCount) +
-                ",\"queue_delay_events\":" + std::to_string(fakeStats.queueDelayEvents) +
-                ",\"max_queue_delay_ms\":" + std::to_string(fakeStats.maxQueueDelayMs) +
-                "}")
-             : "{\"available\":false}")
+         << ",\"fake_stats\":" << (fakeStatsAvailable ? FakeStatsJson(fakeStats) : "{\"available\":false}")
          << ",\"fake_config_available\":" << (fakeConfigAvailable ? "true" : "false")
          << ",\"fake_config_abi_return\":" << fakeConfigAbiReturn
          << ",\"fake_config_struct_bytes_received\":" << fakeConfig.structBytes
          << ",\"fake_config_struct_bytes_expected\":" << sizeof(fakeConfig)
-         << ",\"fake_config\":" << (fakeConfigAvailable
-             ? ("{\"profile\":\"" + JsonEscape(fakeConfig.profile) +
-                "\",\"physical_rate_bps\":" + std::to_string(fakeConfig.physicalRateBps) +
-                ",\"latency_ms\":" + std::to_string(fakeConfig.latencyMs) +
-                ",\"jitter_ms\":" + std::to_string(fakeConfig.jitterMs) +
-                ",\"loss_permille\":" + std::to_string(fakeConfig.lossPermille) +
-                ",\"ack_loss_permille\":" + std::to_string(fakeConfig.ackLossPermille) +
-                ",\"setup_ms\":" + std::to_string(fakeConfig.setupMs) +
-                ",\"metadata_delay_ms\":" + std::to_string(fakeConfig.metadataDelayMs) +
-                ",\"reconnect_ms\":" + std::to_string(fakeConfig.reconnectMs) +
-                ",\"outage_ms\":" + std::to_string(fakeConfig.outageMs) +
-                ",\"nodelay_policy\":" + std::to_string(fakeConfig.nodelayPolicy) +
-                ",\"queue_delay_ms\":" + std::to_string(fakeConfig.queueDelayMs) +
-                ",\"queue_delay_period_ms\":" + std::to_string(fakeConfig.queueDelayPeriodMs) +
-                ",\"queue_delay_window_ms\":" + std::to_string(fakeConfig.queueDelayWindowMs) +
-                ",\"queue_delay_phase_ms\":" + std::to_string(fakeConfig.queueDelayPhaseMs) +
-                ",\"queue_delay_enabled\":" + std::to_string(fakeConfig.queueDelayEnabled) +
-                "}")
-             : "{\"available\":false}")
+         << ",\"fake_config\":" << (fakeConfigAvailable ? FakeConfigJson(fakeConfig) : "{\"available\":false}")
          << ",\"sampled_before_stop\":true"
          << ",\"queue_sample_thread\":\"production-worker-before-native-wait\""
          << ",\"error\":\"" << JsonEscape(finalError.c_str()) << '\"'

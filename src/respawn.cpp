@@ -2,9 +2,11 @@
 #include "respawn.h"
 
 #include "ai.h"
+#include "guid.h"
 #include "journal.h"
 #include "log.h"
 #include "net.h"
+#include "npclease_runtime.h"
 #include "npcs.h"
 #include "npcremoval.h"
 
@@ -56,7 +58,7 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     eCEntity* instance = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     if (npcremoval::Suppressed(instance)) return 0;
-    if (!net::IsHost() || npcs::IsMirrored(instance)) { ++mirrorsSkipped; return 0; }
+    if (!net::IsHost() || npcs::IsMirrored(instance) || npclease::Fenced(instance)) { ++mirrorsSkipped; return 0; }
     if (!enabled || !instance) return original(spu, self, other, args);
     Entity npc(instance);
     const bool deadBefore = Dead(npc);
@@ -68,9 +70,9 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         ++stood;
         EndDeathTask(npc);
         journal::NewLife(instance);
-        uint8_t guid[16];
-        std::memcpy(guid, &eCEntityProxy(instance).GetEntityID().GetCore(), 16);
-        npcs::NewLife(guid);
+        uint8_t rawGuid[16];
+        guid::CopyEntity(instance, rawGuid);
+        npcs::NewLife(rawGuid);
         Logf("respawn: %s stands up on the host; a new NPC incarnation will be published", npc.GetName().GetText());
     } else if ((instance->GetWorldPosition() - before).GetMagnitude() > 10000.0f) {
         ++gone;

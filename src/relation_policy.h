@@ -149,14 +149,14 @@ struct FocusPriorityInput {
     bool sharedHostile = false;
     bool targetsCoopSide = false;
     bool inCombat = false;
-    bool outsideBout = false;
+    bool inBout = false;
     CombatRole role = CombatRole::OrdinaryNpc;
     int attitude = None;
 };
 
 inline int CombatFocusPriorityOverride(FocusPriorityInput const& in)
 {
-    if (!in.alive || in.down || !in.combatTask || in.role != CombatRole::OrdinaryNpc || in.outsideBout)
+    if (!in.alive || in.down || !in.combatTask || in.role != CombatRole::OrdinaryNpc || in.inBout)
         return -1;
     if (in.sharedHostile) return 3;
     if (in.mirrored && in.inCombat &&

@@ -35,7 +35,7 @@ class GroundImmunityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.sources = {
             name: _testbuild.src_text(f"{name}.cpp")
-            for name in ("downed", "combat", "spells", "npcs", "npcplayback")
+            for name in ("downed", "combat", "spells", "npcs", "npc_contact", "npcplayback")
         }
 
     def body(self, source, signature):
@@ -121,7 +121,7 @@ class GroundImmunityTests(unittest.TestCase):
             self.assertLess(body.index("downed::RejectHarm"), body.rindex("originals["))
         area = self.body("spells", r"\bbTObjArray<Entity>\s+GE_STDCALL\s+AreaTargets\s*\(")
         self.assertIn('downed::RejectHarm(targets.GetAt(i).GetInstance(), areaCaster, "area-spell")', area)
-        force = self.body("npcs", r"\bvoid\s+__fastcall\s+HookAddForce\s*\(")
+        force = self.body("npc_contact", r"\bvoid\s+__fastcall\s+HookAddForce\s*\(")
         self.assertLess(force.index("RejectHarm"), force.index("originalAddForce(self, edx, force, at)"))
 
     def test_native_hp_decreases_and_reaction_bypasses_are_guarded(self):

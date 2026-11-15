@@ -26,41 +26,6 @@
 
 namespace g3t::npcs::detail {
 
-void NoteTakeover(GuidKey const& key, net::NpcRecord const& record, uint8_t owner)
-{
-    static unsigned noted = 0;
-    if (noted >= 60) return;
-    ++noted;
-    Entity npc = Resolve(key);
-    eCEntity* body = remote::ControlledBody();
-    if (!npc.GetInstance() || !body) return;
-    const bCVector& h = body->GetWorldPosition();
-    const bCVector& p = npc.GetInstance()->GetWorldPosition();
-    const float hero[3] = {h.GetX(), h.GetY(), h.GetZ()}, here[3] = {p.GetX(), p.GetY(), p.GetZ()};
-    const auto sent = sendNotes.find(key);
-    Logf("npcs: host mirrors %s of player %u: here %.1f m from the host's hero, there %.1f m; last left out here: %s, %d ms ago",
-         npc.GetName().GetText(), owner, body::Distance(here, hero) / 100.0f, body::Distance(record.position, hero) / 100.0f,
-         sent == sendNotes.end() ? "never seen" : sent->second.reason,
-         sent == sendNotes.end() ? -1 : static_cast<int>(net::Now() - sent->second.at));
-}
-
-bool Contested(GuidKey const& key, uint8_t owner)
-{
-    const auto sent = sendNotes.find(key);
-    if (sent == sendNotes.end() || std::strcmp(sent->second.reason, "range") || static_cast<int32_t>(net::Now() - sent->second.at) > 1000) return false;
-    Entity npc = Resolve(key);
-    if (!npc.GetInstance() || npc.IsDead() || !lastPlayerCount) return false;
-    const bCVector& p = npc.GetInstance()->GetWorldPosition();
-    const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
-    float nearest = 1e30f;
-    for (int k = 0; k < lastPlayerCount; ++k) nearest = std::min(nearest, body::Distance(here, lastPlayers[k]));
-    if (nearest > KeepRadius) return false;
-    if (contested.insert(key).second && contested.size() < 200)
-        Logf("npcs: %s of player %u refused: here %.1f m from the nearest player, in this machine's band; sent from here now",
-             npc.GetName().GetText(), owner, nearest / 100.0f);
-    return true;
-}
-
 void DropMirror(GuidKey const& key)
 {
     auto it = mirrors.find(key);
@@ -114,7 +79,16 @@ void RefreshCompanionIdentity()
 
 void OfferCompanions(uint32_t now)
 {
-    RefreshCompanionIdentity();
+    static uint64_t lastIdentitySignature = 0;
+    uint64_t sig = steam::PlayerId() ^ (static_cast<uint64_t>(companionIdentity.owners.size()) << 32);
+    for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+        if (net::PeerJoined(id))
+            sig = (sig * 1099511628211ull) ^ net::PeerAccount(id) ^ (static_cast<uint64_t>(net::PeerGeneration(id)) << 16) ^ id;
+    }
+    if (sig != lastIdentitySignature) {
+        lastIdentitySignature = sig;
+        RefreshCompanionIdentity();
+    }
     if (!offering) return;
     for (auto const& [rawKey, owner] : companionIdentity.owners) {
         if (!owner.account || owner.summoned) continue;
@@ -651,7 +625,7 @@ bool AdmitIncomingNpc(net::NpcRecord const& record, GuidKey const& key, uint32_t
         absences.erase(absent);
         world::RequestProcessingUpdate();
     }
-    if (!net::IsHost() && (record.flags & 1) != 0 && npcpresence::IsVoidDespawnPosition(record.position)) {
+    if ((record.flags & 1) != 0 && npcpresence::IsVoidDespawnPosition(record.position)) {
         LeaseReleaseMirror(record.guid);
         absences[key] = record;
         pendingForces.erase(key);
@@ -667,44 +641,15 @@ bool AdmitIncomingNpc(net::NpcRecord const& record, GuidKey const& key, uint32_t
         return false;
     }
     if (!(record.flags & 1)) journal::NewLife(record.guid);
-    if (net::IsHost() && existing != mirrors.end()) {
-        Mirror const& current = existing->second;
-        const bool ownerConnected = current.owner > 1 && current.owner < net::MaxPlayers &&
-                                    net::PeerJoined(current.owner) && net::InWorld(current.owner) &&
-                                    current.ownerGeneration == net::PeerGeneration(current.owner);
-        if (current.owner != owner && !current.released && ownerConnected) {
-            ++claimsRefused;
-            return false;
-        }
-    }
-    if (net::IsHost() && hostTaken.count(key)) { ++claimsRefused; return false; }
-    if (net::IsHost() && reclaimed.count(key)) { ++reclaimRefused; return false; }
-    if (deadStays && net::IsHost() && owner > 1 && !(record.flags & 1)) {
-        Entity here = Resolve(record.guid);
-        if (here.GetInstance() && here.IsDead()) { ++deadRefused; return false; }
-    }
     if (owned.count(key) && !claimedBy.count(key)) {
-        if (net::IsHost() || !hostWinsRule) { ++claimsRefused; return false; }
+        if (!hostWinsRule) { ++claimsRefused; return false; }
         owned.erase(key);
         ++hostWins;
     }
     const auto claim = claimedBy.find(key);
     if (claim != claimedBy.end() && claim->second != owner) { ++claimsRefused; return false; }
-    if (net::IsHost() && owner > 1 && owner < net::MaxPlayers && claim == claimedBy.end() && joinGraceRule) {
-        if (!joinedAt[owner]) joinedAt[owner] = now ? now : 1;
-        if (static_cast<int32_t>(now - joinedAt[owner]) < static_cast<int32_t>(JoinGrace) && !mirrors.count(key)) {
-            eCEntity* body = remote::ControlledBody();
-            const bCVector& h = body ? body->GetWorldPosition() : bCVector();
-            const float heroAt[3] = {h.GetX(), h.GetY(), h.GetZ()};
-            if (body && body::Distance(record.position, heroAt) <= InterestRadius) { ++joinRefused; return false; }
-        }
-    }
     if (claim != claimedBy.end()) claimSeen[key] = now;
     givenBack.erase(key);
-    if (net::IsHost() && owner > 1 && claim == claimedBy.end() && !mirrors.count(key)) {
-        if (contestRule && Contested(key, owner)) { ++contestedRefused; return false; }
-        NoteTakeover(key, record, owner);
-    }
     return true;
 }
 
