@@ -2,6 +2,51 @@
 #include "../src/snapshot.h"
 
 #include <cassert>
+#include <cmath>
+
+static void TestDeathPelvisDiscontinuityHold()
+{
+    using namespace g3t::body;
+    Track npc;
+    npc.predictive = false;
+    SetPoseInterval(npc, 16);
+    const float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    MotionState alive{};
+    alive.flags = 8; // fighting, alive on ground
+    uint32_t sent = 2000;
+    for (int i = 0; i < 6; ++i, sent += 16) {
+        const float ground[3] = {91200.0f + i * 2.0f, 5141.1f, -12700.0f};
+        Feed(npc, ground, rotation, sent, sent + 4, 2, alive);
+    }
+    const float lastGround[3] = {91210.0f, 5141.1f, -12700.0f};
+    float shown[3] = {}, turn[4] = {};
+    Presentation presentation{};
+    // Anchor render clock at the last alive sample (sent - 16 = 2080).
+    uint32_t now = (sent - 16) + 4 + 65;
+    assert(Sample(npc, now, shown, turn, -65, true, &presentation));
+    assert((presentation.motion.flags & 1) == 0);
+
+    // Host ragdoll death jumps WorldPosition +90 cm from feet (5141.1) to Bip01 Pelvis (5231.1).
+    MotionState deadRagdoll{};
+    deadRagdoll.flags = 129; // dead | ragdoll
+    const float pelvis[3] = {91211.0f, 5231.1f, -12699.0f};
+    Feed(npc, pelvis, rotation, sent, sent + 4, 14, deadRagdoll);
+
+    // Advance 8 ms (halfway between alive at 2080 and dead+ragdoll at 2096, fraction = 0.5):
+    // must keep alive ground Y=5141.1 instead of floating +45 cm into the air while still alive.
+    now += 8;
+    assert(Sample(npc, now, shown, turn, -65, true, &presentation));
+    assert((presentation.motion.flags & 1) == 0);
+    assert(std::fabs(shown[0] - lastGround[0]) < 0.01f);
+    assert(std::fabs(shown[1] - 5141.1f) < 0.01f);
+    assert(presentation.speed == 0.0f);
+
+    // Advance another 8 ms to reach the death snapshot (2096): death flags take effect cleanly.
+    now += 8;
+    assert(Sample(npc, now, shown, turn, -65, true, &presentation));
+    assert((presentation.motion.flags & 129) == 129);
+    assert(std::fabs(shown[1] - 5231.1f) < 0.01f);
+}
 
 static void TestArrivalGapDiagnostics()
 {
@@ -28,6 +73,7 @@ int main()
 {
     using namespace g3t::body;
     TestArrivalGapDiagnostics();
+    TestDeathPelvisDiscontinuityHold();
     Track npc;
     npc.predictive = false;
     float position[3] = {};

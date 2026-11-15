@@ -25,11 +25,18 @@ namespace {
 using g3t::ragdoll::ClampedBoneCount;
 using g3t::ragdoll::CorpseOriginInput;
 using g3t::ragdoll::CorpseOriginResult;
+using g3t::ragdoll::ExtendPausedFallbackGrace;
 using g3t::ragdoll::Finite;
 using g3t::ragdoll::FiniteMatrix12;
+using g3t::ragdoll::IsGroundOriginSample;
+using g3t::ragdoll::RagdollDeadMovementMode;
 using g3t::ragdoll::SafeTraceVelocity;
 using g3t::ragdoll::SelectCorpseOrigin;
 using g3t::ragdoll::ShapeCorpseImpulse;
+using g3t::ragdoll::ShouldDeferCorpseRagdoll;
+using g3t::ragdoll::ShouldFreezeActiveRagdollPresentation;
+using g3t::ragdoll::ShouldHoldPreDeathTransform;
+using g3t::ragdoll::ShouldRestartUnsettledCorpseAfterPause;
 using g3t::ragdoll::Vector;
 
 bool Near(float a, float b, float eps = 0.01f) { return std::fabs(a - b) <= eps; }
@@ -73,6 +80,51 @@ int TestOriginSelection()
     if (!SelectCorpseOrigin(teleported, out)) return 16;
     if (out.keepLiveMatrix || !NearVec(out.origin, teleported.shownPos)) return 17;
 
+    // Live-presented mirror that drifted up toward Pelvis (+90 cm) clamps back down to durable ground Y.
+    CorpseOriginInput driftedLive = live;
+    driftedLive.entityPos = {1002.0f, 590.0f, -1998.0f};
+    if (!SelectCorpseOrigin(driftedLive, out)) return 18;
+    if (out.keepLiveMatrix || !NearVec(out.origin, {1002.0f, 500.0f, -1998.0f})) return 19;
+
+    // Unpresented mirror right at spawn (< 150 cm) with no prior alive packet strips +90 cm Pelvis lift.
+    CorpseOriginInput spawnDead{};
+    spawnDead.entityPos = {4200.0f, 425.0f, 3100.0f};
+    spawnDead.shownPos = {4210.0f, 515.0f, 3095.0f};
+    spawnDead.hostRagdoll = true;
+    if (!SelectCorpseOrigin(spawnDead, out)) return 40;
+    if (out.keepLiveMatrix || !NearVec(out.origin, {4210.0f, 425.0f, 3095.0f})) return 41;
+
+    return 0;
+}
+
+int TestPauseAndGroundPolicies()
+{
+    if (!IsGroundOriginSample(0, 2, {100.0f, 200.0f, 300.0f})) return 50;
+    if (!IsGroundOriginSample(2, 1, {100.0f, 200.0f, 300.0f})) return 51; // downed stays on ground
+    if (IsGroundOriginSample(1, 2, {100.0f, 200.0f, 300.0f})) return 52;
+    if (IsGroundOriginSample(128, 2, {100.0f, 200.0f, 300.0f})) return 53;
+    if (IsGroundOriginSample(0, RagdollDeadMovementMode, {100.0f, 200.0f, 300.0f})) return 54;
+
+    if (!ShouldHoldPreDeathTransform(0, 2, 129, RagdollDeadMovementMode, 0.5f)) return 55;
+    if (ShouldHoldPreDeathTransform(0, 2, 129, RagdollDeadMovementMode, 1.0f)) return 56;
+    if (ShouldHoldPreDeathTransform(129, RagdollDeadMovementMode, 129, RagdollDeadMovementMode, 0.5f)) return 57;
+
+    if (!ShouldDeferCorpseRagdoll(false, true, false)) return 58;
+    if (ShouldDeferCorpseRagdoll(true, true, false)) return 59;
+    if (ShouldDeferCorpseRagdoll(false, false, false)) return 60;
+    if (ShouldDeferCorpseRagdoll(false, true, true)) return 61;
+
+    if (!ShouldFreezeActiveRagdollPresentation(false, true, true, true)) return 62;
+    if (!ShouldFreezeActiveRagdollPresentation(false, true, false, true)) return 63;
+    if (ShouldFreezeActiveRagdollPresentation(false, true, false, false)) return 64;
+    if (ShouldFreezeActiveRagdollPresentation(false, false, true, true)) return 65;
+
+    if (!ShouldRestartUnsettledCorpseAfterPause(true, false, true, false, false)) return 66;
+    if (ShouldRestartUnsettledCorpseAfterPause(true, false, true, true, false)) return 67;
+    if (ShouldRestartUnsettledCorpseAfterPause(true, false, true, false, true)) return 68;
+
+    if (ExtendPausedFallbackGrace(0, 50000) != 0) return 69;
+    if (ExtendPausedFallbackGrace(10500, 50000) != 50500) return 70;
     return 0;
 }
 
@@ -151,6 +203,7 @@ int main(int argc, char** argv)
     if (std::strcmp(argv[1], "origin") == 0) return TestOriginSelection();
     if (std::strcmp(argv[1], "corpse_impulse") == 0) return TestCorpseImpulseShaping();
     if (std::strcmp(argv[1], "sanitize") == 0) return TestBoneBoundsAndSanitization();
+    if (std::strcmp(argv[1], "pause_policy") == 0) return TestPauseAndGroundPolicies();
     return 2;
 }
 """
@@ -193,6 +246,9 @@ class RagdollForceTests(unittest.TestCase):
 
     def test_bone_bounds_matrix_validation_and_trace_velocity_reject_inf_nan(self):
         self.run_corpse_case("sanitize")
+
+    def test_pause_deferral_ground_origin_and_unsettled_recovery_policies(self):
+        self.run_corpse_case("pause_policy")
 
 
 if __name__ == "__main__":

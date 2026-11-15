@@ -13,6 +13,7 @@
 namespace g3t::npcs::detail {
 namespace {
 using Vec3 = ragdoll::Vector;
+static_assert(static_cast<uint8_t>(gECharMovementMode_RagDollDead) == ragdoll::RagdollDeadMovementMode);
 
 struct CorpseGroundAnchor {
     uint32_t incarnation = 0;
@@ -322,6 +323,11 @@ bool HostForceAvailable(Mirror const& m)
 
 bool TryApplyForce(Mirror& m, uint32_t now)
 {
+    if (!net::IsHost() && gCSession::GetInstance().IsPaused()) {
+        if (m.deathImpulse.Pending() && m.fallbackGraceUntil)
+            m.fallbackGraceUntil = ragdoll::ExtendPausedFallbackGrace(m.fallbackGraceUntil, now);
+        return false;
+    }
     auto* animation = static_cast<eCVisualAnimation_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
     if (!m.killed || !m.ragdollInitialized || !animation) return false;
     const bool active = animation->GetRagDollEnabled() && animation->GetRagDollController();
@@ -410,11 +416,17 @@ void CaptureCorpsePose(Mirror& m, uint32_t now, bool final)
 
 void RestoreCorpseActor(Mirror& m)
 {
-    if (!m.ragdollInitialized || m.corpsePose.empty() || !FiniteMatrix(m.corpseRoot)) return;
+    if (!m.ragdollInitialized) return;
     auto* entity = m.entity.GetInstance();
     auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
     auto* actor = animation ? animation->GetActor() : nullptr;
-    if (!actor || !actor->GetInstance() || actor->GetInstance() == m.corpseActor) return;
+    if (!actor || !actor->GetInstance() || !m.corpseActor || actor->GetInstance() == m.corpseActor) return;
+    if (!m.corpseSettled || m.corpsePose.empty() || !FiniteMatrix(m.corpseRoot)) {
+        m.corpseActor = actor->GetInstance();
+        m.ragdollStarted = m.ragdollInitialized = m.corpseSimulating = false;
+        m.lieCheckAt = m.ragdollTryAt = 0;
+        return;
+    }
     animation->SetRagDollEnabled(GEFalse, 0.0f, GETrue);
     entity->SetToWorldMatrix(m.corpseRoot);
     if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
@@ -429,19 +441,39 @@ void UpdateCorpsePresentation(Mirror& m, uint32_t now)
     auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!animation || !actor) return;
+    const bool sessionPaused = !net::IsHost() && gCSession::GetInstance().IsPaused();
     if (!net::IsHost() && m.killed && !m.ragdollInitialized) {
         if (m.corpsePose.empty()) CaptureCorpsePose(m, now);
         if (!m.corpsePose.empty())
             npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
         return;
     }
+    const bool controllerActive = animation->GetRagDollEnabled() && animation->GetRagDollController();
+    if (ragdoll::ShouldFreezeActiveRagdollPresentation(
+            net::IsHost(), sessionPaused, controllerActive, m.ragdollInitialized && !m.corpseSettled)) {
+        m.ragdollPaused = true;
+        m.corpseSimulating = controllerActive;
+        return;
+    }
+    if (m.ragdollPaused && !sessionPaused) {
+        const bool restart = ragdoll::ShouldRestartUnsettledCorpseAfterPause(
+            true, false, m.ragdollInitialized, m.corpseSettled, controllerActive);
+        m.ragdollPaused = false;
+        if (m.ragdollTraceSampleAt) m.ragdollTraceSampleAt = now;
+        if (restart && actor->GetInstance() && ActorBonesFinite(animation)) {
+            animation->SetRagDollEnabled(GETrue, 0.0f, GETrue);
+            ++m.ragdollWakes;
+        }
+    }
     if (animation->GetRagDollEnabled() && animation->GetRagDollController()) {
         npcplayback::UpdatePresentation(entity);
         const bool active = animation->GetRagDollEnabled() && animation->GetRagDollController();
         CaptureCorpsePose(m, now, !active);
         m.corpseSimulating = active;
+        if (!active) m.corpseSettled = true;
     } else if (m.ragdollInitialized) {
         m.corpseSimulating = false;
+        m.corpseSettled = true;
         const bool restored = !m.corpsePose.empty() &&
             npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
         if (!restored && !(m.lieNoted & 16)) {
@@ -459,7 +491,7 @@ void PresentDeadMirror(GuidKey const& key, Mirror& m, net::NpcRecord const& show
     deadOnHost.insert(key);
     auto* entity = m.entity.GetInstance();
     if (!m.corpsePlaced) {
-        if (m.ragdollInitialized && !m.corpsePose.empty() && FiniteMatrix(m.corpseRoot)) {
+        if (m.ragdollInitialized && m.corpseSettled && !m.corpsePose.empty() && FiniteMatrix(m.corpseRoot)) {
             entity->SetToWorldMatrix(m.corpseRoot);
             if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
                 rigid->SetPose(m.corpseRoot);
@@ -469,12 +501,17 @@ void PresentDeadMirror(GuidKey const& key, Mirror& m, net::NpcRecord const& show
             const bCVector& cur = entity->GetWorldPosition();
             ragdoll::CorpseOriginInput originInput{};
             originInput.entityPos = {cur.GetX(), cur.GetY(), cur.GetZ()};
-            originInput.previousPos = {m.previous.position[0], m.previous.position[1], m.previous.position[2]};
+            const bool haveDurableGround = m.haveLastGroundPos && m.lastGroundIncarnation == shown.incarnation;
+            if (haveDurableGround) {
+                originInput.previousPos = {m.lastGroundPos[0], m.lastGroundPos[1], m.lastGroundPos[2]};
+                originInput.havePreviousAlive = true;
+            } else {
+                originInput.previousPos = {m.previous.position[0], m.previous.position[1], m.previous.position[2]};
+                originInput.havePreviousAlive = m.previousTicks != 0 &&
+                    ragdoll::IsGroundOriginSample(m.previous.flags, m.previous.movementMode, originInput.previousPos);
+            }
             originInput.shownPos = {shown.position[0], shown.position[1], shown.position[2]};
             originInput.livePresented = (m.replay.initialized || m.replayReady) && FiniteMatrix(entity->GetWorldMatrix());
-            originInput.havePreviousAlive = m.previousTicks != 0 &&
-                (m.previous.flags & 1) == 0 && (m.previous.flags & 128) == 0 &&
-                m.previous.movementMode != static_cast<uint8_t>(gECharMovementMode_RagDollDead);
             originInput.hostRagdoll = (shown.flags & 128) != 0 ||
                 shown.movementMode == static_cast<uint8_t>(gECharMovementMode_RagDollDead) ||
                 (m.latest.flags & 128) != 0 ||
@@ -552,9 +589,30 @@ void LayDown(Mirror& m, uint32_t now)
             m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
             return;
         }
+        const bool sessionPaused = !net::IsHost() && gCSession::GetInstance().IsPaused();
+        if (ragdoll::ShouldDeferCorpseRagdoll(net::IsHost(), sessionPaused, m.ragdollInitialized)) {
+            if (!npcplayback::IsPassive(entity)) body::Pacify(m.entity, m.body);
+            if (m.corpsePose.empty()) CaptureCorpsePose(m, now);
+            if (FiniteMatrix(entity->GetWorldMatrix()))
+                RecordCorpseGroundAnchor(Key(m.latest.guid), m.latest.incarnation,
+                                         SafeVec3(entity->GetWorldPosition()), now, false);
+            if (auto* routine = static_cast<gCScriptRoutine_PS*>(entity->GetPropertySet(eEPropertySetType_ScriptRoutine)))
+                routine->AccessAIMode().AccessValue() = gEAIMode_Dead;
+            m.entity.CharacterMovement.StopMovement();
+            if (m.deathImpulse.Pending() && m.fallbackGraceUntil)
+                m.fallbackGraceUntil = ragdoll::ExtendPausedFallbackGrace(m.fallbackGraceUntil, now);
+            m.ragdollPaused = true;
+            m.ragdollTryAt = 0;
+            m.lieCheckAt = 0;
+            std::strcpy(m.presentationSource, "paused_defer");
+            return;
+        }
         auto completeRagdollStart = [&]() {
             if (!m.ragdollInitialized) {
                 m.ragdollInitialized = true;
+                m.ragdollPaused = false;
+                m.corpseSettled = false;
+                m.corpsePoseAt = 0;
                 ++m.ragdollStarts;
                 ++ragdollsStarted;
                 std::strcpy(m.presentationSource, RagdollSource(m));
@@ -809,6 +867,13 @@ void CorpseTick(uint32_t now)
             TickDeathFocusWatch(c, now);
         }
         if (!c.entity.IsDead()) { it = corpses.erase(it); continue; }
+        if (!net::IsHost() && c.wasMirror) {
+            c.killed = true;
+            PresentDeadMirror(it->first, c, c.latest, now);
+            LateCheck(c, now, "mirror");
+            ++it;
+            continue;
+        }
         LayDown(c, now);
         if (npcplayback::IsPassive(c.entity.GetInstance())) UpdateCorpsePresentation(c, now);
         LateCheck(c, now, c.wasMirror ? "mirror" : "journal");

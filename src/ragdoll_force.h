@@ -28,10 +28,63 @@ constexpr double MaximumDeathForce = 80000.0 * 1.019803902718557;
 constexpr float MaximumTransformCoordCm = 1.0e7f;
 constexpr float MaxLiveCorpseStepCm = 500.0f;
 constexpr float MaxUnragdolledDeathClimbCm = 15.0f;
+constexpr float MaxSpawnPelvisAnchorRadiusCm = 150.0f;
+constexpr float MaxPelvisLiftCm = 130.0f;
 constexpr float MaximumDownwardCorpseForce = 4000.0f;
 constexpr float MinCorpseForceHeightCm = 50.0f;
 constexpr float MaxCorpseForceHeightCm = 100.0f;
 constexpr float MaxCorpseForceRadiusCm = 45.0f;
+constexpr uint8_t DeadFlag = 1u;
+constexpr uint8_t DownFlag = 2u;
+constexpr uint8_t RagdollFlag = 128u;
+constexpr uint8_t DeadOrRagdollFlags = DeadFlag | RagdollFlag;
+constexpr uint8_t RagdollDeadMovementMode = 14u;
+
+inline bool IsRagdollOrDeadState(uint8_t flags, uint8_t movementMode)
+{
+    return (flags & DeadOrRagdollFlags) != 0 || movementMode == RagdollDeadMovementMode;
+}
+
+// Hold the pre-death ground transform while fraction < 1.0f instead of blending feet WorldPosition
+// upward toward the host's Bip01 Pelvis ragdoll root on the frame before death takes effect.
+inline bool ShouldHoldPreDeathTransform(uint8_t flagsA, uint8_t modeA,
+                                        uint8_t flagsB, uint8_t modeB, float fraction)
+{
+    return fraction < 1.0f && !IsRagdollOrDeadState(flagsA, modeA) && IsRagdollOrDeadState(flagsB, modeB);
+}
+
+inline bool IsGroundOriginSample(uint8_t flags, uint8_t movementMode, Vector const& pos)
+{
+    return !IsRagdollOrDeadState(flags, movementMode) && Finite(pos);
+}
+
+inline bool ShouldDeferCorpseRagdoll(bool isHost, bool sessionPaused, bool ragdollInitialized)
+{
+    return !isHost && sessionPaused && !ragdollInitialized;
+}
+
+// Engine.dll RagDollTick (RVA 0x031d40) advances low-velocity settle and max-age timers from real
+// wall-clock frame dt while Novodex is paused (velocity == 0), calling StopRagDoll (RVA 0x034550)
+// after ~1-2 s. Suppressing OnProcess while paused preserves active and mid-fall ragdolls for unpause.
+inline bool ShouldFreezeActiveRagdollPresentation(bool isHost, bool sessionPaused,
+                                                  bool ragdollActive, bool corpseUnsettled)
+{
+    return !isHost && sessionPaused && (ragdollActive || corpseUnsettled);
+}
+
+inline bool ShouldRestartUnsettledCorpseAfterPause(bool wasPaused, bool sessionPaused,
+                                                   bool ragdollInitialized, bool corpseSettled,
+                                                   bool controllerActive)
+{
+    return wasPaused && !sessionPaused && ragdollInitialized && !corpseSettled && !controllerActive;
+}
+
+inline uint32_t ExtendPausedFallbackGrace(uint32_t graceUntil, uint32_t now, uint32_t graceMs = 500u)
+{
+    if (!graceUntil) return 0;
+    const uint32_t extended = now + graceMs;
+    return extended ? extended : 1u;
+}
 
 inline double Magnitude(Vector const& v)
 {
@@ -103,6 +156,12 @@ inline bool SelectCorpseOrigin(CorpseOriginInput const& input, CorpseOriginResul
 {
     if (input.livePresented && Finite(input.entityPos) &&
         (!Finite(input.shownPos) || HorizontalNear(input.entityPos, input.shownPos, MaxLiveCorpseStepCm))) {
+        if (input.hostRagdoll && input.havePreviousAlive && Finite(input.previousPos) &&
+            HorizontalNear(input.previousPos, input.entityPos, MaxLiveCorpseStepCm) &&
+            (input.entityPos.y - input.previousPos.y) > MaxUnragdolledDeathClimbCm) {
+            out = {{input.entityPos.x, input.previousPos.y, input.entityPos.z}, false};
+            return true;
+        }
         out = {input.entityPos, true};
         return true;
     }
@@ -118,6 +177,11 @@ inline bool SelectCorpseOrigin(CorpseOriginInput const& input, CorpseOriginResul
             ? placed.y > input.previousPos.y
             : (placed.y - input.previousPos.y) > MaxUnragdolledDeathClimbCm;
         if (jumpedUp) placed.y = input.previousPos.y;
+    } else if (input.hostRagdoll && Finite(input.entityPos) &&
+               HorizontalNear(input.entityPos, input.shownPos, MaxSpawnPelvisAnchorRadiusCm)) {
+        const float lift = placed.y - input.entityPos.y;
+        if (lift > MaxUnragdolledDeathClimbCm && lift <= MaxPelvisLiftCm)
+            placed.y = input.entityPos.y;
     }
     out = {placed, false};
     return true;

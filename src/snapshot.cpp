@@ -2,6 +2,7 @@
 #include "snapshot.h"
 #include "npcsend_policy.h"
 #include "combat_timing.h"
+#include "ragdoll_force.h"
 
 #include <algorithm>
 #include <cmath>
@@ -191,18 +192,23 @@ void Interpolate(Track const& track, Track::Snap const& a, Track::Snap const& b,
 {
     const int32_t span = static_cast<int32_t>(b.sent - a.sent);
     const float fraction = std::clamp(static_cast<float>(static_cast<int32_t>(render - a.sent)) / span, 0.0f, 1.0f);
-    for (int k = 0; k < 3; ++k) position[k] = a.position[k] + (b.position[k] - a.position[k]) * fraction;
+    const bool holdPreDeath = ragdoll::ShouldHoldPreDeathTransform(
+        a.motion.flags, a.movementMode, b.motion.flags, b.movementMode, fraction);
+    const float poseFraction = holdPreDeath ? 0.0f : fraction;
+    for (int k = 0; k < 3; ++k) position[k] = a.position[k] + (b.position[k] - a.position[k]) * poseFraction;
     float dot = 0.0f, length = 0.0f;
     for (int k = 0; k < 4; ++k) dot += a.rotation[k] * b.rotation[k];
     const float sign = dot < 0.0f ? -1.0f : 1.0f;
     for (int k = 0; k < 4; ++k) {
-        rotation[k] = a.rotation[k] * (1.0f - fraction) + sign * b.rotation[k] * fraction;
+        rotation[k] = a.rotation[k] * (1.0f - poseFraction) + sign * b.rotation[k] * poseFraction;
         length += rotation[k] * rotation[k];
     }
     length = std::sqrt(length);
     if (length > 0.0f) for (int k = 0; k < 4; ++k) rotation[k] /= length;
-    Describe(out, fraction < 1.0f ? a : b,
-             std::min(MaximumTravelSpeed, Distance(a.position, b.position) * 1000.0f / span), render);
+    const float travelSpeed = (!holdPreDeath && span > 0)
+        ? std::min(MaximumTravelSpeed, Distance(a.position, b.position) * 1000.0f / span)
+        : 0.0f;
+    Describe(out, fraction < 1.0f ? a : b, travelSpeed, render);
     if (!track.predictive) {
         for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
             auto const& first = a.motion.motions[slot];

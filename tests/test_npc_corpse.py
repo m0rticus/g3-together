@@ -151,6 +151,81 @@ int SimulateSkeletonOverreadProtection()
 
     return 0;
 }
+
+int SimulatePausedClientDeathAndUnpauseRecovery()
+{
+    // Reproduces Build 78 Scout_04: host kills NPC while client is paused for 109 s,
+    // sends multiple dead+ragdoll packets (Pelvis Y=5231.1) + RagdollNote + FinalAndRelease.
+    const uint32_t inc = 1;
+    Vector lastGroundPos{91210.0f, 5141.1f, -12700.0f};
+    bool haveLastGroundPos = false;
+    Vector previousPos = lastGroundPos;
+
+    // Alive sample records durable ground origin.
+    if (IsGroundOriginSample(8, 2, lastGroundPos)) haveLastGroundPos = true;
+    if (!haveLastGroundPos) return 30;
+
+    // 10 dead+ragdoll packets arrive during client pause, overwriting `previousPos` with Pelvis Y=5231.1.
+    for (int pkt = 0; pkt < 10; ++pkt) {
+        const Vector deadPelvis{91211.0f, 5231.1f, -12699.0f};
+        previousPos = deadPelvis;
+        if (IsGroundOriginSample(129, RagdollDeadMovementMode, deadPelvis)) return 31;
+    }
+
+    SimulatedCorpse pausedKill{};
+    pausedKill.entityWorldPos = {91211.0f, 5231.1f, -12699.0f}; // even if entity drifted
+    CorpseOriginInput in{};
+    in.entityPos = pausedKill.entityWorldPos;
+    in.previousPos = lastGroundPos;
+    in.shownPos = previousPos;
+    in.livePresented = true;
+    in.havePreviousAlive = haveLastGroundPos;
+    in.hostRagdoll = true;
+
+    CorpseOriginResult chosen{};
+    if (!SelectCorpseOrigin(in, chosen)) return 32;
+    if (chosen.keepLiveMatrix || !Near(chosen.origin.y, 5141.1f)) return 33;
+    pausedKill.entityWorldPos = chosen.origin;
+    RecordGroundAnchor(pausedKill, inc, chosen.origin, true);
+
+    // Across 109 s of paused client frames, ragdoll start is deferred, impulse stays pending,
+    // and fallbackGraceUntil never expires while paused.
+    bool ragdollPaused = false;
+    bool corpseSettled = false;
+    uint32_t graceUntil = 10500;
+    for (uint32_t now = 10000; now <= 119000; now += 16) {
+        if (!ShouldDeferCorpseRagdoll(false, true, pausedKill.ragdollInitialized)) return 34;
+        ragdollPaused = true;
+        graceUntil = ExtendPausedFallbackGrace(graceUntil, now);
+    }
+    if (!ragdollPaused || pausedKill.ragdollInitialized || !pausedKill.deathImpulse.Pending()) return 35;
+    if (static_cast<int32_t>(119016 - graceUntil) >= 0) return 36;
+
+    // Unpause at t=119016: ragdoll starts immediately at ground feet (5141.1 -> single Pelvis 5231.1,
+    // NOT double-lifted 5341.1) and consumes the preserved host RagdollNote.
+    if (ShouldDeferCorpseRagdoll(false, false, pausedKill.ragdollInitialized)) return 37;
+    pausedKill.ragdollStarted = true;
+    pausedKill.ragdollInitialized = true;
+    ragdollPaused = false;
+    pausedKill.entityWorldPos.y += 90.0f; // single native SetEntityPoseFromRagDoll pelvis offset
+    if (!Near(pausedKill.entityWorldPos.y, 5231.1f) || ragdollPaused) return 38;
+
+    Vector force{}, rel{}, worldAt{};
+    if (!ShapeCorpseImpulse({-9000.0f, 11000.0f, 4500.0f}, {0.0f, 175.0f, 0.0f},
+                            GroundOrigin(pausedKill, inc), force, rel, worldAt))
+        return 39;
+    if (!pausedKill.deathImpulse.Choose(Source::Host)) return 40;
+    if (!Near(worldAt.y, 5241.1f) || !Near(force.y, 0.0f)) return 41;
+
+    // Mid-fall corpse (Slave_02) started 670 ms before pause: OnProcess is frozen during pause so
+    // RagDollTick cannot call StopRagDoll, and if controller was lost before settle it restarts on unpause.
+    if (!ShouldFreezeActiveRagdollPresentation(false, true, true, !corpseSettled)) return 42;
+    if (!ShouldRestartUnsettledCorpseAfterPause(true, false, true, corpseSettled, false)) return 43;
+    corpseSettled = true;
+    if (ShouldRestartUnsettledCorpseAfterPause(true, false, true, corpseSettled, false)) return 44;
+
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -158,6 +233,7 @@ int main(int argc, char** argv)
     if (argc != 2) return 2;
     if (std::strcmp(argv[1], "lifecycle") == 0) return SimulateDeathAndDelayedRagdollNote();
     if (std::strcmp(argv[1], "overread") == 0) return SimulateSkeletonOverreadProtection();
+    if (std::strcmp(argv[1], "pause_recovery") == 0) return SimulatePausedClientDeathAndUnpauseRecovery();
     return 2;
 }
 """
@@ -177,13 +253,44 @@ class NpcCorpseTests(unittest.TestCase):
         cls.sim_exe = SIM_TARGET.executable()
 
     def test_touched_files_stay_under_one_thousand_lines(self):
-        self.assertLess(len(self.corpse_cpp.splitlines()), 1000)
-        self.assertLess(len(self.corpse_h.splitlines()), 1000)
-        self.assertLess(len(self.ragdoll_h.splitlines()), 1000)
+        for name in (
+            "npc_corpse.cpp",
+            "npc_corpse.h",
+            "ragdoll_force.h",
+            "snapshot.cpp",
+            "npcs.cpp",
+            "npc_state.h",
+            "npc_contact.cpp",
+            "npc_companions.cpp",
+        ):
+            self.assertLess(len(_testbuild.src_text(name).splitlines()), 1000, name)
 
     def test_simulated_death_ragdoll_lifecycle_and_skeleton_bounds(self):
         subprocess.run([str(self.sim_exe), "lifecycle"], check=True, capture_output=True, text=True)
         subprocess.run([str(self.sim_exe), "overread"], check=True, capture_output=True, text=True)
+        subprocess.run([str(self.sim_exe), "pause_recovery"], check=True, capture_output=True, text=True)
+
+    def test_pause_deferral_and_unpause_recovery_contracts(self):
+        lay = section(self.corpse_cpp, "void LayDown(Mirror& m, uint32_t now)", "void LogClientDeathImpl(")
+        self.assertIn("ragdoll::ShouldDeferCorpseRagdoll(net::IsHost(), sessionPaused, m.ragdollInitialized)", lay)
+        self.assertIn("m.lieCheckAt = 0;", lay)
+
+        apply_fn = section(self.corpse_cpp, "bool TryApplyForce(", "bool HasPendingCorpseForce(")
+        self.assertIn("gCSession::GetInstance().IsPaused()", apply_fn)
+        self.assertIn("ragdoll::ExtendPausedFallbackGrace(m.fallbackGraceUntil, now)", apply_fn)
+
+        update_fn = section(self.corpse_cpp, "void UpdateCorpsePresentation(", "void PresentDeadMirror(")
+        self.assertIn("ragdoll::ShouldFreezeActiveRagdollPresentation(", update_fn)
+        self.assertIn("ragdoll::ShouldRestartUnsettledCorpseAfterPause(", update_fn)
+
+        npcs_cpp = _testbuild.src_text("npcs.cpp")
+        on_npcs = section(npcs_cpp, "int OnNpcs(", "void SendOwned(")
+        self.assertIn("ragdoll::IsGroundOriginSample(", on_npcs)
+        self.assertIn("m.lastGroundPos", on_npcs)
+
+        passive = section(npcs_cpp, "if (!HostPresentationAvailable(m.entity.GetInstance())) {", "if (m.staleHeld || m.replay.holding)")
+        self.assertIn("PresentDeadMirror(it->first, m, m.latest, now);", passive)
+        self.assertIn("else if (m.latest.flags & 2)", passive)
 
     def test_present_dead_mirror_preserves_live_ground_matrix_and_records_anchor(self):
         present = section(self.corpse_cpp, "void PresentDeadMirror(", "void OnRagdollNote(")

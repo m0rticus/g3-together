@@ -586,6 +586,8 @@ void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const
     if (!sameOwner && m.latest.incarnation != record.incarnation) {
         m.deathLife = replication::TerminalLife{};
         m.ragdollStarted = m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
+        m.ragdollPaused = m.corpseSettled = m.haveLastGroundPos = false;
+        m.lastGroundIncarnation = 0;
         m.corpsePose.clear();
         m.corpseActor = nullptr;
         m.corpsePoseAt = m.ragdollTryAt = m.lieCheckAt = 0;

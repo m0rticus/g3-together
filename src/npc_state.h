@@ -162,6 +162,10 @@ struct Mirror {
     bool laid = false;
     bool ragdollStarted = false;
     bool ragdollInitialized = false, corpsePlaced = false, corpseSimulating = false;
+    bool ragdollPaused = false, corpseSettled = false;
+    float lastGroundPos[3] = {};
+    uint32_t lastGroundIncarnation = 0;
+    bool haveLastGroundPos = false;
     replication::TerminalLife deathLife;
     std::vector<pose::Bone> corpsePose;
     uint8_t corpsePoseFlags = 0;

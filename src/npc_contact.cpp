@@ -673,7 +673,7 @@ void BeginPassiveMirrorFrame(uint32_t now)
 
 void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
 {
-    const bool keepCorpse = m.killed && m.ragdollInitialized && !m.corpsePose.empty();
+    const bool keepCorpse = m.killed && m.corpseSettled && !m.corpsePose.empty();
     if (m.resolved)
         Logf("npcs: mirror %s unloaded or changed property sets; waiting for its live instance",
              live.GetInstance() ? live.GetName().GetText() : "(unloaded)");
@@ -682,11 +682,11 @@ void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
         ClearLocalReferencesToDeadMirror(previous, nullptr, false, true);
     m.entity = live;
     if (live.GetInstance() != previous) m.deathReferencesCleared = nullptr;
-    m.resolved = m.replayReady = m.corpsePlaced = m.corpseSimulating = false;
+    m.resolved = m.replayReady = m.corpsePlaced = m.corpseSimulating = m.ragdollPaused = false;
     m.resolvedAt = 0;
     m.replay = npcplayback::State{};
     ResetMirrorIncomingContact(m);
-    m.ragdollStarted = m.ragdollInitialized = keepCorpse;
+    m.ragdollStarted = m.ragdollInitialized = m.corpseSettled = keepCorpse;
     if (!keepCorpse) m.corpsePose.clear();
     m.corpseActor = nullptr;
     m.corpsePoseAt = m.ragdollTryAt = m.lieCheckAt = 0;
@@ -701,6 +701,7 @@ void ReconcileMirrorAlive(GuidKey const& key, Mirror& m)
     npcplayback::ResetLocalHitState(m.replay);
     ResetMirrorIncomingContact(m);
     m.ragdollStarted = m.laid = m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
+    m.ragdollPaused = m.corpseSettled = false;
     m.deathImpulse = {};
     m.ragdollTraceAt = m.ragdollTraceSampleAt = m.ragdollTraceStage = 0;
     m.localHitValid = m.deathLogged = m.focusWatchLogged = false;

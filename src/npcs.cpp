@@ -92,6 +92,12 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
         m.latest = records[i];
         m.latestTicks = now;
         m.latestSent = captured;
+        if (ragdoll::IsGroundOriginSample(records[i].flags, records[i].movementMode,
+                                          {records[i].position[0], records[i].position[1], records[i].position[2]})) {
+            std::memcpy(m.lastGroundPos, records[i].position, sizeof(m.lastGroundPos));
+            m.lastGroundIncarnation = records[i].incarnation;
+            m.haveLastGroundPos = true;
+        }
         ++m.records;
         m.staleHeld = false;
         body::MotionState motion;
@@ -653,9 +659,25 @@ void PassiveMirrorTick()
                 m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
                     m.deathReferencesCleared != m.entity.GetInstance());
                 m.deathReferencesCleared = m.entity.GetInstance();
-                LayDown(m, now);
-                UpdateCorpsePresentation(m, now);
-            } else if (!(m.latest.flags & 2)) {
+                if (!m.deathLogged) {
+                    m.fallbackGraceUntil = now ? now + 500 : 501;
+                    m.focusWatchUntil = now ? now + 5000 : 5001;
+                    m.focusWatchLogged = false;
+                    std::strcpy(m.presentationSource, RagdollSource(m));
+                    if (m.latest.hitPlayer)
+                        std::snprintf(m.killerAttribution, sizeof(m.killerAttribution), "reported_player_%u", m.latest.hitPlayer);
+                    LogClientDeath(m, m.latest, now);
+                }
+                PresentDeadMirror(it->first, m, m.latest, now);
+            } else if (m.latest.flags & 2) {
+                if (auto* routine = static_cast<gCScriptRoutine_PS*>(
+                        m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine))) {
+                    routine->AccessAIMode().AccessValue() = static_cast<gEAIMode>(m.latest.aiMode);
+                    routine->AccessAniState().AccessValue() = static_cast<gEAniState>(m.latest.aniState);
+                }
+                if (!m.replay.initialized)
+                    m.replayReady = npcplayback::Replay(m.entity.GetInstance(), m.replay, m.latest, &MotionNameOf, now);
+            } else {
                 npcplayback::HoldUnavailable(m.entity.GetInstance(), m.replay);
             }
             ++it;
