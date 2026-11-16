@@ -17,6 +17,7 @@ void Report(LogFn log);                         // QA: WITNESS line
 void Off(LogFn log);                            // QA negative control (witnessoff): nothing is passed on
 void MirrorPerceiveOff(LogFn log);              // QA negative control (mirrorperceiveoff): mirrors miss this hero's take and use
 void Saw(char const* argument, LogFn log);      // QA (witness): "<NPC>_<reason>": that NPC judges this machine's hero (AssessTarget)
+bool PerceiveChestUse(eCEntity* chest);         // checks witnesses/watching mirrors for chest opening/looting; true if caught
 
 // P7, witnesses of what another machine's player or NPC did to an NPC of this machine (combat.cpp applies those hits
 // with AddHitPoints and OnCheatKill, which tell nobody around): the perceptions the game's own hit path sends

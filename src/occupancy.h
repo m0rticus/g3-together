@@ -17,6 +17,10 @@ void Tick();  // every frame; looks at the local hero every 250 ms
 void OnState(uint8_t from, net::WorldState const& s);  // kind 13: player `guard` uses (npc 1) or let go of (npc 0) object guid
 void OnWorldChange();
 void Forget(int player, eCEntity* puppet);  // that player's puppet goes: the objects it used here are free again
+bool IsWorldInteractable(eCEntity const* object);
+bool StaleUser(eCEntity* object);
+bool ClearStaleUser(eCEntity* object, char const* reason = nullptr);
+void ReleaseNpc(eCEntity* npc, bool scanRoi = false);
 using LogFn = void (*)(char const*);
 void Report(LogFn log);  // QA: OCCUPANCY line
 void Off(LogFn log);     // QA negative control (usesyncoff): nothing is reported

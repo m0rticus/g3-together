@@ -2,10 +2,15 @@
 #include "occupancy.h"
 
 #include "containers.h"
+#include "guid.h"
+#include "guid_key.h"
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
 #include "net.h"
+#include "npcplayback.h"
+#include "npcremoval.h"
+#include "occupancy_policy.h"
 #include "remote.h"
 
 #include <Game.h>
@@ -15,8 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
-#include <map>
-#include <string>
+#include <unordered_map>
 
 namespace g3t::occupancy {
 namespace {
@@ -26,22 +30,13 @@ bool enabled = true;  // QA negative control: usesyncoff
 DWORD lastLook = 0;
 eCEntity* used = nullptr;   // the object this machine's hero uses, as last reported
 uint8_t usedGuid[16] = {};
-std::map<std::string, uint8_t> marked;  // objects whose user here is another player's puppet: by GUID, that player
-unsigned occupied = 0, released = 0, applied = 0, cleared = 0, busy = 0, refused = 0;
+std::unordered_map<GuidKey, uint8_t, GuidHash> marked;  // objects whose user here is another player's puppet
+unsigned occupied = 0, released = 0, applied = 0, cleared = 0, busy = 0, refused = 0, staleCleared = 0;
 eCEntity* refusedObject = nullptr;  // the last place this hero was kept from (one message per try)
-
-std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
-
-void GuidOf(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
 
 bool UsedBy(eCEntity* object, eCEntity* user)
 {
-    return object && user && object->GetPropertySet(eEPropertySetType_Interaction) && !object->GetPropertySet(eEPropertySetType_NPC) &&
-           !containers::IsPersonalInventory(object) &&
+    return user && IsWorldInteractable(object) &&
            Entity(object).Interaction.GetUser().GetInstance() == user;
 }
 
@@ -58,11 +53,10 @@ void Send(uint8_t const guid[16], bool use)
 // The player whose puppet uses this object here, 0 if none.
 uint8_t TakenBy(eCEntity* object)
 {
-    if (!object || !object->GetPropertySet(eEPropertySetType_Interaction) || object->GetPropertySet(eEPropertySetType_NPC)) return 0;
-    if (containers::IsPersonalInventory(object)) return 0;
+    if (!IsWorldInteractable(object)) return 0;
     uint8_t guid[16];
-    GuidOf(object, guid);
-    const auto it = marked.find(Key(guid));
+    guid::CopyEntity(object, guid);
+    const auto it = marked.find(ToGuidKey(guid));
     return it != marked.end() ? it->second : 0;
 }
 
@@ -101,6 +95,106 @@ eCEntity* InUse(eCEntity* hero)
     if (eCEntity* focus = self.Focus.GetFocusEntity().GetInstance(); UsedBy(focus, hero)) return focus;
     return nullptr;
 }
+
+occupancy_policy::InteractUserState BuildUserState(eCEntity* object)
+{
+    occupancy_policy::InteractUserState s{};
+    s.validObject = IsWorldInteractable(object);
+    if (!s.validObject) return s;
+    eCEntity* user = Entity(object).Interaction.GetUser().GetInstance();
+    s.hasUser = user != nullptr;
+    if (!user) return s;
+    s.userIsCharacter = user->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    if (!s.userIsCharacter) return s;
+    s.userIsLocalHero = user == remote::ControlledBody() || user == gCSession::GetInstance().GetHero();
+    s.puppetOwner = static_cast<uint8_t>(remote::PuppetOwner(user));
+    s.markedPlayer = TakenBy(object);
+    s.userSuppressed = npcremoval::Suppressed(user);
+    s.userPassive = npcplayback::IsPassive(user);
+    if (user->GetPropertySet(eEPropertySetType_ScriptRoutine)) {
+        Entity actor(user);
+        const int aiMode = static_cast<int>(static_cast<gEAIMode>(actor.Routine.AIMode));
+        s.userDeadOrDown = actor.IsDead() || actor.IsDown() ||
+                           aiMode == gEAIMode_Dead || aiMode == gEAIMode_Down;
+        s.userInactiveRoutine = aiMode == gEAIMode_Combat ||
+                                aiMode == gEAIMode_Flee ||
+                                aiMode == gEAIMode_Abandoned;
+    }
+    return s;
+}
+
+void ScrubStaleUsers()
+{
+    auto const& interactions = gCInteractionAdmin::GetInstance().GetInteractionsInROI();
+    for (int i = 0; i < interactions.GetCount(); ++i) {
+        auto* interaction = interactions.GetAt(i);
+        eCEntity* object = interaction ? interaction->GetEntity() : nullptr;
+        if (object && interaction->GetUser().GetEntity())
+            ClearStaleUser(object, "roi-scrub");
+    }
+}
+}
+
+bool IsWorldInteractable(eCEntity const* object)
+{
+    eCEntity* mutableObject = const_cast<eCEntity*>(object);
+    return mutableObject &&
+           !mutableObject->GetPropertySet(eEPropertySetType_NPC) &&
+           !mutableObject->GetPropertySet(eEPropertySetType_Item) &&
+           mutableObject->GetPropertySet(eEPropertySetType_Interaction) &&
+           !containers::IsPersonalInventory(mutableObject);
+}
+
+bool StaleUser(eCEntity* object)
+{
+    return occupancy_policy::ShouldClearInteractUser(BuildUserState(object));
+}
+
+bool ClearStaleUser(eCEntity* object, char const* reason)
+{
+    const occupancy_policy::InteractUserState state = BuildUserState(object);
+    if (!occupancy_policy::ShouldClearInteractUser(state)) return false;
+    Entity interact(object);
+    eCEntity* user = interact.Interaction.GetUser().GetInstance();
+    interact.Interaction.SetUser(Entity());
+    if (occupancy_policy::ShouldDecrementAnchorUserCount(state)) {
+        Entity anchor = interact.Interaction.GetAnchorPoint();
+        if (anchor.GetInstance()) {
+            if (auto* anchorPs = static_cast<gCAnchor_PS*>(
+                    anchor.GetInstance()->GetPropertySet(eEPropertySetType_Anchor))) {
+                const GEU32 count = anchorPs->GetUserCount();
+                if (count > 0) anchorPs->SetUserCount(count - 1);
+            }
+        }
+    }
+    ++staleCleared;
+    Logf("occupancy: cleared stale user %s on %s (%s)",
+         user ? user->GetName().GetText() : "-",
+         object->GetName().GetText(),
+         reason ? reason : "stale");
+    return true;
+}
+
+void ReleaseNpc(eCEntity* npc, bool scanRoi)
+{
+    if (!npc || !npc->GetPropertySet(eEPropertySetType_NPC)) return;
+    if (npc->GetPropertySet(eEPropertySetType_Navigation)) {
+        eCEntity* dest = Entity(npc).Navigation.GetCurrentDestinationPoint().GetInstance();
+        if (dest && Entity(dest).GetInstance() &&
+            dest->GetPropertySet(eEPropertySetType_Interaction) &&
+            Entity(dest).Interaction.GetUser().GetInstance() == npc) {
+            ClearStaleUser(dest, "silence");
+        }
+    }
+    if (!scanRoi) return;
+    auto const& interactions = gCInteractionAdmin::GetInstance().GetInteractionsInROI();
+    for (int i = 0; i < interactions.GetCount(); ++i) {
+        auto* interaction = interactions.GetAt(i);
+        eCEntity* object = interaction ? interaction->GetEntity() : nullptr;
+        if (object && interaction->GetUser().GetEntity() == npc) {
+            ClearStaleUser(object, "silence-roi");
+        }
+    }
 }
 
 void Tick()
@@ -111,6 +205,7 @@ void Tick()
     const DWORD now = GetTickCount();
     if (now - lastLook < LookEvery) return;
     lastLook = now;
+    ScrubStaleUsers();
     eCEntity* hero = remote::ControlledBody();
     eCEntity* object = hero ? InUse(hero) : nullptr;
     if (object == used) return;
@@ -121,7 +216,7 @@ void Tick()
     }
     used = object;
     if (!object) return;
-    GuidOf(object, usedGuid);
+    guid::CopyEntity(object, usedGuid);
     if (!enabled) return;
     Send(usedGuid, true);
     ++occupied;
@@ -131,28 +226,28 @@ void Tick()
 void OnState(uint8_t from, net::WorldState const& s)
 {
     const uint8_t player = s.guard ? s.guard : from;
-    _GUID raw;
-    std::memcpy(&raw, s.guid, 16);
-    Entity object = Entity(bCPropertyID(bCGuid(raw)));
+    Entity object = guid::Resolve(s.guid);
     eCEntity* instance = object.GetInstance();
-    if (!instance || !instance->GetPropertySet(eEPropertySetType_Interaction) || instance->GetPropertySet(eEPropertySetType_NPC)) return;
-    if (containers::IsPersonalInventory(instance)) return;
+    if (!IsWorldInteractable(instance)) return;
     eCEntity* puppet = remote::PuppetOf(player);
     eCEntity* user = object.Interaction.GetUser().GetInstance();
+    const GuidKey key = ToGuidKey(s.guid);
     if (s.npc) {
         if (!puppet) return;
+        if (ClearStaleUser(instance, "remote-takeover"))
+            user = object.Interaction.GetUser().GetInstance();
         if (user && user != puppet && !remote::PuppetOwner(user)) {
             ++busy;  // someone here sits there already (this hero or an NPC): it stays theirs
             Logf("occupancy: player %u uses %s, which %s uses here", player, instance->GetName().GetText(), Entity(user).GetName().GetText());
             return;
         }
         object.Interaction.SetUser(Entity(puppet));
-        marked[Key(s.guid)] = player;
+        marked[key] = player;
         ++applied;
         Logf("occupancy: player %u uses %s; taken here too", player, instance->GetName().GetText());
         return;
     }
-    marked.erase(Key(s.guid));
+    marked.erase(key);
     if (user && remote::PuppetOwner(user) == player) {
         object.Interaction.SetUser(Entity());
         ++cleared;
@@ -164,9 +259,7 @@ void Forget(int player, eCEntity* puppet)
 {
     for (auto it = marked.begin(); it != marked.end();) {
         if (it->second != player) { ++it; continue; }
-        _GUID raw;
-        std::memcpy(&raw, it->first.data(), 16);
-        Entity object = Entity(bCPropertyID(bCGuid(raw)));
+        Entity object = guid::Resolve(it->first.data());
         if (object.GetInstance() && puppet && object.Interaction.GetUser().GetInstance() == puppet) {
             object.Interaction.SetUser(Entity());
             ++cleared;
@@ -184,9 +277,9 @@ void OnWorldChange()
 
 void Report(LogFn log)
 {
-    char line[200];
-    Format(line, "OCCUPANCY enabled=%d using=%s occupied=%u released=%u applied=%u cleared=%u busy=%u marked=%u refused=%u", enabled ? 1 : 0,
-              used ? used->GetName().GetText() : "-", occupied, released, applied, cleared, busy, static_cast<unsigned>(marked.size()), refused);
+    char line[224];
+    Format(line, "OCCUPANCY enabled=%d using=%s occupied=%u released=%u applied=%u cleared=%u busy=%u marked=%u refused=%u stale_cleared=%u", enabled ? 1 : 0,
+              used ? used->GetName().GetText() : "-", occupied, released, applied, cleared, busy, static_cast<unsigned>(marked.size()), refused, staleCleared);
     log(line);
 }
 

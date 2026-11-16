@@ -4,6 +4,7 @@
 
 #include "ai.h"
 #include "enclaves.h"
+#include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -22,6 +23,8 @@
 namespace g3t::witness {
 namespace {
 static_assert(policy::AimRoutine == gEAIMode_Routine);
+static_assert(policy::AimReaction == gEAIMode_Reaction);
+static_assert(policy::AimCombat == gEAIMode_Combat);
 static_assert(policy::AimFlee == gEAIMode_Flee);
 static_assert(policy::AimTalk == gEAIMode_Talk);
 static_assert(policy::AimDown == gEAIMode_Down);
@@ -79,14 +82,6 @@ void SetLastCrime(eCEntity* npc, int crime)
     static_cast<gCNPC_PS*>(npc->GetPropertySet(eEPropertySetType_NPC))->AccessLastPlayerCrime() = static_cast<gEPlayerCrime>(crime);
 }
 
-void GuidOf(eCEntity* entity, uint8_t out[16])
-{
-    std::memset(out, 0, 16);
-    if (!entity) return;
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
-
 // This build: push ebp; mov ebp,esp; and esp,-8; sub esp,0x154 (re/out/npc-spells-detail-c.asm).
 unsigned char* NativeAssess()
 {
@@ -117,12 +112,104 @@ char const* Who(eCEntity* entity)
     return npcs::IsMirrored(entity) ? "mirror" : "npc";
 }
 
-GEInt SendWithMirrors(gFScript original, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
+bool IsInteractableObject(eCEntity* candidate, eCEntity const* hero)
 {
-    eCEntity* actor = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
-    eCEntity* thing = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
-    eCEntity* hero = gCSession::GetInstance().GetHero();
-    if (!mirrorsPerceive || !enabled || !hero || (actor != hero && thing != hero) || !net::Connected()) return original(spu, self, other, args);
+    return candidate && candidate != hero &&
+           !candidate->GetPropertySet(eEPropertySetType_NPC) &&
+           !candidate->GetPropertySet(eEPropertySetType_Item) &&
+           candidate->GetPropertySet(eEPropertySetType_Interaction);
+}
+
+eCEntity* ResolveChestEntity(eCEntity* hero, eCEntity* thing)
+{
+    if (IsInteractableObject(thing, hero)) return thing;
+    if (hero && hero->GetPropertySet(eEPropertySetType_NPC)) {
+        if (eCEntity* target = Entity(hero).NPC.GetCurrentTarget().GetInstance(); IsInteractableObject(target, hero))
+            return target;
+    }
+    if (hero && hero->GetPropertySet(eEPropertySetType_Focus)) {
+        if (eCEntity* focus = Entity(hero).Focus.GetFocusEntity().GetInstance(); IsInteractableObject(focus, hero))
+            return focus;
+    }
+    return nullptr;
+}
+
+struct ChestCandidate {
+    eCEntity* body = nullptr;
+    policy::MirrorState mirror{};
+};
+
+class MirrorPerceptionScope {
+public:
+    MirrorPerceptionScope(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other)
+    {
+        eCEntity* actor = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+        thing_ = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+        hero_ = gCSession::GetInstance().GetHero();
+        if (!mirrorsPerceive || !enabled || !hero_ || (actor != hero_ && thing_ != hero_) || !net::Connected())
+            return;
+        active_ = true;
+        const bCVector& at = hero_->GetWorldPosition();
+        const bTObjArray<Entity> all = Entity::GetNPCs();
+        for (int i = 0; i < all.GetCount(); ++i) {
+            Entity npc = all.GetAt(i);
+            eCEntity* body = npc.GetInstance();
+            auto* routine = body ? static_cast<gCScriptRoutine_PS*>(body->GetPropertySet(eEPropertySetType_ScriptRoutine)) : nullptr;
+            const bool hasProps = body && body->GetPropertySet(eEPropertySetType_NPC) && routine;
+            if (!body || !hasProps) continue;
+            const bCVector& p = body->GetWorldPosition();
+            const float dx = p.GetX() - at.GetX(), dy = p.GetY() - at.GetY(), dz = p.GetZ() - at.GetZ();
+            const gEAIMode mode = routine->GetAIMode();
+            const bCString savedTask = routine->GetCurrentTask();
+
+            policy::MirrorState state{};
+            state.mirrored = npcs::IsMirrored(body);
+            state.isHeroOrPuppet = body == hero_ || remote::IsPuppet(body);
+            state.hasNpcAndRoutine = hasProps;
+            state.deadOrDown = npc.IsDead() != GEFalse || npc.IsDown() != GEFalse;
+            state.distanceSqCm = dx * dx + dy * dy + dz * dz;
+            state.aiMode = static_cast<int>(mode);
+            state.taskEmpty = !savedTask.GetLength();
+            state.taskUnconscious = savedTask.Contains("ZS_Unconscious") != GEFalse;
+
+            const auto plan = policy::PlanMirrorPerception(state);
+            if (plan.eligible) {
+                // Mirrors are silenced by npcplayback::Silence (empty CurrentTask) and may hold AIMode Abandoned;
+                // Script_Game's perception gate (0x31c80) rejects both, so open them just for this perception pass.
+                if (plan.openMode) routine->AccessAIMode().AccessValue() = gEAIMode_Routine;
+                if (plan.openTask) routine->AccessCurrentTask() = bCString("ZS_HangAround_DoNothing");
+                opened_.push_back({body, mode, savedTask, plan.openMode, plan.openTask});
+            }
+            if (policy::IsMirrorPerceptible(state, policy::MaxChestPerceiveRadiusSqCm)) {
+                chestCandidates_.push_back({body, state});
+            }
+        }
+    }
+
+    MirrorPerceptionScope(MirrorPerceptionScope const&) = delete;
+    MirrorPerceptionScope& operator=(MirrorPerceptionScope const&) = delete;
+
+    ~MirrorPerceptionScope()
+    {
+        if (!active_) return;
+        for (OpenedMirror const& entry : opened_) {
+            auto* routine = entry.body
+                ? static_cast<gCScriptRoutine_PS*>(entry.body->GetPropertySet(eEPropertySetType_ScriptRoutine))
+                : nullptr;
+            if (!routine) continue;
+            if (entry.openMode) routine->AccessAIMode().AccessValue() = entry.savedMode;
+            if (entry.openTask) routine->AccessCurrentTask() = entry.savedTask;
+        }
+        ++perceptionsOpened;
+        mirrorsOpened += static_cast<unsigned>(opened_.size());
+    }
+
+    bool Active() const noexcept { return active_; }
+    eCEntity* Hero() const noexcept { return hero_; }
+    eCEntity* Thing() const noexcept { return thing_; }
+    std::vector<ChestCandidate> const& ChestCandidates() const noexcept { return chestCandidates_; }
+
+private:
     struct OpenedMirror {
         eCEntity* body;
         gEAIMode savedMode;
@@ -130,56 +217,70 @@ GEInt SendWithMirrors(gFScript original, gCScriptProcessingUnit* spu, GELPVoid s
         bool openMode;
         bool openTask;
     };
-    std::vector<OpenedMirror> opened;
-    const bCVector& at = hero->GetWorldPosition();
-    const bTObjArray<Entity> all = Entity::GetNPCs();
-    for (int i = 0; i < all.GetCount(); ++i) {
-        Entity npc = all.GetAt(i);
-        eCEntity* body = npc.GetInstance();
-        auto* routine = body ? static_cast<gCScriptRoutine_PS*>(body->GetPropertySet(eEPropertySetType_ScriptRoutine)) : nullptr;
-        const bool hasProps = body && body->GetPropertySet(eEPropertySetType_NPC) && routine;
-        const bCVector& p = body ? body->GetWorldPosition() : at;
-        const float dx = p.GetX() - at.GetX(), dy = p.GetY() - at.GetY(), dz = p.GetZ() - at.GetZ();
-        const gEAIMode mode = routine ? routine->GetAIMode() : gEAIMode_Dead;
-        const bCString savedTask = routine ? routine->GetCurrentTask() : bCString();
-        const auto plan = policy::PlanMirrorPerception(
-            body && npcs::IsMirrored(body),
-            !body || body == hero || remote::IsPuppet(body),
-            hasProps,
-            !body || npc.IsDead() || npc.IsDown(),
-            dx * dx + dy * dy + dz * dz,
-            static_cast<int>(mode),
-            !savedTask.GetLength(),
-            savedTask.Contains("ZS_Unconscious") != GEFalse);
-        if (!plan.eligible) continue;
-        // Mirrors are silenced by npcplayback::Silence (empty CurrentTask) and may also hold AIMode Abandoned;
-        // Script_Game's perception gate (0x31c80) rejects both, so open them just for this perception pass.
-        if (plan.openMode) routine->AccessAIMode().AccessValue() = gEAIMode_Routine;
-        if (plan.openTask) routine->AccessCurrentTask() = bCString("ZS_HangAround_DoNothing");
-        opened.push_back({body, mode, savedTask, plan.openMode, plan.openTask});
+
+    bool active_ = false;
+    eCEntity* hero_ = nullptr;
+    eCEntity* thing_ = nullptr;
+    std::vector<OpenedMirror> opened_;
+    std::vector<ChestCandidate> chestCandidates_;
+};
+
+bool CheckWatchingMirrorsForChestUse(eCEntity* hero, eCEntity* chest,
+                                     std::vector<ChestCandidate> const& candidates)
+{
+    if (!enabled || !mirrorsPerceive || !hero || !chest || candidates.empty() || !net::Connected())
+        return false;
+    Entity heroEntity(hero);
+    Entity chestEntity(chest);
+    const bool heroHasGhost = hero->GetPropertySet(eEPropertySetType_NPC) &&
+                              heroEntity.NPC.HasStatusEffects(gEStatusEffect_IsGhost) != GEFalse;
+    const Entity heroZone = heroEntity.GetZone();
+    const Entity chestZone = chestEntity.GetIndoorOwnerZone(100.0f);
+    bool caught = false;
+    for (ChestCandidate const& candidate : candidates) {
+        eCEntity* body = candidate.body;
+        if (!body || !body->GetPropertySet(eEPropertySetType_NPC)) continue;
+        Entity npc(body);
+        const Entity npcZone = npc.GetZone();
+        policy::MirrorChestUseInput in{};
+        in.enabled = enabled;
+        in.mirrorsPerceive = mirrorsPerceive;
+        in.mirror = candidate.mirror;
+        in.npcHasMistEffect = npc.NPC.HasStatusEffects(gEStatusEffect_IsImNebel) != GEFalse;
+        in.heroHasGhostEffect = heroHasGhost;
+        in.sameIndoorZone = npcZone.GetInstance() &&
+            npcZone.GetAIZoneType() == gEZoneType_Indoor &&
+            (npcZone.GetInstance() == heroZone.GetInstance() || npcZone.GetInstance() == chestZone.GetInstance());
+        in.freeLosToHero = npc.IsFreeLOS(heroEntity, GEFalse) != GEFalse;
+        in.freeLosToChest = npc.IsFreeLOS(chestEntity, GEFalse) != GEFalse;
+        in.inFovToHero = npc.IsInFOV(heroEntity) != GEFalse;
+        in.inFovToChest = npc.IsInFOV(chestEntity) != GEFalse;
+        if (!policy::ShouldMirrorCatchChestUse(in)) continue;
+        if (!GetScriptAdminExt().CallScript(bCString("AssessUseInteractObject"), body, chest, 0)) continue;
+        if (GetScriptAdminExt().CallScript(bCString("AssessTarget"), body, hero, gEAttackReason_UseInteractObject)) {
+            caught = true;
+        }
     }
-    const GEInt result = original(spu, self, other, args);
-    for (OpenedMirror const& entry : opened) {
-        auto* routine = entry.body
-            ? static_cast<gCScriptRoutine_PS*>(entry.body->GetPropertySet(eEPropertySetType_ScriptRoutine))
-            : nullptr;
-        if (!routine) continue;
-        if (entry.openMode) routine->AccessAIMode().AccessValue() = entry.savedMode;
-        if (entry.openTask) routine->AccessCurrentTask() = entry.savedTask;
-    }
-    ++perceptionsOpened;
-    mirrorsOpened += static_cast<unsigned>(opened.size());
-    return result;
+    return caught;
 }
 
 GEInt GE_STDCALL SendTake(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
-    return SendWithMirrors(originalSendTake, spu, self, other, args);
+    MirrorPerceptionScope scope(spu, self, other);
+    return originalSendTake(spu, self, other, args);
 }
 
 GEInt GE_STDCALL SendUse(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
-    return SendWithMirrors(originalSendUse, spu, self, other, args);
+    MirrorPerceptionScope scope(spu, self, other);
+    GEInt result = originalSendUse(spu, self, other, args);
+    if (!result && scope.Active()) {
+        if (eCEntity* chest = ResolveChestEntity(scope.Hero(), scope.Thing())) {
+            if (CheckWatchingMirrorsForChestUse(scope.Hero(), chest, scope.ChestCandidates()))
+                result = 1;
+        }
+    }
+    return result;
 }
 
 GEInt GE_STDCALL SendMurder(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -219,7 +320,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             const GEInt result = originalAssess(spu, self, other, args);
             net::WitnessNote note;
             note.op = net::WitnessJudge;
-            GuidOf(npc, note.npc);
+            guid::CopyEntity(npc, note.npc);
             note.value = args;
             net::SendWitness(static_cast<uint8_t>(player), note);
             ++judgesSent;
@@ -239,7 +340,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     const GEInt result = originalAssess(spu, self, other, args);
     ++seen;
     net::WitnessNote note;
-    GuidOf(npc, note.npc);
+    guid::CopyEntity(npc, note.npc);
     if (const uint8_t owner = policy::ResolveWitnessOwner(npcs::OwnerOf(npc), net::IsHost(), npcs::IsMirrored(npc))) {
         note.op = net::WitnessSaw;
         note.value = args;
@@ -269,6 +370,13 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
             ++refused;
             Logf("witness: %s saw player %u's crime, but it does not react here (%s)", witness.GetName().GetText(), from,
                  !enabled ? "off" : !puppet ? "no puppet" : npcs::IsMirrored(npc) ? "not run here" : "down");
+            return;
+        }
+        const int aiMode = static_cast<int>(static_cast<gEAIMode>(witness.Routine.AIMode));
+        const bool sameTarget = witness.NPC.GetCurrentTarget().GetInstance() == puppet;
+        const bool inAttackTask = witness.Routine.GetCurrentTask() == bCString("ZS_Attack");
+        if (!policy::ShouldApplyWitnessReaction(aiMode, sameTarget, inAttackTask)) {
+            ++applied;
             return;
         }
         ++depth;
@@ -446,5 +554,19 @@ void Saw(char const* argument, LogFn log)
     Format(line, "WITNESSSAW name=%s reason=%d result=%d passed_on=%d mirrored=%d last_crime=%d", name, reason, result, sent != sentBefore ? 1 : 0,
               npcs::IsMirrored(npc.GetInstance()) ? 1 : 0, npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ? LastCrime(npc.GetInstance()) : -1);
     log(line);
+}
+
+bool PerceiveChestUse(eCEntity* chest)
+{
+    if (!enabled || !chest || !gCSession::GetInstance().IsGameRunning() || !net::Connected()) return false;
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    if (!hero || !hero->GetPropertySet(eEPropertySetType_NPC) || !IsInteractableObject(chest, hero)) return false;
+    Entity heroEntity(hero);
+    const Entity prevTarget = heroEntity.NPC.GetCurrentTarget();
+    const bool swapped = prevTarget.GetInstance() != chest;
+    if (swapped) heroEntity.NPC.SetCurrentTarget(Entity(chest));
+    const GEInt perceived = GetScriptAdminExt().CallScript(bCString("SendPerceptionUseInteractObject"), hero, chest, 0);
+    if (swapped) heroEntity.NPC.SetCurrentTarget(prevTarget);
+    return perceived != 0;
 }
 }

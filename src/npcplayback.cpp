@@ -13,6 +13,7 @@
 #include "downed.h"
 #include "log.h"
 #include "net.h"
+#include "occupancy.h"
 #include "remote.h"
 #include "npcs.h"
 #include "npcremoval.h"
@@ -172,6 +173,7 @@ void Silence(eCEntity* entity)
     routine->AIFullStop();
     routine->AccessCurrentTask() = bCString();
     routine->AccessCurrentState() = bCString();
+    occupancy::ReleaseNpc(entity, true);
 }
 
 void Stats(LogFn log)

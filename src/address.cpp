@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "address.h"
+#include "address_policy.h"
 
 #include "body.h"
+#include "guid.h"
+#include "guid_key.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -14,7 +17,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <unordered_map>
 
 namespace g3t::address {
@@ -28,14 +30,6 @@ constexpr uint32_t Rest = 60000;        // ms before the same NPC is asked for a
 bool on = true;  // QA negative control: addressoff
 uint32_t nextLook = 0;
 unsigned requested = 0, addressed = 0, expired = 0, accepted = 0, refused = 0, started = 0, gaveUp = 0;
-
-std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
-
-void GuidOf(eCEntity* entity, uint8_t out[16])
-{
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
-}
 
 float Distance(eCEntity* a, eCEntity* b)
 {
@@ -51,18 +45,40 @@ bool InDialog(eCEntity* npc = nullptr)
 {
     gCInfoManager_PS* manager = Infos();
     if (!manager || !manager->AccessIsRunning()) return false;
-    return !npc || reinterpret_cast<eCEntity*>(manager->GetDialogPartnerNPC()) == npc;
+    if (!npc) return true;
+    return reinterpret_cast<eCEntity*>(manager->GetDialogPartnerNPC()) == npc ||
+           reinterpret_cast<eCEntity*>(manager->GetDialogPartner1()) == npc ||
+           reinterpret_cast<eCEntity*>(manager->GetCurrentSelf()) == npc ||
+           reinterpret_cast<eCEntity*>(manager->GetCurrentOther()) == npc;
+}
+
+address_policy::HostNpcState BuildHostNpcState(Entity& npc, eCEntity* puppet)
+{
+    eCEntity* inst = npc.GetInstance();
+    address_policy::HostNpcState s{};
+    s.entityExists = inst != nullptr;
+    s.puppetExists = puppet != nullptr;
+    if (!inst) return s;
+    s.isDead = npc.IsDead() != GEFalse;
+    s.isDown = npc.IsDown() != GEFalse;
+    s.isMirrored = npcs::IsMirrored(inst);
+    s.hasNavigation = inst->GetPropertySet(eEPropertySetType_Navigation) != nullptr;
+    s.heldForRemoteTalk = talk::IsHeld(inst);
+    s.inHostDialog = InDialog(inst);
+    s.aiMode = body::AIModeOf(inst);
+    s.tooFar = puppet != nullptr && Distance(inst, puppet) > CallFrom + 500.0f;
+    return s;
 }
 
 // Client: the NPC asked for and until when it may come; NPCs asked for lately.
 struct Asked { uint8_t guid[16]; uint32_t until; };
 Asked pending{};
 bool waiting = false;
-std::unordered_map<std::string, uint32_t> rested;
+std::unordered_map<GuidKey, uint32_t, GuidHash> rested;
 
 // Host: NPCs on their way to a player's puppet.
 struct Approach { Entity npc; uint8_t player; uint32_t until, nextGoto; };
-std::unordered_map<std::string, Approach> approaches;
+std::unordered_map<GuidKey, Approach, GuidHash> approaches;
 
 void ClientTick(uint32_t now)
 {
@@ -74,7 +90,12 @@ void ClientTick(uint32_t now)
             waiting = false;
             return;
         }
-        if (!npc.GetInstance() || npc.IsDead() || static_cast<int32_t>(now - pending.until) > 0) {
+        address_policy::ClientWaitState waitState{};
+        waitState.entityExists = npc.GetInstance() != nullptr;
+        waitState.isDead = waitState.entityExists && npc.IsDead() != GEFalse;
+        waitState.isDown = waitState.entityExists && npc.IsDown() != GEFalse;
+        waitState.expired = static_cast<int32_t>(now - pending.until) > 0;
+        if (address_policy::ShouldCancelClientWait(waitState)) {
             waiting = false;
             ++expired;
             Logf("address: %s did not come", npc.GetInstance() ? npc.GetName().GetText() : "the NPC");
@@ -100,8 +121,8 @@ void ClientTick(uint32_t now)
         const float d = Distance(instance, hero);
         if (d >= bestDistance) continue;
         uint8_t guid[16];
-        GuidOf(instance, guid);
-        auto it = rested.find(Key(guid));
+        guid::CopyEntity(instance, guid);
+        auto it = rested.find(ToGuidKey(guid));
         if (it != rested.end() && static_cast<int32_t>(now - it->second) < 0) continue;
         if (!npc.HasImportantInfo(Entity(hero))) continue;
         best = instance;
@@ -110,21 +131,23 @@ void ClientTick(uint32_t now)
     if (!best) return;
     net::WorldState s{};
     s.kind = Kind;
-    GuidOf(best, s.guid);
+    guid::CopyEntity(best, s.guid);
     s.guard = net::LocalId();
     net::SendWorldState(s, 0);
     std::memcpy(pending.guid, s.guid, 16);
     pending.until = now + Wait;
     waiting = true;
-    rested[Key(s.guid)] = now + Rest;
+    rested[ToGuidKey(s.guid)] = now + Rest;
     ++requested;
     Logf("address: %s has an important info for this hero (%.0f m); asked the host to send it", Entity(best).GetName().GetText(),
          bestDistance / 100.0f);
 }
 
-void End(Approach& approach, bool back)
+void RestoreRoutine(Approach& approach)
 {
-    if (back && approach.npc.GetInstance() && !approach.npc.IsDead()) {
+    eCEntity* npc = approach.npc.GetInstance();
+    if (npc && !approach.npc.IsDead() && !approach.npc.IsDown() &&
+        !InDialog(npc) && !talk::IsHeld(npc) && body::AIModeOf(npc) == 0) {
         approach.npc.Routine.FullStop();
         approach.npc.Routine.ContinueRoutine();
     }
@@ -136,28 +159,44 @@ void HostTick(uint32_t now)
         Approach& a = it->second;
         eCEntity* npc = a.npc.GetInstance();
         eCEntity* puppet = remote::PuppetOf(a.player);
-        if (npc && talk::IsHeld(npc)) {  // the player addressed it: the dialog holds it now (talk.cpp)
+        const address_policy::HostNpcState state = BuildHostNpcState(a.npc, puppet);
+        const bool approachExpired = static_cast<int32_t>(now - a.until) > 0;
+        switch (address_policy::DecideHostApproach(state, approachExpired)) {
+        case address_policy::HostApproachAction::StartedRemoteTalk:
             ++started;
             Logf("address: %s talks to player %u", a.npc.GetName().GetText(), a.player);
             it = approaches.erase(it);
             continue;
-        }
-        if (!npc || !puppet || a.npc.IsDead() || static_cast<int32_t>(now - a.until) > 0) {
+        case address_policy::HostApproachAction::CancelKeepState:
             ++gaveUp;
-            Logf("address: %s back to its routine (no dialog with player %u)", npc ? a.npc.GetName().GetText() : "-", a.player);
-            End(a, true);
+            Logf("address: %s busy (%s, ai=%d); cancelled approach to player %u",
+                 a.npc.GetName().GetText(),
+                 state.inHostDialog ? "in host dialog"
+                 : state.isDown ? "down"
+                 : state.isMirrored ? "mirrored"
+                 : !state.hasNavigation ? "no navigation"
+                 : "not in routine",
+                 state.aiMode, a.player);
             it = approaches.erase(it);
             continue;
-        }
-        // The player went away (teleport, a far walk): a goto after its puppet crashed the host in
-        // gCNavZone_PS::DetectCollisionCircleExit (Game.dll+0x117c09 reading 0xd4, regression 25.10.: Hamlar sent while the
-        // client stood 18 m from him, the client teleported away, the crash 10-21 s later in 7 quest runs).
-        if (Distance(npc, puppet) > CallFrom + 500.0f) {
+        case address_policy::HostApproachAction::EraseOnly:
             ++gaveUp;
-            Logf("address: player %u went away; %s back to its routine", a.player, a.npc.GetName().GetText());
-            End(a, true);
+            Logf("address: %s back to its routine (no dialog with player %u)",
+                 npc ? a.npc.GetName().GetText() : "-", a.player);
             it = approaches.erase(it);
             continue;
+        case address_policy::HostApproachAction::GiveUpAndRestore:
+            ++gaveUp;
+            // The player went away (teleport, a far walk): stop walking after the puppet and restore routine.
+            if (state.tooFar)
+                Logf("address: player %u went away; %s back to its routine", a.player, a.npc.GetName().GetText());
+            else
+                Logf("address: %s back to its routine (no dialog with player %u)", a.npc.GetName().GetText(), a.player);
+            RestoreRoutine(a);
+            it = approaches.erase(it);
+            continue;
+        case address_policy::HostApproachAction::Continue:
+            break;
         }
         if (static_cast<int32_t>(now - a.nextGoto) >= 0) {
             a.nextGoto = now + 1000;
@@ -192,21 +231,16 @@ void OnState(uint8_t from, net::WorldState const& s)
     if (!net::IsHost() || s.kind != Kind) return;
     Entity npc(npcs::NpcByGuid(s.guid));
     eCEntity* puppet = remote::PuppetOf(from);
-    char const* why = nullptr;
-    if (!npc.GetInstance() || npc.IsDead() || npc.IsDown()) why = "gone";
-    else if (!puppet) why = "no puppet";
-    else if (npcs::IsMirrored(npc.GetInstance())) why = "not simulated here";
-    else if (talk::IsHeld(npc.GetInstance()) || InDialog(npc.GetInstance())) why = "in a dialog";
-    else if (body::AIModeOf(npc.GetInstance()) != 0) why = "not in its routine";  // fighting, fleeing, down ...
-    else if (Distance(npc.GetInstance(), puppet) > CallFrom + 500.0f) why = "too far";
-    else if (approaches.count(Key(s.guid))) why = "already on its way";
+    const GuidKey key = ToGuidKey(s.guid);
+    const address_policy::HostNpcState state = BuildHostNpcState(npc, puppet);
+    char const* why = address_policy::RejectHostAddressRequest(state, approaches.find(key) != approaches.end());
     if (why) {
         ++refused;
         Logf("address: player %u asks for %s: refused, %s", from, npc.GetInstance() ? npc.GetName().GetText() : "an NPC", why);
         return;
     }
     npc.Routine.FullStop();
-    approaches[Key(s.guid)] = Approach{npc, from, net::Now() + Wait, 0};
+    approaches[key] = Approach{npc, from, net::Now() + Wait, 0};
     ++accepted;
     Logf("address: %s goes to player %u (task was %s)", npc.GetName().GetText(), from, npc.Routine.GetCurrentTask().GetText());
 }

@@ -12,6 +12,7 @@
 #include "npclease_runtime.h"
 #include "npcremoval.h"
 #include "npcs.h"
+#include "occupancy.h"
 #include "patch.h"
 #include "relation_policy.h"
 #include "remote.h"
@@ -388,6 +389,9 @@ GEInt GE_STDCALL FilterFocusEntityPriority(gCScriptProcessingUnit* spu, GELPVoid
         const int overridePriority = relation::CombatFocusPriorityOverride(fi);
         if (overridePriority >= 0) return overridePriority;
     }
+    // Script_Game.dll GetFocusEntityPriority (0xAA4A0) rejects world interactables whose Interaction.User
+    // is still populated; scrub any stale user first so the native script evaluates true usability.
+    occupancy::ClearStaleUser(candidate, "focus");
     return originalFocusPriority ? originalFocusPriority(spu, self, other, args) : 0;
 }
 

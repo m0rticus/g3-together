@@ -23,6 +23,7 @@
 #include "movement.h"
 #include "relation_policy.h"
 #include "enclaves.h"
+#include "navzone_guard.h"
 #include "patch.h"
 #include "npc_targets.h"
 
@@ -476,6 +477,7 @@ void WrapAssessTarget(gCScriptAdminExt& admin)
     Log(nativeGuard ? "ai: downed AssessTarget guard installed at native and script entries"
                     : "ai: downed AssessTarget guard SCRIPT ONLY; native address/prologue or jump unavailable");
 }
+
 }
 
 bool PerceptionFiltered() { return installed; }
@@ -553,6 +555,7 @@ void Tick()
         }
     }
     if (gCSession::GetInstance().IsGameRunning()) downed::InstallTerminalGuards();
+    if (gCSession::GetInstance().IsGameRunning()) navzone_guard::Install();
     if ((installed || searched) && statesWrapped && originalContinue && originalPlayerKeys &&
         originalPlayerRoutine && moveLengthSearched) return;
     const DWORD now = GetTickCount();

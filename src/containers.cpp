@@ -12,6 +12,7 @@
 #include "personal_store.h"
 #include "remote.h"
 #include "trade.h"
+#include "witness.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -126,6 +127,26 @@ bool PersonalPlayerTransfer(gCInventory_PS* from, gCInventory_PS* to)
     return hero && ((from && from->GetEntity() == hero) || (to && to->GetEntity() == hero));
 }
 
+bool IsLootPageOpen()
+{
+    gCGUIManager* guiManager = gCSession::GetInstance().GetGUIManager();
+    return guiManager && guiManager->IsAnyPageOpen() && guiManager->GetActivePage() == gEGamePage_Loot;
+}
+
+bool BlockWitnessedChestLoot(eCEntity* chestEntity)
+{
+    Entity chest(chestEntity);
+    if (!chestEntity || !IsChest(chest) || !witness::PerceiveChestUse(chestEntity)) return false;
+    if (IsLootPageOpen()) gCSession::GetInstance().GetGUIManager()->ClosePage();
+    return true;
+}
+
+bool ChestTakeBlockedByWitness(gCInventory_PS* from, gCInventory_PS* to)
+{
+    eCEntity* hero = gCSession::GetInstance().GetHero();
+    return hero && from && to && to->GetEntity() == hero && BlockWitnessedChestLoot(from->GetEntity());
+}
+
 GEBool __fastcall RefreshPersonalTrade(gCInventory_PS* inventory, void* edx)
 {
     if (!nativeRefreshTrade) return GEFalse;
@@ -144,6 +165,7 @@ template <typename Call>
 GEBool GuardedInventoryTransfer(gCInventory_PS* from, gCInventory_PS* to, Call&& call)
 {
     if (ai::ShuttingDown() || !PersonalPlayerTransfer(from, to)) return call();
+    if (ChestTakeBlockedByWitness(from, to)) return GEFalse;
     PersonalMutation mutation;
     if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
     return call();
@@ -222,6 +244,9 @@ GEBool GE_STDCALL PersonalState(bTObjStack<gScriptRunTimeSingleState>& stack, gC
     Entity* chest = local && IsChest(target) ? &target : local && IsChest(focus) ? &focus : nullptr;
     if (chest && (!PersonalAdmitted() || !EnsurePersonal(*chest))) return GEFalse;
     if (chest) RememberPersonal(*chest);
+    if (local && chest && !std::strcmp(name, "PS_Interact_Chest_Loop") && IsLootPageOpen()) {
+        BlockWitnessedChestLoot(chest->GetInstance());
+    }
     const std::string key = chest ? EntityKey(chest->GetInstance()) : std::string();
     const GEBool result = original->second(stack, spu);
     if (!key.empty()) {
@@ -433,6 +458,10 @@ GEBool __fastcall QuickTake(PSInventory* self, void*, GEInt stack, GEInt amount,
     if (toHero && PersonalKind(entity, kind)) {
         if (!PersonalAdmitted()) { ++quickRefused; return GEFalse; }
         if (!EnsurePersonal(entity)) { ++quickRefused; return GEFalse; }
+        if (BlockWitnessedChestLoot(owner)) {
+            ++quickRefused;
+            return GEFalse;
+        }
         RememberPersonal(entity);
         const std::string key = EntityKey(owner);
         const GEBool moved = self->TransferAmountTo(stack, amount, to);
