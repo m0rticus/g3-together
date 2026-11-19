@@ -352,6 +352,14 @@ bool HostTaken(eCEntity const* entity)
     return hostTaken.count(Key(guid)) != 0;
 }
 
+void ClearHostBinding(uint8_t const guid[16])
+{
+    if (!guid) return;
+    const GuidKey key = Key(guid);
+    directedBy.erase(key);
+    hostTaken.erase(key);
+}
+
 uint8_t CompanionOwner(eCEntity* entity)
 {
     if (!entity) return 0;

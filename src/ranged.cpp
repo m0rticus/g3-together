@@ -599,4 +599,17 @@ void Flying(LogFn log)
     Format(line, "FLYING projectiles=%d first=%s at=%s meteors=%d", projectiles, first, where, meteors);
     log(line);
 }
+
+void OnWorldChange()
+{
+    pending = PendingShot{};
+    lastArrow = nullptr;
+    lastArrowId = bCPropertyID();
+    lastTarget = nullptr;
+    trace = Trace{};
+    partsOff.clear();
+    partsOnAt = 0;
+    aimActive = false;
+    ResetPuppetOverlays();
+}
 } // namespace g3t::ranged

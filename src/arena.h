@@ -8,7 +8,7 @@
 class eCEntity;
 
 namespace g3t::arena {
-void Tick();  // wrap SendToArena once the game runs; give opponents back once their fight is over
+void Tick();  // wrap arena scripts once the game runs; drive host/client bouts and release finished fighters
 // Client: the host hands back an NPC from its save. True when it is the opponent of a running arena or sparring quest: it is
 // given back to the host at once instead of becoming a companion (its fight starts again from the dialog).
 bool Readopt(eCEntity* npc);
@@ -17,4 +17,10 @@ using LogFn = void (*)(char const*);
 void Report(LogFn log);  // QA: ARENASYNC line
 void Off(LogFn log);     // QA negative control: arenasyncoff, the opponent stays where it is simulated
 void OnState(uint8_t from, net::WorldState const& state);
+bool AllowClientQuestStatusOnHost(uint8_t from, char const* questName, int clientNewStatus);
+void OnClientArenaQuestStatus(uint8_t from, char const* questName, int prevStatus, int newStatus);
+void NoteQuestStatusFromHost(char const* questName, int newStatus);
+void SyncArenaStatuses();
+void TrackDuel(eCEntity* npc, uint8_t player);
+uint8_t ChallengerForNpc(eCEntity const* npc);
 }

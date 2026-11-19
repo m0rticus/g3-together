@@ -106,5 +106,6 @@ bool VerifyLocalHitPresentation(eCEntity* entity, State const& state, net::NpcRe
 void SetEntityPose(eCEntity* entity, bCMatrix const& pose);
 void Tick();
 void OnWorldDeactivate();
+void OnEntityDestroyed(eCEntity* entity);
 void ForgetRemoved(uint8_t const guid[16]);
 }

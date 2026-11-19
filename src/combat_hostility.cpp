@@ -215,19 +215,22 @@ relation::SharedCombatInput BuildInput(eCEntity const* npc, int knownBaseAttitud
             in.aiMode = rec->aiMode;
             in.combatState = (rec->flags & 4u) ? 1u : 0u;
             in.attackReason = rec->attackReason ? rec->attackReason : RemoteAttackReason(key);
-            const uint8_t targetPlayer = (rec->flags >> 3) & 7u;
-            if (targetPlayer != 0) {
-                in.targetsCoopSide = true;
-            } else {
-                eCEntity* opponent = nullptr;
-                if (npcs::CombatTarget(mutableNpc, opponent) && IsCoopParticipant(opponent))
+            if (!relation::NonCombatAiMode(in.aiMode)) {
+                const uint8_t targetPlayer = (rec->flags >> 3) & 7u;
+                if (targetPlayer != 0) {
                     in.targetsCoopSide = true;
+                } else {
+                    eCEntity* opponent = nullptr;
+                    if (npcs::CombatTarget(mutableNpc, opponent) && IsCoopParticipant(opponent))
+                        in.targetsCoopSide = true;
+                }
             }
         } else {
             in.aiMode = body::AIModeOf(mutableNpc);
             in.attackReason = RemoteAttackReason(key);
         }
-        const bool inCombat = (in.aiMode == gEAIMode_Combat || in.combatState != 0) &&
+        const bool inCombat = !relation::NonCombatAiMode(in.aiMode) &&
+                              (in.aiMode == gEAIMode_Combat || in.combatState != 0) &&
                               !relation::BoutAttackReason(in.attackReason);
         in.syncedSharedHostile = relation::MirrorSharesCombatHostility(
             true, true, rec != nullptr, rec ? rec->attitude : relation::Unset,
@@ -251,13 +254,14 @@ relation::SharedCombatInput BuildInput(eCEntity const* npc, int knownBaseAttitud
     eCEntity* target = nullptr;
     eCEntity* alt = nullptr;
     eCEntity* attacker = nullptr;
-    const bool active = in.aiMode == gEAIMode_Combat || in.combatState != 0 ||
-                        in.lastFight == gELastFightAgainstPlayer_Running;
+    const bool active = !relation::NonCombatAiMode(in.aiMode) &&
+                        (in.aiMode == gEAIMode_Combat || in.combatState != 0);
     if (active && !remoteLeasedOnHost) {
         target = self.NPC.GetCurrentTarget().GetInstance();
         alt = self.NPC.GetAlternativeTarget().GetInstance();
         attacker = self.NPC.GetCurrentAttacker().GetInstance();
-        in.targetsCoopSide = IsCoopParticipant(target) || IsCoopParticipant(alt) || IsCoopParticipant(attacker);
+        in.targetsCoopSide = IsCoopParticipant(target) || IsCoopParticipant(alt) ||
+                             (!target && !alt && IsCoopParticipant(attacker));
     }
 
     if (relation::ActiveSharedCombatHostility(in)) {
@@ -324,6 +328,8 @@ void SyncNativeEntity(eCEntity* npc)
     const bool localSimAuthority = (net::IsHost() && !npclease::RemoteOwner(npc)) || npclease::LocalAuthority(npc);
     if (net::IsHost() && !npclease::RemoteOwner(npc) && HasRemoteHostile(key)) {
         ClearRemoteHostileOnHost(key);
+    } else if (!net::IsHost() && npclease::LocalAuthority(npc)) {
+        remoteHostile.erase(key);
     }
     const relation::SharedCombatInput in = BuildInput(npc);
     const bool hostileNow = relation::ActiveSharedCombatHostility(in);
@@ -381,8 +387,8 @@ GEInt GE_STDCALL FilterFocusEntityPriority(gCScriptProcessingUnit* spu, GELPVoid
         fi.mirrored = sc.mirrored;
         fi.sharedHostile = relation::ActiveSharedCombatHostility(sc);
         fi.targetsCoopSide = sc.targetsCoopSide;
-        fi.inCombat = sc.aiMode == gEAIMode_Combat || sc.combatState != 0 ||
-                      sc.lastFight == gELastFightAgainstPlayer_Running;
+        fi.inCombat = !relation::NonCombatAiMode(sc.aiMode) &&
+                      (sc.aiMode == gEAIMode_Combat || sc.combatState != 0);
         fi.inBout = relation::BoutAttackReason(sc.attackReason);
         fi.role = sc.role;
         fi.attitude = sc.storedAttitude;
@@ -427,6 +433,24 @@ void InstallHooks()
     Logf("relation: GetFocusEntityPriority wrapped (%s)", focusPriorityNative ? "native jump and script table" : "script table only");
 }
 
+void ExpireCalmMirroredHostilityOnClient()
+{
+    if (net::IsHost() || !net::Connected()) return;
+    for (auto& [key, peers] : remoteHostile) {
+        if (peers[1].state == RemoteInactive) continue;
+        eCEntity* npc = npcs::NpcByGuid(key.data());
+        if (!npc || !npcs::IsMirrored(npc)) continue;
+        auto const* rec = npcs::CombatRecord(npc);
+        if (!rec) continue;
+        const bool inCombat = !relation::NonCombatAiMode(rec->aiMode) &&
+                              (rec->aiMode == gEAIMode_Combat || (rec->flags & 4u) != 0) &&
+                              !relation::BoutAttackReason(rec->attackReason);
+        if (!relation::MirrorSharesCombatHostility(true, true, true, rec->attitude, inCombat, true, false) &&
+            !inCombat)
+            peers[1] = {};
+    }
+}
+
 void PruneDisconnectedPeers()
 {
     if (!net::Connected()) {
@@ -434,6 +458,7 @@ void PruneDisconnectedPeers()
         sentState.clear();
         return;
     }
+    ExpireCalmMirroredHostilityOnClient();
     for (auto it = remoteHostile.begin(); it != remoteHostile.end();) {
         bool any = net::IsHost() ? false : (it->second[1].state != RemoteInactive);
         for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
@@ -486,7 +511,9 @@ void SyncClientLeasedNpc(eCEntity* npc)
 void OnClientLeaseConfirmed(uint8_t const guid[16])
 {
     if (net::IsHost() || !guid || ai::ShuttingDown()) return;
-    sentState.erase(KeyOf(guid));
+    const GuidKey key = KeyOf(guid);
+    sentState.erase(key);
+    remoteHostile.erase(key);
     if (eCEntity* npc = npcs::NpcByGuid(guid))
         SyncClientLeasedNpc(npc);
 }
@@ -495,6 +522,7 @@ void ClearClientLeasedNpc(uint8_t const guid[16])
 {
     if (net::IsHost() || !guid) return;
     const GuidKey key = KeyOf(guid);
+    remoteHostile.erase(key);
     RestorePromotedEntityAttitude(npcs::NpcByGuid(guid), key);
     PublishTransition(key, RemoteInactive, 0);
 }
@@ -604,11 +632,14 @@ uint8_t MirrorAttitude(eCEntity const* npc, uint8_t wanted)
     if (!ValidNpc(npc) || !npcs::IsMirrored(npc)) return wanted;
     eCEntity* mutableNpc = const_cast<eCEntity*>(npc);
     const relation::SharedCombatInput in = BuildInput(npc);
-    const bool useLocalRelation = !enclaves::Together() || fightmem::HasLocalOverride(mutableNpc);
+    const bool sharedHostile = relation::ActiveSharedCombatHostility(in);
+    const bool useLocalRelation = !relation::MirrorUsesHostAttitude(
+        enclaves::Together(), npcs::CompanionOwner(mutableNpc),
+        fightmem::HasLocalOverride(mutableNpc), sharedHostile);
     int local = -1;
     const bool haveLocal = useLocalRelation && ai::LocalAttitude(mutableNpc, local) &&
                            relation::ValidAttitude(local) && local > relation::None;
-    if (!relation::ActiveSharedCombatHostility(in)) {
+    if (!sharedHostile) {
         return haveLocal ? static_cast<uint8_t>(local) : wanted;
     }
     auto const* rec = npcs::CombatRecord(npc);

@@ -45,10 +45,22 @@ void TestTalkHoldMaintenanceAndSilencing()
     assert(ShouldRepacifyHeldTalk(false, false, AiModeTalk, "ZS_GuidePlayer"));
     assert(ShouldRepacifyHeldTalk(false, false, AiModeTalk, "Reddock"));
     assert(ShouldRepacifyHeldTalk(false, false, AiModeTalk, nullptr));
-    // Dead, downed, or combat NPCs are never forced back into talk.
+    // Dead, downed, combat, or arena NPCs are never forced back into talk, and talk release skips restarting routines on combat/arena NPCs.
     assert(!ShouldRepacifyHeldTalk(true, false, AiModeTalk, "ZS_Walk"));
     assert(!ShouldRepacifyHeldTalk(false, true, AiModeTalk, "ZS_Walk"));
     assert(!ShouldRepacifyHeldTalk(false, false, AiModeCombat, "ZS_Attack"));
+    assert(!ShouldRepacifyHeldTalk(false, false, AiModeArena, "ZS_Arena"));
+    assert(ShouldRestartRoutineOnTalkRelease(false, false, AiModeTalk));
+    assert(ShouldRestartRoutineOnTalkRelease(false, false, 0));
+    assert(!ShouldRestartRoutineOnTalkRelease(true, false, AiModeTalk));
+    assert(!ShouldRestartRoutineOnTalkRelease(false, true, AiModeTalk));
+    assert(!ShouldRestartRoutineOnTalkRelease(false, false, AiModeCombat));
+    assert(!ShouldRestartRoutineOnTalkRelease(false, false, AiModeArena));
+    assert(!ShouldBlockHeldTalkEvent(true, true, false, false, AiModeArena, "ContinueRoutine"));
+    assert(ShouldBindActingPlayerForEvent(true, false, "OnArena"));
+    assert(ShouldBindActingPlayerForEvent(true, false, "SendToArena"));
+    assert(!ShouldBlockHeldTalkTask(true, true, false, false, 0, "ZS_Arena"));
+    assert(!ShouldBlockHeldTalkTask(true, true, false, false, AiModeArena, "ZS_HangAround"));
 
     // Passive mirrors silence residual tasks except while acting as the hero's dialogue partner.
     assert(ShouldSilencePassiveRoutine(true, false));

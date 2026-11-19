@@ -6,7 +6,9 @@
 #include "clock.h"
 #include "crashlog.h"
 #include "doors.h"
+#include "journal.h"
 #include "log.h"
+#include "npcs.h"
 #include "steam.h"
 #include "story.h"
 
@@ -700,6 +702,8 @@ void OnWorldActivate()
     needsNewHero = false;
     restoreFailed = false;
     localKind = net::KindMenu;
+    journal::Clear();
+    npcs::ClearCompanions();
     clock::OnWorldChange();
     NewEpoch();
 }
@@ -714,6 +718,8 @@ void OnWorldDeactivate()
         campaign.clear();
         needsNewHero = false;
         restoreFailed = false;
+        journal::Clear();
+        npcs::ClearCompanions();
         clock::OnWorldChange();
         NewEpoch();
     } else {

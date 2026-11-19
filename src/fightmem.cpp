@@ -310,9 +310,56 @@ T Hook(HMODULE game, uintptr_t rva, void* detour)
 }
 }
 
+bool IsAngryFightOutcome(int value)
+{
+    return value == gELastFightAgainstPlayer_Lost || value == gELastFightAgainstPlayer_Cancel;
+}
+
+bool GrudgeExpired(Memory const& m, eCEntity* npc)
+{
+    if (m.value == gELastFightAgainstPlayer_Cancel) {
+        if (m.reason == gEAttackReason_Kill || m.at <= 0.0f) return false;
+        const float limit = (m.reason == gEAttackReason_Enemy || m.reason == gEAttackReason_Murder) ? 1.2f : 0.24f;
+        return (Entity::GetPlayingTime() - m.at) >= limit;
+    }
+    if (m.value == gELastFightAgainstPlayer_Running) {
+        if (!npc) return true;
+        Entity e(npc);
+        return e.IsDead() || e.IsDown() ||
+               (e.Routine.AIMode != gEAIMode_Combat && e.NPC.CombatState == 0);
+    }
+    return false;
+}
+
+void PruneAndSyncGrudges()
+{
+    if (!net::IsHost() || !net::Connected() || grudges.empty()) return;
+    for (auto it = grudges.begin(); it != grudges.end();) {
+        if (it->first.size() < 17) { it = grudges.erase(it); continue; }
+        const uint8_t player = static_cast<uint8_t>(it->first[16]);
+        if (!net::PeerJoined(player)) { it = grudges.erase(it); continue; }
+        auto const* guid = reinterpret_cast<uint8_t const*>(it->first.data());
+        eCEntity* npc = npcs::NpcByGuid(guid);
+        if (!GrudgeExpired(it->second, npc)) { ++it; continue; }
+        if (net::InWorld(player)) {
+            net::WorldState clearMsg{};
+            clearMsg.kind = Kind;
+            std::memcpy(clearMsg.guid, guid, 16);
+            clearMsg.guard = player;
+            clearMsg.npc = static_cast<uint8_t>(gELastFightAgainstPlayer_None);
+            net::SendWorldState(clearMsg, 0);
+        }
+        Logf("fightmem: %s cleared fight memory with player %u (was %d)",
+             npc ? Entity(npc).GetName().GetText() : "-", player, it->second.value);
+        it = grudges.erase(it);
+    }
+}
+
 void Tick()
 {
-    if (installed || !gCSession::GetInstance().IsGameRunning()) return;
+    if (!gCSession::GetInstance().IsGameRunning()) return;
+    PruneAndSyncGrudges();
+    if (installed) return;
     const DWORD now = GetTickCount();
     if (now - lastTry < 1000) return;
     lastTry = now;
@@ -359,13 +406,19 @@ void AfterState(eCEntity* self)
 
 void OnState(uint8_t from, net::WorldState const& s)
 {
-    if (s.kind != Kind || s.guard != net::LocalId()) return;
+    if (s.kind != Kind || s.guard != net::LocalId() ||
+        s.npc > static_cast<uint8_t>(gELastFightAgainstPlayer_Friendly)) return;
     eCEntity* npc = npcs::NpcByGuid(s.guid);
     if (!IsNpc(npc)) return;
     Entity e(npc);
     const int before = static_cast<int>(e.NPC.LastFightAgainstPlayer);
     e.NPC.LastFightAgainstPlayer = static_cast<gELastFightAgainstPlayer>(s.npc);
-    e.NPC.LastFightTimestamp = Entity::GetPlayingTime();
+    if (s.npc == gELastFightAgainstPlayer_None) {
+        e.NPC.LastFightTimestamp = 0.0f;
+        e.NPC.LastPlayerAR = gEAttackReason_None;
+    } else {
+        e.NPC.LastFightTimestamp = Entity::GetPlayingTime();
+    }
     ++applied;
     Logf("fightmem: %s remembers our fight (from player %u): %d -> %d", e.GetName().GetText(), from, before, static_cast<int>(s.npc));
 }
@@ -385,9 +438,9 @@ void OnWorldChange()
 bool HasLocalOverride(eCEntity* npc)
 {
     if (!IsNpc(npc)) return false;
-    if (!net::IsHost() && Read(npc).value != gELastFightAgainstPlayer_None) return true;
+    if (!net::IsHost() && IsAngryFightOutcome(Read(npc).value)) return true;
     const auto it = grudges.find(Key(npc, net::LocalId()));
-    return it != grudges.end() && it->second.value != gELastFightAgainstPlayer_None;
+    return it != grudges.end() && IsAngryFightOutcome(it->second.value);
 }
 
 // The game's grudge on sight (AssessActivePerception, its player's slot): an NPC that gave up a fight with its player

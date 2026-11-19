@@ -469,6 +469,16 @@ void TickPlaying()
         ++it;
     }
 }
+void ResetState()
+{
+    StopAll();
+    speaking = {};
+    sentOptions.clear();
+    optionsFrom = 0;
+    subtitleFrom = 0;
+    subtitleLine = 0;
+    for (auto& menu : menus) menu = Menu{};
+}
 }
 
 void Start() { net::SetDialogLineHandler(&OnLine); }
@@ -476,18 +486,23 @@ void Start() { net::SetDialogLineHandler(&OnLine); }
 void OnWorldChange()
 {
     // Before a load and before the game shuts down (the world goes first): no channel of ours outlives the audio system.
-    StopAll();
-    speaking = {};
+    ResetState();
 }
 
 void Tick()
 {
     if (!gCSession::GetInstance().IsGameRunning()) {
-        StopAll();
-        speaking = {};
+        ResetState();
         return;
     }
     if (!hooked && !hookFailed) Hook();
+    net::Remote const* remotes = net::Remotes();
+    for (uint8_t i = 1; i < net::MaxPlayers; ++i) {
+        if (!menus[i].ids.empty() && (!net::Connected() || i == net::LocalId() || !remotes[i].connected)) {
+            menus[i] = Menu{};
+            if (optionsFrom == i) HideMenu();
+        }
+    }
     TickSpeaking();
     if (!disabled && net::Connected()) TickMenu();
     TickPlaying();

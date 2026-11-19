@@ -567,6 +567,7 @@ void ResetWorldNpcTables()
     awaitedHits.clear();
     npclease::OnWorldDeactivate();
     playerContact = PlayerContact{};
+    targetingWatch = TargetingWatchState{};
     net::ResetNpcReplication();
     corpses.clear();
     absences.clear();
@@ -582,10 +583,12 @@ void ResetWorldNpcTables()
     hostTaken.clear();
     reclaimed.clear();
     sentStates.clear();
+    sendNotes.clear();
     deadOnHost.clear();
     ClearCorpseGroundAnchors();
     lastSent.clear();
     for (auto& states : recipientNpcs) states.clear();
+    for (auto& pacer : initialPacers) pacer.Reset();
     std::fill(recipientGenerations, recipientGenerations + net::MaxPlayers, 0);
     incarnations.clear();
     hostHits.clear();

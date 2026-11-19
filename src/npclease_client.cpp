@@ -219,8 +219,12 @@ void ReceiveClient(Message const& note)
         entry.hasBaseline = true;
         entry.offeredState = note.state;
         entry.hasOfferedState = !npcpresence::OfferMatchesLocalBaseline(
-            entry.lease.state.position, entry.lease.state.hp, entry.lease.state.dead,
-            note.state.position, note.state.hp, note.state.dead);
+            {entry.lease.state.position, entry.lease.state.hp, entry.lease.state.dead,
+             entry.lease.state.attitude, entry.lease.state.aiMode, entry.lease.state.attackReason,
+             entry.lease.state.defeated},
+            {note.state.position, note.state.hp, note.state.dead,
+             note.state.attitude, note.state.aiMode, note.state.attackReason,
+             note.state.defeated});
         if (!entry.hasOfferedState) { entry.vetted = true; entry.vettedInSession = true; }
         entry.localDeadline = note.echo + note.duration - LeaseSafetyMs;
         entry.echo = now; entry.hostSeenAt = now;
@@ -484,7 +488,7 @@ void MaintainOwners(uint32_t now)
             continue;
         }
         if (!entry.local) continue;
-        if (!entity) continue; // unloaded by the engine: suspended, state kept for its return
+        if (!entity) { entry.ownedEntity = nullptr; continue; } // unloaded by the engine: suspended, state kept for its return
         if (entry.ownedEntity != entity && !HostWins(key)) {
             // The engine reloaded the entity under a new instance: restore the latest local state into it once it is
             // processable (ownership and the checkpoint are retained meanwhile).

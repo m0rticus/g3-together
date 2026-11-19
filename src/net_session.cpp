@@ -266,6 +266,7 @@ void DropClientRemotes()
             handlers.peerLeft(i, remotes[i].latest.name);
         Drop(i);
     }
+    if (!isHost) ResetNpcReplication();
 }
 
 void ProcessRelayDrops()

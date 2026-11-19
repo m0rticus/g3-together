@@ -114,6 +114,8 @@ void DrawOnCompass(CFFGFCWnd* control)
         const bool attached = created && compassMark->IsAttached() && compassMark->GetHandle();
         Logf("mapmarks: compass arrow bitmap G3_HUD_Arrow.tga: create=%d attached=%d", created ? 1 : 0, attached ? 1 : 0);
         if (!attached) {
+            delete compassMark;
+            compassMark = nullptr;
             compassMarkFailed = true;
             Log("mapmarks: no compass mark bitmap; a small copy of the needle points to each player instead");
         }

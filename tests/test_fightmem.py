@@ -95,6 +95,9 @@ class FightmemTests(unittest.TestCase):
         tick = function_body(self.fightmem, r"\bvoid\s+Tick\s*\(")
         self.assertIn("0x27510", tick)
         self.assertIn("InstallQuestDefeatGuard();", tick)
+        self.assertIn("PruneAndSyncGrudges();", tick)
+        self.assertIn("IsAngryFightOutcome(", self.fightmem)
+        self.assertIn("gELastFightAgainstPlayer_None", self.fightmem)
 
     def test_real_native_defeat_and_quest_prologues_read_only(self):
         game = os.environ.get("G3T_GAME_DLL")

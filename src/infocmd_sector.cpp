@@ -2,7 +2,9 @@
 #include "infocmd_internal.h"
 
 #include "ai.h"
+#include "arena.h"
 #include "body.h"
+#include "guards.h"
 #include "log.h"
 #include "npclease_runtime.h"
 #include "npcs.h"
@@ -96,9 +98,20 @@ void StartFights()
             continue;
         }
         if (!attacker.GetInstance() || !target) { ++it; continue; }  // not loaded here yet, or the puppet not spawned
-        if (talk::IsHeld(attacker.GetInstance())) { ++it; continue; }  // still standing in the client's dialog
-        const int reason = ReasonOf(it->reason, attacker.GetInstance(), target);
-        GetScriptAdminExt().CallScript(bCString("AssessTarget"), attacker.GetInstance(), target, reason);
+        if (npclease::Fenced(attacker.GetInstance())) { ++it; continue; }
+        if (talk::IsHeld(attacker.GetInstance())) {
+            it->until = now + 15000;
+            ++it;
+            continue;
+        }  // still standing in the client's dialog
+        int reason = 0;
+        {
+            guards::Acting context(target);
+            reason = ReasonOf(it->reason, attacker.GetInstance(), target);
+            if (reason == gEAttackReason_Duel || arena::ChallengerForNpc(attacker.GetInstance()) != 0)
+                arena::TrackDuel(attacker.GetInstance(), it->player);
+            GetScriptAdminExt().CallScript(bCString("AssessTarget"), attacker.GetInstance(), target, reason);
+        }
         remote::NoteContact(attacker.GetInstance(), target);
         ++stats.fightsStarted;
         Logf("infocmd: %s attacks player %u (%s, reason %d) after a dialog", attacker.GetName().GetText(), it->player, it->reason.c_str(), reason);

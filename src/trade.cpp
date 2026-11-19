@@ -484,6 +484,7 @@ void OnWorldChange()
     for (auto& goods : received) goods = Wares{};
     for (auto& gold : filledGold) gold = 0;
     sentItems.clear();
+    names.clear();
     sentGold = -1;
     serial = nextSerial = 0;
     goodsSchedule = GoodsSchedule{};

@@ -124,6 +124,10 @@ class OccupancyPolicyTests(unittest.TestCase):
         self.assertIn('ClearStaleUser(instance, "remote-takeover")', occ)
         self.assertIn("occupancy_policy::ShouldClearInteractUser(", occ)
         self.assertIn("occupancy_policy::ShouldDecrementAnchorUserCount(", occ)
+        self.assertNotIn("eCEntity* used =", occ)
+        self.assertNotIn("eCEntity* refusedObject =", occ)
+        self.assertIn("guid::Resolve(usedGuid)", occ)
+        self.assertIn("const GuidKey currentRefused = ToGuidKey(objectGuid);", occ)
 
         playback = source("npcplayback.cpp")
         silence = between(playback, "void Silence(eCEntity* entity)", "void Stats(LogFn log)")

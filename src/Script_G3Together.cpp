@@ -43,10 +43,12 @@
 #include "npclease_runtime.h"
 #include "offer.h"
 #include "remote.h"
+#include "ranged.h"
 #include "crashlog.h"
 #include "shot.h"
 #include "spells.h"
 #include "summon.h"
+#include "transform.h"
 #include "world.h"
 #include "hud.h"
 #include "i18n.h"
@@ -272,7 +274,11 @@ class Module : public eCEngineComponentBase
             {"Ardea removal cleanup", &g3t::npcremoval::OnWorldDeactivate},
             {"combat cleanup", &g3t::combat::OnWorldChange},
             {"combat hostility cleanup", &g3t::combat_hostility::OnWorldChange},
+            {"relation cleanup", &g3t::relation::OnWorldChange},
+            {"guards cleanup", &g3t::guards::OnWorldChange},
             {"shot cleanup", &g3t::shot::OnWorldChange},
+            {"ranged cleanup", &g3t::ranged::OnWorldChange},
+            {"transform cleanup", &g3t::transform::OnWorldChange},
             {"summon cleanup", &g3t::summon::OnWorldChange},
             {"fight memory cleanup", &g3t::fightmem::OnWorldChange},
             {"XP share cleanup", &g3t::xpshare::OnWorldChange},

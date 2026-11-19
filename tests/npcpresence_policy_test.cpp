@@ -121,6 +121,11 @@ int main()
     assert(!OfferMatchesLocalBaseline(ardeaDeer, 120, 0, fledDeer, 120, 0));
     assert(!OfferMatchesLocalBaseline(ardeaDeer, 120, 0, ardeaDeer, 80, 0));
     assert(!OfferMatchesLocalBaseline(ardeaDeer, 120, 0, ardeaDeer, 0, 1));
+    assert(OfferMatchesLocalBaseline({ardeaDeer, 120, 0, 1, 0, 0, 0}, {ardeaDeer, 120, 0, 1, 0, 0, 0}));
+    assert(!OfferMatchesLocalBaseline({ardeaDeer, 120, 0, 3, 0, 0, 0}, {ardeaDeer, 120, 0, 1, 0, 0, 0}));
+    assert(!OfferMatchesLocalBaseline({ardeaDeer, 120, 0, 1, 3, 0, 0}, {ardeaDeer, 120, 0, 1, 0, 0, 0}));
+    assert(!OfferMatchesLocalBaseline({ardeaDeer, 120, 0, 1, 0, 9, 0}, {ardeaDeer, 120, 0, 1, 0, 0, 0}));
+    assert(!OfferMatchesLocalBaseline({ardeaDeer, 120, 0, 1, 0, 0, 1}, {ardeaDeer, 120, 0, 1, 0, 0, 0}));
 
     // 8. Kind::Reject wire message passes Valid() and round-trips without requiring a full Checkpoint payload.
     g3t::npclease::Message reject{};

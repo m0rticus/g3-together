@@ -499,7 +499,7 @@ bool Context::InstallBaseline(Stream stream, std::uint16_t id, std::uint16_t tok
         throw;
     }
     auto& committed = history_.find(id)->second;
-    committed.usedBaselines = next.usedBaselines;
+    committed.usedBaselines.swap(next.usedBaselines);
     committed.retained.swap(next.retained);
     committed.highestAnchor = next.highestAnchor;
     committed.usedAnchors = next.usedAnchors;

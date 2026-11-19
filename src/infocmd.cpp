@@ -3,6 +3,7 @@
 
 #include "address.h"
 #include "arena.h"
+#include "arena_policy.h"
 #include "body.h"
 #include "combat_hostility.h"
 #include "doors.h"
@@ -14,6 +15,7 @@
 #include "guide.h"
 #include "guide_policy.h"
 #include "log.h"
+#include "npclease_runtime.h"
 #include "npcremoval.h"
 #include "npcs.h"
 #include "occupancy.h"
@@ -272,6 +274,7 @@ void OnWorldState(uint8_t from, net::WorldState const& s)
         return;
     }
     switch (s.kind) {
+    case 20: if (net::IsHost()) arena::OnState(from, s); return;
     case 23: combat_hostility::OnState(from, s); return;
     case 14: Logf("infocmd: obsolete NPC lifecycle result from player %u refused; host snapshots own NPC state", from); return;
     case 6:
@@ -386,8 +389,14 @@ void Observe(gCScriptProcessingUnit* spu)
     }
     if (!std::strcmp(name, "GiveXP")) return;
     eCEntity* target = e1.GetInstance();
-    if (!std::strcmp(name, "Attack") && !net::IsHost() && target && npcs::IsMirrored(target) &&
-        e2.GetInstance() == gCSession::GetInstance().GetHero()) {
+    if (!std::strcmp(name, "Attack") &&
+        arena_policy::ShouldForwardClientDialogAttack(
+            net::IsHost(), net::Connected(), target != nullptr,
+            target && npcs::IsMirrored(target), target && npclease::LocalAuthority(target),
+            guards::IsLocalPlayer(e2.GetInstance()))) {
+        if (npclease::LocalAuthority(target))
+            npclease::RelinquishToHost(target, "dialog fight");
+        story::FlushQuests();
         net::WorldState s{};
         s.kind = 3;
         guid::CopyEntity(target, s.guid);

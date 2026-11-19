@@ -167,6 +167,22 @@ int main()
         }
         assert(!MirrorAnswersFromHost(true, true, true, 0xFF));
         assert(!MirrorAnswersFromHost(true, true, true, Hostile, false));
+
+        assert(MirrorUsesHostAttitude(true, 0, false, false));
+        assert(!MirrorUsesHostAttitude(true, 0, true, false));
+        assert(MirrorUsesHostAttitude(false, 2, false, false));
+        assert(!MirrorUsesHostAttitude(false, 2, true, false));
+        assert(MirrorUsesHostAttitude(false, 2, true, true));
+        assert(MirrorUsesHostAttitude(false, 0, false, true));
+        assert(!MirrorUsesHostAttitude(false, 0, false, false));
+
+        assert(HostRecordIsCalm(0, 0, Friendly));
+        assert(HostRecordIsCalm(0, 0, Neutral));
+        assert(!HostRecordIsCalm(3, 0, Friendly));
+        assert(!HostRecordIsCalm(0, 4u, Friendly));
+        assert(!HostRecordIsCalm(0, 0, Angry));
+        assert(!HostRecordIsCalm(0, 0, Hostile));
+        assert(!HostRecordIsCalm(0, 0, Predator));
     }
 
     // Client diagnostics separate drift, unapplied host updates, and normal playback delay.
@@ -301,6 +317,18 @@ int main()
         in.syncedSharedHostile = false;
         in.targetsCoopSide = true;
         assert(!ActiveSharedCombatHostility(in));
+        in.lastFight = 4; // stale LastFightAgainstPlayer::Running without active combat must not promote
+        assert(!ActiveSharedCombatHostility(in));
+        in.aiMode = 6; // Talk
+        in.combatState = 1;
+        assert(!ActiveSharedCombatHostility(in));
+        in.aiMode = 4; // Flee
+        assert(!ActiveSharedCombatHostility(in));
+        in.aiMode = 5; // Arena (ZS_Arena walk-in before AttackReason==Arena)
+        assert(!ActiveSharedCombatHostility(in));
+        in.aiMode = 7; // Sleep
+        assert(!ActiveSharedCombatHostility(in));
+        in.aiMode = 0;
         in.combatState = 1;
         assert(ActiveSharedCombatHostility(in));
         in.down = true;
@@ -348,10 +376,13 @@ int main()
         assert(CombatFocusPriorityOverride(fi) == -1);
     }
 
-    // Shared combat hostility suppresses false TruthDiffers/Unapplied warnings and works in all reputation modes.
+    // Shared combat hostility suppresses false TruthDiffers/Unapplied warnings and works in all reputation modes,
+    // while fresh non-combat Friendly/Neutral host records override stale remoteSharedHostile.
     {
         assert(MirrorSharesCombatHostility(true, true, true, Hostile, true, false));
         assert(MirrorSharesCombatHostility(true, true, false, Unset, false, true));
+        assert(!MirrorSharesCombatHostility(true, true, true, Friendly, false, true));
+        assert(!MirrorSharesCombatHostility(true, true, true, Neutral, false, true));
         assert(!MirrorSharesCombatHostility(true, true, true, Neutral, false, false));
         assert(!MirrorSharesCombatHostility(false, true, true, Hostile, true, true));
 

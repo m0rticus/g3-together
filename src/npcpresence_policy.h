@@ -32,11 +32,29 @@ inline float PositionDriftSq(float const a[3], float const b[3]) noexcept
     return dx * dx + dy * dy + dz * dz;
 }
 
+struct BaselineSnapshot {
+    float const* position = nullptr;
+    int32_t hp = 0;
+    uint8_t dead = 0;
+    uint8_t attitude = 0;
+    uint8_t aiMode = 0;
+    uint8_t attackReason = 0;
+    uint8_t defeated = 0;
+};
+
+inline bool OfferMatchesLocalBaseline(BaselineSnapshot const& local, BaselineSnapshot const& host) noexcept
+{
+    if (!local.position || !host.position) return false;
+    return local.dead == host.dead && local.hp == host.hp &&
+           PositionDriftSq(local.position, host.position) <= 10000.0f &&
+           local.attitude == host.attitude && local.aiMode == host.aiMode &&
+           local.attackReason == host.attackReason && local.defeated == host.defeated;
+}
+
 inline bool OfferMatchesLocalBaseline(float const localPos[3], int32_t localHp, uint8_t localDead,
                                       float const hostPos[3], int32_t hostHp, uint8_t hostDead) noexcept
 {
-    return localDead == hostDead && localHp == hostHp &&
-           PositionDriftSq(localPos, hostPos) <= 10000.0f;
+    return OfferMatchesLocalBaseline({localPos, localHp, localDead}, {hostPos, hostHp, hostDead});
 }
 
 enum class Verdict : uint8_t {

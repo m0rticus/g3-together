@@ -88,6 +88,7 @@ eCResourceDataEntity* QueryNativeMotion(eCEntity* entity, gEAction action, gEPha
                                         std::string* lastCandidate, char const** failureReason);
 
 void PruneSkeletonCache(uint32_t now);
+void ForgetActorSkeleton(eCWrapper_emfx2Actor* actor);
 void ClearSkeletonCache();
 
 } // namespace g3t::npcplayback::detail

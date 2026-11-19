@@ -28,11 +28,13 @@ constexpr uint8_t KindUse = 13;  // net::WorldState kind
 constexpr DWORD LookEvery = 250;  // ms
 bool enabled = true;  // QA negative control: usesyncoff
 DWORD lastLook = 0;
-eCEntity* used = nullptr;   // the object this machine's hero uses, as last reported
+bool hasUsed = false;   // whether this machine's hero uses an object, as last reported
 uint8_t usedGuid[16] = {};
+char usedName[96] = "-";
 std::unordered_map<GuidKey, uint8_t, GuidHash> marked;  // objects whose user here is another player's puppet
 unsigned occupied = 0, released = 0, applied = 0, cleared = 0, busy = 0, refused = 0, staleCleared = 0;
-eCEntity* refusedObject = nullptr;  // the last place this hero was kept from (one message per try)
+bool hasRefused = false;
+GuidKey refusedKey{};  // the last place this hero was kept from (one message per try)
 
 bool UsedBy(eCEntity* object, eCEntity* user)
 {
@@ -65,7 +67,7 @@ uint8_t TakenBy(eCEntity* object)
 void Refuse(eCEntity* hero)
 {
     Entity self(hero);
-    if (self.Routine.GetCurrentTask() != bCString("PS_Interact")) { refusedObject = nullptr; return; }
+    if (self.Routine.GetCurrentTask() != bCString("PS_Interact")) { hasRefused = false; return; }
     eCEntity* object = self.NPC.GetCurrentTarget().GetInstance();
     uint8_t player = TakenBy(object);
     if (!player) {
@@ -78,8 +80,12 @@ void Refuse(eCEntity* hero)
     Entity(object).Interaction.SetUser(Entity(puppet));
     ++refused;
     Logf("occupancy: this player wanted to use %s, which player %u uses; refused", object->GetName().GetText(), player);
-    if (object == refusedObject) return;
-    refusedObject = object;
+    uint8_t objectGuid[16] = {};
+    guid::CopyEntity(object, objectGuid);
+    const GuidKey currentRefused = ToGuidKey(objectGuid);
+    if (hasRefused && currentRefused == refusedKey) return;
+    refusedKey = currentRefused;
+    hasRefused = true;
     wchar_t name[64] = {}, text[160];
     MultiByteToWideChar(CP_UTF8, 0, net::PeerName(player), -1, name, 64);
     swprintf_s(text, i18n::Text(i18n::PlaceInUse), name[0] ? name : L"?");
@@ -89,7 +95,10 @@ void Refuse(eCEntity* hero)
 // The object the hero uses: the game sets it as the object's user; the hero's target or focus points at it.
 eCEntity* InUse(eCEntity* hero)
 {
-    if (UsedBy(used, hero)) return used;
+    if (hasUsed) {
+        eCEntity* current = guid::Resolve(usedGuid).GetInstance();
+        if (UsedBy(current, hero)) return current;
+    }
     Entity self(hero);
     if (eCEntity* target = self.NPC.GetCurrentTarget().GetInstance(); UsedBy(target, hero)) return target;
     if (eCEntity* focus = self.Focus.GetFocusEntity().GetInstance(); UsedBy(focus, hero)) return focus;
@@ -208,19 +217,28 @@ void Tick()
     ScrubStaleUsers();
     eCEntity* hero = remote::ControlledBody();
     eCEntity* object = hero ? InUse(hero) : nullptr;
-    if (object == used) return;
-    if (used && enabled) {
+    uint8_t nextGuid[16] = {};
+    if (object) guid::CopyEntity(object, nextGuid);
+    const bool same = object ? (hasUsed && std::memcmp(nextGuid, usedGuid, sizeof(usedGuid)) == 0) : !hasUsed;
+    if (same) return;
+    if (hasUsed && enabled) {
         Send(usedGuid, false);
         ++released;
-        Logf("occupancy: this player let go of %s", used->GetName().GetText());
+        Logf("occupancy: this player let go of %s", usedName);
     }
-    used = object;
-    if (!object) return;
-    guid::CopyEntity(object, usedGuid);
+    if (!object) {
+        hasUsed = false;
+        std::memset(usedGuid, 0, sizeof(usedGuid));
+        strcpy_s(usedName, "-");
+        return;
+    }
+    std::memcpy(usedGuid, nextGuid, sizeof(usedGuid));
+    strncpy_s(usedName, object->GetName().GetText(), _TRUNCATE);
+    hasUsed = true;
     if (!enabled) return;
     Send(usedGuid, true);
     ++occupied;
-    Logf("occupancy: this player uses %s", object->GetName().GetText());
+    Logf("occupancy: this player uses %s", usedName);
 }
 
 void OnState(uint8_t from, net::WorldState const& s)
@@ -270,8 +288,12 @@ void Forget(int player, eCEntity* puppet)
 
 void OnWorldChange()
 {
-    used = nullptr;
-    refusedObject = nullptr;
+    hasUsed = false;
+    std::memset(usedGuid, 0, sizeof(usedGuid));
+    strcpy_s(usedName, "-");
+    hasRefused = false;
+    refusedKey = {};
+    lastLook = 0;
     marked.clear();
 }
 
@@ -279,7 +301,7 @@ void Report(LogFn log)
 {
     char line[224];
     Format(line, "OCCUPANCY enabled=%d using=%s occupied=%u released=%u applied=%u cleared=%u busy=%u marked=%u refused=%u stale_cleared=%u", enabled ? 1 : 0,
-              used ? used->GetName().GetText() : "-", occupied, released, applied, cleared, busy, static_cast<unsigned>(marked.size()), refused, staleCleared);
+              hasUsed ? usedName : "-", occupied, released, applied, cleared, busy, static_cast<unsigned>(marked.size()), refused, staleCleared);
     log(line);
 }
 

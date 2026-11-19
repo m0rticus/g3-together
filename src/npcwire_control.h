@@ -2,12 +2,13 @@
 // Engine-independent codec for the live NPC protocol.
 #pragma once
 
+#include <algorithm>
 #include <array>
-#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -145,8 +146,31 @@ public:
 private:
     struct LifeAnchor { std::uint32_t life; Anchor value; };
     struct LifeBaseline { std::uint32_t life, anchor; Control value; std::vector<std::uint8_t> bytes; };
+    class BaselineFence {
+    public:
+        bool test(std::uint16_t token) const noexcept
+        {
+            const auto page = static_cast<std::uint16_t>(token >> 6);
+            const auto it = std::lower_bound(pages_.begin(), pages_.end(), page,
+                [](auto const& entry, std::uint16_t key) { return entry.first < key; });
+            return it != pages_.end() && it->first == page &&
+                   (it->second & (std::uint64_t{1} << (token & 63u))) != 0;
+        }
+        void set(std::uint16_t token)
+        {
+            const auto page = static_cast<std::uint16_t>(token >> 6);
+            const auto bit = std::uint64_t{1} << (token & 63u);
+            const auto it = std::lower_bound(pages_.begin(), pages_.end(), page,
+                [](auto const& entry, std::uint16_t key) { return entry.first < key; });
+            if (it != pages_.end() && it->first == page) it->second |= bit;
+            else pages_.insert(it, {page, bit});
+        }
+        void swap(BaselineFence& other) noexcept { pages_.swap(other.pages_); }
+    private:
+        std::vector<std::pair<std::uint16_t, std::uint64_t>> pages_;
+    };
     struct History {
-        std::bitset<65536> usedBaselines{};
+        BaselineFence usedBaselines{};
         std::deque<std::uint16_t> retained;
         std::uint32_t highestAnchor = 0;
         std::uint64_t usedAnchors = 0;

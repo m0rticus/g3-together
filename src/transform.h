@@ -9,4 +9,5 @@ void Start(char const* creatureTemplate, LogFn log);  // QA: "transform Wolf"
 void Back(LogFn log);                                 // QA: "transformback"
 void Report(LogFn log);                               // QA: TRANSFORM line
 void Walk(int direction, LogFn log);  // QA: the body the player controls runs 6 m (movement goal) towards 45-degree direction
+void OnWorldChange();
 }

@@ -777,7 +777,9 @@ bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note)
         !PeerJoined(to) || !InWorld(to) || !note.epoch ||
         note.epoch != worldEpoch || !note.incarnation) return false;
     const NpcRemovalMsg message{MsgNpcRemoval, note};
-    return Send(peers[to], &message, sizeof(message), ChannelDefinitions, true);
+    if (!Send(peers[to], &message, sizeof(message), ChannelDefinitions, true)) return false;
+    sentPoses[to].erase(NpcKey(note.guid));
+    return true;
 }
 
 void SendMotionName(uint32_t hash, char const* name)

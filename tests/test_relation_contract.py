@@ -161,13 +161,26 @@ class RelationContractTests(unittest.TestCase):
         send_delta = between(enclaves, "void SendDelta(", "void SettlePending()")
         self.assertIn("d.known = now.known != before.known ? now.known : -1;", send_delta)
         self.assertIn("d.suspect[i] = now.suspect[i] != before.suspect[i] ? now.suspect[i] : -1;", send_delta)
+        settle = between(enclaves, "void SettlePending()", "void OnNote(")
+        self.assertIn("if (p.delta.known == gEPlayerCrime_Theft) c.known = p.priorKnown;", settle)
+        self.assertIn("if (p.delta.known == gEPlayerCrime_Theft) p.delta.known = -1;", settle)
         on_note = between(enclaves, "void OnNote(", "void Start()")
         self.assertIn("if (note.known == gEPlayerCrime_None) c.known = gEPlayerCrime_None;", on_note)
         self.assertIn("if (note.suspect[i] == 0) c.suspect[i] = 0;", on_note)
 
         relation = source("relation.cpp")
+        scrub = between(relation, "void ScrubCalmMirroredMemory(", "void Tick()")
+        self.assertIn("AccessLastPlayerCrime()", scrub)
         tick = between(relation, "void Tick()", "uint8_t Outgoing(")
+        self.assertIn("ScrubCalmMirroredMemory(npc, now);", tick)
         self.assertIn("ValidAttitude(local) && local > None", tick)
+        self.assertIn("MirrorUsesHostAttitude(", tick)
+        self.assertIn("npcs::CompanionOwner(npc)", tick)
+
+        lease_client = source("npclease_client.cpp")
+        self.assertIn("entry.lease.state.attitude", lease_client)
+        admission = source("npclease_admission.h")
+        self.assertIn("npc.NPC.LastPlayerCrime = gEPlayerCrime_None;", admission)
 
     def test_wire_and_pose_codecs_are_untouched(self):
         for name in ("npcwire_pose.h", "npcwire_bonepack.h"):

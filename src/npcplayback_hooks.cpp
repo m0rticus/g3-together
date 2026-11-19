@@ -17,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace g3t::npcplayback::detail {
@@ -25,6 +26,7 @@ namespace {
 std::unordered_map<eCWrapper_emfx2Actor*, std::array<CapturedOptions, Slots>> sourceOptions;
 std::mutex sourceOptionsMutex;
 uint32_t nextInstance = 0;
+uint32_t lastOptionsPruneAt = 0;
 
 HookCounters counters;
 thread_local NativePose* presentingPose = nullptr;
@@ -363,6 +365,12 @@ void __fastcall StopMotion(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx
     if (ai::ShuttingDown()) { if (originalStop) originalStop(self, edx, slot, blend); return; }
     auto* visual = updatingVisual && IsPassive(visualEntity) && !DialogPartner(visualEntity) ? Animation(visualEntity) : nullptr;
     if (!presenting && visual && !visual->GetRagDollEnabled()) { ++counters.blockedAnimations; return; }
+    const int index = static_cast<int>(slot);
+    if (!presenting && index >= 0 && index < Slots) {
+        std::lock_guard<std::mutex> lock(sourceOptionsMutex);
+        const auto found = sourceOptions.find(self);
+        if (found != sourceOptions.end()) found->second[index].available = false;
+    }
     originalStop(self, edx, slot, blend);
 }
 
@@ -526,10 +534,44 @@ bool MarkTimedCombatPlayer(eCWrapper_emfx2Actor* actor, uint32_t instance, uint8
 uint32_t ActorMotionInstance(eCEntity* entity, int slot)
 {
     auto* animation = Animation(entity);
-    if (!animation || slot < 0 || slot >= Slots) return 0;
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    if (!animation || !actor || slot < 0 || slot >= Slots) return 0;
+    const auto motionType = static_cast<eCWrapper_emfx2Actor::eEMotionType>(slot);
+    if (!animation->HasMotion(motionType) || !actor->HasMotionInstance(motionType)) return 0;
+    eCWrapper_emfx2Motion const* currentMotion = &animation->GetMotion(motionType);
     std::lock_guard<std::mutex> lock(sourceOptionsMutex);
-    const auto found = sourceOptions.find(animation->GetActor());
-    return found == sourceOptions.end() ? 0 : found->second[slot].instance;
+    const auto found = sourceOptions.find(actor);
+    if (found == sourceOptions.end()) return 0;
+    auto const& captured = found->second[slot];
+    return (captured.available && captured.motion == currentMotion) ? captured.instance : 0;
+}
+
+void PruneSourceOptions(uint32_t now)
+{
+    {
+        std::lock_guard<std::mutex> lock(sourceOptionsMutex);
+        if (lastOptionsPruneAt && now - lastOptionsPruneAt < 15000) return;
+        if (sourceOptions.size() <= 256) return;
+        lastOptionsPruneAt = now;
+    }
+    auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
+    if (!scene) return;
+    std::unordered_set<eCWrapper_emfx2Actor*> liveActors;
+    auto& nodes = scene->m_mapEntities.GetNodes();
+    for (GEInt i = 0; i < nodes.GetCount(); ++i) {
+        for (auto* node = nodes[i]; node; node = node->m_pNext) {
+            eCEntity* raw = node->m_Element;
+            if (!raw || !raw->GetEntityFlags().m_CachedIn) continue;
+            auto* animation = Animation(raw);
+            if (auto* actor = animation ? animation->GetActor() : nullptr)
+                liveActors.insert(actor);
+        }
+    }
+    std::lock_guard<std::mutex> lock(sourceOptionsMutex);
+    for (auto it = sourceOptions.begin(); it != sourceOptions.end();) {
+        if (liveActors.find(it->first) == liveActors.end()) it = sourceOptions.erase(it);
+        else ++it;
+    }
 }
 
 void ResetHooksState()
@@ -537,6 +579,7 @@ void ResetHooksState()
     std::lock_guard<std::mutex> lock(sourceOptionsMutex);
     sourceOptions.clear();
     nextInstance = 0;
+    lastOptionsPruneAt = 0;
 }
 
 void RecordBlockedTaskVerdict(eCEntity const* entity, char const* task)
@@ -581,6 +624,19 @@ char const* HitTask(eCEntity const* entity)
 uint32_t MotionInstance(eCEntity* entity, int slot)
 {
     return detail::ActorMotionInstance(entity, slot);
+}
+
+void OnEntityDestroyed(eCEntity* entity)
+{
+    if (!entity || ai::ShuttingDown()) return;
+    auto* animation = detail::Animation(entity);
+    auto* actor = animation ? animation->GetActor() : nullptr;
+    if (!actor) return;
+    {
+        std::lock_guard<std::mutex> lock(detail::sourceOptionsMutex);
+        detail::sourceOptions.erase(actor);
+    }
+    detail::ForgetActorSkeleton(actor);
 }
 
 } // namespace g3t::npcplayback

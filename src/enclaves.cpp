@@ -212,7 +212,7 @@ void SendDelta(std::string const& name, Counters const& before, Counters const& 
     }
     d.known = now.known != before.known ? now.known : -1;
     d.fame = now.fame - before.fame;
-    Pending p{name, Note(net::EnclaveDelta, name, d), GetTickCount(), items::Returned(), items::TakesBegun(), items::TakesDone()};
+    Pending p{name, Note(net::EnclaveDelta, name, d), GetTickCount(), before.known, items::Returned(), items::TakesBegun(), items::TakesDone()};
     if (d.crime[gEPlayerCrime_Theft] > 0) {  // wait: the take this theft was counted for may go to someone else
         pending.push_back(p);
         return;
@@ -238,10 +238,13 @@ void SettlePending()
             if (gCEnclave_PS* enclave = Native(e)) {
                 Counters c = Read(enclave);
                 c.crime[gEPlayerCrime_Theft] -= p.delta.crime[gEPlayerCrime_Theft];
+                if (c.crime[gEPlayerCrime_Theft] < 0) c.crime[gEPlayerCrime_Theft] = 0;
+                if (p.delta.known == gEPlayerCrime_Theft) c.known = p.priorKnown;
                 Write(e, c);
                 seen[p.name] = c;
             }
             p.delta.crime[gEPlayerCrime_Theft] = 0;
+            if (p.delta.known == gEPlayerCrime_Theft) p.delta.known = -1;
             ++dropped;
             Logf("enclaves: theft at %s taken back (someone else got the item)", p.name.c_str());
             net::SendEnclave(p.delta, 0);

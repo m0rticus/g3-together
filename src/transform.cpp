@@ -88,4 +88,9 @@ void Walk(int direction, LogFn log)
               at.GetY(), at.GetZ(), goal.GetX(), goal.GetY(), goal.GetZ());
     log(line);
 }
+
+void OnWorldChange()
+{
+    original = Entity();
+}
 }

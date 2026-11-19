@@ -321,6 +321,12 @@ void PruneSkeletonCache(uint32_t now)
     for (auto it = sourceSkeletons.begin(); it != sourceSkeletons.end();)
         if (now - it->second.seen > 5000) it = sourceSkeletons.erase(it);
         else ++it;
+    PruneSourceOptions(now);
+}
+
+void ForgetActorSkeleton(eCWrapper_emfx2Actor* actor)
+{
+    if (actor) sourceSkeletons.erase(actor);
 }
 
 void ClearSkeletonCache()

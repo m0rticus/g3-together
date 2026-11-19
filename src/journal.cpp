@@ -87,6 +87,13 @@ void ApplyUnprocessedClientDeath(Entity& npc, uint8_t const guid[16])
     }
 }
 
+bool IsTemporarySummon(eCEntity const* raw)
+{
+    if (!raw || !raw->GetPropertySet(eEPropertySetType_Party)) return false;
+    Entity npc(const_cast<eCEntity*>(raw));
+    return static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) == gEPartyMemberType_Summoned;
+}
+
 void OnDeath(uint8_t by, uint8_t const guid[16])
 {
     if (npcremoval::Suppressed(guid)) return;
@@ -104,6 +111,7 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
         }
         return;
     }
+    if (IsTemporarySummon(npc.GetInstance())) return;
     const bool first = deaths.find(key) == deaths.end();
     Death& d = deaths[key];
     // Kill quests count by the victim's name in gCQuest_PS::OnNPCKilled, called from the death script Kill, which
@@ -241,7 +249,8 @@ void SeedWorldDeaths()
     for (GEInt i = 0; i < nodes.GetCount(); ++i) {
         for (auto* node = nodes[i]; node; node = node->m_pNext) {
             eCEntity* raw = node->m_Element;
-            if (!raw || raw == hero || remote::IsPuppet(raw) || npcremoval::Suppressed(raw)) continue;
+            if (!raw || raw == hero || remote::IsPuppet(raw) || npcremoval::Suppressed(raw) || IsTemporarySummon(raw))
+                continue;
             if (!raw->GetPropertySet(eEPropertySetType_NPC) || !raw->GetPropertySet(eEPropertySetType_ScriptRoutine) ||
                 !raw->GetPropertySet(eEPropertySetType_DamageReceiver)) continue;
             Entity npc(raw);
@@ -338,7 +347,9 @@ void Tick()
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity npc = all.GetAt(i);
         eCEntity* instance = npc.GetInstance();
-        if (!instance || instance == hero || remote::IsPuppet(instance) || npcremoval::Suppressed(instance)) continue;
+        if (!instance || instance == hero || remote::IsPuppet(instance) || npcremoval::Suppressed(instance) ||
+            IsTemporarySummon(instance))
+            continue;
         const std::string key = Key(instance);
         const bool dead = npc.IsDead();
         auto entry = deaths.find(key);

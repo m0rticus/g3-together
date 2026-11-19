@@ -25,6 +25,7 @@ struct Pending {
     std::string name;
     net::EnclaveNote delta;
     uint32_t at = 0;
+    int32_t priorKnown = 0;
     unsigned returned = 0; // items::Returned() when the theft was counted
     unsigned begun = 0, done = 0; // items::TakesBegun()/TakesDone() then
 };

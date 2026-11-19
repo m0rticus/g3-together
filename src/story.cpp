@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "story_internal.h"
 
+#include "arena.h"
 #include "guide.h"
 #include "log.h"
 #include "reputation_policy.h"
@@ -182,15 +183,19 @@ void ApplyHostClientDelta(uint8_t from, Domain* d, bool snapshot, int count,
 {
     if (d->kind == net::StateQuests) FlushReputation();
     for (auto const& entry : decoded) {
+        gCQuest_PS* quest = nullptr;
         int prevQuestStatus = -1;
         if (d->kind == net::StateQuests && !snapshot) {
-            if (gCQuest_PS* quest = Quests()->GetQuest(bCString(entry.first.c_str())))
-                prevQuestStatus = StatusOf(quest);
+            if (!arena::AllowClientQuestStatusOnHost(from, entry.first.c_str(), static_cast<int>(entry.second)))
+                continue;
+            quest = Quests()->GetQuest(bCString(entry.first.c_str()));
+            if (quest) prevQuestStatus = StatusOf(quest);
         }
         Apply(*d, entry.first.c_str(), entry.second);
-        if (d->kind == net::StateQuests && !snapshot && prevQuestStatus >= 0) {
-            if (gCQuest_PS* quest = Quests()->GetQuest(bCString(entry.first.c_str())))
-                guide::OnClientFollowQuestRunning(from, entry.first.c_str(), prevQuestStatus, StatusOf(quest));
+        if (quest && prevQuestStatus >= 0) {
+            const int nowStatus = StatusOf(quest);
+            guide::OnClientFollowQuestRunning(from, entry.first.c_str(), prevQuestStatus, nowStatus);
+            arena::OnClientArenaQuestStatus(from, entry.first.c_str(), prevQuestStatus, nowStatus);
         }
     }
     States current;
@@ -204,7 +209,10 @@ void ApplyHostClientDelta(uint8_t from, Domain* d, bool snapshot, int count,
         Entry(*d, it->first, it->second, result);
     }
     Send(*d, result);
-    if (d->kind == net::StateQuests) FlushReputation();
+    if (d->kind == net::StateQuests) {
+        arena::SyncArenaStatuses();
+        FlushReputation();
+    }
     Logf("story: applied %d %s change(s) from player %u", count, d->label, from);
 }
 
@@ -216,8 +224,10 @@ void ApplyClientStates(Domain* d, bool catchup, std::vector<std::pair<std::strin
         }
         d->known[entry.first] = entry.second;
         if (d->kind != net::StateWorldClock) Apply(*d, entry.first.c_str(), entry.second, catchup);
-        if (d->kind == net::StateQuests)
+        if (d->kind == net::StateQuests) {
             guide::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
+            arena::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
+        }
     }
 }
 
@@ -262,8 +272,10 @@ bool CommitBaselines()
         if (d.kind != net::StateQuestRuntime && d.kind != net::StateWorldClock) {
             for (auto const& entry : d.baseline.values) {
                 Apply(d, entry.first.c_str(), entry.second, true);
-                if (d.kind == net::StateQuests)
+                if (d.kind == net::StateQuests) {
                     guide::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
+                    arena::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
+                }
             }
         }
         d.known.clear();
@@ -272,6 +284,7 @@ bool CommitBaselines()
         d.wasConnected = true;
         Logf("story: authoritative %s baseline restored entries=%zu rewards=0", d.label, d.known.size());
     }
+    arena::SyncArenaStatuses();
     admissionApplied = true;
     return true;
 }
@@ -379,6 +392,14 @@ void FlushReputation()
 {
     if (disabled || !net::IsHost()) return;
     if (Domain* d = Find(net::StateReputation)) Poll(*d);
+}
+
+void FlushQuests()
+{
+    if (disabled) return;
+    if (Domain* rt = Find(net::StateQuestRuntime)) Poll(*rt);
+    if (Domain* q = Find(net::StateQuests)) Poll(*q);
+    if (Domain* inf = Find(net::StateInfos)) Poll(*inf);
 }
 
 bool FinishAdmission(unsigned char player)

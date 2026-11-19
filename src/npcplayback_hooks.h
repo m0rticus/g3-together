@@ -64,6 +64,7 @@ void RecordBlockedTaskVerdict(eCEntity const* entity, char const* task);
 bool LookupCapturedOptions(eCWrapper_emfx2Actor* actor, int slot, CapturedOptions& out);
 bool MarkTimedCombatPlayer(eCWrapper_emfx2Actor* actor, uint32_t instance, uint8_t player);
 uint32_t ActorMotionInstance(eCEntity* entity, int slot);
+void PruneSourceOptions(uint32_t now);
 void ResetHooksState();
 
 } // namespace g3t::npcplayback::detail

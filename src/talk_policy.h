@@ -10,6 +10,7 @@ namespace g3t::talk_policy {
 
 constexpr int AiModeCombat = 3;      // gEAIMode_Combat
 constexpr int AiModeFlee = 4;        // gEAIMode_Flee
+constexpr int AiModeArena = 5;       // gEAIMode_Arena
 constexpr int AiModeTalk = 6;        // gEAIMode_Talk
 constexpr int MoveModeSneak = 2;     // gECharMovementMode_Sneak
 constexpr int MoveModeSprint = 5;    // gECharMovementMode_Sprint
@@ -61,11 +62,16 @@ constexpr bool ShouldStopHeldLocomotion(int movementMode) noexcept
     return movementMode >= MoveModeSneak && movementMode <= MoveModeSprint;
 }
 
-// Re-enter ZS_Talk whenever a live, non-combat, non-downed held NPC drops out of gEAIMode_Talk or "ZS_Talk".
+// Re-enter ZS_Talk whenever a live, non-combat, non-arena, non-downed held NPC drops out of gEAIMode_Talk or "ZS_Talk".
 inline bool ShouldRepacifyHeldTalk(bool isDead, bool isDown, int aiMode, char const* currentTask) noexcept
 {
-    if (isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee) return false;
+    if (isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee || aiMode == AiModeArena) return false;
     return aiMode != AiModeTalk || !currentTask || std::strcmp(currentTask, "ZS_Talk") != 0;
+}
+
+constexpr bool ShouldRestartRoutineOnTalkRelease(bool isDead, bool isDown, int aiMode) noexcept
+{
+    return !isDead && !isDown && aiMode != AiModeCombat && aiMode != AiModeFlee && aiMode != AiModeArena;
 }
 
 constexpr bool IsSeatedTalkAniState(int aniState) noexcept
@@ -137,7 +143,9 @@ inline bool IsStandUpMotion(char const* motion) noexcept
 inline bool ShouldBlockHeldTalkEvent(bool isHost, bool heldInTalk, bool isDead, bool isDown,
                                      int aiMode, char const* eventName) noexcept
 {
-    if (!isHost || !heldInTalk || isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee) return false;
+    if (!isHost || !heldInTalk || isDead || isDown ||
+        aiMode == AiModeCombat || aiMode == AiModeFlee || aiMode == AiModeArena)
+        return false;
     return eventName && std::strcmp(eventName, "ContinueRoutine") == 0;
 }
 
@@ -146,13 +154,16 @@ inline bool ShouldBindActingPlayerForEvent(bool isHost, bool heldInTalk, char co
     if (!isHost || heldInTalk || !eventName || !*eventName) return false;
     return std::strcmp(eventName, "ContinueRoutine") == 0 ||
            std::strcmp(eventName, "OnGuidePlayer") == 0 ||
-           std::strcmp(eventName, "OnFollowPlayer") == 0;
+           std::strcmp(eventName, "OnFollowPlayer") == 0 ||
+           std::strcmp(eventName, "OnArena") == 0 ||
+           std::strcmp(eventName, "SendToArena") == 0;
 }
 
 inline bool IsAllowedHeldTalkTask(char const* taskName) noexcept
 {
     if (!taskName || !*taskName) return true;
     return std::strcmp(taskName, "ZS_Talk") == 0 ||
+           std::strcmp(taskName, "ZS_Arena") == 0 ||
            std::strcmp(taskName, "ZS_Attack") == 0 ||
            std::strcmp(taskName, "ZS_Flee") == 0 ||
            std::strcmp(taskName, "ZS_Dead") == 0 ||
@@ -172,7 +183,9 @@ inline bool IsAllowedHeldTalkTask(char const* taskName) noexcept
 inline bool ShouldBlockHeldTalkTask(bool isHost, bool heldInTalk, bool isDead, bool isDown,
                                     int aiMode, char const* taskName) noexcept
 {
-    if (!isHost || !heldInTalk || isDead || isDown || aiMode == AiModeCombat || aiMode == AiModeFlee) return false;
+    if (!isHost || !heldInTalk || isDead || isDown ||
+        aiMode == AiModeCombat || aiMode == AiModeFlee || aiMode == AiModeArena)
+        return false;
     return taskName && *taskName && !IsAllowedHeldTalkTask(taskName);
 }
 
@@ -226,7 +239,8 @@ inline size_t MotionStem(char const* motion, char* out, size_t capacity) noexcep
 constexpr bool ShouldAcceptGestureOnHost(bool isHost, bool holdValid, uint8_t holdPlayer, uint8_t fromPlayer,
                                          bool isDead, bool isDown, int aiMode) noexcept
 {
-    return isHost && holdValid && holdPlayer != 0 && holdPlayer == fromPlayer && !isDead && !isDown && aiMode != AiModeCombat;
+    return isHost && holdValid && holdPlayer != 0 && holdPlayer == fromPlayer &&
+           !isDead && !isDown && aiMode != AiModeCombat && aiMode != AiModeArena;
 }
 
 // While a client's hero is actively talking to a live, non-downed, non-combat passive mirror, yield host pose/motion

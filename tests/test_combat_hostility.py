@@ -163,8 +163,15 @@ class CombatHostilityContractTests(unittest.TestCase):
         self.assertIn("attitude == relation::Hostile || attitude == relation::Angry", resume)
 
         mirror = between(ch, "uint8_t MirrorAttitude(", "int EffectiveAttitude(")
-        self.assertIn("!enclaves::Together() || fightmem::HasLocalOverride(mutableNpc)", mirror)
+        self.assertIn("!relation::MirrorUsesHostAttitude(", mirror)
+        self.assertIn("enclaves::Together()", mirror)
+        self.assertIn("fightmem::HasLocalOverride(mutableNpc)", mirror)
+        self.assertIn("npcs::CompanionOwner(mutableNpc)", mirror)
         self.assertIn("relation::EffectiveAttitude(base, in)", mirror)
+
+        self.assertIn("NonCombatAiMode(", policy)
+        self.assertIn("NonCombatAiMode(in.aiMode)", ch)
+        self.assertIn("remoteHostile.erase(key);", ch)
 
         ai = source("ai.cpp")
         filt = between(ai, "GEInt GE_STDCALL FilterAttitude(", "GEInt GE_STDCALL FilterContinue(")

@@ -15,6 +15,60 @@ if str(TESTS_DIR) not in sys.path:
 import _testbuild
 
 
+HUD_ENTITIES_POLICY_CODE = r"""
+#undef NDEBUG
+#include <cassert>
+#include <cstring>
+#include <vector>
+#include "hud_entities.h"
+
+int main()
+{
+    using namespace g3t::hud::entities;
+
+    int a = 1, b = 2;
+    assert(!ShouldScrubSlotOnDestroy(&a, nullptr));
+    assert(!ShouldScrubSlotOnDestroy(nullptr, &a));
+    assert(!ShouldScrubSlotOnDestroy(&a, &b));
+    assert(ShouldScrubSlotOnDestroy(&a, &a));
+
+    assert(!ShouldScrubIdleSlot(PlayerSlot, -1, false));
+    assert(!ShouldScrubIdleSlot(DialogNpcSlot, -1, true));
+    assert(ShouldScrubIdleSlot(DialogNpcSlot, -1, false));
+    assert(!ShouldScrubIdleSlot(FirstTransientPageSlot, 0, false));
+    for (int slot = FirstTransientPageSlot; slot < EntitySlotCount; ++slot)
+        assert(ShouldScrubIdleSlot(slot, -1, true));
+    assert(!ShouldScrubIdleSlot(EntitySlotCount, -1, false));
+
+    assert(!ValidActivePage(-1));
+    assert(ValidActivePage(0));
+    assert(ValidActivePage(PageSlotCount - 1));
+    assert(!ValidActivePage(PageSlotCount));
+
+    std::vector<std::uint8_t> image(SetActivePageRva + sizeof(SetActivePagePrefixBytes) + 16, 0);
+    const auto base = reinterpret_cast<uintptr_t>(image.data());
+    assert(!VerifyHudEntityLayout(nullptr, base + ClearAllEntitiesWrapperRva));
+    assert(!VerifyHudEntityLayout(image.data(), base + ClearAllEntitiesWrapperRva + 4));
+    assert(!VerifyHudEntityLayout(image.data(), base + ClearAllEntitiesWrapperRva));
+
+    std::memcpy(image.data() + ClearAllEntitiesWrapperRva, ClearAllEntitiesWrapperBytes, sizeof(ClearAllEntitiesWrapperBytes));
+    std::memcpy(image.data() + DialogClearAllEntitiesRva, DialogClearAllEntitiesBytes, sizeof(DialogClearAllEntitiesBytes));
+    std::memcpy(image.data() + SetActivePageRva, SetActivePagePrefixBytes, sizeof(SetActivePagePrefixBytes));
+    assert(VerifyHudEntityLayout(image.data(), base + ClearAllEntitiesWrapperRva));
+
+    image[SetActivePageRva + 7] ^= 0xff;
+    assert(!VerifyHudEntityLayout(image.data(), base + ClearAllEntitiesWrapperRva));
+    return 0;
+}
+"""
+
+HUD_ENTITIES_TARGET = _testbuild.register_target(
+    "hud_entities_policy",
+    [_testbuild.inline_unit("hud_entities_policy_test.cpp", HUD_ENTITIES_POLICY_CODE)],
+    msvc_vcvars=False,
+)
+
+
 def read_rva(data, rva, size):
     pe = struct.unpack_from("<I", data, 0x3C)[0]
     sections = struct.unpack_from("<H", data, pe + 6)[0]
@@ -167,6 +221,32 @@ class HudNoticeTests(unittest.TestCase):
         for address, color in ((0x7C64A, 0x103F2AAC), (0x7C912, 0x103F2A94),
                                (0x7CA6E, 0x103F2AB8), (0x7CAC6, 0x103F2A88)):
             self.assertEqual(read_rva(data, address, 5), b"\x68" + struct.pack("<I", color))
+        entities_header = _testbuild.src_text("hud_entities.h")
+        for name, address in (("ClearAllEntitiesWrapperBytes", 0x7C260),
+                              ("DialogClearAllEntitiesBytes", 0x8B620),
+                              ("SetActivePagePrefixBytes", 0x8B340)):
+            match = re.search(rf"\b{name}\[\]\s*=\s*\{{([^}}]+)\}}", entities_header)
+            expected = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]+)", match[1]))
+            self.assertEqual(read_rva(data, address, len(expected)), expected, name)
+
+    def test_dangling_hud_entity_slots_scrubbed_on_destroy_idle_and_world_change(self):
+        result = HUD_ENTITIES_TARGET.run(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        pvs = _testbuild.src_text("world_pvs.cpp")
+        destroy = function_body(pvs, r"\bvoid\s+__fastcall\s+DestroyEntity\s*\(")
+        self.assertIn("hud::OnEntityDestroyed(entity);", destroy)
+        self.assertIn("npcplayback::OnEntityDestroyed(entity);", destroy)
+        self.assertLess(destroy.index("hud::OnEntityDestroyed(entity);"),
+                        destroy.index("originalDestroyEntity(entity, edx);"))
+
+        tick = function_body(self.hud, r"\bvoid\s+Tick\s*\(")
+        self.assertIn("ScrubIdleEntitySlots();", tick)
+        self.assertLess(tick.index("ScrubIdleEntitySlots();"), tick.index("if (!list)"))
+
+        reset = function_body(self.hud, r"\bvoid\s+OnWorldChange\s*\(")
+        self.assertIn("ScrubWorldEntitySlots();", reset)
+        self.assertNotIn("pending", reset)
 
 
 if __name__ == "__main__":

@@ -603,4 +603,41 @@ int main() {
     assert(stressReceiver.AddId({300, 2}, 1, resetBase.guid));
     assert(stressReceiver.AdvanceLife({300, 2}, 1, 7));
     assert(stressReceiver.AddBaseline({300, 2}, 1, 1, 1, resetBase));
+
+    // Sparse baseline tokens across distant 64-token pages remain fenced after
+    // window eviction and clear cleanly when life advances.
+    Context sparseFence;
+    constexpr Stream sparseStream{400, 1};
+    assert(sparseFence.Reset(sparseStream.epoch, sparseStream.generation));
+    assert(sparseFence.AddId(sparseStream, 1, guid(1)));
+    assert(sparseFence.AdvanceLife(sparseStream, 1, 7));
+    const std::uint16_t sparseTokens[] = {0x0001u, 0x1040u, 0x7fffu, 0xfffeu};
+    std::uint16_t anchorSeq = 1;
+    for (std::uint16_t tok : sparseTokens) {
+        auto s = snapshot(1, 0); s.baseline = tok; s.anchor = anchorSeq++;
+        assert(sparseFence.AddBaseline(sparseStream, 1, tok, s.anchor, s));
+    }
+    for (std::uint16_t extra = 0x2000u; extra < 0x2000u + MaxBaselinesPerNpc; ++extra) {
+        auto s = snapshot(1, 0); s.baseline = extra; s.anchor = anchorSeq++;
+        assert(sparseFence.AddBaseline(sparseStream, 1, extra, s.anchor, s));
+    }
+    assert(sparseFence.RetainedBaselines(1) == MaxBaselinesPerNpc);
+    for (std::uint16_t tok : sparseTokens) {
+        auto s = snapshot(1, 0); s.baseline = tok; s.anchor = anchorSeq++;
+        assert(!sparseFence.AddBaseline(sparseStream, 1, tok, s.anchor, s));
+    }
+    assert(sparseFence.AdvanceLife(sparseStream, 1, 8));
+    for (std::uint16_t tok : sparseTokens) {
+        auto s = snapshot(1, 0); s.incarnation = 8; s.baseline = tok; s.anchor = anchorSeq++;
+        assert(!sparseFence.AddBaseline(sparseStream, 1, tok, s.anchor, s));
+    }
+    constexpr Stream nextSparseStream{400, 2};
+    assert(sparseFence.Reset(nextSparseStream.epoch, nextSparseStream.generation));
+    assert(sparseFence.AddId(nextSparseStream, 1, guid(1)));
+    assert(sparseFence.AdvanceLife(nextSparseStream, 1, 8));
+    anchorSeq = 1;
+    for (std::uint16_t tok : sparseTokens) {
+        auto s = snapshot(1, 0); s.incarnation = 8; s.baseline = tok; s.anchor = anchorSeq++;
+        assert(sparseFence.AddBaseline(nextSparseStream, 1, tok, s.anchor, s));
+    }
 }

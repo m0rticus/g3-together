@@ -119,6 +119,7 @@ void Mirrored(std::vector<eCEntity*>& out);  // client: the NPCs driven from ano
 bool HostTake(eCEntity* entity);
 void HostRelease(eCEntity* entity);
 bool HostTaken(eCEntity const* entity);
+void ClearHostBinding(uint8_t const guid[16]);
 void SendInfo(char const* name, LogFn log);  // QA: NPCSEND line, why this machine last did not send the NPC (name or GUID), or sent
 void LifeReport(char const* guid, LogFn log);  // QA: canonical/displayed incarnation, removal fence and replay readiness
 void CorpseSleep(char const* guid, LogFn log);  // QA: disable a settled mirror's physics without a new death

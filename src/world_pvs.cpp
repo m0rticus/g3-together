@@ -5,12 +5,15 @@
 #include "body.h"
 #include "config.h"
 #include "crashlog.h"
+#include "guards.h"
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
 #include "net.h"
+#include "npcplayback.h"
 #include "npcs.h"
 #include "persist.h"
+#include "relation.h"
 #include "remote.h"
 #include "world_collision.h"
 #include "world_collision_policy.h"
@@ -575,6 +578,10 @@ void __fastcall DestroyEntity(eCEntity* entity, void* edx)
         crashlog::NativeStack("eCEntity::Destroy cached-in invariant");
         reportingDestroy = false;
     }
+    hud::OnEntityDestroyed(entity);
+    npcplayback::OnEntityDestroyed(entity);
+    guards::OnEntityDestroyed(entity);
+    relation::OnEntityDestroyed(entity);
     collision::OnEntityDestroyed(entity);
     originalDestroyEntity(entity, edx);
 }

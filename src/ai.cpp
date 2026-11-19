@@ -314,8 +314,11 @@ GEInt FocusNameAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     const bool mirrored = judge && npcs::IsMirrored(judge);
     const bool haveHost = mirrored && npcs::HostAttitude(judge, hostAttitude);
     const bool sharedMirror = mirrored && combat_hostility::MirrorSharesCombatHostility(judge);
-    if (relation::MirrorAnswersFromHost(mirrored, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
-                                       (enclaves::Together() && !fightmem::HasLocalOverride(judge)) || sharedMirror)) {
+    if (relation::MirrorAnswersFromHost(
+            mirrored, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
+            mirrored && relation::MirrorUsesHostAttitude(
+                            enclaves::Together(), npcs::CompanionOwner(judge),
+                            fightmem::HasLocalOverride(judge), sharedMirror))) {
         ++relationMirrorAnswered;
         return combat_hostility::MirrorAttitude(judge, static_cast<uint8_t>(hostAttitude));
     }
@@ -350,9 +353,11 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
         const bool sharedMirror = !suppressPromotion && combat_hostility::MirrorSharesCombatHostility(judge);
         if (!(suppressPromotion &&
               (hostAttitude == relation::Hostile || hostAttitude == relation::Angry)) &&
-            relation::MirrorAnswersFromHost(true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
-                                           (enclaves::Together() && !fightmem::HasLocalOverride(judge)) ||
-                                               sharedMirror))
+            relation::MirrorAnswersFromHost(
+                true, haveHost, haveHost, static_cast<uint8_t>(hostAttitude),
+                relation::MirrorUsesHostAttitude(
+                    enclaves::Together(), npcs::CompanionOwner(judge),
+                    fightmem::HasLocalOverride(judge), sharedMirror)))
             return suppressPromotion
                 ? static_cast<GEInt>(hostAttitude)
                 : combat_hostility::MirrorAttitude(judge, static_cast<uint8_t>(hostAttitude));

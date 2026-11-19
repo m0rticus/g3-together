@@ -95,14 +95,38 @@ inline bool MirrorAnswersFromHost(bool mirrored, bool currentHostSession, bool h
     return mirrored && currentHostSession && haveRecord && ValidAttitude(hostAttitude) && sharedAttitudeValid;
 }
 
+constexpr bool MirrorUsesHostAttitude(bool enclavesTogether, uint8_t companionOwner,
+                                      bool hasLocalOverride, bool sharedCombatHostile) noexcept
+{
+    return ((enclavesTogether || companionOwner != 0) && !hasLocalOverride) || sharedCombatHostile;
+}
+
+constexpr bool HostRecordIsCalm(int aiMode, uint8_t flags, uint8_t attitude) noexcept
+{
+    return aiMode == 0 && (flags & 4u) == 0 &&
+           attitude != Angry && attitude != Hostile && attitude != Predator;
+}
+
 inline bool MirrorSharesCombatHostility(bool mirrored, bool currentHostSession, bool haveRecord,
                                         uint8_t hostAttitude, bool inCombat, bool remoteSharedHostile,
                                         bool targetsCoopSide = false)
 {
-    return mirrored && currentHostSession &&
-           (remoteSharedHostile ||
-            (haveRecord && inCombat &&
-             (targetsCoopSide || hostAttitude == Hostile || hostAttitude == Predator)));
+    if (!mirrored || !currentHostSession) return false;
+    if (haveRecord) {
+        if (inCombat && (targetsCoopSide || hostAttitude == Hostile || hostAttitude == Predator))
+            return true;
+        if (!inCombat && hostAttitude != Hostile && hostAttitude != Predator && hostAttitude != Angry)
+            return false;
+    }
+    return remoteSharedHostile;
+}
+
+// Non-combat AI modes (Flee=4, Arena=5, Talk=6, Sleep=7, Down=8, Dead=9, Abandoned=10) are never active shared
+// combat, even if stale LastFightAgainstPlayer==Running or CombatState lingers while the NPC walks to an arena,
+// talks, sleeps, or flees.
+inline bool NonCombatAiMode(int aiMode)
+{
+    return aiMode >= 4 && aiMode <= 10;
 }
 
 // Humanoid combat species in Gothic 3 CP 1.75 (gESpecies_Human == 0, gESpecies_Orc == 5) use non-lethal knockouts
@@ -161,7 +185,7 @@ inline bool ActiveSharedCombatHostility(SharedCombatInput const& in)
 {
     if (!in.alive || in.down || in.role != CombatRole::OrdinaryNpc) return false;
     if (BoutAttackReason(in.attackReason)) return false;
-    const bool inCombat = in.aiMode == 3 || in.combatState != 0 || in.lastFight == 4;
+    const bool inCombat = !NonCombatAiMode(in.aiMode) && (in.aiMode == 3 || in.combatState != 0);
     if (in.mirrored && in.syncedSharedHostile) return true;
     if (in.clientLeasedEngagement && (inCombat || in.syncedSharedHostile)) return true;
     return inCombat && (in.targetsCoopSide || in.syncedSharedHostile);

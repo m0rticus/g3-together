@@ -362,7 +362,27 @@ static void WatchZones()
     const DWORD now = GetTickCount();
     if (!originalPerceive || now - lastZoneLook < 500 || !net::Connected()) return;
     lastZoneLook = now;
+    if (lastCheck.size() > 256) {
+        for (auto it = lastCheck.begin(); it != lastCheck.end();) {
+            if (now - it->second > 10000) it = lastCheck.erase(it);
+            else ++it;
+        }
+    }
     for (int id = 1; id <= net::MaxPlayers; ++id) KeepZone(remote::PuppetOf(id));
+}
+
+void OnWorldChange()
+{
+    lastCheck.clear();
+    lastZoneLook = 0;
+    actor = nullptr;
+    depth = 0;
+}
+
+void OnEntityDestroyed(eCEntity const* entity)
+{
+    if (!entity) return;
+    lastCheck.erase(const_cast<eCEntity*>(entity));
 }
 
 void Tick()

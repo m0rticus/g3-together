@@ -34,4 +34,5 @@ void PresentPuppetOverlay(eCEntity* puppetEntity, char const* anim0, char const*
                           uint32_t overlayMeta, ranged_anim::OverlayHot const& hot);
 void ClearPuppetOverlay(eCEntity* puppetEntity);
 void ResetPuppetOverlays();
+void OnWorldChange();
 }

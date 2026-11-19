@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hud.h"
+#include "hud_entities.h"
 
 #include "ai.h"
 #include "downed.h"
@@ -52,6 +53,96 @@ constexpr unsigned char AppendReturn[] = {0x5e, 0x5d, 0x83, 0xc4, 0x08, 0xc2, 0x
 unsigned char* presentationGame = nullptr;
 void* appendText = nullptr;
 bool presentationChecked = false, presentationWaiting = false;
+bool entitySlotsChecked = false, entitySlotsReady = false;
+
+using SetHudEntityFn = void(__thiscall*)(void*, eCEntity*, int);
+
+bool BindEntitySlots()
+{
+    if (entitySlotsReady) return true;
+    if (entitySlotsChecked) return false;
+    HMODULE game = GetModuleHandleA("Game.dll");
+    if (!game) return false;
+    entitySlotsChecked = true;
+    auto* bytes = reinterpret_cast<uint8_t const*>(game);
+    const auto wrapper = reinterpret_cast<uintptr_t>(
+        GetProcAddress(game, "?ClearAllEntities@gCGUIManager@@QAE_NXZ"));
+    if (!entities::VerifyHudEntityLayout(bytes, wrapper)) {
+        Log("hud: ANOMALY entity-slot ABI mismatch; dangling-slot scrubber disabled");
+        return false;
+    }
+    entitySlotsReady = true;
+    return true;
+}
+
+unsigned char* DialogRoot()
+{
+    if (!BindEntitySlots()) return nullptr;
+    gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
+    if (!manager) return nullptr;
+    unsigned char* root = nullptr;
+    std::memcpy(&root, reinterpret_cast<unsigned char const*>(manager) + entities::ManagerRootOffset, sizeof(root));
+    return root;
+}
+
+void InvokeSetEntityNull(void* target, int slot)
+{
+    if (!target) return;
+    void* const* vtable = nullptr;
+    std::memcpy(&vtable, target, sizeof(vtable));
+    if (!vtable) return;
+    SetHudEntityFn fn = nullptr;
+    std::memcpy(&fn, reinterpret_cast<unsigned char const*>(vtable) + entities::SetEntityVtableOffset, sizeof(fn));
+    if (fn) fn(target, nullptr, slot);
+}
+
+void ClearRootEntitySlot(unsigned char* root, int slot)
+{
+    if (!root || slot < 0 || slot >= entities::EntitySlotCount) return;
+    eCEntity* empty = nullptr;
+    std::memcpy(root + entities::RootSlotsOffset + static_cast<size_t>(slot) * sizeof(eCEntity*), &empty, sizeof(empty));
+    void* hudOwner = nullptr;
+    std::memcpy(&hudOwner, root + entities::RootHudOffset, sizeof(hudOwner));
+    InvokeSetEntityNull(hudOwner, slot);
+    int32_t activePage = -1;
+    std::memcpy(&activePage, root + entities::RootActivePageOffset, sizeof(activePage));
+    if (entities::ValidActivePage(activePage)) {
+        void* page = nullptr;
+        std::memcpy(&page, root + entities::RootPagesOffset + static_cast<size_t>(activePage) * sizeof(void*),
+                    sizeof(page));
+        InvokeSetEntityNull(page, slot);
+    }
+}
+
+template <typename Predicate>
+void ScrubEntitySlots(Predicate&& shouldScrub)
+{
+    unsigned char* root = DialogRoot();
+    if (!root) return;
+    int32_t activePage = -1;
+    std::memcpy(&activePage, root + entities::RootActivePageOffset, sizeof(activePage));
+    for (int slot = 0; slot < entities::EntitySlotCount; ++slot) {
+        eCEntity const* current = nullptr;
+        std::memcpy(&current, root + entities::RootSlotsOffset + static_cast<size_t>(slot) * sizeof(current),
+                    sizeof(current));
+        if (current && shouldScrub(slot, activePage, current))
+            ClearRootEntitySlot(root, slot);
+    }
+}
+
+void ScrubIdleEntitySlots()
+{
+    auto* infos = gCInfoManager_PS::GetInstance();
+    const bool dialogRunning = infos && infos->AccessIsRunning();
+    ScrubEntitySlots([dialogRunning](int slot, int32_t activePage, eCEntity const*) {
+        return entities::ShouldScrubIdleSlot(slot, activePage, dialogRunning);
+    });
+}
+
+void ScrubWorldEntitySlots()
+{
+    ScrubEntitySlots([](int, int32_t, eCEntity const*) { return true; });
+}
 
 // Native ABI: list in EAX, six stack arguments, ret 0x18. Remove only the
 // extra list argument; the native callee returns directly to our stdcall caller.
@@ -96,10 +187,10 @@ void* MessageList()
     gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
     if (!manager) return nullptr;
     void* root = nullptr;
-    std::memcpy(&root, reinterpret_cast<unsigned char*>(manager) + 4, sizeof(root));
+    std::memcpy(&root, reinterpret_cast<unsigned char*>(manager) + entities::ManagerRootOffset, sizeof(root));
     if (!root) return nullptr;
     void* owner = nullptr;
-    std::memcpy(&owner, static_cast<unsigned char*>(root) + 0x7c, sizeof(owner));
+    std::memcpy(&owner, static_cast<unsigned char*>(root) + entities::RootHudOffset, sizeof(owner));
     return owner ? static_cast<unsigned char*>(owner) + 0x288 : nullptr;
 }
 
@@ -209,6 +300,7 @@ void Tick()
     if (ai::ShuttingDown() || persist::NativeLoading() || !gCSession::GetInstance().IsGameRunning()) return;
     movement::Stage stage("passive HUD");
     SampleDue(GetTickCount());
+    ScrubIdleEntitySlots();
     {
         std::lock_guard<std::mutex> lock(noticeMutex);
         if (pending.empty()) return;
@@ -250,6 +342,15 @@ void OnWorldChange()
     if (!observations.empty())
         Logf("hud-motion: phase=cancelled count=%zu reason=world-change", observations.size());
     observations.clear();
+    if (!ai::ShuttingDown()) ScrubWorldEntitySlots();
+}
+
+void OnEntityDestroyed(eCEntity const* entity)
+{
+    if (!entity || ai::ShuttingDown()) return;
+    ScrubEntitySlots([entity](int, int32_t, eCEntity const* current) {
+        return entities::ShouldScrubSlotOnDestroy(current, entity);
+    });
 }
 
 bool InventoryOpen()

@@ -305,6 +305,21 @@ void FinishOwnedTick(eCEntity* hero, float const players[][3], int playerCount)
         context.sim = world::HostSimulationStatus();
         context.perf = host_frame_diag::Global().TakeStreamSummary(now);
         streamDiag.Flush(now, context, [](char const* line) { Log(line); });
+        for (auto& [key, last] : lastSent) {
+            if (last.bones.capacity() == 0 || owned.find(key) != owned.end()) continue;
+            bool activeRecipient = false;
+            for (int id = 2; id < net::MaxPlayers; ++id) {
+                if (recipientNpcs[id].find(key) != recipientNpcs[id].end()) {
+                    activeRecipient = true;
+                    break;
+                }
+            }
+            if (!activeRecipient) {
+                last.posed = false;
+                last.poseFlags = 0;
+                std::vector<pose::Bone>().swap(last.bones);
+            }
+        }
     }
 }
 

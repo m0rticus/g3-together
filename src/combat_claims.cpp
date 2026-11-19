@@ -418,7 +418,12 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             CallScript("AddHitPoints", victim, attacker, -HitPoints(target));
             target.Routine.FullStop();
             target.Routine.SetTask(bCString("ZS_Unconscious"));
-            knockedAt[KillKey(guid)] = GetTickCount();
+            const DWORD now = GetTickCount();
+            for (auto it = knockedAt.begin(); it != knockedAt.end();) {
+                if (now - it->second >= 3000) it = knockedAt.erase(it);
+                else ++it;
+            }
+            knockedAt[KillKey(guid)] = now;
             witness::KnockOutSeen(victim, attacker);
             ++knockedOut;
             if (paysXp) RewardKill(from, guid);

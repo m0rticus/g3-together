@@ -3,9 +3,11 @@
 
 #ifdef G3T_NPCLEASE_NATIVE_RUNTIME
 #include "combat_hostility.h"
+#include "fightmem.h"
 #include "guid.h"
 #include "npclease.h"
 #include "npcs.h"
+#include "relation_policy.h"
 #include "world.h"
 
 #include <Game.h>
@@ -87,6 +89,13 @@ inline void ImportNativeFields(eCEntity* entity, Checkpoint const& state, bool w
     npc.DamageReceiver.StaminaPointsMax = state.maxStamina; npc.DamageReceiver.StaminaPoints = state.stamina;
     npc.NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(state.attitude);
     combat_hostility::NoteImportedAttitude(entity, state.attitude);
+    if (!state.dead && state.aiMode != gEAIMode_Combat &&
+        (state.attitude == relation::Friendly || state.attitude == relation::Neutral) &&
+        !fightmem::HasLocalOverride(entity)) {
+        npc.NPC.LastPlayerCrime = gEPlayerCrime_None;
+        if (npc.NPC.LastFightAgainstPlayer == gELastFightAgainstPlayer_Running)
+            npc.NPC.LastFightAgainstPlayer = gELastFightAgainstPlayer_None;
+    }
     npc.NPC.Level = state.level;
     npc.NPC.AttackReason = static_cast<gEAttackReason>(state.attackReason);
     npc.NPC.DefeatedByPlayer = state.defeated != 0;

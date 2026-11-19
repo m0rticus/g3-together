@@ -386,6 +386,10 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertIn("PersonalPass(false)", tick)
         self.assertNotIn("HostTick();", tick)
         self.assertNotIn("ClientTick();", tick)
+        reclaim = part(ledger_source, "void DetachAndRecycleObserver(", "void ReclaimCompletedObservers(")
+        self.assertIn("observer->inventory->RemoveListener(observer)", reclaim)
+        self.assertIn("reusablePersonalObservers.push_back(observer)", reclaim)
+        self.assertIn("ReclaimCompletedObservers()", ledger_source)
 
     def test_merchant_quirks_normalize_and_never_poison_saves(self):
         result = NORMALIZE_TARGET.run()

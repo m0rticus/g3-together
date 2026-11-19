@@ -97,21 +97,44 @@ bool PersonalCounted(Entity& entity, int index)
     return true;
 }
 
+void DetachAndRecycleObserver(ObserverState* observer, eCEntity* instance)
+{
+    if (observer->inventory && instance &&
+        instance->GetPropertySet(eEPropertySetType_Inventory) == observer->inventory) {
+        observer->inventory->RemoveListener(observer);
+    }
+    observer->active = false;
+    observer->inventory = nullptr;
+    observer->retiredInventory = nullptr;
+    observer->owner = nullptr;
+    if (!observer->depth) reusablePersonalObservers.push_back(observer);
+}
+
+void ReclaimCompletedObservers()
+{
+    for (auto it = currentPersonalObservers.begin(); it != currentPersonalObservers.end();) {
+        ObserverState* observer = it->second;
+        if (observer->depth) { ++it; continue; }
+        Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(it->first.data()));
+        eCEntity* instance = entity.GetInstance();
+        auto* currentInv = instance
+            ? static_cast<gCInventory_PS*>(instance->GetPropertySet(eEPropertySetType_Inventory))
+            : nullptr;
+        const bool liveMatch = observer->inventory && currentInv == observer->inventory;
+        const bool activeTeardown = observer->changes.destroyed && instance &&
+                                    observer->owner == instance &&
+                                    currentInv && currentInv == observer->retiredInventory;
+        if (liveMatch || activeTeardown) { ++it; continue; }
+        DetachAndRecycleObserver(observer, instance);
+        it = currentPersonalObservers.erase(it);
+    }
+}
+
 void RetirePersonalObservers()
 {
     for (auto const& entry : currentPersonalObservers) {
-        ObserverState* observer = entry.second;
         Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(entry.first.data()));
-        eCEntity* instance = entity.GetInstance();
-        if (observer->inventory && instance &&
-            instance->GetPropertySet(eEPropertySetType_Inventory) == observer->inventory) {
-            observer->inventory->RemoveListener(observer);
-            observer->active = false;
-            observer->inventory = nullptr;
-            reusablePersonalObservers.push_back(observer);
-        } else {
-            observer->active = false;
-        }
+        DetachAndRecycleObserver(entry.second, entity.GetInstance());
     }
     currentPersonalObservers.clear();
 }
@@ -127,9 +150,10 @@ bool ObservePersonal(Entity& entity)
     if (existing != currentPersonalObservers.end()) {
         ObserverState* observer = existing->second;
         if (observer->inventory == inventory && observer->changes.CanRefresh()) return true;
-        observer->active = false;
+        DetachAndRecycleObserver(observer, instance);
         currentPersonalObservers.erase(existing);
     }
+    if (reusablePersonalObservers.empty()) ReclaimCompletedObservers();
     ObserverState* observer = nullptr;
     if (!reusablePersonalObservers.empty()) {
         observer = reusablePersonalObservers.back();
@@ -548,6 +572,7 @@ bool FlushPersonalObservers()
         }
         RememberPersonal(entity);
     }
+    ReclaimCompletedObservers();
     personalUncertain.clear();
     return true;
 }

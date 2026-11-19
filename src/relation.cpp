@@ -45,6 +45,7 @@ struct Tracked {
 };
 
 std::unordered_map<eCEntity*, uint32_t> healAt;
+std::unordered_map<eCEntity*, uint32_t> mirrorCrimeClearAt;
 std::vector<Tracked> tracked;
 unsigned healed = 0, reports = 0, mismatchLines = 0;
 uint32_t nextReportAt = 0, nextWatchAt = 0;
@@ -113,12 +114,13 @@ View Inspect(eCEntity* entity, bool wantTruth)
         if (ai::LocalAttitude(entity, truth)) v.truth = truth;
     }
     Observation& o = v.observation;
+    const uint8_t owner = npcs::CompanionOwner(entity);
     o.sharedHostile = combat_hostility::IsSharedCombatHostile(entity);
     o.mirrorBound = v.info.mirrored && v.info.bound &&
-                    ((enclaves::Together() && !fightmem::HasLocalOverride(entity)) ||
-                     combat_hostility::MirrorSharesCombatHostility(entity));
+                    MirrorUsesHostAttitude(enclaves::Together(), owner,
+                                           fightmem::HasLocalOverride(entity),
+                                           combat_hostility::MirrorSharesCombatHostility(entity));
     o.alive = v.alive;
-    const uint8_t owner = npcs::CompanionOwner(entity);
     o.ledByRemote = owner && owner != net::LocalId();
     o.stored = v.stored;
     o.truth = v.truth;
@@ -235,6 +237,37 @@ void Watch()
         LogMismatch(Inspect(entity, true));
     }
 }
+void ScrubCalmMirroredMemory(eCEntity* npc, uint32_t now)
+{
+    auto const* rec = npcs::CombatRecord(npc);
+    if (!rec) return;
+    static_assert(gEAIMode_Routine == 0);
+    auto* ps = static_cast<gCNPC_PS*>(npc->GetPropertySet(eEPropertySetType_NPC));
+    if (!ps || !HostRecordIsCalm(rec->aiMode, rec->flags, rec->attitude)) {
+        mirrorCrimeClearAt.erase(npc);
+        return;
+    }
+    if (static_cast<gELastFightAgainstPlayer const&>(ps->AccessLastFightAgainstPlayer()) ==
+        gELastFightAgainstPlayer_Running)
+        ps->AccessLastFightAgainstPlayer() = gELastFightAgainstPlayer_None;
+    if (static_cast<gEPlayerCrime const&>(ps->AccessLastPlayerCrime()) == gEPlayerCrime_None) {
+        mirrorCrimeClearAt.erase(npc);
+        return;
+    }
+    eCEntity* encEntity = ps->GetEnclaveProxy().GetEntity();
+    auto* enc = encEntity ? static_cast<gCEnclave_PS*>(encEntity->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
+    const bool enclaveCalm = !enc ||
+        static_cast<gEPlayerCrime const&>(enc->AccessKnownPlayerCrime()) == gEPlayerCrime_None;
+    if (!enclaveCalm) {
+        mirrorCrimeClearAt.erase(npc);
+        return;
+    }
+    auto [it, inserted] = mirrorCrimeClearAt.emplace(npc, now + 2500);
+    if (!inserted && Due(now, it->second)) {
+        ps->AccessLastPlayerCrime() = gEPlayerCrime_None;
+        mirrorCrimeClearAt.erase(it);
+    }
+}
 }
 
 void Tick()
@@ -243,19 +276,22 @@ void Tick()
     combat_hostility::Tick();
     eCEntity* hero = remote::ControlledBody();
     if (!hero) return;
+    const uint32_t now = net::Now();
     if (!net::IsHost()) {
         const auto all = Entity::GetNPCs();
         for (int i = 0; i < all.GetCount(); ++i) {
             eCEntity* npc = all.GetAt(i).GetInstance();
-            if (!Eligible(npc) || !npcs::IsMirrored(npc) ||
-                (enclaves::Together() && !fightmem::HasLocalOverride(npc)) ||
-                combat_hostility::MirrorSharesCombatHostility(npc)) continue;
+            if (!Eligible(npc) || !npcs::IsMirrored(npc)) continue;
+            ScrubCalmMirroredMemory(npc, now);
+            if (MirrorUsesHostAttitude(enclaves::Together(), npcs::CompanionOwner(npc),
+                                       fightmem::HasLocalOverride(npc),
+                                       combat_hostility::MirrorSharesCombatHostility(npc)))
+                continue;
             int local = -1;
             if (ai::LocalAttitude(npc, local) && ValidAttitude(local) && local > None && Stored(npc) != local)
                 Entity(npc).NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(local);
         }
     }
-    const uint32_t now = net::Now();
     const uint32_t mask = downed::UnavailablePlayers();
     char const* reason = nullptr;
     if (!haveMask) {
@@ -294,7 +330,6 @@ uint8_t Outgoing(eCEntity* npc, bool alive)
     uint32_t& next = healAt[npc];
     if (!DueOrUnset(now, next)) return 0;
     next = now + HealIntervalMs;
-    if (healAt.size() > 8192) healAt.clear();
     int truth = -1;
     if (!ai::LocalAttitude(npc, truth) || !HealStored(stored, truth, alive)) return 0;
     Entity(npc).NPC.AttitudeToPlayer2 = static_cast<gEAttitude>(truth);
@@ -303,5 +338,26 @@ uint8_t Outgoing(eCEntity* npc, bool alive)
         Logf("relation: heal npc=%.40s stored=0 truth=%d colour=%s (no script stored its relation yet, or a stale None); written back",
              Entity(npc).GetName().GetText(), truth, ColourName(NameColour(truth, false, false)));
     return static_cast<uint8_t>(truth);
+}
+
+void OnWorldChange()
+{
+    healAt.clear();
+    mirrorCrimeClearAt.clear();
+    tracked.clear();
+    nextReportAt = 0;
+    nextWatchAt = 0;
+    followUpAt[0] = followUpAt[1] = 0;
+    followUps = 0;
+    previousMask = 0;
+    haveMask = false;
+}
+
+void OnEntityDestroyed(eCEntity const* entity)
+{
+    if (!entity) return;
+    auto* key = const_cast<eCEntity*>(entity);
+    healAt.erase(key);
+    mirrorCrimeClearAt.erase(key);
 }
 }

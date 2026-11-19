@@ -14,6 +14,7 @@
 #include "npcplayback.h"
 #include "npcs.h"
 #include "remote.h"
+#include "story.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -141,8 +142,11 @@ void Release(Hold& hold)
             guards::Acting context(actingPlayer > 1 ? remote::PuppetOf(actingPlayer) : nullptr);
             hold.entity.SetAlignmentTarget(Entity());
             hold.entity.SetLookAtTarget(Entity());
-            hold.entity.Routine.FullStop();
-            hold.entity.Routine.ContinueRoutine();
+            if (talk_policy::ShouldRestartRoutineOnTalkRelease(
+                    hold.entity.IsDead(), hold.entity.IsDown(), static_cast<int>(hold.entity.Routine.AIMode))) {
+                hold.entity.Routine.FullStop();
+                hold.entity.Routine.ContinueRoutine();
+            }
         }
     }
     ++holdsEnded;
@@ -559,6 +563,7 @@ void Tick()
         std::memcpy(previousGuid, clientTalk.guid, sizeof(previousGuid));
         ReleaseClientPartner(npcs::NpcByGuid(previousGuid), previousGuid);
         if (talk_policy::ShouldReleaseClientTalkHold(connected, clientTalk.holdSent)) net::SendTalk(false, previousGuid);
+        story::FlushQuests();
         clientTalk.active = false;
         clientTalk.holdSent = false;
         clientTalk.welcome = 0;
