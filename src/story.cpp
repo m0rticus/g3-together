@@ -82,6 +82,11 @@ bool Entry(Domain& d, std::string const& name, uint32_t value, std::vector<net::
         packed = policy::NameId(name);
     }
     if (packed.size() >= sizeof(entry.name)) {
+        if (d.kind == net::StateEvents) {
+            Logf("story: event name too long (%zu bytes) name=%s; skipped", packed.size(), name.c_str());
+            ++d.skipped;
+            return true;
+        }
         Logf("story: named state too long kind=%u name=%s; snapshot refused", d.kind, name.c_str());
         ++d.skipped;
         return false;
@@ -330,7 +335,9 @@ void OnStates(uint8_t from, uint8_t kind, net::StateEntry const* entries, int co
     }
     if (!net::IsHost() && !admissionApplied) {
         if (d->baseline.begun)
-            for (auto const& entry : decoded) d->baseline.values[entry.first] = entry.second;
+            for (auto const& entry : decoded)
+                policy::MergeLiveBaselineDelta(
+                    d->baseline.values, d->kind == net::StateQuestRuntime, entry.first, entry.second);
         return;
     }
     if (net::IsHost()) ApplyHostClientDelta(from, d, snapshot, count, decoded);
@@ -469,11 +476,14 @@ void OnWorldChange()
 {
     ResetDomainCaches();
     initialReplays = {};
-    if (!reloadReset || net::IsHost()) return;
-    admissionRequested = false;
-    admissionApplied = false;
+    if (!reloadReset && !net::IsHost()) return;
+    if (!net::IsHost()) {
+        admissionRequested = false;
+        admissionApplied = false;
+    }
     for (Domain& d : domains) {
         d.known.clear();
+        d.zeroed.clear();
         d.primed = false;
         d.wasConnected = false;
         d.baseline = {};

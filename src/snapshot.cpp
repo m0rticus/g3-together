@@ -210,7 +210,7 @@ void Interpolate(Track const& track, Track::Snap const& a, Track::Snap const& b,
         ? std::min(MaximumTravelSpeed, Distance(a.position, b.position) * 1000.0f / span)
         : 0.0f;
     Describe(out, fraction < 1.0f ? a : b, travelSpeed, render);
-    if (!track.predictive) {
+    if (out && !track.predictive) {
         for (int slot = 0; slot < net::NpcMotionSlots; ++slot) {
             auto const& first = a.motion.motions[slot];
             auto const& second = b.motion.motions[slot];
@@ -259,6 +259,35 @@ void SetPoseInterval(Track& track, uint32_t interval)
     track.delayMs = std::max(track.delayMs, static_cast<int32_t>(clamped * 2));
 }
 
+void SoftResetTrack(Track& track, bool preserveOffset)
+{
+    const uint32_t serial = track.serial + 1;
+    const bool predictive = track.predictive;
+    const uint8_t combatPlayer = track.combatPlayer;
+    const uint32_t interval = track.poseIntervalMs;
+    const unsigned underruns = track.underruns;
+    const unsigned catchUpFrames = track.catchUpFrames;
+    const uint32_t gapCount = track.gapCount, gapMinMs = track.gapMinMs, gapMaxMs = track.gapMaxMs;
+    const uint64_t gapSumMs = track.gapSumMs;
+    const bool haveOffset = preserveOffset && track.haveOffset;
+    const int32_t offset = track.offset;
+    const uint32_t lastArrived = preserveOffset ? track.lastArrived : 0;
+    track = Track{};
+    track.serial = serial;
+    track.predictive = predictive;
+    track.combatPlayer = combatPlayer;
+    track.underruns = underruns;
+    track.catchUpFrames = catchUpFrames;
+    track.gapCount = gapCount;
+    track.gapMinMs = gapMinMs;
+    track.gapMaxMs = gapMaxMs;
+    track.gapSumMs = gapSumMs;
+    track.haveOffset = haveOffset;
+    track.offset = offset;
+    track.lastArrived = lastArrived;
+    SetPoseInterval(track, interval);
+}
+
 void Feed(Track& track, float const position[3], float const rotation[4], uint32_t sent, uint32_t arrived, int movementMode,
           MotionState const& motion)
 {
@@ -267,36 +296,36 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
         const int32_t span = static_cast<int32_t>(sent - last.sent);
         if (span < 0) return;
         if (!span) {
-            Track::Snap& state = track.snaps[track.count - 1];
-            const bool edge = EventChanged(track, state.motion, motion);
-            if (edge && !track.haveRenderTime && track.count == 1 && track.pendingEvents.empty())
-                PushPendingEvent(track, state);
-            std::memcpy(state.position, position, sizeof(state.position));
-            std::memcpy(state.rotation, rotation, sizeof(state.rotation));
-            state.movementMode = movementMode;
-            state.motion = motion;
-            if (edge) PushPendingEvent(track, state);
-            else if (!track.pendingEvents.empty() && track.pendingEvents.back().sent == sent)
-                track.pendingEvents.back() = state;
-            return;
-        }
-        if (static_cast<uint32_t>(span) > RestartAfter ||
-            Distance(last.position, position) > 300.0f + MaximumTravelSpeed * span / 1000.0f) {
-            const uint32_t serial = track.serial + 1;
-            const bool predictive = track.predictive;
-            const uint8_t combatPlayer = track.combatPlayer;
-            const uint32_t interval = track.poseIntervalMs;
-            track = Track{};
-            track.serial = serial;
-            track.predictive = predictive;
-            track.combatPlayer = combatPlayer;
-            SetPoseInterval(track, interval);
+            if (Distance(last.position, position) <= 300.0f) {
+                Track::Snap& state = track.snaps[track.count - 1];
+                const bool edge = EventChanged(track, state.motion, motion);
+                if (edge && !track.haveRenderTime && track.count == 1 && track.pendingEvents.empty())
+                    PushPendingEvent(track, state);
+                std::memcpy(state.position, position, sizeof(state.position));
+                std::memcpy(state.rotation, rotation, sizeof(state.rotation));
+                state.movementMode = movementMode;
+                state.motion = motion;
+                if (edge) PushPendingEvent(track, state);
+                else if (!track.pendingEvents.empty() && track.pendingEvents.back().sent == sent)
+                    track.pendingEvents.back() = state;
+                return;
+            }
+            SoftResetTrack(track, true);
+        } else if (static_cast<uint32_t>(span) > RestartAfter ||
+                   Distance(last.position, position) > 300.0f + MaximumTravelSpeed * span / 1000.0f) {
+            const bool clockStall = static_cast<uint32_t>(span) > RestartAfter;
+            SoftResetTrack(track, !clockStall);
         } else if (track.predictive ||
                    (!track.quietHold && !track.lastQuietHold &&
                     static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs)) {
             // Sparse idle NPC keyframes are intentional, not evidence of network jitter.
             const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, 100u);
-            if (arrived - track.cadenceWindowAt >= OffsetWindow) {
+            if (!track.haveCadenceWindow) {
+                track.haveCadenceWindow = true;
+                track.cadenceWindowAt = arrived;
+                track.cadenceMin = interval;
+                track.previousCadenceMin = interval;
+            } else if (static_cast<int32_t>(arrived - track.cadenceWindowAt) >= static_cast<int32_t>(OffsetWindow)) {
                 track.previousCadenceMin = track.cadenceMin;
                 track.cadenceMin = interval;
                 track.cadenceWindowAt = arrived;

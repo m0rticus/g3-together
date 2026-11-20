@@ -123,7 +123,6 @@ bool CaptureCharacter(saving::Key const& key, Bytes& bytes)
                     bytes.size() <= saving::store::CharacterLimit && ValidateCharacter(bytes, key);
     Logf("persist: character capture world=%s save=%s player=%llu ok=%d bytes=%zu crc=%08x",
          key.world.c_str(), key.save.c_str(), key.player, ok ? 1 : 0, bytes.size(), saving::store::Crc(bytes));
-    if (ok) ++recordsWritten;
     return ok;
 }
 
@@ -178,7 +177,6 @@ bool ApplyCharacter(Bytes const& bytes, saving::Key const& key)
     Logf("persist: character restore account=%llu save=%s bytes=%zu ok=%d reason=%s",
          key.player, key.save.c_str(), bytes.size(), ok ? 1 : 0, hero::LastRefusal() ? hero::LastRefusal() : "-");
     if (ok) {
-        ++recordsApplied;
         combat::OnWorldChange();
         xpshare::OnWorldChange();
         if (!net::IsHost()) xpshare::OnClientRecordRestored(true);
@@ -289,6 +287,7 @@ void FinishSave(bool ok, char const* why)
     StopSaveTimer();
     operation = {};
     nativeSaved = false;
+    doors::ResetSettle();
     CleanupStaging();
     if (ok) {
         xpshare::CommitSaveCapture();
@@ -372,9 +371,14 @@ bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
     if (!pairedEnabled || nativeSaveDepth || ai::ShuttingDown()) return originalDelete(self, name);
     if (!SafeName(name.GetText())) { SaveFailure("name"); return false; }
     if (!NativeReady()) { SaveFailure("native-hooks"); return false; }
-    const std::string slot = name.GetText(), path = Path(slot, 2);
+    const std::string slot = name.GetText(), path = Path(slot, 2), publishMarker = path + ".publish";
     if (operation.active && requestedSlot == slot) CancelSave("canceled-delete");
-    if (!Exists(path)) return originalDelete(self, name);
+    if (!Exists(path)) {
+        const bool ok = originalDelete(self, name);
+        if (ok && !Exists(Path(slot, 0)) && !Exists(Path(slot, 1)) && Exists(publishMarker))
+            DeleteFileA(publishMarker.c_str());
+        return ok;
+    }
     Bytes bytes;
     Save intact;
     const bool recoverable = ReadAll(path, bytes) && saving::store::Decode(bytes, intact);
@@ -382,6 +386,7 @@ bool __fastcall DeleteDetour(gCWorld* self, void*, bCString const& name)
     DWORD failure = nativeOk ? 0 : GetLastError();
     const bool gone = !Exists(Path(slot, 0)) && !Exists(Path(slot, 1));
     if (gone && (!Exists(path) || DeleteFileA(path.c_str()))) {
+        if (Exists(publishMarker)) DeleteFileA(publishMarker.c_str());
         Logf("persist: host slot deleted slot=%s native_ok=%d", slot.c_str(), nativeOk ? 1 : 0);
         return true;
     }
@@ -594,7 +599,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     lastLoad = slot; loading = slot; current = std::move(save); campaign = slot;
     localKind = net::KindMenu; ownCharacterReady = false; restoreFailed = false;
     NewEpoch();
-    ++loads; newWorld = false;
+    newWorld = false;
     // Release every puppet, NPC mirror/lease, summon, and dual PVS prefetcher job while old entities are still alive.
     if (worldCleanup) worldCleanup();
     clock::OnWorldChange();

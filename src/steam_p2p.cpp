@@ -161,8 +161,7 @@ void WorkerRuntime::SendDirectUdpControl(Remote& r)
     frame[27] = static_cast<uint8_t>(ipCount);
     for (unsigned i = 0; i < ipCount; ++i)
         std::memcpy(frame + 28 + i * 4, &localIps[i], 4);
-    if (RawControlSend(r.id, SendReliable, frame, 28 + ipCount * 4) == ResultOk)
-        r.lastDirectOfferSent = Now() ? Now() : 1;
+    RawControlSend(r.id, SendReliable, frame, 28 + ipCount * 4);
 }
 
 void WorkerRuntime::RecordAcceptedItemTraffic(send::Item const& item, std::size_t encodedSize)
@@ -239,12 +238,15 @@ int WorkerRuntime::SendMessagesEnvelope(u64 to, int flags, int channel,
 int WorkerRuntime::RawDataSend(Remote& r, send::Item const& item)
 {
     const unsigned size = static_cast<unsigned>(item.bytes.size());
+    auto recordAccepted = [&](std::size_t encodedSize) {
+        ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
+        RecordAcceptedItemTraffic(item, encodedSize);
+    };
     if (socketsLaneTransport && r.p2pConn && r.p2pConnected && r.p2pLanesConfigured && api.AllocateMessage) {
         std::size_t encodedSize = 0;
         const int result = SubmitSocketEnvelope(r, item.bytes.data(), size, item.Flags(), item.Lane(), encodedSize);
         if (result == ResultOk) {
-            ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
-            RecordAcceptedItemTraffic(item, encodedSize);
+            recordAccepted(encodedSize);
             return ResultOk;
         }
         ++r.steamDataFailed[result >= 0 && result < 128 ? result : 0];
@@ -264,12 +266,10 @@ int WorkerRuntime::RawDataSend(Remote& r, send::Item const& item)
     }
     std::size_t encodedSize = 0;
     const int result = SendMessagesEnvelope(r.id, item.Flags(), ChannelData, item.bytes.data(), size, encodedSize);
-    if (result == ResultOk) {
-        ++(item.Flags() & SendReliable ? r.steamReliableOk : r.steamUnreliableOk);
-        RecordAcceptedItemTraffic(item, encodedSize);
-    } else {
+    if (result == ResultOk)
+        recordAccepted(encodedSize);
+    else
         ++r.steamDataFailed[result >= 0 && result < 128 ? result : 0];
-    }
     return result;
 }
 
@@ -304,12 +304,19 @@ void WorkerRuntime::Control(u64 to, char what, bool reliable)
 u64 WorkerRuntime::Sender(char const* message)
 {
     if (senderOffset) return api.IdentityGetSteamId(message + senderOffset);
-    const u64 at16 = api.IdentityGetSteamId(message + 16), at12 = api.IdentityGetSteamId(message + 12);
-    if (at16 || at12) {
-        senderOffset = at16 ? 16 : 12;
+    constexpr int expected = static_cast<int>(offsetof(SteamNetworkingMessage, identityPeer));
+    if (const u64 atExpected = api.IdentityGetSteamId(message + expected)) {
+        senderOffset = expected;
         Logf("steam: a message's sender identity is at offset %d", senderOffset);
+        return atExpected;
     }
-    return at16 ? at16 : at12;
+    constexpr int fallback = expected == 16 ? 12 : 16;
+    if (const u64 atFallback = api.IdentityGetSteamId(message + fallback)) {
+        senderOffset = fallback;
+        Logf("steam: a message's sender identity is at offset %d", senderOffset);
+        return atFallback;
+    }
+    return 0;
 }
 
 bool WorkerRuntime::UnpackRelayEnvelope(char const* raw, int rawSize, void const*& payload, std::size_t& payloadSize)
@@ -351,8 +358,11 @@ void WorkerRuntime::Receive(int channel)
             }
             data = static_cast<char const*>(payload);
             size = static_cast<int>(payloadSize);
+            const bool allowedPeer = isHost && lobby && InLobby(from) &&
+                (connectionMode != connect::Mode::Invite || hostFlow.Admit(from));
             Remote* r = !from || (!isHost && from != owner) ? nullptr
-                : isHost && !Find(from) && !(lobby && InLobby(from)) ? nullptr : Get(from);
+                : channel == ChannelData ? Find(from)
+                : isHost && !Find(from) && !allowedPeer ? nullptr : Get(from);
             if (r && size > 0) {
                 r->heard = Now();
                 if (channel == ChannelControl) OnControl(*r, data, size);
@@ -415,6 +425,7 @@ void WorkerRuntime::OnControl(Remote& r, char const* data, int size)
             }
             r.linked = true;
             r.linkedAt = Now();
+            if (rejoinPartner == r.id) rejoinPartner = 0;
             CopyName(r.name, sizeof(r.name), api.FriendPersonaName(friends, r.id));
             Logf("steam: %s (%llu) linked to this game", Text(api.FriendPersonaName(friends, r.id)), r.id);
             if (connectionMode == connect::Mode::Invite) {
@@ -662,7 +673,10 @@ void WorkerRuntime::OnP2PStatusChanged(char const* p, int size)
     auto const& info = statusChanged.info;
     const u64 peerId = api.IdentityGetSteamId(info.identity);
     if (info.state == diagnostics::Connecting && isHost && listenSocketP2P && info.listenSocket == listenSocketP2P) {
-        Remote* r = lobby && peerId && (InLobby(peerId) || Find(peerId)) ? Get(peerId) : nullptr;
+        const bool hostAdmitted = lobby && peerId &&
+            (connectionMode != connect::Mode::Invite || hostFlow.Admit(peerId)) &&
+            (InLobby(peerId) || Find(peerId));
+        Remote* r = hostAdmitted ? Get(peerId) : nullptr;
         if (!r) {
             api.CloseConnection(sockets, conn, 0, "unauthorized peer", 0);
             return;

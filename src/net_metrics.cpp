@@ -66,7 +66,7 @@ void UpdateBudgets(uint32_t now)
         sample.validRtt = peer.lastReceiveTime != 0 && peer.packetsSent >= 32;
         if (peer.packetsLost != budgetLastLost[i]) {
             budgetLastLost[i] = peer.packetsLost;
-            budgetLossAt[i] = now;
+            budgetLossAt[i] = now ? now : 1;
         }
         sample.packetsSent = peer.packetsSent;
         sample.packetsLost = peer.packetsLost;
@@ -208,9 +208,16 @@ namespace g3t::net {
 void SetBandwidthBudget(uint32_t bytesPerSecond)
 {
     budgetRate = (std::clamp)(bytesPerSecond, 64u * 1024, 4096u * 1024);
-    if (host)
-        for (size_t i = 0; i < host->peerCount && i < MaxPlayers; ++i)
-            ResetBudget(&host->peers[i]);
+    if (host) {
+        for (size_t i = 0; i < host->peerCount && i < MaxPlayers; ++i) {
+            BudgetConfig config;
+            config.bytesPerSecond = budgetRate;
+            config.mtuBytes = host->peers[i].mtu;
+            config.envelopeBytes = relayEnvelopeBytes;
+            config.checksumBytes = host->checksum ? 4 : 0;
+            peerBudgets[i].UpdateConfig(config);
+        }
+    }
 }
 
 BudgetSnapshot PeerBandwidth(uint8_t to)

@@ -36,7 +36,9 @@ inline Cylinder BuildTargetCylinder(float const worldPos[3], float const boxMin[
         if (dx > 4.0f && dy > 10.0f && dz > 4.0f &&
             dx < 1200.0f && dy < 1200.0f && dz < 1200.0f &&
             std::fabs(midX - worldPos[0]) < 400.0f &&
-            std::fabs(midZ - worldPos[2]) < 400.0f) {
+            std::fabs(midZ - worldPos[2]) < 400.0f &&
+            boxMax[1] >= worldPos[1] - 100.0f &&
+            boxMin[1] <= worldPos[1] + 400.0f) {
             const float rawRadius = 0.5f * std::min(dx, dz);
             const float maxRadius = (std::isfinite(characterHeight) && characterHeight > 20.0f)
                                         ? std::clamp(characterHeight * 0.40f, 36.0f, 150.0f)

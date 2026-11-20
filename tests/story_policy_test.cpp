@@ -82,4 +82,14 @@ int main()
     assert(!ShouldResetInitialReplay(7, 7, false));
     assert(ShouldResetInitialReplay(7, 7, true));
     assert(ShouldResetInitialReplay(7, 8, false));
+
+    // Pre-admission live StateQuestRuntime deltas shrinking CounterCount must prune out-of-bounds c<idx> entries,
+    // and out-of-bounds c<idx> entries must not be inserted into the pending baseline.
+    std::map<std::string, uint32_t> liveRt{{"QuestA\x1fn", 2}, {"QuestA\x1f" "c0", 10}, {"QuestA\x1f" "c1", 20}};
+    MergeLiveBaselineDelta(liveRt, true, "QuestA\x1fn", 1);
+    assert(liveRt.at("QuestA\x1fn") == 1);
+    assert(liveRt.count("QuestA\x1f" "c0") == 1);
+    assert(liveRt.count("QuestA\x1f" "c1") == 0);
+    MergeLiveBaselineDelta(liveRt, true, "QuestA\x1f" "c1", 99);
+    assert(liveRt.count("QuestA\x1f" "c1") == 0);
 }

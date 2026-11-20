@@ -147,7 +147,7 @@ public:
     {
         eCEntity* actor = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
         thing_ = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
-        hero_ = gCSession::GetInstance().GetHero();
+        hero_ = remote::ControlledBody();
         if (!mirrorsPerceive || !enabled || !hero_ || (actor != hero_ && thing_ != hero_) || !net::Connected())
             return;
         active_ = true;
@@ -344,7 +344,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (depth || !enabled || !CrimeReason(args)) return originalAssess(spu, self, other, args);
     eCEntity* npc = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
-    eCEntity* hero = gCSession::GetInstance().GetHero();
+    eCEntity* hero = remote::ControlledBody();
     if (!npc || !hero || target != hero || !net::Connected() || !npc->GetPropertySet(eEPropertySetType_NPC))
         return originalAssess(spu, self, other, args);
     Entity witness(npc);
@@ -402,7 +402,7 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
         Logf("witness: %s saw player %u's crime (reason %d); it reacts here: result %d, task %s", witness.GetName().GetText(), from,
              note.value, result, witness.Routine.GetCurrentTask().GetText());
     } else if (note.op == net::WitnessJudge) {
-        eCEntity* hero = gCSession::GetInstance().GetHero();
+        eCEntity* hero = remote::ControlledBody();
         if (!enabled || !hero || !KillReason(note.value) || witness.IsDead()) {
             ++refused;
             return;
@@ -566,7 +566,7 @@ void Saw(char const* argument, LogFn log)
     std::memcpy(name, argument, sep - argument);
     const int reason = std::atoi(sep + 1);
     Entity npc = Entity::GetEntity(bCString(name));
-    eCEntity* hero = gCSession::GetInstance().GetHero();
+    eCEntity* hero = remote::ControlledBody();
     if (!npc.GetInstance() || !hero) { log("REFUSED witness: no such NPC or no hero"); return; }
     const unsigned sentBefore = sent;
     const GEInt result = GetScriptAdminExt().CallScript(bCString("AssessTarget"), npc.GetInstance(), hero, reason);
@@ -578,7 +578,7 @@ void Saw(char const* argument, LogFn log)
 bool PerceiveChestUse(eCEntity* chest)
 {
     if (!enabled || !chest || !gCSession::GetInstance().IsGameRunning() || !net::Connected()) return false;
-    eCEntity* hero = gCSession::GetInstance().GetHero();
+    eCEntity* hero = remote::ControlledBody();
     if (!hero || !hero->GetPropertySet(eEPropertySetType_NPC) || !IsInteractableObject(chest, hero)) return false;
     Entity heroEntity(hero);
     const Entity prevTarget = heroEntity.NPC.GetCurrentTarget();

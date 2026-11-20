@@ -19,6 +19,7 @@ reject = function_body(_guards, r"\bbool\s+RejectRemoteWrite\s*\(")
 HARNESS = f"""
 #include "position_policy.h"
 #include <cassert>
+#include <limits>
 class eCEntity {{}};
 static eCEntity hero, creature, puppet, npc;
 static eCEntity* controlled = &hero;
@@ -60,6 +61,11 @@ int main() {{
     const float falling[3] = {{0,-600,0}}, fall[3] = {{0,-60,0}};
     assert(!movement::PositionDiscontinuity(origin, fall, falling, falling, 100000, true));
     assert(movement::PositionDiscontinuity(origin, fall, zero, zero, 10000, true));
+    const float nanPos[3] = {{std::numeric_limits<float>::quiet_NaN(), 0, 0}};
+    const float infVel[3] = {{std::numeric_limits<float>::infinity(), 0, 0}};
+    assert(movement::PositionDiscontinuity(origin, nanPos, zero, zero, 10000, false));
+    assert(movement::PositionDiscontinuity(nanPos, origin, zero, zero, 10000, false));
+    assert(movement::PositionDiscontinuity(origin, normal, infVel, run, 10000, false));
 }}
 """
 TARGET = _testbuild.register_target(

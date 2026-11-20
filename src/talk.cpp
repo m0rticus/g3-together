@@ -95,7 +95,7 @@ unsigned begins = 0, ends = 0;
 // Host: NPCs held for a remote player's dialog.
 struct Hold {
     Entity entity;
-    body::State state;
+    uint32_t gestureUntil = 0;
     uint8_t player;
     uint8_t guid[16] = {};
     uint32_t generation = 0, incarnation = 0;
@@ -117,6 +117,7 @@ unsigned busyRefused = 0;
 constexpr uint8_t GestureKind = 15;
 bool gestures = true;  // QA negative control: gesturesoff
 std::unordered_map<uint32_t, bool> gestureNamesSent;
+uint32_t gestureNamesWelcome = 0;
 unsigned gesturesSent = 0, gesturesPlayed = 0, gesturesUnknown = 0;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
@@ -170,7 +171,7 @@ bool PlayHeldGesture(Hold& hold, uint32_t motionHash)
     if (talk_policy::IsStandUpMotion(motion))
         hold.entity.Routine.AniState = gEAniState_Stand;
     hold.entity.StartPlayAni(bCString(stem), 0, GEFalse, 1.0f, GEFalse);
-    hold.state.actionUntil = net::Now() + 1200;
+    hold.gestureUntil = net::Now() + 1200;
     ++gesturesPlayed;
     return true;
 }
@@ -323,10 +324,10 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
     const DWORD now = GetTickCount();
     if (now - lastBusyMessage > 3000) {
         lastBusyMessage = now;
-        wchar_t who[64] = {}, player[64] = {}, text[200];
-        MultiByteToWideChar(CP_UTF8, 0, Entity(addressedNpc).GetName().GetText(), -1, who, 64);
-        MultiByteToWideChar(CP_UTF8, 0, net::PeerName(hold->player), -1, player, 64);
-        swprintf_s(text, i18n::Text(i18n::NpcTalking), who, player[0] ? player : L"?");
+        wchar_t who[64] = {}, player[64] = {}, text[200] = {};
+        MultiByteToWideChar(CP_UTF8, 0, Entity(addressedNpc).GetName().GetText(), -1, who, 63);
+        MultiByteToWideChar(CP_UTF8, 0, net::PeerName(hold->player), -1, player, 63);
+        _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::NpcTalking), who, player[0] ? player : L"?");
         hud::Message(hud::Info, text);
         Logf("talk: %s talks to player %u; this player's address refused", Entity(addressedNpc).GetName().GetText(), hold->player);
         telemetry::OnTalkEvent("busy_refused", hold->player, addressedNpc, hold->guid, "host_assess_talk");
@@ -334,33 +335,38 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
     return 0;
 }
 
+void SetupTalkStance(Entity& npc, eCEntity* speaker, bool inferFromSlot0)
+{
+    NormalizeTalkPartnerAnimationState(npc, npc.GetInstance(), inferFromSlot0);
+    if (npc.NPC.GetCurrentTarget().GetInstance() != speaker) npc.NPC.SetCurrentTarget(Entity(speaker));
+    StopTalkNavigation(npc);
+    ApplyTalkFacing(npc, speaker);
+}
+
+void ApplyTalkTask(Entity& npc, bool fullStop)
+{
+    if (fullStop) npc.Routine.FullStop();
+    npc.Routine.AIMode = gEAIMode_Talk;
+    npc.Routine.SetTask(bCString("ZS_Talk"));
+}
+
 bool MaintainStationaryTalk(Entity& npc, eCEntity* speaker, bool fullStopOnRepacify)
 {
     const int aiMode = static_cast<int>(npc.Routine.AIMode);
     if (npc.IsDead() || npc.IsDown() || aiMode == talk_policy::AiModeCombat || aiMode == talk_policy::AiModeFlee)
         return false;
-    NormalizeTalkPartnerAnimationState(npc, npc.GetInstance(), false);
-    if (npc.NPC.GetCurrentTarget().GetInstance() != speaker) npc.NPC.SetCurrentTarget(Entity(speaker));
-    StopTalkNavigation(npc);
-    ApplyTalkFacing(npc, speaker);
+    SetupTalkStance(npc, speaker, false);
     if (!talk_policy::ShouldRepacifyHeldTalk(npc.IsDead(), npc.IsDown(), aiMode,
                                              npc.Routine.GetCurrentTask().GetText()))
         return false;
-    if (fullStopOnRepacify) npc.Routine.FullStop();
-    npc.Routine.AIMode = gEAIMode_Talk;
-    npc.Routine.SetTask(bCString("ZS_Talk"));
+    ApplyTalkTask(npc, fullStopOnRepacify);
     return true;
 }
 
 void EnterStationaryTalk(Hold& hold, eCEntity* speaker)
 {
-    NormalizeTalkPartnerAnimationState(hold.entity, hold.entity.GetInstance(), true);
-    hold.entity.NPC.SetCurrentTarget(Entity(speaker));
-    StopTalkNavigation(hold.entity);
-    ApplyTalkFacing(hold.entity, speaker);
-    hold.entity.Routine.FullStop();
-    hold.entity.Routine.AIMode = gEAIMode_Talk;
-    hold.entity.Routine.SetTask(bCString("ZS_Talk"));
+    SetupTalkStance(hold.entity, speaker, true);
+    ApplyTalkTask(hold.entity, true);
 }
 
 eCEntity* CurrentClientPartner(eCEntity* hero)
@@ -472,7 +478,7 @@ void OnTalk(uint8_t from, bool begin, uint8_t const guid[16])
             }
         eCEntity* speaker = remote::PuppetOf(from);
         if (!speaker) { Log("talk: host cannot start NPC conversation without the player's body"); return; }
-        Hold& hold = holds.emplace(key, Hold{npc, {}, from}).first->second;
+        Hold& hold = holds.emplace(key, Hold{npc, 0, from}).first->second;
         std::memcpy(hold.guid, guid, sizeof(hold.guid));
         hold.generation = net::PeerGeneration(from);
         hold.incarnation = npcs::Incarnation(guid);
@@ -495,6 +501,11 @@ void OnPartnerMotion(eCEntity* partner, char const* motion)
 {
     if (net::IsHost() || !net::Connected() ||
         !talk_policy::ShouldForwardGesture(gestures, TalkingWithHero(partner), motion)) return;
+    const uint32_t welcome = net::WelcomeSerial();
+    if (gestureNamesWelcome != welcome) {
+        gestureNamesSent.clear();
+        gestureNamesWelcome = welcome;
+    }
     const uint32_t hash = net::HashName(motion);
     if (!gestureNamesSent[hash]) {
         net::SendMotionName(hash, motion);
@@ -531,43 +542,51 @@ void OnGesture(uint8_t from, uint8_t const guid[16], uint32_t motion, float cons
     }
 }
 
-void Tick()
+void EnsureAssessTalkHook()
 {
-    if (!assessInstalled && gCSession::GetInstance().IsGameRunning() && GetTickCount() - lastAssessTry >= 1000) {
-        lastAssessTry = GetTickCount();
-        gSScript* script = nullptr;
-        if (GetScriptAdminExt().GetScripts().GetAt(bCString("AssessTalk"), script) && script && script->m_funcScript) {
-            if (unsigned char* code = NativeAssessTalk(); code && reinterpret_cast<void*>(script->m_funcScript) == code) {
-                originalAssessTalk = reinterpret_cast<gFScript>(ai::JumpTo(code, reinterpret_cast<void*>(&AssessTalkDetour)));
-                assessNative = originalAssessTalk != nullptr;
-            }
-            assessInstalled = true;
-            Logf("talk: AssessTalk %s", assessNative ? "wrapped (an NPC in another player's dialog is busy)" : "not wrapped (another build)");
+    if (assessInstalled || !gCSession::GetInstance().IsGameRunning() || GetTickCount() - lastAssessTry < 1000) return;
+    lastAssessTry = GetTickCount();
+    gSScript* script = nullptr;
+    if (GetScriptAdminExt().GetScripts().GetAt(bCString("AssessTalk"), script) && script && script->m_funcScript) {
+        if (unsigned char* code = NativeAssessTalk(); code && reinterpret_cast<void*>(script->m_funcScript) == code) {
+            originalAssessTalk = reinterpret_cast<gFScript>(ai::JumpTo(code, reinterpret_cast<void*>(&AssessTalkDetour)));
+            assessNative = originalAssessTalk != nullptr;
         }
+        assessInstalled = true;
+        Logf("talk: AssessTalk %s", assessNative ? "wrapped (an NPC in another player's dialog is busy)" : "not wrapped (another build)");
     }
-    if (net::IsHost()) {
-        net::Remote const* remotes = net::Remotes();
-        for (auto it = holds.begin(); it != holds.end();) {
-            Hold& hold = it->second;
-            hold.entity = Entity(npcs::NpcByGuid(hold.guid));
-            eCEntity* speaker = remote::PuppetOf(hold.player);
-            if (!hold.entity.GetInstance() || hold.entity.IsDead() || !speaker || !remotes[hold.player].connected ||
-                hold.generation != net::PeerGeneration(hold.player) || hold.incarnation != npcs::Incarnation(hold.guid)) {
-                it = EraseAndReleaseHold(it);
-                continue;
-            }
-            if (MaintainStationaryTalk(hold.entity, speaker, true)) ++repacified;
-            if (!hold.entity.IsDown() && static_cast<int>(hold.entity.Routine.AIMode) != talk_policy::AiModeCombat &&
-                hold.pendingGesture && PlayHeldGesture(hold, hold.pendingGesture))
-                hold.pendingGesture = 0;
-            ++it;
+}
+
+void TickHostHolds()
+{
+    net::Remote const* remotes = net::Remotes();
+    for (auto it = holds.begin(); it != holds.end();) {
+        Hold& hold = it->second;
+        hold.entity = Entity(npcs::NpcByGuid(hold.guid));
+        eCEntity* speaker = remote::PuppetOf(hold.player);
+        if (!hold.entity.GetInstance() || hold.entity.IsDead() || !speaker || !remotes[hold.player].connected ||
+            hold.generation != net::PeerGeneration(hold.player) || hold.incarnation != npcs::Incarnation(hold.guid)) {
+            it = EraseAndReleaseHold(it);
+            continue;
         }
-        return;
+        if (MaintainStationaryTalk(hold.entity, speaker, true)) ++repacified;
+        if (!hold.entity.IsDown() && static_cast<int>(hold.entity.Routine.AIMode) != talk_policy::AiModeCombat &&
+            hold.pendingGesture && PlayHeldGesture(hold, hold.pendingGesture))
+            hold.pendingGesture = 0;
+        ++it;
     }
+}
+
+void TickClientTalk()
+{
     eCEntity* hero = gCSession::GetInstance().GetHero();
     eCEntity* partner = CurrentClientPartner(hero);
     const bool connected = net::Connected();
-    if (!connected) clientTalk.holdSent = false;
+    if (!connected) {
+        clientTalk.holdSent = false;
+        gestureNamesSent.clear();
+        gestureNamesWelcome = 0;
+    }
     if (clientTalk.active && partner && SameGuid(partner, clientTalk.guid)) {
         clientTalk.ClearPending();
         SyncClientPartner(partner, hero, false);
@@ -583,14 +602,15 @@ void Tick()
     if (clientTalk.active) {
         uint8_t previousGuid[16] = {};
         std::memcpy(previousGuid, clientTalk.guid, sizeof(previousGuid));
-        ReleaseClientPartner(npcs::NpcByGuid(previousGuid), previousGuid);
-        if (talk_policy::ShouldReleaseClientTalkHold(connected, clientTalk.holdSent)) net::SendTalk(false, previousGuid);
-        story::FlushQuests();
+        const bool wasHoldSent = clientTalk.holdSent;
         clientTalk.active = false;
         clientTalk.holdSent = false;
         clientTalk.welcome = 0;
         clientTalk.ClearPrepared();
         std::memset(clientTalk.guid, 0, sizeof(clientTalk.guid));
+        ReleaseClientPartner(npcs::NpcByGuid(previousGuid), previousGuid);
+        if (talk_policy::ShouldReleaseClientTalkHold(connected, wasHoldSent)) net::SendTalk(false, previousGuid);
+        story::FlushQuests();
         ++ends;
         telemetry::OnTalkEvent("client_talk_end", net::LocalId(), npcs::NpcByGuid(previousGuid), previousGuid, "client_dialog");
     }
@@ -625,6 +645,13 @@ void Tick()
             ReleaseClientPartner(npcs::NpcByGuid(expiredGuid), expiredGuid);
         }
     }
+}
+
+void Tick()
+{
+    EnsureAssessTalkHook();
+    if (net::IsHost()) TickHostHolds();
+    else TickClientTalk();
 }
 
 bool AllowPassiveTalkTask(eCEntity const* entity, char const* task)
@@ -670,10 +697,9 @@ bool HoldingForPlayer(uint8_t player)
 
 bool InGesture(eCEntity const* entity)
 {
-    for (auto const& entry : holds)
-        if (entity && entry.second.entity.GetInstance() == entity)
-            return static_cast<int32_t>(entry.second.state.actionUntil - net::Now()) > 0;
-    return false;
+    if (!net::IsHost() || holdDisabled) return false;
+    Hold const* hold = HoldOf(entity);
+    return hold && static_cast<int32_t>(hold->gestureUntil - net::Now()) > 0;
 }
 
 void OnWorldChange()
@@ -681,6 +707,7 @@ void OnWorldChange()
     holds.clear();
     clientTalk.Reset();
     gestureNamesSent.clear();
+    gestureNamesWelcome = 0;
 }
 
 bool IsHeld(eCEntity const* entity)

@@ -14,6 +14,7 @@ struct Entry {
     Eligibility interest;
     ClientWindow window;
     uint32_t lastRequest = 0, lastState = 0, lastControl = 0, localDeadline = 0;
+    uint32_t highestEpoch = 0;
     uint32_t echo = 0, welcome = 0, world = 0, recallAt = 0;
     uint32_t previousGeneration = 0;
     uint32_t appliedRevision = 0;

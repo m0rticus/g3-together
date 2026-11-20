@@ -10,8 +10,11 @@ int main()
         for (unsigned state = 0; state < 8; ++state) {
             const bool held = state & 1, terminal = state & 2, recovering = state & 4;
             assert(!HarmImmune(false, held, terminal, flags, recovering));
+            assert(!HarmImmune(false, held, terminal, flags, recovering, true));
             assert(HarmImmune(true, held, terminal, flags, recovering) ==
                    (!terminal && !(flags & 4) && (held || (flags & 8) || recovering)));
+            assert(HarmImmune(true, held, terminal, flags, recovering, true) ==
+                   (!terminal && !(flags & 4)));
         }
     assert(!HarmImmune(true, false, false, 2, false)); // ordinary unconscious state is not co-op recovery
     assert(HarmImmune(true, true, false, 0, false)); // immediate: no native pose or packet required

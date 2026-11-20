@@ -20,7 +20,7 @@ std::atomic<DWORD> logOwner{0};
 std::atomic<uint64_t> telemetrySeq{0};
 
 constexpr size_t TelemetryRingCapacity = 64;
-constexpr size_t TelemetryLineBytes = 2048;
+constexpr size_t TelemetryLineBytes = 4096;
 std::mutex telemetryRingMutex;
 char telemetryRing[TelemetryRingCapacity][TelemetryLineBytes] = {};
 size_t telemetryRingWrite = 0;

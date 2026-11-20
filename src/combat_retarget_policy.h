@@ -26,8 +26,8 @@ struct HitRetargetPlan {
 // 1. Predicted claims (!hostJudged) shift CurrentAttacker -> LastAttacker and record attacker in CurrentAttacker
 //    before running stumble/retarget logic, matching native AssessHit.
 // 2. Stumble reaction tasks (ZS_QuickStumble / ZS_Stumble / ZS_PierceStumble / ZS_SitKnockDown) call AssessAgressor
-//    at task completion; running React() immediately as well either overwrote the stumble task or double-counted a
-//    friendly NPC's warning blow. Immediate React() runs only when no stumble reaction task is active.
+//    at task completion; host-judged hits without a stumble already ran AssessAgressor inside JudgeDamage -> OnDamage ->
+//    AssessHit. Immediate React() runs only for predicted hits (!hostJudged) when no stumble reaction task is active.
 // 3. When the NPC is already in AIMode_Combat with another target and AssessAgressor's retarget condition holds
 //    (attacker == LastAttacker || CombatState == 0), switch CurrentTarget immediately so interleaved companion blows
 //    during the stumble animation cannot overwrite LastAttacker before ZS_*Stumble finishes.
@@ -40,7 +40,7 @@ inline HitRetargetPlan PlanHostNpcHit(NpcCombatSnapshot const& current, uintptr_
     plan.nextLastAttacker = hostJudged ? current.lastAttacker : current.currentAttacker;
     plan.nextCurrentAttacker = hostJudged ? current.currentAttacker : attacker;
     plan.applyReactionTask = !hostJudged && hasReactionCode;
-    plan.runImmediateAssessAgressor = !stumbleReactionActive;
+    plan.runImmediateAssessAgressor = !hostJudged && !stumbleReactionActive;
     if (current.inCombatMode && current.currentTarget != attacker &&
         (plan.nextLastAttacker == attacker || current.combatState == 0)) {
         plan.immediateCombatTarget = attacker;

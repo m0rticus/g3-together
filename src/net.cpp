@@ -295,13 +295,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         ActivityMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
-        if (isHost) {
-            const uintptr_t from = reinterpret_cast<uintptr_t>(peer->data);
-            if (from < 2 || from >= MaxPlayers || peers[from] != peer) return;
-            message.id = static_cast<uint8_t>(from);
-        } else if (peer != server || !connected) {
-            return;
-        }
+        const uint8_t from = AuthenticatedSender(peer);
+        if (!from) return;
+        if (isHost) message.id = from;
         if (!message.id || message.id >= MaxPlayers || message.id == localId ||
             !downed::ValidActivityFlags(message.flags)) return;
         Remote& r = remotes[message.id];
@@ -369,11 +365,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         HandleControlId(peer, packet);
     } else if (type == MsgControlSignal) {
         uint8_t peerId = 0;
-        decltype(controlStates)::const_iterator state;
-        if (HandleControlSignal(peer, packet, peerId, state))
-            SendFullNpc(peers[peerId], state->second.latest, true);
-    } else if (type == MsgBoneDictionary) {
-        HandleNpcStreamMessage(peer, packet, type);
+        NpcRecord latest{};
+        if (HandleControlSignal(peer, packet, peerId, latest))
+            SendFullNpc(peers[peerId], latest, true);
     } else if (HandleNpcStreamMessage(peer, packet, type)) {
         return;
     } else if (type == MsgHitNpc && packet->dataLength == sizeof(HitNpcMsg)) {
@@ -418,14 +412,15 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         if (handlers.hitPlayer)
             handlers.hitPlayer(message.delta, message.attacker, message.attackerPlayer, message.meansToKill != 0);
     } else if (type == MsgGoods && packet->dataLength >= sizeof(GoodsHeader)) {
-        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && (!connected || peer != server))) return;
+        const uint8_t from = AuthenticatedSender(peer);
+        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && !from)) return;
         GoodsHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         if (header.count > MaxGoodsEntries || packet->dataLength != sizeof(header) + header.count * sizeof(GoodsEntry) || header.gold < 0)
             return;
         if (isHost) {
-            header.player = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data));
-            if (header.player < 2 || header.player >= MaxPlayers || peers[header.player] != peer) return;
+            if (!from) return;
+            header.player = from;
             std::memcpy(packet->data, &header, sizeof(header));
         }
         if (header.player == 0 || header.player >= MaxPlayers || header.player == localId) return;
@@ -450,28 +445,30 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         }
         if (handlers.goods) handlers.goods(header.player, header.epoch, header.serial, header.gold, entries, header.count);
     } else if (type == MsgWorldState && packet->dataLength == sizeof(WorldStateMsg)) {
-        if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || (!isHost && (!connected || peer != server))) return;
+        const uint8_t from = AuthenticatedSender(peer);
+        if (!from || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         WorldStateMsg message;
         std::memcpy(&message, packet->data, sizeof(message));
         message.state.routine[sizeof(message.state.routine) - 1] = 0;
-        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
-        if (isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) return;
+        if (message.state.moved) {
+            for (float v : message.state.position) if (!std::isfinite(v)) return;
+            for (float v : message.state.rotation) if (!std::isfinite(v)) return;
+        }
         if (isHost && message.state.kind != 19 && !ClientWorldStateKind(message.state.kind)) return;
         if (isHost && (message.state.kind == 8 || message.state.kind == 9))
             message.state.npcClass = from;
         if (message.state.kind == 19) {
             if (message.state.dialog > 3) return;
             if (isHost) {
-                if (from < 2 || from >= MaxPlayers || peers[from] != peer || message.state.npcClass != from) return;
+                if (message.state.npcClass != from) return;
             } else if (from != 1 || message.state.npcClass != 1) {
                 return;
             }
         }
-        if (worldStateHandler && from) worldStateHandler(from, message.state);
+        if (worldStateHandler) worldStateHandler(from, message.state);
     } else if (type == MsgCharacter && packet->dataLength >= sizeof(CharacterMsg)) {
-        const uint8_t from = isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1;
-        if ((isHost && (from < 2 || from >= MaxPlayers || peers[from] != peer)) || (!isHost && (!connected || peer != server)) ||
-            !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
+        const uint8_t from = AuthenticatedSender(peer);
+        if (!from || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
         CharacterMsg message{};
         std::memcpy(&message, packet->data, sizeof(message));
         auto const& note = message.note;
@@ -619,7 +616,7 @@ void SetHitResultHandler(HitResultHandler handler) { handlers.hitResult = handle
 
 void SendHitPlayer(uint8_t playerId, int32_t delta, uint8_t const attacker[16], uint8_t attackerPlayer, bool meansToKill)
 {
-    if (!host || playerId == localId || playerId >= MaxPlayers) return;
+    if (!host || !playerId || playerId == localId || playerId >= MaxPlayers) return;
     if (downed::PlayerInteractionFlags(playerId)) {
         Logf("net: player hit not sent target=%u reason=%s", playerId,
              downed::InteractionReason(downed::PlayerInteractionFlags(playerId)));
@@ -824,7 +821,7 @@ void Service(PlayerState const& local, bool haveLocal)
     if (!isHost && !server && !refused && steamLinked && now - lastConnectAttempt > 3000) {
         DirectPunchSession* direct = FindClientDirectSession();
         if (!ClientPunchWaiting(direct, now))
-            FinishClientConnectAttempt(direct, false, now);
+            FinishClientConnectAttempt(direct, now);
     }
     UpdateBudgets(now);
     if (connected) {
@@ -915,14 +912,7 @@ void Tick(PlayerState const& local, bool haveLocal)
 void Reconnect(void (*log)(char const*))
 {
     if (isHost || !server || !connected) { if (log) log("REFUSED reconnect: a connected client only"); return; }
-    enet_peer_disconnect_now(server, 0);
-    connected = false;
-    inWorld = false;
-    haveCurrentLocal = false;
-    playerCadence = {};
-    activitySent = false;
-    lastActivitySend = 0;
-    for (uint8_t i = 0; i < MaxPlayers; ++i) Drop(i);
+    ResetClientLinkState(true);
     DirectPunchSession* direct = FindClientDirectSession();
     bool useDirect = false;
     ENetAddress connectTo = target;

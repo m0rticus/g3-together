@@ -121,9 +121,11 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
         !instance->GetPropertySet(eEPropertySetType_ScriptRoutine)) return false;
     Entity npc(instance);
     if (npc.IsDead() || npc.IsDown()) return false;
+    const bool hasMovement = instance->GetPropertySet(eEPropertySetType_CharacterMovement) != nullptr;
     const Entity current = npc.NPC.GetCurrentTarget(), alternative = npc.NPC.GetAlternativeTarget(),
                  attacker = npc.NPC.GetCurrentAttacker(), last = npc.NPC.GetLastAttacker(),
-                 spell = npc.NPC.GetSpellTarget(), alignment = npc.GetAlignmentTarget();
+                 spell = npc.NPC.GetSpellTarget(),
+                 alignment = hasMovement ? npc.GetAlignmentTarget() : Entity();
     const Entity inflictor = instance->GetPropertySet(eEPropertySetType_DamageReceiver)
         ? npc.DamageReceiver.GetLastInflictor() : Entity();
     uint32_t bindings = 0;
@@ -156,7 +158,7 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
         npc.Routine.FullStop();
         npc.Routine.StopAICombatMove();
         npc.Routine.StopAIGoto();
-        npc.CharacterMovement.StopMovement();
+        if (hasMovement) npc.CharacterMovement.StopMovement();
     }
     Entity none;
     if (bindings & downed::Current) npc.NPC.SetCurrentTarget(none);
@@ -164,7 +166,7 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
     if (bindings & downed::Attacker) npc.NPC.SetCurrentAttacker(none);
     if (bindings & downed::LastAttacker) npc.NPC.SetLastAttacker(none);
     if (bindings & downed::Spell) npc.NPC.SetSpellTarget(none);
-    if (bindings & downed::Alignment) npc.SetAlignmentTarget(none);
+    if (bindings & downed::Alignment) { if (hasMovement) npc.SetAlignmentTarget(none); }
     if (bindings & downed::Inflictor) npc.DamageReceiver.SetLastInflictor(none);
     if (stop) {
         if (!spu) spu = &static_cast<gCScriptRoutine_PS*>(instance->GetPropertySet(eEPropertySetType_ScriptRoutine))->GetSPU();
@@ -173,7 +175,7 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
         Entity next = fighting ? SelectReplacement(npc, current, alternative, bindings, source) : Entity();
         char const* reason = retarget::Reason(source);
         if (next.GetInstance()) {
-            npc.SetAlignmentTarget(next);
+            if (hasMovement) npc.SetAlignmentTarget(next);
             if (source == retarget::Source::Current) {
                 npc.Routine.SetTask(bCString("ZS_Attack"));
             } else {
@@ -187,7 +189,7 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
                     Logf("ai: downed retarget assessment failed npc=%s target=%s result=%d",
                          npc.GetName().GetText(), next.GetName().GetText(), assessed);
                     npc.NPC.SetCurrentTarget(none);
-                    npc.SetAlignmentTarget(none);
+                    if (hasMovement) npc.SetAlignmentTarget(none);
                     next = none;
                     reason = "assessment-failed";
                 }
@@ -242,7 +244,7 @@ ScrubStats ScrubEntityReferences(eCEntity* target, bool removeInstructions, bool
         const bool authority = net::IsHost() || npclease::LocalAuthority(instance);
         const bool passive = !authority && npcs::IsMirrored(instance);
         auto* properties = static_cast<gCNPC_PS*>(instance->GetPropertySet(eEPropertySetType_NPC));
-        const bool stop = authority && !guards::IsLocalPlayer(instance) && !remote::IsPuppet(instance) &&
+        const bool stop = routine && authority && !guards::IsLocalPlayer(instance) && !remote::IsPuppet(instance) &&
             !npc.IsDead() && !npc.IsDown() && (current || spell || other);
         if (removeInstructions && stop && routine) {
             npc.Routine.FullStop();
@@ -283,6 +285,31 @@ ScrubStats ScrubEntityReferences(eCEntity* target, bool removeInstructions, bool
     return stats;
 }
 
+void ScrubDownedProxies(eCEntity* instance)
+{
+    auto* properties = static_cast<gCNPC_PS*>(instance->GetPropertySet(eEPropertySetType_NPC));
+    if (!properties) return;
+    auto clear = [](eCEntityProxy& proxy) {
+        if (downed::CombatUnavailable(proxy.GetEntity())) proxy.SetEntity(static_cast<eCEntity*>(nullptr));
+    };
+    clear(properties->AccessCurrentTargetEntity());
+    clear(properties->AccessAlternativeTargetEntity());
+    clear(properties->AccessCurrentAttackerEntity());
+    clear(properties->AccessLastAttackerEntity());
+    clear(properties->AccessSpellTarget());
+    Entity npc(instance), none;
+    if (instance->GetPropertySet(eEPropertySetType_CharacterMovement) &&
+        downed::CombatUnavailable(npc.GetAlignmentTarget().GetInstance()))
+        npc.SetAlignmentTarget(none);
+    if (instance->GetPropertySet(eEPropertySetType_DamageReceiver) &&
+        downed::CombatUnavailable(npc.DamageReceiver.GetLastInflictor().GetInstance()))
+        npc.DamageReceiver.SetLastInflictor(none);
+    if (auto* routine = static_cast<gCScriptRoutine_PS*>(instance->GetPropertySet(eEPropertySetType_ScriptRoutine))) {
+        auto& spu = routine->GetSPU();
+        if (downed::CombatUnavailable(spu.GetOtherEntity())) spu.SetOtherEntity(nullptr);
+    }
+}
+
 void SyncDownedTargets()
 {
     if (!gCSession::GetInstance().IsGameRunning() || !downed::UnavailablePlayers()) return;
@@ -291,27 +318,13 @@ void SyncDownedTargets()
         eCEntity* instance = all.GetAt(i).GetInstance();
         if (!instance) continue;
         if (!net::IsHost() && !npclease::LocalAuthority(instance)) {
-            if (!npcs::IsMirrored(instance)) continue;
-            auto* properties = static_cast<gCNPC_PS*>(instance->GetPropertySet(eEPropertySetType_NPC));
-            if (!properties) continue;
-            auto clear = [](eCEntityProxy& proxy) {
-                if (downed::CombatUnavailable(proxy.GetEntity())) proxy.SetEntity(static_cast<eCEntity*>(nullptr));
-            };
-            clear(properties->AccessCurrentTargetEntity());
-            clear(properties->AccessAlternativeTargetEntity());
-            clear(properties->AccessCurrentAttackerEntity());
-            clear(properties->AccessLastAttackerEntity());
-            clear(properties->AccessSpellTarget());
-            Entity npc(instance), none;
-            if (instance->GetPropertySet(eEPropertySetType_CharacterMovement) &&
-                downed::CombatUnavailable(npc.GetAlignmentTarget().GetInstance()))
-                npc.SetAlignmentTarget(none);
-            if (instance->GetPropertySet(eEPropertySetType_DamageReceiver) &&
-                downed::CombatUnavailable(npc.DamageReceiver.GetLastInflictor().GetInstance()))
-                npc.DamageReceiver.SetLastInflictor(none);
+            if (npcs::IsMirrored(instance)) ScrubDownedProxies(instance);
             continue;
         }
-        ReleaseDownedTargets(instance, "frame-release", nullptr);
+        if (!ReleaseDownedTargets(instance, "frame-release", nullptr) &&
+            !net::IsHost() && npclease::LocalAuthority(instance) && talk::IsHeld(instance)) {
+            ScrubDownedProxies(instance);
+        }
     }
 }
 } // namespace g3t::npc_targets

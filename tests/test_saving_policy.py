@@ -533,6 +533,11 @@ class SavingPolicyTests(unittest.TestCase):
         self.assertIn("cached.complete", controls)
         self.assertIn("captured.bytes", controls)
         self.assertIn("requests[from].token == note.save", controls)
+        self.assertIn("if (wasActive) QueueReply(from, Note(net::SavePrepare, savingManifest));", controls)
+        start = function_body(self.persist, r"\bbool\s+StartSave\s*\(")
+        self.assertLess(start.index("SetTimer(saveWindow, SaveTimer, 30, &SaveNow)"), start.index("operation.active = true;"))
+        native_ready = function_body(self.persist, r"\bbool\s+NativeReady\s*\(")
+        self.assertIn("rejoinHooks = false;", native_ready)
 
     def test_plain_native_load_does_not_require_published_steam_account(self):
         legacy = function_body(self.persist, r"\bbool\s+ReadLegacy\s*\(")
@@ -545,6 +550,8 @@ class SavingPolicyTests(unittest.TestCase):
         deletion = function_body(self.persist, r"\bbool\s+__fastcall\s+DeleteDetour\s*\(")
         self.assertIn("nativeSaveDepth", deletion)
         self.assertIn("DeleteFileA(path.c_str())", deletion)
+        self.assertIn('publishMarker = path + ".publish"', deletion)
+        self.assertIn("DeleteFileA(publishMarker.c_str())", deletion)
         self.assertIn("Materialize(slot, intact)", deletion)
         self.assertIn("!Exists(Path(slot, 0)) && !Exists(Path(slot, 1))", deletion)
 
@@ -628,8 +635,11 @@ class SavingPolicyTests(unittest.TestCase):
 
         stacks_fn = function_body(self.hero, r"\bstd::vector<Stack>\s+Stacks\s*\(")
         self.assertIn("self.Inventory.GetQuality(i) & QualityMask", stacks_fn)
+        spells_fn = function_body(self.hero, r"\bstd::vector<std::string>\s+LearnedSpellsOf\s*\(")
+        self.assertIn("self.Inventory.GetAmount(i) <= 0 && self.Inventory.GetSlotFromStack(i) == gESlot_None", spells_fn)
         quicks_fn = function_body(self.hero, r"\bstd::vector<Quick>\s+QuickSlotsOf\s*\(")
         self.assertIn("self.Inventory.GetQuality(i) & QualityMask", quicks_fn)
+        self.assertIn("self.Inventory.GetAmount(i) <= 0 && self.Inventory.GetSlotFromStack(i) == gESlot_None", quicks_fn)
 
     def test_duplicate_stacks_and_load_lifecycle_regressions(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -641,6 +651,14 @@ class SavingPolicyTests(unittest.TestCase):
         for fn in (load_hero, rollback_hero):
             self.assertIn("codec::RestoreStackOrder(", fn)
             self.assertIn("codec::RestoreItemStack(", fn)
+        self.assertLess(load_hero.index("saving::PoseRestored(pose, actual)"),
+                        load_hero.index('downed::Restore(savedDowned != 0, "hero-record")'))
+        prep_hero = function_body(self.hero, r"\bchar const\*\s+PrepareInventoryForSnapshot\s*\(")
+        skill_hero = function_body(self.hero, r"\bchar const\*\s+ApplySkillStack\s*\(")
+        self.assertIn("RemoveStack(", prep_hero)
+        self.assertIn("RemoveStack(", skill_hero)
+        capture_hero = function_body(self.hero, r"\bbool\s+CaptureHeroSnapshot\s*\(")
+        self.assertIn("ReadNormalizedPose(hero)", capture_hero)
         quick_apply = function_body(self.hero, r"\bbool\s+ApplySpellAndQuick\s*\(")
         self.assertLess(
             quick_apply.index("AssignStackToQuickSlot(i, -1)"),

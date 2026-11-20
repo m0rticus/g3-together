@@ -77,6 +77,7 @@ void WorkerRuntime::Search()
         char const* name = Text(api.FriendPersonaName(friends, id));
         uint64_t wantedId = 0;
         if (*wantedHost && (identity::SteamId(wantedHost, wantedId) ? id != wantedId : _stricmp(name, wantedHost) != 0)) continue;
+        error[0] = '\0';
         InspectLobby(info.lobby, *name ? name : "a friend");
         return;
     }

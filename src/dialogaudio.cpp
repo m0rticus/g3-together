@@ -135,9 +135,9 @@ void HideSubtitle()
 }
 
 // The line's text in this game's language, as the game shows its own dialog's (when the player has subtitles on).
-void ShowSubtitle(uint8_t from, net::DialogLineNote const& note, eCEntity* speaker)
+bool ShowSubtitle(uint8_t from, net::DialogLineNote const& note, eCEntity* speaker)
 {
-    if (!subtitles || !note.text[0] || !eCApplication::GetInstance().GetEngineSetup().ShowSubtitle) return;
+    if (!subtitles || !note.text[0] || !eCApplication::GetInstance().GetEngineSetup().ShowSubtitle) return false;
     const std::string id = std::string("INFO_") + note.text;
     const bCUnicodeString text = eCLocString(bCString(id.c_str()));
     char utf8[96] = {};
@@ -145,7 +145,7 @@ void ShowSubtitle(uint8_t from, net::DialogLineNote const& note, eCEntity* speak
     if (!text.GetLength() || !std::strcmp(utf8, id.c_str())) {
         ++subtitlesMissing;
         Logf("dialogaudio: line %u from player %u: no text %s here", note.lineId, from, id.c_str());
-        return;
+        return false;
     }
     gui2.StartSay(Entity(speaker), text, GEFalse);
     subtitleFrom = from;
@@ -154,6 +154,7 @@ void ShowSubtitle(uint8_t from, net::DialogLineNote const& note, eCEntity* speak
     for (char* c = utf8; *c; ++c)
         if (*c == ' ') *c = '_';  // one word for the QA line
     strncpy_s(lastSubtitle, utf8, _TRUNCATE);
+    return true;
 }
 
 void SendEnd(uint8_t reason)
@@ -331,22 +332,25 @@ void ShowMenu(uint8_t from)
     if (!eCApplication::GetInstance().GetEngineSetup().ShowSubtitle) return;
     std::wstring text;
     wchar_t name[64] = {};
-    MultiByteToWideChar(CP_UTF8, 0, net::PeerName(from), -1, name, 64);
+    MultiByteToWideChar(CP_UTF8, 0, net::PeerName(from), -1, name, 63);
     text = std::wstring(name[0] ? name : L"?") + L":";
     int shown = 0;
     for (size_t i = 0; i < menu.ids.size(); ++i) {
         const bCUnicodeString option = eCLocString(bCString(menu.ids[i].c_str()));
         if (!option.GetLength()) continue;
-        wchar_t number[8];
-        swprintf_s(number, L"\n%zu. ", i + 1);
+        wchar_t number[16];
+        _snwprintf_s(number, _TRUNCATE, L"\n%zu. ", i + 1);
         text += number;
         text += reinterpret_cast<wchar_t const*>(option.GetText());
         ++shown;
     }
     if (!shown) return;
     gui2.StartSay(Entity(puppet), bCUnicodeString(text.c_str()), GEFalse);
+    subtitleFrom = 0;
+    subtitleLine = 0;
     optionsFrom = from;
     ++optionsShown;
+    std::memset(lastOptions, 0, sizeof(lastOptions));
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, lastOptions, sizeof(lastOptions) - 1, nullptr, nullptr);
     for (char* c = lastOptions; *c; ++c)
         if (*c == ' ' || *c == '\n') *c = '_';  // one word for the QA line
@@ -424,8 +428,10 @@ void OnLine(uint8_t from, net::DialogLineNote const& note)
     ++played;
     strncpy_s(lastSample, note.sample, _TRUNCATE);
     Logf("dialogaudio: line %u from player %u plays at %s: %s", note.lineId, from, speaker->GetName().GetText(), note.sample);
-    if (optionsFrom == from) optionsFrom = 0;  // the chosen line's text takes the box
-    ShowSubtitle(from, note, speaker);
+    const bool hadMenuBox = (optionsFrom == from);
+    if (hadMenuBox) optionsFrom = 0;  // the chosen line's text takes the box
+    if (!ShowSubtitle(from, note, speaker) && hadMenuBox && !OwnDialog())
+        gui2.StopSay();
     playing.push_back(std::move(line));
 }
 
@@ -505,6 +511,7 @@ void Tick()
     }
     TickSpeaking();
     if (!disabled && net::Connected()) TickMenu();
+    else sentOptions.clear();
     TickPlaying();
 }
 

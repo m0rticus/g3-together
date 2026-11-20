@@ -185,22 +185,31 @@ bool PrepareTransforms(eCEntity* entity, eCVisualAnimation_PS& animation, State&
             return false;
         }
         state.initialized = false;
+        state.actor = nullptr;
+        state.actorName.clear();
         state.nodes = nullptr;
+        state.nodeCount = 0;
     }
     auto* actor = animation.GetActor();
     auto* skeleton = actor ? actor->GetInstance() : nullptr;
-    if (!skeleton || !skeleton->mNodes.mData || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096) return false;
+    if (!ValidSkeleton(skeleton)) return false;
     auto const& nodes = skeleton->mNodes;
+    char const* actorName = actor->GetActorName().GetText();
+    result.actor = actor;
+    result.actorName = actorName ? actorName : "";
     result.instance = skeleton;
     result.nodes = nodes.mData;
     result.count = nodes.mLength;
-    if (state.nodes != nodes.mData || state.nodeCount != nodes.mLength) {
+    if (state.actor != actor || state.actorName != result.actorName ||
+        state.nodes != nodes.mData || state.nodeCount != nodes.mLength) {
         state.boneIndices.clear();
         for (int i = 0; i < nodes.mLength; ++i) {
             const auto hash = net::HashName(actor->GetName(nodes.mData + i).GetText());
             const auto inserted = state.boneIndices.emplace(hash, i);
             if (!inserted.second) inserted.first->second = -1;
         }
+        state.actor = actor;
+        state.actorName = result.actorName;
         state.nodes = nodes.mData;
         state.nodeCount = nodes.mLength;
     }

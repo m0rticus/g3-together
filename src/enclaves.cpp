@@ -142,7 +142,7 @@ void SendPolitical(net::EnclaveNote const& note, uint8_t except)
         ++politicalSent;
         return;
     }
-    for (int id = 2; id <= net::MaxPlayers; ++id) {
+    for (int id = 2; id < net::MaxPlayers; ++id) {
         if (id == except || !net::InWorld(static_cast<uint8_t>(id))) continue;
         net::SendEnclave(note, static_cast<uint8_t>(id));
         ++politicalSent;
@@ -240,14 +240,14 @@ reputation::PlayerTheftState& PlayerTheftFor(std::string const& name, uint8_t pl
 void SendState(std::string const& name, Counters const& c, uint8_t to)
 {
     if (net::IsHost() && mode != Personal) {
-        if (to >= 2 && to <= net::MaxPlayers) {
+        if (to >= 2 && to < net::MaxPlayers) {
             const Counters projected = reputation::ProjectClientEnclaveState(c, PlayerTheftFor(name, to));
             net::SendEnclave(Note(net::EnclaveState, name, projected), to);
             ++sent;
             return;
         }
         if (to == 0) {
-            for (int id = 2; id <= net::MaxPlayers; ++id) {
+            for (int id = 2; id < net::MaxPlayers; ++id) {
                 const uint8_t player = static_cast<uint8_t>(id);
                 if (!net::PeerJoined(player)) continue;
                 const Counters projected = reputation::ProjectClientEnclaveState(c, PlayerTheftFor(name, player));
@@ -272,11 +272,25 @@ void SendDelta(std::string const& name, Counters const& before, Counters const& 
     }
     d.known = now.known != before.known ? now.known : -1;
     d.fame = now.fame - before.fame;
-    Pending p{name, Note(net::EnclaveDelta, name, d), GetTickCount(), before.known, items::Returned(), items::TakesBegun(), items::TakesDone()};
     if (d.crime[gEPlayerCrime_Theft] > 0) {  // wait: the take this theft was counted for may go to someone else
+        if (reputation::HasSharedNonTheftChange(before, now, clientFame)) {
+            Counters nonTheft = d;
+            nonTheft.crime[gEPlayerCrime_Theft] = 0;
+            nonTheft.suspect[gEPlayerCrime_Theft] = -1;
+            if (nonTheft.known == gEPlayerCrime_Theft) nonTheft.known = -1;
+            net::SendEnclave(Note(net::EnclaveDelta, name, nonTheft), 0);
+            ++sent;
+            d = {};
+            for (int i = 0; i < Crimes; ++i) d.suspect[i] = -1;
+            d.crime[gEPlayerCrime_Theft] = now.crime[gEPlayerCrime_Theft] - before.crime[gEPlayerCrime_Theft];
+            d.suspect[gEPlayerCrime_Theft] = now.suspect[gEPlayerCrime_Theft] != before.suspect[gEPlayerCrime_Theft] ? now.suspect[gEPlayerCrime_Theft] : -1;
+            d.known = (now.known == gEPlayerCrime_Theft && before.known != gEPlayerCrime_Theft) ? gEPlayerCrime_Theft : -1;
+        }
+        Pending p{name, Note(net::EnclaveDelta, name, d), GetTickCount(), before.known, items::Returned(), items::TakesBegun(), items::TakesDone()};
         pending.push_back(p);
         return;
     }
+    Pending p{name, Note(net::EnclaveDelta, name, d), GetTickCount(), before.known, items::Returned(), items::TakesBegun(), items::TakesDone()};
     net::SendEnclave(p.delta, 0);
     ++sent;
 }
@@ -291,7 +305,8 @@ void SettlePending()
         // first, theftdiag both 20.10.). A theft without a take (from an NPC) goes on as counted.
         const bool reached = items::TakesBegun() > p.begun || items::TakesDone() > p.done ||
                              (lastTakeTask && static_cast<int32_t>(lastTakeTask - p.at) > -2000);
-        const bool lost = items::Returned() > p.returned || (now - p.at > TheftWait && reached && items::TakesDone() == p.done);
+        const bool lost = (items::Returned() > p.returned && items::TakesDone() == p.done) ||
+                          (now - p.at > TheftWait && reached && items::TakesDone() == p.done);
         if (lost) {
             // Take it back here; the rest of the change (if any) still goes to the host.
             Entity e = PSEnclave::GetEnclave(bCString(p.name.c_str()));
@@ -299,7 +314,9 @@ void SettlePending()
                 Counters c = Read(enclave);
                 c.crime[gEPlayerCrime_Theft] -= p.delta.crime[gEPlayerCrime_Theft];
                 if (c.crime[gEPlayerCrime_Theft] < 0) c.crime[gEPlayerCrime_Theft] = 0;
-                if (p.delta.known == gEPlayerCrime_Theft) c.known = p.priorKnown;
+                if (c.known == gEPlayerCrime_Theft) {
+                    if (p.delta.known == gEPlayerCrime_Theft) c.known = p.priorKnown;
+                }
                 Write(e, c);
                 seen[p.name] = c;
             }
@@ -321,6 +338,10 @@ void SettlePending()
         }
     }
 }
+
+void HandleRepDeltaOnHost(uint8_t from, net::EnclaveNote const& note);
+void HandleClientDeltaOnHost(uint8_t from, net::EnclaveNote const& note);
+void ApplyStateOnClient(uint8_t from, net::EnclaveNote const& note);
 
 void OnNote(uint8_t from, net::EnclaveNote const& note)
 {
@@ -350,88 +371,103 @@ void OnNote(uint8_t from, net::EnclaveNote const& note)
         return;
     }
     if (note.op == net::EnclaveRepDelta) {
-        if (!net::IsHost() || note.fame == 0 || note.fame < -100 || note.fame > 100) return;
-        story::FlushReputation();
-        if (note.name[0] == '\0') {
-            if (note.known < 0 || static_cast<size_t>(note.known) >= reputation::PoliticalAlignmentCount) return;
-            eCEntity* hero = gCSession::GetInstance().GetHero();
-            auto* memory = hero ? static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory)) : nullptr;
-            if (!memory) return;
-            auto& pol = memory->AccessPoliticalFame();
-            const GEInt idx = static_cast<GEInt>(note.known);
-            const int32_t cur = idx < pol.GetCount() ? pol.GetAt(idx) : 0;
-            const int32_t next = reputation::ApplyClampedDelta(cur, note.fame);
-            const GEInt oldCount = pol.GetCount();
-            const GEInt needed = static_cast<GEInt>(reputation::RequiredPoliticalArrayCount(
-                oldCount > 0 ? static_cast<size_t>(oldCount) : 0u, static_cast<size_t>(idx), next));
-            if (oldCount < needed) {
-                pol.SetCount(needed);
-                for (GEInt i = oldCount < 0 ? 0 : oldCount; i < needed; ++i) pol.AccessAt(i) = 0;
-            }
-            if (idx < pol.GetCount()) pol.AccessAt(idx) = next;
-            telemetry::OnEnclaveEvent("camp_rep_delta", "political", from, ModeName(mode), nullptr, nullptr, -1, -1, cur, next);
-            Logf("enclaves: player %u modified camp %d reputation %d -> %d", from, note.known, cur, next);
-            story::FlushReputation();
-            return;
-        }
-        Entity e = PSEnclave::GetEnclave(bCString(note.name));
-        gCEnclave_PS* enclave = Native(e);
-        if (!enclave) return;
-        const int32_t cur = enclave->AccessPlayerFame();
-        const int32_t next = reputation::ApplyClampedDelta(cur, note.fame);
-        enclave->AccessPlayerFame() = next;
-        const std::string name(note.name);
-        seen[name] = ReadPreservingNonTheft(enclave, name);
-        SendState(name, seen[name], 0);
-        story::FlushReputation();
-        telemetry::OnEnclaveEvent("enclave_rep_delta", note.name, from, ModeName(mode), nullptr, nullptr, seen[name].known, seen[name].known, cur, next);
-        Logf("enclaves: player %u modified %s reputation %d -> %d", from, note.name, cur, next);
+        HandleRepDeltaOnHost(from, note);
         return;
     }
     if (net::IsHost()) {
-        if (note.op == net::EnclaveRequest) {
-            ForEach([&](std::string const& name, Entity& e, gCEnclave_PS* enclave) {
-                const Counters base = ReadPreservingNonTheft(enclave, name);
-                seen[name] = base;
-                SendState(name, base, from);
-                if (statusSync) infocmd::Changed(e.GetInstance());  // its status too (to everyone; the others have it already)
-            });
-            return;
-        }
-        if (note.op != net::EnclaveDelta || mode == Personal || from < 2 || from > net::MaxPlayers) return;
-        Entity e = PSEnclave::GetEnclave(bCString(note.name));
-        gCEnclave_PS* enclave = Native(e);
-        if (!enclave) return;
-        const std::string name(note.name);
-        Counters hostShared = ReadPreservingNonTheft(enclave, name);
-        reputation::PlayerTheftState& pt = PlayerTheftFor(name, from);
-        const Counters beforeView = reputation::ProjectClientEnclaveState(hostShared, pt);
-        bool sharedChanged = false, theftChanged = false;
-        reputation::ApplyClientDeltaOnHost(hostShared, pt, NoteToPolicy(note), clientFame, sharedChanged, theftChanged);
-        if (sharedChanged) {
-            Write(e, hostShared);
-            Counters updated = Read(enclave);
-            updated.nonTheftKnown = hostShared.nonTheftKnown;
-            seen[name] = updated;
-        } else if (seen.find(name) == seen.end()) {
-            seen[name] = hostShared;
-        }
-        const Counters afterView = reputation::ProjectClientEnclaveState(seen[name], pt);
-        ++deltas;
-        telemetry::OnEnclaveEvent("delta_applied_on_host", note.name, from, ModeName(mode),
-                                  beforeView.crime, afterView.crime, beforeView.known, afterView.known,
-                                  beforeView.fame, afterView.fame);
-        Logf("enclaves: player %u changed %s (theft +%d [split total=%d suspect=%d known=%d], murder +%d)",
-             from, note.name, note.crime[gEPlayerCrime_Theft], pt.crimeCount, pt.suspectComment,
-             pt.knownTheft ? 1 : 0, note.crime[gEPlayerCrime_Murder]);
-        if (sharedChanged) {
-            SendState(name, seen[name], 0);
-            if (clientFame) story::FlushReputation();
-        } else if (theftChanged) {
-            SendState(name, seen[name], from);
-        }
+        HandleClientDeltaOnHost(from, note);
         return;
     }
+    ApplyStateOnClient(from, note);
+}
+
+void HandleRepDeltaOnHost(uint8_t from, net::EnclaveNote const& note)
+{
+    if (!net::IsHost() || note.fame == 0 || note.fame < -100 || note.fame > 100) return;
+    story::FlushReputation();
+    if (note.name[0] == '\0') {
+        if (note.known < 0 || static_cast<size_t>(note.known) >= reputation::PoliticalAlignmentCount) return;
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        auto* memory = hero ? static_cast<gCPlayerMemory_PS*>(hero->GetPropertySet(eEPropertySetType_PlayerMemory)) : nullptr;
+        if (!memory) return;
+        auto& pol = memory->AccessPoliticalFame();
+        const GEInt idx = static_cast<GEInt>(note.known);
+        const int32_t cur = idx < pol.GetCount() ? pol.GetAt(idx) : 0;
+        const int32_t next = reputation::ApplyClampedDelta(cur, note.fame);
+        const GEInt oldCount = pol.GetCount();
+        const GEInt needed = static_cast<GEInt>(reputation::RequiredPoliticalArrayCount(
+            oldCount > 0 ? static_cast<size_t>(oldCount) : 0u, static_cast<size_t>(idx), next));
+        if (oldCount < needed) {
+            pol.SetCount(needed);
+            for (GEInt i = oldCount < 0 ? 0 : oldCount; i < needed; ++i) pol.AccessAt(i) = 0;
+        }
+        if (idx < pol.GetCount()) pol.AccessAt(idx) = next;
+        telemetry::OnEnclaveEvent("camp_rep_delta", "political", from, ModeName(mode), nullptr, nullptr, -1, -1, cur, next);
+        Logf("enclaves: player %u modified camp %d reputation %d -> %d", from, note.known, cur, next);
+        story::FlushReputation();
+        return;
+    }
+    Entity e = PSEnclave::GetEnclave(bCString(note.name));
+    gCEnclave_PS* enclave = Native(e);
+    if (!enclave) return;
+    const int32_t cur = enclave->AccessPlayerFame();
+    const int32_t next = reputation::ApplyClampedDelta(cur, note.fame);
+    enclave->AccessPlayerFame() = next;
+    const std::string name(note.name);
+    seen[name] = ReadPreservingNonTheft(enclave, name);
+    SendState(name, seen[name], 0);
+    story::FlushReputation();
+    telemetry::OnEnclaveEvent("enclave_rep_delta", note.name, from, ModeName(mode), nullptr, nullptr, seen[name].known, seen[name].known, cur, next);
+    Logf("enclaves: player %u modified %s reputation %d -> %d", from, note.name, cur, next);
+}
+
+void HandleClientDeltaOnHost(uint8_t from, net::EnclaveNote const& note)
+{
+    if (note.op == net::EnclaveRequest) {
+        ForEach([&](std::string const& name, Entity& e, gCEnclave_PS* enclave) {
+            const Counters base = ReadPreservingNonTheft(enclave, name);
+            seen[name] = base;
+            SendState(name, base, from);
+            if (statusSync) infocmd::Changed(e.GetInstance());  // its status too (to everyone; the others have it already)
+        });
+        return;
+    }
+    if (note.op != net::EnclaveDelta || mode == Personal || from < 2 || from >= net::MaxPlayers) return;
+    Entity e = PSEnclave::GetEnclave(bCString(note.name));
+    gCEnclave_PS* enclave = Native(e);
+    if (!enclave) return;
+    const std::string name(note.name);
+    Counters hostShared = ReadPreservingNonTheft(enclave, name);
+    reputation::PlayerTheftState& pt = PlayerTheftFor(name, from);
+    const Counters beforeView = reputation::ProjectClientEnclaveState(hostShared, pt);
+    bool sharedChanged = false, theftChanged = false;
+    reputation::ApplyClientDeltaOnHost(hostShared, pt, NoteToPolicy(note), clientFame, sharedChanged, theftChanged);
+    if (sharedChanged) {
+        Write(e, hostShared);
+        Counters updated = Read(enclave);
+        updated.nonTheftKnown = hostShared.nonTheftKnown;
+        seen[name] = updated;
+    } else if (seen.find(name) == seen.end()) {
+        seen[name] = hostShared;
+    }
+    const Counters afterView = reputation::ProjectClientEnclaveState(seen[name], pt);
+    ++deltas;
+    telemetry::OnEnclaveEvent("delta_applied_on_host", note.name, from, ModeName(mode),
+                              beforeView.crime, afterView.crime, beforeView.known, afterView.known,
+                              beforeView.fame, afterView.fame);
+    Logf("enclaves: player %u changed %s (theft +%d [split total=%d suspect=%d known=%d], murder +%d)",
+         from, note.name, note.crime[gEPlayerCrime_Theft], pt.crimeCount, pt.suspectComment,
+         pt.knownTheft ? 1 : 0, note.crime[gEPlayerCrime_Murder]);
+    if (sharedChanged) {
+        SendState(name, seen[name], 0);
+        if (clientFame) story::FlushReputation();
+    } else if (theftChanged) {
+        SendState(name, seen[name], from);
+    }
+}
+
+void ApplyStateOnClient(uint8_t from, net::EnclaveNote const& note)
+{
     if (note.op != net::EnclaveState) return;
     mode = static_cast<Mode>(note.mode <= Personal ? note.mode : Shared);
     Entity e = PSEnclave::GetEnclave(bCString(note.name));
@@ -489,42 +525,9 @@ void OnNote(uint8_t from, net::EnclaveNote const& note)
     }
     ++applied;
 }
-} // namespace
 
-void Start()
+void ScanEnclaves()
 {
-    mode = FromConfig();
-    net::SetEnclaveHandler(&OnNote);
-}
-
-void Tick()
-{
-    if (gCSession::GetInstance().IsGameRunning()) InstallNotify();
-    if (net::IsHost()) SendHeldCredits();
-    if (!sync) { sessionRequest.active = false; return; }
-    const bool enteredSession = reputation::UpdateSessionRequest(
-        sessionRequest, net::Connected(), net::InWorld(net::LocalId()),
-        gCSession::GetInstance().IsGameRunning(), net::WelcomeSerial(), net::WorldEpoch());
-    if (!sessionRequest.active) return;
-    if (enteredSession) {
-        if (net::IsHost()) {
-            mode = FromConfig();
-        } else {  // admitted (or re-admitted after reconnect / host load): request the host's enclave state
-            net::EnclaveNote ask;
-            ask.op = net::EnclaveRequest;
-            net::SendEnclave(ask, 0);
-            ++sent;
-        }
-    }
-    if (!net::IsHost()) {
-        if (eCDynamicEntity* hero = gCSession::GetInstance().GetHero()) {
-            if (Entity(hero).Routine.GetCurrentTask() == bCString("PS_Normal_Take")) lastTakeTask = GetTickCount();
-        }
-        SettlePending();
-    }
-    const uint32_t now = GetTickCount();
-    if (now - lastScan < ScanEvery || static_cast<int32_t>(now - scanPausedUntil) < 0) return;
-    lastScan = now;
     bool hostFameChanged = false;
     ForEach([&](std::string const& name, Entity& e, gCEnclave_PS* enclave) {
         if (statusSync) {
@@ -564,6 +567,44 @@ void Tick()
         }
     });
     if (hostFameChanged) story::FlushReputation();
+}
+} // namespace
+
+void Start()
+{
+    mode = FromConfig();
+    net::SetEnclaveHandler(&OnNote);
+}
+
+void Tick()
+{
+    if (gCSession::GetInstance().IsGameRunning()) InstallNotify();
+    if (net::IsHost()) SendHeldCredits();
+    if (!sync) { sessionRequest.active = false; return; }
+    const bool enteredSession = reputation::UpdateSessionRequest(
+        sessionRequest, net::Connected(), net::InWorld(net::LocalId()),
+        gCSession::GetInstance().IsGameRunning(), net::WelcomeSerial(), net::WorldEpoch());
+    if (!sessionRequest.active) return;
+    if (enteredSession) {
+        if (net::IsHost()) {
+            mode = FromConfig();
+        } else {  // admitted (or re-admitted after reconnect / host load): request the host's enclave state
+            net::EnclaveNote ask;
+            ask.op = net::EnclaveRequest;
+            net::SendEnclave(ask, 0);
+            ++sent;
+        }
+    }
+    if (!net::IsHost()) {
+        if (eCDynamicEntity* hero = gCSession::GetInstance().GetHero()) {
+            if (Entity(hero).Routine.GetCurrentTask() == bCString("PS_Normal_Take")) lastTakeTask = GetTickCount();
+        }
+        SettlePending();
+    }
+    const uint32_t now = GetTickCount();
+    if (now - lastScan < ScanEvery || static_cast<int32_t>(now - scanPausedUntil) < 0) return;
+    lastScan = now;
+    ScanEnclaves();
     WatchPolitical();
 }
 
@@ -643,7 +684,7 @@ void WriteTheftFields(gCEnclave_PS* enclave, eCEntity* enclaveEntity, int32_t cr
 bool ApplyPlayerTheft(eCEntity* npc, uint8_t playerId, SavedTheftState& saved)
 {
     saved = {};
-    if (!net::IsHost() || mode == Personal || !npc || playerId < 2 || playerId > net::MaxPlayers ||
+    if (!net::IsHost() || mode == Personal || !npc || playerId < 2 || playerId >= net::MaxPlayers ||
         !npc->GetPropertySet(eEPropertySetType_NPC))
         return false;
     Entity town = Entity(npc).GetEnclave();
@@ -663,24 +704,67 @@ bool ApplyPlayerTheft(eCEntity* npc, uint8_t playerId, SavedTheftState& saved)
     const int32_t fallbackNonTheft = (seenIt != seen.end()) ? reputation::SharedNonTheftKnown(seenIt->second) : 0;
     reputation::PlayerTheftState const& pt = PlayerTheftFor(key, playerId);
     const int32_t targetKnown = reputation::EffectiveKnownCrime(savedKnown, pt.knownTheft, fallbackNonTheft);
-    if (savedCrime == pt.crimeCount && savedSuspect == pt.suspectComment && savedKnown == targetKnown)
-        return false;
 
     saved.enclaveEntity = town.GetInstance();
     saved.enclave = enclave;
+    saved.enclaveName = key;
+    saved.playerId = playerId;
     saved.crime = savedCrime;
     saved.suspect = savedSuspect;
     saved.known = savedKnown;
     saved.active = true;
 
-    WriteTheftFields(enclave, saved.enclaveEntity, pt.crimeCount, pt.suspectComment, targetKnown);
+    if (savedCrime != pt.crimeCount || savedSuspect != pt.suspectComment || savedKnown != targetKnown)
+        WriteTheftFields(enclave, saved.enclaveEntity, pt.crimeCount, pt.suspectComment, targetKnown);
     return true;
 }
 
 void RestorePlayerTheft(SavedTheftState const& saved)
 {
     if (!saved.active || !saved.enclave) return;
-    WriteTheftFields(saved.enclave, saved.enclaveEntity, saved.crime, saved.suspect, saved.known);
+    bTValArray<GEI32> const& crimeArr = saved.enclave->AccessCrimeCount();
+    bTValArray<GEI32> const& suspectArr = saved.enclave->AccessSuspectComment();
+    const int32_t afterCrime = gEPlayerCrime_Theft < crimeArr.GetCount() ? crimeArr.GetAt(gEPlayerCrime_Theft) : 0;
+    const int32_t afterSuspect = gEPlayerCrime_Theft < suspectArr.GetCount() ? suspectArr.GetAt(gEPlayerCrime_Theft) : 0;
+    const int32_t afterKnown = static_cast<int32_t>(static_cast<gEPlayerCrime const&>(saved.enclave->AccessKnownPlayerCrime()));
+
+    bool theftUpdated = false;
+    if (!saved.enclaveName.empty() && saved.playerId >= 2 && saved.playerId < net::MaxPlayers) {
+        reputation::PlayerTheftState& pt = PlayerTheftFor(saved.enclaveName, saved.playerId);
+        if (afterCrime != pt.crimeCount) {
+            pt.crimeCount = afterCrime;
+            theftUpdated = true;
+        }
+        if (afterSuspect != pt.suspectComment) {
+            pt.suspectComment = afterSuspect;
+            theftUpdated = true;
+        }
+        if (afterKnown == gEPlayerCrime_Theft && !pt.knownTheft) {
+            pt.knownTheft = true;
+            theftUpdated = true;
+        } else if (pt.knownTheft && afterKnown < gEPlayerCrime_Theft) {
+            pt.knownTheft = false;
+            theftUpdated = true;
+        }
+    }
+
+    int32_t restoredKnown = saved.known;
+    if (afterKnown != gEPlayerCrime_Theft && afterKnown > restoredKnown) {
+        restoredKnown = afterKnown;
+        if (!saved.enclaveName.empty()) {
+            auto seenIt = seen.find(saved.enclaveName);
+            if (seenIt != seen.end()) {
+                seenIt->second.known = afterKnown;
+                seenIt->second.nonTheftKnown = (afterKnown < gEPlayerCrime_Theft) ? afterKnown : reputation::CrimeNone;
+            }
+        }
+    }
+    WriteTheftFields(saved.enclave, saved.enclaveEntity, saved.crime, saved.suspect, restoredKnown);
+    if (theftUpdated && net::InWorld(saved.playerId) && !saved.enclaveName.empty()) {
+        Counters base = ReadPreservingNonTheft(saved.enclave, saved.enclaveName);
+        seen[saved.enclaveName] = base;
+        SendState(saved.enclaveName, base, saved.playerId);
+    }
 }
 
 bool Together() { return mode == Mode::Together; }

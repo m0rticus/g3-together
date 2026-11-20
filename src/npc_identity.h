@@ -5,8 +5,6 @@
 
 namespace g3t::npcs::detail {
 
-using NpcOpponents = std::unordered_map<uint32_t, eCEntity*>;
-
 std::string FocusIdentity(eCEntity* entity);
 bool FocusProcessed(eCEntity* entity);
 std::string FocusRawIdentity(eCEntity* entity);

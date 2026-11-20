@@ -358,7 +358,7 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
                 std::copy_n(bones, count, rigidReconstruction.data());
 
                 auto spatial = [&](size_t i, int k, uint8_t type, uint8_t omittedIndex) -> int32_t {
-                    if (!detail::Mode4FirstOrderMatch(i, boneType[i - 1], omitted[i - 1], type, omittedIndex))
+                    if (!i || !detail::Mode4FirstOrderMatch(i, boneType[i - 1], omitted[i - 1], type, omittedIndex))
                         return 0;
                     if (detail::Mode4SecondOrderMatch(secondOrder, i, boneType[i - 1],
                                                       i > 1 ? boneType[i - 2] : 0,
@@ -603,16 +603,9 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::EncodeCompactImpl(
     EncodeMode2And3(layout, *base, olderForPredictive, bones, count, now,
                     bestSize, out, resultKey, resultStats);
 
-    if (allowMode4 && !keyDue && !ackRefs_.empty()) {
-        const Frame* recent = Find(ackRefs_.front(), incarnation, layout, flags);
-        const Frame* olderCandidate = ackRefs_.size() >= 2
-            ? Find(ackRefs_[1], incarnation, layout, flags) : nullptr;
-        if (recent && recent->bones.size() == count &&
-            (!olderCandidate || (olderCandidate->bones.size() == count &&
-                                 PoseNewer(recent->token, olderCandidate->token)))) {
-            EncodeMode4(layout, *recent, olderCandidate, bones, count, now,
-                        bestSize, out, resultKey, decodedOutput, resultStats);
-        }
+    if (allowMode4 && !keyDue) {
+        EncodeMode4(layout, *base, olderForPredictive, bones, count, now,
+                    bestSize, out, resultKey, decodedOutput, resultStats);
     }
 
     if (bestSize == mode0Bytes) {

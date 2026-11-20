@@ -405,14 +405,20 @@ void __fastcall NewGameCommandDetour(void* self, void*)
     }
     AutoloadCancel("manual New Game");
     if (gCSession::GetInstance().GetPlayer() || clientRejoin.pending || captured.valid || requestPending) {
+        if (!clientRejoin.pending && !HostWorldEntryAvailable()) {
+            EnterHostWorld("new-game-command");
+            return;
+        }
         Logf("persist: client enter state=queued reason=new-game-command epoch=%08x", hostWorld.epoch);
         entryManual = true;
+        entryApproved = autoloadAwaiting = false;
         QueueClientReturn();
         Notice(i18n::ClientReturningToMenu);
         return;
     }
     if (clientWorldEntered && HostWorldEntryAvailable()) {
         entryManual = true;
+        entryApproved = autoloadAwaiting = false;
         if (EnterHostWorld("new-game-command") != EnterResult::Unavailable) Notice(i18n::ClientReturningToMenu);
         return;
     }
@@ -483,7 +489,10 @@ rejoin::tmpl::Report TemplateState(bool deep)
 {
     namespace tpl = rejoin::tmpl;
     const uint32_t now = GetTickCount();
-    if (!deep && templateCheckedAt && now - templateCheckedAt < 500) return templateReport;
+    const bool altBal = eCApplication::GetInstance().GetEngineSetup().AlternativeBalancing != GEFalse;
+    static bool templateAltBal = false;
+    if (!deep && templateCheckedAt && altBal == templateAltBal && now - templateCheckedAt < 500) return templateReport;
+    templateAltBal = altBal;
     const auto paths = TemplatePaths();
     const auto identity = TemplateIdentity();
     tpl::Facts facts;
@@ -805,6 +814,7 @@ bool ProcessClientTransition()
         return false;
     }
     if (!clientRejoin.pending) {
+        createWaitSince = 0;
         if (background) {
             templateBackground.Tried(now);
             TemplateStart(rejoin::tmpl::Origin::World, TemplateJob::Background);
@@ -815,7 +825,7 @@ bool ProcessClientTransition()
             Log("template: save abandoned; no quiet boundary within the hold window");
             return false;
         }
-        if (!templateCapture.Due(now) || !game.GetHero() || !game.IsGameRunning() || !quiet) return false;
+        if (!templateCapture.Due(now) || !game.GetHero() || !game.IsGameRunning() || !quiet || NativeSaveReason()) return false;
         templateCapture.Began();
         TemplateStart(rejoin::tmpl::Origin::NewGame, TemplateJob::FirstEntry);
         return true;
@@ -829,6 +839,7 @@ bool ProcessClientTransition()
                i18n::ClientReturningToMenu);
     }
     if (!worldCleanup || !clientRejoin.CanRetire(boundary)) return false;
+    if (!entryManual && !entryApproved) createWaitSince = 0;
     if (!entryManual && !entryApproved) return false;
     using R = rejoin::tmpl::Route;
     const auto plan = EntryPlan(quiet);

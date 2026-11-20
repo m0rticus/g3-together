@@ -54,7 +54,7 @@ class CombatTimingTests(unittest.TestCase):
 
         snapshot_reset = (
             "const bool predictive = track.predictive;\n"
-            "            const uint8_t combatPlayer = track.combatPlayer;"
+            "    const uint8_t combatPlayer = track.combatPlayer;"
         )
         self.assertIn(snapshot_reset, snapshot)
         self.assertIn("track.predictive = predictive;", snapshot)

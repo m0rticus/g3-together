@@ -110,6 +110,7 @@ void OnWorldDeactivate()
     detail::ResetHooksState();
     poseCleanupAt = 0;
     playbackTick = 0;
+    maximumReplayPhaseError = 0.0f;
 }
 
 bool Start(bool client)
@@ -434,7 +435,7 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
         record.motions[0].instance != state.localOptions.instance) state.pendingHit = 0;
     if (npcplayback_hit_policy::PendingHitExpired(state.pendingHit, state.localStart, now))
         state.pendingHit = 0;
-    const float localAge = static_cast<float>(now - state.localStart) / 1000.0f;
+    const float localAge = npcplayback_hit_policy::ElapsedSecondsSigned(now, state.localStart);
     char const* firstName = record.motions[0].active ? names(record.motions[0].name) : nullptr;
     const bool ownSequenceSeen = record.hitPlayer == net::LocalId() &&
         npcplayback_hit_policy::OwnImpactSequenceSeen(state.acknowledgedHit, record.hitSequence);
@@ -631,6 +632,7 @@ bool ReplayFrozenPose(eCEntity* entity, State& state, std::vector<pose::Bone> co
     transforms.reserve(bones.size());
     for (auto const& bone : bones) transforms.push_back(pose::Decode(bone));
     NativePose frozen;
+    frozen.allowNonPassive = true;
     if (!PrepareTransforms(entity, *animation, state, transforms, flags, nullptr, frozen)) return false;
     NativePoseScope poseScope(&frozen);
     UpdatePresentation(entity);
@@ -646,7 +648,11 @@ bool HoldUnavailable(eCEntity* entity, State& callerState)
         return false;
     }
     Entity npc(entity);
-    if (npc.IsDead() || npc.IsDown()) return false;
+    if (npc.IsDead() || npc.IsDown()) {
+        callerState.holding = false;
+        ReleaseUnavailable(entity);
+        return false;
+    }
     auto* animation = Animation(entity);
     if (!animation || !animation->GetActor()) return false;
     const GuidKey key = EntityKey(entity);
@@ -775,7 +781,7 @@ void UpdatePresentation(eCEntity* entity)
     animation->OnProcess();
     animation->OnPostProcess();
     NativePose* presentingPose = detail::CurrentPresentingPose();
-    if (presentingPose && !presentingPose->evaluateOnly) {
+    if (presentingPose && presentingPose->evaluated && !presentingPose->evaluateOnly) {
         auto* actor = animation->GetActor();
         if (actor && ApplyPose(*actor, *presentingPose)) actor->ProcessGeometry();
     }
@@ -901,8 +907,20 @@ void Tick()
 }
 
 namespace detail {
+void ForgetDestroyedEntity(eCEntity const* entity)
+{
+    if (!entity) return;
+    for (auto it = unavailable.begin(); it != unavailable.end();)
+        if (it->second.entity == entity) it = unavailable.erase(it);
+        else ++it;
+    for (auto it = provenPoses.begin(); it != provenPoses.end();)
+        if (it->second.entity == entity) it = provenPoses.erase(it);
+        else ++it;
+}
+
 bool TaskBlocked(gCScriptRoutine_PS* self, bCString const& task)
 {
+    if (!self) return false;
     eCEntity* entity = self->GetEntity();
     if (downed::RejectReaction(entity, task.GetText(), "routine-task")) return true;
     if (talk::BlockHeldTalkTask(entity, task.GetText())) {

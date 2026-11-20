@@ -154,6 +154,13 @@ static void Recovery()
     assert(sender.Ack(0, 1));
     assert(sender.Encode(d, 1, 1, 0, bones.data(), 1, PoseKeyMs + 2, bytes, key) == Status::Ok && key);
     assert(rejoin.Decode(d, bytes.data(), bytes.size(), 1, 0, decoded, id) == Status::Ok);
+
+    // Mode 4 requires a non-zero reference token; ref == 0 is Malformed, not UnknownPose.
+    uint8_t mode4ZeroRef[24]{};
+    mode4ZeroRef[0] = 1;
+    mode4ZeroRef[6] = 4;
+    assert(rejoin.Decode(d, mode4ZeroRef, sizeof(mode4ZeroRef), 1, 0, decoded, id) == Status::Malformed);
+
     assert(sender.Encode(d, 1, 2, pose::Facial, bones.data(), 1, PoseKeyMs + 3, bytes, key) == Status::Ok && key);
     sender.Store(61, 2, 1, pose::Facial, bones.data(), 1, PoseKeyMs + 3, key);
     assert(sender.Retained() == 1 && !sender.Ack(60, 1));

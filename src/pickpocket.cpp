@@ -3,6 +3,7 @@
 
 #include "ai.h"
 #include "guid.h"
+#include "guid_key.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 namespace g3t::pickpocket {
 namespace {
@@ -29,6 +31,17 @@ bool installed = false, native = false;
 DWORD lastTry = 0;
 bool enabled = true;  // QA negative control: pickpocketoff
 unsigned tries = 0, successes = 0, sent = 0, applied = 0, already = 0;
+uint32_t trackedWorldEpoch = 0;
+std::unordered_set<GuidKey, GuidHash> pendingPicked;
+
+void SyncWorldEpoch()
+{
+    const uint32_t epoch = net::WorldEpoch();
+    if (epoch != trackedWorldEpoch) {
+        trackedWorldEpoch = epoch;
+        pendingPicked.clear();
+    }
+}
 
 unsigned char* NativePick()
 {
@@ -40,6 +53,12 @@ unsigned char* NativePick()
 }
 
 bool HasDialog(eCEntity* entity) { return entity && entity->GetPropertySet(eEPropertySetType_Dialog); }
+
+bool IsPickpocketTarget(eCEntity* entity)
+{
+    return HasDialog(entity) && entity->GetPropertySet(eEPropertySetType_NPC) &&
+           entity != gCSession::GetInstance().GetHero() && !remote::IsPuppet(entity);
+}
 
 bool Picked(eCEntity* entity) { return HasDialog(entity) && Entity(entity).Dialog.PickedPocket; }
 
@@ -59,6 +78,8 @@ int ItemCount(Entity& who)
 GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalPick ? originalPick(spu, self, other, args) : 0;
+    if (!originalPick) return 0;
+    eCEntity* thief = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* victim = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (remote::IsPuppet(victim)) {
         remote::LogPuppetInteraction(victim, "pickpocket-refused", 0);
@@ -67,7 +88,8 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     const bool before = Picked(victim);
     const GEInt result = originalPick(spu, self, other, args);
     ++tries;
-    if (!victim || before || !Picked(victim)) return result;
+    if (!IsPickpocketTarget(victim) || before || !Picked(victim)) return result;
+    if (thief && thief != gCSession::GetInstance().GetHero()) return result;
     ++successes;
     if (!enabled || !net::Connected()) return result;
     net::WorldState s{};
@@ -84,7 +106,23 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
 
 void Tick()
 {
-    if (installed || !gCSession::GetInstance().IsGameRunning()) return;
+    if (!gCSession::GetInstance().IsGameRunning()) return;
+    SyncWorldEpoch();
+    for (auto it = pendingPicked.begin(); it != pendingPicked.end();) {
+        Entity npc = guid::Resolve(it->data());
+        eCEntity* instance = npc.GetInstance();
+        if (!instance) { ++it; continue; }
+        if (IsPickpocketTarget(instance)) {
+            if (npc.Dialog.PickedPocket) ++already;
+            else {
+                npc.Dialog.PickedPocket = GETrue;
+                ++applied;
+                Logf("pickpocket: marked streamed-in %s's pocket as picked", npc.GetName().GetText());
+            }
+        }
+        it = pendingPicked.erase(it);
+    }
+    if (installed) return;
     const DWORD now = GetTickCount();
     if (now - lastTry < 1000) return;
     lastTry = now;
@@ -100,14 +138,21 @@ void Tick()
 
 void OnState(uint8_t from, net::WorldState const& s)
 {
+    SyncWorldEpoch();
+    if (IsZeroGuid(s.guid)) return;
+    const uint8_t actor = (s.guard > 0 && s.guard < net::MaxPlayers) ? s.guard : from;
     Entity npc = guid::Resolve(s.guid);
     eCEntity* instance = npc.GetInstance();
-    if (!HasDialog(instance)) return;
+    if (!instance) {
+        pendingPicked.insert(ToGuidKey(s.guid));
+        return;
+    }
+    if (!IsPickpocketTarget(instance)) return;
     if (npc.Dialog.PickedPocket) { ++already; return; }  // the game never takes the mark back
     npc.Dialog.PickedPocket = GETrue;
     ++applied;
-    telemetry::OnCrimeTransfer("pickpocket_remote", s.guard ? s.guard : from, 0, instance, 0, applied);
-    Logf("pickpocket: player %u picked %s's pocket; marked here too", s.guard ? s.guard : from, npc.GetName().GetText());
+    telemetry::OnCrimeTransfer("pickpocket_remote", actor, 0, instance, 0, applied);
+    Logf("pickpocket: player %u picked %s's pocket; marked here too", actor, npc.GetName().GetText());
 }
 
 void Report(LogFn log)
@@ -179,6 +224,7 @@ void ThiefPrep(LogFn log)
 // QA (learnperk <Perk_...>): this machine's hero learns that skill (P1 stations: mining needs Perk_Mining).
 void LearnPerk(char const* name, LogFn log)
 {
+    if (!name || !*name) { log("REFUSED learnperk: missing skill name"); return; }
     char line[160];
     eCEntity* hero = gCSession::GetInstance().GetHero();
     const Template perk(name);

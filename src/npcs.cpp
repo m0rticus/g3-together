@@ -75,9 +75,12 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
             Logf("combat: NPCATTACK stage=receive npc_hash=%08X player=%u instance=%u host_sample=%u client_received=%u phase=%.4f",
                  net::HashGuid(records[i].guid), net::LocalId(), records[i].motions[0].instance, captured, now,
                  records[i].motions[0].phase);
-        m.previous = m.latestTicks ? m.latest : records[i];
-        m.previousTicks = m.latestTicks ? m.latestTicks : now;
-        m.previousSent = m.latestTicks ? m.latestSent : captured;
+        const bool sameTick = m.latestTicks && sameOwner && captured == m.latestSent;
+        if (!sameTick) {
+            m.previous = m.latestTicks ? m.latest : records[i];
+            m.previousTicks = m.latestTicks ? m.latestTicks : now;
+            m.previousSent = m.latestTicks ? m.latestSent : captured;
+        }
         m.latest = records[i];
         m.latestTicks = now;
         m.latestSent = captured;
@@ -594,11 +597,16 @@ void PassiveMirrorTick()
                      now - m.latestTicks);
             }
             if (m.latest.flags & 3) npcplayback::ResetLocalHitState(m.replay);
-            if (m.latest.flags & 1) {
+            const bool bufferedAliveAhead = !m.killed && !m.released && net::Connected() &&
+                now - m.latestTicks <= StaleAfter && m.body.track.haveRenderTime &&
+                m.body.track.count > 0 && !(m.body.track.snaps[0].motion.flags & 1);
+            if ((m.latest.flags & 1) && !bufferedAliveAhead) {
                 m.deathLife.Observe(m.latest.incarnation, true);
                 m.killed = true;
                 if (!m.killedAt) m.killedAt = now ? now : 1;
-                m.entity.DamageReceiver.HitPoints = 0;
+                if (auto* receiver = static_cast<gCDamageReceiver_PS*>(
+                        m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver)))
+                    receiver->AccessHitPoints() = 0;
                 KeepDead(m.entity);
                 m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
                     m.deathReferencesCleared != m.entity.GetInstance());
@@ -664,9 +672,18 @@ void PassiveMirrorTick()
         } else if (!m.killed) {
             m.deathReferencesCleared = nullptr;
         }
-        auto* routine = static_cast<gCScriptRoutine_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine));
-        if (!routine) {
-            Logf("npcs: %s lost its script property during presentation; rebinding next frame", m.entity.GetName().GetText());
+        auto* routine = m.entity.GetInstance()
+            ? static_cast<gCScriptRoutine_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine))
+            : nullptr;
+        auto* receiver = m.entity.GetInstance()
+            ? static_cast<gCDamageReceiver_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver))
+            : nullptr;
+        auto* npcProperties = m.entity.GetInstance()
+            ? static_cast<gCNPC_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC))
+            : nullptr;
+        if (!routine || !receiver || !npcProperties) {
+            if (m.entity.GetInstance())
+                Logf("npcs: %s lost its script property during presentation; rebinding next frame", m.entity.GetName().GetText());
             m.resolved = false;
             m.resolvedAt = 0;
             ++it;
@@ -674,14 +691,12 @@ void PassiveMirrorTick()
         }
         m.attitudeShown = shown.attitude;
         KeepHostAttitude(m, shown.attitude, "shown");
-        auto* receiver = static_cast<gCDamageReceiver_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver));
         receiver->AccessHitPointsMax() = shown.hitPointsMax;
         receiver->AccessHitPoints() = m.killed ? 0 : shown.hitPoints;
         SyncMirrorPartyAndGuide(it->first, m, shown);
         if (!m.killed && YieldMirrorForClientTalk(m, shown.flags, now)) { ++it; continue; }
         routine->AccessAIMode().AccessValue() = m.killed ? gEAIMode_Dead : static_cast<gEAIMode>(shown.aiMode);
         routine->AccessAction().AccessValue() = static_cast<gEAction>(shown.action);
-        auto* npcProperties = static_cast<gCNPC_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC));
         npcProperties->AccessAttackReason().AccessValue() = static_cast<gEAttackReason>(shown.attackReason);
         m.shownCombatTarget = shown.combatTarget;
         const uint8_t target = (shown.flags >> 3) & 7;
@@ -760,7 +775,8 @@ bool HostPresentationAvailable(eCEntity const* entity)
     if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
     const auto& mirror = found->second;
     if (mirror.entity.GetInstance() != entity) return false;
-    if (mirror.released) return net::Connected() && HostReleasePending(identity);
+    if (mirror.released)
+        return net::Connected() && net::Now() - mirror.latestTicks <= StaleAfter && HostReleasePending(identity);
     const uint32_t poseInt = npcplayback::PoseInterval(mirror.latest);
     const uint32_t effectiveInt = poseInt ? poseInt : npcsend::QuietCadenceMs;
     return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks,
@@ -861,6 +877,29 @@ void OnWorldDeactivate()
     detail::ResetWorldNpcTables();
 }
 
+void OnEntityDestroyed(eCEntity const* entity)
+{
+    if (!entity) return;
+    for (auto it = quarantinedEntities.begin(); it != quarantinedEntities.end();) {
+        if (it->first == entity || it->second.root == entity) it = quarantinedEntities.erase(it);
+        else ++it;
+    }
+    hiddenClientStates.erase(entity);
+    if (targetingWatch.body == entity) targetingWatch.body = nullptr;
+    auto clearDestroyedPointers = [entity](Mirror& m) {
+        if (m.deathReferencesCleared == entity) m.deathReferencesCleared = nullptr;
+        if (m.watchedFocus == entity) m.watchedFocus = nullptr;
+        if (m.body.contactTarget == entity) m.body.contactTarget = nullptr;
+        if (m.entity.GetInstance() == entity) {
+            m.corpseActor = (m.killed && m.corpseSettled && !m.corpsePose.empty())
+                ? reinterpret_cast<void const*>(1)
+                : nullptr;
+        }
+    };
+    for (auto& entry : mirrors) clearDestroyedPointers(entry.second);
+    for (auto& entry : corpses) clearDestroyedPointers(entry.second);
+}
+
 void Start()
 {
     (void)&MirrorTick;
@@ -874,7 +913,6 @@ void Tick()
 {
     gCSession& session = gCSession::GetInstance();
     if (!session.IsGameRunning() || !session.GetHero()) return;
-    static int lastXp = -1;
     Entity hero(session.GetHero());
     const int xp = static_cast<int>(hero.PlayerMemory.XP);
     if (lastXp >= 0 && xp != lastXp) Logf("xp: %+d total=%d", xp - lastXp, xp);

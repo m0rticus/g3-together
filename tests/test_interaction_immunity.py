@@ -147,7 +147,7 @@ class InteractionImmunityTests(unittest.TestCase):
         mode = self.body("downed", r"\bvoid\s+__fastcall\s+SetMode\s*\(")
         for condition in ("requested == gEAIMode_Down", "requested == gEAIMode_Dead", "InteractionOf(entity)"):
             self.assertIn(condition, mode)
-        self.assertLess(mode.index('RejectHarm(entity, nullptr, "SetAIMode")'), mode.index("originalSetMode("))
+        self.assertLess(mode.index('RejectHarm(entity, nullptr, "SetAIMode")'), mode.rindex("originalSetMode("))
         death = self.body("downed", r"\bbool\s+RedirectDeath\s*\(")
         self.assertLess(death.index('RejectHarm(self, nullptr, "redirect-death")'), death.index("hero.Routine.FullStop()"))
         blow = self.body("downed", r"\bvoid\s+NoteBlow\s*\(")

@@ -115,6 +115,7 @@ void SetGold(Entity& body, int amount)
 // The game's own member (the script wrapper looks properties up by name; see infocmd.cpp).
 void ClearRansacked(eCEntity* body)
 {
+    if (!body) return;
     if (auto* ps = static_cast<gCNPC_PS*>(body->GetPropertySet(eEPropertySetType_NPC))) ps->AccessRansacked() = GEFalse;
 }
 
@@ -130,6 +131,7 @@ void Wide(char const* text, wchar_t* out, int size)
 GEBool __fastcall RobTransfer(PSInventory* self, void*, GEInt stack, GEInt amount, Entity& to)
 {
     if (ai::ShuttingDown()) return self ? self->TransferAmountTo(stack, amount, to) : GEFalse;
+    if (!self) return GEFalse;
     eCEntity* owner = nullptr;
     if (auto* set = reinterpret_cast<EntityPropertySet*>(self)->m_pEngineEntityPropertySet) owner = set->GetEntity();
     if (remote::IsHeldPuppet(owner) || (downed::Held() && owner == gCSession::GetInstance().GetHero())) {
@@ -138,35 +140,54 @@ GEBool __fastcall RobTransfer(PSInventory* self, void*, GEInt stack, GEInt amoun
         return GEFalse;
     }
     const int id = remote::PuppetOwner(owner);
+    const int stackBefore = id > 0 && id < net::MaxPlayers ? self->GetAmount(stack) : 0;
+    const int robberBefore = id > 0 && id < net::MaxPlayers && to.GetInstance() ? GoldOn(to) : 0;
     const GEBool moved = self->TransferAmountTo(stack, amount, to);
-    if (!id) return moved;
-    victims[id].robbed = true;
-    if (!moved || amount <= 0) {
-        Logf("ransack: %s could not take %d gold from player %d's puppet", to.GetName().GetText(), amount, id);
+    if (id <= 0 || id >= net::MaxPlayers) return moved;
+    int transferred = 0;
+    if (moved && amount > 0) {
+        if (to.GetInstance()) {
+            transferred = GoldOn(to) - robberBefore;
+            if (transferred <= 0 && stackBefore > 0) {
+                const int stackAfter = self->GetAmount(stack);
+                if (stackAfter >= 0 && stackBefore > stackAfter) transferred = stackBefore - stackAfter;
+            }
+        } else {
+            const int stackAfter = self->GetAmount(stack);
+            transferred = stackBefore > stackAfter && stackAfter >= 0 ? stackBefore - stackAfter : std::min<int>(amount, stackBefore);
+        }
+        if (transferred > amount) transferred = amount;
+    }
+    if (!moved || transferred <= 0) {
+        Logf("ransack: %s could not take %d gold from player %d's puppet",
+             to.GetInstance() ? to.GetName().GetText() : "?", amount, id);
         return moved;
     }
-    goldTaken += amount;
+    victims[id].robbed = true;
+    goldTaken += transferred;
     if (!enabled) {
-        Logf("ransack: %s took %d gold from player %d's puppet; not passed on (ransackoff)", to.GetName().GetText(), amount, id);
+        Logf("ransack: %s took %d gold from player %d's puppet; not passed on (ransackoff)",
+             to.GetInstance() ? to.GetName().GetText() : "?", transferred, id);
         return moved;
     }
     Pending take;
     take.player = static_cast<uint8_t>(id);
     take.seq = nextSeq++;
-    take.amount = amount;
+    take.amount = transferred;
     GuidOf(to.GetInstance(), take.robber);
     take.at = net::Now();
     pending.push_back(take);
     net::RansackNote note;
     note.op = net::RansackTake;
     note.seq = take.seq;
-    note.amount = amount;
+    note.amount = transferred;
     std::memcpy(note.robber, take.robber, 16);
     net::SendRansack(take.player, note);
     ++takesSent;
-    telemetry::OnCrimeTransfer("ransack_take_sent", net::LocalId(), take.player, to.GetInstance(), amount, take.seq);
-    Logf("ransack: %s took %d gold from player %d's puppet (robbery %u, robber now %d gold); the player pays it", to.GetName().GetText(),
-         amount, id, take.seq, to.Inventory.GetItemAmount(Template(Gold)));
+    telemetry::OnCrimeTransfer("ransack_take_sent", net::LocalId(), take.player, to.GetInstance(), transferred, take.seq);
+    Logf("ransack: %s took %d gold from player %d's puppet (robbery %u, robber now %d gold); the player pays it",
+         to.GetInstance() ? to.GetName().GetText() : "?", transferred, id, take.seq,
+         to.GetInstance() ? to.Inventory.GetItemAmount(Template(Gold)) : -1);
     return moved;
 }
 
@@ -197,10 +218,8 @@ void Hook()
     const bool flushed = FlushInstructionCache(GetCurrentProcess(), site, 6) != 0;
     ai::TrackPatch(site, original, installed, sizeof(original), "ransack robbery call");
     if (!restored || !flushed) {
-        hookFailed = true;
-        Logf("ransack: robbery hook finalize failed restored=%d flushed=%d error=%lu",
+        Logf("WARN ransack: robbery hook finalize warning restored=%d flushed=%d error=%lu",
              restored ? 1 : 0, flushed ? 1 : 0, GetLastError());
-        return;
     }
     hooked = true;
     Log("ransack: robbery hook installed");
@@ -241,17 +260,19 @@ void Pay(uint8_t from, net::RansackNote const& note)
     Logf("ransack: robbed of %d gold by %s (robbery %u of player %d; asked %d, had %d)", paid, robber ? Entity(robber).GetName().GetText() : "?",
          note.seq, from, note.amount, before);
     if (paid <= 0) return;
-    wchar_t text[200];
+    wchar_t text[200] = {};
     if (robber) {
-        wchar_t name[64];
+        wchar_t name[64] = {};
         bCUnicodeString focus = Entity(robber).GetFocusName();
-        wcsncpy_s(name, reinterpret_cast<wchar_t const*>(focus.GetText()), _TRUNCATE);
+        if (auto const* focusText = reinterpret_cast<wchar_t const*>(focus.GetText()))
+            wcsncpy_s(name, focusText, _TRUNCATE);
         if (!name[0]) Wide(Entity(robber).GetName().GetText(), name, 64);
-        swprintf_s(text, i18n::Text(i18n::RobbedBy), name, paid);
-    } else {
-        swprintf_s(text, i18n::Text(i18n::Robbed), paid);
+        if (wchar_t const* fmt = i18n::Text(i18n::RobbedBy))
+            _snwprintf_s(text, _TRUNCATE, fmt, name, paid);
+    } else if (wchar_t const* fmt = i18n::Text(i18n::Robbed)) {
+        _snwprintf_s(text, _TRUNCATE, fmt, paid);
     }
-    hud::Message(hud::Bad, text);
+    if (text[0]) hud::Message(hud::Bad, text);
 }
 
 // Robbing side: the player paid. Whatever it could not pay, the robber gives back.
@@ -335,13 +356,16 @@ void Tick()
     net::Remote const* remotes = net::Remotes();
     for (int id = 1; id < net::MaxPlayers; ++id) {
         if (id == net::LocalId()) continue;
+        net::Remote const& r = remotes[id];
+        if (!r.connected) applied[id].clear();
         Victim& victim = victims[id];
         eCEntity* body = remote::PuppetOf(id);
         if (!body) { victim = Victim{}; continue; }  // a new puppet starts as the game made it
-        net::Remote const& r = remotes[id];
-        const bool fresh = r.connected && r.latestTicks && now - r.latestTicks < 5000;
-        const bool down = fresh && (r.latest.flags & 16) && !(r.latest.flags & 4) && !remote::IsHeldPuppet(body);
+        const bool held = remote::IsHeldPuppet(body);
+        const bool down = r.connected && r.latestTicks && !held &&
+                          (r.latest.flags & 16) && !(r.latest.flags & 4);
         Entity puppet(body);
+        const int targetGold = r.latest.gold > 0 ? r.latest.gold : 0;
         if (down) {
             if (!victim.down) {
                 victim.down = true;
@@ -349,12 +373,12 @@ void Tick()
                 victim.lastHold = 0;
                 ClearRansacked(body);  // a new knock-out may be robbed again (no Defeat runs for a puppet here)
                 ++downs;
-                Logf("ransack: player %d is knocked out (%d gold); its puppet lies down for the AI", id, r.latest.gold);
+                Logf("ransack: player %d is knocked out (%d gold); its puppet lies down for the AI", id, targetGold);
             }
             if (puppet.Routine.AIMode != gEAIMode_Down) puppet.Routine.AIMode = gEAIMode_Down;
-            if (!victim.robbed && (victim.mirrored != r.latest.gold || GoldOn(puppet) != r.latest.gold)) {
-                SetGold(puppet, r.latest.gold);
-                victim.mirrored = r.latest.gold;
+            if (!victim.robbed && (victim.mirrored != targetGold || GoldOn(puppet) != targetGold)) {
+                SetGold(puppet, targetGold);
+                victim.mirrored = targetGold;
             }
         } else if (victim.down) {
             victim.down = false;
@@ -416,6 +440,7 @@ void Off(LogFn log)
 
 void NpcGold(char const* name, LogFn log)
 {
+    if (!name || !*name) { log("REFUSED npcgold: missing name"); return; }
     char line[200];
     Entity npc = Entity::GetEntity(bCString(name));
     Format(line, "NPCGOLD name=%s found=%d gold=%d task=%s", name, npc.GetInstance() ? 1 : 0, npc.GetInstance() ? GoldOn(npc) : -1,

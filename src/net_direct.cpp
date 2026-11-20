@@ -160,9 +160,12 @@ void SyncDirectSessions(uint32_t now)
                 if (!s.account) { slot = &s; break; }
         }
         if (!slot) continue;
+        const bool becameReady = offer.ready && !slot->ready;
         if (!slot->account) {
             slot->account = offer.account;
             slot->generation = offer.generation;
+            slot->startedAt = now ? now : 1;
+        } else if (becameReady) {
             slot->startedAt = now ? now : 1;
         }
         std::memcpy(slot->cookie, offer.cookie, 16);
@@ -237,9 +240,10 @@ void ConnectClientWithDirectFallback(DirectPunchSession* direct, bool& useDirect
     }
 }
 
-void FinishClientConnectAttempt(DirectPunchSession* direct, bool useDirect, uint32_t now)
+void FinishClientConnectAttempt(DirectPunchSession* direct, uint32_t now)
 {
     lastConnectAttempt = now;
+    bool useDirect = false;
     ENetAddress connectTo = target;
     ConnectClientWithDirectFallback(direct, useDirect, connectTo, true);
     steam::NoteClientEnetState(server ? server->state : ENET_PEER_STATE_DISCONNECTED, ENET_EVENT_TYPE_NONE, 0,

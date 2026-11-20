@@ -156,6 +156,33 @@ bool IsCounterOutOfBounds(States const& states, ParsedRuntimeKey const& parsed)
     return count == states.end() || parsed.index >= count->second;
 }
 
+template<class States>
+void MergeLiveBaselineDelta(States& values, bool isQuestRuntime, std::string const& name, uint32_t value)
+{
+    if (!isQuestRuntime) {
+        values[name] = value;
+        return;
+    }
+    ParsedRuntimeKey parsed;
+    if (!ParseRuntimeKey(name, parsed)) {
+        values[name] = value;
+        return;
+    }
+    if (parsed.field == RuntimeField::CounterCount) {
+        values[name] = value;
+        const std::string prefix = parsed.target + "\x1f" "c";
+        for (auto it = values.lower_bound(prefix); it != values.end() && it->first.compare(0, prefix.size(), prefix) == 0;) {
+            uint32_t idx = 0;
+            if (Number(it->first.substr(prefix.size()), idx) && idx >= value) it = values.erase(it);
+            else ++it;
+        }
+        return;
+    }
+    if (parsed.field == RuntimeField::CounterElem && IsCounterOutOfBounds(values, parsed))
+        return;
+    values[name] = value;
+}
+
 // Reset a peer's cached admission baseline on a new connection generation OR when that peer already completed a prior
 // admission cycle and re-enters template bootstrap on the same connection (WorldOther manual reload / rejoin).
 constexpr bool ShouldResetInitialReplay(uint32_t recordedGeneration, uint32_t currentGeneration,

@@ -128,7 +128,13 @@ void TestFocusDiagAndHostFrameDiag()
     const auto lost = g3t::focus_diag::AdvanceFrame(51000u, false, false, true);
     assert(lost.lost);
     const auto regained = g3t::focus_diag::AdvanceFrame(52350u, true, false, true);
-    assert(regained.regained && regained.awayMs == 1350u);
+    assert(regained.regained && regained.awayMs == 1350u && regained.watching && regained.serial > 0u);
+    const auto followUp = g3t::focus_diag::AdvanceFrame(52600u, true, false, true);
+    assert(followUp.watching && followUp.sampleDue && followUp.serial == regained.serial);
+
+    g3t::focus_diag::Reset();
+    assert(!g3t::focus_diag::AdvanceFrame(1000u, false, false, false).watching);
+    assert(!g3t::focus_diag::AdvanceFrame(1500u, true, false, false).watching);
 
     g3t::host_frame_diag::Accumulator acc{};
     const uint32_t startMs = 0xffffd8f0u; // 10,000 ms before uint32 wrap

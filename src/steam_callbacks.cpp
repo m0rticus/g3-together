@@ -99,10 +99,11 @@ void WorkerRuntime::OnLobbyEnter(char const* p, int size)
     }
     if (!joined || metadata == connect::LobbyMetadata::Different) {
         Logf("steam: lobby %llu refused (response %u, incompatible session ID or transport)", id, response);
-        Format(error, response != LobbyEnterResponseSuccess
-                   ? "the Steam lobby is full or closed"
-                   : "different session_id or incompatible G3 Together transport");
-        RecordClientEnd(error, clientFlow.state());
+        if (wantedLobby == id || !std::strcmp(candidateReason, "accepted through Steam"))
+            Format(error, response != LobbyEnterResponseSuccess
+                       ? "the Steam lobby is full or closed"
+                       : "different session_id or incompatible G3 Together transport");
+        RecordClientEnd(error[0] ? error : "lobby entry refused", clientFlow.state());
         LeaveLobby();
         Skip(id, 30000);
         return;
@@ -144,12 +145,18 @@ void WorkerRuntime::OnCallback(int callback, char const* p, int size)
         a = chat.lobby;
         b = chat.userChanged;
         state = chat.stateChange;
+        if (a == lobby && (state & 0x01u) && b == rejoinPartner) rejoinPartner = 0;
         if (a == lobby && (state & LobbyChatMemberLeftMask)) {
             if (Remote* r = Find(b)) {
                 r->leaving = true;
                 r->lobbyChange = state;
             } else if (isHost && connectionMode == connect::Mode::Invite && b == hostFlow.partner()) {
-                OnHostLinkLost(b, "left the lobby before saying hello");
+                if (rejoinPartner == b) {
+                    rejoinPartner = 0;
+                    Logf("connect: ignoring stale lobby leave from %llu during partner rejoin", b);
+                } else {
+                    OnHostLinkLost(b, "left the lobby before saying hello");
+                }
             }
         }
         break;
@@ -213,7 +220,9 @@ void WorkerRuntime::OnCallback(int callback, char const* p, int size)
             if (fx & connect::ClientFlow::Teardown) RecordClientEnd("Steam session failed (callback 1252)", before);
             AfterClient("session failed", before, fx);
         }
-        Drop(Find(a), "session failed");
+        if (Remote* r = Find(a)) Drop(r, "session failed");
+        else if (isHost && connectionMode == connect::Mode::Invite && a && a == hostFlow.partner())
+            OnHostLinkLost(a, "session failed");
         break;
     default:
         break;

@@ -103,8 +103,13 @@ class ClientAutoloadTests(unittest.TestCase):
         command = function_body(persist, r"\bvoid\s+__fastcall\s+NewGameCommandDetour\s*\(")
         self.assertLess(command.index('AutoloadCancel("manual New Game")'), command.index("GetPlayer()"))
         self.assertEqual(command.count("entryManual = true;"), 2)
+        self.assertEqual(command.count("entryApproved = autoloadAwaiting = false;"), 2)
+        self.assertIn("!clientRejoin.pending && !HostWorldEntryAvailable()", command)
         self.assertIn("clientWorldEntered && HostWorldEntryAvailable()", command)
         self.assertIn('EnterHostWorld("new-game-command")', command)
+        transition = function_body(persist, r"\bbool\s+ProcessClientTransition\s*\(")
+        self.assertIn("if (!entryManual && !entryApproved) createWaitSince = 0;", transition)
+        self.assertIn("NativeSaveReason()", transition)
 
     def test_menu_text_precedes_legacy_hint_and_completion_is_polled(self):
         persist = source("src/persist.cpp")

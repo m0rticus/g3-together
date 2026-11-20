@@ -2,6 +2,7 @@
 #include "npclease_internal.h"
 #include "npclease_presentation.h"
 
+#include "ai.h"
 #include "body.h"
 #include "config.h"
 #include "journal.h"
@@ -19,15 +20,16 @@
 
 namespace g3t::npclease::detail {
 namespace {
-Interest InterestOf(Checkpoint const& state, uint8_t client, eCEntity* hostNpc)
+Interest InterestOf(Checkpoint const& state, uint8_t client, eCEntity* hostNpc, bool forRecall = false)
 {
     Interest value;
     value.hostPresent = NativeReady(hostNpc);
     value.eligible = GetConfig().npcAuthorityFallback && installed && !installFailed;
     value.sameWorld = client > 1 && client < net::MaxPlayers && net::InWorld(client) &&
         net::Remotes()[client].latest.world == remote::CurrentWorld();
+    const uint32_t maxStateAge = forRecall ? npcown::AuthorityObservationMs : 1000;
     value.ready = value.sameWorld && (net::Remotes()[client].latest.flags & 1) &&
-        net::RemoteStateAgeMs(client) < 1000 && !persist::CheckpointBusy();
+        net::RemoteStateAgeMs(client) <= maxStateAge && (forRecall || !persist::CheckpointBusy());
     value.hostRoi = GetConfig().hostRoi;
     const auto& camera = eCApplication::GetInstance().GetCurrentCamera().GetPosition();
     const auto& hero = remote::ControlledBody()->GetWorldPosition();
@@ -268,7 +270,7 @@ void TickHost(uint32_t now)
             }
         }
         if (entry.lease.phase == Phase::Client || entry.lease.phase == Phase::Recalling) {
-            auto value = InterestOf(entry.lease.state, entry.lease.owner, entity);
+            auto value = InterestOf(entry.lease.state, entry.lease.owner, entity, true);
             value.hostPresent = value.hostPresent && value.hostDistance <= value.hostRoi &&
                 CanResumePresentation(entity);
             const bool ownerGone = !CurrentPeer(entry.lease.owner, entry.lease.generation);
@@ -277,7 +279,9 @@ void TickHost(uint32_t now)
                 CommitDeath(key, entry);
                 entry.lease.state.dead = 1;
             }
-            if (ownerGone || entry.interest.Recall(value) || !Running() || recallDead) {
+            const bool sessionStopping = ai::ShuttingDown() || !net::Connected() ||
+                persist::NativeLoading() || persist::HeroPending();
+            if (ownerGone || entry.interest.Recall(value) || sessionStopping || recallDead) {
                 if (entry.lease.Recall(now)) {
                     ++recalled; entry.recallAt = now ? now : 1;
                     Send(key, entry, Kind::Recall);
@@ -300,13 +304,18 @@ void TickHost(uint32_t now)
                 authoritySerial != UINT32_MAX) {
                 const uint8_t client = entry.lease.owner;
                 const uint32_t generation = entry.lease.generation;
+                const Lease priorLease = entry.lease;
                 if (entry.lease.HandBack(++authoritySerial, now)) {
                     entry.committed = false;
                     if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data()))) {
+                        entry.interest = Eligibility{};
                         if (CurrentPeer(client, generation))
                             net::SendNpcLease(client, Control(key, entry, Kind::Commit));
                         Diagnostic("host-active", key, entry, "imported frozen client cut");
-                    } else Diagnostic("host-held", key, entry, "native restart unavailable");
+                    } else {
+                        entry.lease = priorLease;
+                        Diagnostic("host-held", key, entry, "native restart unavailable");
+                    }
                 }
             }
         }
@@ -315,6 +324,7 @@ void TickHost(uint32_t now)
         const uint32_t previousGeneration = entry.lease.generation;
         if (entry.lease.Recover(now)) {
             ++recovered;
+            entry.interest = Eligibility{};
             if (prior == Phase::Offering) {
                 entry.committed = true;
                 auto abort = Control(key, entry, Kind::Abort);
@@ -332,13 +342,33 @@ void TickHost(uint32_t now)
             Running() && !persist::CheckpointBusy() && npcplayback::GuardForLease(entity) &&
             Import(entity, entry.lease.state)) {
             const uint8_t client = entry.previousOwner;
+            const Lease priorLease = entry.lease;
+            const bool priorCommitted = entry.committed;
             entry.lease.phase = Phase::Host; entry.lease.owner = 1;
             entry.lease.generation = 0; entry.committed = false;
-            if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data())) &&
-                CurrentPeer(client, entry.previousGeneration))
-                net::SendNpcLease(client, Control(key, entry, Kind::Commit));
+            if (Activate(entity, entry, reinterpret_cast<uint8_t const*>(key.data()))) {
+                entry.interest = Eligibility{};
+                if (CurrentPeer(client, entry.previousGeneration))
+                    net::SendNpcLease(client, Control(key, entry, Kind::Commit));
+            } else {
+                entry.lease = priorLease;
+                entry.committed = priorCommitted;
+            }
         }
         PublishGuard(key, entry);
+    }
+    if (entries.size() + 64 >= MaxLeases) {
+        for (auto it = entries.begin(); it != entries.end();) {
+            Entry const& idle = it->second;
+            if (idle.lease.phase == Phase::Host && idle.committed &&
+                !idle.lease.state.dead && !(idle.lease.state.effects & NativeDeath) &&
+                !npcs::NpcByGuid(it->first.data())) {
+                guardStates.Erase(it->first);
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 }
 }

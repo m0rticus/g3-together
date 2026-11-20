@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -219,6 +220,29 @@ void TestPhaseLagAndPacingMath()
     // Non-looping action does NOT wrap past maxSec
     const double oneShot = ExpectedPuppetPlayTime(0.90, EncodeRunningMotionFrac(0.90), 200, 1000.0, false);
     assert(oneShot > 0.90);
+
+    // Non-finite or huge play times must return 0 without hanging
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    assert(ExpectedPuppetPlayTime(inf, EncodeRunningMotionFrac(0.5), 10, 1000.0, true) == 0.0);
+    assert(ExpectedPuppetPlayTime(1.0, EncodeRunningMotionFrac(0.5), 10, inf, true) == 0.0);
+    assert(PuppetPhaseLagMs(inf, 0.2, 0.8, 1000.0, true) == 0.0f);
+    assert(PuppetPhaseLagMs(-inf, 0.2, 0.8, 1000.0, true) == 0.0f);
+    assert(PuppetPhaseLagMs(nan, 0.2, 0.8, 1000.0, true) == 0.0f);
+    assert(PuppetPhaseLagMs(0.2, nan, 0.8, 1000.0, true) == 0.0f);
+    assert(PuppetPhaseLagMs(0.2, 0.3, inf, 1000.0, true) == 0.0f);
+    const float hugeLag = PuppetPhaseLagMs(1e9 + 0.78, 0.02, 0.80, 1000.0, true);
+    assert(std::isfinite(hugeLag) && std::fabs(hugeLag) <= 400.0f);
+
+    // NoMotionFrac -> valid transition must not advance b's phase from a.sent
+    PuppetMotionHistory missingFirst;
+    const uint32_t walk = Hash("Hero_1H_1H_1H_P0_Move_Walk_N_Fwd_160.xmot");
+    missingFirst.Push(1, PuppetMotionSample{1000, walk, 0, 0, NoMotionFrac, 3, 1, 0, true});
+    missingFirst.Push(1, PuppetMotionSample{1040, walk, 0, 0, EncodeRunningMotionFrac(0.40), 3, 1, 0, true});
+    PuppetMotionSample sampled{};
+    uint32_t ageMs = 999;
+    assert(missingFirst.Sample(1020, sampled, ageMs));
+    assert(sampled.motionFrac == NoMotionFrac && ageMs == 0u);
 }
 }
 

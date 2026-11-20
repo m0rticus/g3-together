@@ -148,18 +148,35 @@ void CheatKill(char const* name, LogFn log)
     log(line);
 }
 
+namespace {
+bool ParseEnclaveCrimeArg(char const* argument, char const* usage, char const* missingMsg, LogFn log,
+                          char (&name)[64], int& index, int& value, Entity& outEntity, gCEnclave_PS*& outEnclave)
+{
+    if (sscanf_s(argument, "%63[^-]-%d-%d", name, static_cast<unsigned>(sizeof(name)), &index, &value) != 3 ||
+        index < 0 || index >= Crimes) {
+        log(usage);
+        return false;
+    }
+    outEntity = PSEnclave::GetEnclave(bCString(name));
+    outEnclave = Native(outEntity);
+    if (!outEnclave) {
+        log(missingMsg);
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 // QA stand-in for a deed: "<enclave>-<crime>-<n>" (the QA channel passes only [A-Za-z0-9_-]) adds n to that crime here.
 void AddCrime(char const* argument, LogFn log)
 {
     char name[64] = {};
     int index = -1, n = 0;
-    if (sscanf_s(argument, "%63[^-]-%d-%d", name, static_cast<unsigned>(sizeof(name)), &index, &n) != 3 || index < 0 || index >= Crimes) {
-        log("REFUSED crimeadd: <enclave>-<crime 0..4>-<n>");
+    Entity e;
+    gCEnclave_PS* enclave = nullptr;
+    if (!ParseEnclaveCrimeArg(argument, "REFUSED crimeadd: <enclave>-<crime 0..4>-<n>",
+                              "REFUSED crimeadd: no such enclave", log, name, index, n, e, enclave))
         return;
-    }
-    Entity e = PSEnclave::GetEnclave(bCString(name));
-    gCEnclave_PS* enclave = Native(e);
-    if (!enclave) { log("REFUSED crimeadd: no such enclave"); return; }
     Counters c = Read(enclave);
     c.crime[index] += n;
     Write(e, c);
@@ -174,13 +191,11 @@ void SetSuspect(char const* argument, LogFn log)
 {
     char name[64] = {};
     int index = -1, n = 0;
-    if (sscanf_s(argument, "%63[^-]-%d-%d", name, static_cast<unsigned>(sizeof(name)), &index, &n) != 3 || index < 0 || index >= Crimes) {
-        log("REFUSED crimesuspect: <enclave>-<crime 0..4>-<n>");
+    Entity e;
+    gCEnclave_PS* enclave = nullptr;
+    if (!ParseEnclaveCrimeArg(argument, "REFUSED crimesuspect: <enclave>-<crime 0..4>-<n>",
+                              "REFUSED crimesuspect: no such enclave", log, name, index, n, e, enclave))
         return;
-    }
-    Entity e = PSEnclave::GetEnclave(bCString(name));
-    gCEnclave_PS* enclave = Native(e);
-    if (!enclave) { log("REFUSED crimesuspect: no such enclave"); return; }
     Counters c = Read(enclave);
     c.suspect[index] = n;
     Write(e, c);

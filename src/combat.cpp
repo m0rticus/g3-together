@@ -450,6 +450,19 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         const int32_t scaled = Scaled(instance, attacker, args);
         if (scaled >= 0) return GETrue;
         if (HitPoints(victim) + scaled > 0) return CallOriginalAndLog(spu, self, other, scaled);
+        if (victim.NPC.Immortal) {
+            if (Outcome(victim) == net::HitKnockOut || KnocksOut(victim)) {
+                const GEInt res = CallOriginalAndLog(spu, self, other, -HitPoints(victim));
+                if (!victim.IsDead() && !victim.IsDown()) {
+                    victim.NPC.SetCurrentAttacker(Entity(attacker));
+                    victim.Routine.FullStop();
+                    victim.Routine.SetTask(bCString("ZS_Unconscious"));
+                    witness::KnockOutSeen(instance, attacker);
+                }
+                return res;
+            }
+            return CallOriginalAndLog(spu, self, other, scaled);
+        }
         const GEInt res = CallOriginalAndLog(spu, self, other, -HitPoints(victim));
         if (!victim.IsDead() && !victim.IsDown()) {
             if (Outcome(victim) == net::HitKnockOut) {
@@ -469,7 +482,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         return res;
     }
     // 2. A hit on an NPC simulated elsewhere goes to its owner, who applies it (and kills); the result comes back
-    //    through mirroring. Our hero's hits, and our own NPCs' hits (fights where two players' regions meet).
+    //    through mirroring. Our hero's hits go as claims (NPC-origin damage is host-simulated).
     uint8_t owner = npcs::OwnerOf(instance);
     if (!owner && !net::IsHost() && net::Connected() && instance && instance != hero &&
         instance != localMeleeActor && !remote::IsPuppet(instance) &&
@@ -481,18 +494,6 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     }
     if (owner) {
         if (net::IsHost() && owner > 1) return GETrue;
-        if (attacker && attacker != hero && attacker->GetPropertySet(eEPropertySetType_NPC)) {
-            uint8_t guid[16], npc[16], flags[16] = {};
-            Guid(instance, guid);
-            Guid(attacker, npc);
-            // P3: a companion or summon of our hero (its party leader). For NPC hits the weapon field carries flags;
-            // byte 0 = 1: a kill pays this player (the game pays the player for its party's kills in its death script).
-            if (attacker->GetPropertySet(eEPropertySetType_Party) && Entity(attacker).Party.GetPartyLeader().GetInstance() == hero)
-                flags[0] = 1;
-            net::SendHitNpc(owner, guid, args, flags, npc);
-            ++npcHitsSent;
-            return GETrue;
-        }
         if (attacker != hero) { ++dropped; return GETrue; }
         uint8_t guid[16], weapon[16] = {};
         Guid(instance, guid);
@@ -663,7 +664,7 @@ GEBool GE_STDCALL HookFinishingAttack(gCScriptProcessingUnit* spu)
         eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(self), &kind);
         if (!Entity(target).IsDead() && !Entity(target).NPC.Immortal && IsGroundImmuneNpc(target) &&
             IsExplicitFinishingBlow(self, target, source)) {
-            SendFinishingBlow(self, target, source);
+            SendFinishingBlow(self, target, source, true);
         }
         spu->AISetStatePosition(2);
         return GETrue;

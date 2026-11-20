@@ -104,6 +104,9 @@ class ReputationSyncTests(unittest.TestCase):
         self.assertIn("reputation::HasSharedNonTheftChange(", enclaves)
         self.assertIn("bool ApplyPlayerTheft(", enclaves)
         self.assertIn("void RestorePlayerTheft(", enclaves)
+        restore_fn = enclaves[enclaves.index("void RestorePlayerTheft("):enclaves.index("bool Together()")]
+        self.assertIn("else if (pt.knownTheft && afterKnown < gEPlayerCrime_Theft)", restore_fn)
+        self.assertIn("pt.knownTheft = false;", restore_fn)
 
         guards_cpp = _testbuild.src_text("guards.cpp")
         self.assertIn("enclaves::ApplyPlayerTheft(", guards_cpp)

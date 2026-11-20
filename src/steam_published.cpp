@@ -333,6 +333,10 @@ uint64_t HostRelayGeneration()
 bool RequestClientDisconnect()
 {
     if (rt.isHost || rt.connectionMode != connect::Mode::Invite) return false;
+    {
+        std::lock_guard<std::mutex> lock(store.mutex);
+        store.disconnectGeneration = store.published.hostGeneration;
+    }
     store.disconnectRequested.store(true);
     if (store.wakeEvent) SetEvent(store.wakeEvent);
     return true;

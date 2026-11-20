@@ -17,6 +17,7 @@ namespace g3t::guards {
 void Tick();  // installs the hooks once the game's scripts are registered
 void OnWorldChange();
 void OnEntityDestroyed(eCEntity const* entity);
+void KeepZone(eCEntity* puppet);
 
 // While alive, the game's player is `puppet` for Script_Game.dll (none: no change).
 // Read-only queries pass keepChapter=false to avoid changing the puppet's PlayerMemory.

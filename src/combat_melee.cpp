@@ -399,12 +399,14 @@ bool IsExplicitFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* sou
     return aimed ? aimed == victim : focus == victim;
 }
 
-bool SendFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source)
+bool SendFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source, bool allowEpisodeRetry)
 {
     if (!attacker || !victim || net::IsHost() || !npcs::OwnerOf(victim)) return false;
     if (IgnoreFriendlyHit(victim, attacker)) return false;
     Entity target(victim);
     if (InBout(target) || target.IsDead() || target.NPC.Immortal) return false;
+    auto const* record = npcs::CombatRecord(victim);
+    if (record && (record->flags & 1u) != 0) return false;
     uint8_t identity[16], weapon[16] = {};
     Guid(victim, identity);
     const std::string key = KillKey(identity);
@@ -415,9 +417,11 @@ bool SendFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source)
     contact.targetOnly = 1;
     std::memcpy(contact.target, identity, 16);
     std::memcpy(contact.focus, identity, 16);
-    if (contact.motion && ClaimedPlayerSwing(identity, contact.motion)) return false;
-    if (finishingEpisode != 0 && lastFinishingEpisode == finishingEpisode && lastFinishingKey == key)
-        return false;
+    if (!allowEpisodeRetry) {
+        if (contact.motion && ClaimedPlayerSwing(identity, contact.motion)) return false;
+        if (finishingEpisode != 0 && lastFinishingEpisode == finishingEpisode && lastFinishingKey == key)
+            return false;
+    }
     const GEInt held = Entity(attacker).Inventory.FindStackIndex(gESlot_RightHand);
     if (held >= 0) {
         const Template item = Entity(attacker).Inventory.GetTemplate(held);
@@ -489,8 +493,10 @@ bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player)
             telemetry::OnCombatIgnored("friendly_fire", source, victim, static_cast<uint8_t>(player));
             return true;
         }
-        Entity owner = Entity(source).Interaction.GetOwner();
-        eCEntity* next = owner.GetInstance();
+        eCEntity* next = source->GetPropertySet(eEPropertySetType_Interaction)
+                             ? Entity(source).Interaction.GetOwner().GetInstance()
+                             : nullptr;
+        if (!next || next == source) next = source->GetParent();
         if (!next || next == source) break;
         source = next;
     }

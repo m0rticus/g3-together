@@ -91,7 +91,7 @@ class PuppetAnimationSyncTests(unittest.TestCase):
 
     def test_feed_player_and_hold_keep_continuous_motions_stall_free_and_weapons_instant(self):
         feed = function_body(self.remote, r"\bvoid\s+FeedPlayer\s*\(")
-        self.assertIn("puppet.body.playing[0] = '\\0';", feed)
+        self.assertIn("puppet.body = body::State{};", feed)
         self.assertIn("puppet.downedSequence = 0;", feed)
         self.assertIn("movement::IsContinuousPuppetMotion(state.animation)", feed)
         self.assertIn("motion.motion = continuous ? 0u : animHash", feed)
@@ -119,6 +119,23 @@ class PuppetAnimationSyncTests(unittest.TestCase):
 
         update = function_body(self.remote, r"\bvoid\s+UpdatePuppet\s*\(")
         self.assertIn("SyncPuppetHitPoints(puppet.entity, remote.latest);", update)
+
+    def test_puppet_lifecycle_and_timeline_edge_guards(self):
+        is_puppet = function_body(self.remote, r"\bbool\s+IsPuppet\s*\(")
+        self.assertIn("PuppetOwner(entity) != 0", is_puppet)
+
+        update = function_body(self.remote, r"\bvoid\s+UpdatePuppet\s*\(")
+        self.assertIn("remote.activity.ticks - remote.latestTicks", update)
+        self.assertIn("!heldOwner", update)
+
+        feed = function_body(self.remote, r"\bvoid\s+FeedPlayer\s*\(")
+        self.assertIn("puppet.body = body::State{};", feed)
+
+        drive_puppet = function_body(self.body, r"\bvoid\s+DrivePuppetTimeline\s*\(")
+        self.assertLess(drive_puppet.index("if (needStart && validFrac)"),
+                        drive_puppet.index("state.lastCase == 3 && target.motionAgeMs > 180"))
+        not_running = function_body(drive_puppet, r"\bif\s*\(\s*!actor->IsMotionRunning\s*\(\s*slot0\s*\)\s*\)")
+        self.assertIn("state.paced = false", not_running)
 
 
 if __name__ == "__main__":

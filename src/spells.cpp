@@ -88,14 +88,46 @@ struct AreaScope {
     ~AreaScope() { areaCaster = before; }
 };
 
+struct LentSpellScope {
+    Entity self;
+    Entity held;
+    bool active = false;
+    LentSpellScope(Entity caster, char const* itemName) : self(caster)
+    {
+        if (!itemName) return;
+        const Template item(itemName);
+        if (item.IsValid() && self.Inventory.GetItemAmount(item) < 1) self.Inventory.CreateItems(item, 0, 1);
+        const GEInt stack = item.IsValid() ? self.Inventory.FindStackIndex(item) : -1;
+        const Entity spell = stack >= 0 ? self.Inventory.GetTemplateItem(stack).Item.GetSpell() : Entity();
+        if (spell.GetInstance()) {
+            held = self.Interaction.GetSpell();
+            self.Interaction.SetSpell(spell);
+            active = true;
+        }
+    }
+    ~LentSpellScope()
+    {
+        if (active) self.Interaction.SetSpell(held);
+    }
+};
+
 bTObjArray<Entity> GE_STDCALL AreaTargets()
 {
     bTObjArray<Entity> targets = originalGetNpcs();
     if (ai::ShuttingDown()) return targets;
-    if (areaCaster)
-        for (int i = targets.GetCount() - 1; i >= 0; --i)
-            if (downed::RejectHarm(targets.GetAt(i).GetInstance(), areaCaster, "area-spell") ||
-                combat::IgnoreFriendlyHit(targets.GetAt(i).GetInstance(), areaCaster)) targets.RemoveAt(i);
+    if (areaCaster) {
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        eCEntity* controlled = remote::ControlledBody();
+        for (int i = targets.GetCount() - 1; i >= 0; --i) {
+            eCEntity* t = targets.GetAt(i).GetInstance();
+            if (!t || t == hero || t == controlled || remote::IsPuppet(t) ||
+                npcs::IsMirrored(t) || npclease::Fenced(t) ||
+                downed::RejectHarm(targets.GetAt(i).GetInstance(), areaCaster, "area-spell") ||
+                combat::IgnoreFriendlyHit(t, areaCaster)) {
+                targets.RemoveAt(i);
+            }
+        }
+    }
     return targets;
 }
 
@@ -119,11 +151,35 @@ int IndexOf(char const* name)
     return -1;
 }
 
-Entity ByGuid(uint8_t const guid[16])
+bool IsZeroGuid(uint8_t const guid[16])
 {
     static const uint8_t none[16] = {};
-    if (!std::memcmp(guid, none, 16)) return Entity();
+    return std::memcmp(guid, none, 16) == 0;
+}
+
+Entity ByGuid(uint8_t const guid[16])
+{
+    if (IsZeroGuid(guid)) return Entity();
     return guid::Resolve(guid);
+}
+
+void QueueTakeOver(uint8_t from, uint8_t const guid[16], int index, int32_t args)
+{
+    const uint32_t queuedAt = net::Now();
+    const uint32_t gen = from == net::LocalId() ? 0u : net::PeerGeneration(from);
+    for (auto& existing : pendingTakeOvers) {
+        if (existing.from == from && existing.generation == gen &&
+            existing.world == net::WorldEpoch() && std::memcmp(existing.guid, guid, sizeof(existing.guid)) == 0) {
+            existing.queuedAt = queuedAt;
+            existing.index = index;
+            existing.args = args;
+            return;
+        }
+    }
+    if (pendingTakeOvers.size() >= 512) { ++npcRefused; return; }
+    PendingTakeOver pending{from, {}, gen, net::WorldEpoch(), queuedAt, index, args};
+    std::memcpy(pending.guid, guid, sizeof(pending.guid));
+    pendingTakeOvers.push_back(pending);
 }
 
 // One wrapper per script: the index picks the original, the name to send and what it acts on.
@@ -134,6 +190,12 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     if (shot::InNpcReplicaContact() && target != remote::ControlledBody()) return 0;
+    if (shot::InPlayerReplicaContact() &&
+        (net::IsHost() || !target || target == gCSession::GetInstance().GetHero() ||
+         target == remote::ControlledBody() || remote::IsPuppet(target) ||
+         !npclease::LocalAuthority(target))) {
+        return 0;
+    }
     if (HarmfulTarget(I) && downed::RejectHarm(target, caster, Specs[I].name)) return 0;
     if (HarmfulTarget(I) && combat::IgnoreFriendlyHit(target, caster)) return 0;
     const bool own = mirror && caster && caster == remote::ControlledBody();
@@ -154,22 +216,42 @@ GEInt GE_STDCALL Wrap(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other
         ++npcSent;
         return GETrue;
     }
-    if (own && (Specs[I].kind == AroundCaster || Specs[I].kind == AroundCasterAt) && !net::IsHost()) {
+    if (own && net::IsHost() && Specs[I].kind == TakeOver && target &&
+        (npcs::IsMirrored(target) || npclease::Fenced(target) || npclease::RemoteOwner(target) > 1)) {
+        uint8_t guid[16]; guid::CopyEntity(target, guid);
+        if (const uint8_t leaseOwner = npclease::RemoteOwner(target); leaseOwner > 1) {
+            net::SendNpcSpell(leaseOwner, Specs[I].name, guid, args);
+            ++npcSent;
+        } else if (npcs::IsMirrored(target)) {
+            npcs::HostTake(target);
+        }
+        if (npcs::IsMirrored(target) || npclease::Fenced(target) || npclease::RemoteOwner(target) > 1) {
+            QueueTakeOver(net::LocalId(), guid, I, args);
+            return GETrue;
+        }
+    }
+    const bool isArea = Specs[I].kind == AroundCaster || Specs[I].kind == AroundCasterAt;
+    if (own && isArea && !net::IsHost()) {
         uint8_t guid[16] = {};
-        if (Specs[I].kind == AroundCasterAt && target) guid::CopyEntity(target, guid);
-        net::SendNpcSpell(1, Specs[I].name, guid, args);
+        uint8_t targetPlayer = 0;
+        if (Specs[I].kind == AroundCasterAt && target) {
+            if (const int puppetPlayer = remote::PuppetOwner(target); puppetPlayer > 0)
+                targetPlayer = static_cast<uint8_t>(puppetPlayer);
+            else
+                guid::CopyEntity(target, guid);
+        }
+        net::SendNpcSpell(1, Specs[I].name, guid, args, targetPlayer);
         ++npcSent;
         Logf("spells: %s around us: sent to the host", Specs[I].name);
-        AreaScope area(Specs[I].kind == AroundCaster ? caster : nullptr);
-        return originals[I](spu, self, other, args);
     }
-    AreaScope area(Specs[I].kind == AroundCaster ? caster : nullptr);
+    AreaScope area(isArea ? caster : nullptr);
     const GEInt result = originals[I](spu, self, other, args);
-    const int player = target ? remote::PuppetOwner(target) : 0;
-    if (own && Specs[I].kind == OnPlayer && player) {
-        net::SendPlayerSpell(static_cast<uint8_t>(player), Specs[I].name);
-        ++sent;
-        Logf("spells: %s on player %d's puppet, sent", Specs[I].name, player);
+    if (own && Specs[I].kind == OnPlayer) {
+        if (const int player = target ? remote::PuppetOwner(target) : 0) {
+            net::SendPlayerSpell(static_cast<uint8_t>(player), Specs[I].name);
+            ++sent;
+            Logf("spells: %s on player %d's puppet, sent", Specs[I].name, player);
+        }
     }
     return result;
 }
@@ -236,7 +318,9 @@ void InstallTick()
 bool NormalizeCoopEarner(eCEntity* earner, eCDynamicEntity* hero)
 {
     if (!hero || !earner || earner == hero) return false;
-    if (remote::IsPuppet(earner) || npcs::CompanionOwner(earner) > 1) return true;
+    const uint8_t compOwner = npcs::CompanionOwner(earner);
+    const uint8_t localId = net::LocalId();
+    if (remote::IsPuppet(earner) || (compOwner != 0 && compOwner != localId)) return true;
     if (earner->GetPropertySet(eEPropertySetType_Party)) {
         Entity member(earner);
         if (static_cast<int>(member.Party.PartyMemberType) == 5) return false;
@@ -318,66 +402,65 @@ void OnPlayerSpell(uint8_t from, char const* script)
 
 // A spell another player cast on NPCs this machine simulates: the game's own script, cast by that player's puppet,
 // on the NPC itself (or round the puppet).
-void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_t args)
+void OnNpcSpell(uint8_t from, char const* script, uint8_t const guid[16], int32_t args, uint8_t targetPlayer)
 {
     ++npcReceived;
     const int index = IndexOf(script);
     eCEntity* puppet = remote::PuppetOf(from);
-    Entity target = ByGuid(guid);
-    const bool known = net::IsHost() && index >= 0 && originals[index];
-    const bool onNpc = known && (Specs[index].kind == OnNpc || Specs[index].kind == TakeOver || Specs[index].kind == OnPlayer);
-    const bool at = known && Specs[index].kind == AroundCasterAt;
-    if (known && Specs[index].kind == TakeOver && puppet &&
-        (!target.GetInstance() || npclease::Fenced(target.GetInstance()) || npcs::IsMirrored(target.GetInstance()))) {
-        const uint32_t queuedAt = net::Now() ? net::Now() : 1;
-        for (auto& existing : pendingTakeOvers) {
-            if (existing.from == from && existing.generation == net::PeerGeneration(from) &&
-                existing.world == net::WorldEpoch() && std::memcmp(existing.guid, guid, sizeof(existing.guid)) == 0) {
-                existing.queuedAt = queuedAt;
-                existing.index = index;
-                existing.args = args;
-                return;
-            }
-        }
-        if (pendingTakeOvers.size() >= 512) { ++npcRefused; return; }
-        PendingTakeOver pending{from, {}, net::PeerGeneration(from), net::WorldEpoch(), queuedAt, index, args};
-        std::memcpy(pending.guid, guid, sizeof(pending.guid));
-        pendingTakeOvers.push_back(pending);
+    Entity target = targetPlayer && targetPlayer < net::MaxPlayers
+        ? Entity(targetPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(targetPlayer))
+        : ByGuid(guid);
+    const bool validIndex = index >= 0 && originals[index];
+    const bool hostPath = net::IsHost() && validIndex;
+    const bool clientLeasedPath = !net::IsHost() && from == 1 && validIndex &&
+        (Specs[index].kind == OnNpc || Specs[index].kind == OnPlayer || Specs[index].kind == TakeOver) &&
+        target.GetInstance() && npclease::LocalAuthority(target.GetInstance());
+    const bool known = hostPath || clientLeasedPath;
+    if (clientLeasedPath && Specs[index].kind == TakeOver) {
+        npclease::RelinquishToHost(target.GetInstance(), "tame/control spell");
+        ++npcApplied;
         return;
     }
-    if (!known || !puppet || (onNpc && (!npcs::NpcByGuid(guid) || npcs::IsMirrored(target.GetInstance()))) || (at && !target.GetInstance())) {
+    const bool onNpc = known && (Specs[index].kind == OnNpc || Specs[index].kind == TakeOver || Specs[index].kind == OnPlayer);
+    const bool at = known && Specs[index].kind == AroundCasterAt;
+    if (hostPath && Specs[index].kind == TakeOver && puppet &&
+        (!target.GetInstance() || npclease::Fenced(target.GetInstance()) || npcs::IsMirrored(target.GetInstance()))) {
+        if (target.GetInstance()) {
+            if (const uint8_t leaseOwner = npclease::RemoteOwner(target.GetInstance()); leaseOwner > 1 && leaseOwner != from) {
+                net::SendNpcSpell(leaseOwner, Specs[index].name, guid, args);
+                ++npcSent;
+            }
+        }
+        QueueTakeOver(from, guid, index, args);
+        return;
+    }
+    if (!known || !puppet ||
+        (onNpc && (!npcs::NpcByGuid(guid) || npcs::IsMirrored(target.GetInstance()) ||
+                   (!hostPath && !npclease::LocalAuthority(target.GetInstance())))) ||
+        (at && !IsZeroGuid(guid) && !target.GetInstance())) {
         ++npcRefused;
         Logf("spells: %s from player %u refused (unknown, no puppet, or the NPC is not simulated here)", script, from);
         return;
     }
     Entity self(puppet);
-    Entity other = onNpc || at ? target : Entity(puppet);
+    Entity other = onNpc ? target : (at ? target : Entity(puppet));
     if (HarmfulTarget(index) && downed::RejectHarm(target.GetInstance(), puppet, Specs[index].name)) return;
     if (HarmfulTarget(index) && combat::IgnoreFriendlyHit(target.GetInstance(), puppet, from)) return;
     // Poison and disease judge the target by the caster's spell (re/findings/poison-plan-c.md): the puppet holds none, so
     // it gets the spell's item and that spell for the replay, as copies of spell projectiles do (shot.cpp).
-    Entity held;
-    bool lent = false;
-    if (Specs[index].item) {
-        const Template item(Specs[index].item);
-        if (item.IsValid() && self.Inventory.GetItemAmount(item) < 1) self.Inventory.CreateItems(item, 0, 1);
-        const GEInt stack = item.IsValid() ? self.Inventory.FindStackIndex(item) : -1;
-        const Entity spell = stack >= 0 ? self.Inventory.GetTemplateItem(stack).Item.GetSpell() : Entity();
-        if (spell.GetInstance()) {
-            held = self.Interaction.GetSpell();
-            self.Interaction.SetSpell(spell);
-            lent = true;
-        }
+    {
+        LentSpellScope lentSpell(self, Specs[index].item);
+        const bool isArea = Specs[index].kind == AroundCaster || Specs[index].kind == AroundCasterAt;
+        AreaScope area(isArea ? puppet : nullptr);
+        guards::Acting context(puppet);
+        originals[index](nullptr, &self, &other, args);
     }
-    AreaScope area(Specs[index].kind == AroundCaster ? puppet : nullptr);
-    guards::Acting context(puppet);
-    originals[index](nullptr, &self, &other, args);
-    if (lent) self.Interaction.SetSpell(held);
-    if (Specs[index].kind == TakeOver && target.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
+    if (hostPath && Specs[index].kind == TakeOver && target.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
         target.Party.GetPartyLeader().GetInstance() == puppet)
         npcs::OnClaim(guid, from, true);
     ++npcApplied;
-    Logf("spells: %s from player %u applied%s%s", script, from, onNpc || at ? " on " : "", onNpc || at ? target.GetName().GetText() : "");
+    Logf("spells: %s from player %u applied%s%s", script, from, (onNpc || (at && target.GetInstance())) ? " on " : "",
+         (onNpc || (at && target.GetInstance())) ? target.GetName().GetText() : "");
 }
 }
 
@@ -394,24 +477,36 @@ void Tick()
     const uint32_t netNow = net::Now();
     for (size_t i = 0; i < pendingTakeOvers.size();) {
         const auto pending = pendingTakeOvers[i];
-        if (!net::IsHost() || pending.world != net::WorldEpoch() || !net::PeerJoined(pending.from) ||
-            net::PeerGeneration(pending.from) != pending.generation) {
+        const bool hostSelf = pending.from == net::LocalId();
+        if (!net::IsHost() || pending.world != net::WorldEpoch() ||
+            (!hostSelf && (!net::PeerJoined(pending.from) || net::PeerGeneration(pending.from) != pending.generation))) {
             pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
             continue;
         }
-        if (pending.queuedAt && static_cast<uint32_t>(netNow - pending.queuedAt) >= PendingTakeOverExpireMs) {
+        if (static_cast<uint32_t>(netNow - pending.queuedAt) >= PendingTakeOverExpireMs) {
             ++npcRefused;
             Logf("spells: deferred %s from player %u expired (target unavailable on host)", Specs[pending.index].name, pending.from);
             pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
             continue;
         }
         eCEntity* target = npcs::NpcByGuid(pending.guid);
-        if (!target || !remote::PuppetOf(pending.from) || npclease::Fenced(target) || npcs::IsMirrored(target)) {
+        if (!target || (!hostSelf && !remote::PuppetOf(pending.from)) ||
+            npclease::Fenced(target) || npcs::IsMirrored(target) ||
+            (hostSelf && npclease::RemoteOwner(target) > 1)) {
             ++i;
             continue;
         }
         pendingTakeOvers.erase(pendingTakeOvers.begin() + i);
-        OnNpcSpell(pending.from, Specs[pending.index].name, pending.guid, pending.args);
+        if (hostSelf) {
+            if (eCEntity* caster = remote::ControlledBody(); caster && originals[pending.index]) {
+                Entity self(caster), other(target);
+                AreaScope area(nullptr);
+                guards::LocalPlayer local;
+                originals[pending.index](nullptr, &self, &other, pending.args);
+            }
+        } else {
+            OnNpcSpell(pending.from, Specs[pending.index].name, pending.guid, pending.args, 0);
+        }
     }
     const DWORD now = GetTickCount();
     if (installed || !gCSession::GetInstance().IsGameRunning() || now - lastTry < 1000) return;
@@ -453,23 +548,42 @@ void MirrorOff(LogFn log)
     log("SPELLMIRROROFF casts on puppets and on other machines' NPCs are not sent");
 }
 
+bool ResolveNpcByGuid(char const* guidText, char const* tag, LogFn log, Entity& outNpc)
+{
+    _GUID raw;
+    uint8_t bytes[16];
+    if (!guid::Parse(guidText, raw)) {
+        char msg[80];
+        Format(msg, "%s refused bad GUID", tag);
+        log(msg);
+        return false;
+    }
+    std::memcpy(bytes, &raw, 16);
+    Entity npc = ByGuid(bytes);
+    if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) {
+        char msg[80];
+        Format(msg, "%s refused no such NPC", tag);
+        log(msg);
+        return false;
+    }
+    outNpc = npc;
+    return true;
+}
+
 void PuppetGuid(char const* player, LogFn log)
 {
-    char line[120];
+    char line[120], guidText[40];
     eCEntity* puppet = remote::PuppetOf(std::atoi(player));
     if (!puppet) { log("PUPPET refused no puppet of that player here"); return; }
-    const eCEntityProxy proxy(puppet);
-    bCPropertyID::bSCore core;
-    std::memcpy(&core, &proxy.GetEntityID().GetCore(), 16);
-    Format(line, "PUPPET player=%s guid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", player, core.Data1, core.Data2, core.Data3,
-              core.Data4[0], core.Data4[1], core.Data4[2], core.Data4[3], core.Data4[4], core.Data4[5], core.Data4[6], core.Data4[7]);
+    guid::FormatEntity(puppet, guidText, sizeof(guidText));
+    Format(line, "PUPPET player=%s guid=%s", player, guidText);
     log(line);
 }
 
 // QA: an NPC from a template 4 m in front of the local hero (an animal to tame, for instance), with its GUID.
 void SpawnNpc(char const* name, LogFn log)
 {
-    char line[200];
+    char line[200], guidText[40];
     eCEntity* hero = remote::ControlledBody();
     const Template t(name);
     if (!hero || !t.IsValid()) { Format(line, "SPAWNNPC refused template %s valid=%d", name, t.IsValid() ? 1 : 0); log(line); return; }
@@ -477,11 +591,8 @@ void SpawnNpc(char const* name, LogFn log)
     pose.AccessTranslation() = hero->GetWorldPosition() + hero->GetWorldMatrix().GetZAxis() * 400.0f;
     Entity npc = Entity::Spawn(t, pose);
     if (!npc.GetInstance()) { log("SPAWNNPC refused spawn failed"); return; }
-    const eCEntityProxy proxy(npc.GetInstance());
-    bCPropertyID::bSCore g;
-    std::memcpy(&g, &proxy.GetEntityID().GetCore(), 16);
-    Format(line, "SPAWNNPC name=%s guid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", npc.GetName().GetText(), g.Data1, g.Data2,
-              g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    guid::FormatEntity(npc.GetInstance(), guidText, sizeof(guidText));
+    Format(line, "SPAWNNPC name=%s guid=%s", npc.GetName().GetText(), guidText);
     log(line);
 }
 
@@ -489,12 +600,8 @@ void SpawnNpc(char const* name, LogFn log)
 void StatusOf(char const* guid, LogFn log)
 {
     char line[420];
-    _GUID raw;
-    uint8_t bytes[16];
-    if (!guid::Parse(guid, raw)) { log("STATUSOF refused bad GUID"); return; }
-    std::memcpy(bytes, &raw, 16);
-    Entity npc = ByGuid(bytes);
-    if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("STATUSOF refused no such NPC"); return; }
+    Entity npc;
+    if (!ResolveNpcByGuid(guid, "STATUSOF", log, npc)) return;
     const bCVector at = npc.GetPosition();
     Format(line, "STATUSOF name=%s bits=%u hp=%d hp_max=%d poisoned_at=%u mirrored=%d owner=%u dead=%d ai_mode=%d pos=%.0f,%.0f,%.0f task=%s state=%s",
               npc.GetName().GetText(), static_cast<unsigned>(npc.NPC.StatusEffects), static_cast<int>(npc.DamageReceiver.HitPoints),
@@ -510,15 +617,14 @@ void NpcHp(char const* argument, LogFn log)
 {
     char guid[64] = {};
     int hp = 0;
-    _GUID raw;
-    uint8_t bytes[16];
     char const* sep = std::strrchr(argument, '_');
     if (!sep || sep - argument >= static_cast<ptrdiff_t>(sizeof(guid)) || (hp = std::atoi(sep + 1)) < 1) { log("NPCHP refused GUID_HP"); return; }
     std::memcpy(guid, argument, sep - argument);
-    if (!guid::Parse(guid, raw)) { log("NPCHP refused bad GUID"); return; }
-    std::memcpy(bytes, &raw, 16);
-    Entity npc = ByGuid(bytes);
-    if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) || npc.IsDead()) { log("NPCHP refused no living NPC"); return; }
+    Entity npc;
+    if (!ResolveNpcByGuid(guid, "NPCHP", log, npc) || npc.IsDead()) {
+        if (npc.GetInstance() && npc.IsDead()) log("NPCHP refused no living NPC");
+        return;
+    }
     npc.DamageReceiver.HitPoints = hp;
     StatusOf(guid, log);
 }
@@ -532,20 +638,18 @@ void TickGuardOff(LogFn log)
 // QA: the local hero's party, with each member's type (4 controlled, 5 summoned ...).
 void Party(LogFn log)
 {
-    char line[260];
+    char line[260], guidText[40];
     eCEntity* hero = remote::ControlledBody();
     if (hero && hero->GetPropertySet(eEPropertySetType_Party)) {
         const bTValArray<eCEntity*> members = Entity(hero).Party.GetMembers(GEFalse);
         for (int i = 0; i < members.GetCount(); ++i) {
             Entity m(members.GetAt(i));
             if (!m.GetInstance()) continue;
-            const eCEntityProxy proxy(m.GetInstance());
-            bCPropertyID::bSCore g;
-            std::memcpy(&g, &proxy.GetEntityID().GetCore(), 16);
+            guid::FormatEntity(m.GetInstance(), guidText, sizeof(guidText));
             const bCVector& at = m.GetInstance()->GetWorldPosition();
-            Format(line, "MEMBER name=%s guid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X type=%d task=%s at=%.0f_%.0f_%.0f",
-                      m.GetName().GetText(), g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4],
-                      g.Data4[5], g.Data4[6], g.Data4[7], static_cast<int>(static_cast<gEPartyMemberType>(m.Party.PartyMemberType)),
+            Format(line, "MEMBER name=%s guid=%s type=%d task=%s at=%.0f_%.0f_%.0f",
+                      m.GetName().GetText(), guidText,
+                      static_cast<int>(static_cast<gEPartyMemberType>(m.Party.PartyMemberType)),
                       m.Routine.GetCurrentTask().GetText(), at.GetX(), at.GetY(), at.GetZ());
             log(line);
         }
@@ -557,12 +661,8 @@ void Party(LogFn log)
 void NpcMemory(char const* guid, LogFn log)
 {
     char line[220];
-    _GUID raw;
-    uint8_t bytes[16];
-    if (!guid::Parse(guid, raw)) { log("NPCMEMORY refused bad GUID"); return; }
-    std::memcpy(bytes, &raw, 16);
-    Entity npc = ByGuid(bytes);
-    if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("NPCMEMORY refused no such NPC"); return; }
+    Entity npc;
+    if (!ResolveNpcByGuid(guid, "NPCMEMORY", log, npc)) return;
     Format(line, "NPCMEMORY name=%s attitude=%d last_player_ar=%d attack_reason=%d last_fight=%d last_crime=%d last_fight_time=%.0f",
               npc.GetName().GetText(), static_cast<int>(static_cast<gEAttitude>(npc.NPC.AttitudeToPlayer2)),
               static_cast<int>(static_cast<gEAttackReason>(npc.NPC.LastPlayerAR)), static_cast<int>(static_cast<gEAttackReason>(npc.NPC.AttackReason)),
@@ -574,12 +674,8 @@ void NpcMemory(char const* guid, LogFn log)
 // QA for charm: the NPC holds a grudge against the player (hostile, attacked, a lost fight), as after a quarrel.
 void NpcGrudge(char const* guid, LogFn log)
 {
-    _GUID raw;
-    uint8_t bytes[16];
-    if (!guid::Parse(guid, raw)) { log("NPCGRUDGE refused bad GUID"); return; }
-    std::memcpy(bytes, &raw, 16);
-    Entity npc = ByGuid(bytes);
-    if (!npc.GetInstance() || !npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) { log("NPCGRUDGE refused no such NPC"); return; }
+    Entity npc;
+    if (!ResolveNpcByGuid(guid, "NPCGRUDGE", log, npc)) return;
     npc.NPC.AttitudeToPlayer2 = gEAttitude_Angry;
     npc.NPC.LastPlayerAR = gEAttackReason_ReactToWeapon;
     npc.NPC.LastPlayerCrime = gEPlayerCrime_Attack;

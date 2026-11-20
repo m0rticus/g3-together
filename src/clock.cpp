@@ -19,6 +19,7 @@ constexpr uint32_t SendInterval = 5000;  // ms
 constexpr int Tolerance = 120;
 bool following = true;
 uint32_t lastSend = 0;
+bool sendImmediately = false;
 unsigned corrections = 0, received = 0;
 int lastDifference = 0;
 uint32_t lastLocal = 0;        // client: the local clock at the previous frame
@@ -99,7 +100,7 @@ void Wait()
     ++waits;
     Logf("clock: waiting until morning; time moves on %u game seconds to day %d 09:00", lastLocal - before, world.Clock.GetDay());
     if (net::IsHost()) {
-        lastSend = 0;  // tell everyone at once
+        sendImmediately = true;  // tell everyone at once
         return;
     }
     net::SendClock(Now());
@@ -120,9 +121,18 @@ void OnClock(net::ClockState const& host)
             Logf("clock: a time request out of range (day %u %02u:%02u, %u s ahead); ignored", host.day, host.hour, host.minute, host.timestamp - own);
             return;
         }
+        const net::ClockState prev = Now();
         Apply(host);
+        const uint32_t applied = Entity::GetWorldEntity().Clock.GetTimeStampInSeconds();
+        const uint32_t tsDelta = applied >= host.timestamp ? applied - host.timestamp : host.timestamp - applied;
+        if (applied <= own || applied - own > 48u * 3600 || tsDelta > 120u) {
+            Apply(prev);
+            Logf("clock: a time request with mismatched calendar (day %u %02u:%02u, ts=%u vs applied=%u); ignored",
+                 host.day, host.hour, host.minute, host.timestamp, applied);
+            return;
+        }
         ++granted;
-        lastSend = 0;  // tell everyone at once
+        sendImmediately = true;  // tell everyone at once
         Logf("clock: a player slept; time moves on to day %u %02u:%02u for everyone", host.day, host.hour, host.minute);
         return;
     }
@@ -176,7 +186,8 @@ void Tick()
         return;
     }
     const uint32_t now = net::Now();
-    if (now - lastSend < SendInterval) return;
+    if (!sendImmediately && now - lastSend < SendInterval) return;
+    sendImmediately = false;
     lastSend = now;
     net::SendClock(Now());
 }
@@ -187,6 +198,7 @@ void OnWorldChange()
     requestedAt = 0;
     waitJumped = false;
     lastSend = 0;
+    sendImmediately = false;
 }
 
 void Report(LogFn log)
@@ -210,6 +222,7 @@ void Set(char const* hhmm, LogFn log)
     Entity world = Entity::GetWorldEntity();
     world.Clock.SetHour(hour);
     world.Clock.SetMinute(minute);
+    lastLocal = world.Clock.GetTimeStampInSeconds();
     Report(log);
 }
 
@@ -222,6 +235,7 @@ void AddDays(char const* days, LogFn log)
     }
     Entity world = Entity::GetWorldEntity();
     world.Clock.SetDay(world.Clock.GetDay() + n);
+    lastLocal = world.Clock.GetTimeStampInSeconds();
     Report(log);
 }
 

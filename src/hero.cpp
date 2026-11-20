@@ -60,6 +60,13 @@ Template FromHex(std::string const& hex)
     return Template(bCPropertyID(bCGuid(raw)));
 }
 
+std::string StackHex(Entity& self, int i)
+{
+    const Template item = self.Inventory.GetTemplate(i);
+    bCPropertyID const& id = item;
+    return Hex(id);
+}
+
 Template SkillOf(Entity& self, int i)
 {
     Entity item = self.Inventory.GetTemplateItem(i);
@@ -71,9 +78,7 @@ int FindSkillStack(Entity& self, std::string const& hex)
 {
     for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
         if (static_cast<int>(self.Inventory.GetCategory(i)) != gEItemCategory_Skill) continue;
-        const Template t = self.Inventory.GetTemplate(i);
-        bCPropertyID const& id = t;
-        if (Hex(id) == hex) return i;
+        if (StackHex(self, i) == hex) return i;
     }
     return -1;
 }
@@ -85,9 +90,7 @@ std::vector<Stack> Stacks(Entity& self)
     std::vector<Stack> out;
     for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
         Stack s;
-        const Template item = self.Inventory.GetTemplate(i);
-        bCPropertyID const& id = item;
-        s.id = Hex(id);
+        s.id = StackHex(self, i);
         s.amount = self.Inventory.GetAmount(i);
         s.quality = self.Inventory.GetQuality(i) & QualityMask;
         s.slot = static_cast<int>(self.Inventory.GetSlotFromStack(i));
@@ -198,11 +201,10 @@ std::vector<std::string> LearnedSpellsOf(Entity& self)
     std::vector<std::string> out;
     gCInventory_PS const* inventory = InventoryPs(self);
     for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
+        if (self.Inventory.GetAmount(i) <= 0 && self.Inventory.GetSlotFromStack(i) == gESlot_None) continue;
         if (static_cast<int>(self.Inventory.GetCategory(i)) != gEItemCategory_Spellbook ||
             StackLearned(inventory, i) != 1) continue;
-        const Template item = self.Inventory.GetTemplate(i);
-        bCPropertyID const& id = item;
-        std::string hex = Hex(id);
+        std::string hex = StackHex(self, i);
         if (std::find(out.begin(), out.end(), hex) == out.end()) out.push_back(std::move(hex));
     }
     return out;
@@ -215,9 +217,8 @@ std::vector<Quick> QuickSlotsOf(Entity& self)
     for (int slot = 0; slot < QuickSlots; ++slot) {
         const GEInt i = self.Inventory.FindStackIndexByQuickSlot(slot);
         if (i < 0 || i >= self.Inventory.GetStackCount() || StackQuickSlot(inventory, i) != slot) continue;
-        const Template item = self.Inventory.GetTemplate(i);
-        bCPropertyID const& id = item;
-        out.push_back({slot, Hex(id), self.Inventory.GetQuality(i) & QualityMask});
+        if (self.Inventory.GetAmount(i) <= 0 && self.Inventory.GetSlotFromStack(i) == gESlot_None) continue;
+        out.push_back({slot, StackHex(self, i), self.Inventory.GetQuality(i) & QualityMask});
     }
     return out;
 }
@@ -259,9 +260,7 @@ bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::strin
         int index = -1;
         for (int i = 0; i < self.Inventory.GetStackCount() && index < 0; ++i) {
             if (static_cast<int>(self.Inventory.GetCategory(i)) != gEItemCategory_Spellbook) continue;
-            const Template item = self.Inventory.GetTemplate(i);
-            bCPropertyID const& itemId = item;
-            if (Hex(itemId) == id) index = i;
+            if (StackHex(self, i) == id) index = i;
         }
         if (index >= 0 && (StackLearned(inventory, index) == 1 || (inventory && inventory->LearnStack(index))) &&
             StackLearned(inventory, index) == 1) ++learned;
@@ -275,9 +274,7 @@ bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::strin
         int index = -1;
         for (int i = 0; i < self.Inventory.GetStackCount() && index < 0; ++i) {
             if (StackQuickSlot(inventory, i) >= 0) continue;
-            const Template item = self.Inventory.GetTemplate(i);
-            bCPropertyID const& id = item;
-            if (Hex(id) == q.id && (self.Inventory.GetQuality(i) & QualityMask) == q.quality) index = i;
+            if (StackHex(self, i) == q.id && (self.Inventory.GetQuality(i) & QualityMask) == q.quality) index = i;
         }
         if (index >= 0 && self.Inventory.AssignStackToQuickSlot(index, q.slot) &&
             self.Inventory.FindStackIndexByQuickSlot(q.slot) == index && StackQuickSlot(inventory, index) == q.slot) {
@@ -302,13 +299,30 @@ bool ApplySpellAndQuick(Entity& self, char const* source, std::vector<std::strin
     return spellsMissing == 0 && missing == 0;
 }
 
+saving::RecordPose ReadPose(eCDynamicEntity const& hero)
+{
+    const bCVector& p = hero.GetWorldPosition();
+    const bCQuaternion q = hero.GetWorldRotation();
+    return {{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+}
+
+saving::RecordPose ReadNormalizedPose(eCDynamicEntity const& hero)
+{
+    saving::RecordPose pose = ReadPose(hero);
+    const float qLen2 = pose.rotation[0] * pose.rotation[0] + pose.rotation[1] * pose.rotation[1] +
+                        pose.rotation[2] * pose.rotation[2] + pose.rotation[3] * pose.rotation[3];
+    if (std::isfinite(qLen2) && qLen2 > 0.25f && (qLen2 < 0.99f || qLen2 > 1.01f)) {
+        const float inv = 1.0f / std::sqrt(qLen2);
+        for (float& component : pose.rotation) component *= inv;
+    }
+    return pose;
+}
+
 bool CaptureHeroSnapshot(Entity& self, eCDynamicEntity& hero, codec::ParsedRecord& out)
 {
     auto* memory = static_cast<gCPlayerMemory_PS*>(hero.GetPropertySet(eEPropertySetType_PlayerMemory));
     if (!memory) return false;
-    const bCVector& p = hero.GetWorldPosition();
-    const bCQuaternion q = hero.GetWorldRotation();
-    out.pose = {{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+    out.pose = ReadNormalizedPose(hero);
     out.downed = downed::Held() ? 1 : 0;
     out.level = static_cast<unsigned>(self.NPC.Level);
     out.levelMax = static_cast<unsigned>(self.NPC.LevelMax);
@@ -342,6 +356,14 @@ struct HeroItemOps {
     }
 };
 
+char const* RemoveStack(Entity& self, int index, bool strict, char const* unequipErr, char const* deleteErr)
+{
+    if (self.Inventory.GetSlotFromStack(index) != gESlot_None && !self.Inventory.UnEquipStack(index) && strict)
+        return unequipErr;
+    if (!self.Inventory.DeleteStack(index) && strict) return deleteErr;
+    return nullptr;
+}
+
 char const* PrepareInventoryForSnapshot(Entity& self, std::vector<Stack> const& stacks, bool strict,
                                         RestoreStats* stats = nullptr)
 {
@@ -352,16 +374,15 @@ char const* PrepareInventoryForSnapshot(Entity& self, std::vector<Stack> const& 
 
     for (int i = self.Inventory.GetStackCount() - 1; i >= 0; --i) {
         if (static_cast<int>(self.Inventory.GetCategory(i)) == gEItemCategory_Skill) {
-            const Template t = self.Inventory.GetTemplate(i);
-            bCPropertyID const& id = t;
-            if (skillSet.count(Hex(id))) continue;
-            if (!self.Inventory.DeleteStack(i) && strict) return "could not remove a skill stack";
+            if (skillSet.count(StackHex(self, i))) continue;
+            if (char const* err = RemoveStack(self, i, strict, "could not unequip a skill item",
+                                              "could not remove a skill stack"))
+                return err;
             if (stats) ++stats->skillsRemoved;
             continue;
         }
-        if (self.Inventory.GetSlotFromStack(i) != gESlot_None && !self.Inventory.UnEquipStack(i) && strict)
-            return "could not unequip an item";
-        if (!self.Inventory.DeleteStack(i) && strict) return "could not remove an item";
+        if (char const* err = RemoveStack(self, i, strict, "could not unequip an item", "could not remove an item"))
+            return err;
     }
     return nullptr;
 }
@@ -372,7 +393,9 @@ char const* ApplySkillStack(Entity& self, Stack const& s, bool strict, RestoreSt
     int index = FindSkillStack(self, s.id);
     if (index >= 0 && ((self.Inventory.GetQuality(index) & QualityMask) != s.quality ||
                        self.Inventory.GetAmount(index) != s.amount)) {
-        if (!self.Inventory.DeleteStack(index) && strict) return "could not replace a skill stack";
+        if (char const* err = RemoveStack(self, index, strict, "could not unequip a skill item",
+                                          "could not replace a skill stack"))
+            return err;
         index = -1;
     }
     if (index < 0) index = self.Inventory.CreateItems(item, s.quality, s.amount);
@@ -387,7 +410,9 @@ char const* ApplySkillStack(Entity& self, Stack const& s, bool strict, RestoreSt
                 return "could not teach a skill";
             if (stats) ++stats->skillsTaught;
         } else if (s.learned == 0 && knows) {
-            if (!self.Inventory.DeleteStack(index) && strict) return "could not unlearn a skill";
+            if (char const* err = RemoveStack(self, index, strict, "could not unequip a skill item",
+                                              "could not unlearn a skill"))
+                return err;
             index = self.Inventory.CreateItems(item, s.quality, s.amount);
             if ((index < 0 || self.Inventory.HasLearnedSkill(skill)) && strict)
                 return "could not recreate an unlearned skill";
@@ -407,7 +432,7 @@ char const* ApplySkillStack(Entity& self, Stack const& s, bool strict, RestoreSt
 }
 
 char const* ApplyCoreStatsAndAttributes(Entity& self, eCDynamicEntity& hero, codec::ParsedRecord const& snapshot,
-                                        bool strict, char const* label)
+                                        bool strict, char const* label, bool treatDowned)
 {
     self.NPC.Level = snapshot.level;
     self.NPC.LevelMax = snapshot.levelMax;
@@ -417,7 +442,7 @@ char const* ApplyCoreStatsAndAttributes(Entity& self, eCDynamicEntity& hero, cod
     auto* memory = static_cast<gCPlayerMemory_PS*>(hero.GetPropertySet(eEPropertySetType_PlayerMemory));
     if (memory && !ApplyAttributes(*memory, snapshot.attrs) && strict)
         return "an attribute could not be restored";
-    if (downed::Held()) self.PlayerMemory.SetBaseValue(bCString("HP"), 1);
+    if (treatDowned) self.PlayerMemory.SetBaseValue(bCString("HP"), 1);
     if (!ApplySpellAndQuick(self, label, snapshot.spells, snapshot.quicks) && strict)
         return "spells or quick slots could not be restored";
     if (strict && (!memory ||
@@ -426,7 +451,7 @@ char const* ApplyCoreStatsAndAttributes(Entity& self, eCDynamicEntity& hero, cod
                    static_cast<int>(self.PlayerMemory.XP) != snapshot.xp ||
                    static_cast<int>(self.PlayerMemory.LPAttribs) != snapshot.lpAttribs ||
                    static_cast<int>(self.PlayerMemory.LPPerks) != snapshot.lpPerks ||
-                   !AttributesMatch(*memory, snapshot.attrs, downed::Held())))
+                   !AttributesMatch(*memory, snapshot.attrs, treatDowned)))
         return "restored character stats do not match the record";
     return nullptr;
 }
@@ -442,7 +467,7 @@ void RollbackHeroSnapshot(Entity& self, eCDynamicEntity& hero, codec::ParsedReco
         if (s.category == gEItemCategory_Skill) ApplySkillStack(self, s, false);
         else codec::RestoreItemStack(s, gESlot_None, itemOps);
     }
-    ApplyCoreStatsAndAttributes(self, hero, backup, false, "rollback");
+    ApplyCoreStatsAndAttributes(self, hero, backup, false, "rollback", downed::Held());
     if (!net::IsHost() && saving::ValidRecordPose(backup.pose))
         self.MoveTo(body::Pose(hero, backup.pose.position, backup.pose.rotation));
 }
@@ -476,15 +501,7 @@ bool SaveRecordImpl(char const* path, saving::Key const& key)
     }
     eCDynamicEntity* hero = Hero();
     if (!Ready(hero)) { Logf("hero: record %s not written (hero not ready)", path); return false; }
-    const bCVector& p = hero->GetWorldPosition();
-    const bCQuaternion q = hero->GetWorldRotation();
-    saving::RecordPose pose = {{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
-    const float qLen2 = pose.rotation[0] * pose.rotation[0] + pose.rotation[1] * pose.rotation[1] +
-                        pose.rotation[2] * pose.rotation[2] + pose.rotation[3] * pose.rotation[3];
-    if (std::isfinite(qLen2) && qLen2 > 0.25f && (qLen2 < 0.99f || qLen2 > 1.01f)) {
-        const float inv = 1.0f / std::sqrt(qLen2);
-        for (float& component : pose.rotation) component *= inv;
-    }
+    const saving::RecordPose pose = ReadNormalizedPose(*hero);
     if (!saving::ValidRecordPose(pose)) { Logf("hero: record %s not written (invalid pose)", path); return false; }
 
     Entity self(hero);
@@ -578,7 +595,7 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
     };
 
     const int savedDowned = parsed.downed;
-    downed::Restore(savedDowned != 0, "hero-record");
+    const bool treatDowned = downed::Held() || (savedDowned != 0 && !downed::Terminal());
     if (!self.Inventory.HoldStacks(-1, -1) &&
         (self.Inventory.GetItemFromSlot(gESlot_RightHand).GetInstance() ||
          self.Inventory.GetItemFromSlot(gESlot_LeftHand).GetInstance()))
@@ -595,13 +612,11 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
         if (err) return fail(err);
     }
     if (!codec::SameStacks(Stacks(self), parsed.stacks)) return fail("restored inventory does not match the record");
-    if (char const* err = ApplyCoreStatsAndAttributes(self, *hero, parsed, true, label)) return fail(err);
+    if (char const* err = ApplyCoreStatsAndAttributes(self, *hero, parsed, true, label, treatDowned)) return fail(err);
 
     const saving::RecordPose& pose = parsed.pose;
     if (net::IsHost()) {
-        const bCVector& p = hero->GetWorldPosition();
-        const bCQuaternion q = hero->GetWorldRotation();
-        const saving::RecordPose actual{{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+        const saving::RecordPose actual = ReadPose(*hero);
         if (!saving::PoseRestored(pose, actual)) {
             Logf("hero: host load preserving native .g3savcpdat placement native=(%.1f,%.1f,%.1f) record=(%.1f,%.1f,%.1f)",
                  actual.position[0], actual.position[1], actual.position[2],
@@ -609,9 +624,7 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
         }
     } else if (saving::ValidRecordPose(pose)) {
         self.MoveTo(body::Pose(*hero, pose.position, pose.rotation));
-        const bCVector& p = hero->GetWorldPosition();
-        const bCQuaternion q = hero->GetWorldRotation();
-        const saving::RecordPose actual{{p.GetX(), p.GetY(), p.GetZ()}, {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}};
+        const saving::RecordPose actual = ReadPose(*hero);
         if (!saving::PoseRestored(pose, actual)) return fail("pose could not be restored");
         const float dx = actual.position[0] - pose.position[0],
                     dy = actual.position[1] - pose.position[1],
@@ -623,6 +636,9 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
         return fail("pose could not be restored");
     }
 
+    // Apply downed state only after every fallible restoration and pose check succeeds.
+    downed::Restore(savedDowned != 0, "hero-record");
+
     Logf("hero: bound record applied version=%u world=%s save=%s player=%llu level=%u xp=%d stacks=%zu skills=%zu/%u/%u/%u",
          parsed.schemaVersion, parsed.key.world.c_str(), parsed.key.save.c_str(),
          static_cast<unsigned long long>(parsed.key.player), parsed.level, parsed.xp,
@@ -630,7 +646,7 @@ bool LoadRecordImpl(char const* data, size_t size, char const* label, saving::Ke
     return true;
 }
 
-bool LoadRecord(char const* path, saving::Key const& key)
+bool LoadRecordFile(char const* path, saving::Key const& key, bool validateOnly)
 {
     std::vector<char> bytes;
     if (!ReadFileToMemory(path, bytes)) {
@@ -638,19 +654,12 @@ bool LoadRecord(char const* path, saving::Key const& key)
         Logf("hero: record %s refused (%s)", path ? path : "(null)", lastRefusal);
         return false;
     }
-    return LoadRecordImpl(bytes.data(), bytes.size(), path, key, false);
+    return LoadRecordImpl(bytes.data(), bytes.size(), path, key, validateOnly);
 }
 
-bool ValidateRecord(char const* path, saving::Key const& key)
-{
-    std::vector<char> bytes;
-    if (!ReadFileToMemory(path, bytes)) {
-        lastRefusal = !path || !*path ? "invalid path or identity" : "the file cannot be read";
-        Logf("hero: record %s refused (%s)", path ? path : "(null)", lastRefusal);
-        return false;
-    }
-    return LoadRecordImpl(bytes.data(), bytes.size(), path, key, true);
-}
+bool LoadRecord(char const* path, saving::Key const& key) { return LoadRecordFile(path, key, false); }
+
+bool ValidateRecord(char const* path, saving::Key const& key) { return LoadRecordFile(path, key, true); }
 
 bool LoadRecordFromMemory(uint8_t const* data, size_t size, saving::Key const& key)
 {

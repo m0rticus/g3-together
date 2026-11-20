@@ -430,6 +430,50 @@ inline bool KnockbackMatchesHostRecord(HitKnockbackState const& kb, uint16_t ack
            recordHitSequence == kb.hitSequence;
 }
 
+inline uint16_t WrapNonZeroHitSeq(uint32_t seq)
+{
+    if (seq == 0) return 0;
+    const uint16_t low = static_cast<uint16_t>(seq);
+    return low != 0 ? low : 1;
+}
+
+inline float ElapsedSecondsSigned(uint32_t nowMs, uint32_t startedAtMs)
+{
+    return std::max(0.0f, static_cast<float>(static_cast<int32_t>(nowMs - startedAtMs)) / 1000.0f);
+}
+
+template <typename Action>
+inline int BuildHitReactionCandidates(uint8_t reaction, bool allowQuickClip, Action firstStumble, Action secondStumble,
+                                      Action stumble, Action quickStumble, Action pierceStumble, Action sitKnockDown,
+                                      Action outCandidates[4])
+{
+    if (reaction == ReactionQuickStumble && allowQuickClip) {
+        outCandidates[0] = quickStumble;
+        outCandidates[1] = firstStumble;
+        outCandidates[2] = secondStumble;
+        outCandidates[3] = stumble;
+        return 4;
+    }
+    if (reaction == ReactionPierceStumble) {
+        outCandidates[0] = pierceStumble;
+        outCandidates[1] = firstStumble;
+        outCandidates[2] = secondStumble;
+        outCandidates[3] = stumble;
+        return 4;
+    }
+    if (reaction == ReactionSitKnockDown) {
+        outCandidates[0] = sitKnockDown;
+        outCandidates[1] = firstStumble;
+        outCandidates[2] = secondStumble;
+        outCandidates[3] = stumble;
+        return 4;
+    }
+    outCandidates[0] = firstStumble;
+    outCandidates[1] = secondStumble;
+    outCandidates[2] = stumble;
+    return 3;
+}
+
 // A reliable HitResult can arrive after an unreliable NpcRecord with the
 // same hitSequence already cleared pendingHit. Accept it when it matches either
 // pendingHit or an unconfirmed active knockback for that sequence.
@@ -493,11 +537,11 @@ inline void ConfirmHitKnockback(HitKnockbackState& kb, uint16_t hitSequence, uin
 
     kb.hostConfirmed = true;
     if (hostReaction == ReactionNone || !(hostStepCm > 0.5f)) {
+        kb.hostImpactDone = true;
         if (!kb.active) return;
         for (int k = 0; k < 3; ++k) kb.segmentOriginPos[k] = kb.goalPos[k] = curPos[k];
         kb.stepCm = 0.0f;
         kb.groundDeltaY = 0.0f;
-        kb.hostImpactDone = true;
         return;
     }
 
@@ -564,6 +608,18 @@ inline bool AdvanceHitKnockback(HitKnockbackState& kb, uint32_t nowMs, uint32_t 
         return false;
     }
     if (!kb.active) {
+        if (kb.hitSequence != 0 && !kb.refused) {
+            if (ownImpactEcho) {
+                kb.hostImpactSeen = true;
+                kb.hostImpactDone = false;
+            } else if (ownRecoverEcho || kb.hostImpactSeen) {
+                kb.hostImpactDone = true;
+            } else if (acknowledgedAtMs != 0) {
+                const int32_t hostAfterAckMs = static_cast<int32_t>(recordSentMs - acknowledgedAtMs) - 16;
+                const int32_t hitMs = static_cast<int32_t>(kb.hitDurationSec * 1000.0f) + 32;
+                if (hostAfterAckMs >= hitMs) kb.hostImpactDone = true;
+            }
+        }
         kb.lastPresentedPos[0] = basePos[0];
         kb.lastPresentedPos[1] = basePos[1];
         kb.lastPresentedPos[2] = basePos[2];

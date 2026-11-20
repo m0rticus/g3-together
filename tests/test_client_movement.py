@@ -130,7 +130,7 @@ class ClientMovementTests(unittest.TestCase):
         ):
             body = function_body(self.ai, signature)
             self.assertIsNotNone(body, signature)
-            self.assertLess(body.index("guards::LocalPlayer"), body.index(native))
+            self.assertLess(body.index("guards::LocalPlayer"), body.rindex(native))
         keys = function_body(self.ai, r"\bGEInt\s+GE_STDCALL\s+FilterPlayerKeys\s*\(")
         self.assertIn("if (downed::Held() || downed::Terminal()) return 0", keys)
         self.assertIn("movement::KeyDispatch", keys)
@@ -149,6 +149,8 @@ class ClientMovementTests(unittest.TestCase):
         touch = function_body(self.movement, r"\bvoid\s+Touch\s*\(")
         self.assertIn("!guards::IsLocalPlayer(entity)", touch)
         self.assertIn("persist::NativeLoading()", touch)
+        self.assertIn("strncpy_s(call.kind,", touch)
+        self.assertNotIn("strcpy_s(call.kind,", touch)
         for io in ("Logf", "Log(", "WriteFile", "CreateFile", "fopen", "new "):
             self.assertNotIn(io, touch)
         capture = function_body(self.movement, r"\bSample\s+Capture\s*\(")

@@ -335,21 +335,23 @@ void Touch(eCEntity* entity, char const* kind, char const* value, void* caller)
         ai::ShuttingDown() || persist::NativeLoading() || !guards::IsLocalPlayer(entity) ||
         !gCSession::GetInstance().IsGameRunning()) return;
     const long long now = NowUs();
+    char const* safeKind = kind ? kind : "";
+    char const* safeValue = value ? value : "";
     ++frameCalls; ++stageCalls;
-    if (!std::strcmp(kind, "StopMovement")) ++nativeStops;
-    if (!std::strcmp(kind, "AIFullStop")) ++nativeFullStops;
-    if (!std::strcmp(kind, "ExitProcessingRange")) ++nativeExits;
-    if (!std::strcmp(kind, "local-context")) ++contextClears;
+    if (!std::strcmp(safeKind, "StopMovement")) ++nativeStops;
+    if (!std::strcmp(safeKind, "AIFullStop")) ++nativeFullStops;
+    if (!std::strcmp(safeKind, "ExitProcessingRange")) ++nativeExits;
+    if (!std::strcmp(safeKind, "local-context")) ++contextClears;
     if (callCount) {
         auto& last = calls[(nextCall + calls.size() - 1) % calls.size()];
-        if (!std::strcmp(last.kind, kind) && !std::strcmp(last.value, value) &&
+        if (!std::strcmp(last.kind, safeKind) && !std::strcmp(last.value, safeValue) &&
             last.caller == reinterpret_cast<uintptr_t>(caller) && last.stage == phase && now - last.at < 100000) {
             last.at = now; ++last.count;
             last.frameSequence = frameCalls; last.stageSequence = stageCalls; return;
         }
     }
     auto& call = calls[nextCall];
-    strcpy_s(call.kind, kind); strncpy_s(call.value, value, _TRUNCATE);
+    strncpy_s(call.kind, safeKind, _TRUNCATE); strncpy_s(call.value, safeValue, _TRUNCATE);
     call.caller = reinterpret_cast<uintptr_t>(caller); call.at = now; call.stage = phase; call.count = 1;
     call.frameSequence = frameCalls; call.stageSequence = stageCalls;
     call.stackCount = caller ? CaptureStackBackTrace(2, 4, call.stack, nullptr) : 0;

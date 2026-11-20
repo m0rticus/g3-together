@@ -4,8 +4,11 @@
 #include "ai.h"
 #include "body.h"
 #include "crashlog.h"
+#include "downed.h"
+#include "journal.h"
 #include "log.h"
 #include "net.h"
+#include "npc_companions.h"
 #include "npcs.h"
 #include "guards.h"
 #include "remote.h"
@@ -67,8 +70,8 @@ SetIdFn setId = nullptr;
 
 // Waiting for a summon to show up among the world's entities (it does a frame after MagicSummon spawned it).
 struct Pending {
-    eCEntity* owner = nullptr;  // the caster (own summon) or the caster's puppet (copy)
-    uint32_t netId = 0;         // 0 while it is our own summon without an ID yet
+    uint8_t ownerGuid[16] = {};  // the caster (own summon) or the caster's puppet (copy)
+    uint32_t netId = 0;          // 0 while it is our own summon without an ID yet
     uint8_t target[16] = {};
     char spellItem[40] = {};
     char spawn[40] = {};
@@ -87,6 +90,7 @@ std::vector<Known> known;
 // QA: every hit while a summon acts (until 4 s after the last one appeared), with the hit points before and after;
 // the latest MaxHitLines of them.
 DWORD watchUntil = 0;
+bool watchActive = false;
 constexpr int MaxHitLines = 24;
 char hitLines[MaxHitLines][200];
 int hitLineCount = 0;
@@ -149,21 +153,26 @@ GEInt GE_STDCALL WrapSummon(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
     Entity caster = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     Entity target = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     Pending p;
-    const bool own = mirror && caster.GetInstance() && caster.GetInstance() == remote::ControlledBody();
+    eCEntity* casterEntity = caster.GetInstance();
+    const bool own = mirror && casterEntity && casterEntity == remote::ControlledBody();
     if (own) {
-        p.owner = caster.GetInstance();
+        Guid(casterEntity, p.ownerGuid);
         if (target.GetInstance()) Guid(target.GetInstance(), p.target);
-        const Entity item = caster.Inventory.GetItemFromSlot(gESlot_RightHand);
+        const Entity item = casterEntity->GetPropertySet(eEPropertySetType_Inventory)
+            ? caster.Inventory.GetItemFromSlot(gESlot_RightHand) : Entity();
         strncpy_s(p.spellItem, NameOf(item), _TRUNCATE);
-        const Entity spell = caster.Interaction.GetSpell();
-        const Entity spawn = spell.GetInstance() ? spell.Magic.GetSpawn() : Entity();
+        const Entity spell = casterEntity->GetPropertySet(eEPropertySetType_Interaction)
+            ? caster.Interaction.GetSpell() : Entity();
+        const Entity spawn = spell.GetInstance() && spell.GetInstance()->GetPropertySet(eEPropertySetType_Magic)
+            ? spell.Magic.GetSpawn() : Entity();
         strncpy_s(p.spawn, NameOf(spawn), _TRUNCATE);
         p.since = GetTickCount();
     }
     const GEInt result = originalSummon(spu, self, other, args);
-    if (own && *p.spawn != '-') {
+    if (own && *p.spawn && *p.spawn != '-') {
         pending.push_back(p);
         watchUntil = GetTickCount() + 4000;
+        watchActive = true;
     }
     return result;
 }
@@ -172,7 +181,10 @@ GEInt GE_STDCALL WrapSummon(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
 GEInt GE_STDCALL WatchHit(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalHit ? originalHit(spu, self, other, args) : 0;
-    if (args >= 0 || static_cast<int32_t>(GetTickCount() - watchUntil) > 0) return originalHit(spu, self, other, args);
+    if (args >= 0 || !watchActive || static_cast<int32_t>(GetTickCount() - watchUntil) > 0) {
+        if (watchActive && static_cast<int32_t>(GetTickCount() - watchUntil) > 0) watchActive = false;
+        return originalHit(spu, self, other, args);
+    }
     Entity victim = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     Entity source = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     const int before = HitPoints(victim);
@@ -181,7 +193,9 @@ GEInt GE_STDCALL WatchHit(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
     const bool applied = before != after;
     applied ? ++hitsApplied : ++hitsBlocked;
     {
-        const Entity owner = source.GetInstance() ? source.Interaction.GetOwner() : Entity();
+        eCEntity* src = source.GetInstance();
+        const Entity owner = src && src->GetPropertySet(eEPropertySetType_Interaction)
+            ? source.Interaction.GetOwner() : Entity();
         Format(hitLines[hitLineCount++ % MaxHitLines], "SMNHIT victim=%s source=%s owner=%s owner_puppet_of=%d delta=%d hp=%d..%d applied=%d",
                   NameOf(victim), NameOf(source), NameOf(owner), owner.GetInstance() ? remote::PuppetOwner(owner.GetInstance()) : 0,
                   args, before, after, applied ? 1 : 0);
@@ -230,6 +244,7 @@ GEInt GE_STDCALL WrapCreature(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
 {
     if (ai::ShuttingDown()) return creatureOriginals[I] ? creatureOriginals[I](spu, self, other, args) : 0;
     eCEntity* caster = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+    eCEntity* otherEntity = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     const bool own = mirror && caster && caster == remote::ControlledBody();
     if (own && !net::IsHost()) {
         net::SummonNote request;
@@ -238,10 +253,12 @@ GEInt GE_STDCALL WrapCreature(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
         request.args = args;
         request.ownerPlayer = net::LocalId();
         strncpy_s(request.spawn, CreatureScripts[I], _TRUNCATE);
-        const Entity held = Entity(caster).Inventory.GetItemFromSlot(gESlot_RightHand);
-        if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Item) && held.Item.GetSpell().GetInstance())
-            strncpy_s(request.spellItem, held.GetName().GetText(), _TRUNCATE);
-        if (other && static_cast<Entity*>(other)->GetInstance()) Guid(static_cast<Entity*>(other)->GetInstance(), request.target);
+        if (caster->GetPropertySet(eEPropertySetType_Inventory)) {
+            const Entity held = Entity(caster).Inventory.GetItemFromSlot(gESlot_RightHand);
+            if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Item) && held.Item.GetSpell().GetInstance())
+                strncpy_s(request.spellItem, held.GetName().GetText(), _TRUNCATE);
+        }
+        if (otherEntity) Guid(otherEntity, request.target);
         net::SendSummon(request);
         return GETrue;
     }
@@ -258,6 +275,11 @@ GEInt GE_STDCALL WrapCreature(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
 const gFScript creatureWrappers[CreatureCount] = {&WrapCreature<0>, &WrapCreature<1>, &WrapCreature<2>, &WrapCreature<3>,
                                                   &WrapCreature<4>, &WrapCreature<5>, &WrapCreature<6>, &WrapCreature<7>};
 
+eCEntity* ResolveOwnerActor(uint8_t ownerPlayer)
+{
+    return ownerPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(ownerPlayer);
+}
+
 // The other machine's creature: a copy under its GUID, which npcs.cpp then drives from that machine's snapshots.
 void CopyCreature(uint8_t from, net::SummonNote const& note)
 {
@@ -265,7 +287,7 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
     std::memcpy(&raw, note.guid, 16);
     auto setOwner = [&](Entity& copy) {
         if (copy.GetInstance() && copy.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
-            eCEntity* owner = note.ownerPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(note.ownerPlayer);
+            eCEntity* owner = ResolveOwnerActor(note.ownerPlayer);
             if (owner) copy.Party.SetPartyLeader(Entity(owner));
             copy.Party.PartyMemberType = gEPartyMemberType_Summoned;
         }
@@ -273,7 +295,8 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
     for (auto& existing : creatureCopyList)
         if (!std::memcmp(existing.guid, note.guid, 16) && existing.netId == note.netId) {
             existing.ownerPlayer = note.ownerPlayer;
-            Entity copy(npcs::NpcByGuid(note.guid));
+            Entity copy = ByGuid(note.guid);
+            if (!copy.GetInstance()) copy = Entity(npcs::NpcByGuid(note.guid));
             setOwner(copy);
             npcs::Rebind(note.guid);
             return;
@@ -281,7 +304,8 @@ void CopyCreature(uint8_t from, net::SummonNote const& note)
     creatureCopyList.erase(std::remove_if(creatureCopyList.begin(), creatureCopyList.end(), [&](CreatureCopy const& previous) {
         return !std::memcmp(previous.guid, note.guid, 16);
     }), creatureCopyList.end());
-    Entity copy(npcs::NpcByGuid(note.guid));
+    Entity copy = ByGuid(note.guid);
+    if (!copy.GetInstance()) copy = Entity(npcs::NpcByGuid(note.guid));
     if (copy.GetInstance()) {
         setOwner(copy);
         CreatureCopy tracked;
@@ -328,7 +352,9 @@ GEInt GE_STDCALL HookAreaTick(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
 {
     if (ai::ShuttingDown()) return originalAreaTick ? originalAreaTick(spu, self, other, args) : 0;
     Entity cloud = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
-    const Entity owner = cloud.GetInstance() ? cloud.Interaction.GetOwner() : Entity();
+    eCEntity* cloudEntity = cloud.GetInstance();
+    const Entity owner = cloudEntity && cloudEntity->GetPropertySet(eEPropertySetType_Interaction)
+        ? cloud.Interaction.GetOwner() : Entity();
     if (areaSkip && owner.GetInstance() && remote::PuppetOwner(owner.GetInstance())) {
         ++areaTicksSkipped;
         return 0;
@@ -435,13 +461,16 @@ void Resolve()
     const bTObjArray<Entity> all = Entity::GetEntities();
     for (size_t i = 0; i < pending.size();) {
         Pending const& p = pending[i];
+        eCEntity* expectedOwner = ByGuid(p.ownerGuid).GetInstance();
         eCEntity* found = nullptr;
-        for (int j = 0; j < all.GetCount() && !found; ++j) {
-            Entity e = all.GetAt(j);
-            eCEntity* instance = e.GetInstance();
-            if (!instance || std::strcmp(e.GetName().GetText(), p.spawn) || !instance->GetPropertySet(eEPropertySetType_Interaction)) continue;
-            if (e.Interaction.GetOwner().GetInstance() != p.owner || IsKnown(instance)) continue;
-            found = instance;
+        if (expectedOwner) {
+            for (int j = 0; j < all.GetCount() && !found; ++j) {
+                Entity e = all.GetAt(j);
+                eCEntity* instance = e.GetInstance();
+                if (!instance || std::strcmp(e.GetName().GetText(), p.spawn) || !instance->GetPropertySet(eEPropertySetType_Interaction)) continue;
+                if (e.Interaction.GetOwner().GetInstance() != expectedOwner || IsKnown(instance)) continue;
+                found = instance;
+            }
         }
         if (found) {
             p.netId ? Bind(p, found) : Announce(p, found);
@@ -469,8 +498,7 @@ void CheckKnown()
         for (auto const& creature : creatureCopyList) {
             if (!creature.ownerPlayer) continue;
             Entity copy(npcs::NpcByGuid(creature.guid));
-            eCEntity* leader = creature.ownerPlayer == net::LocalId() ? remote::ControlledBody() :
-                remote::PuppetOf(creature.ownerPlayer);
+            eCEntity* leader = ResolveOwnerActor(creature.ownerPlayer);
             if (leader && copy.GetInstance() && copy.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
                 copy.Party.GetPartyLeader().GetInstance() != leader)
                 copy.Party.SetPartyLeader(Entity(leader));
@@ -505,9 +533,10 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
         if (!net::IsHost()) return;
         int index = -1;
         for (int i = 0; i < CreatureCount; ++i) if (!std::strcmp(note.spawn, CreatureScripts[i])) index = i;
-        eCEntity* actor = remote::PuppetOf(from);
-        if (index < 0 || !creatureOriginals[index] || !actor) {
-            Log("summon: creature cast request refused: unknown spell or missing player");
+        eCEntity* actor = net::InWorld(from) ? remote::PuppetOf(from) : nullptr;
+        if (index < 0 || !creatureOriginals[index] || !actor || downed::CombatUnavailable(actor) ||
+            !actor->GetPropertySet(eEPropertySetType_Interaction) || !actor->GetPropertySet(eEPropertySetType_Inventory)) {
+            Log("summon: creature cast request refused: unknown spell, missing player, or player unavailable");
             return;
         }
         const auto before = SummonedOf(actor);
@@ -521,6 +550,8 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
             const Entity spell = stack >= 0 ? self.Inventory.GetTemplateItem(stack).Item.GetSpell() : Entity();
             if (!spell.GetInstance()) { Log("summon: creature cast refused: item has no spell"); return; }
             self.Interaction.SetSpell(spell);
+        } else {
+            self.Interaction.SetSpell(Entity());
         }
         guards::Acting context(actor);
         creatureOriginals[index](nullptr, &self, &target, note.args);
@@ -556,6 +587,7 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
                 Entity copy = ByGuid(it->guid);
                 if (copy.GetInstance()) copy.Kill();
                 creatureCopyList.erase(it);
+                ++creatureCopiesRemoved;
                 break;
             }
         }
@@ -574,25 +606,29 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
     // The copy is the caster's: the game's own MagicSummon on the puppet, with the puppet holding the same spell.
     Entity puppet(puppetBody);
     const Template item(note.spellItem);
-    if (item.IsValid() && puppet.Inventory.GetItemAmount(item) < 1) puppet.Inventory.CreateItems(item, 0, 1);
-    const GEInt stack = item.IsValid() ? puppet.Inventory.FindStackIndex(item) : -1;
+    const bool hasInv = puppetBody->GetPropertySet(eEPropertySetType_Inventory) != nullptr;
+    const bool hasInteraction = puppetBody->GetPropertySet(eEPropertySetType_Interaction) != nullptr;
+    if (hasInv && item.IsValid() && puppet.Inventory.GetItemAmount(item) < 1) puppet.Inventory.CreateItems(item, 0, 1);
+    const GEInt stack = (hasInv && item.IsValid()) ? puppet.Inventory.FindStackIndex(item) : -1;
     const Entity spell = stack >= 0 ? puppet.Inventory.GetTemplateItem(stack).Item.GetSpell() : Entity();
     Entity target = ByGuid(note.target);
     Pending p;
-    p.owner = puppetBody;
+    Guid(puppetBody, p.ownerGuid);
     p.netId = note.netId;
     std::memcpy(p.target, note.target, 16);
     strncpy_s(p.spellItem, note.spellItem, _TRUNCATE);
     strncpy_s(p.spawn, note.spawn, _TRUNCATE);
     p.since = GetTickCount();
-    if (spell.GetInstance() && target.GetInstance()) {
+    if (hasInteraction && spell.GetInstance() && target.GetInstance()) {
+        const Entity previousSpell = puppet.Interaction.GetSpell();
         puppet.Interaction.SetSpell(spell);
         GetScriptAdminExt().CallScript(bCString("MagicSummon"), puppetBody, target.GetInstance(), stack);
+        puppet.Interaction.SetSpell(previousSpell);
         ++replayed;
     } else {
         // No target here (out of this machine's range) or no spell: the summon's template where the caster's was.
         Entity copy = Entity::Spawn(Template(note.spawn), body::Pose(*puppetBody, note.position, note.rotation));
-        if (copy.GetInstance()) {
+        if (copy.GetInstance() && copy.GetInstance()->GetPropertySet(eEPropertySetType_Interaction)) {
             copy.Interaction.SetOwner(puppet);
             if (spell.GetInstance()) copy.Interaction.SetSpell(spell);
         }
@@ -600,6 +636,7 @@ void OnSummon(uint8_t from, net::SummonNote const& note)
     }
     pending.push_back(p);
     watchUntil = GetTickCount() + 4000;
+    watchActive = true;
     Logf("summon: net %08X from player %u: %s (%s) target=%s", note.netId, from, note.spawn, note.spellItem, NameOf(target));
 }
 }
@@ -614,9 +651,6 @@ bool HitBlocked(eCEntity const* entity)
     if (!net::IsHost()) {
         for (CreatureCopy const& copy : creatureCopyList)
             if (copy.ownerPlayer != net::LocalId() && !std::memcmp(copy.guid, guid, 16)) return true;
-    } else {
-        for (auto const& creature : hostCreatures)
-            if (creature.ownerPlayer == 0 && !std::memcmp(creature.guid, guid, 16)) return true;
     }
     return false;
 }
@@ -631,12 +665,14 @@ void OnWorldChange()
     creatureCopyList.clear();
     hostCreatures.clear();
     creatureJoins = 0;
+    watchUntil = 0;
+    watchActive = false;
 }
 
 void CaptureCacheInventory()
 {
     const auto count = pending.size() + known.size() + lateCopies.size() + creatureCopyList.size() + hostCreatures.size();
-    void const* first = pending.empty() ? nullptr : pending.front().owner;
+    void const* first = pending.empty() ? nullptr : pending.data();
     if (!first && !known.empty()) first = known.data();
     if (!first && !lateCopies.empty()) first = lateCopies.data();
     if (!first && !creatureCopyList.empty()) first = creatureCopyList.data();
@@ -644,7 +680,11 @@ void CaptureCacheInventory()
     crashlog::CacheObjects(crashlog::CacheKind::Summons, static_cast<uint32_t>(count), first);
 }
 
-void WatchHits() { watchUntil = GetTickCount() + 4000; }
+void WatchHits()
+{
+    watchUntil = GetTickCount() + 4000;
+    watchActive = true;
+}
 
 // P6: a hailstorm's copy spawns its weather (Wth_Hailstorm, the copy's Interaction user) at Entity::GetPlayer and its states
 // pull it there every 400 ms: on the other PC the hail fell around that PC's own hero (re/findings/p6-magic-b.md). Each
@@ -686,33 +726,45 @@ void Tick()
             }
         }
         for (auto it = hostCreatures.begin(); it != hostCreatures.end();) {
-            if (!ByGuid(it->guid).GetInstance()) {
+            Entity creature = ByGuid(it->guid);
+            eCEntity* creatureInstance = creature.GetInstance();
+            const bool ownerDisconnected = it->ownerPlayer > 1 && !net::PeerJoined(it->ownerPlayer) &&
+                                           !remote::PuppetOf(it->ownerPlayer);
+            const bool loadedDead = creatureInstance &&
+                creatureInstance->GetPropertySet(eEPropertySetType_ScriptRoutine) && creature.IsDead();
+            const bool confirmedGone = !creatureInstance &&
+                (journal::RecordedDeath(it->guid) || npcs::IsDespawned(it->guid) || ownerDisconnected);
+            if (loadedDead || confirmedGone) {
                 net::SummonNote gone = *it;
                 gone.op = net::SummonGone;
                 net::SendSummon(gone);
+                npcs::detail::ForgetSummon(it->guid);
                 it = hostCreatures.erase(it);
-            } else {
-                Entity creature = ByGuid(it->guid);
-                const uint8_t owner = npcs::CompanionOwner(creature.GetInstance());
-                if (!owner && it->ownerPlayer > 1 && !net::PeerJoined(it->ownerPlayer) &&
-                    !remote::PuppetOf(it->ownerPlayer)) {
-                    creature.Kill();
-                    net::SummonNote gone = *it;
-                    gone.op = net::SummonGone;
-                    net::SendSummon(gone);
-                    it = hostCreatures.erase(it);
-                    continue;
-                }
-                if (!owner) { ++it; continue; }
-                const bool changed = owner != it->ownerPlayer;
-                it->ownerPlayer = owner;
-                eCEntity* leader = owner == 1 ? remote::ControlledBody() : remote::PuppetOf(owner);
-                if (creature.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
-                    creature.Party.GetPartyLeader().GetInstance() != leader)
-                    creature.Party.SetPartyLeader(Entity(leader));
-                if (owner && (joined || changed)) net::SendSummon(*it);
-                ++it;
+                continue;
             }
+            if (!creatureInstance) {
+                ++it;
+                continue;
+            }
+            const uint8_t owner = npcs::CompanionOwner(creatureInstance);
+            if (!owner && ownerDisconnected) {
+                creature.Kill();
+                net::SummonNote gone = *it;
+                gone.op = net::SummonGone;
+                net::SendSummon(gone);
+                npcs::detail::ForgetSummon(it->guid);
+                it = hostCreatures.erase(it);
+                continue;
+            }
+            if (!owner) { ++it; continue; }
+            const bool changed = owner != it->ownerPlayer;
+            it->ownerPlayer = owner;
+            eCEntity* leader = ResolveOwnerActor(owner);
+            if (creatureInstance->GetPropertySet(eEPropertySetType_Party) &&
+                creature.Party.GetPartyLeader().GetInstance() != leader)
+                creature.Party.SetPartyLeader(Entity(leader));
+            if (owner && (joined || changed)) net::SendSummon(*it);
+            ++it;
         }
     }
     if (weatherFollow && !known.empty()) FollowWeather();

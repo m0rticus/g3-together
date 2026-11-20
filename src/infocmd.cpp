@@ -233,7 +233,7 @@ void Apply(net::WorldState const& s, uint8_t from)
         if (!net::IsHost()) return;
         const uint8_t player = s.guard ? s.guard : from;
         if (player != from || player >= net::MaxPlayers) return;
-        Fight f{{}, player, s.routine, net::Now() + 15000, net::JoinCount()};
+        Fight f{{}, player, s.routine, net::Now() + 15000, net::PeerGeneration(player)};
         std::memcpy(f.attacker, s.guid, 16);
         fights.push_back(f);
         return;
@@ -311,7 +311,7 @@ void OnWorldState(uint8_t from, net::WorldState const& s)
         if (downed::Terminal()) return;
         downed::NoteReviveSent(s.guard, helpSequence);
     }
-    if (net::IsHost() && s.kind != 3 && s.kind != 16) net::SendWorldState(s, from);  // pass it on to everyone else
+    if (net::IsHost() && s.kind != 3 && s.kind != 10 && s.kind != 16) net::SendWorldState(s, from);  // pass it on to everyone else
     Apply(s, from);
 }
 } // namespace
@@ -339,16 +339,30 @@ void Observe(gCScriptProcessingUnit* spu)
     Entity owner(self);
     PSInfoScriptCommand command;
     bool waitingForScript = false;
+    gCInfo_PS const* currentInfo = nullptr;
     if (owner.GetInstance() && owner.GetInstance()->GetPropertySet(eEPropertySetType_InfoManager)) {
         command = owner.InfoManager.GetCurrentCommand();
         waitingForScript = owner.InfoManager.IsWaitingforScript() != GEFalse;
+        currentInfo = static_cast<gCInfoManager_PS*>(
+            owner.GetInstance()->GetPropertySet(eEPropertySetType_InfoManager))->GetCurrentInfo();
     }
     if (!command.IsValid()) {
         Entity worldEntity = Entity::GetWorldEntity();
         command = worldEntity.InfoManager.GetCurrentCommand();
         waitingForScript = worldEntity.InfoManager.IsWaitingforScript() != GEFalse;
+        if (auto* mgr = worldEntity.GetInstance()
+                ? static_cast<gCInfoManager_PS*>(worldEntity.GetInstance()->GetPropertySet(eEPropertySetType_InfoManager))
+                : nullptr)
+            currentInfo = mgr->GetCurrentInfo();
     }
-    if (!command.IsValid()) return;
+    if (currentInfo != stats.lastInfo) {
+        stats.lastInfo = currentInfo;
+        stats.lastKey.clear();
+    }
+    if (!command.IsValid()) {
+        stats.lastKey.clear();
+        return;
+    }
     const Entity e1 = command.GetEntity1(), e2 = command.GetEntity2();
     if (!waitingForScript && flags.sharing && net::Connected()) {
         reputation::DialogRepMutation repMutation{};
@@ -445,7 +459,10 @@ void Tick()
         story::FlushReputation();
     }
     if (gCSession::GetInstance().IsGameRunning()) {
-        if (auto* mgr = gCInfoManager_PS::GetInstance(); !mgr || !mgr->AccessIsRunning()) stats.lastKey.clear();
+        if (auto* mgr = gCInfoManager_PS::GetInstance(); !mgr || !mgr->AccessIsRunning()) {
+            stats.lastKey.clear();
+            stats.lastInfo = nullptr;
+        }
     }
     TrackLocalDialogAndProgression();
     if (!fights.empty()) StartFights();

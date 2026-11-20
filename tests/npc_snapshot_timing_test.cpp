@@ -212,4 +212,33 @@ int main()
     Feed(combatNpc, combatPos, rotation, combatNow, combatNow + 15, 2, motion);
     Sample(combatNpc, combatNow + 15, shown, turn, -PlaybackDelay(combatNpc), true, &presentation);
     assert(PlaybackDelay(combatNpc) == NpcBufferFloor);
+
+    // 10 Hz predictive track initializes cadenceWindowAt on its first interval instead of underestimating 50 ms.
+    Track pred10Hz;
+    Feed(pred10Hz, combatPos, rotation, 10000, 10010, 2, motion);
+    Feed(pred10Hz, combatPos, rotation, 10100, 10110, 2, motion);
+    assert(PlaybackDelay(pred10Hz) >= 200);
+
+    // Sample with nullptr Presentation safely omits motion interpolation without dereferencing null.
+    assert(Sample(combatNpc, combatNow + 15, shown, turn, -PlaybackDelay(combatNpc), false, nullptr));
+
+    // Position teleport soft-resets ring/render state while preserving clock offset and counters;
+    // clock stalls (> RestartAfter) drop stale offset while preserving cumulative counters.
+    Track teleportTrack;
+    teleportTrack.predictive = false;
+    SetPoseInterval(teleportTrack, 16);
+    float tpPos[3] = {100.0f, 0.0f, 0.0f};
+    Feed(teleportTrack, tpPos, rotation, 1000, 1020, 2, motion);
+    tpPos[0] = 102.0f;
+    Feed(teleportTrack, tpPos, rotation, 1016, 1036, 2, motion);
+    assert(teleportTrack.haveOffset && teleportTrack.offset == 20);
+    const uint32_t gapsBefore = teleportTrack.gapCount;
+    tpPos[0] = 2500.0f;
+    Feed(teleportTrack, tpPos, rotation, 1016, 1036, 2, motion); // !span teleport
+    assert(teleportTrack.serial == 2 && teleportTrack.count == 1 && teleportTrack.haveOffset && teleportTrack.offset == 20);
+    assert(teleportTrack.gapCount == gapsBefore);
+    tpPos[0] = 2502.0f;
+    Feed(teleportTrack, tpPos, rotation, 3500, 3580, 2, motion); // > RestartAfter clock stall
+    assert(teleportTrack.serial == 3 && teleportTrack.count == 1 && teleportTrack.offset == 80);
+    assert(teleportTrack.gapCount == gapsBefore);
 }

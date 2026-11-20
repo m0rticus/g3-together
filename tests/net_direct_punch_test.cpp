@@ -472,16 +472,34 @@ void TestClientDirectFallbackToSteamRelay()
     assert(connectAddresses.size() == 2);
     assert(connectAddresses[1].host == 0x0100007fu && connectAddresses[1].port == 29999);
 
-    // Once connected over relay, Reconnect stays on relay (since directFailed is sticky) and resets activity state;
-    // Stop clears directSessions cleanly.
+    // Once connected over relay, Reconnect stays on relay (since directFailed is sticky) and resets
+    // activity and everConnected state; Stop clears directSessions cleanly.
     connected = true;
+    everConnected = true;
     activitySent = true;
     Reconnect([](char const*) {});
-    assert(!connected && !activitySent);
+    assert(!connected && !activitySent && !everConnected);
     assert(connectAddresses.size() == 3);
     assert(connectAddresses[2].host == 0x0100007fu && connectAddresses[2].port == 29999);
     Stop();
     assert(directSessions[0].account == 0);
+
+    // Case B1: SyncDirectSessions starts DirectPunchTimeoutMs only once offer.ready becomes true.
+    fakeNow = 30000;
+    socketSent.clear();
+    fakeDirectOffers.clear();
+    offer.ready = false;
+    fakeDirectOffers.push_back(offer);
+    assert(Start(true));
+    SyncDirectSessions(fakeNow);
+    fakeNow += 2000;
+    offer.ready = true;
+    fakeDirectOffers[0] = offer;
+    SyncDirectSessions(fakeNow);
+    assert(!socketSent.empty());
+    Stop();
+    fakeDirectOffers.clear();
+    fakeDirectOffers.push_back(offer);
 
     // Case B: Direct UDP verified, but ConnectTransportHost fails immediately -> immediate fallback to Steam relay in same Tick!
     fakeNow = 40000;
@@ -583,6 +601,101 @@ void TestMsgGoodsValidationBeforeRelay()
     peers[2] = peers[3] = nullptr;
     Stop();
 }
+
+void TestMessageBoundsReliabilityAndReturnValues()
+{
+    using namespace g3t::net;
+    using namespace g3t::net::internal;
+
+    fakeNow = 70000;
+    peerSent.clear();
+    pendingEvents.clear();
+    fakeDirectOffers.clear();
+    fakeHostGeneration = 0;
+
+    assert(Start(true));
+    worldEpoch = 9;
+    for (uint8_t slot = 2; slot <= 2; ++slot) {
+        ENetPeer* p = &fakePeersStorage[slot];
+        p->state = ENET_PEER_STATE_CONNECTED;
+        p->address = {0x0100007fu, 30001};
+        p->data = reinterpret_cast<void*>(uintptr_t(slot));
+        peers[slot] = p;
+        peerAccounts[slot] = 2001ull;
+        peerRelayGenerations[slot] = 77ull;
+        clientInWorld[slot] = true;
+        ResetBudget(p);
+    }
+
+    static unsigned sWorldStates = 0, sShots = 0, sSummons = 0, sTalks = 0;
+    sWorldStates = sShots = sSummons = sTalks = 0;
+    SetWorldStateHandler([](uint8_t, WorldState const&) { ++sWorldStates; });
+    SetShotHandler([](uint8_t, ShotNote const&) { ++sShots; });
+    SetSummonHandler([](uint8_t, SummonNote const&) { ++sSummons; });
+    SetTalkHandler([](uint8_t, bool, uint8_t const*) { ++sTalks; });
+
+    auto deliverFrom2 = [&](void const* data, size_t size, enet_uint32 flags) {
+        ENetEvent ev{};
+        ev.type = ENET_EVENT_TYPE_RECEIVE;
+        ev.peer = peers[2];
+        ev.channelID = ChannelReliable;
+        ev.packet = enet_packet_create(data, size, flags);
+        pendingEvents.push_back(ev);
+        PlayerState local{};
+        Tick(local, false);
+    };
+
+    // Unreliable MsgTalk / MsgSummon rejected; NaN floats in MsgWorldState(moved=1), MsgShot, MsgSummon rejected.
+    TalkMsg talk{MsgTalk, 1, {}};
+    deliverFrom2(&talk, sizeof(talk), 0);
+    assert(sTalks == 0);
+
+    WorldStateMsg ws{MsgWorldState, {}};
+    ws.state.kind = 1;
+    ws.state.moved = 1;
+    ws.state.position[0] = std::numeric_limits<float>::quiet_NaN();
+    deliverFrom2(&ws, sizeof(ws), ENET_PACKET_FLAG_RELIABLE);
+    assert(sWorldStates == 0);
+
+    ShotMsg shot{MsgShot, 2, {}};
+    shot.note.epoch = worldEpoch;
+    shot.note.velocity = std::numeric_limits<float>::infinity();
+    deliverFrom2(&shot, sizeof(shot), 0);
+    assert(sShots == 0);
+
+    SummonMsg summon{MsgSummon, 2, {}};
+    summon.note.op = SummonSpawned;
+    summon.note.epoch = worldEpoch;
+    deliverFrom2(&summon, sizeof(summon), 0);
+    assert(sSummons == 0);
+    summon.note.position[1] = std::numeric_limits<float>::quiet_NaN();
+    deliverFrom2(&summon, sizeof(summon), ENET_PACKET_FLAG_RELIABLE);
+    assert(sSummons == 0);
+
+    // SendHitPlayer(0, ...) ignores slot 0; SendOffer works cleanly without UB; SendContents propagates Send result.
+    peerSent.clear();
+    uint8_t zero[16] = {};
+    SendHitPlayer(0, -10, zero, 0, false);
+    assert(peerSent.empty());
+    OfferNote offer{};
+    offer.seller = 2;
+    assert(SendOffer(offer));
+    assert(peerSent.size() == 1 && peerSent[0].bytes[0] == MsgOffer);
+
+    // SendContainerTx returns false when disconnected on client.
+    isHost = false;
+    connected = false;
+    ContentEntry ce{};
+    assert(!SendContainerTx(zero, 1, &ce, 1));
+    isHost = true;
+
+    SetWorldStateHandler(nullptr);
+    SetShotHandler(nullptr);
+    SetSummonHandler(nullptr);
+    SetTalkHandler(nullptr);
+    peers[2] = nullptr;
+    Stop();
+}
 } // namespace
 
 int main()
@@ -590,5 +703,6 @@ int main()
     TestDirectPunchRoleValidationAndEndpointLock();
     TestClientDirectFallbackToSteamRelay();
     TestMsgGoodsValidationBeforeRelay();
+    TestMessageBoundsReliabilityAndReturnValues();
     return 0;
 }

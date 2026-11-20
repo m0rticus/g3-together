@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npclease_internal.h"
-#include "npclease_save.h"
 #include "npclease_presentation.h"
 #define G3T_NPCLEASE_NATIVE_RUNTIME
 #include "npclease_admission.h"
@@ -31,12 +30,10 @@
 #include <Windows.h>
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace g3t::npclease {
 namespace detail {
@@ -117,20 +114,21 @@ void Refusal(GuidKey const& key, char const* name, char const* reason)
     guid::Format(key.data(), text, sizeof(text));
     Logf("npclease: admission-refused guid=%s name=%s reason=%s", text, name, reason);
 }
-void OwnEvent(GuidKey const& key, char const* name, npcown::Event event, char const* detail)
+void LogOwnEvent(GuidKey const& key, char const* name, npcown::Event event, char const* detail)
 {
-    if (!transitions.Changed(key, event)) return;
     char text[40], line[420];
     guid::Format(key.data(), text, sizeof(text));
     npcown::FormatEvent(line, sizeof(line), text, name, event, detail);
     Log(line);
 }
+void OwnEvent(GuidKey const& key, char const* name, npcown::Event event, char const* detail)
+{
+    if (!transitions.Changed(key, event)) return;
+    LogOwnEvent(key, name, event, detail);
+}
 void OwnEventAlways(GuidKey const& key, char const* name, npcown::Event event, char const* detail)
 {
-    char text[40], line[420];
-    guid::Format(key.data(), text, sizeof(text));
-    npcown::FormatEvent(line, sizeof(line), text, name, event, detail);
-    Log(line);
+    LogOwnEvent(key, name, event, detail);
     const auto found = entries.find(key);
     telemetry::OnLeaseEvent(npcown::Name(event), 0, net::LocalId(), key.data(), nullptr,
                             found != entries.end() ? found->second.lease.epoch : 0u,
@@ -204,22 +202,31 @@ void ReceiveClient(Message const& note)
 {
     const auto key = Key(note.guid);
     const uint32_t now = net::Now();
+    const uint32_t echoNow = now ? now : 1;
     if (note.kind == Kind::Offer) {
         // Client-first: the NPC already runs natively here; an Offer only attaches the host epoch. Never Import or Stop.
         if (!GetConfig().npcAuthorityFallback || note.owner != net::LocalId() ||
             Reached(now + LeaseSafetyMs, note.echo + note.duration)) { ++refused; return; }
         auto it = entries.find(key);
-        if (it == entries.end() || !it->second.local || it->second.cut ||
-            (it->second.lease.epoch && !Newer(note.epoch, it->second.lease.epoch))) {
-            ++refused; return;
-        }
+        if (it == entries.end() || !it->second.local || it->second.cut) { ++refused; return; }
         Entry& entry = it->second;
+        const uint32_t epochFloor = (entry.hasBaseline && note.incarnation == entry.lease.incarnation)
+            ? (entry.highestEpoch ? entry.highestEpoch : entry.lease.epoch)
+            : 0u;
+        if (epochFloor && !Newer(note.epoch, epochFloor)) { ++refused; return; }
         eCEntity* entity = npcs::NpcByGuid(note.guid);
         if (!entity || !Eligible(entity)) { ++refused; return; }
         if (!entry.window.Prepare(note.epoch, note.echo, note.duration, now)) { ++refused; return; }
+        if (entry.hasBaseline && note.incarnation != entry.lease.incarnation) {
+            entry.lease.state.effects = 0;
+            entry.hasPresentationFloor = false;
+            entry.presentationFloor = 0;
+            entry.highestEpoch = 0;
+        }
         entry.prepared = true; entry.committed = false; entry.confirmed = false;
         entry.lease.owner = note.owner; entry.lease.generation = note.generation;
         entry.lease.incarnation = note.incarnation; entry.lease.epoch = note.epoch;
+        if (Newer(note.epoch, entry.highestEpoch)) entry.highestEpoch = note.epoch;
         entry.lease.revision = note.revision; entry.lease.phase = Phase::Client;
         entry.hasBaseline = true;
         entry.offeredState = note.state;
@@ -232,7 +239,7 @@ void ReceiveClient(Message const& note)
              note.state.defeated});
         if (!entry.hasOfferedState) { entry.vetted = true; entry.vettedInSession = true; }
         entry.localDeadline = note.echo + note.duration - LeaseSafetyMs;
-        entry.echo = now; entry.hostSeenAt = now;
+        entry.echo = echoNow; entry.hostSeenAt = now;
         PublishGuard(key, entry);
         Send(key, entry, Kind::Prepared);
         return;
@@ -246,25 +253,28 @@ void ReceiveClient(Message const& note)
         ReleaseLocal(key, entry, entity, true);
         entry.vettedInSession = false;
         entry.handbackUntil = 0;
-        entry.yieldedAt = now ? now : 1;
-        entry.retryAt = (now ? now : 1) + 5000;
+        entry.yieldedAt = echoNow;
+        entry.retryAt = echoNow + 5000;
         OwnEvent(key, entry.lease.state.name, npcown::Event::Refused, "reason=host rejected lease request");
         return;
     }
     if (note.kind == Kind::Commit && note.owner == 1 && note.world == entry.world &&
         note.incarnation == entry.lease.incarnation && Newer(note.epoch, entry.lease.epoch) &&
+        (!entry.highestEpoch || Newer(note.epoch, entry.highestEpoch)) &&
         (entry.cut || entry.local || entry.lease.phase == Phase::Host)) {
         const bool wasCut = entry.cut;
         eCEntity* entity = npcs::NpcByGuid(note.guid);
         ReleaseLocal(key, entry, entity, !wasCut);
-        entry.lease.epoch = note.epoch; entry.lease.owner = 1; entry.lease.phase = Phase::Host;
+        entry.lease.epoch = note.epoch;
+        if (Newer(note.epoch, entry.highestEpoch)) entry.highestEpoch = note.epoch;
+        entry.lease.owner = 1; entry.lease.phase = Phase::Host;
         entry.lease.generation = note.generation;
         entry.lease.state = note.state; entry.lease.revision = note.revision;
         entry.presentationFloor = note.echo;
         entry.hasPresentationFloor = true;
-        entry.yieldedAt = now ? now : 1;
+        entry.yieldedAt = echoNow;
         entry.window.Reset(note.epoch);
-        entry.echo = now;
+        entry.echo = echoNow;
         PublishGuard(key, entry);
         Send(key, entry, Kind::Ack);
         ++ownTotals.handBacks;
@@ -286,7 +296,7 @@ void ReceiveClient(Message const& note)
                     entry.lease.state = entry.offeredState;
                     eCEntity* entity = npcs::NpcByGuid(note.guid);
                     ready = entity && NativeReady(entity) && Activate(entity, entry, note.guid);
-                    if (!ready) entry.ownedEntity = nullptr;
+                    entry.ownedEntity = ready ? entity : nullptr;
                 }
             }
             entry.window.Commit(note.epoch, now); // telemetry only; ownership never depends on the window
@@ -295,14 +305,14 @@ void ReceiveClient(Message const& note)
             entry.hostSeenAt = now;
             combat_hostility::OnClientLeaseConfirmed(note.guid);
             if (locallyDead && ++entry.lease.revision != 0) {
-                entry.echo = now;
+                entry.echo = echoNow;
                 if (Send(key, entry, Kind::State)) { entry.lastState = now; ++stateSent; }
             }
             char detail[80];
             std::snprintf(detail, sizeof(detail), "epoch=%u life=%u", entry.lease.epoch, entry.lease.incarnation);
             OwnEvent(key, entry.lease.state.name, npcown::Event::Confirmed, detail);
         }
-        entry.echo = now;
+        entry.echo = echoNow;
         Send(key, entry, Kind::Ack);
     } else if (note.kind == Kind::Renew) {
         if (!entry.local || entry.cut || !entry.confirmed) { ++refused; return; }
@@ -310,11 +320,8 @@ void ReceiveClient(Message const& note)
         entry.hostSeenAt = now;
         entry.silentLogged = false;
         entry.lease.state.effects |= note.state.effects;
-    } else if (note.kind == Kind::Recall) {
-        if (!entry.recallAt) entry.recallAt = now ? now : 1;
     } else if (note.kind == Kind::Abort) {
         // The host could not keep its side of the offer: keep running natively and retry the handshake later.
-        Send(key, entry, Kind::Ack);
         entry.prepared = false; entry.confirmed = false; entry.recallAt = 0;
         entry.window.Reset(0);
         entry.lease.epoch = 0;
@@ -366,19 +373,24 @@ char const* TakeOver(eCEntity* entity, GuidKey const& key, uint32_t now)
     if (!npcown::AcquisitionTimely(npcs::HostStreamDelay(), net::RoundTrip(1)))
         return "host stream stale; authority unknown";
     Entry& entry = entries[key];
-    const uint8_t priorEffects = entry.lease.state.effects;
-    Checkpoint state;
-    if (!CaptureNative(entity, state)) return "native checkpoint invalid";
-    state.effects |= priorEffects;
+    uint32_t inc = npcs::Incarnation(key.data());
+    if (!inc) inc = 1;
     if (entry.world != net::WorldEpoch() || entry.welcome != net::WelcomeSerial()) {
         entry.vettedInSession = false;
         entry.handbackUntil = 0;
+        entry.highestEpoch = 0;
     }
+    const bool sameLife = entry.hasBaseline && entry.lease.incarnation == inc &&
+        entry.world == net::WorldEpoch() && entry.welcome == net::WelcomeSerial();
+    const uint8_t priorEffects = sameLife ? entry.lease.state.effects : 0;
+    if (!sameLife) entry.highestEpoch = 0;
+    Checkpoint state;
+    if (!CaptureNative(entity, state)) return "native checkpoint invalid";
+    state.effects |= priorEffects;
     entry.world = net::WorldEpoch(); entry.welcome = net::WelcomeSerial();
     entry.handbackUntil = 0;
     entry.lease.state = state; entry.lease.owner = net::LocalId();
-    entry.lease.incarnation = npcs::Incarnation(key.data());
-    if (!entry.lease.incarnation) entry.lease.incarnation = 1;
+    entry.lease.incarnation = inc;
     entry.lease.epoch = 0; entry.lease.revision = 0; entry.lease.generation = 0;
     entry.lease.phase = Phase::Client;
     entry.lease.started = now;
@@ -552,6 +564,12 @@ void MaintainOwners(uint32_t now)
                 std::snprintf(detail, sizeof(detail), "reason=%s stream_age_ms=%u local state discarded; host stream applies",
                     release, age == UINT32_MAX ? 0u : age);
                 OwnEventAlways(key, entry.lease.state.name, npcown::Event::Yielded, detail);
+            } else if (facts.role.removed) {
+                ReleaseLocal(key, entry, entity, true);
+                entry.yieldedAt = now ? now : 1;
+                ++ownTotals.yields;
+                OwnEventAlways(key, entry.lease.state.name, npcown::Event::Yielded,
+                    "reason=authored removal local state discarded");
             } else CutToHost(key, entry, entity, &state, release, now);
             continue;
         }
@@ -569,7 +587,7 @@ void MaintainOwners(uint32_t now)
                 Log("FAIL npclease: revision exhausted; NPC released to the host stream");
                 continue;
             }
-            entry.echo = now;
+            entry.echo = now ? now : 1;
             if (event && entry.confirmed)
                 Diagnostic("state-event", key, entry, "native HP/life/attitude/status changed; owner unchanged");
             if (entry.confirmed) { if (Send(key, entry, Kind::State)) { entry.lastState = now; ++stateSent; } }
@@ -577,7 +595,7 @@ void MaintainOwners(uint32_t now)
         }
         // Handshake with the host: asynchronous, backed off, never a precondition for animating or reacting.
         if (!entry.confirmed && !entry.prepared && now - entry.lastRequest >= entry.requestEvery) {
-            entry.echo = now;
+            entry.echo = now ? now : 1;
             if (Send(key, entry, Kind::Adopt)) {
                 entry.lastRequest = now;
                 entry.requestEvery = std::min<uint32_t>(entry.requestEvery * 2, 8000);
@@ -585,7 +603,7 @@ void MaintainOwners(uint32_t now)
         }
         if (entry.prepared && Reached(now, entry.localDeadline) && !entry.confirmed) {
             entry.prepared = false;
-            entry.lease.epoch = 0; entry.window.Reset(0);
+            entry.window.Reset(entry.lease.epoch);
             entry.lastRequest = 0;
             Diagnostic("prepare-expired", key, entry, "late commit; client keeps running natively and retries the handshake");
         }
@@ -607,7 +625,8 @@ void ScanClient(uint32_t now)
 {
     static uint32_t lastWorldEntries = 0;
     if (ai::ShuttingDown() || persist::NativeLoading() || persist::HeroPending() ||
-        !gCSession::GetInstance().IsGameRunning() || !remote::ControlledBody() || installFailed) return;
+        !gCSession::GetInstance().IsGameRunning() || gCSession::GetInstance().IsPaused() ||
+        !remote::ControlledBody() || !net::Connected() || !net::WorldEpoch() || installFailed) return;
     const uint32_t entriesNow = net::WorldEntryCount();
     if (entriesNow != lastWorldEntries) {
         lastWorldEntries = entriesNow;
@@ -646,7 +665,7 @@ void ScanClient(uint32_t now)
         facts.hostReleasePending = npcs::HostReleasePending(key.data());
         facts.settled = settled;
         facts.cooldownHeld = found != entries.end() && npcown::CooldownHeld(now, found->second.yieldedAt);
-        facts.alreadyOwned = found != entries.end() && found->second.local && found->second.ownedEntity == entity;
+        facts.alreadyOwned = found != entries.end() && found->second.local;
         const auto decision = npcown::Decide(facts);
         switch (decision.verdict) {
         case npcown::Verdict::Excluded:

@@ -28,6 +28,18 @@ using detail::recentJudge;
 using detail::SafeEntityName;
 using schema::QuestStatusLabel;
 
+bool TryRecentJudgeForVictim(eCEntity* victim, uint32_t now, uint32_t windowMs,
+                              eCEntity*& attacker, char const*& fallbackAttackerName)
+{
+    if (victim && recentJudge.victim.GetEntity() == victim &&
+        static_cast<uint32_t>(now - recentJudge.atMs) <= windowMs) {
+        attacker = recentJudge.attacker.GetEntity();
+        fallbackAttackerName = recentJudge.attackerName;
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 void NoteCombatJudge(char const* script, eCEntity* victim, eCEntity* attacker, eCEntity* source, int hpBefore)
@@ -43,7 +55,7 @@ void NoteCombatJudge(char const* script, eCEntity* victim, eCEntity* attacker, e
     if (victim && (victim == gCSession::GetInstance().GetHero() || victim == remote::ControlledBody())) {
         char detailText[96];
         Format(detailText, "%s(hp_before=%d,weapon=%s)", recentJudge.script, hpBefore, recentJudge.sourceName);
-        lastCombatCause.Record(LastTelemetrySeq() + 1, now, "combat_judge",
+        lastCombatCause.Record(LastTelemetrySeq(), now, "combat_judge",
                                recentJudge.attackerName, SafeEntityName(victim), detailText);
     }
 }
@@ -53,11 +65,7 @@ void OnCombatHit(char const* path, eCEntity* attacker, eCEntity* victim, eCEntit
 {
     const uint32_t now = NowMs();
     char const* fallbackAttackerName = nullptr;
-    if (!attacker && victim && recentJudge.victim.GetEntity() == victim &&
-        static_cast<uint32_t>(now - recentJudge.atMs) <= 250) {
-        attacker = recentJudge.attacker.GetEntity();
-        fallbackAttackerName = recentJudge.attackerName;
-    }
+    if (!attacker) TryRecentJudgeForVictim(victim, now, 250, attacker, fallbackAttackerName);
     Event ev;
     ev.kv.Str("path", path ? path : "hit").Int("delta", delta).TransitionInt("hp", hpBefore, hpAfter)
       .Str("outcome", OutcomeLabel(outcome)).Str("reaction", ReactionLabel(reaction))
@@ -119,9 +127,7 @@ void OnGroundHit(eCEntity* victim, eCEntity* attacker, char const* entry, int be
     char resolvedVia[32] = "direct";
     char const* fallbackAttackerName = nullptr;
     if (!attacker && victim) {
-        if (recentJudge.victim.GetEntity() == victim && static_cast<uint32_t>(now - recentJudge.atMs) <= 300) {
-            attacker = recentJudge.attacker.GetEntity();
-            fallbackAttackerName = recentJudge.attackerName;
+        if (TryRecentJudgeForVictim(victim, now, 300, attacker, fallbackAttackerName)) {
             Format(resolvedVia, "judge:%s", recentJudge.script);
         } else if (victim->GetPropertySet(eEPropertySetType_NPC)) {
             if (eCEntity* cur = Entity(victim).NPC.GetCurrentAttacker().GetInstance()) {

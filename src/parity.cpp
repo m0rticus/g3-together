@@ -44,12 +44,11 @@ std::string Lower(std::string text)
 }
 
 // The file's bytes; a missing file adds a marker instead, so "missing" differs from "empty".
-void AddFile(Fnv& fnv, std::string const& path)
+void AddFile(Fnv& fnv, std::string const& path, std::vector<unsigned char>& buffer)
 {
     HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) { fnv.Add("<missing>"); return; }
-    std::vector<unsigned char> buffer(1 << 18);
     DWORD read = 0;
     while (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read) fnv.Add(buffer.data(), read);
     CloseHandle(file);
@@ -135,17 +134,18 @@ void Compute()
 {
     const DWORD began = GetTickCount();
     const std::string dir = GameDir();
+    std::vector<unsigned char> buffer(1 << 18);
     char const* const dlls[] = {"Game.dll", "Script.dll", "Engine.dll"};
-    for (int i = 0; i != 3; ++i) { Fnv fnv; AddFile(fnv, dir + "\\" + dlls[i]); items[GameDll + i] = fnv.value; }
+    for (int i = 0; i != 3; ++i) { Fnv fnv; AddFile(fnv, dir + "\\" + dlls[i], buffer); items[GameDll + i] = fnv.value; }
 
     Fnv scripts;
-    for (auto const& f : FilesIn(dir + "\\scripts", "*.dll")) { scripts.Add(f.name.c_str()); AddFile(scripts, dir + "\\scripts\\" + f.name); }
+    for (auto const& f : FilesIn(dir + "\\scripts", "*.dll")) { scripts.Add(f.name.c_str()); AddFile(scripts, dir + "\\scripts\\" + f.name, buffer); }
     items[ScriptsFolder] = scripts.value;
 
     Fnv rules, other;
     for (auto const& f : FilesIn(dir + "\\Data", "*")) {
-        if (IsRulesArchive(f.name)) { rules.Add(f.name.c_str()); AddFile(rules, dir + "\\Data\\" + f.name); }
-        else { other.Add(f.name.c_str()); AddFile(other, dir + "\\Data\\" + f.name); }
+        if (IsRulesArchive(f.name)) { rules.Add(f.name.c_str()); AddFile(rules, dir + "\\Data\\" + f.name, buffer); }
+        else { other.Add(f.name.c_str()); AddFile(other, dir + "\\Data\\" + f.name, buffer); }
     }
     items[DataRules] = rules.value;
     items[DataOther] = other.value;

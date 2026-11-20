@@ -32,12 +32,58 @@ def function_body(source, signature):
     return None
 
 
+TRADE_POLICY_CODE = r"""
+#undef NDEBUG
+#include <cassert>
+#include "trade_policy.h"
+
+int main()
+{
+    using namespace g3t::trade_policy;
+
+    long v = 0;
+    assert(ParseDecimalLong("0", 0, 100, v) && v == 0);
+    assert(ParseDecimalLong("42", 1, 100, v) && v == 42);
+    assert(!ParseDecimalLong("", 0, 100, v));
+    assert(!ParseDecimalLong(" 42", 0, 100, v));
+    assert(!ParseDecimalLong("+42", 0, 100, v));
+    assert(!ParseDecimalLong("42abc", 0, 100, v));
+    assert(!ParseDecimalLong("101", 0, 100, v));
+
+    std::string name = "It_Sword-q1023";
+    int q = -1;
+    assert(ParseQualitySuffix(name, q) && name == "It_Sword" && q == 1023);
+    name = "It_Sword-q1024";
+    assert(!ParseQualitySuffix(name, q));
+    name = "It_Sword-q+5";
+    assert(!ParseQualitySuffix(name, q));
+
+    int id = 0;
+    assert(ParsePuppetId("puppet2", 8, id) && id == 2);
+    assert(!ParsePuppetId("puppet0", 8, id));
+    assert(!ParsePuppetId("puppet8", 8, id));
+    assert(!ParsePuppetId("puppet2x", 8, id));
+    return 0;
+}
+"""
+
+TRADE_POLICY_TARGET = _testbuild.register_target(
+    "trade_policy_parse",
+    [_testbuild.inline_unit("trade_policy_parse_test.cpp", TRADE_POLICY_CODE)],
+    msvc_vcvars=False,
+)
+
+
 class TradePolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.trade_h = _testbuild.src_text("trade.h")
         cls.trade_cpp = _testbuild.src_text("trade.cpp")
         cls.offer_cpp = _testbuild.src_text("offer.cpp")
+
+    def test_decimal_and_suffix_parsing(self):
+        result = TRADE_POLICY_TARGET.run(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_shared_classifier_is_declared_and_has_one_stack_definition(self):
         self.assertRegex(self.trade_h, r"\bTradableItem\s*\(")
@@ -115,6 +161,32 @@ class TradePolicyTests(unittest.TestCase):
         self.assertIsNotNone(take_body)
         self.assertIn("GetQuality(stack) & trade_policy::QualityMask", same_body)
         self.assertIn("GetQuality(i) & trade_policy::QualityMask", take_body)
+
+    def test_exchange_quality_mask_overflow_and_rollback_safety(self):
+        exchange_body = function_body(self.trade_cpp, r"\bbool\s+Exchange\s*\(")
+        self.assertIn("if (!inventory) return false;", exchange_body)
+        self.assertIn("GetQuality(i) & trade_policy::QualityMask", exchange_body)
+
+        read_body = function_body(self.trade_cpp, r"\bvoid\s+Read\s*\(")
+        self.assertIn("int64_t goldTotal", read_body)
+        publish_body = function_body(self.trade_cpp, r"\buint32_t\s+Publish\s*\(")
+        self.assertIn("std::min(amount, trade_policy::MaxStackAmount)", publish_body)
+
+        build_body = function_body(self.trade_cpp, r"\bbool\s+BuildExchange\s*\(")
+        self.assertIn("if (amount < 0) return false;", build_body)
+
+        tick_body = function_body(self.trade_cpp, r"\bvoid\s+Tick\s*\(")
+        self.assertIn("if (!puppetDialog && !windowOpen) partner = 0;", tick_body)
+
+        undo_body = function_body(self.offer_cpp, r"\bvoid\s+Undo\s*\(")
+        self.assertIn("Take(self, it->item, it->quality, it->amount, none, true)", undo_body)
+
+        peer_left_body = function_body(self.offer_cpp, r"\bvoid\s+OnPeerLeft\s*\(")
+        self.assertIn("it->note.seller == player && it->delivered", peer_left_body)
+        self.assertIn("sent.erase(it)", peer_left_body)
+
+        apply_body = function_body(self.offer_cpp, r"\bbool\s+Apply\s*\(")
+        self.assertIn("!inventoryHealthy", apply_body)
 
 
 if __name__ == "__main__":

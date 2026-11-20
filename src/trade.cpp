@@ -66,17 +66,24 @@ void Read(Entity& self, Content& items, int32_t& gold)
 {
     items.clear();
     gold = 0;
+    int64_t goldTotal = 0;
+    std::map<std::string, int64_t> itemTotals;
     for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
         if (!TradableStack(self, i)) continue;
+        const int amount = self.Inventory.GetAmount(i);
+        if (amount <= 0) continue;
         Entity item = self.Inventory.GetTemplateItem(i);
         if (!std::strcmp(item.GetName().GetText(), Gold)) {
-            gold += self.Inventory.GetAmount(i);
+            goldTotal += amount;
             continue;
         }
         const std::string key = StackKey(self, i);
         names[key] = item.GetName().GetText();
-        items[key] += self.Inventory.GetAmount(i);
+        itemTotals[key] += amount;
     }
+    gold = static_cast<int32_t>(std::clamp<int64_t>(goldTotal, 0, INT32_MAX));
+    for (auto const& [key, total] : itemTotals)
+        items[key] = static_cast<int>(std::min<int64_t>(total, INT32_MAX));
 }
 
 int Selected(gCInventory_PS* inventory, int stack, int amount)
@@ -107,6 +114,13 @@ void CreateMerchandise(Entity& puppet, eCTemplateEntityProxy& item, uint16_t qua
     }
 }
 
+void CreateGoldMerchandise(Entity& puppet, int amount)
+{
+    eCTemplateEntityProxy gold;
+    gold.SetEntity(bCString(Gold));
+    CreateMerchandise(puppet, gold, 0, amount);
+}
+
 void Fill(Entity& puppet, Wares const& goods)
 {
     gCInventory_PS* inventory = Inventory(puppet.GetInstance());
@@ -125,9 +139,7 @@ void Fill(Entity& puppet, Wares const& goods)
         item.SetEntity(guid::Property(raw));
         CreateMerchandise(puppet, item, trade_policy::StackQuality(key), amount);
     }
-    eCTemplateEntityProxy gold;
-    gold.SetEntity(bCString(Gold));
-    CreateMerchandise(puppet, gold, 0, goods.gold);
+    CreateGoldMerchandise(puppet, goods.gold);
     for (int i = 0; i < puppet.Inventory.GetStackCount(); ++i) {
         const auto selected = selection.find(StackKey(puppet, i));
         if (selected != selection.end() && puppet.Inventory.GetSlotFromStack(i) == gESlot_None)
@@ -148,7 +160,7 @@ void OnGoods(uint8_t player, uint64_t epochIn, uint32_t serialIn, int32_t gold, 
         goods.items[key] += entries[i].amount;
     }
     ++goodsReceived;
-    if (player == partner && !fillOff)
+    if (player == partner && (windowOpen || puppetDialog) && !fillOff)
         if (eCEntity* body = remote::PuppetOf(player)) {
             Entity puppet(body);
             Fill(puppet, goods);
@@ -200,6 +212,7 @@ bool BuildExchange(gCInventory_PS* heroInventory, gCInventory_PS* puppetInventor
         Entity entity(inventory->GetEntity());
         for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
             const int amount = Selected(inventory, i, entity.Inventory.GetAmount(i));
+            if (amount < 0) return false;
             if (!amount) continue;
             if (!TradableStack(entity, i)) return false;
             const int signedAmount = side ? amount : -amount;
@@ -382,6 +395,7 @@ uint32_t Publish()
     Read(self, items, gold);
     std::vector<net::GoodsEntry> entries;
     for (auto const& [key, amount] : items) {
+        if (amount <= 0) continue;
         if (entries.size() == net::MaxGoodsEntries) {
             if (!overflowWarned) Log("trade: inventory exceeds advertised stock capacity; remaining stacks are not offered");
             overflowWarned = true;
@@ -390,7 +404,7 @@ uint32_t Publish()
         net::GoodsEntry entry{};
         std::memcpy(entry.id, key.data(), 16);
         entry.quality = trade_policy::StackQuality(key);
-        entry.amount = amount;
+        entry.amount = std::min(amount, trade_policy::MaxStackAmount);
         strncpy_s(entry.name, names[key].c_str(), _TRUNCATE);
         entries.push_back(entry);
     }
@@ -421,9 +435,13 @@ void Tick()
     gCInfoManager_PS* infos = gCInfoManager_PS::GetInstance();
     const bool talking = infos && infos->AccessIsRunning();
     eCEntity* npc = talking ? infos->GetDialogPartnerNPC() : nullptr;
-    if (npc && remote::PuppetOwner(npc)) {
-        if (!puppetDialog) OnOpen(npc);
+    const int talkingPuppet = npc ? remote::PuppetOwner(npc) : 0;
+    if (talkingPuppet) {
+        if (!puppetDialog || partner != talkingPuppet) OnOpen(npc);
         puppetDialog = true;
+        dialogOverSince = 0;
+    } else if (talking) {
+        puppetDialog = false;
         dialogOverSince = 0;
     }
     if (puppetDialog && !talking) {
@@ -450,7 +468,8 @@ void Tick()
             if (!fillOff) Fill(puppet, received[partner]);
         }
     }
-    windowOpen = partner && trading;
+    windowOpen = partner && puppetDialog && trading;
+    if (!puppetDialog && !windowOpen) partner = 0;
     const DWORD now = GetTickCount();
     if (now - lastScan < 250) return;
     lastScan = now;
@@ -518,9 +537,7 @@ void RestoreGold(eCEntity* body, int player)
         if (item.GetInstance() && !std::strcmp(item.GetName().GetText(), Gold) && puppet.Inventory.GetSlotFromStack(i) == gESlot_None)
             puppet.Inventory.DeleteStack(i);
     }
-    eCTemplateEntityProxy gold;
-    gold.SetEntity(bCString(Gold));
-    CreateMerchandise(puppet, gold, 0, filledGold[player]);
+    CreateGoldMerchandise(puppet, filledGold[player]);
 }
 
 bool Exchange(eCEntity* body, char const* name, int amount, bool take)
@@ -533,12 +550,13 @@ bool Exchange(eCEntity* body, char const* name, int amount, bool take)
     int quality = -1;
     if (!trade_policy::ParseQualitySuffix(itemName, quality)) return false;
     gCInventory_PS* inventory = Inventory(entity.GetInstance());
+    if (!inventory) return false;
     ClearSelection(Inventory(hero));
     ClearSelection(Inventory(body));
     for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
         Entity item = entity.Inventory.GetTemplateItem(i);
         if (item.GetInstance() && itemName == item.GetName().GetText() && TradableStack(entity, i) &&
-            (quality < 0 || entity.Inventory.GetQuality(i) == static_cast<unsigned>(quality)) &&
+            (quality < 0 || (entity.Inventory.GetQuality(i) & trade_policy::QualityMask) == static_cast<unsigned>(quality)) &&
             entity.Inventory.GetAmount(i) >= amount) {
             inventory->SetTransactionAmount(i, amount);
             return BeginExchange(Inventory(hero), Inventory(body), id);

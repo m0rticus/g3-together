@@ -485,8 +485,8 @@ using PlayerSpellHandler = void (*)(uint8_t from, char const* script);
 void SetPlayerSpellHandler(PlayerSpellHandler handler);
 // A spell a player cast on NPCs another machine simulates (spells.cpp): it runs there. Any machine -> player `to`
 // (through the host). target: the NPC's GUID (zeros: the NPCs round the caster); args: the script's int argument.
-void SendNpcSpell(uint8_t to, char const* script, uint8_t const target[16], int32_t args);
-using NpcSpellHandler = void (*)(uint8_t from, char const* script, uint8_t const target[16], int32_t args);
+void SendNpcSpell(uint8_t to, char const* script, uint8_t const target[16], int32_t args, uint8_t targetPlayer = 0);
+using NpcSpellHandler = void (*)(uint8_t from, char const* script, uint8_t const target[16], int32_t args, uint8_t targetPlayer);
 void SetNpcSpellHandler(NpcSpellHandler handler);
 // Robbery (ransack.cpp; owner 24.10.: a guard robs a knocked-out partner as in single-player), reliable, through the host.
 // The machine whose NPC robs a player's puppet -> that player: RansackHold (the robber is at work: stay down, as the game

@@ -17,5 +17,6 @@ void SendRevoke(GuidKey const& key, uint8_t player);
 void RefreshCompanionIdentity();
 void OfferCompanions(uint32_t now);
 void ClaimTick(uint32_t now);
+void ForgetSummon(uint8_t const guid[16]);
 
 } // namespace g3t::npcs::detail

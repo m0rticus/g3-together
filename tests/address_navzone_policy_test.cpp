@@ -119,12 +119,13 @@ void TestClientWaitCancellation()
 {
     using namespace g3t::address_policy;
 
-    ClientWaitState ok{true, false, false, false};
+    ClientWaitState ok{true, false, false, false, false};
     assert(!ShouldCancelClientWait(ok));
-    assert(ShouldCancelClientWait(ClientWaitState{false, false, false, false}));
-    assert(ShouldCancelClientWait(ClientWaitState{true, true, false, false}));
-    assert(ShouldCancelClientWait(ClientWaitState{true, false, true, false}));
-    assert(ShouldCancelClientWait(ClientWaitState{true, false, false, true}));
+    assert(ShouldCancelClientWait(ClientWaitState{false, false, false, false, false}));
+    assert(ShouldCancelClientWait(ClientWaitState{true, true, false, false, false}));
+    assert(ShouldCancelClientWait(ClientWaitState{true, false, true, false, false}));
+    assert(ShouldCancelClientWait(ClientWaitState{true, false, false, true, false}));
+    assert(ShouldCancelClientWait(ClientWaitState{true, false, false, false, true}));
 }
 
 } // namespace

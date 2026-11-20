@@ -63,19 +63,35 @@ int Amount(Entity& self, Template const& item, unsigned quality = AnyQuality)
 
 struct Step { Template item; unsigned quality; int amount; bool created; };
 
-int Take(Entity& self, Template const& item, unsigned quality, int amount, std::vector<Step>& steps)
+Template GoldTemplate() { return Template(trade_policy::GoldTemplateName); }
+
+bool CreateStep(Entity& self, Template const& item, unsigned quality, int amount, std::vector<Step>& steps)
+{
+    if (self.Inventory.CreateItems(item, quality, amount) < 0) return false;
+    steps.push_back({item, quality, amount, true});
+    return true;
+}
+
+int Take(Entity& self, Template const& item, unsigned quality, int amount, std::vector<Step>& steps, bool allowEquipped = false)
 {
     int taken = 0;
-    for (int i = self.Inventory.GetStackCount() - 1; i >= 0 && taken < amount; --i) {
-        if (!Same(self, i, item, quality) || !trade::TradableStack(self, i)) continue;
-        const int n = std::min(amount - taken, self.Inventory.GetAmount(i));
-        if (n <= 0) continue;
-        const unsigned q = self.Inventory.GetQuality(i) & trade_policy::QualityMask;
-        if (n == self.Inventory.GetAmount(i) ? self.Inventory.DeleteStack(i) : self.Inventory.DeleteItems(i, n)) {
-            taken += n;
-            steps.push_back({item, q, n, false});
+    auto takePass = [&](bool equippedPass) {
+        for (int i = self.Inventory.GetStackCount() - 1; i >= 0 && taken < amount; --i) {
+            if (!Same(self, i, item, quality)) continue;
+            const bool unequipped = self.Inventory.GetSlotFromStack(i) == gESlot_None;
+            if (equippedPass == unequipped) continue;
+            if (!equippedPass ? !trade::TradableStack(self, i) : !trade::TradableItem(self.Inventory.GetTemplateItem(i))) continue;
+            const int n = std::min(amount - taken, self.Inventory.GetAmount(i));
+            if (n <= 0) continue;
+            const unsigned q = self.Inventory.GetQuality(i) & trade_policy::QualityMask;
+            if (n == self.Inventory.GetAmount(i) ? self.Inventory.DeleteStack(i) : self.Inventory.DeleteItems(i, n)) {
+                taken += n;
+                steps.push_back({item, q, n, false});
+            }
         }
-    }
+    };
+    takePass(false);
+    if (allowEquipped && taken < amount) takePass(true);
     return taken;
 }
 
@@ -84,7 +100,7 @@ void Undo(Entity& self, std::vector<Step> const& steps)
     bool ok = true;
     for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
         std::vector<Step> none;
-        if (it->created) ok = (Take(self, it->item, it->quality, it->amount, none) == it->amount) && ok;
+        if (it->created) ok = (Take(self, it->item, it->quality, it->amount, none, true) == it->amount) && ok;
         else ok = (self.Inventory.CreateItems(it->item, it->quality, it->amount) >= 0) && ok;
     }
     ++rolledBack;
@@ -97,13 +113,13 @@ void Undo(Entity& self, std::vector<Step> const& steps)
 
 bool Apply(net::OfferNote const& note)
 {
-    if (persist::CheckpointBusy()) return false;
+    if (!inventoryHealthy || persist::CheckpointBusy()) return false;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero || !gCSession::GetInstance().IsGameRunning() || note.sellerEpoch != trade::Epoch() ||
         !note.buyerEpoch || !note.serial || note.acknowledge || (!note.count && !note.gold) ||
         note.gold < -trade_policy::MaxGoldAmount || note.gold > trade_policy::MaxGoldAmount) return false;
     Entity self(hero);
-    const Template gold(trade_policy::GoldTemplateName);
+    const Template gold = GoldTemplate();
     std::map<std::string, bool> unique;
     for (int i = 0; i < note.count; ++i) {
         auto const& entry = note.entries[i];
@@ -126,16 +142,10 @@ bool Apply(net::OfferNote const& note)
         auto const& entry = note.entries[i];
         const Template item = Of(entry.item);
         if (entry.amount > 0) ok = Take(self, item, entry.quality, entry.amount, steps) == entry.amount;
-        else {
-            ok = self.Inventory.CreateItems(item, entry.quality, -entry.amount) >= 0;
-            if (ok) steps.push_back({item, entry.quality, -entry.amount, true});
-        }
+        else ok = CreateStep(self, item, entry.quality, -entry.amount, steps);
     }
     if (ok && note.gold > 0) ok = Take(self, gold, AnyQuality, note.gold, steps) == note.gold;
-    if (ok && note.gold < 0) {
-        ok = self.Inventory.CreateItems(gold, 0, -note.gold) >= 0;
-        if (ok) steps.push_back({gold, 0, -note.gold, true});
-    }
+    if (ok && note.gold < 0) ok = CreateStep(self, gold, 0, -note.gold, steps);
     if (!ok) Undo(self, steps);
     return ok;
 }
@@ -165,7 +175,8 @@ void SummarizeOffer(net::OfferNote const& note, char* out, size_t cap)
 
 void OnOffer(net::OfferNote const& note)
 {
-    if (note.count > net::MaxOfferEntries || note.acknowledge > 1 || note.buyer == note.seller) return;
+    if (note.count > net::MaxOfferEntries || note.acknowledge > 1 || note.buyer == note.seller ||
+        note.seller != net::LocalId() || !note.buyer || note.buyer >= net::MaxPlayers) return;
     if (!trade::replay::SellerEpoch(note.sellerEpoch, trade::Epoch())) {
         Logf("trade: ignored exchange %u for an earlier seller session player=%u", note.serial, note.buyer);
         return;
@@ -210,6 +221,7 @@ void OnOffer(net::OfferNote const& note)
 
 void OnResult(net::OfferResultNote const& result)
 {
+    if (result.buyer != net::LocalId()) return;
     for (auto it = sent.begin(); it != sent.end(); ++it) {
         auto& pending = *it;
         auto const& note = pending.note;
@@ -284,7 +296,7 @@ bool Reserve(net::OfferNote const& note)
             return false;
         }
     }
-    if (note.gold < 0 && Take(self, Template(trade_policy::GoldTemplateName), AnyQuality, -note.gold, steps) != -note.gold) {
+    if (note.gold < 0 && Take(self, GoldTemplate(), AnyQuality, -note.gold, steps) != -note.gold) {
         Undo(self, steps);
         return false;
     }
@@ -297,19 +309,14 @@ bool Deliver(net::OfferNote const& note, bool accepted)
     if (!hero || note.buyerEpoch != trade::Epoch()) return false;
     Entity self(hero);
     std::vector<Step> steps;
-    auto give = [&](Template const& item, unsigned quality, int amount) {
-        if (self.Inventory.CreateItems(item, quality, amount) < 0) return false;
-        steps.push_back({item, quality, amount, true});
-        return true;
-    };
     bool ok = true;
     for (int i = 0; i < note.count && ok; ++i) {
         auto const& entry = note.entries[i];
         if (accepted ? entry.amount > 0 : entry.amount < 0)
-            ok = give(Of(entry.item), entry.quality, accepted ? entry.amount : -entry.amount);
+            ok = CreateStep(self, Of(entry.item), entry.quality, accepted ? entry.amount : -entry.amount, steps);
     }
     if (ok && (accepted ? note.gold > 0 : note.gold < 0))
-        ok = give(Template(trade_policy::GoldTemplateName), 0, accepted ? note.gold : -note.gold);
+        ok = CreateStep(self, GoldTemplate(), 0, accepted ? note.gold : -note.gold, steps);
     if (!ok) {
         Undo(self, steps);
         hud::Message(hud::Warning, i18n::Text(i18n::TradeRestoreFailed));
@@ -357,8 +364,14 @@ void OnWorldChange()
 void OnPeerLeft(uint8_t player)
 {
     bool uncertain = false;
-    for (auto const& pending : sent)
-        if (pending.note.seller == player) uncertain = true;
+    for (auto it = sent.begin(); it != sent.end();) {
+        if (it->note.seller == player && it->delivered) {
+            it = sent.erase(it);
+            continue;
+        }
+        if (it->note.seller == player) uncertain = true;
+        ++it;
+    }
     for (auto const& entry : outcomes)
         if (std::get<0>(entry.first) == player && !entry.second.finalized) uncertain = true;
     if (uncertain)
@@ -380,11 +393,16 @@ void AddCommand(char const* argument, LogFn log)
     const size_t cut = arg.rfind('_');
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     const Template item(cut == std::string::npos ? "" : arg.substr(0, cut).c_str());
-    const int amount = cut == std::string::npos ? 0 : std::atoi(arg.substr(cut + 1).c_str());
-    if (!hero || !item.IsValid() || amount < 1 || amount > trade_policy::MaxStackAmount) { log("REFUSED heroadd: <name>_<amount>"); return; }
+    long amount = 0;
+    if (!hero || !item.IsValid() || cut == std::string::npos ||
+        !trade_policy::ParseDecimalLong(arg.c_str() + cut + 1, 1, trade_policy::MaxStackAmount, amount)) {
+        log("REFUSED heroadd: <name>_<amount>");
+        return;
+    }
     Entity self(hero);
     char line[160];
-    Format(line, "HEROADD name=%s amount=%d stack=%d", arg.substr(0, cut).c_str(), amount, self.Inventory.CreateItems(item, 0, amount));
+    Format(line, "HEROADD name=%s amount=%ld stack=%d", arg.substr(0, cut).c_str(), amount,
+           self.Inventory.CreateItems(item, 0, static_cast<GEU32>(amount)));
     log(line);
 }
 

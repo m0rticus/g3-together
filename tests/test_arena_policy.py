@@ -45,10 +45,12 @@ class ArenaPolicyTests(unittest.TestCase):
         sector = _testbuild.src_text("infocmd_sector.cpp")
         talk = _testbuild.src_text("talk.cpp")
 
-        # 1. Remote puppet CurrentZoneEntityProxy refresh so OnArena / ZS_Arena sees puppet inside the ring.
-        self.assertIn("RefreshPuppetZone(eCEntity* puppet)", arena)
-        self.assertIn("admin->GetZone(*puppet, here, path, GEFalse)", arena)
-        self.assertIn("navigation->AccessCurrentZoneEntityProxy() = here", arena)
+        # 1. Remote puppet CurrentZoneEntityProxy refresh via guards::KeepZone so OnArena / ZS_Arena sees puppet inside the ring.
+        guards_cpp = _testbuild.src_text("guards.cpp")
+        self.assertIn("guards::KeepZone(puppet)", arena)
+        self.assertIn("void KeepZone(eCEntity* puppet)", guards_cpp)
+        self.assertIn("admin->GetZone(*puppet, here, path, GEFalse)", guards_cpp)
+        self.assertIn("navigation->AccessCurrentZoneEntityProxy() = here", guards_cpp)
 
         # 2. Ring-exit protection hooks both OnLeaveArea and OnEnterArea, suppresses non-local actors on clients,
         #    and extracts other entity (not StringParameter).

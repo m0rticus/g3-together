@@ -84,10 +84,11 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
     if (!state.id || state.id >= net::MaxPlayers || state.id == net::LocalId()) return;
     Puppet& puppet = puppets[state.id];
     if (reset) {
-        puppet.body.track = body::Track{};
-        puppet.body.presentationSerial = 0;
-        puppet.body.actionSeq = -1;
-        puppet.body.playing[0] = '\0';
+        const bool pacified = puppet.body.pacified;
+        const bool isPuppet = puppet.body.puppet;
+        puppet.body = body::State{};
+        puppet.body.pacified = pacified;
+        puppet.body.puppet = isPuppet;
         puppet.motions.Reset();
         puppet.heldRight.clear();
         puppet.heldLeft.clear();
@@ -166,7 +167,6 @@ bool LocalState(net::PlayerState& state)
     if (hero != own) strncpy_s(state.shape, Entity(hero).GetName().GetText(), _TRUNCATE);
     const bCVector& p = hero->GetWorldPosition();
     const bCQuaternion q = hero->GetWorldRotation();
-    state.world = CurrentWorld();
     state.position[0] = p.GetX();
     state.position[1] = p.GetY();
     state.position[2] = p.GetZ();
@@ -226,19 +226,19 @@ bool LocalState(net::PlayerState& state)
 // walk through Entity::GetNPCs() met a freed NPC still in that list, a per-frame copy of raw entity pointers (access
 // violation while the host saved, run 20261022-080317; re/findings/save-forget-npclist-c.md).
 std::unordered_set<GuidKey, GuidHash> contacts[net::MaxPlayers];
-unsigned contactsNoted = 0, contactsLookedUp = 0, contactsGone = 0;
 
 void Forget(int id, eCEntity* entity)
 {
-    if (!entity) return;
     occupancy::Forget(id, entity);  // a stool or bench it sat on (the object's user)
+    if (!entity) {
+        contacts[id].clear();
+        return;
+    }
     std::vector<Entity> candidates;
     if (qa.byContacts) {
         for (auto const& key : contacts[id]) {
-            ++contactsLookedUp;
             Entity npc = ByKey(key);
             if (npc.GetInstance()) candidates.push_back(npc);
-            else ++contactsGone;
         }
     } else {
         const bTObjArray<Entity> all = Entity::GetNPCs();
@@ -290,7 +290,7 @@ void Despawn(int id, char const* reason)
     Puppet& puppet = puppets[id];
     if (!puppet.spawned) return;
     eCEntity* entity = puppet.entity.GetInstance();
-    ranged::ClearPuppetOverlay(entity);
+    if (entity) ranged::ClearPuppetOverlay(entity);
     if (guards::RejectRemoteWrite(entity, "remote::Despawn")) { puppet = Puppet{}; return; }
     gCWorld* current = gCWorld::GetCurrentWorld();
     if (entity && current && puppet.world == CurrentWorld()) {
@@ -300,9 +300,11 @@ void Despawn(int id, char const* reason)
             puppet.entity.Party.PartyMemberType = gEPartyMemberType_None;
         }
         Forget(id, entity);
-    }
-    if (entity && current && puppet.world == CurrentWorld())
         current->DestroyDynamicEntity(static_cast<eCDynamicEntity*>(entity));
+    } else {
+        occupancy::Forget(id, nullptr);
+        contacts[id].clear();
+    }
     puppet = Puppet{};
     Logf("remote: puppet %d removed (%s)", id, reason);
 }
@@ -451,9 +453,14 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
                            remote.activity.world == remote.latest.world;
     const bool fresh = remote.connected && remote.latestTicks &&
                        (static_cast<int32_t>(now - remote.latestTicks) < 15000 || heldOwner);
-    const bool sameWorld = (remote.latest.flags & net::PlayerFlags::InGame) && remote.latest.world == CurrentWorld();
+    const bool leftInGame = remote.activity.known &&
+                            static_cast<int32_t>(remote.activity.ticks - remote.latestTicks) > 0 &&
+                            !heldOwner &&
+                            (remote.activity.flags & net::PlayerFlags::InGame) == 0;
+    const bool sameWorld = (remote.latest.flags & net::PlayerFlags::InGame) &&
+                           remote.latest.world == CurrentWorld() && !leftInGame;
     if (!fresh || !sameWorld) {
-        Despawn(id, !fresh ? "no recent state" : "other world");
+        Despawn(id, !fresh ? "no recent state" : (leftInGame ? "not in game" : "other world"));
         return;
     }
     char const* requested = *remote.latest.shape ? remote.latest.shape
@@ -522,6 +529,11 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     puppet.entity.Dialog.TradeEnabled = (trade::Available() && !temporarilyDowned) ? GETrue : GEFalse;
     const bool dead = (remote.latest.flags & net::PlayerFlags::Dead) != 0;
     if (dead && !puppet.terminal) {
+        if (!*remote.latest.shape) {
+            NoDrop(puppet, now);
+            Hold(puppet, remote.latest.heldRight, remote.latest.heldLeft, now);
+            Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
+        }
         StartPuppetTerminal(puppet, id, hero, now);
     }
     if (puppet.terminal) {
@@ -644,12 +656,10 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     // The player's swings replay as the game's combat moves too (owner's look: players' attacks hardly visible);
     // a body whose move faults goes back to motion names (body.cpp).
-    const bool held = downed::HeldPuppet(remote.latest.flags, remote.latest.downedSequence);
+    const bool held = heldForRevive;
     const bool newHeldEpisode = held && puppet.downedSequence != remote.latest.downedSequence;
     if (held) {
         if (puppet.downedSequence != remote.latest.downedSequence) {
-            puppet.body.actionUntil = 0;
-            puppet.body.localHitUntil = 0;
             puppet.body.playing[0] = '\0';
             puppet.entity.StopPlayAni();
             world::RequestProcessingUpdate();
@@ -732,9 +742,7 @@ eCEntity* ControlledBody()
 
 bool IsPuppet(eCEntity const* entity)
 {
-    for (auto& puppet : puppets)
-        if (puppet.spawned && puppet.entity.GetInstance() == entity) return true;
-    return false;
+    return PuppetOwner(entity) != 0;
 }
 
 int PuppetOwner(eCEntity const* entity)
@@ -808,7 +816,7 @@ void NoteContact(eCEntity* npc, eCEntity* puppet)
 {
     const int id = PuppetOwner(puppet);
     if (!qa.noting || !id || !npc || npc == puppet) return;
-    if (contacts[id].insert(KeyOf(npc)).second) ++contactsNoted;
+    contacts[id].insert(KeyOf(npc));
 }
 
 void Tick()

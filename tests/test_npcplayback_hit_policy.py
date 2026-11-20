@@ -337,6 +337,34 @@ int main() {
     assert(!ShouldAcceptHitResult(0, oooKb, 22, true));  // wrong sequence
     ConfirmHitKnockback(oooKb, 21, 7030, ReactionStumble, 615, 615, authOrigin, hostGoal84, 83.8f);
     assert(!ShouldAcceptHitResult(0, oooKb, 21, true));  // already confirmed
+
+    // 7) 16-bit sequence wrapping preserves non-zero values at multiples of 65536; signed elapsed time never wraps.
+    assert(WrapNonZeroHitSeq(0u) == 0u);
+    assert(WrapNonZeroHitSeq(65536u) == 1u);
+    assert(WrapNonZeroHitSeq(65535u) == 65535u);
+    assert(ElapsedSecondsSigned(995u, 1000u) == 0.0f);
+    assert(std::fabs(ElapsedSecondsSigned(1050u, 1000u) - 0.05f) < 1e-5f);
+
+    // 8) Zero-step knockback (!kb.active) still tracks hostImpactSeen / hostImpactDone for Recover cut-off.
+    HitKnockbackState zeroStepKb;
+    StartHitKnockback(zeroStepKb, 31, 8000, 0.30f, 0.30f, authOrigin, dir, 0.0f, 0.0f);
+    assert(!zeroStepKb.active);
+    float zsPos[3] = {};
+    AdvanceHitKnockback(zeroStepKb, 8050, 7980, 8010, true, false, 0.2f, false, authOrigin, zsPos);
+    assert(zeroStepKb.hostImpactSeen && !zeroStepKb.hostImpactDone);
+    AdvanceHitKnockback(zeroStepKb, 8350, 8280, 8010, false, true, 0.1f, false, authOrigin, zsPos);
+    assert(zeroStepKb.hostImpactDone);
+    HitKnockbackState zeroConfirmKb;
+    StartHitKnockback(zeroConfirmKb, 32, 9000, 0.30f, 0.30f, authOrigin, dir, 0.0f, 0.0f);
+    ConfirmHitKnockback(zeroConfirmKb, 32, 9020, ReactionNone, 0, 0, authOrigin, authOrigin, 0.0f);
+    assert(zeroConfirmKb.hostImpactDone);
+
+    // 9) QuickStumble candidate list omits QuickStumble when allowQuickClip is false.
+    int cands[4] = {};
+    const int disallowedCount = BuildHitReactionCandidates(ReactionQuickStumble, false, 10, 11, 12, 13, 14, 15, cands);
+    assert(disallowedCount == 3 && cands[0] == 10 && cands[1] == 11 && cands[2] == 12);
+    const int allowedCount = BuildHitReactionCandidates(ReactionQuickStumble, true, 10, 11, 12, 13, 14, 15, cands);
+    assert(allowedCount == 4 && cands[0] == 13);
     return 0;
 }
 ''', encoding="utf-8")

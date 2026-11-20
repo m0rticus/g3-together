@@ -60,7 +60,7 @@ class OptionsPolicyTests(unittest.TestCase):
         parity = _testbuild.src_text("parity.cpp")
         self.assertIn("options::policy::Capability", parity)
         self.assertNotIn("fnv.AddValue(setup.", parity)
-        self.assertIn('AddFile(other, dir + "\\\\Data\\\\" + f.name)', parity)
+        self.assertIn('AddFile(other, dir + "\\\\Data\\\\" + f.name, buffer)', parity)
 
     def test_localized_summary_and_package_import_remain(self):
         texts = _testbuild.src_text("i18n.cpp")

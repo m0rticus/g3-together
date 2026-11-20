@@ -128,6 +128,11 @@ class OccupancyPolicyTests(unittest.TestCase):
         self.assertNotIn("eCEntity* refusedObject =", occ)
         self.assertIn("guid::Resolve(usedGuid)", occ)
         self.assertIn("const GuidKey currentRefused = ToGuidKey(objectGuid);", occ)
+        self.assertIn("_snwprintf_s(text, _TRUNCATE", occ)
+        self.assertNotIn("swprintf_s(text,", occ)
+        self.assertIn("gEAIMode_Arena", occ)
+        self.assertIn("if (s.npc > 1 || IsZeroGuid(s.guid)) return;", occ)
+        self.assertIn("it->second == player", occ)
 
         playback = source("npcplayback.cpp")
         silence = between(playback, "void Silence(eCEntity* entity)", "void Stats(LogFn log)")

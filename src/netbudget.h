@@ -113,8 +113,7 @@ public:
 
     void Reset(uint32_t nowMs, const BudgetConfig& config = BudgetConfig{})
     {
-        config_ = config;
-        if (!config_.mtuBytes) config_.mtuBytes = 1200u;
+        UpdateConfig(config);
         lastNowMs_ = nowMs;
         telemetry_ = BudgetTelemetry{};
         pressure_ = BudgetPressure::Clear;
@@ -128,6 +127,12 @@ public:
         rttMinCurrent_ = rttMinPrevious_ = UINT32_MAX;
         rttWindowAtMs_ = nowMs;
         baseRttMs_ = 0;
+    }
+
+    void UpdateConfig(const BudgetConfig& config)
+    {
+        config_ = config;
+        if (!config_.mtuBytes) config_.mtuBytes = 1200u;
     }
 
     void Advance(uint32_t nowMs, const BudgetTelemetry& telemetry = BudgetTelemetry{})
@@ -280,6 +285,7 @@ private:
 
     static bool RetryFresh(uint32_t nowMs, uint32_t retryMs)
     {
+        if (!retryMs) return false;
         const uint32_t age = Elapsed(retryMs, nowMs);
         return age != 0u ? age <= 2000u : nowMs == retryMs;
     }

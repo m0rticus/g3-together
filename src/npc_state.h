@@ -33,17 +33,14 @@
 namespace g3t::npcs::detail {
 
 constexpr float InterestRadius = 4000.0f;
-constexpr uint32_t FullEvery = 100;
 constexpr uint32_t StaleAfter = npcsend::MirrorStaleMs;
 constexpr uint32_t JoinGrace = 10000;
 constexpr float KeepRadius = InterestRadius + 2000.0f;
-constexpr float CorpseAlignment = 300.0f;
 constexpr int StateHistory = 128;
 constexpr uint32_t SentStatesFor = 1500;
 constexpr uint32_t OfferEvery = 20000;
 constexpr uint32_t RetryLookup = 1000;
 constexpr uint32_t MinHold = 10000;
-constexpr uint32_t NativeHitTail = 450;
 
 using NpcOpponents = std::unordered_map<uint32_t, eCEntity*>;
 
@@ -151,6 +148,7 @@ struct Mirror {
     char swingBlocker[48] = {};
     float swingRayCm = 0.0f, swingHitCm = 0.0f;
     bool partyApplied = false, appliedWaiting = false;
+    bool waitingPending = false, pendingWaitingValue = false;
     uint8_t appliedOwner = 0;
     bool relationAcknowledged = false, guideAcknowledged = false, guideDestinationApplied = false;
     net::NpcRecord previous;
@@ -183,7 +181,6 @@ struct Mirror {
     uint8_t lieNoted = 0;
     uint32_t killedAt = 0;
     bool lateNoted = false;
-    bool wasMirror = false;
     bool released = false, staleHeld = false;
     uint32_t shownSent = 0, truthSent = 0;
     bool havePresentation = false;
@@ -223,13 +220,17 @@ inline bool fastNpcs = true;
 inline std::unordered_map<GuidKey, LastSent, GuidHash> lastSent;
 inline std::unordered_map<GuidKey, AwaitedHit, GuidHash> awaitedHits;
 inline std::unordered_map<eCEntity const*, QuarantinedEntity> quarantinedEntities;
-inline std::unordered_map<GuidKey, HiddenClientState, GuidHash> hiddenClientStates;
+inline std::unordered_map<eCEntity const*, HiddenClientState> hiddenClientStates;
 inline uint32_t identityCensusAt = 0, identityLogAt = 0;
 inline std::unordered_map<GuidKey, npcsend::State, GuidHash> recipientNpcs[net::MaxPlayers];
 inline uint32_t recipientGenerations[net::MaxPlayers] = {};
+inline uint32_t syncedWorldGen[net::MaxPlayers] = {};
+inline uint32_t syncedWorldId[net::MaxPlayers] = {};
 inline npcsend::InitialPacer initialPacers[net::MaxPlayers];
 inline npcsend::Stats sendStats;
 inline uint32_t lastSend = 0;
+inline int lastXp = -1;
+inline uint64_t lastIdentitySignature = 0;
 inline replication::Cadence60 sendCadence;
 inline uint32_t captureTicks = 0, captureStartedAt = 0;
 inline std::unordered_map<GuidKey, uint32_t, GuidHash> incarnations;
@@ -238,7 +239,6 @@ inline std::unordered_map<GuidKey, std::vector<net::RagdollNote>, GuidHash> forc
 inline std::unordered_map<ForceSeqKey, replication::Sequence, ForceSeqHash> forceSequences;
 inline uint32_t forceSequence = 0;
 inline uint32_t knownJoins = 0;
-inline bool wasConnected = false;
 inline std::unordered_set<uint32_t> namesSent;
 inline std::unordered_set<GuidKey, GuidHash> owned;
 inline bool owning = true;
@@ -258,6 +258,7 @@ inline bool contestRule = true;
 inline float lastPlayers[net::MaxPlayers][3] = {};
 inline int lastPlayerCount = 0;
 inline std::unordered_map<GuidKey, uint8_t, GuidHash> claimedBy;
+inline std::unordered_map<GuidKey, eCEntity*, GuidHash> claimActors;
 inline std::unordered_map<GuidKey, uint8_t, GuidHash> directedBy;
 inline std::unordered_set<GuidKey, GuidHash> myClaims;
 inline std::unordered_map<GuidKey, uint32_t, GuidHash> claimSeen;

@@ -113,18 +113,22 @@ struct PoseRiceReader {
         while (quotient < 15 && ok && Get(1)) ++quotient;
         if (!ok) return false;
         if (quotient == 15) {
-            if (Get(1)) { ok = false; return false; }
+            if (Get(1) || !ok) { ok = false; return false; }
             value = Get(rawWidth);
-            if ((value >> k) < 15 || value >= (uint32_t(1) << rawWidth)) {
+            if (!ok || (value >> k) < 15 || value >= (uint32_t(1) << rawWidth)) {
                 ok = false;
                 return false;
             }
-            return ok;
+            return true;
         }
         const uint32_t remainder = k ? Get(k) : 0;
         if (!ok) return false;
         value = (uint32_t(quotient) << k) | remainder;
-        return value < (uint32_t(1) << rawWidth);
+        if (value >= (uint32_t(1) << rawWidth)) {
+            ok = false;
+            return false;
+        }
+        return true;
     }
 
     bool AlignAndFinish()

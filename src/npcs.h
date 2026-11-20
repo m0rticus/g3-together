@@ -46,6 +46,7 @@ struct RelationInfo {
 bool RelationOf(eCEntity const* entity, RelationInfo& info);  // relation.cpp diagnostics: mirror and last-sent state
 bool HostKnows(uint8_t const guid[16]); // canonical history, independent of current capture freshness
 void OnWorldDeactivate();
+void OnEntityDestroyed(eCEntity const* entity);
 bool IsMirrored(eCEntity const* entity);  // a client NPC currently driven from host snapshots
 bool Ready(eCEntity const* entity);
 net::NpcRecord const* CombatRecord(eCEntity const* entity); // received relations, independent of visual replay

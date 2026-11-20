@@ -51,6 +51,8 @@ class CombatHostilityContractTests(unittest.TestCase):
         self.assertIn("CombatFocusPriorityOverride(", ch)
         self.assertIn("ActiveSharedCombatHostility(", ch)
         self.assertIn("net::SendWorldState(s, 0)", ch)
+        self.assertIn("ResyncActiveHostilityOnAdmission(", ch)
+        self.assertIn("net::SendWorldStateTo(to, s)", ch)
         # Zero artificial rate-caps or throttles on hostility replication.
         self.assertNotIn("RateLimit", ch)
         self.assertNotIn("Throttle", ch)

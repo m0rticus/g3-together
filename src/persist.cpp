@@ -258,7 +258,7 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         if (char const* reason = SaveReadiness()) { CancelSave(reason); return; }
         if (!doors::SettleForSave()) return;
         void* manager = FileManager(false);
-        if (!manager || !writing) { CancelSave("native-hooks"); return; }
+        if (!manager) { CancelSave("native-hooks"); return; }
         Bytes hero, state;
         if (!CaptureCharacter(savingManifest.key, hero)) { CancelSave("character-write"); return; }
         saving::Key heroKey;
@@ -280,7 +280,6 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         ++nativeSaveDepth;
         const bool nativeOk = originalSave(manager, &name);
         --nativeSaveDepth;
-        ++saves;
         Logf("persist: native result=HUD.SaveGame save=%s ok=%d lower_calls=%u lower_ok=%d",
              savingManifest.key.save.c_str(), nativeOk ? 1 : 0, lowerSaveCalls, lowerSaveGood ? 1 : 0);
         if (!nativeOk || lowerSaveCalls != 1 || !lowerSaveGood) { CancelSave("native-save"); return; }
@@ -323,7 +322,6 @@ void CALLBACK SaveNow(HWND, UINT, UINT_PTR, DWORD)
         CancelSave(saving::store::IoReason(error, reason)); return;
     }
     current = savingManifest;
-    lastSave = requestedSlot;
     // Saving is not a world change: do not reset epochs, admission, or the client's live character.
     Logf("persist: host container published schema=%u min_reader=%u save=%s slot=%s bytes=%zu records=%zu menu_ok=%d network_world_bytes=0",
          current.schemaVersion, current.minReaderVersion, current.key.save.c_str(), requestedSlot.c_str(),
@@ -435,7 +433,7 @@ bool TemplateStart(rejoin::tmpl::Origin origin, TemplateJob job)
 }
 bool StartSave(char const* name)
 {
-    if (!pairedEnabled || !NativeReady() || !writing) { SaveFailure("native-hooks"); return false; }
+    if (!pairedEnabled || !NativeReady()) { SaveFailure("native-hooks"); return false; }
     if (!SafeName(name) || saving::Prefix(name, "G3T_pending_")) { SaveFailure("name"); return false; }
     if (operation.active) {
         if (requestedSlot == name) return true;
@@ -463,20 +461,23 @@ bool StartSave(char const* name)
     }
     requestedSlot = name; stagingSlot = "G3T_pending_" + savingManifest.key.save;
     nativeSaved = false;
-    operation = {};
-    operation.active = true; operation.epoch = epoch; operation.started = GetTickCount();
+    decltype(operation) pendingOp{};
+    pendingOp.epoch = epoch; pendingOp.started = GetTickCount();
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
         if (!net::PeerJoined(i)) continue;
         const uint64_t account = net::PeerAccount(i);
-        if (!net::InWorld(i)) { CancelSave("peer-loading"); return false; }
-        if (!account || account == steam::PlayerId()) { CancelSave("identity"); return false; }
+        if (!net::InWorld(i)) { SaveFailure("peer-loading"); return false; }
+        if (!account || account == steam::PlayerId()) { SaveFailure("identity"); return false; }
         for (uint8_t j = 2; j < i; ++j)
-            if (operation.members[j].account == account) { CancelSave("identity"); return false; }
-        operation.members[i] = {net::PeerGeneration(i), 0, account, false};
-        QueueReply(i, Note(net::SavePrepare, savingManifest));
+            if (pendingOp.members[j].account == account) { SaveFailure("identity"); return false; }
+        pendingOp.members[i] = {net::PeerGeneration(i), 0, account, false};
     }
     saveWindow = eCApplication::GetInstance().GetHandle();
-    if (!saveWindow || !SetTimer(saveWindow, SaveTimer, 30, &SaveNow)) { CancelSave("timer"); return false; }
+    if (!saveWindow || !SetTimer(saveWindow, SaveTimer, 30, &SaveNow)) { SaveFailure("timer"); return false; }
+    operation = pendingOp;
+    operation.active = true;
+    for (uint8_t i = 2; i < net::MaxPlayers; ++i)
+        if (operation.members[i].generation) QueueReply(i, Note(net::SavePrepare, savingManifest));
     xpshare::BeginSaveCapture();
     PrepareSaveThumbnail();
     Logf("persist: host save requested world=%s save=%s slot=%s epoch=%08x", savingManifest.key.world.c_str(),
@@ -523,6 +524,7 @@ void OnSave(uint8_t from, net::SaveNote const& note)
                 return;
             }
             cached = {note.save, {}, {}, net::PeerGeneration(from), epoch, false};
+            const bool wasActive = operation.active;
             const char* refusal = !net::InWorld(from) ? "peer-loading" : !SafeName(note.name) ? "name" : nullptr;
             if (refusal || !StartSave(note.name)) {
                 auto result = note; result.op = net::SaveResult; result.ok = 0;
@@ -531,8 +533,9 @@ void OnSave(uint8_t from, net::SaveNote const& note)
                 QueueReply(from, result);
             } else {
                 cached.transaction = savingManifest.key.save;
-                // Prepare identifies the transaction even when the request raced the host's same-slot save.
-                QueueReply(from, Note(net::SavePrepare, savingManifest));
+                // Prepare identifies the transaction when joining an already-active same-slot save;
+                // a newly started save already queued SavePrepare to every joined peer in StartSave.
+                if (wasActive) QueueReply(from, Note(net::SavePrepare, savingManifest));
             }
         } else if (note.op == net::SaveCancel && operation.active && !*note.world && !note.ok &&
                    requests[from].token == note.save && requests[from].transaction == savingManifest.key.save &&
@@ -787,7 +790,10 @@ void Tick()
         HostTick(now);
         return;
     }
-    if (!net::Joined()) { captured = {}; requestPending = false; return; }
+    if (!net::Joined()) {
+        if (captured.valid) xpshare::CancelSaveCapture();
+        captured = {}; requestPending = false; return;
+    }
     if (seenWelcome != net::WelcomeSerial()) {
         seenWelcome = net::WelcomeSerial(); synced = 0;
         hostAdmissionAck = false; nextAdmissionTry = 0;

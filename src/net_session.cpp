@@ -214,7 +214,7 @@ void HandleHello(ENetPeer* peer, bool exactSize, uint16_t version, char const* n
     peers[id] = peer;
     peerAccounts[id] = account;
     peerRelayGenerations[id] = relayGeneration;
-    if (peer->address.host != target.host)
+    if (peer->address.host != target.host || !steam::IsPeerRelay(peer->address.port))
         LockDirectSessionEndpoint(account, relayGeneration, true);
     rememberedSlots[account] = id;
     for (auto& sender : playerSenders[id]) sender = {};
@@ -233,9 +233,8 @@ void HandleHello(ENetPeer* peer, bool exactSize, uint16_t version, char const* n
 
 void HandleSaveMessage(ENetPeer* peer, ENetPacket const* packet)
 {
-    const uint8_t from = isHost ? PeerSlotOf(peer) : 1;
-    if ((isHost && !from) || (!isHost && (!connected || peer != server))) return;
-    if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
+    const uint8_t from = AuthenticatedSender(peer);
+    if (!from || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) return;
     SaveMsg message{};
     std::memcpy(&message, packet->data, sizeof(message));
     SaveNote const& note = message.note;
@@ -304,6 +303,12 @@ uint8_t PeerSlotOf(ENetPeer const* peer)
     return slot >= 2 && slot < MaxPlayers && peers[slot] == peer ? static_cast<uint8_t>(slot) : 0;
 }
 
+uint8_t AuthenticatedSender(ENetPeer const* peer)
+{
+    if (isHost) return PeerSlotOf(peer);
+    return connected && peer == server ? 1 : 0;
+}
+
 uint8_t DestinationId(ENetPeer const* peer)
 {
     return isHost ? PeerSlotOf(peer) : 1;
@@ -341,11 +346,8 @@ void SendBroadcastExcept(void const* data, size_t size, uint8_t channel, bool re
         if (peers[i] && i != except) Send(peers[i], data, size, channel, reliable);
 }
 
-void CloseClientLink()
+void ResetClientLinkState(bool clearRefusal)
 {
-    steamLinked = false;
-    hostRelayGeneration = 0;
-    startedAt = 0;
     if (server) {
         enet_peer_disconnect_now(server, 0);
         enet_host_flush(host);
@@ -353,8 +355,25 @@ void CloseClientLink()
     }
     connected = false;
     inWorld = false;
+    everConnected = false;
+    if (clearRefusal) {
+        refused = false;
+        refusalReason[0] = '\0';
+    }
+    haveCurrentLocal = false;
+    playerCadence = {};
+    activitySent = false;
+    lastActivitySend = 0;
     options::Restore();
     DropClientRemotes();
+}
+
+void CloseClientLink()
+{
+    steamLinked = false;
+    hostRelayGeneration = 0;
+    startedAt = 0;
+    ResetClientLinkState(false);
 }
 
 } // namespace g3t::net::internal

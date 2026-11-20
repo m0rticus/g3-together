@@ -103,7 +103,7 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
     if (static_cast<int32_t>(last - now) > 0 || now - last < 500) return result;
     last = now;
     if (static_cast<gEAIMode>(guard.Routine.AIMode) != gEAIMode_Combat) {
-        for (int id = 1; id <= net::MaxPlayers; ++id) {
+        for (int id = 1; id < net::MaxPlayers; ++id) {
             eCEntity* puppet = remote::PuppetOf(id);
             if (!puppet || Distance(npc, puppet) > 3000.0f || !fightmem::Upset(npc, puppet)) continue;
             remote::NoteContact(npc, puppet);
@@ -111,7 +111,7 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         }
     }
     if (remote::IsPuppet(guard.NPC.GetCurrentTarget().GetInstance())) return result;
-    for (int id = 1; id <= net::MaxPlayers; ++id) {
+    for (int id = 1; id < net::MaxPlayers; ++id) {
         eCEntity* puppet = remote::PuppetOf(id);
         if (!puppet || Distance(npc, puppet) > 3000.0f) continue;  // the game's own checks decide nearer ones
         ++depth;
@@ -142,19 +142,6 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
 
 gFScript originalKill = nullptr;
 unsigned killAsked = 0;
-
-void KeepZone(eCEntity* puppet)
-{
-    static gCNavigationAdmin* admin = nullptr;
-    if (!puppet) return;
-    if (!admin) admin = static_cast<gCNavigationAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("gCNavigationAdmin")));
-    auto* navigation = static_cast<gCNavigation_PS*>(puppet->GetPropertySet(eEPropertySetType_Navigation));
-    if (!admin || !navigation || navigation->GetCurrentZoneEntityProxy().GetEntity()) return;
-    eCEntityProxy here;
-    GEBool path = GEFalse;
-    if (admin->GetZone(*puppet, here, path, GEFalse) != bEResult_Ok || !here.GetEntity()) return;
-    navigation->AccessCurrentZoneEntityProxy() = here;
-}
 
 GEInt GE_STDCALL KillIntent(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
@@ -222,7 +209,7 @@ GEBool GE_STDCALL OnAnimalSleep(gCScriptProcessingUnit* spu)
     Entity self(animal);
     const bCString asleep = self.Routine.GetCurrentState();
     if (!std::strstr(asleep.GetText(), "Sleep")) return result;  // the game's own player woke it
-    for (int id = 1; id <= net::MaxPlayers; ++id) {
+    for (int id = 1; id < net::MaxPlayers; ++id) {
         eCEntity* puppet = remote::PuppetOf(id);
         if (!puppet || Distance(animal, puppet) > 1100.0f) continue;
         ++depth;
@@ -253,7 +240,7 @@ eCEntity* WaitActor(eCEntity* self)
     if (!point || !hero) return nullptr;
     float best = Distance(hero, point);
     eCEntity* nearest = nullptr;
-    for (int id = 1; id <= net::MaxPlayers; ++id) {
+    for (int id = 1; id < net::MaxPlayers; ++id) {
         eCEntity* puppet = remote::PuppetOf(id);
         if (!puppet) continue;
         const float d = Distance(puppet, point);
@@ -286,16 +273,20 @@ static void KeepChapter(eCEntity* puppet)
 void Acting::Enter(eCEntity* puppet, bool keepChapter, eCEntity* npc)
 {
     if (puppet) {
-        prevNpc = activeNpc;
-        hadPrevTheft = activeTheft.active;
-        if (activeTheft.active) {
-            enclaves::RestorePlayerTheft(activeTheft);
-            activeTheft = {};
-            activeNpc = nullptr;
+        const int owner = remote::PuppetOwner(puppet);
+        const int prevOwner = before ? remote::PuppetOwner(before) : 0;
+        const bool needTheftSwap = (npc != nullptr) || (owner != prevOwner);
+        if (needTheftSwap) {
+            prevNpc = activeNpc;
+            hadPrevTheft = activeTheft.active;
+            if (activeTheft.active) {
+                enclaves::RestorePlayerTheft(activeTheft);
+                activeTheft = {};
+                activeNpc = nullptr;
+            }
         }
         if (keepChapter) KeepChapter(puppet);
         actor = puppet;
-        const int owner = remote::PuppetOwner(puppet);
         if (npc && owner > 1 && enclaves::ApplyPlayerTheft(npc, static_cast<uint8_t>(owner), activeTheft)) {
             appliedTheft = true;
             activeNpc = npc;
@@ -360,6 +351,20 @@ LocalPlayer::~LocalPlayer()
 
 eCEntity* CurrentActor() { return actor; }
 bool PlayerContextReady() { return originalGetPlayer && originalIsPlayer; }
+
+void KeepZone(eCEntity* puppet)
+{
+    static gCNavigationAdmin* admin = nullptr;
+    if (!puppet) return;
+    if (!admin) admin = static_cast<gCNavigationAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("gCNavigationAdmin")));
+    auto* navigation = static_cast<gCNavigation_PS*>(puppet->GetPropertySet(eEPropertySetType_Navigation));
+    if (!admin || !navigation) return;
+    eCEntityProxy here;
+    GEBool path = GEFalse;
+    if (admin->GetZone(*puppet, here, path, GEFalse) != bEResult_Ok || !here.GetEntity()) return;
+    if (navigation->GetCurrentZoneEntityProxy().GetEntity() != here.GetEntity())
+        navigation->AccessCurrentZoneEntityProxy() = here;
+}
 
 bool IsLocalPlayer(eCEntity const* entity)
 {
@@ -429,7 +434,7 @@ static void WatchZones()
             else ++it;
         }
     }
-    for (int id = 1; id <= net::MaxPlayers; ++id) KeepZone(remote::PuppetOf(id));
+    for (int id = 1; id < net::MaxPlayers; ++id) KeepZone(remote::PuppetOf(id));
 }
 
 void OnWorldChange()

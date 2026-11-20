@@ -34,8 +34,9 @@ void Line(char const* prefix, LogFn log)
               hero && player.GetInstance() == hero ? 1 : 0, original.GetInstance() ? original.GetName().GetText() : "-",
               original.GetInstance() && original.GetInstance()->IsEnabled() ? 1 : 0,
               hero && hero->GetPropertySet(eEPropertySetType_NPC) ? (self.NPC.IsTransformed() ? 1 : 0) : -1,
-              original.GetInstance() ? static_cast<float>(original.PlayerMemory.SecondsTransformRemain) : -1.0f, HitPoints(self),
-              HitPoints(player), motion);
+              (original.GetInstance() && original.GetInstance()->GetPropertySet(eEPropertySetType_PlayerMemory))
+                  ? static_cast<float>(original.PlayerMemory.SecondsTransformRemain) : -1.0f,
+              HitPoints(self), HitPoints(player), motion);
     log(line);
 }
 }
@@ -53,8 +54,21 @@ void Start(char const* creatureTemplate, LogFn log)
         return;
     }
     Entity self(hero);
+    if (Entity::GetPlayer().GetInstance() != hero ||
+        (hero->GetPropertySet(eEPropertySetType_NPC) && self.NPC.IsTransformed())) {
+        log("TRANSFORM refused already transformed");
+        return;
+    }
     Entity creature = Entity::Spawn(shape, hero->GetWorldMatrix());
-    if (!creature.GetInstance()) { log("TRANSFORM refused spawn failed"); return; }
+    eCEntity* creatureInstance = creature.GetInstance();
+    if (!creatureInstance) { log("TRANSFORM refused spawn failed"); return; }
+    if (!creatureInstance->GetPropertySet(eEPropertySetType_NPC) ||
+        !creatureInstance->GetPropertySet(eEPropertySetType_ScriptRoutine)) {
+        if (gCWorld* world = gCWorld::GetCurrentWorld())
+            world->DestroyDynamicEntity(static_cast<eCDynamicEntity*>(creatureInstance));
+        log("TRANSFORM refused non-npc template");
+        return;
+    }
     original = self;
     self.StartTransform(creature, 120.0f, GEFalse);
     creature.Routine.SetTask(bCString("PS_Melee"));
@@ -66,6 +80,7 @@ void Start(char const* creatureTemplate, LogFn log)
 void Back(LogFn log)
 {
     Entity player = Entity::GetPlayer();
+    if (!player.GetInstance()) { log("TRANSFORMBACK refused no player"); return; }
     GetScriptAdminExt().CallScript(bCString("TransformBack"), player.GetInstance(), player.GetInstance(), 0);
     Line("TRANSFORMBACK", log);
     original = Entity();

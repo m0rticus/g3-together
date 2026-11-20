@@ -31,13 +31,11 @@
 #include <Script.h>
 #include <Windows.h>
 #include <intrin.h>
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <unordered_map>
-#include <vector>
 #include <utility>
 
 namespace g3t::ai {
@@ -95,6 +93,11 @@ eCEntity* Self(gCScriptProcessingUnit* spu, GELPVoid self)
     if (self) return static_cast<Entity*>(self)->GetInstance();
     return spu ? spu->GetSelfEntity() : nullptr;
 }
+eCEntity* Other(gCScriptProcessingUnit* spu, GELPVoid other)
+{
+    if (other) return static_cast<Entity*>(other)->GetInstance();
+    return spu ? spu->GetOtherEntity() : nullptr;
+}
 bool HostNpc(eCEntity* entity)
 {
     return (net::IsHost() || npclease::LocalAuthority(entity)) && entity && entity->GetPropertySet(eEPropertySetType_NPC) &&
@@ -114,7 +117,7 @@ bool retargetAttackSearched = false;
 GEInt GE_STDCALL FilterRetargetAttack(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (!ShuttingDown() && npc_targets::ReleaseDownedTargets(Self(spu, self), "attack-release", spu)) return 1;
-    return originalRetargetAttack(spu, self, other, args);
+    return originalRetargetAttack ? originalRetargetAttack(spu, self, other, args) : 0;
 }
 void WrapRetargetAttack(gCScriptAdminExt& admin)
 {
@@ -144,7 +147,7 @@ GEInt GE_STDCALL FilterScript(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
     // While another player's puppet stands for the game's player (an Acting scope), this machine's own hero is no player to the
     // scripts and would take part in the fight it hears as a villager does (ZS_WatchFight, ZS_Applaud; 2 Nov.): it perceives nothing then.
     if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return 0; }
-    eCEntity* sender = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    eCEntity* sender = Other(spu, other);
     if (!npclease::ContactAllowed(receiver, sender)) return 0;
     if (RejectDownedTarget(receiver, sender, "perception-refused")) return 0;
     if (receiver && receiver == detail::damageReceiver) return GETrue;
@@ -163,6 +166,7 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
         return GEFalse;
     }
     eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
+    eCEntity* const previousActor = guards::CurrentActor();
     guards::LocalPlayer localPlayer(guards::IsLocalPlayer(self));
     if (downed::GuardState(self, name)) return GEFalse;
     // A mirrored NPC in a dialog with this client's hero runs its talk states, info scripts, and _AI_* gesture/facing helpers.
@@ -192,9 +196,8 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
         if (SpectatorState(name)) {
             ++playerSpectatorRefused;
             if (playerSpectatorRefused <= 20) {
-                eCEntity* actingFor = guards::CurrentActor();
                 Logf("ai: the player body %s was put into %s (acting for %s); back to its routine", Entity(self).GetName().GetText(), name,
-                     actingFor ? Entity(actingFor).GetName().GetText() : "-");
+                     previousActor ? Entity(previousActor).GetName().GetText() : "-");
             }
             Entity body(self);
             body.Routine.FullStop();
@@ -253,9 +256,17 @@ bool attitudeNative = false;
 // return address tells the name-colour query from every targeting query. 0: call site not verified in this build.
 uintptr_t focusNameReturn = 0;
 unsigned relationQueries = 0, relationScopeCleared = 0, relationDownedAllowed = 0, relationMirrorAnswered = 0;
-eCEntity* redirectedFor = nullptr;  // the puppet whose GetAttitude runs as the local hero's right now
-bool plainAsk = false;              // QA attchain: one question answered without the redirect (as attitudeoff would)
+thread_local eCEntity* redirectedFor = nullptr;  // the puppet whose GetAttitude runs as the local hero's right now
+thread_local unsigned plainAskDepth = 0;     // QA attchain: questions answered without the redirect (as attitudeoff would)
 thread_local unsigned playerAttitudeQueries = 0;
+
+struct RedirectScope {
+    eCEntity* before;
+    explicit RedirectScope(eCEntity* target) : before(redirectedFor) { redirectedFor = target; }
+    ~RedirectScope() { redirectedFor = before; }
+    RedirectScope(RedirectScope const&) = delete;
+    RedirectScope& operator=(RedirectScope const&) = delete;
+};
 // Script_Game.dll of this build: GetAttitude at RVA 0xE3B0 starts with push ebp; mov ebp,esp; and esp,-8 (6 bytes
 // of complete, position-independent instructions), then sub esp,0x354.
 unsigned char* NativeAttitude();
@@ -333,7 +344,7 @@ GEInt FocusNameAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         if (player.GetInstance() && player.GetInstance() != judge)
             return promote(originalAttitude(spu, self, &player, args));
     }
-    eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    eCEntity* target = Other(spu, other);
     if (HostNpc(judge) && downed::CombatUnavailable(target)) ++relationDownedAllowed;
     return promote(originalAttitude(spu, self, other, args));
 }
@@ -342,10 +353,11 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
     if (ShuttingDown()) return originalAttitude ? originalAttitude(spu, self, other, args) : 0;
     if (focusNameReturn && reinterpret_cast<uintptr_t>(_ReturnAddress()) == focusNameReturn)
         return FocusNameAttitude(spu, self, other, args);
-    eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    eCEntity* target = Other(spu, other);
     if (relation::RefuseDownedAttitude(false, true) && RejectDownedTarget(Self(spu, self), target, "attitude-refused")) return gEAttitude_None;
     if (playerAttitudeQueries) return originalAttitude(spu, self, other, args);
     eCEntity* judge = Self(spu, self);
+    const bool plainAsk = plainAskDepth != 0;
     const bool suppressPromotion = plainAsk || InDefeatJudgement();
     if (target && target == remote::ControlledBody() && judge && npcs::IsMirrored(judge)) {
         int hostAttitude = 0;
@@ -372,23 +384,25 @@ GEInt GE_STDCALL FilterAttitude(gCScriptProcessingUnit* spu, GELPVoid self, GELP
         remote::NoteContact(judge, target);
         // A scoped remote player must remain the same player for GetPlayer, IsPlayer and attitude checks.
         if (guards::CurrentActor() == target) return promote(originalAttitude(spu, self, other, args));
-        eCEntity* hero = gCSession::GetInstance().GetHero();
-        if (attitudeOn && !plainAsk && hero && judge && judge != hero && !Driven(judge)) {
+        eCEntity* hero = remote::ControlledBody();
+        if (!hero) hero = gCSession::GetInstance().GetHero();
+        if (attitudeOn && !plainAsk && hero && judge && judge != hero &&
+            judge != gCSession::GetInstance().GetHero() && !Driven(judge)) {
             // GetAttitude answers Panic when self flees and its current target is other. With the hero in place of
             // the puppet that check fails, and an NPC fleeing from the puppet turned on it (re/findings/attitude-callers.md).
             Entity npc(judge);
-            if (fleeKeep && judge->GetPropertySet(eEPropertySetType_NPC) && npc.Routine.AIMode == gEAIMode_Flee &&
+            if (fleeKeep && judge->GetPropertySet(eEPropertySetType_NPC) &&
+                judge->GetPropertySet(eEPropertySetType_ScriptRoutine) &&
+                npc.Routine.AIMode == gEAIMode_Flee &&
                 npc.NPC.GetCurrentTarget().GetInstance() == target) {
                 ++attitudeFleeKept;
                 return promote(originalAttitude(spu, self, other, args));
             }
             ++attitudeRedirected;
+            guards::LocalPlayer local(true);
             Entity asHero(hero);
-            eCEntity* const before = redirectedFor;
-            redirectedFor = target;
-            const GEInt result = originalAttitude(spu, self, &asHero, args);
-            redirectedFor = before;
-            return promote(result);
+            RedirectScope redirect(target);
+            return promote(originalAttitude(spu, self, &asHero, args));
         }
     }
     return promote(originalAttitude(spu, self, other, args));
@@ -404,11 +418,12 @@ GEInt GE_STDCALL FilterContinue(gCScriptProcessingUnit* spu, GELPVoid self, GELP
 }
 GEInt GE_STDCALL FilterPlayerKeys(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
+    if (ShuttingDown()) return originalPlayerKeys ? originalPlayerKeys(spu, self, other, args) : 0;
     // This is the local keyboard dispatcher; its script self can be unset.
     guards::LocalPlayer localPlayer;
     movement::KeyDispatch(args, downed::Held() || downed::Terminal());
     if (downed::Held() || downed::Terminal()) return 0;
-    return originalPlayerKeys(spu, self, other, args);
+    return originalPlayerKeys ? originalPlayerKeys(spu, self, other, args) : 0;
 }
 gFScriptAIRoutine originalPlayerRoutine = nullptr;
 
@@ -416,7 +431,7 @@ GEBool GE_STDCALL FilterPlayerRoutine(gCScriptProcessingUnit* spu)
 {
     guards::LocalPlayer localPlayer(guards::IsLocalPlayer(spu ? spu->GetSelfEntity() : nullptr));
     if (!ShuttingDown() && downed::GuardState(spu ? spu->GetSelfEntity() : nullptr, "Rtn_Player")) return GETrue;
-    const GEBool result = originalPlayerRoutine(spu);
+    const GEBool result = originalPlayerRoutine ? originalPlayerRoutine(spu) : GETrue;
     downed::ObserveTerminal(spu ? spu->GetSelfEntity() : nullptr, "Rtn_Player");
     return result;
 }
@@ -437,7 +452,9 @@ GEBool GE_STDCALL FilterCallback(gCScriptProcessingUnit* spu)
     eCEntity* receiver = spu ? spu->GetSelfEntity() : nullptr;
     if (PerceptionBlocked(receiver, Driven(receiver))) { ++blocked; return GEFalse; }
     if (receiver && guards::CurrentActor() && guards::IsLocalPlayer(receiver)) { ++heroPerceptionBlocked; return GEFalse; }
-    if (RejectDownedTarget(receiver, spu ? spu->GetOtherEntity() : nullptr, "perception-refused")) return GEFalse;
+    eCEntity* sender = spu ? spu->GetOtherEntity() : nullptr;
+    if (!npclease::ContactAllowed(receiver, sender)) return GEFalse;
+    if (RejectDownedTarget(receiver, sender, "perception-refused")) return GEFalse;
     if (receiver && receiver == detail::damageReceiver) return GETrue;
     return originalCallback(spu);
 }
@@ -448,7 +465,7 @@ bool assessTargetSearched = false;
 GEInt GE_STDCALL FilterAssessTarget(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ShuttingDown()) return originalAssessTarget ? originalAssessTarget(spu, self, other, args) : 0;
-    eCEntity* target = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+    eCEntity* target = Other(spu, other);
     if (RejectDownedTarget(Self(spu, self), target, "assessment-refused")) return 0;
     return originalAssessTarget(spu, self, other, args);
 }
@@ -526,6 +543,7 @@ bool RetargetDownedBeforeCancel(eCEntity* npc, void* spu)
 
 void Tick()
 {
+    if (ShuttingDown()) return;
     npc_targets::SyncDownedTargets();
     if (!retargetAttackSearched && gCSession::GetInstance().IsGameRunning()) {
         retargetAttackSearched = true;
@@ -732,14 +750,18 @@ unsigned char* NativeAttitude()
 
 int PlainAttitude(eCEntity* self, eCEntity* other)
 {
-    plainAsk = true;
+    struct PlainAskScope {
+        PlainAskScope() { ++plainAskDepth; }
+        ~PlainAskScope() { --plainAskDepth; }
+        PlainAskScope(PlainAskScope const&) = delete;
+        PlainAskScope& operator=(PlainAskScope const&) = delete;
+    } plainAskScope;
     const GEInt result = GetScriptAdminExt().CallScript(bCString("GetAttitude"), self, other, 0);
-    plainAsk = false;
     return static_cast<int>(result);
 }
 bool TryPlayerAttitude(eCEntity* self, eCEntity* player, int& attitude)
 {
-    if (!self || !player || !originalAttitude || !guards::PlayerContextReady()) return false;
+    if (!self || !player || !originalAttitude || ShuttingDown() || !guards::PlayerContextReady()) return false;
     guards::Acting acting(player, false);
     struct Query {
         Query() { ++playerAttitudeQueries; }

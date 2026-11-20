@@ -81,7 +81,7 @@ bool SampleThreadStack(DWORD id, ThreadSample& sample, bool captureEbp)
                 uintptr_t pair[2] = {};
                 if (!ReadMemory(ebp, pair, sizeof(pair)) || !pair[1]) break;
                 sample.ebpFrames[sample.ebpCount++] = pair[1];
-                if (!pair[0] || pair[0] == ebp) break;
+                if (!pair[0] || pair[0] <= ebp) break;
                 ebp = pair[0];
             }
         }

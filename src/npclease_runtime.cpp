@@ -32,12 +32,10 @@
 #include <Windows.h>
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace g3t::npclease {
 namespace detail {
@@ -317,8 +315,14 @@ void Diagnostic(char const* action, GuidKey const& key, Entry const& entry, char
                             reinterpret_cast<uint8_t const*>(key.data()), nullptr, entry.lease.epoch,
                             entry.lease.incarnation, why);
 }
+void SyncSessionEpoch()
+{
+    if (seenWorld != net::WorldEpoch() || (!net::IsHost() && seenWelcome != net::WelcomeSerial()))
+        OnWorldDeactivate();
+}
 void Receive(uint8_t from, Message const& note)
 {
+    SyncSessionEpoch();
     if (!installed || npcremoval::Suppressed(note.guid) || note.world != net::WorldEpoch() ||
         persist::NativeLoading()) { ++refused; return; }
     Message hydrated = note;
@@ -565,9 +569,18 @@ void OnWorldDeactivate()
 void OnEntityDestroyed(eCEntity const* entity)
 {
     if (!entity) return;
-    for (auto& item : entries)
+    for (auto& item : entries) {
         if (item.second.applied == entity) item.second.applied = nullptr;
-    guardStates.Erase(Key(entity));
+        if (item.second.ownedEntity == entity) item.second.ownedEntity = nullptr;
+        if (item.second.observedEntity == entity) {
+            item.second.observedEntity = nullptr;
+            item.second.observedRange = false;
+            item.second.observedProcessable = false;
+        }
+    }
+    const auto key = Key(entity);
+    if (const auto it = entries.find(key); it != entries.end()) PublishGuard(it->first, it->second);
+    else guardStates.Erase(key);
 }
 void CaptureCacheInventory()
 {
@@ -578,9 +591,21 @@ void CaptureCacheInventory()
 }
 bool NewLife(uint8_t const identity[16])
 {
-    if (!net::IsHost()) return true;
+    SyncSessionEpoch();
     const auto found = entries.find(Key(identity));
     if (found == entries.end()) return true;
+    if (!net::IsHost()) {
+        if (!found->second.local && !found->second.cut) {
+            guardStates.Erase(found->first);
+            entries.erase(found);
+        } else {
+            found->second.lease.state.effects = 0;
+            found->second.highestEpoch = 0;
+            found->second.hasPresentationFloor = false;
+            found->second.presentationFloor = 0;
+        }
+        return true;
+    }
     if (found->second.lease.phase != Phase::Host) {
         Log("FAIL npclease: native respawn of a fenced NPC refused");
         return false;
@@ -593,7 +618,7 @@ void Tick()
 {
     if (ai::ShuttingDown() || persist::NativeLoading() || !remote::ControlledBody()) return;
     if (!Install()) return;
-    if (seenWorld != net::WorldEpoch() || (!net::IsHost() && seenWelcome != net::WelcomeSerial())) OnWorldDeactivate();
+    SyncSessionEpoch();
     const uint32_t now = net::Now();
     if (scanAt && now - scanAt < 100) return;
     scanAt = now ? now : 1;

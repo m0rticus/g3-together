@@ -3,6 +3,7 @@
 
 #include "net.h"
 #include "npcplayback_hit_policy.h"
+#include <string>
 #include <unordered_map>
 
 class bCMatrix;
@@ -16,6 +17,8 @@ struct PoseBlendState {
     bool active = false;
     uint32_t startedAtMs = 0;
     float durationSec = 0.0f;
+    void const* actor = nullptr;
+    std::string actorName;
     void const* skeleton = nullptr;
     void const* nodes = nullptr;
     std::vector<pose::Transform> fromTransforms;
@@ -44,6 +47,8 @@ struct State {
     net::NpcMotion localOptions;
     npcplayback_hit_policy::HitKnockbackState knockback;
     PoseBlendState poseBlend;
+    void const* actor = nullptr;
+    std::string actorName;
     void const* nodes = nullptr;
     int nodeCount = 0;
     std::unordered_map<uint32_t, int> boneIndices;
@@ -108,4 +113,5 @@ void Tick();
 void OnWorldDeactivate();
 void OnEntityDestroyed(eCEntity* entity);
 void ForgetRemoved(uint8_t const guid[16]);
+namespace detail { void ForgetDestroyedEntity(eCEntity const* entity); }
 }

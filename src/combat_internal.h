@@ -44,6 +44,7 @@ void Guid(eCEntity* entity, uint8_t out[16]);
 uint8_t SideOf(eCEntity* entity);
 int32_t Scaled(eCEntity* victim, eCEntity* attacker, int32_t delta);
 bool MeansToKill(eCEntity* attacker, eCEntity* victim);
+bool KnocksOut(Entity& npc);
 void NoteInventoryHit();
 bool LocalNpcContact(gCScriptProcessingUnit* spu, GELPVoid other, eCEntity* attacker);
 bool InventoryBlocksNpc(eCEntity* victim, eCEntity* attacker);

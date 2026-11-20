@@ -126,7 +126,6 @@ struct Remote
     DirectEndpoint directCandidates[8] = {};
     unsigned directCandidateCount = 0;
     uint16_t directPeerPort = 0;
-    uint32_t lastDirectOfferSent = 0;
     unsigned toEnet = 0, toSteam = 0;
     send::Queue pending;
     uint64_t steamReliableOk = 0, steamUnreliableOk = 0;
@@ -206,6 +205,7 @@ struct PublishedStore
     std::vector<RelayDrop> relayDrops;
     std::vector<RelayClose> relayCloses;
     std::atomic<bool> disconnectRequested{false};
+    uint64_t disconnectGeneration = 0;
     HANDLE worker = nullptr;
     HANDLE stopEvent = nullptr;
     HANDLE wakeEvent = nullptr;
@@ -262,6 +262,7 @@ struct WorkerRuntime
     bool connectPublished = false;
     uint32_t lastPresence = 0;
     u64 requestedHost = 0;
+    u64 rejoinPartner = 0;
     uint32_t clientAttemptAt = 0, clientLinkedAt = 0;
     bool clientHadLink = false, clientEndRecorded = false, clientEndedImmediately = false;
     char clientEndReason[160] = {};

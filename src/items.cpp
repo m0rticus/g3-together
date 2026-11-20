@@ -66,7 +66,10 @@ void Take(char const* guid, LogFn log)
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     if (!hero || !guid::Parse(guid, raw)) { log("REFUSED itemtake: no hero or bad GUID"); return; }
     Entity item = guid::Resolve(raw);
-    if (!item.GetInstance()) { log("REFUSED itemtake: no such entity"); return; }
+    if (!item.GetInstance() || !item.IsItem() || item.GetOwner().GetInstance()) {
+        log("REFUSED itemtake: no such loose item");
+        return;
+    }
     const GEInt stack = Entity(hero).Inventory.InsertStack(item);
     char line[120];
     Format(line, "ITEMTAKE guid=%s stack=%d", guid, stack);
@@ -105,15 +108,20 @@ uint32_t takingAmount = 1;
 std::map<std::string, int> carriedBefore;  // the hero's inventory when the take began: item template -> amount
 std::set<std::string> consumed, denied;
 
-std::map<std::string, int> Carried(eCDynamicEntity* hero)
+std::map<std::string, int> SumByName(Entity& entity)
 {
     std::map<std::string, int> out;
-    Entity self(hero);
-    for (int i = 0; i < self.Inventory.GetStackCount(); ++i) {
-        Entity item = self.Inventory.GetTemplateItem(i);
-        if (item.GetInstance()) out[item.GetName().GetText()] += self.Inventory.GetAmount(i);
+    for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
+        Entity item = entity.Inventory.GetTemplateItem(i);
+        if (item.GetInstance()) out[item.GetName().GetText()] += entity.Inventory.GetAmount(i);
     }
     return out;
+}
+
+std::map<std::string, int> Carried(eCDynamicEntity* hero)
+{
+    Entity self(hero);
+    return SumByName(self);
 }
 unsigned takesBegun = 0;
 unsigned tookCount = 0, ignoredRemotePickups = 0;
@@ -122,15 +130,21 @@ char lastTook[200] = "-";
 
 bool BeforeTake(gCScriptProcessingUnit* spu)
 {
-    if (!spu || spu->GetSelfEntity() != gCSession::GetInstance().GetHero()) return true;
-    eCEntity* item = spu ? spu->GetTargetEntity() : nullptr;
-    if (!item) item = spu ? spu->GetOtherEntity() : nullptr;
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (!spu || !hero || spu->GetSelfEntity() != hero) return true;
+    eCEntity* item = spu->GetTargetEntity();
+    if (!item) item = spu->GetOtherEntity();
     taking = item && Entity(item).IsItem() && !Entity(item).GetOwner().GetInstance();
     if (!taking) return true;
+    uint8_t raw[16];
+    guid::CopyEntity(item, raw);
+    const std::string key(reinterpret_cast<char const*>(raw), 16);
+    if (!saving::personal::Id(key)) {
+        taking = false;
+        return true;
+    }
     ++takesBegun;
-    const eCEntityProxy proxy(item);
-    std::memcpy(takingGuid, &proxy.GetEntityID().GetCore(), 16);
-    const std::string key(reinterpret_cast<char const*>(takingGuid), 16);
+    std::memcpy(takingGuid, raw, 16);
     if (consumed.count(key)) {
         taking = false;
         if (denied.insert(key).second) {
@@ -141,13 +155,14 @@ bool BeforeTake(gCScriptProcessingUnit* spu)
     }
     strncpy_s(takingName, Entity(item).GetName().GetText(), _TRUNCATE);
     takingAmount = Entity(item).Item.GetAmount();
-    carriedBefore = Carried(gCSession::GetInstance().GetHero());
+    carriedBefore = Carried(hero);
     return true;
 }
 
 void AfterTake(gCScriptProcessingUnit* spu)
 {
-    if (!spu || spu->GetSelfEntity() != gCSession::GetInstance().GetHero()) return;
+    eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
+    if (!spu || !hero || spu->GetSelfEntity() != hero) return;
     if (!taking) return;
     _GUID raw;
     std::memcpy(&raw, takingGuid, 16);
@@ -156,7 +171,7 @@ void AfterTake(gCScriptProcessingUnit* spu)
     consumed.insert(std::string(reinterpret_cast<char const*>(takingGuid), 16));
     ++tookCount;
     // What actually arrived can differ from the world item (a gold stack turns into coins): compare.
-    for (auto const& [name, amount] : Carried(gCSession::GetInstance().GetHero())) {
+    for (auto const& [name, amount] : Carried(hero)) {
         auto it = carriedBefore.find(name);
         const int gained = amount - (it == carriedBefore.end() ? 0 : it->second);
         if (gained <= 0) continue;
@@ -208,8 +223,9 @@ void TickPersonal()
     for (GEU16 i = 0; all && i < all->GetCount(); ++i) {
         Entity item(all->GetAt(i));
         if (!item.GetInstance() || !item.IsItem() || item.GetOwner().GetInstance()) continue;
-        const eCEntityProxy proxy(item.GetInstance());
-        const std::string key(reinterpret_cast<char const*>(&proxy.GetEntityID().GetCore()), 16);
+        uint8_t raw[16];
+        guid::CopyEntity(item.GetInstance(), raw);
+        const std::string key(reinterpret_cast<char const*>(raw), 16);
         if (!consumed.count(key)) continue;
         item.Decay();
         // Decay is void and may defer removal. Keep the tombstone and retry while the item remains processed.
@@ -280,7 +296,6 @@ void Containers(LogFn log)
     std::string line;
     const bTObjArray<Entity> all = Entity::GetEntities();
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    int found = 0;
     for (int i = 0; i < all.GetCount(); ++i) {
         Entity entity = all.GetAt(i);
         eCEntity* instance = entity.GetInstance();
@@ -291,11 +306,7 @@ void Containers(LogFn log)
         guid::FormatEntity(instance, guid, sizeof(guid));
         line = std::string("CONTAINER guid=") + guid + " name=" + entity.GetName().GetText() + (npc ? " kind=corpse" : " kind=other") +
                " items=";
-        std::map<std::string, int> contents;
-        for (int s = 0; s < entity.Inventory.GetStackCount(); ++s) {
-            Entity item = entity.Inventory.GetTemplateItem(s);
-            if (item.GetInstance()) contents[item.GetName().GetText()] += entity.Inventory.GetAmount(s);
-        }
+        const std::map<std::string, int> contents = SumByName(entity);
         bool first = true;
         for (auto const& [name, amount] : contents) {
             line += (first ? "" : ",") + name + ":" + std::to_string(amount);
@@ -303,7 +314,6 @@ void Containers(LogFn log)
         }
         if (first) line += "-";
         log(line.c_str());
-        ++found;
     }
     log("CONTAINERS end");
 }

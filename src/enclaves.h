@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 class eCEntity;
 class gCEnclave_PS;
@@ -18,6 +19,8 @@ using LogFn = void (*)(char const*);
 struct SavedTheftState {
     eCEntity* enclaveEntity = nullptr;
     gCEnclave_PS* enclave = nullptr;
+    std::string enclaveName;
+    uint8_t playerId = 0;
     int32_t crime = 0;
     int32_t suspect = 0;
     int32_t known = 0;

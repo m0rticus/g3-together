@@ -48,77 +48,94 @@ public:
 
     KvWriter& Str(char const* key, char const* val) noexcept
     {
-        BeginKey(key);
-        AppendSanitized(val);
-        return *this;
+        return EmitField(key, [&]() { return AppendSanitized(val); });
     }
     KvWriter& Int(char const* key, int64_t val) noexcept
     {
-        BeginKey(key);
-        len_ += static_cast<size_t>(Format(buf_ + len_, Remaining(), "%lld", static_cast<long long>(val)));
-        return *this;
+        return EmitField(key, [&]() {
+            return AppendFmt("%lld", static_cast<long long>(val));
+        });
     }
     KvWriter& Uint(char const* key, uint64_t val) noexcept
     {
-        BeginKey(key);
-        len_ += static_cast<size_t>(Format(buf_ + len_, Remaining(), "%llu", static_cast<unsigned long long>(val)));
-        return *this;
+        return EmitField(key, [&]() {
+            return AppendFmt("%llu", static_cast<unsigned long long>(val));
+        });
     }
     KvWriter& Hex(char const* key, uint64_t val) noexcept
     {
-        BeginKey(key);
-        len_ += static_cast<size_t>(Format(buf_ + len_, Remaining(), "0x%llx", static_cast<unsigned long long>(val)));
-        return *this;
+        return EmitField(key, [&]() {
+            return AppendFmt("0x%llx", static_cast<unsigned long long>(val));
+        });
     }
     KvWriter& Bool(char const* key, bool val) noexcept { return Uint(key, val ? 1u : 0u); }
     KvWriter& Float1(char const* key, double val) noexcept
     {
-        BeginKey(key);
-        len_ += static_cast<size_t>(Format(buf_ + len_, Remaining(), "%.1f", val));
-        return *this;
+        return EmitField(key, [&]() { return AppendFmt("%.1f", val); });
     }
     KvWriter& Pos(char const* key, float x, float y, float z) noexcept
     {
-        BeginKey(key);
-        len_ += static_cast<size_t>(Format(buf_ + len_, Remaining(), "%.1f,%.1f,%.1f", x, y, z));
-        return *this;
+        return EmitField(key, [&]() { return AppendFmt("%.1f,%.1f,%.1f", x, y, z); });
     }
     KvWriter& TransitionInt(char const* key, int64_t before, int64_t after) noexcept
     {
-        BeginKey(key);
-        len_ += static_cast<size_t>(
-            Format(buf_ + len_, Remaining(), "%lld->%lld", static_cast<long long>(before), static_cast<long long>(after)));
-        return *this;
+        return EmitField(key, [&]() {
+            return AppendFmt("%lld->%lld", static_cast<long long>(before), static_cast<long long>(after));
+        });
     }
     KvWriter& TransitionStr(char const* key, char const* before, char const* after) noexcept
     {
-        BeginKey(key);
-        AppendSanitized(before);
-        PutRaw("->");
-        AppendSanitized(after);
-        return *this;
+        return EmitField(key, [&]() {
+            return AppendSanitized(before) && PutRaw("->") && AppendSanitized(after);
+        });
     }
 
 private:
     size_t Remaining() const noexcept { return (buf_ && len_ < cap_) ? (cap_ - len_) : 0; }
-    void PutChar(char ch) noexcept
+    bool PutChar(char ch) noexcept
     {
-        if (buf_ && len_ + 1 < cap_) {
-            buf_[len_++] = ch;
+        if (!buf_ || len_ + 1 >= cap_) return false;
+        buf_[len_++] = ch;
+        buf_[len_] = '\0';
+        return true;
+    }
+    bool PutRaw(char const* text) noexcept
+    {
+        if (!text) return true;
+        while (*text) {
+            if (!PutChar(*text++)) return false;
+        }
+        return true;
+    }
+    template <typename... Args>
+    bool AppendFmt(char const* fmt, Args... args) noexcept
+    {
+        if (Remaining() <= 1) return false;
+        const size_t rem = Remaining();
+        const int wrote = Format(buf_ + len_, rem, fmt, args...);
+        if (wrote <= 0 || static_cast<size_t>(wrote) >= rem - 1) {
+            buf_[len_] = '\0';
+            return false;
+        }
+        len_ += static_cast<size_t>(wrote);
+        return true;
+    }
+    bool BeginKey(char const* key) noexcept
+    {
+        if (!key || !*key || !buf_ || cap_ < 2) return false;
+        if (len_ > 0 && !PutChar(' ')) return false;
+        return PutRaw(key) && PutChar('=');
+    }
+    template <typename ValueFn>
+    KvWriter& EmitField(char const* key, ValueFn&& writeValue) noexcept
+    {
+        if (!buf_ || cap_ == 0) return *this;
+        const size_t saved = len_;
+        if (!BeginKey(key) || !writeValue()) {
+            len_ = saved;
             buf_[len_] = '\0';
         }
-    }
-    void PutRaw(char const* text) noexcept
-    {
-        if (!text) return;
-        while (*text && len_ + 1 < cap_) PutChar(*text++);
-    }
-    void BeginKey(char const* key) noexcept
-    {
-        if (!key || !*key || !buf_ || cap_ < 2) return;
-        if (len_ > 0) PutChar(' ');
-        PutRaw(key);
-        PutChar('=');
+        return *this;
     }
     static bool NeedsQuotes(char const* text) noexcept
     {
@@ -127,23 +144,17 @@ private:
         }
         return false;
     }
-    void AppendSanitized(char const* val) noexcept
+    bool AppendSanitized(char const* val) noexcept
     {
-        if (!val || !*val) {
-            PutChar('-');
-            return;
+        if (!val || !*val) return PutChar('-');
+        if (!NeedsQuotes(val)) return PutRaw(val);
+        if (!PutChar('"')) return false;
+        for (unsigned char const* p = reinterpret_cast<unsigned char const*>(val); *p; ++p) {
+            if (len_ + 2 >= cap_) break;
+            const char ch = (*p == '"') ? '\'' : ((*p < 0x20) ? ' ' : static_cast<char>(*p));
+            if (!PutChar(ch)) return false;
         }
-        if (!NeedsQuotes(val)) {
-            PutRaw(val);
-            return;
-        }
-        PutChar('"');
-        for (unsigned char const* p = reinterpret_cast<unsigned char const*>(val); *p && len_ + 2 < cap_; ++p) {
-            if (*p == '"') PutChar('\'');
-            else if (*p < 0x20) PutChar(' ');
-            else PutChar(static_cast<char>(*p));
-        }
-        PutChar('"');
+        return PutChar('"');
     }
 
     char* buf_ = nullptr;

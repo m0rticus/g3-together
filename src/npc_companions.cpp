@@ -31,7 +31,8 @@ void DropMirror(GuidKey const& key)
 {
     auto it = mirrors.find(key);
     if (it == mirrors.end()) return;
-    if (net::IsHost() && !it->second.killed && it->second.entity.GetInstance()) {
+    if (!it->second.killed && it->second.entity.GetInstance()) {
+        npcplayback::ReleaseUnavailable(it->second.entity.GetInstance());
         body::Release(it->second.entity, it->second.body);
         if (it->second.guarded) it->second.entity.NPC.DefeatedByPlayer = it->second.defeatedBefore;
     }
@@ -80,7 +81,6 @@ void RefreshCompanionIdentity()
 
 void OfferCompanions(uint32_t now)
 {
-    static uint64_t lastIdentitySignature = 0;
     uint64_t sig = steam::PlayerId() ^ (static_cast<uint64_t>(companionIdentity.owners.size()) << 32);
     for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
         if (net::PeerJoined(id))
@@ -99,8 +99,9 @@ void OfferCompanions(uint32_t now)
         if (last != offered.end() && static_cast<int32_t>(now - last->second) < static_cast<int32_t>(OfferEvery)) continue;
         for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
             net::Remote const& r = net::Remotes()[id];
-            if (!r.connected || !(r.latest.flags & 1) || r.latest.world != remote::CurrentWorld() ||
-                owner.account != net::PeerAccount(id)) continue;
+            eCEntity* actor = remote::PuppetOf(id);
+            if (!r.connected || !net::InWorld(id) || !actor || !(r.latest.flags & 1) ||
+                r.latest.world != remote::CurrentWorld() || owner.account != net::PeerAccount(id)) continue;
             Entity npc = Resolve(key);
             if (!npc.GetInstance()) break;
             if (companionNear) {
@@ -108,20 +109,23 @@ void OfferCompanions(uint32_t now)
                 const float at[3] = {p.GetX(), p.GetY(), p.GetZ()};
                 if (body::Distance(at, r.latest.position) > InterestRadius) { ++companionsFar; break; }
             }
+            bool applied = false;
+            if (guide::IsQuestGuide(npc.GetInstance())) {
+                applied = npcs::Guide(key.data(), id);
+            } else {
+                const bool party = npc.GetInstance()->GetPropertySet(eEPropertySetType_Party) != nullptr;
+                const auto type = party ? static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) : gEPartyMemberType_Slave;
+                applied = npcs::Follow(key.data(), id, static_cast<uint8_t>(type), party && npc.Party.Waiting);
+            }
+            if (!applied) continue;
             net::WorldState s{};
             s.kind = 7;
             std::memcpy(s.guid, key.data(), 16);
             s.guard = id;
             net::SendWorldState(s, 0);
             claimedBy[key] = id;
+            claimActors[key] = actor;
             claimSeen[key] = now;
-            if (guide::IsQuestGuide(npc.GetInstance()))
-                npcs::Guide(key.data(), id);
-            else {
-                const bool party = npc.GetInstance()->GetPropertySet(eEPropertySetType_Party) != nullptr;
-                const auto type = party ? static_cast<gEPartyMemberType>(npc.Party.PartyMemberType) : gEPartyMemberType_Slave;
-                npcs::Follow(key.data(), id, static_cast<uint8_t>(type), party && npc.Party.Waiting);
-            }
             offered[rawKey] = now;
             ++companionsOffered;
             Logf("npcs: %s is %s's companion (saved steamid=%llu); handed over",
@@ -149,15 +153,41 @@ void ClaimTick(uint32_t now)
             const auto joined = claimSeen.find(it->first);
             const bool pending = joined != claimSeen.end() && now - joined->second < 2000;
             if (!npc.GetInstance() || !actor || pending) { ++it; continue; }
+            const bool isGuide = guide::IsQuestGuide(npc.GetInstance());
             const bool follower = npc.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
                                   npc.Party.GetPartyLeader().GetInstance() == actor;
             const bool guide = actor->GetPropertySet(eEPropertySetType_Party) &&
                                Entity(actor).Party.GetPartyLeader().GetInstance() == npc.GetInstance();
-            if (follower || guide) { ++it; continue; }
+            if (follower || guide) {
+                claimActors[it->first] = actor;
+                ++it;
+                continue;
+            }
+            const auto prevActorIt = claimActors.find(it->first);
+            eCEntity* prevActor = prevActorIt != claimActors.end() ? prevActorIt->second : nullptr;
+            const bool puppetReplaced = prevActor != nullptr && prevActor != actor;
+            const bool stillCompanionTask = npc.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine) &&
+                (!std::strcmp(npc.Routine.GetCurrentTask().GetText(), "ZS_FollowPlayer") ||
+                 !std::strcmp(npc.Routine.GetCurrentTask().GetText(), "ZS_GuidePlayer"));
+            const bool missingLeader = npc.GetInstance()->GetPropertySet(eEPropertySetType_Party) &&
+                npc.Party.GetPartyLeader().GetInstance() == nullptr;
+            if (puppetReplaced && (isGuide || stillCompanionTask || missingLeader)) {
+                if (isGuide) {
+                    if (actor->GetPropertySet(eEPropertySetType_Party)) Entity(actor).Party.SetPartyLeader(npc);
+                } else if (npc.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
+                    npc.Party.SetPartyLeader(Entity(actor));
+                    npc.NPC.SetCurrentTarget(Entity(actor));
+                }
+                claimActors[it->first] = actor;
+                claimSeen[it->first] = now;
+                ++it;
+                continue;
+            }
             Logf("npcs: %s's canonical relationship with player %u ended", npc.GetName().GetText(), player);
             telemetry::OnGuideEvent("companion_ended", player, npc.GetInstance(), it->first.data(), true, "relation_ended");
             SendRevoke(it->first, player);
             companionIdentity.owners.erase(rawKey);
+            claimActors.erase(it->first);
             claimSeen.erase(it->first);
             directedBy.erase(it->first);
             it = claimedBy.erase(it);
@@ -180,6 +210,7 @@ void ClaimTick(uint32_t now)
             npc.Routine.FullStop();
             npc.Routine.SetTask(bCString("ZS_HangAround_DoNothing"));
         }
+        claimActors.erase(it->first);
         claimSeen.erase(it->first);
         directedBy.erase(it->first);
         it = claimedBy.erase(it);
@@ -297,11 +328,13 @@ bool OnClaim(uint8_t const guid[16], uint8_t player, bool take)
     if (!take && (current == claimedBy.end() || current->second != player)) return false;
     if (take) {
         claimedBy[key] = player;
+        claimActors[key] = remote::PuppetOf(player);
         claimSeen[key] = net::Now();
         companionIdentity.owners[rawKey] = {account, {}, saved != companionIdentity.owners.end() && saved->second.summoned};
         DropMirror(key);
     } else {
         claimedBy.erase(key);
+        claimActors.erase(key);
         companionIdentity.owners.erase(rawKey);
         claimSeen.erase(key);
         DropMirror(key);
@@ -331,15 +364,11 @@ bool HostTake(eCEntity* entity)
     const GuidKey key = Key(guid);
     if (companionWins)
         if (const auto c = claimedBy.find(key); c != claimedBy.end() && net::Remotes()[c->second].connected) return false;
-    auto it = mirrors.find(key);
-    if (it == mirrors.end()) return false;
-    const unsigned owner = it->second.owner;
-    hostTaken.insert(key);
-    if (!it->second.killed) body::Release(it->second.entity, it->second.body);
-    if (it->second.guarded) it->second.entity.NPC.DefeatedByPlayer = it->second.defeatedBefore;
-    mirrors.erase(it);
-    Logf("npcs: took %s from player %u (it guides or follows the host)", Entity(entity).GetName().GetText(), owner);
-    return true;
+    if (npclease::RemoteOwner(entity) > 1 || npclease::Fenced(entity)) {
+        hostTaken.insert(key);
+        return true;
+    }
+    return false;
 }
 
 void HostRelease(eCEntity* entity)
@@ -524,9 +553,11 @@ bool Follow(uint8_t const guid[16], uint8_t player, uint8_t memberType, bool wai
     npc.Party.PartyMemberType = static_cast<gEPartyMemberType>(memberType);
     npc.Party.Waiting = waiting ? GETrue : GEFalse;
     npc.NPC.SetCurrentTarget(Entity(actor));
-    npc.Routine.FullStop();
-    if (waiting) npc.Routine.ContinueRoutine();
-    else npc.Routine.SetTask(bCString("ZS_FollowPlayer"));
+    if (guide_policy::ShouldImmediatelyRestartRoutineOnApply(false, talk::IsHeld(npc.GetInstance()))) {
+        npc.Routine.FullStop();
+        if (waiting) npc.Routine.ContinueRoutine();
+        else npc.Routine.SetTask(bCString("ZS_FollowPlayer"));
+    }
     return true;
 }
 
@@ -549,15 +580,32 @@ uint8_t ClaimedBy(eCEntity const* entity)
 
 void Adopt(uint8_t const guid[16])
 {
+    if (!guid) return;
+    const GuidKey key = Key(guid);
+    myClaims.insert(key);
+    givenBack.erase(key);
+    if (auto mirror = mirrors.find(key); mirror != mirrors.end())
+        mirror->second.relationAcknowledged = mirror->second.guideAcknowledged = false;
     Entity e = Resolve(guid);
     if (!IsNpc(e.GetInstance())) return;
-    Claim(e.GetInstance());
+    Logf("npcs: requested player relation for %s; NPC remains host simulated", e.GetName().GetText());
     if (guide::Readopt(e.GetInstance())) { ++companionsAdopted; return; }
     if (arena::Readopt(e.GetInstance())) return;
-    e.Routine.FullStop();
-    e.Dialog.SlaveryEnabled = GETrue;
-    GetScriptAdminExt().CallScript(bCString("JoinPlayerSlavery"), e.GetInstance(), nullptr, 0);
-    e.Routine.SetTask(bCString("ZS_FollowPlayer"));
+    if (auto mirror = mirrors.find(key);
+        mirror != mirrors.end() && mirror->second.latestTicks &&
+        mirror->second.latest.partyPlayer == net::LocalId() &&
+        (mirror->second.latest.partyType != static_cast<uint8_t>(gEPartyMemberType_Slave) ||
+         guide_policy::DecodeWaitingField(mirror->second.latest.partyPlayer, mirror->second.latest.guidePlayer,
+                                          mirror->second.latest.waiting, mirror->second.guideDestinationApplied).partyWaiting)) {
+        ++companionsAdopted;
+        return;
+    }
+    if (e.GetInstance()->GetPropertySet(eEPropertySetType_Dialog)) {
+        e.Routine.FullStop();
+        e.Dialog.SlaveryEnabled = GETrue;
+        GetScriptAdminExt().CallScript(bCString("JoinPlayerSlavery"), e.GetInstance(), nullptr, 0);
+        e.Routine.SetTask(bCString("ZS_FollowPlayer"));
+    }
     ++companionsAdopted;
     Logf("npcs: %s is our companion again (from the host's save)", e.GetName().GetText());
 }
@@ -584,6 +632,7 @@ bool ReadCompanions(FILE* file)
     if (ferror(file)) { Log("identity: companion journal read failed"); return false; }
     companionIdentity = std::move(restored);
     identityWarnings.clear();
+    lastIdentitySignature = 0;
     return true;
 }
 
@@ -592,6 +641,7 @@ void ClearCompanions()
     companionIdentity = {};
     identityWarnings.clear();
     offered.clear();
+    lastIdentitySignature = 0;
 }
 
 void SyncDefeatedByPlayer(uint8_t const guid[16], bool defeated)
@@ -622,6 +672,15 @@ void RememberSummon(uint8_t const guid[16], uint8_t player)
 }
 
 namespace detail {
+
+void ForgetSummon(uint8_t const guid[16])
+{
+    if (!guid || !net::IsHost()) return;
+    const std::string rawKey = CompanionKey(guid);
+    const auto existing = companionIdentity.owners.find(rawKey);
+    if (existing != companionIdentity.owners.end() && existing->second.summoned)
+        companionIdentity.owners.erase(existing);
+}
 
 bool AdmitIncomingNpc(net::NpcRecord const& record, GuidKey const& key, uint32_t captured,
                       uint8_t owner, uint32_t now)
@@ -703,6 +762,20 @@ void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const
     m.body.actionSeq = -1;
     m.latestTicks = 0;
     m.havePresentation = false;
+    m.records = 0;
+    if (!sameOwner) {
+        m.attitudeWritten = 0xFF;
+        m.attitudeShown = 0xFF;
+        m.attitudeDrifts = 0;
+        m.partyApplied = false;
+        m.appliedWaiting = false;
+        m.waitingPending = false;
+        m.pendingWaitingValue = false;
+        m.appliedOwner = 0;
+        m.relationAcknowledged = false;
+        m.guideAcknowledged = false;
+        m.guideDestinationApplied = false;
+    }
 }
 
 void PackMotionFromRecord(body::MotionState& motion, net::NpcRecord const& r)
@@ -769,6 +842,8 @@ void CopyMotionToRecord(net::NpcRecord& shown, body::Presentation const& present
 
 void SyncMirrorPartyAndGuide(GuidKey const& key, Mirror& m, net::NpcRecord const& shown)
 {
+    const auto decoded = guide_policy::DecodeWaitingField(
+        shown.partyPlayer, shown.guidePlayer, shown.waiting, m.guideDestinationApplied);
     if (m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Party)) {
         const bool waiting = m.entity.Party.Waiting != GEFalse;
         const uint8_t actualOwner = PlayerOf(m.entity.Party.GetPartyLeader().GetInstance());
@@ -779,8 +854,8 @@ void SyncMirrorPartyAndGuide(GuidKey const& key, Mirror& m, net::NpcRecord const
             request.npcClass = 1;
             std::memcpy(request.guid, shown.guid, 16);
             net::SendWorldState(request, 0);
-        } else if (m.partyApplied && m.appliedOwner == net::LocalId() && actualOwner != net::LocalId() &&
-                   myClaims.count(key) && m.relationAcknowledged) {
+        } else if (m.partyApplied && actualOwner != net::LocalId() && myClaims.count(key) &&
+                   (m.appliedOwner == net::LocalId() ? m.relationAcknowledged : true)) {
             Unclaim(m.entity.GetInstance());
             net::WorldState request{};
             request.kind = 5;
@@ -788,30 +863,32 @@ void SyncMirrorPartyAndGuide(GuidKey const& key, Mirror& m, net::NpcRecord const
             net::SendWorldState(request, 0);
         }
         if (shown.partyPlayer == net::LocalId()) m.relationAcknowledged = true;
+        if (m.waitingPending && (shown.partyPlayer != net::LocalId() || decoded.partyWaiting == m.pendingWaitingValue))
+            m.waitingPending = false;
         if (m.partyApplied && m.appliedOwner == net::LocalId() && waiting != m.appliedWaiting) {
             net::WorldState request{};
             request.kind = 22;
             std::memcpy(request.guid, shown.guid, 16);
             request.immortal = waiting ? 1 : 0;
             net::SendWorldState(request, 0);
+            m.waitingPending = true;
+            m.pendingWaitingValue = waiting;
         }
-        const auto decodedWaiting = guide_policy::DecodeWaitingField(
-            shown.partyPlayer, shown.guidePlayer, shown.waiting, m.guideDestinationApplied);
         eCEntity* leader = shown.partyPlayer == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(shown.partyPlayer);
         const bool pending = myClaims.count(key) && !m.relationAcknowledged && actualOwner == net::LocalId();
         if (!pending) {
             if (m.entity.Party.GetPartyLeader().GetInstance() != leader) m.entity.Party.SetPartyLeader(Entity(leader));
             m.entity.Party.PartyMemberType = static_cast<gEPartyMemberType>(shown.partyType);
-            m.entity.Party.Waiting = decodedWaiting.partyWaiting ? GETrue : GEFalse;
+            if (!(m.waitingPending && shown.partyPlayer == net::LocalId()))
+                m.entity.Party.Waiting = decoded.partyWaiting ? GETrue : GEFalse;
         }
         m.partyApplied = true;
         m.appliedOwner = shown.partyPlayer;
-        m.appliedWaiting = decodedWaiting.partyWaiting;
+        m.appliedWaiting = (m.waitingPending && shown.partyPlayer == net::LocalId())
+            ? m.pendingWaitingValue : decoded.partyWaiting;
     }
-    const auto decodedGuide = guide_policy::DecodeWaitingField(
-        shown.partyPlayer, shown.guidePlayer, shown.waiting, m.guideDestinationApplied);
-    if (decodedGuide.writeGuideDestination && m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Navigation)) {
-        m.entity.Navigation.IsOnDestination = decodedGuide.guideIsOnDestination ? GETrue : GEFalse;
+    if (decoded.writeGuideDestination && m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Navigation)) {
+        m.entity.Navigation.IsOnDestination = decoded.guideIsOnDestination ? GETrue : GEFalse;
         m.guideDestinationApplied = shown.partyPlayer == 0 && shown.guidePlayer != 0;
     }
     eCEntity* hero = remote::ControlledBody();

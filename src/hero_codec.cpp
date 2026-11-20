@@ -29,6 +29,118 @@ void AppendSection(std::vector<uint8_t>& payload, uint32_t type, uint32_t flags,
     payload.insert(payload.end(), data.begin(), data.end());
 }
 
+bool GetI32(uint8_t const* bytes, size_t end, size_t& at, int32_t& out)
+{
+    uint64_t raw = 0;
+    if (!saving::GetLe(bytes, end, at, raw, 4)) return false;
+    out = static_cast<int32_t>(static_cast<uint32_t>(raw));
+    return true;
+}
+
+void PutI32(std::vector<uint8_t>& out, int32_t value)
+{
+    saving::PutLe(out, static_cast<uint32_t>(value), 4);
+}
+
+char const* ParseStateSection(uint8_t const* bytes, size_t secEnd, size_t& sAt, ParsedRecord& candidate)
+{
+    uint64_t lvl = 0, lvlMax = 0;
+    if (secEnd - sAt != 24 || sAt + 4 > secEnd) return "level, experience or learn points missing";
+    candidate.downed = bytes[sAt];
+    sAt += 4;
+    if (!saving::GetLe(bytes, secEnd, sAt, lvl, 4) || !saving::GetLe(bytes, secEnd, sAt, lvlMax, 4) ||
+        !GetI32(bytes, secEnd, sAt, candidate.xp) || !GetI32(bytes, secEnd, sAt, candidate.lpAttribs) ||
+        !GetI32(bytes, secEnd, sAt, candidate.lpPerks)) {
+        return "level, experience or learn points missing";
+    }
+    candidate.level = static_cast<unsigned>(lvl);
+    candidate.levelMax = static_cast<unsigned>(lvlMax);
+    return nullptr;
+}
+
+char const* ParseAttributesSection(uint8_t const* bytes, size_t secEnd, size_t& sAt, ParsedRecord& candidate)
+{
+    uint64_t count = 0;
+    if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > sizeof(kTags) / sizeof(kTags[0])) {
+        return "too many record entries";
+    }
+    for (uint64_t j = 0; j < count; ++j) {
+        if (sAt >= secEnd) return "an attribute missing or twice";
+        const size_t tagLen = bytes[sAt++];
+        if (!tagLen || tagLen > 8 || tagLen > secEnd - sAt) return "an attribute this record does not know";
+        saving::RecordAttribute attr;
+        attr.tag.assign(reinterpret_cast<char const*>(bytes + sAt), tagLen);
+        sAt += tagLen;
+        if (!GetI32(bytes, secEnd, sAt, attr.base) || !GetI32(bytes, secEnd, sAt, attr.modifier) ||
+            !GetI32(bytes, secEnd, sAt, attr.baseMaximum) || !GetI32(bytes, secEnd, sAt, attr.maximumModifier)) {
+            return "an attribute missing or twice";
+        }
+        candidate.attrs.push_back(std::move(attr));
+    }
+    return nullptr;
+}
+
+char const* ParseInventorySection(uint8_t const* bytes, size_t secEnd, size_t& sAt, ParsedRecord& candidate)
+{
+    uint64_t count = 0;
+    if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > MaxRecordEntries || count > (secEnd - sAt) / 49) {
+        return "too many record entries";
+    }
+    candidate.stacks.reserve(static_cast<size_t>(count));
+    for (uint64_t j = 0; j < count; ++j) {
+        Stack s;
+        s.id.assign(reinterpret_cast<char const*>(bytes + sAt), 32);
+        sAt += 32;
+        uint64_t quality = 0;
+        if (!GetI32(bytes, secEnd, sAt, s.amount) || !saving::GetLe(bytes, secEnd, sAt, quality, 4) ||
+            !GetI32(bytes, secEnd, sAt, s.slot) || !GetI32(bytes, secEnd, sAt, s.category) || sAt >= secEnd) {
+            return "damaged or truncated binary hero section";
+        }
+        s.quality = static_cast<uint32_t>(quality);
+        s.learned = static_cast<int8_t>(bytes[sAt++]);
+        candidate.stacks.push_back(std::move(s));
+    }
+    return nullptr;
+}
+
+char const* ParseSpellsSection(uint8_t const* bytes, size_t secEnd, size_t& sAt, ParsedRecord& candidate)
+{
+    uint64_t count = 0;
+    if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > MaxRecordEntries || count > (secEnd - sAt) / 32) {
+        return "too many record entries";
+    }
+    candidate.spells.reserve(static_cast<size_t>(count));
+    for (uint64_t j = 0; j < count; ++j) {
+        candidate.spells.emplace_back(reinterpret_cast<char const*>(bytes + sAt), 32);
+        sAt += 32;
+    }
+    return nullptr;
+}
+
+char const* ParseQuickSlotsSection(uint8_t const* bytes, size_t secEnd, size_t& sAt, ParsedRecord& candidate)
+{
+    uint64_t count = 0;
+    if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > QuickSlots || count > (secEnd - sAt) / 40) {
+        return "too many record entries";
+    }
+    candidate.quicks.reserve(static_cast<size_t>(count));
+    for (uint64_t j = 0; j < count; ++j) {
+        Quick q;
+        uint64_t quality = 0;
+        if (!GetI32(bytes, secEnd, sAt, q.slot) || sAt + 32 > secEnd) {
+            return "damaged or truncated binary hero section";
+        }
+        q.id.assign(reinterpret_cast<char const*>(bytes + sAt), 32);
+        sAt += 32;
+        if (!saving::GetLe(bytes, secEnd, sAt, quality, 4)) {
+            return "damaged or truncated binary hero section";
+        }
+        q.quality = static_cast<uint32_t>(quality);
+        candidate.quicks.push_back(std::move(q));
+    }
+    return nullptr;
+}
+
 char const* ParseBinaryRecord(uint8_t const* bytes, size_t size, saving::Key const& expected,
                               Schema const& schema, ParsedRecord& out)
 {
@@ -45,111 +157,27 @@ char const* ParseBinaryRecord(uint8_t const* bytes, size_t size, saving::Key con
     for (saving::HeroBinarySectionSpan const& sec : env.sections) {
         const uint32_t type = sec.type;
         const size_t at = sec.payloadOffset;
-        const size_t secSize = sec.size;
-        const size_t secEnd = at + secSize;
+        const size_t secEnd = at + sec.size;
         size_t sAt = at;
+        char const* sectionErr = nullptr;
         if (type == saving::HeroSecIdentity || type == saving::HeroSecPose) {
             sAt = secEnd;
         } else if (type == saving::HeroSecState) {
-            uint64_t lvl = 0, lvlMax = 0, xp = 0, lpa = 0, lpp = 0;
-            if (secSize != 24 || sAt + 4 > secEnd) return "level, experience or learn points missing";
-            candidate.downed = bytes[sAt];
-            sAt += 4;
-            if (!saving::GetLe(bytes, secEnd, sAt, lvl, 4) || !saving::GetLe(bytes, secEnd, sAt, lvlMax, 4) ||
-                !saving::GetLe(bytes, secEnd, sAt, xp, 4) || !saving::GetLe(bytes, secEnd, sAt, lpa, 4) ||
-                !saving::GetLe(bytes, secEnd, sAt, lpp, 4)) {
-                return "level, experience or learn points missing";
-            }
-            candidate.level = static_cast<unsigned>(lvl);
-            candidate.levelMax = static_cast<unsigned>(lvlMax);
-            candidate.xp = static_cast<int32_t>(static_cast<uint32_t>(xp));
-            candidate.lpAttribs = static_cast<int32_t>(static_cast<uint32_t>(lpa));
-            candidate.lpPerks = static_cast<int32_t>(static_cast<uint32_t>(lpp));
+            sectionErr = ParseStateSection(bytes, secEnd, sAt, candidate);
         } else if (type == saving::HeroSecAttributes) {
-            uint64_t count = 0;
-            if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > sizeof(kTags) / sizeof(kTags[0])) {
-                return "too many record entries";
-            }
-            for (uint64_t j = 0; j < count; ++j) {
-                if (sAt >= secEnd) return "an attribute missing or twice";
-                const size_t tagLen = bytes[sAt++];
-                if (!tagLen || tagLen > 8 || tagLen > secEnd - sAt) return "an attribute this record does not know";
-                saving::RecordAttribute attr;
-                attr.tag.assign(reinterpret_cast<char const*>(bytes + sAt), tagLen);
-                sAt += tagLen;
-                uint64_t b = 0, m = 0, bm = 0, mm = 0;
-                if (!saving::GetLe(bytes, secEnd, sAt, b, 4) || !saving::GetLe(bytes, secEnd, sAt, m, 4) ||
-                    !saving::GetLe(bytes, secEnd, sAt, bm, 4) || !saving::GetLe(bytes, secEnd, sAt, mm, 4)) {
-                    return "an attribute missing or twice";
-                }
-                attr.base = static_cast<int32_t>(static_cast<uint32_t>(b));
-                attr.modifier = static_cast<int32_t>(static_cast<uint32_t>(m));
-                attr.baseMaximum = static_cast<int32_t>(static_cast<uint32_t>(bm));
-                attr.maximumModifier = static_cast<int32_t>(static_cast<uint32_t>(mm));
-                candidate.attrs.push_back(std::move(attr));
-            }
+            sectionErr = ParseAttributesSection(bytes, secEnd, sAt, candidate);
         } else if (type == saving::HeroSecInventory) {
-            uint64_t count = 0;
-            if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > MaxRecordEntries ||
-                count > (secEnd - sAt) / 49) {
-                return "too many record entries";
-            }
-            candidate.stacks.reserve(static_cast<size_t>(count));
-            for (uint64_t j = 0; j < count; ++j) {
-                Stack s;
-                s.id.assign(reinterpret_cast<char const*>(bytes + sAt), 32);
-                sAt += 32;
-                uint64_t amount = 0, quality = 0, slot = 0, cat = 0;
-                if (!saving::GetLe(bytes, secEnd, sAt, amount, 4) || !saving::GetLe(bytes, secEnd, sAt, quality, 4) ||
-                    !saving::GetLe(bytes, secEnd, sAt, slot, 4) || !saving::GetLe(bytes, secEnd, sAt, cat, 4) ||
-                    sAt >= secEnd) {
-                    return "damaged or truncated binary hero section";
-                }
-                s.amount = static_cast<int32_t>(static_cast<uint32_t>(amount));
-                s.quality = static_cast<uint32_t>(quality);
-                s.slot = static_cast<int32_t>(static_cast<uint32_t>(slot));
-                s.category = static_cast<int32_t>(static_cast<uint32_t>(cat));
-                s.learned = static_cast<int8_t>(bytes[sAt++]);
-                candidate.stacks.push_back(std::move(s));
-            }
+            sectionErr = ParseInventorySection(bytes, secEnd, sAt, candidate);
         } else if (type == saving::HeroSecSpells) {
-            uint64_t count = 0;
-            if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > MaxRecordEntries ||
-                count > (secEnd - sAt) / 32) {
-                return "too many record entries";
-            }
-            candidate.spells.reserve(static_cast<size_t>(count));
-            for (uint64_t j = 0; j < count; ++j) {
-                candidate.spells.emplace_back(reinterpret_cast<char const*>(bytes + sAt), 32);
-                sAt += 32;
-            }
+            sectionErr = ParseSpellsSection(bytes, secEnd, sAt, candidate);
         } else if (type == saving::HeroSecQuickSlots) {
-            uint64_t count = 0;
-            if (!saving::GetLe(bytes, secEnd, sAt, count, 4) || count > QuickSlots ||
-                count > (secEnd - sAt) / 40) {
-                return "too many record entries";
-            }
-            candidate.quicks.reserve(static_cast<size_t>(count));
-            for (uint64_t j = 0; j < count; ++j) {
-                Quick q;
-                uint64_t slot = 0, quality = 0;
-                if (!saving::GetLe(bytes, secEnd, sAt, slot, 4) || sAt + 32 > secEnd) {
-                    return "damaged or truncated binary hero section";
-                }
-                q.slot = static_cast<int32_t>(static_cast<uint32_t>(slot));
-                q.id.assign(reinterpret_cast<char const*>(bytes + sAt), 32);
-                sAt += 32;
-                if (!saving::GetLe(bytes, secEnd, sAt, quality, 4)) {
-                    return "damaged or truncated binary hero section";
-                }
-                q.quality = static_cast<uint32_t>(quality);
-                candidate.quicks.push_back(std::move(q));
-            }
+            sectionErr = ParseQuickSlotsSection(bytes, secEnd, sAt, candidate);
         } else {
             candidate.extraSections.push_back(
                 {type, sec.flags, std::vector<uint8_t>(bytes + at, bytes + secEnd)});
             sAt = secEnd;
         }
+        if (sectionErr) return sectionErr;
         if (sAt != secEnd) return "damaged or truncated binary hero section";
     }
     if (char const* refused = ValidateStatsAndAttributes(candidate)) return refused;
@@ -293,9 +321,9 @@ char const* EncodeRecord(ParsedRecord const& record, Schema const& schema, std::
     sec.push_back(0); sec.push_back(0); sec.push_back(0);
     saving::PutLe(sec, record.level, 4);
     saving::PutLe(sec, record.levelMax, 4);
-    saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(record.xp)), 4);
-    saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(record.lpAttribs)), 4);
-    saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(record.lpPerks)), 4);
+    PutI32(sec, static_cast<int32_t>(record.xp));
+    PutI32(sec, static_cast<int32_t>(record.lpAttribs));
+    PutI32(sec, static_cast<int32_t>(record.lpPerks));
     AppendSection(payload, saving::HeroSecState, saving::HeroSectionRequired, sec);
 
     // 4. Attributes
@@ -304,10 +332,10 @@ char const* EncodeRecord(ParsedRecord const& record, Schema const& schema, std::
     for (auto const& at : record.attrs) {
         sec.push_back(static_cast<uint8_t>(at.tag.size()));
         sec.insert(sec.end(), at.tag.begin(), at.tag.end());
-        saving::PutLe(sec, static_cast<uint32_t>(at.base), 4);
-        saving::PutLe(sec, static_cast<uint32_t>(at.modifier), 4);
-        saving::PutLe(sec, static_cast<uint32_t>(at.baseMaximum), 4);
-        saving::PutLe(sec, static_cast<uint32_t>(at.maximumModifier), 4);
+        PutI32(sec, at.base);
+        PutI32(sec, at.modifier);
+        PutI32(sec, at.baseMaximum);
+        PutI32(sec, at.maximumModifier);
     }
     AppendSection(payload, saving::HeroSecAttributes, saving::HeroSectionRequired, sec);
 
@@ -316,10 +344,10 @@ char const* EncodeRecord(ParsedRecord const& record, Schema const& schema, std::
     saving::PutLe(sec, record.stacks.size(), 4);
     for (Stack const& s : record.stacks) {
         sec.insert(sec.end(), s.id.begin(), s.id.end());
-        saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(s.amount)), 4);
+        PutI32(sec, static_cast<int32_t>(s.amount));
         saving::PutLe(sec, s.quality, 4);
-        saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(s.slot)), 4);
-        saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(s.category)), 4);
+        PutI32(sec, static_cast<int32_t>(s.slot));
+        PutI32(sec, static_cast<int32_t>(s.category));
         sec.push_back(static_cast<uint8_t>(static_cast<int8_t>(s.learned)));
     }
     AppendSection(payload, saving::HeroSecInventory, saving::HeroSectionRequired, sec);
@@ -334,7 +362,7 @@ char const* EncodeRecord(ParsedRecord const& record, Schema const& schema, std::
     sec.clear();
     saving::PutLe(sec, record.quicks.size(), 4);
     for (Quick const& q : record.quicks) {
-        saving::PutLe(sec, static_cast<uint32_t>(static_cast<int32_t>(q.slot)), 4);
+        PutI32(sec, static_cast<int32_t>(q.slot));
         sec.insert(sec.end(), q.id.begin(), q.id.end());
         saving::PutLe(sec, q.quality, 4);
     }

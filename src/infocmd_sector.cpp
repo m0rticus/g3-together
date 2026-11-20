@@ -99,7 +99,8 @@ void StartFights()
     for (auto it = fights.begin(); it != fights.end();) {
         Entity attacker = guid::Resolve(it->attacker);
         eCEntity* target = remote::PuppetOf(it->player);
-        if (static_cast<int32_t>(now - it->until) > 0 || it->joins != net::JoinCount() || !net::Remotes()[it->player].connected) {
+        if (static_cast<int32_t>(now - it->until) > 0 ||
+            it->generation != net::PeerGeneration(it->player) || !net::InWorld(it->player)) {
             it = fights.erase(it);
             continue;
         }

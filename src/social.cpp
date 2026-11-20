@@ -58,11 +58,31 @@ std::string EnclaveText(eCEntity* enclaveEntity)
               static_cast<int>(enclave->AccessPlayerFame()));
     return text;
 }
+
+float WithinRadius(char const* radius)
+{
+    return radius && *radius ? static_cast<float>(std::atof(radius)) : 3000.0f;
+}
+
+gCEnclave_PS* FindEnclaveByName(char const* town, eCEntity*& outInstance)
+{
+    for (GEInt i = 0; i < PSEnclave::GetEnclaveCount(); ++i) {
+        Entity e = PSEnclave::GetEnclaveAt(i);
+        eCEntity* instance = e.GetInstance();
+        auto* enclave = instance ? static_cast<gCEnclave_PS*>(instance->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
+        if (enclave && !std::strcmp(instance->GetName().GetText(), town)) {
+            outInstance = instance;
+            return enclave;
+        }
+    }
+    outInstance = nullptr;
+    return nullptr;
+}
 }
 
 void Owned(char const* radius, LogFn log)
 {
-    const float within = radius && *radius ? static_cast<float>(std::atof(radius)) : 3000.0f;
+    const float within = WithinRadius(radius);
     char line[320], guid[48];
     const bTObjArray<Entity> all = Entity::GetEntities();
     int found = 0;
@@ -94,7 +114,7 @@ void Owned(char const* radius, LogFn log)
 // AssessTakeItem before the witness judges, re/out/p7-half-20261026-b.c). Only items with at least one such NPC.
 void Bothered(char const* radius, LogFn log)
 {
-    const float within = radius && *radius ? static_cast<float>(std::atof(radius)) : 3000.0f;
+    const float within = WithinRadius(radius);
     char line[700], guid[48];
     const bTObjArray<Entity> all = Entity::GetEntities();
     const bTObjArray<Entity> people = Entity::GetNPCs();
@@ -142,7 +162,7 @@ void Bothered(char const* radius, LogFn log)
 // as AssessUseInteractObject's helper asks (SG 0x30840 via 0xaf20), with their use function, type and user.
 void OwnedObjects(char const* radius, LogFn log)
 {
-    const float within = radius && *radius ? static_cast<float>(std::atof(radius)) : 3000.0f;
+    const float within = WithinRadius(radius);
     char line[400], guid[48];
     const bTObjArray<Entity> all = Entity::GetEntities();
     int found = 0;
@@ -211,11 +231,8 @@ void Enclaves(LogFn log)
 void Revolution(char const* town, LogFn log)
 {
     char line[200];
-    for (GEInt i = 0; i < PSEnclave::GetEnclaveCount(); ++i) {
-        Entity e = PSEnclave::GetEnclaveAt(i);
-        eCEntity* instance = e.GetInstance();
-        auto* enclave = instance ? static_cast<gCEnclave_PS*>(instance->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
-        if (!enclave || std::strcmp(instance->GetName().GetText(), town)) continue;
+    eCEntity* instance = nullptr;
+    if (gCEnclave_PS* enclave = FindEnclaveByName(town, instance)) {
         enclave->AccessRevolution() = GETrue;
         infocmd::Changed(instance);
         Format(line, "REVOLUTION town=%s revolution=%d status=%d", town, enclave->AccessRevolution() ? 1 : 0,
@@ -233,11 +250,8 @@ void Revolution(char const* town, LogFn log)
 void StartRevolution(char const* town, LogFn log)
 {
     char line[200];
-    for (GEInt i = 0; i < PSEnclave::GetEnclaveCount(); ++i) {
-        Entity e = PSEnclave::GetEnclaveAt(i);
-        eCEntity* instance = e.GetInstance();
-        auto* enclave = instance ? static_cast<gCEnclave_PS*>(instance->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
-        if (!enclave || std::strcmp(instance->GetName().GetText(), town)) continue;
+    eCEntity* instance = nullptr;
+    if (gCEnclave_PS* enclave = FindEnclaveByName(town, instance)) {
         enclave->AccessRaid() = GETrue;
         enclave->AccessStatus() = static_cast<gEEnclaveStatus>(1);
         infocmd::Changed(instance);

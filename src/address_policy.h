@@ -56,11 +56,12 @@ struct ClientWaitState {
     bool isDead = false;
     bool isDown = false;
     bool expired = false;
+    bool tooFar = false;
 };
 
 constexpr bool ShouldCancelClientWait(ClientWaitState const& s) noexcept
 {
-    return !s.entityExists || s.isDead || s.isDown || s.expired;
+    return !s.entityExists || s.isDead || s.isDown || s.expired || s.tooFar;
 }
 
 } // namespace g3t::address_policy

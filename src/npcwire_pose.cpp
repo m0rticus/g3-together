@@ -205,6 +205,7 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::DecodeMode4(
     std::vector<pose::Bone>& out, uint16_t& layout, PoseStats& stats) const
 {
     if (size < 20) return Status::Malformed;
+    if (!ref) return Status::Malformed;
     if (data[7] & ~7u) return Status::Malformed;
     const bool secondOrder = (data[7] & 4) != 0;
     const uint32_t secondary = ReadPose32(data + 8);
@@ -337,7 +338,6 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::DecodeMode4(
                 uint32_t zig = 0;
                 if (!reader.Rice(zig, kval[k], 21)) return Status::Malformed;
                 if (zig > (secondOrder ? 524280u : 262140u)) return Status::Malformed;
-                if (zig) boneChanged = true;
                 const int64_t value = int64_t(predicted.values[k]) +
                     int64_t(PoseUnzigZag(zig)) * ((data[7] & 2) ? 4 : 1) +
                     spatial(i, k, 2, omitted[i]);
@@ -357,7 +357,6 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::DecodeMode4(
                 uint32_t zig = 0;
                 if (!reader.Rice(zig, kval[k], 21)) return Status::Malformed;
                 if (zig > (secondOrder ? 524280u : 262140u)) return Status::Malformed;
-                if (zig) boneChanged = true;
                 const int32_t prediction = TemporalPrediction(*recent, older, ratio, i, k);
                 const int64_t decoded = int64_t(prediction) + PoseUnzigZag(zig) + spatial(i, k, 2, omitted[i]);
                 if (decoded < -32768 || decoded > 32767) return Status::Malformed;

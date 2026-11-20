@@ -99,6 +99,16 @@ class Window {
 
     bool Due(uint32_t now) const { return started && static_cast<int32_t>(now - startedAt) >= static_cast<int32_t>(PeriodMs); }
 
+    void Reset()
+    {
+        started = false;
+        startedAt = 0;
+        ticks = 0;
+        interaction = processedNpc = candidates = processedTotal = 0;
+        std::memset(shared, 0, sizeof(shared));
+        for (Recipient& r : recipients) r = Recipient{};
+    }
+
     // One line per connected recipient; resets the window counters.
     template <class Emit>
     void Flush(uint32_t now, Context const& context, Emit emit)

@@ -46,7 +46,7 @@ struct InFlightPhysicOp {
 };
 
 std::unordered_set<eCEntity*> pinnedStatics;
-std::unordered_set<eCEntity*> cachingOutStatics;
+std::vector<InFlightPhysicOp> cachingOutOps;
 std::vector<InFlightPhysicOp> inFlightPhysicOps;
 std::vector<eCEntity const*> readyRemoteNpcs;
 std::vector<std::pair<uintptr_t, bool>> lastSphereReadiness;
@@ -59,21 +59,42 @@ bool HasOtherThreadInFlightLocked(eCEntity const* entity, DWORD selfThread)
     return false;
 }
 
+bool HasOtherThreadCachingOutLocked(eCEntity const* entity, DWORD selfThread)
+{
+    for (InFlightPhysicOp const& op : cachingOutOps) {
+        if (op.entity == entity && op.threadId != selfThread) return true;
+    }
+    return false;
+}
+
+bool IsCachingOutLocked(eCEntity const* entity)
+{
+    for (InFlightPhysicOp const& op : cachingOutOps) {
+        if (op.entity == entity) return true;
+    }
+    return false;
+}
+
 void BeginPhysicOpLocked(eCEntity* entity, DWORD selfThread)
 {
     inFlightPhysicOps.push_back({entity, selfThread});
+}
+
+void EraseOneOpLocked(std::vector<InFlightPhysicOp>& ops, eCEntity const* entity, DWORD selfThread)
+{
+    for (auto it = ops.begin(); it != ops.end(); ++it) {
+        if (it->entity == entity && it->threadId == selfThread) {
+            ops.erase(it);
+            return;
+        }
+    }
 }
 
 void EndPhysicOp(eCEntity* entity, DWORD selfThread)
 {
     {
         std::lock_guard<std::mutex> lock(Mutex());
-        for (auto it = inFlightPhysicOps.begin(); it != inFlightPhysicOps.end(); ++it) {
-            if (it->entity == entity && it->threadId == selfThread) {
-                inFlightPhysicOps.erase(it);
-                break;
-            }
-        }
+        EraseOneOpLocked(inFlightPhysicOps, entity, selfThread);
     }
     PhysicOpCv().notify_all();
 }
@@ -111,7 +132,7 @@ void __fastcall OnExitProcessingRangeDetour(eCEntity* entity, void* edx)
         std::lock_guard<std::mutex> lock(Mutex());
         const bool isPinned = pinnedStatics.find(entity) != pinnedStatics.end();
         if (!isPinned) return;
-        const bool isCachingOut = cachingOutStatics.find(entity) != cachingOutStatics.end();
+        const bool isCachingOut = IsCachingOutLocked(entity);
         shouldRestore = ShouldRestorePinnedOnExitRange(isPinned, isCachingOut, ReadStaticShapeState(entity));
         if (shouldRestore) BeginPhysicOpLocked(entity, selfThread);
     }
@@ -124,11 +145,15 @@ void __fastcall CacheOutInternalDetour(eCEntity* entity, void* edx, GEBool direc
 {
     bool tracked = false;
     bool shouldDestroy = false;
+    const DWORD selfThread = GetCurrentThreadId();
     if (entity && !entity->GetEntityFlags().Dynamic) {
-        const DWORD selfThread = GetCurrentThreadId();
         std::unique_lock<std::mutex> lock(Mutex());
-        PhysicOpCv().wait(lock, [&] { return !HasOtherThreadInFlightLocked(entity, selfThread); });
-        cachingOutStatics.insert(entity);
+        PhysicOpCv().wait(lock, [&] {
+            return !HasOtherThreadInFlightLocked(entity, selfThread) &&
+                   !HasOtherThreadCachingOutLocked(entity, selfThread);
+        });
+        cachingOutOps.push_back({entity, selfThread});
+        BeginPhysicOpLocked(entity, selfThread);
         tracked = true;
         shouldDestroy = pinnedStatics.erase(entity) > 0 &&
                         ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity));
@@ -138,27 +163,26 @@ void __fastcall CacheOutInternalDetour(eCEntity* entity, void* edx, GEBool direc
     if (tracked) {
         {
             std::lock_guard<std::mutex> lock(Mutex());
-            cachingOutStatics.erase(entity);
+            EraseOneOpLocked(cachingOutOps, entity, selfThread);
+            EraseOneOpLocked(inFlightPhysicOps, entity, selfThread);
         }
         PhysicOpCv().notify_all();
     }
 }
 
-void UnpinAllOutsideLock()
+void UnpinPhysicObjects(std::vector<eCEntity*> const& candidates, DWORD selfThread)
 {
-    const DWORD selfThread = GetCurrentThreadId();
-    std::vector<eCEntity*> candidates;
-    {
-        std::lock_guard<std::mutex> lock(Mutex());
-        candidates.assign(pinnedStatics.begin(), pinnedStatics.end());
-        pinnedStatics.clear();
-    }
     for (eCEntity* entity : candidates) {
+        if (!entity) continue;
         bool doDestroy = false;
         {
-            std::lock_guard<std::mutex> lock(Mutex());
-            if (entity && pinnedStatics.find(entity) == pinnedStatics.end() &&
-                cachingOutStatics.find(entity) == cachingOutStatics.end() &&
+            std::unique_lock<std::mutex> lock(Mutex());
+            PhysicOpCv().wait(lock, [&] {
+                return !HasOtherThreadInFlightLocked(entity, selfThread) &&
+                       !HasOtherThreadCachingOutLocked(entity, selfThread);
+            });
+            const bool wasPinned = pinnedStatics.erase(entity) > 0;
+            if (wasPinned && !IsCachingOutLocked(entity) &&
                 ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity))) {
                 BeginPhysicOpLocked(entity, selfThread);
                 doDestroy = true;
@@ -169,6 +193,17 @@ void UnpinAllOutsideLock()
             EndPhysicOp(entity, selfThread);
         }
     }
+}
+
+void UnpinAllOutsideLock()
+{
+    const DWORD selfThread = GetCurrentThreadId();
+    std::vector<eCEntity*> candidates;
+    {
+        std::lock_guard<std::mutex> lock(Mutex());
+        candidates.assign(pinnedStatics.begin(), pinnedStatics.end());
+    }
+    UnpinPhysicObjects(candidates, selfThread);
 }
 
 bool IntersectsAnySphere(float const box[6], processing::Sphere const* spheres, int sphereCount, float margin)
@@ -356,45 +391,24 @@ void SyncPinnedPhysicObjects(std::unordered_set<eCEntity*> const& desiredPinned,
     std::vector<eCEntity*> toCreate;
     {
         std::lock_guard<std::mutex> lock(Mutex());
-        for (auto it = pinnedStatics.begin(); it != pinnedStatics.end();) {
-            eCEntity* entity = *it;
-            if (desiredPinned.find(entity) == desiredPinned.end()) {
-                if (entity) toUnpin.push_back(entity);
-                it = pinnedStatics.erase(it);
-            } else {
-                ++it;
-            }
+        for (eCEntity* entity : pinnedStatics) {
+            if (entity && desiredPinned.find(entity) == desiredPinned.end())
+                toUnpin.push_back(entity);
         }
         for (eCEntity* entity : desiredPinned) {
-            if (!entity || cachingOutStatics.find(entity) != cachingOutStatics.end()) continue;
+            if (!entity || IsCachingOutLocked(entity)) continue;
             const StaticShapeState state = ReadStaticShapeState(entity);
             if (!ShouldPinStaticCollision(state)) continue;
             pinnedStatics.insert(entity);
             if (!state.hasPhysicObject) toCreate.push_back(entity);
         }
     }
-    for (eCEntity* entity : toUnpin) {
-        bool doDestroy = false;
-        {
-            std::lock_guard<std::mutex> lock(Mutex());
-            if (pinnedStatics.find(entity) == pinnedStatics.end() &&
-                cachingOutStatics.find(entity) == cachingOutStatics.end() &&
-                ShouldDestroyPinnedPhysicObject(ReadStaticShapeState(entity))) {
-                BeginPhysicOpLocked(entity, selfThread);
-                doDestroy = true;
-            }
-        }
-        if (doDestroy) {
-            entity->DestroyPhysicObject();
-            EndPhysicOp(entity, selfThread);
-        }
-    }
+    UnpinPhysicObjects(toUnpin, selfThread);
     for (eCEntity* entity : toCreate) {
         bool doCreate = false;
         {
             std::lock_guard<std::mutex> lock(Mutex());
-            if (pinnedStatics.find(entity) != pinnedStatics.end() &&
-                cachingOutStatics.find(entity) == cachingOutStatics.end()) {
+            if (pinnedStatics.find(entity) != pinnedStatics.end() && !IsCachingOutLocked(entity)) {
                 const StaticShapeState state = ReadStaticShapeState(entity);
                 if (ShouldPinStaticCollision(state) && !state.hasPhysicObject) {
                     BeginPhysicOpLocked(entity, selfThread);
@@ -410,7 +424,7 @@ void SyncPinnedPhysicObjects(std::unordered_set<eCEntity*> const& desiredPinned,
     std::lock_guard<std::mutex> lock(Mutex());
     for (NpcCandidate& cand : candidates) {
         for (eCEntity* staticEnt : cand.localRange1Statics) {
-            if (!staticEnt || cachingOutStatics.find(staticEnt) != cachingOutStatics.end() ||
+            if (!staticEnt || IsCachingOutLocked(staticEnt) ||
                 staticEnt->GetPhysicObject() == nullptr) {
                 cand.allLocalRange1Pinned = false;
                 break;
@@ -541,9 +555,11 @@ void OnEntityDestroyed(eCEntity* entity)
     if (!entity) return;
     const DWORD selfThread = GetCurrentThreadId();
     std::unique_lock<std::mutex> lock(Mutex());
-    PhysicOpCv().wait(lock, [&] { return !HasOtherThreadInFlightLocked(entity, selfThread); });
+    PhysicOpCv().wait(lock, [&] {
+        return !HasOtherThreadInFlightLocked(entity, selfThread) &&
+               !HasOtherThreadCachingOutLocked(entity, selfThread);
+    });
     pinnedStatics.erase(entity);
-    cachingOutStatics.erase(entity);
     auto it = std::lower_bound(readyRemoteNpcs.begin(), readyRemoteNpcs.end(), entity);
     if (it != readyRemoteNpcs.end() && *it == entity) readyRemoteNpcs.erase(it);
     const uintptr_t key = reinterpret_cast<uintptr_t>(entity);

@@ -205,6 +205,20 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
         witness::HitSeen(victim, attacker.GetInstance());  // those around hear the fight (P7)
         return;
     }
+    if (target.NPC.Immortal) {
+        eCEntity* sourceNpc = attacker.GetInstance() ? attacker.GetInstance() : victim;
+        if (KnocksOut(target)) {
+            if (attacker.GetInstance()) target.NPC.SetCurrentAttacker(attacker);
+            CallScript("AddHitPoints", victim, sourceNpc, -HitPoints(target));
+            target.Routine.FullStop();
+            target.Routine.SetTask(bCString("ZS_Unconscious"));
+            witness::KnockOutSeen(victim, attacker.GetInstance());
+        } else {
+            CallScript("AddHitPoints", victim, sourceNpc, delta);
+            witness::HitSeen(victim, attacker.GetInstance());
+        }
+        return;
+    }
     uint8_t guid[16];
     Guid(victim, guid);
     killedHere.insert(KillKey(guid));  // before the death call: OnHitNpc drops further hits on it (R9)
@@ -222,6 +236,14 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     }
     telemetry::OnCombatDefeat(party ? "party_npc_kill" : "npc_kill", attacker.GetInstance(), victim, party ? from : 0, false, paysXp);
     Logf("combat: %s of player %u killed %s", attacker.GetInstance() ? attacker.GetName().GetText() : "an NPC", from, target.GetName().GetText());
+}
+
+void PruneKnockedAt(DWORD now)
+{
+    for (auto it = knockedAt.begin(); it != knockedAt.end();) {
+        if (now - it->second >= 3000) it = knockedAt.erase(it);
+        else ++it;
+    }
 }
 
 // Host: a client's hit on one of the host's NPCs.
@@ -408,10 +430,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         target.Routine.FullStop();
         target.Routine.SetTask(bCString("ZS_Unconscious"));
         const DWORD now = GetTickCount();
-        for (auto it = knockedAt.begin(); it != knockedAt.end();) {
-            if (now - it->second >= 3000) it = knockedAt.erase(it);
-            else ++it;
-        }
+        PruneKnockedAt(now);
         knockedAt[KillKey(guid)] = now;
         ++duelKnockouts;
         telemetry::OnCombatDefeat("bout_knockout", attacker, victim, from, false, false);
@@ -435,10 +454,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             target.Routine.FullStop();
             target.Routine.SetTask(bCString("ZS_Unconscious"));
             const DWORD now = GetTickCount();
-            for (auto it = knockedAt.begin(); it != knockedAt.end();) {
-                if (now - it->second >= 3000) it = knockedAt.erase(it);
-                else ++it;
-            }
+            PruneKnockedAt(now);
             knockedAt[KillKey(guid)] = now;
             witness::KnockOutSeen(victim, attacker);
             ++knockedOut;
@@ -457,6 +473,22 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     // right after (its player left) made them use a deleted entity (eCEntity::QueryEntityProxyInternal crash on a
     // client in stage E2). The real killer is rewarded on its own machine (SendKilled).
     eCEntity* victim = target.GetInstance();
+    if (target.NPC.Immortal) {
+        if (KnocksOut(target)) {
+            target.NPC.SetCurrentAttacker(Entity(attacker));
+            CallScript("AddHitPoints", victim, attacker, -HitPoints(target));
+            target.Routine.FullStop();
+            target.Routine.SetTask(bCString("ZS_Unconscious"));
+            const DWORD now = GetTickCount();
+            PruneKnockedAt(now);
+            knockedAt[KillKey(guid)] = now;
+            witness::KnockOutSeen(victim, attacker);
+        } else {
+            CallScript("AddHitPoints", victim, attacker, delta);
+            witness::HitSeen(victim, attacker);
+        }
+        return;
+    }
     const bool paysXp = !target.NPC.DefeatedByPlayer;
     killedHere.insert(KillKey(guid));  // before the death call (R9)
     knockedAt.erase(KillKey(guid));

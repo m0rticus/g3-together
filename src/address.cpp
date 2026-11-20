@@ -95,6 +95,7 @@ void ClientTick(uint32_t now)
         waitState.isDead = waitState.entityExists && npc.IsDead() != GEFalse;
         waitState.isDown = waitState.entityExists && npc.IsDown() != GEFalse;
         waitState.expired = static_cast<int32_t>(now - pending.until) > 0;
+        waitState.tooFar = waitState.entityExists && Distance(npc.GetInstance(), hero) > CallFrom + 500.0f;
         if (address_policy::ShouldCancelClientWait(waitState)) {
             waiting = false;
             ++expired;
@@ -158,6 +159,10 @@ void HostTick(uint32_t now)
     for (auto it = approaches.begin(); it != approaches.end();) {
         Approach& a = it->second;
         eCEntity* npc = a.npc.GetInstance();
+        if (!npc) {
+            npc = npcs::NpcByGuid(it->first.data());
+            if (npc) a.npc = Entity(npc);
+        }
         eCEntity* puppet = remote::PuppetOf(a.player);
         const address_policy::HostNpcState state = BuildHostNpcState(a.npc, puppet);
         const bool approachExpired = static_cast<int32_t>(now - a.until) > 0;
@@ -202,10 +207,14 @@ void HostTick(uint32_t now)
             a.nextGoto = now + 1000;
             const bCVector& p = puppet->GetWorldPosition();
             const bCVector& n = npc->GetWorldPosition();
-            const float dx = n.GetX() - p.GetX(), dz = n.GetZ() - p.GetZ(), length = std::sqrt(dx * dx + dz * dz);
-            if (length > StandBy + 60.0f) {
+            const float dx = n.GetX() - p.GetX(), dy = n.GetY() - p.GetY(), dz = n.GetZ() - p.GetZ();
+            const float length = std::sqrt(dx * dx + dz * dz);
+            const float dist3d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (dist3d > StandBy + 60.0f && length > 1.0f) {
                 const bCVector goal(p.GetX() + dx / length * StandBy, p.GetY(), p.GetZ() + dz / length * StandBy);
                 a.npc.StartGoto(goal, gEWalkMode_Walk);
+            } else if (dist3d > StandBy + 60.0f) {
+                a.npc.StartGoto(p, gEWalkMode_Walk);
             }
         }
         ++it;
@@ -250,6 +259,7 @@ void OnWorldChange()
     approaches.clear();
     rested.clear();
     waiting = false;
+    nextLook = 0;
 }
 
 void Report(LogFn log)
@@ -263,6 +273,7 @@ void Report(LogFn log)
 void Off(LogFn log)
 {
     on = false;
+    waiting = false;
     log("ADDRESSOFF ok=1");
 }
 

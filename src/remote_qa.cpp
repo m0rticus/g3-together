@@ -17,7 +17,6 @@ namespace g3t::remote {
 namespace internal {
 namespace {
 constexpr gESlot WornSlots[2] = {gESlot_Body, gESlot_Helmet};
-unsigned puppetDropsRemoved = 0;
 }
 
 GEInt StackFor(Entity& body, char const* name)
@@ -36,6 +35,10 @@ void TakeOff(Entity& body, gESlot slot)
 {
     for (GEInt i = 0; i < body.Inventory.GetStackCount(); ++i)
         if (body.Inventory.GetSlotFromStack(i) == slot) body.Inventory.UnEquipStack(i);
+    if (body.Inventory.FindStackIndex(slot) >= 0) {
+        if (auto* inv = static_cast<gCInventory_PS*>(body.GetInstance()->GetPropertySet(eEPropertySetType_Inventory)))
+            inv->UnlinkStackFromSlot(slot);
+    }
 }
 
 void NoDrop(Puppet& puppet, uint32_t now)
@@ -49,7 +52,6 @@ void NoDrop(Puppet& puppet, uint32_t now)
             if (item.GetInstance() && item.IsItem() && !item.GetOwner().GetInstance()) {
                 Logf("remote: %s fell from a puppet's hand; removed (its player's own copy counts)", item.GetName().GetText());
                 item.Decay();
-                ++puppetDropsRemoved;
             }
         }
         key = {};
@@ -60,8 +62,8 @@ void NoDrop(Puppet& puppet, uint32_t now)
 
 void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now)
 {
-    if (!qa.puppetWear || static_cast<int32_t>(now - puppet.wearChecked) < 250) return;
-    puppet.wearChecked = now;
+    if (!qa.puppetWear || (puppet.wearChecked && static_cast<int32_t>(now - puppet.wearChecked) < 250)) return;
+    puppet.wearChecked = now ? now : 1u;
     char const* const wanted[2] = {armor, helmet};
     for (int i = 0; i < 2; ++i) {
         const Entity worn = puppet.entity.Inventory.GetItemFromSlot(WornSlots[i]);
@@ -288,7 +290,7 @@ void WalkRel(char const* argument, LogFn log)
 void Step(int index, LogFn log)
 {
     char line[200];
-    eCEntity* hero = gCSession::GetInstance().GetHero() ? ControlledBody() : nullptr;
+    eCEntity* hero = ControlledBody();
     if (!hero || !gCSession::GetInstance().IsGameRunning()) { log("REFUSED step: no hero"); return; }
     if (!haveAnchor) { anchor = hero->GetWorldPosition(); haveAnchor = true; }
     const float angle = index * 0.785398f;

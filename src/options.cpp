@@ -131,11 +131,11 @@ void Summary(unsigned changed, policy::Snapshot const& s)
     number(policy::NpcHp, i18n::OptionsNpcHp, static_cast<double>(s.npcHp));
     if (changed & policy::PlayerStart) {
         wchar_t name[64] = {};
-        MultiByteToWideChar(CP_UTF8, 0, s.playerStart, -1, name, 64);
+        MultiByteToWideChar(CP_UTF8, 0, s.playerStart, -1, name, 63);
         number(policy::PlayerStart, i18n::OptionsPlayerStart, name);
     }
     wchar_t difficulty[64] = {}, text[900] = {};
-    MultiByteToWideChar(CP_UTF8, 0, LocalSetup().Difficulty.GetText(), -1, difficulty, 64);
+    MultiByteToWideChar(CP_UTF8, 0, LocalSetup().Difficulty.GetText(), -1, difficulty, 63);
     _snwprintf_s(text, _TRUNCATE, i18n::Text(i18n::OptionsAdopted), list.c_str(), difficulty);
     {
         std::lock_guard<std::mutex> lock(sessionMutex);
@@ -234,8 +234,8 @@ bool Adopt(policy::Snapshot const& host, uint32_t epoch)
         if (!session.Adopt(local, host, epoch)) return false;
         sessionActive.store(session.active, std::memory_order_release);
         original = session.original;
+        if (policy::NeedsEntry(newValues, running)) reentry = true;
     }
-    if (policy::NeedsEntry(newValues, running)) reentry = true;
     Logf("options: epoch=%08x option=alternative_balancing host=%u original=%u effective=%u source=host/getter",
          epoch, host.balancing, original.balancing, host.balancing);
     Logf("options: epoch=%08x option=alternative_ai host=%u original=%u effective=%u source=host/getter",
@@ -289,6 +289,7 @@ wchar_t const* Hint()
 }
 bool WorldAnnounced()
 {
+    std::lock_guard<std::mutex> lock(sessionMutex);
     if (!reentry) return true;
     if (persist::ClientTransitionPending()) {
         reentry = false; // The existing epoch handler already queued this world replacement.

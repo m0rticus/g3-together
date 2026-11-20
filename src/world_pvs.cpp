@@ -14,6 +14,7 @@
 #include "npcplayback.h"
 #include "npcs.h"
 #include "persist.h"
+#include "ranged.h"
 #include "relation.h"
 #include "remote.h"
 #include "telemetry.h"
@@ -290,6 +291,7 @@ bool CompletePrefetcher(eCPVSPrefetcher3& prefetcher, char const* phase)
     eCPVSPrefetcherJob* job = nullptr;
     std::memcpy(&job, reinterpret_cast<unsigned char const*>(&prefetcher) + 0xc, sizeof(job));
     if (!job) {
+        prefetcher.WaitForEmptyThreadQueue();
         Logf("world: %s prefetcher has no active job", phase);
         return true;
     }
@@ -490,6 +492,16 @@ void ReleaseRegion(RemoteRegionState& region)
     contextRefreshPending.store(true, std::memory_order_relaxed);
 }
 
+bool MarkRegionFailed(RemoteRegionState& region, char const* logMessage = nullptr)
+{
+    region.failed = true;
+    region.retryAt = net::Now() + 5000;
+    ++remoteRegionFailures;
+    if (logMessage) Log(logMessage);
+    RegionError();
+    return false;
+}
+
 bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
 {
     if (GatePaused() || ai::ShuttingDown()) return false;
@@ -502,32 +514,23 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
         auto* renderer = RenderAdmin();
         if (!renderer || !InstallDatabaseIndexFix() || !InstallRemoteCacheOut() ||
             !InstallContextOwnership(renderer->GetPVSPrefetcher3())) {
-            region.failed = true;
-            region.retryAt = net::Now() + 5000;
-            ++remoteRegionFailures;
-            RegionError();
-            return false;
+            return MarkRegionFailed(region);
         }
         auto prefetcher = std::make_unique<eCPVSPrefetcher3>();
         if (prefetcher->Create() != bEResult_Ok) {
-            region.failed = true;
-            region.retryAt = net::Now() + 5000;
-            ++remoteRegionFailures;
-            Log("FAIL world: cannot create an isolated remote prefetcher");
-            RegionError();
-            return false;
+            return MarkRegionFailed(region, "FAIL world: cannot create an isolated remote prefetcher");
         }
         prefetcher->SetContextCacheOutCallback(&KeepSharedContext);
         auto camera = std::make_unique<eCCameraBase>();
         if (camera->Create(GEFalse, GETrue) != bEResult_Ok ||
             camera->Init(bCRect(0, 0, 32, 32), 60.0f, 1.0f, radius) != bEResult_Ok ||
             camera->GetFrustumDatabase().GetFrustumDatabaseIndex() == 0xffffffffu) {
-            region.failed = true;
-            region.retryAt = net::Now() + 5000;
-            ++remoteRegionFailures;
-            Log("FAIL world: cannot register a remote simulation camera; no client-simulation fallback");
-            RegionError();
-            return false;
+            auto& database = camera->GetFrustumDatabase();
+            if (database.GetFrustumDatabaseIndex() != 0xffffffffu) {
+                renderer->UnregisterDatabase(database);
+                renderer->FlushThreadQueues();
+            }
+            return MarkRegionFailed(region, "FAIL world: cannot register a remote simulation camera; no client-simulation fallback");
         }
         region.camera = std::move(camera);
         region.prefetcher = std::move(prefetcher);
@@ -557,12 +560,7 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
     }
     auto* renderer = RenderAdmin();
     if (!renderer || !region.prefetcher || !region.prefetcher->Process(region.camera->GetFrustumDatabase())) {
-        region.failed = true;
-        region.retryAt = net::Now() + 5000;
-        ++remoteRegionFailures;
-        Log("FAIL world: remote simulation prefetch refused; no client-simulation fallback");
-        RegionError();
-        return false;
+        return MarkRegionFailed(region, "FAIL world: remote simulation prefetch refused; no client-simulation fallback");
     }
     ++region.frames;
     return true;
@@ -570,7 +568,7 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
 
 void __fastcall DestroyEntity(eCEntity* entity, void* edx)
 {
-    if (entity->GetEntityFlags().m_CachedIn && !reportingDestroy) {
+    if (entity && entity->GetEntityFlags().m_CachedIn && !reportingDestroy) {
         reportingDestroy = true;
         static_assert(offsetof(eCEntity, m_EntityFlags) == 0x3c, "native entity flag offset");
         uint32_t flags = 0;
@@ -583,6 +581,8 @@ void __fastcall DestroyEntity(eCEntity* entity, void* edx)
         reportingDestroy = false;
     }
     hud::OnEntityDestroyed(entity);
+    npcs::OnEntityDestroyed(entity);
+    ranged::ClearPuppetOverlay(entity);
     npcplayback::OnEntityDestroyed(entity);
     npclease::OnEntityDestroyed(entity);
     telemetry::OnEntityDestroyed(entity);
@@ -745,8 +745,10 @@ void TickHostRegions()
     const bCVector& p = camera.GetPosition();
     const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
     RefreshSimulationAnchors();
-    std::vector<AnchorGroup> groups;
-    std::vector<size_t> anchorGroups;
+    static std::vector<AnchorGroup> groups;
+    static std::vector<size_t> anchorGroups;
+    groups.clear();
+    anchorGroups.clear();
     ClusterAnchorGroups(here, camera.GetClipDepth().GetY(), groups, anchorGroups);
     SyncActiveRegions(groups);
     UpdateReadySimulationAnchors(renderer->GetPVSPrefetcher3(), anchorGroups);

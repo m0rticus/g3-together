@@ -105,24 +105,28 @@ bool SafeNativeProperty(eEPropertySetType type)
     }
 }
 
-PropertyTable const* PropertyHooks(eCEntityPropertySet* self)
+PropertyTable const* FindPropertyTable(eCEntityPropertySet* self)
 {
     void** table = *reinterpret_cast<void***>(self);
     const unsigned count = propertyTableCount.load(std::memory_order_acquire);
-    for (unsigned i = 0; i < count; ++i) if (propertyTables[i].table == table) return &propertyTables[i];
+    for (unsigned i = 0; i < count; ++i)
+        if (propertyTables[i].table == table) return &propertyTables[i];
+    return nullptr;
+}
+
+PropertyTable const* PropertyHooks(eCEntityPropertySet* self)
+{
+    if (!self) return nullptr;
+    if (auto* table = FindPropertyTable(self)) return table;
     Log("FAIL npcplayback: missing event dispatch table");
     return nullptr;
 }
 
 void PropertyDispatch(eCEntityPropertySet* self, void* edx, unsigned phase)
 {
+    if (!self) return;
     if (ai::ShuttingDown()) {
-        if (self) {
-            void** table = *reinterpret_cast<void***>(self);
-            const unsigned count = propertyTableCount.load(std::memory_order_acquire);
-            for (unsigned i = 0; i < count; ++i)
-                if (propertyTables[i].table == table) { propertyTables[i].original[phase](self, edx); return; }
-        }
+        if (auto* table = FindPropertyTable(self)) { table->original[phase](self, edx); return; }
         return;
     }
     const eEPropertySetType type = self->GetPropertySetType();
@@ -137,10 +141,7 @@ void PropertyDispatch(eCEntityPropertySet* self, void* edx, unsigned phase)
         ++counters.blockedProperties;
         return;
     }
-    void** table = *reinterpret_cast<void***>(self);
-    const unsigned count = propertyTableCount.load(std::memory_order_acquire);
-    for (unsigned i = 0; i < count; ++i)
-        if (propertyTables[i].table == table) { propertyTables[i].original[phase](self, edx); return; }
+    if (auto* table = FindPropertyTable(self)) { table->original[phase](self, edx); return; }
     Log("FAIL npcplayback: unregistered property dispatch table");
 }
 
@@ -332,7 +333,14 @@ void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2
     captured.defaults = options == nullptr;
     captured.started = net::Now();
     originalActorPlay(self, edx, slot, motion, options);
-    if (presenting || index < 0 || index >= Slots || !self->HasMotionInstance(slot)) return;
+    if (index < 0 || index >= Slots) return;
+    if (presenting) {
+        std::lock_guard<std::mutex> lock(sourceOptionsMutex);
+        if (const auto found = sourceOptions.find(self); found != sourceOptions.end())
+            found->second[index].available = false;
+        return;
+    }
+    if (!self->HasMotionInstance(slot)) return;
     std::lock_guard<std::mutex> lock(sourceOptionsMutex);
     if (++nextInstance == 0) ++nextInstance;
     captured.instance = nextInstance;
@@ -366,7 +374,7 @@ void __fastcall StopMotion(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx
     auto* visual = updatingVisual && IsPassive(visualEntity) && !DialogPartner(visualEntity) ? Animation(visualEntity) : nullptr;
     if (!presenting && visual && !visual->GetRagDollEnabled()) { ++counters.blockedAnimations; return; }
     const int index = static_cast<int>(slot);
-    if (!presenting && index >= 0 && index < Slots) {
+    if (index >= 0 && index < Slots) {
         std::lock_guard<std::mutex> lock(sourceOptionsMutex);
         const auto found = sourceOptions.find(self);
         if (found != sourceOptions.end()) found->second[index].available = false;
@@ -383,11 +391,12 @@ void __fastcall SetTask(gCScriptRoutine_PS* self, void* edx, bCString const& tas
 void __fastcall AISetTask(gCScriptRoutine_PS* self, void* edx, bCString const& task)
 {
     if (ai::ShuttingDown()) { if (originalAISetTask) originalAISetTask(self, edx, task); return; }
-    if (net::IsHost() && std::strstr(task.GetText(), "Stumble")) {
+    if (TaskBlocked(self, task)) return;
+    if (net::IsHost() && self && std::strstr(task.GetText(), "Stumble")) {
         eCEntity* entity = self->GetEntity();
         npcs::HostHit(entity, entity == originEntity ? originPlayer : 0, entity == originEntity ? originSequence : 0);
     }
-    if (!TaskBlocked(self, task)) originalAISetTask(self, edx, task);
+    originalAISetTask(self, edx, task);
 }
 
 template <typename Fn, size_t N>
@@ -432,7 +441,8 @@ void __fastcall ActorProcess(eCWrapper_emfx2Actor* self, void* edx, bCMatrix con
                              GEBool skeleton, GEBool physics, GEFloat scale)
 {
     if (ai::ShuttingDown()) { if (originalActorProcess) originalActorProcess(self, edx, world, skeleton, physics, scale); return; }
-    auto* animation = updatingVisual && IsPassive(visualEntity) ? Animation(visualEntity) : nullptr;
+    auto* animation = updatingVisual && (IsPassive(visualEntity) || (presentingPose && presentingPose->allowNonPassive))
+        ? Animation(visualEntity) : nullptr;
     if (presentingPose && animation && animation->GetActor() == self) {
         // Retire stopped native instances without advancing a mirror's animation or blend clocks.
         originalActorProcess(self, edx, world, GETrue, GEFalse, 0.0f);
@@ -551,8 +561,8 @@ void PruneSourceOptions(uint32_t now)
     {
         std::lock_guard<std::mutex> lock(sourceOptionsMutex);
         if (lastOptionsPruneAt && now - lastOptionsPruneAt < 15000) return;
-        if (sourceOptions.size() <= 256) return;
-        lastOptionsPruneAt = now;
+        if (sourceOptions.empty()) return;
+        lastOptionsPruneAt = now ? now : 1;
     }
     auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
     if (!scene) return;
@@ -629,6 +639,16 @@ uint32_t MotionInstance(eCEntity* entity, int slot)
 void OnEntityDestroyed(eCEntity* entity)
 {
     if (!entity || ai::ShuttingDown()) return;
+    if (detail::verdictEntity == entity) {
+        detail::verdictEntity = nullptr;
+        detail::verdictTask[0] = '\0';
+    }
+    if (detail::originEntity == entity) {
+        detail::originEntity = nullptr;
+        detail::originPlayer = 0;
+        detail::originSequence = 0;
+    }
+    detail::ForgetDestroyedEntity(entity);
     auto* animation = detail::Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor) return;

@@ -67,6 +67,9 @@ uint8_t TakenBy(eCEntity* object)
 // an NPC sitting there would keep it off, and keep the other player's puppet as the user.
 void Refuse(eCEntity* hero)
 {
+    if (!hero || !hero->GetPropertySet(eEPropertySetType_ScriptRoutine) ||
+        !hero->GetPropertySet(eEPropertySetType_NPC) ||
+        !hero->GetPropertySet(eEPropertySetType_Focus)) return;
     Entity self(hero);
     if (self.Routine.GetCurrentTask() != bCString("PS_Interact")) { hasRefused = false; return; }
     eCEntity* object = self.NPC.GetCurrentTarget().GetInstance();
@@ -88,22 +91,30 @@ void Refuse(eCEntity* hero)
     refusedKey = currentRefused;
     hasRefused = true;
     telemetry::OnOccupancyEvent("refused_in_use", player, object, objectGuid, puppet, "local_interact_refused");
-    wchar_t name[64] = {}, text[160];
-    MultiByteToWideChar(CP_UTF8, 0, net::PeerName(player), -1, name, 64);
-    swprintf_s(text, i18n::Text(i18n::PlaceInUse), name[0] ? name : L"?");
-    hud::Message(hud::Info, text);
+    wchar_t name[64] = {}, text[160] = {};
+    if (char const* peer = net::PeerName(player))
+        MultiByteToWideChar(CP_UTF8, 0, peer, -1, name, static_cast<int>(sizeof(name) / sizeof(name[0])));
+    name[63] = L'\0';
+    if (wchar_t const* fmt = i18n::Text(i18n::PlaceInUse)) {
+        _snwprintf_s(text, _TRUNCATE, fmt, name[0] ? name : L"?");
+        hud::Message(hud::Info, text);
+    }
 }
 
 // The object the hero uses: the game sets it as the object's user; the hero's target or focus points at it.
 eCEntity* InUse(eCEntity* hero)
 {
+    if (!hero) return nullptr;
+    Entity self(hero);
+    if (self.IsDead() || self.IsDown()) return nullptr;
     if (hasUsed) {
         eCEntity* current = guid::Resolve(usedGuid).GetInstance();
         if (UsedBy(current, hero)) return current;
     }
-    Entity self(hero);
-    if (eCEntity* target = self.NPC.GetCurrentTarget().GetInstance(); UsedBy(target, hero)) return target;
-    if (eCEntity* focus = self.Focus.GetFocusEntity().GetInstance(); UsedBy(focus, hero)) return focus;
+    if (hero->GetPropertySet(eEPropertySetType_NPC))
+        if (eCEntity* target = self.NPC.GetCurrentTarget().GetInstance(); UsedBy(target, hero)) return target;
+    if (hero->GetPropertySet(eEPropertySetType_Focus))
+        if (eCEntity* focus = self.Focus.GetFocusEntity().GetInstance(); UsedBy(focus, hero)) return focus;
     return nullptr;
 }
 
@@ -129,19 +140,33 @@ occupancy_policy::InteractUserState BuildUserState(eCEntity* object)
                            aiMode == gEAIMode_Dead || aiMode == gEAIMode_Down;
         s.userInactiveRoutine = aiMode == gEAIMode_Combat ||
                                 aiMode == gEAIMode_Flee ||
-                                aiMode == gEAIMode_Abandoned;
+                                aiMode == gEAIMode_Abandoned ||
+                                aiMode == gEAIMode_Arena;
     }
     return s;
 }
 
-void ScrubStaleUsers()
+void ScrubRoi(eCEntity* onlyUser, char const* reason)
 {
     auto const& interactions = gCInteractionAdmin::GetInstance().GetInteractionsInROI();
     for (int i = 0; i < interactions.GetCount(); ++i) {
         auto* interaction = interactions.GetAt(i);
         eCEntity* object = interaction ? interaction->GetEntity() : nullptr;
-        if (object && interaction->GetUser().GetEntity())
-            ClearStaleUser(object, "roi-scrub");
+        eCEntity const* user = interaction ? interaction->GetUser().GetEntity() : nullptr;
+        if (object && user && (!onlyUser || user == onlyUser))
+            ClearStaleUser(object, reason);
+    }
+}
+
+void ScrubStaleUsers()
+{
+    ScrubRoi(nullptr, "roi-scrub");
+    for (auto const& entry : marked) {
+        eCEntity* instance = guid::Resolve(entry.first.data()).GetInstance();
+        if (!IsWorldInteractable(instance)) continue;
+        if (Entity(instance).Interaction.GetUser().GetInstance()) continue;
+        if (eCEntity* puppet = remote::PuppetOf(entry.second))
+            Entity(instance).Interaction.SetUser(Entity(puppet));
     }
 }
 }
@@ -194,26 +219,25 @@ void ReleaseNpc(eCEntity* npc, bool scanRoi)
     if (!npc || !npc->GetPropertySet(eEPropertySetType_NPC)) return;
     if (npc->GetPropertySet(eEPropertySetType_Navigation)) {
         eCEntity* dest = Entity(npc).Navigation.GetCurrentDestinationPoint().GetInstance();
-        if (dest && Entity(dest).GetInstance() &&
-            dest->GetPropertySet(eEPropertySetType_Interaction) &&
+        if (dest && dest->GetPropertySet(eEPropertySetType_Interaction) &&
             Entity(dest).Interaction.GetUser().GetInstance() == npc) {
             ClearStaleUser(dest, "silence");
         }
     }
     if (!scanRoi) return;
-    auto const& interactions = gCInteractionAdmin::GetInstance().GetInteractionsInROI();
-    for (int i = 0; i < interactions.GetCount(); ++i) {
-        auto* interaction = interactions.GetAt(i);
-        eCEntity* object = interaction ? interaction->GetEntity() : nullptr;
-        if (object && interaction->GetUser().GetEntity() == npc) {
-            ClearStaleUser(object, "silence-roi");
-        }
-    }
+    ScrubRoi(npc, "silence-roi");
 }
 
 void Tick()
 {
-    if (!net::Connected() || !gCSession::GetInstance().IsGameRunning()) return;
+    if (!net::Connected() || !gCSession::GetInstance().IsGameRunning()) {
+        hasUsed = false;
+        std::memset(usedGuid, 0, sizeof(usedGuid));
+        strcpy_s(usedName, "-");
+        hasRefused = false;
+        refusedKey = {};
+        return;
+    }
     if (enabled && !marked.empty())
         if (eCEntity* hero = remote::ControlledBody()) Refuse(hero);  // every frame: before the hero gets there
     const DWORD now = GetTickCount();
@@ -250,37 +274,57 @@ void Tick()
 
 void OnState(uint8_t from, net::WorldState const& s)
 {
-    const uint8_t player = s.guard ? s.guard : from;
+    if (s.npc > 1 || IsZeroGuid(s.guid)) return;
+    uint8_t player = 0;
+    if (net::IsHost()) {
+        if (from < 2 || from >= net::MaxPlayers || !net::InWorld(from)) return;
+        if (s.guard && s.guard != from) return;
+        player = from;
+    } else {
+        if (from != 1) return;
+        player = s.guard ? s.guard : from;
+        if (!player || player >= net::MaxPlayers || player == net::LocalId()) return;
+    }
     Entity object = guid::Resolve(s.guid);
     eCEntity* instance = object.GetInstance();
-    if (!IsWorldInteractable(instance)) return;
-    eCEntity* puppet = remote::PuppetOf(player);
-    eCEntity* user = object.Interaction.GetUser().GetInstance();
     const GuidKey key = ToGuidKey(s.guid);
-    if (s.npc) {
-        if (!puppet) return;
-        if (ClearStaleUser(instance, "remote-takeover"))
-            user = object.Interaction.GetUser().GetInstance();
-        if (user && user != puppet && !remote::PuppetOwner(user)) {
-            ++busy;  // someone here sits there already (this hero or an NPC): it stays theirs
-            Logf("occupancy: player %u uses %s, which %s uses here", player, instance->GetName().GetText(), Entity(user).GetName().GetText());
-            telemetry::OnOccupancyEvent("remote_busy_conflict", player, instance, s.guid, user, "occupied_locally");
-            return;
+    if (!s.npc) {
+        if (auto it = marked.find(key); it != marked.end() && it->second == player) marked.erase(it);
+        if (IsWorldInteractable(instance)) {
+            eCEntity* user = object.Interaction.GetUser().GetInstance();
+            if (user && remote::PuppetOwner(user) == player) {
+                object.Interaction.SetUser(Entity());
+                ++cleared;
+                Logf("occupancy: player %u let go of %s; free here too", player, instance->GetName().GetText());
+                telemetry::OnOccupancyEvent("remote_release", player, instance, s.guid, user, "remote_let_go");
+            }
         }
-        object.Interaction.SetUser(Entity(puppet));
-        marked[key] = player;
-        ++applied;
-        Logf("occupancy: player %u uses %s; taken here too", player, instance->GetName().GetText());
-        telemetry::OnOccupancyEvent("remote_occupy", player, instance, s.guid, puppet, "remote_use");
         return;
     }
-    marked.erase(key);
-    if (user && remote::PuppetOwner(user) == player) {
-        object.Interaction.SetUser(Entity());
-        ++cleared;
-        Logf("occupancy: player %u let go of %s; free here too", player, instance->GetName().GetText());
-        telemetry::OnOccupancyEvent("remote_release", player, instance, s.guid, puppet, "remote_let_go");
+    if (auto it = marked.find(key); it != marked.end() && it->second != player) {
+        ++busy;
+        return;
     }
+    if (!instance) {
+        marked[key] = player;
+        return;
+    }
+    if (!IsWorldInteractable(instance)) return;
+    eCEntity* puppet = remote::PuppetOf(player);
+    ClearStaleUser(instance, "remote-takeover");
+    eCEntity* user = object.Interaction.GetUser().GetInstance();
+    if (user && user != puppet && (!remote::PuppetOwner(user) || remote::PuppetOwner(user) != player)) {
+        ++busy;  // someone here sits there already (this hero, an NPC, or another puppet): it stays theirs
+        Logf("occupancy: player %u uses %s, which %s uses here", player, instance->GetName().GetText(), Entity(user).GetName().GetText());
+        telemetry::OnOccupancyEvent("remote_busy_conflict", player, instance, s.guid, user, "occupied_locally");
+        return;
+    }
+    marked[key] = player;
+    if (!puppet) return;
+    object.Interaction.SetUser(Entity(puppet));
+    ++applied;
+    Logf("occupancy: player %u uses %s; taken here too", player, instance->GetName().GetText());
+    telemetry::OnOccupancyEvent("remote_occupy", player, instance, s.guid, puppet, "remote_use");
 }
 
 void Forget(int player, eCEntity* puppet)

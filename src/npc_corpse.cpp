@@ -187,20 +187,20 @@ eCEntity* AutoAimTarget(eCVisualAnimation_PS* animation)
     return target;
 }
 
-unsigned ClearLocalReferencesToDeadMirror(eCEntity* dead, unsigned* combatStops, bool first, bool removed)
+unsigned ClearLocalReferencesToDeadMirror(eCEntity* dead, unsigned* /*combatStops*/, bool first, bool removed)
 {
     if (!dead || net::IsHost()) return 0;
 
     unsigned cleared = 0;
-    if (combatStops) *combatStops = 0;
-    const bool wasDead = !removed && Entity(dead).IsDead();
+    auto* deadRoutine = static_cast<gCScriptRoutine_PS*>(dead->GetPropertySet(eEPropertySetType_ScriptRoutine));
+    const bool wasDead = !removed && deadRoutine && Entity(dead).IsDead();
     if (!removed) {
-        if (auto* routine = static_cast<gCScriptRoutine_PS*>(dead->GetPropertySet(eEPropertySetType_ScriptRoutine)))
-            routine->AccessAIMode().AccessValue() = gEAIMode_Dead;
+        if (deadRoutine) deadRoutine->AccessAIMode().AccessValue() = gEAIMode_Dead;
         auto* receiver = static_cast<gCDamageReceiver_PS*>(dead->GetPropertySet(eEPropertySetType_DamageReceiver));
         if (receiver) receiver->AccessHitPoints() = 0;
         if (first) Logf("npcs: CLIENTDEATHSTATE name=%.64s instance=%p native_dead_before=%d native_dead_after=%d hp=%ld",
-                        dead->GetName().GetText(), dead, wasDead ? 1 : 0, Entity(dead).IsDead() ? 1 : 0,
+                        dead->GetName().GetText(), dead, wasDead ? 1 : 0,
+                        deadRoutine && Entity(dead).IsDead() ? 1 : 0,
                         receiver ? receiver->GetHitPoints() : -1L);
         if (first) containers::PrepareCorpseLoot(dead);
     }
@@ -470,6 +470,7 @@ void PresentDeadMirror(GuidKey const& key, Mirror& m, net::NpcRecord const& show
 {
     deadOnHost.insert(key);
     auto* entity = m.entity.GetInstance();
+    if (!entity) return;
     if (!m.corpsePlaced) {
         if (m.ragdollInitialized && m.corpseSettled && !m.corpsePose.empty() && FiniteMatrix(m.corpseRoot)) {
             SetEntityAndRigidPose(entity, m.corpseRoot);
@@ -552,11 +553,13 @@ void OnRagdollNote(net::RagdollNote const& note)
 
 void LayDown(Mirror& m, uint32_t now)
 {
+    if (!m.entity.GetInstance()) return;
     RestoreCorpseActor(m);
     if (!deadPose || static_cast<int32_t>(now - m.lieCheckAt) < 0) return;
     if (m.ragdollStarted || (!net::IsHost() && m.killed) ||
         (m.latest.flags & 128) || m.latest.movementMode == gECharMovementMode_RagDollDead) {
         auto* entity = m.entity.GetInstance();
+        if (!entity) return;
         auto* animation = static_cast<eCVisualAnimation_PS*>(entity->GetPropertySet(eEPropertySetType_Animation));
         if (m.ragdollInitialized) {
             TryApplyForce(m, now);
@@ -596,6 +599,13 @@ void LayDown(Mirror& m, uint32_t now)
             TryApplyForce(m, now);
             m.lieCheckAt = now + (HasPendingCorpseForce(m) ? 100 : 5000);
         };
+        auto recordRagdollWait = [&](uint32_t earlyMs, uint32_t lateMs) {
+            ++m.ragdollFails;
+            ++ragdollsNotReady;
+            m.ragdollTryAt = now + (m.ragdollFails < 4 ? earlyMs : lateMs);
+            m.lieCheckAt = m.ragdollTryAt;
+            strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+        };
         if (!m.ragdollStarted) {
             if (!npcplayback::IsPassive(entity)) body::Pacify(m.entity, m.body);
             CaptureCorpsePose(m, now);
@@ -613,11 +623,7 @@ void LayDown(Mirror& m, uint32_t now)
             m.entity.CharacterMovement.StopMovement();
             const bool haveActor = animation && animation->GetActor() && animation->GetActor()->GetInstance();
             if (haveActor && !EnsureFiniteRagdollPose(m, entity, animation)) {
-                ++m.ragdollFails;
-                ++ragdollsNotReady;
-                m.ragdollTryAt = now + (m.ragdollFails < 4 ? 250 : 1500);
-                m.lieCheckAt = m.ragdollTryAt;
-                strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+                recordRagdollWait(250, 1500);
                 return;
             }
             if (haveActor) m.entity.CharacterMovement.SetMovementMode(gECharMovementMode_RagDollDead);
@@ -631,11 +637,7 @@ void LayDown(Mirror& m, uint32_t now)
         if (animation && animation->GetActor() && animation->GetActor()->GetInstance() &&
             static_cast<int32_t>(now - m.ragdollTryAt) >= 0) {
             if (!EnsureFiniteRagdollPose(m, entity, animation)) {
-                ++m.ragdollFails;
-                ++ragdollsNotReady;
-                m.ragdollTryAt = now + (m.ragdollFails < 4 ? 250 : 1500);
-                m.lieCheckAt = m.ragdollTryAt;
-                strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+                recordRagdollWait(250, 1500);
                 return;
             }
             using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
@@ -654,14 +656,11 @@ void LayDown(Mirror& m, uint32_t now)
             }
             if (!m.corpsePose.empty())
                 npcplayback::ReplayFrozenPose(entity, m.replay, m.corpsePose, m.corpsePoseFlags);
-            ++m.ragdollFails;
-            ++ragdollsNotReady;
-            m.ragdollTryAt = now + (m.ragdollFails < 4 ? 1500 : 5000);
-            m.lieCheckAt = m.ragdollTryAt;
-            strcpy_s(m.presentationSource, m.ragdollFails <= 1 ? "not_ready" : "retry");
+            recordRagdollWait(1500, 5000);
             if (m.ragdollFails <= 3 || m.ragdollFails % 10 == 0) RequestCorpseRoiUpdate(now);
             if (m.ragdollFails <= 2 || m.ragdollFails == 10)
                 Logf("npcs: corpse %s ragdoll physics not ready (try %u); preserving death pose and retrying", m.entity.GetName().GetText(), m.ragdollFails);
+            return;
         }
         if (!m.ragdollInitialized) {
             if (!m.corpsePose.empty())
@@ -784,23 +783,48 @@ void LogClientDeathImpl(Mirror& m, net::NpcRecord const& shown, uint32_t now)
          m.deathClearCount, m.deathCombatStopCount, task.GetText(), focus, target, alignment);
 }
 
+void ResetCorpseAndWatchFields(Mirror& c, bool clearUnsettledActor)
+{
+    c.replay = npcplayback::State{};
+    c.corpsePlaced = false;
+    c.deathReferencesCleared = nullptr;
+    c.watchedFocus = nullptr;
+    c.focusWatchUntil = 0;
+    c.focusWatchLogged = false;
+    c.focusWatchChanges = 0;
+    if (clearUnsettledActor && !(c.killed && c.corpseSettled && !c.corpsePose.empty()))
+        c.corpseActor = nullptr;
+}
+
 void CorpseTick(uint32_t now)
 {
     for (auto it = corpses.begin(); it != corpses.end();) {
         Mirror& c = it->second;
         eCEntity* previous = c.entity.GetInstance();
         c.entity = Resolve(c.latest.guid);
-        if (previous && c.entity.GetInstance() != previous)
-            ClearLocalReferencesToDeadMirror(previous, nullptr, false, true);
-        if (!c.entity.GetInstance()) { ++it; continue; }
+        eCEntity* current = c.entity.GetInstance();
+        if (current != previous) {
+            if (previous) ClearLocalReferencesToDeadMirror(previous, nullptr, false, true);
+            ResetCorpseAndWatchFields(c, true);
+        }
+        if (!current) {
+            ResetCorpseAndWatchFields(c, true);
+            ++it;
+            continue;
+        }
         if (mirrors.count(it->first)) { it = corpses.erase(it); continue; }
+        if (!IsNpc(current)) { ++it; continue; }
         if (!net::IsHost() && net::Connected()) c.hostSession = net::WelcomeSerial();
         const bool heldDead = deadStays && !net::IsHost() && deadOnHost.count(it->first);
-        if (heldDead && !c.entity.IsDead()) c.entity.NPC.DefeatedByPlayer = GETrue;
+        if (heldDead && !c.entity.IsDead()) {
+            KeepDead(c.entity);
+            if (auto* receiver = static_cast<gCDamageReceiver_PS*>(current->GetPropertySet(eEPropertySetType_DamageReceiver)))
+                receiver->AccessHitPoints() = 0;
+        }
         if (!net::IsHost() && (heldDead || c.entity.IsDead())) {
-            const bool first = c.deathReferencesCleared != c.entity.GetInstance();
-            c.deathClearCount += ClearLocalReferencesToDeadMirror(c.entity.GetInstance(), &c.deathCombatStopCount, first);
-            c.deathReferencesCleared = c.entity.GetInstance();
+            const bool first = c.deathReferencesCleared != current;
+            c.deathClearCount += ClearLocalReferencesToDeadMirror(current, &c.deathCombatStopCount, first);
+            c.deathReferencesCleared = current;
             if (first) {
                 c.focusWatchUntil = now ? now + 5000 : 5001;
                 c.focusWatchLogged = false;
@@ -808,16 +832,9 @@ void CorpseTick(uint32_t now)
             TickDeathFocusWatch(c, now);
         }
         if (!c.entity.IsDead()) { it = corpses.erase(it); continue; }
-        if (!net::IsHost() && c.wasMirror) {
-            c.killed = true;
-            PresentDeadMirror(it->first, c, c.latest, now);
-            LateCheck(c, now, "mirror");
-            ++it;
-            continue;
-        }
         LayDown(c, now);
-        if (npcplayback::IsPassive(c.entity.GetInstance())) UpdateCorpsePresentation(c, now);
-        LateCheck(c, now, c.wasMirror ? "mirror" : "journal");
+        if (npcplayback::IsPassive(current)) UpdateCorpsePresentation(c, now);
+        LateCheck(c, now, "journal");
         ++it;
     }
 }
@@ -856,7 +873,18 @@ void LayDownCorpse(eCEntity* entity)
     Guid(entity, guid);
     const GuidKey key = Key(guid);
     if (auto existing = corpses.find(key); existing != corpses.end()) {
-        existing->second.hostSession = net::WelcomeSerial();
+        Mirror& c = existing->second;
+        c.hostSession = net::WelcomeSerial();
+        if (c.entity.GetInstance() != entity) {
+            if (c.entity.GetInstance())
+                ClearLocalReferencesToDeadMirror(c.entity.GetInstance(), nullptr, false, true);
+            c.entity = Entity(entity);
+            ResetCorpseAndWatchFields(c, false);
+        }
+        if (!net::IsHost() && c.deathReferencesCleared != entity) {
+            c.deathClearCount += ClearLocalReferencesToDeadMirror(entity, &c.deathCombatStopCount, true);
+            c.deathReferencesCleared = entity;
+        }
         return;
     }
     Mirror& c = corpses[key];
@@ -867,8 +895,7 @@ void LayDownCorpse(eCEntity* entity)
     c.killed = true;
     c.killedAt = net::Now() ? net::Now() : 1;
     if (!net::IsHost()) {
-        containers::PrepareCorpseLoot(entity);
-        c.deathClearCount = ClearLocalReferencesToDeadMirror(entity, &c.deathCombatStopCount);
+        c.deathClearCount = ClearLocalReferencesToDeadMirror(entity, &c.deathCombatStopCount, true);
         c.deathReferencesCleared = entity;
         c.focusWatchUntil = c.killedAt + 5000;
         c.focusWatchLogged = false;

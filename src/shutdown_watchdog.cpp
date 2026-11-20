@@ -116,18 +116,19 @@ bool SampleGraphicsWait(shutdown::GraphicsWait& wait)
     }
     CONTEXT context{};
     context.ContextFlags = CONTEXT_FULL;
-    uint32_t stack[1024]{}, objectWords[22]{};
-    SIZE_T read = 0;
+    uint32_t objectWords[22]{};
     const bool captured = GetThreadContext(thread, &context) != FALSE;
     lastGraphics.status = captured ? "outside verified native wait" : "GetThreadContext failed";
     if (!captured) lastGraphics.error = GetLastError();
     bool matched = !suspended && captured && context.Eip == graphicsSites.nativeWait + 0xc;
     if (suspended) lastGraphics.status = "thread was already suspended";
     if (matched) {
-        const BOOL stackRead = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Esp),
-                                                 stack, sizeof(stack), &read);
-        if (!stackRead) lastGraphics.error = GetLastError();
-        const uint32_t object = shutdown::WaitingObject(stack, read / sizeof(stack[0]),
+        uintptr_t words[256]{};
+        unsigned wordCount = 0;
+        symbols::CopyRemoteStackWords(context.Esp, words, wordCount);
+        if (!wordCount) lastGraphics.error = GetLastError();
+        static_assert(sizeof(words[0]) == sizeof(uint32_t), "Win32 stack word size");
+        const uint32_t object = shutdown::WaitingObject(reinterpret_cast<uint32_t const*>(words), wordCount,
             graphicsSites.conditionReturn, graphicsSites.driverReturn, graphicsSites.deviceReturn);
         lastGraphics.status = object ? "driver counters unreadable" : "nested wait stack not matched";
         matched = object && symbols::ReadMemory(object, objectWords, sizeof(objectWords));
@@ -305,9 +306,9 @@ DWORD WINAPI WatchdogThread(LPVOID)
             Logf("shutdown watchdog: wait failed error=%lu", GetLastError());
             return 0;
         }
-        const uint32_t now = GetTickCount();
         const bool finished = preShutdownFinished.load();
         const uint32_t finishedAt = preShutdownAt.load();
+        const uint32_t now = GetTickCount();
         lastGraphics.matched = finished && fastExitReady.load() && SampleGraphicsWait(lastGraphics.wait);
         if (exit.Observe(now, finished && fastExitReady.load(), finishedAt, lastGraphics.matched, lastGraphics.wait)) {
             Logf("shutdown: native DX9/AMD Release stalled after cleanup thread=%lu object=%08x "
@@ -323,7 +324,8 @@ DWORD WINAPI WatchdogThread(LPVOID)
                 fastExitReady.store(false);
             }
         }
-        if (now - (finished ? finishedAt : began) >= shutdown::DiagnosticMs) break;
+        const uint32_t since = finished ? finishedAt : began;
+        if (static_cast<int32_t>(now - since) >= 0 && now - since >= shutdown::DiagnosticMs) break;
     }
     LogCacheInventory("shutdown watchdog");
     EnsureWatchdogDir();

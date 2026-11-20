@@ -89,4 +89,8 @@ int main()
     assert(!wrap.Observe(start, true, start, true, wait));
     assert(!wrap.Observe(start + GraphicsGraceMs - 1, true, start, true, wait));
     assert(wrap.Observe(start + GraphicsGraceMs, true, start, true, wait));
+
+    // TOCTOU where now was sampled slightly before cleanupSince must never underflow into a false stall trigger.
+    ExitPolicy toctou;
+    assert(!toctou.Observe(1000, true, 1005, true, wait));
 }

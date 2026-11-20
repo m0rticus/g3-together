@@ -129,9 +129,18 @@ class RangedAnimationSyncTests(unittest.TestCase):
     def test_puppet_hands_link_arrow_or_bolt_when_bow_or_crossbow_held(self):
         sync_hands = function_body(self.ranged_overlay, r"\bvoid\s+SyncPuppetHands\s*\(")
         self.assertIsNotNone(sync_hands)
+        self.assertLess(sync_hands.index("UnlinkPuppetSlot(body, gESlot_LeftHand)"),
+                        sync_hands.index("EnsurePuppetStack(body, wantLeft)"))
         self.assertIn("HoldStacks(leftStack, rightStack)", sync_hands)
         self.assertIn("HoldRightStack(idx)", sync_hands)
         self.assertIn("inv->LinkStackToSlot(idx, gESlot_RightHand, GETrue)", sync_hands)
+        self.assertIn("EnableCollision(GEFalse)", sync_hands)
+
+        clear_overlay = function_body(self.ranged_overlay, r"\bvoid\s+ClearPuppetOverlay\s*\(")
+        self.assertIn("puppetOverlays.find(puppetEntity->GetID())", clear_overlay)
+        self.assertIn("state.entityProxy.GetEntity() == puppetEntity", clear_overlay)
+        self.assertNotIn("PruneDeadOverlays", self.ranged_overlay)
+        self.assertNotIn("IsProcessedEntity", self.ranged_overlay)
 
         hold = function_body(self.remote, r"\bvoid\s+Hold\s*\(")
         self.assertIn("ranged::SyncPuppetHands", hold)

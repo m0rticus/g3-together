@@ -38,12 +38,19 @@ unsigned char* NativeRespawn()
     return std::memcmp(code, expected, sizeof(expected)) == 0 ? code : nullptr;
 }
 
-bool Dead(Entity& npc) { return npc.Routine.AIMode == gEAIMode_Dead; }
+bool Dead(Entity& npc)
+{
+    eCEntity* instance = npc.GetInstance();
+    if (!instance || !instance->GetPropertySet(eEPropertySetType_ScriptRoutine)) return false;
+    return npc.Routine.AIMode == gEAIMode_Dead;
+}
 
 // The routine's task stayed the death task it ended with (ZS_RagDollDead): the next lethal hit set that task again, which
 // does not run it again, so the animal stood at 0 hit points and never died a second time (stageRespawn at Kent, 14:08).
 void EndDeathTask(Entity& npc)
 {
+    eCEntity* instance = npc.GetInstance();
+    if (!instance || !instance->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;
     const bCString task = npc.Routine.GetCurrentTask();
     if (!std::strstr(task.GetText(), "Dead")) return;
     npc.Routine.FullStop();
@@ -58,8 +65,10 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (ai::ShuttingDown()) return original ? original(spu, self, other, args) : 0;
     eCEntity* instance = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     if (npcremoval::Suppressed(instance)) return 0;
+    if (!net::Connected()) return original(spu, self, other, args);
     if (!net::IsHost() || npcs::IsMirrored(instance) || npclease::Fenced(instance)) { ++mirrorsSkipped; return 0; }
-    if (!enabled || !instance) return original(spu, self, other, args);
+    if (!enabled || !instance || !instance->GetPropertySet(eEPropertySetType_ScriptRoutine))
+        return original(spu, self, other, args);
     Entity npc(instance);
     const bool deadBefore = Dead(npc);
     const bCVector before = instance->GetWorldPosition();
@@ -69,10 +78,10 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     if (!Dead(npc)) {
         ++stood;
         EndDeathTask(npc);
-        journal::NewLife(instance);
         uint8_t rawGuid[16];
         guid::CopyEntity(instance, rawGuid);
         npcs::NewLife(rawGuid);
+        journal::NewLife(instance);
         Logf("respawn: %s stands up on the host; a new NPC incarnation will be published", npc.GetName().GetText());
     } else if ((instance->GetWorldPosition() - before).GetMagnitude() > 10000.0f) {
         ++gone;
@@ -106,7 +115,8 @@ void Report(LogFn log)
 {
     char line[220];
     Format(line, "RESPAWNSYNC enabled=%d installed=%d native=%d rolls=%u stood=%u gone=%u kept=%u mirrors_skipped=%u host_authority=%d",
-              enabled ? 1 : 0, installed ? 1 : 0, native ? 1 : 0, rolls, stood, gone, kept, mirrorsSkipped, native ? 1 : 0);
+              enabled ? 1 : 0, installed ? 1 : 0, native ? 1 : 0, rolls, stood, gone, kept, mirrorsSkipped,
+              (net::IsHost() && native && enabled) ? 1 : 0);
     log(line);
 }
 

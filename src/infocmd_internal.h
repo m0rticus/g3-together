@@ -44,7 +44,7 @@ struct Fight {
     uint8_t player = 0;
     std::string reason;
     uint32_t until = 0;
-    uint32_t joins = 0;
+    uint32_t generation = 0;
 };
 
 struct Stats {
@@ -57,6 +57,7 @@ struct Stats {
     unsigned fightsSent = 0;
     unsigned fightsStarted = 0;
     unsigned companionsKept = 0;
+    gCInfo_PS const* lastInfo = nullptr;
     std::string lastKey;
     std::string lastText = "-";
 };

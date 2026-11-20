@@ -260,10 +260,13 @@ class DownedPolicyTests(unittest.TestCase):
         load = function_body(hero, r"\bbool\s+LoadRecordImpl\s*\(")
         self.assertIn("out.downed = downed::Held() ? 1 : 0;", capture)
         self.assertLess(save.index("CaptureHeroSnapshot("), save.index("codec::EncodeRecord("))
+        self.assertIn("const bool treatDowned = downed::Held() || (savedDowned != 0 && !downed::Terminal());", load)
+        self.assertLess(load.index("treatDowned"), load.index("ApplyCoreStatsAndAttributes("))
+        self.assertIn("ApplyCoreStatsAndAttributes(self, *hero, parsed, true, label, treatDowned)", load)
         self.assertIn('downed::Restore(savedDowned != 0, "hero-record")', load)
-        self.assertLess(load.index("downed::Restore"), load.index("self.Inventory.HoldStacks"))
-        self.assertLess(load.index("downed::Restore"), load.index("ApplyCoreStatsAndAttributes("))
-        self.assertIn("downed::Held()", apply_stats)
+        self.assertLess(load.index("ApplyCoreStatsAndAttributes("), load.index('downed::Restore(savedDowned != 0, "hero-record")'))
+        self.assertIn("if (treatDowned) self.PlayerMemory.SetBaseValue(bCString(\"HP\"), 1);", apply_stats)
+        self.assertIn("AttributesMatch(*memory, snapshot.attrs, treatDowned)", apply_stats)
 
     def test_paid_revive_is_bound_to_sender_and_down_episode(self):
         self.assertIn("sequence != life.sequence", self.downed_cpp)
@@ -317,7 +320,8 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIsNotNone(receive)
         host_filter = "if (isHost && message.state.kind != 19 && !ClientWorldStateKind(message.state.kind)) return;"
         sanitization = "if (isHost && (message.state.kind == 8 || message.state.kind == 9))"
-        self.assertIn("isHost ? static_cast<uint8_t>(reinterpret_cast<uintptr_t>(peer->data)) : 1", receive)
+        self.assertIn("const uint8_t from = AuthenticatedSender(peer);", receive)
+        self.assertIn("peers[slot] == peer", function_body(_testbuild.src_text("net_session.cpp"), r"\buint8_t\s+PeerSlotOf\s*\("))
         self.assertIn(host_filter, receive)
         self.assertLess(receive.index(host_filter), receive.index("worldStateHandler(from, message.state)"))
         self.assertIn(sanitization, receive)
@@ -326,10 +330,10 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertLess(receive.index("message.state.npcClass = from;"), receive.index("worldStateHandler(from, message.state)"))
         special_receive = function_body(receive, r"\bif\s*\(\s*message\.state\.kind\s*==\s*19\s*\)")
         self.assertIn("if (message.state.dialog > 3) return;", special_receive)
-        self.assertIn("from < 2 || from >= MaxPlayers || peers[from] != peer || message.state.npcClass != from", special_receive)
+        self.assertIn("if (message.state.npcClass != from) return;", special_receive)
         self.assertIn("from != 1 || message.state.npcClass != 1", special_receive)
         infocmd = _testbuild.src_text("infocmd.cpp")
-        self.assertIn("if (net::IsHost() && s.kind != 3 && s.kind != 16) net::SendWorldState(s, from);", infocmd)
+        self.assertIn("if (net::IsHost() && s.kind != 3 && s.kind != 10 && s.kind != 16) net::SendWorldState(s, from);", infocmd)
         apply = function_body(infocmd, r"\bvoid\s+Apply\s*\(")
         help_message = function_body(apply, r"\bif\s*\(\s*s\.kind\s*==\s*8\s*\|\|\s*s\.kind\s*==\s*9\s*\)")
         target = function_body(help_message, r"\bif\s*\(\s*s\.guard\s*==\s*net::LocalId\(\)\s*\)")
@@ -359,6 +363,21 @@ class DownedPolicyTests(unittest.TestCase):
             self.assertIsNotNone(body)
             self.assertIn("LogEndStep();", body)
 
+    def test_pierced_death_status_clear_reconnect_and_wipe_epoch_preservation(self):
+        redirect = function_body(self.downed_cpp, r"\bbool\s+RedirectDeath\s*\(")
+        self.assertIn('"ZS_PiercedDead"', redirect)
+        hold = function_body(self.downed_cpp, r"\bvoid\s+Hold\s*\(")
+        self.assertIn("gEStatusEffect_Burning", hold)
+        self.assertIn("gEStatusEffect_Poisoned", hold)
+        sync_states = function_body(self.downed_cpp, r"\bvoid\s+SyncStates\s*\(")
+        self.assertIn("sameTickReconnect", sync_states)
+        self.assertIn("acceptedStates < peer.lastAcceptedStates", sync_states)
+        world_change = function_body(self.downed_cpp, r"\bvoid\s+OnWorldChange\s*\(")
+        self.assertIn("life.Reset(true, true);", world_change)
+        set_mode = function_body(self.downed_cpp, r"\bvoid\s+__fastcall\s+SetMode\s*\(")
+        self.assertIn("ai::ShuttingDown()", set_mode)
+        self.assertIn("HarmProtected(entity)", set_mode)
+
     def test_minidump_fallback_is_limited_and_truncates_before_retry(self):
         crash = _testbuild.src_text("crashlog.cpp")
         dump = function_body(crash, r"\bbool\s+WriteDump\s*\(")
@@ -366,7 +385,7 @@ class DownedPolicyTests(unittest.TestCase):
         for flag in ("MiniDumpWithThreadInfo", "MiniDumpWithHandleData", "MiniDumpWithUnloadedModules",
                      "MiniDumpWithDataSegs", "MiniDumpWithIndirectlyReferencedMemory"):
             self.assertIn(flag, dump)
-        self.assertEqual(dump.count("writeDump("), 1)
+        self.assertEqual(dump.count("fn(GetCurrentProcess()"), 1)
         self.assertIn("MiniDumpWithFullMemoryInfo", dump)
         self.assertNotIn("#ifdef MiniDumpWithFullMemoryInfo", dump)
         self.assertIn("const Profile profiles[]", dump)
@@ -412,7 +431,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn("dumpExceptionCopied = true;", admit)
         self.assertLess(admit.index("dumpExceptionRecord ="), admit.index("SetEvent(dumpRequest)"))
         self.assertIn("if (!SetEvent(dumpRequest))", admit)
-        self.assertIn("const DWORD waited = WaitForSingleObject(dumpDone, wait);", admit)
+        self.assertIn("const DWORD waited = WaitForMultipleObjects(2, waits, FALSE, wait);", admit)
         self.assertIn("WAIT_TIMEOUT", admit)
         self.assertIn("crash dump wait timeout", admit)
         self.assertIn("WAIT_FAILED", admit)
@@ -432,7 +451,7 @@ class DownedPolicyTests(unittest.TestCase):
     def test_known_crash_symbols_use_actual_enet_entries_and_executable_rva_bounds(self):
         crash = _testbuild.src_text("crashlog.cpp")
         self.assertLess(crash.index("#include <enet/enet.h>"), crash.index("#include <Game.h>"))
-        known = function_body(crash, r"\bvoid\s+FindKnownSymbols\s*\(")
+        known = function_body(crash, r"\bvoid\s+EnsureKnownSymbols\s*\(")
         self.assertIsNotNone(known)
         for symbol in (
             "enet_range_coder_compress",
@@ -444,30 +463,30 @@ class DownedPolicyTests(unittest.TestCase):
             self.assertIn("&" + symbol, known)
         lookup = function_body(crash, r"\bchar\s+const\*\s+NearestKnownSymbol\s*\(")
         self.assertIsNotNone(lookup)
-        self.assertLess(crash.index("bool Executable(Module const& m, uintptr_t rva);"),
+        self.assertLess(crash.index("bool IsExecRva(Module const& m, uintptr_t rva, ExecRange const* ranges, size_t rangeCount)"),
                         crash.index("char const* NearestKnownSymbol"))
-        self.assertIn("Executable(m, rva)", lookup)
-        self.assertIn("Executable(m, at)", lookup)
+        self.assertIn("IsExecRva(m, rva, ranges, rangeCount)", lookup)
+        self.assertIn("IsExecRva(m, at, ranges, rangeCount)", lookup)
         self.assertIn("at <= rva", lookup)
         self.assertIn("at > *start", lookup)
         self.assertIn("m.base + m.size", lookup)
         where = function_body(crash, r"\bbool\s+Where\s*\(")
         self.assertIsNotNone(where)
         self.assertNotIn("if (!name && m.game)", where)
-        self.assertIn("NearestKnownSymbol(m, rva, &start)", where)
-        self.assertIn("NearestExport(m, rva, &exportStart)", where)
+        self.assertIn("NearestKnownSymbol(m, rva, ranges, rangeCount, &start)", where)
+        self.assertIn("NearestExport(m, nt, ranges, rangeCount, rva, &exportStart)", where)
         self.assertIn("exportStart > start", where)
         self.assertIn("scriptStart > start", where)
         self.assertIn("nearest known symbol", where)
         self.assertIn("nearest export symbol", where)
-        self.assertIn("Executable(m, rva)", where)
-        executable = crash.split("bool Executable(Module const& m, uintptr_t rva)\n", 1)[1].split(
-            "// The exported function", 1)[0]
-        self.assertIn("RvaRange(m, rva, 1)", executable)
-        self.assertIn("Headers(m)", executable)
+        self.assertIn("IsExecRva(m, rva, ranges, rangeCount)", where)
+        is_exec = function_body(crash, r"\bbool\s+IsExecRva\s*\(")
+        self.assertIsNotNone(is_exec)
+        self.assertIn("RvaRange(m, rva, 1)", is_exec)
+        self.assertIn("Headers(m)", where)
         export_lookup = function_body(crash, r"\bchar\s+const\*\s+NearestExport\s*\(")
         self.assertIsNotNone(export_lookup)
-        self.assertIn("Headers(m)", export_lookup)
+        self.assertIn("RvaRange(m,", export_lookup)
         self.assertIn("RvaRange(m, nameRvas[i], 1)", export_lookup)
         self.assertIn("NumberOfFunctions", export_lookup)
         self.assertIn("NumberOfNames", export_lookup)
@@ -507,7 +526,7 @@ class DownedPolicyTests(unittest.TestCase):
         for function, native in (("SetTask", "originalSetTask"), ("SetState", "originalSetState")):
             setter = function_body(self.downed_cpp, rf"\bvoid\s+__fastcall\s+{function}\s*\(")
             self.assertIn("RejectHeldTransition", setter)
-            self.assertLess(setter.index("RejectHeldTransition"), setter.index(native))
+            self.assertLess(setter.index("RejectHeldTransition"), setter.rindex(native))
         guard = function_body(self.downed_cpp, r"\bbool\s+RejectHeldTransition\s*\(")
         for condition in ("!life.held", "life.terminal", "GetHero()", "persist::NativeLoading()",
                           "persist::HeroPending()", "ai::ShuttingDown()", "DownTask(state)", "ZS_Unconscious_Loop"):
@@ -605,9 +624,12 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertNotIn("case MsgState:", gate) # presentation/gameplay still gated
         receive = function_body(net, r"\belse\s+if\s*\(\s*type\s*==\s*MsgPlayerActivity\b[^{}]*\)")
         self.assertIn("ENET_PACKET_FLAG_RELIABLE", receive)
-        self.assertIn("peers[from] != peer", receive)
-        self.assertIn("message.id = static_cast<uint8_t>(from)", receive)
-        self.assertIn("peer != server || !connected", receive)
+        self.assertIn("const uint8_t from = AuthenticatedSender(peer);", receive)
+        self.assertIn("if (!from) return;", receive)
+        self.assertIn("if (isHost) message.id = from;", receive)
+        auth = function_body(_testbuild.src_text("net_session.cpp"), r"\buint8_t\s+AuthenticatedSender\s*\(")
+        self.assertIn("PeerSlotOf(peer)", auth)
+        self.assertIn("connected && peer == server ? 1 : 0", auth)
         self.assertIn("r.activity.Accept", receive)
         self.assertNotIn("Store(", receive)
         self.assertNotIn("SetInWorld", receive)

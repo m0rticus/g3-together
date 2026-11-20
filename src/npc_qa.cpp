@@ -54,9 +54,13 @@ void Report(LogFn log)
         char text[48];
         guid::Format(guid, text, sizeof(text));
         auto mirror = mirrors.find(Key(guid));
+        auto* receiver = static_cast<gCDamageReceiver_PS*>(instance->GetPropertySet(eEPropertySetType_DamageReceiver));
+        auto* routine = static_cast<gCScriptRoutine_PS*>(instance->GetPropertySet(eEPropertySetType_ScriptRoutine));
         Format(line, "NPC guid=%s name=%s pos=%.1f,%.1f,%.1f hp=%d dead=%d mirrored=%d task=%s repacified=%u last_foreign=%s owner=%u",
-               text, npc.GetName().GetText(), at[0], at[1], at[2], static_cast<int>(npc.DamageReceiver.HitPoints),
-               npc.IsDead(), IsMirrored(instance), npc.Routine.GetCurrentTask().GetText(),
+               text, npc.GetName().GetText(), at[0], at[1], at[2],
+               receiver ? static_cast<int>(receiver->GetHitPoints()) : -1,
+               routine ? npc.IsDead() : 0, IsMirrored(instance),
+               routine ? routine->GetCurrentTask().GetText() : "-",
                mirror != mirrors.end() ? mirror->second.body.repacified : 0,
                mirror != mirrors.end() && *mirror->second.body.lastForeign ? mirror->second.body.lastForeign : "-",
                OwnerOf(instance));
@@ -419,30 +423,32 @@ void DeadPoseReport(LogFn log)
 {
     char line[700];
     unsigned alive = 0;
-    auto report = [&](Mirror& m, char const* kind) {
+    auto report = [&](Mirror const& m, eCEntity* instance, char const* kind) {
+        if (!instance) return;
         char shows[128], slots[400];
-        Lies(m.entity.GetInstance(), shows, sizeof(shows), slots, sizeof(slots));
-        auto* animation = static_cast<eCVisualAnimation_PS*>(m.entity.GetInstance()->GetPropertySet(eEPropertySetType_Animation));
+        Lies(instance, shows, sizeof(shows), slots, sizeof(slots));
+        auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
+        auto* routine = static_cast<gCScriptRoutine_PS*>(instance->GetPropertySet(eEPropertySetType_ScriptRoutine));
         bool processed = false;
         if (auto* entities = world::ProcessedEntities())
             for (GEU16 i = 0; i < entities->GetCount(); ++i)
-                if (entities->GetAt(i) == m.entity.GetInstance()) { processed = true; break; }
+                if (entities->GetAt(i) == instance) { processed = true; break; }
         Format(line, "DEADPOSE mirror=%s killed=%d running=%d height=%.0f ani=%d motion=%s slots=%s kind=%s ragdoll=%d processed=%d task=%s",
-               m.entity.GetName().GetText(), m.killed ? 1 : 0, body::MotionRunning(m.entity.GetInstance()) ? 1 : 0,
-               body::BoundaryHeight(m.entity.GetInstance()), static_cast<int>(m.entity.Routine.AniState),
+               instance->GetName().GetText(), m.killed ? 1 : 0, body::MotionRunning(instance) ? 1 : 0,
+               body::BoundaryHeight(instance), routine ? static_cast<int>(routine->GetAniState()) : -1,
                *shows ? shows : "-", slots, kind, animation && animation->GetRagDollEnabled() ? 1 : 0,
-               processed ? 1 : 0, m.entity.Routine.GetCurrentTask().GetText());
+               processed ? 1 : 0, routine ? routine->GetCurrentTask().GetText() : "-");
         log(line);
     };
-    for (auto& entry : mirrors) {
-        Mirror& m = entry.second;
+    for (auto const& entry : mirrors) {
+        Mirror const& m = entry.second;
         if (!m.entity.GetInstance() || (!m.killed && alive++ >= 3)) continue;
-        report(m, "mirror");
+        report(m, m.entity.GetInstance(), "mirror");
     }
-    for (auto& entry : corpses) {
-        Mirror& c = entry.second;
-        c.entity = Resolve(c.latest.guid);
-        if (c.entity.GetInstance()) report(c, "journal");
+    for (auto const& entry : corpses) {
+        Mirror const& c = entry.second;
+        eCEntity* instance = c.entity.GetInstance() ? c.entity.GetInstance() : Resolve(c.latest.guid).GetInstance();
+        if (instance) report(c, instance, "journal");
     }
     Format(line, "DEADPOSE enabled=%d laid=%u loops=%u slots_stopped=%u ragdolls=%u ragdolls_not_ready=%u",
            deadPose ? 1 : 0, corpsesLaid, corpseLoops, slotsStopped, ragdollsStarted, ragdollsNotReady);
@@ -545,7 +551,7 @@ void LogDeathFocus(eCEntity* dead, eCEntity* body, char const* phase, uint32_t e
     const bool focusDead = selected.GetInstance() &&
         selected.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine) && selected.IsDead();
     Logf("npcs: DEATHFOCUS dead=%.64s instance=%p phase=%s elapsed_ms=%u body=%p hero_dead=%d task=%.48s state=%.48s action=%d ani=%d combat_state=%lu mode=%d locked=%d focus=%.64s focus_ptr=%p focus_dead=%d script_priority=%d target=%.64s target_ptr=%p alignment=%.64s alignment_ptr=%p autoaim=%d autoaim_target=%p",
-         removed ? "(removed)" : dead->GetName().GetText(), dead, phase, elapsed, body,
+         (!dead || removed) ? "(removed)" : dead->GetName().GetText(), dead, phase, elapsed, body,
          routine && local.IsDead() ? 1 : 0, task.GetText(), state.GetText(),
          routine ? static_cast<int>(local.Routine.Action) : -1,
          routine ? static_cast<int>(local.Routine.AniState) : -1,
@@ -564,14 +570,15 @@ void TickDeathFocusWatch(Mirror& m, uint32_t now)
     eCEntity* hero = remote::ControlledBody();
     if (!hero) hero = gCSession::GetInstance().GetHero();
     if (!hero) return;
-    const uint32_t elapsed = now - (m.focusWatchUntil - 5000);
+    const int32_t elapsedSigned = static_cast<int32_t>(now - (m.focusWatchUntil - 5000));
+    const uint32_t elapsed = elapsedSigned > 0 ? static_cast<uint32_t>(elapsedSigned) : 0u;
     eCEntity* selected = hero->GetPropertySet(eEPropertySetType_Focus)
         ? Entity(hero).Focus.GetFocusEntity().GetInstance() : nullptr;
     if (static_cast<int32_t>(now - m.focusWatchUntil) >= 0) {
         LogDeathFocus(m.entity.GetInstance(), hero, "settled", elapsed);
         m.focusWatchUntil = 0;
     } else if (!m.focusWatchLogged) {
-        if (!elapsed) return;
+        if (elapsedSigned <= 0) return;
         LogDeathFocus(m.entity.GetInstance(), hero, "next_frame", elapsed);
         m.focusWatchLogged = true;
         m.focusWatchChanges = 0;

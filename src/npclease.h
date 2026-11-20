@@ -251,16 +251,6 @@ constexpr uint32_t OverlayVersion = 2, LegacyOverlayVersion = 1;
 constexpr uint32_t LegacySavedWireSize = 16u + 4u + 4u + 4u + sizeof(Checkpoint);
 constexpr uint32_t SavedWireSize = LegacySavedWireSize + 1u;
 
-inline uint32_t Crc32Update(uint32_t crc, uint8_t const* bytes, size_t count)
-{
-    for (size_t i = 0; i < count; ++i) {
-        crc ^= bytes[i];
-        for (int bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-    }
-    return crc;
-}
-
 inline uint32_t OverlayCrc32(uint8_t const* bytes, size_t size)
 {
     uint32_t crc = 0xffffffffu;

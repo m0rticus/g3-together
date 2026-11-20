@@ -68,16 +68,23 @@ int main(int argc, char** argv) {
         out << "role = client\n"
             << "session_id = test-room\n"
             << "friendly_fire = 15\n"
+            << "friendly_fire = off\n"
+            << "send_rate = 45\n"
+            << "send_rate = 30abc\n"
             << "npc_damage = 1.25\n"
+            << "npc_damage = 9.0bad\n"
             << "npc_hp = 1.5\n"
+            << "steam_host = HostName#1234\n"
             << "legacy_companion_owner = 76561198011111111 Diego#1\n"
-            << "legacy_companion_owner = 76561198022222222 Milten#2\n"
+            << "legacy_companion_owner = 76561198022222222\tMilten#2\n"
             << "# " << std::string(300, 'x') << "\nrole = host\n";
         out << "look = " << std::string(280, 'A') << "role = host\n";
     }
     const auto& loaded = g3t::LoadConfig();
     assert(loaded.host == true);
     assert(loaded.friendlyFire == 15);
+    assert(loaded.sendRate == 45);
+    assert(std::strcmp(loaded.steamHost, "HostName#1234") == 0);
     assert(std::fabs(loaded.npcDamage - 1.25f) < 1e-5f);
     assert(std::fabs(loaded.npcHp - 1.5f) < 1e-5f);
     assert(loaded.look[0] == '\0');
@@ -202,7 +209,7 @@ class ShutdownPolicyTests(unittest.TestCase):
         sample = function(source, "bool SampleGraphicsWait(")
         self.assertLess(sample.index("ResumeThread(thread)"), sample.index("Logf("))
         self.assertNotIn("TerminateProcess", sample)
-        self.assertIn("ReadProcessMemory", sample)
+        self.assertIn("CopyRemoteStackWords", sample)
         self.assertIn("context.Eip == graphicsSites.nativeWait + 0xc", sample)
         self.assertIn("shutdown::WaitingObject(", sample)
         self.assertIn("objectWords[0x48 / 4]", sample)

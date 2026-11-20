@@ -90,7 +90,17 @@ void NoteSyncedSector(char const* sector, bool enabled)
 void BufferClientNpcState(GuidKey const& key, net::WorldState const& s)
 {
     SyncClientBufferEpoch();
-    bufferedWorldStates[key] = s;
+    auto [it, inserted] = bufferedWorldStates.emplace(key, s);
+    if (inserted) return;
+    net::WorldState merged = s;
+    if (merged.moved == 0 && it->second.moved != 0) {
+        merged.moved = it->second.moved;
+        std::memcpy(merged.position, it->second.position, sizeof(merged.position));
+        std::memcpy(merged.rotation, it->second.rotation, sizeof(merged.rotation));
+    }
+    if (merged.routine[0] == '\0' && it->second.routine[0] != '\0')
+        strncpy_s(merged.routine, it->second.routine, _TRUNCATE);
+    it->second = merged;
 }
 
 void BufferClientSectorState(char const* sector, bool enabled)

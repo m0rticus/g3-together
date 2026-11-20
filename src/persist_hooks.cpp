@@ -40,11 +40,10 @@ unsigned char* loadTarget = nullptr;
 unsigned char* nativeEntries[5]{}, *nativeImage = nullptr;
 size_t nativeImageSize = 0;
 bool loadCallInstalled = false;
-bool installed = false, pairedEnabled = false, writing = true;
+bool installed = false, pairedEnabled = false;
 unsigned processDepth = 0, nativeLoadDepth = 0, nativeSaveDepth = 0;
-unsigned saves = 0, loads = 0;
-unsigned recordsWritten = 0, recordsApplied = 0, loadFrames = 0, epochs = 0;
-std::string lastSave, lastLoad, campaign, loading;
+unsigned epochs = 0;
+std::string lastLoad, campaign, loading;
 std::string hookFailure, pupDigestHex;
 uint8_t localKind = net::KindMenu;
 bool newWorld = false, ownCharacterReady = false, needsNewHero = false, restoreFailed = false;
@@ -550,6 +549,7 @@ bool NativeReady()
     if (!pairedEnabled || ai::ShuttingDown()) return false;
     if (ReverifyNative(true)) return true;
     pairedEnabled = false;
+    rejoinHooks = false;
     CancelSave("native-hooks");
     ownCharacterReady = false;
     Log("persist: native pre-use verification failed; host-managed saves disabled");
@@ -662,7 +662,6 @@ void* LoadTarget() { return loadTarget; }
 bool BeginFrame()
 {
     if (nativeLoadDepth || nativeSaveDepth) {
-        ++loadFrames;
         crashlog::WorldEntryWait(nativeLoadDepth ? "native HUD.LoadGame return" : "native save return");
         return false;
     }

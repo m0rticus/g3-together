@@ -67,6 +67,7 @@ struct Track
     double fractionalAdvance = 0.0;
     bool haveRenderTime = false;
     uint32_t lastArrived = 0, cadenceWindowAt = 0, recoveryUntil = 0, underrunAt = 0;
+    bool haveCadenceWindow = false;
     uint32_t cadenceMin = 50, previousCadenceMin = 50;
     uint32_t poseIntervalMs = 0;
     bool quietHold = false, lastQuietHold = false;

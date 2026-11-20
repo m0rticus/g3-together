@@ -99,6 +99,12 @@ class FightmemTests(unittest.TestCase):
         self.assertIn("IsAngryFightOutcome(", self.fightmem)
         self.assertIn("gELastFightAgainstPlayer_None", self.fightmem)
 
+        read_fn = function_body(self.fightmem, r"\bMemory\s+Read\s*\(")
+        self.assertIn("guards::IsLocalPlayer(npc)", read_fn)
+        prune_fn = function_body(self.fightmem, r"\bvoid\s+PruneAndSyncGrudges\s*\(")
+        self.assertNotIn("if (!net::IsHost() ||", prune_fn)
+        self.assertIn("net::Remotes()[player].connected", prune_fn)
+
     def test_real_native_defeat_and_quest_prologues_read_only(self):
         game = os.environ.get("G3T_GAME_DLL")
         if not game:

@@ -61,6 +61,13 @@ int main()
     assert(std::fabs(fallback.cz - (-3000.0f)) < 0.1f);
     assert(SweepSegmentCylinder(p0, p1, fallback, 6.0f, hitT, hitPt));
 
+    // 2b. Vertically stale AABB with matching X/Z falls back to worldPos + characterHeight.
+    const float vertStaleMin[3] = {4965.0f, 900.0f, -3035.0f};
+    const float vertStaleMax[3] = {5035.0f, 1080.0f, -2965.0f};
+    const Cylinder vertFallback = BuildTargetCylinder(worldPos, vertStaleMin, vertStaleMax, 180.0f);
+    assert(std::fabs(vertFallback.bottomY - 200.0f) < 0.1f && std::fabs(vertFallback.topY - 380.0f) < 0.1f);
+    assert(SweepSegmentCylinder(p0, p1, vertFallback, 6.0f, hitT, hitPt));
+
     // 3. Point-blank frame-1 launch origin seeding catches close NPCs without projecting behind shooter.
     const float shooterChest[3] = {4880.0f, 310.0f, -3000.0f};
     const float firstFrameArrow[3] = {5060.0f, 308.0f, -3000.0f};
@@ -108,8 +115,30 @@ class ShotAndRangedCombatTests(unittest.TestCase):
         self.assertIsNotNone(sweep)
         self.assertIn("shot_sweep::SweepSegmentCylinder", sweep)
         self.assertIn("combat::IsGroundImmuneNpc(e)", sweep)
+        self.assertIn("npcremoval::Suppressed(e)", sweep)
+        self.assertIn("npcs::RedundantClientEntity(e)", sweep)
+        self.assertIn("!npcs::ClientPresent(e)", sweep)
         self.assertIn("combat::ProjectileHit(bestNpc, instance)", sweep)
         self.assertIn("FlushPendingShot(instance)", sweep)
+        self.assertIn("gESlot_RightHand", spawn_shot)
+
+        own_caster = function_body(self.shot, r"\bbool\s+OwnCaster\s*\(")
+        self.assertIn("net::IsHost()", own_caster)
+        self.assertIn("RecordClaimedArrowInRemaining", self.shot)
+
+    def test_spells_replica_lease_and_area_gates(self):
+        spells = _testbuild.src_text("spells.cpp")
+        wrap = function_body(spells, r"\bGEInt\s+GE_STDCALL\s+Wrap\s*\(")
+        self.assertIn("shot::InPlayerReplicaContact()", wrap)
+        self.assertIn("targetPlayer", wrap)
+        area = function_body(spells, r"\bbTObjArray<Entity>\s+GE_STDCALL\s+AreaTargets\s*\(")
+        self.assertIn("npcs::IsMirrored(t)", area)
+        self.assertIn("npclease::Fenced(t)", area)
+        on_npc = function_body(spells, r"\bvoid\s+OnNpcSpell\s*\(")
+        self.assertIn("npclease::LocalAuthority(target.GetInstance())", on_npc)
+        self.assertIn("targetPlayer", on_npc)
+        norm = function_body(spells, r"\bbool\s+NormalizeCoopEarner\s*\(")
+        self.assertIn("compOwner != localId", norm)
 
     def test_ranged_claim_routing_bow_slot_fallback_and_lethal_arrows(self):
         filt = function_body(self.combat, r"\bGEInt\s+GE_STDCALL\s+Filter\s*\(")

@@ -2,6 +2,8 @@
 #include "doors.h"
 
 #include "containers.h"
+#include "guid.h"
+#include "guid_key.h"
 #include "log.h"
 #include "story.h"
 #include "world.h"
@@ -35,21 +37,21 @@ std::unordered_set<std::string> baselines;
 std::unordered_map<std::string, uint32_t> requested;
 struct PendingRequest { uint32_t generation[net::MaxPlayers]{}; };
 std::unordered_map<std::string, PendingRequest> pendingRequests;
-struct InitialDoors { uint32_t generation = 0; std::unordered_set<std::string> keys; };
+struct InitialDoors { uint32_t generation = 0; bool admitted = false; std::unordered_set<std::string> keys; };
 std::array<InitialDoors, net::MaxPlayers> initialDoors;
 bool scanned = false;
 unsigned pendingNearby = 0;
 bool wasConnected = false;
 uint32_t lastScan = 0;
+uint32_t settleStart = 0;
 bool sync = true;  // QA negative control
 unsigned sent = 0, received = 0, applied = 0, watched = 0;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
-void GuidOf(eCEntity* entity, uint8_t out[16])
+Entity ResolveKey(std::string const& key)
 {
-    const eCEntityProxy proxy(entity);
-    std::memcpy(out, &proxy.GetEntityID().GetCore(), 16);
+    return guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
 }
 
 Seen Read(eCEntity* entity)
@@ -59,6 +61,13 @@ Seen Read(eCEntity* entity)
     if (entity->GetPropertySet(eEPropertySetType_Door)) s.parts |= 1, s.open = e.Door.IsOpen() ? 1 : 0;
     if (entity->GetPropertySet(eEPropertySetType_Lock)) s.parts |= 2, s.locked = e.Lock.IsLocked() ? 1 : 0;
     return s;
+}
+
+Seen MergeSeen(Seen dst, Seen const& src)
+{
+    if (src.parts & 1) { dst.parts |= 1; dst.open = src.open; }
+    if (src.parts & 2) { dst.parts |= 2; dst.locked = src.locked; }
+    return dst;
 }
 
 bool Same(Seen const& a, Seen const& b)
@@ -83,7 +92,10 @@ void Apply(eCEntity* entity, Seen const& want)
 
 void Send(uint8_t const guid[16], Seen const& s)
 {
-    if (net::IsHost()) changed[Key(guid)] = s;
+    if (net::IsHost()) {
+        const std::string key = Key(guid);
+        changed[key] = MergeSeen(changed[key], s);
+    }
     net::WorldState w{};
     w.kind = Kind;
     std::memcpy(w.guid, guid, 16);
@@ -104,22 +116,40 @@ bool Reply(uint8_t to, std::string const& key)
 {
     auto& initial = initialDoors[to];
     const uint32_t generation = net::PeerGeneration(to);
-    if (initial.generation != generation) { initial = {}; initial.generation = generation; }
-    if (!net::InWorld(to) && !initial.keys.count(key) && initial.keys.size() >= 1024) {
+    const bool inWorld = net::InWorld(to);
+    if (inWorld) initial.admitted = true;
+    if (initial.generation != generation || (!inWorld && initial.admitted)) {
+        initial = {};
+        initial.generation = generation;
+    }
+    if (!inWorld && !initial.keys.count(key) && initial.keys.size() >= 1024) {
         Log("doors: initial baseline interest limit exceeded; admission refused"); return false;
     }
-    _GUID raw;
-    std::memcpy(&raw, key.data(), 16);
-    Entity object{bCPropertyID(bCGuid(raw))};
-    if (!Shared(object.GetInstance())) return false;
-    const auto desired = wanted.find(key);
-    const Seen state = desired == wanted.end() ? Read(object.GetInstance()) : desired->second;
+    Entity object = ResolveKey(key);
+    eCEntity* instance = object.GetInstance();
+    if (instance && !Shared(instance)) return false;
+    Seen state{};
+    bool known = false;
+    if (Shared(instance)) {
+        state = Read(instance);
+        known = true;
+    }
+    if (auto it = changed.find(key); it != changed.end()) {
+        state = known ? MergeSeen(state, it->second) : it->second;
+        known = true;
+    }
+    if (auto it = wanted.find(key); it != wanted.end()) {
+        state = known ? MergeSeen(state, it->second) : it->second;
+        known = true;
+    }
     net::WorldState note{};
-    note.kind = Kind; note.npcClass = Baseline | state.parts;
-    note.guard = state.open; note.alignment = state.locked;
+    note.kind = Kind;
+    note.npcClass = Baseline | (known ? state.parts : 0);
+    note.guard = state.open;
+    note.alignment = state.locked;
     std::memcpy(note.guid, key.data(), 16);
     if (!net::SendWorldStateTo(to, note)) return false;
-    if (!net::InWorld(to)) initial.keys.insert(key);
+    if (!inWorld) initial.keys.insert(key);
     return true;
 }
 }
@@ -160,7 +190,7 @@ void Tick()
         if (!Shared(entity)) continue;
         ++count;
         uint8_t guid[16];
-        GuidOf(entity, guid);
+        guid::CopyEntity(entity, guid);
         const std::string key = Key(guid);
         Seen now_ = Read(entity);
         if (!net::IsHost() && !baselines.count(key)) {
@@ -191,7 +221,6 @@ void Tick()
         auto last = seen.find(key);
         if (last == seen.end()) {
             seen[key] = now_;
-            if (net::IsHost()) Send(guid, now_);
             continue;
         }
         if (!net::IsHost() && !net::InWorld(net::LocalId())) continue;
@@ -207,12 +236,12 @@ void Tick()
 void OnState(uint8_t from, net::WorldState const& s)
 {
     if (!sync) return;
-    if (s.npcClass & Request) {  // host: a player joined; everyone gets this session's changes again (unchanged ones are ignored)
+    if (s.npcClass & Request) {  // host: a player joined; send this session's changes directly as baselines
         if (net::IsHost() && net::PeerJoined(from) && net::InWorld(1)) {
-            bool nonzero = false;
-            for (uint8_t byte : s.guid) nonzero = nonzero || byte != 0;
-            if (nonzero) {
+            if (!IsZeroGuid(s.guid)) {
                 const std::string key = Key(s.guid);
+                Entity object = guid::Resolve(s.guid);
+                if (object.GetInstance() && !Shared(object.GetInstance())) return;
                 if (!Reply(from, key)) {
                     if (!pendingRequests.count(key) && pendingRequests.size() >= 1024) {
                         Log("doors: baseline request queue full; client will retry"); return;
@@ -222,31 +251,42 @@ void OnState(uint8_t from, net::WorldState const& s)
                 return;
             }
             for (auto const& entry : changed) {
-                uint8_t guid[16];
-                std::memcpy(guid, entry.first.data(), 16);
-                Send(guid, entry.second);
+                net::WorldState note{};
+                note.kind = Kind;
+                note.npcClass = Baseline | entry.second.parts;
+                note.guard = entry.second.open;
+                note.alignment = entry.second.locked;
+                std::memcpy(note.guid, entry.first.data(), 16);
+                net::SendWorldStateTo(from, note);
             }
         }
         return;
     }
     if ((s.npcClass & Baseline) && (net::IsHost() || from != 1 || !story::AdmissionStarted())) return;
     if (!(s.npcClass & Baseline) && (net::IsHost() ? !net::InWorld(from) : from != 1)) return;
-    if (s.guard > 1 || s.alignment > 1 || !(s.npcClass & 3) || (s.npcClass & ~(Baseline | 3))) return;
-    _GUID raw;
-    std::memcpy(&raw, s.guid, 16);
-    Entity object{bCPropertyID(bCGuid(raw))};
-    if (containers::IsPersonalInventory(object.GetInstance())) return;
+    if (IsZeroGuid(s.guid) || s.guard > 1 || s.alignment > 1 || (s.npcClass & ~(Baseline | 3))) return;
+    Entity object = guid::Resolve(s.guid);
+    eCEntity* instance = object.GetInstance();
+    if (instance && !Shared(instance)) return;
+    const std::string key = Key(s.guid);
+    if ((s.npcClass & Baseline) && !(s.npcClass & 3)) {
+        ++received;
+        baselines.insert(key);
+        requested.erase(key);
+        return;
+    }
+    if (!(s.npcClass & 3)) return;
     ++received;
     Seen want;
     want.open = s.guard ? 1 : 0;
     want.locked = s.alignment ? 1 : 0;
     want.parts = s.npcClass & 3;
-    const std::string key = Key(s.guid);
-    wanted[key] = want;
+    const Seen base = seen.count(key) ? seen[key] : (Shared(instance) ? Read(instance) : Seen{});
+    wanted[key] = MergeSeen(wanted.count(key) ? wanted[key] : base, want);
     if (s.npcClass & Baseline) { baselines.insert(key); requested.erase(key); }
-    seen[key] = want;  // so that applying it is not taken for a change made here
+    seen[key] = MergeSeen(base, want);  // so that applying it is not taken for a change made here
     if (net::IsHost()) {
-        changed[key] = want;
+        changed[key] = MergeSeen(changed[key], want);
         net::SendWorldState(s, from);
     }
 }
@@ -260,10 +300,12 @@ void OnWorldChange()
     initialDoors = {};
     scanned = false; pendingNearby = 0;
     wasConnected = false;  // a client that just loaded the host's save asks again
+    settleStart = 0;
 }
 void PrepareAdmission()
 {
-    baselines.clear(); requested.clear(); scanned = false; pendingNearby = 0; lastScan = 0;
+    baselines.clear(); requested.clear(); wanted.clear(); seen.clear();
+    scanned = false; pendingNearby = 0; lastScan = 0; wasConnected = false;
 }
 bool AdmissionReady()
 {
@@ -275,7 +317,7 @@ bool AdmissionReady()
         auto* entity = every->GetAt(i);
         if (!Shared(entity)) continue;
         uint8_t guid[16];
-        GuidOf(entity, guid);
+        guid::CopyEntity(entity, guid);
         const auto key = Key(guid);
         if (!baselines.count(key) || wanted.count(key)) return false;
     }
@@ -289,21 +331,29 @@ bool FinishAdmission(uint8_t player)
     for (auto const& key : initial.keys) if (!Reply(player, key)) return false;
     return true;
 }
+void ResetSettle() { settleStart = 0; }
+
 bool SettleForSave()
 {
     if (!net::IsHost()) return false;
+    if (wanted.empty()) { settleStart = 0; return true; }
+    const uint32_t now = GetTickCount();
+    if (!settleStart) settleStart = now ? now : 1;
     for (auto entry = wanted.begin(); entry != wanted.end();) {
-        _GUID raw;
-        std::memcpy(&raw, entry->first.data(), 16);
-        Entity object{bCPropertyID(bCGuid(raw))};
+        Entity object = ResolveKey(entry->first);
         eCEntity* instance = object.GetInstance();
         if (!instance) { ++entry; continue; }
         if (!Shared(instance)) { entry = wanted.erase(entry); continue; }
-        if (!Same(Read(instance), entry->second)) Apply(instance, entry->second);
-        if (!Same(Read(instance), entry->second)) return false;
-        seen[entry->first] = entry->second;
+        Seen current = Read(instance);
+        if (!Same(current, entry->second)) {
+            Apply(instance, entry->second);
+            current = Read(instance);
+        }
+        seen[entry->first] = MergeSeen(current, entry->second);
+        if (!Same(current, entry->second) && now - settleStart < 500) return false;
         entry = wanted.erase(entry);
     }
+    settleStart = 0;
     return true;
 }
 
@@ -333,13 +383,12 @@ void Movers(LogFn log)
         eCEntity* entity = every->GetAt(i);
         auto* mover = entity ? static_cast<gCMover_PS*>(entity->GetPropertySet(eEPropertySetType_Mover)) : nullptr;
         if (!mover) continue;
-        uint8_t guid[16];
-        GuidOf(entity, guid);
+        char guid[48];
+        guid::FormatEntity(entity, guid, sizeof(guid));
         const bCVector& p = entity->GetWorldPosition();
         const float d = (p - hero->GetWorldPosition()).GetMagnitude();
-        Format(line, "MOVER name=%s guid=%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X state=%d loop=%d distance=%.0f pos=%.0f_%.0f_%.0f",
-                  entity->GetName().GetText(), *reinterpret_cast<uint32_t*>(guid), *reinterpret_cast<uint16_t*>(guid + 4),
-                  *reinterpret_cast<uint16_t*>(guid + 6), guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15],
+        Format(line, "MOVER name=%s guid=%s state=%d loop=%d distance=%.0f pos=%.0f_%.0f_%.0f",
+                  entity->GetName().GetText(), guid,
                   static_cast<int>(static_cast<gEMoverState>(Entity(entity).Mover.MoverState)), mover->AccessLoopAni() ? 1 : 0, d,
                   p.GetX(), p.GetY(), p.GetZ());
         log(line);

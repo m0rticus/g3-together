@@ -444,7 +444,7 @@ class ClientFlow
     unsigned LobbyEntered(uint64_t lobby, bool joined, LobbyMetadata metadata, uint64_t owner, uint32_t now)
     {
         if (state_ != State::Joining || !verified_ || joinAnswered_ || lobby != lobby_) return Ignored;
-        if (!joined || !owner) {
+        if (!joined || !owner || owner == self_) {
             Fail(Why::LobbyGone, 0);
             return Teardown;
         }

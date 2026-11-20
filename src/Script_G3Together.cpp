@@ -158,8 +158,8 @@ void Report()
 void Frame()
 {
     if (faulted) return;
-    ObserveFocus();
     __try {
+        ObserveFocus();
         ++frames;
         const DWORD now = GetTickCount();
         if (now - lastReport >= 1000) {
@@ -409,6 +409,8 @@ class Module : public eCEngineComponentBase
             Step("frame report", &Frame);
         }
         if (!g3t::npcplayback::Available()) {
+            Step("crashlog", &g3t::crashlog::Tick);
+            Step("persist", &g3t::persist::Tick);
             g3t::hud::MenuLine(g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
             if (!playbackErrorShown && gCSession::GetInstance().IsGameRunning()) {
                 g3t::hud::Message(g3t::hud::Bad, g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
@@ -507,9 +509,9 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
     g3t::crashlog::Install();
     const bool playbackReady = g3t::npcplayback::Start(!g3t::GetConfig().host);
     g3t::trace::Configure(g3t::GetConfig().trace);
-    g3t::remote::Start();
-    if (!playbackReady) {
-        g3t::net::Stop();
+    if (playbackReady) {
+        g3t::remote::Start();
+    } else {
         g3t::Log("FAIL co-op disabled: this game build does not support authoritative NPC playback");
     }
     g3t::npcs::Start();

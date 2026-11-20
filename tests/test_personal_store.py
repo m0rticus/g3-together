@@ -315,8 +315,11 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertLess(apply.index("ResolveStackTemplates(entity, instance, row.stacks"), apply.index("DeleteStack"))
         self.assertIn("PersonalCounted(entity, i)", apply)
         self.assertIn("!entity.Inventory.DeleteStack(i)", apply)
-        self.assertIn("inventory->CreateItems", apply)
-        self.assertIn("< 0) return rollbackAndFail()", apply)
+        create_helper = part(ledger_source, "int CreateAndEquipStack(", "bool ReadRawPersonal(")
+        self.assertIn("inventory.CreateItems", create_helper)
+        self.assertIn("CreateAndEquipStack(", apply)
+        self.assertIn("< 0)", apply)
+        self.assertIn("return rollbackAndFail()", apply)
         self.assertIn("RollbackPersonal(entity, *inventory, before, beforeTemplates, &beforeSlots)", apply)
         ensure = part(ledger_source, "bool EnsurePersonal(", "bool RememberPersonal(")
         self.assertIn("AwaitingDeath(entity", ensure)
@@ -343,8 +346,9 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertIn("guid::Resolve", restore)
         self.assertIn("AwaitingDeath", restore)
         self.assertIn("EnsurePersonal(entity);", restore)
-        self.assertLess(restore.index("if (personalLedger.empty()) return true"),
-                        restore.index("if (!installAccessGuards || !installAccessGuards())"))
+        self.assertLess(restore.index("if (hasInventories && !GuardsAvailable(installAccessGuards))"),
+                        restore.index("personalLedger.swap"))
+        self.assertIn("if (personalLedger.empty()) return true;", restore)
         reset_ledger = part(ledger_source, "void Reset()", "bool Capture(")
         self.assertIn("personalLedger.clear()", reset_ledger)
         self.assertIn("items::OnWorldChange()", reset_ledger)
@@ -401,9 +405,11 @@ class PersonalStoreTests(unittest.TestCase):
         def part(text, start, end):
             return text[text.index(start):text.index(end, text.index(start))]
 
+        collect_fn = part(ledger_source, "void CollectPersonalStacks(", "int CreateAndEquipStack(")
+        self.assertIn("StackMerchandise(entity, inventory, i, kind)", collect_fn)
+        self.assertIn("personal::MaskQuality(entity.Inventory.GetQuality(i))", collect_fn)
         read_fn = part(ledger_source, "bool ReadPersonal(", "bool CompatiblePersonalKind(")
-        self.assertIn("StackMerchandise(entity, *inventory, i, kind)", read_fn)
-        self.assertIn("personal::MaskQuality(entity.Inventory.GetQuality(i))", read_fn)
+        self.assertIn("CollectPersonalStacks(entity, *inventory, kind, personal::MaxAmount, true, result)", read_fn)
         self.assertIn("personal::NormalizeStacks(result.stacks", read_fn)
 
         resolve_fn = part(ledger_source, "bool ResolveStackTemplates(", "void ApplyPersonalMetadata(")
@@ -451,14 +457,16 @@ class PersonalStoreTests(unittest.TestCase):
             fn = part(ledger_source, name, end_marker)
             self.assertIn("IsDown()", fn, name)
 
+        create_helper = part(ledger_source, "int CreateAndEquipStack(", "bool ReadRawPersonal(")
         apply_fn = part(ledger_source, "bool ApplyPersonal(", "bool AwaitingDeath(")
         self.assertIn("CaptureEquippedSlots(", apply_fn)
         self.assertIn("UnEquipStack(i)", apply_fn)
-        self.assertIn("RestoreMatchingSlot(", apply_fn)
+        self.assertIn("CreateAndEquipStack(", apply_fn)
 
         rollback_fn = part(ledger_source, "void RollbackPersonal(", "bool ReadPersonal(")
         self.assertIn("UnEquipStack(i)", rollback_fn)
-        self.assertIn("RestoreMatchingSlot(", rollback_fn)
+        self.assertIn("CreateAndEquipStack(", rollback_fn)
+        self.assertIn("RestoreMatchingSlot(", create_helper)
 
         resolve_fn = part(ledger_source, "bool ResolveStackTemplates(", "void CaptureEquippedSlots(")
         self.assertIn("gESlot_Ammo", resolve_fn)
@@ -479,12 +487,30 @@ class PersonalStoreTests(unittest.TestCase):
 
         enter_fn = part(ledger_source, "bool PersonalMutation::Enter(", "bool PersonalMutation::StillAvailable(")
         self.assertNotIn("if (wasPending) return false;", enter_fn)
+        self.assertIn("observer->changes.destroyed", enter_fn)
+
+        finish_fn = part(ledger_source, "void PersonalMutation::Finish()", "} // namespace g3t::containers::ledger")
+        self.assertIn("observerGeneration", finish_fn)
+        self.assertIn("reusablePersonalObservers.push_back(observer)", finish_fn)
+
+        flush_fn = part(ledger_source, "bool FlushPersonalObservers()", "void Reset()")
+        self.assertIn("keys.push_back(entry.first)", flush_fn)
+        self.assertIn("allClean = false", flush_fn)
+
+        self.assertIn("PreservedCorpseStack(", apply_fn)
+        self.assertIn("preservedTotals", apply_fn)
+        self.assertIn("SplitStack(", part(ledger_source, "void RestoreMatchingSlot(", "void ApplyPersonalMetadata("))
+
+        state_fn = part(containers_source, "GEBool GE_STDCALL PersonalState(", "void* InstallPersonalNative(")
+        self.assertIn('!std::strcmp(name, "PS_HUD_Loop")', state_fn)
+        self.assertIn("if (hudLoop) return original->second(stack, spu);", state_fn)
 
         self.assertIn("void PrepareCorpseLoot(eCEntity* entity);", containers_header)
         local_tick = part(containers_source, "void LocalInventoryTick()", "gFScript originalLoot")
         self.assertIn("Corpse(focus)", local_tick)
         self.assertIn("PrepareLocalLoot(focus)", local_tick)
         quick = part(containers_source, "GEBool __fastcall QuickTake(", "void HookQuickLoot()")
+        self.assertIn("if (!self) return GEFalse;", quick)
         self.assertIn("kind == personal::Kind::Corpse && !entity.Inventory.IsGeneratedPlunder()", quick)
         self.assertIn("PrepareLocalLoot(entity)", quick)
 

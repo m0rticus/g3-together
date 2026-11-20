@@ -114,6 +114,14 @@ inline bool Id(std::string const& id)
 
 inline constexpr uint32_t MaskQuality(uint32_t quality) { return quality & MaxQuality; }
 
+inline bool StackOrderLess(Stack const& a, Stack const& b)
+{
+    if (a.item != b.item) return a.item < b.item;
+    if (a.quality != b.quality) return a.quality < b.quality;
+    if (a.type != b.type) return static_cast<uint8_t>(a.type) < static_cast<uint8_t>(b.type);
+    return a.amount < b.amount;
+}
+
 inline void NormalizeStacks(std::vector<Stack>& stacks, bool* truncated = nullptr)
 {
     if (truncated) *truncated = false;
@@ -145,11 +153,7 @@ inline void NormalizeStacks(std::vector<Stack>& stacks, bool* truncated = nullpt
         }
         normalized.push_back({group.item, static_cast<uint32_t>(total), group.quality, group.type});
     }
-    std::sort(normalized.begin(), normalized.end(), [](Stack const& a, Stack const& b) {
-        if (a.item != b.item) return a.item < b.item;
-        if (a.quality != b.quality) return a.quality < b.quality;
-        return static_cast<uint8_t>(a.type) < static_cast<uint8_t>(b.type);
-    });
+    std::sort(normalized.begin(), normalized.end(), StackOrderLess);
     stacks.swap(normalized);
 }
 
@@ -199,12 +203,7 @@ inline bool Encode(Snapshot const& snapshot, Bytes& output)
         out.push_back(row.flags);
         Put(out, static_cast<uint32_t>(row.stacks.size()), 2);
         auto stacks = row.stacks;
-        std::sort(stacks.begin(), stacks.end(), [](Stack const& a, Stack const& b) {
-            if (a.item != b.item) return a.item < b.item;
-            if (a.quality != b.quality) return a.quality < b.quality;
-            if (a.type != b.type) return static_cast<uint8_t>(a.type) < static_cast<uint8_t>(b.type);
-            return a.amount < b.amount;
-        });
+        std::sort(stacks.begin(), stacks.end(), StackOrderLess);
         for (auto const& stack : stacks) {
             out.insert(out.end(), stack.item.begin(), stack.item.end());
             Put(out, stack.amount, 4);

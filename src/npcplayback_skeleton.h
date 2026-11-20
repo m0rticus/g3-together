@@ -42,10 +42,12 @@ struct NativeBone {
 
 struct NativePose {
     std::vector<NativeBone> bones;
+    void const* actor = nullptr;
+    std::string actorName;
     void const* instance = nullptr;
     void const* nodes = nullptr;
     int count = 0;
-    bool applied = false, evaluated = false, valid = true, evaluateOnly = false;
+    bool applied = false, evaluated = false, valid = true, evaluateOnly = false, allowNonPassive = false;
 };
 
 struct Motion {
@@ -68,6 +70,11 @@ struct Frame {
 };
 
 eCVisualAnimation_PS* Animation(eCEntity* entity);
+template <typename Skeleton>
+inline bool ValidSkeleton(Skeleton const* skeleton)
+{
+    return skeleton && skeleton->mNodes.mData && skeleton->mNodes.mLength > 0 && skeleton->mNodes.mLength <= 4096;
+}
 pose::Transform TransformOf(bCMatrix const& matrix, uint32_t name);
 bCMatrix MatrixOf(pose::Transform const& transform);
 bool SetFacialRig(eCVisualAnimation_PS& animation, bool facial);

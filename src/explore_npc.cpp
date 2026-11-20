@@ -119,11 +119,12 @@ void FarMove(char const* argument, LogFn log)
     float target[3];
     // QA commands take one token of [A-Za-z0-9_-]: X_Y_Z_<name>, the name after the third underscore.
     int consumed = 0;
-    if (sscanf_s(argument, "%f_%f_%f_%n", &target[0], &target[1], &target[2], &consumed) != 3 || !consumed ||
-        strcpy_s(name, argument + consumed)) {
+    if (!argument || sscanf_s(argument, "%f_%f_%f_%n", &target[0], &target[1], &target[2], &consumed) != 3 ||
+        !consumed || std::strlen(argument + consumed) >= sizeof(name)) {
         log("REFUSED farmove: X_Y_Z_<name>");
         return;
     }
+    strcpy_s(name, argument + consumed);
     Entity entity = Entity::GetEntity(bCString(name));
     if (!entity.GetInstance()) { Format(line, "REFUSED farmove %s: not found", name); log(line); return; }
     const bCQuaternion q = entity.GetInstance()->GetWorldRotation();
@@ -177,7 +178,7 @@ void NpcRoutine(char const* name, LogFn log)
 void Aggro(char const* argument, LogFn log)
 {
     char line[300], name[96] = {};
-    char const* sep = std::strrchr(argument, '_');
+    char const* sep = argument ? std::strrchr(argument, '_') : nullptr;
     if (!sep || sep - argument >= static_cast<ptrdiff_t>(sizeof(name))) { log("REFUSED aggro: Name_Reason"); return; }
     std::memcpy(name, argument, sep - argument);
     const int reason = std::atoi(sep + 1);
@@ -193,7 +194,7 @@ void Aggro(char const* argument, LogFn log)
 void AssessHero(char const* argument, LogFn log)
 {
     char line[300], name[96] = {};
-    char const* sep = std::strrchr(argument, '_');
+    char const* sep = argument ? std::strrchr(argument, '_') : nullptr;
     if (!sep || sep - argument >= static_cast<ptrdiff_t>(sizeof(name))) { log("REFUSED assesshero: Name_Reason"); return; }
     std::memcpy(name, argument, sep - argument);
     const int reason = std::atoi(sep + 1);

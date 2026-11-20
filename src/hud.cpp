@@ -75,14 +75,18 @@ bool BindEntitySlots()
     return true;
 }
 
-unsigned char* DialogRoot()
+unsigned char* GuiRoot()
 {
-    if (!BindEntitySlots()) return nullptr;
     gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
     if (!manager) return nullptr;
     unsigned char* root = nullptr;
     std::memcpy(&root, reinterpret_cast<unsigned char const*>(manager) + entities::ManagerRootOffset, sizeof(root));
     return root;
+}
+
+unsigned char* DialogRoot()
+{
+    return BindEntitySlots() ? GuiRoot() : nullptr;
 }
 
 void InvokeSetEntityNull(void* target, int slot)
@@ -96,16 +100,13 @@ void InvokeSetEntityNull(void* target, int slot)
     if (fn) fn(target, nullptr, slot);
 }
 
-void ClearRootEntitySlot(unsigned char* root, int slot)
+void ClearRootEntitySlot(unsigned char* root, int slot, int32_t activePage)
 {
-    if (!root || slot < 0 || slot >= entities::EntitySlotCount) return;
     eCEntity* empty = nullptr;
     std::memcpy(root + entities::RootSlotsOffset + static_cast<size_t>(slot) * sizeof(eCEntity*), &empty, sizeof(empty));
     void* hudOwner = nullptr;
     std::memcpy(&hudOwner, root + entities::RootHudOffset, sizeof(hudOwner));
     InvokeSetEntityNull(hudOwner, slot);
-    int32_t activePage = -1;
-    std::memcpy(&activePage, root + entities::RootActivePageOffset, sizeof(activePage));
     if (entities::ValidActivePage(activePage)) {
         void* page = nullptr;
         std::memcpy(&page, root + entities::RootPagesOffset + static_cast<size_t>(activePage) * sizeof(void*),
@@ -126,7 +127,7 @@ void ScrubEntitySlots(Predicate&& shouldScrub)
         std::memcpy(&current, root + entities::RootSlotsOffset + static_cast<size_t>(slot) * sizeof(current),
                     sizeof(current));
         if (current && shouldScrub(slot, activePage, current))
-            ClearRootEntitySlot(root, slot);
+            ClearRootEntitySlot(root, slot, activePage);
     }
 }
 
@@ -182,13 +183,10 @@ bool BindPresentation()
 
 void* MessageList()
 {
-    gCGUIManager* manager = gCSession::GetInstance().GetGUIManager();
-    if (!manager) return nullptr;
-    void* root = nullptr;
-    std::memcpy(&root, reinterpret_cast<unsigned char*>(manager) + entities::ManagerRootOffset, sizeof(root));
+    unsigned char* root = GuiRoot();
     if (!root) return nullptr;
     void* owner = nullptr;
-    std::memcpy(&owner, static_cast<unsigned char*>(root) + entities::RootHudOffset, sizeof(owner));
+    std::memcpy(&owner, root + entities::RootHudOffset, sizeof(owner));
     return owner ? static_cast<unsigned char*>(owner) + 0x288 : nullptr;
 }
 
@@ -408,7 +406,8 @@ bool MenuLine(wchar_t const* text)
         return true;
     }
     std::wstring content(text);
-    if (auto* adopted = options::Hint()) {
+    wchar_t const* const adopted = options::Hint();
+    if (adopted) {
         content += L"\n";
         content += adopted;
     }
@@ -421,7 +420,7 @@ bool MenuLine(wchar_t const* text)
     }
     // Room for the version and two lines of text: a refusal that lists differing files, or German, runs longer.
     line->MoveWindow(bCRect(0, lineRect.GetTop(), 1024,
-        lineRect.GetTop() + (options::Hint() ? 5 : 3) * lineRect.GetHeight() + 4));
+        lineRect.GetTop() + (adopted ? 5 : 3) * lineRect.GetHeight() + 4));
     lineChanged = true;
     return true;
 }

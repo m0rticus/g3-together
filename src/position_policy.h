@@ -10,6 +10,11 @@ inline bool PositionDiscontinuity(float const before[3], float const after[3],
                                   uint64_t elapsedUs, bool airborne)
 {
     if (elapsedUs >= 250000) return false; // Loading/frame stalls cannot be attributed to one physics step.
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!std::isfinite(before[i]) || !std::isfinite(after[i]) ||
+            !std::isfinite(velocityBefore[i]) || !std::isfinite(velocityAfter[i]))
+            return true;
+    }
     float distanceSquared = 0.0f, speedBefore = 0.0f, speedAfter = 0.0f;
     for (unsigned i = 0; i < 3; ++i) {
         const float delta = after[i] - before[i];

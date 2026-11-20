@@ -131,6 +131,7 @@ void WorkerRuntime::RotatePartnerForRejoin(u64 id)
     if (!r || !r->id) return;
     Logf("connect: rotating relay generation for rejoining partner=%llu prev_gen=%llu relay_port=%u",
          id, static_cast<unsigned long long>(r->generation), static_cast<unsigned>(r->relayPort));
+    rejoinPartner = id;
     ReleaseRemote(*r, "partner rejoined", false, false);
 }
 
@@ -183,7 +184,8 @@ void WorkerRuntime::LeaveLobby()
     if (!isHost && owner) RecordClientEnd("local lobby closed", clientFlow.state());
     for (auto& r : remotes)
         if (r.id && (isHost || r.id == owner))
-            ReleaseRemote(r, "lobby closed", true, true);
+            ReleaseRemote(r, "lobby closed", false, true);
+    rejoinPartner = 0;
     api.LeaveLobby(matchmaking, lobby);
     if (isHost && connectionMode == connect::Mode::Auto) {
         api.SetRichPresence(friends, "connect", "");

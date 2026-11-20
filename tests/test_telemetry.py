@@ -63,8 +63,16 @@ int main()
 
         char tiny[20];
         KvWriter shortKv(tiny, sizeof(tiny));
-        shortKv.Str("very_long_key_name", "very_long_value_ignored_safely");
-        assert(std::strlen(shortKv.c_str()) < sizeof(tiny));
+        shortKv.Str("ok", "1").Str("", "no_key").Str("very_long_key_name", "very_long_value_ignored_safely");
+        assert(std::strcmp(shortKv.c_str(), "ok=1") == 0);
+
+        char quoteBuf[20];
+        KvWriter quoteKv(quoteBuf, sizeof(quoteBuf));
+        quoteKv.Str("k", "a b c d e f g h i j k");
+        std::string qs(quoteKv.c_str());
+        size_t quotes = 0;
+        for (char c : qs) if (c == '"') ++quotes;
+        assert(quotes == 0 || quotes == 2);
     }
 
     // 2. Monotonic sequence numbers and recent-telemetry ring buffer wraparound.
@@ -86,10 +94,10 @@ int main()
         assert(std::strstr(recent, "idx=6") != nullptr);
         assert(std::strstr(recent, "idx=69") != nullptr);
 
-        // Long baseline/loot lines (>1000 chars) are preserved intact without 768-byte truncation.
-        std::string longPayload(1200, 'x');
+        // Long baseline/loot lines (>2048 chars) are preserved intact without 2 KB truncation.
+        std::string longPayload(3200, 'x');
         longPayload += "_ENDMARK";
-        char longFields[1400];
+        char longFields[3600];
         KvWriter longKv(longFields, sizeof(longFields));
         longKv.Str("blob", longPayload.c_str());
         LogTelemetryLine(NextTelemetrySeq(), "test.long", longKv.c_str());

@@ -10,6 +10,22 @@
 namespace g3t::ai {
 using namespace detail;
 
+namespace {
+uintptr_t ResolveModuleRva(void const* code, char* moduleOut, size_t moduleCap, char const* fallback)
+{
+    if (moduleOut && moduleCap) std::snprintf(moduleOut, moduleCap, "%s", fallback ? fallback : "");
+    HMODULE owner = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       static_cast<LPCSTR>(code), &owner);
+    if (!owner) return reinterpret_cast<uintptr_t>(code);
+    char file[MAX_PATH] = {};
+    GetModuleFileNameA(owner, file, sizeof(file));
+    char const* slash = std::strrchr(file, '\\');
+    if (moduleOut && moduleCap) std::snprintf(moduleOut, moduleCap, "%s", slash ? slash + 1 : file);
+    return reinterpret_cast<uintptr_t>(code) - reinterpret_cast<uintptr_t>(owner);
+}
+} // namespace
+
 void AttitudeOff(void (*log)(char const*))
 {
     attitudeOn = false;
@@ -64,10 +80,19 @@ void Count(char const* names, void (*log)(char const*))
 
 void FindByRva(char const* rvaHex, void (*log)(char const*))
 {
+    if (!rvaHex || !*rvaHex) {
+        log("SCRIPTFIND end rva=- found=0");
+        return;
+    }
     gCScriptAdminExt& admin = GetScriptAdminExt();
     HMODULE game = GetModuleHandleA("Script_Game.dll");
-    const uintptr_t want = reinterpret_cast<uintptr_t>(game) + std::strtoul(rvaHex, nullptr, 16);
     char line[200];
+    if (!game) {
+        Format(line, "SCRIPTFIND end rva=%s found=0", rvaHex);
+        log(line);
+        return;
+    }
+    const uintptr_t want = reinterpret_cast<uintptr_t>(game) + std::strtoul(rvaHex, nullptr, 16);
     unsigned found = 0;
     auto check = [&](char const* table, char const* name, void const* fn) {
         if (reinterpret_cast<uintptr_t>(fn) != want) return;
@@ -89,6 +114,7 @@ void FindByRva(char const* rvaHex, void (*log)(char const*))
 
 void Describe(char const* name, void (*log)(char const*))
 {
+    if (!name) name = "";
     gCScriptAdminExt& admin = GetScriptAdminExt();
     char line[200];
     Format(line, "SCRIPTINFO name=%s script=%d callback=%d state=%d function=%d routine=%d", name,
@@ -97,36 +123,25 @@ void Describe(char const* name, void (*log)(char const*))
            Find(admin.GetScriptAIRoutines(), name) != nullptr);
     log(line);
     // AI states and functions: the original entry (ours is wrapped around it).
+    auto logAddress = [&](void const* target) {
+        char moduleName[MAX_PATH] = {};
+        const uintptr_t rva = ResolveModuleRva(target, moduleName, sizeof(moduleName), "");
+        Format(line, "SCRIPTINFO address name=%s module=%s rva=%#lx", name, moduleName,
+               static_cast<unsigned long>(rva));
+        log(line);
+    };
     void* target = nullptr;
     if (auto it = originalStates.find(name); it != originalStates.end()) target = reinterpret_cast<void*>(it->second);
     else if (auto it2 = originalFunctions.find(name); it2 != originalFunctions.end()) target = reinterpret_cast<void*>(it2->second);
-    if (target) {
-        HMODULE owner = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCSTR>(target), &owner);
-        char file[MAX_PATH] = {};
-        if (owner) GetModuleFileNameA(owner, file, MAX_PATH);
-        char const* base = strrchr(file, '\\');
-        Format(line, "SCRIPTINFO address name=%s module=%s rva=%#lx", name, base ? base + 1 : file,
-               static_cast<unsigned long>(reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(owner)));
-        log(line);
-    }
-    if (gSScript* script = Find(admin.GetScripts(), name)) {
-        HMODULE owner = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(script->m_funcScript), &owner);
-        char file[MAX_PATH] = {};
-        if (owner) GetModuleFileNameA(owner, file, MAX_PATH);
-        char const* base = strrchr(file, '\\');
-        Format(line, "SCRIPTINFO address name=%s module=%s rva=%#lx", name, base ? base + 1 : file,
-               static_cast<unsigned long>(reinterpret_cast<uintptr_t>(script->m_funcScript) - reinterpret_cast<uintptr_t>(owner)));
-        log(line);
-    }
+    if (target) logAddress(target);
+    if (gSScript* script = Find(admin.GetScripts(), name))
+        logAddress(reinterpret_cast<void const*>(script->m_funcScript));
 }
 
 // QA diagnostic: every registered script, AI callback, state, function and routine whose name contains text.
 void ListNames(char const* text, void (*log)(char const*))
 {
+    if (!text) text = "";
     gCScriptAdminExt& admin = GetScriptAdminExt();
     char line[200];
     auto scan = [&](char const* kind, auto& map) {
@@ -159,16 +174,10 @@ void DumpNames(char const* path, void (*log)(char const*))
         {
             if (!entry) continue;
             void const* code = reinterpret_cast<void const*>(entry->*function);
-            HMODULE module = nullptr;
             char moduleName[MAX_PATH] = "-";
-            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               static_cast<LPCSTR>(code), &module);
-            if (module) {
-                GetModuleFileNameA(module, moduleName, sizeof(moduleName));
-                if (char const* slash = std::strrchr(moduleName, '\\')) std::memmove(moduleName, slash + 1, std::strlen(slash));
-            }
-            const uintptr_t rva = module ? reinterpret_cast<uintptr_t>(code) - reinterpret_cast<uintptr_t>(module) : 0;
-            std::fprintf(file, "%s\t%s\t%s\t%#x\t%s\r\n", kind, name.GetText(), moduleName, static_cast<unsigned>(rva),
+            const uintptr_t rva = ResolveModuleRva(code, moduleName, sizeof(moduleName), "-");
+            const uintptr_t printedRva = std::strcmp(moduleName, "-") == 0 ? 0 : rva;
+            std::fprintf(file, "%s\t%s\t%s\t%#x\t%s\r\n", kind, name.GetText(), moduleName, static_cast<unsigned>(printedRva),
                          entry->m_strSource.GetText());
             ++count;
         }

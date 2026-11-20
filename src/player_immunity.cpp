@@ -25,13 +25,13 @@ auto& convergence = life.convergence;
 auto& lastHp = life.lastHp;
 auto& lethalBlowAt = life.lethalBlowAt;
 auto& recoveryUnknownNoted = life.recoveryUnknownNoted;
-auto& potionsPaid = life.potionsPaid;
-auto& refusedNoPotion = life.refusedNoPotion;
+auto& potionsPaid = life.stats.potionsPaid;
+auto& refusedNoPotion = life.stats.refusedNoPotion;
 auto& helpSaidAt = life.helpSaidAt;
-auto& helpNotSaid = life.helpNotSaid;
+auto& helpNotSaid = life.stats.helpNotSaid;
 auto& lastOffer = life.lastOffer;
-auto& optionsOffered = life.optionsOffered;
-auto& optionsChosen = life.optionsChosen;
+auto& optionsOffered = life.stats.optionsOffered;
+auto& optionsChosen = life.stats.optionsChosen;
 }
 PeerRecovery puppetRecovery[net::MaxPlayers];
 InteractionProtection interaction;
@@ -171,14 +171,12 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
         }
         return;
     }
-    if (stack >= 0) {
-        if (!hero.Inventory.DeleteItems(stack, 1)) {
-            Logf("downed: help refused player=%u target=%d sequence=%u reason=potion-removal-failed potion=%s",
-                 net::LocalId(), i, r.latest.downedSequence, potion);
-            return;
-        }
-        ++potionsPaid;
+    if (!hero.Inventory.DeleteItems(stack, 1)) {
+        Logf("downed: help refused player=%u target=%d sequence=%u reason=potion-removal-failed potion=%s",
+             net::LocalId(), i, r.latest.downedSequence, potion);
+        return;
     }
+    ++potionsPaid;
     peers[i].payment.MarkPaid(r.latest.downedSequence);
     peers[i].hinted = false;
     SendToPlayer(8, i, r.latest.downedSequence);
@@ -317,7 +315,7 @@ bool HarmProtected(eCEntity* entity)
     if (id <= 0 || id >= net::MaxPlayers) return false;
     net::Remote const& r = net::Remotes()[id];
     const bool present = r.connected && r.latestTicks && r.latest.world == remote::CurrentWorld();
-    return HarmImmune(present, false, false, r.latest.flags, TrackPuppetRecovery(id)) || InteractionOf(entity) != 0;
+    return HarmImmune(present, false, false, r.latest.flags, TrackPuppetRecovery(id), InteractionOf(entity) != 0);
 }
 
 void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int before, int after, char const* decision)
@@ -376,7 +374,9 @@ bool RejectReaction(eCEntity* victim, char const* state, char const* path)
         convergence.Request();
         return true;
     }
-    eCEntity* attacker = Entity(victim).NPC.GetCurrentAttacker().GetInstance();
+    eCEntity* attacker = victim->GetPropertySet(eEPropertySetType_NPC)
+                             ? Entity(victim).NPC.GetCurrentAttacker().GetInstance()
+                             : nullptr;
     if (!RejectHarm(victim, attacker, path)) return false;
     Logf("downed: ground reaction refused player=%u path=%s requested=%s", net::LocalId(), path, state);
     return true;

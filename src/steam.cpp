@@ -196,8 +196,20 @@ void WorkerRuntime::PumpOnce()
             sbool failed = 0;
             if (completed.size <= sizeof(result) &&
                 api.DispatchResult(pipe, completed.call, result, static_cast<int>(completed.size),
-                                   completed.callback, &failed) && !failed)
-                OnCallback(completed.callback, result, static_cast<int>(completed.size));
+                                   completed.callback, &failed)) {
+                if (!failed) {
+                    OnCallback(completed.callback, result, static_cast<int>(completed.size));
+                } else if (completed.callback == CbLobbyCreated) {
+                    LobbyCreatedParam fail{};
+                    fail.result = 2;
+                    OnLobbyCreated(reinterpret_cast<char const*>(&fail), static_cast<int>(sizeof(fail)));
+                } else if (completed.callback == CbLobbyEnter && !isHost && lobby && !owner) {
+                    LobbyEnterParam fail{};
+                    fail.lobby = lobby;
+                    fail.response = 5;
+                    OnLobbyEnter(reinterpret_cast<char const*>(&fail), static_cast<int>(sizeof(fail)));
+                }
+            }
         } else {
             OnCallback(message.callback, message.param, message.size);
         }
@@ -220,11 +232,16 @@ void WorkerRuntime::PumpOnce()
     if (store.disconnectRequested.exchange(false) && !isHost &&
         connectionMode == connect::Mode::Invite && clientFlow.Active()) {
         ClientEnet enet;
+        uint64_t generation = 0;
         {
             std::lock_guard<std::mutex> lock(store.mutex);
             enet = store.clientEnet;
+            generation = store.disconnectGeneration;
+            store.disconnectGeneration = 0;
         }
-        OnClientLinkLost(clientFlow.host(), enet.reason[0] ? enet.reason : "ENet connection ended (no event reason)");
+        const Remote* activeHost = owner ? Find(owner) : nullptr;
+        if (generation && activeHost && activeHost->linked && activeHost->generation == generation)
+            OnClientLinkLost(clientFlow.host(), enet.reason[0] ? enet.reason : "ENet connection ended (no event reason)");
     }
     if (!isHost) {
         PollLobbyMetadata();

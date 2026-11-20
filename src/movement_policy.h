@@ -127,7 +127,8 @@ inline uint16_t InterpolateMotionFrac(uint16_t a, uint16_t b, float t, bool loop
 
 inline double ExpectedPuppetPlayTime(double maxSec, int motionFrac, uint32_t ageMs, double unitMs, bool looping)
 {
-    if (!(maxSec > 0.0) || !(unitMs > 0.0) || motionFrac < 0 || motionFrac >= NoMotionFrac) return 0.0;
+    if (!std::isfinite(maxSec) || !(maxSec > 0.0) || !std::isfinite(unitMs) || !(unitMs > 0.0) ||
+        motionFrac < 0 || motionFrac >= NoMotionFrac) return 0.0;
     const double base = (static_cast<double>(motionFrac) / static_cast<double>(MaxRunningMotionFrac)) * maxSec;
     const double raw = base + static_cast<double>(ageMs) / unitMs;
     if (!looping) return raw;
@@ -138,12 +139,15 @@ inline double ExpectedPuppetPlayTime(double maxSec, int motionFrac, uint32_t age
 
 inline float PuppetPhaseLagMs(double localPlaySec, double expectedSec, double maxSec, double unitMs, bool looping)
 {
-    if (!(maxSec > 0.0) || !(unitMs > 0.0)) return 0.0f;
+    if (!std::isfinite(localPlaySec) || !std::isfinite(expectedSec) ||
+        !std::isfinite(maxSec) || !(maxSec > 0.0) ||
+        !std::isfinite(unitMs) || !(unitMs > 0.0)) return 0.0f;
     double diff = expectedSec - localPlaySec;
     if (looping) {
+        diff = std::fmod(diff, maxSec);
         const double half = 0.5 * maxSec;
-        while (diff > half) diff -= maxSec;
-        while (diff < -half) diff += maxSec;
+        if (diff > half) diff -= maxSec;
+        else if (diff < -half) diff += maxSec;
     }
     return static_cast<float>(diff * unitMs);
 }
@@ -233,8 +237,13 @@ struct PuppetMotionHistory {
                 a.overlayMeta, a.overlayAnim0, a.overlayAnim1, a.weaponAnim, a.overlayHot,
                 b.overlayMeta, b.overlayAnim0, b.overlayAnim1, b.weaponAnim, b.overlayHot, t);
             if (a.motion == b.motion && a.motion != 0 && (a.looping || a.actionSeq == b.actionSeq)) {
-                out.motionFrac = InterpolateMotionFrac(a.motionFrac, b.motionFrac, t, a.looping);
-                ageMsOut = (a.motionFrac < NoMotionFrac && b.motionFrac < NoMotionFrac) ? 0u : static_cast<uint32_t>(num);
+                if (a.motionFrac >= NoMotionFrac) {
+                    out.motionFrac = NoMotionFrac;
+                    ageMsOut = 0u;
+                } else {
+                    out.motionFrac = InterpolateMotionFrac(a.motionFrac, b.motionFrac, t, a.looping);
+                    ageMsOut = (b.motionFrac < NoMotionFrac) ? 0u : static_cast<uint32_t>(num);
+                }
                 return true;
             }
             ageMsOut = static_cast<uint32_t>(num);

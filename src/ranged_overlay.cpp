@@ -2,11 +2,11 @@
 // Remote puppet hand-ammo linking, hero upper-body/weapon overlay capture, and puppet overlay playback.
 #include "ranged.h"
 
+#include "guid_key.h"
 #include "movement_policy.h"
 #include "npcplayback_hooks.h"
 #include "ranged_anim.h"
 #include "remote.h"
-#include "world.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -39,15 +39,26 @@ struct DrivenSlotState {
 };
 
 struct PuppetOverlayState {
+    eCEntityProxy entityProxy;
     uint8_t drivenMask = 0;
     DrivenSlotState slots[8]{};
     eCEntity* weapon = nullptr;
+    eCEntityProxy weaponProxy;
     uint8_t weaponSeq = 0;
     bool weaponDriven = false;
     char weaponFile[128] = {};
 };
 
-std::unordered_map<eCEntity*, PuppetOverlayState> puppetOverlays;
+struct PropertyIdHash {
+    size_t operator()(bCPropertyID const& id) const noexcept
+    {
+        GuidKey key{};
+        std::memcpy(key.data(), &id.GetCore(), 16);
+        return GuidHash{}(key);
+    }
+};
+
+std::unordered_map<bCPropertyID, PuppetOverlayState, PropertyIdHash> puppetOverlays;
 
 uintptr_t RawMotionInstance(eCWrapper_emfx2Actor const& actor, int slot)
 {
@@ -116,34 +127,170 @@ void UnlinkPuppetSlot(Entity& body, gESlot slot)
     }
 }
 
+using MotionOwner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
+
+struct MotionPlayDesc {
+    float blendInTime;
+    int32_t playMode;
+    float playSpeed;
+    int32_t maxLoops;
+    float targetWeight;
+    float blendOutTime;
+    int32_t blendMode;
+};
+static_assert(sizeof(MotionPlayDesc) == 28);
+
+void StopAnimationSlot(eCVisualAnimation_PS* animation, eCWrapper_emfx2Actor* actor,
+                       eCWrapper_emfx2Actor::eEMotionType slot, float blendOut)
+{
+    if (!animation || !actor) return;
+    animation->SetMotionOwner(slot, static_cast<MotionOwner>(2));
+    actor->SetPlaySpeed(slot, 1.0f);
+    if (actor->HasMotionInstance(slot)) animation->StopMotion(slot, blendOut);
+}
+
 void StopDrivenWeapon(PuppetOverlayState& state)
 {
     if (!state.weaponDriven || !state.weapon) {
         state.weapon = nullptr;
+        state.weaponProxy = eCEntityProxy();
         state.weaponDriven = false;
         state.weaponFile[0] = '\0';
         return;
     }
-    // Verify the weapon pointer is still live in the world before touching it.
-    bool live = false;
-    if (bTSmallArray<eCEntity*> const* every = world::ProcessedEntities()) {
-        for (GEU16 i = 0; i < every->GetCount(); ++i)
-            if (every->GetAt(i) == state.weapon) { live = true; break; }
-    }
-    if (live) {
-        auto* anim = static_cast<eCVisualAnimation_PS*>(state.weapon->GetPropertySet(eEPropertySetType_Animation));
+    if (eCEntity* live = state.weaponProxy.GetEntity(); live && live == state.weapon) {
+        auto* anim = static_cast<eCVisualAnimation_PS*>(live->GetPropertySet(eEPropertySetType_Animation));
         auto* actor = anim ? anim->GetActor() : nullptr;
-        const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
-        if (anim && actor) {
-            using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
-            anim->SetMotionOwner(slot0, static_cast<Owner>(2));
-            actor->SetPlaySpeed(slot0, 1.0f);
-            if (actor->HasMotionInstance(slot0)) anim->StopMotion(slot0, 0.05f);
-        }
+        StopAnimationSlot(anim, actor, static_cast<eCWrapper_emfx2Actor::eEMotionType>(0), 0.05f);
     }
     state.weapon = nullptr;
+    state.weaponProxy = eCEntityProxy();
     state.weaponDriven = false;
     state.weaponFile[0] = '\0';
+}
+
+void DriveFrozenMotion(eCWrapper_emfx2Actor* actor, eCWrapper_emfx2Actor::eEMotionType slot,
+                       float phase, float weight)
+{
+    const float duration = static_cast<float>(actor->GetMaxTime(slot));
+    if (duration > 0.0f && std::isfinite(duration)) {
+        actor->SetIntroExtroBlending(slot, 0.0f, 0.0f);
+        actor->SetTargetWeight(slot, weight);
+        actor->SetPlaySpeed(slot, 0.0f);
+        actor->PauseMotion(GEFalse, slot);
+        actor->SetPlayTime(slot, std::min(duration * phase, std::nextafter(duration, 0.0f)));
+    }
+}
+
+void PresentOverlayChannels(eCVisualAnimation_PS* animation, eCWrapper_emfx2Actor* actor,
+                            PuppetOverlayState& state, ranged_anim::OverlayMeta const& meta,
+                            uint32_t overlayMeta, char const* anim0, char const* anim1,
+                            ranged_anim::OverlayHot const& hot)
+{
+    struct DesiredSlot {
+        bool active = false;
+        ranged_anim::OverlayChannelMeta ch{};
+        uint32_t rawBits = 0;
+        float phase = 0.0f;
+        float weight = 0.0f;
+        char file[128] = {};
+    } desired[8]{};
+
+    auto stageChannel = [&](ranged_anim::OverlayChannelMeta const& ch, uint32_t rawBits,
+                            char const* rawName, uint8_t qPhase, uint8_t qWeight) {
+        if (ch.slot < 1 || ch.slot > 7 || !rawName || !*rawName) return;
+        DesiredSlot& d = desired[ch.slot];
+        NormalizeXmotFile(rawName, d.file);
+        if (!d.file[0]) return;
+        d.active = true;
+        d.ch = ch;
+        d.rawBits = rawBits;
+        d.phase = ranged_anim::DequantizeUnit(qPhase);
+        d.weight = std::max(ranged_anim::DequantizeUnit(qWeight), 0.001f);
+    };
+    stageChannel(meta.ch0, overlayMeta & 0xfffu, anim0, hot.phase0, hot.weight0);
+    stageChannel(meta.ch1, (overlayMeta >> 12) & 0xfffu, anim1, hot.phase1, hot.weight1);
+
+    uint8_t nextMask = 0;
+    for (int s = 1; s <= 7; ++s) {
+        const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(s);
+        const uint8_t bit = static_cast<uint8_t>(1u << s);
+        DesiredSlot const& d = desired[s];
+        if (!d.active) {
+            if (state.drivenMask & bit) {
+                StopAnimationSlot(animation, actor, slot, 0.08f);
+                state.slots[s] = DrivenSlotState{};
+            }
+            continue;
+        }
+        const bool restart = (state.drivenMask & bit) == 0 ||
+                             state.slots[s].metaBits != d.rawBits ||
+                             std::strcmp(state.slots[s].file, d.file) != 0 ||
+                             !actor->HasMotionInstance(slot);
+        if (restart) {
+            auto& desc = const_cast<eCVisualAnimation_PS::eSMotionDesc&>(animation->GetMotionDesc(slot));
+            desc.SetMotion(bCString(d.file));
+            auto* resource = desc.GetMotion();
+            if (!resource) continue;
+            animation->SetMotion(slot, resource);
+            MotionPlayDesc play{0.0f, static_cast<int32_t>(d.ch.playMode), 1.0f, d.ch.looping ? -1 : 1,
+                                d.weight, 0.0f, static_cast<int32_t>(d.ch.blendMode)};
+            animation->PlayMotion(slot, d.ch.defaults
+                ? nullptr
+                : reinterpret_cast<eCWrapper_emfx2Motion::eSMotionDesc*>(&play));
+            animation->SetMotionOwner(slot, static_cast<MotionOwner>(4));
+            state.slots[s].metaBits = d.rawBits;
+            strncpy_s(state.slots[s].file, d.file, _TRUNCATE);
+        }
+        if (!actor->HasMotionInstance(slot)) continue;
+        actor->SetBlendMode(slot, static_cast<eCWrapper_emfx2Motion::eEMotionBlendMode>(d.ch.blendMode));
+        DriveFrozenMotion(actor, slot, d.phase, d.weight);
+        nextMask |= bit;
+    }
+    state.drivenMask = nextMask;
+}
+
+void PresentWeaponMotion(eCEntity* puppetEntity, PuppetOverlayState& state,
+                         ranged_anim::OverlayMeta const& meta, char const* weaponAnim,
+                         ranged_anim::OverlayHot const& hot)
+{
+    char wantedWeaponFile[128] = {};
+    if (meta.weaponActive && weaponAnim && *weaponAnim)
+        NormalizeXmotFile(weaponAnim, wantedWeaponFile);
+    eCEntity* heldLeft = puppetEntity->GetPropertySet(eEPropertySetType_Inventory)
+        ? Entity(puppetEntity).Inventory.GetItemFromSlot(gESlot_LeftHand).GetInstance()
+        : nullptr;
+    if (!wantedWeaponFile[0] || !heldLeft) {
+        StopDrivenWeapon(state);
+        return;
+    }
+    if (state.weapon && state.weapon != heldLeft)
+        StopDrivenWeapon(state);
+    auto* wAnim = static_cast<eCVisualAnimation_PS*>(heldLeft->GetPropertySet(eEPropertySetType_Animation));
+    auto* wActor = wAnim ? wAnim->GetActor() : nullptr;
+    const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+    if (!wAnim || !wActor) return;
+    const bool wRestart = !state.weaponDriven || state.weapon != heldLeft ||
+                          state.weaponSeq != meta.weaponSeq ||
+                          std::strcmp(state.weaponFile, wantedWeaponFile) != 0 ||
+                          !wActor->HasMotionInstance(slot0);
+    if (wRestart) {
+        auto& wDesc = const_cast<eCVisualAnimation_PS::eSMotionDesc&>(wAnim->GetMotionDesc(slot0));
+        wDesc.SetMotion(bCString(wantedWeaponFile));
+        if (auto* wRes = wDesc.GetMotion()) {
+            MotionPlayDesc wPlay{0.0f, 0, 1.0f, 1, 1.0f, 0.0f, 1};
+            wAnim->SetMotion(slot0, wRes);
+            wAnim->PlayMotion(slot0, reinterpret_cast<eCWrapper_emfx2Motion::eSMotionDesc*>(&wPlay));
+            wAnim->SetMotionOwner(slot0, static_cast<MotionOwner>(4));
+            state.weapon = heldLeft;
+            state.weaponProxy = eCEntityProxy(heldLeft);
+            state.weaponSeq = meta.weaponSeq;
+            state.weaponDriven = true;
+            strncpy_s(state.weaponFile, wantedWeaponFile, _TRUNCATE);
+        }
+    }
+    if (state.weaponDriven && wActor->HasMotionInstance(slot0))
+        DriveFrozenMotion(wActor, slot0, ranged_anim::DequantizeUnit(hot.weaponPhase), 1.0f);
 }
 } // namespace
 
@@ -154,10 +301,11 @@ void SyncPuppetHands(eCEntity* puppetEntity, char const* right, char const* left
     Entity body(puppetEntity);
     char const* wantRight = right ? right : "";
     char const* wantLeft = left ? left : "";
-    const GEInt leftStack = EnsurePuppetStack(body, wantLeft);
-    const GEInt rightStack = EnsurePuppetStack(body, wantRight);
     if (!*wantLeft) UnlinkPuppetSlot(body, gESlot_LeftHand);
     if (!*wantRight) UnlinkPuppetSlot(body, gESlot_RightHand);
+    GEInt leftStack = EnsurePuppetStack(body, wantLeft);
+    const GEInt rightStack = EnsurePuppetStack(body, wantRight);
+    if (*wantLeft) leftStack = EnsurePuppetStack(body, wantLeft);
     if (leftStack >= 0 || rightStack >= 0)
         body.Inventory.HoldStacks(leftStack, rightStack);
 
@@ -187,6 +335,8 @@ void SyncPuppetHands(eCEntity* puppetEntity, char const* right, char const* left
     }
     const Entity finalRight = body.Inventory.GetItemFromSlot(gESlot_RightHand);
     const Entity finalLeft = body.Inventory.GetItemFromSlot(gESlot_LeftHand);
+    if (finalRight.GetInstance() && finalRight.GetInstance()->HasCollision()) finalRight.GetInstance()->EnableCollision(GEFalse);
+    if (finalLeft.GetInstance() && finalLeft.GetInstance()->HasCollision()) finalLeft.GetInstance()->EnableCollision(GEFalse);
     heldRightOut = finalRight.GetInstance() ? finalRight.GetName().GetText() : "";
     heldLeftOut = finalLeft.GetInstance() ? finalLeft.GetName().GetText() : "";
 }
@@ -331,155 +481,26 @@ void PresentPuppetOverlay(eCEntity* puppetEntity, char const* anim0, char const*
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor) return;
 
-    PuppetOverlayState& state = puppetOverlays[puppetEntity];
+    PuppetOverlayState& state = puppetOverlays[puppetEntity->GetID()];
+    state.entityProxy = eCEntityProxy(puppetEntity);
     const ranged_anim::OverlayMeta meta = ranged_anim::UnpackOverlayMeta(overlayMeta);
-
-    struct DesiredSlot {
-        bool active = false;
-        ranged_anim::OverlayChannelMeta ch{};
-        uint32_t rawBits = 0;
-        float phase = 0.0f;
-        float weight = 0.0f;
-        char file[128] = {};
-    } desired[8]{};
-
-    auto stageChannel = [&](ranged_anim::OverlayChannelMeta const& ch, uint32_t rawBits,
-                            char const* rawName, uint8_t qPhase, uint8_t qWeight) {
-        if (ch.slot < 1 || ch.slot > 7 || !rawName || !*rawName) return;
-        DesiredSlot& d = desired[ch.slot];
-        NormalizeXmotFile(rawName, d.file);
-        if (!d.file[0]) return;
-        d.active = true;
-        d.ch = ch;
-        d.rawBits = rawBits;
-        d.phase = ranged_anim::DequantizeUnit(qPhase);
-        d.weight = std::max(ranged_anim::DequantizeUnit(qWeight), 0.001f);
-    };
-    stageChannel(meta.ch0, overlayMeta & 0xfffu, anim0, hot.phase0, hot.weight0);
-    stageChannel(meta.ch1, (overlayMeta >> 12) & 0xfffu, anim1, hot.phase1, hot.weight1);
-
-    using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
-    struct MotionPlayDesc {
-        float blendInTime;
-        int32_t playMode;
-        float playSpeed;
-        int32_t maxLoops;
-        float targetWeight;
-        float blendOutTime;
-        int32_t blendMode;
-    };
-    static_assert(sizeof(MotionPlayDesc) == 28);
-
-    uint8_t nextMask = 0;
-    for (int s = 1; s <= 7; ++s) {
-        const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(s);
-        const uint8_t bit = static_cast<uint8_t>(1u << s);
-        DesiredSlot const& d = desired[s];
-        if (!d.active) {
-            if (state.drivenMask & bit) {
-                animation->SetMotionOwner(slot, static_cast<Owner>(2));
-                actor->SetPlaySpeed(slot, 1.0f);
-                if (actor->HasMotionInstance(slot)) animation->StopMotion(slot, 0.08f);
-                state.slots[s] = DrivenSlotState{};
-            }
-            continue;
-        }
-        const bool restart = (state.drivenMask & bit) == 0 ||
-                             state.slots[s].metaBits != d.rawBits ||
-                             std::strcmp(state.slots[s].file, d.file) != 0 ||
-                             !actor->HasMotionInstance(slot);
-        if (restart) {
-            auto& desc = const_cast<eCVisualAnimation_PS::eSMotionDesc&>(animation->GetMotionDesc(slot));
-            desc.SetMotion(bCString(d.file));
-            auto* resource = desc.GetMotion();
-            if (!resource) continue;
-            animation->SetMotion(slot, resource);
-            MotionPlayDesc play{0.0f, static_cast<int32_t>(d.ch.playMode), 1.0f, d.ch.looping ? -1 : 1,
-                                d.weight, 0.0f, static_cast<int32_t>(d.ch.blendMode)};
-            animation->PlayMotion(slot, d.ch.defaults
-                ? nullptr
-                : reinterpret_cast<eCWrapper_emfx2Motion::eSMotionDesc*>(&play));
-            animation->SetMotionOwner(slot, static_cast<Owner>(4));
-            state.slots[s].metaBits = d.rawBits;
-            strncpy_s(state.slots[s].file, d.file, _TRUNCATE);
-        }
-        if (!actor->HasMotionInstance(slot)) continue;
-        const float duration = static_cast<float>(actor->GetMaxTime(slot));
-        if (duration > 0.0f && std::isfinite(duration)) {
-            actor->SetBlendMode(slot, static_cast<eCWrapper_emfx2Motion::eEMotionBlendMode>(d.ch.blendMode));
-            actor->SetIntroExtroBlending(slot, 0.0f, 0.0f);
-            actor->SetTargetWeight(slot, d.weight);
-            actor->SetPlaySpeed(slot, 0.0f);
-            actor->PauseMotion(GEFalse, slot);
-            actor->SetPlayTime(slot, std::min(duration * d.phase, std::nextafter(duration, 0.0f)));
-        }
-        nextMask |= bit;
-    }
-    state.drivenMask = nextMask;
-
-    char wantedWeaponFile[128] = {};
-    if (meta.weaponActive && weaponAnim && *weaponAnim)
-        NormalizeXmotFile(weaponAnim, wantedWeaponFile);
-    eCEntity* heldLeft = puppetEntity->GetPropertySet(eEPropertySetType_Inventory)
-        ? Entity(puppetEntity).Inventory.GetItemFromSlot(gESlot_LeftHand).GetInstance()
-        : nullptr;
-    if (!wantedWeaponFile[0] || !heldLeft) {
-        StopDrivenWeapon(state);
-        return;
-    }
-    if (state.weapon && state.weapon != heldLeft)
-        StopDrivenWeapon(state);
-    auto* wAnim = static_cast<eCVisualAnimation_PS*>(heldLeft->GetPropertySet(eEPropertySetType_Animation));
-    auto* wActor = wAnim ? wAnim->GetActor() : nullptr;
-    const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
-    if (!wAnim || !wActor) return;
-    const bool wRestart = !state.weaponDriven || state.weapon != heldLeft ||
-                          state.weaponSeq != meta.weaponSeq ||
-                          std::strcmp(state.weaponFile, wantedWeaponFile) != 0 ||
-                          !wActor->HasMotionInstance(slot0);
-    if (wRestart) {
-        auto& wDesc = const_cast<eCVisualAnimation_PS::eSMotionDesc&>(wAnim->GetMotionDesc(slot0));
-        wDesc.SetMotion(bCString(wantedWeaponFile));
-        if (auto* wRes = wDesc.GetMotion()) {
-            MotionPlayDesc wPlay{0.0f, 0, 1.0f, 1, 1.0f, 0.0f, 1};
-            wAnim->SetMotion(slot0, wRes);
-            wAnim->PlayMotion(slot0, reinterpret_cast<eCWrapper_emfx2Motion::eSMotionDesc*>(&wPlay));
-            wAnim->SetMotionOwner(slot0, static_cast<Owner>(4));
-            state.weapon = heldLeft;
-            state.weaponSeq = meta.weaponSeq;
-            state.weaponDriven = true;
-            strncpy_s(state.weaponFile, wantedWeaponFile, _TRUNCATE);
-        }
-    }
-    if (state.weaponDriven && wActor->HasMotionInstance(slot0)) {
-        const float wDur = static_cast<float>(wActor->GetMaxTime(slot0));
-        if (wDur > 0.0f && std::isfinite(wDur)) {
-            const float wPhase = ranged_anim::DequantizeUnit(hot.weaponPhase);
-            wActor->SetIntroExtroBlending(slot0, 0.0f, 0.0f);
-            wActor->SetTargetWeight(slot0, 1.0f);
-            wActor->SetPlaySpeed(slot0, 0.0f);
-            wActor->PauseMotion(GEFalse, slot0);
-            wActor->SetPlayTime(slot0, std::min(wDur * wPhase, std::nextafter(wDur, 0.0f)));
-        }
-    }
+    PresentOverlayChannels(animation, actor, state, meta, overlayMeta, anim0, anim1, hot);
+    PresentWeaponMotion(puppetEntity, state, meta, weaponAnim, hot);
 }
 
 void ClearPuppetOverlay(eCEntity* puppetEntity)
 {
-    const auto it = puppetOverlays.find(puppetEntity);
+    if (!puppetEntity) return;
+    const auto it = puppetOverlays.find(puppetEntity->GetID());
     if (it == puppetOverlays.end()) return;
     PuppetOverlayState& state = it->second;
-    if (puppetEntity && state.drivenMask != 0) {
+    if (state.entityProxy.GetEntity() == puppetEntity && state.drivenMask != 0) {
         auto* animation = static_cast<eCVisualAnimation_PS*>(puppetEntity->GetPropertySet(eEPropertySetType_Animation));
         auto* actor = animation ? animation->GetActor() : nullptr;
-        using Owner = eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner;
         if (animation && actor) {
             for (int s = 1; s <= 7; ++s) {
                 if ((state.drivenMask & (1u << s)) == 0) continue;
-                const auto slot = static_cast<eCWrapper_emfx2Actor::eEMotionType>(s);
-                animation->SetMotionOwner(slot, static_cast<Owner>(2));
-                actor->SetPlaySpeed(slot, 1.0f);
-                if (actor->HasMotionInstance(slot)) animation->StopMotion(slot, 0.08f);
+                StopAnimationSlot(animation, actor, static_cast<eCWrapper_emfx2Actor::eEMotionType>(s), 0.08f);
             }
         }
     }

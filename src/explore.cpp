@@ -102,7 +102,7 @@ void SetAttribute(char const* argument, LogFn log)
     char line[160], tag[8] = {};
     int value = 0;
     eCEntity* hero = gCSession::GetInstance().GetHero();
-    if (!hero || sscanf_s(argument, "%3[A-Z]_%d", tag, static_cast<unsigned>(sizeof(tag)), &value) != 2) { log("REFUSED setattr: no hero or not TAG_value"); return; }
+    if (!hero || !argument || sscanf_s(argument, "%3[A-Z]_%d", tag, static_cast<unsigned>(sizeof(tag)), &value) != 2) { log("REFUSED setattr: no hero or not TAG_value"); return; }
     Entity self(hero);
     self.PlayerMemory.SetBaseValue(bCString(tag), value);
     Format(line, "SETATTR tag=%s value=%d strength=%d", tag, value, static_cast<int>(self.PlayerMemory.GetStrength()));
@@ -221,11 +221,12 @@ void Find(char const* name, LogFn log)
     PositionOf(npc.GetInstance(), p);
     PositionOf(hero, h);
     const bool damageable = npc.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver) != nullptr;
+    const bool hasRoutine = npc.GetInstance()->GetPropertySet(eEPropertySetType_ScriptRoutine) != nullptr;
     Entity target = npc.GetInstance()->GetPropertySet(eEPropertySetType_NPC) ? npc.NPC.GetCurrentTarget() : Entity();
     _snprintf_s(line, sizeof(line), _TRUNCATE, "FIND name=%s found=1 pos=%.0f_%.0f_%.0f task=%s distance_m=%.0f mirrored=%d hp=%d dead=%d state=%s target=%s ai_mode=%d target_puppet=%d target_hero=%d owner=%u", name,
-              p[0], p[1], p[2], npc.Routine.GetCurrentTask().GetText(), body::Distance(p, h) / 100.0f, npcs::IsMirrored(npc.GetInstance()) ? 1 : 0,
-              damageable ? static_cast<int>(npc.DamageReceiver.HitPoints) : -1, npc.IsDead() ? 1 : 0, npc.Routine.GetCurrentState().GetText(),
-              target.GetInstance() ? target.GetName().GetText() : "-", static_cast<int>(npc.Routine.AIMode),
+              p[0], p[1], p[2], hasRoutine ? npc.Routine.GetCurrentTask().GetText() : "-", body::Distance(p, h) / 100.0f, npcs::IsMirrored(npc.GetInstance()) ? 1 : 0,
+              damageable ? static_cast<int>(npc.DamageReceiver.HitPoints) : -1, hasRoutine && npc.IsDead() ? 1 : 0, hasRoutine ? npc.Routine.GetCurrentState().GetText() : "-",
+              target.GetInstance() ? target.GetName().GetText() : "-", hasRoutine ? static_cast<int>(npc.Routine.AIMode) : -1,
               remote::PuppetOwner(target.GetInstance()), target.GetInstance() && target.GetInstance() == hero ? 1 : 0,
               npcs::OwnerOf(npc.GetInstance()));
     log(line);
@@ -376,7 +377,7 @@ void SwimGoal(char const* argument, LogFn log)
     char line[200];
     eCEntity* hero = gCSession::GetInstance().GetHero();
     int dx = 0, dz = 0, ms = 0;
-    if (!hero || sscanf_s(argument, "%d_%d_%d", &dx, &dz, &ms) != 3 || ms <= 0) { log("REFUSED swimgoal: no hero or not DX_DZ_MS"); return; }
+    if (!hero || !argument || sscanf_s(argument, "%d_%d_%d", &dx, &dz, &ms) != 3 || ms <= 0) { log("REFUSED swimgoal: no hero or not DX_DZ_MS"); return; }
     const bCVector& p = hero->GetWorldPosition();
     swimGoal = bCVector(p.GetX() + static_cast<float>(dx), p.GetY(), p.GetZ() + static_cast<float>(dz));
     swimUntil = GetTickCount() + static_cast<DWORD>(ms);

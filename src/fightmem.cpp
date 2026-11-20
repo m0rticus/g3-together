@@ -72,7 +72,7 @@ eCEntity* PuppetFor(eCEntity* self, std::initializer_list<eCEntity*> fighters)
 }
 
 struct Memory {
-    eCEntity* npc = nullptr;
+    bool valid = false;
     int value = 0;
     float at = 0.0f;
     int reason = 0;  // LastPlayerAR
@@ -80,9 +80,9 @@ struct Memory {
 
 Memory Read(eCEntity* npc)
 {
-    if (!IsNpc(npc) || remote::IsPuppet(npc)) return {};
+    if (!IsNpc(npc) || remote::IsPuppet(npc) || guards::IsLocalPlayer(npc)) return {};
     Entity e(npc);
-    return {npc, static_cast<int>(e.NPC.LastFightAgainstPlayer), static_cast<float>(e.NPC.LastFightTimestamp),
+    return {true, static_cast<int>(e.NPC.LastFightAgainstPlayer), static_cast<float>(e.NPC.LastFightTimestamp),
             static_cast<int>(e.NPC.LastPlayerAR)};
 }
 
@@ -113,19 +113,19 @@ std::string Key(eCEntity* npc, int player)
 // to that player's machine (its copy of the NPC remembers the same); here the NPC gets its own player's memory back, and
 // this machine keeps the other player's for the grudge (Upset). `reason`: the NPC's attack reason before the script; the
 // game sets LastPlayerAR for its own player only, so the reason it fought the puppet for stands in.
-void Pass(Memory const& before, eCEntity* puppet, char const* where, int reason = 0)
+void Pass(eCEntity* npc, Memory const& before, eCEntity* puppet, char const* where, int reason = 0)
 {
-    if (!before.npc || !puppet) return;
-    Memory now = Read(before.npc);
-    if (now.value == before.value && now.at == before.at && now.reason == before.reason) return;
-    if (apart) Write(before.npc, before);
-    if (npcs::IsMirrored(before.npc)) return;  // its owner keeps it
+    if (!npc || !before.valid || !puppet) return;
+    Memory now = Read(npc);
+    if (!now.valid || (now.value == before.value && now.at == before.at && now.reason == before.reason)) return;
+    if (apart) Write(npc, before);
+    if (npcs::IsMirrored(npc)) return;  // its owner keeps it
     // Only what the script changed is about the other player (an onlooker's earlier memory is this machine's player's).
     const int player = remote::PuppetOwner(puppet);
-    Memory& kept = grudges[Key(before.npc, player)];
-    const Memory was = kept.npc ? kept : Memory{before.npc, 0, 0.0f, 0};
+    Memory& kept = grudges[Key(npc, player)];
+    const Memory was = kept.valid ? kept : Memory{true, 0, 0.0f, 0};
     kept = was;
-    kept.npc = before.npc;
+    kept.valid = true;
     if (now.value != before.value) kept.value = now.value;
     if (now.at != before.at) kept.at = now.at;
     if (now.reason != before.reason) kept.reason = now.reason;
@@ -134,13 +134,13 @@ void Pass(Memory const& before, eCEntity* puppet, char const* where, int reason 
     if ((now.value == was.value && now.at == was.at) || !net::Connected()) return;
     net::WorldState s{};
     s.kind = Kind;
-    const eCEntityProxy proxy(before.npc);
+    const eCEntityProxy proxy(npc);
     std::memcpy(s.guid, &proxy.GetEntityID().GetCore(), 16);
     s.guard = static_cast<uint8_t>(remote::PuppetOwner(puppet));
     s.npc = static_cast<uint8_t>(now.value);
     net::SendWorldState(s, 0);
     ++sent;
-    Logf("fightmem: %s remembers a fight with player %u: %d (%s, reason %d)", Entity(before.npc).GetName().GetText(), s.guard, now.value,
+    Logf("fightmem: %s remembers a fight with player %u: %d (%s, reason %d)", Entity(npc).GetName().GetText(), s.guard, now.value,
          where, now.reason);
 }
 
@@ -149,14 +149,15 @@ void Pass(Memory const& before, eCEntity* puppet, char const* where, int reason 
 GEInt GE_STDCALL Sound(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalSound ? originalSound(spu, self, other, args) : 0;
+    eCEntity* seer = Of(spu, self, true);
     eCEntity* victim = Of(spu, other, false);
-    eCEntity* puppet = PuppetFor(Of(spu, self, true), {victim, AttackerOf(victim)});
-    const Memory before = Read(Of(spu, self, true));
+    eCEntity* puppet = PuppetFor(seer, {victim, AttackerOf(victim)});
+    const Memory before = Read(seer);
     guards::Acting acting(puppet);
     const GEInt result = originalSound(spu, self, other, args);
     if (puppet) {
         ++sounds;
-        Pass(before, puppet, "fight sound");
+        Pass(seer, before, puppet, "fight sound");
     }
     return result;
 }
@@ -179,7 +180,7 @@ GEInt GE_STDCALL Defeated(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
              TargetOf(seer) ? Entity(TargetOf(seer)).GetName().GetText() : "-");
     if (puppet) {
         ++defeats;
-        Pass(before, puppet, "knock-out seen");
+        Pass(seer, before, puppet, "knock-out seen");
     }
     return result;
 }
@@ -253,8 +254,8 @@ GEInt GE_STDCALL Defeat(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     const GEInt result = originalDefeat(spu, winnerArg, other, args);
     if (puppet) {
         ++ends;
-        Pass(first, puppet, "defeat");
-        Pass(second, puppet, "defeat");
+        Pass(effectiveWinner, first, puppet, "defeat");
+        Pass(b, second, puppet, "defeat");
     }
     return result;
 }
@@ -271,7 +272,7 @@ GEInt GE_STDCALL Cancel(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     const GEInt result = originalCancel(spu, self, other, args);
     if (puppet) {
         ++ends;
-        Pass(before, puppet, "fight called off", reason);
+        Pass(a, before, puppet, "fight called off", reason);
     }
     return result;
 }
@@ -286,7 +287,7 @@ GEBool GE_STDCALL Watch(gCScriptProcessingUnit* spu)
     const GEBool result = originalWatch(spu);
     if (puppet) {
         ++watched;
-        Pass(before, puppet, "watched");
+        Pass(self, before, puppet, "watched");
     }
     return result;
 }
@@ -294,6 +295,7 @@ GEBool GE_STDCALL Watch(gCScriptProcessingUnit* spu)
 // ai.cpp, the attack states that run with a puppet as the player: each one's memory and attack reason before. A stack:
 // a state runs others inside (an inner one cleared the single record of 26.10., and the running fight stayed unpassed).
 struct Frame {
+    eCEntity* npc;
     Memory before;
     int reason;
     eCEntity* puppet;
@@ -333,15 +335,21 @@ bool GrudgeExpired(Memory const& m, eCEntity* npc)
 
 void PruneAndSyncGrudges()
 {
-    if (!net::IsHost() || !net::Connected() || grudges.empty()) return;
+    if (!net::Connected() || grudges.empty()) return;
     for (auto it = grudges.begin(); it != grudges.end();) {
         if (it->first.size() < 17) { it = grudges.erase(it); continue; }
         const uint8_t player = static_cast<uint8_t>(it->first[16]);
-        if (!net::PeerJoined(player)) { it = grudges.erase(it); continue; }
+        const bool peerOnline = net::IsHost()
+            ? net::PeerJoined(player)
+            : (player == 1 || (player > 1 && player < net::MaxPlayers && net::Remotes()[player].connected));
+        if (!peerOnline) { it = grudges.erase(it); continue; }
         auto const* guid = reinterpret_cast<uint8_t const*>(it->first.data());
         eCEntity* npc = npcs::NpcByGuid(guid);
         if (!GrudgeExpired(it->second, npc)) { ++it; continue; }
-        if (net::InWorld(player)) {
+        const bool canSend = net::IsHost()
+            ? net::InWorld(player)
+            : (net::InWorld(net::LocalId()) && npc && !npcs::IsMirrored(npc));
+        if (canSend) {
             net::WorldState clearMsg{};
             clearMsg.kind = Kind;
             std::memcpy(clearMsg.guid, guid, 16);
@@ -392,7 +400,7 @@ eCEntity* StateActor(eCEntity* self, char const* state)
     eCEntity* puppet = attack ? PuppetAmong({TargetOf(self)}) : PuppetAmong({AttackerOf(self), TargetOf(self)});
     if (!puppet) return nullptr;
     ++stateRuns;
-    frames.push_back({Read(self), ReasonOf(self), puppet});
+    frames.push_back({self, Read(self), ReasonOf(self), puppet});
     return puppet;
 }
 
@@ -401,7 +409,7 @@ void AfterState(eCEntity* self)
     if (frames.empty()) return;
     const Frame frame = frames.back();
     frames.pop_back();
-    if (frame.before.npc == self) Pass(frame.before, frame.puppet, "attack", frame.reason);
+    if (frame.npc == self) Pass(self, frame.before, frame.puppet, "attack", frame.reason);
 }
 
 void OnState(uint8_t from, net::WorldState const& s)

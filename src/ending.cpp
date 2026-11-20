@@ -106,8 +106,10 @@ void OnState(uint8_t from, net::WorldState const& s)
 {
     if (!on) return;
     ++received;
-    const std::string name(s.routine);
-    if (name.empty() || name == announced) return;  // it plays here already
+    const size_t len = strnlen(s.routine, sizeof(s.routine));
+    if (len == sizeof(s.routine)) return;
+    const std::string name(s.routine, len);
+    if (name.empty() || name == announced || name == waiting) return;  // already playing or waiting here
     waiting = name;
     waitingFrom = from;
     waitingSince = net::Now();

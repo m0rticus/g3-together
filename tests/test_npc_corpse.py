@@ -339,10 +339,14 @@ class NpcCorpseTests(unittest.TestCase):
         # Journal corpses bind hostSession = net::WelcomeSerial() so PresenceFacts keeps them visible.
         lay_corpse = section(self.corpse_cpp, "void LayDownCorpse(", "} // namespace g3t::npcs")
         self.assertIn("c.hostSession = net::WelcomeSerial();", lay_corpse)
-        self.assertIn("existing->second.hostSession = net::WelcomeSerial();", lay_corpse)
-        self.assertIn("containers::PrepareCorpseLoot(entity);", lay_corpse)
+        self.assertIn("ClearLocalReferencesToDeadMirror(entity, &c.deathCombatStopCount, true)", lay_corpse)
         clear_refs = section(self.corpse_cpp, "unsigned ClearLocalReferencesToDeadMirror(", "void KeepDead(")
         self.assertIn("containers::PrepareCorpseLoot(dead);", clear_refs)
+        self.assertNotIn("*combatStops = 0;", clear_refs)
+        lay_fn = section(self.corpse_cpp, "void LayDown(Mirror& m, uint32_t now)", "void LogClientDeathImpl(")
+        self.assertIn("recordRagdollWait(1500, 5000);", lay_fn)
+        retry_block = lay_fn[lay_fn.index("recordRagdollWait(1500, 5000);"):lay_fn.index("if (!m.ragdollInitialized) {", lay_fn.index("recordRagdollWait(1500, 5000);"))]
+        self.assertIn("return;", retry_block)
         corpse_tick = section(self.corpse_cpp, "void CorpseTick(", "void ForgetCorpseGroundAnchor(")
         self.assertIn("c.hostSession = net::WelcomeSerial();", corpse_tick)
         # PresentedContactPoints clamps mNodes.mLength via ragdoll::ClampedBoneCount(..., 128) to avoid off-by-one GetBoneMatrix overread.

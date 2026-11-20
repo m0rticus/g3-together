@@ -345,7 +345,8 @@ class MeleePolicyTests(unittest.TestCase):
 
     def test_resync_republishes_gameplay_and_queue_failure_is_not_counted_as_success(self):
         signal = self.net.split("} else if (type == MsgControlSignal)", 1)[1].split("} else if (type == MsgBoneDictionary)", 1)[0]
-        self.assertIn("SendFullNpc(peers[peerId], state->second.latest, true)", signal)
+        self.assertIn("HandleControlSignal(peer, packet, peerId, latest)", signal)
+        self.assertIn("SendFullNpc(peers[peerId], latest, true)", signal)
         send = self.net.split("uint32_t SendHitNpc(", 1)[1].split("void SetHitResultHandler(", 1)[0]
         self.assertIn("if (!Send(server, &message, sizeof(message), ChannelCombat, true))", send)
         self.assertIn("ValidHitContact(", send)
@@ -403,6 +404,27 @@ class MeleePolicyTests(unittest.TestCase):
 
         npc_hit = self.combat_claims.split("void OnNpcHit(", 1)[1].split("void OnHitNpc(", 1)[0]
         self.assertIn("IsGroundImmuneNpc(target.GetInstance())", npc_hit)
+
+    def test_immortal_guard_interaction_check_and_finishing_retry(self):
+        on_hit_npc = self.combat_claims.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
+        self.assertIn("if (target.NPC.Immortal)", on_hit_npc)
+        self.assertLess(on_hit_npc.index("if (target.NPC.Immortal)"), on_hit_npc.rindex('CallScript("OnCheatKill"'))
+
+        on_npc_hit = self.combat_claims.split("void OnNpcHit(", 1)[1].split("void OnHitNpc(", 1)[0]
+        self.assertIn("if (target.NPC.Immortal)", on_npc_hit)
+        self.assertLess(on_npc_hit.index("if (target.NPC.Immortal)"), on_npc_hit.index('CallScript("OnCheatKill"'))
+
+        filt = self.combat.split("GEInt GE_STDCALL Filter(", 1)[1].split("GEInt JudgeDamage(", 1)[0]
+        self.assertIn("if (victim.NPC.Immortal)", filt)
+        self.assertLess(filt.index("if (victim.NPC.Immortal)"), filt.index('CallScript("OnCheatKill"'))
+        self.assertNotIn("net::SendHitNpc(owner, guid, args, flags, npc)", filt)
+
+        ignore = self.combat_melee.split("bool IgnoreFriendlyHit(", 1)[1].split("bool InParadeMode(", 1)[0]
+        self.assertIn("eEPropertySetType_Interaction", ignore)
+        self.assertIn("GetParent()", ignore)
+
+        hook_finish = self.combat.split("HookFinishingAttack(", 1)[1].split("GEInt GE_STDCALL TouchDamage(", 1)[0]
+        self.assertIn("SendFinishingBlow(self, target, source, true)", hook_finish)
 
 
 if __name__ == "__main__":

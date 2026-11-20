@@ -222,6 +222,8 @@ bool PresentedContactPoints(Entity& entity, uint32_t heldRight, float a[3], floa
 {
     eCEntity* weapon = nullptr;
     if (heldRight) {
+        if (!entity.GetInstance() || !entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory))
+            return false;
         Entity held = entity.Inventory.GetItemFromSlot(gESlot_RightHand);
         if (!held.GetInstance() || HeldHash(entity, gESlot_RightHand) != heldRight) return false;
         if (held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) && held.Interaction.GetUseType() != gEUseType_Fist)
@@ -450,9 +452,11 @@ void SamplePlayerContact(uint32_t now)
     eCEntity* hero = remote::ControlledBody();
     if (!hero || !net::Connected()) { playerContact = PlayerContact{}; return; }
     Entity player(hero);
+    const uint32_t heldRight = hero->GetPropertySet(eEPropertySetType_Inventory)
+        ? HeldHash(player, gESlot_RightHand) : 0u;
     float a[3], b[3], thickness = 0;
     int bone = -1;
-    if (!PresentedContactPoints(player, HeldHash(player, gESlot_RightHand), a, b, thickness, bone)) {
+    if (!PresentedContactPoints(player, heldRight, a, b, thickness, bone)) {
         playerContact = PlayerContact{};
         return;
     }
@@ -526,7 +530,7 @@ void OnHitResult(net::HitResult const& result)
     const auto found = mirrors.find(key);
     if (found == mirrors.end()) return;
     Mirror& m = found->second;
-    const uint16_t seq = static_cast<uint16_t>(result.sequence);
+    const uint16_t seq = npcplayback_hit_policy::WrapNonZeroHitSeq(result.sequence);
     const bool matchesPending = m.replay.pendingHit != 0 && m.replay.pendingHit == seq;
     if (!npcplayback_hit_policy::ShouldAcceptHitResult(
             m.replay.pendingHit, m.replay.knockback, seq, result.accepted))
@@ -678,7 +682,7 @@ void BeginPassiveMirrorFrame(uint32_t now)
             entity->SetToWorldMatrix(pose);
             if (auto* rigid = static_cast<eCRigidBody_PS*>(entity->GetPropertySet(eEPropertySetType_RigidBody)))
                 rigid->SetPose(pose);
-            ClearLocalReferencesToDeadMirror(entity, nullptr, false);
+            ClearLocalReferencesToDeadMirror(entity, nullptr, false, true);
         }
     }
     SamplePlayerContact(now);
@@ -693,6 +697,37 @@ void BeginPassiveMirrorFrame(uint32_t now)
     lastFrameAt = now;
 }
 
+namespace {
+void ResetCorpseAndWatchFields(Mirror& m, bool keepCorpse)
+{
+    m.corpsePlaced = m.corpseSimulating = m.ragdollPaused = m.laid = false;
+    m.ragdollStarted = m.ragdollInitialized = m.corpseSettled = keepCorpse;
+    if (!keepCorpse) {
+        m.corpsePose.clear();
+        m.corpsePoseFlags = 0;
+        m.corpseRoot = bCMatrix{};
+        m.corpseActor = nullptr;
+        m.deathImpulse = {};
+        m.ragdollTraceAt = m.ragdollTraceSampleAt = m.ragdollTraceStage = 0;
+        m.killedAt = 0;
+        m.lateNoted = false;
+        m.deathLogged = false;
+        m.deathClearCount = m.deathCombatStopCount = 0;
+        std::strcpy(m.killerAttribution, "host_or_npc_unknown");
+    }
+    m.corpsePoseAt = m.ragdollTryAt = m.lieCheckAt = 0;
+    m.ragdollStarts = m.ragdollWakes = m.ragdollFails = m.lieTries = m.lieNoted = 0;
+    m.localHitValid = m.guarded = m.focusWatchLogged = false;
+    m.localHitAt = m.fallbackGraceUntil = m.focusWatchUntil = 0;
+    m.deathReferencesCleared = nullptr;
+    m.watchedFocus = nullptr;
+    m.focusWatchChanges = 0;
+    m.body.localHitUntil = m.body.actionUntil = 0;
+    m.body.localNative = false;
+    m.body.playing[0] = '\0';
+}
+} // namespace
+
 void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
 {
     const bool keepCorpse = m.killed && m.corpseSettled && !m.corpsePose.empty();
@@ -703,18 +738,16 @@ void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous)
     if (previous && live.GetInstance() != previous)
         ClearLocalReferencesToDeadMirror(previous, nullptr, false, true);
     m.entity = live;
-    if (live.GetInstance() != previous) m.deathReferencesCleared = nullptr;
-    m.resolved = m.replayReady = m.corpsePlaced = m.corpseSimulating = m.ragdollPaused = false;
+    m.resolved = m.replayReady = false;
     m.resolvedAt = 0;
     m.replay = npcplayback::State{};
     ResetMirrorIncomingContact(m);
-    m.ragdollStarted = m.ragdollInitialized = m.corpseSettled = keepCorpse;
-    if (!keepCorpse) m.corpsePose.clear();
-    m.corpseActor = nullptr;
-    m.corpsePoseAt = m.ragdollTryAt = m.lieCheckAt = 0;
-    m.ragdollStarts = m.ragdollWakes = m.ragdollFails = m.lieTries = m.lieNoted = 0;
-    m.laid = m.localHitValid = m.guarded = false;
-    m.localHitAt = m.fallbackGraceUntil = 0;
+    m.partyApplied = m.appliedWaiting = m.relationAcknowledged = m.guideAcknowledged = m.guideDestinationApplied = false;
+    m.appliedOwner = 0;
+    m.body.pacified = m.body.walking = false;
+    void const* const savedCorpseActor = m.corpseActor;
+    ResetCorpseAndWatchFields(m, keepCorpse);
+    if (keepCorpse) m.corpseActor = savedCorpseActor;
     std::strcpy(m.presentationSource, RagdollSource(m));
 }
 
@@ -722,39 +755,44 @@ void ReconcileMirrorAlive(GuidKey const& key, Mirror& m)
 {
     npcplayback::ResetLocalHitState(m.replay);
     ResetMirrorIncomingContact(m);
-    m.ragdollStarted = m.laid = m.ragdollInitialized = m.corpsePlaced = m.corpseSimulating = false;
-    m.ragdollPaused = m.corpseSettled = false;
-    m.deathImpulse = {};
-    m.ragdollTraceAt = m.ragdollTraceSampleAt = m.ragdollTraceStage = 0;
-    m.localHitValid = m.deathLogged = m.focusWatchLogged = false;
-    m.localHitAt = m.fallbackGraceUntil = m.focusWatchUntil = 0;
-    m.deathClearCount = m.deathCombatStopCount = 0;
+    ResetCorpseAndWatchFields(m, false);
     std::strcpy(m.presentationSource, "gravity");
-    std::strcpy(m.killerAttribution, "host_or_npc_unknown");
     deadOnHost.erase(key);
     ForgetCorpseGroundAnchor(key);
 }
 
 void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown)
 {
-    if (shown.heldRight != HeldHash(m.entity, gESlot_RightHand) ||
-        shown.heldLeft != HeldHash(m.entity, gESlot_LeftHand)) {
-        EnsureItem(m.entity, shown.heldRight);
-        EnsureItem(m.entity, shown.heldLeft);
-        m.entity.Inventory.HoldStacks(StackOf(m.entity, shown.heldLeft), StackOf(m.entity, shown.heldRight));
-        ++holdChanges;
-    }
-    for (gESlot slot : {gESlot_RightHand, gESlot_LeftHand}) {
-        Entity held = m.entity.Inventory.GetItemFromSlot(slot);
-        if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&
-            held.Interaction.GetOwner().GetInstance() != m.entity.GetInstance())
-            held.Interaction.SetOwner(m.entity);
+    eCEntity* entity = m.entity.GetInstance();
+    if (!entity) return;
+    Entity damageSource = m.entity;
+    if (auto* inv = static_cast<gCInventory_PS*>(entity->GetPropertySet(eEPropertySetType_Inventory))) {
+        if (shown.heldRight != HeldHash(m.entity, gESlot_RightHand) ||
+            shown.heldLeft != HeldHash(m.entity, gESlot_LeftHand)) {
+            EnsureItem(m.entity, shown.heldRight);
+            EnsureItem(m.entity, shown.heldLeft);
+            const GEInt leftStack = StackOf(m.entity, shown.heldLeft);
+            const GEInt rightStack = StackOf(m.entity, shown.heldRight);
+            m.entity.Inventory.HoldStacks(leftStack, rightStack);
+            if (shown.heldRight && HeldHash(m.entity, gESlot_RightHand) != shown.heldRight && rightStack >= 0) {
+                m.entity.Inventory.HoldRightStack(rightStack);
+                if (HeldHash(m.entity, gESlot_RightHand) != shown.heldRight)
+                    inv->LinkStackToSlot(rightStack, gESlot_RightHand, GETrue);
+            }
+            ++holdChanges;
+        }
+        for (gESlot slot : {gESlot_RightHand, gESlot_LeftHand}) {
+            Entity held = m.entity.Inventory.GetItemFromSlot(slot);
+            if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&
+                held.Interaction.GetOwner().GetInstance() != entity)
+                held.Interaction.SetOwner(m.entity);
+        }
+        Entity rightItem = m.entity.Inventory.GetItemFromSlot(gESlot_RightHand);
+        if (rightItem.GetInstance() && rightItem.GetInstance()->GetPropertySet(eEPropertySetType_Damage))
+            damageSource = rightItem;
     }
     if (auto name = motionNames.find(shown.motions[0].name); name != motionNames.end())
         LearnSkeleton(m, name->second.c_str());
-    Entity damageSource = m.entity.Inventory.GetItemFromSlot(gESlot_RightHand);
-    if (!damageSource.GetInstance() || !damageSource.GetInstance()->GetPropertySet(eEPropertySetType_Damage))
-        damageSource = m.entity;
     if (auto* damage = static_cast<gCDamage_PS*>(damageSource.GetInstance()->GetPropertySet(eEPropertySetType_Damage))) {
         damage->AccessDamageType().AccessValue() = static_cast<gEDamageType>(shown.damageType);
         damage->AccessDamageAmount() = shown.damageAmount;

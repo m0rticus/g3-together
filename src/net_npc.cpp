@@ -26,14 +26,21 @@ namespace {
 uint32_t controlGeneration = 0, nextControlId = 0;
 uint32_t nextControlOffer = 0;
 bool controlGenerationExhausted = false, controlIdExhaustedLogged = false;
+struct RequestedControlEntry {
+    uint32_t generation = 0;
+    uint32_t anchor = 0;
+    uint16_t baseline = 0;
+    npcwire::ResyncReason reason = npcwire::ResyncReason::None;
+    bool operator==(RequestedControlEntry const& other) const noexcept
+    {
+        return generation == other.generation && anchor == other.anchor &&
+               baseline == other.baseline && reason == other.reason;
+    }
+};
 std::unordered_map<uint16_t, NpcKeyValue> controlKeys;
 std::unordered_map<uint16_t, ControlOffer> controlOffered[MaxPlayers];
 std::unordered_map<uint16_t, npcwire::BaselineRef> controlAcknowledged[MaxPlayers];
-uint32_t requestedControlAt = 0, requestedControlGeneration = 0;
-uint16_t requestedControlId = 0;
-uint32_t requestedControlAnchor = 0;
-uint16_t requestedControlBaseline = 0;
-npcwire::ResyncReason requestedControlReason = npcwire::ResyncReason::None;
+std::unordered_map<uint16_t, RequestedControlEntry> requestedControls;
 unsigned controlBaselineLogs = 0, controlRequestLogs = 0, controlBatchLogs = 0;
 unsigned npcControlPending = 0, npcControlStale = 0, npcControlResync = 0, npcControlPartial = 0;
 
@@ -277,10 +284,9 @@ void RequestControl(ENetPeer* peer, npcwire::Stream stream, uint16_t id, uint32_
                     npcwire::ResyncReason reason)
 {
     if (!id || !stream.epoch || !stream.generation || stream.epoch != worldEpoch) return;
-    if (requestedControlId == id && requestedControlGeneration == stream.generation &&
-        requestedControlAnchor == anchor && requestedControlBaseline == baseline &&
-        requestedControlReason == reason) return;
-    const uint32_t now = enet_time_get();
+    const RequestedControlEntry entry{stream.generation, anchor, baseline, reason};
+    if (const auto existing = requestedControls.find(id);
+        existing != requestedControls.end() && existing->second == entry) return;
     npcwire::Context future;
     npcwire::Context const* context = &controlReceiver;
     if (!controlReceiver.Matches(stream)) {
@@ -296,12 +302,7 @@ void RequestControl(ENetPeer* peer, npcwire::Stream stream, uint16_t id, uint32_
     std::vector<uint8_t> message;
     if (npcwire::EncodeSignal(*context, npcSequence, signal, message) &&
         SendBoneControl(peer, MsgControlSignal, message)) {
-        requestedControlId = id;
-        requestedControlGeneration = stream.generation;
-        requestedControlAt = now;
-        requestedControlAnchor = anchor;
-        requestedControlBaseline = baseline;
-        requestedControlReason = reason;
+        requestedControls[id] = entry;
         if (BoneLog(controlRequestLogs))
             Logf("net: requested NPC control id=%u reason=%u", static_cast<unsigned>(id), static_cast<unsigned>(reason));
     }
@@ -469,7 +470,13 @@ void ForgetControlPeer(uint8_t id)
 {
     controlOffered[id].clear();
     controlAcknowledged[id].clear();
-    requestedControlGeneration = 0;
+}
+
+void ClearClientControlTables()
+{
+    controlReceiver = npcwire::Context{};
+    receivedControlGeneration = 0;
+    requestedControls.clear();
 }
 
 void ResetNpcCountersOnStart()
@@ -496,7 +503,7 @@ void HandleControlId(ENetPeer* peer, ENetPacket const* packet)
         }
         controlReceiver = std::move(candidate);
         receivedControlGeneration = stream.generation;
-        requestedControlGeneration = 0;
+        requestedControls.clear();
     } else if (!npcwire::DecodeId(controlReceiver, data, size, id)) {
         ++npcRejected;
     }
@@ -538,8 +545,9 @@ bool OnNpcBaselineAck(uint8_t peerId, npcwire::Signal const& signal)
 }
 
 bool OnNpcResync(uint8_t peerId, npcwire::Signal const& signal, uint8_t& peerIdOut,
-                 decltype(controlStates)::const_iterator& stateOut)
+                 NpcRecord& latestOut)
 {
+    if (!clientInWorld[peerId]) { ++npcRejected; return false; }
     const auto key = controlKeys.find(signal.reference.id);
     if (key == controlKeys.end()) { ++npcRejected; return false; }
     const auto state = controlStates.find(key->second);
@@ -561,7 +569,8 @@ bool OnNpcResync(uint8_t peerId, npcwire::Signal const& signal, uint8_t& peerIdO
     const bool evicted = !controlSender.GetAnchor(state->second.id, state->second.current.anchor, saved) ||
                          baselineAge >= npcwire::MaxBaselinesPerNpc ||
                          controlSender.RetainedBaselines(state->second.id) == 0;
-    PreparedControl prepared = PrepareControl(state->second.latest, evicted);
+    const NpcRecord latestCopy = state->second.latest;
+    PreparedControl prepared = PrepareControl(latestCopy, evicted);
     const bool offerQueued = prepared.available && OfferControl(peerId, prepared, true);
     auto& updated = controlOffered[peerId][signal.reference.id];
     if (!offerQueued && SameControlRef(updated.ref, signal.reference) && updated.serial != 0 &&
@@ -586,13 +595,12 @@ bool OnNpcResync(uint8_t peerId, npcwire::Signal const& signal, uint8_t& peerIdO
              static_cast<unsigned>(signal.reference.id), static_cast<unsigned>(signal.reason),
              evicted ? 1u : 0u, npcControlPending, npcControlCreated, npcControlFallback);
     peerIdOut = peerId;
-    stateOut = state;
+    latestOut = latestCopy;
     return true;
 }
 } // namespace
 
-bool HandleControlSignal(ENetPeer* peer, ENetPacket* packet, uint8_t& peerIdOut,
-                         decltype(controlStates)::const_iterator& stateOut)
+bool HandleControlSignal(ENetPeer* peer, ENetPacket* packet, uint8_t& peerIdOut, NpcRecord& latestOut)
 {
     if (!isHost || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return false; }
     const uint8_t peerId = PeerSlotOf(peer);
@@ -603,7 +611,7 @@ bool HandleControlSignal(ENetPeer* peer, ENetPacket* packet, uint8_t& peerIdOut,
         return false;
     }
     if (signal.kind == npcwire::SignalKind::Ack) return OnNpcBaselineAck(peerId, signal);
-    return OnNpcResync(peerId, signal, peerIdOut, stateOut);
+    return OnNpcResync(peerId, signal, peerIdOut, latestOut);
 }
 
 bool HandleControlBaseline(ENetPeer* peer, ENetPacket const* packet)
@@ -626,14 +634,7 @@ bool HandleControlBaseline(ENetPeer* peer, ENetPacket const* packet)
     }
     npcwire::BaselineRef ref;
     if (!npcwire::DecodeBaseline(controlReceiver, data, size, ref)) { ++npcRejected; return true; }
-    if (requestedControlId == ref.id) {
-        requestedControlId = 0;
-        requestedControlGeneration = 0;
-        requestedControlAt = 0;
-        requestedControlAnchor = 0;
-        requestedControlBaseline = 0;
-        requestedControlReason = npcwire::ResyncReason::None;
-    }
+    requestedControls.erase(ref.id);
     npcwire::Signal ack;
     ack.reference = ref;
     std::vector<uint8_t> message;
@@ -663,14 +664,9 @@ void ResetNpcReplication()
     npcPublications.clear();
     ResetBoneReplicationState();
     controlSender = npcwire::Context{};
-    controlReceiver = npcwire::Context{};
+    ClearClientControlTables();
     controlStates.clear();
     controlKeys.clear();
-    receivedControlGeneration = requestedControlGeneration = requestedControlAt = 0;
-    requestedControlId = 0;
-    requestedControlAnchor = 0;
-    requestedControlBaseline = 0;
-    requestedControlReason = npcwire::ResyncReason::None;
     nextControlId = 0;
     nextControlOffer = 0;
     controlIdExhaustedLogged = false;
@@ -784,7 +780,7 @@ bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note)
 
 void SendMotionName(uint32_t hash, char const* name)
 {
-    if (!host || !isHost) return;
+    if (!host || !isHost || !name) return;
     MotionNameMsg message{MsgMotionName, hash, {}};
     strncpy_s(message.name, name, _TRUNCATE);
     SendBroadcast(&message, sizeof(message), ChannelReliable, true);

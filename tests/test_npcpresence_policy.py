@@ -69,6 +69,7 @@ class NpcPresencePolicyTests(unittest.TestCase):
         journal = _testbuild.src_text("journal.cpp")
 
         detour = respawn[respawn.index("GEInt GE_STDCALL Detour("):respawn.index("void Tick()")]
+        self.assertIn("if (!net::Connected()) return original(spu, self, other, args);", detour)
         self.assertIn("!net::IsHost() || npcs::IsMirrored(instance)", detour)
 
         despawn = send[send.index("void Despawn(eCEntity* entity)"):send.index("uint32_t Incarnation(")]

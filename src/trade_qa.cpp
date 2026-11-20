@@ -14,6 +14,19 @@
 namespace g3t::trade {
 using namespace detail;
 
+namespace {
+eCEntity* ResolvePartnerBody(std::string const& who, bool allowNamedEntity)
+{
+    if (who.compare(0, 6, "puppet") == 0) {
+        int puppetId = 0;
+        return trade_policy::ParsePuppetId(who.c_str(), net::MaxPlayers, puppetId)
+            ? remote::PuppetOf(puppetId)
+            : nullptr;
+    }
+    return allowNamedEntity ? Entity::GetEntity(bCString(who.c_str())).GetInstance() : nullptr;
+}
+} // namespace
+
 void Report(LogFn log)
 {
     const SyncSnapshot snap = GetSyncSnapshot();
@@ -42,14 +55,10 @@ void GoodsReport(char const* argument, LogFn log)
     int32_t gold = 0;
     uint32_t seenSerial = 0;
     bool known = false;
-    if (who.compare(0, 6, "puppet") == 0) {
-        int puppetId = 0;
-        eCEntity* body = trade_policy::ParsePuppetId(who.c_str(), net::MaxPlayers, puppetId) ? remote::PuppetOf(puppetId) : nullptr;
-        if (body) {
-            Entity puppet(body);
-            ReadInventory(puppet, items, gold);
-            known = true;
-        }
+    if (eCEntity* body = ResolvePartnerBody(who, false)) {
+        Entity puppet(body);
+        ReadInventory(puppet, items, gold);
+        known = true;
     } else if (!who.empty() && std::isdigit(static_cast<unsigned char>(who[0]))) {
         char* end = nullptr;
         const long parsed = std::strtol(who.c_str(), &end, 10);
@@ -74,14 +83,7 @@ void Price(char const* argument, LogFn log)
     const size_t cut = arg.find('_');
     if (cut == std::string::npos) { log("REFUSED tradeprice: <partner>_<Item>"); return; }
     const std::string who = arg.substr(0, cut), name = arg.substr(cut + 1);
-    eCEntity* body = nullptr;
-    if (who.compare(0, 6, "puppet") == 0) {
-        int puppetId = 0;
-        if (trade_policy::ParsePuppetId(who.c_str(), net::MaxPlayers, puppetId))
-            body = remote::PuppetOf(puppetId);
-    } else {
-        body = Entity::GetEntity(bCString(who.c_str())).GetInstance();
-    }
+    eCEntity* body = ResolvePartnerBody(who, true);
     eCDynamicEntity* heroBody = gCSession::GetInstance().GetHero();
     if (!body || !heroBody) { log("REFUSED tradeprice: no hero or partner"); return; }
     Entity hero(heroBody), other(body);
@@ -112,9 +114,8 @@ void GiftCommand(char const* argument, LogFn log)
     const char* text = arg.c_str() + cut + 1;
     const bool take = *text == 'n';
     if (take) ++text;
-    char* end = nullptr;
-    const long amount = std::strtol(text, &end, 10);
-    if (end == text || *end || amount < 1 || amount > trade_policy::MaxGoldAmount) { log("REFUSED tradegift: invalid amount"); return; }
+    long amount = 0;
+    if (!trade_policy::ParseDecimalLong(text, 1, trade_policy::MaxGoldAmount, amount)) { log("REFUSED tradegift: invalid amount"); return; }
     const bool ok = Exchange(remote::PuppetOf(id), trade_policy::GoldTemplateName, static_cast<int>(amount), take);
     log(ok ? "TRADEGIFT native_exchange=1" : "REFUSED tradegift: exchange unavailable");
 }
@@ -124,14 +125,8 @@ void GiveQuality(char const* argument, LogFn log)
     const std::string arg = argument ? argument : "";
     const size_t cut = arg.rfind('_');
     if (cut == std::string::npos) { log("REFUSED givequality: <Item>_<quality>"); return; }
-    char const* qText = arg.c_str() + cut + 1;
-    if (!*qText || !std::isdigit(static_cast<unsigned char>(*qText))) {
-        log("REFUSED givequality: invalid hero, item or quality");
-        return;
-    }
-    char* end = nullptr;
-    const unsigned long parsedQuality = std::strtoul(qText, &end, 10);
-    if (end == qText || *end != '\0' || parsedQuality >= trade_policy::MaxQuality) {
+    long parsedQuality = 0;
+    if (!trade_policy::ParseDecimalLong(arg.c_str() + cut + 1, 0, trade_policy::MaxQuality - 1, parsedQuality)) {
         log("REFUSED givequality: invalid hero, item or quality");
         return;
     }

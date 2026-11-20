@@ -274,10 +274,6 @@ inline void copyStrings(std::uint16_t mask, const net::PlayerState& src, net::Pl
         if (mask & field.bit) std::memcpy(field.write(dst), field.read(src), field.capacity);
 }
 
-inline bool newer(std::uint32_t value, std::uint32_t previous) {
-    return static_cast<std::int32_t>(value - previous) > 0;
-}
-
 } // namespace detail
 
 inline bool PeekPlayerId(const std::uint8_t* data, std::size_t size, std::uint8_t& id) {
@@ -416,7 +412,7 @@ public:
         if (full == FullFlag) {
             if (hasKeyframe_ && static_cast<std::int32_t>(sequence - sequence_) <= 0)
                 return Status::Stale;
-            if (id != 0 && hasKeyframe_ && id != currentState_.id)
+            if (hasKeyframe_ && id != currentState_.id)
                 return Status::Invalid;
 
             value.focusNpc = metadata.focusNpc;

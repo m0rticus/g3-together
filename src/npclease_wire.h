@@ -254,15 +254,19 @@ inline float GetF32(uint8_t const* bytes)
     return value;
 }
 
-inline uint32_t Crc32(uint8_t const* data, size_t size)
+inline uint32_t Crc32Update(uint32_t crc, uint8_t const* data, size_t size)
 {
-    uint32_t crc = 0xffffffffu;
     for (size_t i = 0; i < size; ++i) {
         crc ^= data[i];
         for (int bit = 0; bit < 8; ++bit)
             crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
     }
-    return crc ^ 0xffffffffu;
+    return crc;
+}
+
+inline uint32_t Crc32(uint8_t const* data, size_t size)
+{
+    return Crc32Update(0xffffffffu, data, size) ^ 0xffffffffu;
 }
 
 inline size_t WriteCheckpoint(uint8_t* bytes, size_t offset, Checkpoint const& c)

@@ -896,6 +896,11 @@ void SupersessionAndWrap()
     assert(host.Request(Join(), Protocol, wrapStart) == H::CreateLobby);
     assert(host.LobbyCreated(false, -1, wrapStart) == H::SendDecline);
     assert(host.declineWhy() == Why::HostError && host.declineArg() == 0 && host.partner() == 0);
+
+    // Client promoted to lobby owner (owner == self) must fail immediately with LobbyGone (#23).
+    C selfOwner = MakeClient(ClientFixture::Offered);
+    assert(selfOwner.LobbyEntered(Lobby, true, M::Match, Self, Start) == C::Teardown);
+    assert(selfOwner.state() == CS::Declined && selfOwner.why() == Why::LobbyGone);
 }
 }
 

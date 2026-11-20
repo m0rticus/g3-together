@@ -31,7 +31,7 @@ auto& lethalSeenDown = life.lethalSeenDown;
 auto& lethalAt = life.lethalAt;
 auto& lastHp = life.lastHp;
 auto& lethalBlowAt = life.lethalBlowAt;
-auto& nativeLethal = life.nativeLethal;
+auto& nativeLethal = life.stats.nativeLethal;
 auto& nativeNoted = life.nativeNoted;
 auto& recoveryUnknownNoted = life.recoveryUnknownNoted;
 auto& nativeTerminalKills = life.nativeTerminalKills;
@@ -48,12 +48,12 @@ auto& wasDown = life.wasDown;
 auto& aloneSince = life.aloneSince;
 auto& revivedBy = life.revivedBy;
 auto& pendingReviveSequence = life.pendingReviveSequence;
-auto& transitions = life.transitions;
+auto& transitions = life.stats.transitions;
 auto& corrections = life.corrections;
 auto& lastCorrection = life.lastCorrection;
 auto& standRefusals = life.standRefusals;
-auto& redirects = life.redirects;
-auto& revives = life.revives;
+auto& redirects = life.stats.redirects;
+auto& revives = life.stats.revives;
 }
 char const* const KnockOutTask = "ZS_LieKnockDown";
 void SyncStates() {
@@ -63,7 +63,16 @@ void SyncStates() {
         auto& peer = peers[i];
         const uint32_t generation = net::PeerGeneration(static_cast<uint8_t>(i));
         const bool changed = remotes[i].connected && generation && peer.payment.generation && generation != peer.payment.generation;
-        if (!remotes[i].connected || changed) { peer.Reset(); ResetPeerImmunity(i); }
+        const bool activityReset = !remotes[i].activity.known && peer.lastActivitySeq != 0;
+        const bool activityRewound = remotes[i].activity.known && peer.lastActivitySeq != 0 &&
+            remotes[i].activity.sequence < peer.lastActivitySeq &&
+            (peer.lastActivitySeq - remotes[i].activity.sequence) < 0x80000000u;
+        const bool sameTickReconnect = peer.wasConnected && remotes[i].connected &&
+            (remotes[i].acceptedStates < peer.lastAcceptedStates || activityReset || activityRewound);
+        if (!remotes[i].connected || changed || sameTickReconnect) { peer.Reset(); ResetPeerImmunity(i); }
+        peer.wasConnected = remotes[i].connected;
+        peer.lastAcceptedStates = remotes[i].acceptedStates;
+        peer.lastActivitySeq = remotes[i].activity.known ? remotes[i].activity.sequence : 0;
         peer.payment.ObserveConnection(remotes[i].connected, generation);
         if (remotes[i].connected && remotes[i].latestTicks != 0) {
             const uint8_t flags = remotes[i].latest.flags;
@@ -93,9 +102,12 @@ void Transition(char const* reason, char const* source)
 }
 void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer<gEAIMode> const& value)
 {
+    if (ai::ShuttingDown()) return originalSetMode(self, edx, value);
     eCEntity* entity = self ? self->GetEntity() : nullptr;
     const int requested = static_cast<int>(value.GetValue());
-    if ((requested == gEAIMode_Down || requested == gEAIMode_Dead) && InteractionOf(entity) &&
+    const bool allowHeldDown = requested == gEAIMode_Down && life.held && entity == gCSession::GetInstance().GetHero();
+    if (((requested == gEAIMode_Down && !allowHeldDown) || requested == gEAIMode_Dead) &&
+        (InteractionOf(entity) || HarmProtected(entity)) &&
         RejectHarm(entity, nullptr, "SetAIMode")) return;
     char modeText[24];
     Format(modeText, sizeof(modeText), "%d", static_cast<int>(value.GetValue()));
@@ -115,6 +127,7 @@ void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer
 }
 void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, GEBool caught)
 {
+    if (ai::ShuttingDown()) return originalSetTask(self, edx, task, caught);
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
     movement::Touch(entity, "AISetTask", task.GetText(), _ReturnAddress());
     if (RejectReaction(entity, task.GetText(), "AISetTask")) return;
@@ -129,6 +142,7 @@ void __fastcall SetTask(gCScriptProcessingUnit* self, void* edx, bCString task, 
 }
 void __fastcall SetState(gCScriptProcessingUnit* self, void* edx, bCString state)
 {
+    if (ai::ShuttingDown()) return originalSetState(self, edx, state);
     eCEntity* entity = self ? self->GetSelfEntity() : nullptr;
     movement::Touch(entity, "AISetState", state.GetText(), _ReturnAddress());
     if (RejectReaction(entity, state.GetText(), "AISetState")) return;
@@ -180,8 +194,8 @@ void KeepDown(Entity& hero, char const* source)
     const int hp = hero.PlayerMemory.GetHitPoints();
     if (repair || hp > 1) {
         ++corrections;
-        if (repair || !lastCorrection || net::Now() - lastCorrection >= 5000) {
-            lastCorrection = net::Now();
+        if (repair || !lastCorrection || now - lastCorrection >= 5000) {
+            lastCorrection = now;
             Logf("downed: hold correction=%u player=%u sequence=%u source=%s task=%s state=%s ai=%d ani=%d hp=%d timer=%.3f repair=%d",
                  corrections, net::LocalId(), life.sequence, source, task.GetText(), state.GetText(),
                  static_cast<int>(hero.Routine.AIMode), static_cast<int>(hero.Routine.AniState), hp,
@@ -214,6 +228,13 @@ void Hold(char const* reason, char const* source)
     if (life.held || life.terminal) return;
     recovery.Clear();
     convergence.Clear();
+    if (eCEntity* heroInst = gCSession::GetInstance().GetHero();
+        heroInst && heroInst->GetPropertySet(eEPropertySetType_NPC)) {
+        Entity hero(heroInst);
+        hero.NPC.EnableStatusEffects(static_cast<GEInt>(gEStatusEffect_Burning), GEFalse);
+        hero.NPC.EnableStatusEffects(static_cast<GEInt>(gEStatusEffect_Poisoned), GEFalse);
+        hero.Effect.StopEffect(GETrue);
+    }
     life.Restore(true);
     CancelAlone("new-held-life");
     revivedBy = 0;
@@ -264,7 +285,8 @@ bool IsLethalNpcAttacker(eCEntity* attacker, Entity& hero)
 bool RedirectDeath(eCEntity* self, char const* state)
 {
     if (life.terminal || !self || self != gCSession::GetInstance().GetHero()) return false;
-    if (std::strcmp(state, "ZS_Dead") != 0 && std::strcmp(state, "ZS_RagDollDead") != 0) return false;
+    if (std::strcmp(state, "ZS_Dead") != 0 && std::strcmp(state, "ZS_RagDollDead") != 0 &&
+        std::strcmp(state, "ZS_PiercedDead") != 0) return false;
     if (RejectHarm(self, nullptr, "redirect-death")) return true;
     Entity hero(self);
     const uint32_t now = net::Now();
@@ -750,7 +772,7 @@ bool NativeDown()
 void OnWorldChange() {
     CancelAlone("world-change");
     life.OnWorldChange();
-    life.Reset(true);
+    life.Reset(true, true);
     recovery.Clear();
     convergence.Clear();
     nativeTerminalKills = 0;
@@ -763,7 +785,6 @@ void OnWorldChange() {
     lastInteractionFlags = 0;
     for (int i = 0; i < net::MaxPlayers; ++i) {
         puppetRecovery[i].Clear();
-        peers[i].payment.Reset();
         peers[i].Reset();
     }
     crashlog::EndStep("world-change");
@@ -771,7 +792,7 @@ void OnWorldChange() {
 }
 void OnWorldDeactivate() {
     CancelAlone("world-deactivate");
-    life.Reset(true);
+    life.Reset(true, true);
     recovery.Clear();
     convergence.Clear();
     interaction.Clear();
@@ -780,7 +801,6 @@ void OnWorldDeactivate() {
     lastInteractionFlags = 0;
     for (int i = 0; i < net::MaxPlayers; ++i) {
         puppetRecovery[i].Clear();
-        peers[i].payment.Reset();
         peers[i].Reset();
     }
 }

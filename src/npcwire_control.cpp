@@ -126,12 +126,6 @@ bool readMetadata(Reader& r, Control& v, const Control& base) {
 }
 #undef NPCWIRE_METADATA_FIELDS
 
-bool sameDescriptor(const MotionDescriptor& a, const MotionDescriptor& b) {
-    return a.name == b.name && a.instance == b.instance && sameFloat(a.speed, b.speed) &&
-           sameFloat(a.intro, b.intro) && sameFloat(a.extro, b.extro) && a.blend == b.blend &&
-           a.options == b.options;
-}
-
 #define NPCWIRE_MOTION_FIELDS(X) \
     X(0, descriptor.name, 4) X(1, descriptor.instance, 4) \
     X(2, descriptor.speed, 4) X(3, descriptor.intro, 4) X(4, descriptor.extro, 4) \
@@ -665,19 +659,9 @@ bool DecodeRecord(const Context& c, const std::uint8_t* bytes, std::size_t size,
         }
         for (std::size_t i = 0; i < MotionSlots; ++i) {
             if (overrideMask & (1u << i)) continue;
-            const Motion& omitted = v.motions[i];
-            const Motion& immutable = baseline->second.value.motions[i];
-            if (!sameDescriptor(omitted.descriptor, immutable.descriptor) ||
-                omitted.active != immutable.active)
-                return false;
-            if (motionFieldMask(omitted, immutable) != 0) return false;
+            if (motionFieldMask(v.motions[i], baseline->second.value.motions[i]) != 0) return false;
         }
         if (activeMask(v) != slots) return false;
-        std::uint8_t canonicalMask = 0;
-        for (std::size_t i = 0; i < MotionSlots; ++i)
-            if (motionFieldMask(v.motions[i], baseline->second.value.motions[i]))
-                canonicalMask |= static_cast<std::uint8_t>(1u << i);
-        if (canonicalMask != overrideMask) return false;
     } else if (activeMask(v) != slots) {
         return false;
     }

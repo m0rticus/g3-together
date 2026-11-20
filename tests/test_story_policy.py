@@ -75,6 +75,26 @@ class StoryRestorationTests(unittest.TestCase):
         self.assertIn("item.Decay()", tick)
         self.assertNotIn("retired.insert", tick)
         self.assertNotIn("Inventory", tick)
+        self.assertIn("!spu || !hero || spu->GetSelfEntity() != hero", before)
+        self.assertIn("!saving::personal::Id(key)", before)
+
+    def test_doors_and_pickpocket_sync_contracts(self):
+        doors = _testbuild.src_text("doors.cpp")
+        doors_tick = doors[doors.index("void Tick()"):doors.index("void OnState(")]
+        self.assertNotIn("if (net::IsHost()) Send(guid, now_);", doors_tick)
+        doors_onstate = doors[doors.index("void OnState("):doors.index("void OnWorldChange(")]
+        self.assertIn("net::SendWorldStateTo(from, note);", doors_onstate)
+        self.assertIn("MergeSeen(", doors_onstate)
+        self.assertIn("IsZeroGuid(s.guid)", doors_onstate)
+        prep = doors[doors.index("void PrepareAdmission()"):doors.index("bool AdmissionReady()")]
+        self.assertIn("wasConnected = false;", prep)
+        self.assertIn("wanted.clear();", prep)
+        self.assertIn("seen.clear();", prep)
+
+        pickpocket = _testbuild.src_text("pickpocket.cpp")
+        self.assertIn("net::WorldEpoch()", pickpocket)
+        self.assertIn("pendingPicked", pickpocket)
+        self.assertIn("IsPickpocketTarget(", pickpocket)
 
 
 if __name__ == "__main__":

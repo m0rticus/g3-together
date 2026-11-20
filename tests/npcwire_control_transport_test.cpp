@@ -957,7 +957,7 @@ int main()
     // Simulate client losing its control receiver and requesting a resync while host Send fails.
     controlReceiver = npcwire::Context{};
     receivedControlGeneration = 0;
-    requestedControlId = 0;
+    requestedControls.clear();
     fakeTime += 33;
     resyncRecord.sent = fakeTime;
     transmissions.clear();
@@ -968,8 +968,46 @@ int main()
     Deliver(&fakePeer, compactSample);
     assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
     const auto resyncSignal = transmissions.front();
+
+    // ForgetControlPeer for another slot must NOT wipe client-global resync dedup state (#9).
+    ForgetControlPeer(3);
+    assert(!requestedControls.empty());
+    transmissions.clear();
+    Deliver(&fakePeer, compactSample);
+    assert(transmissions.empty());
+
+    // ClearClientNpcTables clears client resync dedup state so re-entry re-requests (#1).
+    ClearClientNpcTables();
+    assert(requestedControls.empty());
+    Deliver(&fakePeer, compactSample);
+    assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgControlSignal);
+
+    // Concurrent resync requests for two distinct NPC IDs do not clobber each other (#12).
+    npcwire::Stream dummyStream{worldEpoch, receivedControlGeneration ? receivedControlGeneration : controlGeneration};
+    transmissions.clear();
+    RequestControl(&fakePeer, dummyStream, 11, 1, 1, npcwire::ResyncReason::UnknownId);
+    RequestControl(&fakePeer, dummyStream, 12, 1, 1, npcwire::ResyncReason::UnknownId);
+    assert(transmissions.size() == 2);
+    transmissions.clear();
+    RequestControl(&fakePeer, dummyStream, 11, 1, 1, npcwire::ResyncReason::UnknownId);
+    assert(transmissions.empty());
+
     transmissions.clear();
     isHost = true;
+    // Delayed MsgControlSignal while peer is out of world is rejected by OnNpcResync (#11).
+    clientInWorld[2] = false;
+    const unsigned rejectedOutOfWorld = npcRejected;
+    {
+        ENetPacket* rawPkt = enet_packet_create(resyncSignal.bytes.data(), resyncSignal.bytes.size(),
+                                                resyncSignal.flags);
+        uint8_t outPeer = 0;
+        NpcRecord outLatest{};
+        assert(!HandleControlSignal(&fakePeer, rawPkt, outPeer, outLatest));
+        enet_packet_destroy(rawPkt);
+    }
+    assert(npcRejected == rejectedOutOfWorld + 1 && transmissions.empty());
+    clientInWorld[2] = true;
+
     failSend = true;
     Deliver(&fakePeer, resyncSignal);
     failSend = false;
@@ -988,6 +1026,35 @@ int main()
     assert(!controlAcknowledged[2].count(resyncControlId));
     clientReceive(reofferedPackets);
     assert(controlAcknowledged[2].count(resyncControlId) == 1);
+
+    // Stale non-anchor MsgCompactPosedNpc counts as npcStale without emitting MsgPoseAck(0) (#10).
+    isHost = true;
+    ResetNpcReplication();
+    NpcRecord compactOnly = Record(904);
+    assert(SendPosedNpcTo(2, compactOnly, streamBones, 1, 0, false, 33));
+    clientReceive(transmissions);
+    fakeTime += 33; compactOnly.sent = fakeTime; ++streamBones[0].values[9];
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, compactOnly, streamBones, 1, 0, false, 33));
+    clientReceive(transmissions);
+    fakeTime += 33; compactOnly.sent = fakeTime; ++streamBones[0].values[9];
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, compactOnly, streamBones, 1, 0, false, 33));
+    assert(transmissions.size() == 1);
+    // Advance publication with a newer update first, then deliver an older MsgCompactPosedNpc delta.
+    const auto olderCompact = transmissions.front();
+    fakeTime += 33; compactOnly.sent = fakeTime; ++streamBones[0].values[9];
+    transmissions.clear();
+    assert(SendPosedNpcTo(2, compactOnly, streamBones, 1, 0, false, 33));
+    clientReceive(transmissions);
+    if (olderCompact.bytes[0] == MsgCompactPosedNpc) {
+        const unsigned staleBefore = npcStale;
+        const uint64_t missesBefore = bandwidth.poseReferenceMisses;
+        transmissions.clear();
+        isHost = false;
+        Deliver(&fakePeer, olderCompact);
+        assert(npcStale == staleBefore + 1 && bandwidth.poseReferenceMisses == missesBefore && transmissions.empty());
+    }
 
     return 0;
 }

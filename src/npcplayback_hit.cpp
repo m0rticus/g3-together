@@ -142,6 +142,43 @@ float ClampKnockbackToWorld(eCEntity* entity, eCEntity const* attacker, bCVector
     return stepCm;
 }
 
+template <typename AcceptFn>
+eCResourceDataEntity* FindValidatedMotionResource(eCAnimationAdmin& admin, bCString const& stem,
+                                                  bCString const& extension, AcceptFn&& accept)
+{
+    if (!stem.GetLength()) return nullptr;
+    bCString varied(stem);
+    admin.GetAniVariation(varied);
+    for (auto const& candidate : {varied, stem}) {
+        bCString name(candidate);
+        name += extension;
+        if (!accept(name.GetText())) continue;
+        if (auto* resource = admin.QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate)) {
+            if (resource->SearchResourcePropertySet()) return resource;
+            resource->ReleaseReference();
+        }
+    }
+    return nullptr;
+}
+
+float ComputeClampedKnockbackStep(eCEntity* entity, eCEntity const* attacker, bCVector const& origin,
+                                  float desiredStepCm, float baseDurationSec, float (&outDirXZ)[2],
+                                  float& outGroundDeltaY, float& outMoveDurationSec)
+{
+    if (!entity || !(desiredStepCm > 0.5f)) return 0.0f;
+    const bCVector attackerPos = attacker ? attacker->GetWorldPosition() : origin;
+    const bCVector forward = entity->GetWorldMatrix().GetZAxis();
+    if (!npcplayback_hit_policy::ComputeKnockbackStepDirection(
+            origin.GetX(), origin.GetZ(), attackerPos.GetX(), attackerPos.GetZ(),
+            forward.GetX(), forward.GetZ(), outDirXZ)) {
+        return 0.0f;
+    }
+    const float stepCm = ClampKnockbackToWorld(entity, attacker, origin, outDirXZ, desiredStepCm, outGroundDeltaY);
+    if (stepCm > 0.5f)
+        outMoveDurationSec = std::clamp(baseDurationSec * (stepCm / desiredStepCm), 0.05f, baseDurationSec);
+    return stepCm;
+}
+
 bool ResolveRecoverMotion(eCVisualAnimation_PS& animation, eCWrapper_emfx2Actor& actor, char const* hitMotion,
                           net::NpcMotion const& localOptions, float effectiveSpeed,
                           char outRecoverMotion[96], float& outRecoverDuration)
@@ -156,26 +193,18 @@ bool ResolveRecoverMotion(eCVisualAnimation_PS& animation, eCWrapper_emfx2Actor&
         char stemBuf[96] = {};
         if (!npcplayback_hit_policy::BuildRecoverStemFromHitMotion(hitMotion, stemBuf, sizeof(stemBuf), useExitPose))
             continue;
-        const bCString stem(stemBuf);
-        bCString varied(stem);
-        admin->GetAniVariation(varied);
-        for (auto const& candidate : {varied, stem}) {
-            bCString name(candidate);
-            name += extension;
-            if (!npcplayback_hit_policy::HitRecoverMotion(name.GetText())) continue;
-            auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate);
-            if (!resource) continue;
-            const bool valid = resource->SearchResourcePropertySet() != nullptr;
-            const bCString fileName = resource->GetFileName();
-            resource->ReleaseReference();
-            if (!valid || !fileName.GetLength() || static_cast<std::size_t>(fileName.GetLength()) >= 96) continue;
-            if (!detail::PresentMotion(animation, actor, 0, fileName.GetText(), localOptions, true)) continue;
-            const float clipSec = static_cast<float>(actor.GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
-            if (!(clipSec > 0.01f) || !std::isfinite(clipSec)) continue;
-            strcpy_s(outRecoverMotion, 96, fileName.GetText());
-            outRecoverDuration = clipSec / effectiveSpeed;
-            return true;
-        }
+        auto* resource = FindValidatedMotionResource(*admin, bCString(stemBuf), extension,
+                                                     &npcplayback_hit_policy::HitRecoverMotion);
+        if (!resource) continue;
+        const bCString fileName = resource->GetFileName();
+        resource->ReleaseReference();
+        if (!fileName.GetLength() || static_cast<std::size_t>(fileName.GetLength()) >= 96) continue;
+        if (!detail::PresentMotion(animation, actor, 0, fileName.GetText(), localOptions, true)) continue;
+        const float clipSec = static_cast<float>(actor.GetMaxTime(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0)));
+        if (!(clipSec > 0.01f) || !std::isfinite(clipSec)) continue;
+        strcpy_s(outRecoverMotion, 96, fileName.GetText());
+        outRecoverDuration = clipSec / effectiveSpeed;
+        return true;
     }
     return false;
 }
@@ -219,8 +248,7 @@ void CaptureEntityPoseBlend(eCEntity* entity, State& state, uint32_t now, float 
     auto* animation = Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     auto* skeleton = actor ? actor->GetInstance() : nullptr;
-    if (!skeleton || !skeleton->mNodes.mData || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096 ||
-        !(durationSec > 0.001f)) {
+    if (!ValidSkeleton(skeleton) || !(durationSec > 0.001f)) {
         state.poseBlend.active = false;
         return;
     }
@@ -229,6 +257,9 @@ void CaptureEntityPoseBlend(eCEntity* entity, State& state, uint32_t now, float 
     for (int i = 0; i < nodes.mLength; ++i)
         state.poseBlend.fromTransforms[static_cast<std::size_t>(i)] =
             TransformOf(ReadNodeMatrix(nodes.mData, i), 0);
+    state.poseBlend.actor = actor;
+    char const* actorName = actor->GetActorName().GetText();
+    state.poseBlend.actorName = actorName ? actorName : "";
     state.poseBlend.skeleton = skeleton;
     state.poseBlend.nodes = nodes.mData;
     state.poseBlend.startedAtMs = now;
@@ -244,7 +275,10 @@ bool EvaluateLocalActorPose(eCEntity* entity, NativePose& outPose)
     if (!entity || !actor || !actor->GetInstance() || !originalActorProcess) return false;
     originalActorProcess(actor, nullptr, entity->GetWorldMatrix(), GETrue, GEFalse, 0.0f);
     auto* skeleton = actor->GetInstance();
-    if (!skeleton || !skeleton->mNodes.mData || skeleton->mNodes.mLength <= 0 || skeleton->mNodes.mLength > 4096) return false;
+    if (!ValidSkeleton(skeleton)) return false;
+    outPose.actor = actor;
+    char const* actorName = actor->GetActorName().GetText();
+    outPose.actorName = actorName ? actorName : "";
     outPose.instance = skeleton;
     outPose.nodes = skeleton->mNodes.mData;
     outPose.count = skeleton->mNodes.mLength;
@@ -263,7 +297,8 @@ bool ApplyPoseBlend(State& state, NativePose& targetPose, uint32_t now)
     if (!state.poseBlend.active) return false;
     const float alpha = npcplayback_hit_policy::PoseBlendAlpha(
         state.poseBlend.active, state.poseBlend.startedAtMs, now, state.poseBlend.durationSec);
-    if (alpha >= 0.999f || targetPose.instance != state.poseBlend.skeleton ||
+    if (alpha >= 0.999f || targetPose.actor != state.poseBlend.actor ||
+        targetPose.actorName != state.poseBlend.actorName || targetPose.instance != state.poseBlend.skeleton ||
         targetPose.nodes != state.poseBlend.nodes ||
         static_cast<std::size_t>(targetPose.count) != state.poseBlend.fromTransforms.size()) {
         state.poseBlend.active = false;
@@ -307,20 +342,13 @@ float StartLocalHitKnockback(eCEntity* entity, eCEntity const* attacker, State& 
         }
         if (desiredStepCm > 0.5f) {
             const bCVector origin(anchorWorld[0], anchorWorld[1], anchorWorld[2]);
-            const bCVector attackerPos = sourceAttacker ? sourceAttacker->GetWorldPosition() : origin;
-            const bCVector forward = entity->GetWorldMatrix().GetZAxis();
-            if (npcplayback_hit_policy::ComputeKnockbackStepDirection(
-                    origin.GetX(), origin.GetZ(), attackerPos.GetX(), attackerPos.GetZ(),
-                    forward.GetX(), forward.GetZ(), dirXZ)) {
-                stepCm = ClampKnockbackToWorld(entity, sourceAttacker, origin, dirXZ, desiredStepCm, groundDeltaY);
-                if (stepCm > 0.5f)
-                    moveDurationSec = std::clamp(state.localDuration * (stepCm / desiredStepCm), 0.05f, state.localDuration);
-            }
+            stepCm = ComputeClampedKnockbackStep(entity, sourceAttacker, origin, desiredStepCm, state.localDuration,
+                                                 dirXZ, groundDeltaY, moveDurationSec);
         }
     }
     npcplayback_hit_policy::StartHitKnockback(
-        state.knockback, static_cast<uint16_t>(hit), now, state.localDuration, state.localRecoverDuration,
-        anchorWorld, dirXZ, stepCm, groundDeltaY, moveDurationSec);
+        state.knockback, npcplayback_hit_policy::WrapNonZeroHitSeq(hit), now, state.localDuration,
+        state.localRecoverDuration, anchorWorld, dirXZ, stepCm, groundDeltaY, moveDurationSec);
     return stepCm;
 }
 
@@ -339,9 +367,6 @@ bool StartLocalHitPresentation(eCEntity* entity, State& state, char const* motio
     local.phase = 0.0f;
     local.weight = 1.0f;
     const float effectiveSpeed = (playSpeed > 0.05f && std::isfinite(playSpeed)) ? playSpeed : 1.0f;
-    char recoverMotion[96] = {};
-    float recoverDuration = 0.0f;
-    ResolveRecoverMotion(*animation, *actor, motion, local, effectiveSpeed, recoverMotion, recoverDuration);
     if (!PresentMotion(*animation, *actor, 0, motion, local, true)) {
         state.poseBlend.active = false;
         return false;
@@ -351,7 +376,14 @@ bool StartLocalHitPresentation(eCEntity* entity, State& state, char const* motio
         state.poseBlend.active = false;
         return false;
     }
-    state.pendingHit = static_cast<uint16_t>(hit);
+    char recoverMotion[96] = {};
+    float recoverDuration = 0.0f;
+    ResolveRecoverMotion(*animation, *actor, motion, local, effectiveSpeed, recoverMotion, recoverDuration);
+    if (!PresentMotion(*animation, *actor, 0, motion, local, true)) {
+        state.poseBlend.active = false;
+        return false;
+    }
+    state.pendingHit = npcplayback_hit_policy::WrapNonZeroHitSeq(hit);
     state.acknowledgedAt = 0;
     state.localStart = now;
     state.localPlaySpeed = effectiveSpeed;
@@ -444,24 +476,10 @@ bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reacti
     }
     const bool allowQuickClip = npcplayback_hit_policy::NativeQuickStumbleAllowed(species, rightUse, leftUse);
 
-    gEAction candidates[4] = {firstStumble, secondStumble, gEAction_Stumble, gEAction_QuickStumble};
-    constexpr int candidateCount = 4;
-    if (reaction == net::HitQuickStumble && allowQuickClip) {
-        candidates[0] = gEAction_QuickStumble;
-        candidates[1] = firstStumble;
-        candidates[2] = secondStumble;
-        candidates[3] = gEAction_Stumble;
-    } else if (reaction == net::HitPierceStumble) {
-        candidates[0] = gEAction_PierceStumble;
-        candidates[1] = firstStumble;
-        candidates[2] = secondStumble;
-        candidates[3] = gEAction_Stumble;
-    } else if (reaction == net::HitSitKnockDown) {
-        candidates[0] = gEAction_SitKnockDown;
-        candidates[1] = firstStumble;
-        candidates[2] = secondStumble;
-        candidates[3] = gEAction_Stumble;
-    }
+    gEAction candidates[4] = {};
+    const int candidateCount = npcplayback_hit_policy::BuildHitReactionCandidates(
+        reaction, allowQuickClip, firstStumble, secondStumble, gEAction_Stumble,
+        gEAction_QuickStumble, gEAction_PierceStumble, gEAction_SitKnockDown, candidates);
 
     bCString extension;
     eCResourceAnimationMotion_PS::GetNativeFileExt(extension);
@@ -480,20 +498,9 @@ bool ResolveHitMotion(eCEntity* entity, eCEntity const* attacker, uint8_t reacti
                 npc.GetAni(action, gEUseType_None, gEUseType_None, gEPhase_Hit),
             };
             for (auto const& stem : stems) {
-                if (!stem.GetLength()) continue;
-                bCString varied(stem);
-                admin->GetAniVariation(varied);
-                for (auto const& candidate : {varied, stem}) {
-                    bCString name(candidate);
-                    name += extension;
-                    if (!detail::ReactionResourceName(name.GetText())) continue;
-                    if (auto* resource = admin->QueryMotionDataEntity(name, eEResourceCacheBehavior_Immediate)) {
-                        if (resource->SearchResourcePropertySet()) {
-                            matchedAction = action;
-                            return resource;
-                        }
-                        resource->ReleaseReference();
-                    }
+                if (auto* resource = FindValidatedMotionResource(*admin, stem, extension, &detail::ReactionResourceName)) {
+                    matchedAction = action;
+                    return resource;
                 }
             }
         }
@@ -587,21 +594,15 @@ bool EstimateHostHitKnockback(eCEntity* entity, eCEntity const* attacker, uint8_
 
     const float desiredStepCm = npcplayback_hit_policy::EffectiveNativeKnockbackCm(rawStepCm, estHitDurationSec);
     float dirXZ[2] = {};
-    const bCVector attackerPos = attacker ? attacker->GetWorldPosition() : origin;
-    const bCVector forward = entity->GetWorldMatrix().GetZAxis();
-    if (!npcplayback_hit_policy::ComputeKnockbackStepDirection(
-            origin.GetX(), origin.GetZ(), attackerPos.GetX(), attackerPos.GetZ(),
-            forward.GetX(), forward.GetZ(), dirXZ)) {
-        return true;
-    }
     float groundDeltaY = 0.0f;
-    const float stepCm = ClampKnockbackToWorld(entity, attacker, origin, dirXZ, desiredStepCm, groundDeltaY);
+    float moveSec = estHitDurationSec;
+    const float stepCm = ComputeClampedKnockbackStep(entity, attacker, origin, desiredStepCm, estHitDurationSec,
+                                                     dirXZ, groundDeltaY, moveSec);
     outResult.stepCm = stepCm;
     if (stepCm > 0.5f && desiredStepCm > 0.5f) {
         outResult.goalPos[0] = origin.GetX() + dirXZ[0] * stepCm;
         outResult.goalPos[1] = origin.GetY() + groundDeltaY;
         outResult.goalPos[2] = origin.GetZ() + dirXZ[1] * stepCm;
-        const float moveSec = std::clamp(estHitDurationSec * (stepCm / desiredStepCm), 0.05f, estHitDurationSec);
         outResult.moveDurationMs = static_cast<uint16_t>(std::clamp(moveSec * 1000.0f + 0.5f, 50.0f, 5000.0f));
     }
     return true;
@@ -611,7 +612,7 @@ void ConfirmLocalHitKnockback(State& state, net::HitResult const& result, uint32
 {
     if (!result.knockbackValid) return;
     npcplayback_hit_policy::ConfirmHitKnockback(
-        state.knockback, static_cast<uint16_t>(result.sequence), now,
+        state.knockback, npcplayback_hit_policy::WrapNonZeroHitSeq(result.sequence), now,
         result.hostReaction, result.hitDurationMs, result.moveDurationMs,
         result.originPos, result.goalPos, result.stepCm);
 }

@@ -84,7 +84,7 @@ Header AdvanceFrame(uint32_t now, bool focused, bool paused, bool inWorld)
     if (header.lost || header.regained || header.resumed || header.longGap) {
         header.serial = ++state.serial;
         header.awayMs = (header.regained && state.lostKnown) ? now - state.lostAt : 0;
-        if (header.regained || header.resumed || header.longGap) {
+        if (inWorld && (header.regained || header.resumed || header.longGap)) {
             state.watching = true;
             state.resumedAt = now;
             state.weapons.clear();
@@ -98,8 +98,13 @@ Header AdvanceFrame(uint32_t now, bool focused, bool paused, bool inWorld)
     state.focused = focused;
     state.paused = paused;
     state.frameAt = now;
+    if (!inWorld) {
+        state.watching = false;
+        header.watching = false;
+        return header;
+    }
     header.watching = state.watching;
-    if (!inWorld) return header;
+    if (state.watching && !header.serial) header.serial = state.serial;
     if (header.lost || pauseEdge) {
         header.sampleDue = true;
         return header;

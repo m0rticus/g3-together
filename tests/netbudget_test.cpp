@@ -243,6 +243,28 @@ static void TestLossSamplesAndFreshness()
     assert(!(budget.Snapshot().signals & SignalLoss));
     budget.Advance(4101, telemetry);
     assert(budget.NpcStretchPermille() == 1000);
+
+    // Zero retrySampleAt never counts as a fresh loss sample, even during early uptime (nowMs <= 2000).
+    PeerBudget zeroSample;
+    zeroSample.Reset(0, Config());
+    telemetry.retrySampleAt = 0;
+    telemetry.lossPermille = 200;
+    telemetry.packetsSent = 300;
+    telemetry.packetsLost = 60;
+    zeroSample.Advance(500, telemetry);
+    assert(!(zeroSample.Snapshot().signals & SignalLoss));
+    assert(zeroSample.NpcStretchPermille() == 1000);
+
+    // UpdateConfig refreshes config without wiping learned RTT baseline or active stretch.
+    BudgetTelemetry rttSample{};
+    rttSample.validRtt = true;
+    rttSample.rttMs = 100;
+    rttSample.throttle = 32;
+    budget.Advance(4105, rttSample);
+    const uint32_t learnedRtt = budget.Snapshot().baseRttMs;
+    assert(learnedRtt > 0);
+    budget.UpdateConfig(Config(1024u * 1024u));
+    assert(budget.Snapshot().baseRttMs == learnedRtt);
 }
 
 int main()

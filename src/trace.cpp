@@ -12,15 +12,18 @@
 #include <Script.h>
 #include <Windows.h>
 #include <intrin.h>
+#include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <share.h>
 #include <cstring>
 
 namespace g3t::trace {
 namespace {
 enum Mode { Off, Driven, All };
-Mode mode = Off;
+std::atomic<Mode> mode{Off};
 bool installed = false;
+std::mutex traceMutex;
 FILE* out = nullptr;
 unsigned lines = 0;
 constexpr unsigned MaxLines = 50000;  // one session; the file is rewritten at every start
@@ -44,8 +47,9 @@ unsigned char* Locate(Site const& site)
 
 bool Wanted(eCEntity* entity)
 {
-    if (mode == Off || !entity || !out || lines >= MaxLines) return false;
-    return mode == All || remote::IsPuppet(entity) || npcs::IsMirrored(entity);
+    const Mode currentMode = mode.load(std::memory_order_acquire);
+    if (currentMode == Off || !entity) return false;
+    return currentMode == All || remote::IsPuppet(entity) || npcs::IsMirrored(entity);
 }
 
 // "Game.dll+0x16abb0" for a code address.
@@ -62,6 +66,8 @@ void Write(char const* kind, eCEntity* entity, char const* what, void* caller)
     SYSTEMTIME now;
     GetLocalTime(&now);
     Entity e(entity);
+    std::lock_guard<std::mutex> lock(traceMutex);
+    if (mode.load(std::memory_order_relaxed) == Off || !out || lines >= MaxLines) return;
     fprintf(out, "%02u:%02u:%02u.%03u %10lu telem=#%llu %s %s%s %s by %s\n",
             now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetTickCount(),
             static_cast<unsigned long long>(LastTelemetrySeq()), kind, e.GetName().GetText(),
@@ -100,19 +106,14 @@ void TaskLine(char const* kind, gCScriptRoutine_PS* self, bCString const& task, 
     eCEntity* entity = self ? self->GetEntity() : nullptr;
     if (!Wanted(entity)) return;
     char what[1200];
-    Format(what, "task=%s", task.GetText());
+    const int pos = Format(what, "task=%s", task.GetText());
     // AISetTask is reached through Script.dll's wrapper: the direct caller alone does not say who wants the task
     // (puppet turn, 20.10.). The frames above it, as far as the stack walk finds them, nearest first.
-    if (!std::strcmp(kind, "aitask")) {
-        void* frames[8] = {};
-        const USHORT count = RtlCaptureStackBackTrace(2, 8, frames, nullptr);
-        strcat_s(what, " stack=");
-        for (USHORT i = 0; i < count; ++i) {
-            char frame[MAX_PATH + 16];
-            Caller(frames[i], frame, sizeof(frame));
-            if (i) strcat_s(what, "<");
-            strcat_s(what, frame);
-        }
+    if (!std::strcmp(kind, "aitask") && pos > 0 && static_cast<size_t>(pos) + 12 < sizeof(what)) {
+        char chain[900] = {};
+        CallerChain(2, 8, chain, sizeof(chain));
+        if (chain[0] && chain[0] != '-')
+            _snprintf_s(what + pos, sizeof(what) - static_cast<size_t>(pos), _TRUNCATE, " stack=%s", chain);
     }
     Write(kind, entity, what, caller);
 }
@@ -140,7 +141,10 @@ void Install()
 
 void Configure(char const* text)
 {
+    if (!text) text = "";
     const Mode wanted = !_stricmp(text, "all") ? All : (!_stricmp(text, "on") || !_stricmp(text, "driven")) ? Driven : Off;
+    if (wanted != Off) Install();
+    std::lock_guard<std::mutex> lock(traceMutex);
     if (wanted != Off) {
         if (!out) {
             char path[MAX_PATH];
@@ -149,28 +153,44 @@ void Configure(char const* text)
             out = _fsopen(path, "w", _SH_DENYNO);  // readable while the game runs (logs, QA)
             lines = 0;
         }
-        Install();
+    } else if (out) {
+        fflush(out);
+        fclose(out);
+        out = nullptr;
     }
-    mode = wanted;
+    mode.store(wanted, std::memory_order_release);
     if (out) fflush(out);
 }
 
 void Command(char const* text, LogFn log)
 {
     if (text && *text) Configure(text);  // no argument: status only
+    const Mode currentMode = mode.load(std::memory_order_acquire);
+    unsigned currentLines = 0;
+    {
+        std::lock_guard<std::mutex> lock(traceMutex);
+        currentLines = lines;
+    }
     char line[160];
-    Format(line, "TRACE mode=%s lines=%u hooks=%d%d%d", mode == All ? "all" : mode == Driven ? "driven" : "off", lines,
-              playMotion != nullptr, setCurrentTask != nullptr, aiSetTask != nullptr);
+    Format(line, "TRACE mode=%s lines=%u hooks=%d%d%d", currentMode == All ? "all" : currentMode == Driven ? "driven" : "off",
+           currentLines, playMotion != nullptr, setCurrentTask != nullptr, aiSetTask != nullptr);
     log(line);
 }
 
-bool Active() { return mode != Off && out != nullptr; }
+bool Active()
+{
+    if (mode.load(std::memory_order_acquire) == Off) return false;
+    std::lock_guard<std::mutex> lock(traceMutex);
+    return out != nullptr;
+}
 
 void Marker(uint64_t telemSeq, char const* domainEvent, char const* detail)
 {
-    if (mode == Off || !out) return;
+    if (mode.load(std::memory_order_acquire) == Off) return;
     SYSTEMTIME now;
     GetLocalTime(&now);
+    std::lock_guard<std::mutex> lock(traceMutex);
+    if (mode.load(std::memory_order_relaxed) == Off || !out || lines >= MaxLines) return;
     fprintf(out, "%02u:%02u:%02u.%03u %10lu telem=#%llu [%s] %s\n",
             now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetTickCount(),
             static_cast<unsigned long long>(telemSeq), domainEvent ? domainEvent : "telem", detail ? detail : "");

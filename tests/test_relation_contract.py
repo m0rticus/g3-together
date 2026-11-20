@@ -191,3 +191,23 @@ class RelationContractTests(unittest.TestCase):
             self.assertNotIn("relation", source(name))
         net = source("net.h")
         self.assertIn("uint8_t attitude = 0;    // protocol 71", net)
+
+    def test_ai_attitude_redirect_and_callback_guards(self):
+        ai = source("ai.cpp")
+        self.assertIn("thread_local eCEntity* redirectedFor = nullptr;", ai)
+        self.assertIn("thread_local unsigned plainAskDepth = 0;", ai)
+
+        filt = between(ai, "GEInt GE_STDCALL FilterAttitude(", "GEInt GE_STDCALL FilterContinue(")
+        self.assertIn("remote::ControlledBody()", filt)
+        self.assertIn("eEPropertySetType_ScriptRoutine", filt)
+        self.assertIn("guards::LocalPlayer local(true);", filt)
+        self.assertIn("RedirectScope redirect(target);", filt)
+
+        plain = between(ai, "int PlainAttitude(", "bool TryPlayerAttitude(")
+        self.assertIn("PlainAskScope", plain)
+
+        cb = between(ai, "GEBool GE_STDCALL FilterCallback(", "gFScript originalAssessTarget")
+        self.assertIn("npclease::ContactAllowed(receiver, sender)", cb)
+
+        tick = between(ai, "void Tick()", "namespace g3t::ai {\nbool EnterTerminalDeath")
+        self.assertTrue(tick[tick.index("{") + 1:].lstrip().startswith("if (ShuttingDown()) return;"))

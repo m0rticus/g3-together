@@ -518,6 +518,37 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         self.assertIn("entry.ownedEntity != entity && !HostWins(key)", maintain)
         self.assertLess(kill.index("HostWins(Key(victim))"), kill.index("return originalKill"))
         self.assertIn("native death refused", kill)
+
+    def test_epoch_sync_pauses_respawn_and_lifecycle_hardening(self):
+        host = self.host_only_source[self.host_only_source.index("void TickHost("):]
+        recall_section = section(host, "if (entry.lease.phase == Phase::Client || entry.lease.phase == Phase::Recalling)",
+                                 "if (entry.lease.phase == Phase::Frozen)")
+        self.assertIn("InterestOf(entry.lease.state, entry.lease.owner, entity, true)", recall_section)
+        self.assertNotIn("!Running()", recall_section)
+        self.assertIn("sessionStopping", recall_section)
+        self.assertIn("!idle.lease.state.dead && !(idle.lease.state.effects & NativeDeath)", host)
+        self.assertIn("entry.lease = priorLease;", host)
+
+        receive = section(self.core_source, "void Receive(uint8_t", "GEBool __fastcall Quest(")
+        new_life = section(self.core_source, "bool NewLife(", "void Tick()")
+        destroyed = section(self.core_source, "void OnEntityDestroyed(", "void CaptureCacheInventory(")
+        self.assertIn("SyncSessionEpoch();", receive)
+        self.assertIn("SyncSessionEpoch();", new_life)
+        self.assertIn("item.second.ownedEntity = nullptr;", destroyed)
+        self.assertIn("item.second.observedEntity = nullptr;", destroyed)
+        self.assertIn("PublishGuard(it->first, it->second);", destroyed)
+
+        client = section(self.client_source, "void ReceiveClient(", "void RegisterProcessing(")
+        takeover = section(self.client_source, "char const* TakeOver(", "void CutToHost(")
+        maintain = section(self.client_source, "void MaintainOwners(", "void ScanClient(")
+        scan = section(self.client_source, "void ScanClient(", "void TickClient(")
+        self.assertIn("entry.highestEpoch", client)
+        self.assertNotIn("Send(key, entry, Kind::Ack);\n        entry.prepared = false;", client)
+        self.assertIn("entry.lease.incarnation == inc", takeover)
+        self.assertIn("else if (facts.role.removed)", maintain)
+        self.assertIn("entry.window.Reset(entry.lease.epoch);", maintain)
+        self.assertIn("!net::Connected() || !net::WorldEpoch()", scan)
+        self.assertIn("IsPaused()", scan)
         npcs = _testbuild.src_text("npcs.cpp")
         claim = section(npcs, "bool HostStreamClaimed(", "uint32_t HostStreamDelay(")
         self.assertNotIn("PresentationFresh", claim)

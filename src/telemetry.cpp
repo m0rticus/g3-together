@@ -333,80 +333,91 @@ bool CaptureHeroVitals(eCDynamicEntity* rawHero, Vitals& out) noexcept
     return true;
 }
 
-void EmitWorldBaseline(eCDynamicEntity* rawHero, Vitals const& v, SlotTable const& slots)
+void EmitHeroBaseline(eCDynamicEntity* rawHero, Vitals const& v, SlotTable const& slots)
 {
     Entity hero(rawHero);
-    {
-        Event ev;
-        const bCVector& p = rawHero->GetWorldPosition();
-        ev.kv.Str("hero", SafeEntityName(rawHero)).Pos("pos", p.GetX(), p.GetY(), p.GetZ())
-          .Int("hp", v.hp).Int("hp_max", v.hpMax).Int("mp", v.mp).Int("mp_max", v.mpMax)
-          .Int("sp", v.sp).Int("sp_max", v.spMax).Int("level", v.level).Int("xp", v.xp)
-          .Int("lp", v.lpAttribs).Int("gold", v.gold).Int("stacks", hero.Inventory.GetStackCount()).Int("chapter", v.chapter);
-        char equipped[1024] = {};
-        size_t pos = 0;
-        for (int s = 1; s < schema::MaxTrackedSlots; ++s)
-            if (slots.items[s][0])
-                pos += static_cast<size_t>(Format(equipped + pos, sizeof(equipped) - pos, "%s%s:%s",
-                                                  pos ? "," : "", SlotLabel(s), slots.items[s]));
-        ev.kv.Str("equipped", pos ? equipped : "none");
-        ev.Send("hero.baseline");
+    Event ev;
+    const bCVector& p = rawHero->GetWorldPosition();
+    ev.kv.Str("hero", SafeEntityName(rawHero)).Pos("pos", p.GetX(), p.GetY(), p.GetZ())
+      .Int("hp", v.hp).Int("hp_max", v.hpMax).Int("mp", v.mp).Int("mp_max", v.mpMax)
+      .Int("sp", v.sp).Int("sp_max", v.spMax).Int("level", v.level).Int("xp", v.xp)
+      .Int("lp", v.lpAttribs).Int("gold", v.gold).Int("stacks", hero.Inventory.GetStackCount()).Int("chapter", v.chapter);
+    char equipped[1024] = {};
+    size_t pos = 0;
+    for (int s = 1; s < schema::MaxTrackedSlots; ++s)
+        if (slots.items[s][0])
+            pos += static_cast<size_t>(Format(equipped + pos, sizeof(equipped) - pos, "%s%s:%s",
+                                              pos ? "," : "", SlotLabel(s), slots.items[s]));
+    ev.kv.Str("equipped", pos ? equipped : "none");
+    ev.Send("hero.baseline");
+}
+
+void EmitEnclaveBaseline()
+{
+    char summary[3840] = {};
+    size_t pos = 0;
+    int notable = 0;
+    const GEInt count = PSEnclave::GetEnclaveCount();
+    for (GEInt i = 0; i < count; ++i) {
+        Entity e = PSEnclave::GetEnclaveAt(i);
+        eCEntity* inst = e.GetInstance();
+        auto* enc = inst ? static_cast<gCEnclave_PS*>(inst->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
+        if (!enc) continue;
+        auto const& crime = enc->AccessCrimeCount();
+        auto const& suspect = enc->AccessSuspectComment();
+        const int theft = gEPlayerCrime_Theft < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Theft) : 0;
+        const int murder = gEPlayerCrime_Murder < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Murder) : 0;
+        const int attack = gEPlayerCrime_Attack < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Attack) : 0;
+        const int livestock = gEPlayerCrime_Livestock < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Livestock) : 0;
+        const int known = static_cast<int>(static_cast<gEPlayerCrime const&>(enc->AccessKnownPlayerCrime()));
+        const int fame = enc->AccessPlayerFame();
+        int suspectMask = 0;
+        for (int c = 1; c < gEPlayerCrime_Count && c < suspect.GetCount(); ++c)
+            if (suspect.GetAt(c)) suspectMask |= (1 << c);
+        if (!theft && !murder && !attack && !livestock && known <= 0 && !suspectMask && !fame) continue;
+        ++notable;
+        pos += static_cast<size_t>(Format(summary + pos, sizeof(summary) - pos,
+            "%s%s(fame:%d,theft:%d,murder:%d,atk:%d,live:%d,known:%s,susp:0x%x)",
+            pos ? ";" : "", e.GetName().GetText(), fame, theft, murder, attack, livestock,
+            CrimeLabel(known), suspectMask));
     }
-    {
-        char summary[3840] = {};
-        size_t pos = 0;
-        int notable = 0;
-        const GEInt count = PSEnclave::GetEnclaveCount();
-        for (GEInt i = 0; i < count; ++i) {
-            Entity e = PSEnclave::GetEnclaveAt(i);
-            eCEntity* inst = e.GetInstance();
-            auto* enc = inst ? static_cast<gCEnclave_PS*>(inst->GetPropertySet(eEPropertySetType_Enclave)) : nullptr;
-            if (!enc) continue;
-            auto const& crime = enc->AccessCrimeCount();
-            auto const& suspect = enc->AccessSuspectComment();
-            const int theft = gEPlayerCrime_Theft < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Theft) : 0;
-            const int murder = gEPlayerCrime_Murder < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Murder) : 0;
-            const int attack = gEPlayerCrime_Attack < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Attack) : 0;
-            const int livestock = gEPlayerCrime_Livestock < crime.GetCount() ? crime.GetAt(gEPlayerCrime_Livestock) : 0;
-            const int known = static_cast<int>(static_cast<gEPlayerCrime const&>(enc->AccessKnownPlayerCrime()));
-            const int fame = enc->AccessPlayerFame();
-            int suspectMask = 0;
-            for (int c = 1; c < gEPlayerCrime_Count && c < suspect.GetCount(); ++c)
-                if (suspect.GetAt(c)) suspectMask |= (1 << c);
-            if (!theft && !murder && !attack && !livestock && known <= 0 && !suspectMask && !fame) continue;
-            ++notable;
-            pos += static_cast<size_t>(Format(summary + pos, sizeof(summary) - pos,
-                "%s%s(fame:%d,theft:%d,murder:%d,atk:%d,live:%d,known:%s,susp:0x%x)",
-                pos ? ";" : "", e.GetName().GetText(), fame, theft, murder, attack, livestock,
-                CrimeLabel(known), suspectMask));
-        }
-        Event ev;
-        ev.kv.Int("total_enclaves", count).Int("notable", notable).Str("enclaves", pos ? summary : "clean");
-        ev.Send("enclave.baseline");
+    Event ev;
+    ev.kv.Int("total_enclaves", count).Int("notable", notable).Str("enclaves", pos ? summary : "clean");
+    ev.Send("enclave.baseline");
+}
+
+void EmitQuestBaseline()
+{
+    gCQuestManager_PS* qm = gCQuestManager_PS::GetInstance();
+    if (!qm) return;
+    auto& all = qm->AccessQuests();
+    int running = 0, succeeded = 0, failed = 0, cancelled = 0;
+    char activeList[3072] = {};
+    size_t pos = 0;
+    for (int i = 0; i < all.GetCount(); ++i) {
+        auto* q = static_cast<gCQuest_PS*>(all.AccessAt(i));
+        if (!q) continue;
+        const int st = static_cast<int>(q->GetStatus().GetValue());
+        if (st == gEQuestStatus_Running) {
+            ++running;
+            if (pos + 64 < sizeof(activeList))
+                pos += static_cast<size_t>(Format(activeList + pos, sizeof(activeList) - pos, "%s%s",
+                                                  pos ? "," : "", q->AccessName().GetText()));
+        } else if (st == gEQuestStatus_Success || st == gEQuestStatus_Won) ++succeeded;
+        else if (st == gEQuestStatus_Failed || st == gEQuestStatus_Lost) ++failed;
+        else if (st == gEQuestStatus_Cancelled || st == gEQuestStatus_Obsolete) ++cancelled;
     }
-    if (gCQuestManager_PS* qm = gCQuestManager_PS::GetInstance()) {
-        auto& all = qm->AccessQuests();
-        int running = 0, succeeded = 0, failed = 0, cancelled = 0;
-        char activeList[3072] = {};
-        size_t pos = 0;
-        for (int i = 0; i < all.GetCount(); ++i) {
-            auto* q = static_cast<gCQuest_PS*>(all.AccessAt(i));
-            if (!q) continue;
-            const int st = static_cast<int>(q->GetStatus().GetValue());
-            if (st == gEQuestStatus_Running) {
-                ++running;
-                if (pos + 64 < sizeof(activeList))
-                    pos += static_cast<size_t>(Format(activeList + pos, sizeof(activeList) - pos, "%s%s",
-                                                      pos ? "," : "", q->AccessName().GetText()));
-            } else if (st == gEQuestStatus_Success || st == gEQuestStatus_Won) ++succeeded;
-            else if (st == gEQuestStatus_Failed || st == gEQuestStatus_Lost) ++failed;
-            else if (st == gEQuestStatus_Cancelled || st == gEQuestStatus_Obsolete) ++cancelled;
-        }
-        Event ev;
-        ev.kv.Int("running", running).Int("succeeded", succeeded).Int("failed", failed).Int("cancelled", cancelled)
-          .Str("running_quests", pos ? activeList : "none");
-        ev.Send("quest.baseline");
-    }
+    Event ev;
+    ev.kv.Int("running", running).Int("succeeded", succeeded).Int("failed", failed).Int("cancelled", cancelled)
+      .Str("running_quests", pos ? activeList : "none");
+    ev.Send("quest.baseline");
+}
+
+void EmitWorldBaseline(eCDynamicEntity* rawHero, Vitals const& v, SlotTable const& slots)
+{
+    EmitHeroBaseline(rawHero, v, slots);
+    EmitEnclaveBaseline();
+    EmitQuestBaseline();
 }
 
 void ObserveHeroTransitions(eCDynamicEntity* rawHero, uint32_t nowMs)
@@ -434,10 +445,12 @@ void ObserveHeroTransitions(eCDynamicEntity* rawHero, uint32_t nowMs)
             lastCombatCause.AppendTo(ev.kv, nowMs, 2500, "combat_cause");
             ev.Send("hero.hp");
         }
-        if (cur.level != prevVitals.level || cur.lpAttribs != prevVitals.lpAttribs || cur.chapter != prevVitals.chapter) {
+        if (cur.level != prevVitals.level || cur.lpAttribs != prevVitals.lpAttribs ||
+            cur.lpPerks != prevVitals.lpPerks || cur.chapter != prevVitals.chapter) {
             Event ev;
             ev.kv.TransitionInt("level", prevVitals.level, cur.level)
               .TransitionInt("lp", prevVitals.lpAttribs, cur.lpAttribs)
+              .TransitionInt("lp_perks", prevVitals.lpPerks, cur.lpPerks)
               .TransitionInt("xp", prevVitals.xp, cur.xp)
               .TransitionInt("chapter", prevVitals.chapter, cur.chapter);
             lastQuestCause.AppendTo(ev.kv, nowMs, 5000, "quest_cause");
@@ -578,6 +591,12 @@ void OnWorldDeactivate()
     wasDialogOpen = false;
     prevVitals = Vitals{};
     prevSlots.Clear();
+    recentJudge = detail::CombatContext{};
+    lastCombatCause.Clear();
+    lastCrimeCause.Clear();
+    lastLootCause.Clear();
+    lastQuestCause.Clear();
+    std::memset(prevPeers, 0, sizeof(prevPeers));
     groundFilter.Reset();
     Event{}.Send("world.deactivate");
 }
@@ -593,6 +612,7 @@ void OnWorldChange()
     lastCrimeCause.Clear();
     lastLootCause.Clear();
     lastQuestCause.Clear();
+    std::memset(prevPeers, 0, sizeof(prevPeers));
     groundFilter.Reset();
 }
 

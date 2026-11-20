@@ -161,6 +161,14 @@ eCEntity* AdmitHostSendCandidate(GuidKey const& candidateKey, eCEntity* hero, eC
     return instance;
 }
 
+bool QueueNpcSnapshotTo(uint8_t id, net::NpcRecord const& record, std::vector<pose::Bone> const& bones,
+                        bool posed, uint8_t poseFlags, bool essential, uint8_t intervalWire)
+{
+    return posed
+        ? net::SendPosedNpcTo(id, record, bones.data(), static_cast<int>(bones.size()), poseFlags, essential, intervalWire)
+        : net::SendNpcsTo(id, &record, 1, essential);
+}
+
 void SendNpcToRecipients(Entity& self, eCEntity* instance, eCEntity* hostFocus, eCEntity* hostTarget,
                          GuidKey const& key, uint8_t const guid[16], float const at[3], net::NpcRecord const& r,
                          std::vector<pose::Bone> const& bones, uint8_t poseFlags, bool posed, bool moving,
@@ -215,9 +223,7 @@ void SendNpcToRecipients(Entity& self, eCEntity* instance, eCEntity* hostFocus, 
             streamDiag.Result(id, Drop::Invalid);
         } else if (result.decision == npcsend::Decision::FinalAndRelease) {
             const uint8_t intervalWire = npclease::EncodePoseIntervalWire(npcsend::QuietCadenceMs);
-            const bool finalQueued = posed
-                ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, true, intervalWire)
-                : net::SendNpcsTo(id, &r, 1, true);
+            const bool finalQueued = QueueNpcSnapshotTo(id, r, bones, posed, poseFlags, true, intervalWire);
             const bool releaseQueued = finalQueued && net::SendNpcReleaseTo(id, guid, 1);
             if (releaseQueued && npcsend::Commit(state, input, result.decision)) {
                 states.erase(key);
@@ -237,10 +243,7 @@ void SendNpcToRecipients(Entity& self, eCEntity* instance, eCEntity* hostFocus, 
             }
             const uint8_t intervalWire = npclease::EncodePoseIntervalWire(
                 npcsend::EffectivePresentationInterval(result, state, input));
-            const bool queued = posed
-                ? net::SendPosedNpcTo(id, r, bones.data(), static_cast<int>(bones.size()), poseFlags, result.essential,
-                                      intervalWire)
-                : net::SendNpcsTo(id, &r, 1, result.essential);
+            const bool queued = QueueNpcSnapshotTo(id, r, bones, posed, poseFlags, result.essential, intervalWire);
             const uint32_t previousSentAt = state.sentAt;
             const bool attackStart = combat_timing::RemoteCombat(r.flags, r.combatTarget) &&
                 r.motions[0].active && state.record.motions[0].instance != r.motions[0].instance;
@@ -278,10 +281,7 @@ void FinishOwnedTick(eCEntity* hero, float const players[][3], int playerCount)
             if (range && final != lastSent.end()) {
                 const auto& last = final->second;
                 const uint8_t intervalWire = npclease::EncodePoseIntervalWire(npcsend::QuietCadenceMs);
-                finalQueued = last.posed
-                    ? net::SendPosedNpcTo(id, last.record, last.bones.data(), static_cast<int>(last.bones.size()),
-                                          last.poseFlags, true, intervalWire)
-                    : net::SendNpcsTo(id, &last.record, 1, true);
+                finalQueued = QueueNpcSnapshotTo(id, last.record, last.bones, last.posed, last.poseFlags, true, intervalWire);
             }
             const bool released = finalQueued && net::SendNpcReleaseTo(id, it->first.data(), 1);
             if (released) {
@@ -338,8 +338,6 @@ void HostTick(void (*sendOwned)(eCEntity*, float const[][3], int))
         journal::SyncToClients();
         infocmd::SyncToClients();
     }
-    static uint32_t syncedWorldGen[net::MaxPlayers] = {};
-    static uint32_t syncedWorldId[net::MaxPlayers] = {};
     float players[net::MaxPlayers][3];
     int playerCount = 0;
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
@@ -452,24 +450,16 @@ void Despawn(eCEntity* entity)
     const uint32_t inc = Incarnation(guid);
     const auto existing = absences.find(key);
     const bool alreadySent = existing != absences.end() && existing->second.incarnation == inc;
-    LastSent& last = lastSent[key];
-    auto& record = last.record;
+    net::NpcRecord record{};
     std::memcpy(record.guid, guid, sizeof(record.guid));
     record.incarnation = inc;
     record.sent = net::Now();
-    record.flags |= 1;
-    record.hitPoints = 0;
+    record.flags = 1;
     if (auto* receiver = static_cast<gCDamageReceiver_PS*>(entity->GetPropertySet(eEPropertySetType_DamageReceiver))) {
         const int32_t maxHp = receiver->GetHitPointsMax();
         if (maxHp >= 1) record.hitPointsMax = maxHp;
     }
     record.aiMode = static_cast<uint8_t>(gEAIMode_Dead);
-    record.partyPlayer = 0;
-    record.partyType = 0;
-    record.waiting = 0;
-    record.guidePlayer = 0;
-    record.contact = 0;
-    std::memset(record.motions, 0, sizeof(record.motions));
     const auto& at = entity->GetWorldPosition();
     const auto turn = entity->GetWorldRotation();
     record.position[0] = at.GetX(); record.position[1] = at.GetY(); record.position[2] = at.GetZ();
@@ -481,6 +471,8 @@ void Despawn(eCEntity* entity)
     record.rotation[0] = turn.GetX(); record.rotation[1] = turn.GetY();
     record.rotation[2] = turn.GetZ(); record.rotation[3] = turn.GetW();
     npcsend::SanitizeCapturedRecord(record);
+    LastSent& last = lastSent[key];
+    last.record = record;
     last.at = record.sent;
     last.posed = false;
     last.poseFlags = 0;
@@ -490,6 +482,7 @@ void Despawn(eCEntity* entity)
     sending.erase(key);
     owned.erase(key);
     forceHistory.erase(key);
+    for (auto& states : recipientNpcs) states.erase(key);
     ForgetCorpseGroundAnchor(key);
     if (!alreadySent) net::SendNpcs(&record, 1, true);
 }
@@ -520,6 +513,31 @@ void NewLife(uint8_t const guid[16])
         absences.erase(key);
         hostHits.erase(key);
         forceHistory.erase(key);
+        lastSent.erase(key);
+        if (net::Connected()) {
+            if (eCEntity* live = Resolve(guid).GetInstance(); IsNpc(live)) {
+                net::NpcRecord r{};
+                std::memcpy(r.guid, guid, sizeof(r.guid));
+                r.incarnation = incarnation;
+                r.sent = net::Now();
+                const bCVector& at = live->GetWorldPosition();
+                const bCQuaternion q = live->GetWorldRotation();
+                r.position[0] = at.GetX(); r.position[1] = at.GetY(); r.position[2] = at.GetZ();
+                r.rotation[0] = q.GetX(); r.rotation[1] = q.GetY(); r.rotation[2] = q.GetZ(); r.rotation[3] = q.GetW();
+                if (auto* receiver = static_cast<gCDamageReceiver_PS*>(
+                        live->GetPropertySet(eEPropertySetType_DamageReceiver))) {
+                    r.hitPoints = receiver->GetHitPoints();
+                    r.hitPointsMax = receiver->GetHitPointsMax();
+                }
+                r.aiMode = static_cast<uint8_t>(body::AIModeOf(live));
+                npcsend::SanitizeCapturedRecord(r);
+                net::SendNpcs(&r, 1, true);
+                net::Remote const* remotes = net::Remotes();
+                for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+                    if (net::InWorld(id) && remotes[id].connected && !recipientNpcs[id].count(key))
+                        net::SendNpcReleaseTo(id, guid, 1);
+            }
+        }
     }
     if (newLife && deadOnHost.erase(key)) Logf("npcs: %s no longer held dead here (it stood up again)", Resolve(guid).GetName().GetText());
     if (newLife) ForgetCorpseGroundAnchor(key);
@@ -695,9 +713,10 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
     uint32_t& incarnation = incarnations[key];
     if (!incarnation) incarnation = 1;
     r.incarnation = incarnation;
-    if (auto hit = hostHits.find(key); hit != hostHits.end()) {
+    const auto hit = hostHits.find(key);
+    if (hit != hostHits.end()) {
         r.hitPlayer = hit->second.player;
-        r.hitSequence = static_cast<uint16_t>(hit->second.sequence);
+        r.hitSequence = npcplayback_hit_policy::WrapNonZeroHitSeq(hit->second.sequence);
     }
     const bool parrying = r.aniState == gEAniState_Parade && combat::InParadeMode(instance);
     if (parrying) r.flags |= 64;
@@ -716,7 +735,7 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
         r.motion = net::HashName(motion);
         if (namesSent.insert(r.motion).second) net::SendMotionName(r.motion, motion);
     }
-    if (auto hit = hostHits.find(key); hit != hostHits.end()) {
+    if (hit != hostHits.end()) {
         if (npcplayback_hit_policy::HostHitStampExpired(
                 hit->second.at, r.sent, StaggerState(self.Routine.GetCurrentTask().GetText()), motion)) {
             hostHits.erase(hit);

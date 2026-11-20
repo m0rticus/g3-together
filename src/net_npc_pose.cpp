@@ -27,6 +27,23 @@ uint16_t requestedBoneLayout = 0;
 unsigned boneLayoutLogs = 0, boneAckLogs = 0, boneFullPoseLogs = 0, boneCompactPoseLogs = 0;
 unsigned boneRequestLogs = 0, boneDefinitionFailureLogs = 0;
 
+void RecordAcceptedPoseStats(uint8_t statsTierInterval, size_t datagramBytes, size_t poseBytes,
+                             uint16_t boneCount, bool isKey, bool fullHashFallback,
+                             bonewire::PoseStats stats, size_t outerControlBytes,
+                             uint32_t maxBasisErrorUnits)
+{
+    bandwidth.Pose(statsTierInterval, datagramBytes, poseBytes, boneCount, isKey);
+    if (fullHashFallback) {
+        stats.headerBytes = 2 + boneCount * sizeof(uint32_t);
+        stats.rotationBits = boneCount * 144;
+        stats.translationBits = boneCount * 48;
+        stats.includedBones = boneCount;
+    }
+    bandwidth.PoseComponents(stats.headerBytes + 2, stats.maskBits, stats.rotationBits, stats.translationBits,
+        stats.includedBones, isKey, stats.predictive, outerControlBytes, sizeof(NpcsHeader),
+        stats.rigidBones, maxBasisErrorUnits, stats.PaddingBits());
+}
+
 bool ValidPoseBoneHashes(uint32_t const* values, int length) noexcept
 {
     constexpr unsigned Slots = static_cast<unsigned>(pose::MaxBones) * 2u;
@@ -212,8 +229,9 @@ void ClearClientNpcTables()
     decodedPoses.clear();
     receivedBoneGeneration = 0;
     requestedBoneEpoch = 0;
-    controlReceiver = npcwire::Context{};
-    receivedControlGeneration = 0;
+    requestedBoneLayout = 0;
+    requestedBoneAt = 0;
+    ClearClientControlTables();
 }
 
 bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
@@ -320,7 +338,8 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         if (isHost || peer != server) { ++npcRejected; return true; }
         NpcsHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
-        if (!header.count || header.count > MaxNpcsPerMessage || header.epoch != worldEpoch || header.owner != 1) {
+        if (!header.count || header.count > MaxNpcsPerMessage || !worldEpoch ||
+            header.epoch != worldEpoch || header.owner != 1) {
             ++npcRejected;
             return true;
         }
@@ -430,9 +449,24 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
                 if (BoneLog(boneInvalidLogs)) Log("net: rejected truncated or invalid compact pose");
                 return true;
             }
+            const uint8_t wireFlags = packet->data[recordsSize];
+            const bool anchorSection = (wireFlags & PoseAnchorFlag) != 0;
+            const bool essentialSection = (wireFlags & PoseEssentialFlag) != 0;
+            if ((anchorSection || essentialSection) && !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) {
+                ++npcRejected;
+                return true;
+            }
             NpcRecord posedRecord{};
             std::memcpy(&posedRecord, packet->data + sizeof(header), sizeof(posedRecord));
             if (!SaneNpc(posedRecord)) { ++npcRejected; return true; }
+            if (!anchorSection && !essentialSection) {
+                const auto pub = npcPublications.find(NpcKey(posedRecord.guid));
+                if (pub != npcPublications.end() && pub->second.publication.initialized &&
+                    !npcwire::Newer(header.publication, pub->second.publication.latest)) {
+                    ++npcStale;
+                    return true;
+                }
+            }
             DecodedCompactPose compact{};
             if (!DecodeCompactPoseSection(peer, posedRecord, packet->data + recordsSize,
                                           packet->dataLength - recordsSize, packet->flags, decodedBones, compact, true))
@@ -483,17 +517,9 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
                 if (bones) {
                     const uint32_t decodedInt = npclease::DecodePoseIntervalWire(intervalMs);
                     const uint8_t statsTierInterval = static_cast<uint8_t>((std::min)(decodedInt, 100u));
-                    bandwidth.Pose(statsTierInterval, packet->dataLength, receivedPoseBytes, boneCount, receivedPoseKey);
-                    if (!poseLayout) {
-                        receivedPoseStats.headerBytes = 2 + boneCount * sizeof(uint32_t);
-                        receivedPoseStats.rotationBits = boneCount * 144;
-                        receivedPoseStats.translationBits = boneCount * 48;
-                        receivedPoseStats.includedBones = boneCount;
-                    }
-                    bandwidth.PoseComponents(receivedPoseStats.headerBytes + 2, receivedPoseStats.maskBits,
-                        receivedPoseStats.rotationBits, receivedPoseStats.translationBits, receivedPoseStats.includedBones,
-                        receivedPoseKey, receivedPoseStats.predictive, packet->dataLength - receivedPoseBytes - sizeof(header),
-                        sizeof(header), receivedPoseStats.rigidBones, 0, receivedPoseStats.PaddingBits());
+                    RecordAcceptedPoseStats(statsTierInterval, packet->dataLength, receivedPoseBytes, boneCount,
+                        receivedPoseKey, !poseLayout, receivedPoseStats,
+                        packet->dataLength - receivedPoseBytes - sizeof(header), 0);
                 }
                 if (bones && handlers.npcPose)
                     handlers.npcPose(record, bones, boneCount, poseFlags, poseEssential, intervalMs);
@@ -537,12 +563,12 @@ bool HandleNpcStreamMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
     if (type == MsgNpcRelease) {
         if (packet->dataLength < sizeof(NpcReleaseHeader)) return true;
-        if (isHost || peer != server) { ++npcRejected; return true; }
+        if (isHost || peer != server || !(packet->flags & ENET_PACKET_FLAG_RELIABLE)) { ++npcRejected; return true; }
         NpcReleaseHeader header{};
         std::memcpy(&header, packet->data, sizeof(header));
         if (!header.count || header.count > MaxNpcsPerMessage ||
-            packet->dataLength != sizeof(header) + header.count * 16u || header.epoch != worldEpoch ||
-            header.owner != 1) {
+            packet->dataLength != sizeof(header) + header.count * 16u ||
+            !worldEpoch || header.epoch != worldEpoch || header.owner != 1) {
             ++npcRejected;
             return true;
         }
@@ -732,17 +758,9 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
             }
             const uint32_t decodedInt = npclease::DecodePoseIntervalWire(intervalMs);
             const uint8_t statsTierInterval = static_cast<uint8_t>((std::min)(decodedInt ? decodedInt : uint32_t(intervalMs), 100u));
-            bandwidth.Pose(statsTierInterval, bytes, poseBytes, count, poseKey || !compactReady);
-            if (!compactReady) {
-                poseStats.headerBytes = 2 + count * sizeof(uint32_t);
-                poseStats.rotationBits = count * 144;
-                poseStats.translationBits = count * 48;
-                poseStats.includedBones = count;
-            }
-            bandwidth.PoseComponents(poseStats.headerBytes + 2, poseStats.maskBits, poseStats.rotationBits,
-                poseStats.translationBits, poseStats.includedBones, poseKey || !compactReady, poseStats.predictive,
-                bytes - poseBytes - sizeof(header), sizeof(header), poseStats.rigidBones, poseStats.maxBasisErrorUnits,
-                poseStats.PaddingBits());
+            RecordAcceptedPoseStats(statsTierInterval, bytes, poseBytes, static_cast<uint16_t>(count),
+                poseKey || !compactReady, !compactReady, poseStats, bytes - poseBytes - sizeof(header),
+                poseStats.maxBasisErrorUnits);
         } else {
             ++poseSendFailed;
             if (!compactReady && BoneLog(boneFallbackFailureLogs))

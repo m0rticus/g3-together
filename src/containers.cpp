@@ -245,9 +245,15 @@ GEBool GE_STDCALL PersonalState(bTObjStack<gScriptRunTimeSingleState>& stack, gC
     Entity focus(hero ? Entity(hero).Focus.GetFocusEntity() : Entity());
     Entity target(spu ? spu->GetTargetEntity() : nullptr);
     const bool local = hero && spu && spu->GetSelfEntity() == hero;
+    const bool hudLoop = !std::strcmp(name, "PS_HUD_Loop");
     Entity* chest = local && IsChest(target) ? &target : local && IsChest(focus) ? &focus : nullptr;
-    if (chest && (!PersonalAdmitted() || !EnsurePersonal(*chest))) return GEFalse;
-    if (chest) RememberPersonal(*chest);
+    if (chest) {
+        if (!PersonalAdmitted() || !EnsurePersonal(*chest)) {
+            if (hudLoop) return original->second(stack, spu);
+            return GEFalse;
+        }
+        RememberPersonal(*chest);
+    }
     if (local && chest && !std::strcmp(name, "PS_Interact_Chest_Loop") && IsLootPageOpen()) {
         BlockWitnessedChestLoot(chest->GetInstance());
     }
@@ -441,6 +447,8 @@ GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         return 0;
     }
     if (!Opened(spu, other, false)) {
+        eCEntity* actor = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+        ExitGonnaLoot(actor);
         telemetry::OnContainerAccess("open_loot", gCSession::GetInstance().GetHero(), partner.GetInstance(), false, "refused_pending");
         return 0;
     }
@@ -472,6 +480,7 @@ unsigned quickTakes = 0, quickRefused = 0;
 GEBool __fastcall QuickTake(PSInventory* self, void*, GEInt stack, GEInt amount, Entity& to)
 {
     if (ai::ShuttingDown()) return self ? self->TransferAmountTo(stack, amount, to) : GEFalse;
+    if (!self) return GEFalse;
     eCEntity* owner = nullptr;
     if (auto* set = reinterpret_cast<EntityPropertySet*>(self)->m_pEngineEntityPropertySet) owner = set->GetEntity();
     if (remote::PuppetOwner(owner)) { ++quickRefused; return GEFalse; }
@@ -491,8 +500,10 @@ GEBool __fastcall QuickTake(PSInventory* self, void*, GEInt stack, GEInt amount,
             ++quickRefused;
             return GEFalse;
         }
-        if (kind == personal::Kind::Corpse && !entity.Inventory.IsGeneratedPlunder()) {
-            PrepareLocalLoot(entity);
+        if (kind == personal::Kind::Corpse && !entity.Inventory.IsGeneratedPlunder() &&
+            !PrepareLocalLoot(entity)) {
+            ++quickRefused;
+            return GEFalse;
         }
         RememberPersonal(entity);
         const std::string key = EntityKey(owner);
@@ -534,10 +545,8 @@ void HookQuickLoot()
     const bool flushed = FlushInstructionCache(GetCurrentProcess(), site, 6) != 0;
     ai::TrackPatch(site, original, installed, sizeof(original), "containers quick loot call");
     if (!restored || !flushed) {
-        quickHookFailed = true;
-        Logf("FAIL containers: quick loot hook finalize failed restored=%d flushed=%d error=%lu",
+        Logf("WARN containers: quick loot hook finalize warning restored=%d flushed=%d error=%lu",
              restored ? 1 : 0, flushed ? 1 : 0, GetLastError());
-        return;
     }
     quickHooked = true;
     Log("containers: quick loot hook installed");

@@ -98,6 +98,21 @@ static void RiceAndIntegerBounds()
         t.values[0] = 32768.0f / pose::BasisScale;
         assert(!pose::Encode(t, encoded));
     }
+    // PoseRiceReader::Rice sets ok = false on out-of-range value and truncated escape.
+    {
+        PoseRiceWriter w;
+        w.Rice(1u << 21, 0, 21);
+        w.Align();
+        PoseRiceReader r{w.bytes};
+        uint32_t out = 0;
+        assert(!r.Rice(out, 0, 21) && !r.ok);
+
+        PoseRiceWriter trunc;
+        trunc.Put(0x7fff, 15);
+        trunc.Align();
+        PoseRiceReader rTrunc(trunc.bytes.data(), 1);
+        assert(!rTrunc.Rice(out, 0, 21) && !rTrunc.ok);
+    }
 }
 
 static void QuaternionFidelity()

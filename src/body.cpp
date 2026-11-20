@@ -306,13 +306,22 @@ float BoundaryHeight(eCEntity* entity)
 bCMatrix Pose(eCEntity const& base, float const position[3], float const rotation[4])
 {
     bCMatrix m = base.GetWorldMatrix();
-    bCQuaternion q;
-    q.AccessX() = rotation[0];
-    q.AccessY() = rotation[1];
-    q.AccessZ() = rotation[2];
-    q.AccessW() = rotation[3];
-    m.ModifyRotation(q);
-    m.AccessTranslation() = bCVector(position[0], position[1], position[2]);
+    if (rotation && std::isfinite(rotation[0]) && std::isfinite(rotation[1]) &&
+        std::isfinite(rotation[2]) && std::isfinite(rotation[3])) {
+        const float lenSq = rotation[0] * rotation[0] + rotation[1] * rotation[1] +
+                            rotation[2] * rotation[2] + rotation[3] * rotation[3];
+        if (lenSq > 1e-8f) {
+            const float inv = 1.0f / std::sqrt(lenSq);
+            bCQuaternion q;
+            q.AccessX() = rotation[0] * inv;
+            q.AccessY() = rotation[1] * inv;
+            q.AccessZ() = rotation[2] * inv;
+            q.AccessW() = rotation[3] * inv;
+            m.ModifyRotation(q);
+        }
+    }
+    if (position && std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]))
+        m.AccessTranslation() = bCVector(position[0], position[1], position[2]);
     return m;
 }
 
@@ -333,8 +342,8 @@ void Pacify(Entity& entity, State& state)
     if (!entity.GetInstance() || guards::RejectRemoteWrite(entity.GetInstance(), "body::Pacify")) return;
     // Never touch combat targets here: clearing them while a scene script ran a combat state crashed the
     // game (gCScriptProcessingUnit::sAICombatMoveInstr). AI states of driven bodies are skipped in ai.cpp.
-    entity.Routine.FullStop();
     if (gCScriptRoutine_PS* routine = RoutineOf(entity.GetInstance())) {
+        entity.Routine.FullStop();
         bCString& name = static_cast<bCString&>(routine->AccessRoutine());
         gEAIMode& mode = static_cast<gEAIMode&>(routine->AccessAIMode());
         if (!state.pacified) {
@@ -343,30 +352,33 @@ void Pacify(Entity& entity, State& state)
         }
         name = bCString("");
         mode = gEAIMode_Abandoned;
+        entity.Routine.SetTask(bCString(Idle));
     }
-    entity.Routine.SetTask(bCString(Idle));
     state.pacified = true;
 }
 
 void Release(Entity& entity, State& state)
 {
     if (guards::RejectRemoteWrite(entity.GetInstance(), "body::Release")) { state = State{}; return; }
-    if (!state.pacified || !entity.GetInstance()) { state = State{}; return; }
-    entity.CharacterMovement.StopMovement();
-    if (gCScriptRoutine_PS* routine = RoutineOf(entity.GetInstance())) {
+    eCEntity* instance = entity.GetInstance();
+    if (!state.pacified || !instance) { state = State{}; return; }
+    if (instance->GetPropertySet(eEPropertySetType_CharacterMovement))
+        entity.CharacterMovement.StopMovement();
+    if (auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation))) {
+        const auto slot0 = static_cast<eCWrapper_emfx2Actor::eEMotionType>(0);
+        if (state.paced) {
+            if (eCWrapper_emfx2Actor* actor = animation->GetActor()) actor->SetPlaySpeed(slot0, 1.0f);
+        }
+        if (state.combatOwned || animation->GetMotionOwner(slot0) == static_cast<eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner>(4))
+            animation->SetMotionOwner(slot0, static_cast<eCVisualAnimation_PS::eSMotionDesc::eEMotionOwner>(2));
+    }
+    if (gCScriptRoutine_PS* routine = RoutineOf(instance)) {
         static_cast<bCString&>(routine->AccessRoutine()) = bCString(state.routine);
         static_cast<gEAIMode&>(routine->AccessAIMode()) = static_cast<gEAIMode>(state.aiMode);
+        entity.Routine.FullStop();
+        entity.Routine.ContinueRoutine();
     }
-    entity.Routine.FullStop();
-    entity.Routine.ContinueRoutine();
     state = State{};
-}
-
-bool SlotRunning(eCEntity* instance)
-{
-    auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
-    eCWrapper_emfx2Actor* actor = animation ? animation->GetActor() : nullptr;
-    return actor && actor->IsMotionRunning(static_cast<eCWrapper_emfx2Actor::eEMotionType>(0));
 }
 
 void ReleaseFinished(eCEntity* instance, State& state)
@@ -401,12 +413,14 @@ void FollowSenderOnce(eCEntity* instance, State& state, Target const& target, ui
         return;
     }
     const double max = actor->GetMaxTime(slot0);
-    if (!(max > 0.0)) { ++followSkips[kind][2]; return; }
+    if (!(max > 0.0) || !std::isfinite(max)) { ++followSkips[kind][2]; return; }
     const double unitMs = MotionUnitMs(max);
     const double expected = target.motionFrac / static_cast<double>(movement::MaxRunningMotionFrac) * max + target.motionAgeMs / unitMs;
     if (expected >= max) { ++followSkips[kind][4]; return; }
+    const double playTime = actor->GetPlayTime(slot0);
+    if (!std::isfinite(playTime)) { ++followSkips[kind][2]; return; }
     ++followSkips[kind][5];
-    float lag = static_cast<float>((expected - actor->GetPlayTime(slot0)) * unitMs);
+    float lag = static_cast<float>((expected - playTime) * unitMs);
     const bool on = MotionSeekEnabled();
     if (on && std::fabs(lag) > SeekOver && static_cast<int32_t>(now - state.seekAt) >= 0) {
         actor->SetPlayTime(slot0, static_cast<float>(expected));
@@ -528,6 +542,7 @@ void DrivePuppetTimeline(Entity& entity, eCEntity* instance, State& state, Targe
             state.combatOwned = false;
             state.paced = false;
         } else {
+            if (state.paced) { actor->SetPlaySpeed(slot0, 1.0f); state.paced = false; }
             char stem[96];
             strncpy_s(stem, fileName, _TRUNCATE);
             if (char* ext = std::strstr(stem, ".xmot")) *ext = '\0';
@@ -553,27 +568,34 @@ void DrivePuppetTimeline(Entity& entity, eCEntity* instance, State& state, Targe
         }
         strncpy_s(state.playing, target.motion, _TRUNCATE);
     }
-    if (!actor->IsMotionRunning(slot0)) return;
+    if (!actor->IsMotionRunning(slot0)) {
+        if (state.paced) { actor->SetPlaySpeed(slot0, 1.0f); state.paced = false; }
+        return;
+    }
     animation->SetMotionOwner(slot0, static_cast<Owner>(4));
     const double max = actor->GetMaxTime(slot0);
     if (!(max > 0.0) || !std::isfinite(max)) return;
+    const double unitMs = MotionUnitMs(max);
+    const bool validFrac = target.motionFrac >= 0 && target.motionFrac < movement::NoMotionFrac;
+    const double expected = validFrac
+        ? movement::ExpectedPuppetPlayTime(max, target.motionFrac, target.motionAgeMs, unitMs, looping)
+        : 0.0;
+    const double maxPlay = std::nextafter(max, 0.0);
+    if (needStart && validFrac) {
+        actor->SetPlayTime(slot0, static_cast<float>(std::clamp(expected, 0.0, maxPlay)));
+        actor->SetPlaySpeed(slot0, 1.0f);
+        state.paced = false;
+    }
     if (state.lastCase == 3 && target.motionAgeMs > 180 && movement::IsTranslatingLocomotion(fileName)) {
         actor->SetPlaySpeed(slot0, 0.0f);
         state.paced = true;
         return;
     }
-    if (target.motionFrac < 0 || target.motionFrac >= movement::NoMotionFrac) {
+    if (!validFrac) {
         if (state.paced) { actor->SetPlaySpeed(slot0, 1.0f); state.paced = false; }
         return;
     }
-    const double unitMs = MotionUnitMs(max);
-    const double expected = movement::ExpectedPuppetPlayTime(max, target.motionFrac, target.motionAgeMs, unitMs, looping);
-    const double maxPlay = std::nextafter(max, 0.0);
-    if (needStart) {
-        actor->SetPlayTime(slot0, static_cast<float>(std::clamp(expected, 0.0, maxPlay)));
-        actor->SetPlaySpeed(slot0, 1.0f);
-        return;
-    }
+    if (needStart) return;
     if (!looping && expected >= max) {
         if (state.paced) { actor->SetPlaySpeed(slot0, 1.0f); state.paced = false; }
         ++followSkips[1][4];
@@ -651,9 +673,9 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
     const uint32_t dt = now - state.lastAt;
     const float traveled = Distance(current, state.lastPos);
     if (state.lastAt && dt > 0 && dt < 500) {
-        const float moved = Distance(current, state.lastPos), speed = moved * 1000.0f / dt;
+        const float speed = traveled * 1000.0f / dt;
         Glide& g = glide[state.puppet ? 1 : 0];
-        if (moved > 150.0f && speed > 1500.0f) ++g.snaps;
+        if (traveled > 150.0f && speed > 1500.0f) ++g.snaps;
         else if (speed > 100.0f) {
             g.movingMs += dt;
             const bool timelineDriven = state.puppet && target.timeline;
@@ -806,7 +828,7 @@ void Drive(Entity& entity, State& state, Target const& target, uint32_t now)
             state.loopCheckAt = now + (idle ? 1000 : 300);
             char shows[128];
             CurrentMotion(instance, shows, sizeof(shows));
-            if (!SlotRunning(instance) || (!idle && strcmp(shows, target.motion) != 0)) {
+            if (!MotionRunning(instance) || (!idle && strcmp(shows, target.motion) != 0)) {
                 *state.playing = '\0';
                 state.idleAsScriptAni = idle;
                 ++loopRestarts;

@@ -915,9 +915,32 @@ void TestRealSteamConfigScopesOnHostAndClient()
     rt.ConfigureSocketOptions(config::ListenSocketScope, 0);
 
     // Host incoming P2P connection accept uses ConnectionScope (4), respects locked ICE, and preserves larger ceilings.
+    // Uninvited peers in Invite mode are rejected; admitted partners are accepted.
+    const u64 uninvitedPeer = 76561198000000099ULL;
     const u64 peerId = 76561198000000005ULL;
-    g_lobbyMember = peerId;
+    g_lobbyMember = uninvitedPeer;
     rt.lobby = 9001;
+    rt.connectionMode = connect::Mode::Invite;
+    rt.hostFlow.Ready(connect::Mode::Invite, Now());
+    {
+        connect::Frame j{};
+        j.type = 'J';
+        strcpy_s(j.session, "thermos-sec1");
+        j.protocol = g3t::saving::Protocol;
+        rt.OnJoinRequest(peerId, j);
+        rt.hostFlow.LobbyCreated(true, ResultOk, Now());
+    }
+    const uint32_t uninvitedConn = 400u;
+    g_liveConnections.insert(uninvitedConn);
+    ConnectionStatusChangedParam uninvitedIncoming{};
+    uninvitedIncoming.conn = uninvitedConn;
+    uninvitedIncoming.info.listenSocket = rt.listenSocketP2P;
+    uninvitedIncoming.info.state = 1; // Connecting
+    FakeIdentitySetSteamId(uninvitedIncoming.info.identity, uninvitedPeer);
+    rt.OnP2PStatusChanged(reinterpret_cast<char const*>(&uninvitedIncoming), sizeof(uninvitedIncoming));
+    assert(rt.Find(uninvitedPeer) == nullptr && g_closedConns == 1);
+
+    g_lobbyMember = peerId;
     const uint32_t incomingConn = 401u;
     g_liveConnections.insert(incomingConn);
     g_iceLockedConnections.insert(incomingConn);
@@ -982,6 +1005,101 @@ void TestCallbackBoundsAndDuplicateLobbyCleanup()
     Status(&g3t::Log);
     assert(LogsContain("STEAMSTATUS app=39500 ready=1"));
 }
+
+void TestAuditFixesRegressions()
+{
+    // #18 Sender() prefers identityPeer offset (12 on x86) even if offset 16 looks like SteamID type 16.
+    ResetHarness();
+    SteamNetworkingMessage msg{};
+    const u64 realSender = 76561198000000011ULL;
+    FakeIdentitySetSteamId(msg.identityPeer, realSender);
+    // FakeIdentityGetSteamId reads 8 bytes at pointer; verify Sender latches expected offset (12 on Win32, 16 on x64).
+    const u64 gotSender = rt.Sender(reinterpret_cast<char const*>(&msg));
+    assert(gotSender == realSender);
+    assert(rt.senderOffset == static_cast<int>(offsetof(SteamNetworkingMessage, identityPeer)));
+
+    // #20 Stale RequestClientDisconnect from an older hostGeneration does not tear down a new link.
+    ResetHarness();
+    rt.isHost = false;
+    rt.connectionMode = connect::Mode::Invite;
+    const u64 hostId = 76561198000000022ULL;
+    rt.clientFlow.Configure(rt.me, "thermos-sec1");
+    rt.clientFlow.Ready();
+    connect::Target t{};
+    t.kind = connect::Target::Kind::Host;
+    t.id = hostId;
+    strcpy_s(t.session, "thermos-sec1");
+    rt.clientFlow.Accept(connect::ClientFlow::Source::RichJoin, hostId, t, Now());
+    rt.clientFlow.Offer(hostId, 9001, Now());
+    rt.clientFlow.LobbyEntered(9001, true, connect::LobbyMetadata::Match, hostId, Now());
+    rt.clientFlow.Welcomed(hostId);
+    rt.owner = hostId;
+    rt.lobby = 9001;
+    Remote* oldHost = rt.Get(hostId);
+    oldHost->linked = true;
+    const uint64_t oldGen = oldHost->generation;
+    rt.Publish();
+    assert(HostRelayGeneration() == oldGen);
+    assert(RequestClientDisconnect());
+    // Rotate to a new host link generation before the worker processes disconnectRequested.
+    oldHost->generation = oldGen + 1;
+    rt.Publish();
+    if (store.disconnectRequested.exchange(false)) {
+        uint64_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lock(store.mutex);
+            gen = store.disconnectGeneration;
+            store.disconnectGeneration = 0;
+        }
+        Remote const* active = rt.Find(rt.owner);
+        if (gen && active && active->linked && active->generation == gen)
+            rt.OnClientLinkLost(rt.clientFlow.host(), "stale");
+    }
+    assert(rt.clientFlow.state() == connect::ClientFlow::State::Linked);
+
+    // #21 Delayed MemberLeft during RotatePartnerForRejoin does not tear down the lobby; #22 CbSessionFailed in Offered tears down.
+    ResetHarness();
+    rt.isHost = true;
+    rt.connectionMode = connect::Mode::Invite;
+    rt.hostFlow.Ready(connect::Mode::Invite, Now());
+    const u64 partnerId = 76561198000000033ULL;
+    connect::Frame join{};
+    join.type = 'J';
+    strcpy_s(join.session, "thermos-sec1");
+    join.protocol = g3t::saving::Protocol;
+    rt.OnJoinRequest(partnerId, join);
+    rt.lobby = 9001;
+    rt.hostFlow.LobbyCreated(true, ResultOk, Now());
+    Remote* partner = rt.Get(partnerId);
+    partner->linked = true;
+    rt.hostFlow.Linked(partnerId);
+    rt.OnJoinRequest(partnerId, join); // Linked -> Offered + RotatePartnerForRejoin
+    assert(rt.hostFlow.state() == connect::HostFlow::State::Offered && rt.rejoinPartner == partnerId);
+    LobbyChatUpdateParam left{};
+    left.lobby = 9001;
+    left.userChanged = partnerId;
+    left.stateChange = 0x02u; // Left
+    rt.OnCallback(CbLobbyChatUpdate, reinterpret_cast<char const*>(&left), sizeof(left));
+    assert(rt.hostFlow.state() == connect::HostFlow::State::Offered && rt.lobby == 9001 && !rt.rejoinPartner);
+
+    // #22 CbSessionFailed for partner in Offered (Find(a) == nullptr) calls OnHostLinkLost.
+    char failedId[SteamIdentityBytes] = {};
+    FakeIdentitySetSteamId(failedId, partnerId);
+    rt.OnCallback(CbSessionFailed, failedId, sizeof(failedId));
+    assert(rt.hostFlow.state() == connect::HostFlow::State::Waiting && rt.lobby == 0);
+
+    // #25 Auto-mode OnLobbyEnter failure on unrelated friend lobby does not leave persistent rt.error.
+    ResetHarness();
+    rt.isHost = false;
+    rt.connectionMode = connect::Mode::Auto;
+    rt.lobby = 9005;
+    rt.wantedLobby = 0;
+    LobbyEnterParam enterFail{};
+    enterFail.lobby = 9005;
+    enterFail.response = 5;
+    rt.OnLobbyEnter(reinterpret_cast<char const*>(&enterFail), sizeof(enterFail));
+    assert(rt.error[0] == '\0' && rt.lobby == 0);
+}
 }
 
 int main()
@@ -994,6 +1112,7 @@ int main()
     TestClientForwardPortFilter();
     TestRealSteamConfigScopesOnHostAndClient();
     TestCallbackBoundsAndDuplicateLobbyCleanup();
+    TestAuditFixesRegressions();
     std::puts("Steam v012 runtime: zero-copy lanes, Messages fallback, active v012 diagnostics, candidate validation, mismatched-gen handshake, endpoint pinning, rejoin rotation, port filtering, real Steam config scopes and callback bounds passed");
     return 0;
 }

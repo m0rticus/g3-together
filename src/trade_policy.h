@@ -31,6 +31,17 @@ inline uint16_t StackQuality(std::string const& key)
     return value;
 }
 
+inline bool ParseDecimalLong(char const* text, long minVal, long maxVal, long& out)
+{
+    out = 0;
+    if (!text || !*text || !std::isdigit(static_cast<unsigned char>(*text))) return false;
+    char* end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < minVal || parsed > maxVal) return false;
+    out = parsed;
+    return true;
+}
+
 // Parses an optional "-q<digits>" suffix from `itemName`.
 // If no "-q" suffix is present, leaves `itemName` unchanged, sets `qualityOut = -1`, and returns true.
 // If "-q" is present, requires a non-empty decimal integer in [0, MaxQuality - 1].
@@ -39,11 +50,8 @@ inline bool ParseQualitySuffix(std::string& itemName, int& qualityOut)
     qualityOut = -1;
     const size_t q = itemName.rfind("-q");
     if (q == std::string::npos) return true;
-    char const* digits = itemName.c_str() + q + 2;
-    if (!*digits || !std::isdigit(static_cast<unsigned char>(*digits))) return false;
-    char* end = nullptr;
-    const long parsed = std::strtol(digits, &end, 10);
-    if (end == digits || *end != '\0' || parsed < 0 || parsed >= MaxQuality) return false;
+    long parsed = 0;
+    if (!ParseDecimalLong(itemName.c_str() + q + 2, 0, MaxQuality - 1, parsed)) return false;
     qualityOut = static_cast<int>(parsed);
     itemName.resize(q);
     return true;
@@ -54,11 +62,8 @@ inline bool ParsePuppetId(char const* text, int maxPlayers, int& idOut)
 {
     idOut = 0;
     if (!text || std::strncmp(text, "puppet", 6) != 0) return false;
-    char const* digits = text + 6;
-    if (!*digits || !std::isdigit(static_cast<unsigned char>(*digits))) return false;
-    char* end = nullptr;
-    const long parsed = std::strtol(digits, &end, 10);
-    if (end == digits || *end != '\0' || parsed <= 0 || parsed >= maxPlayers) return false;
+    long parsed = 0;
+    if (!ParseDecimalLong(text + 6, 1, static_cast<long>(maxPlayers) - 1, parsed)) return false;
     idOut = static_cast<int>(parsed);
     return true;
 }

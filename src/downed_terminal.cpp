@@ -42,7 +42,7 @@ auto& revivedBy = life.revivedBy;
 auto& pendingReviveSequence = life.pendingReviveSequence;
 auto& lastStandRefusal = life.lastStandRefusal;
 auto& standRefusals = life.standRefusals;
-auto& deaths = life.deaths;
+auto& deaths = life.stats.deaths;
 }
 SetModeFn originalSetMode = nullptr;
 SetHpFn originalSetHp = nullptr, originalAddHp = nullptr, originalSetValue = nullptr;
@@ -108,6 +108,7 @@ bool RejectHp(eCEntity* entity, bCString const& tag, int value, bool additive, c
 
 GEBool __fastcall SetHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
 {
+    if (ai::ShuttingDown()) return originalSetHp(self, edx, tag, value);
     eCEntity* entity = self ? self->GetEntity() : nullptr;
     if (RejectHp(entity, tag, value, false, "SetBaseValue(HP)")) return GEFalse;
     if (LocalTerminal(entity) && tag == "HP") {
@@ -129,6 +130,7 @@ GEBool __fastcall SetHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag,
 
 GEBool __fastcall AddHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
 {
+    if (ai::ShuttingDown()) return originalAddHp(self, edx, tag, value);
     eCEntity* entity = self ? self->GetEntity() : nullptr;
     if (RejectHp(entity, tag, value, true, "AddBaseValue(HP)")) return GEFalse;
     if (LocalTerminal(entity) && tag == "HP" && value > 0) {
@@ -145,6 +147,7 @@ GEBool __fastcall AddHp(gCPlayerMemory_PS* self, void* edx, bCString const& tag,
 
 GEBool __fastcall SetValue(gCPlayerMemory_PS* self, void* edx, bCString const& tag, GEInt value)
 {
+    if (ai::ShuttingDown()) return originalSetValue(self, edx, tag, value);
     eCEntity* entity = self ? self->GetEntity() : nullptr;
     if (RejectHp(entity, tag, value, false, "SetValue(HP)")) return GEFalse;
     if (LocalTerminal(entity) && tag == "HP" && !life.TerminalHpAllowed(value)) {

@@ -52,9 +52,31 @@ struct Drawn {
 };
 Drawn drawn[net::MaxPlayers];
 float viewX = 0, viewZ = 0;  // the camera's horizontal direction at the last compass paint
+void* lastWorldEntity = nullptr;
+bool lastGameRunning = false;
+uint32_t lastWorldEntryCount = 0;
+uint32_t lastJoinCount = 0;
+
+void SyncWorldState()
+{
+    void* worldEntity = Entity::GetWorldEntity().GetInstance();
+    const bool gameRunning = gCSession::GetInstance().IsGameRunning() != GEFalse;
+    const uint32_t entryCount = net::WorldEntryCount();
+    const uint32_t joinCount = net::JoinCount();
+    if (!gameRunning || worldEntity != lastWorldEntity || entryCount != lastWorldEntryCount ||
+        joinCount != lastJoinCount || (lastGameRunning && !gameRunning)) {
+        for (Mark& mark : marks) mark = {};
+        for (Drawn& d : drawn) d = {};
+    }
+    lastWorldEntity = worldEntity;
+    lastGameRunning = gameRunning;
+    lastWorldEntryCount = entryCount;
+    lastJoinCount = joinCount;
+}
 
 void DrawOnMap(CFFGFCWnd* control)
 {
+    SyncWorldState();
     auto* bytes = reinterpret_cast<unsigned char*>(control);
     gCMap_PS* map = *reinterpret_cast<gCMap_PS**>(bytes + ShownMap);
     if (!map) return;
@@ -89,6 +111,7 @@ void DrawOnMap(CFFGFCWnd* control)
 // top of the ring, one to its right at the right, one behind it at the bottom.
 void DrawOnCompass(CFFGFCWnd* control)
 {
+    SyncWorldState();
     gCSession& session = gCSession::GetInstance();
     gCCameraAI_PS* camera = session.GetCamera_PS();
     eCEntity* eye = camera ? camera->GetEntity() : nullptr;
@@ -186,19 +209,24 @@ void Start()
 
 void Tick()
 {
+    SyncWorldState();
     net::Remote const* remotes = net::Remotes();
     for (int i = 1; i < net::MaxPlayers; ++i) {
         Mark& mark = marks[i];
         // Shown while its puppet is here (fresh state, same world): the puppet's place, smoothed as everyone sees it.
         eCEntity* puppet = i != net::LocalId() ? remote::PuppetOf(i) : nullptr;
-        mark.shown = puppet != nullptr;
-        if (!puppet) continue;
+        if (!puppet) {
+            mark = {};
+            continue;
+        }
+        mark.shown = true;
         const bCVector& p = puppet->GetWorldPosition();
         mark.position[0] = p.GetX();
         mark.position[1] = p.GetY();
         mark.position[2] = p.GetZ();
         float const* matrix = reinterpret_cast<float const*>(&puppet->GetWorldMatrix());  // its z axis, as the game's arrow reads it
         if (matrix[8] != 0.0f || matrix[10] != 0.0f) mark.heading = std::atan2(matrix[8], matrix[10]);
+        else mark.heading = 0.0f;
         MultiByteToWideChar(CP_UTF8, 0, remotes[i].latest.name, -1, mark.name, 31);
         mark.name[31] = 0;
     }

@@ -87,20 +87,21 @@ void WorkerRuntime::TransportConfigDiagnostics() const
 void WorkerRuntime::SendDiagnostics(uint32_t now)
 {
     if (CountLinked()) {
+        config::Read current[4]{};
+        bool verified = networkingConfigured;
+        for (unsigned i = 0; i < 4; ++i) {
+            current[i] = ReadNetworkingConfig(config::Settings[i].id);
+            const bool ok = config::Settings[i].exact
+                ? current[i].value == networkingConfig[i].requested
+                : current[i].value >= networkingConfig[i].requested;
+            verified = verified && current[i].Valid() && ok;
+        }
         auto readById = [&](int id) {
             for (unsigned i = 0; i < 4; ++i) {
-                if (config::Settings[i].id == id) return ReadNetworkingConfig(id);
+                if (config::Settings[i].id == id) return current[i];
             }
             return config::Read{};
         };
-        bool verified = networkingConfigured;
-        for (unsigned i = 0; i < 4; ++i) {
-            const auto value = ReadNetworkingConfig(config::Settings[i].id);
-            const bool ok = config::Settings[i].exact
-                ? value.value == networkingConfig[i].requested
-                : value.value >= networkingConfig[i].requested;
-            verified = verified && value.Valid() && ok;
-        }
         const auto sendBuf = readById(config::SendBufferSize);
         const auto rateMin = readById(config::SendRateMin);
         const auto rateMax = readById(config::SendRateMax);

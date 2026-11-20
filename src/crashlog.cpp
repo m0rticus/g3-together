@@ -8,6 +8,7 @@
 #include <Game.h>
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <mutex>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -30,7 +31,7 @@ void LogEndStep()
 
 using DumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
                              PMINIDUMP_CALLBACK_INFORMATION);
-DumpFn writeDump = nullptr;
+std::atomic<DumpFn> writeDump{nullptr};
 SRWLOCK dbghelpLock = SRWLOCK_INIT;
 HANDLE dumpRequest = nullptr, dumpDone = nullptr, dumpStop = nullptr, dumpThreadHandle = nullptr;
 EXCEPTION_RECORD dumpExceptionRecord{};
@@ -39,9 +40,10 @@ EXCEPTION_POINTERS dumpExceptionPointers{};
 bool dumpExceptionCopied = false;
 LONG dumpBusy = 0;
 std::atomic<uint32_t> activeDumpCallers{0};
+std::atomic<bool> shuttingDown{false};
 DWORD dumpThreadId = 0, dumpWorkerThreadId = 0;
 char dumpDir[MAX_PATH] = {};
-LONG dumps = 0, dumpSequence = 0;
+LONG firstChanceDumps = 0, lastChanceDumps = 0, dumpSequence = 0;
 constexpr LONG MaxFirstChanceDumps = 2;
 LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
 bool filterInstalled = false;
@@ -77,7 +79,8 @@ void EnsureDumpDir()
 
 bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception, bool waitLock)
 {
-    if (!writeDump) { Log("crashlog: crash dump writer unavailable"); return false; }
+    DumpFn const fn = writeDump.load(std::memory_order_acquire);
+    if (!fn) { Log("crashlog: crash dump writer unavailable"); return false; }
     DbgHelpGuard guard(waitLock);
     if (!guard.locked) {
         Log("crashlog: dbghelp busy; skipping concurrent dump");
@@ -113,7 +116,7 @@ bool WriteDump(HANDLE file, PMINIDUMP_EXCEPTION_INFORMATION exception, bool wait
     // The game ships dbghelp 5.2: only unsupported flags permit a more compatible profile.
     for (size_t i = 0; i != std::size(profiles); ++i) {
         if (i && !rewind()) { logRetries(); return false; }
-        if (writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, profiles[i].type, exception, nullptr, nullptr)) {
+        if (fn(GetCurrentProcess(), GetCurrentProcessId(), file, profiles[i].type, exception, nullptr, nullptr)) {
             logRetries();
             Logf("crashlog: crash dump success profile=%s type=%lu", profiles[i].name,
                  static_cast<unsigned long>(profiles[i].type));
@@ -183,7 +186,9 @@ void Dump(EXCEPTION_POINTERS* info, LONG sequence = 0)
         CallerGuard() { activeDumpCallers.fetch_add(1, std::memory_order_acq_rel); }
         ~CallerGuard() { activeDumpCallers.fetch_sub(1, std::memory_order_acq_rel); }
     } caller;
-    if (!writeDump || !dumpRequest || !dumpDone || ai::ShuttingDown()) return;
+    if (shuttingDown.load(std::memory_order_acquire) || ai::ShuttingDown() ||
+        !writeDump.load(std::memory_order_acquire) || !dumpRequest || !dumpDone || !dumpStop)
+        return;
     if (InterlockedCompareExchange(&dumpBusy, 1, 0) != 0) {
         Log("guard: crashlog dump busy; skipping overlapping request");
         return;
@@ -214,8 +219,9 @@ void Dump(EXCEPTION_POINTERS* info, LONG sequence = 0)
         InterlockedExchange(&dumpBusy, 0);
         return;
     }
-    const DWORD wait = ai::ShuttingDown() ? 1000 : 30000;
-    const DWORD waited = WaitForSingleObject(dumpDone, wait);
+    const DWORD wait = (shuttingDown.load(std::memory_order_acquire) || ai::ShuttingDown()) ? 1000 : 30000;
+    HANDLE waits[2] = {dumpDone, dumpStop};
+    const DWORD waited = WaitForMultipleObjects(2, waits, FALSE, wait);
     if (waited == WAIT_TIMEOUT) {
         Logf("crashlog: crash dump wait timeout ms=%lu guard=busy", wait);
     } else if (waited == WAIT_FAILED) {
@@ -225,9 +231,10 @@ void Dump(EXCEPTION_POINTERS* info, LONG sequence = 0)
 
 LONG WINAPI LastChance(EXCEPTION_POINTERS* info)
 {
-    if (ai::ShuttingDown() || GetCurrentThreadId() == dumpWorkerThreadId)
+    if (shuttingDown.load(std::memory_order_acquire) || ai::ShuttingDown() ||
+        GetCurrentThreadId() == dumpWorkerThreadId)
         return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
-    if (const LONG seq = InterlockedIncrement(&dumps); seq <= 4) Dump(info, seq);
+    if (const LONG seq = InterlockedIncrement(&lastChanceDumps); seq <= 4) Dump(info, 100 + seq);
     LogEndStep();
     return previousFilter ? previousFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -239,13 +246,14 @@ void InstallDumps()
     EnsureDumpDir();
     if (!*dumpDir) { Log("crashlog: no minidumps (game directory unavailable)"); return; }
     HMODULE dbghelp = EnsureDbgHelp();
-    writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    DumpFn const fn = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    writeDump.store(fn, std::memory_order_release);
     dumpRequest = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     dumpDone = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     dumpStop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    dumpThreadHandle = writeDump && dumpRequest && dumpDone && dumpStop
+    dumpThreadHandle = fn && dumpRequest && dumpDone && dumpStop
         ? CreateThread(nullptr, 256 * 1024, &DumpThread, nullptr, 0, &dumpWorkerThreadId) : nullptr;
-    if (!dumpThreadHandle) { writeDump = nullptr; Log("crashlog: no minidumps (dbghelp or thread missing)"); return; }
+    if (!dumpThreadHandle) { writeDump.store(nullptr, std::memory_order_release); Log("crashlog: no minidumps (dbghelp or thread missing)"); return; }
     previousFilter = SetUnhandledExceptionFilter(&LastChance);
     filterInstalled = true;
     Logf("crashlog: minidumps on a crash go to %sg3together-crash-*.dmp", dumpDir);
@@ -257,11 +265,27 @@ struct Module {
 };
 struct ModuleSlot {
     char const* name;
+    std::atomic<uint32_t> seq{0};
     std::atomic<uintptr_t> base{0}, size{0};
     Module Load() const
     {
-        const uintptr_t b = base.load(std::memory_order_acquire);
-        return {name, b, b ? size.load(std::memory_order_relaxed) : 0};
+        for (;;) {
+            const uint32_t s1 = seq.load(std::memory_order_acquire);
+            if (s1 & 1u) continue;
+            const uintptr_t b = base.load(std::memory_order_relaxed);
+            const uintptr_t s = size.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq.load(std::memory_order_relaxed) == s1)
+                return {name, b, b ? s : 0};
+        }
+    }
+    void Store(uintptr_t b, uintptr_t s)
+    {
+        const uint32_t cur = seq.load(std::memory_order_relaxed);
+        seq.store(cur + 1, std::memory_order_release);
+        base.store(b, std::memory_order_relaxed);
+        size.store(s, std::memory_order_relaxed);
+        seq.store(cur + 2, std::memory_order_release);
     }
 };
 ModuleSlot modules[] = {{"Gothic3.exe"}, {"Gothic3Final.exe"}, {"Engine.dll"}, {"Game.dll"}, {"Script.dll"},
@@ -277,7 +301,7 @@ struct Script {
     char name[48];
 };
 Script scripts[4096];
-volatile LONG scriptCount = 0;
+std::atomic<LONG> scriptCount{0};
 bool scriptsTaken = false;
 bool tickModulesRefreshed = false;
 
@@ -291,47 +315,21 @@ struct KnownSymbol {
     char const* name = nullptr;
 };
 KnownSymbol knownSymbols[4];
-size_t knownSymbolCount = 0;
-bool Executable(Module const& m, uintptr_t rva);
+std::atomic<int> knownSymbolsState{0};  // 0=uninit, 1=initing, 2=ready
 
-void FindKnownSymbols()
-{
-    knownSymbolCount = 0;
-    uintptr_t addresses[] = {
-        reinterpret_cast<uintptr_t>(&enet_range_coder_compress),
-        reinterpret_cast<uintptr_t>(&enet_range_coder_decompress),
-        reinterpret_cast<uintptr_t>(&enet_host_flush),
-        reinterpret_cast<uintptr_t>(&enet_host_service),
-    };
-    char const* symbolNames[] = {
-        "enet_range_coder_compress",
-        "enet_range_coder_decompress",
-        "enet_host_flush",
-        "enet_host_service",
-    };
-    for (size_t i = 0; i != std::size(addresses); ++i) {
-        knownSymbols[knownSymbolCount].at = addresses[i];
-        knownSymbols[knownSymbolCount].name = symbolNames[i];
-        ++knownSymbolCount;
-    }
-}
+struct ExecRange {
+    uintptr_t start = 0, end = 0;
+};
 
-char const* NearestKnownSymbol(Module const& m, uintptr_t rva, uintptr_t* start)
+void EnsureKnownSymbols()
 {
-    if (!Executable(m, rva)) return nullptr;
-    char const* best = nullptr;
-    for (size_t i = 0; i != knownSymbolCount; ++i) {
-        if (!knownSymbols[i].at || knownSymbols[i].at < m.base ||
-            knownSymbols[i].at >= m.base + m.size)
-            continue;
-        uintptr_t at = knownSymbols[i].at - m.base;
-        if (!Executable(m, at)) continue;
-        if (at <= rva && (!best || at > *start)) {
-            best = knownSymbols[i].name;
-            *start = at;
-        }
-    }
-    return best;
+    int expected = 0;
+    if (!knownSymbolsState.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return;
+    knownSymbols[0] = {reinterpret_cast<uintptr_t>(&enet_range_coder_compress), "enet_range_coder_compress"};
+    knownSymbols[1] = {reinterpret_cast<uintptr_t>(&enet_range_coder_decompress), "enet_range_coder_decompress"};
+    knownSymbols[2] = {reinterpret_cast<uintptr_t>(&enet_host_flush), "enet_host_flush"};
+    knownSymbols[3] = {reinterpret_cast<uintptr_t>(&enet_host_service), "enet_host_service"};
+    knownSymbolsState.store(2, std::memory_order_release);
 }
 
 bool ModuleMapped(Module const& m)
@@ -354,27 +352,53 @@ IMAGE_NT_HEADERS const* Headers(Module const& m)
     return nt->Signature == IMAGE_NT_SIGNATURE ? nt : nullptr;
 }
 
-bool Executable(Module const& m, uintptr_t rva)
+size_t CollectExecRanges(Module const& m, IMAGE_NT_HEADERS const* nt, ExecRange (&ranges)[16])
 {
-    if (!RvaRange(m, rva, 1)) return false;
-    IMAGE_NT_HEADERS const* nt = Headers(m);
-    if (!nt) return false;
+    if (!nt) return 0;
     if (!RvaRange(m, static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(IMAGE_FIRST_SECTION(nt)) - m.base),
                   nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER)))
-        return false;
+        return 0;
+    size_t count = 0;
     IMAGE_SECTION_HEADER const* section = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i != nt->FileHeader.NumberOfSections; ++i, ++section) {
-        const uintptr_t size = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
-        if (rva >= section->VirtualAddress && rva < section->VirtualAddress + size)
-            return (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+    for (WORD i = 0; i != nt->FileHeader.NumberOfSections && count < std::size(ranges); ++i, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uintptr_t secSize = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
+        if (!secSize || !RvaRange(m, section->VirtualAddress, 1)) continue;
+        ranges[count++] = {section->VirtualAddress, section->VirtualAddress + secSize};
     }
+    return count;
+}
+
+bool IsExecRva(Module const& m, uintptr_t rva, ExecRange const* ranges, size_t rangeCount)
+{
+    if (!RvaRange(m, rva, 1)) return false;
+    for (size_t i = 0; i < rangeCount; ++i)
+        if (rva >= ranges[i].start && rva < ranges[i].end) return true;
     return false;
 }
 
-// The exported function that starts nearest at or below rva (forwarders and data skipped, a jmp thunk followed).
-char const* NearestExport(Module const& m, uintptr_t rva, uintptr_t* start)
+char const* NearestKnownSymbol(Module const& m, uintptr_t rva, ExecRange const* ranges, size_t rangeCount, uintptr_t* start)
 {
-    IMAGE_NT_HEADERS const* nt = Headers(m);
+    if (knownSymbolsState.load(std::memory_order_acquire) != 2 || !IsExecRva(m, rva, ranges, rangeCount)) return nullptr;
+    char const* best = nullptr;
+    for (size_t i = 0; i != std::size(knownSymbols); ++i) {
+        if (!knownSymbols[i].at || knownSymbols[i].at < m.base ||
+            knownSymbols[i].at >= m.base + m.size)
+            continue;
+        const uintptr_t at = knownSymbols[i].at - m.base;
+        if (!IsExecRva(m, at, ranges, rangeCount)) continue;
+        if (at <= rva && (!best || at > *start)) {
+            best = knownSymbols[i].name;
+            *start = at;
+        }
+    }
+    return best;
+}
+
+// The exported function that starts nearest at or below rva (forwarders and data skipped, a jmp thunk followed).
+char const* NearestExport(Module const& m, IMAGE_NT_HEADERS const* nt, ExecRange const* ranges, size_t rangeCount,
+                          uintptr_t rva, uintptr_t* start)
+{
     if (!nt) return nullptr;
     auto const* base = reinterpret_cast<unsigned char const*>(m.base);
     IMAGE_DATA_DIRECTORY const& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -397,13 +421,13 @@ char const* NearestExport(Module const& m, uintptr_t rva, uintptr_t* start)
         if (ordinals[i] >= exports->NumberOfFunctions) continue;
         uintptr_t at = functions[ordinals[i]];
         if (at >= dir.VirtualAddress && at < dir.VirtualAddress + dir.Size) continue;  // forwarder
-        if (!Executable(m, at)) continue;
+        if (!IsExecRva(m, at, ranges, rangeCount)) continue;
         if (base[at] == 0xE9) {  // incremental-link thunk: jmp rel32
             if (!RvaRange(m, at, 5)) continue;
             int32_t relative;
             std::memcpy(&relative, base + at + 1, sizeof(relative));
             at += 5 + relative;
-            if (at >= m.size || !Executable(m, at)) continue;
+            if (at >= m.size || !IsExecRva(m, at, ranges, rangeCount)) continue;
         }
         if (at <= rva && (!best || at > *start)) {
             if (!RvaRange(m, nameRvas[i], 1)) continue;
@@ -419,14 +443,14 @@ char const* NearestExport(Module const& m, uintptr_t rva, uintptr_t* start)
     return best;
 }
 
-char const* NearestScript(Module const& m, uintptr_t address, uintptr_t* start)
+char const* NearestScript(Module const& m, ExecRange const* ranges, size_t rangeCount, uintptr_t address, uintptr_t* start)
 {
     char const* best = nullptr;
-    const LONG count = scriptCount;
+    const LONG count = scriptCount.load(std::memory_order_acquire);
     for (LONG i = 0; i != count; ++i) {
         const uintptr_t at = scripts[i].at;
         if (at < m.base || at > address || (best && at - m.base <= *start)) continue;
-        if (at >= m.base + m.size || !Executable(m, at - m.base)) continue;
+        if (at >= m.base + m.size || !IsExecRva(m, at - m.base, ranges, rangeCount)) continue;
         best = scripts[i].name;
         *start = at - m.base;
     }
@@ -435,11 +459,11 @@ char const* NearestScript(Module const& m, uintptr_t address, uintptr_t* start)
 
 void FindModules()
 {
+    EnsureKnownSymbols();
     for (ModuleSlot& m : modules) {
         HMODULE h = GetModuleHandleA(m.name);
         if (!h) {
-            m.base.store(0, std::memory_order_release);
-            m.size.store(0, std::memory_order_relaxed);
+            m.Store(0, 0);
             continue;
         }
         const uintptr_t base = reinterpret_cast<uintptr_t>(h);
@@ -448,14 +472,11 @@ void FindModules()
         if (!symbols::ReadMemory(base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
             !symbols::ReadMemory(base + static_cast<uintptr_t>(dos.e_lfanew), &nt, sizeof(nt)) ||
             nt.Signature != IMAGE_NT_SIGNATURE) {
-            m.base.store(0, std::memory_order_release);
-            m.size.store(0, std::memory_order_relaxed);
+            m.Store(0, 0);
             continue;
         }
-        m.size.store(nt.OptionalHeader.SizeOfImage, std::memory_order_relaxed);
-        m.base.store(base, std::memory_order_release);
+        m.Store(base, nt.OptionalHeader.SizeOfImage);
     }
-    if (!knownSymbolCount) FindKnownSymbols();
 }
 
 // Once a game runs, all scripts are registered: their entry points with their names, for crash lines.
@@ -480,7 +501,7 @@ void TakeScripts()
         if (function) take(name, reinterpret_cast<void const*>(function->m_funcScriptAIFunction));
     GE_MAP_FOR_EACH (name, callback, admin.GetScriptAICallbacks())
         if (callback) take(name, reinterpret_cast<void const*>(callback->m_funcScriptAICallback));
-    InterlockedExchange(&scriptCount, count);
+    scriptCount.store(count, std::memory_order_release);
     Logf("crashlog: %d script names taken for crash lines", static_cast<int>(count));
 }
 
@@ -494,17 +515,20 @@ bool Where(uintptr_t address, char* out, size_t size)
         if (m.base && address >= m.base && address < m.base + m.size) {
             const uintptr_t rva = address - m.base;
             int length = Format(out, size, "%s+%#x", m.name, static_cast<unsigned>(rva));
-            if (!Executable(m, rva)) return true;
+            IMAGE_NT_HEADERS const* nt = Headers(m);
+            ExecRange ranges[16]{};
+            const size_t rangeCount = CollectExecRanges(m, nt, ranges);
+            if (!IsExecRva(m, rva, ranges, rangeCount)) return true;
             uintptr_t start = 0, exportStart = 0, scriptStart = 0;
-            char const* name = NearestKnownSymbol(m, rva, &start);
+            char const* name = NearestKnownSymbol(m, rva, ranges, rangeCount, &start);
             char const* kind = name ? "nearest known symbol" : nullptr;
-            if (char const* exportName = NearestExport(m, rva, &exportStart);
+            if (char const* exportName = NearestExport(m, nt, ranges, rangeCount, rva, &exportStart);
                 exportName && exportStart > start) {
                 name = exportName;
                 start = exportStart;
                 kind = "nearest export symbol";
             }
-            if (char const* script = NearestScript(m, address, &scriptStart); script && scriptStart > start) {
+            if (char const* script = NearestScript(m, ranges, rangeCount, address, &scriptStart); script && scriptStart > start) {
                 name = script;
                 start = scriptStart;
                 kind = "nearest registered script";
@@ -524,11 +548,13 @@ bool Where(uintptr_t address, char* out, size_t size)
 
 bool WriteProcessDump(char const* path)
 {
-    if (!writeDump) {
+    DumpFn fn = writeDump.load(std::memory_order_acquire);
+    if (!fn) {
         HMODULE dbghelp = EnsureDbgHelp();
-        writeDump = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+        fn = dbghelp ? reinterpret_cast<DumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+        writeDump.store(fn, std::memory_order_release);
     }
-    if (!writeDump) {
+    if (!fn) {
         Log("shutdown watchdog: dmp write failed (MiniDumpWriteDump unavailable)");
         return false;
     }
@@ -545,7 +571,7 @@ bool WriteProcessDump(char const* path)
 namespace {
 LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
 {
-    if (ai::ShuttingDown()) return EXCEPTION_CONTINUE_SEARCH;
+    if (shuttingDown.load(std::memory_order_acquire) || ai::ShuttingDown()) return EXCEPTION_CONTINUE_SEARCH;
     if (!info || !info->ExceptionRecord || !info->ContextRecord) {
         Log("guard: crashlog missing exception record/context; cannot describe fault");
         return EXCEPTION_CONTINUE_SEARCH;
@@ -561,7 +587,7 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     // Unhandled exceptions from any module still reach LastChance.
     if (!gameFault) return EXCEPTION_CONTINUE_SEARCH;
     if (GetCurrentThreadId() != dumpWorkerThreadId) {
-        if (const LONG seq = InterlockedIncrement(&dumps); seq <= MaxFirstChanceDumps)
+        if (const LONG seq = InterlockedIncrement(&firstChanceDumps); seq <= MaxFirstChanceDumps)
             Dump(info, seq);  // before anything
     }
     LogEndStep();
@@ -576,8 +602,8 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
               c.Ebp, GetCurrentThreadId());
     Log(line);
     // Return addresses (and other code pointers) on the stack, nearest first. Read via ReadProcessMemory so guard pages cannot fault.
-    char stack[3000] = "CRASH stack";
-    size_t lineStart = 0;
+    char stack[1024] = "CRASH stack";
+    size_t length = std::strlen(stack);
     int found = 0;
     uintptr_t chunk[16]{};
     unsigned chunkCount = 0, chunkIndex = 0;
@@ -593,20 +619,18 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
         char where[240];
         if (!Where(candidate, where, sizeof(where))) continue;
         const size_t need = std::strlen(where) + 2;
-        size_t length = std::strlen(stack + lineStart);
-        if (length + need >= 1000) {
-            if (lineStart + length + 1 + 16 + need >= sizeof(stack)) break;
-            Log(stack + lineStart);
-            lineStart += length + 1;
-            strcpy_s(stack + lineStart, sizeof(stack) - lineStart, "CRASH stack+");
-            length = std::strlen(stack + lineStart);
+        if (length + need >= sizeof(stack)) {
+            Log(stack);
+            strcpy_s(stack, "CRASH stack+");
+            length = std::strlen(stack);
         }
-        if (lineStart + length + need >= sizeof(stack)) break;
-        strcat_s(stack + lineStart, sizeof(stack) - lineStart, " ");
-        strcat_s(stack + lineStart, sizeof(stack) - lineStart, where);
+        if (length + need >= sizeof(stack)) break;
+        strcat_s(stack, " ");
+        strcat_s(stack, where);
+        length += need - 1;
         ++found;
     }
-    Log(stack + lineStart);
+    Log(stack);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -684,6 +708,7 @@ void Tick()
 
 void BeginShutdown()
 {
+    shuttingDown.store(true, std::memory_order_release);
     if (dumpStop) SetEvent(dumpStop);
     if (vectoredHandler) {
         RemoveVectoredExceptionHandler(vectoredHandler);

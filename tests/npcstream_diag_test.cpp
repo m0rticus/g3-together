@@ -263,6 +263,20 @@ int main()
 
         perfRuntime.Reset();
         CHECK(!perfRuntime.PollHeartbeat(12000, hb));
+
+        window.BeginTick(6000);
+        window.Player(2, true, true, 0, client);
+        window.Candidate(Drop::Range);
+        window.Sent(2);
+        CHECK(window.Due(11000));
+        window.Reset();
+        CHECK(!window.Due(11000));
+        capture.lines.clear();
+        window.BeginTick(12000);
+        window.Player(2, true, true, 0, client);
+        window.Flush(17000, context, [&](char const* line) { capture.Receive(line); });
+        CHECK(capture.terminated && capture.lines.size() == 1);
+        CHECK(Has(capture.lines[0], "considered=0.0 sent=0.0 released=0.0 top_drop=- drops=-"));
     }
     return 0;
 }

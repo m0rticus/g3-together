@@ -116,5 +116,11 @@ int main()
         const auto judged = PlanHostNpcHit(hostJudgedSnap, Player2, true, true, true);
         assert(!judged.shiftAttackers && !judged.applyReactionTask && !judged.runImmediateAssessAgressor);
         assert(judged.immediateCombatTarget == Player2);
+
+        // Host-judged hit with HitNoReaction already ran AssessAgressor inside JudgeDamage -> AssessHit;
+        // must not double-fire React() / AssessAgressor on the first blow.
+        const auto judgedNoReaction = PlanHostNpcHit(routine, Player2, true, false, false);
+        assert(!judgedNoReaction.shiftAttackers && !judgedNoReaction.applyReactionTask &&
+               !judgedNoReaction.runImmediateAssessAgressor);
     }
 }

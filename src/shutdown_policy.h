@@ -72,7 +72,10 @@ class ExitPolicy {
             since = now;
             observing = true;
         }
-        return now - cleanupSince >= GraphicsGraceMs && now - since >= GraphicsStallMs;
+        return static_cast<int32_t>(now - cleanupSince) >= 0 &&
+               static_cast<int32_t>(now - since) >= 0 &&
+               now - cleanupSince >= GraphicsGraceMs &&
+               now - since >= GraphicsStallMs;
     }
 };
 }
