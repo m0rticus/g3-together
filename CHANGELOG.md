@@ -4,42 +4,52 @@ This log summarizes the releases and integration builds that changed gameplay, n
 
 ## Build 86
 
-**8 audit slices, ~180 confirmed multiplayer fixes, and cross-slice hardening**
+**8 audit slices, ~180 verified multiplayer fixes, and cross-slice hardening**
 
 ### Network, Steam, and transport
-- Fixed 25 confirmed network, wire-codec, direct-punch, relay, and Steam transport bugs.
-- Tightened frame/receive handling, ENet and Steam command routing, relay-ID/session handling, wire layouts, and test-copy transport diagnostics.
-- Preserved protocol 77 while hardening large pose/control/stream packets and keeping old or incompatible peers explicit.
+- Fixed mode-4 bone-0 OOB reads in `npcwire_pose_encode.h`, plus `PoseRiceReader` EOF/overflow bounds.
+- Fixed `OnNpcResync` iterator/reference invalidation and corrected `CloseClientLink` to preserve the host refusal reason (`Phase::Refused`).
+- Corrected `Sender()` Steam identity probing at offset 12 and reset client control/pose tables on world or link teardown.
+- Fixed direct-UDP session synchronization, retry freshness, Steam relay routing, and test-copy transport diagnostics.
+- Preserved protocol 79 while hardening pose/control/stream packet handling and explicit peer incompatibility.
 
 ### Persistence, saves, worlds, and player state
-- Fixed confirmed persistence, hero, world, clock, ending, map, save, and auxiliary lifecycle bugs.
-- Hardened save/restore handoffs, world epochs, native world entry, personal ledgers, template publication, and post-restore state.
-- Kept host-managed saves and client rejoin behavior compatible across world-change and reload boundaries.
+- Fixed versioned save/restore and client autoload/rejoin edge cases.
+- Reset canceled-save door settle timers and guarded hero codec/stack restoration.
+- Added `world_pvs` entity-destruction notifications (`npcs::OnEntityDestroyed` and `ranged::ClearPuppetOverlay`) and made world-collision eviction readiness/eviction safer.
+- Fixed clock, ending, mapmarks, snapshot, persistence, and auxiliary lifecycle paths.
 
 ### NPCs, companions, playback, and leases
-- Fixed NPC sync, playback, corpses, companions, summons, presence, retargeting, handback, ownership, and despawn/lease lifecycle issues.
-- Reduced unsafe replay and presentation state changes, improved bind-pose and inactive-NPC handling, and preserved host/client authority.
-- Added clearer NPC stream, lease, ownership, corpse, relation, and hit/playback diagnostics.
+- Fixed 40 NPC sync, playback, corpse, companion, summon, and lease-lifecycle bugs.
+- `NewLife` now immediately sends `SendNpcReleaseTo` to out-of-range peers, preventing stuck `HostStreamClaimed` presentation.
+- A settled-corpse `corpseActor` sentinel survives chunk unload/reload so corpses re-pose instead of standing up.
+- Wired `npcs::HostTake` to lease revocation and deferred `guide.cpp` routine start until the NPC is unfenced.
+- Sanitized despawn records and fixed companion/summon/skeleton/playback state handoffs.
 
 ### Combat, ranged attacks, downed state, and spells
 - Fixed 24 audited combat, downed, ranged, shot, knockback, targeting, and spell problems.
-- Improved melee contact, hit-claim, stagger, downed immunity, ground-hit, puppet-talk, and combat retarget behavior.
-- Tightened ranged overlays, shot sweeps, fight memory, damage ownership, XP/kill reward paths, and player/party immunity.
+- Preserved `pendingHostWipeEpoch` across `OnWorldDeactivate`; added top-of-function `ai::ShuttingDown()` hook guards and per-episode `LocalLifeState` separation.
+- Made `FlushPendingShot` FIFO oldest-first and added explicit `targetPlayer` to `MsgNpcSpell`, with lease relinquishment when a third player takes over a client-leased NPC.
+- Keyed `ranged_overlay` entries by `bCPropertyID`; fixed melee claims, hostility, fight memory, XP, downed `CombatUnavailable`, and anti-cheese `life.held`.
 
 ### Remote players, movement, HUD, and focus
-- Fixed remote puppet/body movement, position authority, transform observers, frame discontinuities, and local-hero write fences.
-- Improved HUD window/list behavior, passive notices, entity-slot reuse, Alt-Tab handling, and focus/sight diagnostics.
-- Preserved native controls for local heroes while keeping mirrored player and NPC presentation separate.
+- Fixed `Despawn` cleanup for null entities in `contacts` and `occupancy::Forget`, plus packet-order-guarded `!InGame` activity despawn (`activity.ticks >= latestTicks`).
+- Added inventory, transform, and terminal guards around `Wear`/`Hold` and prevented stale remote/movement authority writes.
+- Fixed HUD entity-slot reuse and focus diagnostic reporting.
 
 ### Items, containers, trading, doors, and occupancy
-- Fixed confirmed item, container, chest, pickpocket, trade, door, and occupancy problems.
-- Improved personal loot, merchant/corpse state, chest witness/steal behavior, and story/door replay.
-- Reduced stale or duplicate interaction state across reconnect and world-entry handoffs.
+- Fixed 29 confirmed item, container, chest, pickpocket, trade, door, and occupancy bugs.
+- Made `FlushPersonalObservers` snapshot iteration safe and fixed `PersonalMutation` re-entrancy/orphan retirement.
+- Preserved twin-ring multi-slot equipment and Trader-to-Corpse non-merchandise stacks; moved personal admission after `PS_HUD_Loop`.
+- Fixed ransack double-robbery/gold-delta races, epoch-scoped pickpocket queues, and peer-leave buyer cleanup.
+- Stopped first-sight untouched-door packet spam, answered unloaded-door baselines, removed duplicate `infocmd` kind-10 door broadcasts, and hardened occupancy truncation/sender validation.
 
 ### Quests, dialogs, arena, reputation, and telemetry
-- Fixed confirmed quest, dialogue, infocmd, address, arena, enclave, reputation, witness, guide, address, telemetry, log, trace, and shutdown issues.
-- Added cross-slice diagnostics for quests, XP, worlds, doors, teleport/revive, and NPC/host/client state.
-- Hardened crash reporting, shutdown/watchdog behavior, and diagnostic output without adding gameplay automation.
+- Fixed 44 confirmed quest, dialogue, infocmd, address, arena, enclave, reputation, witness, guide, telemetry, and shutdown issues.
+- Made `patch.cpp` cover 8-byte `cmpxchg8b` page boundaries in `VirtualProtect`/`ReadableBytes`, relative jumps in `target + 5`, and bounded PE import-name scans.
+- Cleared `knownTheft` in `RestorePlayerTheft` when a host dialog forgives theft and skipped oversize `StateEvents` names (`>= 63` bytes) without aborting baseline snapshots.
+- Preserved nested `guards::Acting` theft scope for the same puppet and cleared telemetry `eCEntityProxy` maps before engine detach.
+- Kept every `src/` file below 1,000 lines while hardening crash, trace, log, and watchdog diagnostics.
 
 ### Codebase and build quality
 - Split oversized modules into focused slices and audit-specific policy/diagnostic units.
@@ -76,35 +86,30 @@ This log summarizes the releases and integration builds that changed gameplay, n
 ## Builds 80–70
 
 ### Build 79
-- Legacy `HitResult` compatibility and incapacitated-reset hardening.
+- Hardening and follow-ups for late-loaded NPC state and legacy `HitResult` compatibility.
+- NPC presence/handback/despawn fixes, remote-sphere cave and PVS `PopFreeIndex` safety, camp/enclave reputation synchronization, dialogue holds/gestures and `FollowNpc` guiding, ghost-NPC suppression, obstacle-aligned knockback, and host streaming hot-path optimization.
+- Incapacitated reset and reset/epoch edge cases hardened against stale state.
 
 ### Build 78
 - Local hit-state reset and NPC module line-budget cleanup.
-- Client NPC hit clip selection, knockback, and stumble crossfade fixes.
+- Floating corpses now recover correctly after pause/unpause.
+- Client NPC hit clip selection, 1x knockback, and stumble crossfade fixes.
 
 ### Build 77
 - Combo knockback and mirror lifecycle integration.
-- Melee hit responsiveness, stumble parity, and knockback synchronization.
-- Incoming melee raycasts and host counter-attack retargeting.
+- Client/melee incoming and outgoing hit parity, fixed melee contact raycasts, and host counter-attack retargeting.
+- Duplicate blood-effect suppression on acknowledged hit echoes.
+- Stumble/knockback synchronization and mirror lifecycle cleanup.
 
-### Build 76
-- No standalone protocol bump; follow-up fixes continued the guarded bone-stream work.
-
-### Build 75
-- Compact pose and player-state bandwidth changes.
-- 30/10 Hz pose delivery, exact key transport, and per-peer congestion-aware pacing.
-
-### Build 74
-- Targeting and replay corrections, ragdoll/downed follow-up, and compatibility cleanup.
-
-### Build 73
-- Compact NPC wire format and send-policy updates.
-
-### Build 72
-- Targeting fixes after kills and native NPC opponent replay improvements.
-
-### Build 71
-- Host-authoritative NPC synchronization, readiness/corpse fixes, and attitude synchronization.
+### Builds 76–71
+- Thermos S1–S6 integration and 1k-line module splits.
+- `patch::JumpTo` 24-byte `pushfd`/`popfd` guard, NPC death pop/ragdoll/NaN-bone fixes, and NPC playback jitter/post-handback stream-drop fixes.
+- Immediate kill XP and shared-fight XP fixes.
+- Merchant and personal-ledger save poisoning fixes.
+- Corpse ground-anchor resets across world, lease, and life resets.
+- Real-Steam host startup config-scope crash fix.
+- Duplicate-stack hero restore and remote-player animation/foot-sliding fixes.
+- Restore/epoch combat, XP, and puppet-clip state resets.
 
 ### Build 70
 - Protocol 79 high-bandwidth direct UDP and four-lane Steam Sockets fallback.
