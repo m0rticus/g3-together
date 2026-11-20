@@ -2,7 +2,7 @@
 
 **Return to Gothic 3 with a friend.** Share the campaign, fight side by side, and help each other back up when a battle goes wrong. One player hosts the world; the other joins over the network.
 
-[Release packages](https://github.com/m0rticus/g3-together/releases) · [Quickstart](#quickstart) · [Player guides](#player-guides) · [Build and test](#for-developers)
+[Release packages](https://github.com/m0rticus/g3-together/releases) · [Changelog](CHANGELOG.md) · [Quickstart](#quickstart) · [Player guides](#player-guides) · [Build and test](#for-developers)
 
 > **Steam-only fork.** Build from this checkout or use a package built from it. Upstream release packages still support
 > direct UDP and do not contain this change. Steam is required; IP/LAN/VPN joining and IP fallback are removed.
