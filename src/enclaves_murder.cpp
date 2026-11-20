@@ -2,6 +2,7 @@
 #include "enclaves_internal.h"
 #include "ai.h"
 #include "log.h"
+#include "telemetry.h"
 
 #include <Windows.h>
 #include <cstring>
@@ -133,6 +134,7 @@ void CountRemote(eCEntity* victim, RemoteKill const& kill)
     gCEnclave_PS* enclave = Native(town);
     if (char const* why = NotCounted(victim, town, enclave, kill.actor.c_str())) {
         ++remoteNotCounted;
+        telemetry::OnEnclaveEvent("remote_murder_exempt", town.GetInstance() ? town.GetName().GetText() : "-", kill.player, why, nullptr, nullptr, -1, -1, 0, 0);
         Logf("enclaves: player %u killed %s: no murder (%s)", kill.player, dead.GetName().GetText(), why);
         return;
     }
@@ -142,10 +144,12 @@ void CountRemote(eCEntity* victim, RemoteKill const& kill)
         Credit(kill, name, dead.GetName().GetText());
         return;
     }
-    Counters c = Read(enclave); // the scan carries it on (host: to everyone; client: as this machine's delta)
+    const Counters before = Read(enclave);
+    Counters c = before; // the scan carries it on (host: to everyone; client: as this machine's delta)
     ++c.crime[gEPlayerCrime_Murder];
     Write(town, c);
     ++remoteCounted;
+    telemetry::OnEnclaveEvent("remote_murder_counted", name, kill.player, ModeName(mode), before.crime, c.crime, before.known, c.known, before.fame, c.fame);
     Logf("enclaves: player %u murdered %s at %s (murders %d)", kill.player, dead.GetName().GetText(), name, c.crime[gEPlayerCrime_Murder]);
 }
 

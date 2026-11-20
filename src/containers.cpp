@@ -11,6 +11,7 @@
 #include "personal_ledger.h"
 #include "personal_store.h"
 #include "remote.h"
+#include "telemetry.h"
 #include "trade.h"
 #include "witness.h"
 
@@ -137,6 +138,7 @@ bool BlockWitnessedChestLoot(eCEntity* chestEntity)
 {
     Entity chest(chestEntity);
     if (!chestEntity || !IsChest(chest) || !witness::PerceiveChestUse(chestEntity)) return false;
+    telemetry::OnContainerAccess("chest_witness_blocked", gCSession::GetInstance().GetHero(), chestEntity, false, "blocked");
     if (IsLootPageOpen()) gCSession::GetInstance().GetGUIManager()->ClosePage();
     return true;
 }
@@ -162,46 +164,47 @@ GEBool __fastcall RefreshPersonalTrade(gCInventory_PS* inventory, void* edx)
 }
 
 template <typename Call>
-GEBool GuardedInventoryTransfer(gCInventory_PS* from, gCInventory_PS* to, Call&& call)
+GEBool GuardedInventoryTransfer(char const* mode, gCInventory_PS* from, gCInventory_PS* to, Call&& call, int stack = -1, int amount = -1)
 {
     if (ai::ShuttingDown() || !PersonalPlayerTransfer(from, to)) return call();
     if (ChestTakeBlockedByWitness(from, to)) return GEFalse;
     PersonalMutation mutation;
     if (!mutation.Enter(from) || !mutation.Enter(to)) return GEFalse;
-    return call();
+    telemetry::TransferScope transferScope(mode, from ? from->GetEntity() : nullptr, to ? to->GetEntity() : nullptr, stack, amount);
+    return transferScope.Finish(call() != GEFalse) ? GETrue : GEFalse;
 }
 
 GEBool __fastcall TransferPersonalItems(gCInventory_PS* from, void* edx, gCInventory_PS* to,
                                        GEInt stack, GEInt amount, gEStackType type)
 {
     if (!nativeTransferItems) return GEFalse;
-    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferItems(from, edx, to, stack, amount, type); });
+    return GuardedInventoryTransfer("transfer_items", from, to, [&] { return nativeTransferItems(from, edx, to, stack, amount, type); }, stack, amount);
 }
 
 GEBool __fastcall TransferPersonalStack(gCInventory_PS* from, void* edx, gCInventory_PS* to,
                                        GEInt stack, gEStackType type)
 {
     if (!nativeTransferStack) return GEFalse;
-    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferStack(from, edx, to, stack, type); });
+    return GuardedInventoryTransfer("transfer_stack", from, to, [&] { return nativeTransferStack(from, edx, to, stack, type); }, stack, -1);
 }
 
 GEBool __fastcall TransferPersonalAll(gCInventory_PS* from, void* edx, gCInventory_PS* to, gEStackType type)
 {
     if (!nativeTransferAll) return GEFalse;
-    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferAll(from, edx, to, type); });
+    return GuardedInventoryTransfer("transfer_all", from, to, [&] { return nativeTransferAll(from, edx, to, type); });
 }
 
 GEBool __fastcall TransferPersonalTransaction(gCInventory_PS* from, void* edx, gCInventory_PS* to, gEStackType type)
 {
     if (!nativeTransferTransaction) return GEFalse;
-    return GuardedInventoryTransfer(from, to, [&] { return nativeTransferTransaction(from, edx, to, type); });
+    return GuardedInventoryTransfer("transfer_tx", from, to, [&] { return nativeTransferTransaction(from, edx, to, type); });
 }
 
 GEBool __fastcall PerformPersonalTransaction(gCInventory_PS* from, void* edx, gCInventory_PS* to,
                                             gEStackType fromType, gEStackType toType)
 {
     if (!nativeTransaction) return GEFalse;
-    return GuardedInventoryTransfer(from, to, [&] { return nativeTransaction(from, edx, to, fromType, toType); });
+    return GuardedInventoryTransfer("perform_tx", from, to, [&] { return nativeTransaction(from, edx, to, fromType, toType); });
 }
 
 GEBool __fastcall TransferPersonalScript(PSInventory* from, void* edx, GEInt stack, GEInt amount, Entity& to)
@@ -211,7 +214,7 @@ GEBool __fastcall TransferPersonalScript(PSInventory* from, void* edx, GEInt sta
     auto* inventory = property ? static_cast<gCInventory_PS*>(property) : nullptr;
     auto* target = to.GetInstance()
         ? static_cast<gCInventory_PS*>(to.GetInstance()->GetPropertySet(eEPropertySetType_Inventory)) : nullptr;
-    return GuardedInventoryTransfer(inventory, target, [&] { return nativeScriptTransfer(from, edx, stack, amount, to); });
+    return GuardedInventoryTransfer("script_transfer", inventory, target, [&] { return nativeScriptTransfer(from, edx, stack, amount, to); }, stack, amount);
 }
 
 GEBool __fastcall BeginPersonalTrade(gCGUIManager* manager, void* edx, eCEntity* partner)
@@ -228,6 +231,7 @@ GEBool __fastcall BeginPersonalTrade(gCGUIManager* manager, void* edx, eCEntity*
     }
     const GEBool result = nativeBeginTrade(manager, edx, partner);
     if (result && !key.empty() && IsRestored(key)) MarkTradeOpened(key);
+    telemetry::OnContainerAccess("begin_trade", gCSession::GetInstance().GetHero(), partner, true, result ? "opened" : "failed");
     return result;
 }
 
@@ -368,6 +372,10 @@ bool PrepareLocalTrade(Entity& entity)
 void LocalInventoryTick()
 {
     if (!PersonalAdmitted()) return;
+    if (eCEntity* hero = gCSession::GetInstance().GetHero()) {
+        Entity focus = Entity(hero).Focus.GetFocusEntity();
+        if (focus.GetInstance() && Corpse(focus)) PrepareLocalLoot(focus);
+    }
     TrackPersonalFocus();
     const DWORD now = GetTickCount();
     if (now - lastLocalPoll < 1000) return;
@@ -404,6 +412,16 @@ bool Opened(gCScriptProcessingUnit* spu, GELPVoid other, bool trade)
     return trade ? PrepareLocalTrade(partner) : PrepareLocalLoot(partner);
 }
 
+void ExitGonnaLoot(eCEntity* actor)
+{
+    if (!actor || actor != gCSession::GetInstance().GetHero() || downed::CombatUnavailable(actor)) return;
+    if (!actor->GetPropertySet(eEPropertySetType_ScriptRoutine)) return;
+    Entity hero(actor);
+    if (std::strcmp(hero.Routine.GetCurrentState().GetText(), "PS_GonnaLoot") != 0) return;
+    hero.Routine.FullStop();
+    hero.Routine.ContinueRoutine();
+}
+
 GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ai::ShuttingDown()) return originalLoot ? originalLoot(spu, self, other, args) : 0;
@@ -414,13 +432,19 @@ GEInt GE_STDCALL OpenLoot(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
             actor == gCSession::GetInstance().GetHero() && !downed::CombatUnavailable(actor)) {
             const GEInt result = GetScriptAdminExt().CallScript(bCString("AssessTalk"), actor, partner.GetInstance(), 0);
             remote::LogPuppetInteraction(partner.GetInstance(), "loot-rerouted-to-talk", result);
+            if (!result) ExitGonnaLoot(actor);
             return result;
         }
         remote::LogPuppetInteraction(partner.GetInstance(), "loot-refused", 0);
         Note("containers: loot of %s refused (another player)", NameOf(partner).c_str());
+        ExitGonnaLoot(actor);
         return 0;
     }
-    if (!Opened(spu, other, false)) return 0;
+    if (!Opened(spu, other, false)) {
+        telemetry::OnContainerAccess("open_loot", gCSession::GetInstance().GetHero(), partner.GetInstance(), false, "refused_pending");
+        return 0;
+    }
+    telemetry::OnContainerAccess("open_loot", gCSession::GetInstance().GetHero(), partner.GetInstance(), false, "opened");
     return originalLoot(spu, self, other, args);
 }
 
@@ -430,9 +454,14 @@ GEInt GE_STDCALL OpenTrade(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid 
     Entity partner = other ? *static_cast<Entity*>(other) : Entity(spu ? spu->GetOtherEntity() : nullptr);
     if (remote::PuppetOwner(partner.GetInstance()) && !trade::Available()) {
         Log("trade: native player exchange unavailable; opening refused");
+        telemetry::OnContainerAccess("open_player_trade", gCSession::GetInstance().GetHero(), partner.GetInstance(), true, "refused_unavailable");
         return 0;
     }
-    if (!Opened(spu, other, true)) return 0;
+    if (!Opened(spu, other, true)) {
+        telemetry::OnContainerAccess("open_trade", gCSession::GetInstance().GetHero(), partner.GetInstance(), true, "refused_pending");
+        return 0;
+    }
+    telemetry::OnContainerAccess("open_trade", gCSession::GetInstance().GetHero(), partner.GetInstance(), true, "opened");
     return originalTrade(spu, self, other, args);
 }
 
@@ -462,9 +491,13 @@ GEBool __fastcall QuickTake(PSInventory* self, void*, GEInt stack, GEInt amount,
             ++quickRefused;
             return GEFalse;
         }
+        if (kind == personal::Kind::Corpse && !entity.Inventory.IsGeneratedPlunder()) {
+            PrepareLocalLoot(entity);
+        }
         RememberPersonal(entity);
         const std::string key = EntityKey(owner);
-        const GEBool moved = self->TransferAmountTo(stack, amount, to);
+        telemetry::TransferScope transferScope("quickloot", owner, to.GetInstance(), stack, amount);
+        const GEBool moved = transferScope.Finish(self->TransferAmountTo(stack, amount, to) != GEFalse) ? GETrue : GEFalse;
         if (moved) {
             ++quickTakes;
             Entity current = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
@@ -590,6 +623,13 @@ bool PersonalHooksReady()
 {
     if (AreAllPersonalHooksReady()) return true;
     return !ai::ShuttingDown() && gCSession::GetInstance().IsGameRunning() && InstallAccessGuards();
+}
+
+void PrepareCorpseLoot(eCEntity* entity)
+{
+    if (!entity || ai::ShuttingDown() || !gCSession::GetInstance().IsGameRunning()) return;
+    Entity target(entity);
+    if (Corpse(target)) PrepareLocalLoot(target);
 }
 
 bool CapturePersonal(std::vector<uint8_t>& out)

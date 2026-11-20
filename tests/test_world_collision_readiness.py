@@ -40,6 +40,8 @@ class WorldCollisionReadinessTests(unittest.TestCase):
         self.assertIn("ShouldAttemptRegionRelease", world_pvs_cpp)
         self.assertIn("LoadPublishedRegions()", world_pvs_cpp)
         self.assertIn("DrainPrefetcherGroup", world_pvs_cpp)
+        self.assertIn("!HasReadyAnchorCell(*region.prefetcher, at)", world_pvs_cpp)
+        self.assertIn("if (moved || anchorMissing)", world_pvs_cpp)
         self.assertIn("OnExitProcessingRange@eCEntity@@MAEXXZ", world_collision_cpp)
         self.assertIn("CacheOutInternal@eCEntity@@IAEX_N@Z", world_collision_cpp)
         self.assertIn("HasOtherThreadInFlightLocked(entity, selfThread)", world_collision_cpp)

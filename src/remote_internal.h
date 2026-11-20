@@ -73,6 +73,24 @@ extern WearStats wearStats;
 extern bool haveAnchor;
 extern bCVector anchor;
 
+inline GuidKey KeyOf(eCEntity* entity)
+{
+    const eCEntityProxy proxy(entity);
+    GuidKey key{};
+    std::memcpy(key.data(), &proxy.GetEntityID().GetCore(), 16);
+    return key;
+}
+
+inline Entity ByKey(GuidKey const& key)
+{
+    _GUID raw;
+    std::memcpy(&raw, key.data(), 16);
+    return Entity(bCPropertyID(bCGuid(raw)));
+}
+
 GEInt StackFor(Entity& body, char const* name);
 void TakeOff(Entity& body, gESlot slot);
+void NoDrop(Puppet& puppet, uint32_t now);
+void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now);
+void LogPlayerStreams(uint32_t now);
 }

@@ -550,3 +550,13 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         spells = _testbuild.src_text("spells.cpp")
         self.assertIn("PendingTakeOverExpireMs", spells)
 
+    def test_activate_failure_restores_lease_state_and_handback_covers_cooldown(self):
+        activate = section(self.core_source, "bool Activate(", "bool CurrentPeer(")
+        self.assertIn("auto rollback =", activate)
+        self.assertIn("entry.lease.phase = resume;", activate)
+        self.assertIn("entry.active = active;", activate)
+        self.assertIn("return rollback();", activate)
+
+        release = section(self.client_source, "void ReleaseLocal(", "void ReceiveClient(")
+        self.assertIn("npcown::YieldCooldownMs", release)
+

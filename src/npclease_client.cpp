@@ -22,6 +22,7 @@
 #include "persist.h"
 #include "remote.h"
 #include "talk.h"
+#include "telemetry.h"
 #include "world.h"
 #include "crashlog.h"
 
@@ -130,6 +131,10 @@ void OwnEventAlways(GuidKey const& key, char const* name, npcown::Event event, c
     guid::Format(key.data(), text, sizeof(text));
     npcown::FormatEvent(line, sizeof(line), text, name, event, detail);
     Log(line);
+    const auto found = entries.find(key);
+    telemetry::OnLeaseEvent(npcown::Name(event), 0, net::LocalId(), key.data(), nullptr,
+                            found != entries.end() ? found->second.lease.epoch : 0u,
+                            found != entries.end() ? found->second.lease.incarnation : 0u, detail ? detail : name);
 }
 void ReadinessDiagnostic(char const* action, GuidKey const& key, Entry const& entry, eCEntity* entity,
                          ClientReadiness const& readiness, char const* why)
@@ -182,7 +187,7 @@ void ReleaseLocal(GuidKey const& key, Entry& entry, eCEntity* entity, bool stop)
     if (entry.vetted && entry.world == net::WorldEpoch() && entry.welcome == net::WelcomeSerial()) {
         const uint32_t now = net::Now();
         if (entry.lease.owner == net::LocalId() || entry.lease.owner == 0) entry.lease.owner = 1;
-        entry.handbackUntil = (now ? now : 1) + 750u;
+        entry.handbackUntil = (now ? now : 1) + npcown::YieldCooldownMs;
         if (!entry.handbackUntil) entry.handbackUntil = 1;
     }
     entry.local = false; entry.confirmed = false; entry.active = false; entry.prepared = false;

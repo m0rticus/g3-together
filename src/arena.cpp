@@ -15,6 +15,7 @@
 #include "remote.h"
 #include "story.h"
 #include "talk.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -281,6 +282,7 @@ void BindFighterToPlayerOnHost(eCEntity* npc, eCEntity* arenaEntity, char const*
     h.awaitUntil = awaitingQuestSync ? (net::Now() + 5000u) : 0u;
     if (!h.quest.empty()) boutQuests[h.quest].challenger = player;
     npcs::SetContext(npc, player);
+    telemetry::OnArenaBind(npc, arenaEntity, h.arena.c_str(), h.quest.c_str(), player, awaitingQuestSync);
 }
 
 bool BindQuestFightersOnHost(gCQuest_PS* quest, char const* questName, uint8_t player)
@@ -316,6 +318,7 @@ void ForfeitBoutQuestOnHost(gCQuest_PS* quest, std::string const& questName, Hel
         h->awaitUntil = 0;
     }
     FlushArenaAndQuests();
+    telemetry::OnArenaEvent("forfeit", h ? h->arena.c_str() : "", questName.c_str(), nullptr, h ? h->player : 0, gEQuestStatus_Running, gEQuestStatus_Lost, "forfeited");
 }
 
 GEInt InvokeNativeSendToArena(gCScriptProcessingUnit* spu, eCEntity* npc, eCEntity* arenaEntity,
@@ -352,12 +355,19 @@ GEInt GE_STDCALL OnLeaveAreaDetour(gCScriptProcessingUnit* spu, GELPVoid self, G
     eCEntity* leaving = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
     eCEntity* areaEntity = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
     char const* areaName = areaEntity ? Entity(areaEntity).GetName().GetText() : "";
-    if (on && net::Connected() && guards::IsLocalPlayer(leaving) && areaName && *areaName) {
+    const bool localPlayer = guards::IsLocalPlayer(leaving);
+    if (on && leaving &&
+        arena_policy::ShouldSuppressNonLocalAreaActor(
+            net::IsHost(), net::Connected(), localPlayer, npclease::LocalAuthority(leaving))) {
+        return 0;
+    }
+    if (on && net::Connected() && localPlayer && areaName && *areaName) {
         bool hasRunningBout = false;
         const uint8_t challenger = ActiveChallengerForArea(areaName, hasRunningBout);
         const uint8_t localId = net::IsHost() ? 1 : net::LocalId();
         if (arena_policy::ShouldSuppressPlayerLeaveArea(true, hasRunningBout, challenger, localId)) {
             ++leaveSuppressed;
+            telemetry::OnArenaEvent("spectator_leave_suppressed", areaName, "", leaving, challenger, -1, -1, "on_leave_area");
             Logf("arena: ignored spectator player %u leaving active arena %s (challenger=%u)",
                  localId, areaName, challenger);
             return 0;
@@ -375,8 +385,14 @@ GEInt GE_STDCALL OnEnterAreaDetour(gCScriptProcessingUnit* spu, GELPVoid self, G
     if (ai::ShuttingDown() || !originalOnEnterArea)
         return originalOnEnterArea ? originalOnEnterArea(spu, self, other, args) : 0;
     eCEntity* entering = self ? static_cast<Entity*>(self)->GetInstance() : (spu ? spu->GetSelfEntity() : nullptr);
+    const bool localPlayer = guards::IsLocalPlayer(entering);
+    if (on && entering &&
+        arena_policy::ShouldSuppressNonLocalAreaActor(
+            net::IsHost(), net::Connected(), localPlayer, npclease::LocalAuthority(entering))) {
+        return 0;
+    }
     bool challengerLeavingBout = false;
-    if (on && net::Connected() && guards::IsLocalPlayer(entering) &&
+    if (on && net::Connected() && localPlayer &&
         entering && entering->GetPropertySet(eEPropertySetType_NPC)) {
         Entity leavingHero(entering);
         Entity altTarget = leavingHero.NPC.GetAlternativeTarget();
@@ -408,8 +424,12 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     ++sent;
     if (on && !net::IsHost() && npc && net::Connected()) {
         char const* arenaName = arenaEntity ? Entity(arenaEntity).GetName().GetText() : "";
-        if (gCQuest_PS* q = FindCandidateBoutQuestForNpc(npc, arenaName))
-            boutQuests[q->GetName().GetText()].challenger = net::LocalId();
+        if (gCQuest_PS* q = FindCandidateBoutQuestForNpc(npc, arenaName)) {
+            BoutQuestState& qs = boutQuests[q->GetName().GetText()];
+            qs.challenger = net::LocalId();
+            qs.syncedFromHost = false;
+            qs.observedStatus = static_cast<int>(q->GetStatus().GetValue());
+        }
         if (npclease::LocalAuthority(npc))
             npclease::RelinquishToHost(npc, "arena bout");
         if (npcs::Claimed(npc))
@@ -421,16 +441,14 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         if (arenaName && *arenaName) strncpy_s(request.routine, arenaName, _TRUNCATE);
         net::SendWorldState(request, 0);
         ++taken;
+        telemetry::OnArenaEvent("client_request", arenaName, "", npc, net::LocalId(), -1, -1, "send_to_arena");
         Logf("arena: requested host bout with %s at %s for player %u",
              Entity(npc).GetName().GetText(), (arenaName && *arenaName) ? arenaName : "-", net::LocalId());
         return GETrue;
     }
     if (on && net::IsHost() && npc && net::Connected()) {
-        uint8_t player = 1;
-        if (eCEntity* acting = guards::CurrentActor(); acting && remote::IsPuppet(acting)) {
-            const int owner = remote::PuppetOwner(acting);
-            if (owner >= 2 && owner < net::MaxPlayers) player = static_cast<uint8_t>(owner);
-        }
+        // Client bouts dispatch through InvokeNativeSendToArena; Detour on host only runs from host-initiated scripts/dialogs.
+        constexpr uint8_t player = 1;
         char const* arenaName = arenaEntity ? Entity(arenaEntity).GetName().GetText() : "";
         BindFighterToPlayerOnHost(npc, arenaEntity, arenaName, nullptr, player, false);
         SyncArenaStatuses();
@@ -444,8 +462,10 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     return originalSendToArena(spu, self, other, args);
 }
 
-void ObserveQuestTransitions()
+void ObserveQuestTransitions(bool allowFlush)
 {
+    bool syncArenas = false;
+    bool flushQuests = false;
     for (CachedBoutQuest const& entry : BoutQuests()) {
         gCQuest_PS* quest = entry.quest;
         if (!quest) continue;
@@ -455,33 +475,42 @@ void ObserveQuestTransitions()
         const bool firstObservation = (qs.observedStatus < 0);
         const int prev = firstObservation ? status : qs.observedStatus;
         qs.observedStatus = status;
+        auto endBout = [&](bool shouldFlush) {
+            const uint8_t endedChallenger = qs.challenger;
+            qs.challenger = 0;
+            qs.awaitingNpcLoad = false;
+            syncArenas = true;
+            if (shouldFlush) flushQuests = true;
+            telemetry::OnArenaEvent("bout_end", "", entry.name.c_str(), nullptr, endedChallenger, prev, status);
+        };
         if (!net::IsHost()) {
             const bool synced = qs.syncedFromHost;
             qs.syncedFromHost = false;
             if (!firstObservation && arena_policy::ShouldClaimLocalClientBout(
                                          false, net::Connected(), type, prev, status, synced)) {
                 qs.challenger = net::LocalId();
-                FlushArenaAndQuests();
+                syncArenas = true;
+                flushQuests = true;
+                telemetry::OnArenaEvent("client_bout_start", "", entry.name.c_str(), nullptr, qs.challenger, prev, status);
                 Logf("arena: client player %u started %s locally (%d -> %d)",
                      net::LocalId(), entry.name.c_str(), prev, status);
             } else if (status != gEQuestStatus_Running) {
-                qs.challenger = 0;
-                if (!firstObservation && prev == gEQuestStatus_Running) {
-                    SyncArenaStatuses();
-                    if (!synced) story::FlushQuests();
-                }
+                if (!firstObservation && prev == gEQuestStatus_Running) endBout(!synced);
+                else qs.challenger = 0;
             }
             continue;
         }
         if (!firstObservation && arena_policy::IsBoutStartTransition(type, prev, status)) {
             if (qs.challenger == 0) qs.challenger = 1;
-            FlushArenaAndQuests();
+            syncArenas = true;
+            flushQuests = true;
+            telemetry::OnArenaEvent("host_bout_start", "", entry.name.c_str(), nullptr, qs.challenger, prev, status);
         } else if (!firstObservation && status != gEQuestStatus_Running && prev == gEQuestStatus_Running) {
-            qs.challenger = 0;
-            qs.awaitingNpcLoad = false;
-            FlushArenaAndQuests();
+            endBout(true);
         }
     }
+    if (syncArenas) SyncArenaStatuses();
+    if (allowFlush && flushQuests) story::FlushQuests();
 }
 
 void ResolvePendingHostBoutQuests()
@@ -567,6 +596,12 @@ void InstallHooks()
 }
 } // namespace
 
+void ObserveLocalQuests()
+{
+    if (!gCSession::GetInstance().IsGameRunning() || !on) return;
+    ObserveQuestTransitions(false);
+}
+
 void SyncArenaStatuses()
 {
     if (!gCSession::GetInstance().IsGameRunning()) return;
@@ -580,7 +615,7 @@ void SyncArenaStatuses()
     const uint32_t now = net::Now();
     for (CachedArena& a : cachedArenas) {
         eCEntity* inst = a.proxy.GetEntity();
-        if (!inst && !a.proxy.GetEntityID().IsValid() &&
+        if (!inst &&
             (a.runningCount > 0 || a.nextLookupAt == 0 || static_cast<int32_t>(now - a.nextLookupAt) >= 0)) {
             a.nextLookupAt = now + 1000u;
             Entity resolved = Entity::GetEntity(bCString(a.name.c_str()));
@@ -611,6 +646,7 @@ bool AllowClientQuestStatusOnHost(uint8_t from, char const* questName, int clien
     }
     if (!arena_policy::ShouldAcceptClientQuestStatusOnHost(type, hostStatus, challenger, from, clientNewStatus)) {
         ++statusRefused;
+        telemetry::OnArenaEvent("status_refused", "", questName, nullptr, challenger, hostStatus, clientNewStatus, "client_quest_status");
         Logf("arena: refused client player %u status=%d for %s (hostStatus=%d challenger=%u)",
              from, clientNewStatus, questName, hostStatus, challenger);
         return false;
@@ -630,6 +666,8 @@ void OnClientArenaQuestStatus(uint8_t from, char const* questName, int prevStatu
     qs.observedStatus = newStatus;
     if (arena_policy::IsBoutStartTransition(type, prevStatus, newStatus)) {
         qs.challenger = from;
+        for (auto& [key, h] : held)
+            if (h.quest == questName) h.started = false;
         qs.awaitingNpcLoad = !BindQuestFightersOnHost(quest, questName, from);
         SyncArenaStatuses();
         char const* arenaName = quest->GetDestinationEntity().GetText();
@@ -683,6 +721,7 @@ void TrackDuel(eCEntity* npc, uint8_t player)
     }
     npcs::SetContext(npc, player);
     if (player > 1) RefreshPuppetZone(remote::PuppetOf(player));
+    telemetry::OnArenaEvent("duel_track", "", h.quest.c_str(), npc, player, -1, -1, "duel");
 }
 
 uint8_t ChallengerForNpc(eCEntity const* npc)
@@ -718,9 +757,11 @@ void OnState(uint8_t from, net::WorldState const& state)
         arena_policy::ShouldDispatchSendToArenaOnHost(
             Fights(npcInst), talk::IsHeld(npcInst), npclease::Fenced(npc.GetInstance()), task)) {
         InvokeNativeSendToArena(nullptr, npcInst, arenaEntity, from);
-        if (arena_policy::HasFighterEnteredBoutTask(npc.Routine.GetCurrentTask().GetText())) {
+        char const* postTask = npc.Routine.GetCurrentTask().GetText();
+        if (arena_policy::HasFighterEnteredBoutTask(postTask)) {
             h.started = true;
             ++started;
+            telemetry::OnArenaEvent("fighter_active", h.arena.c_str(), h.quest.c_str(), npcInst, h.player, -1, -1, postTask);
         }
     }
 }
@@ -733,7 +774,7 @@ void Tick()
         if (!installed) return;
     }
     if (!on) return;
-    ObserveQuestTransitions();
+    ObserveQuestTransitions(true);
     SyncArenaStatuses();
     if (!net::IsHost()) {
         if (!net::Connected()) {
@@ -817,6 +858,7 @@ void Tick()
             if (!h.started) {
                 h.started = true;
                 ++started;
+                telemetry::OnArenaEvent("fighter_active", h.arena.c_str(), h.quest.c_str(), npc, h.player, -1, -1, task);
                 Logf("arena: %s active in bout for player %u (task %s)", h.name.c_str(), h.player, task);
             }
         }
@@ -827,6 +869,7 @@ void Tick()
         if (npcs::HostTaken(npc)) npcs::HostRelease(npc);
         ++given;
         story::FlushQuests();
+        telemetry::OnArenaEvent("fighter_finished", h.arena.c_str(), h.quest.c_str(), npc, h.player, -1, -1, task);
         Logf("arena: %s finished bout for player %u (task %s)", h.name.c_str(), h.player, task);
         it = held.erase(it);
     }

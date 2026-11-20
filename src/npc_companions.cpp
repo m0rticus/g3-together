@@ -17,6 +17,7 @@
 #include "steam.h"
 #include "talk.h"
 #include "talk_policy.h"
+#include "telemetry.h"
 #include "world.h"
 
 #include <algorithm>
@@ -125,6 +126,8 @@ void OfferCompanions(uint32_t now)
             ++companionsOffered;
             Logf("npcs: %s is %s's companion (saved steamid=%llu); handed over",
                  Resolve(key).GetName().GetText(), net::PeerName(id), owner.account);
+            telemetry::OnGuideEvent("companion_offered", id, npc.GetInstance(), key.data(),
+                                    !guide::IsQuestGuide(npc.GetInstance()), "saved_steamid");
             break;
         }
     }
@@ -152,6 +155,7 @@ void ClaimTick(uint32_t now)
                                Entity(actor).Party.GetPartyLeader().GetInstance() == npc.GetInstance();
             if (follower || guide) { ++it; continue; }
             Logf("npcs: %s's canonical relationship with player %u ended", npc.GetName().GetText(), player);
+            telemetry::OnGuideEvent("companion_ended", player, npc.GetInstance(), it->first.data(), true, "relation_ended");
             SendRevoke(it->first, player);
             companionIdentity.owners.erase(rawKey);
             claimSeen.erase(it->first);
@@ -254,6 +258,7 @@ void Revoked(uint8_t const guid[16])
 {
     Entity e = Resolve(guid);
     Logf("npcs: the host took back %s", e.GetInstance() ? e.GetName().GetText() : "?");
+    telemetry::OnGuideEvent("claim_revoked", net::LocalId(), e.GetInstance(), guid, true, "host_revoked");
     if (e.GetInstance()) {
         Unclaim(e.GetInstance());
         eCEntity* hero = remote::ControlledBody();
@@ -302,6 +307,7 @@ bool OnClaim(uint8_t const guid[16], uint8_t player, bool take)
         DropMirror(key);
     }
     Logf("npcs: player %u %s %s", player, take ? "took over" : "gave back", Resolve(guid).GetInstance() ? Resolve(guid).GetName().GetText() : "?");
+    telemetry::OnGuideEvent(take ? "claim_accepted" : "claim_released", player, Resolve(guid).GetInstance(), guid, true, "on_claim");
     return true;
 }
 

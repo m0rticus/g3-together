@@ -8,6 +8,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "movement.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -34,6 +35,8 @@ IsPlayerFn originalIsPlayer = nullptr;
 bool installed = false;
 DWORD lastTry = 0;
 thread_local eCEntity* actor = nullptr;  // the puppet that stands for the game's player now
+thread_local eCEntity* activeNpc = nullptr;
+thread_local enclaves::SavedTheftState activeTheft{};
 thread_local int depth = 0;
 std::unordered_map<eCEntity*, DWORD> lastCheck;  // per NPC: its look around runs every frame in some states
 DWORD lastZoneLook = 0;
@@ -115,7 +118,7 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         GEInt reacted = 0;
         char const* rule = nullptr;
         {
-            Acting acting(puppet);
+            Acting acting(puppet, true, npc);
             for (char const* name : {"AssessPlayerZone", "AssessPlayerWeapon"}) {
                 reacted = GetScriptAdminExt().CallScript(bCString(name), npc, puppet, 0);
                 if (reacted) { rule = name + 12; break; }
@@ -125,6 +128,8 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         if (reacted) {
             last = now + 8000;
             remote::NoteContact(npc, puppet);
+            const int lastCrime = static_cast<int>(static_cast<gEPlayerCrime const&>(static_cast<gCNPC_PS*>(npc->GetPropertySet(eEPropertySetType_NPC))->AccessLastPlayerCrime()));
+            telemetry::OnGuardEvent(rule, npc, puppet, static_cast<int>(guard.NPC.AttackReason), lastCrime, MeansToKill(npc, puppet));
             Logf("guards: %s reacts to player %d (%s; task %s, target %s, ani state %d)", guard.GetName().GetText(), id, rule,
                  guard.Routine.GetCurrentTask().GetText(),
                  guard.NPC.GetCurrentTarget().GetInstance() ? guard.NPC.GetCurrentTarget().GetName().GetText() : "-",
@@ -164,7 +169,7 @@ GEInt GE_STDCALL KillIntent(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid
     }
     LocalPlayer local(!puppet && IsLocalPlayer(asked));
     KeepZone(puppet);
-    Acting acting(puppet);
+    Acting acting(puppet, true, judging);
     const GEInt result = originalKill(spu, self, other, args);
     if (puppet) {
         ++killAsked;
@@ -193,14 +198,14 @@ eCEntity* TargetPuppet(gCScriptProcessingUnit* spu)
 GEBool GE_STDCALL OnZone(gCScriptProcessingUnit* spu)
 {
     if (ai::ShuttingDown()) return originalOnZone ? originalOnZone(spu) : GEFalse;
-    Acting acting(TargetPuppet(spu));
+    Acting acting(TargetPuppet(spu), true, spu ? spu->GetSelfEntity() : nullptr);
     return originalOnZone(spu);
 }
 
 GEBool GE_STDCALL OnWeapon(gCScriptProcessingUnit* spu)
 {
     if (ai::ShuttingDown()) return originalOnWeapon ? originalOnWeapon(spu) : GEFalse;
-    Acting acting(TargetPuppet(spu));
+    Acting acting(TargetPuppet(spu), true, spu ? spu->GetSelfEntity() : nullptr);
     return originalOnWeapon(spu);
 }
 
@@ -229,6 +234,7 @@ GEBool GE_STDCALL OnAnimalSleep(gCScriptProcessingUnit* spu)
         --depth;
         if (std::strcmp(self.Routine.GetCurrentState().GetText(), asleep.GetText())) {
             remote::NoteContact(animal, puppet);
+            telemetry::OnGuardEvent("animal_wake", animal, puppet, static_cast<int>(self.NPC.AttackReason), -1, false);
             Logf("guards: %s wakes up for player %d (%.0f m; task %s, target %s)", self.GetName().GetText(), id, Distance(animal, puppet) / 100.0f,
                  self.Routine.GetCurrentTask().GetText(),
                  self.NPC.GetCurrentTarget().GetInstance() ? self.NPC.GetCurrentTarget().GetName().GetText() : "-");
@@ -277,25 +283,80 @@ static void KeepChapter(eCEntity* puppet)
     body.PlayerMemory.Chapter = chapter;
 }
 
-Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor)
+void Acting::Enter(eCEntity* puppet, bool keepChapter, eCEntity* npc)
 {
     if (puppet) {
+        prevNpc = activeNpc;
+        hadPrevTheft = activeTheft.active;
+        if (activeTheft.active) {
+            enclaves::RestorePlayerTheft(activeTheft);
+            activeTheft = {};
+            activeNpc = nullptr;
+        }
         if (keepChapter) KeepChapter(puppet);
         actor = puppet;
+        const int owner = remote::PuppetOwner(puppet);
+        if (npc && owner > 1 && enclaves::ApplyPlayerTheft(npc, static_cast<uint8_t>(owner), activeTheft)) {
+            appliedTheft = true;
+            activeNpc = npc;
+        }
     }
 }
 
-Acting::~Acting() { actor = before; }
+Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor)
+{
+    Enter(puppet, keepChapter, nullptr);
+}
+
+Acting::Acting(eCEntity* puppet, bool keepChapter, eCEntity* npc) : before(actor)
+{
+    Enter(puppet, keepChapter, npc);
+}
+
+Acting::~Acting()
+{
+    if (appliedTheft && activeTheft.active) {
+        enclaves::RestorePlayerTheft(activeTheft);
+        activeTheft = {};
+        activeNpc = nullptr;
+    }
+    actor = before;
+    if (hadPrevTheft && before && prevNpc) {
+        const int owner = remote::PuppetOwner(before);
+        if (owner > 1 && enclaves::ApplyPlayerTheft(prevNpc, static_cast<uint8_t>(owner), activeTheft))
+            activeNpc = prevNpc;
+    }
+}
 
 LocalPlayer::LocalPlayer(bool local) : before(actor)
 {
     if (local) {
         if (actor) movement::Touch(remote::ControlledBody(), "local-context", "puppet-context-cleared");
+        if (activeTheft.active) {
+            pausedNpc = activeNpc;
+            enclaves::RestorePlayerTheft(activeTheft);
+            activeTheft = {};
+            activeNpc = nullptr;
+            resumedTheft = true;
+        }
         actor = nullptr;
     }
 }
 
-LocalPlayer::~LocalPlayer() { actor = before; }
+LocalPlayer::~LocalPlayer()
+{
+    if (resumedTheft && activeTheft.active) {
+        enclaves::RestorePlayerTheft(activeTheft);
+        activeTheft = {};
+        activeNpc = nullptr;
+    }
+    actor = before;
+    if (resumedTheft && before && pausedNpc) {
+        const int owner = remote::PuppetOwner(before);
+        if (owner > 1 && enclaves::ApplyPlayerTheft(pausedNpc, static_cast<uint8_t>(owner), activeTheft))
+            activeNpc = pausedNpc;
+    }
+}
 
 eCEntity* CurrentActor() { return actor; }
 bool PlayerContextReady() { return originalGetPlayer && originalIsPlayer; }
@@ -344,7 +405,7 @@ bool MeansToKill(eCEntity* npc, eCEntity* playerTarget)
     {
         LocalPlayer local(!puppet);
         KeepZone(puppet);
-        Acting acting(puppet, false);
+        Acting acting(puppet, false, npc);
         if (originalKill) {
             Entity selfEntity(npc);
             Entity otherEntity(playerTarget);
@@ -376,6 +437,8 @@ void OnWorldChange()
     lastCheck.clear();
     lastZoneLook = 0;
     actor = nullptr;
+    activeNpc = nullptr;
+    activeTheft = {};
     depth = 0;
 }
 
@@ -383,6 +446,8 @@ void OnEntityDestroyed(eCEntity const* entity)
 {
     if (!entity) return;
     lastCheck.erase(const_cast<eCEntity*>(entity));
+    if (activeNpc == entity) activeNpc = nullptr;
+    if (activeTheft.enclaveEntity == entity) activeTheft = {};
 }
 
 void Tick()

@@ -5,6 +5,7 @@
 #include "guards.h"
 #include "log.h"
 #include "net.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -161,6 +162,7 @@ bool Add(int amount)
         if (amount - gained >= 5) ++repaired;
     }
     appliedTotal += amount;
+    telemetry::OnXpEvent("shared_from_peer", 0, before, Experience(hero), amount, LevelOf(hero));
     Logf("xpshare: %+d experience from the others: xp %d -> %d, level %u -> %u", amount, before, Experience(hero), level, LevelOf(hero));
     return true;
 }
@@ -279,6 +281,7 @@ void NoteGiveXp(int gained)
     PrepareAdmissions(now);
     earned += static_cast<uint32_t>(gained);
     ledger.Add(net::LocalId(), static_cast<uint32_t>(gained));
+    if (eCDynamicEntity* h = Hero()) telemetry::OnXpEvent("earned", net::LocalId(), Experience(h) - gained, Experience(h), gained, LevelOf(h));
     Logf("xpshare: the hero earned %d (%u in all)", gained, earned);
     SendLive(now, false);
 }

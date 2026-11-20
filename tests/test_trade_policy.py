@@ -102,6 +102,20 @@ class TradePolicyTests(unittest.TestCase):
         self.assertNotIn("entity.Item.IsMissionItem()", apply_body)
         self.assertNotIn("entity.Item.GetCategory()", apply_body)
 
+    def test_offer_same_and_take_mask_quality_bits(self):
+        same_body = function_body(
+            self.offer_cpp,
+            r"\bbool\s+Same\s*\(",
+        )
+        take_body = function_body(
+            self.offer_cpp,
+            r"\bint\s+Take\s*\(",
+        )
+        self.assertIsNotNone(same_body)
+        self.assertIsNotNone(take_body)
+        self.assertIn("GetQuality(stack) & trade_policy::QualityMask", same_body)
+        self.assertIn("GetQuality(i) & trade_policy::QualityMask", take_body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -340,6 +340,9 @@ class NpcCorpseTests(unittest.TestCase):
         lay_corpse = section(self.corpse_cpp, "void LayDownCorpse(", "} // namespace g3t::npcs")
         self.assertIn("c.hostSession = net::WelcomeSerial();", lay_corpse)
         self.assertIn("existing->second.hostSession = net::WelcomeSerial();", lay_corpse)
+        self.assertIn("containers::PrepareCorpseLoot(entity);", lay_corpse)
+        clear_refs = section(self.corpse_cpp, "unsigned ClearLocalReferencesToDeadMirror(", "void KeepDead(")
+        self.assertIn("containers::PrepareCorpseLoot(dead);", clear_refs)
         corpse_tick = section(self.corpse_cpp, "void CorpseTick(", "void ForgetCorpseGroundAnchor(")
         self.assertIn("c.hostSession = net::WelcomeSerial();", corpse_tick)
         # PresentedContactPoints clamps mNodes.mLength via ragdoll::ClampedBoneCount(..., 128) to avoid off-by-one GetBoneMatrix overread.

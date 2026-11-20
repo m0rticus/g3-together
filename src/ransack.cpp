@@ -8,6 +8,7 @@
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "telemetry.h"
 #include "trade.h"
 #include "ai.h"
 
@@ -163,6 +164,7 @@ GEBool __fastcall RobTransfer(PSInventory* self, void*, GEInt stack, GEInt amoun
     std::memcpy(note.robber, take.robber, 16);
     net::SendRansack(take.player, note);
     ++takesSent;
+    telemetry::OnCrimeTransfer("ransack_take_sent", net::LocalId(), take.player, to.GetInstance(), amount, take.seq);
     Logf("ransack: %s took %d gold from player %d's puppet (robbery %u, robber now %d gold); the player pays it", to.GetName().GetText(),
          amount, id, take.seq, to.Inventory.GetItemAmount(Template(Gold)));
     return moved;
@@ -235,6 +237,7 @@ void Pay(uint8_t from, net::RansackNote const& note)
     net::SendRansack(from, reply);
     goldPaidHere += paid;
     eCEntity* robber = npcs::NpcByGuid(note.robber);
+    telemetry::OnCrimeTransfer("ransack_paid_victim", from, net::LocalId(), robber, paid, note.seq);
     Logf("ransack: robbed of %d gold by %s (robbery %u of player %d; asked %d, had %d)", paid, robber ? Entity(robber).GetName().GetText() : "?",
          note.seq, from, note.amount, before);
     if (paid <= 0) return;
@@ -267,6 +270,7 @@ void Paid(uint8_t from, net::RansackNote const& note)
         } else {
             Logf("ransack: player %d paid %d gold (robbery %u)", from, paidAmount, note.seq);
         }
+        telemetry::OnCrimeTransfer(paidAmount < it->amount ? "ransack_settled_partial" : "ransack_settled", net::LocalId(), from, ByGuid(it->robber).GetInstance(), paidAmount, note.seq);
         pending.erase(it);
         return;
     }

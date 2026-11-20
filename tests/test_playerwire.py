@@ -31,7 +31,7 @@ int main()
     namespace ra = g3t::ranged_anim;
 
     static_assert(pw::FixedBytes == 65);
-    static_assert(pw::MetadataMask == 0x3fffu);
+    static_assert(pw::MetadataMask == 0xffffu);
 
     pw::Encoder sender;
     pw::Decoder receiver;

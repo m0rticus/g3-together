@@ -11,6 +11,7 @@
 #include "npcplayback.h"
 #include "npcs.h"
 #include "remote.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -138,6 +139,7 @@ void Apply(size_t index)
         Logf("npcremoval: name=%s template=%s guid=%s at=%.1f,%.1f,%.1f reason=ardea-authored-cluster role=%s",
              npc.GetName().GetText(), creator ? creator->GetName().GetText() : "(unavailable)", id,
              at[0], at[1], at[2], net::IsHost() ? "host" : "client");
+        telemetry::OnNpcRemoval("suppressed", npc.GetName().GetText(), policy::Entries[index].guid.data(), instance, "ardea_authored_cluster");
         removal.noted = true;
     }
 }
@@ -148,6 +150,7 @@ void OnRemoval(net::NpcRemovalNote const& note)
     if (net::IsHost() || !MainWorld() || note.world != remote::CurrentWorld() || index < 0 ||
         !removals[index].fence.Accept(note.epoch, net::WorldEpoch(), note.incarnation, npcs::Incarnation(note.guid))) {
         Log("npcremoval: stale or out-of-scope host removal refused");
+        telemetry::OnNpcRemoval("refused_stale", "-", note.guid, nullptr, "stale_or_out_of_scope");
         return;
     }
     npcs::ForgetRemoved(note.guid);

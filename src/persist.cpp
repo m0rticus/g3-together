@@ -21,6 +21,7 @@
 #include "remote.h"
 #include "steam.h"
 #include "story.h"
+#include "telemetry.h"
 #include "trade.h"
 #include "world.h"
 #include "xpshare.h"
@@ -185,6 +186,8 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
                     Logf("persist: admission confirmed peer=%u account=%llu epoch=%08x baselines=1", from, net::PeerAccount(from), epoch);
                     Logf("admission: client peer=%u account=%llu in the host's world epoch=%08x kind=%u after_ms=%u", from,
                          net::PeerAccount(from), epoch, localKind, GetTickCount() - clients[from].waitingSince);
+                    telemetry::OnAdmissionStage("host_confirmed_peer", "peer_in_world", epoch, localKind, campaign.c_str(),
+                                                ownCharacterReady, true, true, true, true);
                     HostNotice(i18n::HostClientInWorld, from, hud::Good);
                 }
                 return;
@@ -478,6 +481,7 @@ bool StartSave(char const* name)
     PrepareSaveThumbnail();
     Logf("persist: host save requested world=%s save=%s slot=%s epoch=%08x", savingManifest.key.world.c_str(),
          savingManifest.key.save.c_str(), name, epoch);
+    telemetry::OnPersistEvent("host_save_requested", name, savingManifest.key.world.c_str(), epoch, true, savingManifest.key.save.c_str());
     Notice(i18n::SaveQueued);
     return true;
 }
@@ -501,6 +505,7 @@ bool __stdcall SaveDetour(void* self, bCString const* name)
     requestPending = true; requestWelcome = net::WelcomeSerial(); requestStarted = GetTickCount(); requestRetry = requestStarted + 500;
     net::SendSave(1, requested); // Retry admission without allocating a different request.
     Logf("persist: client save requested token=%s slot=%s epoch=%08x", requested.save, requested.name, requested.epoch);
+    telemetry::OnPersistEvent("client_save_requested", requested.name, requested.world, requested.epoch, true, requested.save);
     Notice(i18n::SaveQueued);
     return false; // UI wrappers own the asynchronous outcome.
 }
@@ -561,6 +566,7 @@ void OnSave(uint8_t from, net::SaveNote const& note)
               (requestPending && requested.save == std::string(note.save)))) return;
         captured = {}; requestPending = false;
         Logf("persist: host save result save=%s ok=%u reason=%s", note.save, note.ok, note.name);
+        telemetry::OnPersistEvent("client_save_result", note.save, note.world, note.epoch, note.ok != 0, note.name);
         if (note.ok) {
             xpshare::CommitSaveCapture();
             Notice(i18n::SaveComplete);
@@ -776,6 +782,7 @@ void Tick()
             receivedRecord.clear(); receivedPersonal.clear(); loading.clear(); ownCharacterReady = true; localKind = net::KindSaved;
             for (uint8_t i = 2; i < net::MaxPlayers; ++i) clients[i].nextTry = 0;
             Logf("persist: host load settled save=%s epoch=%08x own_character=1", current.key.save.c_str(), epoch);
+            telemetry::OnPersistEvent("host_load_settled", lastLoad.c_str(), current.key.world.c_str(), epoch, true, current.key.save.c_str());
         }
         HostTick(now);
         return;

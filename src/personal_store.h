@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "npc_item_quality_policy.h"
 #include "saving_binary.h"
 
 #include <algorithm>
@@ -24,7 +25,7 @@ constexpr size_t MaxRows = (Limit - HeaderBytes) / RowHeaderBytes;
 constexpr size_t MaxInventoryRows = 4096;
 constexpr size_t MaxStacks = 512;
 constexpr uint32_t MaxAmount = 1000000;
-constexpr uint32_t MaxQuality = 1023;
+constexpr uint32_t MaxQuality = npc_item_quality::QualityMask;
 
 enum class Kind : uint8_t { Chest = 1, Corpse = 2, Trader = 3, GroundTaken = 4 };
 enum class Stock : uint8_t { Normal = 0, Merchandise = 2 };

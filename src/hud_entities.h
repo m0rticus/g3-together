@@ -26,7 +26,7 @@ constexpr int EntitySlotCount = 7;
 constexpr int PageSlotCount = 15;
 
 constexpr int PlayerSlot = 0;
-constexpr int DialogNpcSlot = 1;
+constexpr int FocusSlot = 1; // Updated each frame by gCGUIManager::OnProcess for the HUD target HP bar.
 constexpr int FirstTransientPageSlot = 2;
 
 // ?ClearAllEntities@gCGUIManager@@QAE_NXZ at Game.dll + 0x7c260 (17 bytes).
@@ -87,11 +87,9 @@ constexpr bool ShouldScrubSlotOnDestroy(void const* slotEntity, void const* dest
     return destroyedEntity != nullptr && slotEntity == destroyedEntity;
 }
 
-constexpr bool ShouldScrubIdleSlot(int slot, int32_t activePage, bool dialogRunning) noexcept
+constexpr bool ShouldScrubIdleSlot(int slot, int32_t activePage) noexcept
 {
-    if (activePage >= 0) return false;
-    if (slot == DialogNpcSlot) return !dialogRunning;
-    return slot >= FirstTransientPageSlot && slot < EntitySlotCount;
+    return activePage < 0 && slot >= FirstTransientPageSlot && slot < EntitySlotCount;
 }
 
 } // namespace g3t::hud::entities

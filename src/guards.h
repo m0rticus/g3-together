@@ -9,6 +9,8 @@
 // puppet as its target, the game's Entity::GetPlayer and IsPlayer (Script_Game.dll's imports) name that puppet.
 #pragma once
 
+#include "enclaves.h"
+
 class eCEntity;
 
 namespace g3t::guards {
@@ -18,15 +20,21 @@ void OnEntityDestroyed(eCEntity const* entity);
 
 // While alive, the game's player is `puppet` for Script_Game.dll (none: no change).
 // Read-only queries pass keepChapter=false to avoid changing the puppet's PlayerMemory.
+// When `npc` is supplied (or captured by StateActor), also scopes `npc`'s enclave theft state to that player.
 class Acting {
 public:
     explicit Acting(eCEntity* puppet, bool keepChapter = true);
+    Acting(eCEntity* puppet, bool keepChapter, eCEntity* npc);
     ~Acting();
     Acting(Acting const&) = delete;
     Acting& operator=(Acting const&) = delete;
 
 private:
+    void Enter(eCEntity* puppet, bool keepChapter, eCEntity* npc);
     eCEntity* before;
+    eCEntity* prevNpc = nullptr;
+    bool hadPrevTheft = false;
+    bool appliedTheft = false;
 };
 
 // Local script entry points must not inherit a nested NPC's puppet identity.
@@ -39,6 +47,8 @@ public:
 
 private:
     eCEntity* before;
+    eCEntity* pausedNpc = nullptr;
+    bool resumedTheft = false;
 };
 
 // The puppet that stands for the game's player right now, none for the local hero.

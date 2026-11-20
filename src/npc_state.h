@@ -7,6 +7,7 @@
 #include "guid_key.h"
 #include "net.h"
 #include "npcidentity_policy.h"
+#include "npc_item_quality_policy.h"
 #include "npcpresence_policy.h"
 #include "npcplayback.h"
 #include "npcs.h"
@@ -340,12 +341,36 @@ inline GEInt StackOf(Entity& npc, uint32_t hash)
     return -1;
 }
 
+static_assert(npc_item_quality::QualityWorn == static_cast<uint32_t>(gEItemQuality_Worn));
+static_assert(npc_item_quality::CategoryWeapon == static_cast<int>(gEItemCategory_Weapon));
+static_assert(npc_item_quality::UseArrow == static_cast<int>(gEUseType_Arrow));
+static_assert(npc_item_quality::UseBolt == static_cast<int>(gEUseType_Bolt));
+static_assert(npc_item_quality::UseFist == static_cast<int>(gEUseType_Fist));
+static_assert(npc_item_quality::UseShield == static_cast<int>(gEUseType_Shield));
+static_assert(npc_item_quality::UsePhysicalFist == static_cast<int>(gEUseType_PhysicalFist));
+
+inline uint32_t MirroredItemQuality(Template const& item)
+{
+    eCTemplateEntityProxy proxy;
+    proxy.SetEntity(static_cast<bCPropertyID const&>(item));
+    eCTemplateEntity* templateEntity = proxy.GetEntity();
+    if (!templateEntity) return 0;
+    auto* itemPs = static_cast<gCItem_PS*>(templateEntity->GetPropertySet(eEPropertySetType_Item));
+    auto* interactionPs =
+        static_cast<gCInteraction_PS*>(templateEntity->GetPropertySet(eEPropertySetType_Interaction));
+    const int category = itemPs ? static_cast<int>(itemPs->GetCategory()) : -1;
+    const int useType = interactionPs ? static_cast<int>(interactionPs->GetUseType()) : -1;
+    const uint32_t baseQuality = itemPs ? static_cast<uint32_t>(itemPs->GetQuality()) : 0u;
+    return npc_item_quality::MirroredSpawnQuality(category, useType, baseQuality);
+}
+
 inline void EnsureItem(Entity& npc, uint32_t hash)
 {
     if (!hash || StackOf(npc, hash) >= 0) return;
     auto name = motionNames.find(hash);
     if (name == motionNames.end()) return;
-    npc.Inventory.CreateItems(Template(name->second.c_str()), 0, 1);
+    const Template item(name->second.c_str());
+    npc.Inventory.CreateItems(item, MirroredItemQuality(item), 1);
 }
 
 inline bool IsNpc(eCEntity* instance)

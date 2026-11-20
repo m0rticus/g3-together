@@ -3,15 +3,129 @@
 
 #include "ai.h"
 #include "body.h"
+#include "crashlog.h"
 #include "log.h"
 #include "net.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 namespace g3t::remote {
+namespace internal {
+namespace {
+constexpr gESlot WornSlots[2] = {gESlot_Body, gESlot_Helmet};
+unsigned puppetDropsRemoved = 0;
+}
+
+GEInt StackFor(Entity& body, char const* name)
+{
+    if (!name || !*name) return -1;
+    for (int pass = 0; pass < 2; ++pass) {
+        const GEInt count = body.Inventory.GetStackCount();
+        for (GEInt i = 0; i < count; ++i)
+            if (Entity item = body.Inventory.GetTemplateItem(i); item.GetInstance() && !std::strcmp(item.GetName().GetText(), name)) return i;
+        if (pass == 0) body.Inventory.CreateItems(Template(name), 0, 1);
+    }
+    return -1;
+}
+
+void TakeOff(Entity& body, gESlot slot)
+{
+    for (GEInt i = 0; i < body.Inventory.GetStackCount(); ++i)
+        if (body.Inventory.GetSlotFromStack(i) == slot) body.Inventory.UnEquipStack(i);
+}
+
+void NoDrop(Puppet& puppet, uint32_t now)
+{
+    if (!qa.puppetNoDrop || static_cast<int32_t>(now - puppet.dropChecked) < 250) return;
+    puppet.dropChecked = now;
+    for (int i = 0; i < 2; ++i) {
+        GuidKey& key = puppet.heldItems[i];
+        if (!IsZeroGuid(key)) {
+            Entity item = ByKey(key);
+            if (item.GetInstance() && item.IsItem() && !item.GetOwner().GetInstance()) {
+                Logf("remote: %s fell from a puppet's hand; removed (its player's own copy counts)", item.GetName().GetText());
+                item.Decay();
+                ++puppetDropsRemoved;
+            }
+        }
+        key = {};
+        const Entity held = puppet.entity.Inventory.GetItemFromSlot(i ? gESlot_LeftHand : gESlot_RightHand);
+        if (held.GetInstance()) key = KeyOf(held.GetInstance());
+    }
+}
+
+void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now)
+{
+    if (!qa.puppetWear || static_cast<int32_t>(now - puppet.wearChecked) < 250) return;
+    puppet.wearChecked = now;
+    char const* const wanted[2] = {armor, helmet};
+    for (int i = 0; i < 2; ++i) {
+        const Entity worn = puppet.entity.Inventory.GetItemFromSlot(WornSlots[i]);
+        const std::string have = worn.GetInstance() ? worn.GetName().GetText() : "";
+        if (have == wanted[i]) continue;
+        if (!have.empty()) TakeOff(puppet.entity, WornSlots[i]);
+        const GEInt stack = StackFor(puppet.entity, wanted[i]);
+        if (stack < 0) continue;
+        ++wearStats.changes;
+        if (puppet.entity.Inventory.EquipStack(stack) && puppet.entity.Inventory.GetSlotFromStack(stack) == WornSlots[i]) {
+            ++wearStats.equipped;
+            continue;
+        }
+        auto* inventory = static_cast<gCInventory_PS*>(puppet.entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory));
+        if (inventory && inventory->LinkStackToSlot(stack, WornSlots[i], GETrue)) ++wearStats.linked;
+        else ++wearStats.failed;
+    }
+}
+
+void LogPlayerStreams(uint32_t now)
+{
+    auto const* remotes = net::Remotes();
+    for (int id = 1; id < net::MaxPlayers; ++id) {
+        auto const& r = remotes[id];
+        if (id == net::LocalId() || !r.connected) continue;
+        auto const& puppet = puppets[id];
+        auto const& track = puppet.body.track;
+        auto age = [&](uint32_t sent) {
+            return static_cast<unsigned>(std::max(static_cast<int32_t>(now - static_cast<uint32_t>(track.offset) - sent), 0));
+        };
+        Logf("PLAYERSTREAM role=%s player=%d connected=%d world_gate=%d same_world=%d accepted=%u "
+             "metadata_waits=%u stale=%u cached_entry=%u packet=%u arrival_age_ms=%u puppet=%d",
+             net::IsHost() ? "host" : "client", id, r.connected ? 1 : 0,
+             net::InWorld(net::IsHost() ? static_cast<uint8_t>(id) : net::LocalId()) ? 1 : 0,
+             r.latest.world == CurrentWorld() ? 1 : 0, r.acceptedStates, r.metadataWaits, r.staleStates,
+             r.preEntryStates, r.latest.sequence, r.latestTicks ? now - r.latestTicks : 0u,
+             puppet.spawned && puppet.entity.GetInstance() ? 1 : 0);
+        if (!track.count) continue;
+        char shows[128] = {};
+        if (puppet.spawned && puppet.entity.GetInstance())
+            body::CurrentMotion(puppet.entity.GetInstance(), shows, sizeof(shows));
+        Logf("PUPPETLATENCY player=%d samples=%d buffer_ms=%d shown_lag_ms=%u newest_sample_age_ms=%u "
+             "oldest_sample_age_ms=%u transit_excess_ms=%d backlog_ms=%d catchup=%d catchup_frames=%u "
+             "pending_events=%zu requested_motion=%s shown_motion=%s",
+             id, track.count, body::PlaybackDelay(track), track.haveRenderTime ? age(track.renderSent) : 0u,
+             age(track.snaps[track.count - 1].sent), age(body::OldestRetainedSent(track)), track.transitExcessMs,
+             track.backlogMs, track.catchUp ? 1 : 0, track.catchUpFrames, body::PendingEvents(track),
+             *r.latest.animation ? r.latest.animation : "-", *shows ? shows : "-");
+    }
+}
+}
+
+void CaptureCacheInventory()
+{
+    unsigned count = 0;
+    eCEntity* first = nullptr;
+    for (auto const& puppet : internal::puppets)
+        if (auto* entity = puppet.entity.GetInstance()) {
+            ++count;
+            if (!first) first = entity;
+        }
+    crashlog::CacheObjects(crashlog::CacheKind::Puppets, count, first);
+}
+
 namespace {
 using internal::anchor;
 using internal::haveAnchor;

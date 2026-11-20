@@ -11,6 +11,7 @@
 #include "offer.h"
 #include "persist.h"
 #include "remote.h"
+#include "telemetry.h"
 #include "tradeview.h"
 #include "ai.h"
 
@@ -234,6 +235,7 @@ bool BeginExchange(gCInventory_PS* heroInventory, gCInventory_PS* puppetInventor
     ClearSelection(puppetInventory);
     if (!built || !offer::Reserve(note)) {
         hud::Message(hud::Warning, i18n::Text(i18n::TradeUnavailable));
+        telemetry::OnTradeOffer("exchange_refused", net::LocalId(), static_cast<uint8_t>(id), note.serial, note.gold, note.count, "build_or_reserve_failed", 0);
         Log("trade: native exchange refused before sending");
         return false;
     }
@@ -472,6 +474,7 @@ bool OnOpen(eCEntity* body)
         Fill(puppet, received[id]);
     }
     Logf("trade: native player exchange opened with %d, goods known=%d", id, received[id].known ? 1 : 0);
+    telemetry::OnContainerAccess("player_trade_open", gCSession::GetInstance().GetHero(), body, true, received[id].known ? "goods_known" : "goods_unknown");
     return true;
 }
 

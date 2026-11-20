@@ -18,6 +18,7 @@
 #include "remote.h"
 #include "steam.h"
 #include "story.h"
+#include "telemetry.h"
 #include "trade.h"
 #include "world.h"
 #include "xpshare.h"
@@ -272,6 +273,8 @@ void FinishSave(bool ok, char const* why)
     Logf("persist: host save %s world=%s save=%s slot=%s elapsed_ms=%u reason=%s",
          ok ? "complete" : "failed", savingManifest.key.world.c_str(), savingManifest.key.save.c_str(),
          requestedSlot.c_str(), GetTickCount() - operation.started, why);
+    telemetry::OnPersistEvent(ok ? "host_save_complete" : "host_save_failed", requestedSlot.c_str(),
+                              savingManifest.key.world.c_str(), epoch, ok, why);
     for (uint8_t i = 2; i < net::MaxPlayers; ++i) {
         if (!operation.members[i].generation || operation.members[i].generation != net::PeerGeneration(i)) continue;
         auto result = Note(net::SaveResult, savingManifest, ok);
@@ -607,6 +610,8 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     const bool ok = hudOk && lowerLoadCalls == 1 && lowerLoadGood;
     Logf("persist: native load returned slot=%s save=%s ok=%d hud_ok=%d lower_calls=%u lower_ok=%d managed=%d",
          slot.c_str(), current.key.save.c_str(), ok ? 1 : 0, hudOk ? 1 : 0, lowerLoadCalls, lowerLoadGood ? 1 : 0, managed ? 1 : 0);
+    telemetry::OnPersistEvent("host_native_load_returned", slot.c_str(), current.key.world.c_str(), epoch, ok,
+                              current.key.save.c_str());
     if (!ok) { loading.clear(); restoreFailed = true; SaveFailure("native-load"); return false; }
     receivedRecord.clear();
     receivedPersonal.clear();

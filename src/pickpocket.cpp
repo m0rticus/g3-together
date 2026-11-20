@@ -7,6 +7,7 @@
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -75,6 +76,7 @@ GEInt GE_STDCALL Detour(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     s.guard = net::LocalId();
     net::SendWorldState(s, 0);
     ++sent;
+    telemetry::OnCrimeTransfer("pickpocket_local", net::LocalId(), 0, victim, 0, sent);
     Logf("pickpocket: this player picked %s's pocket; the other copies are marked", Entity(victim).GetName().GetText());
     return result;
 }
@@ -104,6 +106,7 @@ void OnState(uint8_t from, net::WorldState const& s)
     if (npc.Dialog.PickedPocket) { ++already; return; }  // the game never takes the mark back
     npc.Dialog.PickedPocket = GETrue;
     ++applied;
+    telemetry::OnCrimeTransfer("pickpocket_remote", s.guard ? s.guard : from, 0, instance, 0, applied);
     Logf("pickpocket: player %u picked %s's pocket; marked here too", s.guard ? s.guard : from, npc.GetName().GetText());
 }
 

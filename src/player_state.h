@@ -53,6 +53,8 @@ struct PlayerState
     char overlayAnim1[96] = {};  // active upper-body emfx2 overlay motion 1 (slots 1..7)
     char weaponAnim[96] = {};    // active left-hand weapon motion (e.g. <Bow>_PowerRaise_00 / <CrossBow>_Cock_00)
     uint32_t overlayMeta = 0;    // packed ranged_anim::OverlayMeta (0 when no overlay/weapon motion is active)
+    int32_t hitPoints = 0;       // current HP of the player's controlled body (PlayerMemory or transformed DamageReceiver)
+    int32_t hitPointsMax = 0;    // max HP of the player's controlled body (0 when not in game)
 };
 #pragma pack(pop)
 

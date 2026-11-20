@@ -16,7 +16,9 @@ if str(TESTS_DIR) not in sys.path:
 import _testbuild
 
 _guards = _testbuild.src_text("guards.cpp")
-acting = function_body(_guards, r"Acting::Acting\s*\(")
+acting_enter = function_body(_guards, r"void\s+Acting::Enter\s*\(")
+acting = function_body(_guards, r"Acting::Acting\s*\(eCEntity\*\s*puppet,\s*bool\s*keepChapter\)\s*:")
+acting_npc = function_body(_guards, r"Acting::Acting\s*\(eCEntity\*\s*puppet,\s*bool\s*keepChapter,\s*eCEntity\*\s*npc\)\s*:")
 acting_end = function_body(_guards, r"Acting::~Acting\s*\(")
 local = function_body(_guards, r"LocalPlayer::LocalPlayer\s*\(")
 local_end = function_body(_guards, r"LocalPlayer::~LocalPlayer\s*\(")
@@ -25,16 +27,38 @@ HARNESS = f"""
 #include "movement.h"
 #include <cassert>
 class eCEntity {{}};
-static eCEntity hero;
+static eCEntity hero, guardNpc;
+static eCEntity* puppet2Ptr = nullptr;
+static bool enclaveTheft = false, client2Theft = true;
 static unsigned observations = 0, chapters = 0;
-namespace g3t::remote {{ eCEntity* ControlledBody() {{ return &hero; }} }}
+namespace g3t::remote {{
+eCEntity* ControlledBody() {{ return &hero; }}
+int PuppetOwner(eCEntity const* entity) {{ return entity && entity == puppet2Ptr ? 2 : 0; }}
+}}
+namespace g3t::enclaves {{
+bool ApplyPlayerTheft(eCEntity* npc, uint8_t player, SavedTheftState& saved) {{
+    if (!npc || player != 2) return false;
+    saved.enclave = reinterpret_cast<gCEnclave_PS*>(npc);
+    saved.crime = enclaveTheft ? 1 : 0;
+    saved.active = true;
+    enclaveTheft = client2Theft;
+    return true;
+}}
+void RestorePlayerTheft(SavedTheftState const& saved) {{
+    if (saved.active) enclaveTheft = saved.crime != 0;
+}}
+}}
 namespace g3t::movement {{
 void Touch(eCEntity*, char const*, char const*, void*) {{ ++observations; }}
 }}
 namespace g3t::guards {{
 static thread_local eCEntity* actor = nullptr;
+static thread_local eCEntity* activeNpc = nullptr;
+static thread_local enclaves::SavedTheftState activeTheft{{}};
 void KeepChapter(eCEntity*) {{ ++chapters; }}
+void Acting::Enter(eCEntity* puppet, bool keepChapter, eCEntity* npc) {{{acting_enter}}}
 Acting::Acting(eCEntity* puppet, bool keepChapter) : before(actor) {{{acting}}}
+Acting::Acting(eCEntity* puppet, bool keepChapter, eCEntity* npc) : before(actor) {{{acting_npc}}}
 Acting::~Acting() {{{acting_end}}}
 LocalPlayer::LocalPlayer(bool local) : before(actor) {{{local}}}
 LocalPlayer::~LocalPlayer() {{{local_end}}}
@@ -44,26 +68,29 @@ void TestMovementPolicy();
 int main() {{
     using namespace g3t::guards;
     eCEntity a, b;
+    puppet2Ptr = &a;
     assert(CurrentActor() == nullptr);
     {{
-        Acting npc(&a, false);
-        {{ Acting inherited(nullptr); assert(CurrentActor() == &a); }}
-        {{ LocalPlayer notLocal(false); assert(CurrentActor() == &a); }}
+        Acting npc(&a, false, &guardNpc);
+        assert(enclaveTheft == true);
+        {{ Acting inherited(nullptr); assert(CurrentActor() == &a && enclaveTheft == true); }}
+        {{ LocalPlayer notLocal(false); assert(CurrentActor() == &a && enclaveTheft == true); }}
         {{
             LocalPlayer player;
-            assert(CurrentActor() == nullptr);
+            assert(CurrentActor() == nullptr && enclaveTheft == false);
             {{
                 Acting nestedNpc(&b, false);
                 {{ LocalPlayer nestedPlayer; assert(CurrentActor() == nullptr); }}
                 assert(CurrentActor() == &b);
             }}
-            assert(CurrentActor() == nullptr);
+            assert(CurrentActor() == nullptr && enclaveTheft == false);
         }}
-        assert(CurrentActor() == &a);
-        try {{ LocalPlayer player; throw 1; }} catch (int) {{}}
-        assert(CurrentActor() == &a);
+        assert(CurrentActor() == &a && enclaveTheft == true);
+        try {{ LocalPlayer player; assert(!enclaveTheft); enclaveTheft = true; throw 1; }} catch (int) {{}}
+        assert(CurrentActor() == &a && enclaveTheft == true);
     }}
-    assert(CurrentActor() == nullptr);
+    assert(CurrentActor() == nullptr && enclaveTheft == true);
+    enclaveTheft = false;
     assert(observations == 3 && chapters == 0);
     TestMovementPolicy();
 }}

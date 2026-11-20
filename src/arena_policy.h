@@ -145,8 +145,19 @@ inline bool IsArenaFighterBusyTask(char const* taskName) noexcept
 inline bool HasFighterEnteredBoutTask(char const* taskName) noexcept
 {
     if (!taskName || !*taskName) return false;
+    if (std::strstr(taskName, "ZS_Attack_End") != nullptr ||
+        std::strstr(taskName, "ZS_Attack_Arena_End") != nullptr)
+        return false;
     return std::strstr(taskName, "ZS_Arena") != nullptr ||
            std::strstr(taskName, "ZS_Attack") != nullptr;
+}
+
+// On a client, OnLeaveArea / OnEnterArea only belong to the local player or client-leased NPCs; passive mirrors
+// and remote puppets are host-simulated and must not mutate local quest DeliveryCounters or trigger ring-outs.
+constexpr bool ShouldSuppressNonLocalAreaActor(bool isHost, bool connected, bool isLocalPlayer,
+                                               bool hasLocalAuthority) noexcept
+{
+    return !isHost && connected && !isLocalPlayer && !hasLocalAuthority;
 }
 
 inline bool ShouldDispatchSendToArenaOnHost(bool questRunning, bool heldInTalk, bool fencedByClientLease,

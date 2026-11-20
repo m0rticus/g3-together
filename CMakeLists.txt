@@ -69,6 +69,7 @@ target_sources(Script_G3Together PRIVATE
     src/trade_qa.cpp)
 target_sources(Script_G3Together PRIVATE src/worldentry_diag.cpp)
 target_sources(Script_G3Together PRIVATE src/focus_diag.cpp)
+target_sources(Script_G3Together PRIVATE src/telemetry.cpp src/telemetry_events.cpp)
 target_sources(Script_G3Together PRIVATE src/explore_watch.cpp src/explore_dialog.cpp src/explore_npc.cpp)
 # The standalone codec rolls back partially installed baselines on allocation failure.
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/npcwire_control.cpp" PROPERTIES COMPILE_OPTIONS /EHsc)

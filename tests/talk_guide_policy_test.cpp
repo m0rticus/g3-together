@@ -57,8 +57,9 @@ void TestTalkHoldMaintenanceAndSilencing()
     assert(!ShouldRestartRoutineOnTalkRelease(false, false, AiModeCombat));
     assert(!ShouldRestartRoutineOnTalkRelease(false, false, AiModeArena));
     assert(!ShouldBlockHeldTalkEvent(true, true, false, false, AiModeArena, "ContinueRoutine"));
-    assert(ShouldBindActingPlayerForEvent(true, false, "OnArena"));
-    assert(ShouldBindActingPlayerForEvent(true, false, "SendToArena"));
+    // SendToArena and OnArena must never bind guards::Acting from nearest-player ContextPlayer on CallScript.
+    assert(!ShouldBindActingPlayerForEvent(true, false, "OnArena"));
+    assert(!ShouldBindActingPlayerForEvent(true, false, "SendToArena"));
     assert(!ShouldBlockHeldTalkTask(true, true, false, false, 0, "ZS_Arena"));
     assert(!ShouldBlockHeldTalkTask(true, true, false, false, AiModeArena, "ZS_HangAround"));
 
@@ -235,6 +236,40 @@ void TestGuideWireMultiplexRoutineDeferralAndOwnerPriority()
     assert(!ShouldAdoptHeroLeaderAsGuide(false, false, true, true));
 }
 
+void TestTemporaryKnockdownPuppetTalkRefusal()
+{
+    using namespace g3t::talk_policy;
+
+    // Non-puppets and held puppets (awaiting potion revive) are never refused here.
+    assert(!ShouldRefusePuppetTalk(false, false, 19, 16, "Hero_Lie_KnockDown.xmot", AiModeDown, true, false, 16, "Hero_Lie_KnockDown.xmot"));
+    assert(!ShouldRefusePuppetTalk(true, true, 1 | 2 | 8, 16, "Hero_Lie_KnockDown.xmot", 10, false, false, 16, "Hero_Lie_KnockDown.xmot"));
+
+    // Upright, in-game non-held puppet remains talkable.
+    assert(!ShouldRefusePuppetTalk(true, false, 1, AniStateStand, "Hero_Stand_Ambient_00.xmot", 10, false, false, AniStateStand, "Hero_Stand_Ambient_00.xmot"));
+    assert(!ShouldRefusePuppetTalk(true, false, 1, AniStateSitBench, "Hero_SitBench_Ambient_00.xmot", 10, false, false, AniStateSitBench, "Hero_SitBench_Ambient_00.xmot"));
+
+    // NativeDown() (nonlethal knockout flags KnockedOut=2 | Robbable=16) refuses talk even before AIMode flips to Down.
+    assert(ShouldRefusePuppetTalk(true, false, 1 | 2 | 16, AniStateStand, "", 10, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1 | 16, AniStateStand, "", 10, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1 | 4, AniStateStand, "", AiModeDead, false, true, AniStateStand, ""));
+
+    // Temporary knockdowns (ZS_SitKnockDown aniState 15 / motion, ZS_LieKnockDown 16, ZS_PiercedKO 20, AIMode Down).
+    assert(ShouldRefusePuppetTalk(true, false, 1, AniStateSitKnockDown, "", 10, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1, AniStateStand, "", 10, false, false, AniStateSitKnockDown, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1, 16, "", 10, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1, 20, "", 10, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1, AniStateStand, "Hero_Stand_None_None_P0_SitKnockDown_Start_00.xmot", 10, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1, AniStateStand, "", 10, false, false, AniStateStand, "Hero_Stand_None_None_P0_PiercedKO_00.xmot"));
+    assert(ShouldRefusePuppetTalk(true, false, 1, AniStateStand, "", AiModeDown, false, false, AniStateStand, ""));
+    assert(ShouldRefusePuppetTalk(true, false, 1, AniStateStand, "", 10, true, false, AniStateStand, ""));
+
+    assert(IsKnockdownOrDownMotion("Hero_Stand_None_None_P0_SitKnockDown_00.xmot"));
+    assert(IsKnockdownOrDownMotion("Hero_Lie_Unconscious_00.xmot"));
+    assert(!IsKnockdownOrDownMotion("Hero_Stand_Ambient_00.xmot"));
+    assert(!IsKnockdownOrDownMotion("<fault>"));
+    assert(!IsKnockdownOrDownMotion(nullptr));
+}
+
 } // namespace
 
 int main()
@@ -244,5 +279,6 @@ int main()
     TestTalkGestures();
     TestGuideClaimAndDestinationPolicy();
     TestGuideWireMultiplexRoutineDeferralAndOwnerPriority();
+    TestTemporaryKnockdownPuppetTalkRefusal();
     return 0;
 }

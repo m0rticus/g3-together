@@ -141,6 +141,14 @@ int main()
         in.inFovToHero = true;
         assert(!ShouldMirrorCatchChestUse(in));
     }
+    {
+        auto in = makeWatch();
+        in.chestDistanceSqCm = 1001.0f * 1001.0f;
+        in.sameIndoorZone = true;
+        in.freeLosToHero = true;
+        in.inFovToHero = true;
+        assert(!ShouldMirrorCatchChestUse(in));
+    }
     // Disabled, non-mirrored, unconscious, mist/ghost status, or sleeping/talking/fleeing/down/dead mirrors never catch.
     {
         auto base = makeWatch();
@@ -200,6 +208,9 @@ class WitnessPolicyTests(unittest.TestCase):
         self.assertIn("policy::ShouldApplyWitnessHolds(", witness)
         self.assertIn("policy::ShouldMirrorCatchChestUse(", witness)
         self.assertIn("policy::ShouldApplyWitnessReaction(", witness)
+        self.assertIn("in.chestDistanceSqCm =", witness)
+        self.assertIn("IsBotheredByPlayerTheftOf", witness)
+        self.assertNotIn('CallScript(bCString("AssessUseInteractObject"), body, chest', witness)
         self.assertIn("PerceiveChestUse(", witness)
         self.assertIn("witness::PerceiveChestUse(", containers)
         self.assertIn("PS_Interact_Chest_Loop", containers)

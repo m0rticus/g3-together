@@ -158,6 +158,38 @@ int main()
     v.relation = None;
     v.focusRelation = Hostile;
     assert(Judge(v) == Decision::Bystander);
+
+    for (int ani = 0; ani < 30; ++ani) {
+        assert(NpcProneAniState(ani) == (ani >= 15 && ani <= 21));
+    }
+    assert(!NpcGroundImmune(false, false, 3, 2, true, 0, false, false));
+    assert(NpcGroundImmune(true, false, 0, 2));
+    assert(NpcGroundImmune(false, true, 0, 2));
+    assert(NpcGroundImmune(false, false, 8, 2));
+    assert(NpcGroundImmune(false, false, 9, 2));
+    assert(NpcGroundImmune(false, false, 0, 15));
+    assert(NpcGroundImmune(false, false, 0, 16));
+    assert(NpcGroundImmune(false, false, 0, 17));
+    assert(NpcGroundImmune(false, false, 0, 20));
+    assert(NpcGroundImmune(false, false, 3, 2, true, 1));
+    assert(NpcGroundImmune(false, false, 3, 2, true, 2));
+    assert(!NpcGroundImmune(false, false, 3, 2, true, 4));
+    assert(NpcGroundImmune(false, false, 3, 2, false, 0, true, false));
+    assert(NpcGroundImmune(false, false, 3, 2, false, 0, false, true));
+
+    assert(IsExplicitFinishingAction(15, 0));
+    assert(IsExplicitFinishingAction(0, 15));
+    assert(!IsExplicitFinishingAction(1, 1));
+    assert(!IsExplicitFinishingAction(11, 11));
+
+    assert(IsFinishingClaim(g3t::net::PredictedMelee, 1, g3t::net::HitDeath, g3t::net::HitNoReaction, true));
+    assert(!IsFinishingClaim(g3t::net::PredictedMelee, 0, g3t::net::HitDeath, g3t::net::HitNoReaction, true));
+    assert(!IsFinishingClaim(g3t::net::PredictedMelee, 1, g3t::net::HitUnjudged, g3t::net::HitNoReaction, true));
+    assert(!IsFinishingClaim(g3t::net::PredictedMelee, 1, g3t::net::HitKnockOut, g3t::net::HitNoReaction, true));
+    assert(!IsFinishingClaim(g3t::net::PredictedMelee, 1, g3t::net::HitDeath, g3t::net::HitStumble, true));
+    assert(!IsFinishingClaim(g3t::net::PredictedMelee, 1, g3t::net::HitDeath, g3t::net::HitNoReaction, false));
+    assert(!IsFinishingClaim(g3t::net::NotMelee, 1, g3t::net::HitDeath, g3t::net::HitNoReaction, true));
+    assert(!IsFinishingClaim(g3t::net::HostJudgedMelee, 1, g3t::net::HitDeath, g3t::net::HitNoReaction, true));
 }
 '''
 
@@ -286,7 +318,8 @@ class MeleePolicyTests(unittest.TestCase):
         self.assertLess(host.index("IgnoreFriendlyHit("), host.index("JudgeDamage("))
         self.assertLess(host.index("OutsideBout("), host.index("JudgeDamage("))
         self.assertLess(host.index("bool finishing = false;"), host.index("JudgeDamage("))
-        self.assertLess(host.index("if (target.IsDown() || since < 3000)"), host.index("JudgeDamage("))
+        self.assertLess(host.index("if (target.IsDown() || since < 3000 || IsGroundImmuneNpc(target.GetInstance()))"),
+                        host.index("JudgeDamage("))
         self.assertIn("const uint32_t hostIncarnation = npcs::Incarnation(guid);", host)
         self.assertIn("reply.result.incarnation = hostIncarnation;", host)
         self.assertIn("delta = -pending;", host)
@@ -336,6 +369,40 @@ class MeleePolicyTests(unittest.TestCase):
         self.assertIn("!Entity(attacker).IsInFOV(Entity(victim))", local)
         self.assertIn("contact.item && !Entity(attacker).IsInFOV(Entity(victim))", local)
         self.assertLess(local.index("IsInFOV("), local.index("playerMeleeContacts[key]"))
+
+    def test_downed_npcs_are_ground_immune_unless_explicitly_executed(self):
+        blow = self.combat_melee.split("bool PlayerBlow(", 1)[1]
+        self.assertIn("IsGroundImmuneNpc(victim)", blow)
+        self.assertLess(blow.index("IsGroundImmuneNpc(victim)"), blow.index("LocalMeleeAllowed("))
+        self.assertLess(blow.index("IsExplicitFinishingBlow(hero, victim, source)"), blow.index("SendFinishingBlow("))
+
+        capture = self.combat_melee.split("net::MeleeContact CaptureMelee(", 1)[1].split("eCEntity* PartyLeader(", 1)[0]
+        self.assertIn("gEAction_FinishingAttack", capture)
+
+        judge = self.combat.split("GEInt Judge(int which", 1)[1].split("GEInt GE_STDCALL FilterLogical(", 1)[0]
+        self.assertLess(judge.index("IsGroundImmuneNpc(victim.GetInstance())"), judge.index("if (localMelee)"))
+
+        filt = self.combat.split("GEInt GE_STDCALL Filter(", 1)[1].split("GEInt JudgeDamage(", 1)[0]
+        self.assertLess(filt.index("IsGroundImmuneNpc(recipient.GetInstance())"), filt.index("if (forwarded)"))
+
+        touch = self.combat.split("GEInt GE_STDCALL TouchDamage(", 1)[1].split("gFScript WrapDamageScript(", 1)[0]
+        self.assertLess(touch.index("IsGroundImmuneNpc(victim)"), touch.rindex("originalTouchDamage("))
+
+        game_hit = self.combat.split("GEInt GameHit(", 1)[1].split("gFScript originalTouchDamage", 1)[0]
+        self.assertLess(game_hit.index("IsGroundImmuneNpc(victim.GetInstance())"), game_hit.index("JudgeDamage("))
+
+        self.assertIn('"OnAI_FinishingAttack"', self.combat)
+        self.assertIn("HookFinishingAttack", self.combat)
+
+        host = self.combat_claims.split("void OnHitNpc(", 1)[1].split("void QueueHitNpc(", 1)[0]
+        self.assertIn("melee::IsFinishingClaim(", host)
+        self.assertIn("InBout(target) || target.NPC.Immortal", host)
+        self.assertLess(host.index("melee::IsFinishingClaim("), host.index("JudgeDamage("))
+        bout_branch = host.split("if (InBout(target)) {", 1)[1].split("if (!finishing) {", 1)[0]
+        self.assertIn("knockedAt[KillKey(guid)] = now;", bout_branch)
+
+        npc_hit = self.combat_claims.split("void OnNpcHit(", 1)[1].split("void OnHitNpc(", 1)[0]
+        self.assertIn("IsGroundImmuneNpc(target.GetInstance())", npc_hit)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@
 #include "persist.h"
 #include "remote.h"
 #include "talk.h"
+#include "telemetry.h"
 #include "world.h"
 #include "crashlog.h"
 
@@ -250,13 +251,20 @@ bool Activate(eCEntity* entity, Entry& entry, uint8_t const identity[16])
 {
     const auto resume = entry.lease.phase;
     const bool active = entry.active;
+    auto rollback = [&]() {
+        entry.lease.phase = resume;
+        entry.active = active;
+        entry.nativeActivated = false;
+        PublishGuard(Key(identity), entry);
+        return false;
+    };
     entry.active = false;
     entry.nativeActivated = false;
     entry.lease.phase = net::IsHost() ? Phase::Dormant : Phase::Frozen;
     PublishGuard(Key(identity), entry);
-    if (!NativeReady(entity) || !npcplayback::GuardForLease(entity)) return false;
+    if (!NativeReady(entity) || !npcplayback::GuardForLease(entity)) return rollback();
     npcs::LeaseReleaseMirror(identity);
-    if (!Import(entity, entry.lease.state)) return false;
+    if (!Import(entity, entry.lease.state)) return rollback();
     entry.lease.phase = resume;
     entry.active = active;
     entry.nativeActivated = true;
@@ -305,6 +313,9 @@ void Diagnostic(char const* action, GuidKey const& key, Entry const& entry, char
          CheckpointClass(entry.lease.state) == NativeClass::Ordinary ? "ordinary_discovered" : "generic_creature",
          entry.lease.owner, entry.lease.epoch, entry.lease.incarnation, entry.lease.revision,
          why, began ? net::Now() - began : 0);
+    telemetry::OnLeaseEvent(action, entry.lease.phase == Phase::Host ? 1 : entry.lease.owner, entry.lease.owner,
+                            reinterpret_cast<uint8_t const*>(key.data()), nullptr, entry.lease.epoch,
+                            entry.lease.incarnation, why);
 }
 void Receive(uint8_t from, Message const& note)
 {
@@ -550,6 +561,13 @@ void OnWorldDeactivate()
     scanAt = 0;
     crashlog::CacheObjects(crashlog::CacheKind::Leases, 0, nullptr);
     seenWorld = net::WorldEpoch(); seenWelcome = net::WelcomeSerial();
+}
+void OnEntityDestroyed(eCEntity const* entity)
+{
+    if (!entity) return;
+    for (auto& item : entries)
+        if (item.second.applied == entity) item.second.applied = nullptr;
+    guardStates.Erase(Key(entity));
 }
 void CaptureCacheInventory()
 {

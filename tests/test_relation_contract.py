@@ -155,7 +155,7 @@ class RelationContractTests(unittest.TestCase):
         self.assertIn("npcs::CompanionOwner(asked)", kill_intent)
         means = between(guards, "bool MeansToKill(", "static void WatchZones()")
         self.assertIn("LocalPlayer local(!puppet);", means)
-        self.assertIn("Acting acting(puppet, false);", means)
+        self.assertIn("Acting acting(puppet, false, npc);", means)
 
         enclaves = source("enclaves.cpp")
         send_delta = between(enclaves, "void SendDelta(", "void SettlePending()")
@@ -165,8 +165,12 @@ class RelationContractTests(unittest.TestCase):
         self.assertIn("if (p.delta.known == gEPlayerCrime_Theft) c.known = p.priorKnown;", settle)
         self.assertIn("if (p.delta.known == gEPlayerCrime_Theft) p.delta.known = -1;", settle)
         on_note = between(enclaves, "void OnNote(", "void Start()")
-        self.assertIn("if (note.known == gEPlayerCrime_None) c.known = gEPlayerCrime_None;", on_note)
-        self.assertIn("if (note.suspect[i] == 0) c.suspect[i] = 0;", on_note)
+        self.assertIn("reputation::ApplyClientDeltaOnHost(", on_note)
+        policy = source("reputation_policy.h")
+        apply_delta = between(policy, "inline void ApplyClientDeltaOnHost(", "} // namespace g3t::reputation")
+        self.assertIn("if (delta.known == CrimeNone)", apply_delta)
+        self.assertIn("if (delta.suspect[i] == 0)", apply_delta)
+        self.assertIn("if (delta.suspect[CrimeTheft] == 0)", apply_delta)
 
         relation = source("relation.cpp")
         scrub = between(relation, "void ScrubCalmMirroredMemory(", "void Tick()")

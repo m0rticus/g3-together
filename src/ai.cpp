@@ -219,7 +219,7 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     // A guard's reaction to another player follows that player; an attack on a puppet is a fight with its player (fightmem.cpp).
     eCEntity* actor = guards::StateActor(self, name);
     eCEntity* fighter = actor ? nullptr : fightmem::StateActor(self, name);
-    guards::Acting player(actor ? actor : fighter);
+    guards::Acting player(actor ? actor : fighter, true, self);
     eCEntity* localHero = gCSession::GetInstance().GetHero();
     const bool localTerminalState = localHero && self == localHero && downed::Terminal() &&
                                     std::strcmp(name, "ZS_RagDollDead") == 0;

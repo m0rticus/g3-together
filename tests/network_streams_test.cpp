@@ -107,7 +107,8 @@ int main()
             assert(transmission.channel == ChannelState);
             if (transmission.bytes[0] == MsgState) {
                 ++statesThisFrame;
-                assert(transmission.bytes.size() < 100);
+                const bool fullFrame = (transmission.bytes[2] & playerwire::FullFlag) != 0;
+                assert(transmission.bytes.size() < (fullFrame ? 112u : 100u));
             } else {
                 assert(transmission.bytes[0] == MsgPlayerActivity);
                 assert(transmission.bytes.size() == sizeof(ActivityMsg));

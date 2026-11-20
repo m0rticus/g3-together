@@ -3,9 +3,11 @@
 
 #include "enclaves.h"
 #include "net.h"
+#include "reputation_policy.h"
 
 #include <Game.h>
 #include <Script.h>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -16,9 +18,10 @@ enum Mode : uint8_t { Shared = 0, Together = 1, Personal = 2 };
 constexpr int Crimes = gEPlayerCrime_Count;
 constexpr int Alignments = 13; // gEPoliticalAlignment 0..12
 
-struct Counters {
-    int32_t crime[Crimes] = {}, suspect[Crimes] = {};
-    int32_t known = 0, fame = 0;
+using Counters = reputation::EnclaveCrimeState;
+
+struct EnclavePlayerThefts {
+    std::array<reputation::PlayerTheftState, net::MaxPlayers + 1> byPlayer{};
 };
 
 struct Pending {
@@ -31,6 +34,7 @@ struct Pending {
 };
 
 extern std::map<std::string, Counters> seen;
+extern std::map<std::string, EnclavePlayerThefts> playerThefts;
 extern std::vector<Pending> pending;
 extern Mode mode;
 extern bool sync;

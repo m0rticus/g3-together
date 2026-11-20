@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "npc_item_quality_policy.h"
+
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -12,8 +14,8 @@ namespace g3t::trade_policy {
 inline constexpr char const* GoldTemplateName = "It_Gold";
 inline constexpr int32_t MaxStackAmount = 1000000;
 inline constexpr int32_t MaxGoldAmount = 10000000;
-inline constexpr uint16_t MaxQuality = 1024;
-inline constexpr uint16_t QualityMask = MaxQuality - 1;
+inline constexpr uint16_t QualityMask = static_cast<uint16_t>(npc_item_quality::QualityMask);
+inline constexpr uint16_t MaxQuality = QualityMask + 1u;
 
 inline std::string StackKeyBytes(void const* guid16, uint16_t quality)
 {

@@ -105,6 +105,8 @@ bool QuestApply(char const* name, uint32_t status)
     else if (target == gEQuestStatus_Failed) manager->FailQuest(id);
     const bool nativeHandled = StatusOf(quest) == status;
     if (!nativeHandled) quest->SetStatus(target);
+    if (!net::IsHost() && StatusOf(quest) != status)
+        quest->AccessStatus() = target;
     if (preserveRep) {
         for (auto const& [repKey, repVal] : preservedRep) ReputationApply(repKey.c_str(), repVal);
     }

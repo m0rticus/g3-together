@@ -4,8 +4,14 @@
 // as module+RVA. Off by default; QA "trace on|all|off" or INI "trace = on|all". Output: <game dir>\g3trace.log.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 namespace g3t::trace {
 using LogFn = void (*)(char const*);
 void Configure(char const* mode);       // "on" (driven bodies), "all" (every entity), "off"
 void Command(char const* mode, LogFn log); // QA: TRACE line; empty mode: status only
+bool Active();
+void Marker(uint64_t telemSeq, char const* domainEvent, char const* detail);
+void CallerChain(unsigned skipFrames, unsigned maxFrames, char* out, size_t size);
 }

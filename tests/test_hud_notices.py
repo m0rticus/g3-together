@@ -32,13 +32,13 @@ int main()
     assert(!ShouldScrubSlotOnDestroy(&a, &b));
     assert(ShouldScrubSlotOnDestroy(&a, &a));
 
-    assert(!ShouldScrubIdleSlot(PlayerSlot, -1, false));
-    assert(!ShouldScrubIdleSlot(DialogNpcSlot, -1, true));
-    assert(ShouldScrubIdleSlot(DialogNpcSlot, -1, false));
-    assert(!ShouldScrubIdleSlot(FirstTransientPageSlot, 0, false));
+    assert(!ShouldScrubIdleSlot(PlayerSlot, -1));
+    assert(!ShouldScrubIdleSlot(FocusSlot, -1));
+    assert(!ShouldScrubIdleSlot(FocusSlot, 0));
+    assert(!ShouldScrubIdleSlot(FirstTransientPageSlot, 0));
     for (int slot = FirstTransientPageSlot; slot < EntitySlotCount; ++slot)
-        assert(ShouldScrubIdleSlot(slot, -1, true));
-    assert(!ShouldScrubIdleSlot(EntitySlotCount, -1, false));
+        assert(ShouldScrubIdleSlot(slot, -1));
+    assert(!ShouldScrubIdleSlot(EntitySlotCount, -1));
 
     assert(!ValidActivePage(-1));
     assert(ValidActivePage(0));

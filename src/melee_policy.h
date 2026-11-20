@@ -47,6 +47,30 @@ constexpr bool ClaimedSwing(std::uint32_t swing, std::uint32_t currentLife, std:
     return swing && (swing == currentLife || swing == unknownLife);
 }
 
+constexpr bool NpcProneAniState(int aniState)
+{
+    return aniState >= 15 && aniState <= 21;
+}
+
+constexpr bool NpcGroundImmune(bool isDead, bool isDown, int aiMode, int aniState,
+                               bool recordPresent = false, std::uint8_t recordFlags = 0,
+                               bool downTask = false, bool recentKnockout = false)
+{
+    return isDead || isDown || aiMode == 8 || aiMode == 9 || NpcProneAniState(aniState) ||
+           (recordPresent && (recordFlags & 3) != 0) || downTask || recentKnockout;
+}
+
+constexpr bool IsExplicitFinishingAction(int routineAction, int motionAction)
+{
+    return routineAction == 15 || motionAction == 15;
+}
+
+constexpr bool IsFinishingClaim(std::uint8_t meleeKind, std::uint8_t targetOnly, std::uint8_t outcome,
+                              std::uint8_t reaction, bool targeted)
+{
+    return meleeKind == 1 && targetOnly == 1 && outcome == 2 && reaction == 0 && targeted;
+}
+
 // Script_Game.dll CP 1.75: OnTouchDamage B492E..B4E78 (player branch), then
 // DoLogicalDamage B51C0..B520C and B54F8..B5748 (melee relational gates).
 constexpr Decision Judge(Victim const& v)

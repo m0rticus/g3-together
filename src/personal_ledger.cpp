@@ -50,6 +50,7 @@ constexpr size_t MaxPersonalObservers = 65536;
 std::vector<std::unique_ptr<ObserverState>> personalObservers;
 std::vector<ObserverState*> reusablePersonalObservers;
 std::map<std::string, ObserverState*> currentPersonalObservers;
+size_t destroyedPersonalObservers = 0;
 
 std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
 
@@ -60,13 +61,15 @@ std::string TemplateKey(Entity& entity, int stack)
     return std::string(reinterpret_cast<char const*>(&id.GetCore()), 16);
 }
 
-bool Counted(Entity& entity, int stack)
+bool Counted(Entity& entity, int stack, bool allowEquipped = false)
 {
-    if (entity.Inventory.GetSlotFromStack(stack) != gESlot_None) return false;
+    const gESlot slot = entity.Inventory.GetSlotFromStack(stack);
+    if (!allowEquipped && slot != gESlot_None) return false;
     auto* inventory = entity.GetInstance()
         ? static_cast<gCInventory_PS*>(entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory))
         : nullptr;
     if (!inventory || !inventory->GetStack(stack) || entity.Inventory.GetAmount(stack) <= 0) return false;
+    if (slot != gESlot_None && entity.Inventory.GetCategory(stack) == gEItemCategory_None) return false;
     Entity item = entity.Inventory.GetTemplateItem(stack);
     if (!item.GetInstance() || !item.GetInstance()->GetPropertySet(eEPropertySetType_Item)) return false;
     if (!std::strcmp(item.GetName().GetText(), "Fist")) return false;
@@ -84,13 +87,15 @@ bool StackMerchandise(Entity& entity, gCInventory_PS const& inventory, int index
 
 bool PersonalCounted(Entity& entity, int index)
 {
-    if (!Counted(entity, index)) return false;
-    if (entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC)) {
+    const bool npc = entity.GetInstance() && entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    personal::Kind kind = personal::Kind::Corpse;
+    const bool haveKind = npc && PersonalKind(entity, kind);
+    const bool allowEquipped = npc && haveKind && kind == personal::Kind::Corpse;
+    if (!Counted(entity, index, allowEquipped)) return false;
+    if (npc) {
         const gEItemCategory category = entity.Inventory.GetCategory(index);
         auto const* inventory = static_cast<gCInventory_PS*>(
             entity.GetInstance()->GetPropertySet(eEPropertySetType_Inventory));
-        personal::Kind kind = personal::Kind::Corpse;
-        PersonalKind(entity, kind);
         if ((category == gEItemCategory_Skill || category == gEItemCategory_Spellbook) &&
             (!inventory || !StackMerchandise(entity, *inventory, index, kind))) return false;
     }
@@ -112,19 +117,21 @@ void DetachAndRecycleObserver(ObserverState* observer, eCEntity* instance)
 
 void ReclaimCompletedObservers()
 {
+    destroyedPersonalObservers = 0;
     for (auto it = currentPersonalObservers.begin(); it != currentPersonalObservers.end();) {
         ObserverState* observer = it->second;
-        if (observer->depth) { ++it; continue; }
+        if (observer->depth) {
+            if (observer->changes.destroyed) ++destroyedPersonalObservers;
+            ++it;
+            continue;
+        }
         Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(it->first.data()));
         eCEntity* instance = entity.GetInstance();
         auto* currentInv = instance
             ? static_cast<gCInventory_PS*>(instance->GetPropertySet(eEPropertySetType_Inventory))
             : nullptr;
         const bool liveMatch = observer->inventory && currentInv == observer->inventory;
-        const bool activeTeardown = observer->changes.destroyed && instance &&
-                                    observer->owner == instance &&
-                                    currentInv && currentInv == observer->retiredInventory;
-        if (liveMatch || activeTeardown) { ++it; continue; }
+        if (liveMatch) { ++it; continue; }
         DetachAndRecycleObserver(observer, instance);
         it = currentPersonalObservers.erase(it);
     }
@@ -137,6 +144,7 @@ void RetirePersonalObservers()
         DetachAndRecycleObserver(entry.second, entity.GetInstance());
     }
     currentPersonalObservers.clear();
+    destroyedPersonalObservers = 0;
 }
 
 bool ObservePersonal(Entity& entity)
@@ -153,7 +161,7 @@ bool ObservePersonal(Entity& entity)
         DetachAndRecycleObserver(observer, instance);
         currentPersonalObservers.erase(existing);
     }
-    if (reusablePersonalObservers.empty()) ReclaimCompletedObservers();
+    if (reusablePersonalObservers.empty() || destroyedPersonalObservers > 0) ReclaimCompletedObservers();
     ObserverState* observer = nullptr;
     if (!reusablePersonalObservers.empty()) {
         observer = reusablePersonalObservers.back();
@@ -200,7 +208,9 @@ bool ResolveStackTemplates(Entity& entity, eCEntity* instance,
             (category == gEItemCategory_Skill || category == gEItemCategory_Spellbook)) return false;
         if (stack.type == personal::Stock::Normal) {
             for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
-                if (!PersonalCounted(entity, i) && entity.Inventory.GetSlotFromStack(i) == gESlot_None &&
+                if (!PersonalCounted(entity, i) &&
+                    (entity.Inventory.GetSlotFromStack(i) == gESlot_None ||
+                     entity.Inventory.GetSlotFromStack(i) == gESlot_Ammo) &&
                     TemplateKey(entity, i) == stack.item)
                     return false;
             }
@@ -208,6 +218,39 @@ bool ResolveStackTemplates(Entity& entity, eCEntity* instance,
         templates.push_back(item);
     }
     return true;
+}
+
+using StackKey = std::tuple<std::string, uint32_t, personal::Stock>;
+using EquippedSlot = std::pair<StackKey, gESlot>;
+
+void CaptureEquippedSlots(Entity& entity, gCInventory_PS const& inventory,
+                          personal::Kind kind, std::vector<EquippedSlot>& slots)
+{
+    slots.clear();
+    for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
+        const gESlot slot = entity.Inventory.GetSlotFromStack(i);
+        if (slot == gESlot_None || !PersonalCounted(entity, i)) continue;
+        const personal::Stock stock = StackMerchandise(entity, inventory, i, kind)
+            ? personal::Stock::Merchandise
+            : personal::Stock::Normal;
+        slots.emplace_back(
+            StackKey{TemplateKey(entity, i), personal::MaskQuality(entity.Inventory.GetQuality(i)), stock},
+            slot);
+    }
+}
+
+void RestoreMatchingSlot(Entity& entity, int created, personal::Stack const& stack,
+                         std::vector<EquippedSlot>& slots)
+{
+    if (created < 0 || slots.empty()) return;
+    const StackKey key{stack.item, stack.quality, stack.type};
+    for (auto it = slots.begin(); it != slots.end(); ++it) {
+        if (it->first != key) continue;
+        if (entity.Inventory.FindStackIndex(it->second) < 0)
+            entity.Inventory.EquipStackToSlot(created, it->second);
+        slots.erase(it);
+        break;
+    }
 }
 
 void ApplyPersonalMetadata(Entity& entity, gCInventory_PS& inventory, uint8_t flags)
@@ -225,14 +268,20 @@ void ApplyPersonalMetadata(Entity& entity, gCInventory_PS& inventory, uint8_t fl
 
 void RollbackPersonal(Entity& entity, gCInventory_PS& inventory,
                       personal::Inventory const& before,
-                      std::vector<eCTemplateEntity*> const& beforeTemplates)
+                      std::vector<eCTemplateEntity*> const& beforeTemplates,
+                      std::vector<EquippedSlot> const* beforeSlots = nullptr)
 {
-    for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i)
-        if (PersonalCounted(entity, i)) entity.Inventory.DeleteStack(i);
+    for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i) {
+        if (!PersonalCounted(entity, i)) continue;
+        if (entity.Inventory.GetSlotFromStack(i) != gESlot_None) entity.Inventory.UnEquipStack(i);
+        entity.Inventory.DeleteStack(i);
+    }
+    std::vector<EquippedSlot> remainingSlots = beforeSlots ? *beforeSlots : std::vector<EquippedSlot>{};
     for (size_t i = 0; i < before.stacks.size() && i < beforeTemplates.size(); ++i) {
         auto const& stack = before.stacks[i];
         const gEStackType type = stack.type == personal::Stock::Merchandise ? gEStackType_Merchandise : gEStackType_Normal;
-        inventory.CreateItems(beforeTemplates[i], stack.quality, stack.amount, type);
+        const int created = inventory.CreateItems(beforeTemplates[i], stack.quality, stack.amount, type);
+        if (before.kind == personal::Kind::Corpse) RestoreMatchingSlot(entity, created, stack, remainingSlots);
     }
     ApplyPersonalMetadata(entity, inventory, before.flags);
 }
@@ -300,25 +349,33 @@ bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
     std::vector<eCTemplateEntity*> beforeTemplates;
     if (!ReadPersonal(entity, before) || !ResolveStackTemplates(entity, instance, before.stacks, beforeTemplates))
         return false;
+    std::vector<EquippedSlot> beforeSlots;
+    CaptureEquippedSlots(entity, *inventory, before.kind, beforeSlots);
+    std::vector<EquippedSlot> remainingSlots = beforeSlots;
 
     auto rollbackAndFail = [&]() {
-        RollbackPersonal(entity, *inventory, before, beforeTemplates);
+        RollbackPersonal(entity, *inventory, before, beforeTemplates, &beforeSlots);
         return false;
     };
 
-    for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i)
-        if (PersonalCounted(entity, i) && !entity.Inventory.DeleteStack(i)) return rollbackAndFail();
+    for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i) {
+        if (!PersonalCounted(entity, i)) continue;
+        if (entity.Inventory.GetSlotFromStack(i) != gESlot_None && !entity.Inventory.UnEquipStack(i))
+            return rollbackAndFail();
+        if (!entity.Inventory.DeleteStack(i)) return rollbackAndFail();
+    }
     for (size_t i = 0; i < row.stacks.size(); ++i) {
         auto const& stack = row.stacks[i];
         const gEStackType type = stack.type == personal::Stock::Merchandise ? gEStackType_Merchandise : gEStackType_Normal;
-        if (inventory->CreateItems(templates[i], stack.quality, stack.amount, type) < 0) return rollbackAndFail();
+        const int created = inventory->CreateItems(templates[i], stack.quality, stack.amount, type);
+        if (created < 0) return rollbackAndFail();
+        if (kind == personal::Kind::Corpse) RestoreMatchingSlot(entity, created, stack, remainingSlots);
     }
     ApplyPersonalMetadata(entity, *inventory, row.flags);
 
     personal::Inventory after;
     if (!ReadPersonal(entity, after)) return rollbackAndFail();
     if (after.kind != kind || row.flags != after.flags) return rollbackAndFail();
-    using StackKey = std::tuple<std::string, uint32_t, personal::Stock>;
     std::map<StackKey, int64_t> totals;
     for (auto const& stack : row.stacks) totals[{stack.item, stack.quality, stack.type}] += stack.amount;
     for (auto const& stack : after.stacks) totals[{stack.item, stack.quality, stack.type}] -= stack.amount;
@@ -329,7 +386,8 @@ bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
 bool AwaitingDeath(Entity& entity, personal::Inventory const& row)
 {
     return row.kind == personal::Kind::Corpse && entity.GetInstance() &&
-           entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC) && !entity.IsDead();
+           entity.GetInstance()->GetPropertySet(eEPropertySetType_NPC) &&
+           !entity.IsDead() && !entity.IsDown();
 }
 } // namespace
 
@@ -339,6 +397,8 @@ void ObserverState::OnDestroyInventory()
     changes.Destroyed();
     retiredInventory = inventory;
     inventory = nullptr;
+    active = false;
+    ++destroyedPersonalObservers;
     if (depth) {
         personalUncertain.insert(key);
         Log("WARN containers: personal inventory unloaded during active mutation; keeping last committed snapshot");
@@ -352,7 +412,7 @@ bool IsContainer(Entity& entity)
 {
     eCEntity* instance = entity.GetInstance();
     if (!HasInventory(instance) || entity.IsItem() || instance == gCSession::GetInstance().GetHero()) return false;
-    return !instance->GetPropertySet(eEPropertySetType_NPC) || entity.IsDead();
+    return !instance->GetPropertySet(eEPropertySetType_NPC) || entity.IsDead() || entity.IsDown();
 }
 
 bool IsChest(Entity& entity)
@@ -365,8 +425,8 @@ bool IsChest(Entity& entity)
 bool IsTrader(Entity& entity)
 {
     eCEntity* instance = entity.GetInstance();
-    if (!HasInventory(instance) || !instance->GetPropertySet(eEPropertySetType_NPC) || entity.IsDead() ||
-        instance == gCSession::GetInstance().GetHero())
+    if (!HasInventory(instance) || !instance->GetPropertySet(eEPropertySetType_NPC) ||
+        entity.IsDead() || entity.IsDown() || instance == gCSession::GetInstance().GetHero())
         return false;
     Entity const sets[5] = {entity.Inventory.GetTreasureSet1(), entity.Inventory.GetTreasureSet2(),
                             entity.Inventory.GetTreasureSet3(), entity.Inventory.GetTreasureSet4(),
@@ -389,7 +449,7 @@ bool Shared(Entity& entity)
 bool Corpse(Entity& entity)
 {
     eCEntity* instance = entity.GetInstance();
-    return instance && instance->GetPropertySet(eEPropertySetType_NPC) && entity.IsDead();
+    return instance && instance->GetPropertySet(eEPropertySetType_NPC) && (entity.IsDead() || entity.IsDown());
 }
 
 bool PersonalKind(Entity& entity, personal::Kind& kind)
@@ -447,6 +507,7 @@ bool EnsurePersonal(Entity& entity)
 {
     eCEntity* instance = entity.GetInstance();
     if (!instance) return true;
+    if (destroyedPersonalObservers > 0) ReclaimCompletedObservers();
     if (PersonalTeardown(entity)) return false;
     const std::string key = EntityKey(instance);
     personalUncertain.erase(key);
@@ -531,6 +592,7 @@ bool TrackPersonalFocus()
 
 bool PersonalPass(bool capture, std::set<std::string>* attempted)
 {
+    if (destroyedPersonalObservers > 0) ReclaimCompletedObservers();
     if (!capture && personalPending.empty()) return true;
     bool ok = true;
     auto const* every = world::ProcessedEntities();
@@ -697,9 +759,7 @@ bool PersonalMutation::Enter(gCInventory_PS* inventory)
     Entity entity(inventory->GetEntity());
     if (!entity.GetInstance()) return true;
     const std::string key = EntityKey(entity.GetInstance());
-    const bool wasPending = personalPending.count(key) != 0;
-    if (wasPending && !EnsurePersonal(entity)) return false;
-    if (wasPending) return false;
+    if (personalPending.count(key) != 0 && !EnsurePersonal(entity)) return false;
     personal::Kind kind;
     if (!PersonalKind(entity, kind)) return true;
     if (!PersonalAdmitted()) return false;

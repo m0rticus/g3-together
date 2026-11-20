@@ -5,6 +5,7 @@
 #include "guid.h"
 #include "log.h"
 #include "net.h"
+#include "telemetry.h"
 #include "world.h"
 
 #include <Game.h>
@@ -132,7 +133,10 @@ bool BeforeTake(gCScriptProcessingUnit* spu)
     const std::string key(reinterpret_cast<char const*>(takingGuid), 16);
     if (consumed.count(key)) {
         taking = false;
-        if (denied.insert(key).second) Log("items: saved personal pickup denied; native retirement pending");
+        if (denied.insert(key).second) {
+            telemetry::OnWorldPickup("denied_already_taken", net::LocalId(), Entity(item).GetName().GetText(), takingGuid, Entity(item).Item.GetAmount(), item);
+            Log("items: saved personal pickup denied; native retirement pending");
+        }
         return false;
     }
     strncpy_s(takingName, Entity(item).GetName().GetText(), _TRUNCATE);
@@ -163,6 +167,7 @@ void AfterTake(gCScriptProcessingUnit* spu)
     char guid[48];
     guid::Format(takingGuid, guid, sizeof(guid));
     Format(lastTook, "guid=%s name=%s amount=%u", guid, takingName, takingAmount);
+    telemetry::OnWorldPickup("took", net::LocalId(), takingName, takingGuid, takingAmount, nullptr);
     Logf("items: hero took %s (personal world pickup; other players' copies unchanged)", lastTook);
 }
 
@@ -217,6 +222,7 @@ void OnWorldChange()
 
 void NoteOwnDrop(char const* name)
 {
+    telemetry::OnWorldPickup("ko_drop", net::LocalId(), name, nullptr, 1, nullptr);
     Logf("items: this hero dropped %s when knocked out (personal world item)", name);
 }
 

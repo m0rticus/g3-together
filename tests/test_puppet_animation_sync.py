@@ -104,6 +104,22 @@ class PuppetAnimationSyncTests(unittest.TestCase):
         hold = function_body(self.remote, r"\bvoid\s+Hold\s*\(")
         self.assertIn("puppet.heldRight != right || puppet.heldLeft != left", hold)
 
+    def test_puppet_hit_points_sync_through_player_state(self):
+        local = function_body(self.remote, r"\bbool\s+LocalState\s*\(")
+        self.assertIn("state.hitPoints", local)
+        self.assertIn("state.hitPointsMax", local)
+
+        sync = function_body(self.remote, r"\bvoid\s+SyncPuppetHitPoints\s*\(")
+        self.assertIsNotNone(sync)
+        self.assertIn("memory->GetAttribute(bCString(\"HP\"))", sync)
+        self.assertIn("attr->SetMaximum(", sync)
+        self.assertIn("attr->SetValue(", sync)
+        self.assertIn("receiver->AccessHitPointsMax()", sync)
+        self.assertIn("receiver->AccessHitPoints()", sync)
+
+        update = function_body(self.remote, r"\bvoid\s+UpdatePuppet\s*\(")
+        self.assertIn("SyncPuppetHitPoints(puppet.entity, remote.latest);", update)
+
 
 if __name__ == "__main__":
     unittest.main()

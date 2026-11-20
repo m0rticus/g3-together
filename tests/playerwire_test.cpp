@@ -46,6 +46,8 @@ g3t::net::PlayerState sample(std::uint32_t sequence = 100) {
     state.downedSequence = 0xabcdef01u;
     state.focusNpc = 0xdeadbeefu;
     state.targetNpc = 0x01234567u;
+    state.hitPoints = 275;
+    state.hitPointsMax = 400;
     return state;
 }
 
@@ -74,6 +76,8 @@ void assertState(const g3t::net::PlayerState& a, const g3t::net::PlayerState& b)
     assert(a.downedSequence == b.downedSequence);
     assert(a.focusNpc == b.focusNpc);
     assert(a.targetNpc == b.targetNpc);
+    assert(a.hitPoints == b.hitPoints);
+    assert(a.hitPointsMax == b.hitPointsMax);
 }
 
 void testRoundtripMasksAndCommitPreview() {
@@ -118,6 +122,8 @@ void testRoundtripMasksAndCommitPreview() {
     metadata.sequence = 102;
     setName(metadata.name, sizeof(metadata.name), "Bob");
     metadata.focusNpc = 0x12345678u;
+    metadata.hitPoints = 190;
+    metadata.hitPointsMax = 420;
     g3t::playerwire::Packet metadataPacket;
     assert(encoder.Plan(metadata, 1066, false, metadataPacket) == g3t::playerwire::Status::Ok);
     assert(metadataPacket.reliable);
@@ -128,6 +134,8 @@ void testRoundtripMasksAndCommitPreview() {
     assert(decoder.Decode(metadataPacket.bytes.data(), metadataPacket.bytes.size(), restored) == g3t::playerwire::Status::Ok);
     assert(std::strcmp(restored.name, "Bob") == 0);
     assert(restored.focusNpc == metadata.focusNpc);
+    assert(restored.hitPoints == 190);
+    assert(restored.hitPointsMax == 420);
     assert(decoder.Revision() == 2);
 
     g3t::net::PlayerState reliable = metadata;
@@ -289,6 +297,13 @@ void testMalformedBoundsAndAuthoritativeId() {
     bad[63] = 0xff;
     bad[64] = 0x04;
     assert(decoder.Decode(bad.data(), bad.size(), out) == g3t::playerwire::Status::Invalid);
+    std::vector<std::uint8_t> legacyFull(packet.bytes.begin(), packet.bytes.end() - 8);
+    legacyFull[63] = static_cast<std::uint8_t>(g3t::playerwire::LegacyMetadataMask & 0xffu);
+    legacyFull[64] = static_cast<std::uint8_t>((g3t::playerwire::LegacyMetadataMask >> 8) & 0xffu);
+    g3t::playerwire::Decoder legacyDecoder;
+    g3t::net::PlayerState legacyOut;
+    assert(legacyDecoder.Decode(legacyFull.data(), legacyFull.size(), legacyOut) == g3t::playerwire::Status::Ok);
+    assert(legacyOut.hitPoints == 0 && legacyOut.hitPointsMax == 0);
     bad = packet.bytes;
     bad.push_back(0);
     assert(decoder.Decode(bad.data(), bad.size(), out) == g3t::playerwire::Status::Invalid);
@@ -314,6 +329,12 @@ void testMalformedBoundsAndAuthoritativeId() {
     g3t::net::PlayerState invalid = state;
     invalid.gold = -1;
     g3t::playerwire::Packet invalidPacket;
+    assert(encoder.Plan(invalid, 1, false, invalidPacket) == g3t::playerwire::Status::Invalid);
+    invalid = state;
+    invalid.hitPointsMax = -1;
+    assert(encoder.Plan(invalid, 1, false, invalidPacket) == g3t::playerwire::Status::Invalid);
+    invalid = state;
+    invalid.hitPoints = g3t::playerwire::MaxHitPoints + 1;
     assert(encoder.Plan(invalid, 1, false, invalidPacket) == g3t::playerwire::Status::Invalid);
     invalid = state;
     invalid.position[0] = std::numeric_limits<float>::infinity();

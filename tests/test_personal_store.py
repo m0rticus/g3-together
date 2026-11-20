@@ -317,7 +317,7 @@ class PersonalStoreTests(unittest.TestCase):
         self.assertIn("!entity.Inventory.DeleteStack(i)", apply)
         self.assertIn("inventory->CreateItems", apply)
         self.assertIn("< 0) return rollbackAndFail()", apply)
-        self.assertIn("RollbackPersonal(entity, *inventory, before, beforeTemplates)", apply)
+        self.assertIn("RollbackPersonal(entity, *inventory, before, beforeTemplates, &beforeSlots)", apply)
         ensure = part(ledger_source, "bool EnsurePersonal(", "bool RememberPersonal(")
         self.assertIn("AwaitingDeath(entity", ensure)
         self.assertLess(ensure.index("!ApplyPersonal"), ensure.index("personalPending.erase"))
@@ -421,6 +421,72 @@ class PersonalStoreTests(unittest.TestCase):
         prepare_trade = part(containers_source, "bool PrepareLocalTrade(", "bool Opened(")
         self.assertNotIn("cannot refresh personal stock", prepare_trade)
         self.assertIn("AccessGeneratedTrade() = GETrue", prepare_trade)
+
+    def test_corpse_equipped_loot_ko_state_and_observer_reclaim(self):
+        ledger_source = _testbuild.src_text("personal_ledger.cpp")
+        containers_source = _testbuild.src_text("containers.cpp")
+        containers_header = _testbuild.src_text("containers.h")
+
+        for name in ("containers.cpp", "containers.h", "personal_ledger.cpp", "personal_ledger.h", "personal_store.h"):
+            self.assertLess(len(_testbuild.src_text(name).splitlines()), 1000, name)
+
+        def part(text, start, end):
+            return text[text.index(start):text.index(end, text.index(start))]
+
+        counted_fn = part(ledger_source, "bool Counted(", "bool StackMerchandise(")
+        self.assertIn("bool allowEquipped", counted_fn)
+        self.assertIn("entity.Inventory.GetCategory(stack) == gEItemCategory_None", counted_fn)
+
+        personal_counted = part(ledger_source, "bool PersonalCounted(", "void DetachAndRecycleObserver(")
+        self.assertIn("kind == personal::Kind::Corpse", personal_counted)
+        self.assertIn("Counted(entity, index, allowEquipped)", personal_counted)
+
+        for name in ("bool IsContainer(", "bool IsTrader(", "bool Corpse(", "bool AwaitingDeath("):
+            end_marker = {
+                "bool IsContainer(": "bool IsChest(",
+                "bool IsTrader(": "bool Shared(",
+                "bool Corpse(": "bool PersonalKind(",
+                "bool AwaitingDeath(": "} // namespace",
+            }[name]
+            fn = part(ledger_source, name, end_marker)
+            self.assertIn("IsDown()", fn, name)
+
+        apply_fn = part(ledger_source, "bool ApplyPersonal(", "bool AwaitingDeath(")
+        self.assertIn("CaptureEquippedSlots(", apply_fn)
+        self.assertIn("UnEquipStack(i)", apply_fn)
+        self.assertIn("RestoreMatchingSlot(", apply_fn)
+
+        rollback_fn = part(ledger_source, "void RollbackPersonal(", "bool ReadPersonal(")
+        self.assertIn("UnEquipStack(i)", rollback_fn)
+        self.assertIn("RestoreMatchingSlot(", rollback_fn)
+
+        resolve_fn = part(ledger_source, "bool ResolveStackTemplates(", "void CaptureEquippedSlots(")
+        self.assertIn("gESlot_Ammo", resolve_fn)
+
+        reclaim_fn = part(ledger_source, "void ReclaimCompletedObservers(", "void RetirePersonalObservers(")
+        self.assertNotIn("activeTeardown", reclaim_fn)
+        self.assertIn("destroyedPersonalObservers", reclaim_fn)
+
+        destroy_fn = part(ledger_source, "void ObserverState::OnDestroyInventory()", "bool HasInventory(")
+        self.assertIn("active = false;", destroy_fn)
+        self.assertIn("++destroyedPersonalObservers;", destroy_fn)
+
+        ensure_fn = part(ledger_source, "bool EnsurePersonal(", "bool RememberPersonal(")
+        self.assertIn("if (destroyedPersonalObservers > 0) ReclaimCompletedObservers();", ensure_fn)
+
+        pass_fn = part(ledger_source, "bool PersonalPass(", "bool FlushPersonalObservers(")
+        self.assertIn("if (destroyedPersonalObservers > 0) ReclaimCompletedObservers();", pass_fn)
+
+        enter_fn = part(ledger_source, "bool PersonalMutation::Enter(", "bool PersonalMutation::StillAvailable(")
+        self.assertNotIn("if (wasPending) return false;", enter_fn)
+
+        self.assertIn("void PrepareCorpseLoot(eCEntity* entity);", containers_header)
+        local_tick = part(containers_source, "void LocalInventoryTick()", "gFScript originalLoot")
+        self.assertIn("Corpse(focus)", local_tick)
+        self.assertIn("PrepareLocalLoot(focus)", local_tick)
+        quick = part(containers_source, "GEBool __fastcall QuickTake(", "void HookQuickLoot()")
+        self.assertIn("kind == personal::Kind::Corpse && !entity.Inventory.IsGeneratedPlunder()", quick)
+        self.assertIn("PrepareLocalLoot(entity)", quick)
 
 
 if __name__ == "__main__":

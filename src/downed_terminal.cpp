@@ -12,6 +12,7 @@
 #include "persist.h"
 #include "remote.h"
 #include "movement.h"
+#include "telemetry.h"
 #include <Windows.h>
 #include <cstdio>
 #include <cstring>
@@ -438,6 +439,7 @@ void Die(Entity& hero, char const* reason)
     EndStep("decision");
     Transition(reason, "end-policy");
     ++deaths;
+    telemetry::OnDownedEvent("die", net::LocalId(), life.sequence, life.held, life.terminal, hero.PlayerMemory.GetHitPoints(), nullptr, 0, reason);
     Logf("downed: nobody can help; the hero dies reason=%s hero=%p hp=%d task=%s state=%s ai=%d",
          reason, hero.GetInstance(), hero.PlayerMemory.GetHitPoints(), hero.Routine.GetCurrentTask().GetText(),
          hero.Routine.GetCurrentState().GetText(), static_cast<int>(hero.Routine.AIMode));

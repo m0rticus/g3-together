@@ -20,6 +20,7 @@ void OnState(uint8_t from, net::WorldState const& state);
 bool AllowClientQuestStatusOnHost(uint8_t from, char const* questName, int clientNewStatus);
 void OnClientArenaQuestStatus(uint8_t from, char const* questName, int prevStatus, int newStatus);
 void NoteQuestStatusFromHost(char const* questName, int newStatus);
+void ObserveLocalQuests();
 void SyncArenaStatuses();
 void TrackDuel(eCEntity* npc, uint8_t player);
 uint8_t ChallengerForNpc(eCEntity const* npc);

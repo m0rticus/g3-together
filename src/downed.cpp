@@ -14,6 +14,7 @@
 #include "persist.h"
 #include "remote.h"
 #include "movement.h"
+#include "telemetry.h"
 #include <Windows.h>
 #include <cstdio>
 #include <cstring>
@@ -85,6 +86,10 @@ void Transition(char const* reason, char const* source)
     Logf("downed: transition=%u player=%u role=%s held=%d terminal=%d sequence=%u reason=%s source=%s",
          ++transitions, net::LocalId(), net::IsHost() ? "host" : "client", life.held ? 1 : 0,
          life.terminal ? 1 : 0, life.sequence, reason, source);
+    eCEntity* h = gCSession::GetInstance().GetHero();
+    telemetry::OnDownedEvent(reason, net::LocalId(), life.sequence, life.held, life.terminal,
+                             h && h->GetPropertySet(eEPropertySetType_PlayerMemory) ? Entity(h).PlayerMemory.GetHitPoints() : -1,
+                             nullptr, revivedBy > 0 ? static_cast<uint8_t>(revivedBy) : 0u, source);
 }
 void __fastcall SetMode(gCScriptRoutine_PS* self, void* edx, bTPropertyContainer<gEAIMode> const& value)
 {
@@ -303,6 +308,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
         nativeNoted = false;
         Logf("downed: non-lethal defeat (%s) by %s (species=%d reason=%d); staying in native unconsciousness (hp=%d)",
              state, attackerName, attackerSpecies, attackerReason, hero.PlayerMemory.GetHitPoints());
+        telemetry::OnDownedEvent("non_lethal_ko", net::LocalId(), life.sequence, life.held, life.terminal, hero.PlayerMemory.GetHitPoints(), currentAttacker, 0, state);
         return true;
     }
     hero.NPC.EnableStatusEffects(static_cast<GEInt>(gEStatusEffect_Burning), GEFalse);
@@ -313,6 +319,7 @@ bool RedirectDeath(eCEntity* self, char const* state)
     lethalAt = now;
     if (!persist::HeroPending()) Hold("redirect-death", state);
     ++redirects;
+    telemetry::OnDownedEvent("redirect_death", net::LocalId(), life.sequence, life.held, life.terminal, hero.PlayerMemory.GetHitPoints(), currentAttacker, 0, state);
     Logf("downed: hero would die (%s), knocked out instead (hp=%d attacker=%s)", state,
          hero.PlayerMemory.GetHitPoints(), attackerName);
     return true;
@@ -545,10 +552,15 @@ void Revived(int byPlayer, uint32_t sequence)
         !instance || !session.IsGameRunning() || persist::HeroPending()) {
         Logf("downed: revive refused player=%u helper=%d sequence=%u current=%u held=%d terminal=%d reason=stale-or-ineligible",
              net::LocalId(), byPlayer, sequence, life.sequence, life.held ? 1 : 0, life.terminal ? 1 : 0);
+        telemetry::OnDownedEvent("revive_refused", net::LocalId(), sequence, life.held, life.terminal,
+                                 instance ? Entity(instance).PlayerMemory.GetHitPoints() : -1, nullptr,
+                                 byPlayer > 0 ? static_cast<uint8_t>(byPlayer) : 0u, "stale_or_ineligible");
         return;
     }
     revivedBy = byPlayer;
     pendingReviveSequence = sequence;
+    telemetry::OnDownedEvent("revive_accepted", net::LocalId(), sequence, life.held, life.terminal,
+                             Entity(instance).PlayerMemory.GetHitPoints(), nullptr, static_cast<uint8_t>(byPlayer), "network");
     Logf("downed: revive accepted player=%u helper=%d sequence=%u source=network", net::LocalId(), byPlayer, sequence);
 }
 

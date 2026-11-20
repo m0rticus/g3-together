@@ -6,6 +6,7 @@
 #include "i18n.h"
 #include "log.h"
 #include "persist.h"
+#include "telemetry.h"
 #include "trade.h"
 #include "trade_policy.h"
 #include "trade_replay.h"
@@ -49,7 +50,7 @@ Template Of(uint8_t const id[16])
 bool Same(Entity& self, int stack, Template const& item, unsigned quality = AnyQuality)
 {
     return self.Inventory.GetTemplate(stack) == static_cast<bCPropertyID const&>(item) &&
-           (quality == AnyQuality || self.Inventory.GetQuality(stack) == quality);
+           (quality == AnyQuality || (self.Inventory.GetQuality(stack) & trade_policy::QualityMask) == quality);
 }
 
 int Amount(Entity& self, Template const& item, unsigned quality = AnyQuality)
@@ -69,7 +70,7 @@ int Take(Entity& self, Template const& item, unsigned quality, int amount, std::
         if (!Same(self, i, item, quality) || !trade::TradableStack(self, i)) continue;
         const int n = std::min(amount - taken, self.Inventory.GetAmount(i));
         if (n <= 0) continue;
-        const unsigned q = self.Inventory.GetQuality(i);
+        const unsigned q = self.Inventory.GetQuality(i) & trade_policy::QualityMask;
         if (n == self.Inventory.GetAmount(i) ? self.Inventory.DeleteStack(i) : self.Inventory.DeleteItems(i, n)) {
             taken += n;
             steps.push_back({item, q, n, false});
@@ -148,6 +149,20 @@ uint64_t Fingerprint(net::OfferNote note)
     return hash;
 }
 
+void SummarizeOffer(net::OfferNote const& note, char* out, size_t cap)
+{
+    if (!out || !cap) return;
+    out[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < note.count && i < 8; ++i) {
+        auto const& e = note.entries[i];
+        const int n = std::snprintf(out + used, cap - used, "%s%s:%+d", i ? "," : "", e.name[0] ? e.name : "item", e.amount);
+        if (n <= 0) break;
+        used = static_cast<size_t>(n) >= cap - used ? cap - 1 : used + static_cast<size_t>(n);
+    }
+    if (!used) std::snprintf(out, cap, "-");
+}
+
 void OnOffer(net::OfferNote const& note)
 {
     if (note.count > net::MaxOfferEntries || note.acknowledge > 1 || note.buyer == note.seller) return;
@@ -186,6 +201,9 @@ void OnOffer(net::OfferNote const& note)
     outcomes.emplace(key, Outcome{result, hash, !ok});
     if (ok) ++applied;
     else ++refused;
+    char sum[256];
+    SummarizeOffer(note, sum, sizeof(sum));
+    telemetry::OnTradeOffer(ok ? "seller_applied" : "seller_refused", note.buyer, net::LocalId(), note.serial, note.gold, note.count, sum, result.result);
     Logf("trade: automatic exchange %u from player %u %s", note.serial, note.buyer, ok ? "applied" : "refused");
     net::SendOfferResult(result);
 }
@@ -214,6 +232,9 @@ void OnResult(net::OfferResultNote const& result)
             pending.delivered = true;
             pending.note.acknowledge = 1;
             trade::Publish();
+            char sum[256];
+            SummarizeOffer(note, sum, sizeof(sum));
+            telemetry::OnTradeOffer(result.result == net::OfferAccepted ? "buyer_completed" : "buyer_refunded", note.buyer, note.seller, note.serial, note.gold, note.count, sum, result.result);
             if (result.result != net::OfferAccepted) hud::Message(hud::Warning, i18n::Text(i18n::TradeUnavailable));
         }
         net::SendOffer(pending.note);
@@ -240,6 +261,9 @@ bool Send(net::OfferNote note)
     if (!net::SendOffer(note)) return false;
     sent.push_back({note, GetTickCount(), sellerAccount, false});
     ++sentCount;
+    char sum[256];
+    SummarizeOffer(note, sum, sizeof(sum));
+    telemetry::OnTradeOffer("sent", note.buyer, note.seller, note.serial, note.gold, note.count, sum, 0);
     return true;
 }
 

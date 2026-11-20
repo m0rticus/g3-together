@@ -127,18 +127,30 @@ void TestFighterTaskAndDefeatPolicies()
     assert(HasFighterEnteredBoutTask("ZS_Arena"));
     assert(HasFighterEnteredBoutTask("ZS_Attack"));
     assert(HasFighterEnteredBoutTask("ZS_Attack_Wait"));
+    assert(!HasFighterEnteredBoutTask("ZS_Attack_End"));
+    assert(!HasFighterEnteredBoutTask("ZS_Attack_Arena_End"));
     assert(!HasFighterEnteredBoutTask("ZS_Talk"));
     assert(!HasFighterEnteredBoutTask("ZS_Stand"));
     assert(!HasFighterEnteredBoutTask(nullptr));
 
-    // SendToArena host dispatch waits for quest Running, talk hold release, lease fence release, and ZS_Talk exit.
+    // SendToArena host dispatch waits for quest Running, talk hold release, lease fence release, and ZS_Talk exit,
+    // while allowing rematch dispatch if the fighter is still in ZS_Attack_End / ZS_Attack_Arena_End.
     assert(ShouldDispatchSendToArenaOnHost(true, false, false, "ZS_Stand"));
+    assert(ShouldDispatchSendToArenaOnHost(true, false, false, "ZS_Attack_End"));
+    assert(ShouldDispatchSendToArenaOnHost(true, false, false, "ZS_Attack_Arena_End"));
     assert(!ShouldDispatchSendToArenaOnHost(false, false, false, "ZS_Stand"));
     assert(!ShouldDispatchSendToArenaOnHost(true, true, false, "ZS_Stand"));
     assert(!ShouldDispatchSendToArenaOnHost(true, false, true, "ZS_Stand"));
     assert(!ShouldDispatchSendToArenaOnHost(true, false, false, "ZS_Talk"));
     assert(!ShouldDispatchSendToArenaOnHost(true, false, false, "ZS_Arena"));
     assert(!ShouldDispatchSendToArenaOnHost(true, false, false, "ZS_Attack"));
+
+    // Client suppresses OnLeaveArea/OnEnterArea for passive mirrored NPCs and remote puppets.
+    assert(ShouldSuppressNonLocalAreaActor(false, true, false, false));
+    assert(!ShouldSuppressNonLocalAreaActor(false, true, true, false));
+    assert(!ShouldSuppressNonLocalAreaActor(false, true, false, true));
+    assert(!ShouldSuppressNonLocalAreaActor(true, true, false, false));
+    assert(!ShouldSuppressNonLocalAreaActor(false, false, false, false));
 
     // Client challenger defeat/absence resolution on host.
     assert(ShouldMarkClientChallengerDefeatedOnHost(true, 2, true, true, true, false, false));

@@ -17,6 +17,7 @@
 #include "npcplayback.h"
 #include "remote.h"
 #include "summon.h"
+#include "telemetry.h"
 #include "witness.h"
 
 #include <Game.h>
@@ -178,6 +179,7 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     HostAppliedOriginScope appliedOrigin(HostAppliedOriginNpc, from, 0);
     uint8_t victimGuid[16]; Guid(target.GetInstance(), victimGuid);
     if (killedHere.count(KillKey(victimGuid))) return;
+    if (target.IsDead() || IsGroundImmuneNpc(target.GetInstance())) return;
     Entity attacker(npcs::NpcByGuid(npc));
     if (IgnoreFriendlyHit(target.GetInstance(), attacker.GetInstance(), party ? from : 0)) return;
     // An attacker not found here (an entity spawned only on the sender's machine, such as a weapon without an owner)
@@ -198,6 +200,7 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
     if (HitPoints(target) + delta > 0) {
         const int before = HitPoints(target);
         CallScript("AddHitPoints", victim, attacker.GetInstance() ? attacker.GetInstance() : victim, delta);
+        telemetry::OnCombatHit("npc_hit_applied", attacker.GetInstance(), victim, nullptr, before, HitPoints(target), delta, 0, 0, 0);
         if (party && HitPoints(target) < before) NotePlayerCombatDamage(victim, PlayerActor(from));
         witness::HitSeen(victim, attacker.GetInstance());  // those around hear the fight (P7)
         return;
@@ -217,6 +220,7 @@ void OnNpcHit(uint8_t from, Entity& target, int32_t delta, uint8_t const npc[16]
         if (paysXp && target.IsDead()) RewardKill(from, guid);
         ++partyKills;
     }
+    telemetry::OnCombatDefeat(party ? "party_npc_kill" : "npc_kill", attacker.GetInstance(), victim, party ? from : 0, false, paysXp);
     Logf("combat: %s of player %u killed %s", attacker.GetInstance() ? attacker.GetName().GetText() : "an NPC", from, target.GetName().GetText());
 }
 
@@ -278,16 +282,20 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     if (IgnoreFriendlyHit(target.GetInstance(), attacker, from)) return;
     if (OutsideBout(target, attacker)) {
         ++duelHitsRefused;
+        telemetry::OnCombatClaim("refused_outside_bout", from, target.GetInstance(), guid, delta, outcome, reaction, sequence, HitPoints(target), HitPoints(target));
         Logf("combat: player %u hit %s, who fights a duel or arena bout with someone else; not counted", from, target.GetName().GetText());
         return;
     }
-    // Native judgement can start a new knockout; only an already-downed victim is a finishing blow.
+    // Native judgement can start a new knockout; only an explicit finishing blow may execute a downed victim.
     bool finishing = false;
     if (attacker) {
         const auto at = knockedAt.find(KillKey(guid));
         const DWORD since = at != knockedAt.end() ? GetTickCount() - at->second : 0xffffffff;
-        if (target.IsDown() || since < 3000) {
-            if (since < 2000 || (InBout(target))) {
+        if (target.IsDown() || since < 3000 || IsGroundImmuneNpc(target.GetInstance())) {
+            const bool targeted = std::memcmp(contact.target, guid, 16) == 0;
+            const bool explicitFinishing = melee::IsFinishingClaim(
+                contact.melee, contact.targetOnly, outcome, reaction, targeted);
+            if (!explicitFinishing || (!target.IsDown() && since < 500) || InBout(target) || target.NPC.Immortal) {
                 ++finishRefused;
                 return;
             }
@@ -330,6 +338,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         guards::Acting player(attacker && guards::PlayerContextReady() ? attacker : nullptr);
         const int before = HitPoints(target);
         const GEInt result = CallScript("AddHitPoints", target.GetInstance(), attacker, delta);
+        telemetry::OnCombatClaim("applied", from, target.GetInstance(), guid, delta, outcome, reaction, sequence, before, HitPoints(target));
         static DWORD lastNoEffectLog = 0;
         const DWORD now = GetTickCount();
         if (claimsApplied <= 100 || (HitPoints(target) == before && now - lastNoEffectLog >= 5000)) {
@@ -398,7 +407,14 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
         CallScript("AddHitPoints", victim, attacker, -HitPoints(target));
         target.Routine.FullStop();
         target.Routine.SetTask(bCString("ZS_Unconscious"));
+        const DWORD now = GetTickCount();
+        for (auto it = knockedAt.begin(); it != knockedAt.end();) {
+            if (now - it->second >= 3000) it = knockedAt.erase(it);
+            else ++it;
+        }
+        knockedAt[KillKey(guid)] = now;
         ++duelKnockouts;
+        telemetry::OnCombatDefeat("bout_knockout", attacker, victim, from, false, false);
         Logf("combat: player %u won the duel or arena bout against %s (knocked out, not killed)", from, target.GetName().GetText());
         return;
     }
@@ -427,6 +443,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
             witness::KnockOutSeen(victim, attacker);
             ++knockedOut;
             if (paysXp) RewardKill(from, guid);
+            telemetry::OnCombatDefeat("knockout", attacker, victim, from, false, paysXp);
             Logf("combat: player %u knocked %s out (outcome %u)", from, target.GetName().GetText(), outcome);
             return;
         }
@@ -451,6 +468,7 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
     Expect(guid, paysXp && !target.IsDead() ? from : 0, paysXp);
     ++kills;
     if (paysXp && target.IsDead()) RewardKill(from, guid);
+    telemetry::OnCombatDefeat("kill", attacker, victim, from, finishing, paysXp);
     Logf("combat: player %u killed %s (OnCheatKill%s)", from, target.GetName().GetText(), finishing ? ", finishing blow" : "");  // ZS_RagDollDead takes effect next frame
 }
 
@@ -514,6 +532,7 @@ void OnHitPlayer(int32_t delta, uint8_t const[16], uint8_t attackerPlayer, bool 
         result = GameHit(self, DamageSource(static_cast<eCDynamicEntity*>(by), &kind), &pending);
     }
     ++forwardedJudged;
+    telemetry::OnCombatHit("player_hit_received", by, hero, nullptr, hpBefore, self.PlayerMemory.GetHitPoints(), delta, 0, 0, 0);
     if (forwardedJudged <= 100)  // QA guard; the first 100 for stageDamageHits (the game's damage and the applied)
         Logf("combat: forwarded blow judged here: result=%#x pending=%d hp %d -> %d sp %d -> %d", result, pending, hpBefore,
              self.PlayerMemory.GetHitPoints(), spBefore, self.PlayerMemory.GetStaminaPoints());

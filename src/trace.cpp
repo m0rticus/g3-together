@@ -59,8 +59,12 @@ void Write(char const* kind, eCEntity* entity, char const* what, void* caller)
 {
     char from[MAX_PATH + 16];
     Caller(caller, from, sizeof(from));
+    SYSTEMTIME now;
+    GetLocalTime(&now);
     Entity e(entity);
-    fprintf(out, "%10lu %s %s%s %s by %s\n", GetTickCount(), kind, e.GetName().GetText(),
+    fprintf(out, "%02u:%02u:%02u.%03u %10lu telem=#%llu %s %s%s %s by %s\n",
+            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetTickCount(),
+            static_cast<unsigned long long>(LastTelemetrySeq()), kind, e.GetName().GetText(),
             remote::IsPuppet(entity) ? "(puppet)" : npcs::IsMirrored(entity) ? "(mirror)" : "", what, from);
     if (++lines % 50 == 0) fflush(out);
 }
@@ -158,5 +162,35 @@ void Command(char const* text, LogFn log)
     Format(line, "TRACE mode=%s lines=%u hooks=%d%d%d", mode == All ? "all" : mode == Driven ? "driven" : "off", lines,
               playMotion != nullptr, setCurrentTask != nullptr, aiSetTask != nullptr);
     log(line);
+}
+
+bool Active() { return mode != Off && out != nullptr; }
+
+void Marker(uint64_t telemSeq, char const* domainEvent, char const* detail)
+{
+    if (mode == Off || !out) return;
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    fprintf(out, "%02u:%02u:%02u.%03u %10lu telem=#%llu [%s] %s\n",
+            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetTickCount(),
+            static_cast<unsigned long long>(telemSeq), domainEvent ? domainEvent : "telem", detail ? detail : "");
+    if (++lines % 25 == 0) fflush(out);
+}
+
+void CallerChain(unsigned skipFrames, unsigned maxFrames, char* outText, size_t size)
+{
+    if (!outText || !size) return;
+    outText[0] = '\0';
+    if (!maxFrames) return;
+    if (maxFrames > 8) maxFrames = 8;
+    void* frames[8] = {};
+    const USHORT count = RtlCaptureStackBackTrace(static_cast<ULONG>(skipFrames + 1), static_cast<ULONG>(maxFrames), frames, nullptr);
+    size_t pos = 0;
+    for (USHORT i = 0; i < count && pos + 2 < size; ++i) {
+        char frame[MAX_PATH + 16];
+        Caller(frames[i], frame, sizeof(frame));
+        pos += static_cast<size_t>(Format(outText + pos, size - pos, "%s%s", i ? "<" : "", frame));
+    }
+    if (!pos) Format(outText, size, "-");
 }
 }

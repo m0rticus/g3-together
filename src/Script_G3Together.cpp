@@ -58,6 +58,7 @@
 #include "guid.h"
 #include "focus_diag.h"
 #include "host_frame_diag.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Windows.h>
@@ -300,6 +301,7 @@ class Module : public eCEngineComponentBase
             {"ransack cleanup", &g3t::ransack::OnWorldChange},
             {"trade cleanup", &g3t::trade::OnWorldChange},  // forget the old hero before retiring its automatic transactions
             {"offer cleanup", &g3t::offer::OnWorldChange},
+            {"telemetry cleanup", &g3t::telemetry::OnWorldChange},
         };
         ResetFocusObservation();
         CaptureCacheInventory("before world cleanup");
@@ -334,6 +336,7 @@ class Module : public eCEngineComponentBase
         ForgetWorld();
         g3t::persist::OnWorldActivate();
         g3t::world::OnWorldActivate();
+        g3t::telemetry::OnWorldActivate();
         g3t::Log("world-entry: activation cleanup returned");
         g3t::crashlog::WorldEntryWait("engine first in-world frame");
         return bEResult_Ok;
@@ -347,6 +350,7 @@ class Module : public eCEngineComponentBase
         ForgetWorld();
         g3t::downed::OnWorldDeactivate();
         g3t::persist::OnWorldDeactivate();
+        g3t::telemetry::OnWorldDeactivate();
         g3t::Log("world-entry: deactivation cleanup returned");
         return bEResult_Ok;
     }
@@ -426,6 +430,7 @@ class Module : public eCEngineComponentBase
             g3t::talk::Tick();
             g3t::trade::Tick();
             g3t::offer::Tick();
+            g3t::telemetry::Tick();
             return;
         }
         Step("AI", &g3t::ai::Tick);
@@ -479,6 +484,7 @@ class Module : public eCEngineComponentBase
             {"spells", &g3t::spells::Tick},
         };
         for (auto const& step : tailSteps) Step(step.name, step.call);
+        Step("telemetry", &g3t::telemetry::Tick);
     }
     void PostProcess() override {}
     void OnBeginRenderSolid() override {}

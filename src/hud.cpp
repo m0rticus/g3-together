@@ -132,10 +132,8 @@ void ScrubEntitySlots(Predicate&& shouldScrub)
 
 void ScrubIdleEntitySlots()
 {
-    auto* infos = gCInfoManager_PS::GetInstance();
-    const bool dialogRunning = infos && infos->AccessIsRunning();
-    ScrubEntitySlots([dialogRunning](int slot, int32_t activePage, eCEntity const*) {
-        return entities::ShouldScrubIdleSlot(slot, activePage, dialogRunning);
+    ScrubEntitySlots([](int slot, int32_t activePage, eCEntity const*) {
+        return entities::ShouldScrubIdleSlot(slot, activePage);
     });
 }
 

@@ -17,6 +17,23 @@ char path[MAX_PATH] = {};
 bool reportedFileError = false;
 std::mutex logMutex;
 std::atomic<DWORD> logOwner{0};
+std::atomic<uint64_t> telemetrySeq{0};
+
+constexpr size_t TelemetryRingCapacity = 64;
+constexpr size_t TelemetryLineBytes = 2048;
+std::mutex telemetryRingMutex;
+char telemetryRing[TelemetryRingCapacity][TelemetryLineBytes] = {};
+size_t telemetryRingWrite = 0;
+size_t telemetryRingCount = 0;
+
+void RememberTelemetry(char const* text)
+{
+    if (!text || !*text) return;
+    std::lock_guard<std::mutex> lock(telemetryRingMutex);
+    _snprintf_s(telemetryRing[telemetryRingWrite], TelemetryLineBytes, _TRUNCATE, "%s", text);
+    telemetryRingWrite = (telemetryRingWrite + 1) % TelemetryRingCapacity;
+    if (telemetryRingCount < TelemetryRingCapacity) ++telemetryRingCount;
+}
 
 void EmergencyLog(char const* text)
 {
@@ -118,6 +135,50 @@ int Format(char* out, size_t size, const char* format, ...)
     const int length = FormatV(out, size, format, args);
     va_end(args);
     return length;
+}
+
+uint64_t NextTelemetrySeq()
+{
+    return telemetrySeq.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t LastTelemetrySeq()
+{
+    return telemetrySeq.load(std::memory_order_relaxed);
+}
+
+void LogTelemetryLine(uint64_t seq, const char* domainEvent, const char* fields)
+{
+    thread_local char formatted[16384];
+    if (fields && *fields) {
+        Format(formatted, "TELEM #%llu [%s] %s", static_cast<unsigned long long>(seq),
+               domainEvent ? domainEvent : "unknown", fields);
+    } else {
+        Format(formatted, "TELEM #%llu [%s]", static_cast<unsigned long long>(seq),
+               domainEvent ? domainEvent : "unknown");
+    }
+    RememberTelemetry(formatted);
+    Log(formatted);
+}
+
+size_t CopyRecentTelemetry(char* out, size_t size, size_t maxEntries)
+{
+    if (!out || !size) return 0;
+    out[0] = '\0';
+    std::unique_lock<std::mutex> lock(telemetryRingMutex, std::try_to_lock);
+    if (!lock.owns_lock() || !telemetryRingCount || !maxEntries) return 0;
+    const size_t take = telemetryRingCount < maxEntries ? telemetryRingCount : maxEntries;
+    const size_t oldest = (telemetryRingWrite + TelemetryRingCapacity - take) % TelemetryRingCapacity;
+    size_t pos = 0;
+    size_t copied = 0;
+    for (size_t i = 0; i < take && pos + 2 < size; ++i) {
+        const size_t idx = (oldest + i) % TelemetryRingCapacity;
+        const int wrote = Format(out + pos, size - pos, "%s\n", telemetryRing[idx]);
+        if (wrote <= 0) break;
+        pos += static_cast<size_t>(wrote);
+        ++copied;
+    }
+    return copied;
 }
 
 void FormatProbe(char const* argument, FormatLogFn log)

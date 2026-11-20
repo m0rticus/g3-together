@@ -95,6 +95,7 @@ struct MirrorChestUseInput {
     bool enabled = false;
     bool mirrorsPerceive = false;
     MirrorState mirror{};
+    float chestDistanceSqCm = 0.0f;
     bool npcHasMistEffect = false;
     bool heroHasGhostEffect = false;
     bool sameIndoorZone = false;
@@ -109,6 +110,8 @@ inline bool ShouldMirrorCatchChestUse(MirrorChestUseInput const& in) noexcept
     if (!in.enabled || !in.mirrorsPerceive || in.npcHasMistEffect || in.heroHasGhostEffect)
         return false;
     if (!IsMirrorPerceptible(in.mirror, MaxChestPerceiveRadiusSqCm))
+        return false;
+    if (in.chestDistanceSqCm > MaxChestPerceiveRadiusSqCm)
         return false;
     if (!in.sameIndoorZone && !in.freeLosToHero && !in.freeLosToChest)
         return false;

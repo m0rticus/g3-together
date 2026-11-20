@@ -50,19 +50,28 @@ class ArenaPolicyTests(unittest.TestCase):
         self.assertIn("admin->GetZone(*puppet, here, path, GEFalse)", arena)
         self.assertIn("navigation->AccessCurrentZoneEntityProxy() = here", arena)
 
-        # 2. Ring-exit protection hooks both OnLeaveArea and OnEnterArea and extracts other entity (not StringParameter).
+        # 2. Ring-exit protection hooks both OnLeaveArea and OnEnterArea, suppresses non-local actors on clients,
+        #    and extracts other entity (not StringParameter).
         self.assertIn("OnLeaveAreaDetour", arena)
         self.assertIn("OnEnterAreaDetour", arena)
         self.assertIn("spu->GetOtherEntity()", arena)
+        self.assertIn("arena_policy::ShouldSuppressNonLocalAreaActor(", arena)
         self.assertIn("arena_policy::ShouldSuppressPlayerLeaveArea(", arena)
 
-        # 3. Arena.Status synchronization and immediate quest flush on dialog end / quest transitions.
+        # 3. Arena.Status synchronization, pre-poll local quest transition observation, and immediate quest flush.
         self.assertIn("SyncArenaStatuses()", arena)
+        self.assertIn("ObserveLocalQuests()", arena)
+        self.assertIn("arena::ObserveLocalQuests()", story)
         self.assertIn("arena::SyncArenaStatuses()", story)
         self.assertIn("arena::AllowClientQuestStatusOnHost(", story)
         self.assertIn("arena::OnClientArenaQuestStatus(", story)
         self.assertIn("arena::NoteQuestStatusFromHost(", story)
         self.assertIn("story::FlushQuests()", talk)
+
+        # 4. Host SendToArena Detour always binds host hero (player 1); client bouts dispatch via InvokeNativeSendToArena.
+        detour = arena[arena.index("GEInt GE_STDCALL Detour("):arena.index("void ObserveQuestTransitions(")]
+        self.assertIn("constexpr uint8_t player = 1;", detour)
+        self.assertNotIn("guards::CurrentActor()", detour)
 
         # 4. Client dialog Attack forwarding works for both mirrored AND client-leased NPCs and relinquishes lease to host.
         self.assertIn("arena_policy::ShouldForwardClientDialogAttack(", infocmd)

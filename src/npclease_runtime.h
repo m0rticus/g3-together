@@ -9,6 +9,7 @@ class eCEntity;
 namespace g3t::npclease {
 void Tick();
 void OnWorldDeactivate();
+void OnEntityDestroyed(eCEntity const* entity);
 void CaptureCacheInventory();
 bool NewLife(uint8_t const guid[16]);
 bool LocalAuthority(eCEntity const* entity);

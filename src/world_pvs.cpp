@@ -10,11 +10,13 @@
 #include "i18n.h"
 #include "log.h"
 #include "net.h"
+#include "npclease_runtime.h"
 #include "npcplayback.h"
 #include "npcs.h"
 #include "persist.h"
 #include "relation.h"
 #include "remote.h"
+#include "telemetry.h"
 #include "world_collision.h"
 #include "world_collision_policy.h"
 #include "world_retirement.h"
@@ -536,13 +538,15 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
              region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex(), at[0], at[1], at[2], radius);
     }
     const bool moved = body::Distance(at, region.position) >= 500.0f || region.radius != radius;
-    if (moved) {
-        if (region.frames && regionLogs < 24) {
+    const bool anchorMissing = region.prefetcher && !region.prefetcher->IsJobRunning() &&
+                               !HasReadyAnchorCell(*region.prefetcher, at);
+    if (moved || anchorMissing) {
+        if (moved && region.frames && regionLogs < 24) {
             ++regionLogs;
             Logf("world: remote simulation region moved to %.0f,%.0f,%.0f radius %.0f cm (%u frames)", at[0], at[1], at[2], radius,
                  region.frames);
         }
-        contextRefreshPending.store(true, std::memory_order_relaxed);
+        if (moved) contextRefreshPending.store(true, std::memory_order_relaxed);
         region.camera->SetClipDepth(bCVector2(1.0f, radius));
         region.camera->SetPosition(bCVector(at[0], at[1], at[2]));
         auto& database = region.camera->GetFrustumDatabase();
@@ -580,6 +584,8 @@ void __fastcall DestroyEntity(eCEntity* entity, void* edx)
     }
     hud::OnEntityDestroyed(entity);
     npcplayback::OnEntityDestroyed(entity);
+    npclease::OnEntityDestroyed(entity);
+    telemetry::OnEntityDestroyed(entity);
     guards::OnEntityDestroyed(entity);
     relation::OnEntityDestroyed(entity);
     collision::OnEntityDestroyed(entity);

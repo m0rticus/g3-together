@@ -35,6 +35,9 @@ void LogMelee(char const* entry, uint8_t player, uint32_t sequence, eCEntity* vi
               net::MeleeContact const& contact, MeleeVerdict const& verdict);
 bool LocalMeleeAllowed(eCEntity* victim, eCEntity* attacker, net::MeleeContact const& contact);
 bool SendHostJudgedMelee(eCEntity* victim, net::MeleeContact contact);
+bool IsExplicitFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source);
+bool SendFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source);
+void BeginFinishingExecution();
 bool ClaimedPlayerSwing(uint8_t const identity[16], uint32_t swing);
 void PlayHitEffect(eCEntity* victim, bool blocked);
 void ClearMelee();

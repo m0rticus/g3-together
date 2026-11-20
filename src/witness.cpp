@@ -4,12 +4,14 @@
 
 #include "ai.h"
 #include "enclaves.h"
+#include "guards.h"
 #include "guid.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
 #include "patch.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -242,10 +244,14 @@ bool CheckWatchingMirrorsForChestUse(eCEntity* hero, eCEntity* chest,
         if (!body || !body->GetPropertySet(eEPropertySetType_NPC)) continue;
         Entity npc(body);
         const Entity npcZone = npc.GetZone();
+        const bCVector& bp = body->GetWorldPosition();
+        const bCVector& cp = chest->GetWorldPosition();
+        const float cdx = bp.GetX() - cp.GetX(), cdy = bp.GetY() - cp.GetY(), cdz = bp.GetZ() - cp.GetZ();
         policy::MirrorChestUseInput in{};
         in.enabled = enabled;
         in.mirrorsPerceive = mirrorsPerceive;
         in.mirror = candidate.mirror;
+        in.chestDistanceSqCm = cdx * cdx + cdy * cdy + cdz * cdz;
         in.npcHasMistEffect = npc.NPC.HasStatusEffects(gEStatusEffect_IsImNebel) != GEFalse;
         in.heroHasGhostEffect = heroHasGhost;
         in.sameIndoorZone = npcZone.GetInstance() &&
@@ -256,8 +262,12 @@ bool CheckWatchingMirrorsForChestUse(eCEntity* hero, eCEntity* chest,
         in.inFovToHero = npc.IsInFOV(heroEntity) != GEFalse;
         in.inFovToChest = npc.IsInFOV(chestEntity) != GEFalse;
         if (!policy::ShouldMirrorCatchChestUse(in)) continue;
-        if (!GetScriptAdminExt().CallScript(bCString("AssessUseInteractObject"), body, chest, 0)) continue;
+        // AssessUseInteractObject expects (npc, hero) and enforces IsInFOV(npc, chest); call IsBotheredByPlayerTheftOf
+        // directly so watching mirrors (ZS_ObserveSuspect) catch chest use/quick-loot by hero LOS/FOV too.
+        guards::LocalPlayer local(true);
+        if (!GetScriptAdminExt().CallScript(bCString("IsBotheredByPlayerTheftOf"), body, chest, 0)) continue;
         if (GetScriptAdminExt().CallScript(bCString("AssessTarget"), body, hero, gEAttackReason_UseInteractObject)) {
+            telemetry::OnWitnessEvent("mirror_caught_chest", body, chest, net::LocalId(), gEAttackReason_UseInteractObject, -1, LastCrime(body), "mirror_los_fov");
             caught = true;
         }
     }
@@ -301,6 +311,7 @@ GEInt GE_STDCALL Murder(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     ++murderReacted;
     Entity witness(npc), dead(victim);
     Entity killer = victim->GetPropertySet(eEPropertySetType_NPC) ? dead.NPC.GetCurrentAttacker() : Entity();
+    telemetry::OnWitnessEvent("saw_murder", npc, victim, killer.GetInstance() ? static_cast<uint8_t>(remote::PuppetOwner(killer.GetInstance())) : 0u, gEAttackReason_Murder, -1, LastCrime(npc), witness.Routine.GetCurrentTask().GetText());
     Logf("witness: %s (%s) saw %s die, killer %s (%s): task %s, target %s", witness.GetName().GetText(), Who(npc), dead.GetName().GetText(),
          killer.GetInstance() ? killer.GetName().GetText() : "-", Who(killer.GetInstance()), witness.Routine.GetCurrentTask().GetText(),
          witness.NPC.GetCurrentTarget().GetInstance() ? witness.NPC.GetCurrentTarget().GetName().GetText() : "-");
@@ -324,6 +335,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
             note.value = args;
             net::SendWitness(static_cast<uint8_t>(player), note);
             ++judgesSent;
+            telemetry::OnWitnessEvent("judge_puppet_sent", npc, target, static_cast<uint8_t>(player), args, -1, LastCrime(npc), Entity(npc).Routine.GetCurrentTask().GetText());
             Logf("witness: %s judged player %d's puppet (reason %d): task %s; that player's machine judges its hero", Entity(npc).GetName().GetText(),
                  player, args, Entity(npc).Routine.GetCurrentTask().GetText());
             return result;
@@ -349,6 +361,7 @@ GEInt GE_STDCALL Assess(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         Logf("witness: %s saw this player's crime (reason %d); player %u runs it and lets it react", witness.GetName().GetText(), args, owner);
     }
     const int after = LastCrime(npc);
+    telemetry::OnWitnessEvent("local_crime_seen", npc, hero, net::LocalId(), args, before, after, witness.Routine.GetCurrentTask().GetText());
     if (policy::ShouldSendWitnessHolds(enabled, enclaves::Together(), before, after)) {
         note.op = net::WitnessHolds;
         note.value = after;
@@ -368,6 +381,8 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
         eCEntity* puppet = remote::PuppetOf(from);
         if (!enabled || !puppet || npcs::IsMirrored(npc) || witness.IsDead() || witness.IsDown()) {
             ++refused;
+            char const* why = !enabled ? "off" : !puppet ? "no_puppet" : npcs::IsMirrored(npc) ? "mirrored" : "down";
+            telemetry::OnWitnessEvent("remote_saw_refused", npc, puppet, from, note.value, -1, LastCrime(npc), why);
             Logf("witness: %s saw player %u's crime, but it does not react here (%s)", witness.GetName().GetText(), from,
                  !enabled ? "off" : !puppet ? "no puppet" : npcs::IsMirrored(npc) ? "not run here" : "down");
             return;
@@ -383,6 +398,7 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
         const GEInt result = GetScriptAdminExt().CallScript(bCString("AssessTarget"), npc, puppet, note.value);
         --depth;
         ++applied;
+        telemetry::OnWitnessEvent("remote_saw_applied", npc, puppet, from, note.value, -1, LastCrime(npc), witness.Routine.GetCurrentTask().GetText());
         Logf("witness: %s saw player %u's crime (reason %d); it reacts here: result %d, task %s", witness.GetName().GetText(), from,
              note.value, result, witness.Routine.GetCurrentTask().GetText());
     } else if (note.op == net::WitnessJudge) {
@@ -399,6 +415,7 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
         --depth;
         ++judgesApplied;
         const int after = LastCrime(npc);
+        telemetry::OnWitnessEvent("remote_judge_applied", npc, hero, from, note.value, before, after, witness.Routine.GetCurrentTask().GetText());
         Logf("witness: %s judged this player (reason %d) on player %u's machine: result %d, crime %d -> %d, task %s%s", witness.GetName().GetText(),
              note.value, from, result, before, after, witness.Routine.GetCurrentTask().GetText(), npcs::IsMirrored(npc) ? " (mirror)" : "");
         if (policy::ShouldSendWitnessHolds(enabled, enclaves::Together(), before, after)) {
@@ -414,10 +431,12 @@ void OnWitness(uint8_t from, net::WitnessNote const& note)
             ++refused;
             return;
         }
+        const int beforeHold = LastCrime(npc);
         if (policy::ShouldApplyWitnessHolds(enabled, enclaves::Together(), witness.IsDead() != GEFalse,
-                                            note.value, LastCrime(npc), gEPlayerCrime_Count)) {
+                                            note.value, beforeHold, gEPlayerCrime_Count)) {
             SetLastCrime(npc, note.value);
             ++holdsApplied;
+            telemetry::OnWitnessEvent("together_holds_applied", npc, nullptr, from, 0, beforeHold, note.value, "together");
             Logf("witness: %s holds crime %d against player %u; together: against this player too", witness.GetName().GetText(), note.value, from);
         }
     }
@@ -567,6 +586,7 @@ bool PerceiveChestUse(eCEntity* chest)
     if (swapped) heroEntity.NPC.SetCurrentTarget(Entity(chest));
     const GEInt perceived = GetScriptAdminExt().CallScript(bCString("SendPerceptionUseInteractObject"), hero, chest, 0);
     if (swapped) heroEntity.NPC.SetCurrentTarget(prevTarget);
+    if (perceived != 0) telemetry::OnWitnessEvent("chest_use_caught", nullptr, chest, net::LocalId(), gEAttackReason_UseInteractObject, -1, -1, "blocked");
     return perceived != 0;
 }
 }

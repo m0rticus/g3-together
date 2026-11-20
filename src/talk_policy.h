@@ -12,6 +12,8 @@ constexpr int AiModeCombat = 3;      // gEAIMode_Combat
 constexpr int AiModeFlee = 4;        // gEAIMode_Flee
 constexpr int AiModeArena = 5;       // gEAIMode_Arena
 constexpr int AiModeTalk = 6;        // gEAIMode_Talk
+constexpr int AiModeDown = 8;        // gEAIMode_Down
+constexpr int AiModeDead = 9;        // gEAIMode_Dead
 constexpr int MoveModeSneak = 2;     // gECharMovementMode_Sneak
 constexpr int MoveModeSprint = 5;    // gECharMovementMode_Sprint
 
@@ -25,6 +27,8 @@ constexpr int AniStateSitBench = 8;       // gEAniState_SitBench
 constexpr int AniStateSitThrone = 9;      // gEAniState_SitThrone
 constexpr int AniStateSleepBed = 10;      // gEAniState_SleepBed
 constexpr int AniStateSleepGround = 11;   // gEAniState_SleepGround
+constexpr int AniStateSitKnockDown = 15;  // gEAniState_SitKnockDown
+constexpr int AniStateLiePiercedDead = 21; // gEAniState_LiePiercedDead
 constexpr int AniStateTalkStand = 22;     // gEAniState_TalkStand
 constexpr int AniStateTalkSitGround = 23; // gEAniState_TalkSitGround
 constexpr int AniStateTalkSitStool = 24;  // gEAniState_TalkSitStool
@@ -154,9 +158,7 @@ inline bool ShouldBindActingPlayerForEvent(bool isHost, bool heldInTalk, char co
     if (!isHost || heldInTalk || !eventName || !*eventName) return false;
     return std::strcmp(eventName, "ContinueRoutine") == 0 ||
            std::strcmp(eventName, "OnGuidePlayer") == 0 ||
-           std::strcmp(eventName, "OnFollowPlayer") == 0 ||
-           std::strcmp(eventName, "OnArena") == 0 ||
-           std::strcmp(eventName, "SendToArena") == 0;
+           std::strcmp(eventName, "OnFollowPlayer") == 0;
 }
 
 inline bool IsAllowedHeldTalkTask(char const* taskName) noexcept
@@ -285,6 +287,30 @@ constexpr bool ShouldSendClientTalkHold(bool connected, bool holdSent, uint32_t 
 constexpr bool ShouldReleaseClientTalkHold(bool connected, bool holdSent) noexcept
 {
     return connected && holdSent;
+}
+
+inline bool IsKnockdownOrDownMotion(char const* motion) noexcept
+{
+    if (!motion || !*motion || std::strcmp(motion, "<fault>") == 0) return false;
+    if (std::strstr(motion, "_Ambient_") != nullptr) return false;
+    return std::strstr(motion, "KnockDown") != nullptr ||
+           std::strstr(motion, "PiercedKO") != nullptr ||
+           std::strstr(motion, "Unconscious") != nullptr;
+}
+
+// Held puppets (awaiting revive) stay talkable for "I will help you." Temporary player knockdowns/unconsciousness
+// (ZS_SitKnockDown, ZS_LieKnockDown, ZS_PiercedKO, aniState 15..21, NativeDown() flags) must not enter ZS_Talk.
+inline bool ShouldRefusePuppetTalk(bool isPuppet, bool isHeldPuppet, uint8_t latestFlags, int latestAniState,
+                                   char const* latestMotion, int puppetAiMode, bool puppetDown, bool puppetDead,
+                                   int puppetAniState, char const* puppetMotion) noexcept
+{
+    if (!isPuppet || isHeldPuppet) return false;
+    if ((latestFlags & 30u) != 0u) return true; // KnockedOut(2) | Dead(4) | Held(8) | Robbable(16)
+    if (puppetAiMode == AiModeDown || puppetAiMode == AiModeDead || puppetDown || puppetDead) return true;
+    if ((latestAniState >= AniStateSitKnockDown && latestAniState <= AniStateLiePiercedDead) ||
+        (puppetAniState >= AniStateSitKnockDown && puppetAniState <= AniStateLiePiercedDead))
+        return true;
+    return IsKnockdownOrDownMotion(latestMotion) || IsKnockdownOrDownMotion(puppetMotion);
 }
 
 } // namespace g3t::talk_policy

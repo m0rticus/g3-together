@@ -10,6 +10,7 @@
 #include "guid.h"
 #include "log.h"
 #include "melee_policy.h"
+#include "movement_policy.h"
 #include "net.h"
 #include "npcs.h"
 #include "npclease_runtime.h"
@@ -17,6 +18,7 @@
 #include "npcplayback.h"
 #include "remote.h"
 #include "shot.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -90,6 +92,10 @@ std::string KillKey(uint8_t const guid[16])
 static_assert(melee::Friendly == static_cast<int>(gEAttitude_Friendly) &&
               melee::Neutral == static_cast<int>(gEAttitude_Neutral) &&
               melee::Hostile == static_cast<int>(gEAttitude_Hostile));
+static_assert(gEAIMode_Down == 8 && gEAIMode_Dead == 9);
+static_assert(gEAction_FinishingAttack == 15);
+static_assert(gEAniState_SitKnockDown == 15 && gEAniState_LieKnockDown == 16 &&
+              gEAniState_LieKnockOut == 17 && gEAniState_LiePiercedDead == 21);
 std::unordered_map<std::string, uint32_t> playerSwings;
 std::unordered_map<std::string, uint32_t> playerClaims;
 struct RefusedMelee { uint32_t motion = 0; std::string reason; };
@@ -146,7 +152,8 @@ net::MeleeContact CaptureMelee(eCEntity* attacker, eCEntity* source)
     contact.melee = 1;
     contact.item = source && source->GetPropertySet(eEPropertySetType_Item);
     const gEAction action = player.Routine.Action;
-    contact.targetOnly = action == gEAction_PierceAttack || action == gEAction_HackAttack;
+    contact.targetOnly = action == gEAction_PierceAttack || action == gEAction_HackAttack ||
+                         action == gEAction_FinishingAttack;
     contact.motion = npcplayback::MotionInstance(attacker);
     guid::CopyEntity(player.Focus.GetFocusEntity().GetInstance(), contact.focus);
     guid::CopyEntity(player.NPC.GetCurrentTarget().GetInstance(), contact.target);
@@ -285,6 +292,7 @@ bool LocalMeleeAllowed(eCEntity* victim, eCEntity* attacker, net::MeleeContact c
         refused.motion = contact.motion;
         refused.reason = verdict.decision;
         ++localMeleeRefused;
+        telemetry::OnCombatIgnored(verdict.decision, attacker, victim, net::LocalId());
         LogMelee("local-refused", net::LocalId(), 0, victim, contact, verdict);
     }
     return false;
@@ -319,6 +327,8 @@ bool SendHostJudgedMelee(eCEntity* victim, net::MeleeContact contact)
     playerClaims[key] = contact.motion;
     ++claimsSent;
     ++hostJudgedClaimsSent;
+    Entity victimEntity(victim);
+    telemetry::OnCombatHit("claim_host_judged", hero, victim, nullptr, HitPoints(victimEntity), HitPoints(victimEntity), 0, net::HitUnjudged, net::HitNoReaction, hit);
     npcs::AwaitHit(victim, hit);
     const auto context = playerMeleeContacts.find(key);
     if (context != playerMeleeContacts.end()) {
@@ -339,13 +349,132 @@ void PlayHitEffect(eCEntity* victim, bool blocked)
     EffectSystem::StartEffect(name, Entity(victim));
     ++hitEffectsPlayed;
 }
+
+uint32_t finishingEpisode = 0;
+uint32_t lastFinishingEpisode = 0;
+std::string lastFinishingKey;
+
+bool IsDownNpcTask(char const* task)
+{
+    if (!task || !*task) return false;
+    for (char const* entry : {"ZS_Unconscious", "ZS_LieKnockDown", "ZS_SitKnockDown", "ZS_PiercedKO",
+                              "ZS_RagDollDead", "ZS_Dead", "ZS_PiercedDead"})
+        if (!std::strcmp(task, entry)) return true;
+    return false;
+}
+
+void BeginFinishingExecution()
+{
+    if (++finishingEpisode == 0) ++finishingEpisode;
+    lastFinishingKey.clear();
+}
+
+bool IsExplicitFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source)
+{
+    if (!attacker || attacker != remote::ControlledBody() || !victim ||
+        !victim->GetPropertySet(eEPropertySetType_NPC) || remote::IsPuppet(victim))
+        return false;
+    if (!IsLocalMelee(attacker, source)) return false;
+    Entity player(attacker), target(victim);
+    if (player.IsDown() || player.IsDead() || target.IsDead() || target.NPC.Immortal) return false;
+    auto const* record = npcs::CombatRecord(victim);
+    constexpr uint8_t NpcRecordDeadFlag = 1;
+    constexpr uint8_t NpcRecordDownFlag = 2;
+    if (record && (record->flags & NpcRecordDeadFlag) != 0) return false;
+    const int localAiMode = victim->GetPropertySet(eEPropertySetType_ScriptRoutine)
+        ? static_cast<int>(static_cast<gEAIMode>(target.Routine.AIMode)) : -1;
+    const bool victimDown = target.IsDown() != GEFalse || localAiMode == gEAIMode_Down ||
+                            (record && ((record->flags & NpcRecordDownFlag) != 0 || record->aiMode == gEAIMode_Down));
+    if (!victimDown) return false;
+    int motionAction = 0;
+    char motion[128] = {}, phase[24] = {};
+    if (body::CurrentMotion(attacker, motion, sizeof(motion)))
+        movement::ParseCombatMove(motion, motionAction, phase, sizeof(phase));
+    const int routineAction = attacker->GetPropertySet(eEPropertySetType_ScriptRoutine)
+        ? static_cast<int>(static_cast<gEAction>(player.Routine.Action)) : 0;
+    if (!melee::IsExplicitFinishingAction(routineAction, motionAction)) return false;
+    eCEntity* aimed = player.NPC.GetCurrentTarget().GetInstance();
+    eCEntity* focus = attacker->GetPropertySet(eEPropertySetType_Focus)
+        ? player.Focus.GetFocusEntity().GetInstance() : nullptr;
+    return aimed ? aimed == victim : focus == victim;
+}
+
+bool SendFinishingBlow(eCEntity* attacker, eCEntity* victim, eCEntity* source)
+{
+    if (!attacker || !victim || net::IsHost() || !npcs::OwnerOf(victim)) return false;
+    if (IgnoreFriendlyHit(victim, attacker)) return false;
+    Entity target(victim);
+    if (InBout(target) || target.IsDead() || target.NPC.Immortal) return false;
+    uint8_t identity[16], weapon[16] = {};
+    Guid(victim, identity);
+    const std::string key = KillKey(identity);
+    const uint32_t incarnation = npcs::Incarnation(identity);
+    if (!incarnation) return false;
+    net::MeleeContact contact = CaptureMelee(attacker, source);
+    contact.melee = net::PredictedMelee;
+    contact.targetOnly = 1;
+    std::memcpy(contact.target, identity, 16);
+    std::memcpy(contact.focus, identity, 16);
+    if (contact.motion && ClaimedPlayerSwing(identity, contact.motion)) return false;
+    if (finishingEpisode != 0 && lastFinishingEpisode == finishingEpisode && lastFinishingKey == key)
+        return false;
+    const GEInt held = Entity(attacker).Inventory.FindStackIndex(gESlot_RightHand);
+    if (held >= 0) {
+        const Template item = Entity(attacker).Inventory.GetTemplate(held);
+        bCPropertyID const& id = item;
+        std::memcpy(weapon, &id.GetCore(), 16);
+    }
+    const uint32_t seen = npcs::SeenAt(victim);
+    const uint32_t hit = net::SendHitNpc(1, identity, -1, weapon, nullptr, net::HitDeath,
+                                         seen, net::HitNoReaction, incarnation, contact);
+    if (!hit) return false;
+    if (contact.motion) playerClaims[key] = contact.motion;
+    if (finishingEpisode != 0) {
+        lastFinishingEpisode = finishingEpisode;
+        lastFinishingKey = key;
+    }
+    ++claimsSent;
+    telemetry::OnCombatHit("claim_finishing", attacker, victim, source, HitPoints(target), HitPoints(target),
+                           -1, net::HitDeath, net::HitNoReaction, hit);
+    npcs::AwaitHit(victim, hit);
+    const bCString finishEffect("eff_col_wh_03_me_fl");
+    if (EffectSystem::ExistsEffect(finishEffect)) EffectSystem::StartEffect(finishEffect, Entity(victim));
+    else PlayHitEffect(victim, false);
+    Logf("combat: finishing-blow sent player=%u sequence=%u victim=%s motion=%u",
+         net::LocalId(), hit, target.GetName().GetText(), contact.motion);
+    return true;
+}
 void ClearMelee()
 {
     playerSwings.clear();
     playerClaims.clear();
     playerMeleeContacts.clear();
     refusedMelee.clear();
+    lastFinishingKey.clear();
+    lastFinishingEpisode = 0;
 }
+}
+bool IsGroundImmuneNpc(eCEntity* entity)
+{
+    if (!entity || !entity->GetPropertySet(eEPropertySetType_NPC)) return false;
+    if (entity == gCSession::GetInstance().GetHero() || entity == remote::ControlledBody() ||
+        remote::IsPuppet(entity))
+        return false;
+    Entity npc(entity);
+    const bool isDead = npc.IsDead() != GEFalse;
+    const bool isDown = npc.IsDown() != GEFalse;
+    int aiMode = -1;
+    int aniState = -1;
+    bool downTask = false;
+    if (entity->GetPropertySet(eEPropertySetType_ScriptRoutine)) {
+        aiMode = static_cast<int>(static_cast<gEAIMode>(npc.Routine.AIMode));
+        aniState = static_cast<int>(static_cast<gEAniState>(npc.Routine.AniState));
+        downTask = IsDownNpcTask(npc.Routine.GetCurrentTask().GetText());
+    }
+    auto const* record = npcs::CombatRecord(entity);
+    const bool recordGround = record && melee::NpcGroundImmune(false, false, record->aiMode, record->aniState,
+                                                               true, record->flags);
+    return melee::NpcGroundImmune(isDead, isDown, aiMode, aniState, false, 0, downTask) || recordGround;
 }
 bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player)
 {
@@ -357,6 +486,7 @@ bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player)
         if (source == victim) return false;
         if (SideOf(source)) {
             ++friendlyHitsIgnored;
+            telemetry::OnCombatIgnored("friendly_fire", source, victim, static_cast<uint8_t>(player));
             return true;
         }
         Entity owner = Entity(source).Interaction.GetOwner();
@@ -366,6 +496,7 @@ bool IgnoreFriendlyHit(eCEntity* victim, eCEntity* source, unsigned player)
     }
     if (player > 0 && player < net::MaxPlayers) {
         ++friendlyHitsIgnored;
+        telemetry::OnCombatIgnored("friendly_fire", source, victim, static_cast<uint8_t>(player));
         return true;
     }
     return false;
@@ -421,6 +552,10 @@ bool PlayerBlow(eCEntity* victim)
     if (player.IsDown() || player.IsDead() || target.IsDead()) return false;
     char const* kind = "";
     eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(hero), &kind);
+    if (IsGroundImmuneNpc(victim)) {
+        if (!IsExplicitFinishingBlow(hero, victim, source)) return false;
+        return SendFinishingBlow(hero, victim, source);
+    }
     const auto contact = CaptureMelee(hero, source);
     if (!LocalMeleeAllowed(victim, hero, contact)) return false;
     uint8_t identity[16]; Guid(victim, identity);

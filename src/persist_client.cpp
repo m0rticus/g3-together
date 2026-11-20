@@ -6,9 +6,12 @@
 #include "clock.h"
 #include "config.h"
 #include "crashlog.h"
+#include "doors.h"
 #include "log.h"
 #include "partner.h"
 #include "steam.h"
+#include "story.h"
+#include "telemetry.h"
 #include "trade.h"
 
 #include <cstdio>
@@ -262,6 +265,9 @@ void NoteAutoload(autoload::Decision const& decision, autoload::Snapshot const& 
          autoload::Name(decision.status), AdmissionCause(decision.status), hostWorld.epoch, hostWorld.kind,
          snapshot.localWorld ? (snapshot.adoptable ? "fresh" : "used") : "none", snapshot.admitted ? 1 : 0, snapshot.queued ? 1 : 0,
          autoloadState.Entries(), snapshot.routeAvailable ? 1 : 0, snapshot.enabled ? 1 : 0, snapshot.hooks ? 1 : 0);
+    telemetry::OnAdmissionStage(autoload::Name(decision.status), AdmissionCause(decision.status), hostWorld.epoch,
+                                hostWorld.kind, hostWorld.campaign, ownCharacterReady, story::AdmissionReady(),
+                                doors::AdmissionReady(), hostAdmissionAck, net::InWorld(net::LocalId()));
     if (decision.status == S::Mismatch)
         Logf("admission: mismatch detected host_epoch=%08x kind=%u: this client's world is not the host's world and cannot be admitted by itself",
              hostWorld.epoch, hostWorld.kind);
@@ -759,6 +765,8 @@ static void EnterTemplateWorld(uint32_t queuedAt)
     Logf("persist: client enter state=%s hud_ok=%d lower_calls=%u lower_ok=%d elapsed_ms=%u player=%p running=%d",
          ok ? "returned" : "failed", hudOk ? 1 : 0, lowerLoadCalls, lowerLoadGood ? 1 : 0, GetTickCount() - queuedAt,
          game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
+    telemetry::OnPersistEvent("client_template_load", rejoin::tmpl::Slot, hostWorld.campaign, hostWorld.epoch, ok,
+                              ok ? "returned" : "failed");
     if (ok) { clientWorldEntered = true; return; }
     RemoveTemplate("native-load-failed");
     Notice(i18n::ClientRejoinFailed, true);

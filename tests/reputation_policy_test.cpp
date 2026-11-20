@@ -389,6 +389,94 @@ void TestRequestTrackerGating()
     assert(!tracker.active);
 }
 
+void TestSplitTheftPerPlayer()
+{
+    // Host (player 1) is innocent; client 2 steals in KapDun (30 thefts + KnownTheft).
+    rep::EnclaveCrimeState hostShared{};
+    rep::PlayerTheftState p2{};
+    rep::PlayerTheftState p3{};
+
+    // 1. Client 2 steals +17 then +13 (unwitnessed): hostShared must remain 0, p3 remains 0.
+    rep::EnclaveCrimeState d1{};
+    d1.crime[rep::CrimeTheft] = 17;
+    d1.suspect[rep::CrimeTheft] = -1;
+    d1.known = -1;
+    bool sharedChanged = false, theftChanged = false;
+    rep::ApplyClientDeltaOnHost(hostShared, p2, d1, false, sharedChanged, theftChanged);
+    assert(!sharedChanged && theftChanged);
+    assert(hostShared.crime[rep::CrimeTheft] == 0 && hostShared.known == rep::CrimeNone);
+    assert(p2.crimeCount == 17 && !p2.knownTheft);
+
+    // 2. Client 2 gets caught (KnownTheft) and Guard comments on 20 thefts: still isolated to p2.
+    rep::EnclaveCrimeState d2{};
+    d2.crime[rep::CrimeTheft] = 13;
+    d2.suspect[rep::CrimeTheft] = 20;
+    d2.known = rep::CrimeTheft;
+    rep::ApplyClientDeltaOnHost(hostShared, p2, d2, false, sharedChanged, theftChanged);
+    assert(!sharedChanged && theftChanged);
+    assert(hostShared.crime[rep::CrimeTheft] == 0);
+    assert(hostShared.suspect[rep::CrimeTheft] == 0);
+    assert(hostShared.known == rep::CrimeNone);
+    assert(p2.crimeCount == 30 && p2.suspectComment == 20 && p2.knownTheft);
+
+    // Projecting EnclaveState to client 2 vs innocent client 3:
+    const rep::EnclaveCrimeState viewP2 = rep::ProjectClientEnclaveState(hostShared, p2);
+    const rep::EnclaveCrimeState viewP3 = rep::ProjectClientEnclaveState(hostShared, p3);
+    assert(viewP2.crime[rep::CrimeTheft] == 30 && viewP2.suspect[rep::CrimeTheft] == 20 && viewP2.known == rep::CrimeTheft);
+    assert(viewP3.crime[rep::CrimeTheft] == 0 && viewP3.suspect[rep::CrimeTheft] == 0 && viewP3.known == rep::CrimeNone);
+
+    // 3. Host commits own theft (+25 + KnownTheft): HasSharedNonTheftChange is false and clients stay untouched.
+    rep::EnclaveCrimeState hostBefore = hostShared;
+    hostShared.crime[rep::CrimeTheft] = 25;
+    hostShared.suspect[rep::CrimeTheft] = 20;
+    hostShared.known = rep::CrimeTheft;
+    assert(!rep::HasSharedNonTheftChange(hostBefore, hostShared, true));
+    const rep::EnclaveCrimeState viewP3AfterHostTheft = rep::ProjectClientEnclaveState(hostShared, p3);
+    assert(viewP3AfterHostTheft.crime[rep::CrimeTheft] == 0 && viewP3AfterHostTheft.known == rep::CrimeNone);
+
+    // 3b. While Host has KnownTheft (3), Client 3 commits Attack (2): Host keeps KnownTheft locally,
+    // while Client 3 (and innocent peers) receive KnownPlayerCrime == Attack (2) instead of dropping it!
+    rep::EnclaveCrimeState attackDelta{};
+    attackDelta.crime[2] = 1;  // CrimeAttack
+    attackDelta.suspect[rep::CrimeTheft] = -1;
+    attackDelta.known = 2;     // CrimeAttack
+    rep::ApplyClientDeltaOnHost(hostShared, p3, attackDelta, false, sharedChanged, theftChanged);
+    assert(sharedChanged && !theftChanged);
+    assert(hostShared.known == rep::CrimeTheft && hostShared.nonTheftKnown == 2);
+    const rep::EnclaveCrimeState viewP3Attack = rep::ProjectClientEnclaveState(hostShared, p3);
+    const rep::EnclaveCrimeState viewP2AttackAndTheft = rep::ProjectClientEnclaveState(hostShared, p2);
+    assert(viewP3Attack.crime[2] == 1 && viewP3Attack.known == 2);
+    assert(viewP2AttackAndTheft.crime[2] == 1 && viewP2AttackAndTheft.known == rep::CrimeTheft);
+
+    // 4. Shared Murder (4) propagates to all players (4 > 3), while p2 keeps its theft count and p3 keeps 0 thefts.
+    rep::EnclaveCrimeState murderDelta{};
+    murderDelta.crime[rep::CrimeMurder] = 1;
+    murderDelta.suspect[rep::CrimeTheft] = -1;
+    murderDelta.known = rep::CrimeMurder;
+    rep::ApplyClientDeltaOnHost(hostShared, p3, murderDelta, false, sharedChanged, theftChanged);
+    assert(sharedChanged && !theftChanged);
+    assert(hostShared.crime[rep::CrimeMurder] == 1 && hostShared.known == rep::CrimeMurder);
+    const rep::EnclaveCrimeState viewP3Murder = rep::ProjectClientEnclaveState(hostShared, p3);
+    assert(viewP3Murder.crime[rep::CrimeMurder] == 1 && viewP3Murder.crime[rep::CrimeTheft] == 0 && viewP3Murder.known == rep::CrimeMurder);
+
+    // 5. Client 2 clearing its own theft (known=None) does NOT clear host Murder (4).
+    rep::EnclaveCrimeState clearP2Theft{};
+    clearP2Theft.crime[rep::CrimeTheft] = -30;
+    clearP2Theft.suspect[rep::CrimeTheft] = 0;
+    clearP2Theft.known = rep::CrimeNone;
+    rep::ApplyClientDeltaOnHost(hostShared, p2, clearP2Theft, false, sharedChanged, theftChanged);
+    assert(!sharedChanged && theftChanged);
+    assert(hostShared.known == rep::CrimeMurder && p2.crimeCount == 0 && p2.suspectComment == 0 && !p2.knownTheft);
+
+    // 6. Native liberation / murder wipe on host detects reset for all players.
+    rep::EnclaveCrimeState hostCleared = hostShared;
+    hostCleared.crime[rep::CrimeMurder] = 0;
+    hostCleared.crime[rep::CrimeTheft] = 0;
+    hostCleared.known = rep::CrimeNone;
+    assert(rep::HasSharedNonTheftChange(hostShared, hostCleared, true));
+    assert(rep::ShouldClearAllPlayerTheftsOnHostReset(hostShared, hostCleared));
+}
+
 }  // namespace
 
 int main()
@@ -399,5 +487,6 @@ int main()
     TestQuestCompletionBothPlayersAndPacketOrders();
     TestDialogReputationAndLiberationAndPersonalMode();
     TestRequestTrackerGating();
+    TestSplitTheftPerPlayer();
     return 0;
 }

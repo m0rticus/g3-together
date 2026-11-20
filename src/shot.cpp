@@ -13,6 +13,7 @@
 #include "remote.h"
 #include "shot_sweep.h"
 #include "summon.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -289,6 +290,8 @@ void Announce(Pending const& p, Entity arrow)
     net::SendShot(note);
     if (p.shooter != remote::ControlledBody()) ++npcAnnounced;
     ++announced;
+    telemetry::OnShotFired(net::LocalId(), p.shooter != remote::ControlledBody() ? p.shooter : nullptr, note.arrow,
+                           note.spell[0] ? note.spell : note.spellItem, note.netId, note.target, note.targetPlayer, note.damage, note.velocity);
     Logf("shot: own %s is net %08X at %.0f %.0f %.0f dir %.2f %.2f %.2f v %.0f path %u", note.arrow, note.netId, at.GetX(),
          at.GetY(), at.GetZ(), direction.GetX(), direction.GetY(), direction.GetZ(), note.velocity, note.path);
 }
@@ -414,6 +417,7 @@ void SpawnShot(uint8_t from, net::ShotNote const& note)
     if (npc) ++npcCopies;
     summon::WatchHits();
     ++copies;
+    telemetry::OnShotSpawned(from, note.arrow, note.spell[0] ? note.spell : note.spellItem, note.netId, note.targetPlayer);
     Logf("shot: net %08X from player %u: %s copy flies, path %u v %.0f, %u puppet parts excluded", note.netId, from, note.arrow, note.path,
          note.velocity, static_cast<unsigned>(parts.size()));
 }
@@ -610,7 +614,7 @@ void SweepLocalProjectiles()
             if (!e || e == hero || e == controlled || remote::IsPuppet(e)) continue;
             if (!e->GetPropertySet(eEPropertySetType_NPC)) continue;
             if (npclease::LocalAuthority(e) || npclease::Fenced(e)) continue;
-            if (npc.IsDead() || npc.IsDown()) continue;
+            if (npc.IsDead() || npc.IsDown() || combat::IsGroundImmuneNpc(e)) continue;
             const bCVector posVec = e->GetWorldPosition();
             bCBox const& box = e->GetWorldNodeBoundary();
             const bCVector& low = box.GetMin();

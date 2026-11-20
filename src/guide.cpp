@@ -11,6 +11,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "talk.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -159,6 +160,8 @@ void Take(eCEntity* npc, Kind kind, char const* questName = nullptr)
     }
     Logf("guide: took over %s (it %s this player, quest=%s), task %s", e.GetName().GetText(), kind == Guide ? "guides" : "follows",
          resolvedQuest ? resolvedQuest : "-", e.Routine.GetCurrentTask().GetText());
+    telemetry::OnGuideEvent("take_over", net::LocalId(), npc, reinterpret_cast<uint8_t const*>(key.data()),
+                            kind == Follower, resolvedQuest ? resolvedQuest : e.Routine.GetCurrentTask().GetText());
 }
 void TickJoinedFollowers(eCEntity* hero, uint32_t now)
 {
@@ -258,6 +261,8 @@ void TickHeldGuides(eCEntity* hero)
             ++given;
             Logf("guide: %s no longer %s this player; %s", it->second.name.c_str(), it->second.kind == Guide ? "guides" : "follows",
                  net::IsHost() ? "the usual simulation rules again" : "given back to the host");
+            telemetry::OnGuideEvent("released", net::LocalId(), npc, reinterpret_cast<uint8_t const*>(it->first.data()),
+                                    it->second.kind == Follower, it->second.questName.c_str());
         }
         it = held.erase(it);  // or the host took it back (a revoked claim)
     }
@@ -301,6 +306,7 @@ void OnClientFollowQuestRunning(unsigned char fromPlayer, char const* questName,
         npcs::Guide(npcGuid, fromPlayer, questName);
         Logf("guide: host auto-started %s guiding player %u from synced quest %s",
              Entity(npc).GetName().GetText(), fromPlayer, questName);
+        telemetry::OnGuideEvent("host_auto_guide", fromPlayer, npc, npcGuid, false, questName);
     }
 }
 
@@ -337,6 +343,7 @@ bool Readopt(eCEntity* npc)
     StartGuiding(e);
     ++readopted;
     Logf("guide: %s guides this player again (from the host's save), task %s", e.GetName().GetText(), e.Routine.GetCurrentTask().GetText());
+    telemetry::OnGuideEvent("readopt", net::LocalId(), npc, reinterpret_cast<uint8_t const*>(key.data()), false, questName);
     return true;
 }
 

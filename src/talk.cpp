@@ -15,6 +15,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "story.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -272,7 +273,24 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
                            : nullptr;
     if (!hold) {
         eCEntity* puppet = remote::IsPuppet(npc) ? npc : remote::IsPuppet(talker) ? talker : nullptr;
-        if (remote::IsHeldPuppet(puppet)) remote::LogPuppetInteraction(puppet, "talk-attempt", -1);
+        const int puppetOwner = puppet ? remote::PuppetOwner(puppet) : 0;
+        const bool heldPuppet = puppet && remote::IsHeldPuppet(puppet);
+        if (puppetOwner && !heldPuppet) {
+            net::Remote const& r = net::Remotes()[puppetOwner];
+            Entity puppetEntity(puppet);
+            const bool hasRoutine = puppet->GetPropertySet(eEPropertySetType_ScriptRoutine) != nullptr;
+            char liveMotion[128] = {};
+            body::CurrentMotion(puppet, liveMotion, sizeof(liveMotion));
+            if (talk_policy::ShouldRefusePuppetTalk(
+                    true, false, r.latest.flags, static_cast<int>(r.latest.aniState), r.latest.animation,
+                    hasRoutine ? static_cast<int>(puppetEntity.Routine.AIMode) : -1,
+                    hasRoutine && puppetEntity.IsDown(), hasRoutine && puppetEntity.IsDead(),
+                    hasRoutine ? static_cast<int>(puppetEntity.Routine.AniState) : -1, liveMotion)) {
+                remote::LogPuppetInteraction(puppet, "talk-refused-downed", 0);
+                return 0;
+            }
+        }
+        if (heldPuppet) remote::LogPuppetInteraction(puppet, "talk-attempt", -1);
         eCEntity* prevAssessing = clientTalk.assessingNpc;
         const bool clientAddressedNpc = !net::IsHost() && addressedNpc && addressedNpc != hero && !remote::IsPuppet(addressedNpc);
         if (clientAddressedNpc) {
@@ -298,7 +316,7 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
                 clientTalk.ClearPrepared();
             }
         }
-        if (remote::IsHeldPuppet(puppet)) remote::LogPuppetInteraction(puppet, "talk-assessed", result);
+        if (heldPuppet) remote::LogPuppetInteraction(puppet, "talk-assessed", result);
         return result;
     }
     ++busyRefused;
@@ -311,6 +329,7 @@ GEInt GE_STDCALL AssessTalkDetour(gCScriptProcessingUnit* spu, GELPVoid self, GE
         swprintf_s(text, i18n::Text(i18n::NpcTalking), who, player[0] ? player : L"?");
         hud::Message(hud::Info, text);
         Logf("talk: %s talks to player %u; this player's address refused", Entity(addressedNpc).GetName().GetText(), hold->player);
+        telemetry::OnTalkEvent("busy_refused", hold->player, addressedNpc, hold->guid, "host_assess_talk");
     }
     return 0;
 }
@@ -437,6 +456,7 @@ void OnTalk(uint8_t from, bool begin, uint8_t const guid[16])
                 it->second.generation == net::PeerGeneration(it->second.player) &&
                 it->second.incarnation == npcs::Incarnation(guid)) {
                 Logf("talk: player %u cannot take player %u's active NPC dialog", from, it->second.player);
+                telemetry::OnTalkEvent("hold_conflict", from, npcs::NpcByGuid(guid), guid, "already_held");
                 return;
             }
             EraseAndReleaseHold(it);
@@ -459,10 +479,12 @@ void OnTalk(uint8_t from, bool begin, uint8_t const guid[16])
         EnterStationaryTalk(hold, speaker);
         ++holdsStarted;
         Logf("talk: holding %s for player %u", npc.GetName().GetText(), from);
+        telemetry::OnTalkEvent("host_hold_start", from, npc.GetInstance(), guid, "remote_dialog");
     } else if (it != holds.end() && it->second.player == from &&
                it->second.generation == net::PeerGeneration(from)) {
         EraseAndReleaseHold(it);
         Logf("talk: player %u ended its NPC dialog", from);
+        telemetry::OnTalkEvent("host_hold_end", from, npcs::NpcByGuid(guid), guid, "remote_dialog");
     }
 }
 }
@@ -570,6 +592,7 @@ void Tick()
         clientTalk.ClearPrepared();
         std::memset(clientTalk.guid, 0, sizeof(clientTalk.guid));
         ++ends;
+        telemetry::OnTalkEvent("client_talk_end", net::LocalId(), npcs::NpcByGuid(previousGuid), previousGuid, "client_dialog");
     }
     if (partner) {
         clientTalk.ClearPending();
@@ -586,6 +609,7 @@ void Tick()
             clientTalk.holdSent = false;
         }
         ++begins;
+        telemetry::OnTalkEvent("client_talk_start", net::LocalId(), partner, clientTalk.guid, "client_dialog");
         return;
     }
     if (clientTalk.pendingActive) {

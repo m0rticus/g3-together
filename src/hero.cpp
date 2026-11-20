@@ -6,6 +6,7 @@
 #include "downed.h"
 #include "log.h"
 #include "net.h"
+#include "npc_item_quality_policy.h"
 #include "saving_policy.h"
 
 #include <Game.h>
@@ -77,7 +78,7 @@ int FindSkillStack(Entity& self, std::string const& hex)
     return -1;
 }
 
-constexpr unsigned QualityMask = 1023u;
+constexpr unsigned QualityMask = npc_item_quality::QualityMask;
 
 std::vector<Stack> Stacks(Entity& self)
 {

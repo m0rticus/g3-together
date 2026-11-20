@@ -5,6 +5,7 @@
 #include "guide.h"
 #include "log.h"
 #include "reputation_policy.h"
+#include "telemetry.h"
 
 #include <algorithm>
 #include <array>
@@ -204,9 +205,12 @@ void ApplyHostClientDelta(uint8_t from, Domain* d, bool snapshot, int count,
     for (auto const& entry : decoded) {
         auto it = current.find(entry.first);
         if (it == current.end()) continue;
+        const auto prevIt = d->known.find(it->first);
+        const uint32_t beforeVal = prevIt != d->known.end() ? prevIt->second : 0u;
         Track(*d, it->first, it->second);
         d->known[it->first] = it->second;
         Entry(*d, it->first, it->second, result);
+        telemetry::OnStoryDelta("client_delta_on_host", from, d->label, it->first.c_str(), beforeVal, it->second);
     }
     Send(*d, result);
     if (d->kind == net::StateQuests) {
@@ -222,8 +226,12 @@ void ApplyClientStates(Domain* d, bool catchup, std::vector<std::pair<std::strin
         if (d->kind == net::StateWorldClock && !ClockApply(entry.first.c_str(), entry.second)) {
             admissionApplied = false; d->baseline = {}; d->nextRequest = 0; return;
         }
+        const auto prevIt = d->known.find(entry.first);
+        const uint32_t beforeVal = prevIt != d->known.end() ? prevIt->second : 0u;
         d->known[entry.first] = entry.second;
         if (d->kind != net::StateWorldClock) Apply(*d, entry.first.c_str(), entry.second, catchup);
+        if (!catchup || beforeVal != entry.second)
+            telemetry::OnStoryDelta(catchup ? "host_catchup" : "host_delta", 1, d->label, entry.first.c_str(), beforeVal, entry.second);
         if (d->kind == net::StateQuests) {
             guide::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
             arena::NoteQuestStatusFromHost(entry.first.c_str(), static_cast<int>(entry.second));
@@ -283,6 +291,7 @@ bool CommitBaselines()
         d.primed = true;
         d.wasConnected = true;
         Logf("story: authoritative %s baseline restored entries=%zu rewards=0", d.label, d.known.size());
+        telemetry::OnStoryDelta("baseline_committed", 1, d.label, "snapshot_entries", 0, static_cast<uint32_t>(d.known.size()));
     }
     arena::SyncArenaStatuses();
     admissionApplied = true;
@@ -357,7 +366,9 @@ void Poll(Domain& d)
     for (auto const& [name, value] : current) {
         auto it = d.known.find(name);
         if (it != d.known.end() && it->second == value) continue;
+        const uint32_t beforeVal = it != d.known.end() ? it->second : 0u;
         Logf("story: local %s %s=%d", d.label, name.c_str(), static_cast<int>(value));
+        telemetry::OnStoryDelta("local_change", net::LocalId(), d.label, name.c_str(), beforeVal, value);
         Track(d, name, value);
         d.known[name] = value;
         Entry(d, name, value, changes);
@@ -397,6 +408,7 @@ void FlushReputation()
 void FlushQuests()
 {
     if (disabled) return;
+    arena::ObserveLocalQuests();
     if (Domain* rt = Find(net::StateQuestRuntime)) Poll(*rt);
     if (Domain* q = Find(net::StateQuests)) Poll(*q);
     if (Domain* inf = Find(net::StateInfos)) Poll(*inf);
@@ -475,6 +487,7 @@ void Tick()
     const DWORD now = GetTickCount();
     if (now - lastPoll < PollInterval) return;
     lastPoll = now;
+    arena::ObserveLocalQuests();
     for (Domain& d : domains) Poll(d);
 }
 } // namespace g3t::story

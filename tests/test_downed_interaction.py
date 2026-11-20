@@ -126,6 +126,13 @@ class DownedInteractionTests(unittest.TestCase):
         self.assertIn("actor == gCSession::GetInstance().GetHero()", loot)
         self.assertIn("loot-rerouted-to-talk", loot)
         self.assertIn("loot-refused", loot)
+        self.assertIn("if (!result) ExitGonnaLoot(actor)", loot)
+        self.assertIn("ExitGonnaLoot(actor);\n        return 0;", loot)
+        exit_loot = function_body(self.source["containers"], r"\bvoid\s+ExitGonnaLoot\s*\(")
+        self.assertIsNotNone(exit_loot)
+        self.assertIn('"PS_GonnaLoot"', exit_loot)
+        self.assertIn("hero.Routine.FullStop()", exit_loot)
+        self.assertIn("hero.Routine.ContinueRoutine()", exit_loot)
         quick = function_body(self.source["containers"], r"\bGEBool\s+__fastcall\s+QuickTake\s*\(")
         self.assertLess(quick.index("remote::PuppetOwner(owner)"), quick.rindex("self->TransferAmountTo("))
         trade = function_body(self.source["containers"], r"\bGEInt\s+GE_STDCALL\s+OpenTrade\s*\(")
@@ -183,6 +190,9 @@ class DownedInteractionTests(unittest.TestCase):
         self.assertLess(assess.index("const GEInt result = originalAssessTalk"), assess.index('"talk-assessed"'))
         self.assertIn("remote::IsPuppet(npc)", assess)
         self.assertIn("remote::IsPuppet(talker)", assess)
+        self.assertIn("talk_policy::ShouldRefusePuppetTalk", assess)
+        self.assertIn('"talk-refused-downed"', assess)
+        self.assertLess(assess.index('"talk-refused-downed"'), assess.index("const GEInt result = originalAssessTalk"))
 
 
 if __name__ == "__main__":

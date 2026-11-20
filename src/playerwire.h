@@ -15,7 +15,7 @@ namespace g3t::playerwire {
 
 constexpr std::uint8_t Version = 1;
 constexpr std::uint8_t FullFlag = 1;
-constexpr std::uint16_t MetadataMask = 0x3fffu;
+constexpr std::uint16_t MetadataMask = 0xffffu;
 constexpr std::uint16_t StringName = 1u << 0;
 constexpr std::uint16_t StringAnimation = 1u << 1;
 constexpr std::uint16_t StringHeldRight = 1u << 2;
@@ -30,8 +30,17 @@ constexpr std::uint16_t StringOverlay0 = 1u << 10;
 constexpr std::uint16_t StringOverlay1 = 1u << 11;
 constexpr std::uint16_t StringWeaponAnim = 1u << 12;
 constexpr std::uint16_t OverlayMeta = 1u << 13;
+constexpr std::uint16_t HitPoints = 1u << 14;
+constexpr std::uint16_t HitPointsMax = 1u << 15;
+constexpr std::uint16_t LegacyMetadataMask = MetadataMask & ~(HitPoints | HitPointsMax);
+constexpr std::int32_t MinHitPoints = -1000000;
+constexpr std::int32_t MaxHitPoints = 1000000;
 constexpr std::size_t FixedBytes = 65;
 constexpr std::uint32_t FullKeyframeMs = 5000;
+
+inline constexpr std::int32_t ClampHitPoints(std::int32_t value, std::int32_t low = MinHitPoints) noexcept {
+    return value < low ? low : (value > MaxHitPoints ? MaxHitPoints : value);
+}
 
 enum class Status : std::uint8_t {
     Ok,
@@ -60,6 +69,8 @@ inline bool finiteCoordsAndRotation(const net::PlayerState& state) {
 inline bool finiteAndLimited(const net::PlayerState& state) {
     if (state.id < 1 || state.id > 7) return false;
     if (state.gold < 0) return false;
+    if (state.hitPoints < MinHitPoints || state.hitPoints > MaxHitPoints) return false;
+    if (state.hitPointsMax < 0 || state.hitPointsMax > MaxHitPoints) return false;
     return finiteCoordsAndRotation(state);
 }
 
@@ -76,6 +87,7 @@ struct Writer {
         u16(static_cast<std::uint16_t>(value));
         u16(static_cast<std::uint16_t>(value >> 16));
     }
+    void i32(std::int32_t value) { u32(static_cast<std::uint32_t>(value)); }
     void f32(float value) {
         std::uint32_t bits;
         static_assert(sizeof(bits) == sizeof(value), "binary32 required");
@@ -103,6 +115,11 @@ struct Reader {
         const std::uint16_t a = u16();
         const std::uint16_t b = u16();
         return static_cast<std::uint32_t>(a) | (static_cast<std::uint32_t>(b) << 16);
+    }
+    std::int32_t i32() {
+        const std::uint32_t bits = u32();
+        return bits <= 0x7fffffffu ? static_cast<std::int32_t>(bits)
+                                   : -1 - static_cast<std::int32_t>(0xffffffffu - bits);
     }
     float f32() {
         const std::uint32_t bits = u32();
@@ -203,6 +220,8 @@ inline std::uint16_t metadataMask(const net::PlayerState& baseline, const net::P
     if (baseline.focusNpc != state.focusNpc) mask |= FocusNpc;
     if (baseline.targetNpc != state.targetNpc) mask |= TargetNpc;
     if (baseline.overlayMeta != state.overlayMeta) mask |= OverlayMeta;
+    if (baseline.hitPoints != state.hitPoints) mask |= HitPoints;
+    if (baseline.hitPointsMax != state.hitPointsMax) mask |= HitPointsMax;
     return mask;
 }
 
@@ -234,6 +253,8 @@ inline void writeMetadata(Writer& writer, const net::PlayerState& state, std::ui
     if (mask & FocusNpc) writer.u32(state.focusNpc);
     if (mask & TargetNpc) writer.u32(state.targetNpc);
     if (mask & OverlayMeta) writer.u32(state.overlayMeta);
+    if (mask & HitPoints) writer.i32(state.hitPoints);
+    if (mask & HitPointsMax) writer.i32(state.hitPointsMax);
 }
 
 inline bool validStrings(const net::PlayerState& state) {
@@ -365,7 +386,7 @@ public:
             id < 1 || id > 7 || (authoritativeId != 0 &&
             (authoritativeId < 1 || authoritativeId > 7 || authoritativeId != id)))
             return Status::Invalid;
-        if ((full == FullFlag) ? (mask != MetadataMask) : ((mask & ~MetadataMask) != 0))
+        if ((full == FullFlag) ? (mask != MetadataMask && mask != LegacyMetadataMask) : ((mask & ~MetadataMask) != 0))
             return Status::Invalid;
         if (!detail::finiteCoordsAndRotation(value)) return Status::Invalid;
         if (goldBits > static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)()))
@@ -382,7 +403,15 @@ public:
         if (mask & FocusNpc) metadata.focusNpc = reader.u32();
         if (mask & TargetNpc) metadata.targetNpc = reader.u32();
         if (mask & OverlayMeta) metadata.overlayMeta = reader.u32();
+        if (mask & HitPoints) metadata.hitPoints = reader.i32();
+        if (mask & HitPointsMax) metadata.hitPointsMax = reader.i32();
         if (!reader.ok || reader.offset != size) return Status::Invalid;
+        if ((mask & HitPoints) &&
+            (metadata.hitPoints < MinHitPoints || metadata.hitPoints > MaxHitPoints))
+            return Status::Invalid;
+        if ((mask & HitPointsMax) &&
+            (metadata.hitPointsMax < 0 || metadata.hitPointsMax > MaxHitPoints))
+            return Status::Invalid;
 
         if (full == FullFlag) {
             if (hasKeyframe_ && static_cast<std::int32_t>(sequence - sequence_) <= 0)
@@ -393,6 +422,8 @@ public:
             value.focusNpc = metadata.focusNpc;
             value.targetNpc = metadata.targetNpc;
             value.overlayMeta = metadata.overlayMeta;
+            value.hitPoints = metadata.hitPoints;
+            value.hitPointsMax = metadata.hitPointsMax;
             detail::copyStrings(MetadataMask, metadata, value);
 
             currentState_ = value;
@@ -418,6 +449,8 @@ public:
         next.focusNpc = (mask & FocusNpc) ? metadata.focusNpc : currentState_.focusNpc;
         next.targetNpc = (mask & TargetNpc) ? metadata.targetNpc : currentState_.targetNpc;
         next.overlayMeta = (mask & OverlayMeta) ? metadata.overlayMeta : currentState_.overlayMeta;
+        next.hitPoints = (mask & HitPoints) ? metadata.hitPoints : currentState_.hitPoints;
+        next.hitPointsMax = (mask & HitPointsMax) ? metadata.hitPointsMax : currentState_.hitPointsMax;
         detail::copyStrings(MetadataMask & ~mask, currentState_, next);
         detail::copyStrings(mask, metadata, next);
 

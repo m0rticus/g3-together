@@ -12,6 +12,7 @@
 #include "npcremoval.h"
 #include "occupancy_policy.h"
 #include "remote.h"
+#include "telemetry.h"
 
 #include <Game.h>
 #include <Script.h>
@@ -86,6 +87,7 @@ void Refuse(eCEntity* hero)
     if (hasRefused && currentRefused == refusedKey) return;
     refusedKey = currentRefused;
     hasRefused = true;
+    telemetry::OnOccupancyEvent("refused_in_use", player, object, objectGuid, puppet, "local_interact_refused");
     wchar_t name[64] = {}, text[160];
     MultiByteToWideChar(CP_UTF8, 0, net::PeerName(player), -1, name, 64);
     swprintf_s(text, i18n::Text(i18n::PlaceInUse), name[0] ? name : L"?");
@@ -181,6 +183,9 @@ bool ClearStaleUser(eCEntity* object, char const* reason)
          user ? user->GetName().GetText() : "-",
          object->GetName().GetText(),
          reason ? reason : "stale");
+    uint8_t objGuid[16] = {};
+    guid::CopyEntity(object, objGuid);
+    telemetry::OnOccupancyEvent("stale_cleared", 0, object, objGuid, user, reason ? reason : "stale");
     return true;
 }
 
@@ -225,6 +230,7 @@ void Tick()
         Send(usedGuid, false);
         ++released;
         Logf("occupancy: this player let go of %s", usedName);
+        telemetry::OnOccupancyEvent("local_release", net::LocalId(), guid::Resolve(usedGuid).GetInstance(), usedGuid, hero, "let_go");
     }
     if (!object) {
         hasUsed = false;
@@ -239,6 +245,7 @@ void Tick()
     Send(usedGuid, true);
     ++occupied;
     Logf("occupancy: this player uses %s", usedName);
+    telemetry::OnOccupancyEvent("local_occupy", net::LocalId(), object, usedGuid, hero, "in_use");
 }
 
 void OnState(uint8_t from, net::WorldState const& s)
@@ -257,12 +264,14 @@ void OnState(uint8_t from, net::WorldState const& s)
         if (user && user != puppet && !remote::PuppetOwner(user)) {
             ++busy;  // someone here sits there already (this hero or an NPC): it stays theirs
             Logf("occupancy: player %u uses %s, which %s uses here", player, instance->GetName().GetText(), Entity(user).GetName().GetText());
+            telemetry::OnOccupancyEvent("remote_busy_conflict", player, instance, s.guid, user, "occupied_locally");
             return;
         }
         object.Interaction.SetUser(Entity(puppet));
         marked[key] = player;
         ++applied;
         Logf("occupancy: player %u uses %s; taken here too", player, instance->GetName().GetText());
+        telemetry::OnOccupancyEvent("remote_occupy", player, instance, s.guid, puppet, "remote_use");
         return;
     }
     marked.erase(key);
@@ -270,6 +279,7 @@ void OnState(uint8_t from, net::WorldState const& s)
         object.Interaction.SetUser(Entity());
         ++cleared;
         Logf("occupancy: player %u let go of %s; free here too", player, instance->GetName().GetText());
+        telemetry::OnOccupancyEvent("remote_release", player, instance, s.guid, puppet, "remote_let_go");
     }
 }
 

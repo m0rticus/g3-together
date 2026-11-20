@@ -10,6 +10,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "talk.h"
+#include "telemetry.h"
 #include "xpshare.h"
 
 #include <cstdio>
@@ -22,10 +23,13 @@ namespace {
 int ReasonOf(std::string const& name, eCEntity* attacker, eCEntity* target)
 {
     if (!_stricmp(name.c_str(), "Duel")) return gEAttackReason_Duel;
+    if (!_stricmp(name.c_str(), "Arena")) return gEAttackReason_Arena;
     if (!_stricmp(name.c_str(), "ReactToWeapon")) return gEAttackReason_ReactToWeapon;
     if (!_stricmp(name.c_str(), "Revolution")) return gEAttackReason_Revolution;
-    if (!_stricmp(name.c_str(), "Guard"))
+    if (!_stricmp(name.c_str(), "Guard")) {
+        guards::Acting guardContext(target, false, attacker);
         return GetScriptAdminExt().CallScript(bCString("GetGuardAttackReason"), attacker, target, 0);
+    }
     return gEAttackReason_Enemy;
 }
 
@@ -82,6 +86,8 @@ GEInt GE_STDCALL SectorRefresh(gCScriptProcessingUnit* spu, GELPVoid self, GELPV
         ++refreshSent;
         Logf("infocmd: the story moved %s (routine %s, %.0f m); passed on", b.entity->GetName().GetText(),
              nav ? nav->AccessRoutine().GetText() : "-", body::Distance(here, was) / 100.0f);
+        telemetry::OnNpcProgression("story_sector_refresh", 1, b.entity, 0, 0, 0, 0, 0, 0, 0, moved,
+                                    nav ? nav->AccessRoutine().GetText() : "");
     }
     return result;
 }
@@ -108,13 +114,15 @@ void StartFights()
         {
             guards::Acting context(target);
             reason = ReasonOf(it->reason, attacker.GetInstance(), target);
-            if (reason == gEAttackReason_Duel || arena::ChallengerForNpc(attacker.GetInstance()) != 0)
+            if (reason == gEAttackReason_Duel || reason == gEAttackReason_Arena ||
+                arena::ChallengerForNpc(attacker.GetInstance()) != 0)
                 arena::TrackDuel(attacker.GetInstance(), it->player);
             GetScriptAdminExt().CallScript(bCString("AssessTarget"), attacker.GetInstance(), target, reason);
         }
         remote::NoteContact(attacker.GetInstance(), target);
         ++stats.fightsStarted;
         Logf("infocmd: %s attacks player %u (%s, reason %d) after a dialog", attacker.GetName().GetText(), it->player, it->reason.c_str(), reason);
+        telemetry::OnTalkEvent("dialog_attack_started", it->player, attacker.GetInstance(), it->attacker, it->reason.c_str());
         it = fights.erase(it);
     }
 }

@@ -14,6 +14,20 @@ class gCEnclave_PS;
 
 namespace g3t::enclaves {
 using LogFn = void (*)(char const*);
+
+struct SavedTheftState {
+    eCEntity* enclaveEntity = nullptr;
+    gCEnclave_PS* enclave = nullptr;
+    int32_t crime = 0;
+    int32_t suspect = 0;
+    int32_t known = 0;
+    bool active = false;
+};
+
+// Host-only: temporarily swaps `npc`'s enclave theft fields to `playerId`'s split theft state
+// while guard/reaction scripts evaluate that remote player's puppet, then restores host state.
+bool ApplyPlayerTheft(eCEntity* npc, uint8_t playerId, SavedTheftState& saved);
+void RestorePlayerTheft(SavedTheftState const& saved);
 void Start();
 void Tick();           // every frame; scans the enclaves every 500 ms
 void OnWorldChange();  // a loaded save: forget what was seen, ask the host again

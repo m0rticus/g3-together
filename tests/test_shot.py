@@ -107,6 +107,7 @@ class ShotAndRangedCombatTests(unittest.TestCase):
         sweep = function_body(self.shot, r"\bvoid\s+SweepLocalProjectiles\s*\(")
         self.assertIsNotNone(sweep)
         self.assertIn("shot_sweep::SweepSegmentCylinder", sweep)
+        self.assertIn("combat::IsGroundImmuneNpc(e)", sweep)
         self.assertIn("combat::ProjectileHit(bestNpc, instance)", sweep)
         self.assertIn("FlushPendingShot(instance)", sweep)
 

@@ -18,6 +18,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "shot.h"
+#include "telemetry.h"
 #include "witness.h"
 
 #include <Game.h>
@@ -195,6 +196,12 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
         IsLocalMelee(attacker, source) && ai::detail::damageReceiver != victim.GetInstance();
     if (!ai::ShuttingDown() && !localMelee && !npclease::ContactAllowed(victim.GetInstance(), attacker)) return 0;
     if (!ai::ShuttingDown() && RejectDownedHit(victim.GetInstance(), attacker, Judgements[which])) return 0;
+    if (!ai::ShuttingDown() && !forwarded && IsGroundImmuneNpc(victim.GetInstance()) &&
+        (npcs::IsMirrored(victim.GetInstance()) ||
+         (attacker && (attacker == hero || attacker == remote::ControlledBody() || remote::IsPuppet(attacker))) ||
+         (source && source->GetPropertySet(eEPropertySetType_Projectile)))) {
+        return 0;
+    }
     if (localMelee) {
         const auto contact = CaptureMelee(attacker, source);
         if (!LocalMeleeAllowed(victim.GetInstance(), attacker, contact)) return 0;
@@ -290,6 +297,7 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
 
     }
     ai::DefeatJudgementScope defeatJudgement(which <= 2);
+    if (which <= 2) telemetry::NoteCombatJudge(Judgements[which], victim.GetInstance(), attacker, source, HitPoints(victim));
     if (victim.Routine.AniState != gEAniState_Parade) return observed(judge[which](spu, self, other, args));
     const bool puppet = remote::PuppetOwner(victim.GetInstance());
     const bool mirror = npcs::IsMirrored(victim.GetInstance()) && attacker && (attacker == hero || attacker == remote::ControlledBody());
@@ -343,9 +351,14 @@ GEInt CallOriginalAndLog(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid ot
     const bool leaseHit = args < 0 && npclease::LocalAuthority(recipient.GetInstance());
     const bool localAuthority = logApplied || leaseHit;
     const int before = localAuthority ? HitPoints(recipient) : 0;
+    const int beforeAny = args < 0 && recipient.GetInstance() ? HitPoints(recipient) : 0;
     eCEntity* attacker = Attacker(spu, other);
     const GEInt result = original(spu, self, other, args);
     const int after = localAuthority ? HitPoints(recipient) : 0;
+    const int afterAny = args < 0 && recipient.GetInstance() ? HitPoints(recipient) : 0;
+    if (args < 0 && afterAny != beforeAny)
+        telemetry::OnCombatHit("local_damage", attacker, recipient.GetInstance(),
+                               other ? static_cast<Entity*>(other)->GetInstance() : nullptr, beforeAny, afterAny, args, 0, 0, 0);
     if (localAuthority && after < before) NotePlayerCombatDamage(recipient.GetInstance(), attacker);
     if (leaseHit) npclease::NoteHit(recipient.GetInstance(), attacker, "AddHitPoints", before, after);
     if (logApplied) LogAppliedHostNpcHit(recipient.GetInstance(), attacker, args, before, after, result);
@@ -359,6 +372,17 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     Entity recipient = self ? *static_cast<Entity*>(self) : Entity(spu ? spu->GetSelfEntity() : nullptr);
     GroundProbe ground(recipient.GetInstance(), Attacker(spu, other), "AddHitPoints");
     if (args < 0 && RejectDownedHit(recipient.GetInstance(), Attacker(spu, other), "AddHitPoints")) return GETrue;
+    if (args < 0 && !forwarded && IsGroundImmuneNpc(recipient.GetInstance())) {
+        eCEntity* rawSource = other ? static_cast<Entity*>(other)->GetInstance() : (spu ? spu->GetOtherEntity() : nullptr);
+        eCEntity* hitAttacker = Attacker(spu, other);
+        eCEntity* hero = gCSession::GetInstance().GetHero();
+        if (npcs::IsMirrored(recipient.GetInstance()) ||
+            (rawSource && shot::PlayerReplica(rawSource)) ||
+            (rawSource && rawSource->GetPropertySet(eEPropertySetType_Projectile)) ||
+            (hitAttacker && (hitAttacker == hero || hitAttacker == remote::ControlledBody() || remote::IsPuppet(hitAttacker)))) {
+            return GETrue;
+        }
+    }
     if (shot::InNpcReplicaContact()) {
         if (recipient.GetInstance() != remote::ControlledBody()) return GETrue;
     }
@@ -525,6 +549,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
                                              reaction, incarnation, contact);
         if (hit) {
             ++claimsSent;
+            telemetry::OnCombatHit("claim_sent", attacker, instance, source, HitPoints(victim), HitPoints(victim), args, lastOutcome, reaction, hit);
             if (swing) playerClaims[claimKey] = swing;
             if (contact.melee) {
                 const auto context = playerMeleeContacts.find(KillKey(guid));
@@ -539,6 +564,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
     // 3. An NPC this machine simulates in a duel or arena bout with someone else: our hero's hit does not count.
     if (attacker && attacker == hero && OutsideBout(victim, hero)) {
         ++duelHitsRefused;
+        telemetry::OnCombatIgnored("outside_bout", hero, instance, net::LocalId());
         return GETrue;
     }
     // 4. A hit on another player's puppet: that player's real hero takes it, judged on that player's machine
@@ -560,6 +586,7 @@ GEInt GE_STDCALL Filter(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid oth
         else if (attacker) Guid(attacker, guid);
         net::SendHitPlayer(static_cast<uint8_t>(puppetOwner), args, guid, attackerPlayer, MeansToKill(attacker, instance));
         ++playerHitsSent;
+        telemetry::OnCombatHit("player_hit_sent", attacker, instance, source, 0, 0, args, 0, 0, 0);
         return GETrue;
     }
     if (net::IsHost() && instance && instance->GetPropertySet(eEPropertySetType_NPC))
@@ -611,9 +638,38 @@ GEInt GameHit(Entity& victim, eCEntity* source, int* pending)
         downed::LogGroundEvent(victim.GetInstance(), source, "synthetic-hit", ground.before, ground.before, "vanilla-prone-reject");
         return 0;
     }
+    if (IsGroundImmuneNpc(victim.GetInstance())) {
+        if (HasDamageReceiver(victim.GetInstance())) victim.DamageReceiver.DamageAmount = 0;
+        return 0;
+    }
     return JudgeDamage(victim, source, pending, true);
 }
 gFScript originalTouchDamage = nullptr;
+gFScriptAICallback originalFinishingAttack = nullptr;
+
+GEBool GE_STDCALL HookFinishingAttack(gCScriptProcessingUnit* spu)
+{
+    if (ai::ShuttingDown()) return originalFinishingAttack ? originalFinishingAttack(spu) : GEFalse;
+    eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
+    if (!net::IsHost() && self && self == remote::ControlledBody() && spu->AIGetStatePosition() == 0)
+        BeginFinishingExecution();
+    eCEntity* target = spu ? spu->GetTargetEntity() : nullptr;
+    if (!target && self && self->GetPropertySet(eEPropertySetType_NPC))
+        target = Entity(self).NPC.GetCurrentTarget().GetInstance();
+    if (!net::IsHost() && self && self == remote::ControlledBody() && target &&
+        npcs::IsMirrored(target) && npcs::OwnerOf(target) &&
+        spu->AIGetStatePosition() == 1 && Entity(self).Routine.GetStateTime() > 1.2f) {
+        char const* kind = "";
+        eCEntity* source = DamageSource(static_cast<eCDynamicEntity*>(self), &kind);
+        if (!Entity(target).IsDead() && !Entity(target).NPC.Immortal && IsGroundImmuneNpc(target) &&
+            IsExplicitFinishingBlow(self, target, source)) {
+            SendFinishingBlow(self, target, source);
+        }
+        spu->AISetStatePosition(2);
+        return GETrue;
+    }
+    return originalFinishingAttack ? originalFinishingAttack(spu) : GEFalse;
+}
 
 GEInt GE_STDCALL TouchDamage(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
@@ -624,6 +680,7 @@ GEInt GE_STDCALL TouchDamage(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoi
     if (BlocksPlayerReplica(victim, source))
         return 0;
     if (RejectDownedHit(victim, source, "OnTouchDamage")) return 0;
+    if (!forwarded && IsGroundImmuneNpc(victim)) return 0;
     return originalTouchDamage(spu, self, other, args);
 }
 
@@ -711,6 +768,24 @@ void InstallHooks()
     gSScript* touch = Find(GetScriptAdminExt().GetScripts(), "OnTouchDamage");
     if (touch && touch->m_funcScript) originalTouchDamage = WrapDamageScript(*touch, &TouchDamage, "OnTouchDamage");
     else Log("combat: ANOMALY OnTouchDamage unavailable; ground contact guard not installed");
+    if (auto* finish = Find(GetScriptAdminExt().GetScriptAICallbacks(), "OnAI_FinishingAttack");
+        finish && finish->m_funcScriptAICallback) {
+        gFScriptAICallback nativeFinish = finish->m_funcScriptAICallback;
+        HMODULE owner = nullptr;
+        auto* code = reinterpret_cast<unsigned char*>(nativeFinish);
+        static const unsigned char prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(nativeFinish), &owner) &&
+            owner == GetModuleHandleA("Script_Game.dll") && !std::memcmp(code, prologue, sizeof(prologue))) {
+            if (void* trampoline = ai::JumpTo(code, reinterpret_cast<void*>(&HookFinishingAttack)))
+                originalFinishingAttack = reinterpret_cast<gFScriptAICallback>(trampoline);
+        }
+        if (!originalFinishingAttack) originalFinishingAttack = nativeFinish;
+        finish->m_funcScriptAICallback = &HookFinishingAttack;
+        ai::TrackPointer(reinterpret_cast<void*>(&finish->m_funcScriptAICallback),
+                         reinterpret_cast<void*>(nativeFinish),
+                         reinterpret_cast<void*>(&HookFinishingAttack), "combat finishing attack callback");
+    }
     // The OnTick callbacks run through the pointer stored at their registration (SG 0xe1ef0), not through the script table:
     // replacing the table's entry left the game's tick untouched (stageFightMusic 28.10.: music_ticks=0). Jump from the
     // function itself, after checking its first bytes (CP 1.75.14).

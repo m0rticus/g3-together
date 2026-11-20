@@ -12,6 +12,7 @@
 #include "persist.h"
 #include "remote.h"
 #include "movement.h"
+#include "telemetry.h"
 #include <Windows.h>
 #include <cstdio>
 #include <cstring>
@@ -165,6 +166,7 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
             swprintf_s(text, i18n::Text(i18n::NeedHealingPotion), name);
             hud::Message(hud::Warning, text);
             SendToPlayer(9, i, r.latest.downedSequence);
+            telemetry::OnDownedEvent("help_no_potion", static_cast<uint8_t>(i), r.latest.downedSequence, true, false, hero.PlayerMemory.GetHitPoints(), nullptr, net::LocalId(), "missing_potion");
             Logf("downed: wants to help player %d without a healing potion", i);
         }
         return;
@@ -181,6 +183,7 @@ void PayAndHelp(Entity& hero, int i, net::Remote const& r, uint32_t now)
     peers[i].hinted = false;
     SendToPlayer(8, i, r.latest.downedSequence);
     NoteReviveSent(i, r.latest.downedSequence);
+    telemetry::OnDownedEvent("help_paid_potion", static_cast<uint8_t>(i), r.latest.downedSequence, true, false, hero.PlayerMemory.GetHitPoints(), nullptr, net::LocalId(), *potion ? potion : "potion");
     swprintf_s(text, i18n::Text(i18n::HelpedUpWithPotion), name);
     hud::Message(hud::Good, text);
     Logf("downed: helped player %d up, paid %s sequence=%u source=help-line", i, *potion ? potion : "nothing", r.latest.downedSequence);
@@ -338,6 +341,7 @@ void LogGroundEvent(eCEntity* victim, eCEntity* attacker, char const* path, int 
          recovery.grace && now - recovery.stoodAt < ReviveGraceMs ? ReviveGraceMs - (now - recovery.stoodAt) : 0,
          static_cast<int>(player.Routine.AIMode), pose, task.GetText(), state.GetText(), decision,
          InteractionReason(interactionFlags));
+    telemetry::OnGroundHit(victim, attacker, path, before, after, task.GetText(), InteractionReason(interactionFlags), decision, life.sequence);
 }
 
 bool RejectHarm(eCEntity* victim, eCEntity* attacker, char const* path)

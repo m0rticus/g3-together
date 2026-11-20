@@ -220,4 +220,150 @@ inline bool UpdateSessionRequest(RequestTracker& tracker, bool connected, bool i
     return false;
 }
 
+inline constexpr int CrimeCountLimit = 5;  // gEPlayerCrime_Count
+inline constexpr int CrimeNone = 0;        // gEPlayerCrime_None
+inline constexpr int CrimeTheft = 3;       // gEPlayerCrime_Theft
+inline constexpr int CrimeMurder = 4;      // gEPlayerCrime_Murder
+
+struct EnclaveCrimeState {
+    int32_t crime[CrimeCountLimit] = {};
+    int32_t suspect[CrimeCountLimit] = {};
+    int32_t known = CrimeNone;
+    int32_t fame = 0;
+    int32_t nonTheftKnown = CrimeNone;
+};
+
+struct PlayerTheftState {
+    int32_t crimeCount = 0;
+    int32_t suspectComment = 0;
+    bool knownTheft = false;
+    uint32_t generation = 0;
+};
+
+inline int32_t SharedNonTheftKnown(EnclaveCrimeState const& s) noexcept
+{
+    if (s.known != CrimeTheft) return s.known;
+    return (s.nonTheftKnown > CrimeNone && s.nonTheftKnown < CrimeTheft) ? s.nonTheftKnown : CrimeNone;
+}
+
+// Strips the host player's own CrimeTheft from shared KnownPlayerCrime so an innocent peer/host
+// never inherits another player's KnownTheft while still preserving shared Livestock/Attack/Murder.
+inline int32_t EffectiveKnownCrime(int32_t sharedKnown, bool playerKnownTheft,
+                                   int32_t fallbackNonTheft = CrimeNone) noexcept
+{
+    const int32_t nonTheft = (sharedKnown == CrimeTheft)
+        ? ((fallbackNonTheft > CrimeNone && fallbackNonTheft < CrimeTheft) ? fallbackNonTheft : CrimeNone)
+        : sharedKnown;
+    if (nonTheft >= CrimeTheft) return nonTheft;
+    return playerKnownTheft ? CrimeTheft : nonTheft;
+}
+
+// Projects the host's shared enclave state (fame + non-theft crimes) together with one client's
+// own split theft state so neither host thefts nor other clients' thefts leak to that client.
+inline EnclaveCrimeState ProjectClientEnclaveState(EnclaveCrimeState const& hostShared,
+                                                   PlayerTheftState const& playerTheft) noexcept
+{
+    EnclaveCrimeState out = hostShared;
+    out.crime[CrimeTheft] = playerTheft.crimeCount;
+    out.suspect[CrimeTheft] = playerTheft.suspectComment;
+    out.known = EffectiveKnownCrime(hostShared.known, playerTheft.knownTheft,
+                                    SharedNonTheftKnown(hostShared));
+    out.nonTheftKnown = CrimeNone;
+    return out;
+}
+
+// True when something other than player 1's own theft counters (crime/suspect[Theft] or None <-> Theft) changed.
+inline bool HasSharedNonTheftChange(EnclaveCrimeState const& before, EnclaveCrimeState const& now,
+                                    bool includeFame = true) noexcept
+{
+    if (includeFame && before.fame != now.fame) return true;
+    for (int i = 0; i < CrimeCountLimit; ++i) {
+        if (i == CrimeTheft) continue;
+        if (before.crime[i] != now.crime[i] || before.suspect[i] != now.suspect[i]) return true;
+    }
+    return SharedNonTheftKnown(before) != SharedNonTheftKnown(now);
+}
+
+// Native town liberation / crime wipe clears shared Murder alongside KnownPlayerCrime = None.
+inline bool ShouldClearAllPlayerTheftsOnHostReset(EnclaveCrimeState const& before,
+                                                  EnclaveCrimeState const& now) noexcept
+{
+    return (before.crime[CrimeMurder] > 0 && now.crime[CrimeMurder] == 0 && now.known == CrimeNone) ||
+           (before.known == CrimeMurder && now.known == CrimeNone);
+}
+
+// Splits an incoming client EnclaveDelta on the host: non-theft crimes/fame update hostShared,
+// while Theft (CrimeCount[3], SuspectComment[3], KnownPlayerCrime == Theft) updates only that
+// player's PlayerTheftState without ever polluting hostShared (PC_Hero).
+inline void ApplyClientDeltaOnHost(EnclaveCrimeState& hostShared, PlayerTheftState& playerTheft,
+                                   EnclaveCrimeState const& delta, bool applyClientFame,
+                                   bool& sharedChanged, bool& playerTheftChanged) noexcept
+{
+    sharedChanged = false;
+    playerTheftChanged = false;
+
+    for (int i = 0; i < CrimeCountLimit; ++i) {
+        if (i == CrimeTheft) continue;
+        const int32_t nextCrime = (std::max<int32_t>)(0, hostShared.crime[i] + delta.crime[i]);
+        if (nextCrime != hostShared.crime[i]) {
+            hostShared.crime[i] = nextCrime;
+            sharedChanged = true;
+        }
+        if (delta.suspect[i] == 0) {
+            if (hostShared.suspect[i] != 0) {
+                hostShared.suspect[i] = 0;
+                sharedChanged = true;
+            }
+        } else if (delta.suspect[i] > hostShared.suspect[i]) {
+            hostShared.suspect[i] = delta.suspect[i];
+            sharedChanged = true;
+        }
+    }
+
+    if (delta.known == CrimeNone) {
+        if (hostShared.known == CrimeMurder && delta.crime[CrimeMurder] < 0) {
+            hostShared.known = CrimeNone;
+            hostShared.nonTheftKnown = CrimeNone;
+            sharedChanged = true;
+        }
+    } else if (delta.known != CrimeTheft && delta.known > CrimeNone && delta.known < CrimeCountLimit) {
+        const int32_t prevNonTheft = SharedNonTheftKnown(hostShared);
+        if (delta.known > hostShared.known) {
+            hostShared.known = delta.known;
+            hostShared.nonTheftKnown = (delta.known < CrimeTheft) ? delta.known : CrimeNone;
+            sharedChanged = true;
+        } else if (hostShared.known == CrimeTheft && delta.known > prevNonTheft) {
+            hostShared.nonTheftKnown = delta.known;
+            sharedChanged = true;
+        }
+    }
+
+    if (applyClientFame && delta.fame != 0) {
+        hostShared.fame += delta.fame;
+        sharedChanged = true;
+    }
+
+    const int32_t nextTheft = (std::max<int32_t>)(0, playerTheft.crimeCount + delta.crime[CrimeTheft]);
+    if (nextTheft != playerTheft.crimeCount) {
+        playerTheft.crimeCount = nextTheft;
+        playerTheftChanged = true;
+    }
+    if (delta.suspect[CrimeTheft] == 0) {
+        if (playerTheft.suspectComment != 0) {
+            playerTheft.suspectComment = 0;
+            playerTheftChanged = true;
+        }
+    } else if (delta.suspect[CrimeTheft] > playerTheft.suspectComment) {
+        playerTheft.suspectComment = delta.suspect[CrimeTheft];
+        playerTheftChanged = true;
+    }
+    if (delta.known == CrimeTheft && !playerTheft.knownTheft) {
+        playerTheft.knownTheft = true;
+        playerTheftChanged = true;
+    } else if (delta.known == CrimeNone && playerTheft.knownTheft) {
+        playerTheft.knownTheft = false;
+        playerTheftChanged = true;
+    }
+}
+
 } // namespace g3t::reputation

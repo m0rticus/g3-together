@@ -92,13 +92,22 @@ class ReputationSyncTests(unittest.TestCase):
         self.assertIn("const bool preserveRep = !net::IsHost() && ReputationReady();", quest_apply)
         self.assertIn("ReputationApply(repKey.c_str(), repVal);", quest_apply)
 
-        # Enclaves: InWorld-gated session request, Personal-mode fame sync, crime-only client delta filter, dialog & liberation handlers.
+        # Enclaves: InWorld-gated session request, Personal-mode fame sync, split-theft per player, dialog & liberation handlers.
         self.assertIn("reputation::UpdateSessionRequest(", enclaves)
         self.assertIn("net::InWorld(net::LocalId())", enclaves)
         self.assertIn("if (note.op == net::EnclaveRepDelta)", enclaves)
         self.assertIn("if (mode == Personal) {\n        enclave->AccessPlayerFame() = note.fame;", enclaves)
         self.assertIn("SameCrimes(", enclaves)
         self.assertIn("void OnHostEnclaveLiberated(", enclaves)
+        self.assertIn("reputation::ApplyClientDeltaOnHost(", enclaves)
+        self.assertIn("reputation::ProjectClientEnclaveState(", enclaves)
+        self.assertIn("reputation::HasSharedNonTheftChange(", enclaves)
+        self.assertIn("bool ApplyPlayerTheft(", enclaves)
+        self.assertIn("void RestorePlayerTheft(", enclaves)
+
+        guards_cpp = _testbuild.src_text("guards.cpp")
+        self.assertIn("enclaves::ApplyPlayerTheft(", guards_cpp)
+        self.assertIn("enclaves::RestorePlayerTheft(", guards_cpp)
 
         # Dialog ModReputPol / ModReputEnc & town-liberation fame forwarding in infocmd.cpp.
         self.assertIn("reputation::ParseDialogReputationCommand(", infocmd)

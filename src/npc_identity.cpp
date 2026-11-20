@@ -10,6 +10,7 @@
 #include "npcremoval.h"
 #include "persist.h"
 #include "talk.h"
+#include "telemetry.h"
 #include "world.h"
 
 #include <Windows.h>
@@ -140,6 +141,7 @@ void CollectDependentNodes(eCEntity* entity, std::vector<eCEntity*>& out)
 void RestoreHiddenTree(eCEntity* entity, HiddenClientState const& state)
 {
     if (!entity || !state.active || RedundantClientEntity(entity)) return;
+    telemetry::OnVisibilityEvent("client_restored", entity, state.root.guid.data(), true, "presence_verified");
     entity->EnableRendering(state.root.rendering ? GETrue : GEFalse);
     entity->EnablePicking(state.root.picking ? GETrue : GEFalse, GEFalse);
     entity->EnableCollision(state.root.collision ? GETrue : GEFalse);
@@ -180,6 +182,7 @@ void HideClientTree(eCEntity* entity, GuidKey const& key)
             state.children.push_back(c);
         }
         ClearLocalReferencesToDeadMirror(entity, nullptr, false, true);
+        telemetry::OnVisibilityEvent("client_hidden", entity, state.root.guid.data(), false, "unplaced_or_despawned");
     } else {
         for (auto* child : nodes) {
             npcidentity::Guid childId{};

@@ -3,6 +3,7 @@
 #include "npcplayback_skeleton.h"
 
 #include "ai.h"
+#include "containers.h"
 #include "downed.h"
 #include "log.h"
 #include "npcremoval.h"
@@ -201,6 +202,7 @@ unsigned ClearLocalReferencesToDeadMirror(eCEntity* dead, unsigned* combatStops,
         if (first) Logf("npcs: CLIENTDEATHSTATE name=%.64s instance=%p native_dead_before=%d native_dead_after=%d hp=%ld",
                         dead->GetName().GetText(), dead, wasDead ? 1 : 0, Entity(dead).IsDead() ? 1 : 0,
                         receiver ? receiver->GetHitPoints() : -1L);
+        if (first) containers::PrepareCorpseLoot(dead);
     }
     eCEntity* bodies[2] = {gCSession::GetInstance().GetHero(), remote::ControlledBody()};
     for (int i = 0; i < 2; ++i) {
@@ -865,6 +867,7 @@ void LayDownCorpse(eCEntity* entity)
     c.killed = true;
     c.killedAt = net::Now() ? net::Now() : 1;
     if (!net::IsHost()) {
+        containers::PrepareCorpseLoot(entity);
         c.deathClearCount = ClearLocalReferencesToDeadMirror(entity, &c.deathCombatStopCount);
         c.deathReferencesCleared = entity;
         c.focusWatchUntil = c.killedAt + 5000;

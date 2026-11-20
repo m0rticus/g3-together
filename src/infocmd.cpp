@@ -24,6 +24,7 @@
 #include "reputation_policy.h"
 #include "story.h"
 #include "talk.h"
+#include "telemetry.h"
 #include "xpshare.h"
 
 #include <cstdio>
@@ -100,6 +101,7 @@ void ApplySectorState(net::WorldState const& s)
     world.SetSectorStatus(bCString(s.routine), s.enclave != 0);
     ++stats.sectorsApplied;
     Logf("infocmd: sector %s %s", s.routine, s.enclave ? "on" : "off");
+    telemetry::OnSectorChange("apply", 0, s.routine, s.enclave != 0);
 }
 
 void ApplyNpcSnapshot(net::WorldState const& s, uint8_t from)
@@ -179,6 +181,8 @@ void ApplyNpcSnapshot(net::WorldState const& s, uint8_t from)
     else if (s.moved && !mirrored && body::Distance(here, s.position) > 200.0f) e.MoveTo(body::Pose(*instance, s.position, s.rotation));
     ++stats.snapshotsApplied;
     Logf("infocmd: applied the state of %s (routine %s)", e.GetName().GetText(), s.routine);
+    telemetry::OnNpcProgression("apply_snapshot", from, instance, s.dialog, s.npc, s.guard, s.npcClass,
+                                s.alignment, s.immortal, s.enclaveStatus, s.moved != 0, s.routine);
 }
 } // namespace
 
@@ -405,6 +409,7 @@ void Observe(gCScriptProcessingUnit* spu)
         Send(s);
         ++stats.fightsSent;
         Logf("infocmd: dialog fight with %s (%s) sent to the host", e1.GetName().GetText(), s.routine);
+        telemetry::OnTalkEvent("dialog_attack_sent", net::LocalId(), target, s.guid, s.routine);
         return;
     }
     if (!std::strcmp(name, "JoinPlayer") && !net::IsHost() && target) {
