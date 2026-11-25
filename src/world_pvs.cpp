@@ -46,6 +46,7 @@ struct RemoteRegionState {
     uint32_t frames = 0;
     bool failed = false;
     uint32_t retryAt = 0;
+    uint32_t anchorRetryAt = 0;
 };
 
 struct PublishedRegion {
@@ -540,9 +541,13 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
         Logf("world: remote simulation region created (database %u) for a player %.0f,%.0f,%.0f radius %.0f cm",
              region.camera->GetFrustumDatabase().GetFrustumDatabaseIndex(), at[0], at[1], at[2], radius);
     }
+    auto* renderer = RenderAdmin();
+    const uint32_t now = net::Now();
     const bool moved = body::Distance(at, region.position) >= 500.0f || region.radius != radius;
+    const bool coveredByMain = renderer && HasReadyAnchorCell(renderer->GetPVSPrefetcher3(), at);
     const bool anchorMissing = region.prefetcher && !region.prefetcher->IsJobRunning() &&
-                               !HasReadyAnchorCell(*region.prefetcher, at);
+                               !HasReadyAnchorCell(*region.prefetcher, at) && !coveredByMain &&
+                               (!region.anchorRetryAt || static_cast<int32_t>(now - region.anchorRetryAt) >= 0);
     if (moved || anchorMissing) {
         if (moved && region.frames && regionLogs < 24) {
             ++regionLogs;
@@ -557,8 +562,8 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
         database.ForcePrefetch();
         std::memcpy(region.position, at, sizeof(region.position));
         region.radius = radius;
+        region.anchorRetryAt = (now ? now : 1) + 500u;
     }
-    auto* renderer = RenderAdmin();
     if (!renderer || !region.prefetcher || !region.prefetcher->Process(region.camera->GetFrustumDatabase())) {
         return MarkRegionFailed(region, "FAIL world: remote simulation prefetch refused; no client-simulation fallback");
     }
@@ -723,11 +728,14 @@ void UpdateReadySimulationAnchors(eCPVSPrefetcher3& mainPrefetcher, std::vector<
         auto const& anchor = simulationAnchors[idx];
         const size_t group = anchorGroups[idx];
         const bool withinMain = group == static_cast<size_t>(-1);
-        const bool mainReady = withinMain && HasReadyAnchorCell(mainPrefetcher, anchor.data());
+        const bool mainCellReady = HasReadyAnchorCell(mainPrefetcher, anchor.data());
+        const bool mainReady = withinMain && mainCellReady;
         bool remoteReady = false;
         if (!withinMain && group < hostRegions.size()) {
             auto const& region = hostRegions[group];
-            const bool cellReady = region.prefetcher && HasReadyAnchorCell(*region.prefetcher, anchor.data());
+            // Main PVS cells still hold sole ownership near the host; reuse their ready coverage while remote cells populate.
+            const bool cellReady = (region.prefetcher && HasReadyAnchorCell(*region.prefetcher, anchor.data())) ||
+                                   mainCellReady;
             remoteReady = collision::IsRemoteRegionReady(region.failed, region.camera != nullptr,
                                                          region.prefetcher != nullptr, cellReady);
         }

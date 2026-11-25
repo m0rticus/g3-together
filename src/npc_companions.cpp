@@ -761,7 +761,7 @@ void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const
     m.body.presentationSerial = 0;
     m.body.actionSeq = -1;
     m.latestTicks = 0;
-    m.havePresentation = false;
+    if (!sameOwner || !m.entity.GetInstance()) m.havePresentation = false;
     m.records = 0;
     if (!sameOwner) {
         m.attitudeWritten = 0xFF;

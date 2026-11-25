@@ -254,7 +254,7 @@ void ReceiveClient(Message const& note)
         entry.vettedInSession = false;
         entry.handbackUntil = 0;
         entry.yieldedAt = echoNow;
-        entry.retryAt = echoNow + 5000;
+        entry.retryAt = echoNow + npcown::YieldCooldownMs;
         OwnEvent(key, entry.lease.state.name, npcown::Event::Refused, "reason=host rejected lease request");
         return;
     }

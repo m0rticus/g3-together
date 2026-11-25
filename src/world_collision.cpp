@@ -322,7 +322,7 @@ void GatherSphereCandidates(std::vector<eCPVSPrefetcher3*> const& prefetchers, p
         auto const& dynamics = indexed.cell->GetDynamicEntities();
         for (GEU16 i = 0; i < dynamics.GetCount(); ++i) {
             eCEntity* entity = dynamics.GetAt(i);
-            if (!entity || entity->IsKilled() || !entity->IsEnabled()) continue;
+            if (!entity || !entity->IsEnabled()) continue;
             if (npcremoval::ExcludeFromProcessing(entity)) continue;
             if (!entity->GetPropertySet(eEPropertySetType_NPC)) continue;
             bCBox const& bounds = entity->GetWorldNodeBoundary();

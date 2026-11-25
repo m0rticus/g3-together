@@ -170,7 +170,7 @@ void HideClientTree(eCEntity* entity, npcidentity::Guid const& guid)
     if (!state.active) {
         state.active = true;
         state.root.guid = guid;
-        state.root.rendering = entity->IsRenderingEnabled() != GEFalse;
+        state.root.rendering = true;
         state.root.picking = entity->IsPickable() != GEFalse;
         state.root.collision = entity->GetEntityFlags().m_CollisionEnabled != 0;
         state.children.clear();

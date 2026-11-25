@@ -559,7 +559,7 @@ void PassiveMirrorTick()
             m.attitudeWritten = relation::Unset;
         }
         if (!m.resolved || !m.entity.GetInstance()) {
-            if (m.resolvedAt && now - m.resolvedAt < RetryLookup) { ++it; continue; }
+            if (m.resolvedAt && now - m.resolvedAt < RetryLookup && !IsNpc(live.GetInstance())) { ++it; continue; }
             m.entity = Resolve(m.latest.guid);
             m.resolvedAt = now ? now : 1;
             m.resolved = IsNpc(m.entity.GetInstance());
@@ -723,6 +723,8 @@ void PassiveMirrorTick()
             m.body.contactTarget = combat_timing::IncomingCombat(shown.flags, shown.combatTarget, net::LocalId())
                                       ? remote::ControlledBody() : nullptr;
             TryLocalBlow(m, shown, now);
+        } else {
+            npcplayback::SetEntityPose(m.entity.GetInstance(), body::Pose(*m.entity.GetInstance(), shown.position, shown.rotation));
         }
         ++it;
     }

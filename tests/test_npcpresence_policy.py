@@ -56,6 +56,15 @@ class NpcPresencePolicyTests(unittest.TestCase):
         self.assertLess(tick.index("PassiveMirrorTick()"), tick.index("detail::ReconcileClientPresence()"))
         self.assertLess(tick.index("CorpseTick("), tick.index("detail::ReconcileClientPresence()"))
 
+        self.assertIn("state.root.rendering = true;", hide)
+        companions = _testbuild.src_text("npc_companions.cpp")
+        reset_stream = companions[companions.index("void ResetMirrorForNewStream("):
+                                  companions.index("void PackMotionFromRecord(")]
+        self.assertIn("if (!sameOwner || !m.entity.GetInstance()) m.havePresentation = false;", reset_stream)
+        passive = npcs[npcs.index("void PassiveMirrorTick()"):npcs.index("bool MirrorFightsHero()")]
+        self.assertIn("!IsNpc(live.GetInstance())", passive)
+        self.assertIn("npcplayback::SetEntityPose(m.entity.GetInstance(), body::Pose(", passive)
+
         blow = npcs[npcs.index("void TryPlayerBlow("):npcs.index("void LogClientDeath(")]
         self.assertIn("!ClientPresent(victim)", blow)
 
