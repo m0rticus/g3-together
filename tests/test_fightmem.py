@@ -105,6 +105,11 @@ class FightmemTests(unittest.TestCase):
         self.assertNotIn("if (!net::IsHost() ||", prune_fn)
         self.assertIn("net::Remotes()[player].connected", prune_fn)
 
+        state_actor = function_body(self.fightmem, r"\beCEntity\*\s+StateActor\s*\(")
+        self.assertIsNotNone(state_actor)
+        self.assertIn("guards_policy::SelectFightStateActor(", state_actor)
+        self.assertIn("guards::IsLocalPlayer(target)", state_actor)
+
     def test_real_native_defeat_and_quest_prologues_read_only(self):
         game = os.environ.get("G3T_GAME_DLL")
         if not game:

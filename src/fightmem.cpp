@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "downed_policy.h"
 #include "guards.h"
+#include "guards_policy.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -396,9 +397,18 @@ eCEntity* StateActor(eCEntity* self, char const* state)
 {
     if (!on || !state || guards::IsLocalPlayer(self)) return nullptr;
     const bool attack = std::strncmp(state, "ZS_Attack", 9) == 0;
-    if (!attack && !StumbleReactionState(state)) return nullptr;
-    eCEntity* puppet = attack ? PuppetAmong({TargetOf(self)}) : PuppetAmong({AttackerOf(self), TargetOf(self)});
-    if (!puppet) return nullptr;
+    const bool stumble = !attack && StumbleReactionState(state);
+    eCEntity* target = TargetOf(self);
+    eCEntity* attacker = AttackerOf(self);
+    eCEntity* puppet = nullptr;
+    switch (guards_policy::SelectFightStateActor(
+        on, false, attack, stumble, target != nullptr,
+        target && remote::IsPuppet(target), guards::IsLocalPlayer(target),
+        attacker && remote::IsPuppet(attacker))) {
+    case guards_policy::StateActorSource::Target: puppet = target; break;
+    case guards_policy::StateActorSource::Attacker: puppet = attacker; break;
+    default: return nullptr;
+    }
     ++stateRuns;
     frames.push_back({self, Read(self), ReasonOf(self), puppet});
     return puppet;

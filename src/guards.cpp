@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "guards.h"
+#include "guards_policy.h"
 
 #include "ai.h"
 #include "fightmem.h"
@@ -248,16 +249,6 @@ eCEntity* WaitActor(eCEntity* self)
     }
     return nearest;
 }
-
-bool FollowsPlayer(char const* state)
-{
-    static char const* const names[] = {"ZS_ReactToZone", "ZS_GotoPlayerZone", "ZS_ObserveZonePlayer", "ZS_ObserveSuspect",
-                                        "ZS_ObserveWeapon", "ZS_ReactToWeapon", "ZS_Threaten", "ZS_ReactToSneak",
-                                        "ZS_ReactToDamage"};
-    for (char const* name : names)
-        if (!std::strncmp(state, name, std::strlen(name))) return true;
-    return false;
-}
 }
 
 static void KeepChapter(eCEntity* puppet)
@@ -387,14 +378,20 @@ bool RejectRemoteWrite(eCEntity const* entity, char const* writer)
 eCEntity* StateActor(eCEntity* self, char const* state)
 {
     if (!installed || !self || !state || !self->GetPropertySet(eEPropertySetType_NPC) || IsLocalPlayer(self)) return nullptr;
-    if (const uint8_t player = npcs::ContextPlayer(self); player > 1)
-        if (eCEntity* leader = remote::PuppetOf(player)) return leader;
-    if (!std::strcmp(state, "ZS_WaitForFreeDestination_Loop")) return WaitActor(self);
-    if (!FollowsPlayer(state) && std::strncmp(state, "ZS_Talk", 7)) return nullptr;
+    const uint8_t player = npcs::ContextPlayer(self);
+    eCEntity* leader = player > 1 ? remote::PuppetOf(player) : nullptr;
     eCEntity* target = Entity(self).NPC.GetCurrentTarget().GetInstance();
-    if (target && remote::IsPuppet(target)) return target;
     eCEntity* attacker = Entity(self).NPC.GetCurrentAttacker().GetInstance();
-    return (attacker && remote::IsPuppet(attacker)) ? attacker : nullptr;
+    switch (guards_policy::SelectGuardStateActor(
+        installed, true, false, state, leader != nullptr,
+        target != nullptr, target && remote::IsPuppet(target), IsLocalPlayer(target),
+        attacker && remote::IsPuppet(attacker))) {
+    case guards_policy::StateActorSource::ContextLeader: return leader;
+    case guards_policy::StateActorSource::WaitNearest: return WaitActor(self);
+    case guards_policy::StateActorSource::Target: return target;
+    case guards_policy::StateActorSource::Attacker: return attacker;
+    default: return nullptr;
+    }
 }
 
 bool MeansToKill(eCEntity* npc, eCEntity* playerTarget)
