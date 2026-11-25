@@ -36,6 +36,7 @@ struct Pending {
     bool moved = false;
     bool story = false;
     bool progressionOnly = false;
+    bool explicitRoutine = false;
     std::string routine;
 };
 
@@ -97,7 +98,7 @@ void TrackLocalDialogAndProgression();
 npc_progression_policy::ObservedProgression Snapshot(Entity& e, net::WorldState& s, bool includeRoutine = true);
 void Apply(net::WorldState const& s, uint8_t from);
 void Send(net::WorldState const& s);
-bool Join(eCEntity* self, bool join, bool follow = true, char const* questName = nullptr);
+bool Join(eCEntity* self, bool join, bool follow = true, char const* questName = nullptr, uint8_t memberType = 0);
 
 void StartFights();
 void HookSectorRefresh();

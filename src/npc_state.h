@@ -262,6 +262,7 @@ inline int lastPlayerCount = 0;
 inline std::unordered_map<GuidKey, uint8_t, GuidHash> claimedBy;
 inline std::unordered_map<GuidKey, eCEntity*, GuidHash> claimActors;
 inline std::unordered_map<GuidKey, uint8_t, GuidHash> directedBy;
+inline std::unordered_set<GuidKey, GuidHash> deferredGuideStarts;
 inline std::unordered_set<GuidKey, GuidHash> myClaims;
 inline std::unordered_map<GuidKey, uint32_t, GuidHash> claimSeen;
 inline std::unordered_map<GuidKey, uint32_t, GuidHash> givenBack;

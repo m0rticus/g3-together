@@ -87,7 +87,10 @@ void ApplyCompanionRelation(net::WorldState const& s, uint8_t from)
     if (s.npcClass == 2) {
         if (npcs::OnClaim(s.guid, from, true)) npcs::Guide(s.guid, from, s.routine);
     } else if (npcs::OnClaim(s.guid, from, true)) {
-        npcs::Follow(s.guid, from, static_cast<uint8_t>(gEPartyMemberType_Slave));
+        const uint8_t existingType = npc.GetInstance()->GetPropertySet(eEPropertySetType_Party)
+            ? static_cast<uint8_t>(static_cast<gEPartyMemberType>(npc.Party.PartyMemberType))
+            : guide_policy::PartyMemberTypeNone;
+        npcs::Follow(s.guid, from, guide_policy::ResolveFollowerMemberType(s.alignment, existingType));
     }
 }
 
@@ -428,14 +431,22 @@ void Observe(gCScriptProcessingUnit* spu)
     }
     if (!std::strcmp(name, "JoinPlayer") && !net::IsHost() && target) {
         const bool join = !_stricmp(command.GetID1().GetText(), "true") || !std::strcmp(command.GetID1().GetText(), "1");
-        if (Join(target, join)) return;
+        if (Join(target, join, true, nullptr, join ? guide_policy::PartyMemberTypeParty : 0)) return;
     }
     if (!detail::IsStateCommand(name) || !target || target == gCSession::GetInstance().GetHero() || remote::IsPuppet(target)) return;
+    if (!std::strcmp(name, "StartRevolution") &&
+        !target->GetPropertySet(eEPropertySetType_Enclave) &&
+        target->GetPropertySet(eEPropertySetType_NPC)) {
+        auto* npcPs = static_cast<gCNPC_PS*>(target->GetPropertySet(eEPropertySetType_NPC));
+        if (eCEntity* enclave = npcPs ? npcPs->GetEnclaveProxy().GetEntity() : nullptr)
+            target = enclave;
+    }
     const bool immediateRoutine = !std::strcmp(name, "SetRoutine") && *command.GetID1().GetText();
     Pending p{};
     guid::CopyEntity(target, p.guid);
     p.due = immediateRoutine ? net::Now() : (net::Now() + ReadAfter);
     p.moved = std::strcmp(name, "MoveTo") == 0;
+    p.explicitRoutine = immediateRoutine;
     if (immediateRoutine) p.routine = command.GetID1().GetText();
     pending.push_back(std::move(p));
 }
@@ -446,6 +457,7 @@ void Changed(eCEntity* entity)
     Pending p{};
     guid::CopyEntity(entity, p.guid);
     p.due = net::Now() + ReadAfter;
+    p.explicitRoutine = true;
     pending.push_back(std::move(p));
 }
 
@@ -481,7 +493,7 @@ void Tick()
             Entity e = guid::Resolve(it->guid);
             if (e.GetInstance()) {
                 const bool includeRoutine = npc_progression_policy::ShouldIncludeRoutineInSnapshot(
-                    net::IsHost(), !it->progressionOnly);
+                    net::IsHost(), it->explicitRoutine);
                 NoteObservedProgression(GuidKeyOf(it->guid), Snapshot(e, s, includeRoutine));
                 if (!it->routine.empty())
                     strncpy_s(s.routine, it->routine.c_str(), _TRUNCATE);

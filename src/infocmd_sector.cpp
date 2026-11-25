@@ -128,7 +128,7 @@ void StartFights()
     }
 }
 
-bool Join(eCEntity* self, bool join, bool follow, char const* questName)
+bool Join(eCEntity* self, bool join, bool follow, char const* questName, uint8_t memberType)
 {
     if (join && self && (npcs::IsMirrored(self) || npclease::LocalAuthority(self))) {
         if (npclease::LocalAuthority(self)) npclease::RelinquishToHost(self, "companion joined");
@@ -141,6 +141,12 @@ bool Join(eCEntity* self, bool join, bool follow, char const* questName)
                                       Entity(hero).Party.GetPartyLeader().GetInstance() == self;
         const bool guide = !follow && ((questName && *questName) || heroGuidedBySelf);
         s.npcClass = guide ? 2 : 1;
+        if (!guide) {
+            const uint8_t existingType = self->GetPropertySet(eEPropertySetType_Party)
+                ? static_cast<uint8_t>(static_cast<gEPartyMemberType>(Entity(self).Party.PartyMemberType))
+                : 0;
+            s.alignment = memberType ? memberType : existingType;
+        }
         if (guide && questName && *questName)
             strncpy_s(s.routine, questName, _TRUNCATE);
         Send(s);

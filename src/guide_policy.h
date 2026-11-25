@@ -14,6 +14,12 @@ constexpr int QuestStatusCancelled = 5;  // gEQuestStatus_Cancelled
 constexpr int QuestStatusLost = 6;       // gEQuestStatus_Lost
 constexpr int QuestTypeFollowNpc = 7;    // gEQuestType_FollowNpc
 
+constexpr uint8_t PartyMemberTypeNone = 0;       // gEPartyMemberType_None
+constexpr uint8_t PartyMemberTypeParty = 1;      // gEPartyMemberType_Party
+constexpr uint8_t PartyMemberTypeMob = 2;        // gEPartyMemberType_Mob
+constexpr uint8_t PartyMemberTypeSlave = 3;      // gEPartyMemberType_Slave
+constexpr uint8_t PartyMemberTypeControlled = 4; // gEPartyMemberType_Controlled
+
 constexpr bool ShouldStartOpenFollowQuestOnGuide(int questType, int questStatus) noexcept
 {
     return questType == QuestTypeFollowNpc && questStatus == QuestStatusOpen;
@@ -128,6 +134,47 @@ constexpr bool ShouldAdoptHeroLeaderAsGuide(bool isHost, bool hasRunningFollowQu
     if (isHost) return true;
     if (hasRunningFollowQuest) return true;
     return !hostEchoesLocalGuide && !awaitingHostRelease;
+}
+
+// SyncMirrorPartyAndGuide may auto-release a local claim as a dismissed party follower ONLY when the host stream
+// previously acknowledged this NPC as this client's party follower (appliedOwner == localId && relationAcknowledged),
+// the NPC is not currently guiding this client, and the NPC's local PartyLeader was cleared or reassigned away.
+// Quest guides (where Hero.PartyLeader == NPC and NPC.PartyLeader == null) and unacknowledged pending follower claims
+// must never be unclaimed here.
+constexpr bool ShouldReleaseLocalPartyClaim(bool partyApplied, uint8_t localId, uint8_t appliedOwner,
+                                            uint8_t actualOwner, bool hasLocalClaim, bool relationAcknowledged,
+                                            uint8_t shownGuidePlayer, bool heroGuidedByNpc) noexcept
+{
+    if (!partyApplied || !localId || !hasLocalClaim) return false;
+    if (shownGuidePlayer == localId || heroGuidedByNpc) return false;
+    if (appliedOwner != localId || !relationAcknowledged) return false;
+    return actualOwner != localId;
+}
+
+// Preserve Party/Mob/Slave/Controlled member type on client follower claims instead of forcing Slave; fall back to the
+// NPC's existing valid member type or Slave when older callers leave the wire field zero.
+constexpr uint8_t ResolveFollowerMemberType(uint8_t requestedType, uint8_t existingType) noexcept
+{
+    if (requestedType >= PartyMemberTypeParty && requestedType <= PartyMemberTypeControlled) return requestedType;
+    if (existingType >= PartyMemberTypeParty && existingType <= PartyMemberTypeControlled) return existingType;
+    return PartyMemberTypeSlave;
+}
+
+// When host_auto_guide already placed an NPC into ZS_GuidePlayer for a remote player and the client's matching kind=4
+// claim arrives milliseconds later, avoid re-running StartGuidePlayer/FullStop/ContinueRoutine mid-stride.
+constexpr bool ShouldKeepExistingGuideActive(bool alreadyLeader, bool alreadyGuidingTask,
+                                             bool sameDestination, bool heldInTalk, bool fenced) noexcept
+{
+    return alreadyLeader && alreadyGuidingTask && sameDestination && !heldInTalk && !fenced;
+}
+
+// When a client starts a FollowNpc quest for an NPC currently fenced under a client lease, defer the host routine
+// restart until both the lease fence and any dialogue hold have cleared.
+constexpr bool ShouldResumeDeferredGuideStart(bool hasDeferredStart, bool isGuidingActor, bool heldInTalk,
+                                              bool fenced, bool isDead, bool isDown,
+                                              bool alreadyGuidingTask) noexcept
+{
+    return hasDeferredStart && isGuidingActor && !heldInTalk && !fenced && !isDead && !isDown && !alreadyGuidingTask;
 }
 
 } // namespace g3t::guide_policy

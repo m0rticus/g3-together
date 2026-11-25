@@ -598,6 +598,7 @@ void ResetWorldNpcTables()
     claimedBy.clear();
     claimActors.clear();
     directedBy.clear();
+    deferredGuideStarts.clear();
     claimSeen.clear();
     myClaims.clear();
     givenBack.clear();

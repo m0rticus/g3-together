@@ -234,6 +234,49 @@ void TestGuideWireMultiplexRoutineDeferralAndOwnerPriority()
     assert(!ShouldAdoptHeroLeaderAsGuide(false, false, true, false));
     assert(!ShouldAdoptHeroLeaderAsGuide(false, false, false, true));
     assert(!ShouldAdoptHeroLeaderAsGuide(false, false, true, true));
+
+    // SyncMirrorPartyAndGuide must NEVER unclaim FollowNpc quest guides (Wenzel_KapDunMetzel, Gorn_ShowReddock, etc.)
+    // or pending unacknowledged party follower claims; only release a previously host-acknowledged party follower whose
+    // local NPC.Party.PartyLeader was cleared/reassigned.
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 0, 0, true, false, 0, true));   // fresh guide claim (heroGuidedByNpc)
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 0, 0, true, false, 2, true));   // echoed guide claim (shownGuidePlayer==2)
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 0, 0, true, false, 0, false));  // pending follower before IS_Running sets PartyLeader
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 2, 0, true, false, 0, false));  // appliedOwner==2 but unacknowledged
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 2, 2, true, true, 0, false));   // still local follower
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 2, 0, true, true, 2, false));   // currently guiding local player
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 2, 0, true, true, 0, true));    // hero guided by this NPC
+    assert(ShouldReleaseLocalPartyClaim(true, 2, 2, 0, true, true, 0, false));    // acknowledged follower dismissed locally -> release!
+    assert(ShouldReleaseLocalPartyClaim(true, 2, 2, 1, true, true, 0, false));    // acknowledged follower reassigned to host -> release!
+    assert(!ShouldReleaseLocalPartyClaim(false, 2, 2, 0, true, true, 0, false));  // party not applied yet
+    assert(!ShouldReleaseLocalPartyClaim(true, 2, 2, 0, false, true, 0, false));  // no local claim
+
+    // Preserve Party / Mob / Slave / Controlled member types on client follower claims instead of hardcoding Slave.
+    assert(ResolveFollowerMemberType(PartyMemberTypeParty, PartyMemberTypeNone) == PartyMemberTypeParty);
+    assert(ResolveFollowerMemberType(PartyMemberTypeMob, PartyMemberTypeNone) == PartyMemberTypeMob);
+    assert(ResolveFollowerMemberType(PartyMemberTypeSlave, PartyMemberTypeParty) == PartyMemberTypeSlave);
+    assert(ResolveFollowerMemberType(PartyMemberTypeControlled, PartyMemberTypeNone) == PartyMemberTypeControlled);
+    assert(ResolveFollowerMemberType(PartyMemberTypeNone, PartyMemberTypeParty) == PartyMemberTypeParty);
+    assert(ResolveFollowerMemberType(PartyMemberTypeNone, PartyMemberTypeNone) == PartyMemberTypeSlave);
+    assert(ResolveFollowerMemberType(99, PartyMemberTypeMob) == PartyMemberTypeMob);
+    assert(ResolveFollowerMemberType(99, 99) == PartyMemberTypeSlave);
+
+    // Host Guide() keeps an already-active guide running cleanly when duplicate kind=4 arrives after host_auto_guide.
+    assert(ShouldKeepExistingGuideActive(true, true, true, false, false));
+    assert(!ShouldKeepExistingGuideActive(false, true, true, false, false));
+    assert(!ShouldKeepExistingGuideActive(true, false, true, false, false));
+    assert(!ShouldKeepExistingGuideActive(true, true, false, false, false));
+    assert(!ShouldKeepExistingGuideActive(true, true, true, true, false));
+    assert(!ShouldKeepExistingGuideActive(true, true, true, false, true));
+
+    // Deferred guide start resumes once lease fence and talk hold clear for a live, upright guided NPC.
+    assert(ShouldResumeDeferredGuideStart(true, true, false, false, false, false, false));
+    assert(!ShouldResumeDeferredGuideStart(false, true, false, false, false, false, false));
+    assert(!ShouldResumeDeferredGuideStart(true, false, false, false, false, false, false));
+    assert(!ShouldResumeDeferredGuideStart(true, true, true, false, false, false, false));
+    assert(!ShouldResumeDeferredGuideStart(true, true, false, true, false, false, false));
+    assert(!ShouldResumeDeferredGuideStart(true, true, false, false, true, false, false));
+    assert(!ShouldResumeDeferredGuideStart(true, true, false, false, false, true, false));
+    assert(!ShouldResumeDeferredGuideStart(true, true, false, false, false, false, true));
 }
 
 void TestTemporaryKnockdownPuppetTalkRefusal()

@@ -318,6 +318,20 @@ int main() {
         # guide.cpp runs frame-driven without a 500 ms poll cap and claims local FollowNpc transitions with questName.
         self.assertNotIn("CheckEvery", guide)
         self.assertNotIn("nextCheck", guide)
+
+        # Client mirror sync must never unclaim quest guides or unacknowledged followers, and host Guide() keeps
+        # already-running guides uninterrupted while deferring/resuming fenced or held-in-talk starts.
+        self.assertIn("guide_policy::ShouldReleaseLocalPartyClaim(", companions)
+        self.assertIn("m.relationAcknowledged = (shown.partyPlayer == net::LocalId());", companions)
+        self.assertIn("guide_policy::ShouldKeepExistingGuideActive(", companions)
+        self.assertIn("guide_policy::ShouldResumeDeferredGuideStart(", companions)
+        self.assertIn("deferredGuideStarts", companions)
+
+        # Client non-SetRoutine commands (e.g. SetPAL) omit stale passive routine; StartRevolution resolves the NPC's
+        # enclave entity; follower claims preserve Party/Mob/Slave/Controlled member type.
+        self.assertIn("ShouldIncludeRoutineInSnapshot(\n                    net::IsHost(), it->explicitRoutine)", infocmd)
+        self.assertIn("guide_policy::ResolveFollowerMemberType(", infocmd)
+        self.assertIn("GetEnclaveProxy().GetEntity()", infocmd)
         self.assertIn("guide_policy::ShouldClaimLocalFollowQuest(", guide)
         self.assertIn("guide_policy::ShouldHostAutoGuideFromQuestSync(", guide)
         self.assertIn("guide_policy::ShouldAdoptHeroLeaderAsGuide(", guide)
