@@ -101,6 +101,16 @@ inline char const* DelegateRefusal(Interest const& interest)
     return "host presents it within its own reach";
 }
 
+// Offer admission must agree with TickHost's recall criterion: if the host is already native-ready
+// within hostRoi and able to resume presentation, treat it as capable of presenting even if lastSent
+// is momentarily stale, so it never offers a lease that TickHost would immediately recall.
+inline bool HostPresentForOffer(bool nativeReady, bool hostCanPresent, bool canResumePresentation,
+                                float hostDistance, float hostRoi)
+{
+    if (!nativeReady) return false;
+    return hostCanPresent || (hostDistance <= hostRoi && canResumePresentation);
+}
+
 struct Lease {
     Phase phase = Phase::Host;
     uint32_t epoch = 0, incarnation = 1, generation = 0, revision = 0, deadline = 0, started = 0;

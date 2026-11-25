@@ -209,6 +209,17 @@ void TestReddockUndergroundNpcGateAndReadinessRebuild()
     const std::vector<std::pair<uintptr_t, bool>> afterStreamIn{{0x1001u, true}, {0x1002u, true}};
     assert(DidReadinessChange(before, afterStreamIn));
     assert(!DidReadinessChange(afterStreamIn, afterStreamIn));
+
+    // Remote PVS simulation region hysteresis prevents create/retire thrashing near mainFarClip.
+    const float hostRoi = 8000.0f;
+    const float mainFarClip = 12000.0f;
+    // Enter threshold: distance + 8000 + 1000 >= 12000 => distance >= 3000 cm.
+    assert(!NeedsRemoteSimulationRegion(2999.0f, hostRoi, mainFarClip, false));
+    assert(NeedsRemoteSimulationRegion(3000.0f, hostRoi, mainFarClip, false));
+    // Once active, stay active across small camera/position jitter until distance < 1500 cm.
+    assert(NeedsRemoteSimulationRegion(2999.0f, hostRoi, mainFarClip, true));
+    assert(NeedsRemoteSimulationRegion(1500.0f, hostRoi, mainFarClip, true));
+    assert(!NeedsRemoteSimulationRegion(1499.0f, hostRoi, mainFarClip, true));
 }
 }
 

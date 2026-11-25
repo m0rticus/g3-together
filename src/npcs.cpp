@@ -948,11 +948,14 @@ void Tick()
     const int xp = static_cast<int>(hero.PlayerMemory.XP);
     if (lastXp >= 0 && xp != lastXp) Logf("xp: %+d total=%d", xp - lastXp, xp);
     lastXp = xp;
-    npclease::Tick();
-    if (net::IsHost()) HostTick(&SendOwned);
+    if (net::IsHost()) {
+        npclease::Tick();
+        HostTick(&SendOwned);
+    }
     InstallRagdollHook(net::Now());
     PassiveMirrorTick();
     CorpseTick(net::Now());
+    if (!net::IsHost()) npclease::Tick();
     detail::ReconcileClientPresence();
     TickTargetingWatch(net::Now());
 }

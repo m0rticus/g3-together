@@ -590,6 +590,18 @@ bool HostReleasePending(uint8_t const identity[16])
         track.renderSent, mirror.latest.sent, body::PendingEvents(track));
 }
 
+bool HostMirrorPlacedForTakeover(eCEntity const* entity)
+{
+    if (!entity || net::IsHost()) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
+    auto const& mirror = found->second;
+    return mirror.entity.GetInstance() == entity && mirror.havePresentation &&
+           !mirror.killed && !(mirror.latest.flags & 1);
+}
+
 bool HostStreamSeen()
 {
     if (!hostStreamSeen || hostStreamSession != net::WelcomeSerial()) return false;

@@ -249,12 +249,10 @@ void ReceiveClient(Message const& note)
     Entry& entry = found->second;
     if (note.kind == Kind::Reject && note.world == entry.world && note.owner == net::LocalId() &&
         entry.local && !entry.confirmed) {
-        eCEntity* entity = npcs::NpcByGuid(note.guid);
-        ReleaseLocal(key, entry, entity, true);
-        entry.vettedInSession = false;
-        entry.handbackUntil = 0;
-        entry.yieldedAt = echoNow;
-        entry.retryAt = echoNow + npcown::YieldCooldownMs;
+        const bool keepVisible = entry.vetted && !npcs::IsDespawned(note.guid) && !journal::RecordedDeath(note.guid);
+        ReleaseLocal(key, entry, npcs::NpcByGuid(note.guid), true);
+        if (!keepVisible) { entry.vettedInSession = false; entry.handbackUntil = 0; }
+        entry.yieldedAt = echoNow; entry.retryAt = echoNow + npcown::YieldCooldownMs;
         OwnEvent(key, entry.lease.state.name, npcown::Event::Refused, "reason=host rejected lease request");
         return;
     }
@@ -398,17 +396,18 @@ char const* TakeOver(eCEntity* entity, GuidKey const& key, uint32_t now)
     entry.lease.started = now;
     entry.window.Reset(0);
     entry.hasBaseline = true;
+    const bool fromPlacedMirror = npcs::HostMirrorPlacedForTakeover(entity);
     entry.local = true; entry.active = true; entry.confirmed = false; entry.prepared = false;
-    entry.vetted = false; entry.hasOfferedState = false;
+    entry.vetted = fromPlacedMirror; entry.hasOfferedState = false;
+    if (fromPlacedMirror) entry.vettedInSession = true;
     entry.cut = false; entry.recallAt = 0; entry.captureFailed = false;
     entry.hasPresentationFloor = false; entry.presentationFloor = 0;
     entry.ownedEntity = entity;
     entry.lastRequest = 0; entry.requestEvery = 500; entry.hostSeenAt = 0; entry.silentLogged = false;
-    entry.cutReason = nullptr;
-    entry.retryAt = 0;
+    entry.cutReason = nullptr; entry.retryAt = 0;
     std::memcpy(entry.sentRoutine, state.routine, sizeof(entry.sentRoutine));
     if (!Activate(entity, entry, key.data())) {
-        entry.local = false; entry.active = false; entry.nativeActivated = false; entry.ownedEntity = nullptr;
+        entry.local = false; entry.active = false; entry.vetted = false; entry.nativeActivated = false; entry.ownedEntity = nullptr;
         entry.lease.phase = Phase::Host;
         PublishGuard(key, entry);
         return "native fence/import/restart unavailable";

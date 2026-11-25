@@ -55,6 +55,16 @@ class NpcPresencePolicyTests(unittest.TestCase):
         tick = npcs[npcs.index("void Tick()"):]
         self.assertLess(tick.index("PassiveMirrorTick()"), tick.index("detail::ReconcileClientPresence()"))
         self.assertLess(tick.index("CorpseTick("), tick.index("detail::ReconcileClientPresence()"))
+        self.assertLess(tick.index("CorpseTick("), tick.index("if (!net::IsHost()) npclease::Tick();"))
+        self.assertLess(tick.index("if (!net::IsHost()) npclease::Tick();"),
+                        tick.index("detail::ReconcileClientPresence()"))
+
+        lease_client = _testbuild.src_text("npclease_client.cpp")
+        takeover = lease_client[lease_client.index("char const* TakeOver("):lease_client.index("void CutToHost(")]
+        self.assertIn("const bool fromPlacedMirror = npcs::HostMirrorPlacedForTakeover(entity);", takeover)
+        self.assertIn("entry.vetted = fromPlacedMirror;", takeover)
+        self.assertLess(takeover.index("npcs::HostMirrorPlacedForTakeover(entity)"),
+                        takeover.index("Activate(entity, entry, key.data())"))
 
         self.assertIn("state.root.rendering = true;", hide)
         companions = _testbuild.src_text("npc_companions.cpp")

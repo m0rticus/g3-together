@@ -194,4 +194,17 @@ inline bool DidReadinessChange(std::vector<std::pair<uintptr_t, bool>> const& pr
     return previous != current;
 }
 
+constexpr float RemoteRegionEnterMarginCm = 1000.0f;
+constexpr float RemoteRegionRetireHysteresisCm = 1500.0f;
+
+// Hysteresis around mainFarClip keeps an active remote PVS region from thrashing create/retire
+// when the client sits near the main camera's far-clip boundary.
+inline bool NeedsRemoteSimulationRegion(float distanceToMainCameraCm, float hostRoiCm,
+                                        float mainFarClipCm, bool currentlyUsingRemoteRegion)
+{
+    const float requiredReach = distanceToMainCameraCm + hostRoiCm + RemoteRegionEnterMarginCm;
+    if (!currentlyUsingRemoteRegion) return requiredReach >= mainFarClipCm;
+    return requiredReach + RemoteRegionRetireHysteresisCm >= mainFarClipCm;
+}
+
 }

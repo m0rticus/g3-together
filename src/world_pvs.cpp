@@ -699,7 +699,17 @@ void ClusterAnchorGroups(float const here[3], float mainFarClip, std::vector<Anc
     anchorGroups.assign(simulationAnchors.size(), static_cast<size_t>(-1));
     for (size_t idx = 0; idx < simulationAnchors.size(); ++idx) {
         auto const& anchor = simulationAnchors[idx];
-        if (body::Distance(here, anchor.data()) + GetConfig().hostRoi + 1000.0f < mainFarClip) continue;
+        bool coveredByRemote = false;
+        for (auto const& region : hostRegions) {
+            if (!region.failed && region.camera && region.prefetcher &&
+                body::Distance(region.position, anchor.data()) <= region.radius) {
+                coveredByRemote = true;
+                break;
+            }
+        }
+        if (!collision::NeedsRemoteSimulationRegion(body::Distance(here, anchor.data()), GetConfig().hostRoi,
+                                                    mainFarClip, coveredByRemote))
+            continue;
         size_t group = groups.size();
         for (size_t previous = 0; previous < groups.size(); ++previous) {
             float centre[3];

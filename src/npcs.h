@@ -27,6 +27,8 @@ bool HostStreamFresh(uint8_t const guid[16]);
 bool HostStreamClaimed(uint8_t const guid[16]);
 // A reliable release does not discard buffered final state/events or authorize takeover from an older displayed state.
 bool HostReleasePending(uint8_t const guid[16]);
+// Client: this entity currently shows a live host mirror in this session, so local takeover continues an already-vetted placement.
+bool HostMirrorPlacedForTakeover(eCEntity const* entity);
 // Age of the newest live host NPC state against its minimum-transit reference; zero when no live stream is claimed.
 uint32_t HostStreamDelay();
 // Records received from the host in this welcome session (the host's first stream batch has arrived).

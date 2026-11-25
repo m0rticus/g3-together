@@ -353,6 +353,22 @@ static void TestEligibilityAndWrap()
     refusal.clientDistance = ClientRadiusCm;
     assert(std::strcmp(DelegateRefusal(refusal), "host presents it within its own reach") == 0);
 
+    // HostPresentForOffer prevents offer->grant->immediate-recall ping-pong when native is
+    // already ready and resumable inside hostRoi even if lastSent is momentarily stale.
+    assert(!HostPresentForOffer(false, true, true, 1000.0f, 8000.0f));
+    assert(HostPresentForOffer(true, true, false, 9500.0f, 8000.0f));
+    assert(HostPresentForOffer(true, false, true, 4000.0f, 8000.0f));
+    assert(!HostPresentForOffer(true, false, false, 4000.0f, 8000.0f));
+    assert(!HostPresentForOffer(true, false, true, 8500.0f, 8000.0f));
+
+    Eligibility noPingPong{};
+    Interest pingPong{};
+    pingPong.hostRoi = 8000.0f;
+    pingPong.hostDistance = 4000.0f;
+    pingPong.clientDistance = 4000.0f;
+    pingPong.hostPresent = HostPresentForOffer(true, false, true, pingPong.hostDistance, pingPong.hostRoi);
+    assert(!noPingPong.Delegate(pingPong, 500));
+
     assert(Reached(0, 0xffffffffu));
     assert(!Reached(0, 1));
     assert(Newer(0, 0xffffffffu));

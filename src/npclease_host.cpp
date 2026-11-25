@@ -158,7 +158,11 @@ void ReceiveHost(uint8_t from, Message const& note)
             reject(note.state.name, "host journal recorded this NPC's death"); return;
         }
         auto interest = InterestOf(HostInterestState(baseline, entry, native, frozen), from, native);
-        interest.hostPresent = interest.hostPresent && npcs::HostCanPresent(note.guid);
+        const bool hostCanPresent = npcs::HostCanPresent(note.guid);
+        const bool hostCanResume = interest.hostPresent && !hostCanPresent &&
+            interest.hostDistance <= interest.hostRoi && CanResumePresentation(native);
+        interest.hostPresent = HostPresentForOffer(interest.hostPresent, hostCanPresent, hostCanResume,
+            interest.hostDistance, interest.hostRoi);
         if (!entry.interest.Delegate(interest, now)) { reject(note.state.name, DelegateRefusal(interest)); return; }
         if (native && !npcplayback::GuardForLease(native)) {
             reject(baseline.name, "native property authority fence unavailable"); return;
