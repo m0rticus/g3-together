@@ -504,6 +504,10 @@ class PersonalStoreTests(unittest.TestCase):
 
         self.assertIn("PreservedCorpseStack(", apply_fn)
         self.assertIn("preservedTotals", apply_fn)
+        self.assertIn("preservedCredit", apply_fn)
+        self.assertIn("ShouldPreserveCorpseEquipped(", apply_fn)
+        self.assertIn("awakenedPersonal", ensure_fn)
+        self.assertIn("awakenedPersonal", destroy_fn)
         self.assertIn("SplitStack(", part(ledger_source, "void RestoreMatchingSlot(", "void ApplyPersonalMetadata("))
 
         state_fn = part(containers_source, "GEBool GE_STDCALL PersonalState(", "void* InstallPersonalNative(")

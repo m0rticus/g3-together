@@ -6,6 +6,7 @@
 #include "items.h"
 #include "log.h"
 #include "net.h"
+#include "npc_equipment_policy.h"
 #include "remote.h"
 #include "world.h"
 
@@ -46,7 +47,7 @@ std::set<std::string> personalErrors;
 std::set<std::string> personalRestoreErrors;
 std::set<std::string> personalUncertain;
 bool personalErrorOverflow = false;
-std::set<std::string> restoredPersonal, openedPersonalTrade, seenPersonalTradePage;
+std::set<std::string> restoredPersonal, openedPersonalTrade, seenPersonalTradePage, awakenedPersonal;
 
 constexpr size_t MaxPersonalObservers = 65536;
 std::vector<std::unique_ptr<ObserverState>> personalObservers;
@@ -63,7 +64,7 @@ void ClearTrackingState()
 {
     personalPending.clear(); personalErrors.clear(); personalRestoreErrors.clear(); personalUncertain.clear();
     personalErrorOverflow = false;
-    restoredPersonal.clear(); openedPersonalTrade.clear(); seenPersonalTradePage.clear();
+    restoredPersonal.clear(); openedPersonalTrade.clear(); seenPersonalTradePage.clear(); awakenedPersonal.clear();
 }
 
 void NoteCaptureError(ObserverState* observer, std::string const& key, char const* message, Entity& entity)
@@ -433,7 +434,7 @@ bool CompatiblePersonalKind(personal::Kind saved, personal::Kind live)
     return saved == live || (saved == personal::Kind::Trader && live == personal::Kind::Corpse);
 }
 
-bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
+bool ApplyPersonal(Entity& entity, personal::Inventory const& row, bool awakened)
 {
     personal::Kind kind;
     if (!PersonalKind(entity, kind) || !CompatiblePersonalKind(row.kind, kind)) return false;
@@ -453,7 +454,9 @@ bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
     CaptureEquippedSlots(entity, *inventory, before.kind, beforeSlots);
     std::vector<EquippedSlot> remainingSlots = beforeSlots;
 
-    const bool preserveCorpseEquipped = row.kind == personal::Kind::Trader && kind == personal::Kind::Corpse;
+    const bool preserveCorpseEquipped = npc_equipment::ShouldPreserveCorpseEquipped(
+        row.kind == personal::Kind::Trader, row.kind == personal::Kind::Corpse,
+        kind == personal::Kind::Corpse, awakened);
     std::map<StackKey, int64_t> preservedTotals;
     if (preserveCorpseEquipped) {
         for (int i = 0; i < entity.Inventory.GetStackCount(); ++i) {
@@ -473,9 +476,21 @@ bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
         }
         if (!entity.Inventory.DeleteStack(i)) return rollbackAndFail();
     }
+    std::map<StackKey, int64_t> preservedCredit =
+        row.kind == personal::Kind::Corpse ? preservedTotals : std::map<StackKey, int64_t>{};
+    std::map<StackKey, int64_t> expectedTotals = preservedTotals;
     for (size_t i = 0; i < row.stacks.size(); ++i) {
         auto const& stack = row.stacks[i];
-        if (CreateAndEquipStack(entity, *inventory, templates[i], stack, stack.amount,
+        const StackKey stackKey{stack.item, stack.quality, stack.type};
+        uint32_t createAmount = stack.amount;
+        if (auto credit = preservedCredit.find(stackKey); credit != preservedCredit.end() && credit->second > 0) {
+            const uint32_t covered = static_cast<uint32_t>(std::min<int64_t>(createAmount, credit->second));
+            createAmount -= covered;
+            credit->second -= covered;
+        }
+        if (!createAmount) continue;
+        expectedTotals[stackKey] += createAmount;
+        if (CreateAndEquipStack(entity, *inventory, templates[i], stack, createAmount,
                                 kind == personal::Kind::Corpse && !preserveCorpseEquipped, remainingSlots) < 0)
             return rollbackAndFail();
     }
@@ -483,9 +498,7 @@ bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
 
     personal::Inventory after;
     if (!ReadPersonal(entity, after) || after.kind != kind || row.flags != after.flags) return rollbackAndFail();
-    std::map<StackKey, int64_t> totals;
-    for (auto const& stack : row.stacks) totals[{stack.item, stack.quality, stack.type}] += stack.amount;
-    for (auto const& entry : preservedTotals) totals[entry.first] += entry.second;
+    std::map<StackKey, int64_t> totals = expectedTotals;
     for (auto const& stack : after.stacks) totals[{stack.item, stack.quality, stack.type}] -= stack.amount;
     for (auto const& entry : totals) if (entry.second != 0) return rollbackAndFail();
     return true;
@@ -510,7 +523,13 @@ void ObserverState::OnDestroyInventory()
         personalUncertain.insert(key);
         Log("WARN containers: personal inventory unloaded during active mutation; keeping last committed snapshot");
     }
-    if (personalLedger.count(key)) personalPending.insert(key);
+    if (auto row = personalLedger.find(key); row != personalLedger.end()) {
+        personalPending.insert(key);
+        if (owner) {
+            Entity entity(owner);
+            if (AwaitingDeath(entity, row->second)) awakenedPersonal.insert(key);
+        }
+    }
 }
 
 bool HasInventory(eCEntity* entity) { return entity && entity->GetPropertySet(eEPropertySetType_Inventory); }
@@ -565,6 +584,11 @@ std::string NameOf(Entity& entity) { return entity.GetInstance() ? entity.GetNam
 bool PersonalAdmitted() { return !net::Connected() || net::IsHost() || net::InWorld(net::LocalId()); }
 bool IsPending(std::string const& key) { return personalPending.count(key) != 0; }
 bool IsRestored(std::string const& key) { return restoredPersonal.count(key) != 0; }
+bool HasCorpseState(std::string const& key)
+{
+    const auto row = personalLedger.find(key);
+    return row != personalLedger.end() && row->second.kind == personal::Kind::Corpse;
+}
 void MarkTradeOpened(std::string const& key) { openedPersonalTrade.insert(key); }
 
 void TrackTradeClose()
@@ -608,8 +632,12 @@ bool EnsurePersonal(Entity& entity)
     if (pending == personalPending.end()) return true;
     auto row = personalLedger.find(key);
     if (row == personalLedger.end()) return false;
-    if (AwaitingDeath(entity, row->second)) return false;
-    if (!ApplyPersonal(entity, row->second)) {
+    if (AwaitingDeath(entity, row->second)) {
+        awakenedPersonal.insert(key);
+        return false;
+    }
+    const bool awakened = awakenedPersonal.count(key) != 0;
+    if (!ApplyPersonal(entity, row->second, awakened)) {
         if (personalRestoreErrors.insert(key).second)
             Logf("WARN containers: personal restore skipped for %s; keeping live inventory", NameOf(entity).c_str());
         const size_t removedBytes = personal::EncodedRowBytes(row->second);
@@ -618,6 +646,7 @@ bool EnsurePersonal(Entity& entity)
             : personal::HeaderBytes;
         personalLedger.erase(row);
         personalPending.erase(pending);
+        awakenedPersonal.erase(key);
         ObservePersonal(entity);
         return true;
     }
@@ -626,6 +655,7 @@ bool EnsurePersonal(Entity& entity)
     personalRestoreErrors.erase(key);
     restoredPersonal.insert(key);
     personalPending.erase(pending);
+    awakenedPersonal.erase(key);
     return true;
 }
 
@@ -662,7 +692,9 @@ bool PendingAwaitingDeath(std::string const& key, Entity& entity)
 {
     if (!personalPending.count(key)) return false;
     auto row = personalLedger.find(key);
-    return row != personalLedger.end() && AwaitingDeath(entity, row->second);
+    if (row == personalLedger.end() || !AwaitingDeath(entity, row->second)) return false;
+    awakenedPersonal.insert(key);
+    return true;
 }
 
 bool TrackPersonalFocus()
@@ -826,7 +858,10 @@ bool Restore(std::vector<uint8_t> const& bytes, AccessGuardFn installAccessGuard
         Entity entity = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
         if (!entity.GetInstance() || PersonalTeardown(entity)) continue;
         auto row = personalLedger.find(key);
-        if (row != personalLedger.end() && AwaitingDeath(entity, row->second)) continue;
+        if (row != personalLedger.end() && AwaitingDeath(entity, row->second)) {
+            awakenedPersonal.insert(key);
+            continue;
+        }
         EnsurePersonal(entity);
     }
     return true;

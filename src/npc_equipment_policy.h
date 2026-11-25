@@ -65,6 +65,28 @@ inline constexpr bool IsMirrorLootStackEligible(bool merchandise, int amount) no
     return !merchandise && amount > 0;
 }
 
+inline constexpr bool ShouldCaptureHostBackSlot(bool hasItem, bool isMerchandise) noexcept
+{
+    return hasItem && !isMerchandise;
+}
+
+inline constexpr bool ShouldSyncMirrorBackEquipment(bool hasPersonalCorpseState) noexcept
+{
+    return !hasPersonalCorpseState;
+}
+
+inline constexpr bool ShouldCreateMirrorHeldItem(bool down, bool hasPersonalCorpseState) noexcept
+{
+    return !down && !hasPersonalCorpseState;
+}
+
+inline constexpr bool ShouldPreserveCorpseEquipped(bool savedTrader, bool savedCorpse,
+                                                   bool liveCorpse, bool awakened) noexcept
+{
+    if (!liveCorpse) return false;
+    return savedTrader || (savedCorpse && awakened);
+}
+
 inline constexpr bool ShouldEnsureCorpseOnState(bool local, bool isChest, bool isCorpse) noexcept
 {
     return local && (isChest || isCorpse);

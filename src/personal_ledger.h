@@ -28,6 +28,7 @@ std::string NameOf(Entity& entity);
 bool PersonalAdmitted();
 bool IsPending(std::string const& key);
 bool IsRestored(std::string const& key);
+bool HasCorpseState(std::string const& key);
 void MarkTradeOpened(std::string const& key);
 void TrackTradeClose();
 

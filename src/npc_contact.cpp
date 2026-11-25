@@ -773,8 +773,9 @@ void SyncMirrorBackEquipment(Mirror& m, net::NpcRecord const& shown, bool killed
             pending != pendingBackEquipment.end() && pending->second.incarnation == shown.incarnation)
             m.backEquipment = pending->second;
     }
-    if (killed && containers::HasPersonalInventoryState(entity)) return;
-    if (m.backEquipment.incarnation == shown.incarnation) {
+    const bool hasPersonalState = containers::HasPersonalInventoryState(entity);
+    if (npc_equipment::ShouldSyncMirrorBackEquipment(hasPersonalState) &&
+        m.backEquipment.incarnation == shown.incarnation) {
         constexpr gESlot BackSlots[npc_equipment::BackSlotCount] = {
             gESlot_BackLeft, gESlot_BackRight, gESlot_Bow, gESlot_Crossbow
         };
@@ -828,8 +829,11 @@ void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown)
     if (auto* inv = static_cast<gCInventory_PS*>(entity->GetPropertySet(eEPropertySetType_Inventory))) {
         if (shown.heldRight != HeldHash(m.entity, gESlot_RightHand) ||
             shown.heldLeft != HeldHash(m.entity, gESlot_LeftHand)) {
-            EnsureItem(m.entity, shown.heldRight);
-            EnsureItem(m.entity, shown.heldLeft);
+            const bool down = (shown.flags & 2) != 0 || m.entity.IsDown();
+            if (npc_equipment::ShouldCreateMirrorHeldItem(down, containers::HasPersonalInventoryState(entity))) {
+                EnsureItem(m.entity, shown.heldRight);
+                EnsureItem(m.entity, shown.heldLeft);
+            }
             const GEInt leftStack = StackOf(m.entity, shown.heldLeft);
             const GEInt rightStack = StackOf(m.entity, shown.heldRight);
             m.entity.Inventory.HoldStacks(leftStack, rightStack);

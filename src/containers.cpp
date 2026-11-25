@@ -600,7 +600,7 @@ bool HasPersonalInventoryState(eCEntity* instance)
 {
     if (!instance) return false;
     const std::string key = EntityKey(instance);
-    if (IsPending(key) || IsRestored(key)) return true;
+    if (ledger::HasCorpseState(key)) return true;
     Entity entity(instance);
     return entity.GetInstance() && instance->GetPropertySet(eEPropertySetType_Inventory) &&
            entity.Inventory.IsGeneratedPlunder() != GEFalse;

@@ -61,6 +61,28 @@ int main()
     assert(!ShouldEnsureCorpseOnState(true, false, false));
     assert(!ShouldEnsureCorpseOnState(false, true, true));
 
+    // 7. Host back-slot capture skips empty and Merchandise stacks so traders cannot replicate unlootable stock.
+    assert(ShouldCaptureHostBackSlot(true, false));
+    assert(!ShouldCaptureHostBackSlot(true, true));
+    assert(!ShouldCaptureHostBackSlot(false, false));
+    assert(!ShouldCaptureHostBackSlot(false, true));
+
+    // 8. Mirror equipment creation stops once personal corpse state exists (or while unconscious for held items).
+    assert(ShouldSyncMirrorBackEquipment(false));
+    assert(!ShouldSyncMirrorBackEquipment(true));
+    assert(ShouldCreateMirrorHeldItem(false, false));
+    assert(!ShouldCreateMirrorHeldItem(true, false));
+    assert(!ShouldCreateMirrorHeldItem(false, true));
+    assert(!ShouldCreateMirrorHeldItem(true, true));
+
+    // 9. Corpse equipped preservation keeps Trader->Corpse and awakened Corpse->Corpse re-armed gear,
+    //    while keeping unawakened same-KO/dead-corpse restores strict.
+    assert(ShouldPreserveCorpseEquipped(true, false, true, false));
+    assert(ShouldPreserveCorpseEquipped(true, false, true, true));
+    assert(!ShouldPreserveCorpseEquipped(false, true, true, false));
+    assert(ShouldPreserveCorpseEquipped(false, true, true, true));
+    assert(!ShouldPreserveCorpseEquipped(true, true, false, true));
+
     return 0;
 }
 """
@@ -90,8 +112,17 @@ class NpcEquipmentPolicyTests(unittest.TestCase):
         npc_contact = _testbuild.src_text("npc_contact.cpp")
         self.assertIn("SyncMirrorBackEquipment(", npc_contact)
         self.assertIn("containers::HasPersonalInventoryState(entity)", npc_contact)
+        self.assertIn("ShouldSyncMirrorBackEquipment(", npc_contact)
+        self.assertIn("ShouldCreateMirrorHeldItem(", npc_contact)
         self.assertIn("ShouldEquipBackSlot(", npc_contact)
         self.assertIn("ShouldUnlinkDeadHandSlot(", npc_contact)
+
+        npc_send = _testbuild.src_text("npc_send.cpp")
+        self.assertIn("ShouldCaptureHostBackSlot(", npc_send)
+        self.assertIn("gEStackType_Merchandise", npc_send)
+
+        containers = _testbuild.src_text("containers.cpp")
+        self.assertIn("ledger::HasCorpseState(key)", containers)
 
         npcs = _testbuild.src_text("npcs.cpp")
         self.assertIn("SetNpcEquipmentHandler(&OnNpcEquipment)", npcs)

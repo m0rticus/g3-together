@@ -767,9 +767,16 @@ void CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey const& k
     constexpr gESlot BackSlots[npc_equipment::BackSlotCount] = {
         gESlot_BackLeft, gESlot_BackRight, gESlot_Bow, gESlot_Crossbow
     };
+    auto* inv = static_cast<gCInventory_PS*>(instance->GetPropertySet(eEPropertySetType_Inventory));
     for (size_t i = 0; i < npc_equipment::BackSlotCount; ++i) {
-        const Entity backItem = self.Inventory.GetItemFromSlot(BackSlots[i]);
-        if (!backItem.GetInstance()) continue;
+        const gESlot slot = BackSlots[i];
+        const Entity backItem = self.Inventory.GetItemFromSlot(slot);
+        const GEInt stackIdx = backItem.GetInstance() ? self.Inventory.FindStackIndex(slot) : -1;
+        auto const* stack = inv && stackIdx >= 0 ? inv->GetStack(stackIdx) : nullptr;
+        const bool merchandise = stackIdx >= 0 &&
+            (self.Inventory.IsStackMerchandise(stackIdx) != GEFalse ||
+             (stack && stack->GetType() == gEStackType_Merchandise));
+        if (!npc_equipment::ShouldCaptureHostBackSlot(backItem.GetInstance() != nullptr, merchandise)) continue;
         char const* backName = backItem.GetName().GetText();
         const uint32_t hash = net::HashName(backName);
         backEquip.slots[i] = hash;
