@@ -416,9 +416,106 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
     }
 }
 
+namespace {
+bool SendEquipmentPacket(ENetPeer* peer, PlayerEquipment const& equip)
+{
+    if (!peer || !equip.sequence) return false;
+    std::vector<uint8_t> payload;
+    if (!player_equip::Encode(equip, payload)) return false;
+    std::vector<uint8_t> packet;
+    packet.reserve(1 + payload.size());
+    packet.push_back(MsgPlayerEquipment);
+    packet.insert(packet.end(), payload.begin(), payload.end());
+    return Send(peer, packet.data(), packet.size(), ChannelState, true);
+}
+} // namespace
+
+bool FlushPlayerEquipment(uint32_t now)
+{
+    bool changed = false;
+    if (havePendingLocalEquip) {
+        const bool dirty = !haveCurrentEquip || !pendingLocalEquip.SameSlots(currentLocalEquip) ||
+                           pendingLocalEquip.world != currentLocalEquip.world ||
+                           currentLocalEquip.epoch != worldEpoch;
+        if (dirty) {
+            currentLocalEquip = pendingLocalEquip;
+            currentLocalEquip.id = localId;
+            if (++equipSequence == 0) ++equipSequence;
+            currentLocalEquip.sequence = equipSequence;
+            currentLocalEquip.sent = now;
+            currentLocalEquip.epoch = worldEpoch;
+            haveCurrentEquip = true;
+            changed = true;
+        }
+    }
+    if (!host || !connected) return changed;
+    if (isHost) {
+        for (uint8_t to = 2; to < MaxPlayers; ++to) {
+            if (!peers[to] || !Open(peers[to])) continue;
+            for (uint8_t from = 1; from < MaxPlayers; ++from) {
+                if (from == to) continue;
+                PlayerEquipment const* src = nullptr;
+                if (from == 1) {
+                    if (haveCurrentEquip && currentLocalEquip.epoch == worldEpoch) src = &currentLocalEquip;
+                } else if (clientInWorld[from] && remotes[from].hasEquip && remotes[from].latestEquip.epoch == worldEpoch) {
+                    src = &remotes[from].latestEquip;
+                }
+                if (!src || !src->sequence || sentEquipSeq[to][from] == src->sequence) continue;
+                if (SendEquipmentPacket(peers[to], *src)) sentEquipSeq[to][from] = src->sequence;
+            }
+        }
+    } else if (server && Open(server) && haveCurrentEquip && currentLocalEquip.epoch == worldEpoch &&
+               currentLocalEquip.sequence && sentEquipSeq[1][localId] != currentLocalEquip.sequence) {
+        if (SendEquipmentPacket(server, currentLocalEquip)) sentEquipSeq[1][localId] = currentLocalEquip.sequence;
+    }
+    return changed;
+}
+
+bool HandlePlayerEquipmentMessage(ENetPeer* peer, ENetPacket const* packet)
+{
+    if (!isHost && (!connected || peer != server)) return true;
+    if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE) || packet->dataLength < 1 + player_equip::FixedWireBytes)
+        return true;
+    uint8_t player = 0;
+    if (!player_equip::PeekPlayerId(packet->data + 1, packet->dataLength - 1, player)) return true;
+    if (isHost) player = PeerSlotOf(peer);
+    if (!player || player >= MaxPlayers || player == localId) return true;
+    PlayerEquipment equip;
+    if (!player_equip::Decode(packet->data + 1, packet->dataLength - 1, equip, player)) {
+        Logf("net: invalid player equipment packet player=%u", player);
+        return true;
+    }
+    if (equip.epoch != worldEpoch || !equip.sequence) return true;
+    Remote& r = remotes[player];
+    if (r.hasEquip && static_cast<int32_t>(equip.sequence - r.latestEquip.sequence) <= 0) return true;
+    const bool reset = !r.hasEquip || r.latestEquip.world != equip.world;
+    r.latestEquip = equip;
+    r.hasEquip = true;
+    const uint32_t arrived = enet_time_get();
+    if (handlers.playerEquipment) handlers.playerEquipment(equip, arrived, reset);
+    if (isHost && clientInWorld[player]) {
+        for (uint8_t to = 2; to < MaxPlayers; ++to) {
+            if (to != player && peers[to] && Open(peers[to]) &&
+                sentEquipSeq[to][player] != equip.sequence && SendEquipmentPacket(peers[to], equip)) {
+                sentEquipSeq[to][player] = equip.sequence;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace g3t::net::internal
 
 namespace g3t::net {
+
+void SetPlayerEquipmentHandler(PlayerEquipmentHandler handler) { handlers.playerEquipment = handler; }
+
+void UpdateLocalEquipment(PlayerEquipment const& equip, bool haveLocal)
+{
+    havePendingLocalEquip = haveLocal;
+    if (haveLocal) pendingLocalEquip = equip;
+    else pendingLocalEquip = PlayerEquipment{};
+}
 
 bool SendNpcLease(uint8_t to, npclease::Message const& note)
 {
@@ -441,6 +538,9 @@ bool SendWorld(WorldNote const& note, uint8_t to)
     if (isHost && note.op == WorldHost && worldEpoch != note.epoch) {
         ResetNpcReplication();
         worldEpoch = note.epoch;
+        haveCurrentEquip = false;
+        currentLocalEquip = {};
+        ClearAllEquipTables();
         hostOptions = options::Capture();
     }
     const WorldMsg message{MsgWorld, note};

@@ -613,6 +613,7 @@ int main()
     Deliver(peers[2], ackFrame); // unreliable MsgPoseAck -> rejected before cache lookup
     assert(npcRejected == rejectedBefore + 1);
 
+<<<<<<< HEAD
     // Reliable NPC back-slot equipment replication (MsgNpcEquipment) obeys world gate, server identity,
     // reliability, and non-zero incarnation invariants.
     static unsigned equipmentMessages = 0;
@@ -665,6 +666,127 @@ int main()
     Deliver(peers[2], equipFrame); // client cannot publish NPC back equipment to host
     assert(equipmentMessages == 1);
     SetNpcEquipmentHandler(nullptr);
+=======
+    // Event-driven MsgPlayerEquipment sync: immediate send on change, join/rejoin/load resync, pre-entry caching, and peer relay.
+    {
+        auto equipTransmissions = [&]() {
+            std::vector<Transmission> out;
+            for (auto const& t : transmissions)
+                if (!t.bytes.empty() && t.bytes[0] == MsgPlayerEquipment) out.push_back(t);
+            return out;
+        };
+        transmissions.clear();
+        isHost = true;
+        localId = 1;
+        worldEpoch = 99;
+        clientInWorld[2] = false;
+        clientInWorld[3] = false;
+        havePendingLocalEquip = false;
+        haveCurrentEquip = false;
+        ClearAllEquipTables();
+        remotes[2] = {};
+        remotes[3] = {};
+
+        static unsigned equipEvents = 0;
+        static PlayerEquipment lastEquip{};
+        SetPlayerEquipmentHandler([](PlayerEquipment const& eq, uint32_t, bool) {
+            ++equipEvents;
+            lastEquip = eq;
+        });
+
+        // Host equips a sword + shield on back, bow + arrow, armor + helmet before client 2 enters world.
+        PlayerEquipment hostEq{};
+        hostEq.world = 42;
+        hostEq.SetSlot(player_equip::SlotBackRight, "It_1H_Sword_01", 2);
+        hostEq.SetSlot(player_equip::SlotBackLeft, "It_Shield_01", 0);
+        hostEq.SetSlot(player_equip::SlotBow, "It_Bow_Long_01", 0);
+        hostEq.SetSlot(player_equip::SlotAmmo, "Arrow", 0);
+        hostEq.SetSlot(player_equip::SlotBody, "Body_Paladin", 0);
+        hostEq.SetSlot(player_equip::SlotHelmet, "It_Helmet_01", 0);
+        UpdateLocalEquipment(hostEq, true);
+        Service(currentLocal, false);
+        assert(equipTransmissions().empty()); // peer 2 not in world yet
+
+        // Peer 2 joins/enters world: host immediately sends cached host equipment reliably on ChannelState.
+        transmissions.clear();
+        SetInWorld(2, true);
+        auto sent = equipTransmissions();
+        assert(sent.size() == 1);
+        const auto hostToClient2 = sent[0];
+        assert(hostToClient2.peer == peers[2] && hostToClient2.channel == ChannelState);
+        assert((hostToClient2.flags & ENET_PACKET_FLAG_RELIABLE) != 0);
+        assert(hostToClient2.bytes[0] == MsgPlayerEquipment);
+        transmissions.clear();
+
+        // Client 2 receives it even just before its own inWorld flips true (pre-entry cache), and keeps it on SetInWorld(true).
+        isHost = false;
+        localId = 2;
+        connected = true;
+        inWorld = false;
+        Deliver(server, hostToClient2);
+        assert(equipEvents == 1 && remotes[1].hasEquip);
+        assert(std::strcmp(lastEquip.slots[player_equip::SlotBackRight].name, "It_1H_Sword_01") == 0);
+        assert(lastEquip.slots[player_equip::SlotBackRight].quality == 2);
+        assert(std::strcmp(lastEquip.slots[player_equip::SlotBow].name, "It_Bow_Long_01") == 0);
+        SetInWorld(2, true);
+        assert(remotes[1].hasEquip);
+
+        // Client 2 equips a 2H axe and sends its equipment; arrives at host pre-entry or in-world and relays to peer 3.
+        PlayerEquipment client2Eq{};
+        client2Eq.world = 42;
+        client2Eq.SetSlot(player_equip::SlotBackRight, "It_2H_Axe_01", 4);
+        UpdateLocalEquipment(client2Eq, true);
+        Service(currentLocal, false);
+        sent = equipTransmissions();
+        assert(sent.size() == 1);
+        const auto client2Pkt = sent[0];
+        // Unchanged second tick sends 0 MsgPlayerEquipment packets (no polling!).
+        transmissions.clear();
+        Service(currentLocal, false);
+        assert(equipTransmissions().empty());
+
+        // Host receives client 2's packet before peer 3 enters, then peer 3 enters and receives both host and client 2!
+        isHost = true;
+        localId = 1;
+        UpdateLocalEquipment(hostEq, true);
+        Service(currentLocal, false);
+        clientInWorld[2] = true;
+        clientInWorld[3] = false;
+        remotes[2] = {};
+        Deliver(peers[2], client2Pkt);
+        assert(equipEvents == 2 && remotes[2].hasEquip);
+        assert(std::strcmp(remotes[2].latestEquip.slots[player_equip::SlotBackRight].name, "It_2H_Axe_01") == 0);
+        transmissions.clear();
+
+        SetInWorld(3, true);
+        auto forPeer3 = equipTransmissions();
+        assert(forPeer3.size() == 2 && forPeer3[0].peer == peers[3] && forPeer3[1].peer == peers[3]); // host + client 2 delivered to peer 3
+        transmissions.clear();
+
+        // World load / epoch bump resets equipment baseline and triggers immediate resync to all in-world peers.
+        worldEpoch = 100;
+        ClearAllEquipTables();
+        SetInWorld(2, false);
+        assert(!remotes[2].hasEquip);
+        SetInWorld(2, true);
+        Service(currentLocal, false);
+        sent = equipTransmissions();
+        assert(sent.size() == 2 && sent[0].peer == peers[2] && sent[1].peer == peers[3]);
+
+        // Stale world epoch or unreliable packet is ignored.
+        isHost = false;
+        localId = 2;
+        auto badEpoch = hostToClient2; // epoch 99 != 100
+        Deliver(server, badEpoch);
+        assert(equipEvents == 2);
+        auto unreliable = sent[0];
+        unreliable.flags = 0;
+        Deliver(server, unreliable);
+        assert(equipEvents == 2);
+
+        SetPlayerEquipmentHandler(nullptr);
+    }
+>>>>>>> dc639fb0 (Sync all host and client equipped weapon and armor slots event-driven)
 
     host = nullptr;
 }

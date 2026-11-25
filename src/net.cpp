@@ -255,7 +255,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     // Channel 0 can deliver the player's keyframe before channel 1 finishes entry.
     // Cache authenticated state now; puppet/world writes still wait for admission.
     const bool playerEntryCache = type == MsgState && !isHost && connected && peer == server;
-    if (Gated(type) && !xpHandshake && !storyHandshake && !playerEntryCache && !Open(peer)) { ++gatedIn; return; }
+    const bool equipEntryCache = type == MsgPlayerEquipment &&
+                                 ((isHost && PeerSlotOf(peer) != 0) || (!isHost && connected && peer == server));
+    if (Gated(type) && !xpHandshake && !storyHandshake && !playerEntryCache && !equipEntryCache && !Open(peer)) { ++gatedIn; return; }
     if (type == MsgHello && isHost && packet->dataLength >= 3) {
         Hello hello{};
         std::memcpy(&hello, packet->data, packet->dataLength < sizeof(hello) ? packet->dataLength : sizeof(hello));
@@ -353,6 +355,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
             for (uint8_t i = 2; i < MaxPlayers; ++i)
                 if (peers[i] && i != player) SendPlayerState(peers[i], state);
         }
+    } else if (type == MsgPlayerEquipment) {
+        HandlePlayerEquipmentMessage(peer, packet);
     } else if (type == MsgPlayerResync && packet->dataLength == sizeof(PlayerResyncMsg) &&
                (packet->flags & ENET_PACKET_FLAG_RELIABLE)) {
         PlayerResyncMsg request{};
@@ -514,6 +518,9 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
         if (!isHost && message.note.op == WorldHost && worldEpoch != message.note.epoch) {
             ResetNpcReplication();
             worldEpoch = message.note.epoch;
+            haveCurrentEquip = false;
+            currentLocalEquip = {};
+            ClearAllEquipTables();
         }
         if (worldHandler && from) worldHandler(from, message.note);
         if (!isHost && message.note.op == WorldHost && !options::WorldAnnounced()) {
@@ -540,6 +547,8 @@ void SetInWorld(uint8_t id, bool in)
         if (!in) for (auto& receiver : playerReceivers) receiver = {};
         ClearAllPlayerTables();
         if (!in) {
+            haveCurrentEquip = false;
+            currentLocalEquip = {};
             for (uint8_t i = 0; i < MaxPlayers; ++i) ClearPresentation(i);
             ClearClientNpcTables();
         }
@@ -570,6 +579,7 @@ void SetInWorld(uint8_t id, bool in)
         for (uint8_t from = 2; from < MaxPlayers; ++from)
             if (from != id && clientInWorld[from] && !goodsCache[from].empty())
                 goodsReplay[id] |= static_cast<uint8_t>(1u << from);
+        FlushPlayerEquipment(enet_time_get());
     } else {
         goodsCache[id].clear();
         goodsReplay[id] = 0;
@@ -824,6 +834,7 @@ void Service(PlayerState const& local, bool haveLocal)
             FinishClientConnectAttempt(direct, now);
     }
     UpdateBudgets(now);
+    const bool equipImmediate = connected ? FlushPlayerEquipment(now) : false;
     if (connected) {
         if (!activitySent || local.flags != lastActivityFlags || local.downedSequence != lastActivityDowned ||
             now - lastActivitySend >= 1000) {
@@ -844,9 +855,14 @@ void Service(PlayerState const& local, bool haveLocal)
         }
         if (!haveLocal) return;
         const bool due = playerCadence.Due(now, static_cast<uint32_t>(sendRate));
-        const bool immediate = !haveCurrentLocal || local.flags != currentLocal.flags ||
+        const bool immediate = !haveCurrentLocal || equipImmediate ||
+            local.flags != currentLocal.flags ||
             local.downedSequence != currentLocal.downedSequence || local.world != currentLocal.world ||
-            local.actionSeq != currentLocal.actionSeq;
+            local.actionSeq != currentLocal.actionSeq ||
+            std::strcmp(local.heldRight, currentLocal.heldRight) != 0 ||
+            std::strcmp(local.heldLeft, currentLocal.heldLeft) != 0 ||
+            std::strcmp(local.armor, currentLocal.armor) != 0 ||
+            std::strcmp(local.helmet, currentLocal.helmet) != 0;
         if (!due && !immediate) return;
         currentLocal = local;
         currentLocal.id = localId;

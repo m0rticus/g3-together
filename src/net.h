@@ -6,11 +6,13 @@
 #include <cstdint>
 #include <vector>
 #include "netbudget.h"
+#include "player_equip.h"
 #include "player_state.h"
 #include "pose.h"
 #include "npclease.h"
 
 namespace g3t::net {
+using player_equip::PlayerEquipment;
 constexpr int NpcMotionSlots = 8;
 #pragma pack(push, 1)
 struct NpcMotion {
@@ -67,6 +69,8 @@ struct Remote
     uint32_t previousTicks = 0;  // net::Now() when previous/latest arrived
     uint32_t latestTicks = 0;
     bool connected = false;
+    PlayerEquipment latestEquip;
+    bool hasEquip = false;
     PlayerActivity activity; // global helper evidence, independent of loaded/presented position
     uint32_t acceptedStates = 0, metadataWaits = 0, staleStates = 0, preEntryStates = 0;
 };
@@ -83,6 +87,9 @@ void Reconnect(void (*log)(char const*));  // QA, client (stage W1): leave the h
 void Tick(PlayerState const& local, bool haveLocal);
 // Flush all gameplay queued after Tick in this frame and wake the independent Steam relay.
 void Flush();
+void UpdateLocalEquipment(PlayerEquipment const& equip, bool haveLocal);
+using PlayerEquipmentHandler = void (*)(PlayerEquipment const& equip, uint32_t arrived, bool reset);
+void SetPlayerEquipmentHandler(PlayerEquipmentHandler handler);
 void SetSendRate(int hz);  // 20..60 Hz for player states, default 30; NPC captures are independent
 void SetBandwidthBudget(uint32_t bytesPerSecond);
 #define G3T_REMOTE_NPC_FOCUS_SUPPORTED 1

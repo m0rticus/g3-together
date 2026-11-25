@@ -90,6 +90,12 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
         puppet.body.pacified = pacified;
         puppet.body.puppet = isPuppet;
         puppet.motions.Reset();
+        puppet.equipHistory.Reset();
+        puppet.equipApplied = false;
+        for (auto& failed : puppet.failedEquip) failed = {};
+        net::Remote const& remote = net::Remotes()[state.id];
+        if (remote.hasEquip && remote.latestEquip.world == state.world)
+            puppet.equipHistory.Push(puppet.body.track.serial, remote.latestEquip);
         puppet.heldRight.clear();
         puppet.heldLeft.clear();
         puppet.holdChecked = 0;
@@ -145,6 +151,18 @@ void FeedPlayer(net::PlayerState const& state, uint32_t arrived, bool reset)
     sample.actionSeq = state.actionSeq;
     sample.looping = movement::IsLoopingPuppetMotion(state.animation);
     puppet.motions.Push(puppet.body.track.serial, sample);
+}
+
+void FeedPlayerEquipment(net::PlayerEquipment const& equip, uint32_t, bool reset)
+{
+    if (!equip.id || equip.id >= net::MaxPlayers || equip.id == net::LocalId()) return;
+    Puppet& puppet = puppets[equip.id];
+    if (reset) {
+        puppet.equipHistory.Reset(puppet.body.track.serial);
+        puppet.equipApplied = false;
+        for (auto& failed : puppet.failedEquip) failed = {};
+    }
+    puppet.equipHistory.Push(puppet.body.track.serial, equip);
 }
 
 bool LocalState(net::PlayerState& state)
@@ -531,8 +549,13 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     if (dead && !puppet.terminal) {
         if (!*remote.latest.shape) {
             NoDrop(puppet, now);
-            Hold(puppet, remote.latest.heldRight, remote.latest.heldLeft, now);
-            Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
+            if (remote.hasEquip && remote.latestEquip.world == CurrentWorld()) {
+                internal::SyncAllEquipment(puppet, remote.latestEquip, qa.puppetHold, qa.puppetWear);
+                puppet.equipApplied = true;
+            } else {
+                Hold(puppet, remote.latest.heldRight, remote.latest.heldLeft, now);
+                Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
+            }
         }
         StartPuppetTerminal(puppet, id, hero, now);
     }
@@ -650,9 +673,27 @@ void UpdatePuppet(int id, net::Remote const& remote, eCEntity const& hero)
     }
     if (!*remote.latest.shape) {  // a creature holds and wears nothing
         NoDrop(puppet, now);
-        Hold(puppet, presented ? wantedRight : remote.latest.heldRight,
-                     presented ? wantedLeft : remote.latest.heldLeft, now);
-        Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
+        if (remote.hasEquip && remote.latestEquip.world == CurrentWorld()) {
+            if (puppet.equipHistory.count == 0)
+                puppet.equipHistory.Push(puppet.body.track.serial, remote.latestEquip);
+            player_equip::PlayerEquipment wantedEquip = remote.latestEquip;
+            if (presented) {
+                puppet.equipHistory.Sample(presentation.sent, puppet.equipApplied, wantedEquip);
+                wantedEquip.SetSlot(player_equip::SlotRightHand, wantedRight,
+                                    wantedEquip.slots[player_equip::SlotRightHand].quality);
+                wantedEquip.SetSlot(player_equip::SlotLeftHand, wantedLeft,
+                                    wantedEquip.slots[player_equip::SlotLeftHand].quality);
+            }
+            internal::UnlinkMismatchedEquipment(puppet, wantedEquip, qa.puppetHold, qa.puppetWear);
+            Hold(puppet, wantedEquip.slots[player_equip::SlotRightHand].name,
+                         wantedEquip.slots[player_equip::SlotLeftHand].name, now);
+            internal::ApplyMissingEquipment(puppet, wantedEquip, qa.puppetHold, qa.puppetWear);
+            puppet.equipApplied = true;
+        } else {
+            Hold(puppet, presented ? wantedRight : remote.latest.heldRight,
+                         presented ? wantedLeft : remote.latest.heldLeft, now);
+            Wear(puppet, remote.latest.armor, remote.latest.helmet, now);
+        }
     }
     // The player's swings replay as the game's combat moves too (owner's look: players' attacks hardly visible);
     // a body whose move faults goes back to motion names (body.cpp).
@@ -797,6 +838,7 @@ void Start()
     Config const& config = GetConfig();
     parity::Compute();
     net::SetPlayerStateHandler(&FeedPlayer);
+    net::SetPlayerEquipmentHandler(&FeedPlayerEquipment);
     net::SetPeerLeftHandler(&PeerLeft);
     net::SetSendRate(config.sendRate);
     net::SetBandwidthBudget(static_cast<uint32_t>(config.networkBudgetKib) * 1024);
@@ -823,9 +865,19 @@ void Tick()
 {
     if (!started) return;
     net::PlayerState local;
+    net::PlayerEquipment localEquip;
     bool haveLocal = false;
-    { movement::Stage stage("remote capture"); haveLocal = LocalState(local); }
-    { movement::Stage stage("ENet service"); net::Tick(local, haveLocal); }
+    bool haveEquip = false;
+    {
+        movement::Stage stage("remote capture");
+        haveLocal = LocalState(local);
+        haveEquip = internal::CaptureLocalEquipment(localEquip);
+    }
+    {
+        movement::Stage stage("ENet service");
+        net::UpdateLocalEquipment(localEquip, haveEquip);
+        net::Tick(local, haveLocal);
+    }
     eCDynamicEntity* hero = gCSession::GetInstance().GetHero();
     net::Remote const* remotes = net::Remotes();
     for (int id = 1; id < net::MaxPlayers; ++id) {

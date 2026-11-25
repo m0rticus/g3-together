@@ -45,7 +45,7 @@ enum : uint8_t {
     MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 47,
     MsgControlSignal = 48, MsgControlPose = 49, MsgPlayerActivity = 50,
     MsgPoseAck = 51, MsgNpcRemoval = 52, MsgCharacter = 53,
-    MsgPlayerResync = 60, MsgNpcLease = 61, MsgNpcEquipment = 62
+    MsgPlayerResync = 60, MsgNpcLease = 61, MsgNpcEquipment = 62, MsgPlayerEquipment = 63
 };
 
 #pragma pack(push, 1)
@@ -177,6 +177,7 @@ struct Handlers {
     NpcLeaseHandler npcLease = nullptr;
     NpcPoseHandler npcPose = nullptr;
     PlayerStateHandler playerState = nullptr;
+    PlayerEquipmentHandler playerEquipment = nullptr;
     PeerLeftHandler peerLeft = nullptr;
     NpcReleaseHandler npcRelease = nullptr;
     NpcRemovalHandler npcRemoval = nullptr;
@@ -276,6 +277,16 @@ extern PlayerState currentLocal;
 extern bool haveCurrentLocal;
 extern playerwire::Cadence playerCadence;
 extern bool forcePlayerFull[MaxPlayers][MaxPlayers];
+extern PlayerEquipment pendingLocalEquip;
+extern bool havePendingLocalEquip;
+extern PlayerEquipment currentLocalEquip;
+extern bool haveCurrentEquip;
+extern uint32_t equipSequence;
+extern uint32_t sentEquipSeq[MaxPlayers][MaxPlayers];
+bool FlushPlayerEquipment(uint32_t now);
+bool HandlePlayerEquipmentMessage(ENetPeer* peer, ENetPacket const* packet);
+void ClearPeerEquipTables(uint8_t id);
+void ClearAllEquipTables();
 extern Remote remotes[MaxPlayers];
 extern uint32_t worldEpoch;
 extern detail::BandwidthCounters bandwidth;

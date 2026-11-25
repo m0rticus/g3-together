@@ -62,7 +62,7 @@ void NoDrop(Puppet& puppet, uint32_t now)
 
 void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now)
 {
-    if (!qa.puppetWear || (puppet.wearChecked && static_cast<int32_t>(now - puppet.wearChecked) < 250)) return;
+    if (!qa.puppetWear) return;
     puppet.wearChecked = now ? now : 1u;
     char const* const wanted[2] = {armor, helmet};
     for (int i = 0; i < 2; ++i) {
@@ -224,6 +224,21 @@ void Report(LogFn log)
             const Entity held = entity ? body.Inventory.GetItemFromSlot(gESlot_RightHand) : Entity();
             Format(line, "HELD id=%d remote=%s puppet=%s", id, *r.latest.heldRight ? r.latest.heldRight : "-",
                    held.GetInstance() ? held.GetName().GetText() : "-");
+            log(line);
+            auto slotText = [&](player_equip::SlotIndex idx, gESlot slot) -> char const* {
+                return r.hasEquip && !r.latestEquip.slots[idx].Empty() ? r.latestEquip.slots[idx].name
+                       : (entity && body.Inventory.GetItemFromSlot(slot).GetInstance() ? "*" : "-");
+            };
+            auto puppetSlot = [&](gESlot slot) -> char const* {
+                const Entity item = entity ? body.Inventory.GetItemFromSlot(slot) : Entity();
+                return item.GetInstance() ? item.GetName().GetText() : "-";
+            };
+            Format(line, "WEAPONS id=%d r_br=%s p_br=%s r_bl=%s p_bl=%s r_bow=%s p_bow=%s r_ammo=%s p_ammo=%s",
+                   id,
+                   slotText(player_equip::SlotBackRight, gESlot_BackRight), puppetSlot(gESlot_BackRight),
+                   slotText(player_equip::SlotBackLeft, gESlot_BackLeft), puppetSlot(gESlot_BackLeft),
+                   slotText(player_equip::SlotBow, gESlot_Bow), puppetSlot(gESlot_Bow),
+                   slotText(player_equip::SlotAmmo, gESlot_Ammo), puppetSlot(gESlot_Ammo));
             log(line);
             const Entity armor = entity ? body.Inventory.GetItemFromSlot(gESlot_Body) : Entity();
             const Entity helmet = entity ? body.Inventory.GetItemFromSlot(gESlot_Helmet) : Entity();

@@ -7,6 +7,7 @@
 #include "movement_policy.h"
 #include "net.h"
 #include "npcplayback.h"
+#include "player_equip.h"
 #include "pose.h"
 
 #include <Game.h>
@@ -31,6 +32,9 @@ struct Puppet
     uint32_t downedSequence = 0;
     body::State body;
     movement::PuppetMotionHistory motions;
+    player_equip::EquipHistory equipHistory;
+    bool equipApplied = false;
+    player_equip::SlotItem failedEquip[player_equip::SlotCount]{};
     std::string shape;
     std::unordered_map<uint32_t, std::string> presentationNames;
     bool terminal = false;
@@ -93,4 +97,11 @@ void TakeOff(Entity& body, gESlot slot);
 void NoDrop(Puppet& puppet, uint32_t now);
 void Wear(Puppet& puppet, char const* armor, char const* helmet, uint32_t now);
 void LogPlayerStreams(uint32_t now);
+bool CaptureLocalEquipment(player_equip::PlayerEquipment& out);
+void UnlinkMismatchedEquipment(Puppet& puppet, player_equip::PlayerEquipment const& wanted,
+                               bool applyWeapons, bool applyWear);
+void ApplyMissingEquipment(Puppet& puppet, player_equip::PlayerEquipment const& wanted,
+                           bool applyWeapons, bool applyWear);
+void SyncAllEquipment(Puppet& puppet, player_equip::PlayerEquipment const& wanted,
+                      bool applyWeapons, bool applyWear);
 }

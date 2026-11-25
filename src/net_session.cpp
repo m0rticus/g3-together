@@ -39,6 +39,12 @@ PlayerState currentLocal{};
 bool haveCurrentLocal = false;
 playerwire::Cadence playerCadence;
 bool forcePlayerFull[MaxPlayers][MaxPlayers] = {};
+PlayerEquipment pendingLocalEquip{};
+bool havePendingLocalEquip = false;
+PlayerEquipment currentLocalEquip{};
+bool haveCurrentEquip = false;
+uint32_t equipSequence = 0;
+uint32_t sentEquipSeq[MaxPlayers][MaxPlayers] = {};
 Remote remotes[MaxPlayers];
 uint32_t worldEpoch = 0;
 detail::BandwidthCounters bandwidth;
@@ -76,6 +82,18 @@ uint32_t queuedAt = 0, lastServiceAt = 0;
 uint32_t peerConnectData[MaxPlayers] = {};
 PoseRoute poseRoutes[MaxPlayers] = {};
 
+void ClearPeerEquipTables(uint8_t id)
+{
+    if (id >= MaxPlayers) return;
+    for (auto& seq : sentEquipSeq[id]) seq = 0;
+    for (auto& row : sentEquipSeq) row[id] = 0;
+}
+
+void ClearAllEquipTables()
+{
+    for (auto& row : sentEquipSeq) for (auto& seq : row) seq = 0;
+}
+
 void ClearPeerPlayerTables(uint8_t id)
 {
     if (id >= MaxPlayers) return;
@@ -83,12 +101,14 @@ void ClearPeerPlayerTables(uint8_t id)
     for (auto& senders : playerSenders) senders[id] = {};
     for (auto& forced : forcePlayerFull[id]) forced = false;
     for (auto& forced : forcePlayerFull) forced[id] = false;
+    ClearPeerEquipTables(id);
 }
 
 void ClearAllPlayerTables()
 {
     for (auto& senders : playerSenders) for (auto& sender : senders) sender = {};
     for (auto& forced : forcePlayerFull) for (auto& flag : forced) flag = false;
+    ClearAllEquipTables();
 }
 
 bool StoryHandshake(void const* data, size_t size)
@@ -362,6 +382,9 @@ void ResetClientLinkState(bool clearRefusal)
     }
     haveCurrentLocal = false;
     playerCadence = {};
+    haveCurrentEquip = false;
+    currentLocalEquip = {};
+    ClearAllEquipTables();
     activitySent = false;
     lastActivitySend = 0;
     options::Restore();
@@ -467,6 +490,12 @@ void Stop()
     refusalReason[0] = '\0';
     haveCurrentLocal = false;
     playerCadence = {};
+    havePendingLocalEquip = false;
+    pendingLocalEquip = {};
+    haveCurrentEquip = false;
+    currentLocalEquip = {};
+    equipSequence = 0;
+    ClearAllEquipTables();
     connected = inWorld = false;
     activitySent = false;
     lastActivitySend = 0;
