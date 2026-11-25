@@ -112,6 +112,12 @@ bool HandleGameplayMessage(ENetPeer* peer, ENetPacket* packet, uint8_t type)
         if (handlers.npcLease) handlers.npcLease(from, note);
         return true;
     }
+    case MsgNpcEquipment: {
+        NpcEquipmentMsg message{};
+        if (isHost || !connected || peer != server || !UnpackReliableFixed(packet, message)) return true;
+        if (message.note.incarnation && handlers.npcEquipment) handlers.npcEquipment(message.note);
+        return true;
+    }
     case MsgSave:
         if (packet->dataLength == sizeof(SaveMsg)) HandleSaveMessage(peer, packet);
         return true;

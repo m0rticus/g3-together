@@ -375,7 +375,10 @@ void RollbackPersonal(Entity& entity, gCInventory_PS& inventory,
 {
     for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i) {
         if (!PersonalCounted(entity, i)) continue;
-        if (entity.Inventory.GetSlotFromStack(i) != gESlot_None && !entity.Inventory.UnEquipStack(i)) continue;
+        if (const gESlot slot = entity.Inventory.GetSlotFromStack(i); slot != gESlot_None) {
+            inventory.UnlinkStackFromSlot(slot);
+            if (entity.Inventory.GetSlotFromStack(i) != gESlot_None) continue;
+        }
         entity.Inventory.DeleteStack(i);
     }
     std::map<StackKey, int64_t> remaining;
@@ -464,7 +467,10 @@ bool ApplyPersonal(Entity& entity, personal::Inventory const& row)
 
     for (int i = entity.Inventory.GetStackCount() - 1; i >= 0; --i) {
         if (!PersonalCounted(entity, i) || PreservedCorpseStack(entity, *inventory, i, kind, preserveCorpseEquipped)) continue;
-        if (entity.Inventory.GetSlotFromStack(i) != gESlot_None && !entity.Inventory.UnEquipStack(i)) return rollbackAndFail();
+        if (const gESlot slot = entity.Inventory.GetSlotFromStack(i); slot != gESlot_None) {
+            inventory->UnlinkStackFromSlot(slot);
+            if (entity.Inventory.GetSlotFromStack(i) != gESlot_None) return rollbackAndFail();
+        }
         if (!entity.Inventory.DeleteStack(i)) return rollbackAndFail();
     }
     for (size_t i = 0; i < row.stacks.size(); ++i) {

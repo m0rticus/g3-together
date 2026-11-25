@@ -65,6 +65,11 @@ int OnNpcs(net::NpcRecord* records, int count, uint32_t now, uint32_t sent, uint
             m.replay = npcplayback::State{};
             npclease::ForgetReceivedNpcPoseBefore(records[i].guid, records[i].incarnation, captured);
         }
+        if (const auto pending = pendingBackEquipment.find(key);
+            pending != pendingBackEquipment.end() && pending->second.incarnation == records[i].incarnation &&
+            npc_equipment::ShouldAcceptBackEquipment(m.backEquipment.incarnation, pending->second.incarnation)) {
+            m.backEquipment = pending->second;
+        }
         if (!m.firstSeen) m.firstSeen = now ? now : 1;
         m.owner = owner;
         m.ownerGeneration = generation;
@@ -168,8 +173,9 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         }
         uint8_t poseFlags = 0;
         bool posed = false, moving = false;
-        CaptureAndRecordOwnedNpc(self, instance, key, frame.partyLeaderOf, r, bones, poseFlags, posed, moving);
-        SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, bones, poseFlags, posed, moving, frame.stretchOf);
+        npc_equipment::BackEquipment backEquip{};
+        CaptureAndRecordOwnedNpc(self, instance, key, frame.partyLeaderOf, r, backEquip, bones, poseFlags, posed, moving);
+        SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, backEquip, bones, poseFlags, posed, moving, frame.stretchOf);
     }
     FinishOwnedTick(hero, players, playerCount);
 }
@@ -579,6 +585,7 @@ void PassiveMirrorTick()
             m.guarded = true;
         }
         if (m.killed && (m.latest.flags & 1)) {
+            SyncMirrorBackEquipment(m, m.latest, true);
             m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
                 m.deathReferencesCleared != m.entity.GetInstance());
             m.deathReferencesCleared = m.entity.GetInstance();
@@ -608,6 +615,7 @@ void PassiveMirrorTick()
                         m.entity.GetInstance()->GetPropertySet(eEPropertySetType_DamageReceiver)))
                     receiver->AccessHitPoints() = 0;
                 KeepDead(m.entity);
+                SyncMirrorBackEquipment(m, m.latest, true);
                 m.deathClearCount += ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount,
                     m.deathReferencesCleared != m.entity.GetInstance());
                 m.deathReferencesCleared = m.entity.GetInstance();
@@ -664,6 +672,7 @@ void PassiveMirrorTick()
         const bool firstDeath = !m.killed;
         m.killed = (shown.flags & 1) != 0;
         if (m.killed && (firstDeath || m.deathReferencesCleared != m.entity.GetInstance())) {
+            SyncMirrorBackEquipment(m, shown, true);
             if (m.deathReferencesCleared != m.entity.GetInstance()) {
                 m.deathClearCount = ClearLocalReferencesToDeadMirror(m.entity.GetInstance(), &m.deathCombatStopCount);
                 m.deathReferencesCleared = m.entity.GetInstance();
@@ -755,6 +764,7 @@ void LeaseReleaseMirror(uint8_t const identity[16])
         mirrors.erase(found);
     }
     npclease::ForgetReceivedNpcPose(identity);
+    pendingBackEquipment.erase(key);
     deadOnHost.erase(key); corpses.erase(key); absences.erase(key); ForgetCorpseGroundAnchor(key);
 }
 
@@ -902,11 +912,30 @@ void OnEntityDestroyed(eCEntity const* entity)
     for (auto& entry : corpses) clearDestroyedPointers(entry.second);
 }
 
+void OnNpcEquipment(net::NpcEquipmentNote const& note)
+{
+    if (net::IsHost() || npcremoval::Suppressed(note.guid) || !note.incarnation) return;
+    const GuidKey key = Key(note.guid);
+    npc_equipment::BackEquipment incoming{};
+    incoming.incarnation = note.incarnation;
+    std::memcpy(incoming.slots, note.backSlots, sizeof(incoming.slots));
+    auto& pending = pendingBackEquipment[key];
+    if (npc_equipment::ShouldAcceptBackEquipment(pending.incarnation, incoming.incarnation))
+        pending = incoming;
+    if (const auto found = mirrors.find(key);
+        found != mirrors.end() &&
+        npc_equipment::ShouldAcceptBackEquipment(found->second.latest.incarnation, incoming.incarnation) &&
+        npc_equipment::ShouldAcceptBackEquipment(found->second.backEquipment.incarnation, incoming.incarnation)) {
+        found->second.backEquipment = incoming;
+    }
+}
+
 void Start()
 {
     (void)&MirrorTick;
     net::SetNpcHandlers(&OnNpcs, &OnMotionName);
     net::SetNpcReleaseHandler(&OnRelease);
+    net::SetNpcEquipmentHandler(&OnNpcEquipment);
     net::SetRagdollHandler(&OnRagdollNote);
     net::SetHitResultHandler(&OnHitResult);
 }

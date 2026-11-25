@@ -45,7 +45,7 @@ enum : uint8_t {
     MsgControlBatch = 45, MsgControlId = 46, MsgControlBaseline = 47,
     MsgControlSignal = 48, MsgControlPose = 49, MsgPlayerActivity = 50,
     MsgPoseAck = 51, MsgNpcRemoval = 52, MsgCharacter = 53,
-    MsgPlayerResync = 60, MsgNpcLease = 61
+    MsgPlayerResync = 60, MsgNpcLease = 61, MsgNpcEquipment = 62
 };
 
 #pragma pack(push, 1)
@@ -73,6 +73,7 @@ struct NpcReleaseHeader {
     uint8_t count, owner;
 };
 struct NpcRemovalMsg { uint8_t type; NpcRemovalNote note; };
+struct NpcEquipmentMsg { uint8_t type; NpcEquipmentNote note; };
 struct MotionNameMsg { uint8_t type; uint32_t hash; char name[96]; };
 struct HitNpcMsg {
     uint8_t type; uint8_t guid[16]; int32_t delta; uint8_t weapon[16];
@@ -179,6 +180,7 @@ struct Handlers {
     PeerLeftHandler peerLeft = nullptr;
     NpcReleaseHandler npcRelease = nullptr;
     NpcRemovalHandler npcRemoval = nullptr;
+    NpcEquipmentHandler npcEquipment = nullptr;
     MotionNameHandler motionName = nullptr;
     HitNpcHandler hitNpc = nullptr;
     HitResultHandler hitResult = nullptr;

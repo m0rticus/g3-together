@@ -6,6 +6,7 @@
 #include "guid.h"
 #include "guid_key.h"
 #include "net.h"
+#include "npc_equipment_policy.h"
 #include "npcidentity_policy.h"
 #include "npc_item_quality_policy.h"
 #include "npcpresence_policy.h"
@@ -158,6 +159,7 @@ struct Mirror {
     uint32_t records = 0;
     uint32_t previousSent = 0, latestSent = 0;
     uint32_t heldRight = 0, heldLeft = 0;
+    npc_equipment::BackEquipment backEquipment{};
     uint32_t holdChecked = 0;
     char skeleton[24] = {};
     bool laid = false;
@@ -286,6 +288,8 @@ inline bool retryMissing = true;
 inline unsigned mirrorsFoundLater = 0, mirrorsExpired = 0, mirrorLookups = 0;
 inline std::unordered_map<GuidKey, Mirror, GuidHash> mirrors;
 inline std::unordered_map<GuidKey, Mirror, GuidHash> corpses;
+inline std::unordered_map<GuidKey, npc_equipment::BackEquipment, GuidHash> pendingBackEquipment;
+inline std::unordered_map<GuidKey, npc_equipment::BackEquipment, GuidHash> sentBackEquipment[net::MaxPlayers];
 inline std::unordered_map<GuidKey, net::NpcRecord, GuidHash> absences;
 inline uint32_t absenceCheckAt = 0;
 inline std::unordered_map<uint32_t, std::string> motionNames;
@@ -335,12 +339,25 @@ inline uint32_t HeldHash(Entity& npc, gESlot slot)
 inline GEInt StackOf(Entity& npc, uint32_t hash)
 {
     if (!hash) return -1;
+    eCEntity* instance = npc.GetInstance();
+    auto* inv = instance ? static_cast<gCInventory_PS*>(instance->GetPropertySet(eEPropertySetType_Inventory)) : nullptr;
     const GEInt count = npc.Inventory.GetStackCount();
-    for (GEInt i = 0; i < count; ++i)
-        if (Entity item = npc.Inventory.GetTemplateItem(i); item.GetInstance() && net::HashName(item.GetName().GetText()) == hash)
+    for (GEInt i = 0; i < count; ++i) {
+        auto const* stack = inv ? inv->GetStack(i) : nullptr;
+        const bool merchandise = npc.Inventory.IsStackMerchandise(i) != GEFalse ||
+            (stack && stack->GetType() == gEStackType_Merchandise);
+        if (!npc_equipment::IsMirrorLootStackEligible(merchandise, npc.Inventory.GetAmount(i))) continue;
+        if (Entity item = npc.Inventory.GetTemplateItem(i);
+            item.GetInstance() && net::HashName(item.GetName().GetText()) == hash)
             return i;
+    }
     return -1;
 }
+
+static_assert(npc_equipment::BackSlotIndices[0] == static_cast<int>(gESlot_BackLeft));
+static_assert(npc_equipment::BackSlotIndices[1] == static_cast<int>(gESlot_BackRight));
+static_assert(npc_equipment::BackSlotIndices[2] == static_cast<int>(gESlot_Bow));
+static_assert(npc_equipment::BackSlotIndices[3] == static_cast<int>(gESlot_Crossbow));
 
 static_assert(npc_item_quality::QualityWorn == static_cast<uint32_t>(gEItemQuality_Worn));
 static_assert(npc_item_quality::CategoryWeapon == static_cast<int>(gEItemCategory_Weapon));

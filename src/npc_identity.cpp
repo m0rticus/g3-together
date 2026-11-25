@@ -609,6 +609,8 @@ void ResetWorldNpcTables()
     deadOnHost.clear();
     ClearCorpseGroundAnchors();
     lastSent.clear();
+    pendingBackEquipment.clear();
+    for (auto& sentBack : sentBackEquipment) sentBack.clear();
     for (auto& states : recipientNpcs) states.clear();
     for (auto& pacer : initialPacers) pacer.Reset();
     std::fill(recipientGenerations, recipientGenerations + net::MaxPlayers, 0);

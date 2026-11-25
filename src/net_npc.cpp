@@ -657,6 +657,7 @@ void SetNpcHandlers(NpcHandler npcs, MotionNameHandler names)
 
 void SetNpcReleaseHandler(NpcReleaseHandler handler) { handlers.npcRelease = handler; }
 void SetNpcRemovalHandler(NpcRemovalHandler handler) { handlers.npcRemoval = handler; }
+void SetNpcEquipmentHandler(NpcEquipmentHandler handler) { handlers.npcEquipment = handler; }
 
 void ResetNpcReplication()
 {
@@ -776,6 +777,14 @@ bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note)
     if (!Send(peers[to], &message, sizeof(message), ChannelDefinitions, true)) return false;
     sentPoses[to].erase(NpcKey(note.guid));
     return true;
+}
+
+bool SendNpcEquipmentTo(uint8_t to, NpcEquipmentNote const& note)
+{
+    if (!isHost || !host || to < 2 || to >= MaxPlayers || !peers[to] ||
+        !PeerJoined(to) || !InWorld(to) || !note.incarnation) return false;
+    const NpcEquipmentMsg message{MsgNpcEquipment, note};
+    return Send(peers[to], &message, sizeof(message), ChannelReliable, true);
 }
 
 void SendMotionName(uint32_t hash, char const* name)

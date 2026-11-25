@@ -8,6 +8,7 @@
 #include "items.h"
 #include "log.h"
 #include "net.h"
+#include "npc_equipment_policy.h"
 #include "personal_ledger.h"
 #include "personal_store.h"
 #include "remote.h"
@@ -217,6 +218,8 @@ GEBool __fastcall TransferPersonalScript(PSInventory* from, void* edx, GEInt sta
     return GuardedInventoryTransfer("script_transfer", inventory, target, [&] { return nativeScriptTransfer(from, edx, stack, amount, to); }, stack, amount);
 }
 
+bool PrepareLocalLoot(Entity& entity);
+
 GEBool __fastcall BeginPersonalTrade(gCGUIManager* manager, void* edx, eCEntity* partner)
 {
     if (!nativeBeginTrade) return GEFalse;
@@ -246,18 +249,27 @@ GEBool GE_STDCALL PersonalState(bTObjStack<gScriptRunTimeSingleState>& stack, gC
     Entity target(spu ? spu->GetTargetEntity() : nullptr);
     const bool local = hero && spu && spu->GetSelfEntity() == hero;
     const bool hudLoop = !std::strcmp(name, "PS_HUD_Loop");
-    Entity* chest = local && IsChest(target) ? &target : local && IsChest(focus) ? &focus : nullptr;
-    if (chest) {
-        if (!PersonalAdmitted() || !EnsurePersonal(*chest)) {
+    const bool targetRelevant = npc_equipment::ShouldEnsureCorpseOnState(local, IsChest(target), Corpse(target));
+    const bool focusRelevant = npc_equipment::ShouldEnsureCorpseOnState(local, IsChest(focus), Corpse(focus));
+    Entity* container = targetRelevant ? &target : focusRelevant ? &focus : nullptr;
+    if (container) {
+        if (!PersonalAdmitted() || !EnsurePersonal(*container)) {
             if (hudLoop) return original->second(stack, spu);
             return GEFalse;
         }
-        RememberPersonal(*chest);
+        if (Corpse(*container) && !container->Inventory.IsGeneratedPlunder()) {
+            if (!PrepareLocalLoot(*container)) {
+                if (hudLoop) return original->second(stack, spu);
+                return GEFalse;
+            }
+        } else {
+            RememberPersonal(*container);
+        }
     }
-    if (local && chest && !std::strcmp(name, "PS_Interact_Chest_Loop") && IsLootPageOpen()) {
-        BlockWitnessedChestLoot(chest->GetInstance());
+    if (local && container && !std::strcmp(name, "PS_Interact_Chest_Loop") && IsLootPageOpen()) {
+        BlockWitnessedChestLoot(container->GetInstance());
     }
-    const std::string key = chest ? EntityKey(chest->GetInstance()) : std::string();
+    const std::string key = container ? EntityKey(container->GetInstance()) : std::string();
     const GEBool result = original->second(stack, spu);
     if (!key.empty()) {
         Entity current = guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
@@ -582,6 +594,16 @@ bool IsPersonalInventory(eCEntity* instance)
 {
     Entity entity(instance);
     return Shared(entity);
+}
+
+bool HasPersonalInventoryState(eCEntity* instance)
+{
+    if (!instance) return false;
+    const std::string key = EntityKey(instance);
+    if (IsPending(key) || IsRestored(key)) return true;
+    Entity entity(instance);
+    return entity.GetInstance() && instance->GetPropertySet(eEPropertySetType_Inventory) &&
+           entity.Inventory.IsGeneratedPlunder() != GEFalse;
 }
 
 void OnWorldChange()

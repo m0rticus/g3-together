@@ -460,13 +460,18 @@ class PersonalStoreTests(unittest.TestCase):
         create_helper = part(ledger_source, "int CreateAndEquipStack(", "bool ReadRawPersonal(")
         apply_fn = part(ledger_source, "bool ApplyPersonal(", "bool AwaitingDeath(")
         self.assertIn("CaptureEquippedSlots(", apply_fn)
-        self.assertIn("UnEquipStack(i)", apply_fn)
+        self.assertIn("UnlinkStackFromSlot(slot)", apply_fn)
         self.assertIn("CreateAndEquipStack(", apply_fn)
 
         rollback_fn = part(ledger_source, "void RollbackPersonal(", "bool ReadPersonal(")
-        self.assertIn("UnEquipStack(i)", rollback_fn)
+        self.assertIn("UnlinkStackFromSlot(slot)", rollback_fn)
         self.assertIn("CreateAndEquipStack(", rollback_fn)
         self.assertIn("RestoreMatchingSlot(", create_helper)
+
+        state_fn = part(containers_source, "GEBool GE_STDCALL PersonalState(", "void* InstallPersonalNative(")
+        self.assertIn("ShouldEnsureCorpseOnState(", state_fn)
+        self.assertIn("Corpse(*container)", state_fn)
+        self.assertIn("PrepareLocalLoot(*container)", state_fn)
 
         resolve_fn = part(ledger_source, "bool ResolveStackTemplates(", "void CaptureEquippedSlots(")
         self.assertIn("gESlot_Ammo", resolve_fn)

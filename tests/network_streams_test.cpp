@@ -613,5 +613,58 @@ int main()
     Deliver(peers[2], ackFrame); // unreliable MsgPoseAck -> rejected before cache lookup
     assert(npcRejected == rejectedBefore + 1);
 
+    // Reliable NPC back-slot equipment replication (MsgNpcEquipment) obeys world gate, server identity,
+    // reliability, and non-zero incarnation invariants.
+    static unsigned equipmentMessages = 0;
+    static NpcEquipmentNote lastEquipment{};
+    SetNpcEquipmentHandler([](NpcEquipmentNote const& note) {
+        ++equipmentMessages;
+        lastEquipment = note;
+    });
+    NpcEquipmentNote equip{};
+    equip.guid[0] = 0x55;
+    equip.incarnation = 4;
+    equip.backSlots[0] = HashName("It_Shield_01");
+    equip.backSlots[1] = HashName("It_1H_Sword_01");
+    equip.backSlots[2] = HashName("It_Bow_01");
+    equip.backSlots[3] = HashName("It_Crossbow_01");
+    transmissions.clear();
+    clientInWorld[2] = false;
+    assert(!SendNpcEquipmentTo(2, equip) && transmissions.empty());
+    clientInWorld[2] = true;
+    assert(SendNpcEquipmentTo(2, equip) && transmissions.size() == 1);
+    const auto equipFrame = transmissions[0];
+    assert(equipFrame.channel == ChannelReliable && (equipFrame.flags & ENET_PACKET_FLAG_RELIABLE));
+    assert(equipFrame.bytes.size() == sizeof(NpcEquipmentMsg) && equipFrame.bytes[0] == MsgNpcEquipment);
+    transmissions.clear();
+    isHost = false;
+    localId = 2;
+    connected = inWorld = true;
+    Deliver(&fakePeers[1], equipFrame); // non-server peer refused
+    assert(equipmentMessages == 0);
+    auto unreliableEquip = equipFrame;
+    unreliableEquip.flags = 0;
+    Deliver(server, unreliableEquip); // unreliable refused
+    assert(equipmentMessages == 0);
+    auto zeroIncEquip = equipFrame;
+    NpcEquipmentMsg zeroIncMsg{};
+    std::memcpy(&zeroIncMsg, zeroIncEquip.bytes.data(), sizeof(zeroIncMsg));
+    zeroIncMsg.note.incarnation = 0;
+    std::memcpy(zeroIncEquip.bytes.data(), &zeroIncMsg, sizeof(zeroIncMsg));
+    Deliver(server, zeroIncEquip);
+    assert(equipmentMessages == 0);
+    inWorld = false;
+    Deliver(server, equipFrame); // gated out before world admission
+    assert(equipmentMessages == 0);
+    inWorld = true;
+    Deliver(server, equipFrame);
+    assert(equipmentMessages == 1 && lastEquipment.guid[0] == 0x55 && lastEquipment.incarnation == 4);
+    assert(lastEquipment.backSlots[2] == equip.backSlots[2] && lastEquipment.backSlots[3] == equip.backSlots[3]);
+    isHost = true;
+    localId = 1;
+    Deliver(peers[2], equipFrame); // client cannot publish NPC back equipment to host
+    assert(equipmentMessages == 1);
+    SetNpcEquipmentHandler(nullptr);
+
     host = nullptr;
 }

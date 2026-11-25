@@ -180,6 +180,17 @@ static_assert(sizeof(NpcRemovalNote) == 28, "NPC removal wire layout");
 bool SendNpcRemovalTo(uint8_t to, NpcRemovalNote const& note);
 using NpcRemovalHandler = void (*)(NpcRemovalNote const&);
 void SetNpcRemovalHandler(NpcRemovalHandler handler);
+#pragma pack(push, 1)
+struct NpcEquipmentNote {
+    uint8_t guid[16] = {};
+    uint32_t incarnation = 1;
+    uint32_t backSlots[4] = {};
+};
+#pragma pack(pop)
+static_assert(sizeof(NpcEquipmentNote) == 36, "NPC equipment wire layout");
+bool SendNpcEquipmentTo(uint8_t to, NpcEquipmentNote const& note);
+using NpcEquipmentHandler = void (*)(NpcEquipmentNote const&);
+void SetNpcEquipmentHandler(NpcEquipmentHandler handler);
 void ResetNpcReplication();  // forget ordering/history fences on a world change, not the host publication clock
 void NpcReplicationCounts(unsigned& accepted, unsigned& rejected, unsigned& stale);
 void NpcPoseCounts(unsigned& sent, unsigned& received, unsigned& failed);

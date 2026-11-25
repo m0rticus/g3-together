@@ -10,6 +10,7 @@ class eCEntity;
 
 namespace g3t::containers {
 bool IsPersonalInventory(eCEntity* entity);  // world inventory, not the hero, an item or another player's puppet
+bool HasPersonalInventoryState(eCEntity* entity);  // pending/restored ledger entry or already-generated corpse loot
 bool PersonalHooksReady();  // true only when every required native/script guard is installed
 void PrepareCorpseLoot(eCEntity* entity);  // ensure personal loot is generated and captured on newly dead/KO'd NPCs
 bool CapturePersonal(std::vector<uint8_t>& out);  // false leaves out unchanged

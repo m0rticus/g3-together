@@ -6,6 +6,7 @@
 #include "combat.h"
 #include "combat_timing.h"
 #include "contact.h"
+#include "containers.h"
 #include "downed.h"
 #include "log.h"
 #include "npclease_runtime.h"
@@ -761,6 +762,64 @@ void ReconcileMirrorAlive(GuidKey const& key, Mirror& m)
     ForgetCorpseGroundAnchor(key);
 }
 
+void SyncMirrorBackEquipment(Mirror& m, net::NpcRecord const& shown, bool killed)
+{
+    eCEntity* entity = m.entity.GetInstance();
+    if (!entity) return;
+    auto* inv = static_cast<gCInventory_PS*>(entity->GetPropertySet(eEPropertySetType_Inventory));
+    if (!inv) return;
+    if (m.backEquipment.incarnation != shown.incarnation) {
+        if (const auto pending = pendingBackEquipment.find(Key(shown.guid));
+            pending != pendingBackEquipment.end() && pending->second.incarnation == shown.incarnation)
+            m.backEquipment = pending->second;
+    }
+    if (killed && containers::HasPersonalInventoryState(entity)) return;
+    if (m.backEquipment.incarnation == shown.incarnation) {
+        constexpr gESlot BackSlots[npc_equipment::BackSlotCount] = {
+            gESlot_BackLeft, gESlot_BackRight, gESlot_Bow, gESlot_Crossbow
+        };
+        const uint32_t heldRight = killed ? 0u : shown.heldRight;
+        const uint32_t heldLeft = killed ? 0u : shown.heldLeft;
+        for (size_t i = 0; i < npc_equipment::BackSlotCount; ++i) {
+            const uint32_t wantHash = m.backEquipment.slots[i];
+            const gESlot slot = BackSlots[i];
+            const GEInt existing = m.entity.Inventory.FindStackIndex(slot);
+            auto const* existingStack = existing >= 0 ? inv->GetStack(existing) : nullptr;
+            const bool existingMerchandise = existing >= 0 &&
+                (m.entity.Inventory.IsStackMerchandise(existing) != GEFalse ||
+                 (existingStack && existingStack->GetType() == gEStackType_Merchandise));
+            const uint32_t currentBackHash = HeldHash(m.entity, slot);
+            if (!npc_equipment::ShouldEquipBackSlot(wantHash, heldRight, heldLeft, currentBackHash, existingMerchandise))
+                continue;
+            if (existing >= 0) inv->UnlinkStackFromSlot(slot);
+            EnsureItem(m.entity, wantHash);
+            GEInt stackIdx = StackOf(m.entity, wantHash);
+            if (stackIdx < 0) continue;
+            const gESlot currentSlot = m.entity.Inventory.GetSlotFromStack(stackIdx);
+            if (currentSlot == gESlot_RightHand || currentSlot == gESlot_LeftHand) {
+                if (!killed) continue;
+                inv->UnlinkStackFromSlot(currentSlot);
+            }
+            if (m.entity.Inventory.GetAmount(stackIdx) > 1) {
+                const GEInt split = m.entity.Inventory.SplitStack(stackIdx, 1);
+                if (split >= 0) stackIdx = split;
+            }
+            if (!m.entity.Inventory.EquipStackToSlot(stackIdx, slot) && HeldHash(m.entity, slot) != wantHash)
+                inv->LinkStackToSlot(stackIdx, slot, GETrue);
+            Entity equipped = m.entity.Inventory.GetItemFromSlot(slot);
+            if (equipped.GetInstance() && equipped.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&
+                equipped.Interaction.GetOwner().GetInstance() != entity)
+                equipped.Interaction.SetOwner(m.entity);
+        }
+    }
+    if (killed) {
+        if (npc_equipment::ShouldUnlinkDeadHandSlot(true, shown.heldRight, HeldHash(m.entity, gESlot_RightHand)))
+            inv->UnlinkStackFromSlot(gESlot_RightHand);
+        if (npc_equipment::ShouldUnlinkDeadHandSlot(true, shown.heldLeft, HeldHash(m.entity, gESlot_LeftHand)))
+            inv->UnlinkStackFromSlot(gESlot_LeftHand);
+    }
+}
+
 void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown)
 {
     eCEntity* entity = m.entity.GetInstance();
@@ -781,6 +840,7 @@ void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown)
             }
             ++holdChanges;
         }
+        SyncMirrorBackEquipment(m, shown, false);
         for (gESlot slot : {gESlot_RightHand, gESlot_LeftHand}) {
             Entity held = m.entity.Inventory.GetItemFromSlot(slot);
             if (held.GetInstance() && held.GetInstance()->GetPropertySet(eEPropertySetType_Interaction) &&

@@ -31,6 +31,7 @@ void OnHitResult(net::HitResult const& result);
 void BeginPassiveMirrorFrame(uint32_t now);
 void ResetUnloadedMirror(Mirror& m, Entity const& live, eCEntity* previous);
 void ReconcileMirrorAlive(GuidKey const& key, Mirror& m);
+void SyncMirrorBackEquipment(Mirror& m, net::NpcRecord const& shown, bool killed);
 void SyncMirrorEquipmentAndDamage(Mirror& m, net::NpcRecord const& shown);
 void RecordMirrorWalkTelemetry(Mirror& m, net::NpcRecord const& shown, uint32_t now);
 bool MirrorFightsHeroImpl();
