@@ -24,6 +24,7 @@
 #include "telemetry.h"
 #include "trade.h"
 #include "world.h"
+#include "world_sectors.h"
 #include "xpshare.h"
 
 #include <algorithm>
@@ -156,7 +157,7 @@ void Evaluate()
     if (seenWelcome != net::WelcomeSerial()) { net::SetInWorld(net::LocalId(), false); return; }
     const bool ready = !nativeLoadDepth && !clientRejoin.pending && loading.empty() && !newWorld && ownCharacterReady &&
                        !needsNewHero && !restoreFailed && synced == hostWorld.epoch &&
-                       story::AdmissionReady() && doors::AdmissionReady();
+                       story::AdmissionReady() && doors::AdmissionReady() && sectors::AdmissionReady();
     bool admitted = ready && hostAdmissionAck && net::InWorld(net::LocalId());
     net::WorldNote answer{};
     answer.op = ready ? net::WorldReady : net::WorldWaiting; answer.kind = localKind; answer.epoch = hostWorld.epoch;
@@ -177,7 +178,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
         if (note.op == net::WorldReady && clients[from].recordSent == epoch && ownCharacterReady && loading.empty()) {
             if (note.flags & net::WorldEntryConfirmed) {
                 if (clients[from].cutover != epoch) return;
-                if (clients[from].ready != epoch && (!story::FinishAdmission(from) || !doors::FinishAdmission(from))) return;
+                if (clients[from].ready != epoch && (!story::FinishAdmission(from) || !doors::FinishAdmission(from) || !sectors::FinishAdmission(from))) return;
                 const bool first = clients[from].ready != epoch;
                 clients[from].ready = epoch;
                 clients[from].hasSavedPose = false;
@@ -192,7 +193,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
                 }
                 return;
             }
-            if (!story::FinishAdmission(from) || !doors::FinishAdmission(from)) return;
+            if (!story::FinishAdmission(from) || !doors::FinishAdmission(from) || !sectors::FinishAdmission(from)) return;
             const bool first = clients[from].cutover != epoch;
             clients[from].cutover = epoch;
             if (first) Logf("persist: admission cutover queued peer=%u account=%llu epoch=%08x; waiting for applied confirmation",
@@ -213,7 +214,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
     }
     if (note.op == net::WorldReady) {
         if (seenWelcome != net::WelcomeSerial() || note.epoch != hostWorld.epoch || note.kind == net::KindMenu || !ownCharacterReady ||
-            synced != hostWorld.epoch || !story::AdmissionReady() || !doors::AdmissionReady()) return;
+            synced != hostWorld.epoch || !story::AdmissionReady() || !doors::AdmissionReady() || !sectors::AdmissionReady()) return;
         hostAdmissionAck = true;
         Evaluate();
         return;
@@ -237,7 +238,7 @@ void OnWorld(uint8_t from, net::WorldNote const& note)
         net::SetInWorld(net::LocalId(), false);
         // Live native objects are retired at the next outer module boundary, never in ENet dispatch.
         if (!clientRejoin.pending) {
-            story::OnWorldChange(); doors::OnWorldChange(); clock::OnWorldChange();
+            story::OnWorldChange(); doors::OnWorldChange(); sectors::OnWorldChange(); clock::OnWorldChange();
             combat::OnWorldChange(); xpshare::OnWorldChange();
         }
     }
@@ -800,7 +801,7 @@ void Tick()
         if (receivedWelcome != seenWelcome) { receivedRecord.clear(); receivedPersonal.clear(); receivedNote = {}; }
         // An admitted same-epoch reconnect keeps its own live character; a new host epoch always restores the save.
         if (ownCharacterReady && hostWorld.epoch && !needsNewHero) {
-            synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+            synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); sectors::PrepareAdmission(); Evaluate();
         }
     }
     TickClientSaveRound(now);
@@ -816,7 +817,7 @@ void Tick()
         needsNewHero = false; ownCharacterReady = true; synced = hostWorld.epoch;
         xpshare::OnClientRecordRestored(false);
         clientRejoin.Left();
-        story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+        story::PrepareAdmission(); doors::PrepareAdmission(); sectors::PrepareAdmission(); Evaluate();
     }
     if (!receivedRecord.empty() && !restoreFailed && !resetLocalWorld && clientRejoin.CanUseFresh(running, hostWorld.kind != net::KindMenu) &&
         !templateCapture.Holding(now) && receivedWelcome == net::WelcomeSerial() &&
@@ -834,10 +835,10 @@ void Tick()
             Log("WARN persist: client personal container restore degraded; admitting restored character");
         receivedRecord.clear(); receivedPersonal.clear(); ownCharacterReady = true; synced = hostWorld.epoch;
         clientRejoin.Left();
-        story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+        story::PrepareAdmission(); doors::PrepareAdmission(); sectors::PrepareAdmission(); Evaluate();
     }
     if (ownCharacterReady && !net::InWorld(net::LocalId()) && synced == hostWorld.epoch &&
-        story::AdmissionReady() && doors::AdmissionReady()) Evaluate();
+        story::AdmissionReady() && doors::AdmissionReady() && sectors::AdmissionReady()) Evaluate();
 }
 void Install()
 {

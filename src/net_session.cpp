@@ -3,6 +3,7 @@
 
 #include "log.h"
 #include "saving_policy.h"
+#include "sector_sync_policy.h"
 #include "story_policy.h"
 
 #include <algorithm>
@@ -130,6 +131,15 @@ bool DoorHandshake(void const* data, size_t size)
     std::memcpy(&message, data, sizeof(message));
     return message.state.kind == 10 && (message.state.npcClass == 0x80 ||
            ((message.state.npcClass & 0x40) && !(message.state.npcClass & ~0x43)));
+}
+
+bool SectorHandshake(void const* data, size_t size)
+{
+    if (size != sizeof(WorldStateMsg) || static_cast<uint8_t const*>(data)[0] != MsgWorldState) return false;
+    WorldStateMsg message{};
+    std::memcpy(&message, data, sizeof(message));
+    message.state.routine[sizeof(message.state.routine) - 1] = '\0';
+    return sector_sync::IsHandshakeWire(message.state.kind, message.state.npcClass, message.state.routine);
 }
 
 bool XpHandshake(void const* data, size_t size)
@@ -450,6 +460,8 @@ bool SendWorldStateTo(uint8_t to, WorldState const& state)
 {
     if (state.kind == 19) {
         if (state.dialog > 3 || state.npcClass != localId) return false;
+    } else if (state.kind == 2) {
+        if (!sector_sync::ValidSendWorldStateTo(isHost, state.kind, state.npcClass, state.routine)) return false;
     } else if (state.kind != 10 || (isHost ? !(state.npcClass & 0x40) : state.npcClass != 0x80)) return false;
     const WorldStateMsg message{MsgWorldState, state};
     if (isHost) {

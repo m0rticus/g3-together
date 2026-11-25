@@ -367,6 +367,7 @@ BudgetClass SendPriority(uint8_t kind, bool reliable);
 void UpdateBudgets(uint32_t now);
 bool StoryHandshake(void const* data, size_t size);
 bool DoorHandshake(void const* data, size_t size);
+bool SectorHandshake(void const* data, size_t size);
 bool XpHandshake(void const* data, size_t size);
 bool SendPlayerState(ENetPeer* peer, PlayerState const& state);
 bool Sane(PlayerState& state);

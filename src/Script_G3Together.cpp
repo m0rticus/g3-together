@@ -50,6 +50,7 @@
 #include "summon.h"
 #include "transform.h"
 #include "world.h"
+#include "world_sectors.h"
 #include "hud.h"
 #include "i18n.h"
 #include "xpshare.h"
@@ -293,6 +294,7 @@ class Module : public eCEngineComponentBase
         };
         constexpr NamedCall lateSteps[] = {
             {"door cleanup", &g3t::doors::OnWorldChange},
+            {"sector cleanup", &g3t::sectors::OnWorldChange},
             {"enclave cleanup", &g3t::enclaves::OnWorldChange},
             {"occupancy cleanup", &g3t::occupancy::OnWorldChange},
             {"address cleanup", &g3t::address::OnWorldChange},
@@ -449,6 +451,7 @@ class Module : public eCEngineComponentBase
             {"range", &g3t::range::Tick},
             {"partner jump", &g3t::partner::Tick},
             {"doors", &g3t::doors::Tick},
+            {"sectors", &g3t::sectors::Tick},
             {"enclaves", &g3t::enclaves::Tick},
             {"journal", &g3t::journal::Tick},
         };
@@ -536,6 +539,7 @@ extern "C" __declspec(dllexport) gSScriptInit const* GE_STDCALL ScriptInit()
     g3t::persist::Install();
     g3t::clock::Start();
     g3t::infocmd::Start();
+    g3t::sectors::Start();
     // The game unloads script DLLs before eCModuleAdmin::DoShutdownModules calls every registered
     // module, which then jumped into unmapped memory. Keep this DLL loaded until the process ends.
     HMODULE pinned = nullptr;

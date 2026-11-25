@@ -351,16 +351,17 @@ int main()
     Deliver(server, upload);
     assert(characters == 2); // Host cannot send a client capture response.
     SetCharacterHandler(nullptr);
-    // Only reliable story/door restoration handshakes bypass closed gameplay gates.
-    static unsigned storyMessages = 0, doorMessages = 0;
+    // Only reliable story/door/sector restoration handshakes bypass closed gameplay gates.
+    static unsigned storyMessages = 0, doorMessages = 0, sectorMessages = 0;
     SetStateHandler([](uint8_t from, uint8_t kind, StateEntry const*, int) {
         assert(from == 1 || from == 2);
         assert(kind & story::policy::Snapshot);
         ++storyMessages;
     });
     SetWorldStateHandler([](uint8_t from, WorldState const& state) {
-        assert((from == 1 || from == 2) && state.kind == 10);
-        ++doorMessages;
+        assert((from == 1 || from == 2) && (state.kind == 10 || state.kind == 2));
+        if (state.kind == 10) ++doorMessages;
+        else ++sectorMessages;
     });
     inWorld = false;
     transmissions.clear();
@@ -373,13 +374,18 @@ int main()
     door.kind = 10; door.npcClass = 0x80; door.guid[0] = 1;
     assert(SendWorldStateTo(1, door));
     const auto doorQuery = transmissions.back();
+    WorldState sectorReq{};
+    sectorReq.kind = 2; sectorReq.npcClass = 0x80;
+    assert(SendWorldStateTo(1, sectorReq));
+    const auto sectorQuery = transmissions.back();
     transmissions.clear();
     isHost = true;
     localId = 1;
     clientInWorld[2] = false;
     Deliver(peers[2], query);
     Deliver(peers[2], doorQuery);
-    assert(storyMessages == 1 && doorMessages == 1);
+    Deliver(peers[2], sectorQuery);
+    assert(storyMessages == 1 && doorMessages == 1 && sectorMessages == 1);
     auto lostReliability = query;
     lostReliability.flags = 0;
     Deliver(peers[2], lostReliability);
@@ -392,11 +398,16 @@ int main()
     assert(SendStatesTo(2, StateQuests | story::policy::Snapshot | story::policy::End, nullptr, 0));
     door.npcClass = 0x43;
     assert(SendWorldStateTo(2, door));
-    assert(transmissions.size() == 4);
+    WorldState sectorEntry{};
+    sectorEntry.kind = 2; sectorEntry.npcClass = 0x40;
+    strcpy_s(sectorEntry.routine, "G3_Myrtana_01_Ardea_NPC_02");
+    sectorEntry.enclave = 1;
+    assert(SendWorldStateTo(2, sectorEntry));
+    assert(transmissions.size() == 5);
     isHost = false;
     localId = 2;
     for (auto const& transmission : transmissions) Deliver(server, transmission);
-    assert(storyMessages == 4 && doorMessages == 2);
+    assert(storyMessages == 4 && doorMessages == 2 && sectorMessages == 2);
     auto rawDelta = transmissions[1];
     rawDelta.bytes[1] = StateQuests;
     Deliver(server, rawDelta);

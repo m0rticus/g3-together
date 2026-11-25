@@ -66,6 +66,7 @@ target_sources(Script_G3Together PRIVATE src/shutdown_watchdog.cpp)
 target_sources(Script_G3Together PRIVATE
     src/story_domains.cpp src/story_qa.cpp
     src/infocmd_progression.cpp src/infocmd_sector.cpp src/infocmd_qa.cpp
+    src/world_sectors.cpp
     src/trade_qa.cpp)
 target_sources(Script_G3Together PRIVATE src/worldentry_diag.cpp)
 target_sources(Script_G3Together PRIVATE src/focus_diag.cpp)

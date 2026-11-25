@@ -6,6 +6,7 @@
 #include "npcs.h"
 #include "remote.h"
 #include "talk.h"
+#include "world_sectors.h"
 
 #include <utility>
 
@@ -13,9 +14,7 @@ namespace g3t::infocmd::detail {
 namespace {
 std::map<GuidKey, npc_progression_policy::ObservedProgression> observedProgression;
 std::set<GuidKey> syncedNpcs;
-std::map<std::string, bool> syncedSectors;
 std::map<GuidKey, net::WorldState> bufferedWorldStates;
-std::map<std::string, bool> bufferedSectors;
 std::set<GuidKey> activeDialogNpcs;
 uint32_t bufferedEpoch = 0;
 bool wasDialogRunning = false;
@@ -27,13 +26,9 @@ void SyncClientBufferEpoch()
     const uint32_t epoch = net::WorldEpoch();
     if (!net::Connected()) {
         bufferedWorldStates.clear();
-        bufferedSectors.clear();
         bufferedEpoch = 0;
     } else if (epoch && bufferedEpoch != epoch) {
-        if (bufferedEpoch) {
-            bufferedWorldStates.clear();
-            bufferedSectors.clear();
-        }
+        if (bufferedEpoch) bufferedWorldStates.clear();
         bufferedEpoch = epoch;
     }
 }
@@ -82,11 +77,6 @@ void NoteObservedProgression(GuidKey const& key, npc_progression_policy::Observe
 
 void NoteSyncedNpc(GuidKey const& key) { syncedNpcs.insert(key); }
 
-void NoteSyncedSector(char const* sector, bool enabled)
-{
-    if (sector && *sector) syncedSectors[sector] = enabled;
-}
-
 void BufferClientNpcState(GuidKey const& key, net::WorldState const& s)
 {
     SyncClientBufferEpoch();
@@ -103,13 +93,6 @@ void BufferClientNpcState(GuidKey const& key, net::WorldState const& s)
     it->second = merged;
 }
 
-void BufferClientSectorState(char const* sector, bool enabled)
-{
-    if (!sector || !*sector) return;
-    SyncClientBufferEpoch();
-    bufferedSectors[sector] = enabled;
-}
-
 void ResetProgressionState()
 {
     observedProgression.clear();
@@ -118,10 +101,8 @@ void ResetProgressionState()
     worldSeeded = false;
     if (net::IsHost()) {
         syncedNpcs.clear();
-        syncedSectors.clear();
     } else {
         bufferedWorldStates.clear();
-        bufferedSectors.clear();
         bufferedEpoch = net::WorldEpoch();
     }
 }
@@ -213,11 +194,6 @@ void FlushBufferedClientStates()
 {
     if (net::IsHost() || !gCSession::GetInstance().IsGameRunning() || !gCSession::GetInstance().GetHero()) return;
     SyncClientBufferEpoch();
-    for (auto const& [sector, status] : bufferedSectors) {
-        world.SetSectorStatus(bCString(sector.c_str()), status);
-        ++stats.sectorsApplied;
-    }
-    bufferedSectors.clear();
     for (auto it = bufferedWorldStates.begin(); it != bufferedWorldStates.end();) {
         Entity e = guid::Resolve(it->second.guid);
         if (!e.GetInstance()) { ++it; continue; }
@@ -280,13 +256,7 @@ void SyncToClients()
     using namespace detail;
     if (!flags.sharing || !net::IsHost() || !net::Connected() || !gCSession::GetInstance().IsGameRunning()) return;
     SeedHostWorldState();
-    for (auto const& [sector, status] : syncedSectors) {
-        net::WorldState s{};
-        s.kind = 2;
-        strncpy_s(s.routine, sector.c_str(), _TRUNCATE);
-        s.enclave = status ? 1 : 0;
-        net::SendWorldState(s, 0);
-    }
+    sectors::SyncToClients();
     for (GuidKey const& key : syncedNpcs) {
         if (npcremoval::Suppressed(key.data())) continue;
         Entity e = guid::Resolve(key.data());

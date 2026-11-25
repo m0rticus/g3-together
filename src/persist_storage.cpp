@@ -21,6 +21,7 @@
 #include "telemetry.h"
 #include "trade.h"
 #include "world.h"
+#include "world_sectors.h"
 #include "xpshare.h"
 
 #include <bcrypt.h>
@@ -472,7 +473,7 @@ void OnCharacter(uint8_t from, net::CharacterNote const& note, Bytes const& byte
                 needsNewHero = false; ownCharacterReady = true;
                 xpshare::OnClientRecordRestored(false);
                 clientRejoin.Left();
-                synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); Evaluate();
+                synced = hostWorld.epoch; story::PrepareAdmission(); doors::PrepareAdmission(); sectors::PrepareAdmission(); Evaluate();
             }
         } else Notice(i18n::SaveCharacterMissing, true);
         Logf("persist: no saved character account=%llu epoch=%08x; fresh New Game required", key.player, note.epoch);
@@ -604,7 +605,7 @@ bool __stdcall LoadDetour(void* self, bCString const* name)
     if (worldCleanup) worldCleanup();
     clock::OnWorldChange();
     dialogaudio::OnWorldChange(); containers::OnWorldChange(); remote::DespawnAll("host load");
-    story::OnWorldChange(); doors::OnWorldChange(); journal::Clear();
+    story::OnWorldChange(); doors::OnWorldChange(); sectors::OnWorldChange(); journal::Clear();
     world::OnWorldDeactivate();
     lowerLoadCalls = 0; lowerLoadGood = true;
     ++nativeLoadDepth;

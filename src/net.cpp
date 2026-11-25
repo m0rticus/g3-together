@@ -165,7 +165,7 @@ bool Send(ENetPeer* peer, void const* data, size_t size, uint8_t channel, bool r
 {
     if (!host || !peer || (size && !data)) return false;
     if (size && Gated(static_cast<uint8_t const*>(data)[0]) && !XpHandshake(data, size) &&
-        !(reliable && (StoryHandshake(data, size) || DoorHandshake(data, size))) && !Open(peer)) { ++gatedOut; return false; }
+        !(reliable && (StoryHandshake(data, size) || DoorHandshake(data, size) || SectorHandshake(data, size))) && !Open(peer)) { ++gatedOut; return false; }
     const size_t peerIdx = PeerIndex(peer);
     if (peerIdx >= MaxPlayers) return false;
     const BudgetClass priority = SendPriority(size ? static_cast<uint8_t const*>(data)[0] : 0, reliable);
@@ -251,7 +251,8 @@ void OnReceive(ENetPeer* peer, ENetPacket* packet)
     if (type == MsgPosedNpc || type == MsgCompactPosedNpc || type == MsgControlPose) ++poseReceived;
     const bool xpHandshake = XpHandshake(packet->data, packet->dataLength);
     const bool storyHandshake = (packet->flags & ENET_PACKET_FLAG_RELIABLE) &&
-                               (StoryHandshake(packet->data, packet->dataLength) || DoorHandshake(packet->data, packet->dataLength));
+                               (StoryHandshake(packet->data, packet->dataLength) || DoorHandshake(packet->data, packet->dataLength) ||
+                                SectorHandshake(packet->data, packet->dataLength));
     // Channel 0 can deliver the player's keyframe before channel 1 finishes entry.
     // Cache authenticated state now; puppet/world writes still wait for admission.
     const bool playerEntryCache = type == MsgState && !isHost && connected && peer == server;

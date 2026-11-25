@@ -11,6 +11,7 @@
 #include "npcs.h"
 #include "steam.h"
 #include "story.h"
+#include "world_sectors.h"
 
 #include <bcrypt.h>
 #include <algorithm>
@@ -687,7 +688,7 @@ bool HeroPending()
     return (pairedEnabled || !net::IsHost()) &&
            (NativeLoading() || clientRejoin.pending || !loading.empty() || !ownCharacterReady || needsNewHero || restoreFailed ||
                              (!net::IsHost() && !net::InWorld(net::LocalId()) &&
-                              (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady())));
+                              (!hostAdmissionAck || !story::AdmissionReady() || !doors::AdmissionReady() || !sectors::AdmissionReady())));
 }
 
 void OnWorldActivate()

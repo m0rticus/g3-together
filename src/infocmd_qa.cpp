@@ -2,6 +2,7 @@
 #include "infocmd_internal.h"
 
 #include "log.h"
+#include "world_sectors.h"
 #include "xpshare.h"
 
 #include <string>
@@ -35,10 +36,12 @@ void StoryMoves(LogFn log)
 
 void Report(LogFn log)
 {
+    unsigned sectorSent = 0, sectorApplied = 0;
+    sectors::Counts(sectorSent, sectorApplied);
     char line[600];
     Format(line, "INFOCMD observed=%u distinct=%u sent=%u applied=%u sectors_sent=%u sectors_applied=%u fights_sent=%u fights_started=%u last=%s",
-           stats.observed, stats.distinct, stats.snapshotsSent, stats.snapshotsApplied, stats.sectorsSent,
-           stats.sectorsApplied, stats.fightsSent, stats.fightsStarted, stats.lastText.c_str());
+           stats.observed, stats.distinct, stats.snapshotsSent, stats.snapshotsApplied, stats.sectorsSent + sectorSent,
+           stats.sectorsApplied + sectorApplied, stats.fightsSent, stats.fightsStarted, stats.lastText.c_str());
     log(line);
 }
 

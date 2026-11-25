@@ -25,6 +25,7 @@
 #include "story.h"
 #include "talk.h"
 #include "telemetry.h"
+#include "world_sectors.h"
 #include "xpshare.h"
 
 #include <cstdio>
@@ -96,15 +97,8 @@ void ApplyCompanionRelation(net::WorldState const& s, uint8_t from)
 
 void ApplySectorState(net::WorldState const& s)
 {
-    if (net::IsHost()) NoteSyncedSector(s.routine, s.enclave != 0);
-    if (!gCSession::GetInstance().IsGameRunning()) {
-        BufferClientSectorState(s.routine, s.enclave != 0);
-        return;
-    }
-    world.SetSectorStatus(bCString(s.routine), s.enclave != 0);
-    ++stats.sectorsApplied;
-    Logf("infocmd: sector %s %s", s.routine, s.enclave ? "on" : "off");
-    telemetry::OnSectorChange("apply", 0, s.routine, s.enclave != 0);
+    if (sectors::ApplySector(s.routine, s.enclave != 0, "infocmd"))
+        ++stats.sectorsApplied;
 }
 
 void ApplyNpcSnapshot(net::WorldState const& s, uint8_t from)
@@ -280,6 +274,7 @@ void OnWorldState(uint8_t from, net::WorldState const& s)
             talk::OnGesture(from, s.guid, static_cast<uint32_t>(std::strtoul(s.routine, nullptr, 16)), s.rotation);
         return;
     }
+    if (s.kind == 2 && sectors::HandleWire(from, s)) return;
     switch (s.kind) {
     case 20: if (net::IsHost()) arena::OnState(from, s); return;
     case 23: combat_hostility::OnState(from, s); return;
@@ -321,10 +316,7 @@ void OnWorldState(uint8_t from, net::WorldState const& s)
 
 void Send(net::WorldState const& s)
 {
-    if (net::IsHost()) {
-        if (s.kind == 1) NoteSyncedNpc(GuidKeyOf(s.guid));
-        else if (s.kind == 2 && *s.routine) NoteSyncedSector(s.routine, s.enclave != 0);
-    }
+    if (net::IsHost() && s.kind == 1) NoteSyncedNpc(GuidKeyOf(s.guid));
     net::SendWorldState(s, 0);
 }
 
@@ -484,11 +476,15 @@ void Tick()
         if (static_cast<int32_t>(now - it->due) < 0) { ++it; continue; }
         net::WorldState s{};
         if (!it->sector.empty()) {
-            s.kind = 2;
-            strncpy_s(s.routine, it->sector.c_str(), _TRUNCATE);
-            s.enclave = world.GetSectorStatus(bCString(it->sector.c_str())) ? 1 : 0;
-            ++stats.sectorsSent;
-            Send(s);
+            if (net::IsHost()) {
+                sectors::BroadcastIfChanged(it->sector.c_str(), world.GetSectorStatus(bCString(it->sector.c_str())) != GEFalse);
+            } else {
+                s.kind = 2;
+                strncpy_s(s.routine, it->sector.c_str(), _TRUNCATE);
+                s.enclave = world.GetSectorStatus(bCString(it->sector.c_str())) ? 1 : 0;
+                ++stats.sectorsSent;
+                Send(s);
+            }
         } else {
             Entity e = guid::Resolve(it->guid);
             if (e.GetInstance()) {
