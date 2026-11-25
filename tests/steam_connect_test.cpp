@@ -22,7 +22,7 @@ using HS = H::State;
 using M = LobbyMetadata;
 constexpr uint64_t Self = 7, Host = 101, Other = 202, Lobby = 1001, OtherLobby = 2002;
 constexpr uint32_t Start = 1000;
-constexpr unsigned Protocol = 80;
+constexpr unsigned Protocol = 81;
 
 Target HostTarget(uint64_t id = Host, char const* session = "default")
 {

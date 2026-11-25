@@ -54,7 +54,7 @@ class ClientAutoloadTests(unittest.TestCase):
         TARGET.run(check=True)
 
     def test_no_wire_change(self):
-        self.assertIn("Protocol = 80", source("src/saving_policy.h"))
+        self.assertIn("Protocol = 81", source("src/saving_policy.h"))
         policy = source("src/client_autoload.h")
         self.assertNotIn("net.h", policy)
         self.assertNotIn("SendWorld", policy)

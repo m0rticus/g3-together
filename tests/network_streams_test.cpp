@@ -514,7 +514,7 @@ int main()
     transmissions.clear();
 
     // MsgHitResult accepts both 68-byte knockback-enriched replies and legacy 34-byte replies (knockbackValid=0).
-    static_assert(saving::Protocol == 80, "Build 80 protocol version must remain 80");
+    static_assert(saving::Protocol == 81, "Build 81 protocol version must remain 81");
     static_assert(LegacyHitResultMsgSize == 34 && sizeof(HitResultMsg) == 68, "HitResultMsg wire layout");
     static unsigned hitResultsReceived = 0;
     static HitResult lastHitResult{};
@@ -624,7 +624,6 @@ int main()
     Deliver(peers[2], ackFrame); // unreliable MsgPoseAck -> rejected before cache lookup
     assert(npcRejected == rejectedBefore + 1);
 
-<<<<<<< HEAD
     // Reliable NPC back-slot equipment replication (MsgNpcEquipment) obeys world gate, server identity,
     // reliability, and non-zero incarnation invariants.
     static unsigned equipmentMessages = 0;
@@ -677,7 +676,7 @@ int main()
     Deliver(peers[2], equipFrame); // client cannot publish NPC back equipment to host
     assert(equipmentMessages == 1);
     SetNpcEquipmentHandler(nullptr);
-=======
+
     // Event-driven MsgPlayerEquipment sync: immediate send on change, join/rejoin/load resync, pre-entry caching, and peer relay.
     {
         auto equipTransmissions = [&]() {
@@ -797,7 +796,6 @@ int main()
 
         SetPlayerEquipmentHandler(nullptr);
     }
->>>>>>> dc639fb0 (Sync all host and client equipped weapon and armor slots event-driven)
 
     host = nullptr;
 }

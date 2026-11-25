@@ -139,7 +139,7 @@ This checklist also covers recording bugs and collecting logs with `tools\collec
   with the existing 10-ms lag. The original unlimited fake DLL cannot reproduce
   Steam's send-buffer failure. Install test tooling only in authorized copies.
 
-Application protocol is **80**; both players need the matching build. Reserved control
+Application protocol is **81**; both players need the matching build. Reserved control
 and pose flags now describe motion overrides and reliable pinned anchors, and independent
 Rice keys permit zero references. Bone packing also selects reversible second-order
 spatial prediction when smaller. Baseline/ID envelopes retain their layouts.
@@ -520,7 +520,7 @@ explicitly cancels them instead of inspecting an old hero.
 Smoke-check partner trade, native/nonlethal knockout, terminal death, save/load, NPC leases/mirroring and
 join/rejoin. No QA command or negative-control switch is needed.
 
-### Host-managed save/load acceptance (protocol 80)
+### Host-managed save/load acceptance (protocol 81)
 
 Before checking saves, require `persist: save and load hooked` on both copies. It reports the five
 verified save/load entry points; `save UI hooked` also identifies the verified quicksave handler,

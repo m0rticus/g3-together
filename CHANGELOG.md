@@ -2,6 +2,16 @@
 
 This log summarizes the releases and integration builds that changed gameplay, networking, saves, NPCs, combat, quests, Steam connection, or supported installations.
 
+## Build 88
+
+**Player equipment sync, NPC handoff/PVS stability, client quest/sector sync, weapon loot anti-duplication, and protocol 81**
+
+- **Event-driven player weapon & armor sync (`src/player_equip.h`, `src/remote_equip.cpp`, `src/remote.cpp`, `src/net*`)**: Added reliable `MsgPlayerEquipment` replication across all weapon and armor slots (with join/rejoin/load resync and pre-entry caching), bumping protocol from 80 to 81.
+- **NPC handoff blinking & PVS hysteresis (`src/npclease_client.cpp`, `src/npclease_host.cpp`, `src/npc_send.cpp`, `src/npcs.cpp`, `src/world_pvs.cpp`, `src/world_collision_policy.h`)**: Inherited live host mirror visibility vetting on client takeover, held handback visibility across live rejections, ordered `npclease::Tick()` after `PassiveMirrorTick()`/`CorpseTick()` and before `ReconcileClientPresence()`, aligned host offer admission with recall readiness via `HostPresentForOffer`, and added hysteresis (`NeedsRemoteSimulationRegion`) around `mainFarClip` to prevent remote PVS thrashing.
+- **Client-triggered NPC guide, party & revolution quests (`src/guide_policy.h`, `src/infocmd.cpp`, `src/infocmd_sector.cpp`, `src/npc_companions.cpp`)**: Guarded `SyncMirrorPartyAndGuide` unclaim with `ShouldReleaseLocalPartyClaim` and reset `relationAcknowledged` on party mismatch, limited `Navigation.Routine` dialog snapshots to explicit `SetRoutine` commands, resolved target enclave proxies for `StartRevolution`, made host `Guide` idempotent, deferred routine restarts while lease-fenced or in talk, and preserved `PartyMemberType`.
+- **Host-authoritative world sector sync (`src/world_sectors.cpp`, `src/world_sectors.h`, `src/sector_sync_policy.h`, `src/persist*.cpp`, `src/net*.cpp`)**: Synced world sector enable/disable states across gameplay hooks, `world_sectors` save extensions, pre-admission ENet handshakes, and client admission reconciliation.
+- **Repeat knockout looting & infinite bow fix (`src/npc_equipment_policy.h`, `src/npc_contact.cpp`, `src/npc_send.cpp`, `src/personal_ledger.cpp`)**: Excluded `Merchandise` back slots from host equipment replication, froze mirror back/held item creation once personal corpse state exists or while unconscious, and preserved deduplicated re-armed weapons across repeated knockouts.
+
 ## Build 87
 
 **Client NPC visibility/playback, guard crime isolation, back-slot lootability, and protocol 80**
