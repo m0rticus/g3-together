@@ -27,7 +27,7 @@ class SteamConnectTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_wire_and_header_dependencies(self):
-        self.assertIn("Protocol = 79", _testbuild.src_text("saving_policy.h"))
+        self.assertIn("Protocol = 80", _testbuild.src_text("saving_policy.h"))
         header = _testbuild.src_text("steam_connect.h")
         includes = re.findall(r'^\s*#\s*include\s*([<"][^>"]+[>"])', header, re.MULTILINE)
         self.assertEqual([name for name in includes if name.startswith('"')], ['"relaywire.h"'])

@@ -135,7 +135,7 @@ int main()
         assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
         std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
         char expected[32];
-        std::snprintf(expected, sizeof(expected), "protocol %u, host 79", ver);
+        std::snprintf(expected, sizeof(expected), "protocol %u, host 80", ver);
         assert(std::strstr(refusal.reason, expected) != nullptr);
         assert(!fakePeers[1].data && !peers[3]);
     }

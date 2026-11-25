@@ -136,7 +136,7 @@ If Steam cannot start, a clear error is shown; fix Steam or the required DLL and
 - Either player can request a save. Wait for **"Co-op save complete"** before leaving.
   The host alone stores the world and every participant's character in one `.g3t` container.
   Back up the host's entire slot, not only its native menu pair. Clients retain only small character backups.
-  Both players need the same protocol/build, now protocol 79.
+  Both players need the same protocol/build, now protocol 80.
 - See **Known issues** in the [full player guide](PLAYING.md) for problems and workarounds.
 
 ## If something goes wrong

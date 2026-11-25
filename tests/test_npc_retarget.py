@@ -103,7 +103,7 @@ class NpcRetargetTests(unittest.TestCase):
         for task in ("ZS_Stumble", "ZS_QuickStumble", "ZS_PierceStumble", "ZS_SitKnockDown", "ZS_StandUp"):
             self.assertIn(task, stumble_pred)
 
-        follows = function_body(guards, r"\bbool\s+FollowsPlayer\s*\(")
+        follows = function_body(_testbuild.src_text("guards_policy.h"), r"\bbool\s+IsFollowsPlayerState\s*\(")
         self.assertIn("ZS_ReactToDamage", follows)
         guard_actor = function_body(guards, r"\beCEntity\*\s+StateActor\s*\(")
         self.assertIn("GetCurrentAttacker()", guard_actor)

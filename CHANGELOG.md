@@ -2,6 +2,15 @@
 
 This log summarizes the releases and integration builds that changed gameplay, networking, saves, NPCs, combat, quests, Steam connection, or supported installations.
 
+## Build 87
+
+**Client NPC visibility/playback, guard crime isolation, back-slot lootability, and protocol 80**
+
+- **Client NPC visibility & PVS coverage (`src/world_pvs.cpp`, `src/npc_companions.cpp`)**: Reused ready main-PVS cell coverage while remote host simulation regions populate, throttled anchor retries, avoided hiding/resetting live visible mirror placement across same-owner stream resets, and cached ready cell boxes (cleared on region teardown/reset) to stop client animal blinking across lease and PVS transitions.
+- **Client NPC idle playback (`src/npcsend_policy.h`, `src/snapshot.cpp`)**: Eliminated client NPC idle animation buffer starvation and catch-up jitter.
+- **Town NPC theft/talk guard (`src/fightmem.cpp`, `src/guards.cpp`, `src/guards_policy.h`)**: Prevented stale `CurrentAttacker` puppets from hijacking host NPC talk and crime status updates.
+- **Back-slot weapon/bow lootability (`src/npc_equipment_policy.h`, `src/net*`, `src/npcs.cpp`, `src/npc_identity.cpp`)**: Added `MsgNpcEquipment` (bumping protocol from 79 to 80) to replicate NPC back-equipped slots (`BackLeft`/`BackRight`/`Bow`/`Crossbow`) to client mirrors without overwriting personal loot, ignored `Merchandise` stacks in mirror lookups, unlinked non-zero hand slots safely via `UnlinkStackFromSlot`, and ensured corpses are prepared before loot/quick-loot scans.
+
 ## Build 86
 
 **8 audit slices, ~180 verified multiplayer fixes, and cross-slice hardening**

@@ -60,7 +60,8 @@ class NpcPresencePolicyTests(unittest.TestCase):
         companions = _testbuild.src_text("npc_companions.cpp")
         reset_stream = companions[companions.index("void ResetMirrorForNewStream("):
                                   companions.index("void PackMotionFromRecord(")]
-        self.assertIn("if (!sameOwner || !m.entity.GetInstance()) m.havePresentation = false;", reset_stream)
+        self.assertIn("const bool keepVisiblePlacement = sameOwner && m.havePresentation && m.entity.GetInstance() != nullptr", reset_stream)
+        self.assertIn("m.havePresentation = keepVisiblePlacement;", reset_stream)
         passive = npcs[npcs.index("void PassiveMirrorTick()"):npcs.index("bool MirrorFightsHero()")]
         self.assertIn("!IsNpc(live.GetInstance())", passive)
         self.assertIn("npcplayback::SetEntityPose(m.entity.GetInstance(), body::Pose(", passive)

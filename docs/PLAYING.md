@@ -77,7 +77,7 @@ with its first New Game. Never overwrite the user's native world/save to accompl
 **Verification boundary:** native getter/read/serialization paths were verified statically
 against the installed CP DLL bytes; this is not an observed running-engine test. The join
 `options:` diagnostics are intended for the next two-player run to confirm actual behaviour.
-Protocol is **79**, with a delegation capability marker in the existing Hello options
+Protocol is **80**, with a delegation capability marker in the existing Hello options
 slot and a versioned balancing snapshot appended only to Welcome and host world announcements.
 Old builds are distinguishable and refuse rather than silently ignoring delegation.
 
@@ -164,7 +164,7 @@ opens a lobby on its own.
 - Session IDs are visible grouping labels, not passwords or access controls. Steam friendship/lobby membership
   still applies. The host publishes a status text and the ID in its Steam Rich Presence connect string,
   `+g3t_connect <host SteamID64> <session_id>`. Both players need this build: older builds cannot invite or be invited
-  by it, even though the relay envelope is unchanged. The current build uses protocol 79; the Steam control channel has new join requests.
+  by it, even though the relay envelope is unchanged. The current build uses protocol 80; the Steam control channel has new join requests.
   The session-scoped relay format is also incompatible with older pre-session relay builds, even in the default group.
 - Each concurrently running real-Steam instance needs a distinct Steam identity. Running six processes under
   one Steam account is not supported by this identity-addressed transport. Multiple copies on one PC also need
@@ -278,7 +278,7 @@ uses unreliable fragments rather than silently becoming reliable; small packets 
 Compact NPC control batches are capped at 1172 bytes. Explicit reliable events and ENet's reliable sequence rollover
 retain their semantics.
 
-The current source uses **protocol 79**. Its host-only NPC overhaul and host-managed saves are experimental; native gameplay acceptance is still
+The current source uses **protocol 80**. Its host-only NPC overhaul and host-managed saves are experimental; native gameplay acceptance is still
 in progress, so this source must not be treated as a verified release. Both players need the same build; older protocol peers are refused. Personal loot,
 NPC merchant inventories and automatic player exchanges are retained.
 
@@ -344,7 +344,7 @@ import or reset leases, so the live encounter and normal hand-back continue unch
 No lease overlay (extension type 256) is written or retained in new saves. Old v1/v2 overlays and
 `npclease1 ` text are ignored on load, never applied over the native world; container integrity checks remain.
 Knocked-out players still block saving: "A player is knocked out. Revive them first."
-Both copies must use the same rebuilt DLL. Protocol is 79; lease wire version 2 is unchanged.
+Both copies must use the same rebuilt DLL. Protocol is 80; lease wire version 2 is unchanged.
 
 NPC captures use a fixed **60 Hz deadline**, including unchanged NPCs, independently of the player's `send_rate`.
 Per-client interest and change detection decide which captured states are actually sent. Nearby moving NPCs use
@@ -745,7 +745,7 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   puppet. Protection lasts another 1.5 seconds after all dialogue/trade windows and spoken dialogue
   end, including Esc/abort. Enemies retain native hostility/targeting; this does not cancel the NPC's
   talk routine or make enemies friendly. Loading/world changes clear interaction protection.
-  The existing player flags/heartbeat carry the state; protocol 79 leaves those packet sizes unchanged.
+  The existing player flags/heartbeat carry the state; protocol 80 leaves those packet sizes unchanged.
 - The game itself lets a human knock out another human or orc instead of killing them, so in a real fight you would never die.
   While your partner is connected, a blow that takes you to 0 hit points from someone who means to kill you (raiders,
   monsters, an intruder; not a duel, the arena, a guard's arrest or another player) counts as a death: you stay down until
@@ -767,7 +767,7 @@ This is a bounded personal overlay, not a reconstruction of every dynamically cr
   retains the previous cross-player damage scaling; setup preserves existing values.
 - Melee swings use Gothic 3's NPC bystander rules on both PCs: a client swinging at a hostile NPC does not hit a
   more friendly bystander the native game would protect. This is separate from `friendly_fire`: deliberate attacks,
-  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 79 build.
+  self-defense and the game's duel/crime rules still apply. Both PCs need the matching protocol 80 build.
   To check it, place a rebel or companion beside an orc, aim at the orc and swing from the client: the orc should take
   one hit per swing, with no protected bystander's damage, flinch or anger. Then deliberately attack a neutral NPC
   outside another fight and check its normal reaction; also check self-defense and a duel/arena bout.

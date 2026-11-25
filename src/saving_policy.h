@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace g3t::saving {
-constexpr uint16_t Protocol = 79;
+constexpr uint16_t Protocol = 80;
 
 inline constexpr uint8_t HeroMagic[8] = {'G', '3', 'T', 'H', 'E', 'R', 'O', '\0'};
 inline constexpr uint32_t HeroSchemaVersion = 5;

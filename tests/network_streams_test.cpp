@@ -502,8 +502,8 @@ int main()
     SetHitHandlers(nullptr, nullptr);
     transmissions.clear();
 
-    // Build 79 MsgHitResult accepts both 68-byte knockback-enriched replies and legacy 34-byte replies (knockbackValid=0).
-    static_assert(saving::Protocol == 79, "Build 79 protocol version must remain 79");
+    // MsgHitResult accepts both 68-byte knockback-enriched replies and legacy 34-byte replies (knockbackValid=0).
+    static_assert(saving::Protocol == 80, "Build 80 protocol version must remain 80");
     static_assert(LegacyHitResultMsgSize == 34 && sizeof(HitResultMsg) == 68, "HitResultMsg wire layout");
     static unsigned hitResultsReceived = 0;
     static HitResult lastHitResult{};
