@@ -241,4 +241,19 @@ int main()
     Feed(teleportTrack, tpPos, rotation, 3500, 3580, 2, motion); // > RestartAfter clock stall
     assert(teleportTrack.serial == 3 && teleportTrack.count == 1 && teleportTrack.offset == 80);
     assert(teleportTrack.gapCount == gapsBefore);
+
+    // Transit excess holds escalated delayMs steady through OffsetWindow instead of pumping down between packets,
+    // and slow-host idle cadence (>100 ms, <=150 ms) raises PlaybackDelay to cover the observed capture period.
+    Track idleTrack;
+    idleTrack.predictive = false;
+    SetPoseInterval(idleTrack, 100);
+    for (int i = 0; i < 25; ++i) {
+        const uint32_t s = 10000 + i * 125;
+        Feed(idleTrack, tpPos, rotation, s, s + 10 + (i % 3 == 0 ? 15 : 0), 1, motion);
+        Sample(idleTrack, s + 10, shown, turn, -PlaybackDelay(idleTrack), true, &presentation);
+    }
+    const int32_t escalated = PlaybackDelay(idleTrack);
+    assert(escalated >= 250);
+    Sample(idleTrack, 10000 + 24 * 125 + 110, shown, turn, -PlaybackDelay(idleTrack), true, &presentation);
+    assert(PlaybackDelay(idleTrack) == escalated);
 }

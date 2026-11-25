@@ -52,7 +52,7 @@ class NpcSendPolicyTests(unittest.TestCase):
 #include <cmath>
 int main() {
     using namespace g3t;
-    static_assert(npcsend::KeepaliveMs == 180, "keepalive must stay under 200 ms mirror buffer ceiling");
+    static_assert(npcsend::KeepaliveMs == 130, "keepalive must leave host-frame and transit headroom under 200 ms buffer");
     static_assert(npcsend::QuietCadenceMs == 250, "quiet cadence wire constant preserved");
 
     net::NpcRecord r{};

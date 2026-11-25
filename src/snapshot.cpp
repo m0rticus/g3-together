@@ -66,7 +66,11 @@ void AdvanceAdaptive(Track& track, uint32_t now)
         track.delayMs = required;
         track.delayDecayCredit = 0.0;
     } else if (!track.recoveryUntil || static_cast<int32_t>(now - track.recoveryUntil) >= 0) {
-        track.delayDecayCredit += elapsed * 0.1;
+        const int32_t afterRecovery = track.recoveryUntil
+            ? static_cast<int32_t>(now - track.recoveryUntil)
+            : elapsed;
+        const int32_t decayElapsed = std::clamp(afterRecovery, 0, elapsed);
+        track.delayDecayCredit += decayElapsed * 0.1;
         const int32_t decay = std::min(track.delayMs - required, static_cast<int32_t>(track.delayDecayCredit));
         track.delayMs -= decay;
         track.delayDecayCredit -= decay;
@@ -319,7 +323,7 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
                    (!track.quietHold && !track.lastQuietHold &&
                     static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs)) {
             // Sparse idle NPC keyframes are intentional, not evidence of network jitter.
-            const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, 100u);
+            const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, track.predictive ? 100u : 150u);
             if (!track.haveCadenceWindow) {
                 track.haveCadenceWindow = true;
                 track.cadenceWindowAt = arrived;
@@ -370,6 +374,8 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
     if (required > track.delayMs) {
         track.delayMs = required;
         track.delayDecayCredit = 0.0;
+        const uint32_t holdUntil = arrived + OffsetWindow;
+        track.recoveryUntil = holdUntil ? holdUntil : 1u;
     }
     if (track.count == SnapshotCount) {
         Track::Snap const& oldest = track.snaps[0];

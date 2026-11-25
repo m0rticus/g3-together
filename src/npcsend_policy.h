@@ -27,10 +27,11 @@ constexpr uint32_t FastIntervalMs = 16, OrdinaryIntervalMs = 33, MovingFarInterv
 // 200 ms buffer before captures become sparse, including movement-to-idle.
 constexpr uint32_t UrgentHoldMs = 2000, OrdinaryHoldMs = 2000, InterestWarmupMs = 200;
 constexpr uint32_t KeyframeMs = 1000;
-// Keep unchanged snapshots inside the 200 ms mirror playback buffer ceiling (and well inside PresentationGraceMs)
-// so idle mirrors never run out of buffered samples and rubber-band into 1.1x catch-up between heartbeats.
+// Keep unchanged snapshots well inside the 200 ms mirror playback buffer ceiling (leaving headroom for
+// 20-50 ms host frame times and network transit jitter) and inside PresentationGraceMs so idle mirrors
+// never run out of buffered samples and rubber-band into 1.1x catch-up between heartbeats.
 static_assert(npclease::PresentationGraceMs > 170, "presentation grace must exceed quiet keepalive plus capture jitter");
-constexpr uint32_t KeepaliveMs = 180;
+constexpr uint32_t KeepaliveMs = 130;
 static_assert(KeepaliveMs < IdleIntervalMs * 2 && KeepaliveMs <= npclease::PresentationGraceMs - 100,
               "quiet keepalive must arrive before the 200 ms mirror buffer runs dry");
 // A due update (not a quiet heartbeat) that leaves later than this counts as overdue in the diagnostics; one frame hitch
