@@ -748,8 +748,6 @@ void ReleaseUnavailable(eCEntity* entity)
     const GuidKey key = EntityKey(entity);
     const auto found = unavailable.find(key);
     if (found == unavailable.end()) return;
-    // A lease restart must not reuse an old idle slot or root.
-    provenPoses.erase(key);
     unavailable.erase(found);
 }
 

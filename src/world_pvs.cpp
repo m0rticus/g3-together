@@ -47,6 +47,7 @@ struct RemoteRegionState {
     bool failed = false;
     uint32_t retryAt = 0;
     uint32_t anchorRetryAt = 0;
+    std::vector<std::array<float, 4>> readyCellBoxes;
 };
 
 struct PublishedRegion {
@@ -319,7 +320,8 @@ struct CellInventory {
     bool Empty() const { return !statics && !dynamics; }
 };
 
-bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3])
+bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3],
+                        std::vector<std::array<float, 4>>* readyCellBoxes = nullptr)
 {
     ScopedCellLock lock;
     bTSmallArray<eCPVSCellItem*> cells;
@@ -331,7 +333,19 @@ bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3])
         if (!cell || cell == permanent) continue;
         auto const* box = reinterpret_cast<float const*>(&cell->GetCellBox());
         if (!collision::BoxContainsXZ(box, anchor[0], anchor[2], 0.0f)) continue;
-        if (jobDone || cell->GetStaticEntities().GetCount() > 0) return true;
+        const std::array<float, 4> xz{box[0], box[2], box[3], box[5]};
+        if (jobDone || cell->GetStaticEntities().GetCount() > 0) {
+            if (readyCellBoxes &&
+                std::find(readyCellBoxes->begin(), readyCellBoxes->end(), xz) == readyCellBoxes->end()) {
+                if (readyCellBoxes->size() >= 64) readyCellBoxes->erase(readyCellBoxes->begin());
+                readyCellBoxes->push_back(xz);
+            }
+            return true;
+        }
+        if (readyCellBoxes &&
+            std::find(readyCellBoxes->begin(), readyCellBoxes->end(), xz) != readyCellBoxes->end()) {
+            return true;
+        }
     }
     return false;
 }
@@ -472,6 +486,8 @@ struct RegionRetirement {
 
 void ReleaseRegion(RemoteRegionState& region)
 {
+    region.readyCellBoxes.clear();
+    region.anchorRetryAt = 0;
     if (!region.camera && !region.prefetcher) { region = RemoteRegionState{}; return; }
     LogRegion(region, "retiring");
     auto* renderer = RenderAdmin();
@@ -495,6 +511,8 @@ void ReleaseRegion(RemoteRegionState& region)
 
 bool MarkRegionFailed(RemoteRegionState& region, char const* logMessage = nullptr)
 {
+    region.readyCellBoxes.clear();
+    region.anchorRetryAt = 0;
     region.failed = true;
     region.retryAt = net::Now() + 5000;
     ++remoteRegionFailures;
@@ -732,10 +750,11 @@ void UpdateReadySimulationAnchors(eCPVSPrefetcher3& mainPrefetcher, std::vector<
         const bool mainReady = withinMain && mainCellReady;
         bool remoteReady = false;
         if (!withinMain && group < hostRegions.size()) {
-            auto const& region = hostRegions[group];
+            auto& region = hostRegions[group];
             // Main PVS cells still hold sole ownership near the host; reuse their ready coverage while remote cells populate.
-            const bool cellReady = (region.prefetcher && HasReadyAnchorCell(*region.prefetcher, anchor.data())) ||
-                                   mainCellReady;
+            const bool cellReady =
+                (region.prefetcher && HasReadyAnchorCell(*region.prefetcher, anchor.data(), &region.readyCellBoxes)) ||
+                mainCellReady;
             remoteReady = collision::IsRemoteRegionReady(region.failed, region.camera != nullptr,
                                                          region.prefetcher != nullptr, cellReady);
         }

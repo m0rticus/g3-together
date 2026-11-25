@@ -591,3 +591,24 @@ class NpcLeaseRuntimeTests(unittest.TestCase):
         release = section(self.client_source, "void ReleaseLocal(", "void ReceiveClient(")
         self.assertIn("npcown::YieldCooldownMs", release)
 
+    def test_client_recall_vetted_handback_and_adopt_baseline_lock_prevent_blinking(self):
+        client = section(self.client_source, "void ReceiveClient(", "// Which native path")
+        self.assertIn("note.kind == Kind::Recall", client)
+        self.assertIn("entry.recallAt = now ? now : 1", client)
+
+        vetted = section(self.client_source, "bool VettedLocalAuthority(", "bool HandbackPending(")
+        self.assertNotIn("!HostWins(key)", vetted)
+
+        maintain = section(self.client_source, "void MaintainOwners(", "void ScanClient(")
+        reclaim = section(maintain, "if (entry.cut && !entry.local)", "if (!entry.local) continue;")
+        self.assertIn("NativeReady(entity)", reclaim)
+        self.assertIn("baselineLocked", maintain)
+        self.assertLess(maintain.index("if (captured) entry.lease.state = state;"),
+                        maintain.index("Send(key, entry, Kind::Adopt)"))
+
+        companions = _testbuild.src_text("npc_companions.cpp")
+        reset_mirror = section(companions, "void ResetMirrorForNewStream(", "void PackMotionFromRecord(")
+        self.assertIn("keepVisiblePlacement", reset_mirror)
+        self.assertIn("!hiddenClientStates.count(m.entity.GetInstance())", reset_mirror)
+        self.assertIn("m.havePresentation = keepVisiblePlacement;", reset_mirror)
+

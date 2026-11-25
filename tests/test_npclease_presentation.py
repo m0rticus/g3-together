@@ -137,3 +137,11 @@ class NpcLeasePresentationTests(unittest.TestCase):
         self.assertLess(stop.index("RememberNativePresentation(entity)"), stop.index("npc.Routine.FullStop()"))
         imported = runtime[runtime.index("bool Import("):runtime.index("bool Activate(")]
         self.assertLess(imported.index("Stop(entity)"), imported.index("entity->SetToWorldMatrix(pose)"))
+
+    def test_transient_release_unavailable_retains_proven_pose(self):
+        source = _testbuild.src_text("npcplayback.cpp")
+        release_unavailable = source[source.index("void ReleaseUnavailable("):source.index("bool ReleaseNativePresentation(")]
+        self.assertNotIn("provenPoses.erase", release_unavailable)
+        release_native = source[source.index("bool ReleaseNativePresentation("):source.index("void UpdatePresentation(")]
+        self.assertIn("provenPoses.erase(EntityKey(entity))", release_native)
+

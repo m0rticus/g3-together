@@ -320,6 +320,8 @@ void ReceiveClient(Message const& note)
         entry.hostSeenAt = now;
         entry.silentLogged = false;
         entry.lease.state.effects |= note.state.effects;
+    } else if (note.kind == Kind::Recall) {
+        if (entry.local && !entry.cut && !entry.recallAt) entry.recallAt = now ? now : 1;
     } else if (note.kind == Kind::Abort) {
         // The host could not keep its side of the offer: keep running natively and retry the handshake later.
         entry.prepared = false; entry.confirmed = false; entry.recallAt = 0;
@@ -488,7 +490,8 @@ void MaintainOwners(uint32_t now)
             const uint32_t reclaimWaitMs = (entry.cutReason && !std::strcmp(entry.cutReason, "tame/control spell"))
                 ? RecallWaitMs
                 : npcown::CutReclaimMs;
-            if (entity && now - entry.cutAt >= reclaimWaitMs && !npcs::HostStreamClaimed(key.data()) &&
+            if (entity && NativeReady(entity) && now - entry.cutAt >= reclaimWaitMs &&
+                !npcs::HostStreamClaimed(key.data()) &&
                 npcown::AcquisitionTimely(npcs::HostStreamDelay(), net::RoundTrip(1)) &&
                 !persist::CheckpointBusy() && !SharedWithOtherClient(entity)) {
                 const bool wasVetted = entry.vetted && entry.world == net::WorldEpoch();
@@ -580,7 +583,8 @@ void MaintainOwners(uint32_t now)
             state.attackReason != entry.lease.state.attackReason ||
             state.targetPlayer != entry.lease.state.targetPlayer);
         const bool settledDead = state.dead && (entry.lease.state.effects & QuestDeath);
-        if (captured && (event || (!settledDead && now - entry.lastState >= StateMs))) {
+        const bool baselineLocked = !entry.confirmed && (entry.prepared || entry.lastRequest != 0);
+        if (captured && (event || (!baselineLocked && !settledDead && now - entry.lastState >= StateMs))) {
             entry.lease.state = state;
             if (++entry.lease.revision == 0) {
                 ReleaseLocal(key, entry, entity, false);
@@ -595,6 +599,7 @@ void MaintainOwners(uint32_t now)
         }
         // Handshake with the host: asynchronous, backed off, never a precondition for animating or reacting.
         if (!entry.confirmed && !entry.prepared && now - entry.lastRequest >= entry.requestEvery) {
+            if (captured) entry.lease.state = state;
             entry.echo = now ? now : 1;
             if (Send(key, entry, Kind::Adopt)) {
                 entry.lastRequest = now;
@@ -769,9 +774,10 @@ bool VettedLocalAuthority(eCEntity const* entity)
     if (net::IsHost() || !entity) return false;
     const auto key = Key(entity);
     const auto it = entries.find(key);
+    // Keep presentation active while local ownership is still held; ReleaseLocal transfers to handbackUntil.
     return it != entries.end() && it->second.local && it->second.active && it->second.vetted &&
         it->second.ownedEntity == entity && it->second.world == net::WorldEpoch() &&
-        it->second.welcome == net::WelcomeSerial() && !HostWins(key);
+        it->second.welcome == net::WelcomeSerial();
 }
 bool HandbackPending(uint8_t const guid[16])
 {

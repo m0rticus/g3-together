@@ -755,13 +755,15 @@ void ResetMirrorForNewStream(Mirror& m, GuidKey const& key, net::NpcRecord const
         forceSequences.erase(ForceSeqKey{key, m.latest.incarnation});
         ForgetCorpseGroundAnchor(key);
     }
+    const bool keepVisiblePlacement = sameOwner && m.havePresentation && m.entity.GetInstance() != nullptr &&
+                                      !hiddenClientStates.count(m.entity.GetInstance());
     m.replay = npcplayback::State{};
     ResetMirrorIncomingContact(m);
     m.body.track = body::Track{};
     m.body.presentationSerial = 0;
     m.body.actionSeq = -1;
     m.latestTicks = 0;
-    if (!sameOwner || !m.entity.GetInstance()) m.havePresentation = false;
+    m.havePresentation = keepVisiblePlacement;
     m.records = 0;
     if (!sameOwner) {
         m.attitudeWritten = 0xFF;
