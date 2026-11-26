@@ -3,6 +3,7 @@
 #include "persist_internal.h"
 
 #include "ai.h"
+#include "client_tips.h"
 #include "clock.h"
 #include "config.h"
 #include "crashlog.h"
@@ -447,6 +448,7 @@ bool __stdcall NewGameDetour(void* self)
     net::SetInWorld(net::LocalId(), false);
     worldCleanup();
     clock::OnWorldChange();
+    if (!net::IsHost() && net::Joined()) tips::PrepareForWorldEntry("new-game");
     crashlog::WorldEntryScope scope("native client HUD.NewGame");
     const bool ok = originalNewGame(self);
     scope.Complete();
@@ -465,6 +467,7 @@ bool __stdcall NewGameDetour(void* self)
         templateHeroFresh = true;
         autoloadState.Adopted(GetTickCount());
         templateCapture.Want(GetTickCount());
+        if (net::Joined()) tips::OnWorldEntered("new-game", gCSession::GetInstance().GetHero(), net::WelcomeSerial());
         requestCharacterAgain = receivedNote.epoch != hostWorld.epoch || !receivedWelcome;
         Log("persist: client native New Game returned; fresh local world ready for own account record");
     }
@@ -760,6 +763,7 @@ static void EnterTemplateWorld(uint32_t queuedAt)
     net::SetInWorld(net::LocalId(), false);
     lowerLoadCalls = 0; lowerLoadGood = true;
     Logf("persist: client enter state=native-load slot=%s elapsed_ms=%u", rejoin::tmpl::Slot, GetTickCount() - queuedAt);
+    if (!net::IsHost() && net::Joined()) tips::PrepareForWorldEntry("template-load");
     crashlog::WorldEntryWait("native client template load");
     crashlog::WorldEntryScope scope("native client template HUD.LoadGame");
     const bool hudOk = originalLoad(files, &name);
@@ -776,7 +780,11 @@ static void EnterTemplateWorld(uint32_t queuedAt)
          game.GetPlayer(), game.IsGameRunning() ? 1 : 0);
     telemetry::OnPersistEvent("client_template_load", rejoin::tmpl::Slot, hostWorld.campaign, hostWorld.epoch, ok,
                               ok ? "returned" : "failed");
-    if (ok) { clientWorldEntered = true; return; }
+    if (ok) {
+        clientWorldEntered = true;
+        if (net::Joined()) tips::OnWorldEntered("template-load", game.GetHero(), net::WelcomeSerial());
+        return;
+    }
     RemoveTemplate("native-load-failed");
     Notice(i18n::ClientRejoinFailed, true);
 }

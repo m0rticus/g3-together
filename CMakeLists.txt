@@ -61,6 +61,7 @@ target_sources(Script_G3Together PRIVATE src/personal_ledger.cpp)
 target_sources(Script_G3Together PRIVATE src/persist_hooks.cpp)
 target_sources(Script_G3Together PRIVATE src/persist_storage.cpp)
 target_sources(Script_G3Together PRIVATE src/persist_client.cpp)
+target_sources(Script_G3Together PRIVATE src/client_tips.cpp)
 target_sources(Script_G3Together PRIVATE src/symbols.cpp)
 target_sources(Script_G3Together PRIVATE src/shutdown_watchdog.cpp)
 target_sources(Script_G3Together PRIVATE

@@ -3,6 +3,7 @@
 // Runs once per game frame on the engine thread: reports the local hero, exchanges player states
 // with the other players and shows them as puppets.
 #include "ai.h"
+#include "client_tips.h"
 #include "combat.h"
 #include "combat_hostility.h"
 #include "net.h"
@@ -336,6 +337,7 @@ class Module : public eCEngineComponentBase
         g3t::crashlog::WorldEntryScope operation("WorldActivate callback");
         g3t::Log("world activated");
         ForgetWorld();
+        g3t::tips::OnWorldActivate();
         g3t::persist::OnWorldActivate();
         g3t::world::OnWorldActivate();
         g3t::telemetry::OnWorldActivate();

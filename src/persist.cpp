@@ -2,6 +2,7 @@
 #include "persist_internal.h"
 
 #include "ai.h"
+#include "client_tips.h"
 #include "clock.h"
 #include "combat.h"
 #include "config.h"
@@ -792,6 +793,7 @@ void Tick()
         return;
     }
     if (!net::Joined()) {
+        tips::Tick(false, false, false, nullptr, 0);
         if (captured.valid) xpshare::CancelSaveCapture();
         captured = {}; requestPending = false; return;
     }
@@ -806,6 +808,7 @@ void Tick()
     }
     TickClientSaveRound(now);
     if (clientRejoin.pending) return;
+    tips::Tick(false, true, running, game.GetHero(), net::WelcomeSerial());
     if (requestCharacterAgain && hostWorld.epoch && hostWorld.kind != net::KindMenu) {
         net::WorldNote answer{};
         answer.op = net::WorldOther; answer.kind = localKind; answer.epoch = hostWorld.epoch;
