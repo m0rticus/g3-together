@@ -3,6 +3,7 @@
 #include "guards_policy.h"
 
 #include "ai.h"
+#include "arena.h"
 #include "fightmem.h"
 #include "log.h"
 #include "navzone_guard.h"
@@ -113,6 +114,7 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         }
     }
     if (remote::IsPuppet(guard.NPC.GetCurrentTarget().GetInstance())) return result;
+    const bool nearArena = arena::IsActiveArenaNear(npc, 3000.0f);
     for (int id = 1; id < net::MaxPlayers; ++id) {
         eCEntity* puppet = remote::PuppetOf(id);
         if (!puppet || Distance(npc, puppet) > 3000.0f) continue;  // the game's own checks decide nearer ones
@@ -122,6 +124,7 @@ GEInt GE_STDCALL Perceive(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
         {
             Acting acting(puppet, true, npc);
             for (char const* name : {"AssessPlayerZone", "AssessPlayerWeapon"}) {
+                if (nearArena && std::strcmp(name, "AssessPlayerWeapon") == 0) continue;
                 reacted = GetScriptAdminExt().CallScript(bCString(name), npc, puppet, 0);
                 if (reacted) { rule = name + 12; break; }
             }
@@ -194,7 +197,13 @@ GEBool GE_STDCALL OnZone(gCScriptProcessingUnit* spu)
 GEBool GE_STDCALL OnWeapon(gCScriptProcessingUnit* spu)
 {
     if (ai::ShuttingDown()) return originalOnWeapon ? originalOnWeapon(spu) : GEFalse;
-    Acting acting(TargetPuppet(spu), true, spu ? spu->GetSelfEntity() : nullptr);
+    eCEntity* self = spu ? spu->GetSelfEntity() : nullptr;
+    if (self && arena::IsActiveArenaNear(self, 3000.0f) && !arena::IsSharedArenaOpponent(self)) {
+        Entity(self).Routine.FullStop();
+        Entity(self).Routine.ContinueRoutine();
+        return GEFalse;
+    }
+    Acting acting(TargetPuppet(spu), true, self);
     return originalOnWeapon(spu);
 }
 

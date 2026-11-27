@@ -92,6 +92,34 @@ class ArenaPolicyTests(unittest.TestCase):
         # 7. Talk release never clobbers AiModeArena / ZS_Arena with FullStop + ContinueRoutine.
         self.assertIn("talk_policy::ShouldRestartRoutineOnTalkRelease(", talk)
 
+    def test_shared_2v1_arena_combat_and_bystander_contracts(self):
+        arena_h = _testbuild.src_text("arena.h")
+        arena = _testbuild.src_text("arena.cpp")
+        combat = _testbuild.src_text("combat.cpp")
+        combat_melee = _testbuild.src_text("combat_melee.cpp")
+        combat_claims = _testbuild.src_text("combat_claims.cpp")
+        combat_hostility = _testbuild.src_text("combat_hostility.cpp")
+        ai = _testbuild.src_text("ai.cpp")
+        fightmem = _testbuild.src_text("fightmem.cpp")
+        guards = _testbuild.src_text("guards.cpp")
+        npc_targets = _testbuild.src_text("npc_targets.cpp")
+
+        self.assertIn("IsSharedArenaOpponent", arena_h)
+        self.assertIn("IsActiveArenaNear", arena_h)
+        self.assertIn("ShouldSuppressQuestDefeatForPartner", arena_h)
+        self.assertIn("arena_policy::ShouldAllowSharedArenaCombat(", arena)
+        self.assertIn("arena::IsSharedArenaOpponent(", combat_melee)
+        self.assertIn("arena::IsSharedArenaOpponent(", combat)
+        self.assertIn("if (!InBout(target))", combat_claims)
+        self.assertIn("PrivateBoutAttackReason", combat_hostility)
+        self.assertIn("arena_policy::ShouldUpgradeArenaAttackReason(", ai)
+        self.assertIn("arena_policy::ShouldSuppressArenaBystanderReaction(", ai)
+        self.assertIn("ZS_ReactToWeapon", ai)
+        self.assertIn("arena::IsActiveArenaNear(", guards)
+        self.assertIn("InArenaBystanderReaction", fightmem)
+        self.assertIn("ShouldSuppressQuestDefeatForPartner(", fightmem)
+        self.assertIn("arena::IsSharedArenaOpponent(", npc_targets)
+
     def test_file_sizes_stay_under_one_thousand_lines(self):
         for rel in TOUCHED_ARENA_FILES:
             path = ROOT / "src" / rel

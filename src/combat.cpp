@@ -3,6 +3,7 @@
 #include "options.h"
 
 #include "ai.h"
+#include "arena.h"
 #include "body.h"
 
 #include "config.h"
@@ -298,6 +299,34 @@ GEInt Judge(int which, gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     }
     ai::DefeatJudgementScope defeatJudgement(which <= 2);
     if (which <= 2) telemetry::NoteCombatJudge(Judgements[which], victim.GetInstance(), attacker, source, HitPoints(victim));
+    // Native DoLogicalDamage (0x100b5668..0x100b5740) rejects hits on AIMode_Combat NPCs whose AttitudeToPlayer2 is
+    // Friendly or Neutral unless CurrentTarget == Entity::GetPlayer(). For shared 2v1 arena opponents, ensure
+    // AttitudeToPlayer2 is at least Angry during DoLogicalDamage so both players' hits register natively.
+    struct SharedArenaAttitudeScope {
+        eCEntity* npc = nullptr;
+        gEAttitude saved = gEAttitude_None;
+        bool restore = false;
+        SharedArenaAttitudeScope(int whichGate, eCEntity* victimInst, eCEntity* attackerInst, eCEntity* heroInst)
+        {
+            if (whichGate != 0 || !victimInst || !victimInst->GetPropertySet(eEPropertySetType_NPC) ||
+                !victimInst->GetPropertySet(eEPropertySetType_ScriptRoutine))
+                return;
+            if (!attackerInst || (attackerInst != heroInst && attackerInst != remote::ControlledBody())) return;
+            if (!arena::IsSharedArenaOpponent(victimInst)) return;
+            Entity e(victimInst);
+            if (e.Routine.AIMode != gEAIMode_Combat) return;
+            saved = static_cast<gEAttitude>(e.NPC.AttitudeToPlayer2);
+            if (saved == gEAttitude_Friendly || saved == gEAttitude_Neutral) {
+                e.NPC.AttitudeToPlayer2 = gEAttitude_Angry;
+                npc = victimInst;
+                restore = true;
+            }
+        }
+        ~SharedArenaAttitudeScope()
+        {
+            if (restore && npc) Entity(npc).NPC.AttitudeToPlayer2 = saved;
+        }
+    } arenaAttitudeScope(which, victim.GetInstance(), attacker, hero);
     if (victim.Routine.AniState != gEAniState_Parade) return observed(judge[which](spu, self, other, args));
     const bool puppet = remote::PuppetOwner(victim.GetInstance());
     const bool mirror = npcs::IsMirrored(victim.GetInstance()) && attacker && (attacker == hero || attacker == remote::ControlledBody());

@@ -33,6 +33,13 @@ inline bool IsFollowsPlayerState(char const* state) noexcept
     return false;
 }
 
+inline bool IsAttackState(char const* state) noexcept
+{
+    return state && std::strncmp(state, "ZS_Attack", 9) == 0 &&
+           std::strcmp(state, "ZS_Attack_End") != 0 &&
+           std::strcmp(state, "ZS_Attack_Arena_End") != 0;
+}
+
 // Decides which remote puppet (if any) stands in as Entity::GetPlayer() during an NPC AI state.
 // Gothic 3 never clears CurrentAttacker when a fight or knockdown ends, so a stale puppet in
 // CurrentAttacker must never hijack a state targeting the local player or any talk/observe state.
@@ -48,7 +55,7 @@ inline StateActorSource SelectGuardStateActor(
         return (!hasTarget && hasContextLeader) ? StateActorSource::ContextLeader : StateActorSource::None;
     }
     const bool followsPlayer = IsFollowsPlayerState(state);
-    if (followsPlayer && targetIsLocalPlayer) return StateActorSource::None;
+    if ((followsPlayer || IsAttackState(state)) && targetIsLocalPlayer) return StateActorSource::None;
     if (hasContextLeader) return StateActorSource::ContextLeader;
     if (IsWaitDestinationState(state)) return StateActorSource::WaitNearest;
     if (!followsPlayer) return StateActorSource::None;

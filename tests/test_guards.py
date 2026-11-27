@@ -67,6 +67,14 @@ int main()
     assert(SelectGuardStateActor(true, true, false, "ZS_WaitForFreeDestination_Loop", true, false, false, false, false) ==
            StateActorSource::ContextLeader);
 
+    // Shared arena opponent bound to ContextLeader (Client 2) must use local hero context when targeting Host Hero.
+    assert(SelectGuardStateActor(true, true, false, "ZS_Attack", true, true, false, true, false) ==
+           StateActorSource::None);
+    assert(SelectGuardStateActor(true, true, false, "ZS_Attack_Attack", true, true, false, true, false) ==
+           StateActorSource::None);
+    assert(SelectGuardStateActor(true, true, false, "ZS_Attack", true, true, true, false, false) ==
+           StateActorSource::ContextLeader);
+
     // fightmem::StateActor must never let stale CurrentAttacker == puppet hijack stumbles/standups targeting host.
     assert(SelectFightStateActor(true, false, false, true, true, false, true, true) ==
            StateActorSource::None);

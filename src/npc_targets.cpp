@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npc_targets.h"
+#include "arena.h"
 #include "downed.h"
 #include "downed_policy.h"
 #include "npc_retarget_policy.h"
@@ -181,7 +182,10 @@ bool ReleaseDownedTargets(eCEntity* instance, char const* boundary, gCScriptProc
             } else {
                 // ZS_Attack_End+0x1A811 uses this same setter/assessment path before any weapon stow.
                 const int attitude = GetScriptAdminExt().CallScript(bCString("GetAttitude"), instance, next.GetInstance(), 0);
-                const gEAttackReason attackReason = npc.NPC.AttackReason == gEAttackReason_Revolution
+                const gEAttackReason attackReason =
+                    (npc.NPC.AttackReason == gEAttackReason_Arena || arena::IsSharedArenaOpponent(instance))
+                    ? gEAttackReason_Arena
+                    : npc.NPC.AttackReason == gEAttackReason_Revolution
                     ? gEAttackReason_Revolution : attitude == gEAttitude_Hostile
                     ? gEAttackReason_Enemy : attitude == gEAttitude_Predator ? gEAttackReason_Prey : gEAttackReason_ReactToDamage;
                 const int assessed = GetScriptAdminExt().CallScript(bCString("AssessTarget"), instance, next.GetInstance(), attackReason);

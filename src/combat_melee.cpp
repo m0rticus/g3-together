@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "combat_internal.h"
 #include "ai.h"
+#include "arena.h"
 #include "body.h"
 #include "combat_hostility.h"
 #include "config.h"
@@ -117,10 +118,12 @@ bool InBout(Entity& npc)
     return reason == gEAttackReason_Duel || reason == gEAttackReason_Arena;
 }
 
-// A hit by `attacker` on an NPC in a bout with someone else: not counted.
+// A hit by `attacker` on an NPC in a private duel/bout with someone else: not counted.
+// Shared arena fights allow both host and client to hit and damage the arena opponent together.
 bool OutsideBout(Entity& npc, eCEntity* attacker)
 {
-    return attacker && InBout(npc) && npc.NPC.GetCurrentTarget().GetInstance() != attacker;
+    return attacker && InBout(npc) && !arena::IsSharedArenaOpponent(npc.GetInstance()) &&
+           npc.NPC.GetCurrentTarget().GetInstance() != attacker;
 }
 bool IsPuppetMeleeJudgement(eCEntity* victim, eCEntity* attacker, eCEntity* source)
 {
@@ -248,7 +251,8 @@ MeleeVerdict JudgeMelee(eCEntity* victim, eCEntity* claimant, uint8_t player, ne
     }
     result.relationsKnown = true;
     Entity npc(victim);
-    if (InBout(npc) && !v.targetsPlayer) {
+    v.sharedArena = arena::IsSharedArenaOpponent(victim);
+    if (InBout(npc) && !v.targetsPlayer && !v.sharedArena) {
         result.decision = "outside-bout";
         return result;
     }

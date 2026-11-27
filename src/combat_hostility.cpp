@@ -95,7 +95,7 @@ uint8_t CoopPlayerOfEntity(eCEntity const* entity)
     return static_cast<uint8_t>(remote::PuppetOwner(entity));
 }
 
-uint8_t CoopCompanionOwner(eCEntity const* entity)
+uint8_t CompanionOwnerOf(eCEntity const* entity)
 {
     if (!ValidNpc(entity)) return 0;
     eCEntity* mutableEntity = const_cast<eCEntity*>(entity);
@@ -129,13 +129,13 @@ uint8_t CoopCompanionOwner(eCEntity const* entity)
 uint8_t CoopOwnerOf(eCEntity const* entity)
 {
     if (const uint8_t player = CoopPlayerOfEntity(entity)) return player;
-    return CoopCompanionOwner(entity);
+    return CompanionOwnerOf(entity);
 }
 
 relation::CombatRole RoleOf(eCEntity const* entity)
 {
     if (CoopPlayerOfEntity(entity) != 0) return relation::CombatRole::PlayerOrPuppet;
-    if (CoopCompanionOwner(entity) != 0) return relation::CombatRole::CoopCompanion;
+    if (CompanionOwnerOf(entity) != 0) return relation::CombatRole::CoopCompanion;
     return relation::CombatRole::OrdinaryNpc;
 }
 
@@ -224,7 +224,7 @@ void PopulateMirroredInput(eCEntity const* npc, eCEntity* mutableNpc, GuidKey co
     }
     const bool inCombat = !relation::NonCombatAiMode(in.aiMode) &&
                           (in.aiMode == gEAIMode_Combat || in.combatState != 0) &&
-                          !relation::BoutAttackReason(in.attackReason);
+                          !relation::PrivateBoutAttackReason(in.attackReason);
     in.syncedSharedHostile = relation::MirrorSharesCombatHostility(
         true, true, rec != nullptr, rec ? rec->attitude : relation::Unset,
         inCombat, remoteActive, in.targetsCoopSide);
@@ -471,7 +471,7 @@ GEInt GE_STDCALL FilterFocusEntityPriority(gCScriptProcessingUnit* spu, GELPVoid
         fi.targetsCoopSide = sc.targetsCoopSide;
         fi.inCombat = !relation::NonCombatAiMode(sc.aiMode) &&
                       (sc.aiMode == gEAIMode_Combat || sc.combatState != 0);
-        fi.inBout = relation::BoutAttackReason(sc.attackReason);
+        fi.inBout = relation::PrivateBoutAttackReason(sc.attackReason);
         fi.role = sc.role;
         fi.attitude = sc.storedAttitude;
         const int overridePriority = relation::CombatFocusPriorityOverride(fi);
@@ -526,7 +526,7 @@ void ExpireCalmMirroredHostilityOnClient()
         if (!rec) continue;
         const bool inCombat = !relation::NonCombatAiMode(rec->aiMode) &&
                               (rec->aiMode == gEAIMode_Combat || (rec->flags & 4u) != 0) &&
-                              !relation::BoutAttackReason(rec->attackReason);
+                              !relation::PrivateBoutAttackReason(rec->attackReason);
         if (!relation::MirrorSharesCombatHostility(true, true, true, rec->attitude, inCombat, true, false) &&
             !inCombat)
             peers[1] = {};
@@ -699,6 +699,11 @@ bool ResumeLeasedCombat(eCEntity* npc, uint8_t aiMode, uint8_t attitude, uint8_t
 bool IsCoopParticipant(eCEntity const* entity)
 {
     return CoopOwnerOf(entity) != 0;
+}
+
+uint8_t CoopCompanionOwner(eCEntity const* entity)
+{
+    return CompanionOwnerOf(entity);
 }
 
 bool IsSharedCombatHostile(eCEntity const* npc)

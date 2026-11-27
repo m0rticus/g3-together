@@ -20,6 +20,7 @@ void OnWorldChange();
 bool ResumeLeasedCombat(eCEntity* npc, uint8_t aiMode, uint8_t attitude, uint8_t attackReason, eCEntity* target);
 
 bool IsCoopParticipant(eCEntity const* entity);
+uint8_t CoopCompanionOwner(eCEntity const* entity);
 bool IsSharedCombatHostile(eCEntity const* npc);
 bool MirrorSharesCombatHostility(eCEntity const* npc);
 uint8_t MirrorAttitude(eCEntity const* npc, uint8_t wanted);

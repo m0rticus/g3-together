@@ -280,13 +280,16 @@ int main()
         in.storedAttitude = Predator;
         assert(EffectiveAttitude(Predator, in) == Predator);
 
-        // Duel and arena bouts stay isolated to the duelists.
+        // Private dialog duels (17) stay isolated; shared arena bouts (18) participate in co-op hostility (Angry/orange).
         in.storedAttitude = Neutral;
         in.attackReason = 17;
         assert(!ActiveSharedCombatHostility(in));
         assert(EffectiveAttitude(Neutral, in) == Neutral);
         in.attackReason = 18;
-        assert(!ActiveSharedCombatHostility(in));
+        in.lethal = IsLethalSharedCombat(true, false, 18, Neutral);
+        assert(ActiveSharedCombatHostility(in));
+        assert(EffectiveAttitude(Neutral, in) == Angry);
+        in.lethal = true;
         in.attackReason = 9;
 
         // Companions and players/puppets never turn hostile toward the co-op side.

@@ -23,4 +23,5 @@ void AfterState(eCEntity* self);                         // ai.cpp, after that s
 void OnState(uint8_t from, net::WorldState const& s);     // kind 18: an NPC's memory of a fight with this player
 void OnWorldChange();  // a load or a new world: the grudges kept for other players belong to the world before
 int Upset(eCEntity* npc, eCEntity* puppet);  // guards.cpp: the NPC takes up a fight it gave up against that puppet's player
+bool InArenaBystanderReaction() noexcept;
 }

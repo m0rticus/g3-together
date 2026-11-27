@@ -22,8 +22,17 @@ constexpr int QuestStatusWon = 7;       // gEQuestStatus_Won
 constexpr int ArenaStatusNone = 0;      // gEArenaStatus_None
 constexpr int ArenaStatusRunning = 1;   // gEArenaStatus_Running
 
-constexpr int AttackReasonDuel = 17;    // gEAttackReason_Duel (0x11)
-constexpr int AttackReasonArena = 18;   // gEAttackReason_Arena (0x12)
+constexpr int AttackReasonReactToWeapon = 6;   // gEAttackReason_ReactToWeapon
+constexpr int AttackReasonAngry = 7;           // gEAttackReason_Angry
+constexpr int AttackReasonStopFight = 8;       // gEAttackReason_StopFight
+constexpr int AttackReasonReactToDamage = 9;   // gEAttackReason_ReactToDamage
+constexpr int AttackReasonEnemy = 12;          // gEAttackReason_Enemy
+constexpr int AttackReasonMurder = 13;         // gEAttackReason_Murder
+constexpr int AttackReasonPlayerCommand = 16;  // gEAttackReason_PlayerCommand
+constexpr int AttackReasonDuel = 17;           // gEAttackReason_Duel (0x11)
+constexpr int AttackReasonArena = 18;          // gEAttackReason_Arena (0x12)
+constexpr int AttackReasonRevolution = 19;     // gEAttackReason_Revolution
+constexpr int AttackReasonKill = 20;           // gEAttackReason_Kill
 
 constexpr bool IsArenaOrSparringQuestType(int questType) noexcept
 {
@@ -170,13 +179,52 @@ inline bool ShouldDispatchSendToArenaOnHost(bool questRunning, bool heldInTalk, 
 
 // When a client challenger is knocked down (downed::CombatUnavailable) during an active bout on the host,
 // fightmem's attackerless-hero guard on the client may skip gCQuest_PS::OnNPCDefeated. Transition the Running
-// quest to Lost (6) on the host so gCArena_PS::Status resets and Lost (20) / Reactivator rematch (21) dialogs open.
+// quest to Lost (6) on the host so gCArena_PS::Status resets and Lost (20) / Reactivator rematch (21) dialogs open,
+// unless a co-op partner is still upright in the arena continuing the shared 2v1 fight.
 constexpr bool ShouldMarkClientChallengerDefeatedOnHost(bool isHost, uint8_t challengerPlayer, bool boutStarted,
                                                         bool questRunning, bool challengerUnavailable,
-                                                        bool fighterDead, bool fighterDown) noexcept
+                                                        bool fighterDead, bool fighterDown,
+                                                        bool partnerFightingInArena = false) noexcept
 {
     return isHost && challengerPlayer >= 2 && boutStarted && questRunning &&
-           challengerUnavailable && !fighterDead && !fighterDown;
+           challengerUnavailable && !fighterDead && !fighterDown && !partnerFightingInArena;
+}
+
+// Shared 2v1 arena fight rules: any gEAttackReason_Arena fight or active Arena/Sparring quest fighter in combat
+// (excluding ZS_Arena walk-in aiMode 5, Talk 6, Down 8, Dead 9) allows both host and client to engage together.
+constexpr bool ShouldAllowSharedArenaCombat(int attackReason, bool runningArenaOrSparringQuest,
+                                            int aiMode, uint32_t combatState) noexcept
+{
+    if (aiMode == 5 || aiMode == 6 || aiMode == 8 || aiMode == 9) return false;
+    if (attackReason == AttackReasonArena) return true;
+    return runningArenaOrSparringQuest && (aiMode == 3 || combatState != 0);
+}
+
+// Keep gEAttackReason_Arena on an active arena opponent when AssessAgressor / AssessTarget / downed retargeting
+// fires for the second co-op player, so spectators never mistake the 2v1 arena bout for a street brawl.
+constexpr bool ShouldUpgradeArenaAttackReason(bool isSharedArenaFighter, bool targetIsCoopParticipant,
+                                              int incomingReason) noexcept
+{
+    return isSharedArenaFighter && targetIsCoopParticipant &&
+           incomingReason > 0 && incomingReason != AttackReasonArena &&
+           incomingReason != AttackReasonMurder && incomingReason != AttackReasonRevolution &&
+           incomingReason != AttackReasonKill;
+}
+
+constexpr bool IsBystanderFightWitnessReason(int attackReason) noexcept
+{
+    return attackReason == AttackReasonReactToWeapon || attackReason == AttackReasonAngry ||
+           attackReason == AttackReasonStopFight || attackReason == AttackReasonReactToDamage ||
+           attackReason == AttackReasonEnemy || attackReason == AttackReasonPlayerCommand ||
+           attackReason == AttackReasonDuel || attackReason == AttackReasonArena;
+}
+
+constexpr bool ShouldSuppressArenaBystanderReaction(bool nearActiveArena, bool isArenaFighter,
+                                                    bool targetIsCoopParticipant, int attackReason,
+                                                    bool bystanderAlreadyHostile) noexcept
+{
+    return nearActiveArena && !isArenaFighter && targetIsCoopParticipant &&
+           !bystanderAlreadyHostile && IsBystanderFightWitnessReason(attackReason);
 }
 
 // If a client challenger disconnects or leaves the world mid-bout, forfeit the Running bout cleanly so the

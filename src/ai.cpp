@@ -2,6 +2,8 @@
 #include "ai.h"
 #include "ai_internal.h"
 
+#include "arena.h"
+#include "arena_policy.h"
 #include "combat_hostility.h"
 
 #include "log.h"
@@ -210,6 +212,12 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
         ++(self && self == gCSession::GetInstance().GetHero() ? c.first : c.second);
     }
     if (downed::RedirectDeath(self, name)) return GEFalse;  // the local hero is knocked out instead of dying
+    if (self && !guards::IsLocalPlayer(self) && std::strcmp(name, "ZS_ReactToWeapon") == 0 &&
+        arena::IsActiveArenaNear(self, 3000.0f) && !arena::IsSharedArenaOpponent(self)) {
+        Entity(self).Routine.FullStop();
+        Entity(self).Routine.ContinueRoutine();
+        return GEFalse;
+    }
     if (strcmp(name, "IS_Running_ProcessInfo") == 0) infocmd::Observe(spu);  // a dialog script line runs
     if (strcmp(name, "ZS_RansackBody") == 0 && ransack::OnRobbing(spu)) return GEFalse;
     if (self && self == gCSession::GetInstance().GetHero() && strcmp(name, "_AI_TakeItem") == 0) {
@@ -465,8 +473,27 @@ bool assessTargetSearched = false;
 GEInt GE_STDCALL FilterAssessTarget(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
 {
     if (ShuttingDown()) return originalAssessTarget ? originalAssessTarget(spu, self, other, args) : 0;
+    eCEntity* npc = Self(spu, self);
     eCEntity* target = Other(spu, other);
-    if (RejectDownedTarget(Self(spu, self), target, "assessment-refused")) return 0;
+    if (RejectDownedTarget(npc, target, "assessment-refused")) return 0;
+    if (npc && target) {
+        const bool isArenaFighter = arena::IsSharedArenaOpponent(npc);
+        const bool targetCoop = combat_hostility::IsCoopParticipant(target);
+        if (arena_policy::ShouldUpgradeArenaAttackReason(isArenaFighter, targetCoop, args)) {
+            args = gEAttackReason_Arena;
+        } else if (!isArenaFighter && targetCoop &&
+                   (fightmem::InArenaBystanderReaction() ||
+                    args == gEAttackReason_ReactToWeapon || args == gEAttackReason_StopFight ||
+                    args == gEAttackReason_Angry)) {
+            int att = gEAttitude_None;
+            const bool haveAtt = remote::IsPuppet(target) ? TryPlayerAttitude(npc, target, att)
+                                                          : LocalAttitude(npc, att);
+            const bool alreadyHostile = haveAtt && (att == gEAttitude_Hostile || att == gEAttitude_Predator);
+            const bool nearArena = fightmem::InArenaBystanderReaction() || arena::IsActiveArenaNear(npc, 3000.0f);
+            if (arena_policy::ShouldSuppressArenaBystanderReaction(nearArena, false, true, args, alreadyHostile))
+                return 0;
+        }
+    }
     return originalAssessTarget(spu, self, other, args);
 }
 

@@ -9,6 +9,7 @@ struct Victim {
     bool partyMember = false, targeted = false, targetsPlayer = false, targetsPlayerParty = false;
     bool combat = false, hasFocus = false, focused = false, hasTarget = false;
     bool playerLedByVictim = false, ledByPlayer = false, targetOnly = false, item = true;
+    bool sharedArena = false;
     int attitude = None, focusAttitude = None, targetAttitude = None;
     int relation = None, focusRelation = None;
 };
@@ -76,7 +77,7 @@ constexpr bool IsFinishingClaim(std::uint8_t meleeKind, std::uint8_t targetOnly,
 constexpr Decision Judge(Victim const& v)
 {
     if (v.partyMember && !v.targeted) return Decision::Party;
-    if (!v.targetsPlayer && !v.partyMember) {
+    if (!v.targetsPlayer && !v.partyMember && !(v.sharedArena && (v.focused || v.targeted))) {
         if (!v.combat) {
             if (v.hasFocus && !v.focused && v.relation < v.focusRelation && v.relation < Hostile)
                 return Decision::Bystander;
@@ -89,7 +90,7 @@ constexpr Decision Judge(Victim const& v)
         }
     }
     if (v.targetOnly && !v.targeted) return Decision::TargetOnly;
-    if (v.item && v.combat && !v.targetsPlayer && !v.targetsPlayerParty) {
+    if (v.item && v.combat && !v.targetsPlayer && !v.targetsPlayerParty && !v.sharedArena) {
         if (v.attitude == Friendly) return Decision::FriendlyCombatant;
         if (v.attitude == Neutral && !v.targeted) return Decision::NeutralCombatant;
     }

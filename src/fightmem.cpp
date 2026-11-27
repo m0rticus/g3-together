@@ -2,6 +2,8 @@
 #include "fightmem.h"
 
 #include "ai.h"
+#include "arena.h"
+#include "combat_hostility.h"
 #include "downed_policy.h"
 #include "guards.h"
 #include "guards_policy.h"
@@ -145,6 +147,16 @@ void Pass(eCEntity* npc, Memory const& before, eCEntity* puppet, char const* whe
          where, now.reason);
 }
 
+thread_local unsigned arenaBystanderDepth = 0;
+
+struct ArenaBystanderScope {
+    bool active = false;
+    explicit ArenaBystanderScope(bool enable) : active(enable) { if (active) ++arenaBystanderDepth; }
+    ~ArenaBystanderScope() { if (active) --arenaBystanderDepth; }
+    ArenaBystanderScope(ArenaBystanderScope const&) = delete;
+    ArenaBystanderScope& operator=(ArenaBystanderScope const&) = delete;
+};
+
 // The scripts as the game calls them (self, other); the fight they are about is other's (AssessFightSound, AssessDefeat:
 // the one hit or knocked out, and its attacker) or self's and other's (Defeat, CancelAttack).
 GEInt GE_STDCALL Sound(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid other, GEInt args)
@@ -152,9 +164,13 @@ GEInt GE_STDCALL Sound(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid othe
     if (ai::ShuttingDown()) return originalSound ? originalSound(spu, self, other, args) : 0;
     eCEntity* seer = Of(spu, self, true);
     eCEntity* victim = Of(spu, other, false);
-    eCEntity* puppet = PuppetFor(seer, {victim, AttackerOf(victim)});
+    eCEntity* attacker = AttackerOf(victim);
+    const bool arenaFight = arena::IsSharedArenaOpponent(victim) || arena::IsSharedArenaOpponent(attacker);
+    if (arenaFight && combat_hostility::CoopCompanionOwner(seer) != 0) return 1;
+    eCEntity* puppet = PuppetFor(seer, {victim, attacker});
     const Memory before = Read(seer);
     guards::Acting acting(puppet);
+    ArenaBystanderScope bystanderScope(arenaFight && !arena::IsSharedArenaOpponent(seer));
     const GEInt result = originalSound(spu, self, other, args);
     if (puppet) {
         ++sounds;
@@ -169,9 +185,12 @@ GEInt GE_STDCALL Defeated(gCScriptProcessingUnit* spu, GELPVoid self, GELPVoid o
     eCEntity* seer = Of(spu, self, true);
     eCEntity* down = Of(spu, other, false);
     eCEntity* attacker = AttackerOf(down);
+    const bool arenaFight = arena::IsSharedArenaOpponent(down) || arena::IsSharedArenaOpponent(attacker);
+    if (arenaFight && combat_hostility::CoopCompanionOwner(seer) != 0) return 1;
     eCEntity* puppet = PuppetFor(seer, {down, attacker});
     const Memory before = Read(seer);
     guards::Acting acting(puppet);
+    ArenaBystanderScope bystanderScope(arenaFight && !arena::IsSharedArenaOpponent(seer));
     const GEInt result = originalDefeated(spu, self, other, args);
     ++defeatsSeen;
     if (result && ++defeatsYes <= 40 && seer)
@@ -201,6 +220,10 @@ void __fastcall QuestDefeated(gCQuest_PS* self, void* edx, eCEntity const* entit
             if (++questDefeatSkipped <= 40)
                 Logf("fightmem: skipped gCQuest_PS::OnNPCDefeated for attackerless hero (quest=%s type=%d status=%d)",
                      self->GetName().GetText(), questType, questStatus);
+            return;
+        }
+        if (arena::ShouldSuppressQuestDefeatForPartner(self, hero)) {
+            Logf("fightmem: kept %s running while co-op partner continues shared arena fight", self->GetName().GetText());
             return;
         }
     }
@@ -490,6 +513,11 @@ int Upset(eCEntity* npc, eCEntity* puppet)
     Logf("fightmem: %s still holds the fight against player %d (reason %d, %.0f game minutes ago): task %s", Entity(npc).GetName().GetText(),
          remote::PuppetOwner(puppet), kept.reason, (Entity::GetPlayingTime() - kept.at) * 60.0f, Entity(npc).Routine.GetCurrentTask().GetText());
     return 1;
+}
+
+bool InArenaBystanderReaction() noexcept
+{
+    return arenaBystanderDepth != 0;
 }
 
 }

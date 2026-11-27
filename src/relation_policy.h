@@ -181,10 +181,16 @@ inline bool BoutAttackReason(int attackReason)
     return attackReason == 17 || attackReason == 18;
 }
 
+// Dialog duels (Duel=17) remain 1v1 bouts; Arena bouts (Arena=18) are shared 2v1 co-op fights.
+inline bool PrivateBoutAttackReason(int attackReason)
+{
+    return attackReason == 17;
+}
+
 inline bool ActiveSharedCombatHostility(SharedCombatInput const& in)
 {
     if (!in.alive || in.down || in.role != CombatRole::OrdinaryNpc) return false;
-    if (BoutAttackReason(in.attackReason)) return false;
+    if (PrivateBoutAttackReason(in.attackReason)) return false;
     const bool inCombat = !NonCombatAiMode(in.aiMode) && (in.aiMode == 3 || in.combatState != 0);
     if (in.mirrored && in.syncedSharedHostile) return true;
     if (in.clientLeasedEngagement && (inCombat || in.syncedSharedHostile)) return true;

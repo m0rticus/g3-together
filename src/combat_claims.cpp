@@ -394,7 +394,8 @@ void OnHitNpc(uint8_t from, uint8_t const guid[16], int32_t delta, uint8_t const
                 Reaction(target) != net::HitNoReaction);
             if (plan.immediateCombatTarget) {
                 target.NPC.SetCurrentTarget(Entity(attacker));
-                target.NPC.AttackReason = gEAttackReason_ReactToDamage;
+                if (!InBout(target))
+                    target.NPC.AttackReason = gEAttackReason_ReactToDamage;
             }
             if (plan.runImmediateAssessAgressor) React(target, attacker);
         }

@@ -3,6 +3,7 @@
 #include "arena_policy.h"
 
 #include "ai.h"
+#include "body.h"
 #include "downed.h"
 #include "guid.h"
 #include "guid_key.h"
@@ -710,6 +711,97 @@ uint8_t ChallengerForNpc(eCEntity const* npc)
     return 0;
 }
 
+bool BodyInArena(eCEntity* body, eCEntity* arenaEntity, eCEntity* fighter)
+{
+    if (!body || downed::CombatUnavailable(body)) return false;
+    if (arenaEntity) {
+        if (auto* nav = static_cast<gCNavigation_PS*>(body->GetPropertySet(eEPropertySetType_Navigation)))
+            return nav->GetCurrentZoneEntityProxy().GetEntity() == arenaEntity;
+    }
+    if (!fighter) return false;
+    const bCVector& a = body->GetWorldPosition();
+    const bCVector& b = fighter->GetWorldPosition();
+    const float dx = a.GetX() - b.GetX(), dy = a.GetY() - b.GetY(), dz = a.GetZ() - b.GetZ();
+    return dx * dx + dy * dy + dz * dz <= 1200.0f * 1200.0f;
+}
+
+bool HasPartnerInArena(gCQuest_PS const* quest, eCEntity* fighter, uint8_t excludePlayer)
+{
+    if (!net::Connected()) return false;
+    eCEntity* arenaEntity = nullptr;
+    if (quest) {
+        char const* dest = quest->GetDestinationEntity().GetText();
+        if (dest && *dest) arenaEntity = Entity::GetEntity(bCString(dest)).GetInstance();
+    }
+    for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
+        if (id == excludePlayer) continue;
+        eCEntity* body = (id == 1) ? gCSession::GetInstance().GetHero()
+                                   : (net::InWorld(id) ? remote::PuppetOf(id) : nullptr);
+        if (!body) continue;
+        if (id > 1) guards::KeepZone(body);
+        if (BodyInArena(body, arenaEntity, fighter)) return true;
+    }
+    return false;
+}
+
+bool IsSharedArenaOpponent(eCEntity const* npc)
+{
+    if (!on || !npc || !npc->GetPropertySet(eEPropertySetType_NPC)) return false;
+    int attackReason = 0, aiMode = 0;
+    uint32_t combatState = 0;
+    if (npcs::IsMirrored(npc)) {
+        if (auto const* rec = npcs::CombatRecord(npc)) {
+            attackReason = rec->attackReason;
+            aiMode = rec->aiMode;
+            combatState = (rec->flags & 4u) ? 1u : 0u;
+        } else {
+            attackReason = static_cast<int>(Entity(const_cast<eCEntity*>(npc)).NPC.AttackReason);
+            aiMode = body::AIModeOf(const_cast<eCEntity*>(npc));
+        }
+    } else {
+        Entity e(const_cast<eCEntity*>(npc));
+        attackReason = static_cast<int>(e.NPC.AttackReason);
+        aiMode = npc->GetPropertySet(eEPropertySetType_ScriptRoutine) ? static_cast<int>(e.Routine.AIMode) : 0;
+        combatState = static_cast<uint32_t>(e.NPC.CombatState);
+    }
+    return arena_policy::ShouldAllowSharedArenaCombat(attackReason, Fights(npc), aiMode, combatState);
+}
+
+bool IsActiveArenaNear(eCEntity const* entity, float radiusCm)
+{
+    if (!on || !entity || radiusCm <= 0.0f) return false;
+    const float maxSq = radiusCm * radiusCm;
+    const bCVector& p = entity->GetWorldPosition();
+    auto nearEntity = [&](eCEntity const* target) {
+        if (!target) return false;
+        const bCVector& q = target->GetWorldPosition();
+        const float dx = p.GetX() - q.GetX(), dy = p.GetY() - q.GetY(), dz = p.GetZ() - q.GetZ();
+        return dx * dx + dy * dy + dz * dz <= maxSq;
+    };
+    BoutQuests();
+    for (CachedArena const& a : cachedArenas) {
+        if (a.runningCount > 0 && nearEntity(a.proxy.GetEntity())) return true;
+    }
+    for (auto const& [key, h] : held) {
+        if (h.duel) continue;
+        if (nearEntity(guid::Resolve(key.data()).GetInstance())) return true;
+    }
+    return false;
+}
+
+bool ShouldSuppressQuestDefeatForPartner(gCQuest_PS const* quest, eCEntity const* defeatedHero)
+{
+    if (!on || !net::IsHost() || !net::Connected() || !quest || !defeatedHero) return false;
+    if (!arena_policy::IsArenaOrSparringQuestType(static_cast<int>(quest->GetType().GetValue())) ||
+        quest->GetStatus().GetValue() != gEQuestStatus_Running)
+        return false;
+    eCEntity* fighter = nullptr;
+    auto const& who = quest->GetDeliveryEntities();
+    for (GEInt i = 0; i < who.GetCount() && !fighter; ++i)
+        fighter = Entity::GetEntity(who.GetAt(i)).GetInstance();
+    return HasPartnerInArena(quest, fighter, 1);
+}
+
 void OnState(uint8_t from, net::WorldState const& state)
 {
     if (!on || !net::IsHost() || from < 2 || from >= net::MaxPlayers) return;
@@ -798,12 +890,20 @@ void TickHostHeld()
         eCEntity* puppet = (peerActive && h.player > 1) ? remote::PuppetOf(h.player) : nullptr;
         if (puppet) guards::KeepZone(puppet);
 
+        const bool partnerInArena = quest && questRunning && !h.duel && HasPartnerInArena(quest, npc, h.player);
         if (quest && puppet &&
             arena_policy::ShouldMarkClientChallengerDefeatedOnHost(
-                true, h.player, h.started, questRunning, downed::CombatUnavailable(puppet), e.IsDead(), e.IsDown())) {
+                true, h.player, h.started, questRunning, downed::CombatUnavailable(puppet),
+                e.IsDead(), e.IsDown(), partnerInArena)) {
             ForfeitBoutQuestOnHost(quest, h.quest, &h);
             questRunning = false;
             Logf("arena: marked %s Lost after challenger player %u was defeated", h.quest.c_str(), h.player);
+        } else if (quest && h.player == 1 && h.started && questRunning && !h.duel &&
+                   downed::CombatUnavailable(gCSession::GetInstance().GetHero()) &&
+                   !e.IsDead() && !e.IsDown() && !partnerInArena) {
+            ForfeitBoutQuestOnHost(quest, h.quest, &h);
+            questRunning = false;
+            Logf("arena: marked %s Lost after challenger player 1 was defeated", h.quest.c_str());
         }
 
         const bool stillRunning = Fights(npc);

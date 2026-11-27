@@ -6,6 +6,7 @@
 
 #include "net.h"
 class eCEntity;
+class gCQuest_PS;
 
 namespace g3t::arena {
 void Tick();  // wrap arena scripts once the game runs; drive host/client bouts and release finished fighters
@@ -24,4 +25,7 @@ void ObserveLocalQuests();
 void SyncArenaStatuses();
 void TrackDuel(eCEntity* npc, uint8_t player);
 uint8_t ChallengerForNpc(eCEntity const* npc);
+bool IsSharedArenaOpponent(eCEntity const* npc);
+bool IsActiveArenaNear(eCEntity const* entity, float radiusCm = 3000.0f);
+bool ShouldSuppressQuestDefeatForPartner(gCQuest_PS const* quest, eCEntity const* defeatedHero);
 }

@@ -2,6 +2,7 @@
 #include "../src/arena_policy.h"
 
 #include <cassert>
+#include <initializer_list>
 
 namespace {
 
@@ -154,6 +155,7 @@ void TestFighterTaskAndDefeatPolicies()
 
     // Client challenger defeat/absence resolution on host.
     assert(ShouldMarkClientChallengerDefeatedOnHost(true, 2, true, true, true, false, false));
+    assert(!ShouldMarkClientChallengerDefeatedOnHost(true, 2, true, true, true, false, false, true)); // partner in arena
     assert(!ShouldMarkClientChallengerDefeatedOnHost(true, 1, true, true, true, false, false));  // host hero uses native fightmem
     assert(!ShouldMarkClientChallengerDefeatedOnHost(true, 2, false, true, true, false, false)); // bout not started yet
     assert(!ShouldMarkClientChallengerDefeatedOnHost(true, 2, true, false, true, false, false)); // quest not Running
@@ -177,8 +179,56 @@ void TestClientDialogAttackForwarding()
     assert(!ShouldForwardClientDialogAttack(true, true, true, false, true, true));   // host executes locally
     assert(!ShouldForwardClientDialogAttack(false, false, true, true, false, true)); // disconnected
     assert(!ShouldForwardClientDialogAttack(false, true, false, true, false, true)); // missing target
-    assert(!ShouldForwardClientDialogAttack(false, true, true, true, false, false)); // target is not local player
-    assert(!ShouldForwardClientDialogAttack(false, true, true, false, false, true)); // neither mirrored nor leased
+    assert(ShouldForwardClientDialogAttack(false, true, true, true, false, false) == false);
+    assert(ShouldForwardClientDialogAttack(false, true, true, false, false, true) == false);
+}
+
+void TestSharedArenaCombatAndBystanderPolicies()
+{
+    using namespace g3t::arena_policy;
+
+    // Shared arena combat activates once fighter enters combat (not while walking in ZS_Arena=5 or Talk=6 or Down/Dead).
+    assert(ShouldAllowSharedArenaCombat(AttackReasonArena, true, 3, 1));
+    assert(ShouldAllowSharedArenaCombat(AttackReasonArena, false, 3, 1));
+    assert(ShouldAllowSharedArenaCombat(AttackReasonArena, false, 10, 0)); // client mirror in Abandoned
+    assert(!ShouldAllowSharedArenaCombat(AttackReasonArena, true, 5, 0)); // ZS_Arena walk-in
+    assert(!ShouldAllowSharedArenaCombat(AttackReasonArena, true, 6, 0)); // Talk
+    assert(!ShouldAllowSharedArenaCombat(AttackReasonArena, true, 8, 0)); // Down
+    assert(!ShouldAllowSharedArenaCombat(AttackReasonArena, true, 9, 0)); // Dead
+    assert(ShouldAllowSharedArenaCombat(AttackReasonDuel, true, 3, 1));  // running Sparring/Arena quest in Combat
+    assert(!ShouldAllowSharedArenaCombat(AttackReasonDuel, false, 3, 1)); // private 1v1 duel stays private
+    assert(!ShouldAllowSharedArenaCombat(0, false, 3, 1));
+
+    // Preserve Arena attack reason when AssessAgressor / AssessTarget / downed retarget fires for 2nd player.
+    assert(ShouldUpgradeArenaAttackReason(true, true, AttackReasonReactToDamage));
+    assert(ShouldUpgradeArenaAttackReason(true, true, AttackReasonStopFight));
+    assert(ShouldUpgradeArenaAttackReason(true, true, AttackReasonEnemy));
+    assert(ShouldUpgradeArenaAttackReason(true, true, AttackReasonReactToWeapon));
+    assert(ShouldUpgradeArenaAttackReason(true, true, AttackReasonDuel));
+    assert(!ShouldUpgradeArenaAttackReason(true, true, AttackReasonArena));
+    assert(!ShouldUpgradeArenaAttackReason(true, true, 0));
+    assert(!ShouldUpgradeArenaAttackReason(true, true, AttackReasonMurder));
+    assert(!ShouldUpgradeArenaAttackReason(true, true, AttackReasonRevolution));
+    assert(!ShouldUpgradeArenaAttackReason(true, true, AttackReasonKill));
+    assert(!ShouldUpgradeArenaAttackReason(false, true, AttackReasonReactToDamage));
+    assert(!ShouldUpgradeArenaAttackReason(true, false, AttackReasonReactToDamage));
+
+    // Bystanders near active arena do not turn angry/hostile at either player from fight-witness or weapon checks,
+    // while theft/murder/revolution and already-hostile NPCs are never suppressed.
+    for (int r : {AttackReasonReactToWeapon, AttackReasonAngry, AttackReasonStopFight,
+                  AttackReasonReactToDamage, AttackReasonEnemy, AttackReasonPlayerCommand,
+                  AttackReasonDuel, AttackReasonArena}) {
+        assert(ShouldSuppressArenaBystanderReaction(true, false, true, r, false));
+        assert(!ShouldSuppressArenaBystanderReaction(false, false, true, r, false));
+        assert(!ShouldSuppressArenaBystanderReaction(true, true, true, r, false));
+        assert(!ShouldSuppressArenaBystanderReaction(true, false, false, r, false));
+        assert(!ShouldSuppressArenaBystanderReaction(true, false, true, r, true));
+    }
+    assert(!ShouldSuppressArenaBystanderReaction(true, false, true, 4, false));  // Theft
+    assert(!ShouldSuppressArenaBystanderReaction(true, false, true, 5, false));  // UseInteractObject
+    assert(!ShouldSuppressArenaBystanderReaction(true, false, true, AttackReasonMurder, false));
+    assert(!ShouldSuppressArenaBystanderReaction(true, false, true, AttackReasonRevolution, false));
+    assert(!ShouldSuppressArenaBystanderReaction(true, false, true, AttackReasonKill, false));
 }
 
 } // namespace
@@ -191,5 +241,6 @@ int main()
     TestSpectatorRingExitSuppression();
     TestFighterTaskAndDefeatPolicies();
     TestClientDialogAttackForwarding();
+    TestSharedArenaCombatAndBystanderPolicies();
     return 0;
 }

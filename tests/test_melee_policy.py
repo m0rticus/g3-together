@@ -159,6 +159,23 @@ int main()
     v.focusRelation = Hostile;
     assert(Judge(v) == Decision::Bystander);
 
+    // Shared 2v1 arena opponent allows hits from the second player even before Attitude promotes or without target lock.
+    {
+        Victim arenaVictim;
+        arenaVictim.combat = true;
+        arenaVictim.targetsPlayer = false;
+        arenaVictim.targeted = false;
+        arenaVictim.attitude = Neutral;
+        arenaVictim.sharedArena = true;
+        assert(Judge(arenaVictim) == Decision::Allow);
+        arenaVictim.attitude = Friendly;
+        assert(Judge(arenaVictim) == Decision::Allow);
+        arenaVictim.hasFocus = true;
+        arenaVictim.focused = true;
+        arenaVictim.focusAttitude = Hostile;
+        assert(Judge(arenaVictim) == Decision::Allow);
+    }
+
     for (int ani = 0; ani < 30; ++ani) {
         assert(NpcProneAniState(ani) == (ani >= 15 && ani <= 21));
     }
