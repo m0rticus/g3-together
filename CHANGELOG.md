@@ -2,6 +2,12 @@
 
 This log summarizes the releases and integration builds that changed gameplay, networking, saves, NPCs, combat, quests, Steam connection, or supported installations.
 
+## Build 89
+
+**Default "Do not show tips" enabled on client join (protocol 81 unchanged)**
+
+- **Client tutorial tips default (`src/client_tips.cpp`, `src/client_tips.h`, `src/client_tips_policy.h`, `src/persist.cpp`, `src/persist_client.cpp`, `src/Script_G3Together.cpp`)**: Automatically enables `gCPlayerMemory_PS::HideTips` and checks the native GUI tutorial `"Do not show tips"` checkbox on client join, new-game entry, and template load so tutorial popups are suppressed by default without modifying protocol 81.
+
 ## Build 88
 
 **Player equipment sync, NPC handoff/PVS stability, client quest/sector sync, weapon loot anti-duplication, and protocol 81**
