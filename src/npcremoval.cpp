@@ -4,6 +4,7 @@
 
 #include "config.h"
 #include "crashlog.h"
+#include "frame_scan.h"
 #include "guid.h"
 #include "log.h"
 #include "net.h"
@@ -177,6 +178,9 @@ bool SuppressedUnloaded(uint8_t const bytes[16], char const* entityName, float c
 bool Suppressed(eCEntity const* entity)
 {
     if (!entity) return false;
+    for (auto const& removal : removals) {
+        if (removal.applied == entity && removal.fence.Removed()) return true;
+    }
     uint8_t bytes[16]; guid::CopyEntity(const_cast<eCEntity*>(entity), bytes);
     return Suppressed(bytes);
 }
@@ -244,8 +248,9 @@ void Tick()
         }
     }
     if (!any) return;
-    const auto all = Entity::GetNPCs();
-    for (GEInt i = 0; i < all.GetCount(); ++i) ClearReferences(all.GetAt(i).GetInstance());
+    for (auto const& entry : frame_scan::Npcs()) {
+        if (entry.entity && entry.npc && !Suppressed(entry.guid.data())) ClearReferences(entry.entity);
+    }
     ClearReferences(gCSession::GetInstance().GetHero());
     if (remote::ControlledBody() != gCSession::GetInstance().GetHero())
         ClearReferences(remote::ControlledBody());

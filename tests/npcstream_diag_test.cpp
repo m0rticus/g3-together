@@ -231,23 +231,31 @@ int main()
         perfRuntime.AddPhase(g3t::host_frame_diag::Phase::World, 100000, 100500);
         perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Net, 100500, 101200);
         perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Npcs, 101200, 104200);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::Relation, 104200, 104600);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::InfoCmd, 104600, 104850);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::Doors, 104850, 104950);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::Clock, 104950, 104970);
         perfRuntime.EndFrame(105000);
 
         perfRuntime.BeginFrame(125000, 5100, false, true);
         perfRuntime.AddPhase(g3t::host_frame_diag::Phase::World, 125000, 125500);
         perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Net, 125500, 126300);
         perfRuntime.AddPhase(g3t::host_frame_diag::Phase::Npcs, 126300, 131300);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::Relation, 131300, 131900);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::InfoCmd, 131900, 132050);
+        perfRuntime.AddSubPhase(g3t::host_frame_diag::SubPhase::Doors, 132050, 132110);
         perfRuntime.EndFrame(132000);
 
         g3t::host_frame_diag::Summary hb{};
         CHECK(perfRuntime.PollHeartbeat(5100, hb));
         CHECK(hb.frames == 2 && hb.focusedPct == 50);
-        char hbLine[512] = {};
+        char hbLine[640] = {};
         g3t::host_frame_diag::FormatHeartbeat(hbLine, sizeof(hbLine), hb, 2, 1876);
         const std::string heartbeatText(hbLine);
         CHECK(Has(heartbeatText, "HEARTBEAT host-perf: window_ms=5000 frames=2 spheres=2 processed=1876"));
         CHECK(Has(heartbeatText, "fps=40.0 focused_pct=50 frame_ms=25.00/25.00 engine_ms=20.00/20.00"));
         CHECK(Has(heartbeatText, "mod_ms=6.00/7.00 mod_npcs_ms=4.00/5.00 mod_net_ms=0.75 mod_world_ms=0.50"));
+        CHECK(Has(heartbeatText, "mod_other_ms=0.79/0.81 mod_top=relation:0.50/0.60,infocmd:0.20/0.25,doors:0.08/0.10"));
 
         Context perfContext = context;
         perfContext.perf = perfRuntime.TakeStreamSummary(5100);

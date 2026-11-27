@@ -14,6 +14,7 @@
 #include <Windows.h>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace g3t::sectors {
 namespace {
@@ -32,6 +33,42 @@ sector_sync::StateMap deferredClientLive;
 uint32_t nextRequestAt = 0;
 unsigned sentCount = 0;
 unsigned appliedCount = 0;
+
+struct CachedHostSector {
+    gCSector* sector = nullptr;
+    bool enabled = false;
+};
+std::vector<CachedHostSector> cachedHostSectors;
+GEInt cachedHostSectorCount = -1;
+
+void RefreshHostSectorCache()
+{
+    cachedHostSectors.clear();
+    cachedHostSectorCount = -1;
+    gCWorld* world = gCWorld::GetCurrentWorld();
+    if (!world) return;
+    const GEInt count = world->GetSectorCount();
+    cachedHostSectorCount = count;
+    cachedHostSectors.reserve(static_cast<size_t>(count > 0 ? count : 0));
+    for (GEInt i = 0; i < count; ++i) {
+        gCSector* sector = world->GetSectorAt(i);
+        if (!sector) continue;
+        char const* name = sector->GetFileBaseName().GetText();
+        if (!name || !*name) continue;
+        cachedHostSectors.push_back({sector, sector->IsEnabled() != GEFalse});
+    }
+}
+
+bool HostSectorsDirty()
+{
+    gCWorld* world = gCWorld::GetCurrentWorld();
+    if (!world) return false;
+    if (world->GetSectorCount() != cachedHostSectorCount) return true;
+    for (auto const& entry : cachedHostSectors) {
+        if ((entry.sector->IsEnabled() != GEFalse) != entry.enabled) return true;
+    }
+    return false;
+}
 
 gCSectorPersistence_PS* SectorPersistence()
 {
@@ -98,6 +135,7 @@ GEBool __fastcall SectorEnableDetour(gCSector* self, void*, GEBool enable)
             char const* name = self->GetFileBaseName().GetText();
             if (name && *name && hostState.RecordLive(name, nowEnabled))
                 BroadcastLive(name, nowEnabled, "native");
+            RefreshHostSectorCache();
         }
         world::RequestProcessingUpdate();
     }
@@ -175,6 +213,7 @@ bool RestoreSaveExtension(uint32_t savedVersion, std::vector<uint8_t> const& byt
         Logf("sectors: restored save extension entries=%zu changed=%u", saved.size(), changed);
     }
     hostState.Seed(CaptureWorldSectors());
+    RefreshHostSectorCache();
     return true;
 }
 
@@ -369,6 +408,8 @@ void OnWorldChange()
     hostState.Reset();
     clientState.Reset();
     deferredClientLive.clear();
+    cachedHostSectors.clear();
+    cachedHostSectorCount = -1;
     nextRequestAt = 0;
 }
 
@@ -381,9 +422,12 @@ void Tick()
             return;
         if (!hostState.seeded) {
             hostState.Seed(CaptureWorldSectors());
+            RefreshHostSectorCache();
             return;
         }
+        if (!HostSectorsDirty()) return;
         const auto deltas = hostState.Reconcile(CaptureWorldSectors());
+        RefreshHostSectorCache();
         if (!deltas.empty()) {
             RefreshPersistence();
             for (auto const& [name, enabled] : deltas)

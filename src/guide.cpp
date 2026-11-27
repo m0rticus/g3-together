@@ -45,6 +45,8 @@ std::unordered_map<GuidKey, uint32_t, GuidHash> joined;     // GUID -> until whe
 std::unordered_map<std::string, int> observedQuestStatus;   // questName -> last observed status
 std::unordered_set<std::string> hostSyncedRunning;          // FollowNpc quests marked Running by host sync
 std::unordered_set<GuidKey, GuidHash> awaitingHostRelease;  // client guides released here, awaiting host guidePlayer clearance
+std::vector<gCQuest_PS*> cachedFollowQuests;
+GEInt cachedQuestCount = -1;
 constexpr uint32_t JoinWatch = 5000;  // ms
 bool on = true;  // QA negative control: guidesyncoff
 unsigned guidesTaken = 0, followersTaken = 0, given = 0, readopted = 0, joinsStarted = 0;
@@ -211,9 +213,16 @@ void TickClientFollowQuests(eCEntity* hero)
     gCQuestManager_PS* manager = gCQuestManager_PS::GetInstance();
     if (!manager) return;
     auto& quests = manager->AccessQuests();
-    for (GEInt qi = 0; qi < quests.GetCount(); ++qi) {
-        auto* quest = static_cast<gCQuest_PS*>(quests.AccessAt(qi));
-        if (!quest || quest->GetType().GetValue() != gEQuestType_FollowNpc) continue;
+    if (quests.GetCount() != cachedQuestCount) {
+        cachedFollowQuests.clear();
+        cachedQuestCount = quests.GetCount();
+        for (GEInt qi = 0; qi < cachedQuestCount; ++qi) {
+            auto* quest = static_cast<gCQuest_PS*>(quests.AccessAt(qi));
+            if (quest && quest->GetType().GetValue() == gEQuestType_FollowNpc)
+                cachedFollowQuests.push_back(quest);
+        }
+    }
+    for (gCQuest_PS* quest : cachedFollowQuests) {
         char const* qName = quest->AccessName().GetText();
         if (!qName || !*qName) continue;
         const int cur = quest->GetStatus().GetValue();
@@ -415,6 +424,8 @@ void OnWorldChange()
     observedQuestStatus.clear();
     hostSyncedRunning.clear();
     awaitingHostRelease.clear();
+    cachedFollowQuests.clear();
+    cachedQuestCount = -1;
 }
 
 void Report(char const* name, LogFn log)

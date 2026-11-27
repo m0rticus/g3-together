@@ -4,6 +4,7 @@
 #include "ai.h"
 #include "body.h"
 #include "downed.h"
+#include "frame_scan.h"
 #include "guid.h"
 #include "items.h"
 #include "log.h"
@@ -408,11 +409,11 @@ void LocalInventoryTick()
     }
     const bCVector& p = hero->GetWorldPosition();
     const float here[3] = {p.GetX(), p.GetY(), p.GetZ()};
-    const bTObjArray<Entity> all = Entity::GetNPCs();
-    for (int i = 0; i < all.GetCount(); ++i) {
-        Entity entity = all.GetAt(i);
-        eCEntity* instance = entity.GetInstance();
-        if (instance && DistanceTo(instance, here) <= PreRollRadius && Corpse(entity)) PrepareLocalLoot(entity);
+    for (auto const& entry : frame_scan::Npcs()) {
+        eCEntity* instance = entry.entity;
+        if (!instance || DistanceTo(instance, here) > PreRollRadius) continue;
+        Entity entity(instance);
+        if (Corpse(entity)) PrepareLocalLoot(entity);
     }
 }
 

@@ -77,6 +77,7 @@ struct CachedBoutQuest {
     gCQuest_PS* quest = nullptr;
     std::string name;
     int arenaIndex = -1;
+    BoutQuestState* state = nullptr;
 };
 
 std::unordered_map<GuidKey, Held, GuidHash> held;           // NPC GUID -> active host/client bout or duel
@@ -147,7 +148,9 @@ std::vector<CachedBoutQuest> const& BoutQuests()
                 }
             }
         }
-        cachedBoutQuests.push_back({quest, quest->GetName().GetText(), arenaIndex});
+        std::string name = quest->GetName().GetText();
+        BoutQuestState* state = &boutQuests[name];
+        cachedBoutQuests.push_back({quest, std::move(name), arenaIndex, state});
     }
     return cachedBoutQuests;
 }
@@ -455,10 +458,10 @@ void ObserveQuestTransitions(bool allowFlush)
     bool flushQuests = false;
     for (CachedBoutQuest const& entry : BoutQuests()) {
         gCQuest_PS* quest = entry.quest;
-        if (!quest) continue;
+        if (!quest || !entry.state) continue;
         const int type = static_cast<int>(quest->GetType().GetValue());
         const int status = static_cast<int>(quest->GetStatus().GetValue());
-        BoutQuestState& qs = boutQuests[entry.name];
+        BoutQuestState& qs = *entry.state;
         const bool firstObservation = (qs.observedStatus < 0);
         const int prev = firstObservation ? status : qs.observedStatus;
         qs.observedStatus = status;

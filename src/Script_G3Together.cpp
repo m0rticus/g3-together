@@ -60,6 +60,7 @@
 #include "body.h"
 #include "guid.h"
 #include "focus_diag.h"
+#include "frame_scan.h"
 #include "host_frame_diag.h"
 #include "telemetry.h"
 
@@ -173,7 +174,7 @@ void Frame()
             g3t::host_frame_diag::Summary perf{};
             if (g3t::host_frame_diag::Global().PollHeartbeat(g3t::net::Now(), perf)) {
                 const auto sim = g3t::world::HostSimulationStatus();
-                char line[512] = {};
+                char line[640] = {};
                 g3t::host_frame_diag::FormatHeartbeat(line, sizeof(line), perf, sim.spheres, sim.processed);
                 g3t::Log(line);
             }
@@ -192,6 +193,15 @@ void Step(char const* name, Fn&& tick)
 }
 
 template <typename Fn>
+void SubStep(g3t::host_frame_diag::SubPhase sub, char const* name, Fn&& tick)
+{
+    g3t::movement::Stage stage(name);
+    const long long t0 = g3t::GetLocalConfig().host ? g3t::movement::EntryTime() : 0;
+    tick();
+    if (t0) g3t::host_frame_diag::Global().AddSubPhase(sub, t0, g3t::movement::EntryTime());
+}
+
+template <typename Fn>
 void TimedStep(char const* name, g3t::host_frame_diag::Phase phase, Fn&& tick)
 {
     g3t::movement::Stage stage(name);
@@ -206,6 +216,7 @@ struct FrameScope {
     {
         if (run) ++moduleProcessDepth;
         if (run && moduleProcessDepth == 1) {
+            g3t::frame_scan::BeginFrame();
             g3t::movement::Begin(entered);
             if (g3t::GetLocalConfig().host) {
                 auto& session = gCSession::GetInstance();
@@ -219,9 +230,13 @@ struct FrameScope {
     {
         if (run) {
             TimedStep("net flush", g3t::host_frame_diag::Phase::Net, [] { g3t::net::Flush(); });
-            Step("persist end", [] { g3t::persist::EndFrame(); });
-            if (--moduleProcessDepth == 0) g3t::hud::Tick();
-            if (moduleProcessDepth == 0) {
+            SubStep(g3t::host_frame_diag::SubPhase::PersistEnd, "persist end", [] { g3t::persist::EndFrame(); });
+            if (--moduleProcessDepth == 0) {
+                const long long t0 = g3t::GetLocalConfig().host ? g3t::movement::EntryTime() : 0;
+                g3t::hud::Tick();
+                if (t0) g3t::host_frame_diag::Global().AddSubPhase(
+                    g3t::host_frame_diag::SubPhase::Hud, t0, g3t::movement::EntryTime());
+                g3t::frame_scan::EndFrame();
                 g3t::movement::End();
                 if (g3t::GetLocalConfig().host)
                     g3t::host_frame_diag::Global().EndFrame(g3t::movement::EntryTime());
@@ -314,6 +329,7 @@ class Module : public eCEngineComponentBase
         ForgetStep("clock cleanup", &g3t::clock::OnWorldChange);
         ForgetStep("HUD observation cleanup", &g3t::hud::OnWorldChange);
         ForgetStep("movement observation cleanup", &g3t::movement::OnWorldChange);
+        g3t::frame_scan::OnWorldChange();
         g3t::host_frame_diag::Global().Reset();
         {
             g3t::crashlog::WorldEntryScope operation("downed cleanup");
@@ -403,8 +419,14 @@ class Module : public eCEngineComponentBase
     }
     // Also a frame the game runs inside its own load (Session::Start, C 22.10.): there nothing of the mod runs, from the
     // first line on (C 23.10.); the world is half made and the load has not returned.
+    struct SubCall {
+        g3t::host_frame_diag::SubPhase sub;
+        char const* name;
+        void (*call)();
+    };
     void Process() override
     {
+        using Sub = g3t::host_frame_diag::SubPhase;
         if (g3t::ai::ShuttingDown()) return;
         if (g3t::persist::ProcessClientTransition()) return;
         g3t::crashlog::WorldEntryScope entryProcess("engine module Process");
@@ -412,11 +434,11 @@ class Module : public eCEngineComponentBase
         if (!frame.run) return;
         {
             g3t::crashlog::WorldEntryScope operation("frame report");
-            Step("frame report", &Frame);
+            SubStep(Sub::Frame, "frame report", &Frame);
         }
         if (!g3t::npcplayback::Available()) {
-            Step("crashlog", &g3t::crashlog::Tick);
-            Step("persist", &g3t::persist::Tick);
+            SubStep(Sub::Crashlog, "crashlog", &g3t::crashlog::Tick);
+            SubStep(Sub::Persist, "persist", &g3t::persist::Tick);
             g3t::hud::MenuLine(g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
             if (!playbackErrorShown && gCSession::GetInstance().IsGameRunning()) {
                 g3t::hud::Message(g3t::hud::Bad, g3t::i18n::Text(g3t::i18n::NpcReplayUnavailable));
@@ -424,11 +446,11 @@ class Module : public eCEngineComponentBase
             }
             return;
         }
-        Step("crashlog", &g3t::crashlog::Tick);
+        SubStep(Sub::Crashlog, "crashlog", &g3t::crashlog::Tick);
         TimedStep("world", g3t::host_frame_diag::Phase::World, &g3t::world::Tick);
-        Step("NPC removal", &g3t::npcremoval::Tick);
-        Step("NPC identity", &g3t::npcs::ReconcileClientEntities);
-        Step("NPC playback", &g3t::npcplayback::Tick);
+        SubStep(Sub::NpcRemoval, "NPC removal", &g3t::npcremoval::Tick);
+        SubStep(Sub::NpcIdentity, "NPC identity", &g3t::npcs::ReconcileClientEntities);
+        SubStep(Sub::NpcPlayback, "NPC playback", &g3t::npcplayback::Tick);
         {
             g3t::crashlog::WorldEntryScope operation("remote tick / ENet service");
             TimedStep("remote / ENet service", g3t::host_frame_diag::Phase::Net, &g3t::remote::Tick);
@@ -441,59 +463,58 @@ class Module : public eCEngineComponentBase
             g3t::telemetry::Tick();
             return;
         }
-        Step("AI", &g3t::ai::Tick);
+        SubStep(Sub::Ai, "AI", &g3t::ai::Tick);
         TimedStep("NPC / lease", g3t::host_frame_diag::Phase::Npcs, &g3t::npcs::Tick);
-        Step("combat", &g3t::combat::Tick);
-        constexpr NamedCall beforeDowned[] = {
-            {"summon", &g3t::summon::Tick},
-            {"story", &g3t::story::Tick},
-            {"talk", &g3t::talk::Tick},
+        SubStep(Sub::Combat, "combat", &g3t::combat::Tick);
+        constexpr SubCall beforeDowned[] = {
+            {Sub::Summon, "summon", &g3t::summon::Tick},
+            {Sub::Story, "story", &g3t::story::Tick},
+            {Sub::Talk, "talk", &g3t::talk::Tick},
         };
-        for (auto const& step : beforeDowned) Step(step.name, step.call);
-        { g3t::movement::Stage stage("downed"); g3t::downed::Tick(); }
-        constexpr NamedCall beforePersist[] = {
-            {"range", &g3t::range::Tick},
-            {"partner jump", &g3t::partner::Tick},
-            {"doors", &g3t::doors::Tick},
-            {"sectors", &g3t::sectors::Tick},
-            {"enclaves", &g3t::enclaves::Tick},
-            {"journal", &g3t::journal::Tick},
+        for (auto const& step : beforeDowned) SubStep(step.sub, step.name, step.call);
+        SubStep(Sub::Downed, "downed", &g3t::downed::Tick);
+        constexpr SubCall beforePersist[] = {
+            {Sub::Range, "range", &g3t::range::Tick},
+            {Sub::Partner, "partner jump", &g3t::partner::Tick},
+            {Sub::Doors, "doors", &g3t::doors::Tick},
+            {Sub::Sectors, "sectors", &g3t::sectors::Tick},
+            {Sub::Enclaves, "enclaves", &g3t::enclaves::Tick},
+            {Sub::Journal, "journal", &g3t::journal::Tick},
         };
-        for (auto const& step : beforePersist) Step(step.name, step.call);
+        for (auto const& step : beforePersist) SubStep(step.sub, step.name, step.call);
         {
             g3t::crashlog::WorldEntryScope operation("persist tick");
-            g3t::movement::Stage stage("persist");
-            g3t::persist::Tick();
+            SubStep(Sub::Persist, "persist", &g3t::persist::Tick);
         }
-        constexpr NamedCall beforeRelations[] = {
-            {"clock", &g3t::clock::Tick},
-            {"info command", &g3t::infocmd::Tick},
-            {"guide", &g3t::guide::Tick},
-            {"arena", &g3t::arena::Tick},
-            {"ending", &g3t::ending::Tick},
-            {"containers", &g3t::containers::Tick},
-            {"trade", &g3t::trade::Tick},
-            {"map marks", &g3t::mapmarks::Tick},
-            {"ransack", &g3t::ransack::Tick},
-            {"witness", &g3t::witness::Tick},
-            {"guards", &g3t::guards::Tick},
-            {"pickpocket", &g3t::pickpocket::Tick},
-            {"respawn", &g3t::respawn::Tick},
-            {"occupancy", &g3t::occupancy::Tick},
-            {"address", &g3t::address::Tick},
+        constexpr SubCall beforeRelations[] = {
+            {Sub::Clock, "clock", &g3t::clock::Tick},
+            {Sub::InfoCmd, "info command", &g3t::infocmd::Tick},
+            {Sub::Guide, "guide", &g3t::guide::Tick},
+            {Sub::Arena, "arena", &g3t::arena::Tick},
+            {Sub::Ending, "ending", &g3t::ending::Tick},
+            {Sub::Containers, "containers", &g3t::containers::Tick},
+            {Sub::Trade, "trade", &g3t::trade::Tick},
+            {Sub::MapMarks, "map marks", &g3t::mapmarks::Tick},
+            {Sub::Ransack, "ransack", &g3t::ransack::Tick},
+            {Sub::Witness, "witness", &g3t::witness::Tick},
+            {Sub::Guards, "guards", &g3t::guards::Tick},
+            {Sub::Pickpocket, "pickpocket", &g3t::pickpocket::Tick},
+            {Sub::Respawn, "respawn", &g3t::respawn::Tick},
+            {Sub::Occupancy, "occupancy", &g3t::occupancy::Tick},
+            {Sub::Address, "address", &g3t::address::Tick},
         };
-        for (auto const& step : beforeRelations) Step(step.name, step.call);
-        { g3t::movement::Stage stage("fight memory"); g3t::fightmem::Tick(); }
-        { g3t::movement::Stage stage("relation"); g3t::relation::Tick(); }
-        constexpr NamedCall tailSteps[] = {
-            {"XP share", &g3t::xpshare::Tick},
-            {"dialog audio", &g3t::dialogaudio::Tick},
-            {"offer", &g3t::offer::Tick},
-            {"shot", &g3t::shot::Tick},
-            {"spells", &g3t::spells::Tick},
+        for (auto const& step : beforeRelations) SubStep(step.sub, step.name, step.call);
+        SubStep(Sub::FightMem, "fight memory", [] { g3t::fightmem::Tick(); });
+        SubStep(Sub::Relation, "relation", [] { g3t::relation::Tick(); });
+        constexpr SubCall tailSteps[] = {
+            {Sub::XpShare, "XP share", &g3t::xpshare::Tick},
+            {Sub::DialogAudio, "dialog audio", &g3t::dialogaudio::Tick},
+            {Sub::Offer, "offer", &g3t::offer::Tick},
+            {Sub::Shot, "shot", &g3t::shot::Tick},
+            {Sub::Spells, "spells", &g3t::spells::Tick},
         };
-        for (auto const& step : tailSteps) Step(step.name, step.call);
-        Step("telemetry", &g3t::telemetry::Tick);
+        for (auto const& step : tailSteps) SubStep(step.sub, step.name, step.call);
+        SubStep(Sub::Telemetry, "telemetry", &g3t::telemetry::Tick);
     }
     void PostProcess() override {}
     void OnBeginRenderSolid() override {}

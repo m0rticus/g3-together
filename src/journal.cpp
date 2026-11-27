@@ -2,7 +2,9 @@
 #include "journal.h"
 #include "npcremoval.h"
 
+#include "frame_scan.h"
 #include "guid.h"
+#include "guid_key.h"
 #include "log.h"
 #include "net.h"
 #include "npcs.h"
@@ -26,8 +28,8 @@ struct Death
     std::string name;
 };
 
-std::unordered_map<std::string, Death> deaths;  // by GUID (16 raw bytes)
-std::unordered_map<std::string, bool> alive;    // NPCs this machine simulates: alive when last seen
+std::unordered_map<GuidKey, Death, GuidHash> deaths;  // by GUID (16 raw bytes)
+std::unordered_map<GuidKey, bool, GuidHash> alive;    // NPCs this machine simulates: alive when last seen
 bool reporting = true;
 unsigned reported = 0, received = 0, appliedCount = 0;
 bool questCounting = true;  // QA negative control: QuestCountOff
@@ -40,19 +42,16 @@ constexpr uint32_t ScanInterval = 250;
 // routine); apply only after that has run.
 constexpr uint32_t SettleTime = 700;
 
-std::string Key(eCEntity const* entity)
+GuidKey Key(eCEntity const* entity)
 {
     uint8_t raw[16] = {};
     guid::CopyEntity(const_cast<eCEntity*>(entity), raw);
-    return std::string(reinterpret_cast<char const*>(raw), 16);
+    return ToGuidKey(raw);
 }
 
 bool Processed(eCEntity const* entity)
 {
-    const bTObjArray<Entity> all = Entity::GetNPCs();
-    for (int i = 0; i < all.GetCount(); ++i)
-        if (all.GetAt(i).GetInstance() == entity) return true;
-    return false;
+    return frame_scan::ContainsRoiNpc(entity);
 }
 
 void CountQuest(Entity& npc)
@@ -100,10 +99,10 @@ void OnDeath(uint8_t by, uint8_t const guid[16])
     SyncClientEpoch();
     ++received;
     if (net::IsHost()) net::SendDeath(guid, by, by);  // pass it on to everyone else
-    const std::string key(reinterpret_cast<char const*>(guid), 16);
+    const GuidKey key = ToGuidKey(guid);
     Entity npc(npcs::NpcByGuid(guid));  // an NPC only (Fable 1.7: quest counters ran on any GUID)
     if (!npc.GetInstance()) {
-        if (!net::IsHost() && key.size() == 16) {
+        if (!net::IsHost()) {
             Death& d = deaths[key];
             d.by = by;
             d.applied = false;
@@ -192,7 +191,7 @@ bool LeaseDeath(eCEntity* entity, unsigned char owner)
 
 bool RecordedDeath(unsigned char const guid[16])
 {
-    return deaths.count(std::string(reinterpret_cast<char const*>(guid), 16)) != 0;
+    return deaths.count(ToGuidKey(guid)) != 0;
 }
 
 unsigned Write(FILE* file)
@@ -217,11 +216,11 @@ unsigned Read(FILE* file)
         unsigned by = 0;
         int applied = 0;
         if (sscanf_s(line, "death %32s %u %d %127s", hex, 33u, &by, &applied, name, 128u) < 3) continue;
-        std::string key(16, '\0');
+        GuidKey key{};
         for (int i = 0; i < 16; ++i) {
             unsigned v = 0;
             sscanf_s(hex + 2 * i, "%2x", &v);
-            key[i] = static_cast<char>(v);
+            key[static_cast<size_t>(i)] = static_cast<uint8_t>(v);
         }
         Death& d = deaths[key];
         d.by = static_cast<uint8_t>(by);
@@ -255,7 +254,7 @@ void SeedWorldDeaths()
                 !raw->GetPropertySet(eEPropertySetType_DamageReceiver)) continue;
             Entity npc(raw);
             if (!npc.IsDead()) continue;
-            const std::string key = Key(raw);
+            const GuidKey key = Key(raw);
             if (deaths.find(key) != deaths.end()) continue;
             Death d{};
             d.by = 1;
@@ -280,10 +279,7 @@ void SyncToClients()
     if (!net::IsHost() || !net::Connected()) return;
     SeedWorldDeaths();
     for (auto const& [key, d] : deaths) {
-        if (key.size() != 16) continue;
-        uint8_t guid[16];
-        std::memcpy(guid, key.data(), 16);
-        if (!npcremoval::Suppressed(guid)) net::SendDeath(guid, d.by ? d.by : 1, 0);
+        if (!npcremoval::Suppressed(key.data())) net::SendDeath(key.data(), d.by ? d.by : 1, 0);
     }
 }
 
@@ -296,7 +292,7 @@ bool Pending(eCEntity const* entity)
 
 void NewLife(unsigned char const guid[16])
 {
-    const std::string key(reinterpret_cast<char const*>(guid), 16);
+    const GuidKey key = ToGuidKey(guid);
     auto it = deaths.find(key);
     if (it != deaths.end()) {
         Logf("journal: %s lives again; its death is over", it->second.name.c_str());
@@ -307,7 +303,7 @@ void NewLife(unsigned char const guid[16])
 void NewLife(eCEntity const* entity)
 {
     if (!entity) return;
-    const std::string key = Key(entity);
+    const GuidKey key = Key(entity);
     auto it = deaths.find(key);
     if (it != deaths.end()) {
         Logf("journal: %s lives again; its death is over", it->second.name.c_str());
@@ -327,15 +323,13 @@ void Tick()
     if (!net::IsHost()) {
         SyncClientEpoch();
         for (auto& [key, d] : deaths) {
-            if (d.applied || key.size() != 16) continue;
-            uint8_t guid[16];
-            std::memcpy(guid, key.data(), 16);
-            Entity npc(npcs::NpcByGuid(guid));
-            if (!npc.GetInstance() || npcremoval::Suppressed(npc.GetInstance()) || npcs::IsMirrored(npc.GetInstance())) continue;
+            if (d.applied) continue;
+            Entity npc(npcs::NpcByGuid(key.data()));
+            if (!npc.GetInstance() || npcremoval::Suppressed(key.data()) || npcs::IsMirrored(npc.GetInstance())) continue;
             if (d.name.empty()) d.name = npc.GetName().GetText();
             if (!Processed(npc.GetInstance())) {
                 d.seenSince = 0;
-                ApplyUnprocessedClientDeath(npc, guid);
+                ApplyUnprocessedClientDeath(npc, key.data());
                 continue;
             }
             SettlePendingDeath(npc, d, now);
@@ -343,14 +337,13 @@ void Tick()
         return;
     }
     SeedWorldDeaths();
-    const bTObjArray<Entity> all = Entity::GetNPCs();
-    for (int i = 0; i < all.GetCount(); ++i) {
-        Entity npc = all.GetAt(i);
-        eCEntity* instance = npc.GetInstance();
-        if (!instance || instance == hero || remote::IsPuppet(instance) || npcremoval::Suppressed(instance) ||
+    for (auto const& scan : frame_scan::Npcs()) {
+        eCEntity* instance = scan.entity;
+        if (!instance || instance == hero || remote::IsPuppet(instance) || npcremoval::Suppressed(scan.guid.data()) ||
             IsTemporarySummon(instance))
             continue;
-        const std::string key = Key(instance);
+        Entity npc(instance);
+        const GuidKey& key = scan.guid;
         const bool dead = npc.IsDead();
         auto entry = deaths.find(key);
         if (npcs::IsMirrored(instance) || npcs::DiedOnHost(instance)) {
@@ -365,10 +358,8 @@ void Tick()
         auto seen = alive.find(key);
         const bool fromJournal = entry != deaths.end();
         if (seen != alive.end() && seen->second && dead && !fromJournal && reporting) {
-            uint8_t guid[16];
-            std::memcpy(guid, key.data(), 16);
             if (net::Connected()) {
-                net::SendDeath(guid, net::LocalId(), 0);
+                net::SendDeath(key.data(), net::LocalId(), 0);
                 ++reported;
             }
             Death& d = deaths[key];  // recorded here as well, already applied

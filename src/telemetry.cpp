@@ -291,20 +291,31 @@ size_t FormatCarryDelta(std::vector<CarryEntry> const& before, std::vector<Carry
     return pos;
 }
 
-void CaptureHeroSlots(Entity& hero, SlotTable& out) noexcept
+void CaptureHeroSlots(Entity& hero, SlotTable& out, int* outGold = nullptr) noexcept
 {
     out.Clear();
     out.primed = true;
-    for (GEInt i = 0; i < hero.Inventory.GetStackCount(); ++i) {
+    int gold = 0;
+    const GEInt count = hero.Inventory.GetStackCount();
+    for (GEInt i = 0; i < count; ++i) {
         const int slot = static_cast<int>(hero.Inventory.GetSlotFromStack(i));
-        if (slot <= gESlot_None || slot >= schema::MaxTrackedSlots) continue;
+        if (slot == gESlot_None) {
+            if (outGold) {
+                Entity item = hero.Inventory.GetTemplateItem(i);
+                if (item.GetInstance() && std::strcmp(item.GetName().GetText(), "It_Gold") == 0)
+                    gold += hero.Inventory.GetAmount(i);
+            }
+            continue;
+        }
+        if (slot < gESlot_None || slot >= schema::MaxTrackedSlots) continue;
         Entity item = hero.Inventory.GetTemplateItem(i);
         char const* name = item.GetInstance() ? item.GetName().GetText() : "";
         out.Set(slot, name, npc_item_quality::MaskQuality(hero.Inventory.GetQuality(i)));
     }
+    if (outGold) *outGold = gold;
 }
 
-bool CaptureHeroVitals(eCDynamicEntity* rawHero, Vitals& out) noexcept
+bool CaptureHeroVitals(eCDynamicEntity* rawHero, Vitals& out, bool includeGold = true) noexcept
 {
     if (!rawHero || !rawHero->GetPropertySet(eEPropertySetType_PlayerMemory) ||
         !rawHero->GetPropertySet(eEPropertySetType_NPC) ||
@@ -323,7 +334,7 @@ bool CaptureHeroVitals(eCDynamicEntity* rawHero, Vitals& out) noexcept
     out.level = static_cast<int>(hero.NPC.Level);
     out.lpAttribs = static_cast<int>(hero.PlayerMemory.LPAttribs);
     out.lpPerks = static_cast<int>(hero.PlayerMemory.LPPerks);
-    out.gold = CountHeroGold(hero);
+    out.gold = includeGold ? CountHeroGold(hero) : 0;
     out.chapter = static_cast<int>(hero.PlayerMemory.Chapter);
     if (auto* routine = static_cast<gCScriptRoutine_PS*>(rawHero->GetPropertySet(eEPropertySetType_ScriptRoutine))) {
         out.aiMode = static_cast<int>(routine->GetAIMode());
@@ -423,10 +434,10 @@ void EmitWorldBaseline(eCDynamicEntity* rawHero, Vitals const& v, SlotTable cons
 void ObserveHeroTransitions(eCDynamicEntity* rawHero, uint32_t nowMs)
 {
     Vitals cur;
-    if (!CaptureHeroVitals(rawHero, cur)) return;
+    if (!CaptureHeroVitals(rawHero, cur, false)) return;
     Entity hero(rawHero);
     SlotTable slots;
-    CaptureHeroSlots(hero, slots);
+    CaptureHeroSlots(hero, slots, &cur.gold);
     const uint32_t epoch = net::WorldEpoch();
     if (!worldBaselineEmitted || baselineEpoch != epoch) {
         worldBaselineEmitted = true;

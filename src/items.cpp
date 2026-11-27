@@ -11,11 +11,12 @@
 #include <Game.h>
 #include <Windows.h>
 #include <Script.h>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <map>
-#include <set>
 #include <string>
+#include <unordered_set>
 
 namespace g3t::items {
 namespace {
@@ -106,7 +107,18 @@ char takingName[64] = "";
 bool taking = false;
 uint32_t takingAmount = 1;
 std::map<std::string, int> carriedBefore;  // the hero's inventory when the take began: item template -> amount
-std::set<std::string> consumed, denied;
+using GuidKey = std::array<uint8_t, 16>;
+struct GuidHash {
+    size_t operator()(GuidKey const& key) const noexcept { return net::HashGuid(key.data()); }
+};
+std::unordered_set<GuidKey, GuidHash> consumed, denied;
+
+GuidKey KeyOf(uint8_t const raw[16])
+{
+    GuidKey key{};
+    std::memcpy(key.data(), raw, 16);
+    return key;
+}
 
 std::map<std::string, int> SumByName(Entity& entity)
 {
@@ -138,13 +150,16 @@ bool BeforeTake(gCScriptProcessingUnit* spu)
     if (!taking) return true;
     uint8_t raw[16];
     guid::CopyEntity(item, raw);
-    const std::string key(reinterpret_cast<char const*>(raw), 16);
-    if (!saving::personal::Id(key)) {
-        taking = false;
-        return true;
+    {
+        const std::string key(reinterpret_cast<char const*>(raw), 16);
+        if (!saving::personal::Id(key)) {
+            taking = false;
+            return true;
+        }
     }
     ++takesBegun;
     std::memcpy(takingGuid, raw, 16);
+    const GuidKey key = KeyOf(raw);
     if (consumed.count(key)) {
         taking = false;
         if (denied.insert(key).second) {
@@ -168,7 +183,7 @@ void AfterTake(gCScriptProcessingUnit* spu)
     std::memcpy(&raw, takingGuid, 16);
     if (guid::Resolve(raw).GetInstance()) return;  // not taken yet (the animation runs over frames)
     taking = false;
-    consumed.insert(std::string(reinterpret_cast<char const*>(takingGuid), 16));
+    consumed.insert(KeyOf(takingGuid));
     ++tookCount;
     // What actually arrived can differ from the world item (a gold stack turns into coins): compare.
     for (auto const& [name, amount] : Carried(hero)) {
@@ -205,27 +220,29 @@ void AppendPersonal(saving::personal::Snapshot& snapshot)
     for (auto const& key : consumed) {
         saving::personal::Inventory row;
         row.kind = saving::personal::Kind::GroundTaken;
-        snapshot[key] = std::move(row);
+        snapshot[std::string(reinterpret_cast<char const*>(key.data()), 16)] = std::move(row);
     }
 }
 bool RestorePersonal(saving::personal::Snapshot const& snapshot)
 {
     consumed.clear(); denied.clear(); taking = false; carriedBefore.clear();
     for (auto const& entry : snapshot)
-        if (entry.second.kind == saving::personal::Kind::GroundTaken) consumed.insert(entry.first);
+        if (entry.second.kind == saving::personal::Kind::GroundTaken && entry.first.size() == 16)
+            consumed.insert(KeyOf(reinterpret_cast<uint8_t const*>(entry.first.data())));
     TickPersonal();
     return true;
 }
 void TickPersonal()
 {
-    if (!gCSession::GetInstance().IsGameRunning()) return;
+    if (consumed.empty() || !gCSession::GetInstance().IsGameRunning()) return;
     auto const* all = world::ProcessedEntities();
     for (GEU16 i = 0; all && i < all->GetCount(); ++i) {
-        Entity item(all->GetAt(i));
-        if (!item.GetInstance() || !item.IsItem() || item.GetOwner().GetInstance()) continue;
-        uint8_t raw[16];
-        guid::CopyEntity(item.GetInstance(), raw);
-        const std::string key(reinterpret_cast<char const*>(raw), 16);
+        eCEntity* rawEntity = all->GetAt(i);
+        if (!rawEntity || !rawEntity->GetPropertySet(eEPropertySetType_Item)) continue;
+        Entity item(rawEntity);
+        if (item.GetOwner().GetInstance()) continue;
+        GuidKey key{};
+        guid::CopyEntity(rawEntity, key.data());
         if (!consumed.count(key)) continue;
         item.Decay();
         // Decay is void and may defer removal. Keep the tombstone and retry while the item remains processed.

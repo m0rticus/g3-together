@@ -6,6 +6,7 @@
 #include "downed.h"
 #include "enclaves.h"
 #include "fightmem.h"
+#include "frame_scan.h"
 #include "guid.h"
 #include "log.h"
 #include "net.h"
@@ -278,10 +279,9 @@ void Tick()
     if (!hero) return;
     const uint32_t now = net::Now();
     if (!net::IsHost()) {
-        const auto all = Entity::GetNPCs();
-        for (int i = 0; i < all.GetCount(); ++i) {
-            eCEntity* npc = all.GetAt(i).GetInstance();
-            if (!Eligible(npc) || !npcs::IsMirrored(npc)) continue;
+        for (auto const& entry : frame_scan::Npcs()) {
+            eCEntity* npc = entry.entity;
+            if (!entry.npc || !entry.routine || !Eligible(npc) || !npcs::IsMirrored(npc)) continue;
             ScrubCalmMirroredMemory(npc, now);
             if (MirrorUsesHostAttitude(enclaves::Together(), npcs::CompanionOwner(npc),
                                        fightmem::HasLocalOverride(npc),

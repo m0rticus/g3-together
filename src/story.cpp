@@ -360,7 +360,8 @@ void Poll(Domain& d)
     if (d.kind == net::StateWorldClock) return; // Ordinary time sharing remains clock.cpp's existing protocol.
     if (d.kind == net::StateReputation && !net::IsHost()) return; // Host is sole authority on camp/enclave reputation.
     if (!net::IsHost() && !net::InWorld(net::LocalId())) return;
-    States current;
+    static States current;
+    current.clear();
     d.snapshot(current);
     if (!d.primed) {
         // Values before this point are the new game's own defaults, identical on every machine.

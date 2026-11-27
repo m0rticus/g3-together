@@ -715,22 +715,23 @@ bool PersonalPass(bool capture, std::set<std::string>* attempted)
     if (!capture && personalPending.empty()) return true;
     bool ok = true;
     auto const* every = world::ProcessedEntities();
+    static std::string scratchKey(16, '\0');
     for (GEU16 i = 0; every && i < every->GetCount(); ++i) {
         eCEntity* instance = every->GetAt(i);
-        if (!instance) continue;
-        const std::string key = EntityKey(instance);
+        if (!HasInventory(instance)) continue;
         Entity entity(instance);
         if (PersonalTeardown(entity)) continue;
-        if (personalPending.count(key)) {
-            if (PendingAwaitingDeath(key, entity)) continue;
-            if (attempted) attempted->insert(key);
+        guid::CopyEntity(instance, reinterpret_cast<uint8_t*>(&scratchKey[0]));
+        if (personalPending.count(scratchKey)) {
+            if (PendingAwaitingDeath(scratchKey, entity)) continue;
+            if (attempted) attempted->insert(scratchKey);
             if (!EnsurePersonal(entity)) { ok = false; continue; }
         }
         if (!capture || !PersonalAdmitted()) continue;
         personal::Kind kind;
         if (!PersonalKind(entity, kind)) continue;
         const bool generated = entity.Inventory.IsGeneratedPlunder() || entity.Inventory.IsGeneratedTrade();
-        if (personalLedger.count(key) || generated) ok = RememberPersonal(entity) && ok;
+        if (personalLedger.count(scratchKey) || generated) ok = RememberPersonal(entity) && ok;
     }
     return ok;
 }

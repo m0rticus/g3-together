@@ -22,6 +22,7 @@
 #include "world_collision.h"
 #include "world_collision_policy.h"
 #include "world_retirement.h"
+#include "frame_scan.h"
 
 #include <Engine.h>
 #include <Game.h>
@@ -614,6 +615,7 @@ void __fastcall DestroyEntity(eCEntity* entity, void* edx)
     relation::OnEntityDestroyed(entity);
     collision::OnEntityDestroyed(entity);
     navzone_guard::OnEntityDestroyed(entity);
+    frame_scan::OnEntityDestroyed(entity);
     originalDestroyEntity(entity, edx);
 }
 }

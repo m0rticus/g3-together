@@ -3,6 +3,7 @@
 #include "address_policy.h"
 
 #include "body.h"
+#include "frame_scan.h"
 #include "guid.h"
 #include "guid_key.h"
 #include "log.h"
@@ -114,16 +115,14 @@ void ClientTick(uint32_t now)
     // The nearest mirrored NPC within 20 m with an important info for this hero.
     eCEntity* best = nullptr;
     float bestDistance = CallFrom;
-    const bTObjArray<Entity> list = Entity::GetNPCs();
-    for (int i = 0; i < list.GetCount(); ++i) {
-        Entity npc = list.GetAt(i);
-        eCEntity* instance = npc.GetInstance();
-        if (!instance || npc.IsDead() || npc.IsDown() || !npcs::IsMirrored(instance)) continue;
+    for (auto const& scan : frame_scan::Npcs()) {
+        eCEntity* instance = scan.entity;
+        if (!instance || !npcs::IsMirrored(instance)) continue;
+        Entity npc(instance);
+        if (npc.IsDead() || npc.IsDown()) continue;
         const float d = Distance(instance, hero);
         if (d >= bestDistance) continue;
-        uint8_t guid[16];
-        guid::CopyEntity(instance, guid);
-        auto it = rested.find(ToGuidKey(guid));
+        auto it = rested.find(scan.guid);
         if (it != rested.end() && static_cast<int32_t>(now - it->second) < 0) continue;
         if (!npc.HasImportantInfo(Entity(hero))) continue;
         best = instance;

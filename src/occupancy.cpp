@@ -71,7 +71,7 @@ void Refuse(eCEntity* hero)
         !hero->GetPropertySet(eEPropertySetType_NPC) ||
         !hero->GetPropertySet(eEPropertySetType_Focus)) return;
     Entity self(hero);
-    if (self.Routine.GetCurrentTask() != bCString("PS_Interact")) { hasRefused = false; return; }
+    if (std::strcmp(self.Routine.GetCurrentTask().GetText(), "PS_Interact") != 0) { hasRefused = false; return; }
     eCEntity* object = self.NPC.GetCurrentTarget().GetInstance();
     uint8_t player = TakenBy(object);
     if (!player) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "infocmd_internal.h"
 
+#include "frame_scan.h"
 #include "npclease_runtime.h"
 #include "npcremoval.h"
 #include "npcs.h"
@@ -8,14 +9,16 @@
 #include "talk.h"
 #include "world_sectors.h"
 
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace g3t::infocmd::detail {
 namespace {
-std::map<GuidKey, npc_progression_policy::ObservedProgression> observedProgression;
-std::set<GuidKey> syncedNpcs;
-std::map<GuidKey, net::WorldState> bufferedWorldStates;
-std::set<GuidKey> activeDialogNpcs;
+std::unordered_map<GuidKey, npc_progression_policy::ObservedProgression, frame_scan::GuidHash> observedProgression;
+std::unordered_set<GuidKey, frame_scan::GuidHash> syncedNpcs;
+std::unordered_map<GuidKey, net::WorldState, frame_scan::GuidHash> bufferedWorldStates;
+std::unordered_set<GuidKey, frame_scan::GuidHash> activeDialogNpcs;
 uint32_t bufferedEpoch = 0;
 bool wasDialogRunning = false;
 bool worldSeeded = false;
@@ -33,20 +36,37 @@ void SyncClientBufferEpoch()
     }
 }
 
-void ObserveEntityProgression(Entity& e, eCEntity* hero, bool activeDialogPartner)
+npc_progression_policy::ObservedProgression CaptureObservedRaw(eCEntity* instance, gCNPC_PS* npcPs, gCDialog_PS* dialogPs)
 {
-    eCEntity* inst = e.GetInstance();
-    if (!inst) return;
-    if (!inst->GetPropertySet(eEPropertySetType_NPC) && !inst->GetPropertySet(eEPropertySetType_Dialog)) return;
+    npc_progression_policy::ObservedProgression obs{};
+    if (!instance) return obs;
+    Entity e(instance);
+    if (dialogPs) {
+        obs.dialog = npc_progression_policy::PackDialog(
+            e.Dialog.TeachEnabled != GEFalse, e.Dialog.TradeEnabled != GEFalse,
+            e.Dialog.PartyEnabled != GEFalse, e.Dialog.MobEnabled != GEFalse,
+            e.Dialog.SlaveryEnabled != GEFalse, e.Dialog.TalkedToPlayer != GEFalse);
+    }
+    if (npcPs) {
+        obs.npc = npc_progression_policy::PackNpcFlags(true, e.NPC.DefeatedByPlayer != GEFalse);
+        obs.guard = static_cast<uint8_t>(static_cast<int>(e.NPC.GuardStatus));
+        obs.npcClass = static_cast<uint8_t>(static_cast<int>(e.NPC.Class));
+        obs.alignment = static_cast<uint8_t>(static_cast<int>(e.NPC.PoliticalAlignment));
+        obs.immortal = e.NPC.Immortal ? 1 : 0;
+    }
+    return obs;
+}
+
+void ObserveEntryProgression(eCEntity* inst, GuidKey const& key, gCNPC_PS* npcPs, gCDialog_PS* dialogPs,
+                             eCEntity* hero, bool activeDialogPartner)
+{
+    if (!inst || (!npcPs && !dialogPs)) return;
     const bool isHero = inst == hero;
     const bool isPuppet = remote::IsPuppet(inst);
-    const bool suppressed = npcremoval::Suppressed(inst);
+    const bool suppressed = npcremoval::Suppressed(key.data());
     if (isHero || isPuppet || suppressed) return;
-    uint8_t guid[16];
-    guid::CopyEntity(inst, guid);
-    const GuidKey key = GuidKeyOf(guid);
     if (activeDialogPartner) activeDialogNpcs.insert(key);
-    const auto nowObs = CaptureObserved(e);
+    const auto nowObs = CaptureObservedRaw(inst, npcPs, dialogPs);
     const bool canAuthor = npc_progression_policy::ShouldAuthorProgressionDiff(
         net::IsHost(), isHero, isPuppet, suppressed,
         npclease::LocalAuthority(inst), activeDialogPartner || talk::TalkingWithHero(inst));
@@ -64,9 +84,21 @@ void ObserveEntityProgression(Entity& e, eCEntity* hero, bool activeDialogPartne
     it->second = nowObs;
     if (!canAuthor) return;
     if (npc_progression_policy::UnpackTalkedToPlayer(nowObs.dialog))
-        ApplyFriendMemory(e.GetName().GetText());
+        ApplyFriendMemory(inst->GetName().GetText());
     if (net::IsHost()) syncedNpcs.insert(key);
-    if (net::Connected()) QueueImmediateState(guid, true);
+    if (net::Connected()) QueueImmediateState(key.data(), true);
+}
+
+void ObserveEntityProgression(Entity& e, eCEntity* hero, bool activeDialogPartner)
+{
+    eCEntity* inst = e.GetInstance();
+    if (!inst) return;
+    auto* npcPs = static_cast<gCNPC_PS*>(inst->GetPropertySet(eEPropertySetType_NPC));
+    auto* dialogPs = static_cast<gCDialog_PS*>(inst->GetPropertySet(eEPropertySetType_Dialog));
+    if (!npcPs && !dialogPs) return;
+    uint8_t guid[16];
+    guid::CopyEntity(inst, guid);
+    ObserveEntryProgression(inst, GuidKeyOf(guid), npcPs, dialogPs, hero, activeDialogPartner);
 }
 } // namespace
 
@@ -241,10 +273,8 @@ void TrackLocalDialogAndProgression()
         }
         activeDialogNpcs.clear();
     }
-    const bTObjArray<Entity> npcsList = Entity::GetNPCs();
-    for (int i = 0; i < npcsList.GetCount(); ++i) {
-        Entity npc = npcsList.GetAt(i);
-        ObserveEntityProgression(npc, hero, false);
+    for (auto const& entry : frame_scan::Npcs()) {
+        ObserveEntryProgression(entry.entity, entry.guid, entry.npc, entry.dialog, hero, false);
     }
 }
 

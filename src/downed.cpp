@@ -44,6 +44,7 @@ auto& lastJudgedReason = life.lastJudgedReason;
 auto& lastJudgedAttackerName = life.lastJudgedAttackerName;
 auto& terminalTask = life.terminalTask;
 auto& inHand = life.inHand;
+eCEntity* inHandEntity[2] = {};
 auto& wasDown = life.wasDown;
 auto& aloneSince = life.aloneSince;
 auto& revivedBy = life.revivedBy;
@@ -386,7 +387,7 @@ bool GuardState(eCEntity* self, char const* state)
 void Tick()
 {
     SyncStates();
-    LocalInteractionFlags();
+    const bool localInteracting = LocalInteractionFlags();
     gCSession& session = gCSession::GetInstance();
     eCDynamicEntity* instance = session.GetHero();
     if (!instance) {
@@ -427,14 +428,16 @@ void Tick()
         const bool present = Playing(HelperState(remotes[i], now));
         const bool dead = present && (remotes[i].activity.flags & 4);
         const bool down = present && (remotes[i].activity.flags & 8) && !dead;
-        Wide(remotes[i].latest.name, name, 32);
-        if (down && !peers[i].told) {
-            swprintf_s(text, i18n::Text(i18n::PartnerDownNeedsPotion), name);
-            hud::Message(hud::Warning, text);
-        }
-        if (dead && !peers[i].toldDead) {
-            swprintf_s(text, i18n::Text(i18n::PartnerDied), name);
-            hud::Message(hud::Bad, text);
+        if ((down && !peers[i].told) || (dead && !peers[i].toldDead)) {
+            Wide(remotes[i].latest.name, name, 32);
+            if (down && !peers[i].told) {
+                swprintf_s(text, i18n::Text(i18n::PartnerDownNeedsPotion), name);
+                hud::Message(hud::Warning, text);
+            }
+            if (dead && !peers[i].toldDead) {
+                swprintf_s(text, i18n::Text(i18n::PartnerDied), name);
+                hud::Message(hud::Bad, text);
+            }
         }
         peers[i].told = down;
         peers[i].toldDead = dead;
@@ -461,7 +464,7 @@ void Tick()
         Die(hero, "host-wipe");
         return;
     }
-    if (LocalInteractionFlags()) {
+    if (localInteracting) {
         lastHp = hero.PlayerMemory.GetHitPoints();
         lethalBlowAt = 0;
     } else {
@@ -471,7 +474,11 @@ void Tick()
     if (!down && !life.held) {
         for (int i = 0; i < 2; ++i) {
             Entity item = hero.Inventory.GetItemFromSlot(i ? gESlot_LeftHand : gESlot_RightHand);
-            inHand[i] = item.GetInstance() ? item.GetName().GetText() : "";
+            eCEntity* itemInst = item.GetInstance();
+            if (itemInst != inHandEntity[i]) {
+                inHandEntity[i] = itemInst;
+                inHand[i] = itemInst ? item.GetName().GetText() : "";
+            }
         }
     } else if (down && !wasDown && !net::IsHost()) {
         for (auto const& n : inHand)
@@ -778,6 +785,7 @@ void OnWorldChange() {
     nativeTerminalKills = 0;
     nativeTerminalKillChecked = false;
     terminalTask.clear();
+    inHandEntity[0] = inHandEntity[1] = nullptr;
     pendingReviveSequence = 0;
     interaction.Clear();
     interactionHero = nullptr;

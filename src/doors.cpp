@@ -27,17 +27,17 @@ constexpr uint32_t ScanEvery = 500;  // ms
 struct Seen {
     uint8_t open = 0, locked = 0, parts = 0;
 };
-std::unordered_map<std::string, Seen> seen;    // what this machine last saw (or was told) per entity
-std::unordered_map<std::string, Seen> wanted;  // states from elsewhere, applied once the entity is processed here
+std::unordered_map<GuidKey, Seen, GuidHash> seen;    // what this machine last saw (or was told) per entity
+std::unordered_map<GuidKey, Seen, GuidHash> wanted;  // states from elsewhere, applied once the entity is processed here
 // Native loaded state and live changes are authoritative; clients query doors at first sight.
-std::unordered_map<std::string, Seen> changed;
+std::unordered_map<GuidKey, Seen, GuidHash> changed;
 constexpr uint8_t Request = 0x80;
 constexpr uint8_t Baseline = 0x40;
-std::unordered_set<std::string> baselines;
-std::unordered_map<std::string, uint32_t> requested;
+std::unordered_set<GuidKey, GuidHash> baselines;
+std::unordered_map<GuidKey, uint32_t, GuidHash> requested;
 struct PendingRequest { uint32_t generation[net::MaxPlayers]{}; };
-std::unordered_map<std::string, PendingRequest> pendingRequests;
-struct InitialDoors { uint32_t generation = 0; bool admitted = false; std::unordered_set<std::string> keys; };
+std::unordered_map<GuidKey, PendingRequest, GuidHash> pendingRequests;
+struct InitialDoors { uint32_t generation = 0; bool admitted = false; std::unordered_set<GuidKey, GuidHash> keys; };
 std::array<InitialDoors, net::MaxPlayers> initialDoors;
 bool scanned = false;
 unsigned pendingNearby = 0;
@@ -47,11 +47,11 @@ uint32_t settleStart = 0;
 bool sync = true;  // QA negative control
 unsigned sent = 0, received = 0, applied = 0, watched = 0;
 
-std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
+GuidKey Key(uint8_t const guid[16]) { return ToGuidKey(guid); }
 
-Entity ResolveKey(std::string const& key)
+Entity ResolveKey(GuidKey const& key)
 {
-    return guid::Resolve(reinterpret_cast<uint8_t const*>(key.data()));
+    return guid::Resolve(key.data());
 }
 
 Seen Read(eCEntity* entity)
@@ -93,7 +93,7 @@ void Apply(eCEntity* entity, Seen const& want)
 void Send(uint8_t const guid[16], Seen const& s)
 {
     if (net::IsHost()) {
-        const std::string key = Key(guid);
+        const GuidKey key = Key(guid);
         changed[key] = MergeSeen(changed[key], s);
     }
     net::WorldState w{};
@@ -112,7 +112,7 @@ bool Shared(eCEntity* entity)
            !entity->GetPropertySet(eEPropertySetType_NPC) && !entity->GetPropertySet(eEPropertySetType_Item) &&
            !containers::IsPersonalInventory(entity);
 }
-bool Reply(uint8_t to, std::string const& key)
+bool Reply(uint8_t to, GuidKey const& key)
 {
     auto& initial = initialDoors[to];
     const uint32_t generation = net::PeerGeneration(to);
@@ -191,7 +191,7 @@ void Tick()
         ++count;
         uint8_t guid[16];
         guid::CopyEntity(entity, guid);
-        const std::string key = Key(guid);
+        const GuidKey key = Key(guid);
         Seen now_ = Read(entity);
         if (!net::IsHost() && !baselines.count(key)) {
             ++pendingNearby;
@@ -239,7 +239,7 @@ void OnState(uint8_t from, net::WorldState const& s)
     if (s.npcClass & Request) {  // host: a player joined; send this session's changes directly as baselines
         if (net::IsHost() && net::PeerJoined(from) && net::InWorld(1)) {
             if (!IsZeroGuid(s.guid)) {
-                const std::string key = Key(s.guid);
+                const GuidKey key = Key(s.guid);
                 Entity object = guid::Resolve(s.guid);
                 if (object.GetInstance() && !Shared(object.GetInstance())) return;
                 if (!Reply(from, key)) {
@@ -268,7 +268,7 @@ void OnState(uint8_t from, net::WorldState const& s)
     Entity object = guid::Resolve(s.guid);
     eCEntity* instance = object.GetInstance();
     if (instance && !Shared(instance)) return;
-    const std::string key = Key(s.guid);
+    const GuidKey key = Key(s.guid);
     if ((s.npcClass & Baseline) && !(s.npcClass & 3)) {
         ++received;
         baselines.insert(key);
