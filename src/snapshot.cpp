@@ -41,7 +41,9 @@ bool EventChanged(Track const& track, MotionState const& a, MotionState const& b
 
 int32_t RequiredDelay(Track const& track)
 {
-    const uint32_t measured = std::min(track.cadenceMin, track.previousCadenceMin);
+    const uint32_t measured = track.predictive
+        ? std::min(track.cadenceMin, track.previousCadenceMin)
+        : std::max(track.cadenceMax, track.previousCadenceMax);
     const uint32_t cadence = !track.predictive && track.count < 2
         ? (track.poseIntervalMs ? track.poseIntervalMs : 17u)
         : !track.predictive && track.poseIntervalMs
@@ -137,9 +139,10 @@ uint32_t RenderTime(Track& track, uint32_t now, int32_t shift, bool counted)
         // Slew clock-offset changes instead of rewinding or jumping the presentation timeline.
         const int32_t error = static_cast<int32_t>(desired - (track.renderSent + elapsed));
         const double catchUpRate = error > 100 ? 1.0 : (track.combatPlayer && error > 35 ? 0.5 : 0.1);
-        const double maximumAdjustment = elapsed * (!track.combatClockProtected ? catchUpRate : 0.1);
-        const double advance = elapsed + std::clamp(static_cast<double>(error), -maximumAdjustment,
-                                                    track.combatClockProtected ? 0.0 : maximumAdjustment)
+        const double growRate = error < -100 ? 0.5 : (error < -30 ? 0.25 : 0.1);
+        const double minAdjustment = elapsed * (!track.combatClockProtected ? growRate : 0.1);
+        const double maxAdjustment = elapsed * (track.combatClockProtected ? 0.0 : catchUpRate);
+        const double advance = elapsed + std::clamp(static_cast<double>(error), -minAdjustment, maxAdjustment)
                                + track.fractionalAdvance;
         const uint32_t whole = static_cast<uint32_t>(advance);
         track.renderSent += whole;
@@ -255,12 +258,16 @@ void SetPoseInterval(Track& track, uint32_t interval)
         return;
     }
     track.quietHold = false;
-    const uint32_t clamped = std::min<uint32_t>(interval, 100u);
+    const uint32_t clamped = std::min<uint32_t>(interval, static_cast<uint32_t>(MaximumBufferDelay));
     if (clamped == track.poseIntervalMs) return;
+    if (track.poseIntervalMs && clamped < track.poseIntervalMs) {
+        track.cadenceMin = track.previousCadenceMin = std::min(track.cadenceMin, clamped);
+        track.cadenceMax = track.previousCadenceMax = clamped;
+    }
     track.poseIntervalMs = clamped;
     // Escalate the buffer immediately on a slower tier. Faster tiers still
     // decay gradually, without rewinding the presentation clock.
-    track.delayMs = std::max(track.delayMs, static_cast<int32_t>(clamped * 2));
+    track.delayMs = std::min(MaximumBufferDelay, std::max(track.delayMs, static_cast<int32_t>(clamped * 2)));
 }
 
 void SoftResetTrack(Track& track, bool preserveOffset)
@@ -323,18 +330,21 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
                    (!track.quietHold && !track.lastQuietHold &&
                     static_cast<uint32_t>(span) <= npcsend::QuietCadenceMs)) {
             // Sparse idle NPC keyframes are intentional, not evidence of network jitter.
-            const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u, track.predictive ? 100u : 150u);
+            const uint32_t interval = std::clamp(static_cast<uint32_t>(span), 8u,
+                                                 track.predictive ? 100u : npcsend::QuietCadenceMs);
             if (!track.haveCadenceWindow) {
                 track.haveCadenceWindow = true;
                 track.cadenceWindowAt = arrived;
-                track.cadenceMin = interval;
-                track.previousCadenceMin = interval;
+                track.cadenceMin = track.cadenceMax = interval;
+                track.previousCadenceMin = track.previousCadenceMax = interval;
             } else if (static_cast<int32_t>(arrived - track.cadenceWindowAt) >= static_cast<int32_t>(OffsetWindow)) {
                 track.previousCadenceMin = track.cadenceMin;
-                track.cadenceMin = interval;
+                track.previousCadenceMax = track.cadenceMax;
+                track.cadenceMin = track.cadenceMax = interval;
                 track.cadenceWindowAt = arrived;
             } else {
                 track.cadenceMin = std::min(track.cadenceMin, interval);
+                track.cadenceMax = std::max(track.cadenceMax, interval);
             }
             const int32_t arrivalSpan = static_cast<int32_t>(arrived - track.lastArrived);
             if (arrivalSpan >= 0) {
@@ -344,7 +354,8 @@ void Feed(Track& track, float const position[3], float const rotation[4], uint32
         }
     }
     if (!track.count && !track.predictive)
-        track.delayMs = std::max(NpcBufferFloor, static_cast<int32_t>(track.poseIntervalMs * 2));
+        track.delayMs = std::min(MaximumBufferDelay,
+                                 std::max(NpcBufferFloor, static_cast<int32_t>(track.poseIntervalMs * 2)));
     if (track.count) {
         const int32_t gap = static_cast<int32_t>(arrived - track.lastArrived);
         if (gap >= 0) {
@@ -410,12 +421,29 @@ void SampleNpc(Track& track, Track::Snap const& newest, uint32_t now, int32_t sh
         ++sampledHeld, track.lastCase = 3;
         const uint32_t desired = now - static_cast<uint32_t>(track.offset) + static_cast<uint32_t>(shift);
         const int32_t late = std::max(0, static_cast<int32_t>(desired - newest.sent));
-        const uint32_t measuredCadence = std::min(track.cadenceMin, track.previousCadenceMin);
+        const uint32_t measuredCadence = track.predictive
+            ? std::min(track.cadenceMin, track.previousCadenceMin)
+            : std::max(track.cadenceMax, track.previousCadenceMax);
         const uint32_t interval = track.poseIntervalMs ? std::max(track.poseIntervalMs, measuredCadence) : measuredCadence;
+        auto activeAnimation = [](Track::Snap const& a, Track::Snap const& b) {
+            for (int i = 0; i < net::NpcMotionSlots; ++i) {
+                auto const& x = a.motion.motions[i];
+                auto const& y = b.motion.motions[i];
+                if (x.active != y.active) return true;
+                if (!x.active) continue;
+                if (x.name != y.name || x.instance != y.instance ||
+                    std::fabs(x.phase - y.phase) >= npcsend::PhaseChange ||
+                    std::fabs(x.weight - y.weight) >= npcsend::WeightChange)
+                    return true;
+            }
+            return false;
+        };
         const bool stationaryHold = track.count >= 2 &&
             (track.quietHold ||
-             (Distance(track.snaps[track.count - 2].position, newest.position) < npcsend::RootChangeCm &&
-              !newest.motion.contact));
+             (track.poseIntervalMs < npcsend::IdleIntervalMs &&
+              Distance(track.snaps[track.count - 2].position, newest.position) < npcsend::RootChangeCm &&
+              !newest.motion.contact &&
+              !activeAnimation(track.snaps[track.count - 2], newest)));
         const uint32_t expectedGap = stationaryHold ? std::max<uint32_t>(interval, npcsend::QuietCadenceMs) : interval;
         // A whole missing interval, not a rounding-boundary hold or intentional stationary keepalive pause, warrants more buffering.
         if (track.count >= 2 && late > static_cast<int32_t>(expectedGap) && !(newest.motion.flags & 1) &&

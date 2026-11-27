@@ -256,4 +256,61 @@ int main()
     assert(escalated >= 250);
     Sample(idleTrack, 10000 + 24 * 125 + 110, shown, turn, -PlaybackDelay(idleTrack), true, &presentation);
     assert(PlaybackDelay(idleTrack) == escalated);
+
+    // Slow-host alternating idle capture intervals (98 ms / 147 ms on a ~21 FPS host) on a stationary NPC:
+    // PlaybackDelay must cover the upper 147 ms capture period instead of locking to cadenceMin=98 ms, and any
+    // active-idle underrun (!quietHold) must still escalate rather than being masked by stationary distance.
+    Track slowIdle;
+    slowIdle.predictive = false;
+    SetPoseInterval(slowIdle, 100);
+    uint32_t slowSent = 20000;
+    for (int i = 0; i < 30; ++i) {
+        const uint32_t gap = (i % 2 == 0) ? 98u : 147u;
+        slowSent += gap;
+        Feed(slowIdle, tpPos, rotation, slowSent, slowSent + 10, 1, motion);
+        for (uint32_t step = 16; step < gap; step += 16)
+            Sample(slowIdle, slowSent + 10 + step, shown, turn, -PlaybackDelay(slowIdle), true, &presentation);
+    }
+    assert(PlaybackDelay(slowIdle) >= 294);
+    const unsigned underrunsAfterWarmup = slowIdle.underruns;
+    for (int i = 0; i < 12; ++i) {
+        const uint32_t gap = (i % 2 == 0) ? 98u : 147u;
+        slowSent += gap;
+        Feed(slowIdle, tpPos, rotation, slowSent, slowSent + 10 + (i == 4 ? 30 : 0), 1, motion);
+        for (uint32_t step = 16; step < gap; step += 16) {
+            Sample(slowIdle, slowSent + 10 + step, shown, turn, -PlaybackDelay(slowIdle), true, &presentation);
+            assert(slowIdle.lastCase == 1);
+        }
+    }
+    assert(slowIdle.underruns == underrunsAfterWarmup);
+
+    // Stationary active idle underrun (!quietHold) escalates delayMs instead of being masked by <0.5 cm displacement.
+    Track activeStationary;
+    activeStationary.predictive = false;
+    SetPoseInterval(activeStationary, 100);
+    Feed(activeStationary, tpPos, rotation, 30000, 30010, 1, motion);
+    Feed(activeStationary, tpPos, rotation, 30100, 30110, 1, motion);
+    const int32_t beforeUnderrun = PlaybackDelay(activeStationary);
+    Sample(activeStationary, 30110, shown, turn, -beforeUnderrun, true, &presentation);
+    // Simulate a late frame 150 ms beyond newest.sent while host still streams active idle (!quietHold).
+    Sample(activeStationary, 30110 + beforeUnderrun + 150, shown, turn, -beforeUnderrun, true, &presentation);
+    assert(activeStationary.underruns == 1);
+    assert(PlaybackDelay(activeStationary) >= beforeUnderrun + 100);
+
+    // Stretched pose interval (>100 ms) propagates into PlaybackDelay, and switching back to 16 ms resets cadenceMax.
+    Track stretched;
+    stretched.predictive = false;
+    SetPoseInterval(stretched, 150);
+    assert(PlaybackDelay(stretched) >= 300);
+    Feed(stretched, tpPos, rotation, 40000, 40010, 1, motion);
+    Feed(stretched, tpPos, rotation, 40150, 40160, 1, motion);
+    assert(PlaybackDelay(stretched) >= 300);
+    SetPoseInterval(stretched, 16);
+    uint32_t fastAt = 40150;
+    for (int i = 0; i < 200; ++i) {
+        fastAt += 16;
+        Feed(stretched, tpPos, rotation, fastAt, fastAt + 10, 2, motion);
+        Sample(stretched, fastAt + 10, shown, turn, -PlaybackDelay(stretched), true, &presentation);
+    }
+    assert(PlaybackDelay(stretched) == NpcBufferFloor);
 }
