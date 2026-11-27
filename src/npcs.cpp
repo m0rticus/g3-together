@@ -123,12 +123,18 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     frame.Clear();
     const auto addCandidate = [&](eCEntity* instance, bool fromProcessed) {
         if (!instance || instance == hero || instance == controlled) return;
+        if (!instance->GetPropertySet(eEPropertySetType_NPC)) return;
+        GuidKey key{};
+        if (fromProcessed && frame.FindByPtr(instance, true, key)) {
+            candidates.push_back(npcsend_candidates::GuidCandidate{key, true, false, false, false, false});
+            return;
+        }
         if (!npcplayback::IsCharacter(instance) ||
             instance->GetPropertySet(eEPropertySetType_PlayerMemory) != nullptr ||
             remote::IsPuppet(instance)) return;
         uint8_t guid[16];
         guid::CopyEntity(instance, guid);
-        const GuidKey key = ToGuidKey(guid);
+        key = ToGuidKey(guid);
         candidates.push_back(npcsend_candidates::GuidCandidate{
             key, true, false, false, false, false
         });
@@ -150,8 +156,9 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         uint8_t guid[16];
         GuidKey key{};
         float at[3] = {};
+        LastSent* existingLast = nullptr;
         eCEntity* instance = AdmitHostSendCandidate(candidateKey, hero, controlled, frame, players, playerCount,
-                                                    guid, key, at);
+                                                    guid, key, at, existingLast);
         if (!instance) continue;
         net::NpcRecord r{};
         std::memcpy(r.guid, guid, 16);
@@ -171,11 +178,13 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
         } else {
             r.combatTarget = 0;
         }
+        npcsend::PoseMeta poseMeta{};
+        bool poseCaptured = false, posed = false, moving = false, outsideAll = false;
         uint8_t poseFlags = 0;
-        bool posed = false, moving = false;
-        npc_equipment::BackEquipment backEquip{};
-        CaptureAndRecordOwnedNpc(self, instance, key, frame.partyLeaderOf, r, backEquip, bones, poseFlags, posed, moving);
-        SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, backEquip, bones, poseFlags, posed, moving, frame.stretchOf);
+        LastSent& last = CaptureAndRecordOwnedNpc(self, instance, key, at, frame, existingLast, r, bones,
+                                                  poseMeta, poseCaptured, poseFlags, posed, moving, outsideAll);
+        SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, last, frame, bones,
+                            poseMeta, poseCaptured, poseFlags, posed, moving, outsideAll);
     }
     FinishOwnedTick(hero, players, playerCount);
 }

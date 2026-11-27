@@ -48,9 +48,24 @@ using NpcOpponents = std::unordered_map<uint32_t, eCEntity*>;
 struct LastSent {
     net::NpcRecord record{};
     uint32_t at = 0, movingUntil = 0;
+    uint32_t heldSince = 0, heldLast = 0;
+    uint32_t namesJoin = 0, skeletonEpoch = 0;
+    void const* cachedActor = nullptr;
+    void const* cachedSkeleton = nullptr;
+    void const* cachedNodes = nullptr;
+    int cachedNodeCount = 0;
+    bool cachedSkeletonValid = false;
     std::vector<pose::Bone> bones;
     uint8_t poseFlags = 0;
     bool posed = false;
+};
+
+struct RecipientNpcState {
+    npcsend::State policy;
+    npc_equipment::BackEquipment backEquip{};
+    uint32_t backEquipJoin = 0;
+    uint32_t skeletonEpoch = 0;
+    bool haveBackEquip = false;
 };
 
 struct AwaitedHit {
@@ -224,7 +239,7 @@ inline std::unordered_map<GuidKey, AwaitedHit, GuidHash> awaitedHits;
 inline std::unordered_map<eCEntity const*, QuarantinedEntity> quarantinedEntities;
 inline std::unordered_map<eCEntity const*, HiddenClientState> hiddenClientStates;
 inline uint32_t identityCensusAt = 0, identityLogAt = 0;
-inline std::unordered_map<GuidKey, npcsend::State, GuidHash> recipientNpcs[net::MaxPlayers];
+inline std::unordered_map<GuidKey, RecipientNpcState, GuidHash> recipientNpcs[net::MaxPlayers];
 inline uint32_t recipientGenerations[net::MaxPlayers] = {};
 inline uint32_t syncedWorldGen[net::MaxPlayers] = {};
 inline uint32_t syncedWorldId[net::MaxPlayers] = {};

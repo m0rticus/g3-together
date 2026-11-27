@@ -950,9 +950,92 @@ static void TestImmediateCombatPublication()
     assert(!ImmediateInitial(f.in));
 }
 
+static void TestPreflightLazyPoseParity()
+{
+    Fixture f(75);
+    f.in.bonesVerified = true;
+    PoseMeta meta{75, 0, true};
+    Result pre{};
+
+    // Outside when not live does not need pose.
+    f.in.distanceCm = InterestEnterCm + 1.0f;
+    assert(Preflight(f.state, f.in, meta, pre) == PoseNeed::NotNeeded && pre.decision == Decision::Outside);
+
+    // Initial needs pose; CanAdmit matches Admit without mutating state.
+    f.in.distanceCm = NearExitCm + 50.0f;
+    InitialPacer pacer;
+    for (unsigned i = 0; i < InitialBurst; ++i) {
+        assert(pacer.CanAdmit(0, 1000));
+        assert(pacer.Admit(0, 1000));
+    }
+    assert(!pacer.CanAdmit(0, 1000));
+    assert(!pacer.Admit(0, 1000));
+    assert(Preflight(f.state, f.in, meta, pre) == PoseNeed::NeedPose);
+    assert(pre.decision == Decision::Initial);
+    assert(Evaluate(f.state, f.in).decision == Decision::Initial);
+    assert(Commit(f.state, f.in, Decision::Initial));
+    f.state.enteredAt = f.in.now - InterestWarmupMs;
+
+    // Wait frames before interval and KeepaliveMs skip pose capture completely.
+    for (uint32_t t : {16u, 33u, 66u, 83u}) {
+        f.in.now = t;
+        assert(Preflight(f.state, f.in, meta, pre) == PoseNeed::NotNeeded);
+        assert(pre.decision == Decision::Wait);
+        assert(Evaluate(f.state, f.in).decision == Decision::Wait);
+    }
+
+    // Skeleton layout mismatch triggers NeedPose -> Semantic even before interval.
+    PoseMeta mismatch = meta;
+    mismatch.matchesBaseline = false;
+    assert(Preflight(f.state, f.in, mismatch, pre) == PoseNeed::NeedPose);
+    assert(pre.decision == Decision::Semantic);
+
+    // Record-only change before interval returns Wait without needing pose; at interval needs pose -> Changed.
+    f.record.position[0] = 5.0f;
+    f.in.now = 99;
+    assert(Preflight(f.state, f.in, meta, pre) == PoseNeed::NotNeeded);
+    assert(pre.decision == Decision::Wait);
+    f.in.now = IdleIntervalMs;
+    assert(Preflight(f.state, f.in, meta, pre) == PoseNeed::NeedPose);
+    assert(pre.decision == Decision::Changed);
+    assert(Evaluate(f.state, f.in).decision == Decision::Changed);
+    assert(Commit(f.state, f.in, Decision::Changed));
+
+    // Keepalive with unchanged record needs pose to check bone deltas, then emits Keyframe.
+    f.in.now += KeepaliveMs;
+    assert(Preflight(f.state, f.in, meta, pre) == PoseNeed::NeedPose);
+    assert(Evaluate(f.state, f.in).decision == Decision::Keyframe);
+    assert(Commit(f.state, f.in, Decision::Keyframe));
+
+    // Zero-bone (ragdoll dead) FinalAndRelease needs no pose.
+    PoseMeta emptyMeta{0, 0, true};
+    f.in.bones = nullptr;
+    f.in.boneCount = 0;
+    f.in.distanceCm = InterestExitCm + 1.0f;
+    assert(Preflight(f.state, f.in, emptyMeta, pre) == PoseNeed::NotNeeded);
+    assert(pre.decision == Decision::FinalAndRelease);
+}
+
+static void TestLargeCandidateUnion()
+{
+    std::vector<npcsend_candidates::GuidCandidate> many;
+    for (int i = 1; i <= 620; ++i) {
+        GuidKey k{};
+        k[0] = static_cast<uint8_t>(i & 0xFF);
+        k[1] = static_cast<uint8_t>((i >> 8) & 0xFF);
+        many.push_back({k, true, false, false, false, false});
+        if (i % 3 == 0) many.push_back({k, true, false, false, false, false});
+    }
+    const std::vector<GuidKey> unique = npcsend_candidates::Union(many);
+    assert(unique.size() == 620);
+    assert(unique.front()[0] == 1 && unique.back()[0] == (620 & 0xFF));
+}
+
 int main()
 {
     TestSendOwnedCandidateUnion();
+    TestLargeCandidateUnion();
+    TestPreflightLazyPoseParity();
     static_assert(QuietCadenceMs == 250 && MirrorStaleMs == 10000 && PoseRetentionMs == 10000);
     static_assert(MovementPositionCm == 0.02f && MovementQuaternionComponent == 0.00025f && MovementHoldMs == 500);
     TestInitialAndHysteresis();

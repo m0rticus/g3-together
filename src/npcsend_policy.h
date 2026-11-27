@@ -90,7 +90,16 @@ struct Input {
     bool eligible = true; // connection/world/ownership gate, not an interest-range decision
     bool nearby = false, focused = false, combat = false, contact = false, moving = false;
     bool force = false; // one-shot caller-known discrete event or pose discontinuity
+    bool bonesVerified = false; // caller already verified non-zero unique bone hashes in bones[0..boneCount-1]
     uint32_t stretchPermille = StretchNormal; // emergency congestion factor for every interval, 1000 = none
+};
+
+enum class PoseNeed : uint8_t { NotNeeded, NeedPose };
+
+struct PoseMeta {
+    int boneCount = 0;
+    uint8_t poseFlags = 0;
+    bool matchesBaseline = false;
 };
 
 // Keep exactly one State per (recipient generation, NPC GUID). Reset externally on
@@ -149,13 +158,12 @@ constexpr int32_t MaxHitPointsAbs = 1000000;
 constexpr float MaxDamageMultiplier = 1000.0f, MaxPositionCm = 1e7f;
 constexpr float MaxMotionSpeed = 100.0f, MaxMotionWeight = 10.0f, MaxMotionBlendMs = 100000.0f;
 
-inline bool Valid(Input const& in)
+inline bool ValidRecordAndCounts(Input const& in, int boneCount, uint8_t poseFlags)
 {
     if (!in.record || !std::isfinite(in.distanceCm) || in.distanceCm < 0 ||
         (in.interest != Interest::Distance && in.interest != Interest::Include && in.interest != Interest::Exclude) ||
-        in.boneCount < 0 || in.boneCount > pose::MaxBones ||
-        (in.boneCount && !in.bones) || (in.poseFlags & ~pose::Facial) ||
-        (!in.boneCount && in.poseFlags)) return false;
+        boneCount < 0 || boneCount > pose::MaxBones ||
+        (poseFlags & ~pose::Facial) || (!boneCount && poseFlags)) return false;
     auto const& r = *in.record;
     if (!r.incarnation || r.hitPlayer >= net::MaxPlayers || r.guidePlayer >= net::MaxPlayers ||
         r.partyPlayer >= net::MaxPlayers || r.partyType > MaxPartyType || r.waiting > 1 || r.contact > 1 ||
@@ -181,6 +189,13 @@ inline bool Valid(Input const& in)
             !std::isfinite(m.intro) || m.intro < 0 || m.intro > MaxMotionBlendMs ||
             !std::isfinite(m.extro) || m.extro < 0 || m.extro > MaxMotionBlendMs) return false;
     }
+    return true;
+}
+
+inline bool Valid(Input const& in)
+{
+    if ((in.boneCount && !in.bones) || !ValidRecordAndCounts(in, in.boneCount, in.poseFlags)) return false;
+    if (!in.boneCount || in.bonesVerified) return true;
     constexpr unsigned NameSlots = pose::MaxBones * 2;
     static_assert((NameSlots & (NameSlots - 1)) == 0, "bone name table must have power-of-two capacity");
     uint32_t names[NameSlots] = {};
@@ -272,16 +287,20 @@ inline bool MotionEdge(net::NpcRecord const& a, net::NpcRecord const& b)
     return false;
 }
 
-inline bool DynamicChanged(State const& state, Input const& in)
+inline bool DynamicRecordChanged(net::NpcRecord const& a, net::NpcRecord const& b)
 {
-    auto const& a = state.record;
-    auto const& b = *in.record;
     if (DistanceSquared(a.position, b.position) >= double(RootChangeCm) * RootChangeCm ||
         RotationChanged(a.rotation, b.rotation, RotationChangeDegrees) ||
         RotationLengthChanged(a.rotation, b.rotation)) return true;
     for (int i = 0; i < net::NpcMotionSlots; ++i)
         if (std::fabs(a.motions[i].phase - b.motions[i].phase) >= PhaseChange ||
             std::fabs(a.motions[i].weight - b.motions[i].weight) >= WeightChange) return true;
+    return false;
+}
+
+inline bool DynamicChanged(State const& state, Input const& in)
+{
+    if (DynamicRecordChanged(state.record, *in.record)) return true;
     for (int i = 0; i < in.boneCount; ++i)
         for (int k = 0; k < 12; ++k)
             if (std::abs(int(state.bones[i].values[k]) - int(in.bones[i].values[k])) >=
@@ -298,14 +317,93 @@ inline Tier DesiredTier(State const& state, Input const& in, bool nearTier, uint
     return fast ? Tier::Fast : ordinary ? Tier::Ordinary : in.moving ? Tier::MovingFar : Tier::Idle;
 }
 
-inline bool ImmediateEdge(State const& state, Input const& in, uint8_t urgent, bool essential)
+inline bool ImmediateEdgeWithoutPose(State const& state, Input const& in, uint8_t urgent, bool essential)
 {
     return (urgent & ~state.urgent) || in.force || essential ||
-        MotionEdge(state.record, *in.record) || PoseSemantic(state, in) ||
+        MotionEdge(state.record, *in.record) ||
         DistanceSquared(state.record.position, in.record->position) >=
             double(RootDiscontinuityCm) * RootDiscontinuityCm ||
         RotationChanged(state.record.rotation, in.record->rotation, RotationDiscontinuityDegrees);
 }
+
+inline bool ImmediateEdge(State const& state, Input const& in, uint8_t urgent, bool essential)
+{
+    return ImmediateEdgeWithoutPose(state, in, urgent, essential) || PoseSemantic(state, in);
+}
+}
+
+// Fast preflight for lazy pose capture: returns PoseNeed::NotNeeded with the exact Decision in `out` whenever the
+// recipient neither needs pose values to decide (Wait/Outside/Invalid/Ineligible) nor needs a pose to send.
+inline PoseNeed Preflight(State& state, Input const& in, PoseMeta const& meta, Result& out)
+{
+    if (!in.eligible) { out = {Decision::Ineligible, Tier::Idle}; return PoseNeed::NotNeeded; }
+    if (!detail::ValidRecordAndCounts(in, meta.boneCount, meta.poseFlags)) {
+        out = {Decision::Invalid, Tier::Idle};
+        return PoseNeed::NotNeeded;
+    }
+    if (state.live && (std::memcmp(state.record.guid, in.record->guid, sizeof(state.record.guid)) ||
+                       uint32_t(in.now - state.sentAt) > 0x7fffffffu)) {
+        out = {Decision::Invalid, Tier::Idle};
+        return PoseNeed::NotNeeded;
+    }
+    const bool interested = in.interest == Interest::Include ||
+        (in.interest == Interest::Distance && in.distanceCm <= (state.live ? InterestExitCm : InterestEnterCm));
+    if (!interested) {
+        out = {state.live ? Decision::FinalAndRelease : Decision::Outside, Tier::Idle, state.live};
+        return (state.live && meta.boneCount > 0) ? PoseNeed::NeedPose : PoseNeed::NotNeeded;
+    }
+    const bool nearTier = in.distanceCm <= (state.live && state.nearTier ? NearExitCm : NearEnterCm);
+    const uint8_t urgent = detail::Urgency(in);
+    if (state.live) {
+        state.nearTier = nearTier;
+        state.urgent &= urgent;
+        if (urgent) { state.urgentUntil = in.now + UrgentHoldMs; state.haveUrgentHold = true; }
+        if ((nearTier || in.nearby) && in.moving) {
+            state.ordinaryUntil = in.now + OrdinaryHoldMs;
+            state.haveOrdinaryHold = true;
+        }
+    }
+    const Tier tier = detail::DesiredTier(state, in, nearTier, urgent);
+    if (!state.live) {
+        out = {Decision::Initial, Tier::Fast, true};
+        return meta.boneCount > 0 ? PoseNeed::NeedPose : PoseNeed::NotNeeded;
+    }
+    const bool essential = EssentialChanged(state.record, *in.record);
+    const bool poseSemantic = state.poseFlags != meta.poseFlags ||
+        state.bones.size() != static_cast<size_t>(meta.boneCount) || !meta.matchesBaseline;
+    if (detail::ImmediateEdgeWithoutPose(state, in, urgent, essential) || poseSemantic) {
+        out = {Decision::Semantic, tier, essential};
+        return meta.boneCount > 0 ? PoseNeed::NeedPose : PoseNeed::NotNeeded;
+    }
+    const uint32_t elapsed = in.now - state.sentAt;
+    const uint32_t stretch = in.stretchPermille;
+    if (elapsed >= Stretched(KeyframeMs, stretch)) {
+        out = {Decision::Keyframe, tier};
+        return meta.boneCount > 0 ? PoseNeed::NeedPose : PoseNeed::NotNeeded;
+    }
+    const uint32_t interval = Stretched(Interval(tier), stretch);
+    const bool due = in.now - state.idealAt >= interval;
+    if (!due && elapsed < KeepaliveMs) {
+        out = {Decision::Wait, tier};
+        return PoseNeed::NotNeeded;
+    }
+    const bool semantic = detail::SemanticRecord(state.record, *in.record);
+    if (due && semantic) {
+        out = {Decision::Semantic, tier};
+        return meta.boneCount > 0 ? PoseNeed::NeedPose : PoseNeed::NotNeeded;
+    }
+    const bool recordChanged = semantic || detail::DynamicRecordChanged(state.record, *in.record);
+    if (recordChanged) {
+        out = {due ? Decision::Changed : Decision::Wait, tier};
+        return (due && meta.boneCount > 0) ? PoseNeed::NeedPose : PoseNeed::NotNeeded;
+    }
+    if (meta.boneCount > 0) return PoseNeed::NeedPose;
+    if (elapsed >= KeepaliveMs) {
+        out = {Decision::Keyframe, tier};
+        return PoseNeed::NotNeeded;
+    }
+    out = {Decision::Wait, tier};
+    return PoseNeed::NotNeeded;
 }
 
 // Evaluate never changes the sent baseline or clears a live entry. It does track
@@ -491,6 +589,20 @@ struct InitialPacer {
     uint32_t admittedInBurst = 0, lastBurstMs = 0, lastBurstNpcs = 0, bursts = 0;
 
     void Reset() { *this = InitialPacer{}; }
+
+    bool CanAdmit(uint32_t now, uint32_t stretchPermille) const
+    {
+        if (!started) return true;
+        const int64_t cap = int64_t(InitialBurst) * 1000;
+        int64_t tokens = milliTokens;
+        const uint32_t elapsed = now - lastAt;
+        if (elapsed && elapsed < 0x7fffffffu) {
+            tokens += int64_t(elapsed) * InitialPerSecond * StretchNormal /
+                      (stretchPermille < StretchNormal ? StretchNormal : stretchPermille);
+            if (tokens > cap) tokens = cap;
+        }
+        return tokens >= 1000;
+    }
 
     bool Admit(uint32_t now, uint32_t stretchPermille)
     {
