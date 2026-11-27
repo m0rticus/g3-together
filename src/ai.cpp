@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -157,8 +158,11 @@ GEInt GE_STDCALL FilterScript(gCScriptProcessingUnit* spu, GELPVoid self, GELPVo
 }
 // One wrapper for every AI state and AI function: the entry on top of the run-time stack names the one
 // being run. Driven bodies run nothing except the idle task; everyone else runs the game's original.
+std::unordered_map<std::string_view, gFScriptAIState> originalStateLookup;
+std::unordered_map<std::string_view, gFScriptAIFunction> originalFunctionLookup;
+
 template <typename Fn>
-GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScriptRunTimeSingleState>& stack,
+GEBool Run(std::unordered_map<std::string_view, Fn> const& originals, bTObjStack<gScriptRunTimeSingleState>& stack,
            gCScriptProcessingUnit* spu)
 {
     char const* name = stack.GetCount() ? stack.Peek().m_strScriptName.GetText() : "";
@@ -172,21 +176,24 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     guards::LocalPlayer localPlayer(guards::IsLocalPlayer(self));
     if (downed::GuardState(self, name)) return GEFalse;
     // A mirrored NPC in a dialog with this client's hero runs its talk states, info scripts, and _AI_* gesture/facing helpers.
-    const bool talking = talk_policy::ShouldAllowPassiveTalkScript(talk::TalkingWithHero(self), name);
-    if (npcplayback::IsPassive(self) && !talking) { ++skipped; return GEFalse; }
+    const bool passive = npcplayback::IsPassive(self);
+    const bool talking = passive && talk_policy::ShouldAllowPassiveTalkScript(talk::TalkingWithHero(self), name);
+    if (passive && !talking) { ++skipped; return GEFalse; }
     if (npc_targets::ReleaseDownedTargets(self, "state-release", spu)) return GEFalse;
+    const bool driven = Driven(self);
     // A mirrored NPC runs its death state only once the host reported it dead (npcs.cpp sets it then);
     // the client's own hit judgement must not decide that.
-    const bool dying = (strncmp(name, "ZS_Dead", 7) == 0 || strncmp(name, "ZS_RagDollDead", 14) == 0) && npcs::DiedOnHost(self);
+    const bool dying = driven && (strncmp(name, "ZS_Dead", 7) == 0 || strncmp(name, "ZS_RagDollDead", 14) == 0) &&
+                       npcs::DiedOnHost(self);
     // Our own blow's stagger on a mirror runs as the game's state (the client's hit feels as it does in single-player).
-    const bool reacting = Driven(self) && npcs::LocalReaction(self, name);
+    const bool reacting = driven && npcs::LocalReaction(self, name);
     // The idle task of a mirror plays its standing motions every frame and replaced every attack the owner sent
     // (first human test: the client saw 11 attack motions where the host played 147); it waits while one plays.
     const bool acting = strcmp(name, IdleTaskName) == 0 &&
-                        (npcs::DiedOnHost(self) || npcs::InAction(self) || talk::InGesture(self));
+                        ((!net::IsHost() && (npcs::DiedOnHost(self) || npcs::InAction(self))) || talk::InGesture(self));
     // Tried on Fable's advice (2026-10-18), no effect on attack motions: returning true here (E3) and running no idle
     // task at all for mirrors (E2). The stance's ambient loop is re-selected outside the AI states.
-    if ((Driven(self) && strcmp(name, IdleTaskName) != 0 && !dying && !talking && !reacting) || acting) {
+    if ((driven && strcmp(name, IdleTaskName) != 0 && !dying && !talking && !reacting) || acting) {
         ++skipped;
         return GEFalse;  // nothing ran; our driver puts the idle task back
     }
@@ -230,12 +237,17 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
     // A guard's reaction to another player follows that player; an attack on a puppet is a fight with its player (fightmem.cpp).
     eCEntity* actor = guards::StateActor(self, name);
     eCEntity* fighter = actor ? nullptr : fightmem::StateActor(self, name);
-    guards::Acting player(actor ? actor : fighter, true, self);
-    eCEntity* localHero = gCSession::GetInstance().GetHero();
+    eCEntity* const localHero = gCSession::GetInstance().GetHero();
     const bool localTerminalState = localHero && self == localHero && downed::Terminal() &&
                                     std::strcmp(name, "ZS_RagDollDead") == 0;
     if (localTerminalState && !downed::ObserveDeathState(self, true)) return GEFalse;
-    const GEBool result = it->second(stack, spu);
+    GEBool result = GEFalse;
+    if (actor || fighter) {
+        guards::Acting player(actor ? actor : fighter, true, self);
+        result = it->second(stack, spu);
+    } else {
+        result = it->second(stack, spu);
+    }
     if (localTerminalState) downed::ObserveDeathState(self, false, result != GEFalse);
     if (fighter) fightmem::AfterState(self);
     downed::ObserveTerminal(self, name);
@@ -243,11 +255,11 @@ GEBool Run(std::unordered_map<std::string, Fn> const& originals, bTObjStack<gScr
 }
 GEBool GE_STDCALL FilterState(bTObjStack<gScriptRunTimeSingleState>& stack, gCScriptProcessingUnit* spu)
 {
-    return Run(originalStates, stack, spu);
+    return Run(originalStateLookup, stack, spu);
 }
 GEBool GE_STDCALL FilterFunction(bTObjStack<gScriptRunTimeSingleState>& stack, gCScriptProcessingUnit* spu)
 {
-    return Run(originalFunctions, stack, spu);
+    return Run(originalFunctionLookup, stack, spu);
 }
 void WrapStates(gCScriptAdminExt& admin);
 // NPCs choose targets through the script GetAttitude, called by name from the perception scanner and the combat
@@ -701,7 +713,7 @@ bool EnterTerminalDeath(eCEntity* hero)
     state.m_strScriptName = "ZS_RagDollDead";
     stack.Add(state);
     guards::Acting localPlayer(hero, false); // native Kill's GO_GameOver comparison must use this PC's hero
-    return Run(originalStates, stack, &routine->GetSPU()) != GEFalse;
+    return Run(originalStateLookup, stack, &routine->GetSPU()) != GEFalse;
 }
 
 
@@ -744,20 +756,24 @@ void WrapStates(gCScriptAdminExt& admin)
     GE_MAP_FOR_EACH (name, state, admin.GetScriptAIStates())
     {
         if (!state || state->m_funcScriptAIState == &FilterState || !state->m_funcScriptAIState) continue;
-        originalStates[name.GetText()] = state->m_funcScriptAIState;
+        auto [it, inserted] = originalStates.emplace(name.GetText(), state->m_funcScriptAIState);
+        if (!inserted) it->second = state->m_funcScriptAIState;
+        originalStateLookup[it->first] = it->second;
         state->m_funcScriptAIState = &FilterState;
         TrackPointer(reinterpret_cast<void*>(&state->m_funcScriptAIState),
-                     reinterpret_cast<void*>(originalStates[name.GetText()]),
+                     reinterpret_cast<void*>(it->second),
                      reinterpret_cast<void*>(&FilterState), "ai script AI state");
         ++wrapped;
     }
     GE_MAP_FOR_EACH (name, function, admin.GetScriptAIFunctions())
     {
         if (!function || function->m_funcScriptAIFunction == &FilterFunction || !function->m_funcScriptAIFunction) continue;
-        originalFunctions[name.GetText()] = function->m_funcScriptAIFunction;
+        auto [it, inserted] = originalFunctions.emplace(name.GetText(), function->m_funcScriptAIFunction);
+        if (!inserted) it->second = function->m_funcScriptAIFunction;
+        originalFunctionLookup[it->first] = it->second;
         function->m_funcScriptAIFunction = &FilterFunction;
         TrackPointer(reinterpret_cast<void*>(&function->m_funcScriptAIFunction),
-                     reinterpret_cast<void*>(originalFunctions[name.GetText()]),
+                     reinterpret_cast<void*>(it->second),
                      reinterpret_cast<void*>(&FilterFunction), "ai script AI function");
         ++wrapped;
     }

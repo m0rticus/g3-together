@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace g3t::npcplayback::detail {
 namespace {
@@ -46,6 +47,7 @@ struct SourceSkeleton {
 };
 
 std::unordered_map<eCWrapper_emfx2Actor*, SourceSkeleton> sourceSkeletons;
+std::unordered_set<eCEntity*> offscreenCaptureVisible;
 uint64_t publishedNameEpoch = 1;
 
 } // namespace
@@ -363,7 +365,39 @@ void ForgetActorSkeleton(eCWrapper_emfx2Actor* actor)
 void ClearSkeletonCache()
 {
     sourceSkeletons.clear();
+    offscreenCaptureVisible.clear();
     ++publishedNameEpoch;
+}
+
+void SetOffscreenCaptureVisible(eCEntity* entity, bool visible)
+{
+    if (!entity) return;
+    if (visible) {
+        offscreenCaptureVisible.insert(entity);
+        if (auto* animation = Animation(entity)) animation->SetForceAlwaysVisible(GETrue);
+        return;
+    }
+    if (offscreenCaptureVisible.erase(entity) > 0) {
+        if (auto* animation = Animation(entity)) animation->SetForceAlwaysVisible(GEFalse);
+    }
+}
+
+bool IsOffscreenCaptureVisible(eCEntity const* entity)
+{
+    return entity && offscreenCaptureVisible.find(const_cast<eCEntity*>(entity)) != offscreenCaptureVisible.end();
+}
+
+void ForgetOffscreenCaptureEntity(eCEntity* entity, bool resetProperty)
+{
+    if (!entity) return;
+    if (offscreenCaptureVisible.erase(entity) > 0 && resetProperty) {
+        if (auto* animation = Animation(entity)) animation->SetForceAlwaysVisible(GEFalse);
+    }
+}
+
+void ResetOffscreenCaptureVisibility()
+{
+    offscreenCaptureVisible.clear();
 }
 
 } // namespace g3t::npcplayback::detail
@@ -373,6 +407,30 @@ namespace g3t::npcplayback {
 void ResetPublishedNames()
 {
     ++detail::publishedNameEpoch;
+}
+
+void SyncHostCaptureVisibility(eCEntity* const* activeEntities, size_t count)
+{
+    auto& tracked = detail::offscreenCaptureVisible;
+    if (tracked.empty()) return;
+    if (!activeEntities || !count) {
+        for (eCEntity* entity : tracked) {
+            if (auto* animation = detail::Animation(entity)) animation->SetForceAlwaysVisible(GEFalse);
+        }
+        tracked.clear();
+        return;
+    }
+    static std::vector<eCEntity*> sorted;
+    sorted.assign(activeEntities, activeEntities + count);
+    std::sort(sorted.begin(), sorted.end());
+    for (auto it = tracked.begin(); it != tracked.end();) {
+        if (!std::binary_search(sorted.begin(), sorted.end(), *it)) {
+            if (auto* animation = detail::Animation(*it)) animation->SetForceAlwaysVisible(GEFalse);
+            it = tracked.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flags, PublishName publish)
@@ -452,11 +510,11 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
     return true;
 }
 
-bool Capture(eCEntity* entity, net::NpcRecord& record, PublishName publish)
+bool Capture(eCEntity* entity, net::NpcRecord& record, PublishName publish, bool allowOffscreenCapture)
 {
     auto* animation = detail::Animation(entity);
     if (!animation) return false;
-    animation->SetForceAlwaysVisible(GETrue);
+    detail::SetOffscreenCaptureVisible(entity, allowOffscreenCapture);
     if (!animation->GetActor()) return false;
     detail::Frame frame;
     if (!detail::CaptureFrame(entity, frame)) return false;

@@ -322,14 +322,9 @@ struct CellInventory {
     bool Empty() const { return !statics && !dynamics; }
 };
 
-bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3],
-                        std::vector<std::array<float, 4>>* readyCellBoxes = nullptr)
+bool CellBoxReadyForAnchor(bTSmallArray<eCPVSCellItem*> const& cells, eCPVSCellItem* permanent, bool jobDone,
+                           float const anchor[3], std::vector<std::array<float, 4>>* readyCellBoxes = nullptr)
 {
-    ScopedCellLock lock;
-    bTSmallArray<eCPVSCellItem*> cells;
-    prefetcher.GetAllValidCells(cells);
-    auto* permanent = prefetcher.GetNonDeactivationCell();
-    const bool jobDone = !prefetcher.IsJobRunning();
     for (GEU16 i = 0; i < cells.GetCount(); ++i) {
         auto* cell = cells.GetAt(i);
         if (!cell || cell == permanent) continue;
@@ -350,6 +345,16 @@ bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3],
         }
     }
     return false;
+}
+
+bool HasReadyAnchorCell(eCPVSPrefetcher3& prefetcher, float const anchor[3],
+                        std::vector<std::array<float, 4>>* readyCellBoxes = nullptr)
+{
+    ScopedCellLock lock;
+    bTSmallArray<eCPVSCellItem*> cells;
+    prefetcher.GetAllValidCells(cells);
+    return CellBoxReadyForAnchor(cells, prefetcher.GetNonDeactivationCell(), !prefetcher.IsJobRunning(),
+                                 anchor, readyCellBoxes);
 }
 
 CellInventory Inventory(eCPVSPrefetcher3* prefetcher)
@@ -564,10 +569,11 @@ bool PlaceRegion(RemoteRegionState& region, float const at[3], float radius)
     auto* renderer = RenderAdmin();
     const uint32_t now = net::Now();
     const bool moved = body::Distance(at, region.position) >= 500.0f || region.radius != radius;
-    const bool coveredByMain = renderer && HasReadyAnchorCell(renderer->GetPVSPrefetcher3(), at);
-    const bool anchorMissing = region.prefetcher && !region.prefetcher->IsJobRunning() &&
-                               !HasReadyAnchorCell(*region.prefetcher, at) && !coveredByMain &&
-                               (!region.anchorRetryAt || static_cast<int32_t>(now - region.anchorRetryAt) >= 0);
+    const bool needAnchorCheck = !moved && region.prefetcher && !region.prefetcher->IsJobRunning() &&
+                                 (!region.anchorRetryAt || static_cast<int32_t>(now - region.anchorRetryAt) >= 0);
+    const bool coveredByMain = needAnchorCheck && renderer && HasReadyAnchorCell(renderer->GetPVSPrefetcher3(), at);
+    const bool anchorMissing = needAnchorCheck &&
+                               !HasReadyAnchorCell(*region.prefetcher, at) && !coveredByMain;
     if (moved || anchorMissing) {
         if (moved && region.frames && regionLogs < 24) {
             ++regionLogs;
@@ -734,33 +740,51 @@ void ClusterAnchorGroups(float const here[3], float mainFarClip, std::vector<Anc
 
 void SyncActiveRegions(std::vector<AnchorGroup> const& groups)
 {
+    bool changed = false;
     for (size_t i = groups.size(); i < hostRegions.size(); ++i) {
-        if (collision::ShouldAttemptRegionRelease(hostRegions[i].failed, net::Now(), hostRegions[i].retryAt))
+        if (collision::ShouldAttemptRegionRelease(hostRegions[i].failed, net::Now(), hostRegions[i].retryAt)) {
             ReleaseRegion(hostRegions[i]);
+            changed = true;
+        }
     }
     size_t retained = groups.size();
     for (size_t i = groups.size(); i < hostRegions.size(); ++i)
         if (hostRegions[i].camera || hostRegions[i].prefetcher) retained = i + 1;
-    hostRegions.resize(retained);
-    PublishActiveRegions();
+    if (retained != hostRegions.size()) {
+        hostRegions.resize(retained);
+        changed = true;
+    }
+    if (changed) PublishActiveRegions();
     for (size_t id = 0; id < groups.size(); ++id) {
         float centre[3];
         for (int k = 0; k < 3; ++k) centre[k] = (groups[id].low[k] + groups[id].high[k]) * 0.5f;
         const float radius = GetConfig().hostRoi + body::Distance(groups[id].low.data(), groups[id].high.data()) * 0.5f + 1500.0f;
+        const bool hadCamera = hostRegions[id].camera != nullptr;
         PlaceRegion(hostRegions[id], centre, radius);
+        if (hadCamera != (hostRegions[id].camera != nullptr)) changed = true;
     }
-    PublishActiveRegions();
+    if (changed) PublishActiveRegions();
 }
 
 void UpdateReadySimulationAnchors(eCPVSPrefetcher3& mainPrefetcher, std::vector<size_t> const& anchorGroups)
 {
     readySimulationAnchors.clear();
+    if (simulationAnchors.empty()) return;
     readySimulationAnchors.reserve(simulationAnchors.size());
+    bTSmallArray<eCPVSCellItem*> mainCells;
+    eCPVSCellItem* mainPermanent = nullptr;
+    bool mainJobDone = false;
+    {
+        ScopedCellLock lock;
+        mainPrefetcher.GetAllValidCells(mainCells);
+        mainPermanent = mainPrefetcher.GetNonDeactivationCell();
+        mainJobDone = !mainPrefetcher.IsJobRunning();
+    }
     for (size_t idx = 0; idx < simulationAnchors.size(); ++idx) {
         auto const& anchor = simulationAnchors[idx];
         const size_t group = anchorGroups[idx];
         const bool withinMain = group == static_cast<size_t>(-1);
-        const bool mainCellReady = HasReadyAnchorCell(mainPrefetcher, anchor.data());
+        const bool mainCellReady = CellBoxReadyForAnchor(mainCells, mainPermanent, mainJobDone, anchor.data());
         const bool mainReady = withinMain && mainCellReady;
         bool remoteReady = false;
         if (!withinMain && group < hostRegions.size()) {

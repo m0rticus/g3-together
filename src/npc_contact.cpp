@@ -617,30 +617,33 @@ bool ParryingAt(eCEntity const* entity, uint32_t at, bool& parrying)
 
 bool InAction(eCEntity const* entity)
 {
-    if (!entity) return false;
-    const uint32_t now = net::Now();
-    for (auto const& entry : mirrors)
-        if (entry.second.entity.GetInstance() == entity)
-            return static_cast<int32_t>(entry.second.body.actionUntil - now) > 0;
+    if (!entity || mirrors.empty()) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found != mirrors.end() && found->second.entity.GetInstance() == entity)
+        return static_cast<int32_t>(found->second.body.actionUntil - net::Now()) > 0;
     return false;
 }
 
 bool DiedOnHost(eCEntity const* entity)
 {
-    if (!entity) return false;
-    for (auto const& entry : mirrors)
-        if (entry.second.killed && entry.second.entity.GetInstance() == entity) return true;
-    return false;
+    if (!entity || mirrors.empty()) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    return found != mirrors.end() && found->second.killed && found->second.entity.GetInstance() == entity;
 }
 
 bool IsMirrored(eCEntity const* entity)
 {
     if (npclease::LocalAuthority(entity)) return false;
     if (npcplayback::IsPassive(entity)) return true;
-    if (!entity) return false;
-    for (auto const& entry : mirrors)
-        if (entry.second.body.pacified && entry.second.entity.GetInstance() == entity) return true;
-    return false;
+    if (!entity || mirrors.empty()) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    return found != mirrors.end() && found->second.body.pacified && found->second.entity.GetInstance() == entity;
 }
 
 bool Ready(eCEntity const* entity)

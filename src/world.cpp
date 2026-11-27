@@ -166,16 +166,18 @@ float const* Field(eCEntityAdmin const* admin, int offset) { return reinterpret_
 
 bool NpcIntersectsAt(eCEntityAdmin* admin, bCBox const& box, unsigned& checks, unsigned& expanded)
 {
-    const bool native = admin->IntersectsProcessingRangeRegion(box);
     // Reached only from the validated LEA/PUSH/CALL sites of the engine's two dynamic-entity range paths.
     static_assert(offsetof(eCEntity, m_WorldNodeBoundary) == 0xe8, "native dynamic-collection box offset");
     auto const* entity = reinterpret_cast<eCEntity const*>(reinterpret_cast<char const*>(&box) - 0xe8);
+    const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    const bool native = admin->IntersectsProcessingRangeRegion(box);
+    if (!npc) return native;
     if (npcremoval::ExcludeFromProcessing(entity)) return false;
     if (native) return true;
     if (!net::IsHost()) return npclease::ProcessingAuthority(entity);
-    const bool npc = entity->GetPropertySet(eEPropertySetType_NPC) != nullptr;
+    if (sphereCount <= 0) return false;
     ++checks;
-    const bool included = processing::IncludesNpc(native, npc, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount) &&
+    const bool included = processing::IncludesNpc(false, true, reinterpret_cast<float const*>(&box), spheres.data(), sphereCount) &&
                           collision::IsNpcCollisionReady(entity);
     if (included) ++expanded;
     return included;
@@ -266,37 +268,48 @@ void PlaceSpheres(eCEntityAdmin* admin, eCEntity* camera)
 {
     lastAdmin = admin;
     auto const& simulationAnchors = pvs::ReadySimulationAnchors();
-    std::vector<Sphere> wanted(simulationAnchors.size() + 3);
-    int n = 0;
+    static std::vector<Sphere> wanted;
+    wanted.clear();
     float const* at = camera ? reinterpret_cast<float const*>(reinterpret_cast<char const*>(camera) + 0x8c) : nullptr;
     const float step = *Field(admin, 0x40);
+    const float nativeRoi = *Field(admin, 0x10);
+    float const* nativeCentre = Field(admin, 0x24);
     elasticActive = false;
     if (spheresHooked && at && net::IsHost() && gCSession::GetInstance().IsGameRunning() &&
         !persist::NativeLoading() && !persist::HeroPending()) {
-        if (GetConfig().hostRoi > *Field(admin, 0x10)) {
-            std::memcpy(wanted[n].at, at, sizeof(wanted[n].at));
-            wanted[n++].radius = GetConfig().hostRoi + step;
-        }
+        auto addSphere = [&](float const pos[3], float radius) {
+            if (GetConfig().hostRoi <= nativeRoi &&
+                body::Distance(pos, nativeCentre) + radius <= nativeRoi)
+                return;
+            for (Sphere const& existing : wanted) {
+                const float dist = body::Distance(pos, existing.at);
+                if (dist + radius <= existing.radius || (dist <= 100.0f && radius <= existing.radius))
+                    return;
+            }
+            Sphere s;
+            std::memcpy(s.at, pos, sizeof(s.at));
+            s.radius = radius;
+            wanted.push_back(s);
+        };
+        if (GetConfig().hostRoi > nativeRoi) addSphere(at, GetConfig().hostRoi + step);
         float centre[3], radius = 0.0f;
         if (GetConfig().hostSimElastic && ElasticSphere(camera, centre, radius)) {
-            std::memcpy(wanted[n].at, centre, sizeof(wanted[n].at));
-            wanted[n++].radius = radius + step;
+            addSphere(centre, radius + step);
             std::memcpy(elasticCentre, centre, sizeof(elasticCentre));
             elasticRadius = radius;
             elasticActive = true;
             ++elasticFrames;
         }
-        for (auto const& anchor : simulationAnchors) {
-            std::memcpy(wanted[n].at, anchor.data(), sizeof(wanted[n].at));
-            wanted[n++].radius = GetConfig().hostRoi + step;
-        }
+        const float anchorRadius = GetConfig().hostRoi + step;
+        for (auto const& anchor : simulationAnchors) addSphere(anchor.data(), anchorRadius);
     }
+    const int n = static_cast<int>(wanted.size());
     bool changed = n != sphereCount;
     for (int i = 0; i < n && !changed; ++i)
         changed = body::Distance(wanted[i].at, spheres[i].at) > step || wanted[i].radius != spheres[i].radius;
     if (changed) {
         if (!MarkProcessingDirty(admin)) return;
-        spheres.assign(wanted.begin(), wanted.begin() + n);
+        spheres.assign(wanted.begin(), wanted.end());
         sphereCount = n;
         ++sphereRebuilds;
     }

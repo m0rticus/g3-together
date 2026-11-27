@@ -14,6 +14,7 @@
 
 #include <Windows.h>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -25,6 +26,7 @@ namespace {
 
 std::unordered_map<eCWrapper_emfx2Actor*, std::array<CapturedOptions, Slots>> sourceOptions;
 std::mutex sourceOptionsMutex;
+std::atomic<bool> sourceOptionsEmpty{true};
 uint32_t nextInstance = 0;
 uint32_t lastOptionsPruneAt = 0;
 
@@ -66,13 +68,20 @@ TaskFn originalSetTask = nullptr, originalAISetTask = nullptr;
 AddPropertyFn originalAddProperty = nullptr;
 
 struct PropertyTable {
-    void** table = nullptr;
+    std::atomic<void**> table{nullptr};
     ProcessFn original[3] = {};
     void* events[6] = {};
 };
-std::array<PropertyTable, 128> propertyTables;
+constexpr unsigned PropertyTableSlots = 256;
+std::array<PropertyTable, PropertyTableSlots> propertyTables;
 std::atomic<unsigned> propertyTableCount{0};
 std::mutex propertyTableMutex;
+
+unsigned PropertyTableSlot(void** table)
+{
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(table);
+    return static_cast<unsigned>((raw >> 2) ^ (raw >> 10)) & (PropertyTableSlots - 1u);
+}
 
 // The one NPC our hero is talking to: while in stationary talk on the client, its local script routine, animation, facial
 // lip-sync, and in-place facing run smoothly for gCInfoManager_PS while slot-0 gestures are also forwarded to the host.
@@ -108,9 +117,14 @@ bool SafeNativeProperty(eEPropertySetType type)
 PropertyTable const* FindPropertyTable(eCEntityPropertySet* self)
 {
     void** table = *reinterpret_cast<void***>(self);
-    const unsigned count = propertyTableCount.load(std::memory_order_acquire);
-    for (unsigned i = 0; i < count; ++i)
-        if (propertyTables[i].table == table) return &propertyTables[i];
+    if (!propertyTableCount.load(std::memory_order_acquire)) return nullptr;
+    unsigned slot = PropertyTableSlot(table);
+    for (unsigned probe = 0; probe < PropertyTableSlots; ++probe) {
+        void** entry = propertyTables[slot].table.load(std::memory_order_acquire);
+        if (entry == table) return &propertyTables[slot];
+        if (!entry) return nullptr;
+        slot = (slot + 1u) & (PropertyTableSlots - 1u);
+    }
     return nullptr;
 }
 
@@ -125,21 +139,23 @@ PropertyTable const* PropertyHooks(eCEntityPropertySet* self)
 void PropertyDispatch(eCEntityPropertySet* self, void* edx, unsigned phase)
 {
     if (!self) return;
-    if (ai::ShuttingDown()) {
-        if (auto* table = FindPropertyTable(self)) { table->original[phase](self, edx); return; }
-        return;
-    }
-    const eEPropertySetType type = self->GetPropertySetType();
-    const bool partnerProperty = talk_policy::ShouldAllowDialogPartnerProperty(
-        DialogPartner(self->GetEntity()),
-        type == eEPropertySetType_ScriptRoutine,
-        type == eEPropertySetType_Animation,
-        type == eEPropertySetType_CharacterMovement,
-        type == eEPropertySetType_Dialog);
-    if (!partnerProperty && IsPassive(self->GetEntity()) &&
-        !SafeNativeProperty(type) && !(updatingVisual && type == eEPropertySetType_Animation)) {
-        ++counters.blockedProperties;
-        return;
+    if (!ai::ShuttingDown()) {
+        const eEPropertySetType type = self->GetPropertySetType();
+        if (!SafeNativeProperty(type) && !(updatingVisual && type == eEPropertySetType_Animation)) {
+            eCEntity* entity = self->GetEntity();
+            if (IsPassive(entity)) {
+                const bool partnerProperty = talk_policy::ShouldAllowDialogPartnerProperty(
+                    DialogPartner(entity),
+                    type == eEPropertySetType_ScriptRoutine,
+                    type == eEPropertySetType_Animation,
+                    type == eEPropertySetType_CharacterMovement,
+                    type == eEPropertySetType_Dialog);
+                if (!partnerProperty) {
+                    ++counters.blockedProperties;
+                    return;
+                }
+            }
+        }
     }
     if (auto* table = FindPropertyTable(self)) { table->original[phase](self, edx); return; }
     Log("FAIL npcplayback: unregistered property dispatch table");
@@ -199,9 +215,19 @@ bool RegisterProperty(eCEntityPropertySet* property)
     if (!property) return false;
     void** table = *reinterpret_cast<void***>(property);
     std::lock_guard<std::mutex> lock(propertyTableMutex);
+    unsigned slot = PropertyTableSlot(table);
+    bool emptySlot = false;
+    for (unsigned probe = 0; probe < PropertyTableSlots; ++probe) {
+        void** entry = propertyTables[slot].table.load(std::memory_order_relaxed);
+        if (entry == table) return true;
+        if (!entry) { emptySlot = true; break; }
+        slot = (slot + 1u) & (PropertyTableSlots - 1u);
+    }
     const unsigned count = propertyTableCount.load(std::memory_order_relaxed);
-    for (unsigned i = 0; i < count; ++i) if (propertyTables[i].table == table) return true;
-    if (count == propertyTables.size()) { Log("FAIL npcplayback: too many native property classes"); return false; }
+    if (!emptySlot || count >= PropertyTableSlots / 2) {
+        Log("FAIL npcplayback: too many native property classes");
+        return false;
+    }
     // CP 1.75's property dispatch loop calls OnProcess at byte 0x124; pre/post follow it.
     constexpr unsigned first = 0x124 / sizeof(void*);
     constexpr unsigned event = 0xc8 / sizeof(void*);
@@ -213,10 +239,10 @@ bool RegisterProperty(eCEntityPropertySet* property)
     }
     std::vector<unsigned char> originalTable(reinterpret_cast<unsigned char*>(table + event),
                                              reinterpret_cast<unsigned char*>(table + event) + bytes);
-    PropertyTable& hook = propertyTables[count];
-    hook.table = table;
+    PropertyTable& hook = propertyTables[slot];
     for (unsigned i = 0; i < 3; ++i) hook.original[i] = reinterpret_cast<ProcessFn>(table[first + i]);
     for (unsigned i = 0; i < 6; ++i) hook.events[i] = table[event + i];
+    hook.table.store(table, std::memory_order_release);
     propertyTableCount.store(count + 1, std::memory_order_release);
     table[first] = reinterpret_cast<void*>(&PropertyProcess);
     table[first + 1] = reinterpret_cast<void*>(&PropertyPre);
@@ -251,8 +277,14 @@ void __fastcall Routine(eCEntityPropertySet* self, void* edx)
     if (ai::ShuttingDown()) { if (originalRoutine) originalRoutine(self, edx); return; }
     eCEntity* entity = self->GetEntity();
     if (IsPassive(entity) && !DialogPartner(entity)) { ++counters.blockedRoutines; return; }
-    const uint8_t player = talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity));
-    guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
+    const uint8_t player = (net::Connected() && net::IsHost())
+        ? talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity))
+        : 0;
+    if (player > 1) {
+        guards::Acting context(remote::PuppetOf(player));
+        originalRoutine(self, edx);
+        return;
+    }
     originalRoutine(self, edx);
 }
 
@@ -275,8 +307,13 @@ bEResult __fastcall Script(gCScriptProcessingUnit* self, void* edx)
     if (ai::ShuttingDown()) return originalScript ? originalScript(self, edx) : bEResult_Ok;
     eCEntity* entity = self->GetSelfEntity();
     if (IsPassive(entity) && !DialogPartner(entity)) { ++counters.blockedScripts; return bEResult_Ok; }
-    const uint8_t player = talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity));
-    guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
+    const uint8_t player = (net::Connected() && net::IsHost())
+        ? talk_policy::EffectiveActingPlayer(net::IsHost(), talk::IsHeld(entity), npcs::ContextPlayer(entity))
+        : 0;
+    if (player > 1) {
+        guards::Acting context(remote::PuppetOf(player));
+        return originalScript(self, edx);
+    }
     return originalScript(self, edx);
 }
 
@@ -285,22 +322,31 @@ GEInt __fastcall EventScript(gCScriptAdmin* self, void* edx, bCString const& nam
 {
     if (ai::ShuttingDown()) return originalEventScript
         ? originalEventScript(self, edx, name, receiver, other, args) : 0;
-    const char* event = name.GetText();
-    if ((!std::strcmp(event, "OnTick") || !std::strcmp(event, "OnEnterProcessingRange") ||
-         !std::strcmp(event, "OnExitProcessingRange") || !std::strcmp(event, "Respawn")) && IsPassive(receiver)) {
-        ++counters.blockedEvents;
-        if (!std::strcmp(event, "OnTick")) ++counters.blockedNpcTicks;
-        return 0;
+    if (receiver) {
+        const char* event = name.GetText();
+        if (event && (event[0] == 'O' || event[0] == 'R') &&
+            (!std::strcmp(event, "OnTick") || !std::strcmp(event, "OnEnterProcessingRange") ||
+             !std::strcmp(event, "OnExitProcessingRange") || !std::strcmp(event, "Respawn")) &&
+            IsPassive(receiver)) {
+            ++counters.blockedEvents;
+            if (!std::strcmp(event, "OnTick")) ++counters.blockedNpcTicks;
+            return 0;
+        }
+        if (talk::BlockHeldTalkEvent(receiver, event)) {
+            ++counters.blockedEvents;
+            return 0;
+        }
+        if (net::Connected() && net::IsHost()) {
+            const bool bindPlayer = talk_policy::ShouldBindActingPlayerForEvent(net::IsHost(), talk::IsHeld(receiver), event);
+            const uint8_t player = bindPlayer
+                ? talk_policy::EffectiveActingPlayer(true, false, npcs::ContextPlayer(receiver))
+                : 0;
+            if (player > 1) {
+                guards::Acting context(remote::PuppetOf(player));
+                return originalEventScript(self, edx, name, receiver, other, args);
+            }
+        }
     }
-    if (talk::BlockHeldTalkEvent(receiver, event)) {
-        ++counters.blockedEvents;
-        return 0;
-    }
-    const bool bindPlayer = talk_policy::ShouldBindActingPlayerForEvent(net::IsHost(), talk::IsHeld(receiver), event);
-    const uint8_t player = bindPlayer
-        ? talk_policy::EffectiveActingPlayer(true, false, npcs::ContextPlayer(receiver))
-        : 0;
-    guards::Acting context(player > 1 ? remote::PuppetOf(player) : nullptr);
     return originalEventScript(self, edx, name, receiver, other, args);
 }
 
@@ -335,9 +381,11 @@ void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2
     originalActorPlay(self, edx, slot, motion, options);
     if (index < 0 || index >= Slots) return;
     if (presenting) {
-        std::lock_guard<std::mutex> lock(sourceOptionsMutex);
-        if (const auto found = sourceOptions.find(self); found != sourceOptions.end())
-            found->second[index].available = false;
+        if (!sourceOptionsEmpty.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(sourceOptionsMutex);
+            if (const auto found = sourceOptions.find(self); found != sourceOptions.end())
+                found->second[index].available = false;
+        }
         return;
     }
     if (!self->HasMotionInstance(slot)) return;
@@ -346,6 +394,7 @@ void __fastcall ActorPlay(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx2
     captured.instance = nextInstance;
     captured.available = true;
     sourceOptions[self][index] = captured;
+    sourceOptionsEmpty.store(false, std::memory_order_release);
 }
 
 bool CanonicalFacial(eCVisualAnimationFactory* factory)
@@ -374,7 +423,7 @@ void __fastcall StopMotion(eCWrapper_emfx2Actor* self, void* edx, eCWrapper_emfx
     auto* visual = updatingVisual && IsPassive(visualEntity) && !DialogPartner(visualEntity) ? Animation(visualEntity) : nullptr;
     if (!presenting && visual && !visual->GetRagDollEnabled()) { ++counters.blockedAnimations; return; }
     const int index = static_cast<int>(slot);
-    if (index >= 0 && index < Slots) {
+    if (index >= 0 && index < Slots && !sourceOptionsEmpty.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(sourceOptionsMutex);
         const auto found = sourceOptions.find(self);
         if (found != sourceOptions.end()) found->second[index].available = false;
@@ -441,14 +490,16 @@ void __fastcall ActorProcess(eCWrapper_emfx2Actor* self, void* edx, bCMatrix con
                              GEBool skeleton, GEBool physics, GEFloat scale)
 {
     if (ai::ShuttingDown()) { if (originalActorProcess) originalActorProcess(self, edx, world, skeleton, physics, scale); return; }
-    auto* animation = updatingVisual && (IsPassive(visualEntity) || (presentingPose && presentingPose->allowNonPassive))
-        ? Animation(visualEntity) : nullptr;
-    if (presentingPose && animation && animation->GetActor() == self) {
-        // Retire stopped native instances without advancing a mirror's animation or blend clocks.
-        originalActorProcess(self, edx, world, GETrue, GEFalse, 0.0f);
-        presentingPose->evaluated = true;
-        if (!presentingPose->evaluateOnly) ApplyPose(*self, *presentingPose);
-        return;
+    if (presentingPose && updatingVisual &&
+        (presentingPose->allowNonPassive || IsPassive(visualEntity))) {
+        auto* animation = Animation(visualEntity);
+        if (animation && animation->GetActor() == self) {
+            // Retire stopped native instances without advancing a mirror's animation or blend clocks.
+            originalActorProcess(self, edx, world, GETrue, GEFalse, 0.0f);
+            presentingPose->evaluated = true;
+            if (!presentingPose->evaluateOnly) ApplyPose(*self, *presentingPose);
+            return;
+        }
     }
     originalActorProcess(self, edx, world, skeleton, physics, scale);
 }
@@ -558,10 +609,14 @@ uint32_t ActorMotionInstance(eCEntity* entity, int slot)
 
 void PruneSourceOptions(uint32_t now)
 {
+    if (sourceOptionsEmpty.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lock(sourceOptionsMutex);
         if (lastOptionsPruneAt && now - lastOptionsPruneAt < 15000) return;
-        if (sourceOptions.empty()) return;
+        if (sourceOptions.empty()) {
+            sourceOptionsEmpty.store(true, std::memory_order_release);
+            return;
+        }
         lastOptionsPruneAt = now ? now : 1;
     }
     auto* scene = static_cast<eCSceneAdmin*>(eCModuleAdmin::GetInstance().FindModule(bCString("eCSceneAdmin")));
@@ -582,12 +637,14 @@ void PruneSourceOptions(uint32_t now)
         if (liveActors.find(it->first) == liveActors.end()) it = sourceOptions.erase(it);
         else ++it;
     }
+    sourceOptionsEmpty.store(sourceOptions.empty(), std::memory_order_release);
 }
 
 void ResetHooksState()
 {
     std::lock_guard<std::mutex> lock(sourceOptionsMutex);
     sourceOptions.clear();
+    sourceOptionsEmpty.store(true, std::memory_order_release);
     nextInstance = 0;
     lastOptionsPruneAt = 0;
 }
@@ -649,12 +706,14 @@ void OnEntityDestroyed(eCEntity* entity)
         detail::originSequence = 0;
     }
     detail::ForgetDestroyedEntity(entity);
+    detail::ForgetOffscreenCaptureEntity(entity, false);
     auto* animation = detail::Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor) return;
-    {
+    if (!detail::sourceOptionsEmpty.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(detail::sourceOptionsMutex);
         detail::sourceOptions.erase(actor);
+        detail::sourceOptionsEmpty.store(detail::sourceOptions.empty(), std::memory_order_release);
     }
     detail::ForgetActorSkeleton(actor);
 }

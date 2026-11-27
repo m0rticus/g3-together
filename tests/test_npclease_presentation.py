@@ -145,3 +145,31 @@ class NpcLeasePresentationTests(unittest.TestCase):
         release_native = source[source.index("bool ReleaseNativePresentation("):source.index("void UpdatePresentation(")]
         self.assertIn("provenPoses.erase(EntityKey(entity))", release_native)
 
+    def test_force_always_visible_is_scoped_and_detour_lookups_avoid_allocations(self):
+        playback = _testbuild.src_text("npcplayback.cpp")
+        skeleton = _testbuild.src_text("npcplayback_skeleton.cpp")
+        hooks = _testbuild.src_text("npcplayback_hooks.cpp")
+        npcs = _testbuild.src_text("npcs.cpp")
+        npc_send = _testbuild.src_text("npc_send.cpp")
+        ai = _testbuild.src_text("ai.cpp")
+        talk = _testbuild.src_text("talk.cpp")
+
+        replay = playback[playback.index("bool Replay("):playback.index("bool ReplayFrozenPose(")]
+        self.assertNotIn("SetForceAlwaysVisible(GETrue)", replay)
+        update = playback[playback.index("void UpdatePresentation("):playback.index("void PresentationCensus(")]
+        self.assertIn("if (!keepVisible) animation->SetForceAlwaysVisible(GEFalse);", update)
+
+        self.assertIn("SetOffscreenCaptureVisible(entity, allowOffscreenCapture);", skeleton)
+        self.assertIn("void SyncHostCaptureVisibility(", skeleton)
+        self.assertIn("animation->SetForceAlwaysVisible(GEFalse)", skeleton)
+        self.assertIn("npcplayback::SyncHostCaptureVisibility(", npcs)
+        self.assertIn("npcplayback::SyncHostCaptureVisibility(nullptr, 0);", npc_send)
+        self.assertIn("const bool allowOffscreenCapture = needRemotePose && !(r.flags & 1);", npc_send)
+
+        self.assertIn("PropertyTableSlot(", hooks)
+        self.assertIn("sourceOptionsEmpty", hooks)
+        self.assertIn("originalStateLookup", ai)
+        self.assertIn("originalFunctionLookup", ai)
+        self.assertIn("std::unordered_map<GuidKey, Hold, GuidHash> holds;", talk)
+        self.assertIn("if (!entity || holds.empty()) return nullptr;", talk)
+

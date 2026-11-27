@@ -119,8 +119,10 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
     static std::vector<npcsend_candidates::GuidCandidate> candidates;
     static HostSendFrame frame;
     static std::vector<pose::Bone> bones;
+    static std::vector<eCEntity*> activeCaptureVisible;
     candidates.clear();
     frame.Clear();
+    activeCaptureVisible.clear();
     const auto addCandidate = [&](eCEntity* instance, bool fromProcessed) {
         if (!instance || instance == hero || instance == controlled) return;
         if (!instance->GetPropertySet(eEPropertySetType_NPC)) return;
@@ -185,8 +187,17 @@ void SendOwned(eCEntity* hero, float const players[][3], int playerCount)
                                                   poseMeta, poseCaptured, poseFlags, posed, moving, outsideAll);
         SendNpcToRecipients(self, instance, hostFocus, hostTarget, key, guid, at, r, last, frame, bones,
                             poseMeta, poseCaptured, poseFlags, posed, moving, outsideAll);
+        if (!outsideAll && !(r.flags & 1)) {
+            for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
+                if (recipientNpcs[id].find(key) != recipientNpcs[id].end()) {
+                    activeCaptureVisible.push_back(instance);
+                    break;
+                }
+            }
+        }
     }
     FinishOwnedTick(hero, players, playerCount);
+    npcplayback::SyncHostCaptureVisibility(activeCaptureVisible.data(), activeCaptureVisible.size());
 }
 
 void TryPlayerBlow(eCEntity* victim)

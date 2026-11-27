@@ -437,8 +437,9 @@ uint8_t CompanionOwner(eCEntity* entity)
     if (const auto it = claimedBy.find(key); it != claimedBy.end() && net::Remotes()[it->second].connected)
         activeClaim = it->second;
     uint8_t activeGuide = 0;
+    const bool connected = net::Connected();
     for (uint8_t id = 1; id < net::MaxPlayers; ++id) {
-        if (id != net::LocalId() && !net::Remotes()[id].connected) continue;
+        if (id != net::LocalId() && (!connected || !net::Remotes()[id].connected)) continue;
         eCEntity* actor = id == net::LocalId() ? remote::ControlledBody() : remote::PuppetOf(id);
         if (actor && actor->GetPropertySet(eEPropertySetType_Party) &&
             Entity(actor).Party.GetPartyLeader().GetInstance() == entity) {
@@ -450,11 +451,13 @@ uint8_t CompanionOwner(eCEntity* entity)
     if (entity->GetPropertySet(eEPropertySetType_Party))
         partyLeader = PlayerOf(Entity(entity).Party.GetPartyLeader().GetInstance());
     uint8_t savedOwner = 0;
-    if (const auto saved = companionIdentity.owners.find(CompanionKey(guid)); saved != companionIdentity.owners.end()) {
-        if (saved->second.account == steam::PlayerId()) savedOwner = 1;
-        else {
-            for (uint8_t id = 2; id < net::MaxPlayers; ++id)
-                if (saved->second.account && saved->second.account == net::PeerAccount(id)) { savedOwner = id; break; }
+    if (!companionIdentity.owners.empty()) {
+        if (const auto saved = companionIdentity.owners.find(CompanionKey(guid)); saved != companionIdentity.owners.end()) {
+            if (saved->second.account == steam::PlayerId()) savedOwner = 1;
+            else {
+                for (uint8_t id = 2; id < net::MaxPlayers; ++id)
+                    if (saved->second.account && saved->second.account == net::PeerAccount(id)) { savedOwner = id; break; }
+            }
         }
     }
     return guide_policy::ResolveCompanionOwner(activeClaim, activeGuide, partyLeader, savedOwner);

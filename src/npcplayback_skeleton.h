@@ -103,5 +103,9 @@ eCResourceDataEntity* QueryNativeMotion(eCEntity* entity, gEAction action, gEPha
 void PruneSkeletonCache(uint32_t now);
 void ForgetActorSkeleton(eCWrapper_emfx2Actor* actor);
 void ClearSkeletonCache();
+void SetOffscreenCaptureVisible(eCEntity* entity, bool visible);
+bool IsOffscreenCaptureVisible(eCEntity const* entity);
+void ForgetOffscreenCaptureEntity(eCEntity* entity, bool resetProperty = true);
+void ResetOffscreenCaptureVisibility();
 
 } // namespace g3t::npcplayback::detail

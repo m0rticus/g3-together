@@ -6,6 +6,7 @@
 #include "body.h"
 #include "guards.h"
 #include "guid.h"
+#include "guid_key.h"
 #include "guide_policy.h"
 #include "hud.h"
 #include "i18n.h"
@@ -101,7 +102,7 @@ struct Hold {
     uint32_t generation = 0, incarnation = 0;
     uint32_t pendingGesture = 0;
 };
-std::unordered_map<std::string, Hold> holds;
+std::unordered_map<GuidKey, Hold, GuidHash> holds;
 bool holdDisabled = false;
 unsigned holdsStarted = 0, holdsEnded = 0, repacified = 0;
 // Phase 5 (25.10., dialogviewdiag): while a client talked to the host's NPC, the host could start a dialog of its own with it,
@@ -120,7 +121,7 @@ std::unordered_map<uint32_t, bool> gestureNamesSent;
 uint32_t gestureNamesWelcome = 0;
 unsigned gesturesSent = 0, gesturesPlayed = 0, gesturesUnknown = 0;
 
-std::string Key(uint8_t const guid[16]) { return std::string(reinterpret_cast<char const*>(guid), 16); }
+GuidKey Key(uint8_t const guid[16]) { return ToGuidKey(guid); }
 
 bool SameGuid(eCEntity const* entity, uint8_t const expected[16])
 {
@@ -154,7 +155,7 @@ void Release(Hold& hold)
     ++holdsEnded;
 }
 
-std::unordered_map<std::string, Hold>::iterator EraseAndReleaseHold(std::unordered_map<std::string, Hold>::iterator it)
+std::unordered_map<GuidKey, Hold, GuidHash>::iterator EraseAndReleaseHold(std::unordered_map<GuidKey, Hold, GuidHash>::iterator it)
 {
     Hold ended = std::move(it->second);
     auto next = holds.erase(it);
@@ -187,7 +188,7 @@ unsigned char* NativeAssessTalk()
 
 Hold const* HoldOf(eCEntity const* entity)
 {
-    if (!entity) return nullptr;
+    if (!entity || holds.empty()) return nullptr;
     uint8_t rawGuid[16];
     guid::CopyEntity(const_cast<eCEntity*>(entity), rawGuid);
     const auto found = holds.find(Key(rawGuid));
@@ -452,7 +453,7 @@ void ReleaseClientPartner(eCEntity* partner, uint8_t const guid[16])
 void OnTalk(uint8_t from, bool begin, uint8_t const guid[16])
 {
     if (!net::IsHost() || holdDisabled) return;
-    const std::string key = Key(guid);
+    const GuidKey key = Key(guid);
     auto it = holds.find(key);
     if (begin) {
         if (it != holds.end()) {

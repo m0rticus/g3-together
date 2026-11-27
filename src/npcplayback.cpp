@@ -164,7 +164,12 @@ uint32_t PoseInterval(net::NpcRecord const& record)
 }
 
 bool IsPassive(eCEntity const* entity) { return Passive(entity); }
-bool GuardForLease(eCEntity* entity) { return enabled && entity && detail::RegisterEntity(entity); }
+bool GuardForLease(eCEntity* entity)
+{
+    if (!enabled || !entity) return false;
+    detail::ForgetOffscreenCaptureEntity(entity, true);
+    return detail::RegisterEntity(entity);
+}
 
 void Silence(eCEntity* entity)
 {
@@ -413,7 +418,6 @@ bool Replay(eCEntity* entity, State& state, net::NpcRecord const& record, FindNa
     Silence(entity);
     PresentationScope scope;
     auto* animation = Animation(entity);
-    if (animation) animation->SetForceAlwaysVisible(GETrue);
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor) return false;
     if (state.incarnation != record.incarnation) {
@@ -754,6 +758,7 @@ void ReleaseUnavailable(eCEntity* entity)
 bool ReleaseNativePresentation(eCEntity* entity)
 {
     if (!entity || Passive(entity)) return false;
+    detail::ForgetOffscreenCaptureEntity(entity, true);
     auto* animation = Animation(entity);
     auto* actor = animation ? animation->GetActor() : nullptr;
     if (!actor) return false;
@@ -774,10 +779,12 @@ void UpdatePresentation(eCEntity* entity)
     if (!animation) return;
     PresentationScope scope(false);
     VisualScope visual(entity);
+    const bool keepVisible = detail::IsOffscreenCaptureVisible(entity);
     animation->SetForceAlwaysVisible(GETrue);
     animation->OnPreProcess();
     animation->OnProcess();
     animation->OnPostProcess();
+    if (!keepVisible) animation->SetForceAlwaysVisible(GEFalse);
     NativePose* presentingPose = detail::CurrentPresentingPose();
     if (presentingPose && presentingPose->evaluated && !presentingPose->evaluateOnly) {
         auto* actor = animation->GetActor();

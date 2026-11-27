@@ -500,7 +500,10 @@ void HostTick(void (*sendOwned)(eCEntity*, float const[][3], int))
         journal::SyncToClients();
         infocmd::SyncToClients();
     }
-    if (!anyClient || !playerCount) return;
+    if (!anyClient || !playerCount) {
+        npcplayback::SyncHostCaptureVisibility(nullptr, 0);
+        return;
+    }
     if (!captureStartedAt) captureStartedAt = now ? now : 1;
     ++captureTicks;
     sendOwned(hero, players, playerCount);
@@ -870,15 +873,19 @@ LastSent& CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey con
 
     net::Remote const* remotes = net::Remotes();
     bool anyInterestedOrLive = false;
+    bool needRemotePose = false;
     if (frame.anyRecipientHere) {
         for (uint8_t id = 2; id < net::MaxPlayers; ++id) {
             if (!frame.recipientHere[id]) continue;
-            if (((r.flags >> 3) & 7) == id || r.partyPlayer == id || r.guidePlayer == id ||
-                body::Distance(at, remotes[id].latest.position) <= npcsend::InterestExitCm ||
-                (!recipientNpcs[id].empty() && recipientNpcs[id].find(key) != recipientNpcs[id].end())) {
+            const bool activeMatch = ((r.flags >> 3) & 7) == id || r.partyPlayer == id || r.guidePlayer == id ||
+                (!recipientNpcs[id].empty() && recipientNpcs[id].find(key) != recipientNpcs[id].end());
+            const float dist = activeMatch ? 0.0f : body::Distance(at, remotes[id].latest.position);
+            if (activeMatch || dist <= npcsend::InterestEnterCm) {
                 anyInterestedOrLive = true;
+                needRemotePose = true;
                 break;
             }
+            if (dist <= npcsend::InterestExitCm) anyInterestedOrLive = true;
         }
     }
     const bool parrying = r.aniState == gEAniState_Parade && combat::InParadeMode(instance);
@@ -959,9 +966,10 @@ LastSent& CaptureAndRecordOwnedNpc(Entity& self, eCEntity* instance, GuidKey con
             }
         }
     }
+    const bool allowOffscreenCapture = needRemotePose && !(r.flags & 1);
     const bool motionReady = npcplayback::Capture(instance, r, [](uint32_t hash, char const* name) {
         if (namesSent.insert(hash).second) net::SendMotionName(hash, name);
-    });
+    }, allowOffscreenCapture);
     if (!(r.flags & 128)) {
         auto* animation = static_cast<eCVisualAnimation_PS*>(instance->GetPropertySet(eEPropertySetType_Animation));
         auto* actor = animation ? animation->GetActor() : nullptr;

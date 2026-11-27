@@ -64,6 +64,24 @@ class WorldCollisionReadinessTests(unittest.TestCase):
         self.assertIn("wasReady || !cand.anyCoveringJobRunning", world_collision_cpp)
         self.assertIn("!persist::NativeLoading() && !persist::HeroPending()", world_cpp)
 
+    def test_sphere_dedup_and_collision_hotpath_optimizations(self):
+        world_cpp = _testbuild.src_text("world.cpp")
+        world_pvs_cpp = _testbuild.src_text("world_pvs.cpp")
+        world_collision_cpp = _testbuild.src_text("world_collision.cpp")
+
+        self.assertIn("static std::vector<Sphere> wanted;", world_cpp)
+        self.assertIn("if (!npc) return native;", world_cpp)
+        self.assertIn("if (sphereCount <= 0) return false;", world_cpp)
+        self.assertIn("if (dist + radius <= existing.radius || (dist <= 100.0f && radius <= existing.radius))", world_cpp)
+
+        self.assertIn("CellBoxReadyForAnchor(", world_pvs_cpp)
+        self.assertIn("const bool needAnchorCheck = !moved && region.prefetcher && !region.prefetcher->IsJobRunning()", world_pvs_cpp)
+
+        self.assertIn("if (admin->IntersectsProcessingRangeRegion(bounds)) continue;", world_collision_cpp)
+        self.assertIn("staticCollisionEpoch", world_collision_cpp)
+        self.assertIn("groundSupportCache", world_collision_cpp)
+        self.assertNotIn("std::unordered_set<eCEntity*> desiredPinned", world_collision_cpp)
+
 
 if __name__ == "__main__":
     unittest.main()

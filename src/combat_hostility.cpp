@@ -136,6 +136,7 @@ uint8_t CompanionOwnerOf(eCEntity const* entity, bool knownValidNpc = false)
     if (!knownValidNpc && !ValidNpc(entity)) return 0;
     eCEntity* mutableEntity = const_cast<eCEntity*>(entity);
     if (const uint8_t owner = npcs::CompanionOwner(mutableEntity)) return owner;
+    if (net::IsHost()) return 0;
     if (auto const* rec = npcs::CombatRecord(entity)) {
         if (rec->partyPlayer != 0) return rec->partyPlayer;
         if (rec->guidePlayer != 0) return rec->guidePlayer;
