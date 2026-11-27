@@ -2,6 +2,18 @@
 
 This log summarizes the releases and integration builds that changed gameplay, networking, saves, NPCs, combat, quests, Steam connection, or supported installations.
 
+## Build 90
+
+**Performance overhaul (Mode 5 bonewire, lazy pose/equipment capture, shared frame scans, scoped visibility/collision), 2v1 arena co-op, NavZone CanEvade crash fix, idle jitter fix, and protocol 82**
+
+- **NavZone `CanEvade` crash fix (`src/navzone_guard.cpp`, `src/navzone_policy.h`, `src/world_pvs.cpp`, `src/remote.cpp`, `src/guards.cpp`)**: Guarded NavZone dynamic collision circles against stale or null-entity DCCs so `CanEvade` cannot crash on destroyed or unlinked entities.
+- **Client NPC idle animation jitter (`src/snapshot.cpp`, `src/snapshot.h`)**: Stabilized client NPC idle animation playback under slow-host and initial-area cadence.
+- **2v1 arena co-op & passive bystanders (`src/arena.cpp`, `src/arena_policy.h`, `src/ai.cpp`, `src/combat*.cpp`, `src/fightmem.cpp`, `src/guards*.cpp`, `src/relation_policy.h`)**: Shared arena fights as 2v1 co-op encounters while keeping uninvolved bystanders passive.
+- **Lazy host NPC pose/equipment capture (`src/npc_send.cpp`, `src/npc_send.h`, `src/npcs.cpp`, `src/npcsend_*.h`)**: Deferred host skeleton pose and back-equipment capture until recipients need them, removing per-tick map/scan overhead.
+- **Mode 5 bonewire & pose capture optimization (`src/npcwire_pose_mode5.h`, `src/npcwire_pose*`, `src/npcwire_bone*`, `src/pose.h`, `src/net_npc_pose.cpp`, `src/npcplayback_skeleton.cpp`, `src/saving_policy.h`)**: Added Mode 5 pose delta encoding, layout caching, and periodic pose ACK requests, bumping protocol from 81 to 82.
+- **Shared per-frame NPC/entity scans & phase diagnostics (`src/frame_scan.cpp`, `src/frame_scan.h`, `src/host_frame_diag.h`, `src/Script_G3Together.cpp`, `src/combat_hostility.cpp`, subsystem ticks)**: Shared per-frame NPC/entity scans across subsystems and added non-NPC phase diagnostics.
+- **Scoped `ForceAlwaysVisible`, sphere collision & detour overhead (`src/npcplayback.cpp`, `src/npcplayback_hooks.cpp`, `src/npcplayback_skeleton.cpp`, `src/npc_send.cpp`, `src/npcs.cpp`, `src/world.cpp`, `src/world_collision.cpp`, `src/world_pvs.cpp`)**: Scoped `ForceAlwaysVisible` to active offscreen capture/presentation lifetimes and reduced sphere-collision and detour lookup overhead.
+
 ## Build 89
 
 **Default "Do not show tips" enabled on client join (protocol 81 unchanged)**

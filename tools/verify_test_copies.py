@@ -330,9 +330,9 @@ def current_protocol() -> int:
     try:
         text = (WORKTREE / "src" / "saving_policy.h").read_text(encoding="utf-8")
         match = re.search(r"\bProtocol\s*=\s*(\d+)", text)
-        return int(match.group(1)) if match else 81
+        return int(match.group(1)) if match else 82
     except OSError:
-        return 81
+        return 82
 
 
 def verify_profile_and_template(

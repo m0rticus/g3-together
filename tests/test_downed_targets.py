@@ -130,7 +130,7 @@ class DownedTargetTests(unittest.TestCase):
             body = function_body(self.ai, signature)
             self.assertLess(body.index("RejectDownedTarget"), body.index("receiver == detail::damageReceiver"))
         assess = function_body(self.ai, r"\bGEInt\s+GE_STDCALL\s+FilterAssessTarget\s*\(")
-        self.assertIn('RejectDownedTarget(Self(spu, self), target, "assessment-refused")', assess)
+        self.assertIn('RejectDownedTarget(npc, target, "assessment-refused")', assess)
         wrap = function_body(self.ai, r"\bvoid\s+WrapAssessTarget\s*\(")
         for required in ("0x31470", "std::memcmp(code, head, sizeof(head))", "JumpTo(", "TrackPointer(", "SCRIPT ONLY"):
             self.assertIn(required, wrap)

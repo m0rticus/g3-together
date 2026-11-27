@@ -109,7 +109,8 @@ class NpcPresencePolicyTests(unittest.TestCase):
         self.assertIn("npclease::RelinquishToHost(live", admit)
 
         on_death = journal[journal.index("void OnDeath("):journal.index("void Apply(")]
-        self.assertIn("if (!net::IsHost() && key.size() == 16)", on_death)
+        self.assertIn("const GuidKey key = ToGuidKey(guid);", on_death)
+        self.assertIn("if (!net::IsHost()) {", on_death)
         world_change = journal[journal.index("void OnWorldChange()"):journal.index("bool Pending(")]
         self.assertIn("if (!net::IsHost()) deaths.clear()", world_change)
 

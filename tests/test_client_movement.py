@@ -226,12 +226,12 @@ class ClientMovementTests(unittest.TestCase):
         self.assertLess(process.index("&g3t::remote::Tick"), process.index("&g3t::ai::Tick"))
         self.assertLess(process.index("&g3t::ai::Tick"), process.index("&g3t::npcs::Tick"))
         for name in ("NPC / lease", "NPC playback", "remote / ENet service", "combat", "downed", "world", "persist"):
-            self.assertRegex(process, rf'(?:Stage\s+stage|(?:Timed)?Step)\s*\(\s*"{re.escape(name)}"')
+            self.assertRegex(process, rf'(?:Stage\s+stage|(?:Timed|Sub)?Step)\s*\([^)]*"{re.escape(name)}"')
         frame = function_body(self.module, r"~FrameScope\s*\(")
         self.assertLess(frame.index("g3t::net::Flush()"), frame.index("g3t::persist::EndFrame()"))
         self.assertLess(frame.index("g3t::hud::Tick()"), frame.index("g3t::movement::End()"))
         self.assertIn("moduleProcessDepth == 1", self.module)
-        self.assertRegex(frame, r"if\s*\(\s*moduleProcessDepth\s*==\s*0\s*\)\s*\{\s*g3t::movement::End\(\);")
+        self.assertRegex(frame, r"if\s*\(\s*--moduleProcessDepth\s*==\s*0\s*\)\s*\{[^}]*g3t::movement::End\(\);")
 
     def test_existing_task_and_mode_hooks_record_before_any_rejection(self):
         for signature, record, gate in (

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "npc_qa.h"
 
+#include "journal.h"
 #include "log.h"
 #include "npc_corpse.h"
+#include "npclease_presentation.h"
 #include "npclease_runtime.h"
+#include "npcsend_policy.h"
 #include "world.h"
 
 #include <algorithm>
@@ -590,5 +593,111 @@ void TickDeathFocusWatch(Mirror& m, uint32_t now)
 }
 
 } // namespace detail
+
+bool HostKnows(uint8_t const identity[16])
+{
+    const GuidKey key = Key(identity);
+    return lastSent.count(key) || incarnations.count(key) || owned.count(key) ||
+        claimedBy.count(key) || directedBy.count(key) || mirrors.count(key) || corpses.count(key) ||
+        absences.count(key) || deadOnHost.count(key) || journal::RecordedDeath(identity);
+}
+
+bool HostStreamFresh(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial() || !found->second.latestTicks) return false;
+    auto const& mirror = found->second;
+    const uint32_t poseInt = npcplayback::PoseInterval(mirror.latest);
+    const uint32_t effectiveInt = poseInt ? poseInt : npcsend::QuietCadenceMs;
+    return npclease::PresentationFresh(net::Connected(), mirror.released, net::Now() - mirror.latestTicks, effectiveInt);
+}
+
+bool HostReleasePending(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
+    auto const& mirror = found->second;
+    auto const& track = mirror.body.track;
+    return npclease::ReleasePending(mirror.released, track.count, track.haveRenderTime,
+        track.renderSent, mirror.latest.sent, body::PendingEvents(track));
+}
+
+bool HostMirrorPlacedForTakeover(eCEntity const* entity)
+{
+    if (!entity || net::IsHost()) return false;
+    uint8_t identity[16];
+    Guid(const_cast<eCEntity*>(entity), identity);
+    const auto found = mirrors.find(Key(identity));
+    if (found == mirrors.end() || found->second.hostSession != net::WelcomeSerial()) return false;
+    auto const& mirror = found->second;
+    return mirror.entity.GetInstance() == entity && mirror.havePresentation &&
+           !mirror.killed && !(mirror.latest.flags & 1);
+}
+
+bool HostStreamSeen()
+{
+    if (!hostStreamSeen || hostStreamSession != net::WelcomeSerial()) return false;
+    return net::Now() - hostStreamFirstSeenAt >= 1500;
+}
+
+uint32_t HostStreamRecords(uint8_t const identity[16])
+{
+    const auto found = mirrors.find(Key(identity));
+    return found == mirrors.end() || found->second.hostSession != net::WelcomeSerial() ? 0 : found->second.records;
+}
+
+bool HostCanPresent(uint8_t const identity[16])
+{
+    const auto found = lastSent.find(Key(identity));
+    return found != lastSent.end() && net::Now() - found->second.at <= npclease::PresentationGraceMs;
+}
+
+void Mirrored(std::vector<eCEntity*>& out)
+{
+    for (auto& [key, m] : mirrors)
+        if (m.resolved && !m.missing && !m.killed && m.entity.GetInstance()) out.push_back(m.entity.GetInstance());
+}
+
+bool DeadStays() { return deadStays; }
+
+uint8_t RemoteOwner(uint8_t const guid[16])
+{
+    if (net::IsHost()) return 0;
+    return npcplayback::IsPassive(NpcByGuid(guid)) ? uint8_t(1) : uint8_t(0);
+}
+
+uint8_t OwnerOf(eCEntity const* entity)
+{
+    if (npclease::LocalAuthority(entity)) return 0;
+    if (net::IsHost()) return npclease::RemoteOwner(entity);
+    if (npcplayback::IsPassive(entity)) return 1;
+    if (!entity) return 0;
+    uint8_t guid[16];
+    Guid(const_cast<eCEntity*>(entity), guid);
+    return RemoteOwner(guid);
+}
+
+bool PaysDeathWithoutKiller(eCEntity const* victim)
+{
+    if (npclease::LocalAuthority(victim)) return true;
+    if (npcplayback::IsPassive(victim)) return false;
+    if (net::IsHost() || !farXpGuard || !victim || IsMirrored(victim) || Claimed(victim)) return true;
+    uint8_t guid[16];
+    Guid(const_cast<eCEntity*>(victim), guid);
+    if (owned.count(Key(guid))) return true;
+    ++farXpRefused;
+    return false;
+}
+
+void FightStats(unsigned& sent, unsigned& seenAny, unsigned& seenUs, unsigned& seenNear)
+{
+    sent = fightSent, seenAny = fightSeenAny, seenUs = fightSeenUs, seenNear = fightSeenNear;
+}
+
+void SwingSamples(unsigned& armed, unsigned& samples)
+{
+    armed = swingArmed;
+    samples = swingSamples;
+}
 
 } // namespace g3t::npcs

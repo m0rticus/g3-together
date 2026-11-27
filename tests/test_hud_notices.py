@@ -132,7 +132,7 @@ class HudNoticeTests(unittest.TestCase):
         frame = function_body(self.module, r"~FrameScope\s*\(\s*\)")
         self.assertLess(frame.index("g3t::net::Flush()"), frame.index("g3t::persist::EndFrame()"))
         self.assertLess(frame.index("g3t::persist::EndFrame()"), frame.index("g3t::hud::Tick()"))
-        self.assertIn("if (--moduleProcessDepth == 0) g3t::hud::Tick()", frame)
+        self.assertRegex(frame, r"if\s*\(\s*--moduleProcessDepth\s*==\s*0\s*\)\s*\{[^}]*g3t::hud::Tick\(\);")
         self.assertIn("if (run) ++moduleProcessDepth", self.module)
         self.assertEqual(self.module.count("g3t::hud::Tick()"), 1)
         tick = function_body(self.hud, r"\bvoid\s+Tick\s*\(")

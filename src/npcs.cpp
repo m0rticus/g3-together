@@ -932,24 +932,6 @@ void OnEntityDestroyed(eCEntity const* entity)
     for (auto& entry : corpses) clearDestroyedPointers(entry.second);
 }
 
-void OnNpcEquipment(net::NpcEquipmentNote const& note)
-{
-    if (net::IsHost() || npcremoval::Suppressed(note.guid) || !note.incarnation) return;
-    const GuidKey key = Key(note.guid);
-    npc_equipment::BackEquipment incoming{};
-    incoming.incarnation = note.incarnation;
-    std::memcpy(incoming.slots, note.backSlots, sizeof(incoming.slots));
-    auto& pending = pendingBackEquipment[key];
-    if (npc_equipment::ShouldAcceptBackEquipment(pending.incarnation, incoming.incarnation))
-        pending = incoming;
-    if (const auto found = mirrors.find(key);
-        found != mirrors.end() &&
-        npc_equipment::ShouldAcceptBackEquipment(found->second.latest.incarnation, incoming.incarnation) &&
-        npc_equipment::ShouldAcceptBackEquipment(found->second.backEquipment.incarnation, incoming.incarnation)) {
-        found->second.backEquipment = incoming;
-    }
-}
-
 void Start()
 {
     (void)&MirrorTick;

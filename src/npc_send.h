@@ -140,6 +140,7 @@ struct HostSendFrame {
 
 int OnRelease(uint8_t owner, uint32_t generation, uint8_t* guids, int count);
 void OnMotionName(uint32_t hash, char const* name);
+void OnNpcEquipment(net::NpcEquipmentNote const& note);
 uint8_t FightFlags(Entity& npc);
 void PrepareHostSendFrame(std::vector<npcsend_candidates::GuidCandidate> const& candidates,
                           size_t firstProcessed, unsigned candidateKeyCount, unsigned processedCount,

@@ -153,7 +153,8 @@ class InteractionImmunityTests(unittest.TestCase):
         blow = self.body("downed", r"\bvoid\s+NoteBlow\s*\(")
         self.assertTrue(blow.strip().startswith("if (LocalInteractionFlags()) return;"))
         tick = self.body("downed", r"\bvoid\s+Tick\s*\(")
-        protected = function_body(tick, r"\bif\s*\(\s*LocalInteractionFlags\(\)\s*\)")
+        self.assertIn("const bool localInteracting = LocalInteractionFlags();", tick)
+        protected = function_body(tick, r"\bif\s*\(\s*localInteracting\s*\)")
         self.assertIn("lethalBlowAt = 0", protected)
         self.assertIn("lastHp = hero.PlayerMemory.GetHitPoints()", protected)
 

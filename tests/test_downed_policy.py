@@ -228,7 +228,7 @@ class DownedPolicyTests(unittest.TestCase):
         self.assertIn('state.m_strScriptName = "ZS_RagDollDead";', enter)
         self.assertIn("stack.Add(state)", enter)
         self.assertIn("guards::Acting localPlayer(hero, false)", enter)
-        self.assertIn("Run(originalStates, stack, &routine->GetSPU())", enter)
+        self.assertIn("Run(originalStateLookup, stack, &routine->GetSPU())", enter)
         self.assertNotIn("ProcessScript()", enter)
         self.assertNotIn("CallScript", enter)
         player_routine = function_body(ai, r"\bGEBool\s+GE_STDCALL\s+FilterPlayerRoutine\s*\(")
