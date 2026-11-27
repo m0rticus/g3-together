@@ -9,6 +9,7 @@
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
+#include "navzone_guard.h"
 #include "net.h"
 #include "npclease_runtime.h"
 #include "npcplayback.h"
@@ -612,6 +613,7 @@ void __fastcall DestroyEntity(eCEntity* entity, void* edx)
     guards::OnEntityDestroyed(entity);
     relation::OnEntityDestroyed(entity);
     collision::OnEntityDestroyed(entity);
+    navzone_guard::OnEntityDestroyed(entity);
     originalDestroyEntity(entity, edx);
 }
 }

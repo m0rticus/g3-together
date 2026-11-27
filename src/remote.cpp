@@ -15,6 +15,7 @@
 #include "hud.h"
 #include "i18n.h"
 #include "log.h"
+#include "navzone_guard.h"
 #include "net.h"
 #include "npcs.h"
 #include "parity.h"
@@ -318,6 +319,7 @@ void Despawn(int id, char const* reason)
             puppet.entity.Party.PartyMemberType = gEPartyMemberType_None;
         }
         Forget(id, entity);
+        navzone_guard::OnEntityDestroyed(entity);
         current->DestroyDynamicEntity(static_cast<eCDynamicEntity*>(entity));
     } else {
         occupancy::Forget(id, nullptr);

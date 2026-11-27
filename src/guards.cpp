@@ -5,6 +5,7 @@
 #include "ai.h"
 #include "fightmem.h"
 #include "log.h"
+#include "navzone_guard.h"
 #include "net.h"
 #include "npcs.h"
 #include "remote.h"
@@ -353,8 +354,16 @@ void KeepZone(eCEntity* puppet)
     eCEntityProxy here;
     GEBool path = GEFalse;
     if (admin->GetZone(*puppet, here, path, GEFalse) != bEResult_Ok || !here.GetEntity()) return;
-    if (navigation->GetCurrentZoneEntityProxy().GetEntity() != here.GetEntity())
+    eCEntity const* const previous = navigation->GetCurrentZoneEntityProxy().GetEntity();
+    if (previous != here.GetEntity()) {
+        eCEntity const* const last = navigation->GetLastZoneEntityProxy().GetEntity();
+        auto* const navDcc = navigation->GetDCC();
+        auto* const entityDcc = static_cast<gCDynamicCollisionCircle_PS*>(
+            puppet->GetPropertySet(eEPropertySetType_DynamicCollisionCircle));
+        navzone_guard::MigrateZone(previous, last, here.GetEntity(), navDcc, entityDcc);
+        navigation->AccessLastZoneEntityProxy() = navigation->GetCurrentZoneEntityProxy();
         navigation->AccessCurrentZoneEntityProxy() = here;
+    }
 }
 
 bool IsLocalPlayer(eCEntity const* entity)

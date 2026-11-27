@@ -54,6 +54,7 @@
 #include "world_sectors.h"
 #include "hud.h"
 #include "i18n.h"
+#include "navzone_guard.h"
 #include "xpshare.h"
 #include "movement.h"
 #include "body.h"
@@ -279,6 +280,7 @@ class Module : public eCEngineComponentBase
             {"combat hostility cleanup", &g3t::combat_hostility::OnWorldChange},
             {"relation cleanup", &g3t::relation::OnWorldChange},
             {"guards cleanup", &g3t::guards::OnWorldChange},
+            {"navzone guard cleanup", &g3t::navzone_guard::OnWorldChange},
             {"shot cleanup", &g3t::shot::OnWorldChange},
             {"ranged cleanup", &g3t::ranged::OnWorldChange},
             {"transform cleanup", &g3t::transform::OnWorldChange},
