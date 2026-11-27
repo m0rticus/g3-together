@@ -44,6 +44,14 @@ void RecordAcceptedPoseStats(uint8_t statsTierInterval, size_t datagramBytes, si
         stats.rigidBones, maxBasisErrorUnits, stats.PaddingBits());
 }
 
+struct CachedPoseLayout {
+    uint32_t epoch = 0;
+    uint64_t generation = 0;
+    uint16_t layoutId = 0;
+};
+
+std::unordered_map<NpcKeyValue, CachedPoseLayout, NpcKeyHash> npcPoseLayouts;
+
 bool ValidPoseBoneHashes(uint32_t const* values, int length) noexcept
 {
     constexpr unsigned Slots = static_cast<unsigned>(pose::MaxBones) * 2u;
@@ -66,20 +74,31 @@ bool ValidPoseBones(pose::Bone const* bones, int length) noexcept
     return ValidPoseBoneHashes(hashes, length);
 }
 
-bool ResolvePoseLayoutId(uint32_t const* hashes, int count, uint16_t& layoutId)
+bool ResolvePoseLayoutIdForNpc(NpcKeyValue const& npcKey, pose::Bone const* bones, int count, uint16_t& layoutId)
 {
     layoutId = 0;
     if (worldEpoch && boneGeneration &&
         boneLayouts.Reset(worldEpoch, boneGeneration) == bonewire::Status::Ok) {
-        auto status = boneLayouts.FindLayout(hashes, count, layoutId);
+        auto cached = npcPoseLayouts.find(npcKey);
+        if (cached != npcPoseLayouts.end() &&
+            cached->second.epoch == worldEpoch &&
+            cached->second.generation == boneGeneration &&
+            cached->second.layoutId != 0 &&
+            boneLayouts.MatchesLayout(cached->second.layoutId, bones, static_cast<size_t>(count))) {
+            layoutId = cached->second.layoutId;
+            return true;
+        }
+        auto status = boneLayouts.FindLayout(bones, static_cast<size_t>(count), layoutId);
         if (status == bonewire::Status::InvalidArgument) {
             if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
             return false;
         }
         if (status == bonewire::Status::UnknownLayout) {
             if (nextBoneLayout < UINT16_MAX) {
+                uint32_t hashes[pose::MaxBones];
+                for (int i = 0; i < count; ++i) hashes[i] = bones[i].name;
                 layoutId = static_cast<uint16_t>(++nextBoneLayout);
-                status = boneLayouts.Register(layoutId, hashes, count);
+                status = boneLayouts.Register(layoutId, hashes, static_cast<size_t>(count));
                 if (status == bonewire::Status::Ok && BoneLog(boneLayoutLogs))
                     Logf("net: new bone layout=%u bones=%d definition_bytes=%u compact_pose_bytes=%u full_pose_bytes=%u",
                          static_cast<unsigned>(layoutId), count, static_cast<unsigned>(1 + bonewire::HeaderBytes + bonewire::CountBytes + count * 4),
@@ -94,10 +113,12 @@ bool ResolvePoseLayoutId(uint32_t const* hashes, int count, uint16_t& layoutId)
             if (status != bonewire::Status::UnknownLayout && BoneLog(boneInvalidLogs))
                 Logf("net: bone layout unavailable (%u); using full-hash pose", static_cast<unsigned>(status));
             layoutId = 0;
+        } else {
+            npcPoseLayouts[npcKey] = {worldEpoch, boneGeneration, layoutId};
         }
         return true;
     }
-    if (!ValidPoseBoneHashes(hashes, count)) {
+    if (!ValidPoseBones(bones, count)) {
         if (BoneLog(boneInvalidLogs)) Log("net: rejected pose with zero or duplicate bone hashes");
         return false;
     }
@@ -208,6 +229,7 @@ void ForgetBonePeer(uint8_t id)
 void ResetBoneReplicationState()
 {
     boneLayouts.Clear();
+    npcPoseLayouts.clear();
     receivedBoneGeneration = 0;
     requestedBoneEpoch = 0;
     requestedBoneLayout = 0;
@@ -620,22 +642,31 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         !npclease::DecodePoseIntervalWire(intervalMs) ||
         (to && (to < 2 || to >= MaxPlayers || !peers[to]))) return false;
 
-    uint32_t hashes[pose::MaxBones];
-    for (int i = 0; i < count; ++i) hashes[i] = bones[i].name;
-
+    const NpcKeyValue npcKey = NpcKey(record.guid);
     uint16_t layoutId = 0;
-    if (!ResolvePoseLayoutId(hashes, count, layoutId)) return false;
+    if (!ResolvePoseLayoutIdForNpc(npcKey, bones, count, layoutId)) return false;
 
     NpcsHeader header{MsgPosedNpc, 0, enet_time_get(), worldEpoch, 1, 0, 1, 1};
     const auto preparedControl = PrepareControl(record);
     const uint16_t boneCount = static_cast<uint16_t>(count);
     const size_t fullSize = sizeof(header) + sizeof(record) + sizeof(boneCount) + 2 + count * sizeof(*bones);
-    std::vector<uint8_t> fallbackBuffer, definition, compact, compactMessage, controlPoseMessage, batch;
-    std::vector<pose::Bone> reconstructed;
-    std::vector<npcwire::Control> singleControl(1);
+    struct PoseSendScratch {
+        std::vector<uint8_t> fallbackBuffer, definition, compact, compactMessage, controlPoseMessage, batch;
+        std::vector<pose::Bone> reconstructed;
+        std::vector<npcwire::Control> singleControl{1};
+    };
+    thread_local PoseSendScratch scratch;
+    auto& fallbackBuffer = scratch.fallbackBuffer;
+    auto& definition = scratch.definition;
+    auto& compact = scratch.compact;
+    auto& compactMessage = scratch.compactMessage;
+    auto& controlPoseMessage = scratch.controlPoseMessage;
+    auto& batch = scratch.batch;
+    auto& reconstructed = scratch.reconstructed;
+    auto& singleControl = scratch.singleControl;
+    fallbackBuffer.clear();
     bool definitionAttempted = false, definitionReady = false;
     bool queued = false;
-    const NpcKeyValue npcKey = NpcKey(record.guid);
 
     for (uint8_t i = 2; i < MaxPlayers; ++i) {
         if (to && i != to) continue;
@@ -664,6 +695,7 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         bool compactReady = layoutId && (dictionaryReady || boneOffered[i].count(layoutId));
         bool poseKey = true;
         bonewire::PoseStats poseStats{};
+        compact.clear();
         compactMessage.clear();
         controlPoseMessage.clear();
         auto& poseCache = sentPoses[i][npcKey];
@@ -671,24 +703,16 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
             poseCache.AnchorDue(record.sent, record.incarnation, layoutId, poseFlags);
         if (compactReady) {
             const auto status = poseCache.EncodeCompact(boneLayouts, layoutId, record.incarnation, poseFlags, bones, count,
-                                                        record.sent, compact, poseKey, reconstructed, &poseStats, anchor);
-            if (status == bonewire::Status::Ok) {
-                compactMessage.resize(sizeof(header) + sizeof(record) + 2 + compact.size());
-                NpcsHeader compactHeader = header;
-                compactHeader.type = MsgCompactPosedNpc;
-                std::memcpy(compactMessage.data(), &compactHeader, sizeof(compactHeader));
-                std::memcpy(compactMessage.data() + sizeof(header), &record, sizeof(record));
-                compactMessage[sizeof(header) + sizeof(record)] =
-                    static_cast<uint8_t>(poseFlags | (anchor ? PoseAnchorFlag : 0) |
-                                         (reliable ? PoseEssentialFlag : 0));
-                compactMessage[sizeof(header) + sizeof(record) + 1] = intervalMs;
-                std::memcpy(compactMessage.data() + sizeof(header) + sizeof(record) + 2, compact.data(), compact.size());
-            } else if (BoneLog(boneInvalidLogs)) {
+                                                        record.sent, compact, poseKey, reconstructed, &poseStats, anchor, true);
+            if (status != bonewire::Status::Ok && BoneLog(boneInvalidLogs)) {
                 Logf("net: could not encode bone layout %u (%u); using full-hash pose",
                      static_cast<unsigned>(layoutId), static_cast<unsigned>(status));
             }
         }
-        compactReady = compactReady && !compactMessage.empty();
+        compactReady = compactReady && !compact.empty();
+        const uint8_t wireFlags = static_cast<uint8_t>(poseFlags | (anchor ? PoseAnchorFlag : 0) |
+            (reliable ? PoseEssentialFlag : 0));
+
         if (compactReady && ControlQueued(i, preparedControl)) {
             batch.clear();
             auto& value = singleControl[0];
@@ -701,7 +725,7 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                 NpcsHeader controlHeader = header;
                 controlHeader.type = MsgControlPose;
                 const size_t controlBytes = batch.size() - sizeof(npcwire::WireBatchHeader) + 4;
-                const size_t poseSectionBytes = compactMessage.size() - sizeof(header) - sizeof(record);
+                const size_t poseSectionBytes = 2 + compact.size();
                 controlPoseMessage.resize(sizeof(header) + 2 + controlBytes + poseSectionBytes);
                 std::memcpy(controlPoseMessage.data(), &controlHeader, sizeof(controlHeader));
                 controlPoseMessage[sizeof(header)] = static_cast<uint8_t>(controlBytes);
@@ -710,13 +734,24 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
                 std::memcpy(dst, batch.data() + 8, 4);
                 std::memcpy(dst + 4, batch.data() + sizeof(npcwire::WireBatchHeader),
                             batch.size() - sizeof(npcwire::WireBatchHeader));
-                std::memcpy(dst + controlBytes, compactMessage.data() + sizeof(header) + sizeof(record),
-                            poseSectionBytes);
+                dst[controlBytes] = wireFlags;
+                dst[controlBytes + 1] = intervalMs;
+                std::memcpy(dst + controlBytes + 2, compact.data(), compact.size());
             } else if (BoneLog(controlErrors)) {
                 Log("npc-converge: compact posed control encode failed; retaining full control with the pose");
             }
         }
         const bool controlReady = compactReady && !controlPoseMessage.empty();
+        if (compactReady && !controlReady) {
+            compactMessage.resize(sizeof(header) + sizeof(record) + 2 + compact.size());
+            NpcsHeader compactHeader = header;
+            compactHeader.type = MsgCompactPosedNpc;
+            std::memcpy(compactMessage.data(), &compactHeader, sizeof(compactHeader));
+            std::memcpy(compactMessage.data() + sizeof(header), &record, sizeof(record));
+            compactMessage[sizeof(header) + sizeof(record)] = wireFlags;
+            compactMessage[sizeof(header) + sizeof(record) + 1] = intervalMs;
+            std::memcpy(compactMessage.data() + sizeof(header) + sizeof(record) + 2, compact.data(), compact.size());
+        }
         const bool orderedSetup = compactReady &&
             (!dictionaryReady || (controlReady && !ControlReady(i, preparedControl)));
         const bool sendReliable = reliable || anchor || orderedSetup;
@@ -736,7 +771,7 @@ bool SendPosedNpcTo(uint8_t to, NpcRecord const& record, pose::Bone const* bones
         const void* data = controlReady ? static_cast<void const*>(controlPoseMessage.data())
             : compactReady ? static_cast<void const*>(compactMessage.data()) : fallbackBuffer.data();
         const size_t bytes = controlReady ? controlPoseMessage.size() : compactReady ? compactMessage.size() : fullSize;
-        const size_t poseBytes = compactReady ? compactMessage.size() - sizeof(header) - sizeof(record)
+        const size_t poseBytes = compactReady ? 2 + compact.size()
                                               : sizeof(boneCount) + 2 + count * sizeof(pose::Bone);
         if (BoneLog(compactReady ? boneCompactPoseLogs : boneFullPoseLogs))
             Logf("net: player %u pose=%s bones=%d pose_bytes=%u datagram_bytes=%u", static_cast<unsigned>(i),

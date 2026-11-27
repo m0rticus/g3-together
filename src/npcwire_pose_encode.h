@@ -52,48 +52,49 @@ G3T_NPCWIRE_POSE_INLINE bool DecoderUsesMode4SecondOrder(
 }
 
 struct Mode4BonePrep {
-    PoseQuat sourceQuat{};
-    PoseQuat recentQuat{};
-    PoseQuat olderQuat{};
-    PoseQuat coarseTarget{};
-    pose::Bone exactMatrix{};
-    pose::Bone coarseMatrix{};
-    size_t exactError = 0;
-    size_t coarseError = 0;
-    uint8_t sourceState = 0; // 0 = unevaluated, 1 = invalid, 2 = valid
-    uint8_t recentState = 0;
-    uint8_t olderState = 0;
-    uint8_t exactState = 0;
-    uint8_t coarseState = 0;
+    PoseQuat sourceQuat;
+    PoseQuat recentQuat;
+    PoseQuat olderQuat;
+    PoseQuat coarseTarget;
+    pose::Bone exactMatrix;
+    pose::Bone coarseMatrix;
+    size_t exactError;
+    size_t coarseError;
 
-    bool EnsureSource(pose::Bone const& bone)
+    bool EnsureSource(pose::Bone const& bone, uint8_t& flags) noexcept
     {
-        if (!sourceState) sourceState = PoseExtractQuat(bone, sourceQuat) ? 2 : 1;
-        return sourceState == 2;
+        if (!(flags & 1)) {
+            flags |= 1 | (PoseExtractQuat(bone, sourceQuat) ? 2 : 0);
+        }
+        return (flags & 2) != 0;
     }
 
     bool PredictQuat(pose::Bone const& recentBone, pose::Bone const* olderBone,
-                     unsigned ratio, uint8_t omitted, PoseQuat& out)
+                     unsigned ratio, uint8_t omitted, uint8_t& flags, PoseQuat& out) noexcept
     {
-        if (!recentState) recentState = PoseExtractQuat(recentBone, recentQuat) ? 2 : 1;
-        if (recentState != 2) return false;
+        if (!(flags & 4)) {
+            flags |= 4 | (PoseExtractQuat(recentBone, recentQuat) ? 8 : 0);
+        }
+        if (!(flags & 8)) return false;
         out = recentQuat;
         if (out.values[omitted] < 0)
             for (auto& value : out.values) value = -value;
         if (!olderBone) return true;
-        if (!olderState) olderState = PoseExtractQuat(*olderBone, olderQuat) ? 2 : 1;
-        if (olderState != 2) return false;
+        if (!(flags & 16)) {
+            flags |= 16 | (PoseExtractQuat(*olderBone, olderQuat) ? 32 : 0);
+        }
+        if (!(flags & 32)) return false;
         PoseQuat previous = olderQuat;
         if (previous.values[omitted] < 0)
             for (auto& value : previous.values) value = -value;
         for (int k = 0; k < 4; ++k)
             out.values[k] = PoseSaturateInt16(int64_t(out.values[k]) +
-                PoseRoundQ8((int64_t(out.values[k]) - previous.values[k]) * ratio));
+                PoseRoundQ8((out.values[k] - previous.values[k]) * static_cast<int32_t>(ratio)));
         return true;
     }
 
     static bool Accepts(PoseQuat const& quaternion, pose::Bone const& bone,
-                        pose::Bone& rigidMatrix, size_t& boneError)
+                        pose::Bone& rigidMatrix, size_t& boneError) noexcept
     {
         if (!PoseQuatToBone(quaternion, bone, rigidMatrix)) return false;
         boneError = 0;
@@ -106,19 +107,21 @@ struct Mode4BonePrep {
         return true;
     }
 
-    bool EvaluateExact(pose::Bone const& bone)
+    bool EvaluateExact(pose::Bone const& bone, uint8_t& flags) noexcept
     {
-        if (!exactState) exactState = Accepts(sourceQuat, bone, exactMatrix, exactError) ? 2 : 1;
-        return exactState == 2;
+        if (!(flags & 64)) {
+            flags |= 64 | (Accepts(sourceQuat, bone, exactMatrix, exactError) ? 128 : 0);
+        }
+        return (flags & 128) != 0;
     }
 
-    bool EvaluateCoarse(pose::Bone const& bone)
+    bool EvaluateCoarse(pose::Bone const& bone, uint8_t& coarseFlags) noexcept
     {
-        if (!coarseState) {
+        if (!(coarseFlags & 1)) {
             PoseQuat candidate = sourceQuat;
             for (int k = 0; k < 4; ++k)
                 if (k != candidate.omitted)
-                    candidate.values[k] = PoseRoundSignedDivide(candidate.values[k], 4) * 4;
+                    candidate.values[k] = PoseRoundSignedDivide4(candidate.values[k]) * 4;
             bool ok = PoseCompleteQuat(candidate) && Accepts(candidate, bone, coarseMatrix, coarseError);
             for (unsigned choice = 0; !ok && choice < 8; ++choice) {
                 candidate = sourceQuat;
@@ -132,13 +135,27 @@ struct Mode4BonePrep {
                 ok = PoseCompleteQuat(candidate) && Accepts(candidate, bone, coarseMatrix, coarseError);
             }
             if (ok) coarseTarget = candidate;
-            coarseState = ok ? 2 : 1;
+            coarseFlags |= 1 | (ok ? 2 : 0);
         }
-        return coarseState == 2;
+        return (coarseFlags & 2) != 0;
     }
 };
 
+inline void AddRiceParams(PoseRiceParameters& dst, PoseRiceParameters const& src) noexcept
+{
+    dst.count += src.count;
+    for (int k = 0; k < 16; ++k) {
+        dst.savings[k] += src.savings[k];
+        dst.widths[k] += src.widths[k];
+    }
+}
+
 } // namespace detail
+} // namespace g3t::npcwire::bones
+
+#include "npcwire_pose_mode5.h"
+
+namespace g3t::npcwire::bones {
 
 G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode1Sparse(
     uint16_t layout, Frame const& base, pose::Bone const* bones, size_t count,
@@ -159,6 +176,9 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode1Sparse(
     }
 
     std::size_t residualRotation = 0, residualTranslation = 0;
+    const std::size_t maskBytes = (count + 7) / 8;
+    const std::size_t minBytes = 19 + maskBytes + (includedSparse * 13 + 7) / 8;
+    if (minBytes >= bestSize) return;
     for (std::size_t i = 0; i < count; ++i) {
         const uint16_t mask = components[i];
         if (!mask) continue;
@@ -167,7 +187,6 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode1Sparse(
                 (k < 9 ? residualRotation : residualTranslation) += widths[k];
     }
 
-    const std::size_t maskBytes = (count + 7) / 8;
     const std::size_t packedBits = includedSparse * 12 + residualRotation + residualTranslation;
     const std::size_t exactBytes = 19 + maskBytes + (packedBits + 7) / 8;
     if (exactBytes >= bestSize) return;
@@ -224,8 +243,9 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode2And3(
     pose::Bone const* bones, size_t count, uint32_t now,
     std::size_t& bestSize, std::vector<uint8_t>& result, bool& resultKey, PoseStats& resultStats)
 {
-    std::array<uint32_t, pose::MaxBones * 12> residual{};
-    std::array<uint8_t, pose::MaxBones> present{};
+    int32_t deltas[pose::MaxBones * 12];
+    uint32_t residual[pose::MaxBones * 12];
+    uint8_t present[pose::MaxBones];
     const std::size_t presenceBytes = (count + 7) / 8;
 
     for (bool useOlder : {false, true}) {
@@ -234,18 +254,24 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode2And3(
         const unsigned ratio = older ? Ratio(recent, older, now) : 0;
         if (useOlder && !ratio) continue;
 
+        for (std::size_t i = 0; i < count; ++i) {
+            for (int k = 0; k < 12; ++k) {
+                const int32_t prediction = TemporalPrediction(recent, older, ratio, i, k);
+                deltas[i * 12 + k] = int32_t(bones[i].values[k]) - prediction;
+            }
+        }
+
         for (uint8_t variant = 0; variant < 3; ++variant) {
             const uint8_t predictiveMode = variant == 0 ? 2 : 3;
             const bool secondOrder = variant == 2;
             if (secondOrder && count < 3) continue;
 
-            std::fill_n(present.data(), count, uint8_t(0));
-            std::array<int32_t, 12> prior{}, prior2{};
+            int32_t prior[12] = {}, prior2[12] = {};
             std::size_t included = 0;
             for (std::size_t i = 0; i < count; ++i) {
+                uint8_t any = 0;
                 for (int k = 0; k < 12; ++k) {
-                    const int32_t prediction = TemporalPrediction(recent, older, ratio, i, k);
-                    const int32_t delta = int32_t(bones[i].values[k]) - prediction;
+                    const int32_t delta = deltas[i * 12 + k];
                     int32_t residualValue = delta;
                     if (predictiveMode == 3) {
                         residualValue -= static_cast<int32_t>(
@@ -255,13 +281,16 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode2And3(
                     }
                     const uint32_t zig = PoseZigZag(residualValue);
                     residual[i * 12 + k] = zig;
-                    if (zig) present[i] = 1;
+                    any |= (zig != 0);
                 }
-                if (present[i]) ++included;
+                present[i] = any;
+                if (any) ++included;
             }
 
             std::array<unsigned, 12> kval{};
             std::size_t residualRotation = 0, residualTranslation = 0;
+            const std::size_t lowerBoundBytes = 20 + presenceBytes + (included * 12 + 7) / 8;
+            if (lowerBoundBytes >= bestSize) continue;
             for (int k = 0; k < 12; ++k) {
                 PoseRiceParameters parameters;
                 if (included) {
@@ -277,10 +306,8 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode2And3(
                 (residualRotation + residualTranslation + 7) / 8;
             if (exactBytes >= bestSize) continue;
 
-            PoseRiceWriter writer;
-            writer.bytes = std::move(result);
-            writer.bytes.clear();
-            writer.bytes.reserve(exactBytes);
+            result.assign(exactBytes, 0);
+            PoseBitBufWriter writer{result.data(), 0};
             writer.Put(layout, 16);
             writer.Put(recent.token, 32);
             writer.Put(predictiveMode, 8);
@@ -296,10 +323,8 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode2And3(
                 for (int k = 0; k < 12; ++k)
                     writer.Rice(residual[i * 12 + k], kval[k], 21);
             }
-            writer.Align();
 
-            result = std::move(writer.bytes);
-            bestSize = result.size();
+            bestSize = exactBytes;
             resultKey = recent.token == 0;
             resultStats = {};
             resultStats.headerBytes = 20;
@@ -312,15 +337,23 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode2And3(
     }
 }
 
-G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
+G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4And5(
     uint16_t layout, Frame const& recent, Frame const* olderCandidate,
     pose::Bone const* bones, size_t count, uint32_t now,
     std::size_t& bestSize, std::vector<uint8_t>& result, bool& resultKey,
     std::vector<pose::Bone>& reconstructed, PoseStats& resultStats)
 {
-    std::array<detail::Mode4BonePrep, pose::MaxBones> prep{};
-    std::array<uint32_t, pose::MaxBones * 12> residual{};
-    std::array<pose::Bone, pose::MaxBones> rigidReconstruction{};
+    thread_local detail::Mode4BonePrep prep[pose::MaxBones];
+    uint8_t prepFlags[pose::MaxBones];
+    uint8_t coarseFlags[pose::MaxBones];
+    std::memset(prepFlags, 0, count);
+    std::memset(coarseFlags, 0, count);
+
+    int32_t pred[pose::MaxBones * 12];
+    int32_t diff[pose::MaxBones * 12];
+    uint32_t residual[pose::MaxBones * 12];
+    int32_t prior[pose::MaxBones][12];
+    pose::Bone rigidReconstruction[pose::MaxBones];
     constexpr std::size_t MaxGroups = (pose::MaxBones + 15) / 16;
     std::array<std::array<unsigned, 12>, MaxGroups> parameters{};
     const std::size_t presenceBytes = (count + 7) / 8;
@@ -332,15 +365,56 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
         const unsigned ratio = older ? Ratio(recent, older, now) : 0;
         if (useOlder && !ratio) continue;
 
-        std::array<PoseQuat, pose::MaxBones> predictedQuaternions{};
-        std::array<uint8_t, pose::MaxBones> readyState{}; // 0 = unevaluated, 1 = false, 2 = true
-        auto ensureReady = [&](std::size_t i) -> bool {
+        bool anyDiff = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            for (int k = 0; k < 12; ++k) {
+                const int32_t p = TemporalPrediction(recent, older, ratio, i, k);
+                const int32_t d = int32_t(bones[i].values[k]) - p;
+                pred[i * 12 + k] = p;
+                diff[i * 12 + k] = d;
+                if (d) anyDiff = true;
+            }
+        }
+        if (!anyDiff) {
+            const std::size_t exactBytes = useOlder ? 14 : 8;
+            if (exactBytes < bestSize) {
+                result.resize(exactBytes);
+                result[0] = static_cast<uint8_t>(layout);
+                result[1] = static_cast<uint8_t>(layout >> 8);
+                result[2] = static_cast<uint8_t>(recent.token);
+                result[3] = static_cast<uint8_t>(recent.token >> 8);
+                result[4] = static_cast<uint8_t>(recent.token >> 16);
+                result[5] = static_cast<uint8_t>(recent.token >> 24);
+                result[6] = 5;
+                result[7] = static_cast<uint8_t>(0xC0u | (useOlder ? 1u : 0u));
+                if (useOlder) {
+                    result[8] = static_cast<uint8_t>(older->token);
+                    result[9] = static_cast<uint8_t>(older->token >> 8);
+                    result[10] = static_cast<uint8_t>(older->token >> 16);
+                    result[11] = static_cast<uint8_t>(older->token >> 24);
+                    result[12] = static_cast<uint8_t>(ratio);
+                    result[13] = static_cast<uint8_t>(ratio >> 8);
+                }
+                bestSize = exactBytes;
+                resultKey = false;
+                resultStats = {};
+                resultStats.headerBytes = exactBytes;
+                resultStats.predictive = true;
+                reconstructed.assign(bones, bones + count);
+            }
+            continue;
+        }
+
+        PoseQuat predictedQuaternions[pose::MaxBones];
+        uint8_t readyState[pose::MaxBones];
+        std::memset(readyState, 0, count);
+        auto ensureReady = [&](std::size_t i) noexcept -> bool {
             if (!readyState[i]) {
-                const bool ok = prep[i].EnsureSource(bones[i]) &&
+                const bool ok = prep[i].EnsureSource(bones[i], prepFlags[i]) &&
                     prep[i].PredictQuat(recent.bones[i],
                                         older ? &older->bones[i] : nullptr,
                                         ratio, prep[i].sourceQuat.omitted,
-                                        predictedQuaternions[i]);
+                                        prepFlags[i], predictedQuaternions[i]);
                 readyState[i] = ok ? 2 : 1;
             }
             return readyState[i] == 2;
@@ -354,39 +428,46 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
                 std::size_t rigidCount = 0;
                 std::size_t included = 0;
                 size_t maxBasisError = 0;
-                int32_t prior[pose::MaxBones][12] = {};
-                std::copy_n(bones, count, rigidReconstruction.data());
-
-                auto spatial = [&](size_t i, int k, uint8_t type, uint8_t omittedIndex) -> int32_t {
-                    if (!i || !detail::Mode4FirstOrderMatch(i, boneType[i - 1], omitted[i - 1], type, omittedIndex))
-                        return 0;
-                    if (detail::Mode4SecondOrderMatch(secondOrder, i, boneType[i - 1],
-                                                      i > 1 ? boneType[i - 2] : 0,
-                                                      omitted[i - 1], i > 1 ? omitted[i - 2] : 0,
-                                                      type, omittedIndex)) {
-                        return 2 * prior[i - 1][k] - prior[i - 2][k];
-                    }
-                    return prior[i - 1][k];
-                };
+                uint8_t transChanged[pose::MaxBones];
+                std::size_t transChangedCount = 0;
+                std::size_t changedOmittedCount = 0;
+                std::copy_n(bones, count, rigidReconstruction);
 
                 for (std::size_t i = 0; i < count; ++i) {
+                    const uint8_t prevType = i ? boneType[i - 1] : 0;
+                    const uint8_t prevPrevType = i > 1 ? boneType[i - 2] : 0;
+                    const uint8_t prevOm = i ? omitted[i - 1] : 0;
+                    const uint8_t prevPrevOm = i > 1 ? omitted[i - 2] : 0;
                     bool unchangedPredicted = true;
                     pose::Bone predictedBone = bones[i];
-                    int32_t predictedPrior[12] = {};
-                    for (int k = 0; k < 12; ++k) {
-                        const int32_t prediction = TemporalPrediction(recent, older, ratio, i, k);
-                        const int64_t candidate = int64_t(prediction) + spatial(i, k, 1, 0);
-                        if (candidate < -32768 || candidate > 32767 ||
-                            candidate != int64_t(bones[i].values[k])) {
-                            unchangedPredicted = false;
-                            break;
+                    int32_t predictedPrior[12];
+                    if (prevType != 1) {
+                        for (int k = 0; k < 12; ++k) {
+                            if (diff[i * 12 + k]) { unchangedPredicted = false; break; }
+                            predictedBone.values[k] = static_cast<int16_t>(pred[i * 12 + k]);
+                            predictedPrior[k] = 0;
                         }
-                        predictedBone.values[k] = static_cast<int16_t>(candidate);
-                        predictedPrior[k] = static_cast<int32_t>(candidate - prediction);
+                    } else {
+                        const bool second1 = secondOrder && i > 1 && prevPrevType == 1;
+                        for (int k = 0; k < 12; ++k) {
+                            const int32_t sp = second1 ? (2 * prior[i - 1][k] - prior[i - 2][k]) : prior[i - 1][k];
+                            if (sp != diff[i * 12 + k]) {
+                                unchangedPredicted = false;
+                                break;
+                            }
+                            const int64_t candidate = int64_t(pred[i * 12 + k]) + sp;
+                            if (candidate < -32768 || candidate > 32767) {
+                                unchangedPredicted = false;
+                                break;
+                            }
+                            predictedBone.values[k] = static_cast<int16_t>(candidate);
+                            predictedPrior[k] = sp;
+                        }
                     }
                     if (unchangedPredicted) {
                         rigidReconstruction[i] = predictedBone;
                         boneType[i] = 0;
+                        transChanged[i] = 0;
                         for (int k = 0; k < 12; ++k) {
                             prior[i][k] = predictedPrior[k];
                             residual[i * 12 + k] = 0;
@@ -403,15 +484,15 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
                         recentQuat = predictedQuaternions[i];
                         if (coarse) {
                             for (auto& value : recentQuat.values)
-                                value = PoseRoundSignedDivide(value, 4) * 4;
-                            rigid = prep[i].EvaluateCoarse(bones[i]);
+                                value = PoseRoundSignedDivide4(value) * 4;
+                            rigid = prep[i].EvaluateCoarse(bones[i], coarseFlags[i]);
                             if (rigid) {
                                 targetQuat = prep[i].coarseTarget;
                                 rigidMatrix = &prep[i].coarseMatrix;
                                 boneError = prep[i].coarseError;
                             }
                         } else {
-                            rigid = prep[i].EvaluateExact(bones[i]);
+                            rigid = prep[i].EvaluateExact(bones[i], prepFlags[i]);
                             if (rigid) {
                                 targetQuat = prep[i].sourceQuat;
                                 rigidMatrix = &prep[i].exactMatrix;
@@ -425,6 +506,9 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
                         rigidReconstruction[i] = *rigidMatrix;
                         boneType[i] = 2;
                         omitted[i] = targetQuat.omitted;
+                        if (omitted[i] != prep[i].recentQuat.omitted) ++changedOmittedCount;
+                        const bool sp1 = prevType == 2 && prevOm == omitted[i];
+                        const bool sp2 = secondOrder && sp1 && i > 1 && prevPrevType == 2 && prevPrevOm == omitted[i];
                         for (int k = 0; k < 12; ++k) {
                             residual[i * 12 + k] = 0;
                             prior[i][k] = 0;
@@ -433,33 +517,43 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
                             if (k == targetQuat.omitted) continue;
                             int32_t difference = targetQuat.values[k] - recentQuat.values[k];
                             prior[i][k] = difference;
-                            difference -= spatial(i, k, 2, omitted[i]);
+                            if (sp1) difference -= sp2 ? (2 * prior[i - 1][k] - prior[i - 2][k]) : prior[i - 1][k];
                             residual[i * 12 + k] = PoseZigZag(coarse ? difference / 4 : difference);
                         }
+                        uint8_t tDirty = 0;
                         for (int k = 9; k < 12; ++k) {
-                            const int32_t prediction = TemporalPrediction(recent, older, ratio, i, k);
-                            int32_t difference = int32_t(bones[i].values[k]) - prediction;
+                            int32_t difference = diff[i * 12 + k];
+                            if (difference) tDirty = 1;
                             prior[i][k] = difference;
-                            difference -= spatial(i, k, 2, omitted[i]);
+                            if (sp1) difference -= sp2 ? (2 * prior[i - 1][k] - prior[i - 2][k]) : prior[i - 1][k];
                             residual[i * 12 + k] = PoseZigZag(difference);
                         }
+                        transChanged[i] = tDirty;
+                        if (tDirty) ++transChangedCount;
                         ++rigidCount;
                         ++included;
                         continue;
                     }
 
+                    const bool sp1 = prevType == 1;
+                    const bool sp2 = secondOrder && sp1 && i > 1 && prevPrevType == 1;
                     bool changedAffine = false;
+                    uint8_t tDirty = 0;
                     for (int k = 0; k < 12; ++k) {
-                        const int32_t prediction = TemporalPrediction(recent, older, ratio, i, k);
-                        int32_t difference = int32_t(bones[i].values[k]) - prediction;
+                        int32_t difference = diff[i * 12 + k];
+                        if (k >= 9 && difference) tDirty = 1;
                         prior[i][k] = difference;
-                        difference -= spatial(i, k, 1, 0);
+                        if (sp1) difference -= sp2 ? (2 * prior[i - 1][k] - prior[i - 2][k]) : prior[i - 1][k];
                         residual[i * 12 + k] = PoseZigZag(difference);
                         if (difference) changedAffine = true;
                     }
                     if (changedAffine) {
                         boneType[i] = 1;
+                        transChanged[i] = tDirty;
+                        if (tDirty) ++transChangedCount;
                         ++included;
+                    } else {
+                        transChanged[i] = 0;
                     }
                 }
 
@@ -468,83 +562,132 @@ G3T_NPCWIRE_POSE_INLINE void PoseCache::EncodeMode4(
                     continue;
 
                 const std::size_t omittedBytes = (rigidCount + 3) / 4;
-                for (bool grouped : {false, true}) {
-                    if (grouped && count <= 16) continue;
-                    const size_t groupBones = grouped ? 16 : count;
-                    const size_t groups = (count + groupBones - 1) / groupBones;
-                    std::size_t residualRotation = 0, residualTranslation = 0;
-                    for (size_t group = 0; group < groups; ++group) {
-                        const std::size_t endBone = (std::min)(count, (group + 1) * groupBones);
-                        for (int k = 0; k < 12; ++k) {
-                            PoseRiceParameters costs;
-                            for (std::size_t i = group * groupBones; i < endBone; ++i)
-                                if (boneType[i] == 1 ||
-                                    (boneType[i] == 2 && ((k < 4 && k != omitted[i]) || k >= 9)))
-                                    costs.Add(residual[i * 12 + k]);
-                            std::size_t compBits = 0;
-                            parameters[group][k] = costs.Best(compBits);
-                            (k < 9 ? residualRotation : residualTranslation) += compBits;
-                        }
-                    }
+                const std::size_t maxGroups = (count + 15) / 16;
+                const bool allRigid = rigidCount == included;
+                uint8_t recentOmitted[pose::MaxBones];
+                for (std::size_t i = 0; i < count; ++i)
+                    recentOmitted[i] = (prepFlags[i] & 8) ? prep[i].recentQuat.omitted : 0;
 
-                    const std::size_t exactBytes = 14 + groups * 6 +
-                        presenceBytes + rigidBytes + omittedBytes +
-                        (residualRotation + residualTranslation + 7) / 8;
-                    if (exactBytes >= bestSize) continue;
-
-                    PoseRiceWriter writer;
-                    writer.bytes = std::move(result);
-                    writer.bytes.clear();
-                    writer.bytes.reserve(exactBytes);
-                    writer.Put(layout, 16);
-                    writer.Put(recent.token, 32);
-                    writer.Put(4, 8);
-                    writer.Put((grouped ? 1 : 0) | (coarse ? 2 : 0) | (secondOrder ? 4 : 0), 8);
-                    writer.Put(older ? older->token : 0, 32);
-                    writer.Put(ratio, 16);
-                    for (size_t group = 0; group < groups; ++group)
-                        for (unsigned k : parameters[group])
-                            writer.Put(k, 4);
-                    writer.Align();
-                    for (std::size_t i = 0; i < count; ++i)
-                        writer.Put(boneType[i] ? 1u : 0u, 1);
-                    writer.Align();
-                    for (std::size_t i = 0; i < count; ++i)
-                        writer.Put(boneType[i] == 2 ? 1u : 0u, 1);
-                    writer.Align();
-                    for (std::size_t i = 0; i < count; ++i)
-                        if (boneType[i] == 2) writer.Put(omitted[i], 2);
-                    writer.Align();
-                    for (std::size_t i = 0; i < count; ++i) {
-                        if (!boneType[i]) continue;
-                        auto const& kval = parameters[i / groupBones];
-                        if (boneType[i] == 2) {
-                            for (int k = 0; k < 4; ++k) {
-                                if (k == omitted[i]) continue;
-                                writer.Rice(residual[i * 12 + k], kval[k], 21);
-                            }
+                // Single-pass Rice histogram accumulation: only collect what Mode 5 / Mode 4 need.
+                PoseRiceParameters groupCosts[MaxGroups][12];
+                PoseRiceParameters globalCosts[12];
+                PoseRiceParameters rigidGroupCosts[MaxGroups][3];
+                PoseRiceParameters rigidGlobalCosts[3];
+                std::memset(groupCosts, 0, maxGroups * sizeof(groupCosts[0]));
+                std::memset(globalCosts, 0, sizeof(globalCosts));
+                if (allRigid) {
+                    std::memset(rigidGroupCosts, 0, maxGroups * sizeof(rigidGroupCosts[0]));
+                    std::memset(rigidGlobalCosts, 0, sizeof(rigidGlobalCosts));
+                }
+                for (size_t group = 0; group < maxGroups; ++group) {
+                    const std::size_t startBone = group * 16;
+                    const std::size_t endBone = (std::min)(count, startBone + 16);
+                    if (allRigid) {
+                        for (std::size_t i = startBone; i < endBone; ++i) {
+                            if (!boneType[i]) continue;
+                            int slot = 0;
+                            for (int k = 0; k < 4; ++k)
+                                if (k != omitted[i]) rigidGroupCosts[group][slot++].Add(residual[i * 12 + k]);
                             for (int k = 9; k < 12; ++k)
-                                writer.Rice(residual[i * 12 + k], kval[k], 21);
-                        } else {
-                            for (int k = 0; k < 12; ++k)
-                                writer.Rice(residual[i * 12 + k], kval[k], 21);
+                                groupCosts[group][k].Add(residual[i * 12 + k]);
                         }
+                        for (int s = 0; s < 3; ++s) {
+                            detail::AddRiceParams(rigidGlobalCosts[s], rigidGroupCosts[group][s]);
+                            detail::AddRiceParams(globalCosts[9 + s], groupCosts[group][9 + s]);
+                        }
+                    } else {
+                        for (std::size_t i = startBone; i < endBone; ++i) {
+                            if (boneType[i] == 1) {
+                                for (int k = 0; k < 12; ++k)
+                                    groupCosts[group][k].Add(residual[i * 12 + k]);
+                            } else if (boneType[i] == 2) {
+                                for (int k = 0; k < 4; ++k)
+                                    if (k != omitted[i]) groupCosts[group][k].Add(residual[i * 12 + k]);
+                                for (int k = 9; k < 12; ++k)
+                                    groupCosts[group][k].Add(residual[i * 12 + k]);
+                            }
+                        }
+                        for (int k = 0; k < 12; ++k) detail::AddRiceParams(globalCosts[k], groupCosts[group][k]);
                     }
-                    writer.Align();
+                }
 
-                    result = std::move(writer.bytes);
-                    bestSize = result.size();
-                    resultKey = false;
-                    resultStats = {};
-                    resultStats.headerBytes = 14 + groups * 6;
-                    resultStats.maskBits = (presenceBytes + rigidBytes + omittedBytes) * 8;
-                    resultStats.rotationBits = residualRotation;
-                    resultStats.translationBits = residualTranslation;
-                    resultStats.includedBones = included;
-                    resultStats.predictive = true;
-                    resultStats.maxBasisErrorUnits = maxBasisError;
-                    resultStats.rigidBones = rigidCount;
-                    reconstructed.assign(rigidReconstruction.data(), rigidReconstruction.data() + count);
+                bool m5AllPresent = false, m5AllRigid = false, m5SameRigid = false, m5SparseOmit = false;
+                detail::Mode5Input m5In{
+                    layout, recent.token, older ? older->token : 0, ratio, useOlder, coarse, secondOrder,
+                    bones, count, diff, boneType.data(), omitted.data(), transChanged,
+                    included, rigidCount, transChangedCount, changedOmittedCount, maxBasisError,
+                    rigidReconstruction, residual, groupCosts, globalCosts, rigidGroupCosts, rigidGlobalCosts,
+                    prepFlags, recentOmitted
+                };
+                detail::EncodeMode5Candidates(m5In, bestSize, result, resultKey, reconstructed, resultStats,
+                                              m5AllPresent, m5AllRigid, m5SameRigid, m5SparseOmit);
+
+                // Mode 4 can only beat Mode 5 if none of Mode 5's structural savings applied.
+                if (!m5AllPresent && !m5AllRigid && !m5SameRigid && !m5SparseOmit && transChangedCount == included) {
+                    for (bool grouped : {false, true}) {
+                        if (grouped && count <= 16) continue;
+                        const size_t groupBones = grouped ? 16 : count;
+                        const size_t groups = (count + groupBones - 1) / groupBones;
+                        std::size_t residualRotation = 0, residualTranslation = 0;
+                        for (size_t group = 0; group < groups; ++group) {
+                            for (int k = 0; k < 12; ++k) {
+                                std::size_t compBits = 0;
+                                parameters[group][k] = (grouped ? groupCosts[group][k] : globalCosts[k]).Best(compBits);
+                                (k < 9 ? residualRotation : residualTranslation) += compBits;
+                            }
+                        }
+                        const std::size_t exactBytes = 14 + groups * 6 +
+                            presenceBytes + rigidBytes + omittedBytes +
+                            (residualRotation + residualTranslation + 7) / 8;
+                        if (exactBytes >= bestSize) continue;
+
+                        result.assign(exactBytes, 0);
+                        PoseBitBufWriter writer{result.data(), 0};
+                        writer.Put(layout, 16);
+                        writer.Put(recent.token, 32);
+                        writer.Put(4, 8);
+                        writer.Put((grouped ? 1 : 0) | (coarse ? 2 : 0) | (secondOrder ? 4 : 0), 8);
+                        writer.Put(older ? older->token : 0, 32);
+                        writer.Put(ratio, 16);
+                        for (size_t group = 0; group < groups; ++group)
+                            for (unsigned k : parameters[group]) writer.Put(k, 4);
+                        writer.Align();
+                        for (std::size_t i = 0; i < count; ++i)
+                            writer.Put(boneType[i] ? 1u : 0u, 1);
+                        writer.Align();
+                        for (std::size_t i = 0; i < count; ++i)
+                            writer.Put(boneType[i] == 2 ? 1u : 0u, 1);
+                        writer.Align();
+                        for (std::size_t i = 0; i < count; ++i)
+                            if (boneType[i] == 2) writer.Put(omitted[i], 2);
+                        writer.Align();
+                        for (std::size_t i = 0; i < count; ++i) {
+                            if (!boneType[i]) continue;
+                            auto const& kval = parameters[i / groupBones];
+                            if (boneType[i] == 2) {
+                                for (int k = 0; k < 4; ++k)
+                                    if (k != omitted[i]) writer.Rice(residual[i * 12 + k], kval[k], 21);
+                                for (int k = 9; k < 12; ++k)
+                                    writer.Rice(residual[i * 12 + k], kval[k], 21);
+                            } else {
+                                for (int k = 0; k < 12; ++k)
+                                    writer.Rice(residual[i * 12 + k], kval[k], 21);
+                            }
+                        }
+
+                        bestSize = exactBytes;
+                        resultKey = false;
+                        resultStats = {};
+                        resultStats.headerBytes = 14 + groups * 6;
+                        resultStats.maskBits = (presenceBytes + rigidBytes + omittedBytes) * 8;
+                        resultStats.rotationBits = residualRotation;
+                        resultStats.translationBits = residualTranslation;
+                        resultStats.includedBones = included;
+                        resultStats.predictive = true;
+                        resultStats.maxBasisErrorUnits = maxBasisError;
+                        resultStats.rigidBones = rigidCount;
+                        reconstructed.assign(rigidReconstruction, rigidReconstruction + count);
+                    }
                 }
             }
         }
@@ -556,13 +699,15 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::EncodeCompactImpl(
     pose::Bone const* bones, size_t count, uint32_t now,
     std::vector<uint8_t>& out, bool& key,
     std::vector<pose::Bone>& decodedOutput, PoseStats* stats,
-    bool allowMode4, bool forceKey) const
+    bool allowMode4, bool forceKey, bool prevalidated) const
 {
-    if (!dictionary.HasLayout(layout) || !incarnation || !layout || !bones ||
+    if (!incarnation || !layout || !bones ||
         !count || count > pose::MaxBones || (flags & ~pose::Facial))
         return Status::InvalidArgument;
-    Status status = dictionary.ValidatePose(layout, bones, count);
-    if (status != Status::Ok) return status;
+    if (!prevalidated) {
+        const Status status = dictionary.ValidatePose(layout, bones, count);
+        if (status != Status::Ok) return status;
+    }
 
     bool keyDue = forceKey || !haveKey_ || now - keyAt_ >= PoseKeyMs;
     const Frame* base = nullptr;
@@ -575,11 +720,35 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::EncodeCompactImpl(
 
     Frame identity{0, incarnation, layout, flags, now, {}};
     if (keyDue) {
-        status = dictionary.IdentityPose(layout, identity.bones);
-        if (status != Status::Ok) return status;
-        base = &identity;
+        if (const auto* idPose = dictionary.IdentityPosePtr(layout)) {
+            identity.bones = *idPose; // reuse vector? Wait: base can just point to &identity or we avoid copy!
+            base = &identity;
+        } else {
+            return Status::UnknownLayout;
+        }
     }
     if (!base->bones.empty() && base->bones.size() != count) return Status::Malformed;
+
+    // Fast path: unchanged relative to base (zero-residual Mode 5 frame, exact 0 error).
+    if (std::memcmp(bones, base->bones.data(), count * sizeof(pose::Bone)) == 0) {
+        out.resize(8);
+        out[0] = static_cast<uint8_t>(layout);
+        out[1] = static_cast<uint8_t>(layout >> 8);
+        out[2] = static_cast<uint8_t>(base->token);
+        out[3] = static_cast<uint8_t>(base->token >> 8);
+        out[4] = static_cast<uint8_t>(base->token >> 16);
+        out[5] = static_cast<uint8_t>(base->token >> 24);
+        out[6] = 5;
+        out[7] = 0xC0u;
+        key = base->token == 0;
+        decodedOutput.assign(bones, bones + count);
+        if (stats) {
+            *stats = {};
+            stats->headerBytes = 8;
+            stats->predictive = true;
+        }
+        return Status::Ok;
+    }
 
     const std::size_t mode0Bytes = 7 + count * TransformBytes;
     std::size_t bestSize = mode0Bytes;
@@ -593,20 +762,21 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::EncodeCompactImpl(
     resultStats.includedBones = 0;
     resultStats.predictive = false;
 
-    EncodeMode1Sparse(layout, *base, bones, count, bestSize, out, resultKey, resultStats);
-
     const Frame* olderForPredictive = !keyDue && ackRefs_.size() >= 2
         ? Find(ackRefs_[1], incarnation, layout, flags) : nullptr;
     if (olderForPredictive && (olderForPredictive->bones.size() != count ||
                                !PoseNewer(base->token, olderForPredictive->token)))
         olderForPredictive = nullptr;
-    EncodeMode2And3(layout, *base, olderForPredictive, bones, count, now,
-                    bestSize, out, resultKey, resultStats);
 
     if (allowMode4 && !keyDue) {
-        EncodeMode4(layout, *base, olderForPredictive, bones, count, now,
-                    bestSize, out, resultKey, decodedOutput, resultStats);
+        EncodeMode4And5(layout, *base, olderForPredictive, bones, count, now,
+                        bestSize, out, resultKey, decodedOutput, resultStats);
     }
+
+    EncodeMode1Sparse(layout, *base, bones, count, bestSize, out, resultKey, resultStats);
+
+    EncodeMode2And3(layout, *base, olderForPredictive, bones, count, now,
+                    bestSize, out, resultKey, resultStats);
 
     if (bestSize == mode0Bytes) {
         out.resize(mode0Bytes);
@@ -635,17 +805,17 @@ G3T_NPCWIRE_POSE_INLINE Status PoseCache::Encode(
 {
     std::vector<pose::Bone> reconstructed;
     return EncodeCompactImpl(dictionary, layout, incarnation, flags, bones, count, now,
-                             out, key, reconstructed, stats, false, forceKey);
+                             out, key, reconstructed, stats, false, forceKey, false);
 }
 
 G3T_NPCWIRE_POSE_INLINE Status PoseCache::EncodeCompact(
     Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
     pose::Bone const* bones, size_t count, uint32_t now,
     std::vector<uint8_t>& out, bool& key,
-    std::vector<pose::Bone>& reconstructed, PoseStats* stats, bool forceKey) const
+    std::vector<pose::Bone>& reconstructed, PoseStats* stats, bool forceKey, bool prevalidated) const
 {
     return EncodeCompactImpl(dictionary, layout, incarnation, flags, bones, count, now,
-                             out, key, reconstructed, stats, true, forceKey);
+                             out, key, reconstructed, stats, true, forceKey, prevalidated);
 }
 
 } // namespace g3t::npcwire::bones

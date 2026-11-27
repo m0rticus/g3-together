@@ -7,7 +7,7 @@
 int main()
 {
     using namespace g3t::saving;
-    static_assert(Protocol == 81, "Build 81 requires protocol 81");
+    static_assert(Protocol == 82, "Protocol 82 includes Mode 5 pose delta encoding and periodic pose ACK requests");
     static_assert(g3t::npcwire::bones::Version == 74, "bone dictionary format version advances separately");
     const std::string world(32, 'a'), checkpoint(32, 'b'), previous(32, 'c');
     const Key alice{world, checkpoint, 123}, bob{world, checkpoint, 456};

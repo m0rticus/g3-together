@@ -301,6 +301,25 @@ void Bounds()
         assert(receiver.DecodePose(pose.data(), pose.size(), output, id) == Status::Ok);
         EqualBones(output, bones);
     }
+
+    // Fast layout matching, Bone-based FindLayout, IdentityPosePtr, and copy/move safety.
+    auto full = MakeBones(12);
+    auto fullHashes = Hashes(full);
+    assert(sender.Register(7, fullHashes.data(), fullHashes.size()) == Status::Ok);
+    assert(sender.MatchesLayout(7, full.data(), full.size()));
+    assert(!sender.MatchesLayout(7, full.data(), full.size() - 1));
+    assert(!sender.MatchesLayout(8, full.data(), full.size()));
+    uint16_t foundId = 0;
+    assert(sender.FindLayout(full.data(), full.size(), foundId) == Status::Ok && foundId == 7);
+    auto* idPtr = sender.IdentityPosePtr(7);
+    assert(idPtr && idPtr->size() == 12 && (*idPtr)[0].values[0] == 4096 && (*idPtr)[0].name == full[0].name);
+    Dictionary copied = sender;
+    assert(copied.MatchesLayout(7, full.data(), full.size()));
+    Dictionary moved = std::move(copied);
+    assert(moved.MatchesLayout(7, full.data(), full.size()));
+    full[3].name ^= 0x100u;
+    assert(!moved.MatchesLayout(7, full.data(), full.size()));
+    assert(moved.FindLayout(full.data(), full.size(), foundId) == Status::UnknownLayout);
 }
 
 int main(int argc, char** argv)

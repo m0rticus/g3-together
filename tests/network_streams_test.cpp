@@ -514,7 +514,7 @@ int main()
     transmissions.clear();
 
     // MsgHitResult accepts both 68-byte knockback-enriched replies and legacy 34-byte replies (knockbackValid=0).
-    static_assert(saving::Protocol == 81, "Build 81 protocol version must remain 81");
+    static_assert(saving::Protocol == 82, "Protocol 82 includes Mode 5 pose delta encoding and periodic pose ACK requests");
     static_assert(LegacyHitResultMsgSize == 34 && sizeof(HitResultMsg) == 68, "HitResultMsg wire layout");
     static unsigned hitResultsReceived = 0;
     static HitResult lastHitResult{};

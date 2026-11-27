@@ -506,5 +506,57 @@ int main()
     assert(logged("pose=compact bones=80"));
     assert(logged("bone layout IDs exhausted"));
     assert(logged("full-hash pose fallback failed"));
+
+    // Verify per-NPC layout ID caching across layout switches and periodic PoseAckReqFlag.
+    input[0].name = 100;
+    ResetNpcReplication();
+    logs.clear();
+    nextBoneLayout = 0;
+    boneExhaustionLogged = false;
+    isHost = true;
+    peers[2] = &fakePeer;
+    peers[3] = nullptr;
+    clientInWorld[2] = true;
+    clientInWorld[3] = false;
+    record.guid[0] = 0x55;
+    record.incarnation = 1;
+    record.sent = 1000;
+    transmissions.clear();
+    SendPosedNpcTo(2, record, input, count, 0, false, 16); // layout 1 + reliable anchor
+    const auto firstBatch = transmissions;
+    assert(!firstBatch.empty());
+
+    // Client receives dictionary/control setup/anchor and sends acks back.
+    isHost = false;
+    inWorld = true;
+    transmissions.clear();
+    for (auto const& tx : firstBatch) Deliver(&fakePeer, tx);
+    const auto clientAcks = transmissions;
+    assert(std::any_of(clientAcks.begin(), clientAcks.end(),
+                       [](Transmission const& tx) { return tx.bytes[0] == MsgPoseAck; }));
+
+    isHost = true;
+    transmissions.clear();
+    for (auto const& tx : clientAcks) Deliver(&fakePeer, tx);
+    const uint16_t layoutCountBefore = static_cast<uint16_t>(nextBoneLayout);
+
+    // Repeated sends with same layout and advancing timestamps reuse the cached layout ID,
+    // and facial rig layout switches back and forth reuse the original layout IDs.
+    for (int step = 1; step <= 4; ++step) {
+        record.sent = 1000 + static_cast<uint32_t>(step * 100);
+        input[0].values[9] = static_cast<int16_t>(input[0].values[9] + 10);
+        transmissions.clear();
+        SendPosedNpcTo(2, record, input, count, 0, false, 16);
+        assert(!transmissions.empty());
+    }
+    assert(nextBoneLayout == layoutCountBefore);
+
+    // Switch to a 79-bone layout (new layout 2), then back to 80 bones (reuses layout 1).
+    SendPosedNpcTo(2, record, input, count - 1, 0, false, 16);
+    assert(nextBoneLayout == layoutCountBefore + 1);
+    transmissions.clear();
+    SendPosedNpcTo(2, record, input, count, 0, false, 16);
+    assert(nextBoneLayout == layoutCountBefore + 1);
+    assert(!transmissions.empty());
     return 0;
 }

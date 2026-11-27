@@ -39,8 +39,8 @@ class PuppetAnimationSyncTests(unittest.TestCase):
         executed = TARGET.run(timeout=30)
         self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
-    def test_protocol_81_and_line_limits_preserved(self):
-        self.assertIn("constexpr uint16_t Protocol = 81;", self.saving_policy)
+    def test_protocol_82_and_line_limits_preserved(self):
+        self.assertIn("constexpr uint16_t Protocol = 82;", self.saving_policy)
         self.assertIn("constexpr std::size_t FixedBytes = 65;", self.playerwire)
         for rel in (
             "src/net.cpp",

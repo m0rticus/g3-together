@@ -16,6 +16,12 @@ namespace g3t::npcplayback::detail {
 
 // Native emfx2Node stores its local bone bCMatrix at byte offset +0x44 in CP 1.75.
 template <typename Node>
+inline void ReadNodeMatrixRaw(Node const* nodes, int index, float (&out)[16])
+{
+    std::memcpy(out, reinterpret_cast<unsigned char const*>(nodes + index) + 0x44, sizeof(out));
+}
+
+template <typename Node>
 inline bCMatrix ReadNodeMatrix(Node const* nodes, int index)
 {
     bCMatrix matrix;

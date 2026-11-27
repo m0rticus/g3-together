@@ -16,6 +16,23 @@
 namespace g3t::npcplayback::detail {
 namespace {
 
+static_assert(sizeof(bCMatrix) == 64, "bCMatrix layout must be four contiguous bCVector4 rows");
+
+bool ContainsInsensitive(char const* haystack, char const* needle) noexcept
+{
+    if (!haystack || !needle || !*needle) return false;
+    for (char const* p = haystack; *p; ++p) {
+        char const* a = p;
+        char const* b = needle;
+        while (*a && *b && std::tolower(static_cast<unsigned char>(*a)) == *b) {
+            ++a;
+            ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
 struct SourceSkeleton {
     void const* instance = nullptr;
     void const* nodes = nullptr;
@@ -42,23 +59,25 @@ pose::Transform TransformOf(bCMatrix const& matrix, uint32_t name)
 {
     pose::Transform transform;
     transform.name = name;
-    const bCVector axes[] = {matrix.GetXAxis(), matrix.GetYAxis(), matrix.GetZAxis(), matrix.GetTranslation()};
-    for (int axis = 0; axis < 4; ++axis) {
-        transform.values[axis * 3] = axes[axis].GetX();
-        transform.values[axis * 3 + 1] = axes[axis].GetY();
-        transform.values[axis * 3 + 2] = axes[axis].GetZ();
-    }
+    float raw[16];
+    std::memcpy(raw, &matrix, sizeof(raw));
+    transform.values[0] = raw[0]; transform.values[1] = raw[1]; transform.values[2] = raw[2];
+    transform.values[3] = raw[4]; transform.values[4] = raw[5]; transform.values[5] = raw[6];
+    transform.values[6] = raw[8]; transform.values[7] = raw[9]; transform.values[8] = raw[10];
+    transform.values[9] = raw[12]; transform.values[10] = raw[13]; transform.values[11] = raw[14];
     return transform;
 }
 
 bCMatrix MatrixOf(pose::Transform const& transform)
 {
     bCMatrix matrix;
-    matrix.SetIdentity();
-    matrix.AccessXAxis() = bCVector(transform.values[0], transform.values[1], transform.values[2]);
-    matrix.AccessYAxis() = bCVector(transform.values[3], transform.values[4], transform.values[5]);
-    matrix.AccessZAxis() = bCVector(transform.values[6], transform.values[7], transform.values[8]);
-    matrix.AccessTranslation() = bCVector(transform.values[9], transform.values[10], transform.values[11]);
+    const float raw[16] = {
+        transform.values[0], transform.values[1], transform.values[2], 0.0f,
+        transform.values[3], transform.values[4], transform.values[5], 0.0f,
+        transform.values[6], transform.values[7], transform.values[8], 0.0f,
+        transform.values[9], transform.values[10], transform.values[11], 1.0f
+    };
+    std::memcpy(&matrix, raw, sizeof(raw));
     return matrix;
 }
 
@@ -100,6 +119,14 @@ bool ApplyPose(eCWrapper_emfx2Actor& actor, NativePose& pose)
 bool FullPose(NativePose const& pose)
 {
     if (pose.count <= 0 || pose.bones.size() != static_cast<size_t>(pose.count)) return false;
+    if (pose.count <= pose::MaxBones) {
+        bool seen[pose::MaxBones] = {};
+        for (auto const& bone : pose.bones) {
+            if (bone.index < 0 || bone.index >= pose.count || seen[bone.index]) return false;
+            seen[bone.index] = true;
+        }
+        return true;
+    }
     std::vector<bool> seen(static_cast<size_t>(pose.count), false);
     for (auto const& bone : pose.bones) {
         if (bone.index < 0 || bone.index >= pose.count || seen[bone.index]) return false;
@@ -203,6 +230,7 @@ bool PrepareTransforms(eCEntity* entity, eCVisualAnimation_PS& animation, State&
     if (state.actor != actor || state.actorName != result.actorName ||
         state.nodes != nodes.mData || state.nodeCount != nodes.mLength) {
         state.boneIndices.clear();
+        state.boneIndices.reserve(static_cast<size_t>(nodes.mLength));
         for (int i = 0; i < nodes.mLength; ++i) {
             const auto hash = net::HashName(actor->GetName(nodes.mData + i).GetText());
             const auto inserted = state.boneIndices.emplace(hash, i);
@@ -263,23 +291,17 @@ bool PresentMotion(eCVisualAnimation_PS& animation, eCWrapper_emfx2Actor& actor,
 bool IdleResourceName(char const* name)
 {
     if (!name || !*name) return false;
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return (lower.find("ambient") != std::string::npos || lower.find("idle") != std::string::npos) &&
-           lower.find("combat") == std::string::npos && lower.find("hit") == std::string::npos &&
-           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos &&
-           lower.find("stumble") == std::string::npos;
+    return (ContainsInsensitive(name, "ambient") || ContainsInsensitive(name, "idle")) &&
+           !ContainsInsensitive(name, "combat") && !ContainsInsensitive(name, "hit") &&
+           !ContainsInsensitive(name, "death") && !ContainsInsensitive(name, "dead") &&
+           !ContainsInsensitive(name, "stumble");
 }
 
 bool ReactionResourceName(char const* name)
 {
     if (!name || !*name) return false;
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return (lower.find("stumble") != std::string::npos || lower.find("hit") != std::string::npos) &&
-           lower.find("death") == std::string::npos && lower.find("dead") == std::string::npos;
+    return (ContainsInsensitive(name, "stumble") || ContainsInsensitive(name, "hit")) &&
+           !ContainsInsensitive(name, "death") && !ContainsInsensitive(name, "dead");
 }
 
 eCResourceDataEntity* QueryNativeMotion(eCEntity* entity, gEAction action, gEPhase phase, bool reaction,
@@ -365,15 +387,16 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
         Logf("npcplayback: %s has an unsupported pose size: %d", entity->GetName().GetText(), nodes.mLength);
         return false;
     }
-    bones.clear();
-    bones.reserve(nodes.mLength);
+    bones.resize(static_cast<size_t>(nodes.mLength));
     auto& cache = detail::sourceSkeletons[actor];
     cache.seen = net::Now();
+    char const* rawActorName = actor->GetActorName().GetText();
+    char const* actorName = rawActorName ? rawActorName : "";
     if (cache.instance != skeleton || cache.nodes != nodes.mData ||
-        cache.names.size() != static_cast<size_t>(nodes.mLength) || cache.actorName != actor->GetActorName().GetText()) {
+        cache.names.size() != static_cast<size_t>(nodes.mLength) || cache.actorName != actorName) {
         cache.instance = skeleton;
         cache.nodes = nodes.mData;
-        cache.actorName = actor->GetActorName().GetText();
+        cache.actorName = actorName;
         cache.names.clear();
         cache.hashes.clear();
         cache.names.reserve(static_cast<size_t>(nodes.mLength));
@@ -400,17 +423,27 @@ bool CapturePose(eCEntity* entity, std::vector<pose::Bone>& bones, uint8_t& flag
         }
         if (!cache.valid) Logf("npcplayback: %s has ambiguous bone names", entity->GetName().GetText());
     }
-    if (!cache.valid) return false;
+    if (!cache.valid) {
+        bones.clear();
+        return false;
+    }
     if (publish && (cache.publishedEpoch != detail::publishedNameEpoch || cache.publishedFn != publish)) {
         for (int i = 0; i < nodes.mLength; ++i) publish(cache.hashes[i], cache.names[i].c_str());
         cache.publishedEpoch = detail::publishedNameEpoch;
         cache.publishedFn = publish;
     }
-    bones.resize(static_cast<size_t>(nodes.mLength));
-    for (int i = 0; i < nodes.mLength; ++i) {
-        const bCMatrix matrix = detail::ReadNodeMatrix(nodes.mData, i);
-        const auto transform = detail::TransformOf(matrix, cache.hashes[i]);
-        if (!pose::Encode(transform, bones[static_cast<size_t>(i)])) {
+    auto const* nodeData = nodes.mData;
+    const int nodeCount = nodes.mLength;
+    uint32_t const* hashes = cache.hashes.data();
+    pose::Bone* outBones = bones.data();
+    for (int i = 0; i < nodeCount; ++i) {
+#if G3T_POSE_SSE2
+        if (i + 1 < nodeCount)
+            _mm_prefetch(reinterpret_cast<char const*>(nodeData + i + 1) + 0x44, _MM_HINT_T0);
+#endif
+        float rawMatrix[16];
+        detail::ReadNodeMatrixRaw(nodeData, i, rawMatrix);
+        if (!pose::EncodeMatrix4x4(hashes[i], rawMatrix, outBones[i])) {
             bones.clear();
             Logf("npcplayback: %s bone %d is outside the canonical pose encoding", entity->GetName().GetText(), i);
             return false;

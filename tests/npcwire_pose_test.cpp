@@ -632,7 +632,7 @@ static void SecondOrderSpatial()
     PoseStats stats;
     assert(sender.EncodeCompact(dictionary, 1, 1, 0, rig.data(), rig.size(), 100,
                                 bytes, key, reconstructed, &stats) == Status::Ok && !key);
-    assert(bytes[6] == 4 && (bytes[7] & 4) && stats.rigidBones && stats.maxBasisErrorUnits <= 2);
+    assert((bytes[6] == 4 || bytes[6] == 5) && (bytes[7] & 4) && stats.rigidBones && stats.maxBasisErrorUnits <= 2);
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout) == Status::Ok);
     assert(Same(decoded, reconstructed));
     for (size_t i = 0; i < rig.size(); ++i)
@@ -641,7 +641,10 @@ static void SecondOrderSpatial()
     valid = bytes;
     for (size_t size = 0; size < valid.size(); ++size)
         assert(receiver.Decode(dictionary, valid.data(), size, 1, 0, decoded, layout) != Status::Ok);
-    bytes = valid; bytes[7] |= 8;
+    bytes = valid;
+    if (bytes[6] == 4) bytes[7] |= 8;
+    else if (!(bytes[7] & 32)) bytes[(bytes[7] & 1) ? 14 : 8] |= 4;
+    else bytes[7] |= 0xC0u;
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout) == Status::Malformed);
     assert(receiver.Store(1, 2, 1, 0, identity.data(), identity.size(), 101, true, true));
     assert(receiver.Decode(dictionary, valid.data(), valid.size(), 1, 0, decoded, layout) == Status::WrongGeneration);
@@ -676,7 +679,7 @@ static void SecondOrderSpatial()
     assert(mode4SecondSender.Ack(1, 1) && mode4SecondSender.Ack(2, 1));
     assert(mode4SecondSender.EncodeCompact(dictionary, 1, 1, 0, frameC.data(), frameC.size(), 300,
                                            bytes, key, reconstructed, &stats) == Status::Ok && !key);
-    assert(bytes[6] == 4);
+    assert(bytes[6] == 4 || bytes[6] == 5);
     assert(mode4SecondReceiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout) == Status::Ok);
     assert(Same(decoded, reconstructed));
 }
@@ -901,6 +904,91 @@ static void Simulation()
     assert(after < before && after / seconds < 1000000);
 }
 
+static void Mode5CompactAndMalformed()
+{
+    auto dictionary = Layout(64);
+    std::vector<pose::Bone> base, next, decoded, reconstructed;
+    assert(dictionary.IdentityPose(1, base) == Status::Ok);
+    for (size_t i = 0; i < base.size(); ++i) {
+        const double angle = 0.08 + i * 0.005;
+        pose::Transform t{};
+        t.name = static_cast<uint32_t>(i + 1);
+        t.values[0] = t.values[8] = static_cast<float>(std::cos(angle));
+        t.values[2] = static_cast<float>(std::sin(angle));
+        t.values[6] = -t.values[2];
+        t.values[4] = 1.0f;
+        t.values[9] = 10.0f + float(i);
+        assert(pose::Encode(t, base[i]));
+    }
+    PoseCache sender, receiver;
+    assert(sender.Store(1, 1, 1, 0, base.data(), base.size(), 100, true, true));
+    assert(receiver.Store(1, 1, 1, 0, base.data(), base.size(), 100, true, true));
+    assert(sender.Ack(1, 1));
+
+    // Zero-residual Mode 5 frame (8 bytes).
+    std::vector<uint8_t> bytes;
+    bool key = true;
+    uint16_t layout = 0;
+    PoseStats stats{};
+    assert(sender.EncodeCompact(dictionary, 1, 1, 0, base.data(), base.size(), 200,
+                                bytes, key, reconstructed, &stats) == Status::Ok);
+    assert(!key && bytes.size() == 8 && bytes[6] == 5 && bytes[7] == 0xC0u);
+    assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout, &stats) == Status::Ok);
+    assert(Same(decoded, base) && stats.headerBytes == 8 && stats.includedBones == 0);
+
+    // Malformed zero-residual Mode 5 variants.
+    auto bad = bytes; bad.push_back(0);
+    assert(receiver.Decode(dictionary, bad.data(), bad.size(), 1, 0, decoded, layout) == Status::Malformed);
+    bad = bytes; bad[7] = 0xC2u;
+    assert(receiver.Decode(dictionary, bad.data(), bad.size(), 1, 0, decoded, layout) == Status::Malformed);
+
+    // Local-space rotation with only bone 0 translating -> transMode == 1 (sparse translation) + sameRigidOmitted.
+    next = base;
+    for (size_t i = 0; i < next.size(); ++i) {
+        const double angle = 0.14 + i * 0.005;
+        pose::Transform t{};
+        t.name = static_cast<uint32_t>(i + 1);
+        t.values[0] = t.values[8] = static_cast<float>(std::cos(angle));
+        t.values[2] = static_cast<float>(std::sin(angle));
+        t.values[6] = -t.values[2];
+        t.values[4] = 1.0f;
+        t.values[9] = (i == 0 ? 18.0f : 10.0f + float(i));
+        assert(pose::Encode(t, next[i]));
+    }
+    assert(sender.EncodeCompact(dictionary, 1, 1, 0, next.data(), next.size(), 250,
+                                bytes, key, reconstructed, &stats) == Status::Ok);
+    assert(!key && bytes[6] == 5 && ((bytes[7] >> 6) & 3u) == 1 && (bytes[7] & 32u));
+    assert(bytes.size() * 8 == stats.headerBytes * 8 + stats.maskBits +
+           stats.rotationBits + stats.translationBits + stats.PaddingBits());
+    assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout, &stats) == Status::Ok);
+    assert(Same(decoded, reconstructed));
+    for (size_t size = 0; size < bytes.size(); ++size)
+        assert(receiver.Decode(dictionary, bytes.data(), size, 1, 0, decoded, layout) != Status::Ok);
+
+    // Zero translation delta across all rotated bones -> transMode == 0.
+    next[0].values[9] = base[0].values[9];
+    assert(sender.EncodeCompact(dictionary, 1, 1, 0, next.data(), next.size(), 280,
+                                bytes, key, reconstructed, &stats) == Status::Ok);
+    assert(!key && bytes[6] == 5 && ((bytes[7] >> 6) & 3u) == 0 && stats.translationBits == 0);
+    assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout, &stats) == Status::Ok);
+    assert(Same(decoded, reconstructed));
+
+    // Omitted index flips on a subset of bones -> sparseOmitted in Mode 5.
+    auto flip = base;
+    for (size_t i = 0; i < 3; ++i) {
+        pose::Transform t{};
+        t.name = static_cast<uint32_t>(i + 1);
+        t.values[0] = -1.0f; t.values[4] = 1.0f; t.values[8] = -1.0f;
+        t.values[9] = base[i].values[9] / pose::PositionScale;
+        assert(pose::Encode(t, flip[i]));
+    }
+    assert(sender.EncodeCompact(dictionary, 1, 1, 0, flip.data(), flip.size(), 310,
+                                bytes, key, reconstructed, &stats) == Status::Ok);
+    assert(!key && bytes[6] == 5 && !(bytes[7] & 32u));
+    assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, layout, &stats) == Status::Ok);
+    assert(Same(decoded, reconstructed));
+}
+
 int main()
 {
     Codec();
@@ -909,5 +997,6 @@ int main()
     ReliableAnchors();
     SecondOrderSpatial();
     LongDelayedFirstAnchor();
+    Mode5CompactAndMalformed();
     Simulation();
 }

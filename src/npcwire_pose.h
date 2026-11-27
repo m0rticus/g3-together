@@ -54,6 +54,11 @@ inline bool PoseNewer(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - 
 // Encode is exact; EncodeCompact also considers guarded near-rigid rotations
 // (at most two Q12 units per basis entry). Both use explicitly ACKed canonical
 // references. Store the returned reconstruction, never an untransmitted source.
+// Mode 5 compacts Mode 4 further: omits secondary/ratio when unused, omits
+// presence/rigid/omitted masks when unchanged or all-present/all-rigid, uses
+// compact 3/6/9/12 Rice parameters, skips zero translation deltas, and emits
+// an 8-byte (or 14-byte with older ref) zero-residual frame when all bones
+// match temporal prediction.
 class PoseCache {
     struct Frame {
         uint32_t token, incarnation;
@@ -66,6 +71,7 @@ class PoseCache {
     std::deque<Frame> anchors_; // newest token first, independent of the transient window
     std::optional<Frame> firstAnchor_;
     std::deque<uint32_t> ackRefs_;
+    std::vector<std::vector<pose::Bone>> spareBones_;
     uint32_t keyAt_ = 0;
     bool haveKey_ = false;
     uint32_t anchorAt_ = 0, anchorToken_ = 0;
@@ -74,11 +80,19 @@ class PoseCache {
     uint16_t layout_ = 0;
     uint8_t flags_ = 0;
 
+    void Recycle(Frame& frame)
+    {
+        if (spareBones_.size() < 8) {
+            frame.bones.clear();
+            spareBones_.push_back(std::move(frame.bones));
+        }
+    }
+
     Frame const* Find(uint32_t token, uint32_t incarnation, uint16_t layout, uint8_t flags) const
     {
-        for (auto const& f : frames_)
-            if (f.token == token && f.incarnation == incarnation &&
-                f.layout == layout && f.flags == flags) return &f;
+        for (auto it = frames_.rbegin(); it != frames_.rend(); ++it)
+            if (it->token == token && it->incarnation == incarnation &&
+                it->layout == layout && it->flags == flags) return &*it;
         for (auto const& f : anchors_)
             if (f.token == token && f.incarnation == incarnation &&
                 f.layout == layout && f.flags == flags) return &f;
@@ -95,15 +109,15 @@ class PoseCache {
     }
 
     static int32_t TemporalPrediction(Frame const& recent, Frame const* older,
-                                      unsigned ratio, size_t bone, int component)
+                                      unsigned ratio, size_t bone, int component) noexcept
     {
         const int32_t base = recent.bones[bone].values[component];
         if (!older) return base;
-        const int64_t difference = int64_t(base) - older->bones[bone].values[component];
-        return PoseSaturateInt16(int64_t(base) + PoseRoundQ8(difference * ratio));
+        const int32_t difference = base - older->bones[bone].values[component];
+        return PoseSaturateInt16(int64_t(base) + PoseRoundQ8(difference * static_cast<int32_t>(ratio)));
     }
 
-    static unsigned Ratio(Frame const& recent, Frame const* older, uint32_t now)
+    static unsigned Ratio(Frame const& recent, Frame const* older, uint32_t now) noexcept
     {
         if (!older || !PoseNewer(recent.now, older->now) || !PoseNewer(now, recent.now)) return 0;
         const uint32_t span = recent.now - older->now;
@@ -114,7 +128,7 @@ class PoseCache {
     }
 
     static bool QuaternionPrediction(Frame const& recent, Frame const* older, unsigned ratio,
-                                     size_t bone, uint8_t omitted, PoseQuat& prediction)
+                                     size_t bone, uint8_t omitted, PoseQuat& prediction) noexcept
     {
         if (!PoseExtractQuat(recent.bones[bone], prediction)) return false;
         if (prediction.values[omitted] < 0)
@@ -126,7 +140,7 @@ class PoseCache {
             for (auto& value : previous.values) value = -value;
         for (int k = 0; k < 4; ++k)
             prediction.values[k] = PoseSaturateInt16(int64_t(prediction.values[k]) +
-                PoseRoundQ8((int64_t(prediction.values[k]) - previous.values[k]) * ratio));
+                PoseRoundQ8((prediction.values[k] - previous.values[k]) * static_cast<int32_t>(ratio)));
         return true;
     }
 
@@ -138,15 +152,15 @@ class PoseCache {
                                 pose::Bone const* bones, size_t count, uint32_t now,
                                 std::size_t& bestSize, std::vector<uint8_t>& result,
                                 bool& resultKey, PoseStats& resultStats);
-    static void EncodeMode4(uint16_t layout, Frame const& recent, Frame const* olderCandidate,
-                            pose::Bone const* bones, size_t count, uint32_t now,
-                            std::size_t& bestSize, std::vector<uint8_t>& result, bool& resultKey,
-                            std::vector<pose::Bone>& reconstructed, PoseStats& resultStats);
+    static void EncodeMode4And5(uint16_t layout, Frame const& recent, Frame const* olderCandidate,
+                                pose::Bone const* bones, size_t count, uint32_t now,
+                                std::size_t& bestSize, std::vector<uint8_t>& result, bool& resultKey,
+                                std::vector<pose::Bone>& reconstructed, PoseStats& resultStats);
     Status EncodeCompactImpl(Dictionary const& dictionary, uint16_t layout, uint32_t incarnation, uint8_t flags,
                              pose::Bone const* bones, size_t count, uint32_t now,
                              std::vector<uint8_t>& out, bool& key,
                              std::vector<pose::Bone>& decodedOutput, PoseStats* stats,
-                             bool allowMode4, bool forceKey) const;
+                             bool allowMode4, bool forceKey, bool prevalidated) const;
 
     Status DecodeMode0(Dictionary const& dictionary, uint8_t const* data, size_t size, uint32_t ref,
                        std::vector<pose::Bone>& out, uint16_t& layout, PoseStats& stats) const;
@@ -159,6 +173,9 @@ class PoseCache {
     Status DecodeMode4(uint8_t const* data, size_t size,
                        uint16_t id, uint32_t ref, uint32_t incarnation, uint8_t flags,
                        std::vector<pose::Bone>& out, uint16_t& layout, PoseStats& stats) const;
+    Status DecodeMode5(Dictionary const& dictionary, uint8_t const* data, size_t size,
+                       uint16_t id, uint32_t ref, uint32_t incarnation, uint8_t flags,
+                       std::vector<pose::Bone>& out, uint16_t& layout, PoseStats& stats) const;
 
 public:
     size_t Retained() const { return frames_.size() + anchors_.size() + (firstAnchor_ ? 1 : 0); }
@@ -167,6 +184,13 @@ public:
     {
         return !latestToken_ || incarnation != incarnation_ || layout != layout_ || flags != flags_ ||
             AnchorDue(now);
+    }
+    uint32_t LatestAckRef() const noexcept { return ackRefs_.empty() ? 0 : ackRefs_.front(); }
+    uint32_t LatestAckTime() const noexcept
+    {
+        if (ackRefs_.empty()) return 0;
+        const Frame* f = Find(ackRefs_.front(), incarnation_, layout_, flags_);
+        return f ? f->now : 0;
     }
 
     bool Ack(uint32_t token, uint32_t incarnation)
@@ -206,9 +230,11 @@ public:
                 return false;
         }
         if (!sameContext) {
+            for (auto& f : frames_) Recycle(f);
             frames_.clear();
+            for (auto& f : anchors_) Recycle(f);
             anchors_.clear();
-            firstAnchor_.reset();
+            if (firstAnchor_) { Recycle(*firstAnchor_); firstAnchor_.reset(); }
             ackRefs_.clear();
             keyAt_ = anchorAt_ = anchorToken_ = 0;
             haveKey_ = haveAnchor_ = false;
@@ -220,18 +246,28 @@ public:
         if (pin) {
             auto existing = std::find_if(frames_.begin(), frames_.end(),
                                          [&](Frame const& f) { return f.token == token; });
-            Frame frame = existing != frames_.end()
-                ? *existing
-                : Frame{token, incarnation, layout, flags, now,
-                        std::vector<pose::Bone>(bones, bones + count)};
-            if (existing != frames_.end()) frames_.erase(existing);
+            Frame frame;
+            if (existing != frames_.end()) {
+                frame = std::move(*existing);
+                frames_.erase(existing);
+            } else {
+                frame = {token, incarnation, layout, flags, now, {}};
+                if (!spareBones_.empty()) {
+                    frame.bones = std::move(spareBones_.back());
+                    spareBones_.pop_back();
+                }
+                frame.bones.assign(bones, bones + count);
+            }
             if (!firstAnchor_) {
                 firstAnchor_ = std::move(frame);
             } else {
                 auto position = std::find_if(anchors_.begin(), anchors_.end(),
                                              [&](Frame const& f) { return PoseNewer(token, f.token); });
                 anchors_.insert(position, std::move(frame));
-                if (anchors_.size() > PoseAnchors) anchors_.pop_back();
+                if (anchors_.size() > PoseAnchors) {
+                    Recycle(anchors_.back());
+                    anchors_.pop_back();
+                }
             }
             if (!haveAnchor_ || PoseNewer(token, anchorToken_)) {
                 anchorAt_ = now;
@@ -239,9 +275,17 @@ public:
                 haveAnchor_ = true;
             }
         } else {
-            if (frames_.size() == PoseWindow) frames_.pop_front();
-            frames_.push_back({token, incarnation, layout, flags, now,
-                               std::vector<pose::Bone>(bones, bones + count)});
+            if (frames_.size() == PoseWindow) {
+                Recycle(frames_.front());
+                frames_.pop_front();
+            }
+            Frame frame{token, incarnation, layout, flags, now, {}};
+            if (!spareBones_.empty()) {
+                frame.bones = std::move(spareBones_.back());
+                spareBones_.pop_back();
+            }
+            frame.bones.assign(bones, bones + count);
+            frames_.push_back(std::move(frame));
         }
         if (newer) latestToken_ = token;
         if (key && (newer || !haveKey_)) { keyAt_ = now; haveKey_ = true; }
@@ -258,7 +302,7 @@ public:
                          pose::Bone const* bones, size_t count, uint32_t now,
                          std::vector<uint8_t>& out, bool& key,
                          std::vector<pose::Bone>& reconstructed, PoseStats* stats = nullptr,
-                         bool forceKey = false) const;
+                         bool forceKey = false, bool prevalidated = false) const;
 
     Status Decode(Dictionary const& dictionary, uint8_t const* data, size_t size,
                   uint32_t incarnation, uint8_t flags,

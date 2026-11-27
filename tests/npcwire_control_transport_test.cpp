@@ -135,7 +135,7 @@ int main()
         assert(transmissions.size() == 1 && transmissions[0].bytes[0] == MsgRefused);
         std::memcpy(&refusal, transmissions[0].bytes.data(), sizeof(refusal));
         char expected[32];
-        std::snprintf(expected, sizeof(expected), "protocol %u, host 81", ver);
+        std::snprintf(expected, sizeof(expected), "protocol %u, host 82", ver);
         assert(std::strstr(refusal.reason, expected) != nullptr);
         assert(!fakePeers[1].data && !peers[3]);
     }
@@ -829,7 +829,7 @@ int main()
         for (auto const& packet : packets) if (packet.bytes[0] == MsgControlPose) {
             const size_t start = sizeof(NpcsHeader) + 2 +
                 BoneWire16(packet.bytes.data() + sizeof(NpcsHeader)) + 2;
-            if (packet.bytes[start + 6] == 4) ++rigidPackets;
+            if (packet.bytes[start + 6] == 4 || packet.bytes[start + 6] == 5) ++rigidPackets;
             if (frame == 2) {
                 auto invalidInterval = packet;
                 invalidInterval.bytes[start - 1] = 0;

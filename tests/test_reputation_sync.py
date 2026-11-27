@@ -74,7 +74,7 @@ class ReputationSyncTests(unittest.TestCase):
         self.assertIn("EnclaveRepDelta = 6", net_h)
         self.assertIn("domain > StateReputation", net_messages)
         self.assertIn("kind <= StateReputation", net_session)
-        self.assertIn("Protocol = 81", saving_policy)
+        self.assertIn("Protocol = 82", saving_policy)
 
         # Story domain ordering, pre-admission cutover mask 0x3f, client QuestApply fame guard, and host quest flush.
         self.assertIn('{net::StateReputation, "reputation", &ReputationReady, &ReputationSnapshot, &ReputationApply}', story_domains)

@@ -69,7 +69,7 @@ class ClientAdmissionTests(unittest.TestCase):
         self.assertNotRegex(policy, r"\bInWorld\b")
 
     def test_protocol_unchanged(self):
-        self.assertIn("Protocol = 81", source("src/saving_policy.h"))
+        self.assertIn("Protocol = 82", source("src/saving_policy.h"))
 
     def test_admission_logging(self):
         persist = source("src/persist.cpp")

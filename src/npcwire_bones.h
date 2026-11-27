@@ -5,7 +5,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -60,6 +59,13 @@ enum class Status {
 
 class Dictionary {
 public:
+    Dictionary() = default;
+    Dictionary(Dictionary const& other);
+    Dictionary& operator=(Dictionary const& other);
+    Dictionary(Dictionary&& other) noexcept;
+    Dictionary& operator=(Dictionary&& other) noexcept;
+    ~Dictionary() = default;
+
     // Both tokens must be nonzero. A changed pair clears the cache; an identical
     // pair is a no-op. Use a fresh pair whenever old packets could still arrive.
     Status Reset(uint32_t world, uint64_t generation);
@@ -71,8 +77,11 @@ public:
     Status Register(uint16_t layoutId, uint32_t const* hashes, std::size_t count);
     // Different IDs may describe the same layout; FindLayout returns the lowest.
     Status FindLayout(uint32_t const* hashes, std::size_t count, uint16_t& layoutId) const;
+    Status FindLayout(pose::Bone const* bones, std::size_t count, uint16_t& layoutId) const;
     bool HasLayout(uint16_t layoutId) const;
+    bool MatchesLayout(uint16_t layoutId, pose::Bone const* bones, std::size_t count) const noexcept;
     Status IdentityPose(uint16_t layoutId, std::vector<pose::Bone>& bones) const;
+    std::vector<pose::Bone> const* IdentityPosePtr(uint16_t layoutId) const noexcept;
 
     // Transmit dictionary messages and requests reliably. No method installs a
     // generation from a packet. Call Reset explicitly when the world changes.
@@ -95,9 +104,19 @@ public:
                       uint16_t& layoutId) const;
 
 private:
+    struct LayoutEntry {
+        std::vector<uint32_t> hashes;
+        std::vector<pose::Bone> identity;
+    };
+
+    static constexpr std::size_t FastLayoutLimit = 512;
+    LayoutEntry const* FindEntry(uint16_t layoutId) const noexcept;
+    void RebuildFastLayouts();
+
     uint32_t world_ = 0;
     uint64_t generation_ = 0;
-    std::map<uint16_t, std::vector<uint32_t>> layouts_;
+    std::unordered_map<uint16_t, LayoutEntry> layouts_;
+    std::vector<LayoutEntry const*> fastLayouts_;
     std::unordered_map<uint64_t, std::vector<uint16_t>> byDigest_;
 };
 

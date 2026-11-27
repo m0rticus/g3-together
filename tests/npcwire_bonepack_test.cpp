@@ -151,7 +151,7 @@ static void QuaternionFidelity()
     sender.Ack(2, 1);
 
     assert(sender.EncodeCompact(dictionary, 1, 1, 0, target.data(), count, 32, bytes, key, canonical, &stats) == Status::Ok);
-    assert(bytes[6] == 4);
+    assert(bytes[6] == 4 || bytes[6] == 5);
     assert(stats.predictive && stats.rigidBones > 0);
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, id, &stats) == Status::Ok);
     assert(decoded.size() == count);
@@ -179,7 +179,11 @@ static void QuaternionFidelity()
     bytes.push_back(0);
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, id) == Status::Malformed);
     bytes = valid;
-    bytes[7] = 8;
+    if (bytes[6] == 4) {
+        bytes[7] = 8;
+    } else {
+        bytes[7] |= 0xC0u;
+    }
     decoded = canonical;
     assert(receiver.Decode(dictionary, bytes.data(), bytes.size(), 1, 0, decoded, id) == Status::Malformed);
 }
@@ -276,7 +280,7 @@ static void BoundedStreamAndRecovery()
         assert(bytes.size() * 8 == stats.headerBytes * 8 + stats.maskBits + stats.rotationBits +
                stats.translationBits + stats.PaddingBits());
         if (step == 0 || step == 81 || step == 140 || step == 155 || step == 165) assert(key);
-        if (bytes[6] == 4) { ++compact; if (bytes[7] & 2) ++coarse; }
+        if (bytes[6] == 4 || bytes[6] == 5) { ++compact; if (bytes[7] & 2) ++coarse; }
         for (size_t i = 0; i < count; ++i)
             for (int k = 0; k < 12; ++k) {
                 const int error = std::abs(int(canonical[i].values[k]) - source[i].values[k]);
@@ -329,6 +333,56 @@ static void BoundedStreamAndRecovery()
     assert(maxOriginErrorCm == 0 && maxAxisErrorDegrees < 0.061);
 }
 
+static void Matrix4x4EncodeParity()
+{
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> basisDist(-7.5f, 7.5f);
+    std::uniform_real_distribution<float> posDist(-8000.0f, 8000.0f);
+    for (int trial = 0; trial < 200; ++trial) {
+        pose::Transform tr{};
+        tr.name = static_cast<uint32_t>(trial + 1);
+        float mat[16] = {};
+        for (int i = 0; i < 3; ++i) { mat[i] = tr.values[i] = basisDist(rng); }
+        for (int i = 0; i < 3; ++i) { mat[4 + i] = tr.values[3 + i] = basisDist(rng); }
+        for (int i = 0; i < 3; ++i) { mat[8 + i] = tr.values[6 + i] = basisDist(rng); }
+        for (int i = 0; i < 3; ++i) { mat[12 + i] = tr.values[9 + i] = posDist(rng); }
+        // Poison w lanes with NaN / Inf / large values; EncodeMatrix4x4 must ignore them.
+        mat[3] = NAN;
+        mat[7] = INFINITY;
+        mat[11] = -INFINITY;
+        mat[15] = 1e30f;
+
+        pose::Bone a{}, b{};
+        assert(pose::Encode(tr, a));
+        assert(pose::EncodeMatrix4x4(tr.name, mat, b));
+        assert(std::memcmp(&a, &b, sizeof(pose::Bone)) == 0);
+    }
+
+    // Halfway tie-breaking and rejection atomicity.
+    float edge[16] = {
+        0.5f / pose::BasisScale, -0.5f / pose::BasisScale, 0.49999997f / pose::BasisScale, NAN,
+        -0.49999997f / pose::BasisScale, 32767.49f / pose::BasisScale, -32768.49f / pose::BasisScale, INFINITY,
+        0.0f, -0.0f, 1.0f, 999999.0f,
+        0.5f / pose::PositionScale, -0.5f / pose::PositionScale, -0.49999997f / pose::PositionScale, 1.0f
+    };
+    pose::Bone out{};
+    assert(pose::EncodeMatrix4x4(77, edge, out));
+    assert(out.name == 77 && out.values[0] == 1 && out.values[1] == -1 && out.values[2] == 0);
+    assert(out.values[3] == 0 && out.values[4] == 32767 && out.values[5] == -32768);
+    assert(out.values[6] == 0 && out.values[7] == 0 && out.values[8] == 4096);
+    assert(out.values[9] == 1 && out.values[10] == -1 && out.values[11] == 0);
+
+    const pose::Bone sentinel = out;
+    edge[5] = 32768.0f / pose::BasisScale;
+    assert(!pose::EncodeMatrix4x4(77, edge, out));
+    assert(std::memcmp(&out, &sentinel, sizeof(out)) == 0);
+    edge[5] = NAN;
+    assert(!pose::EncodeMatrix4x4(77, edge, out));
+    assert(std::memcmp(&out, &sentinel, sizeof(out)) == 0);
+    assert(!pose::EncodeMatrix4x4(0, edge, out));
+    assert(!pose::EncodeMatrix4x4(77, nullptr, out));
+}
+
 int main()
 {
     RiceAndIntegerBounds();
@@ -336,5 +390,6 @@ int main()
     AffineFallbackAndAtomic();
     ExhaustEveryInt16();
     BoundedStreamAndRecovery();
+    Matrix4x4EncodeParity();
     return 0;
 }
